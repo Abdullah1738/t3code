@@ -33,6 +33,9 @@ class Isolated(unittest.TestCase):
         self.stack.callback(home.INVOCATION_RUN.reset, identity_token)
         key_lookup = self.stack.enter_context(patch.object(
             api, '_key', side_effect=AssertionError('real API-key lookup forbidden in unit tests; stub the API boundary')))
+        # Existing allocation fixtures have no guest children. Protection tests restore the real API reader.
+        self.stack.enter_context(patch.object(api, 'box_protection', return_value=
+            dict(ok=True, pin=dict(active=False,holder=None,until=None), holds=[])))
         # Cleanup also catches lookups swallowed by production error handling or background workers.
         self.addCleanup(key_lookup.assert_not_called)
         root = Path(self.tmp.name)
@@ -63,6 +66,8 @@ class Isolated(unittest.TestCase):
         source = root / 'isolated-source'
         source.mkdir()
         self.me = dict(owner='worker', repo_key='repo', repo_root=str(source), session='s',thread='t')
+        # Restore before TemporaryDirectory cleanup, even when a test changes cwd and raises.
+        self.stack.enter_context(contextlib.chdir(os.getcwd()))
 
     def box(self, bid, state='running', used=100, member=False, size='large', source='template:crpko-go'):
         self.con.execute("""INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,last_used_at,source)

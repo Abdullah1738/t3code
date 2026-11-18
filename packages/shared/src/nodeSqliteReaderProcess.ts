@@ -2,6 +2,7 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeSea from "node:sea";
 import * as NodeModule from "node:module";
+import { workerMemoryLimits, workerMemoryHeartbeatSource } from "./workerMemory.ts";
 
 export interface ReaderRuntime {
   readonly completion?: Promise<number>;
@@ -37,11 +38,11 @@ const arm = (limitMs = workerData.statementLimitMs) => {
 };
 // This thread never executes SQLite. It also bounds an orphan's native call if
 // the server is killed while the child cannot handle its IPC disconnect event.
-const guard = new Worker(\`const { workerData } = require("node:worker_threads");
+const guard = new Worker(${JSON.stringify(workerMemoryHeartbeatSource("guard"))} + \`const { workerData } = require("node:worker_threads");
 const deadline = new BigInt64Array(workerData.deadline);
 setInterval(() => { const at = Atomics.load(deadline, 0);
   if (at !== 0n && process.hrtime.bigint() / 1000000n >= at) process.kill(workerData.pid, "SIGKILL");
-}, 100);\`, { eval: true, workerData: { deadline: deadline.buffer, pid: process.pid } });
+}, 100);\`, { eval: true, resourceLimits: ${JSON.stringify(workerMemoryLimits.guard)}, workerData: { deadline: deadline.buffer, pid: process.pid } });
 guard.unref();
 arm();
 const parentPort = {

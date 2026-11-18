@@ -1172,8 +1172,8 @@ describe("CutoverReadiness", () => {
         yield* f.fs.copyFile(f.path.join(source, "toollog.py"), f.path.join(pkg, "toollog.py"));
         yield* f.fs.makeDirectory(f.path.join(pkg, "vendor"));
         yield* f.fs.copyFile(
-          f.path.join(source, "vendor", "codex-models-0.166.0.json"),
-          f.path.join(pkg, "vendor", "codex-models-0.166.0.json"),
+          f.path.join(source, "vendor", "codex-models-0.169.1.json"),
+          f.path.join(pkg, "vendor", "codex-models-0.169.1.json"),
         );
         const manifest = JSON.parse(
           yield* f.fs.readFileString(f.path.join(source, "manifest.json")),

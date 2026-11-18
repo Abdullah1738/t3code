@@ -568,7 +568,7 @@ class ExpiryTests(Isolated):
 
     def test_rm_base_deletes_its_saved_snapshot(self):
         self.base(saved="offbox-base-x")
-        with patch.object(api, "delete"), patch.object(api, "delete_saved") as rm, \
+        with patch.object(api, "delete", return_value={}), patch.object(api, "delete_saved") as rm, \
                 contextlib.redirect_stdout(io.StringIO()):
             bases.rm_base(self.me, "default")
         rm.assert_called_once_with("offbox-base-x")
@@ -641,9 +641,11 @@ class ExpiryTests(Isolated):
                 {"id": "bx_young", "state": "archived", "stoppedAt": iso_ago(2 * DAY)},
                 {"id": "pinned", "state": "archived", "stoppedAt": iso_ago(13 * DAY)}]
         full = {"included": 50, "used": 50}
-        with patch.object(lease, "refresh_box") as refresh:
+        with patch.object(lease, "refresh_box") as refresh, patch.object(bases, 'keep_pin_saved', return_value=True) as saved:
             self.reap(live, [], full)
-        self.assertEqual(sorted(c.args[1] for c in refresh.call_args_list), ["bx_old", "pinned"])
+        self.assertEqual(sorted(c.args[1] for c in refresh.call_args_list), ["bx_old"])
+        saved.assert_called_once()
+        self.assertEqual(saved.call_args.args[1], 'pinned')
 
     def test_refresh_box_resumes_then_stops(self):
         with patch.object(api, "resume") as resume, patch.object(api, "wait_state"), patch.object(api, "stop") as stop:

@@ -19,6 +19,15 @@ const completion = (sql: string): StatementCompletion => ({
 });
 
 describe("statement statistics", () => {
+  it("keeps the largest worker result and its row count across a drain interval", () => {
+    const stats = makeStatementStats();
+    stats.record({ ...completion("SELECT value FROM entries"), resultBytes: 8192, rows: 3 });
+    stats.record({ ...completion("SELECT value FROM entries"), resultBytes: 4096, rows: 7 });
+    const [summary] = stats.drain();
+    assert.strictEqual(summary?.maxResultBytes, 8192);
+    assert.strictEqual(summary?.maxResultRows, 3);
+    assert.deepEqual(stats.drain(), []);
+  });
   it("merges literal variants, separates lanes, and drains only counters", () => {
     const stats = makeStatementStats();
     stats.record(completion("SELECT value FROM entries WHERE id = 'private-value'"));
@@ -123,6 +132,8 @@ describe("statement statistics", () => {
         assert.strictEqual(select?.calls, 1);
         assert.strictEqual(select?.rows, 2);
         assert.strictEqual(select?.connection, workers ? "reader" : "writer");
+        assert.strictEqual(select?.maxResultBytes, workers ? 48 : 0);
+        assert.strictEqual(select?.maxResultRows, workers ? 2 : 0);
         assert.deepEqual(
           observations.map(({ connection, lane, outcome }) => ({ connection, lane, outcome })),
           workers
