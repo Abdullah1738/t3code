@@ -1,4 +1,5 @@
 import { ThreadItemRedacted } from "./ardud/threadRedaction.ts";
+import { ClaudeApiErrorDetails } from "./ardud/claudeApiError.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -1438,6 +1439,7 @@ export type OrchestrationV2RestartAdmissionFailure =
  * Producers must redact credentials before constructing this value.
  */
 export const OrchestrationV2ProviderFailure = Schema.Struct({
+  claudeApiError: Schema.optional(ClaudeApiErrorDetails),
   class: OrchestrationV2ProviderFailureClass,
   message: OrchestrationV2ProviderFailureMessage,
   code: Schema.NullOr(OrchestrationV2ProviderFailureCode),
