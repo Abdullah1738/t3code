@@ -75,13 +75,16 @@ function harness(random = 0.5, network = false, options: { storePath?: string; r
     if (path.endsWith("/evidence")) return ok({ toolEvidence: "ran", complete: !!options.replies, status: options.replies ? "completed" : "running" });
     if (path.endsWith("/respond")) {
       const id = path.split("/").at(-2)!;
+      const pending = requests.findIndex(request => request.requestId === id);
+      if (pending === -1) return Response.json({ ok: false, error: {
+        code: "conflict", reason: "request_resolved", retrySafe: false,
+      } }, { status: 409 });
       const body = JSON.parse(String(init?.body)) as { clientRequestId: string };
       if (!responseReceipts.has(body.clientRequestId)) {
         responses.push({ id, body });
         responseReceipts.add(body.clientRequestId);
       }
-      const pending = requests.findIndex(request => request.requestId === id);
-      if (pending !== -1) requests.splice(pending, 1);
+      requests.splice(pending, 1);
       if (loseReplyResponse) {
         healthy = false;
         for (let n = 0; n < 3; n++) await client.thread("thread").catch(() => {});
@@ -522,6 +525,68 @@ test.each([replyForms[0]!, replyForms[4]!])("$name reuses the response receipt w
         expect(h.sends.map(send => send.text)).toEqual(["first", "Later message"]);
         expect(h.store.db.query("SELECT id FROM inbound WHERE state IN ('failed','unknown')").all()).toEqual([]);
       } finally { intercept.mockRestore(); }
+    });
+  } finally { h.fetcher.mockRestore(); }
+});
+
+test.each(replyForms.flatMap(form => ["request_resolved", "gate refusal", "retry-safe refusal"].map(stage => ({ ...form, stage }))))(
+  "$name keeps the earlier uncertain POST fenced when it commits before a $stage retry (with restarts)", async form => {
+  const h = harness();
+  try {
+    await captureLogs(async () => {
+      await prepareAnswer(h, form);
+      const respond = h.client.respond.bind(h.client);
+      let original: Parameters<typeof respond> | undefined;
+      const lost = spyOn(h.client, "respond").mockImplementation(async (...args) => {
+        original = args;
+        h.healthy = false; await h.down();
+        throw new ControlError(0);
+      });
+      try { await h.router.tick(); } finally { lost.mockRestore(); }
+      expect(h.responses).toEqual([]);
+      expect(h.gate.available).toBe(false);
+      h.healthy = true; await h.advance(start + 1_000);
+      const resolved = h.backend.responseResolved.bind(h.backend);
+      let first = true;
+      const read = spyOn(h.backend, "responseResolved").mockImplementation(async (...args) => {
+        const result = await resolved(...args);
+        if (first) {
+          first = false;
+          expect(result).toBe(false);
+          await respond(...original!);
+          if (form.stage === "gate refusal") { h.healthy = false; await h.down(); }
+        }
+        return result;
+      });
+      let attempts = 0;
+      const retry = spyOn(h.client, "respond").mockImplementation(async (...args) => {
+        attempts++;
+        expect(args).toEqual(original!);
+        if (form.stage === "retry-safe refusal") throw new ControlError(503, "unavailable", { reason: "startup_unavailable", retrySafe: true });
+        return respond(...args);
+      });
+      try {
+        const router = h.restartRouter();
+        if (form.stage === "gate refusal") {
+          await expect(router.tick()).rejects.toBeInstanceOf(RobobLinkDown);
+          expect(h.store.get("steer-attempt:answer")).toMatchObject({ response: { linkUncertain: true, retry: { request: { id: "request" } } } });
+          h.healthy = true; await h.advance(start + 2_000);
+        } else await router.tick();
+        const restarted = h.restartRouter();
+        await restarted.tick(); await restarted.tick();
+        const retained = h.store.get<{ response: { retry?: unknown } }>("steer-attempt:answer");
+        expect(retained).toMatchObject({ response: { linkUncertain: true, operation: { request: { id: "request" } } } });
+        expect(retained!.response.retry).toBeUndefined();
+        expect(h.responses).toEqual([{ id: "request", body: original![2] }]);
+        expect(h.responses[0]!.body).toMatchObject(form.body);
+        expect(attempts).toBe(form.stage === "gate refusal" ? 2 : 1);
+        h.store.set("activeTurn", null);
+        await restarted.tick(); await restarted.tick();
+        expect(h.sends.map(send => send.text)).toEqual(["first", "Later message"]);
+        expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id = 'answer'").get()?.state).toBe("processing");
+        expect(h.store.get<typeof retained>("steer-attempt:answer")).toEqual(retained);
+        expect(h.store.db.query("SELECT id FROM inbound WHERE state IN ('failed','unknown')").all()).toEqual([]);
+      } finally { retry.mockRestore(); read.mockRestore(); }
     });
   } finally { h.fetcher.mockRestore(); }
 });

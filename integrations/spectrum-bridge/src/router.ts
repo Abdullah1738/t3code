@@ -88,7 +88,7 @@ type Turn = Route & {
 };
 /** Older persisted steer attempts contain only their route. */
 type ResponseRetry = { request: PermissionRequest | QuestionRequest; answers: string[][]; decision?: "once" | "reject"; typedReply?: string; outbox: number; before?: string[] | "unknown" };
-type SteerAttempt = Route & { inboundId?: string; text?: string; guidance?: string; parts?: FilePart[]; fileGuidance?: string; startedAt?: number; outbox?: number; sameMode?: boolean; reconcileOnly?: boolean; requeueReason?: RequeueReason; response?: { sessionId: string; directory: string; requestId: string; turn: Turn; operation?: ResponseRetry; retry?: ResponseRetry; preflight?: boolean; linkRetry?: boolean; linkUncertain?: boolean } };
+type SteerAttempt = Route & { inboundId?: string; text?: string; guidance?: string; parts?: FilePart[]; fileGuidance?: string; startedAt?: number; outbox?: number; sameMode?: boolean; reconcileOnly?: boolean; requeueReason?: RequeueReason; response?: { sessionId: string; directory: string; requestId: string; turn: Turn; operation?: ResponseRetry; retry?: ResponseRetry; preflight?: boolean; linkRetry?: boolean; linkUncertain?: boolean; priorUncertain?: boolean } };
 /** The sealed prompt body, retained until delivery is confirmed. */
 type ResendBody = {
   inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string };
@@ -2277,11 +2277,11 @@ export class Router {
           .catch(error => { toolError("router", "router.respond_reconcile", error); return undefined; });
         if (resolved === undefined) return;
         if (response.linkUncertain) {
-          // Only a fresh pending request permits the same sealed response, whose
-          // deterministic key also fences a response still committing at Robob.
+          // A pending read permits only this sealed retry. Its later refusal
+          // cannot settle the earlier POST whose receipt was lost.
           if (!resolved && response.operation) {
             this.store.set(`steer-attempt:${row.id}`, { ...attempt,
-              response: { ...response, retry: response.operation, linkRetry: true } } satisfies SteerAttempt);
+              response: { ...response, retry: response.operation, linkRetry: true, priorUncertain: true } } satisfies SteerAttempt);
             await this.postResponse(row.id, response.turn, response.sessionId, response.directory, response.requestId, response.operation);
           }
           // A disappearing request cannot prove whose response landed.
@@ -5484,6 +5484,7 @@ export class Router {
     // Persist before POST: a timeout or restart cannot turn an unresolved response into a new send.
     let preflight = !this.toolMode && sessionId === turn.id && !Array.isArray(retry.before);
     let linkRetry = this.store.get<SteerAttempt>(`steer-attempt:${id}`)?.response?.linkRetry === true;
+    const priorUncertain = this.store.get<SteerAttempt>(`steer-attempt:${id}`)?.response?.priorUncertain === true;
     const handled = new Set(this.handledNow).add(id);
     // Controls already behind a gate-held answer must wait for its original response.
     if (linkRetry) for (const row of this.store.pendingInbound()) handled.add(row.id);
@@ -5492,6 +5493,7 @@ export class Router {
     const save = (deferred: boolean) => this.store.set(`steer-attempt:${id}`, { ...turn,
       response: { sessionId, directory, requestId, turn, operation: retry, ...(deferred ? { retry } : {}), ...(preflight ? { preflight: true } : {}),
         ...(deferred && linkRetry ? { linkRetry: true } : {}),
+        ...(priorUncertain ? { priorUncertain: true, linkUncertain: true } : {}),
         ...(!deferred && (linkRetry || this.backend.linkAvailable !== undefined) ? { linkUncertain: true } : {}) },
       requeueReason: "respond_failed" } satisfies SteerAttempt);
     save(true);
@@ -5582,15 +5584,17 @@ export class Router {
 
   private answerFailed(id: string, turn: Turn, sessionId: string, directory: string, requestId: string, error: unknown, retry?: ResponseRetry): void {
     const disposition = controlDisposition(error);
-    const linkUncertain = disposition !== "refused" && (this.backend.linkAvailable === false
+    const priorUncertain = this.store.get<SteerAttempt>(`steer-attempt:${id}`)?.response?.priorUncertain === true;
+    const linkUncertain = priorUncertain || disposition !== "refused" && (this.backend.linkAvailable === false
       || disposition === "reconcile" && this.store.get<SteerAttempt>(`steer-attempt:${id}`)?.response?.linkUncertain === true);
-    if (disposition === "same_mode" && retry) {
+    if (disposition === "same_mode" && retry && !priorUncertain) {
       this.store.set(`steer-attempt:${id}`, { ...turn, response: { sessionId, directory, requestId, turn, operation: retry, retry }, requeueReason: "respond_failed" } satisfies SteerAttempt);
       this.store.set(`human-own-turn:${id}`, true);
       this.store.set(`batch-phase:${id}`, "steering");
       this.store.updateInbound(id, "processing");
     } else if (linkUncertain || disposition === "reconcile" && !(error && typeof error === "object" && "reconciled" in error && error.reconciled === true)) {
       this.store.set(`steer-attempt:${id}`, { ...turn, response: { sessionId, directory, requestId, turn, operation: retry,
+        ...(priorUncertain ? { priorUncertain: true } : {}),
         ...(linkUncertain ? { linkUncertain: true } : {}) }, requeueReason: "respond_failed" } satisfies SteerAttempt);
       this.store.set(`human-own-turn:${id}`, true);
       this.store.set(`batch-phase:${id}`, "steering");
