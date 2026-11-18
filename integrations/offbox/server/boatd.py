@@ -3279,7 +3279,7 @@ class Handler(BaseHTTPRequestHandler):
                 p = cmd_dir(bid) / f"{r['pid']}.{which}"
                 with open(p, "rb") as f:
                     f.seek(off)
-                    data = f.read(1 << 20)
+                    data = f.read(max(4, min(1 << 20, int(q.get('limitBytes') or (1 << 20)))))
                     size = os.fstat(f.fileno()).st_size
                 data, nxt = _utf8_cut(data, off)
                 return {"ok": True, "data": data, "nextOffset": nxt, "size": size,

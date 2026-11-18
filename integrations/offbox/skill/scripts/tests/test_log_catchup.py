@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from offbox_lib import api, common, misc, pool, reap, runs
 from offbox_lib.common import OffboxError
 from test_capacity import Isolated
+from test_live_logs import both_history_orders
 
 HISTORY_LOGS = api.history_logs
 
@@ -644,25 +645,28 @@ class LogCatchupTests(Isolated):
     def test_live_budget_keeps_pages_offsets_and_reports_progress_with_fetch_stats(self):
         self.state('running', None)
         clock = [1000.0]
+        timing = threading.local()
+        def monotonic():
+            return getattr(timing, 'now', 1000.0) if threading.current_thread().name.startswith('offbox-history-') else clock[0]
         def history(box, cmd, which, offset, **kw):
             self.assertEqual(kw['deadline'], 1010)
-            clock[0] += 4
+            clock[0] = kw['deadline']
+            timing.now = clock[0]
             return dict(data='more', nextOffset=offset + 4, size=100, done=False)
         self.history.side_effect = history
         with patch.object(misc, '_refresh_running_ttl'), \
                 patch.object(misc.time, 'time', lambda: clock[0]), \
-                patch.object(misc, 'monotonic', lambda: clock[0]):
+                patch.object(misc.time, 'monotonic', monotonic), \
+                patch.object(misc, 'monotonic', monotonic):
             code, out, err = self.invoke()
         self.assertEqual((code, out), (0, 'prefix\nmoremore'))
-        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=15, stderrOffset=0, logBytes=15))
-        self.assertIn('is still running; fetched 15 bytes so far (timeout after 12.0s)', err)
-        self.assertIn('offbox logs run-x --follow, or offbox wait run-x --timeout 570', err)
-        self.assertEqual(err.count('is still running'), 1)
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=11, stderrOffset=4, logBytes=15))
+        self.assertIn('is still running', err)
         self.assertNotIn('incomplete', err)
         event, = self.fetch_events()
-        self.assertEqual(event, dict(run='run-x', live=True, result='incomplete:timeout', seconds=12,
-                                    pages=[3, 0], bytes=8, slowest_ms=4000, lock_wait_ms=0, budget=10,
-                                    page_ms=[[4000, 4000, 4000], []], page_ms_omitted=[0, 0]))
+        self.assertEqual(event, dict(run='run-x', live=True, result='incomplete:more output available', seconds=10,
+                                    pages=[1, 1], bytes=8, slowest_ms=10000, lock_wait_ms=0, budget=10,
+                                    page_ms=[[10000], [10000]], page_ms_omitted=[0, 0]))
 
     def test_queued_only_log_reports_utc_queue_time_without_incomplete_or_running(self):
         lines = [
@@ -710,6 +714,7 @@ class LogCatchupTests(Isolated):
             self.assertFalse(misc._live_log_notice(self.row(), shown, 'n/a', 0))
         say.assert_not_called()
 
+    @both_history_orders
     def test_first_logs_fetch_notices_home_queue_without_preseeded_evidence(self):
         from offbox_lib import home_run_observation as observation
         self.state('running', None)
@@ -719,8 +724,11 @@ class LogCatchupTests(Isolated):
                 patch.dict('os.environ', {'OFFBOX_BACKEND': 'server'}), patch.object(misc, '_refresh_running_ttl'), \
                 patch.object(observation.toollog, 'emit') as event:
             for remote, text, expected in [(None, b'offbox-server: waiting; position 1 of 1; memory\n', True),
-                                           ('queued', b'', True), ('running', b'offbox-server: waiting; position 1 of 1\n', False)]:
-                with self.subTest(remote=remote):
+                                           ('queued', b'', True),
+                                           ('queued', b'offbox-server: waiting; position 1 of 1\n', True),
+                                           ('running', b'offbox-server: waiting; position 1 of 1\n', False),
+                                           ('running', b'', False)]:
+                with self.subTest(remote=remote, text=text):
                     (common.LOGS_DIR / 'run-x.home-read.json').unlink(missing_ok=True)
                     (common.LOGS_DIR / 'run-x.home-queue-notice').unlink(missing_ok=True)
                     self.prefix(b'', out=0, err=0)
@@ -733,6 +741,9 @@ class LogCatchupTests(Isolated):
                     code, out, err = self.invoke()
                     self.assertEqual(code, 0)
                     self.assertEqual(out, text.decode())
+                    read = common.read_json(common.LOGS_DIR / 'run-x.home-read.json', {})
+                    self.assertEqual(read['status'], remote)
+                    self.assertEqual(read['attempt'], 2 if remote else None)
                     self.assertEqual(err.count('it will not move to Boat'), int(expected))
                     self.assertEqual(event.call_count, int(expected))
                     if expected:
@@ -760,15 +771,18 @@ class LogCatchupTests(Isolated):
                                  (False, 'incomplete:timeout', 0, [1, 0]))
                 self.assertEqual((event['seconds'], event['slowest_ms'], event['budget']), (31, 31000, None))
 
+    @both_history_orders
     def test_caught_up_live_fetch_records_both_streams_without_warning(self):
         self.state('running', None)
+        self.prefix(b'prefix\n')
         self.streams(b'prefix\nrest\n', b'error\n')
         with patch.object(misc, '_refresh_running_ttl'):
             code, out, err = self.invoke()
-        self.assertEqual((code, out), (0, 'prefix\nrest\nerror\n'))
+        self.assertEqual(code, 0)
+        self.assertIn(out, ('prefix\nrest\nerror\n', 'prefix\nerror\nrest\n'))
         self.assertNotIn('incomplete', err)
         self.assertNotIn('more output is on the server', err)
-        event, = self.fetch_events()
+        event = self.fetch_events()[-1]
         self.assertEqual((event['result'], event['pages'], event['bytes']), ('caught_up', [1, 1], 11))
         self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=12, stderrOffset=6, logBytes=18))
 

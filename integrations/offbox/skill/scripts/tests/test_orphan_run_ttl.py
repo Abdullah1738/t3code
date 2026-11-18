@@ -6,6 +6,7 @@ import types
 from unittest.mock import patch
 
 from test_capacity import Isolated
+from test_live_logs import both_history_orders, record_history_pages
 from offbox_lib import api, bases, common, lease, misc, reap, runs
 
 
@@ -281,23 +282,44 @@ class LiveLogsTests(Isolated):
             code = misc.logs('run-t', False)
         return code, out.getvalue(), err.getvalue()
 
+    @both_history_orders
     def test_live_logs_save_both_streams_and_survive_box_stop(self):
-        self.assertEqual(self.logs()[:2], (0, 'old\nnew\nerr\n'))
+        self.con.execute("UPDATE runs SET status='running',exit_code=NULL")
+        self.box_get.return_value = dict(state='running')
+        self.history.side_effect = self.page
+        self.keep.reset_mock()
+        self.path.write_bytes(b'old\n')
+        runs._commit(self.path, 4, 0, 4)
+        pages = []
+        with record_history_pages(pages):
+            code, output, _ = self.logs()
+        expected = b'old\n' + b''.join(data for _, data in pages)
+        self.assertEqual((code, output), (0, expected.decode()))
+        for which, offset in (('stdout', 4), ('stderr', 0)):
+            self.assertEqual(b''.join(data for stream, data in pages if stream == which), self.streams[which][offset:])
         self.keep.assert_called_once_with('bx', common.RUN_TTL_S, dict(state='running'))
         self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=8, stderrOffset=4, logBytes=12))
-        self.assertEqual(self.logs()[:2], (0, 'old\nnew\nerr\n'))
+        self.assertEqual(self.logs()[:2], (0, expected.decode()))
         self.con.execute("UPDATE runs SET status='failed',exit_code=143")
         self.con.commit()
         self.box_get.return_value = dict(state='stopped')
         self.history.side_effect = common.OffboxError('stopped')
-        self.assertEqual(self.logs()[:2], (0, 'old\nnew\nerr\n'))
-        self.assertEqual(self.path.read_bytes(), b'old\nnew\nerr\n')
+        self.assertEqual(self.logs()[:2], (0, expected.decode()))
+        self.assertEqual(self.path.read_bytes(), expected)
 
+    @both_history_orders
     def test_background_with_no_local_log_starts_at_zero(self):
         self.path.unlink()
         common.offsets_path(self.path).unlink()
-        self.logs()
-        self.assertEqual(self.path.read_bytes(), b'old\nnew\nerr\n')
+        pages = []
+        with record_history_pages(pages):
+            code, output, _ = self.logs()
+        expected = b''.join(data for _, data in pages)
+        self.assertEqual((code, output), (0, expected.decode()))
+        self.assertEqual(self.path.read_bytes(), expected)
+        for which in ('stdout', 'stderr'):
+            self.assertEqual(b''.join(data for stream, data in pages if stream == which), self.streams[which])
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=8, stderrOffset=4, logBytes=12))
 
     def test_later_fetch_failure_keeps_already_fetched_page(self):
         page = self.page

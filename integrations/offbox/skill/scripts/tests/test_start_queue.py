@@ -6,6 +6,7 @@ import itertools
 import threading
 import urllib.error
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -297,6 +298,7 @@ class ResumeQueueTests(Isolated):
                 patch.object(lease, '_bring_up'), patch.object(lease, 'ensure_ttl'), \
                 patch.object(lease.ssh_sync, 'close_master'), patch.object(self.clock.time, 'sleep', sleep), \
                 patch.object(runs.Runner, 'start', start), patch.object(fallback, 'run_local') as local, \
+                patch.object(runs.Runner, 'stream', side_effect=lambda **kw: signal.raise_signal(signal.SIGTERM)), \
                 patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stdout(io.StringIO()):
             thread = threading.Thread(target=grower)
@@ -304,7 +306,7 @@ class ResumeQueueTests(Isolated):
             try:
                 self.assertTrue(entered.wait(5))
                 self.assertTrue(allocation.resume_inflight(self.con, 'grow'))
-                self.assertEqual(cli.cmd_run(args, self.me), 0, self.err.getvalue())
+                self.assertEqual(cli.cmd_run(args, self.me), common.EXIT_DETACHED, self.err.getvalue())
             finally:
                 release.set()
                 thread.join(5)
