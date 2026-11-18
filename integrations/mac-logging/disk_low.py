@@ -308,13 +308,33 @@ def pending(run=bounded_command, now=None, state=None):
             emit('disk', 'event', 'disk.low_cleared',
                  props=dict(volume=volume, lowForS=max(0, recovered-prior['start'])))
             state.setdefault('clearedKeys', []).append(prior['key'])
-    for volume, episode in list(state.get('episodes', {}).items()):
-        prior = cached.get('episodes', {}).get(volume, {})
-        recovered = cached.get('healthyAt', {}).get(volume, 0)
+    episodes = state.setdefault('episodes', {})
+    for volume, recovered in cached.get('healthyAt', {}).items():
         if recovered > state.get('healthyAt', {}).get(volume, 0):
             state.setdefault('healthyAt', {})[volume] = recovered
-            episode.update(start=now, key=episode_key(volume, recovered), sent=False, logged=False)
-            episode.pop('text', None)
+            # Recovery retires stale primary state even if this source is
+            # unavailable now. Only this tick's low reading can re-arm it.
+            retired = episodes.pop(volume, None)
+            if (retired is not None and retired['start'] <= recovered
+                    and retired['key'] not in state.get('clearedKeys', [])):
+                emit('disk', 'event', 'disk.low_cleared',
+                     props=dict(volume=volume, lowForS=max(0, recovered-retired['start']),
+                                reason='emergency_recovery'))
+                state.setdefault('clearedKeys', []).append(retired['key'])
+            reading = state.get('readings', {}).get(volume)
+            prior = cached.get('episodes', {}).get(volume, {})
+            if (prior.get('start', 0) > recovered and finite_number(prior.get('freeGb'))
+                    and finite_number(prior.get('floorGb'))):
+                # A confirmed later episode is still valid during a source
+                # error; retain its frozen message and receipt without re-arming.
+                episodes[volume] = dict(prior)
+                if reading is not None:
+                    episodes[volume].update(reading)
+            elif reading is not None and reading['freeGb'] < reading['floorGb']:
+                episodes[volume] = dict(start=now, key=episode_key(volume, recovered),
+                                        sent=False, logged=False, **reading)
+    for volume, episode in episodes.items():
+        prior = cached.get('episodes', {}).get(volume, {})
         if prior.get('key') == episode['key']:
             # Keep the frozen payload and any successful send receipt, while
             # retaining the detector's latest free-space reading.

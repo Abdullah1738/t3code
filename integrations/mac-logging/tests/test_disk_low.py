@@ -134,6 +134,58 @@ class FloorTests(unittest.TestCase):
         self.assertTrue(jobs.read_state('disk-low')['episodes']['internal']['sent'])
         self.assertFalse(disk_low.EMERGENCY_STATE.exists())
 
+    def test_emergency_recovery_needs_fresh_low_reading_to_rearm_stale_primary(self):
+        cases = (('source_error', None), ('below_floor', 1),
+                 ('at_floor', 15), ('above_floor', 20))
+        for primary_writable in (False, True):
+            for source, free in cases:
+                with self.subTest(source=source, primary_writable=primary_writable):
+                    jobs.save_state('disk-low', {})
+                    disk_low.EMERGENCY_STATE.unlink(missing_ok=True)
+                    before = len(self.sent)
+                    low_before = len(self.rows('disk.low'))
+                    cleared_before = len(self.rows('disk.low_cleared'))
+                    self.tick(1000)
+                    self.deliver(now=1000, state=self.launched[-1][1])
+                    old_key = self.sent[-1][0][-1]
+                    with patch.object(disk_low, 'save_state', side_effect=OSError(errno.ENOSPC, 'fixture full')):
+                        self.tick(1120, (20, 101))
+                        self.deliver(now=1120, state=self.launched[-1][1])
+                    self.assertEqual(jobs.read_state('disk-low')['episodes']['internal']['key'], old_key)
+                    self.assertEqual(json.loads(disk_low.EMERGENCY_STATE.read_text())['healthyAt']['internal'], 1120)
+
+                    def save(name, state):
+                        if not primary_writable:
+                            raise OSError(errno.ENOSPC, 'fixture full')
+                        jobs.save_state(name, state)
+                    with patch.object(disk_low, 'save_state', side_effect=save):
+                        self.tick(1240, (free or 14, 101), error=0 if free is None else None)
+                        self.deliver(now=1240, state=self.launched[-1][1])
+                    expected = 2 if source == 'below_floor' else 1
+                    self.assertEqual(len(self.sent)-before, expected)
+                    self.assertEqual(len(self.rows('disk.low'))-low_before, expected)
+                    state = (jobs.read_state('disk-low') if primary_writable else
+                             json.loads(disk_low.EMERGENCY_STATE.read_text()))
+                    if source == 'below_floor':
+                        self.assertNotEqual(self.sent[-1][0][-1], old_key)
+                        self.assertEqual(state['episodes']['internal']['freeGb'], 1)
+                        self.assertEqual(state['episodes']['internal']['start'], 1240)
+                    else:
+                        self.assertNotIn('internal', state['episodes'])
+                    self.assertGreaterEqual(state['healthyAt']['internal'], 1120)
+                    recovered_rows = [row['props'] for row in self.rows('disk.low_cleared')[cleared_before:]
+                                      if row['props'].get('reason') == 'emergency_recovery']
+                    if source in ('source_error', 'below_floor'):
+                        self.assertEqual(recovered_rows, [dict(volume='internal', lowForS=120,
+                                                              reason='emergency_recovery')])
+                    else:
+                        self.assertEqual(recovered_rows, [])
+                    # A later confirmed low still opens a valid new episode.
+                    self.tick(1360, (1, 101))
+                    self.deliver(now=1360, state=self.launched[-1][1])
+                    self.assertEqual(len(self.sent)-before, 2)
+                    self.assertNotEqual(self.sent[-1][0][-1], old_key)
+
     def test_unavailable_backup_never_blocks_full_internal_alert(self):
         for external, mounted, error in ((101, False, None), (101, False, 1), (99, True, None)):
             with self.subTest(external=external, mounted=mounted, error=error):
@@ -147,6 +199,39 @@ class FloorTests(unittest.TestCase):
                 self.assertEqual(len(self.sent)-before, 1 if external >= 100 else 2)
                 self.assertFalse(disk_low.EMERGENCY_STATE.exists())
                 self.assertTrue(self.rows('disk.state_failed'))
+
+    def test_missing_primary_keeps_emergency_recovery_across_source_error(self):
+        with patch.object(disk_low, 'save_state', side_effect=OSError(errno.ENOSPC, 'fixture full')):
+            self.tick(1000)
+            self.deliver(now=1000, state=self.launched[-1][1])
+            old_key = self.sent[-1][0][-1]
+            self.tick(1120, (20, 101))
+            self.deliver(now=1120, state=self.launched[-1][1])
+            self.tick(1240, error=0)
+            self.deliver(now=1240, state=self.launched[-1][1])
+            self.assertEqual(len(self.sent), 1)
+            self.assertEqual(len(self.rows('disk.low')), 1)
+            cached = json.loads(disk_low.EMERGENCY_STATE.read_text())
+            self.assertEqual(cached['healthyAt']['internal'], 1120)
+            self.assertNotIn('internal', cached['episodes'])
+        self.tick(1360, (1, 101))
+        self.deliver(now=1360, state=self.launched[-1][1])
+        self.assertEqual(len(self.sent), 2)
+        self.assertNotEqual(old_key, self.sent[-1][0][-1])
+
+    def test_source_error_preserves_already_confirmed_post_recovery_episode(self):
+        with patch.object(disk_low, 'save_state', side_effect=OSError(errno.ENOSPC, 'fixture full')):
+            for now, free, error in ((1000, 14, None), (1120, 20, None),
+                                     (1240, 1, None), (1360, 14, 0), (1480, .5, None)):
+                self.tick(now, (free, 101), error=error)
+                self.deliver(now=now, state=self.launched[-1][1])
+            self.assertEqual(len(self.sent), 2)
+            self.assertEqual(len(self.rows('disk.low')), 2)
+            state = json.loads(disk_low.EMERGENCY_STATE.read_text())
+            episode = state['episodes']['internal']
+            self.assertTrue(episode['sent'])
+            self.assertEqual(episode['start'], 1240)
+            self.assertEqual(episode['freeGb'], .5)
 
     def test_emergency_io_timeout_or_full_backup_still_sends(self):
         for phase in ('mount', 'read', 'write'):

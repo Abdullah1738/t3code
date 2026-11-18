@@ -546,6 +546,8 @@ def safe_fields(values, event=None):
             result[key] = value
         elif key == 'volume' and value in ('internal', 'external'):
             result[key] = value
+        elif event == 'disk.low_cleared' and key == 'reason' and value == 'emergency_recovery':
+            result[key] = value
         elif key in ('previousTs', 'sampleTs', 'deltaFromTs', 'internalDeltaFromTs', 'externalDeltaFromTs') and isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', value):
             result[key] = value
         elif key == 'skipReason' and isinstance(value, str) and value in SKIP_REASONS:
