@@ -52,7 +52,12 @@ export const startTimeoutOf = (event: OrchestrationV2DomainEvent) =>
 /** Which board action a domain event triggers, if any. Exported so the route is tested itself. */
 export const boardEventRoute = (
   event: OrchestrationV2DomainEvent,
-): "turnEnd" | "threadChanged" | "cancelReason" | null => {
+): "turnEnd" | "threadChanged" | "cancelReason" | "pullRequestsChanged" | null => {
+  if (
+    event.type === "thread.pull-request-link-updated" ||
+    event.type === "thread.pull-request-synced"
+  )
+    return "pullRequestsChanged";
   if (cancelReasonRunOf(event) !== null) return "cancelReason";
   if (event.type === "run.updated" && TERMINAL_RUN_STATUSES.has(event.payload.status))
     return "turnEnd";
@@ -151,6 +156,10 @@ export const ArdudKanbanLive = Layer.effectDiscard(
         if (startTimeout !== undefined)
           return service.notifyTurnEnded(event.threadId, startTimeout);
         const route = boardEventRoute(event);
+        if (route === "pullRequestsChanged")
+          return service
+            .notifyPullRequestsChanged(event.threadId)
+            .pipe(Effect.catchCause(warnUnlessInterrupted("missions board PR change")));
         if (route === "cancelReason")
           return service.notifyRunCancellation(event.threadId, cancelReasonRunOf(event)!);
         if (route === "turnEnd") return service.notifyTurnEnded(event.threadId);

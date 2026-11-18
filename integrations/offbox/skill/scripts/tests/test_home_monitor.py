@@ -1108,7 +1108,7 @@ class ReviewMonitorRegressions(unittest.TestCase):
     def test_real_toollog_keeps_health_and_daily_fields(self):
         import toollog
         sim = Sim(self)
-        with patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(sim.dir / "tools")):
+        with patch.dict(os.environ, OFFBOX_LOG_DIR=str(sim.dir / "tools")):
             sim.tick()
             toollog.emit("backend", "backend.home_flaps_daily", props=dict(day="2026-11-15", slow=2,
                          slow_max_s=120.0, slow_total_s=180.0, starting=1, starting_max_s=8.0, down=0))

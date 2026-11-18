@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -12,6 +13,7 @@ from unittest import mock
 import order_tracker as t
 import amazon_email_orders as amazon
 from test_amazon_email_orders import FakeMailsearch, NOW, OID, confirmation
+from test_delivery_cards import make_bridge_store
 
 
 class PollBackoff(unittest.TestCase):
@@ -25,6 +27,14 @@ class PollBackoff(unittest.TestCase):
         self.failing_source = True
         self.ack = True
         self.real_fetch = t.fetch
+        bridge_db = self.root / 'bridge/state.sqlite'
+        make_bridge_store(bridge_db)
+        make_bridge_store(bridge_db.parent / 'chats/moni/state.sqlite')
+        connect = sqlite3.connect
+        def fixture_connect(database, *args, **kwargs):
+            self.assertTrue(str(database).startswith(self.root.as_uri() + '/'),
+                            'bridge reads must stay inside the fixture: ' + str(database))
+            return connect(database, *args, **kwargs)
         for name in ('failing', 'healthy'):
             folder = self.root / name
             folder.mkdir()
@@ -37,8 +47,10 @@ class PollBackoff(unittest.TestCase):
                    mock.patch.object(t.delivery_cards, 'safe_sync', return_value={}),
                    mock.patch.object(t, 'bridge_route', return_value='fixture-session'),
                    mock.patch.object(t.subprocess, 'run', side_effect=self.send),
+                   mock.patch.object(sqlite3, 'connect', side_effect=fixture_connect),
                    mock.patch.dict(os.environ, TOOLLOG_ROOT=str(self.root / 'logs'),
                                    ROBOB_TOOL_LOG_DIR=str(self.root / 'logs'),
+                                   SPECTRUM_BRIDGE_DB=str(bridge_db),
                                    WATCH_RUN='scheduled-fixture', WATCH_MAIN_CHECKED='0')]
         for patch in patches:
             patch.start()
@@ -119,15 +131,21 @@ class PollBackoff(unittest.TestCase):
         self.assertEqual(self.state()['status'], 'placed')
 
     def test_notice_retries_identical_key_after_ambiguous_send_during_backoff(self):
+        self.assert_ambiguous_notice_retries(self.cfg())
+
+    def test_requester_notice_retries_identical_key_after_ambiguous_send_during_backoff(self):
+        self.assert_ambiguous_notice_retries(self.cfg(chat='moni', **{'for': 'moni'}))
+
+    def assert_ambiguous_notice_retries(self, cfg):
         for at in (10000, 10060, 10120):
             self.clock = at
-            self.check()
+            self.check(cfg)
         self.ack = False
-        self.check(pending=True, main_checked=True)
+        self.check(cfg, pending=True, main_checked=True)
         self.ack = True
         self.clock = 10180
-        self.check(pending=True, main_checked=True)
-        self.check(pending=True, main_checked=True)
+        self.check(cfg, pending=True, main_checked=True)
+        self.check(cfg, pending=True, main_checked=True)
         self.assertEqual(len(self.sends), 2)
         self.assertEqual(self.sends[0], self.sends[1])
         self.assertEqual(len(self.polls), 3)

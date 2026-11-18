@@ -682,6 +682,7 @@ def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
     causes, render_failures = Counter(), Counter()
+    probe_rows = defaultdict(Counter)
     samples, references, durations = {}, {}, defaultdict(list)
     order_errors, order_polls = {}, defaultdict(list)
     component_totals, component_errors = Counter(), defaultdict(Counter)
@@ -705,6 +706,14 @@ def rollup(board, day, top_n=20):
     deduped_failures = 0
     def observe_error(row, line_number, weight=1):
         nonlocal single_failures
+        probe_id = (row.get('ids') or {}).get('inboundId', '')
+        if board == 'imessage' and isinstance(probe_id, str) and re.fullmatch(r'row_[a-f0-9]{16}', probe_id):
+            probe_tag = ('router.probe_backoff' if row.get('name') == 'router.probe_backoff'
+                         else 'router.catch1' if (row.get('error') or {}).get('tag') == 'router.catch1' else None)
+            if probe_tag:
+                key = (probe_tag, 'admission_read_failed')
+                causes[key] += weight
+                probe_rows[key][probe_id] += weight
         if board == 'imessage' and row.get('alreadyLogged') is True:
             return
         request_failure = (board == 'imessage' and row.get('component') == 'robob' and row.get('name') == 'turn.robob_call'
@@ -947,7 +956,11 @@ def rollup(board, day, top_n=20):
             for merchant, poll in sorted(poll_counts.items())}
     if board == 'imessage':
         result['dedupedFailures'] = deduped_failures
-        result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count}
+        result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count,
+                                **({'distinctInboundIds': len(probe_rows[(tag, cause)]),
+                                    'topInboundIds': [{'inboundId': row, 'count': attempts} for row, attempts in
+                                                      sorted(probe_rows[(tag, cause)].items(), key=lambda x: (-x[1], x[0]))[:14]]}
+                                   if (tag, cause) in probe_rows else {})}
                                for (tag, cause), count in sorted(causes.items(), key=lambda x: (-x[1], x[0]))[:20]]
         result['cardRenderFailures'] = dict(sorted(render_failures.items()))
         result['byComponent'] = {}

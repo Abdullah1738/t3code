@@ -16546,6 +16546,133 @@ it.effect("the same title is allowed once the first card is verified", () =>
   }),
 );
 
+const prChipFixture = Effect.fn("test.prChipFixture")(function* () {
+  const { kanban, board } = yield* toyBoard;
+  const store = yield* KanbanStore.KanbanStore;
+  const created = yield* kanban.createCard(board.id, { title: "PR chip", prompt: "Fix" }, owner);
+  yield* kanban.dispatchNow;
+  const current = (yield* kanban.card(created.id)).card;
+  const work = current.workThreadId!;
+  const url = "https://forgejo.internal.jingmi.com.tw/abdullah/torssh/pulls/58";
+  const checkedAt = "2026-11-14T10:02:12.000Z";
+  const card: KanbanCard = {
+    ...current,
+    stage: "verified",
+    activeThreadId: null,
+    activeRole: null,
+    activePool: null,
+    reviewStep: 1,
+    subtasks: [],
+    links: [{ kind: "pr", url, label: "Fix", state: "open", checkedAt }],
+  };
+  yield* store.putCard(card);
+  return { kanban, board, store, card, work, url, checkedAt };
+});
+
+it.effect.each(
+  (["completed", "deployed", "verified"] as const).flatMap((stage) =>
+    (["merged", "closed"] as const).map((state) => ({ stage, state })),
+  ),
+)("PR changes refresh $stage chips to $state without a work turn", ({ stage, state }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, store, card, work, url, checkedAt } = yield* prChipFixture();
+      yield* store.putCard({ ...card, stage, settledAt: checkedAt });
+      assert.isEmpty(yield* store.cardsByThread(work));
+      fake.prs.set(work, [{ url, title: "Fix", state }]);
+      yield* kanban.notifyPullRequestsChanged(work);
+      const refreshed = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(refreshed.stage, stage);
+      assert.strictEqual(refreshed.links[0]?.state, state);
+      assert.notStrictEqual(refreshed.links[0]?.checkedAt, checkedAt);
+      assert.strictEqual(
+        refreshed.links[0]?.checkedAt,
+        yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("unchanged PR events and card/board reads never save a card", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, work, url } = yield* prChipFixture();
+      fake.prs.set(work, [{ url, title: "Fix", state: "open" }]);
+      const writes: KanbanCard[] = [];
+      yield* Effect.gen(function* () {
+        yield* kanban.notifyPullRequestsChanged(work);
+        yield* kanban.notifyPullRequestsChanged(work);
+        fake.prs.set(work, [{ url, title: "Fix", state: "merged" }]);
+        yield* kanban.card(card.id);
+        yield* kanban.snapshot(board.id);
+      }).pipe(Effect.provideService(KanbanStore.cardWrites, (cards) => writes.push(...cards)));
+      assert.isEmpty(writes);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).card, card);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("PR refresh visits every owned card and skips cards reassigned to another worker", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board, store, card, work, url } = yield* prChipFixture();
+      const others = [];
+      for (const title of ["Shared worker", "Reassigned"]) {
+        const other = yield* kanban.createCard(board.id, { title, prompt: title }, owner);
+        yield* store.addThreadCard(work, other.id, card.createdAt);
+        yield* store.putCard({
+          ...other,
+          stage: "completed",
+          workThreadId: title === "Reassigned" ? ThreadId.make("new-worker") : work,
+          links: card.links,
+        });
+        others.push(other);
+      }
+      fake.prs.set(work, [{ url, title: "Fix", state: "merged" }]);
+      yield* kanban.notifyPullRequestsChanged(work);
+      for (const id of [card.id, others[0]!.id])
+        assert.strictEqual((yield* kanban.card(id)).card.links[0]?.state, "merged");
+      assert.strictEqual((yield* kanban.card(others[1]!.id)).card.links[0]?.state, "open");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(
+  (["completed", "deployed", "verified"] as const).flatMap((stage) =>
+    [false, true].map((deferred) => ({ stage, deferred })),
+  ),
+)("evaluator move to $stage catches up PR state (deferred=$deferred)", ({ stage, deferred }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, store, card, work, url } = yield* prChipFixture();
+      yield* store.putCard({ ...card, stage: "needs_review" });
+      fake.prs.set(work, [{ url, title: "Fix", state: "merged" }]);
+      const refreshed = Stream.runHead(
+        Stream.filter(
+          yield* kanban.changes,
+          ({ change }) =>
+            change._tag === "card" &&
+            change.card.id === card.id &&
+            change.card.links[0]?.state === "merged",
+        ),
+      );
+      yield* kanban.moveCard(card.id, stage, "evaluator", {
+        _tag: "evaluator",
+        threadId: ThreadId.make("eval"),
+      });
+      assert.isTrue(Option.isSome(yield* refreshed));
+      assert.strictEqual((yield* kanban.card(card.id)).card.links[0]?.state, "merged");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(deferred ? testLayer(fake.layer) : inlineTestLayer(fake.layer)),
+    );
+  }),
+);
+
 it.effect.each([null, "open"] as const)(
   "upgrades legacy Forgejo card links when syncing state %s",
   (state) =>
@@ -22203,6 +22330,74 @@ it.effect("a full context replaces the evaluator without a retry", () =>
       assert.isFalse(msgs.some((m) => String(m).includes("one automatic retry")));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect.each([
+  {
+    status: 404,
+    code: "model_not_found",
+    category: "model_invalid" as const,
+    message: "Claude gave up after repeated API errors. Last error: HTTP 404",
+    errorText: "Model unavailable",
+  },
+  {
+    status: null,
+    code: "ECONNRESET",
+    category: "unknown" as const,
+    message: "Provider turn failed.",
+    errorText: "model unavailable",
+  },
+  {
+    status: null,
+    code: "ECONNRESET",
+    category: "unknown" as const,
+    message: "Provider turn failed.",
+    errorText: "maximum context length exceeded",
+  },
+])(
+  "Evaluator errors includes Claude diagnostics without routing on body: $errorText",
+  ({ status, code, category, message, errorText }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const { board } = yield* toyBoard;
+        const t = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look at it" });
+        const failure: OrchestrationV2ProviderFailure = {
+          class: "provider_error",
+          retryable: false,
+          category,
+          message,
+          code: status === null ? null : `api_error_${status}`,
+          claudeApiError: {
+            model: "claude-opus-5-5",
+            host: "router.test",
+            path: "/v1",
+            status,
+            errorCode: code,
+            errorType: "not_found_error",
+            errorText,
+            attempt: 2,
+            resume: false,
+          },
+        };
+        fake.failures.set(t, failure);
+        yield* kanban.turnEnded(t);
+        assert.isNull((yield* kanban.caller(t))?.paused);
+        yield* TestClock.adjust("2 minutes");
+        yield* kanban.tick;
+        fake.failures.set(t, { ...failure });
+        yield* kanban.turnEnded(t);
+        const channel = (yield* kanban.discussions(board.id)).find(
+          (d) => d.title === "Evaluator errors",
+        );
+        assert.isDefined(channel);
+        const notice = lastText(yield* kanban.messages(channel!.id));
+        for (const value of [code, "claude-opus-5-5", "router.test/v1", errorText])
+          assert.include(notice, value);
+        if (status !== null) assert.include(notice, `HTTP ${status}`);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("a one-shot evaluator that keeps failing is reported in Evaluator errors", () =>

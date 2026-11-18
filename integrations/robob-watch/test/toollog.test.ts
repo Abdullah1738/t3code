@@ -51,6 +51,7 @@ test.each(["data_read.retried", "data_read.failed", "data_write.retried", "data_
   expect(rows(dir).slice(1).every(row => row.props === undefined)).toBe(true);
 });
 const emptyBreakdown = {
+  loadMode: { minutes: 0, switches: 0 },
   byDependency: {}, dependencyTotals: { dependencies: 0, busyRuns: 0 },
   slots: { allSlotsBusyMinutes: 0, topHolders: [] },
   byWatcher: {}, watcherTotals: { watchers: 0, runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0, busy: 0 }, fires: 0 },

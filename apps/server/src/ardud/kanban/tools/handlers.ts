@@ -672,6 +672,10 @@ const handlers = {
             "bad_time",
             window.startsWith("until") ? "until" : "since",
           );
+        if (input.digest !== undefined) {
+          const page = yield* service.activityDigest(board.id, window, input.digest, input.after);
+          return { activity: { boardId: board.id, window, digest: input.digest, ...page } };
+        }
         const read = yield* service.activity(board.id, window);
         return { activity: { boardId: board.id, ...Activity.rollup({ window, ...read }) } };
       }),

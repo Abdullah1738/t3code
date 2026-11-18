@@ -486,13 +486,22 @@ it.effect.each([
       expect(retry.delivery).toBe(first.delivery);
       expect(commands.at(-1)).toMatchObject({
         commandId,
-        dispatchMode: { type: "start_immediately" },
+        dispatchMode: {
+          type: mode === "steer" && !activeTurnOnly ? "queue_after_active" : "start_immediately",
+        },
       });
-      const fresh = yield* Effect.flip(
-        service.sendToThread({ ...input, commandId: CommandId.make(`fresh:${mode}`) }),
-      );
-      expect(fresh).toBeInstanceOf(ThreadManagementService.ThreadManagementNoSteerableRunError);
-      expect(fresh).toMatchObject({ holder: { threadId, runId, status: "completed" } });
+      const freshSend = service.sendToThread({
+        ...input,
+        commandId: CommandId.make(`fresh:${mode}`),
+      });
+      if (mode === "steer" && !activeTurnOnly) {
+        yield* freshSend;
+        expect(commands.at(-1)).toMatchObject({ dispatchMode: { type: "queue_after_active" } });
+      } else {
+        const fresh = yield* Effect.flip(freshSend);
+        expect(fresh).toBeInstanceOf(ThreadManagementService.ThreadManagementNoSteerableRunError);
+        expect(fresh).toMatchObject({ holder: { threadId, runId, status: "completed" } });
+      }
       archived = true;
       const archivedRetry = yield* service.sendToThread(input);
       expect(archivedRetry.message).toEqual(first.message);
@@ -2270,9 +2279,7 @@ it.effect.each(
                       backgroundReads === 1 ? oldReadEntered : newReadEntered,
                       undefined,
                     );
-                    yield* Deferred.await(
-                      backgroundReads === 1 ? oldReadRelease : newReadRelease,
-                    );
+                    yield* Deferred.await(backgroundReads === 1 ? oldReadRelease : newReadRelease);
                   }
                   return snapshot;
                 }),

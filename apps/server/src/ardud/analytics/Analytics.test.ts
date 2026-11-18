@@ -86,6 +86,79 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect(
+    "reads Claude API failures by status, requested model and host without counting give-ups as attempts",
+    () =>
+      Effect.gen(function* () {
+        const setup = yield* fixture;
+        const analytics = yield* open(setup);
+        const detail = {
+          model: "claude-opus-5-5[1m]",
+          host: "router.test",
+          path: "/v1",
+          status: 404,
+          errorCode: "model_not_found",
+          errorType: "not_found_error",
+          errorText: "model unavailable",
+          attempt: 1,
+          resume: true,
+        };
+        for (const row of [
+          event({
+            kind: "provider.claude_api_error",
+            surface: "server",
+            route: "provider",
+            phase: "attempt",
+            claudeApiError: detail,
+          }),
+          event({
+            kind: "provider.claude_api_error",
+            surface: "server",
+            route: "provider",
+            phase: "give_up",
+            claudeApiError: detail,
+          }),
+          event({
+            kind: "provider.claude_api_error",
+            surface: "server",
+            route: "provider",
+            phase: "attempt",
+            claudeApiError: {
+              ...detail,
+              status: 503,
+              model: "claude-sonnet-5-5",
+              host: "api.anthropic.com",
+            },
+          }),
+        ])
+          yield* analytics.record(row);
+        yield* analytics.flush;
+        const result = yield* analytics.read({ day, kind: "provider.claude_api_error" });
+        assert.deepEqual(result.rollup.claudeApiErrors, [
+          {
+            status: 404,
+            model: "claude-opus-5-5[1m]",
+            host: "router.test",
+            attempts: 1,
+            giveUps: 1,
+          },
+          {
+            status: 503,
+            model: "claude-sonnet-5-5",
+            host: "api.anthropic.com",
+            attempts: 1,
+            giveUps: 0,
+          },
+        ]);
+        assert.equal(
+          (yield* readSamples(analytics, { day, kind: "provider.claude_api_error" })).length,
+          3,
+        );
+        const section = yield* analytics.read({ day, section: "claudeApiErrors" });
+        assert.equal(section.rows?.length, 2);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("reads slot and claim decisions in defaults and by kind", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;
