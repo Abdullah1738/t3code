@@ -1378,6 +1378,7 @@ const tracedRead = Effect.fnUntraced(function* <A, E>(read: Effect.Effect<A, E>)
     value,
     rows: span.attributes.get("jsonRowsFetched"),
     bytes: span.attributes.get("jsonBytesFetched"),
+    maxChunkBytes: span.attributes.get("maxJsonChunkBytes"),
   };
 });
 
@@ -1585,12 +1586,14 @@ it.live(
             };
           });
           const baseline = yield* measure(
-            NodeSqliteClient.readOnly(
-              Effect.all([
-                sql`SELECT id, board_id, cache_version, json FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number`,
-                sql`SELECT id, board_id, cache_version, json FROM ardud_kanban_discussions WHERE board_id = ${boardId} ORDER BY rowid`,
-                sql`SELECT id, board_id, cache_version, json, number FROM ardud_kanban_cards WHERE board_id = ${boardId} AND stage = 'todo' AND json_extract(json, '$.settledAt') IS NULL ORDER BY number`,
-              ]),
+            NodeSqliteClient.foregroundReads(
+              NodeSqliteClient.readOnly(
+                Effect.all([
+                  sql`SELECT id, board_id, cache_version, json FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number`,
+                  sql`SELECT id, board_id, cache_version, json FROM ardud_kanban_discussions WHERE board_id = ${boardId} ORDER BY rowid`,
+                  sql`SELECT id, board_id, cache_version, json, number FROM ardud_kanban_cards WHERE board_id = ${boardId} AND stage = 'todo' AND json_extract(json, '$.settledAt') IS NULL ORDER BY number`,
+                ]),
+              ),
             ),
           );
           assert.strictEqual(baseline.rowReplies, 3);
@@ -1951,6 +1954,162 @@ it.effect("validates large metadata rows across all id-keyed caches", () =>
       .pipe(Effect.flip);
     assert.deepStrictEqual(yield* read, changed);
   }).pipe(Effect.provide(TestLayer)),
+);
+
+it.live(
+  "keeps the production-sized open-card working set warm across both boards",
+  () =>
+    withFileStore(
+      Effect.gen(function* () {
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* SqlClient.SqlClient;
+        const secondBoard = KanbanBoardId.make("second-large-board");
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            for (let number = 1; number <= 4700; number++) {
+              yield* store.putCard({
+                ...card(number, "todo"),
+                boardId: number <= 3100 ? boardId : secondBoard,
+                prompt: "漢" + NodeCrypto.randomBytes(10_000).toString("hex"),
+              });
+            }
+          }),
+        );
+        NodeV8.setFlagsFromString("--expose_gc");
+        const gc = NodeVM.runInNewContext("gc") as () => void;
+        gc();
+        const before = process.memoryUsage().heapUsed;
+        for (const id of [boardId, secondBoard]) {
+          const cold = yield* tracedRead(store.openCards(id));
+          assert.strictEqual(cold.value.length, id === boardId ? 3100 : 1600);
+          assert.strictEqual(cold.rows, cold.value.length);
+          assert.isAtMost(Number(cold.maxChunkBytes), 4 * 1024 * 1024);
+        }
+        yield* Effect.yieldNow;
+        gc();
+        const retainedBytes = process.memoryUsage().heapUsed - before;
+        const cold = yield* store.decodeCacheStats;
+        assert.isAbove(cold.card!.sourceBytes, 128 * 1024 * 1024);
+        assert.isAtMost(cold.card!.sourceBytes, 320 * 1024 * 1024);
+        for (const id of [secondBoard, boardId, secondBoard, boardId]) {
+          for (const read of [
+            store.cards(id),
+            store.openCards(id),
+            store.dispatchCards(id),
+            store.claimCards(id, []),
+          ]) {
+            const warm = yield* tracedRead(read);
+            assert.strictEqual(warm.rows, 0);
+            assert.strictEqual(warm.bytes, 0);
+            assert.strictEqual(warm.value.length, id === boardId ? 3100 : 1600);
+          }
+        }
+        yield* sql`UPDATE ardud_kanban_cards SET json = json_set(json, '$.title', 'Changed') WHERE id IN ('card-1', 'card-3101')`;
+        for (const id of [boardId, secondBoard]) {
+          const changed = yield* tracedRead(store.openCards(id));
+          assert.strictEqual(changed.rows, 1);
+          assert.strictEqual(changed.bytes, JSON.stringify(changed.value[0]).length);
+          assert.strictEqual((yield* tracedRead(store.openCards(id))).rows, 0);
+        }
+        const warm = yield* store.decodeCacheStats;
+        assert.strictEqual(warm.card!.entries, 4700);
+        assert.strictEqual(warm.card!.evictions, 0);
+        assert.strictEqual(warm.card!.misses, 4702);
+        yield* Effect.logInfo("KANBAN_PRODUCTION_CARD_CACHE", {
+          cards: 4700,
+          retainedBytes,
+          decodedBytesPerCard: Math.round(retainedBytes / 4700),
+          sourceBudgetBytes: 320 * 1024 * 1024,
+          sourceCharge: "json.length * 2 (UTF-16 estimate; source strings are not retained)",
+          cold: cold.card,
+          warm: warm.card,
+        });
+      }),
+      90_000,
+    ),
+  120_000,
+);
+
+it.live(
+  "bounds all-miss card hydration in SQL before worker replies materialize JSON",
+  () =>
+    withFileStore(
+      Effect.gen(function* () {
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* SqlClient.SqlClient;
+        const expected = Array.from({ length: 24 }, (_, i) => ({
+          ...card(i + 1, "todo"),
+          prompt: ["a", "é", "😀", "\u0000"][i % 4]!.repeat(100_000),
+        }));
+        for (const row of expected) yield* store.putCard(row);
+        const messages = vi.spyOn(NodeWorkerThreads.Worker.prototype, "emit");
+        try {
+          for (const read of [
+            store.cards(boardId),
+            store.openCards(boardId),
+            store.dispatchCards(boardId),
+            store.claimCards(boardId, []),
+          ]) {
+            yield* sql`UPDATE ardud_kanban_cards SET json = json`;
+            messages.mockClear();
+            const result = yield* tracedRead(read);
+            assert.deepStrictEqual(result.value, expected);
+            assert.strictEqual(result.rows, expected.length);
+            let hydratedReplies = 0;
+            for (const [event, reply] of messages.mock.calls) {
+              if (
+                event !== "message" ||
+                typeof reply !== "object" ||
+                reply === null ||
+                !("rows" in reply)
+              )
+                continue;
+              const rows = (reply as { rows?: ReadonlyArray<{ json?: string | null }> }).rows ?? [];
+              const bytes = rows.reduce(
+                (sum, row) =>
+                  sum + (typeof row.json === "string" ? Buffer.byteLength(row.json) : 0),
+                0,
+              );
+              if (bytes > 0) hydratedReplies++;
+              assert.isAtMost(bytes, 4 * 1024 * 1024);
+            }
+            assert.isAtLeast(hydratedReplies, 2);
+          }
+          const huge = { ...card(25, "todo"), prompt: "😀".repeat(1_100_000) };
+          yield* store.putCard(huge);
+          const afterHuge = card(26, "todo");
+          yield* store.putCard(afterHuge);
+          const good = [...expected, afterHuge];
+          for (const read of [
+            store.cards(boardId),
+            store.openCards(boardId),
+            store.dispatchCards(boardId),
+            store.claimCards(boardId, []),
+            store.cardPage(boardId, { after: 0, limit: 100, open: true }),
+            store.cardsInStage("todo"),
+          ]) {
+            const result = yield* read;
+            assert.deepStrictEqual(result, good);
+          }
+          assert.deepStrictEqual(
+            yield* store.cardPage(boardId, { after: 24, limit: 1, open: true }),
+            [afterHuge],
+          );
+          for (const read of [store.card(huge.id), store.cardByNumber(boardId, huge.number)]) {
+            const error = yield* read.pipe(Effect.flip);
+            assert.instanceOf(error.cause, KanbanStore.KanbanJsonTooLarge);
+            const cause = error.cause as KanbanStore.KanbanJsonTooLarge;
+            assert.strictEqual(cause.id, huge.id);
+            assert.strictEqual(cause.bytes, Buffer.byteLength(JSON.stringify(huge)));
+          }
+          assert.deepStrictEqual(yield* store.card(expected[0]!.id), expected[0]);
+        } finally {
+          messages.mockRestore();
+        }
+      }),
+      45_000,
+    ),
+  60_000,
 );
 
 it.live(

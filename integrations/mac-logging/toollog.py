@@ -36,6 +36,7 @@ BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'fil
 FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
                   'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
 NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
+NUMBERS.update(('lockWaitMs', 'waitedMs'))
 NUMBERS.update(('probeTimeouts', 'secondsInProbeTimeouts', 'probeAllowanceMedianS', 'allowanceS'))
 NUMBERS.update(('cpuS', 'loadAvg1Start', 'loadAvg1End', 'loadAvg1Max', 'cpuSecondsDu',
                 'wallSecondsDu', 'firstAttempts', 'firstAttemptTimeouts', 'secondsWasted'))
@@ -50,7 +51,7 @@ BACKUP_ARGS = {'memory_backup.sh', 'health_backup.sh', 'backup_control.py', 'red
                'backup', 'snapshots', 'forget', 'prune',
                '-c', '-f', '-l', '-lc', '-u', '-m', '[redacted]'}
 BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale', 'inventoryComplete'}
-BOOLEANS.add('cached')
+BOOLEANS.update(('cached', 'acquired'))
 NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',
             'diskarbitrationdPid', 'diskarbitrationdUptimeS', 'diskarbitrationdStat'}
 NULLABLE.add('inventoryAgeS')
