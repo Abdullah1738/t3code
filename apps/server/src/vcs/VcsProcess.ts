@@ -22,6 +22,7 @@ import {
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as ProcessRunner from "../processRunner.ts";
+import * as GitExecRate from "./GitExecRate.ts";
 
 export interface VcsProcessInput {
   readonly operation: string;
@@ -180,6 +181,7 @@ const canRetryFullFsync = (stderr: string) =>
 
 export const make = Effect.gen(function* () {
   const processRunner = yield* ProcessRunner.ProcessRunner;
+  const gitExecRate = yield* Effect.serviceOption(GitExecRate.GitExecRate);
   const hostPlatform = yield* HostProcess.Platform;
   const vcsProcesses = yield* Semaphore.make(VCS_PROCESS_CONCURRENCY);
   const githubProcesses = yield* Semaphore.make(GITHUB_PROCESS_CONCURRENCY);
@@ -204,6 +206,13 @@ export const make = Effect.gen(function* () {
         timeoutBehavior: "error",
       })
       .pipe(
+        (effect) =>
+          Effect.andThen(
+            input.command === "git" && gitExecRate._tag === "Some"
+              ? gitExecRate.value.record(input)
+              : Effect.void,
+            effect,
+          ),
         Effect.mapError(
           Match.valueTags({
             ProcessSpawnError: (error) =>
@@ -328,7 +337,12 @@ export const make = Effect.gen(function* () {
         }),
       );
     }
-    return yield* input.command === "gh" ? githubProcesses.withPermits(1)(bounded) : bounded;
+    const executable = ProcessRunner.commandName(input.command);
+    const isGitHub =
+      hostPlatform === "win32"
+        ? /^gh(?:\.(?:exe|cmd|bat))?$/i.test(executable)
+        : executable === "gh";
+    return yield* isGitHub ? githubProcesses.withPermits(1)(bounded) : bounded;
   });
 
   return VcsProcess.of({ run });

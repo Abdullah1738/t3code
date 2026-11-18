@@ -5,8 +5,12 @@
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { AuthSessionId } from "@t3tools/contracts";
+import { AuthSessionId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Etag from "effect/http/Etag";
@@ -27,8 +31,6 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
-import * as ControlStore from "./ControlStore.ts";
-import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
 
 const session = (scopes: ReadonlyArray<string>) =>
@@ -42,7 +44,7 @@ const session = (scopes: ReadonlyArray<string>) =>
       } as never),
   });
 
-const makeHarness = (scopes: ReadonlyArray<string>, liveIds: ReadonlyArray<string>) =>
+const makeHarness = (scopes: ReadonlyArray<string>, activeIds: ReadonlyArray<ThreadId>) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const web = HttpRouter.toWebHandler(
@@ -50,13 +52,9 @@ const makeHarness = (scopes: ReadonlyArray<string>, liveIds: ReadonlyArray<strin
         Layer.provide(
           Layer.mergeAll(
             session(scopes),
-            Layer.mock(ControlStore.ControlStore)({
-              liveThreadIds: () => Effect.succeed(liveIds),
-            }),
-            Layer.mock(ExecutionIdentity.ExecutionIdentity)({
-              currentNative: () => Effect.succeed(new Map()),
-            }),
             Layer.mock(ThreadManagementService.ThreadManagementService)({
+              pageActiveThreadIds: () =>
+                sql`SELECT 1`.pipe(NodeSqliteClient.readOnly, Effect.as(activeIds), Effect.orDie),
               getShellSnapshot: () =>
                 Effect.succeed({
                   schemaVersion: 1,
@@ -113,6 +111,76 @@ const makeHarness = (scopes: ReadonlyArray<string>, liveIds: ReadonlyArray<strin
   });
 
 describe("GET /recovery/snapshot", () => {
+  it.live.each([true, false])(
+    "reads the native binding while writer and background reader are held (active=%s)",
+    (active) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const dir = yield* fs.makeTempDirectoryScoped({ prefix: "recovery-reader-" });
+          yield* Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            const threadId = ThreadId.make("thread-native-binding");
+            const nativeId = "native-recovery-route";
+            yield* sql`INSERT INTO orchestration_v2_projection_threads
+            (thread_id, project_id, title, default_provider, provider_instance_id, runtime_mode,
+             interaction_mode, active_provider_thread_id, created_at, updated_at, payload_json)
+            VALUES (${threadId}, 'project', 'Recovery', 'codex', 'codex', 'full-access',
+              'default', 'provider-native-binding', '2026-11-15', '2026-11-15', '{}')`;
+            yield* sql`INSERT INTO orchestration_v2_projection_provider_threads
+            (provider_thread_id, thread_id, owner_node_id, provider, provider_session_id, status,
+             first_run_ordinal, last_run_ordinal, updated_at, driver, provider_instance_id, payload_json)
+            VALUES ('provider-native-binding', ${threadId}, NULL, 'codex', NULL, 'idle',
+              1, 1, '2026-11-15', 'codex', 'codex',
+              ${JSON.stringify({ nativeThreadRef: { nativeId } })})`;
+            yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests
+            (runtime_request_id, thread_id, node_id, kind, status, created_at, payload_json)
+            VALUES ('pending-native-binding', ${threadId}, 'node', 'user_input', 'pending',
+              '2026-11-15', '{}')`;
+            const { get } = yield* makeHarness(["orchestration:read"], [threadId]);
+            const path = `/recovery/snapshot?active=${active}&limit=1`;
+            // Build the HTTP layer before holding the writer; startup DDL needs it.
+            const warmup = yield* get(path);
+            assert.strictEqual(warmup.status, 200);
+            assert.strictEqual(warmup.body.threads[0]?.nativeId, nativeId);
+            const writerEntered = yield* Deferred.make<void>();
+            const releaseWriter = yield* Deferred.make<void>();
+            const writer = yield* sql
+              .withTransaction(
+                Deferred.succeed(writerEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseWriter)),
+                ),
+              )
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(writerEntered);
+            const entered = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const holder = yield* sql
+              .withTransaction(
+                sql`SELECT 1`.pipe(
+                  Effect.andThen(Deferred.succeed(entered, undefined)),
+                  Effect.andThen(Deferred.await(release)),
+                ),
+              )
+              .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+            yield* Deferred.await(entered);
+            const result = yield* get(path).pipe(
+              Effect.timeout("5 seconds"),
+              Effect.ensuring(Deferred.succeed(release, undefined)),
+              Effect.ensuring(Deferred.succeed(releaseWriter, undefined)),
+            );
+            assert.strictEqual(result.status, 200);
+            assert.strictEqual(result.body.threads.length, 1);
+            assert.strictEqual(result.body.threads[0].threadId, threadId);
+            assert.strictEqual(result.body.threads[0].nativeId, nativeId);
+            assert.strictEqual(result.body.nextCursor, null);
+            yield* Fiber.join(holder);
+            yield* Fiber.join(writer);
+          }).pipe(Effect.provide(Sqlite.layerFromPath(`${dir}/fixture.sqlite`)));
+        }),
+      ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("requires the read scope", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -136,16 +204,18 @@ describe("GET /recovery/snapshot", () => {
     ).pipe(Effect.provide(Sqlite.layerMemory)),
   );
 
-  it.effect("returns the page shape with threads and nextCursor", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const { get } = yield* makeHarness(["orchestration:read"], ["thread-a"]);
-        const response = yield* get("/recovery/snapshot?active=true&limit=10");
-        assert.strictEqual(response.status, 200);
-        assert.strictEqual(response.body.ok, true);
-        assert.deepStrictEqual(response.body.threads, []);
-        assert.strictEqual(response.body.nextCursor, null);
-      }),
-    ).pipe(Effect.provide(Sqlite.layerMemory)),
+  it.effect.each([true, false])(
+    "returns the page shape with threads and nextCursor (active=%s)",
+    (active) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { get } = yield* makeHarness(["orchestration:read"], []);
+          const response = yield* get(`/recovery/snapshot?active=${active}&limit=10`);
+          assert.strictEqual(response.status, 200);
+          assert.strictEqual(response.body.ok, true);
+          assert.deepStrictEqual(response.body.threads, []);
+          assert.strictEqual(response.body.nextCursor, null);
+        }),
+      ).pipe(Effect.provide(Sqlite.layerMemory)),
   );
 });

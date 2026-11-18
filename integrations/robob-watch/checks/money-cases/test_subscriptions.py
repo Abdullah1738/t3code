@@ -1,8 +1,11 @@
 """Subscription expectations never suppress a different or duplicate charge."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import datetime as dt
 import io
 import json
-import os
 from pathlib import Path
 import sys
 from contextlib import redirect_stdout
@@ -308,6 +311,8 @@ class Subscriptions(Base):
                 mc.card_dead(self.data, '2342', 'cancelled')
                 mc.sweep_dead_card(self.data, '2342', at('2026-11-15T12:00'), alerts=[])
                 self.case('ordinary', merchant='Unrelated')
+                before_follow = mc.load(self.data)['cases']
+                self.assertEqual(len(before_follow), 2)
                 now = at('2026-11-15T12:00')
                 text = 'Purchase of USD 100 with your Credit Card ending 2342 at Unexpected.'
                 with patch.object(mc.charges, 'explain', return_value={'verdict': 'ask', 'why': 'unknown', 'errors': []}), \
@@ -317,12 +322,24 @@ class Subscriptions(Base):
                     self.assertEqual(mc.follow(self.data, now + dt.timedelta(days=8), said=lambda *a, **kw: []), [])
                 questions = mc.load_questions(self.data)['questions']
                 self.assertEqual(questions[0]['status'], 'open')
-                self.assertEqual(len(mc.load(self.data)['cases']), 2)
+                cases = mc.load(self.data)['cases']
+                self.assertEqual(len(cases), 3)
+                self.assertEqual(cases[:2], before_follow)
+                unmatched = cases[2]
+                self.assertTrue(unmatched['id'].startswith('unmatched-'))
+                self.assertEqual((unmatched['kind'], unmatched['merchant'], unmatched['amount'], unmatched['currency']),
+                                 ('charge', 'unmatched', '100.00', 'USD'))
+                self.assertEqual(unmatched['reference'], 'card ending 2342')
+                self.assertEqual(unmatched['alert_at'], now.isoformat())
+                self.assertEqual(unmatched['why'], 'charge question ' + result['id'])
+                self.assertEqual(questions[0]['case'], unmatched['id'])
+                self.assertEqual(questions[0]['case_opened'], unmatched['id'])
                 with mc.Locked(self.data, 'questions') as book:
                     mc.case_from(self.data, book['questions'][0], now + dt.timedelta(days=8), 'check')
                 questions = mc.load_questions(self.data)['questions']
                 self.assertEqual(questions[0]['status'], 'case')
-                self.assertEqual(len(mc.load(self.data)['cases']), 3)
+                self.assertEqual(questions[0]['case'], unmatched['id'])
+                self.assertEqual(mc.load(self.data)['cases'], cases)
 
     def test_three_day_ping_once_per_renewal_and_quiet_hours(self):
         self.seed(status='needs card update')

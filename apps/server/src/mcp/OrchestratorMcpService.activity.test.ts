@@ -1,11 +1,15 @@
+import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import {
   EnvironmentId,
+  MessageId,
   NodeId,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   RunId,
   ScheduledTaskId,
   ThreadId,
@@ -21,6 +25,7 @@ import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import { ProviderSessionEndedError } from "../orchestration-v2/ProviderSessionManager.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -33,6 +38,7 @@ import { CommandPolicyCapabilityUnsupportedError } from "../orchestration-v2/Com
 import {
   OrchestratorCommandPreviouslyRejectedError,
   OrchestratorDispatchError,
+  OrchestratorProjectionError,
 } from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import type * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -93,12 +99,21 @@ it.effect.each(["caller row", "caller records", "idle target", "dispatch"] as co
           expect(result.failure.message).toContain(
             blocked === "caller row" ? "Nothing was saved" : "not save",
           );
+        if (result._tag === "Failure" && blocked === "idle target") {
+          expect(result.failure.message).toContain(
+            `target thread read for thread ${childThreadId}`,
+          );
+          expect(result.failure.message).toContain("bounded-send");
+        }
+        if (result._tag === "Failure" && blocked === "dispatch")
+          expect(result.failure.message).toContain(`message dispatch for thread ${childThreadId}`);
         expect(sends).toBe(blocked === "dispatch" ? 1 : 0);
       }).pipe(Effect.provide(layer));
     }),
 );
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -185,6 +200,185 @@ function makeRun(input: {
   };
 }
 
+it.effect.each(
+  (["send", "wait", "wait timeout"] as const).flatMap((operation) =>
+    (["absent", "reason only", "with detail", "detail only"] as const).map((form) => ({
+      operation,
+      form,
+    })),
+  ),
+)("$operation returns JSON cancellation fields ($form)", ({ operation, form }) =>
+  Effect.gen(function* () {
+    const shell = liveThreadShell(parentThreadId);
+    const run = {
+      ...makeRun({ id: cancelledRunId, ordinal: 1, status: "cancelled" }),
+      ...(form === "reason only" || form === "with detail"
+        ? { cancelReason: "task_cancel" as const }
+        : {}),
+      ...(form === "with detail" || form === "detail only"
+        ? { cancelDetail: "Caller cancelled." }
+        : {}),
+    };
+    const projection = {
+      ...idleThreadProjection(shell),
+      runs: [run],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const waiting = yield* Deferred.make<void>();
+    const layer = layerOrchestratorService.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: () => Effect.succeed(shell),
+            getThreadShell: () => Effect.succeed(shell),
+            getThreadRecords: () => Effect.succeed(projection),
+            getProjectThreadRecords: () => Effect.succeed(projection),
+            sendToThread: () =>
+              Effect.succeed({
+                run: projection.runs[0]!,
+                delivery: "started",
+                dispatch: { sequence: 1, storedEvents: [] },
+                projection,
+                message: {
+                  id: MessageId.make("message-json-cancellation"),
+                  threadId: parentThreadId,
+                  runId: run.id,
+                  nodeId: null,
+                  role: "user",
+                  text: "Follow up",
+                  phase: "unknown",
+                  attachments: [],
+                  streaming: false,
+                  createdBy: "agent",
+                  creationSource: "mcp",
+                  createdAt: now,
+                  updatedAt: now,
+                },
+                turnItem: null,
+              }),
+            waitForThread: () =>
+              operation === "wait timeout"
+                ? Deferred.succeed(waiting, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed({
+                    threadId: parentThreadId,
+                    run: projection.runs[0]!,
+                    timedOut: false,
+                  }),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+          NodeCrypto.layer,
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      const response = yield* operation === "send"
+        ? service.sendToThread(makeScope(), { threadId: parentThreadId, message: "Follow up" })
+        : Effect.gen(function* () {
+            const fiber = yield* service
+              .waitForThread(makeScope(), { threadId: parentThreadId, timeoutMs: 1_000 })
+              .pipe(Effect.forkChild);
+            if (operation === "wait timeout") {
+              yield* Deferred.await(waiting);
+              yield* TestClock.adjust("1 second");
+            }
+            return yield* Fiber.join(fiber);
+          });
+      expectJsonRoundTrip(response);
+      expect(response.cancelReason).toBe(run.cancelReason);
+      expect(response.cancelDetail).toBe(run.cancelDetail);
+      if (operation === "wait timeout") expect(response).toMatchObject({ timedOut: true });
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
+it.effect.each(["committed", "without detail", "missing", "unreadable"] as const)(
+  "interrupt response reads committed provenance for its exact run (%s)",
+  (form) =>
+    Effect.gen(function* () {
+      let dispatched = false;
+      const shell = liveThreadShell(parentThreadId);
+      const stale = {
+        ...makeRun({ id: activeRunId, ordinal: 1, status: "running" }),
+        cancelReason: "provider_interrupted",
+        cancelDetail: "Stale detail.",
+      };
+      const before = {
+        ...idleThreadProjection(shell),
+        runs: [stale],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const after = {
+        ...before,
+        runs: [
+          {
+            ...makeRun({ id: cancelledRunId, ordinal: 2, status: "cancelled" }),
+            cancelReason: "thread_reset",
+            cancelDetail: "Unrelated detail.",
+          },
+          ...(form === "missing"
+            ? []
+            : [
+                {
+                  ...stale,
+                  status: "interrupted",
+                  cancelReason: "user_stop",
+                  cancelDetail: form === "without detail" ? undefined : "Caller stopped.",
+                },
+              ]),
+        ],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const layer = layerOrchestratorService.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getCallerRow: () => Effect.succeed(shell),
+              getThreadRecords: () =>
+                dispatched && form === "unreadable"
+                  ? Effect.fail(
+                      new OrchestratorProjectionError({
+                        threadId: parentThreadId,
+                        cause: "read failed",
+                      }),
+                    )
+                  : Effect.succeed(dispatched ? after : before),
+              interruptThread: () =>
+                Effect.sync(() => {
+                  dispatched = true;
+                  return {
+                    type: "interrupt_requested",
+                    run: before.runs[0]!,
+                    dispatch: { sequence: 1, storedEvents: [] },
+                  } as const;
+                }),
+            }),
+            ServerSettings.layerTest(),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+            Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+            NodeCrypto.layer,
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const response = yield* service.interruptThread(makeScope(), { threadId: parentThreadId });
+        expectJsonRoundTrip(response);
+        expect(response.runId).toBe(activeRunId);
+        expect(response.status).toBe("interrupt_requested");
+        expect(response.cancelReason).toBe(
+          form === "missing" || form === "unreadable" ? undefined : "user_stop",
+        );
+        expect(response.cancelDetail).toBe(form === "committed" ? "Caller stopped." : undefined);
+      }).pipe(Effect.provide(layer));
+    }),
+);
+
 it("readThread prefers activity-run status over a newer cancelled queued run", async () => {
   const projection = {
     thread: baseThread({
@@ -195,7 +389,11 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
     }),
     runs: [
       makeRun({ id: activeRunId, ordinal: 1, status: "running" }),
-      makeRun({ id: cancelledRunId, ordinal: 2, status: "cancelled" }),
+      {
+        ...makeRun({ id: cancelledRunId, ordinal: 2, status: "cancelled" }),
+        cancelReason: "server_shutdown",
+        cancelDetail: "Server shut down.",
+      },
     ],
     visibleTurnItems: [],
     runtimeRequests: [],
@@ -251,8 +449,15 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
   await Effect.gen(function* () {
     const service = yield* OrchestratorMcpService.OrchestratorMcpService;
     const result = yield* service.readThread(makeScope(), { threadId: parentThreadId });
+    expectJsonRoundTrip(result);
     expect(result.thread.status).toBe("running");
     expect(result.thread.latestRunId).toBe(cancelledRunId);
+    expect(result.recentRuns[0]?.cancelReason).toBe("server_shutdown");
+    expect(result.recentRuns[0]?.cancelDetail).toBe("Server shut down.");
+    expect(result.recentRuns[0]?.statusSummary).toBe(
+      "cancelled (server_shutdown: Server shut down.)",
+    );
+    expect(JSON.stringify(result)).toContain("cancelled (server_shutdown: Server shut down.)");
     expect(result.thread.activeRunId).toBe(activeRunId);
     // Native harnesses don't know their own thread id: omitting it reads the caller's thread.
     const own = yield* service.readThread(makeScope(), {});
@@ -338,12 +543,68 @@ it("readThread prefers waiting activity status over a newer cancelled queued run
 it.each([
   "working",
   "retrying",
+  "retrying-timeout",
+  "retrying-refused",
   "resuming",
   "cancelled",
   "interrupted",
   "fallback",
   "fallback-resumed",
+  "continuation-cancelled",
+  "continuation-interrupted",
+  "continuation-interrupted-mirrored",
+  "continuation-interrupted-mirrored-transfer",
+  "continuation-interrupted-mirrored-provider-interrupted-transfer",
+  "continuation-interrupted-mirrored-provider-cancelled-transfer",
+  "continuation-interrupted-mirrored-unknown-transfer",
+  "continuation-interrupted-mirrored-detail-only-transfer",
+  "continuation-interrupted-mirrored-specific-transfer",
+  "continuation-interrupted-mirrored-provider-interrupted-no-detail-transfer",
+  "continuation-interrupted-mirrored-legacy",
+  "continuation-interrupted-missing",
+  "continuation-interrupted-no-detail",
+  "continuation-completed",
+  "continuation-running",
+  "restart-interrupted",
+  "restart-interrupted-disposed",
+  "restart-cancelled",
+  "restart-cancelled-marker",
 ])("taskStatus exposes live child state: %s", async (state) => {
+  const retryCause =
+    state === "retrying-timeout"
+      ? "Request timed out — retry 2/10 (request_retry), next in 1 s"
+      : state === "retrying-refused"
+        ? "Connection refused (ECONNREFUSED) — retry 2/10 (connection_retry), next in 1 s"
+        : "Claude API no HTTP response: unknown.";
+  const restart = state.startsWith("restart-interrupted");
+  const unmirroredRestart = state.startsWith("restart-cancelled");
+  const continuation = state === "fallback-resumed" || state.startsWith("continuation-");
+  const mirrored = state.includes("-mirrored");
+  const legacy = state.endsWith("-legacy");
+  const transferred = state.endsWith("-transfer");
+  const mirroredCause = state.includes("-provider-interrupted")
+    ? "provider_interrupted"
+    : state.includes("-provider-cancelled")
+      ? "provider_cancelled"
+      : state.includes("-unknown")
+        ? "unknown"
+        : state.includes("-specific")
+          ? "user_stop"
+          : legacy || transferred
+            ? undefined
+            : "task_cancel";
+  const noDetail = state.includes("-no-detail");
+  const continuationStatus = state.includes("interrupted")
+    ? "interrupted"
+    : state === "continuation-cancelled"
+      ? "cancelled"
+      : state === "continuation-running"
+        ? "running"
+        : "completed";
+  const continuationCause =
+    continuation &&
+    (continuationStatus === "interrupted" || continuationStatus === "cancelled") &&
+    !state.endsWith("-missing");
   const parentProjection = {
     thread: baseThread({
       threadId: parentThreadId,
@@ -352,25 +613,35 @@ it.each([
       model: "gpt-5.4",
     }),
     runs: [makeRun({ id: activeRunId, ordinal: 1, status: "running" })],
-    turnItems:
-      state === "retrying"
-        ? [
-            {
-              type: "error",
-              status: "running",
-              runId: childRunId,
-              ordinal: 1,
-              failure: { message: "Claude API no HTTP response: unknown." },
-              retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
-              startedAt: now,
-              updatedAt: now,
-            },
-          ]
-        : [],
+    turnItems: state.startsWith("retrying")
+      ? [
+          {
+            type: "error",
+            status: "running",
+            runId: childRunId,
+            ordinal: 1,
+            failure: { message: retryCause },
+            retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
+            startedAt: now,
+            updatedAt: now,
+          },
+        ]
+      : [],
     visibleTurnItems: [],
     runtimeRequests: [],
     messages: [],
-    contextTransfers: [],
+    contextTransfers: transferred
+      ? [
+          {
+            id: "transfer:continued-result",
+            type: "subagent_result",
+            sourceThreadId: childThreadId,
+            targetThreadId: parentThreadId,
+            sourcePoint: { runId: RunId.make("run-mcp-resumed") },
+            targetPoint: { runId: activeRunId },
+          },
+        ]
+      : [],
     subagents: [
       {
         id: taskId,
@@ -390,6 +661,30 @@ it.each([
         model: "gpt-5.4",
         status: "running",
         result: null,
+        ...(mirrored
+          ? {
+              status: "interrupted",
+              result: "Task was cancelled.",
+              cancelReason: mirroredCause,
+              cancelDetail:
+                state.includes("-detail-only") ||
+                (mirroredCause !== undefined && mirroredCause !== "task_cancel")
+                  ? "Stale mirrored detail."
+                  : legacy || transferred
+                    ? undefined
+                    : "Task cancelled.",
+            }
+          : {}),
+        ...(restart
+          ? {
+              status: "interrupted",
+              result: "Interrupted by restart. Resume the same child thread.",
+              cancelReason: "server_shutdown",
+              completionDelivery: {
+                state: state.endsWith("-disposed") ? "disposed" : "acknowledged",
+              },
+            }
+          : {}),
         startedAt: now,
         completedAt: null,
         updatedAt: now,
@@ -414,7 +709,7 @@ it.each([
       createdBy: "agent",
     },
     runs: [
-      ...(state === "fallback-resumed"
+      ...(continuation
         ? [
             {
               ...makeRun({
@@ -424,23 +719,38 @@ it.each([
                 instanceId: customCodexInstanceId,
               }),
               delegatedTaskId: taskId,
+              cancelReason: "server_shutdown",
+              cancelDetail: "Original run shut down.",
               modelSelection: { instanceId: customCodexInstanceId, model: "claude-haiku-5-5" },
             },
           ]
         : []),
       {
         ...makeRun({
-          id: state === "fallback-resumed" ? RunId.make("run-mcp-resumed") : childRunId,
-          ordinal: state === "fallback-resumed" ? 2 : 1,
-          status: ["fallback", "fallback-resumed"].includes(state)
-            ? "completed"
-            : state === "cancelled" || state === "interrupted"
-              ? state
-              : "running",
+          id: continuation ? RunId.make("run-mcp-resumed") : childRunId,
+          ordinal: continuation ? 2 : 1,
+          status: continuation
+            ? continuationStatus
+            : unmirroredRestart
+              ? "cancelled"
+              : restart
+                ? "interrupted"
+                : ["fallback", "fallback-resumed"].includes(state)
+                  ? "completed"
+                  : state === "cancelled" || state === "interrupted"
+                    ? state
+                    : "running",
           instanceId: customCodexInstanceId,
         }),
-        ...(state === "fallback-resumed"
+        ...(unmirroredRestart ? { cancelReason: "server_restart" } : {}),
+        ...(continuation
           ? { delegatedTaskId: taskId, restartContinuationOfRunId: childRunId }
+          : {}),
+        ...(continuationCause
+          ? {
+              cancelReason: "task_cancel",
+              cancelDetail: noDetail ? undefined : "Task cancelled.",
+            }
           : {}),
         ...(["fallback", "fallback-resumed"].includes(state)
           ? {
@@ -465,20 +775,32 @@ it.each([
       },
     ],
     turnItems:
-      state === "retrying"
+      state === "restart-cancelled-marker"
         ? [
             {
-              type: "error",
-              status: "running",
+              type: "run_interrupt_request",
               runId: childRunId,
+              cancelReason: "task_cancel",
+              message: "Parent cancelled this interrupted work.",
+              status: "completed",
               ordinal: 1,
-              failure: { message: "Claude API no HTTP response: unknown." },
-              retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
-              startedAt: now,
               updatedAt: now,
             },
           ]
-        : [],
+        : state.startsWith("retrying")
+          ? [
+              {
+                type: "error",
+                status: "running",
+                runId: childRunId,
+                ordinal: 1,
+                failure: { message: retryCause },
+                retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
+                startedAt: now,
+                updatedAt: now,
+              },
+            ]
+          : [],
     visibleTurnItems: [],
     runtimeRequests: [],
     messages: [],
@@ -495,6 +817,24 @@ it.each([
     updatedAt: now,
   } as unknown as OrchestrationV2ThreadProjection;
 
+  const lateStop =
+    transferred &&
+    (state.includes("-provider-") || state.includes("-unknown") || state.includes("-detail-only"));
+  let controlsProjection: OrchestrationV2ThreadProjection = lateStop
+    ? {
+        ...childProjection,
+        runs: childProjection.runs.map((run) =>
+          run.id === RunId.make("run-mcp-resumed")
+            ? {
+                ...run,
+                cancelReason: mirroredCause ?? "provider_interrupted",
+                cancelDetail: "Provider finished first.",
+              }
+            : run,
+        ),
+      }
+    : childProjection;
+
   const layer = layerOrchestratorService.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -505,7 +845,7 @@ it.each([
           getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
           getThreadRecords: (threadId) => {
             if (threadId === parentThreadId) return Effect.succeed(parentProjection);
-            if (threadId === childThreadId) return Effect.succeed(childProjection);
+            if (threadId === childThreadId) return Effect.succeed(controlsProjection);
             return Effect.die(`unexpected thread ${threadId}`);
           },
         } satisfies Partial<ThreadManagementService.ThreadManagementService["Service"]>),
@@ -528,26 +868,63 @@ it.each([
 
   await Effect.gen(function* () {
     const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+    if (lateStop) {
+      const before = yield* service.taskStatus(makeScope(), taskId);
+      expect(before.cancelReason).toBe(mirroredCause ?? "provider_interrupted");
+      // The typed late Stop repairs the run; the finalized result transfer prevents remirroring.
+      controlsProjection = childProjection;
+    }
     const result = yield* service.taskStatus(makeScope(), taskId);
+    expectJsonRoundTrip(result);
     expect(result.providerInstanceId).toBe(customCodexInstanceId);
     expect(result.providerInstanceId).not.toBe(ProviderInstanceId.make(String(codexDriver)));
     expect(result.status).toBe(
-      ["fallback", "fallback-resumed"].includes(state)
-        ? "completed"
-        : state === "cancelled" || state === "interrupted"
-          ? state
-          : "running",
+      continuation
+        ? continuationStatus
+        : unmirroredRestart
+          ? "cancelled"
+          : restart
+            ? "interrupted"
+            : ["fallback", "fallback-resumed"].includes(state)
+              ? "completed"
+              : state === "cancelled" || state === "interrupted"
+                ? state
+                : "running",
     );
+    if (continuation) {
+      expect(result.cancelReason).toBe(
+        state.includes("-specific")
+          ? "user_stop"
+          : continuationCause && !legacy
+            ? "task_cancel"
+            : undefined,
+      );
+      expect(result.cancelDetail).toBe(
+        state.includes("-specific")
+          ? "Stale mirrored detail."
+          : continuationCause && !legacy && !noDetail
+            ? "Task cancelled."
+            : undefined,
+      );
+    }
     expect(result.taskId).toBe(taskId);
+    const resumable = (restart && !state.endsWith("-disposed")) || state === "restart-cancelled";
+    expect(result.resumable).toBe(resumable ? true : undefined);
+    expect(result.resumeThreadId).toBe(resumable ? childThreadId : undefined);
     expect(result.childThreadId).toBe(childThreadId);
     expect(result.finishedOn).toBe(
       ["fallback", "fallback-resumed"].includes(state) ? "claude-sonnet-5-5" : undefined,
     );
-    if (["working", "cancelled", "interrupted", "fallback", "fallback-resumed"].includes(state))
+    if (
+      continuation ||
+      restart ||
+      unmirroredRestart ||
+      ["working", "cancelled", "interrupted", "fallback", "fallback-resumed"].includes(state)
+    )
       expect(result.retry).toBeNull();
     else {
-      expect(result.retry?.state).toBe(state);
-      expect(result.retry?.lastError).toContain(state === "retrying" ? "no HTTP response" : "502");
+      expect(result.retry?.state).toBe(state.startsWith("retrying") ? "retrying" : state);
+      expect(result.retry?.lastError).toContain(state.startsWith("retrying") ? retryCause : "502");
       expect(result.retry?.since).toBe("2026-08-04T12:00:00.000Z");
     }
   }).pipe(Effect.provide(layer), Effect.runPromise);
@@ -624,6 +1001,9 @@ it("readThread and sendToThread reach threads in other projects", async () => {
             if (threadId === foreignThreadId) return Effect.succeed(foreignProjection(threadId));
             return Effect.die(`unexpected thread ${threadId}`);
           },
+          hasReceipt: () => Effect.succeed(false),
+          getCommandReceipt: () => Effect.succeed(Option.none()),
+          getDelegationCommandState: () => Effect.succeed({ status: "never_saved" }),
           getCallerRow: (threadId) =>
             Effect.succeed(
               threadId === foreignThreadId
@@ -837,6 +1217,85 @@ it("readThread and sendToThread reach threads in other projects", async () => {
   }).pipe(Effect.provide(layer), Effect.runPromise);
 });
 
+it.effect("wake tools that need a run return run_starting until admission", () => {
+  const instanceId = ProviderInstanceId.make("claudeAgent");
+  let archived = false;
+  const scope = {
+    ...makeScope(),
+    thread: { ...makeScope().thread!, providerInstanceId: instanceId },
+  };
+  const shell = {
+    ...liveThreadShell(parentThreadId, { activeRunId: null }),
+    providerInstanceId: instanceId,
+    modelSelection: { instanceId, model: "claude-opus-5-5" },
+    get archivedAt() {
+      return archived ? now : null;
+    },
+  };
+  const projection = idleThreadProjection(shell);
+  const dependencies = Layer.mergeAll(
+    McpProviderSessions.layer,
+    Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getCallerRow: () => Effect.succeed(shell),
+      getThreadShell: () => Effect.succeed(shell),
+      getThreadRecords: () => Effect.succeed(projection),
+      hasReceipt: () => Effect.succeed(false),
+      getCommandReceipt: () => Effect.succeed(Option.none()),
+      getDelegationCommandState: () => Effect.succeed({ status: "never_saved" }),
+    }),
+    ServerSettings.layerTest(),
+    Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+    Layer.mock(ProjectService.ProjectService)({}),
+    Layer.mock(SecretRequests.SecretRequests)({}),
+    Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+    Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+    NodeCrypto.layer,
+  );
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const sessions = yield* McpProviderSessions.McpProviderSessions;
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      const caller = scope.thread;
+      const credential = {
+        ...caller,
+        runtimeProviderSessionId: ProviderSessionId.make("runtime:wake-activity"),
+        environmentId,
+        endpoint: "http://localhost/mcp",
+        authorizationHeader: "Bearer test",
+        browserToolsAvailable: false,
+      };
+      yield* sessions.set(credential);
+      let state: McpProviderSessions.WakeCallerState = "starting";
+      yield* sessions.registerWakeCaller(credential, () => state);
+      const calls = [
+        service
+          .delegateTask(scope, { task: "requires a run", clientRequestId: "wake-delegate" })
+          .pipe(Effect.asVoid),
+        service
+          .createThreads(scope, { threads: [{ prompt: "requires a run" }] })
+          .pipe(Effect.asVoid),
+        service
+          .requestSecret(scope, { label: "Secret", reason: "requires a run" })
+          .pipe(Effect.asVoid),
+      ];
+      for (const phase of ["starting", "live", "inactive"] as const) {
+        state = phase;
+        for (const call of calls) {
+          const error = yield* call.pipe(Effect.flip);
+          expect(error.code).toBe(phase === "inactive" ? "parent_not_active" : "run_starting");
+          if (phase !== "inactive") expect(error.saved).toBe(false);
+        }
+      }
+      state = "live";
+      archived = true;
+      for (const call of calls) {
+        const error = yield* call.pipe(Effect.flip);
+        expect(error.code).toBe("parent_not_active");
+      }
+    }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provideMerge(dependencies)))),
+  );
+});
+
 it.each(["missing-session", "capability", "replay"] as const)(
   "sendToThread reports the real rejection reason (%s)",
   async (kind) => {
@@ -910,7 +1369,9 @@ it.each(["missing-session", "capability", "replay"] as const)(
                       commandType: "message.dispatch",
                       cause:
                         kind === "missing-session"
-                          ? "Provider session provider-session-dead is not active."
+                          ? new ProviderSessionEndedError({
+                              providerSessionId: ProviderSessionId.make("provider-session-dead"),
+                            })
                           : new CommandPolicyCapabilityUnsupportedError({
                               commandId: input.commandId,
                               threadId: targetThreadId,
@@ -951,7 +1412,11 @@ it.each(["missing-session", "capability", "replay"] as const)(
       } else {
         expect(failure.message).toBe(
           `Unable to send to thread ${targetThreadId}: ${
-            kind === "capability" ? reason : "Provider session provider-session-dead is not active."
+            kind === "capability"
+              ? reason
+              : new ProviderSessionEndedError({
+                  providerSessionId: ProviderSessionId.make("provider-session-dead"),
+                }).message
           }`,
         );
       }

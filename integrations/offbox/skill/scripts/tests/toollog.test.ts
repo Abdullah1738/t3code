@@ -1,20 +1,77 @@
-import { afterEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test"
 import { chmodSync, closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs"
+import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { gateLog } from "../toollog.ts"
 
 const roots: string[] = []
-const oldRoot = process.env.OFFBOX_TOOL_LOG_DIR
+const oldRoot = process.env.OFFBOX_LOG_DIR
+beforeEach(() => { spyOn(Math, "random").mockReturnValue(0) })
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "offbox-tool-log-")); roots.push(root)
-  process.env.OFFBOX_TOOL_LOG_DIR = join(root, "logs")
-  return process.env.OFFBOX_TOOL_LOG_DIR
+  process.env.OFFBOX_LOG_DIR = join(root, "logs")
+  return process.env.OFFBOX_LOG_DIR
 }
 afterEach(() => {
-  if (oldRoot === undefined) delete process.env.OFFBOX_TOOL_LOG_DIR
-  else process.env.OFFBOX_TOOL_LOG_DIR = oldRoot
+  mock.restore()
+  if (oldRoot === undefined) delete process.env.OFFBOX_LOG_DIR
+  else process.env.OFFBOX_LOG_DIR = oldRoot
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
+
+test.each([{}, { OFFBOX_TEST: "1" }, { NODE_ENV: "test" }])("test guard protects the live default %j", flags => {
+  const root = mkdtempSync(join(tmpdir(), "offbox-tool-log-guard-")); roots.push(root)
+  const live = join(root, ".robob/logs/tools/offbox")
+  mkdirSync(live, { recursive: true })
+  writeFileSync(join(live, "2000-01-01.ndjson"), "sentinel")
+  const env = { ...process.env, HOME: root }
+  delete env.OFFBOX_LOG_DIR
+  delete env.OFFBOX_TOOL_LOG_DIR
+  delete env.OFFBOX_TEST
+  delete env.NODE_ENV
+  Object.assign(env, flags)
+  // The no-flags row exercises Bun's own test-runner detection in a fresh process.
+  const probe = join(root, "guard.test.ts")
+  writeFileSync(probe, `import { test } from 'bun:test'; import { gateLog } from ${JSON.stringify(join(import.meta.dir, "../toollog.ts"))}; test('guard', () => gateLog('denied', 'heavy', 1, true))`)
+  const args = Object.keys(flags).length ? ["-e", `import { gateLog } from ${JSON.stringify(join(import.meta.dir, "../toollog.ts"))}; gateLog('denied', 'heavy', 1, true)`] : ["test", probe]
+  const result = spawnSync(process.execPath, args, { env, encoding: "utf8" })
+  expect(result.status).toBe(0)
+  expect(readdirSync(live)).toEqual(["2000-01-01.ndjson"])
+  expect(readFileSync(join(live, "2000-01-01.ndjson"), "utf8")).toBe("sentinel")
+})
+
+test.each([0, 0.049, 0.05, 0.99])("light allowed sampling at draw %s", draw => {
+  const root = fixture()
+  spyOn(Math, "random").mockReturnValue(draw)
+  gateLog("allowed", "light", 1)
+  if (draw >= 0.05) {
+    expect(readdirSync(roots.at(-1)!)).toEqual([])
+  } else {
+    const row = JSON.parse(readFileSync(join(root, new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8"))
+    expect(row.props).toEqual({ decision: "allowed", harness: "opencode", commandClass: "light", sample: 20 })
+  }
+})
+
+test("all other decisions bypass sampling", () => {
+  const root = fixture()
+  const random = spyOn(Math, "random").mockReturnValue(0.99)
+  for (const [decision, commandClass, failed] of [
+    ["allowed", "js-test", false], ["denied", "js-test", false], ["local-override", "js-test", false],
+    ["denied", "light", false], ["local-override", "light", false], ["allowed", "light", true],
+    ["allowed", "unknown", true], ["allowed", "unknown", false],
+  ] as const) gateLog(decision, commandClass, 1, failed)
+  const rows = readFileSync(join(root, new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line))
+  expect(rows).toHaveLength(8)
+  expect(rows.every(row => !("sample" in row.props))).toBe(true)
+  expect(rows.filter(row => row.kind === "error").map(row => row.error.tag)).toEqual(["gate_failed", "gate_failed"])
+  expect(random).not.toHaveBeenCalled()
+})
+
+test("sampling errors never escape", () => {
+  fixture()
+  spyOn(Math, "random").mockImplementation(() => { throw new Error("fixture") })
+  expect(() => gateLog("allowed", "light", 1)).not.toThrow()
 })
 
 test("gate format, private modes and allowlisted class", () => {
@@ -53,9 +110,11 @@ test("retention removes old day files but preserves other files", () => {
   const root = fixture(); mkdirSync(root)
   writeFileSync(join(root, "2000-01-01.ndjson"), "")
   writeFileSync(join(root, "2000-01-01.cap"), "")
+  writeFileSync(join(root, "rollup-live-2000-01-01.json"), "")
   writeFileSync(join(root, "unrelated"), "")
   gateLog("allowed", "light", 1)
   expect(readdirSync(root)).toContain("unrelated")
   expect(readdirSync(root)).not.toContain("2000-01-01.ndjson")
   expect(readdirSync(root)).not.toContain("2000-01-01.cap")
+  expect(readdirSync(root)).not.toContain("rollup-live-2000-01-01.json")
 })

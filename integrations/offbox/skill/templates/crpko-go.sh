@@ -9,7 +9,7 @@ GO_VERSION="${OFFBOX_GO_VERSION:-1.26.9}"
 if [ -f /usr/local/go/src/runtime/traceexp.go ] || [ -f /usr/local/go/src/strconv/ctoa.go ] || [ -f /usr/local/go/src/syscall/syscall_linux_accept4.go ] || ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
   offbox_fetch "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "/tmp/go.tgz"
   sudo rm -rf /usr/local/go
-  sudo tar -C /usr/local -xzf /tmp/go.tgz
+  sudo tar -C /usr/local --no-same-owner -xzf /tmp/go.tgz
   rm -f /tmp/go.tgz
 fi
 export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH
@@ -17,8 +17,10 @@ go version
 
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends build-essential pkg-config jq rsync ca-certificates \
-  zsh openjdk-21-jre-headless >/dev/null
+  zsh openjdk-21-jdk-headless >/dev/null
 sudo update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java
+sudo update-alternatives --set javac /usr/lib/jvm/java-21-openjdk-amd64/bin/javac
+javac -version 2>&1 | grep -q '^javac 21\.' || { echo 'offbox template: javac 21 missing' >&2; exit 1; }
 
 offbox_crpko_tools
 

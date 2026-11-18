@@ -98,6 +98,28 @@ class ProblemNoticeTests(unittest.TestCase):
         self.check()
         self.assertEqual(len(self.sends), 1)
 
+    def test_amount_only_registration_input_class(self):
+        cases = [('600.00', 'AED', True), ('500.00', 'AED', True),
+                 ('499.99', 'AED', False), ('600.00', 'USD', False),
+                 ('NaN', 'AED', False), ('-600', 'AED', False),
+                 ('5,00', 'AED', False), (True, 'AED', False)]
+        for amount, currency, should_ping in cases:
+            with self.subTest(amount=amount, currency=currency):
+                cfg = dict(self.cfg, total=None, amount=amount, currency=currency)
+                state = {'primed': True}
+                t.queue_problem_notices(cfg, self.result, state, [])
+                self.assertEqual(bool(state.get('problem_notices')), should_ping)
+        cfg = dict(self.cfg, total='AED 400', amount='600.00', currency='AED')
+        self.assertEqual(t.order_total_aed(cfg, {}, {}), 400)
+
+    def test_amount_only_pending_check_sends_large_order_problem_once(self):
+        self.cfg.pop('total')
+        self.cfg.update(amount='600.00', currency='AED', card_last4='2342')
+        self.assertEqual(self.check(pending_only=True), '')
+        self.assertEqual(self.check(pending_only=True), '')
+        self.assertEqual(len(self.sends), 1)
+        self.assertIn('AED 600.00', self.sends[0][-1])
+
     def test_first_scheduled_problem_survives_missing_or_unprimed_state_then_recovery(self):
         self.cfg['total'] = 'AED 500'
         for initial in [None, {'primed': False}]:

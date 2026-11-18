@@ -14,7 +14,10 @@ import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as Tracer from "effect/Tracer";
+import { isSqlError, isSqlErrorReason } from "effect/sql/SqlError";
 import { OtlpResource, OtlpTracer, OtlpSerialization } from "effect/observability";
+
+import { makeSqlDiagnostics, normalizeSql, sqlFingerprint } from "./sqlDiagnostics.ts";
 
 import { makeAsyncRotatingFileSink } from "./logging.ts";
 
@@ -119,12 +122,15 @@ function keepFileSpan(record: TraceRecord, minDurationMs: number) {
     record.durationMs < 0 ||
     record.durationMs >= minDurationMs ||
     !record.parentSpanId ||
+    // Keep durable claim identities even when SQLite returns below the filter threshold.
+    (record.name === "EffectWorker.claim" && record.attributes["result"] === "claimed") ||
     (record.type === "effect-span"
       ? record.exit._tag !== "Success"
       : record.status?.code === "2" ||
         record.status?.message === "Interrupted" ||
         record.attributes["effect.fiber.interrupted"] === true) ||
     record.events.some((event) => {
+      if (event.name === "sql.statement" || event.name === "sql.plan") return true;
       const level = event.attributes["effect.logLevel"];
       return (
         typeof level === "string" &&
@@ -316,6 +322,37 @@ export function compactTraceAttributes(
   return Object.fromEntries(entries);
 }
 
+// Domain wrappers and transaction spans keep the original SQL failure as their cause.
+// Inspect only error links, with a bounded walk; never serialize the original graph.
+function hasSqlFailure(cause: Cause.Cause<unknown>): boolean {
+  const pending: unknown[] = cause.reasons.flatMap((reason) =>
+    Cause.isFailReason(reason) ? [reason.error] : Cause.isDieReason(reason) ? [reason.defect] : [],
+  );
+  const seen = new Set<object>();
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value !== "object" || value === null || seen.has(value)) continue;
+    if (seen.size >= 64) return true;
+    seen.add(value);
+    try {
+      if (isSqlError(value) || isSqlErrorReason(value)) return true;
+      for (const key of ["cause", "reason", "error", "errors", "reasons", "defect"]) {
+        const property = Object.getOwnPropertyDescriptor(value, key);
+        if (property === undefined) continue;
+        if (!("value" in property)) return true;
+        const next: unknown = property.value;
+        if (Array.isArray(next)) {
+          if (next.length > 64) return true;
+          pending.push(...next);
+        } else pending.push(next);
+      }
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
 function formatTraceExit(exit: Exit.Exit<unknown, unknown>): EffectTraceRecord["exit"] {
   if (ExitRuntime.isSuccess(exit)) {
     return { _tag: "Success" };
@@ -410,7 +447,14 @@ function spanToTraceRecord(span: SerializableSpan): EffectTraceRecord {
       spanId: link.span.spanId,
       attributes: truncateTraceAttributes(compactTraceAttributes(link.attributes)),
     })),
-    exit: formatTraceExit(status.exit),
+    // SQLite errors can quote SQL or values; keep only the structural failure tag.
+    exit:
+      span.attributes.has("sql.fingerprint") && ExitRuntime.isFailure(status.exit)
+        ? {
+            _tag: Cause.hasInterruptsOnly(status.exit.cause) ? "Interrupted" : "Failure",
+            cause: causeErrorTag(status.exit.cause),
+          }
+        : formatTraceExit(status.exit),
   };
 }
 
@@ -651,13 +695,17 @@ class LocalFileSpan implements Tracer.Span {
   events: Array<[name: string, startTime: bigint, attributes: Record<string, unknown>]>;
   private readonly delegate: Tracer.Span;
   private readonly push: (record: EffectTraceRecord) => void;
+  private readonly sqlDiagnostics: ReturnType<typeof makeSqlDiagnostics>;
+  private normalizedSql: string | undefined;
 
   constructor(
     options: Parameters<Tracer.Tracer["span"]>[0],
     delegate: Tracer.Span,
     push: (record: EffectTraceRecord) => void,
+    sqlDiagnostics: ReturnType<typeof makeSqlDiagnostics>,
   ) {
     this.delegate = delegate;
+    this.sqlDiagnostics = sqlDiagnostics;
     this.push = push;
     this.name = delegate.name;
     this.spanId = delegate.spanId;
@@ -677,21 +725,55 @@ class LocalFileSpan implements Tracer.Span {
 
   end(endTime: bigint, exit: Exit.Exit<unknown, unknown>): void {
     // Cached lookup fibers retain parent spans. Traces need success status, not result payloads.
-    const traceExit = ExitRuntime.isSuccess(exit) ? ExitRuntime.void : exit;
+    const traceExit = ExitRuntime.isSuccess(exit)
+      ? ExitRuntime.void
+      : (this.normalizedSql !== undefined || hasSqlFailure(exit.cause)) &&
+          !Cause.hasInterruptsOnly(exit.cause)
+        ? ExitRuntime.fail({ _tag: causeErrorTag(exit.cause) })
+        : exit;
     this.status = {
       _tag: "Ended",
       startTime: this.status.startTime,
       endTime,
       exit: traceExit,
     };
+    const sqlEvents: TraceRecordEvent[] = [];
+    if (this.sampled && this.normalizedSql !== undefined) {
+      const fingerprint = String(this.attributes.get("sql.fingerprint"));
+      const statement = this.sqlDiagnostics.statement(fingerprint, this.normalizedSql);
+      if (statement)
+        sqlEvents.push({
+          name: "sql.statement",
+          timeUnixNano: String(endTime),
+          attributes: statement,
+        });
+      const executionMs = this.attributes.get("db.statement.execution_ms");
+      if (typeof executionMs === "number" && executionMs >= 1_000) {
+        const plan = this.sqlDiagnostics.plan(fingerprint);
+        if (plan)
+          sqlEvents.push({ name: "sql.plan", timeUnixNano: String(endTime), attributes: plan });
+      }
+    }
+    this.normalizedSql = undefined;
     this.delegate.end(endTime, traceExit);
 
     if (this.sampled) {
-      this.push(spanToTraceRecord(this));
+      const record = spanToTraceRecord(this);
+      // SQL events have their own byte cap; the general attribute clamp would lose the full text.
+      this.push({ ...record, events: [...record.events, ...sqlEvents] });
     }
   }
 
   attribute(key: string, value: unknown): void {
+    if (key === "db.query.text" && typeof value === "string") {
+      this.normalizedSql = normalizeSql(value);
+      this.attribute("sql.fingerprint", sqlFingerprint(this.normalizedSql));
+      value =
+        this.normalizedSql.length > TRACE_ATTRIBUTE_TRUNCATED_LENGTH
+          ? this.normalizedSql.slice(0, TRACE_ATTRIBUTE_TRUNCATED_LENGTH) +
+            TRACE_ATTRIBUTE_TRUNCATION_SUFFIX
+          : this.normalizedSql;
+    }
     this.attributes.set(key, value);
     this.delegate.attribute(key, value);
   }
@@ -730,12 +812,14 @@ export const makeLocalFileTracer = Effect.fn("makeLocalFileTracer")(function* (
       span: (spanOptions) => new Tracer.NativeSpan(spanOptions),
     });
 
+  const sqlDiagnostics = makeSqlDiagnostics();
   return Tracer.make({
     span(spanOptions) {
       return new LocalFileSpan(
         spanOptions,
         delegate.span(spanOptions),
         sink.capture?.() ?? sink.push,
+        sqlDiagnostics,
       );
     },
     ...(delegate.context ? { context: delegate.context } : {}),

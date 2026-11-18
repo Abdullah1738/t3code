@@ -23,6 +23,14 @@ const MAX_SENDS = 3;
 const COOLDOWNS = [5 * 60_000, 15 * 60_000];
 const REPLAY_DELAY = 60_000;
 const DELIVERY_DEADLINE = 3 * 60_000;
+export const ROUTER_UNAVAILABLE_LIMIT_MS = 15 * 60_000;
+// Allow 300s wake backoff + 240s slot queue + the runner's 90s timeout,
+// with 90s scheduling slack. Check execution can outlive our own 45s timer.
+export const ROUTER_STREAK_GAP_MS = 12 * 60_000;
+export const SUPERVISOR_DEADLINE_MS = 45_000;
+// Skip persistence is one atomic journal write (file + directory fsync).
+export const SAVE_RESERVE_MS = 5_000;
+export const MIN_FETCH_BUDGET_MS = 3_000;
 
 function newState() { return { version: 1, incidents: [], active: null }; }
 
@@ -30,6 +38,10 @@ export function readState(path) {
   try {
     const s = JSON.parse(readFileSync(path, 'utf8'));
     if (s?.version !== 1 || !Array.isArray(s.incidents) || !Object.hasOwn(s, 'active')) throw new Error('invalid state');
+    if (s.routerUnavailableSince !== undefined || s.routerUnavailableCount !== undefined || s.routerUnavailableLastAt !== undefined) {
+      if (!Number.isFinite(s.routerUnavailableSince) || s.routerUnavailableSince < 0 || !Number.isSafeInteger(s.routerUnavailableCount) || s.routerUnavailableCount < 1) throw new Error('invalid router availability state');
+      if (s.routerUnavailableLastAt !== undefined && (!Number.isFinite(s.routerUnavailableLastAt) || s.routerUnavailableLastAt < s.routerUnavailableSince)) throw new Error('invalid router availability state');
+    }
     const incidentIds = new Set(), accountIds = new Set();
     for (const i of s.incidents) {
       if (typeof i.id !== 'string' || !/^[a-zA-Z0-9-]{1,80}$/.test(i.id) || typeof i.accountId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(i.accountId) || !validMarker(i.marker) || incidentIds.has(i.id) || accountIds.has(i.accountId) || !Number.isInteger(i.attempts) || i.attempts < 0 || i.attempts > MAX_ATTEMPTS || typeof i.blocked !== 'boolean' || typeof i.notified !== 'boolean' || (i.alertState !== undefined && !['pending', 'sent'].includes(i.alertState)) || !Number.isFinite(i.nextAt) || i.nextAt < 0) throw new Error('invalid incident');
@@ -178,8 +190,7 @@ function detectorAlertText(i) {
 // Interim mode has no path to createThread, lease mutation, or credentials.
 // Notices are durable per exact (connection ID, effective marker), including
 // across restarts and a temporary clear/disable followed by the same marker.
-async function detectOnly(ctx, state) {
-  const payload = await ctx.providers();
+async function detectOnly(ctx, state, payload) {
   const pending = pendingConnections(payload);
   for (const item of pending) emit('reauth', 'relogin.needed', { ids: { account: item.accountId }, props: { tag: 'effective_marker' } });
   state.detectorIncidents ??= [];
@@ -307,11 +318,53 @@ export async function tick(ctx) {
 
 async function tickImpl(ctx) {
   const state = ctx.load();
+  const startedAt = ctx.now();
+  const continuing = state.routerUnavailableLastAt !== undefined
+    && startedAt >= state.routerUnavailableLastAt
+    && startedAt - state.routerUnavailableLastAt <= ROUTER_STREAK_GAP_MS;
+  // A killed fetch cannot publish its result. Preserve an ongoing outage's
+  // continuity before fetching so the following retry does not look like downtime.
+  if (continuing) {
+    state.routerUnavailableLastAt = startedAt;
+    ctx.save(state);
+  }
+  let payload;
+  try { payload = await ctx.providers(); }
+  catch (error) {
+    if (!(error instanceof RouterUnavailableError)) throw error;
+    const now = ctx.now();
+    // Legacy journals lack a last tick; their elapsed time cannot prove continuity.
+    if (!continuing) {
+      state.routerUnavailableSince = now;
+      state.routerUnavailableCount = 0;
+    }
+    state.routerUnavailableLastAt = now;
+    state.routerUnavailableCount = (state.routerUnavailableCount ?? 0) + 1;
+    ctx.save(state);
+    const elapsed = Math.max(0, now - state.routerUnavailableSince);
+    if (elapsed >= (ctx.routerUnavailableLimitMs ?? ROUTER_UNAVAILABLE_LIMIT_MS)) {
+      error.sustainedMinutes = Math.floor(elapsed / 60_000);
+      throw error;
+    }
+    emit('reauth', 'providers.fetch.skipped', { props: { consecutive: state.routerUnavailableCount, sinceMs: state.routerUnavailableSince } });
+    ctx.log?.(`9router Claude detector: router slow/unavailable (attempt ms ${error.attemptMs.join('/')}); skipped this tick (${state.routerUnavailableCount} consecutive, since ${new Date(state.routerUnavailableSince).toISOString()})`);
+    // Unknown is not an empty snapshot: leave all incident/worker/delivery state
+    // untouched, including queued notices whose markers might still be pending.
+    return;
+  }
+  pendingConnections(payload);
+  if (state.routerUnavailableSince !== undefined) {
+    ctx.log?.(`9router Claude detector: router recovered after ${state.routerUnavailableCount} consecutive unavailable ticks`);
+    delete state.routerUnavailableLastAt;
+    delete state.routerUnavailableSince;
+    delete state.routerUnavailableCount;
+    ctx.save(state);
+  }
   // In the live build the unverified server fence selects detector-only mode;
   // flags and local files cannot enable the recovery path. A future code change
   // must integrate and verify a real server capability before launch is allowed.
-  if (ctx.enforceSafetyFence && !SERVER_IDENTITY_FENCE_VERIFIED) return detectOnly(ctx, state);
-  const list = pendingConnections(await ctx.providers()); // failure is UNKNOWN, never healthy
+  if (ctx.enforceSafetyFence && !SERVER_IDENTITY_FENCE_VERIFIED) return detectOnly(ctx, state, payload);
+  const list = pendingConnections(payload); // failure is UNKNOWN, never healthy
   for (const item of list) emit('reauth', 'relogin.needed', { ids: { account: item.accountId }, props: { tag: 'effective_marker' } });
   ensureIncidents(state, list); ctx.save(state);
   for (const i of state.incidents) await checkAlert(ctx, state, i);
@@ -453,18 +506,98 @@ async function tickImpl(ctx) {
   }
 }
 
-export async function liveProviders({ data = join(homedir(), '.9router'), url = 'http://127.0.0.1:20128/api/providers', timeoutMs = 6_000, phase = () => {} } = {}) {
+export class RouterUnavailableError extends Error {
+  constructor(attemptMs) {
+    super('router slow/unavailable');
+    this.attemptMs = attemptMs;
+  }
+}
+
+function transientFetchError(error) {
+  return ['AbortError', 'TimeoutError'].includes(error?.name)
+    || ['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_SOCKET'].includes(error?.code)
+    || ['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_SOCKET'].includes(error?.cause?.code)
+    || error?.message === 'socket hang up';
+}
+
+function abortable(work, signal) {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) { signal.removeEventListener('abort', abort); abort(); return; }
+    Promise.resolve().then(work).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+export async function liveProviders({ data = join(homedir(), '.9router'), url = 'http://127.0.0.1:20128/api/providers', timeoutMs = 6_000, retryTimeoutMs = 15_000, phase = () => {}, fetch: fetchProvider = fetch, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = () => performance.now(), log = () => {}, deadlineAt = Infinity, signal, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  const attemptMs = [];
+  const remaining = () => Math.max(0, deadlineAt - now());
+  const budgetLog = (tag, ms) => {
+    emit('reauth', 'providers.fetch.budget', { durationMs: ms, props: { tag } });
+    log(`9router Claude detector: providers fetch budget ${tag} (${Math.floor(ms)}ms remaining)`);
+  };
+  const exhausted = tag => { budgetLog(tag, remaining()); return new RouterUnavailableError(attemptMs); };
+  if (remaining() < MIN_FETCH_BUDGET_MS) throw exhausted('below_minimum');
   phase('providers:credentials');
   const raw = readFileSync(join(data, 'machine-id'), 'utf8').trim();
   const secret = readFileSync(join(data, 'auth', 'cli-secret'), 'utf8').trim();
   if (!raw || !secret) throw new Error('router auth unavailable');
   const token = createHash('sha256').update(raw + '9r-cli-auth' + secret).digest('hex').substring(0, 16);
-  phase('providers:fetch');
-  const signal = AbortSignal.timeout(timeoutMs);
-  const r = await fetch(url, { headers: { 'x-9r-cli-token': token, accept: 'application/json' }, cache: 'no-store', signal });
-  if (!r.ok || !(r.headers.get('content-type') ?? '').includes('application/json')) throw new Error('router unavailable');
-  phase('providers:body');
-  return await r.json();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (remaining() < MIN_FETCH_BUDGET_MS || signal?.aborted) throw exhausted('below_minimum');
+    phase(attempt ? 'providers:fetch:retry' : 'providers:fetch');
+    const started = now();
+    const requestedMs = attempt ? retryTimeoutMs : timeoutMs;
+    const allowedMs = Math.min(requestedMs, remaining());
+    if (allowedMs < requestedMs) budgetLog(attempt ? 'retry_shortened' : 'first_shortened', allowedMs);
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal.reason);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    const timer = setTimer(() => controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), Math.ceil(allowedMs));
+    let retryable = false, payload, failure, response;
+    try {
+      const r = await abortable(() => fetchProvider(url, { headers: { 'x-9r-cli-token': token, accept: 'application/json' }, cache: 'no-store', signal: controller.signal }), controller.signal);
+      response = r;
+      if (!r.ok) {
+        retryable = [502, 503, 504].includes(r.status);
+        throw new Error('router unavailable');
+      }
+      if (!(r.headers.get('content-type') ?? '').includes('application/json')) throw new Error('invalid provider content type');
+      phase(attempt ? 'providers:body:retry' : 'providers:body');
+      payload = await abortable(() => r.json(), controller.signal);
+      pendingConnections(payload);
+      if (remaining() <= 0 || signal?.aborted) throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+    } catch (error) {
+      failure = error;
+      retryable ||= transientFetchError(error) || error instanceof RouterUnavailableError;
+    } finally {
+      // Rejected headers leave the body unread. Close its socket before
+      // retiring both abort paths, or a streaming error can outlive the tick.
+      if (response?.body && !response.bodyUsed) {
+        void response.body.cancel().catch(() => {});
+        controller.abort();
+      }
+      clearTimer(timer);
+      signal?.removeEventListener('abort', abort);
+    }
+    attemptMs.push(Math.round(now() - started));
+    if (attempt) {
+      const outcome = failure ? (retryable ? 'unavailable' : 'failed') : 'success';
+      emit('reauth', 'providers.fetch.retry', { ok: !failure, durationMs: attemptMs[1], props: { firstAttemptMs: attemptMs[0], retryAttemptMs: attemptMs[1], outcome } });
+      log(`9router Claude detector: providers retry ${outcome} (providers:fetch=${attemptMs[0]}ms, providers:fetch:retry=${attemptMs[1]}ms)`);
+    }
+    if (!failure) return payload;
+    if (!retryable) throw failure;
+    if (remaining() <= 0 || signal?.aborted) throw exhausted('exhausted');
+    if (attempt) throw new RouterUnavailableError(attemptMs);
+    if (remaining() < 1_000 + MIN_FETCH_BUDGET_MS) throw exhausted('retry_dropped');
+    phase('providers:backoff');
+    if (signal) {
+      try { await abortable(() => sleep(1_000), signal); }
+      catch (error) { if (signal.aborted) throw exhausted('exhausted'); throw error; }
+    } else await sleep(1_000);
+  }
 }
 
 // Resolve on exit, never on pipe close: a descendant may inherit stdout.
@@ -509,10 +642,13 @@ function stderrLine(line) {
   try { writeSync(2, line + '\n'); } catch { /* marker still survives */ }
 }
 
-export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_PHASE, stderr = stderrLine } = {}) {
+export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_PHASE, stderr = stderrLine, startedAt = Number(process.env.WATCH_STARTED_AT), now = () => performance.now(), wallNow = Date.now, log = () => {} } = {}) {
   const path = join(watchDir, '.phase');
-  let phase = 'start', since = performance.now();
-  const durations = [];
+  const bootMs = Number.isFinite(startedAt) && startedAt > 0 ? Math.max(0, wallNow() - startedAt) : 0;
+  let phase = 'start', since = now();
+  const durations = [`boot=${bootMs.toFixed(1)}ms`];
+  emit('reauth', 'supervisor.boot', { durationMs: bootMs });
+  log(`9router Claude detector: phase durations: boot=${bootMs.toFixed(1)}ms`);
   let previousStall;
   try {
     const old = JSON.parse(previous ?? readFileSync(path, 'utf8'));
@@ -522,9 +658,9 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
     }
   } catch { /* no valid previous marker */ }
   const mark = next => {
-    const now = performance.now();
-    durations.push(`${phase}=${(now - since).toFixed(1)}ms`);
-    phase = next; since = now;
+    const at = now();
+    durations.push(`${phase}=${(at - since).toFixed(1)}ms`);
+    phase = next; since = at;
     try { writeFileSync(path, JSON.stringify({ phase, t: Date.now() }) + '\n', { mode: 0o600 }); } catch { /* observability must not change detector safety */ }
   };
   mark('start');
@@ -536,7 +672,7 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
   return {
     mark, previousStall,
     failure: reason => {
-      stderr(`phase durations: ${[...durations, `${phase}=${(performance.now() - since).toFixed(1)}ms`].join(', ')}`);
+      stderr(`phase durations: ${[...durations, `${phase}=${(now() - since).toFixed(1)}ms`].join(', ')}`);
       // The runner keeps only the last 500 stderr characters on failure.
       if (previousStall) stderr(previousStall);
       stderr(`9router Claude detector: ${phase} ${reason}`);
@@ -546,27 +682,67 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
 }
 
 // Synthetic callers inject IO; live() retains all deployment and identity fences.
-export async function runObserved(ctx, { watchDir, deadlineMs = 45_000, previous, stderr, phase, onDeadline = () => {} } = {}) {
-  const report = phase ?? phaseReporter(watchDir, { previous, stderr });
-  const started = performance.now();
-  const deadline = () => {
+export async function runObserved(ctx, { watchDir, deadlineMs = SUPERVISOR_DEADLINE_MS, startedAt = Number(process.env.WATCH_STARTED_AT), previous, stderr, phase, onDeadline = () => {}, now = () => performance.now(), wallNow = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, exit = code => process.exit(code) } = {}) {
+  const report = phase ?? phaseReporter(watchDir, { previous, stderr, startedAt, now, wallNow, log: ctx.log });
+  const bootMs = Number.isFinite(startedAt) && startedAt > 0 ? Math.max(0, wallNow() - startedAt) : 0;
+  const remainingMs = Math.max(1, deadlineMs - bootMs);
+  const deadlineAt = now() + remainingMs;
+  let fetching, fetchSkipped = false, firstFetch = true, currentPhase = 'start', deadlineFailed = false;
+  const mark = next => { currentPhase = next; report.mark(next); };
+  const hardDeadline = () => {
+    deadlineFailed = true;
     report.failure('exceeded deadline');
-    try { onDeadline(); } finally { process.exit(1); }
+    try { onDeadline(); } finally { exit(1); }
   };
-  const timer = setTimeout(deadline, deadlineMs);
+  const deadline = () => {
+    if (fetching && /^providers:(fetch|body|backoff)(:|$)/.test(currentPhase)) {
+      fetching.abort(new RouterUnavailableError([]));
+      // Let the skip's synchronous journal commit finish. Any subsequent async
+      // work is still stopped at the supervisor deadline.
+      timer = setTimer(hardDeadline, 0);
+    } else hardDeadline();
+  };
+  let timer = setTimer(deadline, remainingMs);
   try {
     await tick({
       ...ctx,
-      load: () => { report.mark('load'); return ctx.load(); },
-      providers: () => { report.mark('providers'); return ctx.providers(report.mark); },
-      save: state => { report.mark('save'); return ctx.save(state); },
+      load: () => { mark('load'); return ctx.load(); },
+      providers: async () => {
+        mark('providers');
+        // Only the initial snapshot can skip: later reads follow state changes.
+        if (!firstFetch) return ctx.providers(mark);
+        firstFetch = false;
+        const controller = new AbortController();
+        fetching = controller;
+        const budgetMs = Math.max(0, deadlineAt - now() - SAVE_RESERVE_MS);
+        const budgetTimer = setTimer(() => {
+          if (/^providers:(fetch|body|backoff)(:|$)/.test(currentPhase)) controller.abort(new RouterUnavailableError([]));
+        }, budgetMs);
+        try {
+          return await abortable(() => ctx.providers(mark, { deadlineAt: deadlineAt - SAVE_RESERVE_MS, signal: controller.signal, now, setTimer, clearTimer }), controller.signal);
+        } catch (error) {
+          fetchSkipped = error instanceof RouterUnavailableError;
+          throw error;
+        } finally { fetching = undefined; clearTimer(budgetTimer); }
+      },
+      save: state => {
+        mark('save');
+        const before = now();
+        const result = ctx.save(state);
+        if (now() >= deadlineAt && (!fetchSkipped || now() - before >= SAVE_RESERVE_MS)) hardDeadline();
+        return result;
+      },
     });
-    if (performance.now() - started >= deadlineMs) deadline();
-    report.mark('done');
+    if (now() >= deadlineAt && !fetchSkipped) hardDeadline();
+    mark('done');
   } catch (error) {
-    report.failure('failed; router, notification delivery, journal or prior-worker state unavailable.');
+    // Marker/delivery code can catch IO errors internally. A late result after
+    // a valid snapshot must still report the deadline, even on that error path.
+    if (!deadlineFailed && now() >= deadlineAt && !fetchSkipped) hardDeadline();
+    if (error instanceof RouterUnavailableError) report.mark('providers:fetch:retry');
+    report.failure(`failed; router, notification delivery, journal or prior-worker state unavailable.${error.sustainedMinutes === undefined ? '' : ` for ${error.sustainedMinutes} min`}`);
     throw error;
-  } finally { clearTimeout(timer); }
+  } finally { clearTimer(timer); }
 }
 
 // Import and instantiate only if a future, explicitly fenced recovery path
@@ -583,16 +759,18 @@ async function live() {
   if (process.env.WATCH_DIR !== ROOT || process.env.WATCH_ID !== '9router-claude-reauth' || !process.env.WATCH_RUN || ROOT !== join(homedir(), '.local/share/robob-watch/watchers/9router-claude-reauth') || existsSync(join(ROOT, 'ENABLE_REQUIRED'))) throw new Error('live execution refused');
   // This exported function can also be imported for synthetic tests: the
   // live side additionally checks the runner-only environment and hold.
-  const report = phaseReporter(process.env.WATCH_DIR);
+  // Successful stderr/stdout are not a safe diagnostic channel: the runner
+  // discards stderr and treats stdout as a wake event.
+  const log = line => {
+    try { appendFileSync(join(ROOT, 'log'), `${new Date().toISOString()} ${line}\n`, { mode: 0o600 }); } catch { /* tool log remains available */ }
+  };
+  const report = phaseReporter(process.env.WATCH_DIR, { log });
   const commands = new AbortController();
   const command = args => telegramCommand(args, { phase: report.mark, signal: commands.signal });
   const control = lazyControlClient();
-  // The shell timestamp includes interpreter startup; it never extends 45s.
-  const startedAt = Number(process.env.WATCH_STARTED_AT);
-  const deadlineMs = Number.isFinite(startedAt) && startedAt > 0 ? Math.min(45_000, Math.max(1, 45_000 - (Date.now() - startedAt))) : 45_000;
   await runObserved({
     enforceSafetyFence: true,
-    now: Date.now, load: () => readState(STATE), save: s => writeState(STATE, s), providers: phase => liveProviders({ phase }),
+    now: Date.now, load: () => readState(STATE), save: s => writeState(STATE, s), providers: (phase, budget) => liveProviders({ phase, log, ...budget }), log,
     leasePath: DEFAULT_LEASE, leaseOwner: () => leaseOwner(DEFAULT_LEASE),
     acquireLease: id => acquireLease(DEFAULT_LEASE, 'auto', id), releaseLease: o => releaseLease(DEFAULT_LEASE, o),
     available: async () => (await (await control()).health())?.ok === true,
@@ -602,7 +780,7 @@ async function live() {
     notify: (key, text) => command(['notify', '--source', '9router Claude recovery', '--severity', 'attention', '--text', text, '--key', key]),
     notificationState: async key => notificationState(await command(['notifications']), key),
     notificationSnapshot: () => command(['notifications']),
-  }, { phase: report, deadlineMs, onDeadline: () => commands.abort() });
+  }, { phase: report, onDeadline: () => commands.abort() });
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

@@ -195,10 +195,73 @@ def list_special(M):
     return out
 
 
-def search_account(name, query, limit, timeout, all_folders, deadline):
+def phase_snapshot(diagnostic):
+    if 'failure' in diagnostic:
+        return {key: diagnostic['failure'][key] for key in ('phase', 'phaseElapsedMs')}
+    phase, start = diagnostic.get('current', (None, None))[:2]
+    if phase not in {'session_open', 'order_list', 'order_detail', 'parse'} or start is None:
+        return {}
+    return {'phase': phase, 'phaseElapsedMs': round(max(0, time.monotonic() - start) * 1000, 3)}
+
+
+def phase_progress(diagnostic, state):
+    token = os.environ.get('MAILSEARCH_PHASE_TOKEN', '')
+    if not re.fullmatch(r'[a-f0-9]{32}', token):
+        return
+    failure = diagnostic.get('failure')
+    phase, start, started_at = diagnostic.get('current', (None, None, None))
+    if failure:
+        phase, started_at = failure['phase'], failure['startedAt']
+        state = 'failed'
+    if phase not in {'session_open', 'order_list', 'order_detail', 'parse'}:
+        return
+    row = {'token': token, 'slot': diagnostic.get('slot', 0), 'state': state,
+           'phase': phase, 'startedAt': started_at,
+           'phaseElapsedMs': phase_snapshot(diagnostic).get('phaseElapsedMs'),
+           'timedOut': bool(failure and failure['timedOut'])}
+    try:
+        # One small pipe write keeps concurrent account markers intact. Raw mail,
+        # account names and exception text never enter this deadline side channel.
+        os.write(2, ('MAILSEARCH_PHASE ' + json.dumps(row, separators=(',', ':')) + '\n').encode())
+    except OSError:
+        pass
+
+
+def phase_start(diagnostic, phase):
+    # Python 3.9 on macOS uses a process-relative monotonic origin. Only wall
+    # time can anchor active progress for a parent on a different interpreter.
+    diagnostic['current'] = (phase, time.monotonic(), time.time())
+    phase_progress(diagnostic, 'active')
+
+
+def phase_failed(diagnostic, exc):
+    if 'failure' not in diagnostic:
+        phase, start, started_at = diagnostic.get('current', (None, None, None))
+        if phase not in {'session_open', 'order_list', 'order_detail', 'parse'} or start is None:
+            return
+        diagnostic.setdefault('failure', {
+            'phase': phase, 'phaseElapsedMs': round(max(0, time.monotonic() - start) * 1000, 3),
+            'startedAt': started_at, 'timedOut': isinstance(exc, (TimeoutError, subprocess.TimeoutExpired))})
+    phase_progress(diagnostic, 'failed')
+
+
+def search_account(name, query, limit, timeout, all_folders, deadline, diagnostic=None):
+    diagnostic = diagnostic if diagnostic is not None else {}
+    try:
+        result = _search_account(name, query, limit, timeout, all_folders, deadline, diagnostic)
+    except BaseException as exc:
+        phase_failed(diagnostic, exc)
+        raise
+    phase_progress(diagnostic, 'done')
+    return result
+
+
+def _search_account(name, query, limit, timeout, all_folders, deadline, diagnostic):
     cfg = ACCOUNTS[name]
     t0 = time.time()
+    phase_start(diagnostic, 'session_open')
     M = connect(name, timeout)
+    phase_start(diagnostic, 'order_list')
     hits = []
     try:
         google = cfg["auth"] == "google"
@@ -235,6 +298,7 @@ def search_account(name, query, limit, timeout, all_folders, deadline):
             if uids:
                 typ, fd = M.uid("FETCH", b",".join(uids).decode(),
                                 "(BODY.PEEK[HEADER.FIELDS (DATE FROM TO SUBJECT MESSAGE-ID)] INTERNALDATE)")
+                phase_start(diagnostic, 'parse')
                 for i, item in enumerate(fd):
                     if not isinstance(item, tuple):
                         continue
@@ -273,10 +337,14 @@ def search_account(name, query, limit, timeout, all_folders, deadline):
                         "subject": subj,
                         "message_id": (h.get("Message-ID") or "").strip(),
                     })
+                phase_start(diagnostic, 'order_list')
             folder_hits.sort(key=lambda x: x["uid"] or 0)
             for fh in folder_hits[-limit:]:
                 fh["folder_total"] = total
                 hits.append(fh)
+    except BaseException as exc:
+        phase_failed(diagnostic, exc)
+        raise
     finally:
         try:
             M.logout()
@@ -287,6 +355,7 @@ def search_account(name, query, limit, timeout, all_folders, deadline):
 
 def cmd_search(argv):
     accts, limit, timeout, as_json, all_folders, words = [], 15, 25.0, False, False, []
+    diagnostics = os.environ.get('MAILSEARCH_PHASE_DIAGNOSTICS') == '1'
     it = iter(argv)
     for a in it:
         if a == "-a":
@@ -313,12 +382,16 @@ def cmd_search(argv):
             die(f"unknown account {a!r}; known: {', '.join(ACCOUNTS)}")
     deadline = time.time() + timeout
     ex = ThreadPoolExecutor(max_workers=len(accts))
-    futs = {ex.submit(search_account, a, query, limit, timeout, all_folders, deadline): a for a in accts}
+    phases = {a: {'slot': index} for index, a in enumerate(accts)}
+    futs = {ex.submit(search_account, a, query, limit, timeout, all_folders, deadline, phases[a]): a for a in accts}
     done, pending = wait(futs, timeout=timeout + 2)
     hits, status = [], {}
     for f, a in futs.items():
         if f in pending:
+            phase_failed(phases[a], TimeoutError())
             status[a] = {"ok": False, "error": f"timeout after {timeout:.0f}s"}
+            if diagnostics:
+                status[a].update(phase_snapshot(phases[a]))
             continue
         try:
             h, secs = f.result()
@@ -326,6 +399,8 @@ def cmd_search(argv):
             status[a] = {"ok": True, "hits": len(h), "secs": round(secs, 1)}
         except Exception as e:
             status[a] = {"ok": False, "error": str(e)[:300]}
+            if diagnostics:
+                status[a].update(phase_snapshot(phases[a]))
     hits.sort(key=lambda h: h["_ts"], reverse=True)
     for h in hits:
         h.pop("_ts", None)
@@ -358,6 +433,17 @@ def html_to_text(s):
 
 
 def cmd_read(argv):
+    diagnostic = {}
+    try:
+        result = _cmd_read(argv, diagnostic)
+    except BaseException as exc:
+        phase_failed(diagnostic, exc)
+        raise
+    phase_progress(diagnostic, 'done')
+    return result
+
+
+def _cmd_read(argv, diagnostic):
     raw_mode = "--raw" in argv
     html_mode = "--html" in argv
     args = [a for a in argv if a not in ("--raw", "--html")]
@@ -366,7 +452,9 @@ def cmd_read(argv):
     name, folder, uid = args
     if folder.lower() == "inbox":
         folder = "INBOX"
+    phase_start(diagnostic, 'session_open')
     M = connect(name, 25)
+    phase_start(diagnostic, 'order_detail')
     try:
         typ, _ = M.select(q(folder), readonly=True)
         if typ != "OK":
@@ -375,11 +463,15 @@ def cmd_read(argv):
         data = next((i[1] for i in fd if isinstance(i, tuple)), None)
         if not data:
             die(f"UID {uid} not found in {name}/{folder}", 1)
+    except BaseException as exc:
+        phase_failed(diagnostic, exc)
+        raise
     finally:
         try:
             M.logout()
         except Exception:
             pass
+    phase_start(diagnostic, 'parse')
     if raw_mode:
         sys.stdout.write(data.decode("utf-8", "replace"))
         return 0

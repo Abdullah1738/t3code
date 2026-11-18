@@ -19,7 +19,10 @@
 	<string>Background</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/python3</string>
+		<string>/bin/zsh</string>
+		<string>-fc</string>
+		<string>exec /usr/bin/python3 "$@"</string>
+		<string>--</string>
 		<string>/Users/ardud/.local/share/robob-guard/guard.py</string>
 	</array>
 	<key>RunAtLoad</key>

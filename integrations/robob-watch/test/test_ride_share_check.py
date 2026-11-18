@@ -1,6 +1,9 @@
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import fcntl
 import json
-import os
 import sqlite3
 import stat
 import subprocess
@@ -2185,3 +2188,25 @@ class RenderLogTest(unittest.TestCase):
             self.assertEqual(child.call_args.args[0][2:5], ['log-card-render', '--kind', 'ride'])
         with unittest.mock.patch.object(rc.subprocess, 'Popen', side_effect=OSError('unavailable')):
             rc.log_render(time.monotonic(), True)
+
+
+    def test_render_chat_aliases_use_bridge_slugs_and_private_values_are_reduced(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('ride_log_alias_test', CARD)
+        rc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rc)
+        # All accepted owner input forms must survive person -> metadata -> log reduction.
+        cases = [('owner', 'owner'), ('abdullah', 'owner'), ('me', 'owner'), (' OWNER ', 'owner'),
+                 ('moni', 'moni'), ('MONI', 'moni'), ('friend', 'other')]
+        for value, expected in cases:
+            with self.subTest(value=value), unittest.mock.patch.object(rc, '_render_preview', return_value=False), \
+                    unittest.mock.patch.object(rc.subprocess, 'Popen') as child, unittest.mock.patch.object(rc.threading, 'Thread'):
+                self.assertFalse(rc.render_preview({'rider': rc.person(value)}, None))
+                command = child.call_args.args[0]
+                self.assertEqual(command[command.index('--chat') + 1], expected)
+                self.assertEqual(command[command.index('--failure-code') + 1], 'preview_missing')
+        private = '+971501234567 /Users/private/PRIVATE https://private/?token=PRIVATE'
+        with unittest.mock.patch.object(rc.subprocess, 'Popen') as child, unittest.mock.patch.object(rc.threading, 'Thread'):
+            rc.log_render(time.monotonic(), False, chat=private, failure_code=private)
+            self.assertNotIn('PRIVATE', str(child.call_args))
+            self.assertNotIn('971501234567', str(child.call_args))

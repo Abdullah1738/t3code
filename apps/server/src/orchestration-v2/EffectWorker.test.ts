@@ -4,6 +4,8 @@ import {
   CheckpointId,
   CheckpointScopeId,
   CommandId,
+  DEFAULT_SERVER_SETTINGS,
+  ServerSettingsError,
   MessageId,
   ProviderInstanceId,
   standardModelSelection,
@@ -63,6 +65,7 @@ const providerThreadId = ProviderThreadId.make("provider-thread:effect-worker-re
 const providerTurnId = ProviderTurnId.make("provider-turn:effect-worker-restart");
 const attemptId = RunAttemptId.make("run-attempt:effect-worker-restart");
 const runId = RunId.make("run:effect-worker-restart");
+const decodeProjection = Schema.decodeUnknownEffect(OrchestrationV2ThreadProjection);
 
 function restartEffect(
   now: DateTime.Utc,
@@ -247,6 +250,7 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
+        Layer.mock(EffectOutbox.EffectOutboxV2)({ get: () => Effect.succeed(Option.none()) }),
         Layer.mock(EventSink.EventSinkV2)({
           writeIfRunCurrent: (input) =>
             Effect.sync(() => {
@@ -264,7 +268,16 @@ function layerExecutorFor(input: {
           getThreadRecords: () => Effect.sync(() => ({ runs: [restartRun] }) as never),
           ...input.projections,
         }),
-        input.pacing ?? RestartPacingTestkit.layer,
+        input.pacing ??
+          RestartPacingTestkit.layer.pipe(
+            Layer.provide(
+              ServerSettings.layerTest(
+                input.continueAfterRestart === true
+                  ? { continueThreadsAfterServerUpdate: true }
+                  : {},
+              ),
+            ),
+          ),
         input.mcpRegistry ?? McpSessionRegistryTestkit.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         ServerSettings.layerTest(
@@ -877,6 +890,178 @@ it.effect("keeps a max-attempt replay-safe failure terminal when fail settlement
   }),
 );
 
+it.effect.each([
+  { defect: false, succeeds: false },
+  { defect: true, succeeds: false },
+  { defect: false, succeeds: true },
+  { defect: true, succeeds: true },
+])(
+  "bounds accepted notification bookkeeping (defect=$defect succeeds=$succeeds)",
+  ({ defect, succeeds }) =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const effectId = "effect:accepted-notification";
+      const maxAttempts = 2;
+      const maxAcceptedAttempts = 4;
+      let dispatches = 0;
+      const retryDecisions: boolean[] = [];
+      const dependencies = layerExecutorFor({
+        events: yield* Ref.make<ReadonlyArray<string>>([]),
+        threads: {
+          dispatch: () =>
+            Effect.suspend(() => {
+              dispatches++;
+              if (succeeds && dispatches === maxAcceptedAttempts)
+                return Effect.succeed({ sequence: 1, storedEvents: [] });
+              const error = new Orchestrator.OrchestratorProjectionError({
+                threadId,
+                cause: "accepted notification bookkeeping unavailable",
+              });
+              return defect ? Effect.die(error) : Effect.fail(error);
+            }),
+        },
+      });
+      yield* outbox.enqueue([
+        {
+          id: effectId,
+          commandId: CommandId.make("command:accepted-notification"),
+          threadId,
+          request: {
+            type: "notification.delivery.accept",
+            messageId: MessageId.make("message:accepted-notification"),
+          },
+        },
+      ]);
+      yield* Effect.gen(function* () {
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+          Effect.provide(
+            EffectWorker.layerWithOptions({
+              workerId: "accepted-notification-test",
+              maxAttempts,
+              maxAcceptedAttempts,
+            }).pipe(
+              Layer.provide(
+                Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+                  execute: (effect, options) => {
+                    retryDecisions.push(options!.willRetry);
+                    return executor.execute(effect, options);
+                  },
+                }),
+              ),
+            ),
+          ),
+        );
+        for (let attempt = 1; attempt <= maxAcceptedAttempts; attempt++) {
+          assert.isTrue(yield* worker.runOnce);
+          const persisted = Option.getOrThrow(yield* outbox.get(effectId));
+          assert.equal(persisted.attemptCount, attempt);
+          assert.equal(
+            persisted.status,
+            attempt < maxAcceptedAttempts ? "pending" : succeeds ? "succeeded" : "failed",
+          );
+          if (attempt < maxAcceptedAttempts) yield* TestClock.adjust("30 seconds");
+          else {
+            assert.isNotNull(persisted.completedAt);
+            if (!succeeds) assert.include(persisted.lastError!, "bookkeeping unavailable");
+          }
+        }
+        yield* TestClock.adjust("30 seconds");
+        assert.isFalse(yield* worker.runOnce);
+      }).pipe(Effect.provide(dependencies));
+      assert.equal(dispatches, maxAcceptedAttempts);
+      assert.deepEqual(retryDecisions, [true, true, true, false]);
+    }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
+);
+
+it.effect.each([
+  { stage: "settlement", defect: false, succeeds: false },
+  { stage: "settlement", defect: true, succeeds: false },
+  { stage: "settlement", defect: false, succeeds: true },
+  { stage: "settlement", defect: true, succeeds: true },
+  { stage: "cancellation read", defect: false, succeeds: false },
+  { stage: "cancellation read", defect: true, succeeds: false },
+  { stage: "cancellation read", defect: false, succeeds: true },
+  { stage: "cancellation read", defect: true, succeeds: true },
+])(
+  "bounds accepted notification recovery ($stage defect=$defect succeeds=$succeeds)",
+  ({ stage, defect, succeeds }) =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const effectId = "effect:accepted-notification-recovery";
+      const maxAcceptedAttempts = 4;
+      const retryDecisions: boolean[] = [];
+      let failures = 0;
+      const fail = Effect.suspend(() => {
+        failures++;
+        const error = new EffectOutbox.EffectOutboxError({
+          operation: stage === "settlement" ? "succeed" : "get",
+          effectId,
+          cause: "accepted notification recovery unavailable",
+        });
+        return defect ? Effect.die(error) : Effect.fail(error);
+      });
+      yield* outbox.enqueue([
+        {
+          id: effectId,
+          commandId: CommandId.make("command:accepted-notification-recovery"),
+          threadId,
+          request: {
+            type: "notification.delivery.accept",
+            messageId: MessageId.make("message:accepted-notification-recovery"),
+          },
+        },
+      ]);
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+        Effect.provide(
+          EffectWorker.layerWithOptions({
+            workerId: "accepted-notification-recovery-test",
+            maxAttempts: 2,
+            maxAcceptedAttempts,
+          }).pipe(
+            Layer.provide(
+              Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+                execute: (_effect, options) =>
+                  Effect.sync(() => {
+                    retryDecisions.push(options!.willRetry);
+                  }),
+              }),
+            ),
+          ),
+        ),
+        Effect.provideService(EffectOutbox.EffectOutboxV2, {
+          ...outbox,
+          get: (id) =>
+            stage === "cancellation read" && (!succeeds || failures < maxAcceptedAttempts - 1)
+              ? fail
+              : outbox.get(id),
+          succeed: (input) =>
+            stage === "settlement" && (!succeeds || failures < maxAcceptedAttempts - 1)
+              ? fail
+              : outbox.succeed(input),
+        }),
+      );
+      for (let attempt = 1; attempt <= maxAcceptedAttempts; attempt++) {
+        const exit = yield* Effect.exit(worker.runOnce);
+        assert.equal(Exit.isFailure(exit), !succeeds || attempt < maxAcceptedAttempts);
+        const persisted = Option.getOrThrow(yield* outbox.get(effectId));
+        assert.equal(persisted.attemptCount, attempt);
+        assert.equal(
+          persisted.status,
+          attempt < maxAcceptedAttempts ? "pending" : succeeds ? "succeeded" : "failed",
+        );
+        if (attempt === maxAcceptedAttempts) {
+          assert.isNotNull(persisted.completedAt);
+          if (!succeeds) assert.include(persisted.lastError!, "recovery unavailable");
+        }
+      }
+      assert.equal(failures, succeeds ? maxAcceptedAttempts - 1 : maxAcceptedAttempts);
+      if (stage === "settlement") assert.deepEqual(retryDecisions, [true, true, true, false]);
+      else assert.deepEqual(retryDecisions, succeeds ? [false] : []);
+      assert.isFalse(yield* worker.runOnce);
+    }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
+);
+
 it.effect("uses durable deadlines, notifications, and a slow liveness poll", () =>
   Effect.gen(function* () {
     const attempts = yield* Ref.make(0);
@@ -887,6 +1072,9 @@ it.effect("uses durable deadlines, notifications, and a slow liveness poll", () 
     );
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Queue.take(available),
+      awaitStartWork: Effect.never,
+      runStartOnce: Effect.succeed(false),
+      nextStartClaimableAt: Effect.succeed(Option.none()),
       awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
       runControlOnce: Effect.succeed(false),
@@ -942,6 +1130,9 @@ it.effect("does not hot-loop when a claim fails", () =>
     const now = yield* DateTime.now;
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Effect.never,
+      awaitStartWork: Effect.never,
+      runStartOnce: Effect.succeed(false),
+      nextStartClaimableAt: Effect.succeed(Option.none()),
       awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
       runControlOnce: Effect.succeed(false),
@@ -981,6 +1172,9 @@ it.effect("backs off briefly when a due deadline loses a claim race", () =>
     const now = yield* DateTime.now;
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Effect.never,
+      awaitStartWork: Effect.never,
+      runStartOnce: Effect.succeed(false),
+      nextStartClaimableAt: Effect.succeed(Option.none()),
       awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
       runControlOnce: Effect.succeed(false),
@@ -1175,13 +1369,30 @@ it.effect.each([
               ...(queued ? { queued: true } : {}),
             },
     };
+    let admissions = 0;
+    const admission = {
+      queuedAtMs: 0,
+      waitedMs: 30 * 60_000,
+      positionAtFailure: 7,
+      totalAtFailure: 12,
+      rule: "no_progress" as const,
+    };
+    const expire = Effect.sync(() => {
+      admissions++;
+    }).pipe(
+      Effect.andThen(
+        Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now, admission })),
+      ),
+    );
     const layer = layerExecutorFor({
       events,
       pacing: Layer.mock(RestartPacing.RestartPacing)({
-        acquireRun: () =>
-          Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now })),
-        acquire: () =>
-          Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now })),
+        settingsSnapshot: Effect.succeed({
+          ...DEFAULT_SERVER_SETTINGS,
+          continueThreadsAfterServerUpdate: true,
+        }),
+        acquireRun: () => expire,
+        acquire: () => expire,
         dispatched: () => Effect.void,
         release: () => Effect.void,
         releaseRun: () => Effect.void,
@@ -1200,6 +1411,35 @@ it.effect.each([
           } as never),
       },
       threads: {
+        getThreadRecords: () =>
+          Effect.succeed({
+            ...queuedProjection,
+            runs: [
+              {
+                ...queuedProjection.runs[0]!,
+                status: queued ? "queued" : "cancelled",
+                queueHeld: type === "held queued continuation",
+                startedAt: queued ? null : now,
+                completedAt: queued ? null : now,
+              },
+            ],
+            messages: [
+              {
+                id: queuedProjection.runs[0]!.userMessageId,
+                threadId,
+                runId,
+                nodeId: null,
+                role: "user",
+                text: "Work",
+                attachments: [],
+                streaming: false,
+                createdAt: now,
+                updatedAt: now,
+                createdBy: "user",
+                creationSource: "web",
+              },
+            ],
+          } as typeof queuedProjection),
         dispatch: (command) =>
           Effect.sync(() => {
             commands.push(command);
@@ -1214,8 +1454,11 @@ it.effect.each([
     );
     assert.deepEqual(
       yield* Ref.get(events),
-      type !== "provider-runtime.continue" ? [] : ["recover-delegation"],
+      type === "provider-runtime.continue" || type === "held queued continuation"
+        ? ["recover-delegation"]
+        : [],
     );
+    assert.equal(admissions, type === "held queued continuation" ? 0 : 1);
     if (type !== "provider-runtime.continue" && type !== "held queued continuation")
       assert.deepEqual(commands, [
         {
@@ -1228,6 +1471,7 @@ it.effect.each([
           runId,
           expectedAttemptId: attemptId,
           deadline: now,
+          admission,
         },
       ]);
     else assert.deepEqual(commands, []);
@@ -1339,6 +1583,8 @@ const slotPacing = RestartPacing.layer.pipe(
       ServerSettings.layerTest({ restartPacing: { maxActive: 1, spacingMs: 0 } }),
       Layer.succeed(RestartPacing.RestartLoad, () => 0),
       Layer.succeed(RestartPacingState.RestartPacingState, {
+        wake: () => Effect.succeed(true),
+        hasSuccessor: () => Effect.succeed(false),
         describe: () => Effect.succeed({ priority: 3, activityAt: 0 }),
         pending: () => Effect.succeed(true),
         sourceForRun: (threadId, sourceRunId) => Effect.succeed({ threadId, sourceRunId }),
@@ -1589,4 +1835,314 @@ it.effect("long preparation does not discard an admitted provider start's retry"
       assert.deepEqual(commands, []);
     }).pipe(Effect.provide(Layer.merge(executorLayer, slotPacing)));
   }),
+);
+
+it.effect.each([
+  "reset",
+  "interrupted",
+  "superseded",
+  "provider-changed",
+  "valid",
+  "settings-failed",
+] as const)("a %s continuation retires before restart admission when it cannot dispatch", (kind) =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const source = {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId: "codex",
+      modelSelection: { instanceId: "codex", model: "gpt-6.1-sol" },
+      providerThreadId,
+      userMessageId: "message:source",
+      rootNodeId: "node:source",
+      activeAttemptId: attemptId,
+      status: "cancelled",
+      requestedAt: now,
+      startedAt: now,
+      completedAt: now,
+      checkpointId: null,
+      contextHandoffId: null,
+    };
+    let projection = yield* decodeProjection({
+      thread: {
+        id: threadId,
+        projectId: "project:source",
+        title: "Source",
+        providerInstanceId: "codex",
+        modelSelection: source.modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        activeProviderThreadId: null,
+        lineage: { parentThreadId: null, rootThreadId: threadId, relationshipToParent: null },
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        deletedAt: null,
+        createdBy: "user",
+        creationSource: "web",
+      },
+      runs: kind === "reset" ? [] : [source],
+      attempts: [],
+      nodes: [],
+      subagents: [],
+      providerSessions: [],
+      providerThreads: [],
+      providerTurns: [],
+      runtimeRequests: [],
+      messages: [
+        {
+          id: source.userMessageId,
+          threadId,
+          runId,
+          nodeId: null,
+          role: "user",
+          text: "Work",
+          attachments: [],
+          streaming: false,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: "user",
+          creationSource: "web",
+        },
+      ],
+      plans: [],
+      turnItems: [],
+      checkpointScopes: [],
+      checkpoints: [],
+      contextHandoffs: [],
+      contextTransfers: [],
+      visibleTurnItems: [],
+      updatedAt: now,
+    });
+    if (kind === "interrupted")
+      projection = {
+        ...projection,
+        turnItems: [{ runId, type: "run_interrupt_request" } as never],
+      };
+    if (kind === "superseded")
+      projection = {
+        ...projection,
+        runs: [
+          ...projection.runs,
+          {
+            ...projection.runs[0]!,
+            id: RunId.make("run:newer"),
+            ordinal: 2,
+            status: "completed",
+            startedAt: DateTime.add(now, { seconds: 1 }),
+          },
+        ],
+      };
+    if (kind === "provider-changed")
+      projection = {
+        ...projection,
+        thread: {
+          ...projection.thread,
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        },
+      };
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    let settingsReads = 0;
+    let dispatches = 0;
+    let settingsUnavailable = kind === "settings-failed";
+    const executor = layerExecutorFor({
+      events,
+      continueAfterRestart: true,
+      threads: {
+        getThreadRecords: () => Effect.succeed(projection),
+        recoverDelegatedTask: () => Effect.void,
+        dispatch: () =>
+          kind === "settings-failed"
+            ? Effect.sync(() => {
+                dispatches++;
+                return {} as never;
+              })
+            : Effect.die("admission is held"),
+      },
+      pacing: Layer.succeed(RestartPacing.RestartPacing, {
+        settingsSnapshot: Effect.suspend(() => {
+          settingsReads++;
+          return settingsUnavailable
+            ? Effect.fail(
+                new ServerSettingsError({
+                  settingsPath: "fixture",
+                  operation: "read-file",
+                  cause: "transient read failure",
+                }),
+              )
+            : Effect.succeed({
+                ...DEFAULT_SERVER_SETTINGS,
+                continueThreadsAfterServerUpdate: true,
+              });
+        }),
+        register: () => Effect.void,
+        release: () => Effect.void,
+        releaseRun: () => Effect.void,
+        dispatched: () => Effect.void,
+        acquireRun: () => Effect.succeed(0),
+        acquire: () => Effect.succeed(kind === "settings-failed" ? 0 : 15000),
+      }),
+    });
+    yield* Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      yield* outbox.enqueue([
+        {
+          id: "effect:stale-continuation",
+          commandId: CommandId.make("command:stale-continuation"),
+          threadId,
+          request: { type: "provider-runtime.continue", sourceRunId: runId },
+        },
+      ]);
+      assert.isTrue(yield* outbox.hasPendingRunContinuation(threadId));
+      yield* worker.drain();
+      const pending = kind === "valid" || kind === "settings-failed";
+      assert.equal(yield* outbox.hasPendingRunContinuation(threadId), pending);
+      assert.equal(
+        Option.getOrThrow(yield* outbox.get("effect:stale-continuation")).status,
+        pending ? "pending" : "succeeded",
+      );
+      if (kind === "settings-failed") {
+        assert.equal(settingsReads, 1);
+        assert.equal(dispatches, 0);
+        settingsUnavailable = false;
+        yield* TestClock.adjust("100 millis");
+        yield* worker.drain();
+        assert.equal(dispatches, 1);
+        assert.isFalse(yield* outbox.hasPendingRunContinuation(threadId));
+        assert.equal(
+          Option.getOrThrow(yield* outbox.get("effect:stale-continuation")).status,
+          "succeeded",
+        );
+      }
+    }).pipe(
+      Effect.provide(
+        EffectWorker.layer.pipe(
+          Layer.provide(executor),
+          Layer.provideMerge(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory))),
+        ),
+      ),
+    );
+  }),
+);
+
+it.effect.each(["owner message", "owner continuation", "agent wake"] as const)(
+  "a superseded recovery wake preserves distinct queued input: %s",
+  (kind) =>
+    Effect.gen(function* () {
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
+      const now = yield* DateTime.now;
+      const queuedId = RunId.make("run:thread:preserved:ordinal:3");
+      const newerId = RunId.make("run:thread:preserved:ordinal:12");
+      const queued = {
+        ...queuedProjection.runs[0]!,
+        id: queuedId,
+        ordinal: 3,
+        ...(kind === "owner continuation"
+          ? { restartContinuationOfRunId: RunId.make("run:thread:preserved:ordinal:2") }
+          : {}),
+      };
+      let projection = yield* decodeProjection({
+        ...queuedProjection,
+        runs: [
+          queued,
+          {
+            ...queued,
+            id: newerId,
+            ordinal: 12,
+            status: "interrupted",
+            userMessageId: MessageId.make("message:newer-interrupted"),
+          },
+        ],
+        messages: [
+          {
+            id: queued.userMessageId,
+            threadId,
+            runId: queuedId,
+            nodeId: null,
+            role: "user",
+            text: "Keep this distinct queued request",
+            attachments: [],
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+            createdBy: kind === "agent wake" ? "agent" : "user",
+            creationSource: kind === "agent wake" ? "server" : "web",
+          },
+          {
+            id: MessageId.make("message:newer-interrupted"),
+            threadId,
+            runId: newerId,
+            nodeId: null,
+            role: "user",
+            text: "Unrelated work already in flight",
+            attachments: [],
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+            createdBy: "agent",
+            creationSource: "server",
+          },
+        ],
+      });
+      const pacing = RestartPacing.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest({ restartPacing: { spacingMs: 20_000 } }),
+            Layer.succeed(RestartPacing.RestartLoad, () => 2),
+            Layer.succeed(RestartPacingState.RestartPacingState, {
+              wake: () => Effect.succeed(true),
+              hasSuccessor: () => Effect.succeed(true),
+              describe: () => Effect.succeed({ priority: 0, activityAt: 0 }),
+              pending: () => Effect.succeed(true),
+              sourceForRun: () => Effect.succeed(undefined),
+              active: () => Effect.succeed(false),
+              status: () => Effect.succeed(true),
+            }),
+          ),
+        ),
+      );
+      const prepared = Layer.effect(
+        RestartPacing.RestartPacing,
+        Effect.gen(function* () {
+          const service = yield* RestartPacing.RestartPacing;
+          yield* service.register({ threadId, sourceRunId: newerId });
+          return service;
+        }),
+      ).pipe(Layer.provide(pacing), Layer.orDie);
+      const layer = layerExecutorFor({
+        events,
+        pacing: prepared,
+        continueAfterRestart: true,
+        projections: { getThreadRecords: () => Effect.succeed(projection) },
+        threads: {
+          getThreadRecords: () => Effect.succeed(projection),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              if (command.type === "queued-run.cancel")
+                projection = {
+                  ...projection,
+                  runs: projection.runs.map((run) =>
+                    run.id === command.runId ? { ...run, status: "cancelled" as const } : run,
+                  ),
+                };
+              return { sequence: 0, storedEvents: [] };
+            }),
+        },
+      });
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+        Effect.provide(layer),
+      );
+      yield* executor.execute({
+        ...restartEffect(now, { type: "detach" }),
+        request: { type: "provider-runtime.continue", sourceRunId: queuedId, queued: true },
+      });
+      assert.equal(projection.runs.find((run) => run.id === queuedId)?.status, "queued");
+      assert.equal(projection.messages[0]?.text, "Keep this distinct queued request");
+      assert.deepEqual(yield* Ref.get(events), []);
+    }),
 );

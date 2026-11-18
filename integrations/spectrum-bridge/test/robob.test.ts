@@ -1,11 +1,12 @@
+import { createToolLog } from "../src/toollog.ts";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backendKind } from "../src/backend.ts";
-import { ControlClient, discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
+import { ControlClient, ControlError, discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
 import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, SELECTED_MODEL_ISSUE, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
 import { opencodeRunEvidence } from "../src/opencode-steps.ts";
@@ -13,6 +14,7 @@ import { imessagePreferences } from "../src/preferred-model.ts";
 import { Router, turnRanTools } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 import { firstTurnAlert } from "../src/telegram-fallback.ts";
+import { ProbeBudget } from "../src/probe-policy.ts";
 
 const inbounds = (store: Store) => store.db.query<{ id: string; state: string }, []>("SELECT id, state FROM inbound ORDER BY rowid").all();
 const wakeBody = (title = "Daily board") => `[Watcher event from robob-watch daily-backlog, not typed by the owner. Handle it; reply only if the owner needs to know or act now, otherwise log it to the activity log and end with NO_REPLY.]\n${title}\n\nEvent:\nWORKING #5`;
@@ -27,7 +29,7 @@ type Thread = {
   /** The thread's driver; absent means OpenCode, the driver the OpenCode fixtures represent. */
   driver?: { instanceId: string; model: string };
 };
-type Call = { method: string; path: string; body?: any; auth: string | null };
+type Call = { rows?: number; bytes?: number; method: string; path: string; body?: any; auth: string | null };
 
 const servers: ReturnType<typeof Bun.serve>[] = [];
 const stores: Store[] = [];
@@ -45,7 +47,7 @@ function fakeControl() {
   const natives = new Map<string, string>();
   const calls: Call[] = [];
   /** `ignoreSettled` mimics a server from before PATCH learned `settled`. */
-  const flags = { ignoreSettled: false, recentRunsLimit: Infinity, historicalEvidence: "terminal" as "terminal" | "running" | "unknown" | "unavailable" };
+  const flags = { ignoreSettled: false, recentRunsLimit: Infinity, historicalEvidence: "terminal" as "terminal" | "running" | "unknown" | "unavailable", sendFailure: undefined as string | undefined };
   const projects = [{ projectId: "chats", title: "iMessage", workspaceRoot: "/chats" }];
   let counter = 0;
   const now = () => new Date(Date.now() + counter++).toISOString();
@@ -100,7 +102,16 @@ function fakeControl() {
         return ok({ thread: detail(thread) });
       }
       if (thread && parts.length === 2) return ok({ thread: detail(thread) });
-      if (thread && parts[2] === "messages") return ok({ threadId: thread.threadId, state: state(thread), messages: thread.messages });
+      if (thread && parts[2] === "messages") {
+        const call = calls.at(-1)!;
+        const since = searchParams.has("since") ? Number(searchParams.get("since")) : -Infinity;
+        const response = ok({ threadId: thread.threadId, state: state(thread), status: thread.runs.at(-1)?.status ?? "idle", runId: thread.runs.at(-1)?.runId ?? null,
+          messages: thread.messages.filter(message => message.role !== "system" && Date.parse(message.updatedAt ?? "") > since)
+            .sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? "") || a.messageId.localeCompare(b.messageId)) });
+        const payload = await response.clone().text();
+        Object.assign(call, { rows: JSON.parse(payload).messages.length, bytes: Buffer.byteLength(payload) });
+        return response;
+      }
       if (thread && parts[2] === "runs" && parts[4] === "evidence") {
         const runId = parts[3]!;
         const run = thread.runs.find(candidate => candidate.runId === runId);
@@ -116,6 +127,7 @@ function fakeControl() {
       if (thread && parts[2] === "origin") { thread.origin = body.origin; return ok({ threadId: thread.threadId, origin: body.origin }); }
       if (thread && parts[2] === "interrupt") return ok({ interrupted: true });
       if (thread && parts[2] === "send") {
+        if (flags.sendFailure) return Response.json({ ok: false, error: { reason: flags.sendFailure, retrySafe: true } }, { status: 503 });
         const messageId = `${sentMessagePrefix(thread.threadId)}${encodeURIComponent(body.clientRequestId)}`;
         const running = thread.runs.find(run => run.status === "running");
         if (body.mode === "steer" && !thread.messages.some(message => message.messageId === messageId)) {
@@ -131,7 +143,7 @@ function fakeControl() {
           thread.messages.push({ messageId, runId, role: "user", text: body.text, streaming: false,
             createdBy: body.inboundId ? "user" : "system", createdAt: now(), updatedAt: now() });
         }
-        return ok({ threadId: thread.threadId, messageId, delivery: "started" });
+        return ok({ threadId: thread.threadId, messageId, delivery: "started", runId: thread.messages.find(message => message.messageId === messageId)?.runId });
       }
       if (thread && parts[2] === "requests") {
         thread.pending = thread.pending.filter(request => request.requestId !== parts[3]);
@@ -320,7 +332,7 @@ test.each(["owner", "forChat"])("%s first-turn failures send one attention alert
   expect(store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
     "The chat's model isn't available, so I couldn't process that message. Resending it won't fix this.",
   ]);
-  expect(inbounds(store)).toEqual([{ id: "first", state: "done" }]);
+  expect(inbounds(store)).toEqual([{ id: "first", state: "failed" }]);
   expect(store.inboundFailure("first")).toMatchObject({ stage: "execution" });
   expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
 });
@@ -608,8 +620,7 @@ test("prompt sends channel guidance beside the text, sends the model and dedupes
   await backend.prompt(id, directory, prompt, "hello", "Be brief.");
   const sends = control.calls.filter(call => call.path.endsWith("/send"));
   expect(sends[0]!.body).toMatchObject({ mode: "auto", clientRequestId: prompt, model: "opus/claude-opus-5-5", variant: "high", providerInstanceId: "opencode" });
-  // No preference on the turn sends no model fields at all, so the thread keeps its own.
-  expect(sends[1]!.body).not.toHaveProperty("providerInstanceId");
+  expect(sends[1]!.body).toEqual(sends[0]!.body);
   // The message text is never mixed with the bridge's words (guard r3).
   expect(sends[0]!.body.text).toBe("hello");
   expect(sends[0]!.body.guidance).toBe("Be brief.");
@@ -620,6 +631,14 @@ test("prompt sends channel guidance beside the text, sends the model and dedupes
   // Robob attributed the unverified relay to the bridge; it is still the bridge's prompt.
   const records = await backend.messages(id, directory);
   expect(records).toEqual([{ id: prompt, type: "user", text: "hello", time: expect.any(Object) }]);
+});
+
+test("a new prompt without a model preference keeps the thread model", async () => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"a".repeat(64)}`, "hello");
+  const send = control.calls.find(call => call.path.endsWith("/send"))!;
+  for (const field of ["providerInstanceId", "model", "variant"]) expect(send.body).not.toHaveProperty(field);
 });
 
 test("steer sends mode steer into the running run and reports a refusal when nothing is running", async () => {
@@ -664,9 +683,24 @@ test("approvals and answers carry the typed reply's inbound id only when there i
   await backend.cancelQuestion(id, "q-2", directory, "guid-no");
   const bodies = control.calls.filter(call => call.path.endsWith("/respond")).map(call => call.body);
   expect(bodies).toEqual([
-    { decision: "approve", inboundId: "guid-yes" }, { decision: "deny" },
-    { answers: { q0: "A" }, inboundId: "guid-a" }, { dismiss: true, inboundId: "guid-no" },
+    { decision: "approve", inboundId: "guid-yes", clientRequestId: expect.stringMatching(/^respond_/) }, { decision: "deny", clientRequestId: expect.stringMatching(/^respond_/) },
+    { answers: { q0: "A" }, inboundId: "guid-a", clientRequestId: expect.stringMatching(/^respond_/) }, { dismiss: true, inboundId: "guid-no", clientRequestId: expect.stringMatching(/^respond_/) },
   ]);
+});
+
+test.each(["question", "permission"])("a %s response rechecks admission after resolving its thread", async kind => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const resolve = backend.resolve.bind(backend);
+  backend.resolve = async session => { entered.resolve(); await release.promise; return resolve(session); };
+  let allowed = true;
+  const replying = kind === "question"
+    ? backend.questionReply({ id: "q-1", sessionID: id, title: "Pick", questions: [{ key: "q0", question: "Which?", header: "Pick", options: [] }] }, directory, [["A"]], "answer", () => allowed)
+    : backend.permissionReply(id, "perm-1", directory, "once", "answer", () => allowed);
+  await entered.promise; allowed = false; release.resolve();
+  expect(await replying).toBe(false);
+  expect(control.calls.filter(call => call.path.endsWith("/respond"))).toEqual([]);
 });
 
 test("records: settled runs end with an idle marker; agent-sent wakes are not owner text", () => {
@@ -813,8 +847,8 @@ test("ses_ ids resolve through by-native; requests and replies go to the control
   expect(await backend.questionReply(question!, directory, [["B"]])).toBe(true);
   const responds = control.calls.filter(call => call.path.includes("/requests/"));
   expect(responds.map(call => [call.path, call.body])).toEqual([
-    [`/threads/${id}/requests/perm-1/respond`, { decision: "deny" }],
-    [`/threads/${id}/requests/q-1/respond`, { answers: { q0: "B" } }],
+    [`/threads/${id}/requests/perm-1/respond`, { decision: "deny", clientRequestId: expect.stringMatching(/^respond_/) }],
+    [`/threads/${id}/requests/q-1/respond`, { answers: { q0: "B" }, clientRequestId: expect.stringMatching(/^respond_/) }],
   ]);
   expect(await backend.isSessionAutoAccepting("ses_old", directory)).toBe(true);
   expect(await backend.isSessionAutoAccepting("ses_unknown", directory)).toBeUndefined();
@@ -1135,7 +1169,7 @@ test("an errored step classified between OpenCode's commits, before the native i
   db.close();
   const first = await failedWake(path, "ses_between", base, []);
   // No idle marker yet: the run is between OpenCode's commits, so it is unsettled and the wake is not retried.
-  expect(first.states).toEqual(["done"]);
+  expect(first.states).toEqual(["failed"]);
   expect(first.store.inboundFailure(first.wake)).toMatchObject({ stage: "execution" });
   expect(first.sends()).toBe(1);
   // Execution carries on: retry.scheduled lands, then a tool completes, then the run settles idle.
@@ -1155,7 +1189,7 @@ test("an error step with a pending native retry is never retried, even when that
   // OpenCode recorded the first call as an error with text and a pending retry: the execution is not settled.
   const { path, base } = nativeDb("ses_retry_run", [["msg_retry", { finish: "error", content: [{ type: "text", text: "partial" }], retry: { attempt: 2, at: Date.now() + 120_000 }, error: { type: "provider.internal" } }]]);
   const first = await failedWake(path, "ses_retry_run", base, []);
-  expect(first.states).toEqual(["done"]);
+  expect(first.states).toEqual(["failed"]);
   expect(first.store.inboundFailure(first.wake)).toMatchObject({ stage: "execution" });
   expect(first.sends()).toBe(1);
   // During the backoff the same execution carries on and completes a tool. A terminal step does not prove it stopped.
@@ -1174,7 +1208,7 @@ test("an unfinished native step is never retried, even when that run later compl
   const { path, base } = nativeDb("ses_cont_run", [["msg_open", { content: [] }]]);
   const first = await failedWake(path, "ses_cont_run", base, []);
   // Robob failed the run, but the native row is unfinished: the wake is reported and not retried.
-  expect(first.states).toEqual(["done"]);
+  expect(first.states).toEqual(["failed"]);
   expect(first.store.inboundFailure(first.wake)).toMatchObject({ stage: "execution" });
   expect(first.sends()).toBe(1);
   // The same native row keeps running and finishes with a tool call. The router must still not send again.
@@ -1191,7 +1225,7 @@ test("an unfinished native step is never retried, even when that run later compl
 test("a new chat's first-call error with text is reported without replaying the wake", async () => {
   const { path, base } = nativeDb("ses_text_400", [["msg_text", { finish: "error", content: [{ type: "text", text: "partial" }], error: { type: "aborted" } }]]);
   const run = await failedWake(path, "ses_text_400", base, [120_000]);
-  expect(run.states).toEqual(["done", "done"]);
+  expect(run.states).toEqual(["failed", "failed"]);
   expect(run.store.inboundFailure(run.wake)).toMatchObject({ stage: "execution" });
   expect(run.sends()).toBe(1);
   expect(run.store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
@@ -1202,7 +1236,7 @@ test("a new chat's first-call error with text is reported without replaying the 
 test("a new chat's first-call error with reasoning is reported without replaying the wake", async () => {
   const { path, base } = nativeDb("ses_reason_400", [["msg_reason", { finish: "error", content: [{ type: "reasoning", text: "thinking" }], error: { type: "aborted" } }]]);
   const run = await failedWake(path, "ses_reason_400", base, [120_000]);
-  expect(run.states).toEqual(["done", "done"]);
+  expect(run.states).toEqual(["failed", "failed"]);
   expect(run.store.inboundFailure(run.wake)).toMatchObject({ stage: "execution" });
   expect(run.sends()).toBe(1);
 });
@@ -1242,7 +1276,7 @@ test("a run whose tool call sits past a truncated scan is never retried, through
   thread.nativeSessionId = "ses_native_long";
   thread.runs.at(-1)!.status = "interrupted";
   await router.tick();
-  expect(inbounds(store).find(row => row.id === wake)?.state).toBe("done");
+  expect(inbounds(store).find(row => row.id === wake)?.state).toBe("failed");
   expect(store.inboundFailure(wake)).toMatchObject({ stage: "synthetic" });
   setSystemTime(start + 120_000);
   await router.tick();
@@ -1435,6 +1469,34 @@ function delegatedRouter() {
   return { control, backend, store, router };
 }
 
+test("incremental admission reads respect persisted cooldown and retry cap while normal polling proceeds", async () => {
+  const start = Date.parse("2026-11-18T03:00:00Z"); setSystemTime(start);
+  const h = delegatedRouter(), chat = await h.backend.createChat(), id = "cached-admission";
+  const messageId = `msg_${createHash("sha256").update(id).digest("hex")}`;
+  h.store.set("route", { ...chat, generation: 1 });
+  h.store.acceptInbound(id, { id, text: "Please check", source: "typed", attachments: [], isAudioMessage: false, receivedAt: start - 120_000 } satisfies NormalizedInbound);
+  h.store.updateInbound(id, "processing");
+  h.store.set(`failed-delivery:${id}`, { ...chat, generation: 1, inboundId: id, messageId, startedAt: start - 120_000, phase: "unknown" });
+  expect(await h.backend.promptAccepted(chat.id, chat.directory, messageId)).toBe(false);
+  const reads = spyOn(ControlClient.prototype, "messages").mockRejectedValueOnce(new ControlError(503));
+  try {
+    await h.router.checkInboundLatency();
+    expect(reads).toHaveBeenCalledTimes(1);
+    expect(reads.mock.calls[0]![1]).toBeNumber();
+    setSystemTime(start + 1_000); await h.router.checkInboundLatency();
+    expect(reads).toHaveBeenCalledTimes(1);
+    setSystemTime(start + 60_000);
+    const budget = new ProbeBudget(h.store);
+    while (budget.take()) {}
+    await h.router.checkInboundLatency();
+    expect(reads).toHaveBeenCalledTimes(1);
+    expect(inbounds(h.store)).toEqual([{ id, state: "processing" }]);
+    await h.backend.messages(chat.id, chat.directory);
+    expect(reads).toHaveBeenCalledTimes(2);
+    expect(h.control.calls.filter(call => call.path.endsWith("/send"))).toEqual([]);
+  } finally { reads.mockRestore(); }
+});
+
 test.each([false, true])("a completed parent replies before its delegated child, even with older busy work (%s)", async olderBusy => {
   const { control, backend, store, router } = delegatedRouter();
   store.acceptInbound("parent-76", { id: "parent-76", text: "Did it go through?", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
@@ -1600,6 +1662,7 @@ test("control calls aggregate success timing and retain failed method/duration, 
   const failed = logs.filter(l => l.name === "turn.robob_call" && l.ok === false);
   expect(failed).toHaveLength(1);
   expect(failed[0]).toMatchObject({ props: { method: "POST", route: "/missing" } });
+  expect(failed[0]!.error?.tag).toBe("control.request_failed");
   expect(failed[0]!.durationMs).toBeGreaterThanOrEqual(0);
   for (const value of ["PRIVATE_", "test-token"]) expect(JSON.stringify(logs)).not.toContain(value);
 });
@@ -1619,7 +1682,7 @@ test("steering files: images accompany strict same-id sends without a second pro
     const files = [{ type: "file" as const, mime: "image/png", filename: "flight.png", url: "data:image/png;base64,AQID" }];
     expect(await backend.steer(id, directory, requestId, "Add these flights", "File guidance", files)).toBe("steered");
     expect(await backend.steer(id, directory, requestId, "Add these flights", "File guidance", files)).toBe("started");
-    expect(uploaded).toEqual([1, 2].map(() => ({ name: "flight.png", mimeType: "image/png", bytes })));
+    expect(uploaded).toEqual([{ name: "flight.png", mimeType: "image/png", bytes }]);
     expect(control.calls.filter(call => call.body?.clientRequestId === requestId).map(call => call.body)).toEqual([1, 2].map(() => ({
       text: "Add these flights", guidance: "File guidance", mode: "steer", clientRequestId: requestId, attachments: [attachment],
     })));
@@ -1628,6 +1691,66 @@ test("steering files: images accompany strict same-id sends without a second pro
   } finally { upload.mockRestore(); }
 });
 
+
+test.each(["auto", "steer"].flatMap(mode => ["startup_unavailable", "send_timeout"].flatMap(reason => [false, true].map(restart => ({ mode, reason, restart })))))("file retry keeps identical $mode POST through $reason (restart=$restart)", async ({ mode, reason, restart }) => {
+  let uploads = 0;
+  const bodies: unknown[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === "/api/ardud/control/attachments") return Response.json({ ok: true, attachmentId: `file-${++uploads}`, relativeUrl: "/upload" });
+    if (path === "/upload") return new Response("");
+    if (path.endsWith("/send")) {
+      bodies.push(await request.json());
+      return bodies.length < 3 ? Response.json({ ok: false, error: { reason, retrySafe: true } }, { status: 503 })
+        : Response.json({ ok: true, delivery: "steered" });
+    }
+    return new Response("Unexpected request", { status: 500 });
+  } });
+  servers.push(server);
+  const dir = mkdtempSync(join(tmpdir(), "bridge-file-retry-")); dirs.push(dir);
+  const store = new Store(join(dir, "inbound.sqlite")); stores.push(store);
+  const makeBackend = (state: Store) => {
+    const backend = new RobobBackend({ chatRoot: "/chats", url: server.url.origin, token: "test-token" });
+    backend.trackFirstTurns(state); return backend;
+  };
+  let backend = makeBackend(store);
+  const files = [{ type: "file" as const, mime: "image/png", filename: "flight.png", url: "data:image/png;base64,AQID" }];
+  const send = () => mode === "steer" ? backend.steer("thread-test", "/chats", "msg_retry", "Flight", "Guidance", files)
+    : backend.prompt("thread-test", "/chats", "msg_retry", "Flight", "Guidance", files);
+  await expect(send()).rejects.toMatchObject({ status: 503, reason });
+  if (restart) {
+    const reopened = new Store(join(dir, "inbound.sqlite")); stores.push(reopened);
+    backend = makeBackend(reopened);
+  }
+  await expect(send()).rejects.toMatchObject({ status: 503, reason });
+  await send();
+  expect(uploads).toBe(1);
+  expect(bodies).toHaveLength(3);
+  expect(bodies).toEqual([bodies[0], bodies[0], bodies[0]]);
+  expect(bodies[0]).toMatchObject({ mode, clientRequestId: "msg_retry", attachments: [{ attachmentId: "file-1" }] });
+});
+
+test.each(["bytes", "name", "mime", "removed", "added", "order"])("file retry refuses changed %s under the same identity", async shape => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const attachment = { attachmentId: "file-1", type: "image" as const, name: "flight.png", mimeType: "image/png", sizeBytes: 3 };
+  const upload = spyOn(ControlClient.prototype, "upload").mockResolvedValue(attachment);
+  const files = [{ type: "file" as const, mime: "image/png", filename: "flight.png", url: "data:image/png;base64,AQID" },
+    { type: "file" as const, mime: "image/png", filename: "other.png", url: "data:image/png;base64,BAUG" }];
+  try {
+    await backend.steer(id, directory, "msg_file_identity", "Flight", "Guidance", files);
+    const changed = files.map(file => ({ ...file }));
+    if (shape === "bytes") changed[0]!.url = "data:image/png;base64,BAUG";
+    if (shape === "name") changed[0]!.filename = "renamed.png";
+    if (shape === "mime") changed[0]!.mime = "image/jpeg";
+    if (shape === "removed") changed.pop();
+    if (shape === "added") changed.push({ ...files[0]! });
+    if (shape === "order") changed.reverse();
+    await expect(backend.steer(id, directory, "msg_file_identity", "Flight", "Guidance", changed)).rejects.toThrow("Robob attachment retry changed");
+    expect(control.calls.filter(call => call.body?.clientRequestId === "msg_file_identity")).toHaveLength(1);
+    expect(upload).toHaveBeenCalledTimes(2);
+  } finally { upload.mockRestore(); }
+});
 
 test.each(["question", "cancel"])("steering files: %s during upload prevents the later POST", async kind => {
   const control = fakeControl(); const backend = control.backend();
@@ -1682,4 +1805,499 @@ test("steering files: incomplete family lists are unknown to admission", async (
     expect(await backend.statuses()).toEqual({});
     expect(await backend.children(id, directory)).toEqual([]);
   } finally { list.mockRestore(); }
+});
+
+
+test.each(["transport", "reader_unavailable", "server_error"].flatMap(reason => [false, true].map(restart => ({ reason, restart }))))("deferred steer refusal releases its wire mode ($reason, restart=$restart)", async ({ reason, restart }) => {
+  const { control, backend, store, router } = delegatedRouter(); backend.trackFirstTurns(store);
+  store.acceptInbound("root", { id: "root", text: "Original", attachments: [], isAudioMessage: false, receivedAt: Date.now() });
+  await router.tick();
+  const route = store.get<{ id: string }>("route")!;
+  let readable = true;
+  const thread = ControlClient.prototype.thread;
+  const read = spyOn(ControlClient.prototype, "thread").mockImplementation(async function(this: ControlClient, ...args) {
+    if (!readable) throw new Error("reader unavailable");
+    return thread.apply(this, args);
+  });
+  const request = ControlClient.prototype.request;
+  const post = spyOn(ControlClient.prototype, "request").mockImplementation(async function<T>(this: ControlClient, ...args: Parameters<ControlClient["request"]>): Promise<T> {
+    const [method, path, body] = args;
+    if (method === "POST" && path.endsWith("/send") && (body as { mode?: string })?.mode === "steer") {
+      readable = false;
+      throw new ControlError(reason === "transport" ? 0 : reason === "server_error" ? 500 : 503, "unavailable",
+        reason === "reader_unavailable" ? { reason, retrySafe: false } : {});
+    }
+    return request.apply(this, args) as Promise<T>;
+  });
+  try {
+    store.acceptInbound("human", { id: "human", text: "Follow up", attachments: [], isAudioMessage: false, receivedAt: Date.now() });
+    await router.tick();
+    expect(store.get("steer-attempt:human")).toMatchObject(reason === "server_error" ? { text: "Follow up" } : { reconcileOnly: true });
+    const activeBackend = restart ? control.backend() : backend; activeBackend.trackFirstTurns(store);
+    const activeRouter = restart ? new Router(store, activeBackend, {
+      async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+    }, { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alerts", alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 0 }) : router;
+    readable = true;
+    control.reply(route.id, "Original answered", "completed");
+    await activeRouter.tick(); await activeRouter.tick();
+    expect(control.calls.filter(call => call.path.endsWith("/send")).map(call => call.body.text)).toEqual(["Original", "Follow up"]);
+    expect(store.get("activeTurn")).toMatchObject({ inboundId: "human", phase: "running" });
+    control.reply(route.id, "Follow-up answered", "completed"); await activeRouter.tick();
+    for (const op of store.pendingOutbox()) store.outboxState(op.id, "sent");
+    expect(inbounds(store).find(row => row.id === "human")?.state).toBe("done");
+  } finally { post.mockRestore(); read.mockRestore(); }
+});
+
+test.each(["startup_unavailable", "send_timeout"])("held auto retry preserves every wire field through %s and restart", async reason => {
+  const { control, backend, store, router } = delegatedRouter(); backend.trackFirstTurns(store);
+  const start = Date.now(); setSystemTime(start);
+  control.flags.sendFailure = reason;
+  store.acceptInbound("human", { id: "human", text: "Question", source: "typed", attachments: [], isAudioMessage: false, receivedAt: start });
+  await router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await router.tick(); }
+  expect(store.get("activeTurn")).toMatchObject({ phase: "held" });
+  setSystemTime(start + 180_000); await router.tick();
+  const restartedBackend = control.backend(); restartedBackend.trackFirstTurns(store);
+  const restarted = new Router(store, restartedBackend, {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  }, { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alerts", alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 0 });
+  control.flags.sendFailure = undefined;
+  setSystemTime(start + 240_000); await restarted.tick();
+  const bodies = control.calls.filter(call => call.path.endsWith("/send")).map(call => call.body);
+  expect(bodies).toHaveLength(4);
+  expect(bodies).toEqual(bodies.map(() => bodies[0]));
+  expect(bodies[0]).toMatchObject({ mode: "auto", text: "Question", inboundId: "human" });
+  expect(store.get("activeTurn")).toMatchObject({ phase: "running" });
+});
+
+test.each([false, true].flatMap(restart => [0, 120].map(history => ({ restart, history }))))("a delegated completion racing a sealed wake keeps its reply (restart=$restart, history=$history)", async ({ restart, history }) => {
+  const { control, backend, store, router } = delegatedRouter(); backend.trackFirstTurns(store);
+  store.acceptInbound("root", { id: "root", text: "Ask a delegate", attachments: [], isAudioMessage: false, receivedAt: Date.now() });
+  await router.tick();
+  const route = store.get<{ id: string; directory: string; generation: number }>("route")!;
+  const thread = control.threads.get(route.id)!;
+  thread.driver = { instanceId: "claudeAgent", model: "claude-opus-5-5" };
+  control.reply(route.id, "Working on it", "completed"); await router.tick();
+  for (const op of store.pendingOutbox()) store.outboxState(op.id, "sent");
+  const prompt = backend.prompt.bind(backend);
+  const posting = spyOn(backend, "prompt").mockImplementation(async (...args) => {
+    const runId = `run:thread:${route.id}:ordinal:2`;
+    thread.runs.push({ runId, ordinal: 2, status: "running" });
+    const at = new Date(Date.now() + 1).toISOString();
+    thread.messages.push({ messageId: "delegated-completion", runId, role: "user", text: "Delegated task node:delegated-task:done [completed]:\nDelegate finished", streaming: false, createdBy: "agent", createdAt: at, updatedAt: at });
+    for (let index = 0; index < history; index++) thread.messages.push({
+      messageId: `progress-${index}`, runId, role: "assistant", text: "Progress", phase: "narration",
+      streaming: false, createdBy: "agent", createdAt: at, updatedAt: at,
+    });
+    control.reply(route.id, "Delegate result", "completed");
+    await prompt(...args);
+  });
+  store.acceptInbound("wake:next", { id: "wake:next", text: wakeBody(), attachments: [], isAudioMessage: false, receivedAt: Date.now() });
+  try { await router.tick(); } finally { posting.mockRestore(); }
+  expect(thread.runs.map(run => run.ordinal)).toEqual([1, 2, 3]);
+  control.reply(route.id, "NO_REPLY", "completed");
+  const activeBackend = restart ? control.backend() : backend; activeBackend.trackFirstTurns(store);
+  const activeRouter = restart ? new Router(store, activeBackend, {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  }, { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alerts", alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 0 }) : router;
+  await activeRouter.tick(); await activeRouter.tick();
+  const replies = store.pendingOutbox().filter(op => op.kind === "conversation");
+  expect(replies.map(op => op.text)).toEqual(["Delegate result"]);
+  expect(store.get<string[]>(`reply-covered:${replies[0]!.id}`)).toEqual([]);
+  store.outboxState(replies[0]!.id, "sent"); await activeRouter.tick();
+  expect(store.pendingOutbox().filter(op => op.kind === "conversation")).toEqual([]);
+  expect(store.get("watermark")).toMatchObject({ id: `idle:${thread.runs[2]!.runId}` });
+});
+
+test.each([false, true])("a send's completion read scopes out an older failed run and its stale thread error (restart=%s)", async restart => {
+  const control = fakeControl();
+  let backend = control.backend();
+  const store = new Store(":memory:");
+  stores.push(store);
+  backend.trackFirstTurns(store);
+  const chat = await backend.createChat();
+  const old = Date.parse("2026-11-16T10:16:47Z");
+  const sent = Date.parse("2026-11-16T11:35:32Z");
+  const thread = control.threads.get(chat.id)!;
+  thread.runs.push({ runId: `run:thread:${chat.id}:ordinal:17`, ordinal: 17, status: "failed", requestedAt: new Date(old).toISOString() });
+  thread.messages.push({ messageId: "old-input", runId: thread.runs[0]!.runId, role: "user", text: "Old wake", streaming: false,
+    createdAt: new Date(old).toISOString(), updatedAt: new Date(old).toISOString() });
+  thread.lastError = "The provider could not start this turn";
+  setSystemTime(sent);
+  const prompt = `msg_${"a".repeat(64)}`;
+  await backend.prompt(chat.id, chat.directory, prompt, "New wake");
+  if (restart) { backend = control.backend(); backend.trackFirstTurns(store); }
+  // A stale lastError can remain while the fresh run completes normally.
+  control.reply(chat.id, "NO_REPLY", "completed");
+  const records = await backend.messages(chat.id, chat.directory, { until: prompt, since: sent });
+  expect(records.some(record => record.id === "old-input")).toBe(true);
+  const current = records.slice(records.findIndex(record => record.id === prompt) + 1);
+  expect(current.filter(record => record.type === "idle")).toMatchObject([{ outcome: "succeeded" }]);
+  expect(current.some(record => record.type === "assistant" && record.error)).toBe(false);
+});
+
+test("an admitted steer reads the run it joined even when that run predates the steer", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  const root = `msg_${"b".repeat(64)}`;
+  const followup = `msg_${"c".repeat(64)}`;
+  await backend.prompt(chat.id, chat.directory, root, "Original request");
+  const sent = Date.now() + 60_000;
+  setSystemTime(sent);
+  expect(await backend.steer(chat.id, chat.directory, followup, "Follow-up request")).toBe("steered");
+  control.reply(chat.id, "Both answered", "completed");
+  const records = await backend.messages(chat.id, chat.directory, { until: followup, since: sent });
+  expect(records.some(record => record.id === followup)).toBe(true);
+  expect(records.filter(record => record.type === "idle")).toMatchObject([{ outcome: "succeeded" }]);
+});
+
+// The reference creates a fresh backend for each read, retaining the pre-cache full-read path.
+test("incremental message records equal full reads through streaming, phases, runs and route rotation", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  let chat = await backend.createChat();
+  const prompt = `msg_${"c".repeat(64)}`;
+  await backend.prompt(chat.id, chat.directory, prompt, "first");
+  let thread = control.threads.get(chat.id)!;
+  thread.driver = { instanceId: "codex", model: "test" };
+  const verify = async () => {
+    for (const options of [{ limit: 1 }, { limit: 20, until: prompt }, { until: prompt, since: Date.now() - 60_000 },
+      { limit: 100 }, { until: `idle:${thread.runs[0]!.runId}`, limit: 20 }]) {
+      expect(await backend.messages(chat.id, chat.directory, options)).toEqual(await control.backend().messages(chat.id, chat.directory, options));
+    }
+  };
+  await verify();
+  const at = new Date().toISOString();
+  for (const id of ["a2", "a10", "A1"]) thread.messages.push({ messageId: id, role: "assistant", phase: "narration", streaming: true,
+    text: id, runId: thread.runs[0]!.runId, createdAt: at, updatedAt: at });
+  await verify();
+  for (let i = 1; i <= 3; i++) {
+    for (const message of thread.messages.filter(message => message.role === "assistant")) {
+      message.text += ` update ${i}`;
+      message.updatedAt = new Date(Date.now() + i).toISOString();
+      if (i === 3) { message.phase = "answer"; message.streaming = false; }
+    }
+    await verify();
+  }
+  thread.runs[0]!.status = "completed";
+  await verify();
+  await backend.prompt(chat.id, chat.directory, `msg_${"d".repeat(64)}`, "second");
+  control.reply(chat.id, "second reply", "waiting");
+  await verify();
+  thread.messages.push({ messageId: "background", runId: thread.runs[1]!.runId, role: "user", createdBy: "system",
+    text: "[Subagent completed] background result", streaming: false, createdAt: at, updatedAt: new Date(Date.now() + 4).toISOString() });
+  await verify();
+  chat = await backend.createChat();
+  await backend.retireOthers(chat.id);
+  await backend.prompt(chat.id, chat.directory, prompt, "new route");
+  thread = control.threads.get(chat.id)!;
+  thread.driver = { instanceId: "codex", model: "test" };
+  await verify();
+});
+
+test.each(["auto", "steer"] as const)("ambiguous %s send reconciles a snapshot read before admission", async mode => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  await backend.prompt(chat.id, chat.directory, `msg_${"1".repeat(64)}`, "Original");
+  const followup = `msg_${"2".repeat(64)}`;
+  const projected = await backend.client.thread(chat.id);
+  // Admission can become visible in messages before the thread projection changes.
+  const thread = spyOn(backend.client, "thread").mockResolvedValue(projected);
+  const request = backend.client.request.bind(backend.client);
+  const lost = new ControlError(503, "unavailable", { reason: "reader_unavailable", retrySafe: false });
+  const post = spyOn(backend.client, "request").mockImplementation(async function<T>(...args: Parameters<ControlClient["request"]>): Promise<T> {
+    if (args[0] !== "POST" || !args[1].endsWith("/send")) return request<T>(...args);
+    // Repopulate the same-tick cache after before-send invalidation, while the POST is in flight.
+    expect(await backend.promptAccepted(chat.id, chat.directory, followup)).toBe(false);
+    await request<T>(...args);
+    throw lost;
+  });
+  try {
+    await backend.messageReadScope(async () => {
+      await backend.messages(chat.id);
+      if (mode === "auto") await backend.prompt(chat.id, chat.directory, followup, "Follow up");
+      else expect(await backend.steer(chat.id, chat.directory, followup, "Follow up")).toBe("steered");
+    });
+    expect(lost.reconciled).toBe(true);
+    expect(await backend.promptAccepted(chat.id, chat.directory, followup)).toBe(true);
+    expect(control.calls.filter(call => call.path.endsWith("/send") && call.body.clientRequestId === followup)).toHaveLength(1);
+  } finally { post.mockRestore(); thread.mockRestore(); }
+});
+
+test("message cache shares one read per tick, refreshes later ticks and invalidates after sends", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  const prompt = `msg_${"e".repeat(64)}`;
+  await backend.prompt(chat.id, chat.directory, prompt, "hello");
+  const reads = () => control.calls.filter(call => call.path.includes("/messages?"));
+  await backend.messages(chat.id);
+  control.calls.length = 0;
+  await backend.messageReadScope(async () => {
+    await backend.messages(chat.id, chat.directory, { until: prompt, limit: 20 });
+    expect(await backend.promptAccepted(chat.id, chat.directory, prompt)).toBe(true);
+    await backend.messages(chat.id, chat.directory, { limit: 1 });
+  });
+  expect(reads()).toHaveLength(1); // Three paths, two fewer GETs (67%).
+  expect(reads()[0]!.path).toContain("since=");
+  await backend.messageReadScope(async () => {
+    await backend.messages(chat.id);
+    const steer = `msg_${"f".repeat(64)}`;
+    await backend.steer(chat.id, chat.directory, steer, "also this");
+    expect(await backend.promptAccepted(chat.id, chat.directory, steer)).toBe(true);
+    await backend.messages(chat.id, chat.directory, { until: steer, limit: 20 });
+    expect(await backend.promptAccepted(chat.id, chat.directory, steer)).toBe(true);
+  });
+  expect(reads()).toHaveLength(3); // Pre-write and post-write reads; write is a freshness boundary.
+  expect(reads().every(call => call.path.includes("since="))).toBe(true);
+  await backend.messages(chat.id);
+  expect(reads()).toHaveLength(4); // No cached-skip on future ticks.
+});
+
+test("missing until, route change, merge conflict and ten-minute redaction resync each full-read once", async () => {
+  const start = Date.now();
+  setSystemTime(start);
+  try {
+    const control = fakeControl();
+    const backend = control.backend();
+    const chat = await backend.createChat();
+    await backend.prompt(chat.id, chat.directory, `msg_${"a".repeat(64)}`, "hello");
+    control.reply(chat.id, "original", "completed");
+    const full = () => control.calls.filter(call => call.path.includes("/messages?") && !call.path.includes("since="));
+    await backend.messages(chat.id);
+    expect(full()).toHaveLength(1);
+    await backend.messageReadScope(async () => {
+      await backend.messages(chat.id, chat.directory, { until: "absent" });
+      await backend.messages(chat.id, chat.directory, { until: "absent" });
+    });
+    expect(full()).toHaveLength(2);
+    const row = control.threads.get(chat.id)!.messages[1]!;
+    row.createdAt = new Date(start + 100).toISOString();
+    await backend.messages(chat.id);
+    expect(full()).toHaveLength(3);
+    setSystemTime(start + 3_000);
+    control.threads.get(chat.id)!.messages.push({ messageId: "advance-cursor", runId: row.runId, role: "assistant", phase: "narration", text: "newer row",
+      streaming: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    await backend.messages(chat.id);
+    row.text = "redacted";
+    setSystemTime(start + 5_000);
+    expect(JSON.stringify(await backend.messages(chat.id))).toContain("original");
+    setSystemTime(start + 10 * 60_000);
+    const resynced = await backend.messages(chat.id);
+    expect(JSON.stringify(resynced)).toContain("redacted");
+    expect(full()).toHaveLength(4);
+    await backend.messages(chat.id);
+    expect(full()).toHaveLength(4);
+    await backend.retireOthers(chat.id);
+    await backend.messages(chat.id);
+    await backend.messages(chat.id);
+    expect(full()).toHaveLength(5);
+  } finally { setSystemTime(); }
+});
+
+test.each([100, 1_500].flatMap(historySize => ["idle", "active", "steer"].map(scenario => ({ historySize, scenario }))))(
+  "60-second router budgets preserve completion timing ($historySize rows, $scenario)", async ({ historySize, scenario }) => {
+  const start = Date.parse("2026-11-15T09:30:00Z");
+  const table: object[] = [];
+  try {
+    const results = [];
+    for (const legacy of [true, false]) {
+      setSystemTime(start);
+      const control = fakeControl();
+      const backend = control.backend();
+      if (legacy) {
+        backend.messageReadScope = body => body();
+        backend.client.messages = id => ControlClient.prototype.messages.call(backend.client, id);
+      }
+      const store = new Store(":memory:"); stores.push(store);
+      const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } }, {
+        owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alert",
+        alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 5_000,
+      });
+      const chat = await backend.createChat();
+      const thread = control.threads.get(chat.id)!;
+      thread.driver = { instanceId: "codex", model: "test" };
+      await backend.prompt(chat.id, chat.directory, `msg_${"0".repeat(64)}`, "history");
+      for (let i = 0; i < historySize; i++) thread.messages.push({ messageId: `history-${i}`, role: "assistant", phase: "narration", text: "old text ".repeat(100),
+        runId: thread.runs[0]!.runId, streaming: false, createdAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString(), updatedAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString() });
+      thread.messages[0]!.createdAt = thread.messages[0]!.updatedAt = new Date(start - 120_000).toISOString();
+      thread.runs[0]!.status = "completed";
+      store.set("route", { ...chat, generation: 1 });
+      if (scenario !== "idle") {
+        store.acceptInbound("budget", { id: "budget", text: "hello", attachments: [], isAudioMessage: false, source: "typed", receivedAt: start });
+        await router.tick();
+        thread.messages.push({ messageId: "stream", role: "assistant", phase: "narration", text: "working", streaming: true,
+          runId: thread.runs.at(-1)!.runId, createdAt: new Date(start + 500).toISOString(), updatedAt: new Date(start + 500).toISOString() });
+      }
+      const startup = control.calls.filter(call => call.path.includes("/messages?"));
+      control.calls.length = 0;
+      const paths: Record<string, { messages: number; thread: number; evidence: number }> = {};
+      const collect = (path: string, from: number) => {
+        paths[path] ??= { messages: 0, thread: 0, evidence: 0 };
+        for (const call of control.calls.slice(from)) if (call.method === "GET") {
+          if (call.path.includes("/messages?")) paths[path]!.messages++;
+          else if (call.path.endsWith("/evidence")) paths[path]!.evidence++;
+          else if (/^\/threads\/[^/?]+$/.test(call.path)) paths[path]!.thread++;
+        }
+      };
+      let completedAt = 0;
+      for (let second = 1; second <= 60; second++) {
+        setSystemTime(start + second * 1_000);
+        const stream = thread.messages.find(message => message.messageId === "stream");
+        if (stream && second < 50) { stream.text += "."; stream.updatedAt = new Date().toISOString(); }
+        if (second === 30 && scenario === "steer") store.acceptInbound("budget-steer", { id: "budget-steer", text: "also this", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() });
+        if (second === 50 && scenario !== "idle") control.reply(chat.id, "done", "completed");
+        let from = control.calls.length; await router.checkCompletion(); collect("completion", from);
+        from = control.calls.length; await router.tick(); collect(second === 30 && scenario === "steer" ? "tick-steer" : "tick", from);
+        if (!completedAt && scenario !== "idle" && store.pendingOutbox().some(op => op.kind === "conversation" && op.text === "done")) completedAt = second;
+      }
+      const reads = control.calls.filter(call => call.path.includes("/messages?"));
+      const full = reads.filter(call => !call.path.includes("since="));
+      results.push({ legacy, paths, gets: reads.length, full: full.length + startup.length, startupGets: startup.length, incremental: reads.length - full.length,
+        rows: reads.reduce((sum, call) => sum + (call.rows ?? 0), 0), bytes: reads.reduce((sum, call) => sum + (call.bytes ?? 0), 0), completedAt });
+    }
+    const [before, after] = results;
+    expect(after!.full).toBeLessThanOrEqual(before!.full * .1);
+    expect(after!.rows).toBeLessThan(before!.rows * .2);
+    expect(after!.bytes).toBeLessThan(before!.bytes * .2);
+    expect(after!.gets).toBeLessThanOrEqual(before!.gets);
+    if (scenario !== "idle") { expect(before!.completedAt).toBe(50); expect(after!.completedAt).toBe(50); }
+    table.push({ historySize, scenario, before, after });
+    console.log("message-read-budget", JSON.stringify(table));
+  } finally { setSystemTime(); }
+});
+
+test("message read modes, full reasons and returned bytes survive the minute log aggregation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "message-reads-log-")); dirs.push(root);
+  let now = Date.parse("2026-11-15T09:30:01Z");
+  const log = createToolLog({ root, now: () => now });
+  for (const [mode, reason] of [["full", "first-read"], ["incremental", undefined], ["shared", undefined], ["cached-skip", undefined],
+    ["full", "missing-until"], ["full", "route-change"], ["full", "resync"], ["full", "merge-conflict"], ["full", "clock-skew"]]) {
+    log.write({ component: "robob", kind: "perf", name: "robob.messages_read", ids: { threadId: "thread-fixture" },
+      props: { readMode: mode!, ...(reason ? { fullReason: reason } : {}), rowsReturned: 2, bytesReturned: 500 } });
+  }
+  now += 60_000;
+  await log.tick();
+  const lines = readFileSync(join(root, "2026-11-15.ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  expect(lines.filter(line => line.name === "robob.messages_read")).toHaveLength(0);
+  expect(lines.find(line => line.name === "robob.message_reads")).toMatchObject({ ts: "2026-11-15T09:30:00.000Z", ids: { threadId: "thread-fixture" }, props: {
+    fullReads: 6, incrementalReads: 1, sharedReads: 1, cachedSkipReads: 1, rowsReturned: 18, bytesReturned: 4500,
+    firstReads: 1, missingUntils: 1, routeChanges: 1, resyncs: 1, mergeConflicts: 1, clockSkews: 1,
+  } });
+});
+
+test("a cached run removed by rollback forces one full repair instead of retaining its messages", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  await backend.prompt(chat.id, chat.directory, `msg_${"9".repeat(64)}`, "rolled back");
+  control.reply(chat.id, "old", "completed");
+  await backend.messages(chat.id);
+  const thread = control.threads.get(chat.id)!;
+  thread.messages = []; thread.runs = [];
+  control.calls.length = 0;
+  expect(await backend.messages(chat.id)).toEqual([]);
+  expect(control.calls.filter(call => call.path.includes("/messages?") && !call.path.includes("since="))).toHaveLength(1);
+});
+
+test("completion and external steer writes invalidate an existing tick's snapshot", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  const prompt = `msg_${"7".repeat(64)}`;
+  const steer = `msg_${"8".repeat(64)}`;
+  await backend.prompt(chat.id, chat.directory, prompt, "hello");
+  const ready = Promise.withResolvers<void>();
+  const written = Promise.withResolvers<void>();
+  const reading = backend.messageReadScope(async () => {
+    await backend.messages(chat.id);
+    ready.resolve();
+    await written.promise;
+    expect(await backend.promptAccepted(chat.id, chat.directory, steer)).toBe(true);
+    control.reply(chat.id, "complete", "completed");
+    expect((await backend.messages(chat.id)).at(-1)).toMatchObject({ type: "idle", outcome: "succeeded" });
+  });
+  await ready.promise;
+  try { await backend.steer(chat.id, chat.directory, steer, "also this"); }
+  finally { written.resolve(); }
+  await reading;
+});
+
+test.each([
+  { label: "future timestamp beyond overlap", cachedAt: 10_000, nextAt: 1_000, full: true },
+  { label: "future timestamp at exclusive since boundary", cachedAt: 2_000, nextAt: 0, full: true },
+  { label: "future cursor with delayed poll after clock catches up", cachedAt: 10_000, errorAt: 1_000, nextAt: 15_000, full: true },
+  { label: "exclusive future boundary with delayed poll", cachedAt: 2_000, errorAt: 0, nextAt: 10_000, full: true },
+  { label: "safe overlap with delayed poll", cachedAt: 1_999, errorAt: 0, nextAt: 10_000, full: false },
+  { label: "future timestamp within overlap", cachedAt: 1_999, nextAt: 0, full: false },
+  { label: "wall clock moves backwards beyond overlap", cachedAt: -20_000, nextAt: -10_000, full: true },
+  { label: "wall clock moves backwards at overlap boundary", cachedAt: -20_000, nextAt: -2_000, full: true },
+  { label: "wall clock moves backwards within overlap", cachedAt: -20_000, nextAt: -1_999, full: false },
+  { label: "equal timestamp", cachedAt: 0, nextAt: 0, full: false },
+])("clock skew preserves the first-turn model-error verdict: $label", async ({ cachedAt, nextAt, errorAt = nextAt, full }) => {
+  const start = Date.parse("2026-11-15T12:00:00Z");
+  setSystemTime(start);
+  try {
+    const control = fakeControl();
+    const alerts: string[] = [];
+    const backend = control.backend("/chats", { alert: async (_id, text) => { alerts.push(text); return true; } });
+    const chat = await backend.createChat();
+    await backend.prompt(chat.id, chat.directory, `msg_${"6".repeat(64)}`, "hello");
+    const thread = control.threads.get(chat.id)!;
+    thread.driver = { instanceId: "codex", model: "test" };
+    thread.messages[0]!.updatedAt = new Date(start + cachedAt).toISOString();
+    await backend.messages(chat.id);
+    control.calls.length = 0;
+    setSystemTime(start + errorAt);
+    control.reply(chat.id, "There's an issue with the selected model (test).", "completed");
+    thread.messages.at(-1)!.createdAt = thread.messages.at(-1)!.updatedAt = new Date().toISOString();
+    setSystemTime(start + nextAt);
+    const records = await backend.messages(chat.id);
+    const fullReads = control.calls.filter(call => call.path.includes("/messages?") && !call.path.includes("since="));
+    expect(fullReads).toHaveLength(full ? 1 : 0);
+    expect(records).toEqual(await control.backend().messages(chat.id));
+    expect(records.at(-1)).toMatchObject({ type: "idle", outcome: "failed", modelError: true });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain("issue with the selected model");
+    await backend.messages(chat.id);
+    expect(alerts).toHaveLength(1);
+  } finally { setSystemTime(); }
+});
+
+test("a slow response retains the cursor's request-time skew before a later model error", async () => {
+  const start = Date.parse("2026-11-15T12:00:00Z");
+  const received = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  setSystemTime(start);
+  try {
+    const control = fakeControl();
+    const alerts: string[] = [];
+    const backend = control.backend("/chats", { alert: async (_id, text) => { alerts.push(text); return true; } });
+    const chat = await backend.createChat();
+    await backend.prompt(chat.id, chat.directory, `msg_${"5".repeat(64)}`, "hello");
+    const thread = control.threads.get(chat.id)!;
+    thread.driver = { instanceId: "codex", model: "test" };
+    thread.messages[0]!.updatedAt = new Date(start + 10_000).toISOString();
+    const messages = backend.client.messages.bind(backend.client);
+    backend.client.messages = async (...args) => {
+      const response = await messages(...args);
+      received.resolve();
+      await release.promise;
+      return response;
+    };
+    const initial = backend.messages(chat.id);
+    await received.promise;
+    setSystemTime(start + 1_000);
+    control.reply(chat.id, "There's an issue with the selected model (test).", "completed");
+    setSystemTime(start + 15_000);
+    release.resolve();
+    await initial;
+    backend.client.messages = messages;
+    const records = await backend.messages(chat.id);
+    expect(records).toEqual(await control.backend().messages(chat.id));
+    expect(records.at(-1)).toMatchObject({ type: "idle", outcome: "failed", modelError: true });
+    expect(alerts).toHaveLength(1);
+  } finally { release.resolve(); setSystemTime(); }
 });

@@ -62,6 +62,7 @@ def can_move():
 class Budget:
     def __init__(self, box, end=None, seconds=None):
         seconds = seconds if seconds is not None else capacity.setting('OFFBOX_PREPARE_DEADLINE_SECONDS', 300, minimum=1, maximum=3600)
+        self.resume_watch = None
         self.start = time.monotonic()
         self.end = end if end is not None else self.start + seconds
         self.seconds = seconds
@@ -116,7 +117,10 @@ def guard(box, end=None, seconds=None):
             raise
         if main:
             signal.setitimer(signal.ITIMER_REAL, 0)
-        log(f'resume_stuck {budget.box} {budget.phase} {time.monotonic()-budget.total_start:.1f}s')
+        if budget.resume_watch is not None:
+            budget.resume_watch.stuck(phase=budget.phase)
+        else:
+            log(f'resume_stuck {budget.box} {budget.phase} {time.monotonic()-budget.total_start:.1f}s')
         outage_cause = error if getattr(error, 'outage', False) else budget.outage_cause
         raise Stalled(budget.box, budget.phase, budget.seconds, outage_cause) from None
     finally:
@@ -168,3 +172,32 @@ def observe_outage(error=None):
     if budget is None or error is not None and api.client_budget_expired(error):
         return
     budget.outage_cause = error if error is not None and error.outage else None
+
+
+def track_resume(watch):
+    budget = _ACTIVE.get()
+    if budget is not None:
+        budget.resume_watch = watch
+
+
+@contextlib.contextmanager
+def pause_for_home_start():
+    """An answering home server's startup has its own bound, outside box preparation time."""
+    budget = _ACTIVE.get()
+    if budget is None:
+        yield
+        return
+    began = time.monotonic()
+    main = threading.current_thread() is threading.main_thread()
+    timer = signal.setitimer(signal.ITIMER_REAL, 0) if main else None
+    token = _ACTIVE.set(None)
+    try:
+        with budget.resume_watch.pause() if budget.resume_watch is not None else contextlib.nullcontext():
+            yield
+    finally:
+        elapsed = time.monotonic() - began
+        for field in ('start', 'end', 'total_start', 'phase_start', 'next_progress'):
+            setattr(budget, field, getattr(budget, field) + elapsed)
+        _ACTIVE.reset(token)
+        if timer is not None:
+            signal.setitimer(signal.ITIMER_REAL, *timer)

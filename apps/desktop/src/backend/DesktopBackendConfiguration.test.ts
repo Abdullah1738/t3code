@@ -42,6 +42,7 @@ const isDesktopBackendObservabilitySettingsReadError = Schema.is(
 const layerShellEnvironment = (prepared = true) =>
   Layer.succeed(DesktopShellEnvironment.DesktopShellEnvironment, {
     installIntoProcess: Effect.succeed(prepared),
+    pathHydration: { source: "none", probes: [] },
   });
 
 const layerBackendConfiguration = (prepared = true, buildCommit = Option.none<string>()) =>
@@ -259,11 +260,12 @@ describe("DesktopBackendConfiguration", () => {
         const second = yield* configuration.resolvePrimary;
 
         assert.equal(first.executablePath, process.execPath);
-        assert.deepEqual(first.args.slice(0, 4), [
-          "--max-old-space-size=6144",
+        assert.deepEqual(first.args, [
           "--require",
           environment.compileCachePath,
           environment.backendEntryPath,
+          "--bootstrap-fd",
+          "3",
         ]);
         assert.equal(first.entryPath, environment.backendEntryPath);
         assert.equal(first.cwd, environment.backendCwd);
@@ -406,7 +408,9 @@ describe("DesktopBackendConfiguration", () => {
         const wsl = yield* configuration.resolveWsl({ port: 5000, distro: null });
 
         assert.equal(primary.bootstrap.shellEnvironmentPrepared, true);
+        assert.deepEqual(primary.bootstrap.shellPathHydration, { source: "none", probes: [] });
         assert.isUndefined(wsl.bootstrap.shellEnvironmentPrepared);
+        assert.isUndefined(wsl.bootstrap.shellPathHydration);
       }),
     ),
   );

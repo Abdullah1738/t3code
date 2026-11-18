@@ -2,11 +2,13 @@ import { assert, it } from "@effect/vitest";
 import {
   CommandId,
   MessageId,
+  NodeId,
   EventId,
   ProjectId,
   ProviderInstanceId,
   ProviderDriverKind,
   ProviderThreadId,
+  ProviderTurnId,
   RunId,
   RunAttemptId,
   ThreadId,
@@ -14,6 +16,11 @@ import {
   type ApplicationStoredEvent,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
+import {
+  ControlHistoryCompactedError,
+  controlEventFromStored,
+  makeBody as makeControlBody,
+} from "../ardud/control/ControlEvents.ts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -108,6 +115,7 @@ const stores = Layer.mergeAll(
 const testLayer = (
   hooks: {
     append?: Effect.Effect<void>;
+    read?: Effect.Effect<void>;
     project?: (event: OrchestrationV2DomainEvent) => Effect.Effect<void>;
     outbox?: Effect.Effect<void>;
     normalize?: Effect.Effect<void>;
@@ -119,6 +127,8 @@ const testLayer = (
       EventStore.EventStoreV2,
       Effect.map(EventStore.EventStoreV2, (store) => ({
         ...store,
+        read: (input) =>
+          Stream.unwrap((hooks.read ?? Effect.void).pipe(Effect.as(store.read(input)))),
         append: (input) => (hooks.append ?? Effect.void).pipe(Effect.andThen(store.append(input))),
         publishCommitted: (events) =>
           (hooks.publish?.(events) ?? Effect.void).pipe(
@@ -173,6 +183,149 @@ const phase = (span: Tracer.Span, name: string) =>
   span.attributes.get(`orchestration_v2.phase.${name}`);
 const writeSpans = (spans: ReadonlyArray<Tracer.Span>) =>
   spans.filter((span) => span.name === "orchestrationV2.EventSink.write");
+
+const providerTurn = (id: string, ordinal: number) =>
+  ({
+    id: EventId.make(`event:provider-turn:${id}`),
+    type: "provider-turn.updated",
+    threadId,
+    occurredAt: now,
+    payload: {
+      id: ProviderTurnId.make(id),
+      providerThreadId: ProviderThreadId.make("provider-thread:ordinal"),
+      nodeId: NodeId.make("node:ordinal"),
+      runAttemptId: null,
+      nativeTurnRef: null,
+      ordinal,
+      status: "running",
+      startedAt: now,
+      completedAt: null,
+    },
+  }) satisfies OrchestrationV2DomainEvent;
+
+it.effect.each([false, true])(
+  "concurrent provider turn writes allocate without rollback (duplicate=%s)",
+  (duplicate) => {
+    const trace = capture();
+    return Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const store = yield* EventStore.EventStoreV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sink.write({ events: [created] });
+      const ready = [yield* Deferred.make<void>(), yield* Deferred.make<void>()];
+      const release = yield* Deferred.make<void>();
+      const starts = yield* Effect.forEach(
+        ["turn:first", duplicate ? "turn:first" : "turn:second"],
+        (id, index) =>
+          Effect.gen(function* () {
+            // Both starts observe the same preflight snapshot before either can write.
+            const rows = yield* sql<{
+              ordinal: number;
+            }>`SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal
+          FROM orchestration_v2_projection_provider_turns
+          WHERE provider_thread_id = ${ProviderThreadId.make("provider-thread:ordinal")}`;
+            yield* Deferred.succeed(ready[index]!, undefined);
+            yield* Deferred.await(release);
+            return yield* sink
+              .write({
+                events: [
+                  {
+                    ...providerTurn(id, rows[0]!.ordinal),
+                    id: EventId.make(`event:start:${index}`),
+                  },
+                ],
+              })
+              .pipe(Effect.exit);
+          }).pipe(Effect.forkChild),
+      );
+      yield* Effect.all(ready.map(Deferred.await));
+      yield* Deferred.succeed(release, undefined);
+      const results = yield* Effect.all(starts.map(Fiber.join));
+      assert.isTrue(results.every(Exit.isSuccess));
+      const projection = yield* projections.getThreadRecords(threadId, ["providerTurns"]);
+      assert.deepEqual(
+        projection.providerTurns.map((turn) => turn.ordinal).toSorted(),
+        duplicate ? [1] : [1, 2],
+      );
+      const events = Array.from(yield* store.read().pipe(Stream.runCollect));
+      assert.deepEqual(
+        events.flatMap(({ event }) =>
+          event.type === "provider-turn.updated" ? [event.payload.ordinal] : [],
+        ),
+        duplicate ? [1, 1] : [1, 2],
+      );
+      // Native lifecycle updates retain each start's stale preflight ordinal.
+      const updateIds = ["turn:first", duplicate ? "turn:first" : "turn:second"];
+      yield* sink.write({
+        events: updateIds.map((id, index) => ({
+          ...providerTurn(id, 1),
+          id: EventId.make(`event:refresh:${index}`),
+        })),
+      });
+      const refreshed = Array.from(yield* store.read().pipe(Stream.runCollect));
+      assert.deepEqual(
+        refreshed.flatMap(({ event }) =>
+          event.type === "provider-turn.updated" ? [event.payload.ordinal] : [],
+        ),
+        [
+          ...(duplicate ? [1, 1] : [1, 2]),
+          ...updateIds.map(
+            (id) => projection.providerTurns.find((turn) => turn.id === id)?.ordinal,
+          ),
+        ],
+      );
+      assert.isTrue(
+        writeSpans(trace.spans).every(
+          (span) => span.status._tag === "Ended" && Exit.isSuccess(span.status.exit),
+        ),
+      );
+    }).pipe(Effect.provide(testLayer()), Effect.withTracer(trace.tracer));
+  },
+);
+
+it.effect(
+  "provider turn updates keep their allocation across stale snapshots and a single batch",
+  () =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const store = yield* EventStore.EventStoreV2;
+      yield* sink.write({
+        events: [created, providerTurn("turn:first", 1), providerTurn("turn:second", 1)],
+      });
+      const stale = providerTurn("turn:first", 99);
+      yield* sink.write({
+        events: [
+          {
+            ...stale,
+            id: EventId.make("event:stale"),
+            payload: {
+              ...stale.payload,
+              status: "completed",
+              completedAt: now,
+              tokenUsage: { usedTokens: 42, maxTokens: 100, updatedAt: DateTime.formatIso(now) },
+            },
+          },
+        ],
+      });
+      const projection = yield* projections.getThreadRecords(threadId, ["providerTurns"]);
+      assert.deepEqual(
+        projection.providerTurns.map(({ id, ordinal, status }) => ({ id, ordinal, status })),
+        [
+          { id: "turn:first", ordinal: 1, status: "completed" },
+          { id: "turn:second", ordinal: 2, status: "running" },
+        ],
+      );
+      const events = Array.from(yield* store.read().pipe(Stream.runCollect));
+      assert.deepEqual(
+        events.flatMap(({ event }) =>
+          event.type === "provider-turn.updated" ? [event.payload.ordinal] : [],
+        ),
+        [1, 2, 1],
+      );
+    }).pipe(Effect.provide(testLayer())),
+);
 
 it.effect(
   "records each phase and the slowest event on the enclosing span with body tracing disabled",
@@ -1034,4 +1187,178 @@ it.effect(
       assert.equal(batch.attributes.get("db.transaction.control.commit_count"), 1);
     }).pipe(Effect.provide(testLayer({ project: () => nestedRead })));
   },
+);
+
+it.effect.each([false, true])(
+  "control SSE burst with upstream selection=%s behind blocked origin lookup",
+  (filtered) =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const [seed] = yield* sink.write({ events: [created] });
+      assert.isDefined(seed);
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const drained = yield* Deferred.make<void>();
+      const overflowLogger = Logger.make(({ message }) => {
+        if (String(message).includes("orchestration live event buffer is full"))
+          Deferred.doneUnsafe(drained, Effect.void);
+      });
+      const accepts = (stored: import("@t3tools/contracts").OrchestrationV2StoredEvent) =>
+        controlEventFromStored(stored) !== null;
+      const body = yield* makeControlBody({
+        source: sink.stream({
+          afterSequence: 0,
+          bounded: true,
+          ...(filtered
+            ? {
+                filter: (stored: import("@t3tools/contracts").OrchestrationV2StoredEvent) => {
+                  if (stored.sequence === seed!.sequence + 1101)
+                    Deferred.doneUnsafe(drained, Effect.void);
+                  return accepts(stored);
+                },
+              }
+            : {}),
+        }),
+        afterSequence: 0,
+        resumed: true,
+        threadFilter: null,
+        originFilter: null,
+        accepts,
+        analytics: undefined,
+        originOf: () =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.as(null),
+          ),
+      });
+      const pull = yield* Stream.toPull(body);
+      yield* pull; // ready
+      const reader = yield* pull.pipe(
+        Effect.provide(Logger.layer([overflowLogger])),
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(entered);
+      const eventStore = yield* EventStore.EventStoreV2;
+      const burst = yield* eventStore.append({
+        events: Array.from({ length: 1100 }, (_, i) => item(i)),
+      });
+      const [sentinel] = yield* eventStore.append({
+        events: [{ ...created, id: EventId.make("event:sentinel") }],
+      });
+      assert.isDefined(sentinel);
+      yield* sink.publishCommitted([...burst, sentinel!]);
+      yield* Deferred.await(drained);
+      yield* Deferred.succeed(release, undefined);
+      const frames = [...(yield* Fiber.join(reader))];
+      while (
+        !frames.some((frame) =>
+          new TextDecoder()
+            .decode(frame)
+            .includes(filtered ? `id: ${sentinel!.sequence}` : "event: error"),
+        )
+      ) {
+        frames.push(...(yield* pull));
+      }
+      const output = frames.map((frame) => new TextDecoder().decode(frame)).join("");
+      if (filtered) {
+        assert.notInclude(output, "event: error");
+        assert.include(output, `id: ${sentinel!.sequence}`);
+      } else {
+        assert.include(output, '"code":"buffer_overflow"');
+        const cursor = Number(output.match(/id: (\d+)\nevent: error/)?.[1]);
+        const resumedBody = yield* makeControlBody({
+          source: sink.stream({ afterSequence: cursor, bounded: true, filter: accepts }),
+          afterSequence: cursor,
+          resumed: true,
+          threadFilter: null,
+          originFilter: null,
+          accepts,
+          analytics: undefined,
+          originOf: () => Effect.succeed(null),
+        });
+        const expected = [seed!.sequence, sentinel!.sequence].filter(
+          (sequence) => sequence > cursor,
+        );
+        const replayed = yield* resumedBody.pipe(
+          Stream.take(1 + expected.length),
+          Stream.runCollect,
+        );
+        const replayText = replayed.map((frame) => new TextDecoder().decode(frame)).join("");
+        assert.include(replayText, '"resumed":true');
+        assert.deepEqual(
+          [...replayText.matchAll(/id: (\d+)\nevent: thread.created/g)].map((match) =>
+            Number(match[1]),
+          ),
+          expected,
+        );
+        const initialIds = [...output.matchAll(/id: (\d+)\nevent: thread.created/g)].map((match) =>
+          Number(match[1]),
+        );
+        assert.deepEqual([...initialIds, ...expected], [seed!.sequence, sentinel!.sequence]);
+      }
+    }).pipe(Effect.scoped, Effect.provide(testLayer())),
+);
+
+it.effect("cursor replay joins live exactly once across a blocked catch-up read", () =>
+  Effect.gen(function* () {
+    const replayStarted = yield* Deferred.make<void>();
+    const releaseReplay = yield* Deferred.make<void>();
+    return yield* Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const [seed] = yield* sink.write({ events: [created] });
+      const retained = yield* sink.write({ events: [item(1), item(2)] });
+      const reader = yield* sink
+        .stream({
+          afterSequence: seed!.sequence,
+          bounded: true,
+          filter: (stored) => stored.event.type === "turn-item.updated",
+        })
+        .pipe(Stream.take(4), Stream.runCollect, Effect.forkScoped);
+      yield* Deferred.await(replayStarted);
+      const duringReplay = yield* sink.write({ events: [item(3)] });
+      yield* Deferred.succeed(releaseReplay, undefined);
+      const sentinel = yield* sink.write({ events: [item(4)] });
+      assert.deepEqual(
+        Array.from(yield* Fiber.join(reader), (stored) => stored.sequence),
+        [...retained, ...duringReplay, ...sentinel].map((stored) => stored.sequence),
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        testLayer({
+          read: Deferred.succeed(replayStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseReplay)),
+          ),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("compaction discovered after catch-up fails before delivering the live tail", () =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const [seed] = yield* sink.write({ events: [created] });
+    const body = yield* makeControlBody({
+      source: sink.stream({
+        afterSequence: 0,
+        bounded: true,
+        verifyReplay: () =>
+          sink
+            .publishCommitted([{ ...seed!, sequence: seed!.sequence + 1 }])
+            .pipe(Effect.andThen(Effect.fail(new ControlHistoryCompactedError()))),
+      }),
+      afterSequence: 0,
+      resumed: true,
+      threadFilter: null,
+      originFilter: null,
+      accepts: () => true,
+      originOf: () => Effect.succeed(null),
+      analytics: undefined,
+    });
+    const frames = yield* body.pipe(Stream.runCollect);
+    const output = frames.map((frame) => new TextDecoder().decode(frame)).join("");
+    assert.include(output, '"code":"history_compacted"');
+    assert.isAtMost(Number(output.match(/id: (\d+)\nevent: error/)?.[1]), seed!.sequence);
+  }).pipe(Effect.provide(testLayer())),
 );

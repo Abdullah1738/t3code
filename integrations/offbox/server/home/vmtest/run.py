@@ -209,6 +209,14 @@ def verify_install(c, vm, expect_mode=None):
                      "offbox-rtcwake-shutdown.service offbox-boot-health.timer offbox-emergency-agent.service "
                      "offbox-watchdog.service tailscaled unattended-upgrades 2>&1 | sort | uniq -c")
     c.check(units.strip().endswith("enabled") and len(units.splitlines()) == 1, "offbox units, tailscaled and unattended-upgrades enabled", units)
+    policy = sshv(vm, "perl -c /etc/needrestart/conf.d/50-offbox.conf 2>&1; "
+                       "cat /etc/needrestart/conf.d/50-offbox.conf; "
+                       "cat /etc/apt/apt.conf.d/52offbox-unattended; "
+                       "cat /etc/apt/apt.conf.d/zz-offbox-restart-pending; "
+                       "test -x /usr/local/sbin/offbox-restart-pending && echo writer-executable")
+    c.check("syntax OK" in policy and all(f"qr(^{unit})" in policy for unit in ("incus", "lxcfs", "boatd", "zfs", "mullvad", "offbox-"))
+            and '/usr/local/sbin/offbox-restart-pending || true";' in policy and "writer-executable" in policy,
+            "apt defers run-path restarts and records pending services without failing dpkg", policy)
     wd = sshv(vm, "cat /sys/class/watchdog/watchdog0/identity /sys/class/watchdog/watchdog0/state /sys/class/watchdog/watchdog0/timeout 2>&1")
     c.check("active" in wd and "60" in wd, "hardware watchdog armed by systemd, 60 s", wd.replace("\n", " "))
     sysctl = sshv(vm, "sysctl -n kernel.panic kernel.panic_on_oops")
@@ -896,9 +904,16 @@ def c10(c):
     c.check(sshv(vm, "offbox-status | sed -n 's/.*booted_image=//p' | cut -d' ' -f1") == good, "next boot uses the promoted kernel by default")
 
 
-HOST_FILES = ("../skill/scripts/toollog.py", "boatd.py", "boatd-wrap", "base-image.sh", "boatd.service", "install-host.sh",
+HOST_FILES = ("../skill/scripts/toollog.py", "../skill/scripts/offbox_disk_space.py", "../skill/scripts/offbox_protection.py", "boatd.py", "boatd_disk.py", "boatd_tmp.py", "boatd_memory.py", "host-memory-setup.py", "boatd-wrap", "base-image.sh", "boatd.service", "install-host.sh",
+              "../skill/templates/tools/sqlite.sh", "../skill/templates/tools/fetch.sh",
               "../skill/templates/home/offbox-mgmt-ssh.service", "../skill/templates/home/offbox_mgmt_sshd_config",
               "../skill/templates/home/offbox-ssh-runtime.conf")
+
+HOST_POLICY_FILES = ("home/install-update-policy.sh",
+                     "home/stick/offbox/target/rootfs/etc/needrestart/conf.d/50-offbox.conf",
+                     "home/stick/offbox/target/rootfs/etc/apt/apt.conf.d/52offbox-unattended",
+                     "home/stick/offbox/target/rootfs/etc/apt/apt.conf.d/zz-offbox-restart-pending",
+                     "home/stick/offbox/target/rootfs/usr/local/sbin/offbox-restart-pending")
 
 # Runs inside the VM: one boatd API call with an owner's token (kept in a root-only file there), JSON out.
 API_PY = r'''#!/usr/bin/env python3
@@ -924,6 +939,10 @@ def install_host(c, vm, label="install-host.sh"):
     """Copy the server files and run install-host.sh the way bootstrap.zsh does. Returns the listen IP."""
     vm.ssh("mkdir -p /root/offbox-server")
     vm.scp([os.path.join(SERVER_DIR, f) for f in HOST_FILES], "/root/offbox-server/")
+    for file in HOST_POLICY_FILES:
+        dest = "/root/offbox-server/" + os.path.dirname(file)
+        vm.ssh(f"mkdir -p {dest}")
+        vm.scp([os.path.join(SERVER_DIR, file)], dest + "/")
     ip = sshv(vm, "hostname -I | awk '{print $1}'")
     t0 = time.time()
     rc, out = vm.ssh(f"OFFBOX_LISTEN_IP={ip} bash /root/offbox-server/install-host.sh > /root/install-host.log 2>&1; echo rc=$?; tail -5 /root/install-host.log",

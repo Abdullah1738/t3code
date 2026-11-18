@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests._env import isolate_boat, isolate_home
-from offbox_lib import api, bases, capacity, cli, common, fallback, lease, misc, pool, reap, runs, spend
+from offbox_lib import api, bases, capacity, cli, common, fallback, home, lease, misc, pool, reap, runs, spend
 
 
 class Isolated(unittest.TestCase):
@@ -26,8 +26,16 @@ class Isolated(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.dict(os.environ))
+        for name in (runs.BACKGROUND_RUN_ENV, home.RUN_ID_ENV):
+            os.environ.pop(name, None)
+        identity_token = home.INVOCATION_RUN.set('')
+        self.stack.callback(home.INVOCATION_RUN.reset, identity_token)
         key_lookup = self.stack.enter_context(patch.object(
             api, '_key', side_effect=AssertionError('real API-key lookup forbidden in unit tests; stub the API boundary')))
+        # Existing allocation fixtures have no guest children. Protection tests restore the real API reader.
+        self.stack.enter_context(patch.object(api, 'box_protection', return_value=
+            dict(ok=True, pin=dict(active=False,holder=None,until=None), holds=[])))
         # Cleanup also catches lookups swallowed by production error handling or background workers.
         self.addCleanup(key_lookup.assert_not_called)
         root = Path(self.tmp.name)
@@ -58,6 +66,8 @@ class Isolated(unittest.TestCase):
         source = root / 'isolated-source'
         source.mkdir()
         self.me = dict(owner='worker', repo_key='repo', repo_root=str(source), session='s',thread='t')
+        # Restore before TemporaryDirectory cleanup, even when a test changes cwd and raises.
+        self.stack.enter_context(contextlib.chdir(os.getcwd()))
 
     def box(self, bid, state='running', used=100, member=False, size='large', source='template:crpko-go'):
         self.con.execute("""INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,last_used_at,source)
@@ -413,6 +423,7 @@ class PoolTests(Isolated):
         self.assertEqual(row['box_id'], 'new')
         self.assertIn('skipping a', err.getvalue())
         self.assertIn('fresh lease', err.getvalue())
+        self.assertNotIn('--delete', err.getvalue())
         new.assert_called_once()
         # The marked box is never offered again: a second acquire never even tries to reuse it.
         tried = []

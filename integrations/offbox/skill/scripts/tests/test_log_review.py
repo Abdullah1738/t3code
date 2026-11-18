@@ -17,7 +17,7 @@ class LoggingReview(Isolated):
     def setUp(self):
         super().setUp()
         self.logdir = Path(self.tmp.name)/'shared-logs'
-        self.stack.enter_context(patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.logdir)))
+        self.stack.enter_context(patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.logdir)))
         self.stack.enter_context(patch.object(api, '_COMMAND_DURATIONS', {}))
         self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
@@ -41,7 +41,8 @@ class LoggingReview(Isolated):
         with patch.object(api,'call',return_value=status) as request:
             self.assertIs(api.cmd_status('bx_fixture',42),status)
         request.assert_called_once()
-        with patch.object(runs,'now',return_value=3600): runs.finish(row['run_id'],0,bookkeeping=False)
+        with patch.object(runs,'now',return_value=3600), patch.object(misc, '_catch_up_finished'):
+            runs.finish(row['run_id'],0,bookkeeping=False)
 
         row=self.command_row('run-pulls','fg',43)
         frame={'type':'exit','exitCode':0,'commandId':row['command_id'],
@@ -54,7 +55,8 @@ class LoggingReview(Isolated):
             clock['now']+=600
             return {'ok':True,'files':2,'received':10}
         with patch.object(runs,'now',side_effect=lambda:clock['now']), patch.object(ssh_sync,'pull',side_effect=pull):
-            runs.do_pulls('bx_fixture',row,['artifact'])
+            self.con.execute('UPDATE runs SET pulls=? WHERE run_id=?', ('["artifact"]', row['run_id']))
+            runs.settle_pulls(row['run_id'], 'fg')
             runs.finish(row['run_id'],0,bookkeeping=False)
         unknown=self.command_row('run-unknown','fg',44)
         with patch.object(runs,'now',return_value=7200): runs.finish(unknown['run_id'],0,bookkeeping=False)

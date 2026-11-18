@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -21,13 +22,17 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
+import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -61,6 +66,13 @@ it.effect.each([
   "provider acceptance",
   "cross-target conflict",
   "run snapshot",
+  "background reader",
+  "background reader with paced continuation",
+  "receipt replay",
+  "canonical reader running auto",
+  "canonical reader running steer",
+  "canonical reader completed auto",
+  "checkpoint size target",
 ] as const)(
   "acknowledges idle sends and bounds a blocked %s without duplicating a retry",
   (blocked) =>
@@ -161,13 +173,20 @@ it.effect.each([
             }),
         };
         const registry = ProviderAdapterRegistry.layerSingle(adapter);
-        const database = Sqlite.layerMemory;
+        const database =
+          blocked.startsWith("background reader") ||
+          blocked.startsWith("canonical reader") ||
+          blocked === "checkpoint size target"
+            ? Sqlite.layerFromPath(`${cwd}/send.sqlite`).pipe(Layer.provide(NodeServices.layer))
+            : Sqlite.layerMemory;
         const runtime = ProviderReplayHarness.layerWithRegistry(
           { name: `send-ack-${blocked}`, runtimePolicyOverride: { cwd } },
           registry,
           { databaseLayer: database, runEffectWorker: false },
         );
-        const settings = ServerSettings.layerTest();
+        const settings = ServerSettings.layerTest(
+          blocked === "receipt replay" ? { ardudHarnessMigration: { cutoverComplete: true } } : {},
+        );
         const dispatchRuntime = Layer.effect(
           Orchestrator.OrchestratorV2,
           Effect.gen(function* () {
@@ -189,10 +208,18 @@ it.effect.each([
         const threads = ThreadManagementService.layer.pipe(
           Layer.provideMerge(dispatchRuntime),
           Layer.provideMerge(settings),
-          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(database))),
+          Layer.provideMerge(
+            Layer.mergeAll(
+              CommandReceiptStore.layer,
+              EffectOutbox.layer,
+              ProjectionStore.layer,
+            ).pipe(Layer.provide(database)),
+          ),
           Layer.provideMerge(ThreadCommandExecutor.layer),
         );
         const layer = OrchestratorMcpService.layer.pipe(
+          Layer.provide(McpProviderSessions.layer),
+          Layer.provideMerge(database),
           Layer.provideMerge(threads),
           Layer.provide(
             Layer.mergeAll(
@@ -227,6 +254,227 @@ it.effect.each([
             creationSource: "web",
           });
           const request = { threadId, message: "Start the idle child", clientRequestId: "idle" };
+          if (blocked === "checkpoint size target") {
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`PRAGMA journal_size_limit = 1`;
+            yield* sql`CREATE TABLE checkpoint_pages(payload BLOB)`;
+            const held = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const reader = yield* sql
+              .withTransaction(
+                sql`SELECT COUNT(*) FROM checkpoint_pages`.pipe(
+                  Effect.andThen(Deferred.succeed(held, undefined)),
+                  Effect.andThen(Deferred.await(release)),
+                ),
+              )
+              .pipe(NodeSqliteClient.readOnly, Effect.forkChild);
+            yield* Deferred.await(held);
+            yield* Effect.gen(function* () {
+              yield* sql`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
+                INSERT INTO checkpoint_pages SELECT zeroblob(4000) FROM n`;
+              const state = yield* sql<{
+                log: number;
+                checkpointed: number;
+              }>`PRAGMA wal_checkpoint(NOOP)`;
+              assert.isAbove(state[0]!.log, 1000);
+              assert.isBelow(state[0]!.log, 10000);
+              assert.isBelow(state[0]!.checkpointed, state[0]!.log);
+              const [result] = yield* Effect.all(
+                [
+                  service.sendToThread(scope, request),
+                  sql.withTransaction(sql`INSERT INTO checkpoint_pages VALUES (x'01')`),
+                ],
+                { concurrency: 2 },
+              ).pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+              assert.equal(result.delivery, "started");
+              const replay = yield* service
+                .sendToThread(scope, request)
+                .pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+              assert.equal(replay.messageId, result.messageId);
+              assert.isUndefined(reader.pollUnsafe());
+              assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).messages, 1);
+            }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+            yield* Fiber.join(reader);
+            yield* worker.drain().pipe(TestClock.withLive);
+            assert.equal(starts, 1);
+            return;
+          }
+          if (blocked.startsWith("canonical reader")) {
+            const initial = yield* service.sendToThread(scope, request);
+            const runningEvent = yield* orchestrator.streamDomainEvents.pipe(
+              Stream.filter(
+                (event) =>
+                  event.threadId === threadId &&
+                  event.type === "provider-turn.updated" &&
+                  event.payload.status === "running",
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped,
+            );
+            yield* worker.drain();
+            yield* Fiber.join(runningEvent);
+            const store = yield* ProjectionStore.ProjectionStoreV2;
+            const sink = yield* EventSink.EventSinkV2;
+            const running = (yield* store.getThreadRecords(threadId, ["runs"])).runs.find(
+              (run) => run.id === initial.runId,
+            )!;
+            assert.equal(running.status, "running");
+            const completed = blocked === "canonical reader completed auto";
+            if (completed) {
+              const now = yield* DateTime.now;
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("complete-before-canonical-read"),
+                    type: "run.updated",
+                    threadId,
+                    occurredAt: now,
+                    payload: { ...running, status: "completed", completedAt: now },
+                  },
+                ],
+              });
+            }
+            const entered = yield* Deferred.make<NodeSqliteClient.SqliteStatementObservation>();
+            const release = yield* Deferred.make<void>();
+            let paused = false;
+            // This is the orphan sweep's real read boundary, with its snapshot held open.
+            const reader = yield* store.getThreadRecords(threadId, ["providerThreads"]).pipe(
+              Effect.provideService(NodeSqliteClient.StatementObserver, {
+                slowThresholdMs: 0,
+                record: (observation) =>
+                  Effect.suspend(() => {
+                    if (paused) return Effect.void;
+                    paused = true;
+                    return Deferred.succeed(entered, observation).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                    );
+                  }),
+              }),
+              Effect.forkChild,
+            );
+            yield* Effect.gen(function* () {
+              assert.equal((yield* Deferred.await(entered)).connection, "reader");
+              const followup = {
+                threadId,
+                message: "Follow up during a canonical snapshot",
+                mode:
+                  blocked === "canonical reader running steer"
+                    ? ("steer" as const)
+                    : ("auto" as const),
+                clientRequestId: "during-canonical-read",
+              };
+              const result = yield* service
+                .sendToThread(scope, followup)
+                .pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+              assert.equal(result.delivery, completed ? "started" : "steered");
+              if (completed) assert.notEqual(result.runId, initial.runId);
+              else assert.equal(result.runId, initial.runId);
+              const repeated = yield* service
+                .sendToThread(scope, followup)
+                .pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+              assert.equal(repeated.messageId, result.messageId);
+              assert.equal(repeated.runId, result.runId);
+              assert.isUndefined(reader.pollUnsafe());
+              const messages = yield* store
+                .getThreadRecords(threadId, ["messages"])
+                .pipe(NodeSqliteClient.foregroundReads);
+              assert.lengthOf(messages.messages, 2);
+              assert.lengthOf(
+                messages.messages.filter((message) => message.id === result.messageId),
+                1,
+              );
+            }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+            yield* Fiber.join(reader);
+            return;
+          }
+          if (blocked.startsWith("background reader")) {
+            let expectedMessages = 1;
+            if (blocked === "background reader with paced continuation") {
+              const old = yield* service.sendToThread(scope, {
+                ...request,
+                clientRequestId: "before-restart",
+              });
+              yield* orchestrator.dispatch({
+                type: "run.interrupt",
+                commandId: CommandId.make("restart-cut"),
+                threadId,
+                runId: old.runId,
+                fenced: true,
+              });
+              const outbox = yield* EffectOutbox.EffectOutboxV2;
+              yield* outbox.enqueue([
+                {
+                  id: "leftover-paced-continuation",
+                  commandId: CommandId.make("restart-resume"),
+                  threadId,
+                  request: {
+                    type: "provider-runtime.continue",
+                    sourceRunId: old.runId,
+                  },
+                  availableAt: DateTime.add(yield* DateTime.now, { hours: 1 }),
+                },
+              ]);
+              assert.isTrue(yield* outbox.hasPendingRunContinuation(threadId));
+              assert.isUndefined(
+                ThreadManagementService.latestActiveRun(
+                  yield* orchestrator.getThreadProjection(threadId),
+                ),
+              );
+              expectedMessages += 1;
+            }
+            const sql = yield* SqlClient.SqlClient;
+            const held = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const holder = yield* sql
+              .withTransaction(
+                sql`SELECT 1`.pipe(
+                  Effect.andThen(Deferred.succeed(held, undefined)),
+                  Effect.andThen(Deferred.await(release)),
+                ),
+              )
+              .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+            yield* Deferred.await(held);
+            // The background transaction stays open until the message is committed.
+            const result = yield* service.sendToThread(scope, { ...request, mode: "queue" });
+            assert.equal(result.delivery, "started");
+            const writerHeld = yield* Deferred.make<void>();
+            const releaseWriter = yield* Deferred.make<void>();
+            const writer = yield* sql
+              .withTransaction(
+                sql`SELECT 1`.pipe(
+                  Effect.andThen(Deferred.succeed(writerHeld, undefined)),
+                  Effect.andThen(Deferred.await(releaseWriter)),
+                ),
+              )
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(writerHeld);
+            const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+            const receipt = yield* receipts
+              .getByCommandId(CommandId.make("command:mcp:send-ack-test:thread-send:idle"))
+              .pipe(NodeSqliteClient.foregroundReads);
+            assert.equal(receipt._tag, "Some");
+            yield* Deferred.succeed(releaseWriter, undefined);
+            yield* Fiber.join(writer);
+            if (receipt._tag === "Some") {
+              const ownCommand = CommandId.make("receipt-in-own-transaction");
+              yield* sql.withTransaction(
+                Effect.gen(function* () {
+                  yield* receipts.insertIfAbsent({ ...receipt.value, commandId: ownCommand });
+                  assert.equal((yield* receipts.getByCommandId(ownCommand))._tag, "Some");
+                }),
+              );
+            }
+            yield* Deferred.succeed(release, undefined);
+            yield* Fiber.join(holder);
+            yield* worker.drain();
+            assert.equal(starts, 1);
+            assert.lengthOf(
+              (yield* orchestrator.getThreadProjection(threadId)).messages,
+              expectedMessages,
+            );
+            return;
+          }
           if (blocked === "cross-target conflict") {
             const other = ThreadId.make("thread:other-send-target");
             yield* orchestrator.dispatch({
@@ -343,6 +591,33 @@ it.effect.each([
             assert.equal(replayed.messageId, steered.messageId);
             assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).messages, 2);
             return;
+          }
+          if (blocked === "receipt replay") {
+            const locks = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+            const held = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const holder = yield* locks
+              .withLock(
+                threadId,
+                Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+              )
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(held);
+            const replay = yield* service
+              .sendToThread(scope, request)
+              .pipe(Effect.result, Effect.forkChild);
+            yield* TestClock.adjust("15 seconds");
+            const result = yield* Fiber.join(replay);
+            assert.equal(result._tag, "Failure");
+            if (result._tag === "Failure") {
+              assert.include(
+                result.failure.message,
+                `message replay dispatch for thread ${threadId}`,
+              );
+              assert.notInclude(result.failure.message, "receipt read");
+            }
+            yield* Deferred.succeed(release, undefined);
+            yield* Fiber.join(holder);
           }
           const repeated = yield* service.sendToThread(scope, request);
           assert.equal(repeated.messageId, started.messageId);

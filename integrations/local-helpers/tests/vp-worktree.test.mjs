@@ -3,10 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { test } from "node:test";
 
 const shim = fileURLToPath(new URL("../bin/vp", import.meta.url));
+const maintenance = fileURLToPath(new URL("../libexec/vp/toolchain", import.meta.url));
 const binding = `@oxfmt/binding-${os.platform()}-${os.arch()}`;
 function fixtureLock() {
   return {
@@ -37,13 +38,16 @@ function fixture(t, nativeModules) {
   const main = path.join(temporary, "main");
   const wt = path.join(temporary, "work tree");
   fs.mkdirSync(main);
+  const state = path.join(temporary, "state");
   const git = (...args) => {
     const r = spawnSync("git", ["-C", main, ...args], { encoding: "utf8" });
     assert.equal(r.status, 0, r.stderr);
   };
   git("init", "-q");
   for (const [name, content] of Object.entries({
-    "vite.config.ts": 'export default {fmt:{ignorePatterns:["dist/**"]},lint:{}};\n',
+    "vite.config.ts": nativeModules
+      ? 'export default {fmt:{ignorePatterns:["dist/**"]},lint:{}};\n'
+      : 'export default {fmt:{ignorePatterns:["dist/**"],overrides:[{files:["src/**"],options:{semi:false}}]},lint:{ignorePatterns:["dist/**"],jsPlugins:["@fixture/lint/rules"]}};\n',
     "package.json": "{}\n",
     "pnpm-lock.yaml": nativeModules
       ? fs.readFileSync(path.join(nativeModules, "../pnpm-lock.yaml"), "utf8")
@@ -55,13 +59,27 @@ function fixture(t, nativeModules) {
   git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture");
   git("worktree", "add", "-q", "--detach", wt);
   if (nativeModules) {
-    fs.symlinkSync(nativeModules, path.join(main, "node_modules"));
+    const modules = path.join(main, "node_modules");
+    fs.mkdirSync(modules);
+    for (const name of fs.readdirSync(nativeModules)) {
+      if (!name.startsWith(".") || name === ".bin")
+        fs.symlinkSync(fs.realpathSync(path.join(nativeModules, name)), path.join(modules, name));
+    }
     return {
       main,
       wt,
-      run: (args, cwd = wt) => spawnSync(shim, args, { cwd, encoding: "utf8" }),
+      run: (args, cwd = wt) =>
+        spawnSync(shim, args, {
+          cwd,
+          encoding: "utf8",
+          env: { ...process.env, XDG_STATE_HOME: state },
+        }),
       native: (args, cwd = main) =>
-        spawnSync(path.join(main, "node_modules/.bin/vp"), args, { cwd, encoding: "utf8" }),
+        spawnSync(path.join(main, "node_modules/.bin/vp"), args, {
+          cwd,
+          encoding: "utf8",
+          env: { ...process.env, XDG_STATE_HOME: state },
+        }),
     };
   }
   fs.mkdirSync(path.join(main, "node_modules/.bin"), { recursive: true });
@@ -76,6 +94,7 @@ function fixture(t, nativeModules) {
     [binding]: { os: [os.platform()], cpu: [os.arch()] },
     "@fixture/lint": { exports: { "./rules": "./index.js" } },
     yaml: {},
+    rolldown: { type: "module", exports: "./index.js" },
   })) {
     const dir = path.join(main, "node_modules", name);
     fs.mkdirSync(dir, { recursive: true });
@@ -91,14 +110,23 @@ function fixture(t, nativeModules) {
   fs.writeFileSync(
     path.join(main, "node_modules/vite-plus/index.js"),
     `
-    export async function loadConfigFromFile() {
-      return { dependencies: [], config: {
-        fmt: { ignorePatterns: ["dist/**"], overrides: [{files:["src/**"],options:{semi:false}}] },
-        lint: { ignorePatterns: ["dist/**"], jsPlugins: ["@fixture/lint/rules"] }
-      }};
+    import { pathToFileURL } from "node:url";
+    export async function loadConfigFromFile(_, file) {
+      return { dependencies: [], config: (await import(pathToFileURL(file))).default };
     }
   `,
   );
+  fs.writeFileSync(
+    path.join(main, "node_modules/rolldown/index.js"),
+    `
+    export async function rolldown(options) {
+      return { async generate() { for (const p of options.plugins) p.load(options.input); }, async close() {} };
+    }
+  `,
+  );
+
+  fs.mkdirSync(path.join(main, "node_modules/vite-plus/bin"));
+  fs.writeFileSync(path.join(main, "node_modules/vite-plus/bin/vp"), "fixture");
   const fake = path.join(main, "node_modules/.bin/vp");
   fs.writeFileSync(
     fake,
@@ -112,7 +140,11 @@ function fixture(t, nativeModules) {
     { mode: 0o755 },
   );
   function run(args, cwd = wt, env = {}) {
-    return spawnSync(shim, args, { cwd, encoding: "utf8", env: { ...process.env, ...env } });
+    return spawnSync(shim, args, {
+      cwd,
+      encoding: "utf8",
+      env: { ...process.env, XDG_STATE_HOME: state, ...env },
+    });
   }
   function routed(args, cwd = wt) {
     const r = run(args, cwd);
@@ -124,7 +156,7 @@ function fixture(t, nativeModules) {
     assert.equal(fs.existsSync(result.args[2]), false, "temporary config cleaned up");
     return result;
   }
-  return { main, wt, run, routed, fake };
+  return { main, wt, run, routed, fake, state };
 }
 
 test("fmt uses worktree-root patterns; lint uses main cwd and absolute paths", (t) => {
@@ -473,10 +505,9 @@ for (const row of selectionCases) {
   );
 }
 
-test("config drift, addition and deletion all refuse without running vp", (t) => {
+test("worktree config and ignore additions/deletions no longer require copy equality", (t) => {
   const f = fixture(t);
   for (const name of [
-    "vite.config.ts",
     ".oxfmtrc.json",
     ".oxlintrc.json",
     "oxlint.config.ts",
@@ -485,17 +516,38 @@ test("config drift, addition and deletion all refuse without running vp", (t) =>
     ".eslintignore",
   ]) {
     const file = path.join(f.wt, name);
-    const before = fs.existsSync(file) ? fs.readFileSync(file) : null;
     fs.writeFileSync(file, "different\n");
-    const r = f.run(["fmt", "a.ts"]);
-    assert.equal(r.status, 127);
-    assert.match(r.stderr, /config drift.*offbox run -- vp fmt/);
-    assert.equal(r.stdout, "");
-    if (before) fs.writeFileSync(file, before);
-    else fs.unlinkSync(file);
+    f.routed(["fmt", "a.ts"]);
+    fs.unlinkSync(file);
+    f.routed(["fmt", "a.ts"]);
   }
+  fs.writeFileSync(
+    path.join(f.wt, "vite.config.ts"),
+    "export default {fmt:{printWidth:40},lint:{}};",
+  );
+  assert.equal(f.routed(["fmt", "a.ts"]).config.printWidth, 40);
+  fs.writeFileSync(path.join(f.wt, "vite.config.ts"), "invalid config");
+  const invalid = f.run(["fmt", "a.ts"]);
+  assert.equal(invalid.status, 127);
+  assert.match(invalid.stderr, /offbox run -- vp fmt/);
+  assert.equal(invalid.stdout, "");
   fs.unlinkSync(path.join(f.wt, "vite.config.ts"));
-  assert.match(f.run(["lint", "a.ts"]).stderr, /config drift/);
+  const missing = f.run(["lint", "a.ts"]);
+  assert.equal(missing.status, 127);
+  assert.match(missing.stderr, /vite.config.ts.*offbox run -- vp lint/);
+  assert.equal(missing.stdout, "");
+});
+
+test("missing package in the worktree config refuses without running vp or loading main config", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(
+    path.join(f.wt, "vite.config.ts"),
+    'import "worktree-only-missing-package"; export default {fmt:{},lint:{}};',
+  );
+  const result = f.run(["fmt", "a.ts"]);
+  assert.equal(result.status, 127);
+  assert.match(result.stderr, /worktree-only-missing-package.*offbox run -- vp fmt/);
+  assert.equal(result.stdout, "");
 });
 
 test("unrelated lockfile and package.json edits still reroute fmt and lint", (t) => {
@@ -605,7 +657,7 @@ test("npm aliases and nested peer contexts resolve the selected snapshot", (t) =
   f.routed(["fmt", "a.ts"]);
 });
 
-test("drift in local plugin helpers refuses as well", (t) => {
+test("unused local plugin helper drift does not block the worktree config", (t) => {
   const f = fixture(t);
   for (const dir of [f.wt, f.main]) {
     fs.mkdirSync(path.join(dir, "oxlint-plugin-t3code/rules"), { recursive: true });
@@ -613,16 +665,15 @@ test("drift in local plugin helpers refuses as well", (t) => {
   }
   assert.equal(f.run(["lint", "a.ts"]).status, 0);
   fs.appendFileSync(path.join(f.wt, "oxlint-plugin-t3code/rules/helper.ts"), "changed\n");
-  assert.match(
-    f.run(["lint", "a.ts"]).stderr,
-    /config drift in oxlint-plugin-t3code\/rules\/helper.ts/,
-  );
+  f.routed(["lint", "a.ts"]);
 });
 
 test("unsafe or ambiguous argument forms refuse with an offbox hint", (t) => {
   const f = fixture(t);
   fs.symlinkSync(f.main, path.join(f.wt, "outside"));
   for (const args of [
+    ["--candidate=toolchain copy", f.main, "fmt"],
+    ["--candidate=main checkout", f.main, "fmt"],
     ["test", "a.test.ts"],
     ["check", "a.ts"],
     ["i"],
@@ -644,6 +695,8 @@ test("unsafe or ambiguous argument forms refuse with an offbox hint", (t) => {
 test("local vp wins, preserves cwd, argv, and exit status", (t) => {
   const f = fixture(t);
   fs.mkdirSync(path.join(f.wt, "node_modules/.bin"), { recursive: true });
+  fs.mkdirSync(path.join(f.wt, "node_modules/vite-plus/bin"), { recursive: true });
+  fs.writeFileSync(path.join(f.wt, "node_modules/vite-plus/bin/vp"), "fixture");
   fs.copyFileSync(f.fake, path.join(f.wt, "node_modules/.bin/vp"));
   const nested = path.join(f.wt, "src");
   fs.mkdirSync(nested);
@@ -673,7 +726,684 @@ test("runs with only a minimal PATH and HOME", (t) => {
   const r = spawnSync(shim, ["fmt", "a.ts"], {
     cwd: f.wt,
     encoding: "utf8",
-    env: { HOME: path.dirname(f.main), PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin` },
+    env: {
+      XDG_STATE_HOME: f.state,
+      HOME: path.dirname(f.main),
+      PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
+    },
   });
   assert.equal(r.status, 0, r.stderr);
+});
+
+function fixtureGit(dir, ...args) {
+  const result = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+function toolchainFixture(t) {
+  const f = fixture(t);
+  const copy = path.join(path.dirname(f.main), "toolchain copy");
+  fixtureGit(f.main, "update-ref", "refs/remotes/origin/main", "HEAD");
+  fixtureGit(f.main, "worktree", "add", "-q", "--detach", copy, "origin/main");
+  fs.cpSync(path.join(f.main, "node_modules"), path.join(copy, "node_modules"), {
+    recursive: true,
+  });
+  fixtureGit(f.main, "config", "vp.toolchain", copy);
+  const lock = path.join(fixtureGit(copy, "rev-parse", "--absolute-git-dir"), "vp-sync.lock");
+  const cli = (...args) =>
+    spawnSync(maintenance, args, { cwd: f.wt, encoding: "utf8", timeout: 10000 });
+  return { ...f, copy, lock, cli };
+}
+
+function newerConfig(f) {
+  const original = fs.readFileSync(path.join(f.wt, "vite.config.ts"));
+  fs.writeFileSync(path.join(f.copy, "vite.config.ts"), "old config\n");
+  fixtureGit(f.copy, "add", "vite.config.ts");
+  fixtureGit(
+    f.copy,
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.invalid",
+    "commit",
+    "-qm",
+    "old config",
+  );
+  const old = fixtureGit(f.copy, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(f.copy, "vite.config.ts"), original);
+  fixtureGit(f.copy, "add", "vite.config.ts");
+  fixtureGit(
+    f.copy,
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.invalid",
+    "commit",
+    "-qm",
+    "fixed config",
+  );
+  const target = fixtureGit(f.copy, "rev-parse", "HEAD");
+  fixtureGit(f.main, "update-ref", "refs/remotes/origin/main", target);
+  fixtureGit(f.copy, "checkout", "-q", "--detach", old);
+  return { old, target };
+}
+
+test("matching toolchain copy wins over drifted main for fmt and lint", (t) => {
+  const f = toolchainFixture(t);
+  fs.appendFileSync(path.join(f.main, "vite.config.ts"), "drift\n");
+  for (const command of ["fmt", "lint"]) {
+    const r = f.run([command, "a.ts"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stderr.includes(f.copy), r.stderr);
+    assert.equal(JSON.parse(r.stdout).cwd, command === "fmt" ? f.wt : f.copy);
+  }
+  assert.match(fs.readFileSync(path.join(f.main, "vite.config.ts"), "utf8"), /drift/);
+});
+
+test("shim syncs stale toolchain to local origin/main without touching dependencies or main", (t) => {
+  const f = toolchainFixture(t);
+  const { target } = newerConfig(f);
+  const mainHead = fixtureGit(f.main, "rev-parse", "HEAD");
+  fs.appendFileSync(path.join(f.main, "vite.config.ts"), "owner drift\n");
+  const vpBefore = fs.readFileSync(path.join(f.copy, "node_modules/.bin/vp"));
+  const r = f.run(["fmt", "a.ts"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.stderr.includes(f.copy));
+  assert.equal(fixtureGit(f.copy, "rev-parse", "HEAD"), target);
+  assert.equal(fixtureGit(f.main, "rev-parse", "HEAD"), mainHead);
+  assert.match(fs.readFileSync(path.join(f.main, "vite.config.ts"), "utf8"), /owner drift/);
+  assert.deepEqual(fs.readFileSync(path.join(f.copy, "node_modules/.bin/vp")), vpBefore);
+  assert.equal(fs.existsSync(f.lock), false);
+});
+
+for (const mainDrift of [false, true]) {
+  test(`held sync lock never waits; main drift=${mainDrift}`, (t) => {
+    const f = toolchainFixture(t);
+    const { old } = newerConfig(f);
+    fs.mkdirSync(f.lock);
+    if (mainDrift) fs.appendFileSync(path.join(f.main, "vite.config.ts"), "drift\n");
+    const r = f.run(["fmt", "a.ts"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(fixtureGit(f.copy, "rev-parse", "HEAD"), old);
+    assert.equal(fs.existsSync(f.lock), true);
+    assert.equal(JSON.parse(r.stdout).cwd, f.wt);
+  });
+}
+
+test("sync reclaims an empty lock older than 60 seconds", (t) => {
+  const f = toolchainFixture(t);
+  const { target } = newerConfig(f);
+  fs.mkdirSync(f.lock);
+  const old = new Date(Date.now() - 61000);
+  fs.utimesSync(f.lock, old, old);
+  const r = f.run(["lint", "a.ts"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fixtureGit(f.copy, "rev-parse", "HEAD"), target);
+  assert.equal(fs.existsSync(f.lock), false);
+});
+
+test("stale versions and main drift report both reasons and maintenance hint", (t) => {
+  const f = toolchainFixture(t);
+  const lock = fixtureLock();
+  lock.importers["."].devDependencies["vite-plus"].version = "2.0.0";
+  fs.writeFileSync(path.join(f.wt, "pnpm-lock.yaml"), JSON.stringify(lock));
+  fs.appendFileSync(path.join(f.main, "vite.config.ts"), "drift\n");
+  const r = f.run(["fmt", "a.ts"]);
+  assert.equal(r.status, 127);
+  assert.match(
+    r.stderr,
+    /toolchain copy.*vite-plus.*2.0.0 vs 1.0.0.*main checkout.*vite-plus.*2.0.0 vs 1.0.0/,
+  );
+  assert.match(r.stderr, /toolchain sync --install/);
+  assert.match(r.stderr, /offbox local.*vp toolchain copy.*30m/);
+  assert.match(r.stderr, /offbox run -- vp fmt/);
+});
+
+for (const kind of ["unset", "missing", "no vp", "self", "self symlink"]) {
+  test(`candidate ${kind} preserves main fallback`, (t) => {
+    const f = fixture(t);
+    let candidate = path.join(path.dirname(f.main), "missing");
+    if (kind === "no vp") fs.mkdirSync(candidate);
+    if (kind === "self") candidate = f.wt;
+    if (kind === "self symlink") fs.symlinkSync(f.wt, candidate);
+    if (kind !== "unset") fixtureGit(f.main, "config", "vp.toolchain", candidate);
+    f.routed(["fmt", "a.ts"]);
+    f.routed(["lint", "a.ts"]);
+  });
+}
+
+test("copy config dependencies are irrelevant when the worktree config loads", (t) => {
+  const f = toolchainFixture(t);
+  fs.mkdirSync(path.join(f.copy, "oxlint-local"));
+  fs.writeFileSync(path.join(f.copy, "oxlint-local/helper.ts"), "different");
+  const r = f.run(["lint", "a.ts"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).cwd, f.copy);
+});
+
+test("config pointing at main never syncs or changes its branch or files", (t) => {
+  const f = toolchainFixture(t);
+  const { target } = newerConfig(f);
+  fixtureGit(f.main, "config", "vp.toolchain", f.main);
+  const head = fixtureGit(f.main, "rev-parse", "HEAD");
+  assert.notEqual(head, target);
+  f.routed(["fmt", "a.ts"]);
+  assert.equal(fixtureGit(f.main, "rev-parse", "HEAD"), head);
+  assert.notEqual(fixtureGit(f.main, "symbolic-ref", "HEAD"), "");
+});
+
+test("status reports HEAD, local ref, version match and dependency size", (t) => {
+  const f = toolchainFixture(t);
+  let r = f.cli("status");
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.stdout.includes(`path: ${f.copy}`));
+  assert.match(r.stdout, /current: yes/);
+  assert.match(r.stdout, /toolchain match: yes/);
+  assert.match(r.stdout, /node_modules/);
+  fs.rmSync(path.join(f.copy, "node_modules"), { recursive: true });
+  r = f.cli("status");
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /toolchain match: no/);
+  assert.match(r.stdout, /node_modules: missing/);
+});
+
+test("explicit sync fetches and checks out without installing missing dependencies", (t) => {
+  const f = toolchainFixture(t);
+  const { target } = newerConfig(f);
+  const bare = path.join(path.dirname(f.main), "origin.git");
+  fixtureGit(f.main, "init", "-q", "--bare", bare);
+  fixtureGit(f.main, "remote", "add", "origin", bare);
+  fixtureGit(f.main, "push", "-q", "origin", `${target}:refs/heads/main`);
+  fs.rmSync(path.join(f.copy, "node_modules"), { recursive: true });
+  const r = f.cli("sync");
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fixtureGit(f.copy, "rev-parse", "HEAD"), target);
+  assert.equal(fs.existsSync(path.join(f.copy, "node_modules")), false);
+  assert.match(r.stdout, /synced/);
+});
+
+test("maintenance command rejects unset config and invalid arguments", (t) => {
+  const f = fixture(t);
+  for (const args of [["status"], ["sync"], ["sync", "--bad"], ["status", "extra"]]) {
+    const r = spawnSync(maintenance, args, { cwd: f.wt, encoding: "utf8" });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /unset|usage:/);
+  }
+});
+
+for (const state of ["matching", "missing", "wrong version"]) {
+  test(`local JS plugin runtime dependencies: ${state}`, (t) => {
+    const f = toolchainFixture(t);
+    const lock = fixtureLock();
+    lock.importers["oxlint-local"] = { dependencies: { "fixture-runtime": { version: "1.0.0" } } };
+    lock.snapshots["fixture-runtime@1.0.0"] = {};
+    for (const dir of [f.wt, f.main, f.copy]) {
+      fs.mkdirSync(path.join(dir, "oxlint-local"));
+      fs.writeFileSync(path.join(dir, "oxlint-local/package.json"), "{}");
+      fs.writeFileSync(path.join(dir, "oxlint-local/index.ts"), "export {};\n");
+      fs.writeFileSync(path.join(dir, "pnpm-lock.yaml"), JSON.stringify(lock));
+    }
+    for (const dir of [f.wt, f.main, f.copy])
+      fs.writeFileSync(
+        path.join(dir, "vite.config.ts"),
+        'export default {lint:{jsPlugins:["./oxlint-local/index.ts"]}};',
+      );
+    for (const dir of [f.main, f.copy]) {
+      const pkg = path.join(dir, "node_modules/fixture-runtime");
+      if (dir === f.copy && state === "missing") continue;
+      fs.mkdirSync(pkg);
+      fs.writeFileSync(
+        path.join(pkg, "package.json"),
+        JSON.stringify({
+          name: "fixture-runtime",
+          version: dir === f.copy && state === "wrong version" ? "2.0.0" : "1.0.0",
+        }),
+      );
+    }
+    fs.appendFileSync(path.join(f.main, "vite.config.ts"), "drift\n");
+    const r = f.run(["lint", "a.ts"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stderr.includes(state === "matching" ? f.copy : f.main));
+    if (state !== "matching") {
+      fs.rmSync(path.join(f.main, "node_modules/fixture-runtime"), { recursive: true });
+      const refused = f.run(["lint", "a.ts"]);
+      assert.equal(refused.status, 127, refused.stderr);
+      assert.match(refused.stderr, /fixture-runtime.*toolchain sync --install/);
+      assert.match(refused.stderr, /main checkout.*fixture-runtime/);
+    }
+  });
+}
+
+test("automatic sync never runs checkout hooks", (t) => {
+  const f = toolchainFixture(t);
+  const { target } = newerConfig(f);
+  const hooks = path.join(path.dirname(f.main), "hooks");
+  const marker = path.join(hooks, "called");
+  fs.mkdirSync(hooks);
+  fs.writeFileSync(path.join(hooks, "post-checkout"), `#!/bin/sh\ntouch '${marker}'\n`, {
+    mode: 0o755,
+  });
+  fixtureGit(f.main, "config", "core.hooksPath", hooks);
+  const r = f.run(["fmt", "a.ts"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fixtureGit(f.copy, "rev-parse", "HEAD"), target);
+  assert.equal(fs.existsSync(marker), false);
+});
+
+const nativeConfigTest = {
+  skip:
+    !process.env.VP_TEST_NODE_MODULES &&
+    "set VP_TEST_NODE_MODULES to the pinned checkout's node_modules",
+};
+function writeConfig(base, config) {
+  fs.writeFileSync(
+    path.join(base, "vite.config.ts"),
+    `export default ${JSON.stringify(config)};\n`,
+  );
+}
+function writeRule(base, name, message) {
+  const dir = path.join(base, "oxlint-local");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "package.json"), '{"type":"module"}');
+  fs.writeFileSync(
+    path.join(dir, `${name}.ts`),
+    `export default {create(context) {return {DebuggerStatement(node) {context.report({node, message: ${JSON.stringify(message)}});}};}};`,
+  );
+  fs.writeFileSync(
+    path.join(dir, "index.ts"),
+    `import rule from "./${name}.ts"; export default {meta:{name:"worktree"},rules:{${JSON.stringify(name)}:rule}};`,
+  );
+}
+
+test(
+  "native: lagging plugin index and rule list use worktree rules for fmt and lint",
+  nativeConfigTest,
+  (t) => {
+    const f = fixture(t, process.env.VP_TEST_NODE_MODULES);
+    writeRule(f.main, "copy-only", "COPY ONLY RULE");
+    writeConfig(f.main, {
+      fmt: {},
+      lint: { jsPlugins: ["./oxlint-local/index.ts"], rules: { "worktree/copy-only": "error" } },
+    });
+    writeRule(f.wt, "old-rule", "OLD WORKTREE RULE");
+    writeConfig(f.wt, {
+      fmt: {},
+      lint: { jsPlugins: ["./oxlint-local/index.ts"], rules: { "worktree/old-rule": "off" } },
+    });
+    const file = path.join(f.wt, "sample.ts");
+    fs.writeFileSync(file, "export const value={a:1}\n");
+    const bad = f.run(["fmt", "--check", "sample.ts"]);
+    assert.equal(bad.status, 1, bad.stdout + bad.stderr);
+    const fixed = f.run(["fmt", "--write", "sample.ts"]);
+    assert.equal(fixed.status, 0, fixed.stdout + fixed.stderr);
+    assert.equal(fs.readFileSync(file, "utf8"), "export const value = { a: 1 };\n");
+    const clean = f.run(["fmt", "--check", "sample.ts"]);
+    assert.equal(clean.status, 0, clean.stdout + clean.stderr);
+    fs.writeFileSync(file, "debugger;\n");
+    const lint = f.run(["lint", "sample.ts"]);
+    assert.equal(lint.status, 0, lint.stdout + lint.stderr);
+    assert.doesNotMatch(lint.stdout + lint.stderr, /COPY ONLY RULE/);
+  },
+);
+
+test("native: newly added worktree plugin and its imported rule execute", nativeConfigTest, (t) => {
+  const f = fixture(t, process.env.VP_TEST_NODE_MODULES);
+  writeRule(f.wt, "new-rule", "NEW WORKTREE RULE EXECUTED");
+  writeConfig(f.wt, {
+    fmt: {},
+    lint: { jsPlugins: ["./oxlint-local/index.ts"], rules: { "worktree/new-rule": "error" } },
+  });
+  fs.writeFileSync(path.join(f.wt, "sample.ts"), "debugger;\n");
+  const lint = f.run(["lint", "sample.ts"]);
+  assert.equal(lint.status, 1, lint.stdout + lint.stderr);
+  assert.match(lint.stdout + lint.stderr, /NEW WORKTREE RULE EXECUTED/);
+  assert.match(lint.stdout + lint.stderr, /worktree\(new-rule\)/);
+});
+
+test("native: worktree fmt settings and imported helper win over copy", nativeConfigTest, (t) => {
+  const f = fixture(t, process.env.VP_TEST_NODE_MODULES);
+  for (const base of [f.main, f.wt]) {
+    fs.mkdirSync(path.join(base, "config"));
+    fs.writeFileSync(
+      path.join(base, "config/fmt.ts"),
+      `import { defineConfig } from "vite-plus"; export default defineConfig({fmt:{semi:${base === f.main}}}).fmt;`,
+    );
+    fs.writeFileSync(
+      path.join(base, "vite.config.ts"),
+      'import fmt from "./config/fmt.ts"; export default {fmt,lint:{}};',
+    );
+  }
+  fs.writeFileSync(path.join(f.wt, "sample.ts"), "export const value = 1;\n");
+  const result = f.run(["fmt", "--write", "sample.ts"]);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(fs.readFileSync(path.join(f.wt, "sample.ts"), "utf8"), "export const value = 1\n");
+});
+
+test(
+  "native: missing package in imported worktree helper refuses with no format write",
+  nativeConfigTest,
+  (t) => {
+    const f = fixture(t, process.env.VP_TEST_NODE_MODULES);
+    fs.writeFileSync(
+      path.join(f.wt, "helper.ts"),
+      'import "worktree-only-missing-package"; export default {};',
+    );
+    fs.writeFileSync(
+      path.join(f.wt, "vite.config.ts"),
+      'import fmt from "./helper.ts"; export default {fmt};',
+    );
+    const body = "export const value={a:1}\n";
+    fs.writeFileSync(path.join(f.wt, "sample.ts"), body);
+    const result = f.run(["fmt", "--write", "sample.ts"]);
+    assert.equal(result.status, 127, result.stdout + result.stderr);
+    assert.match(result.stderr, /worktree-only-missing-package/);
+    assert.match(result.stderr, /offbox run -- vp fmt/);
+    assert.equal(fs.readFileSync(path.join(f.wt, "sample.ts"), "utf8"), body);
+  },
+);
+
+for (const form of ["relative", "absolute", "import.meta.url"]) {
+  test(`native: local plugin specifier ${form} uses worktree sources`, nativeConfigTest, (t) => {
+    const f = fixture(t, process.env.VP_TEST_NODE_MODULES);
+    writeRule(f.wt, "new-rule", "WORKTREE SPECIFIER RULE");
+    const plugin =
+      form === "import.meta.url"
+        ? 'new URL("./oxlint-local/index.ts", import.meta.url).pathname'
+        : JSON.stringify(
+            form === "relative"
+              ? "./oxlint-local/index.ts"
+              : path.join(f.wt, "oxlint-local/index.ts"),
+          );
+    fs.writeFileSync(
+      path.join(f.wt, "vite.config.ts"),
+      `export default {lint:{jsPlugins:[${plugin}],rules:{"worktree/new-rule":"error"}}};`,
+    );
+    fs.writeFileSync(path.join(f.wt, "sample.ts"), "debugger;\n");
+    const result = f.run(["lint", "sample.ts"]);
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(result.stdout + result.stderr, /WORKTREE SPECIFIER RULE/);
+    assert.equal(fs.existsSync(path.join(f.wt, "node_modules")), false);
+  });
+}
+
+const localPluginEntries = [
+  { name: "explicit JavaScript file", entry: "index.js", specifier: "index.js" },
+  { name: "extensionless JavaScript file", entry: "index.js", specifier: "index" },
+  { name: "directory index", entry: "index.js", specifier: "" },
+  { name: "directory index with slash", entry: "index.js", specifier: "/" },
+  {
+    name: "directory package main",
+    entry: "dist/entry.js",
+    main: "./dist/entry.js",
+    specifier: "",
+  },
+  {
+    name: "directory extensionless package main",
+    entry: "dist/entry.js",
+    main: "./dist/entry",
+    specifier: "",
+  },
+];
+for (const entry of localPluginEntries) {
+  for (const form of ["relative", "absolute", "import.meta.url"]) {
+    test(`native entry resolution: ${entry.name}, ${form}`, nativeConfigTest, (t) => {
+      const f = fixture(t, process.env.VP_TEST_NODE_MODULES);
+      for (const base of [f.main, f.wt]) {
+        const plugin = path.join(base, "oxlint-local");
+        fs.mkdirSync(path.dirname(path.join(plugin, entry.entry)), { recursive: true });
+        fs.writeFileSync(
+          path.join(plugin, "package.json"),
+          JSON.stringify({ type: "module", ...(entry.main ? { main: entry.main } : {}) }),
+        );
+        fs.writeFileSync(
+          path.join(plugin, entry.entry),
+          'export default {meta:{name:"entry"},rules:{check:{create(context){return {DebuggerStatement(node){context.report({node,message:"ENTRY RULE EXECUTED"});}};}}}};',
+        );
+        const relative = `./oxlint-local${entry.specifier && entry.specifier !== "/" ? "/" : ""}${entry.specifier}`;
+        const specifier =
+          form === "import.meta.url"
+            ? `new URL(${JSON.stringify(relative)}, import.meta.url).pathname`
+            : JSON.stringify(form === "relative" ? relative : path.resolve(base, relative));
+        fs.writeFileSync(
+          path.join(base, "vite.config.ts"),
+          `export default {fmt:{},lint:{jsPlugins:[${specifier}],rules:{"entry/check":"error"}}};`,
+        );
+        fs.writeFileSync(path.join(base, "sample.ts"), "debugger;\n");
+      }
+      const native = f.native(["lint", "sample.ts"]);
+      assert.equal(native.status, 1, native.stdout + native.stderr);
+      assert.match(native.stdout + native.stderr, /ENTRY RULE EXECUTED/);
+      const routed = f.run(["lint", "sample.ts"]);
+      assert.equal(routed.status, native.status, routed.stdout + routed.stderr);
+      assert.match(routed.stdout + routed.stderr, /ENTRY RULE EXECUTED/);
+      assert.equal(fs.existsSync(path.join(f.wt, "node_modules")), false);
+    });
+  }
+}
+
+for (const state of ["missing path", "empty directory", "missing package main"]) {
+  test(`unresolved local plugin entry refuses: ${state}`, (t) => {
+    const f = fixture(t);
+    const plugin = path.join(f.wt, "oxlint-local");
+    if (state !== "missing path") fs.mkdirSync(plugin);
+    if (state === "missing package main")
+      fs.writeFileSync(path.join(plugin, "package.json"), '{"main":"./missing.js"}');
+    writeConfig(f.wt, { fmt: {}, lint: { jsPlugins: ["./oxlint-local"] } });
+    for (const command of ["fmt", "lint"]) {
+      const result = f.run([command, "sample.ts"]);
+      assert.equal(result.status, 127, result.stdout + result.stderr);
+      assert.match(result.stderr, /Cannot find module/);
+      assert.match(result.stderr, new RegExp(`offbox run -- vp ${command}`));
+      assert.equal(result.stdout, "");
+    }
+  });
+}
+
+function eventRows(f) {
+  return fs
+    .readFileSync(path.join(f.state, "vp-shim/events.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map(JSON.parse);
+}
+
+function breakToolchain(directory) {
+  fs.rmSync(path.join(directory, "node_modules/vite-plus/bin"), { recursive: true });
+  fs.symlinkSync("missing-store/bin", path.join(directory, "node_modules/vite-plus/bin"));
+}
+
+test("dangling walk-up target falls back to toolchain copy with one outcome row", (t) => {
+  const f = toolchainFixture(t);
+  breakToolchain(f.main);
+  fs.symlinkSync(path.join(f.main, "node_modules"), path.join(f.wt, "node_modules"));
+  const result = f.run(["fmt", "--check", "a.ts"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /skipping local checkout.*vite-plus\/bin\/vp does not resolve/);
+  assert.match(result.stderr, /offbox run -- pnpm install --frozen-lockfile/);
+  assert.equal(JSON.parse(result.stdout).cwd, f.wt);
+  const rows = eventRows(f);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].event, "dangling-toolchain");
+  assert.equal(rows[0].outcome, "ran");
+  assert.equal(rows[0].candidate, "toolchain copy");
+  assert.equal(rows[0].exitCode, 0);
+  assert.equal(rows[0].cwd, f.wt);
+  assert.equal(rows[0].skipped[0].reason, "dangling-vite-plus");
+  assert.equal(rows[0].reasons[0].diagnosis, null);
+  assert.equal(fs.statSync(path.join(f.state, "vp-shim/events.jsonl")).mode & 0o777, 0o600);
+});
+
+test("all candidate targets dangling refuses clearly and logs every skip", (t) => {
+  const f = toolchainFixture(t);
+  breakToolchain(f.main);
+  breakToolchain(f.copy);
+  const result = f.run(["fmt", "--check", "a.ts"]);
+  assert.equal(result.status, 127);
+  assert.match(result.stderr, /skipping toolchain copy/);
+  assert.match(result.stderr, /skipping main checkout/);
+  assert.match(result.stderr, /run offbox run -- vp fmt/);
+  const [row] = eventRows(f);
+  assert.equal(row.outcome, "refused");
+  assert.equal(row.candidate, null);
+  assert.equal(row.exitCode, 127);
+  assert.equal(row.skipped.length, 2);
+});
+
+test("logs child failures and refusals without argv, rotates, and tolerates unwritable state", (t) => {
+  const f = fixture(t);
+  assert.equal(f.run(["fmt", "private-file.ts"], f.wt, { FAKE_EXIT: "23" }).status, 23);
+  const [row] = eventRows(f);
+  assert.equal(row.outcome, "ran");
+  assert.equal(row.exitCode, 23);
+  assert.equal(row.command, "fmt");
+  assert.ok(!JSON.stringify(row).includes("private-file"));
+  assert.ok(row.durationMs >= 0);
+  assert.equal(f.run(["test", "private-argument"]).status, 127);
+  assert.equal(eventRows(f).at(-1).outcome, "refused");
+  f.run(["fmt", "a.ts"], f.wt, { VP_SHIM_LOG_MAX_BYTES: "1" });
+  assert.ok(fs.existsSync(path.join(f.state, "vp-shim/events.jsonl.1")));
+  const blocked = path.join(f.state, "file");
+  fs.writeFileSync(blocked, "file");
+  const result = f.run(["fmt", "a.ts"], f.wt, { XDG_STATE_HOME: blocked, FAKE_EXIT: "19" });
+  assert.equal(result.status, 19);
+  assert.ok(!result.stderr.includes("EEXIST"));
+});
+
+test(
+  "native: dangling main fallback formats a dependencyless worktree's own Vite config",
+  { skip: !process.env.VP_TEST_NODE_MODULES },
+  (t) => {
+    const f = fixture(t, process.env.VP_TEST_NODE_MODULES);
+    const copy = path.join(path.dirname(f.main), "native-toolchain");
+    fixtureGit(f.main, "update-ref", "refs/remotes/origin/main", "HEAD");
+    fixtureGit(f.main, "worktree", "add", "-q", "--detach", copy, "origin/main");
+    fs.symlinkSync(process.env.VP_TEST_NODE_MODULES, path.join(copy, "node_modules"));
+    fixtureGit(f.main, "config", "vp.toolchain", copy);
+    fs.unlinkSync(path.join(f.main, "node_modules/vite-plus"));
+    fs.symlinkSync("missing-store/vite-plus", path.join(f.main, "node_modules/vite-plus"));
+    fs.writeFileSync(
+      path.join(f.wt, "vite.config.ts"),
+      'import {defineConfig} from "vite-plus"; import {defineProject} from "vite-plus/test/config"; export default defineConfig({fmt:{semi:false},test:defineProject({})});\n',
+    );
+    fs.writeFileSync(path.join(f.wt, "a.ts"), "export const a = 1\n");
+    const result = f.run(["fmt", "--check", "a.ts"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /All matched files use the correct format/);
+    assert.ok(!fs.existsSync(path.join(f.wt, "node_modules")));
+  },
+);
+
+test("direct dispatch and shared-install refusals each log one result", (t) => {
+  const f = fixture(t);
+  assert.equal(f.run(["--version"], f.main, { FAKE_EXIT: "7" }).status, 7);
+  let rows = eventRows(f);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].command, "other");
+  assert.equal(rows[0].candidate, null);
+  assert.equal("selectedPath" in rows[0], false);
+  assert.equal(rows[0].outcome, "ran");
+  assert.equal(rows[0].exitCode, 7);
+  fs.symlinkSync(path.join(f.main, "node_modules"), path.join(f.wt, "node_modules"));
+  assert.equal(f.run(["install"]).status, 1);
+  rows = eventRows(f);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].outcome, "refused");
+  assert.equal(rows[1].exitCode, 1);
+  assert.equal(rows[1].reasons[0].reason, "shared-dependencies");
+});
+
+for (const borrowed of [false, true]) {
+  test(`cancellation forwards SIGTERM and logs 143 (${borrowed ? "borrowed" : "direct"})`, async (t) => {
+    const f = fixture(t);
+    fs.writeFileSync(
+      f.fake,
+      `#!${process.execPath}\nconsole.log(process.pid); setInterval(() => {}, 1000);\n`,
+    );
+    const child = spawn(shim, ["fmt", "a.ts"], {
+      cwd: borrowed ? f.wt : f.main,
+      env: { ...process.env, XDG_STATE_HOME: f.state },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    t.after(() => {
+      if (child.exitCode === null) child.kill("SIGKILL");
+    });
+    let toolPid;
+    await new Promise((resolve, reject) => {
+      let output = "";
+      child.stdout.on("data", (chunk) => {
+        output += chunk;
+        if (output.includes("\n") && !toolPid) {
+          toolPid = Number(output.trim());
+          child.kill("SIGTERM");
+        }
+      });
+      child.on("error", reject);
+      child.on("close", (code) => {
+        try {
+          assert.equal(code, 143);
+          assert.ok(toolPid);
+          assert.throws(() => process.kill(toolPid, 0), { code: "ESRCH" });
+          const rows = eventRows(f);
+          assert.equal(rows.length, 1);
+          assert.equal(rows[0].outcome, "ran");
+          assert.equal(rows[0].exitCode, 143);
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+  });
+}
+
+test("a child signal keeps its shell exit status", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.fake, `#!${process.execPath}\nprocess.kill(process.pid, "SIGTERM");\n`);
+  assert.equal(f.run(["fmt", "a.ts"], f.main).status, 143);
+  assert.equal(eventRows(f)[0].exitCode, 143);
+});
+
+test("cancellation during borrowed config preparation records one refused outcome", async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(
+    path.join(f.wt, "vite.config.ts"),
+    "console.log(`preparing:${process.pid}`); await new Promise(() => setInterval(() => {}, 1000)); export default {fmt:{},lint:{}};\n",
+  );
+  const child = spawn(shim, ["fmt", "a.ts"], {
+    cwd: f.wt,
+    env: { ...process.env, XDG_STATE_HOME: f.state },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(() => {
+    if (child.exitCode === null) child.kill("SIGKILL");
+  });
+  let workerPid;
+  await new Promise((resolve, reject) => {
+    let output = "";
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      const match = output.match(/preparing:(\d+)\n/);
+      if (match && !workerPid) {
+        workerPid = Number(match[1]);
+        child.kill("SIGTERM");
+      }
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      try {
+        assert.equal(code, 143);
+        assert.ok(workerPid);
+        assert.throws(() => process.kill(workerPid, 0), { code: "ESRCH" });
+        const rows = eventRows(f);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].outcome, "refused");
+        assert.equal(rows[0].exitCode, 143);
+        assert.ok(!output.includes('"config":'));
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
 });

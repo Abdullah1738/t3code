@@ -13,7 +13,7 @@ Two sources, unioned:
   - The shared OpenCode service: GET /api/session/active, for OpenCode sessions Robob does not front.
 
 The snapshot is "complete" only when both sources answered in full. A source that is down, returns something
-unreadable, or is truncated (the control API caps a page at 500 and reports the full count in `total`) makes
+unreadable, or cannot be traversed completely through the control API cursors makes
 the snapshot incomplete. The reapers keep everything when it is incomplete: a missing source means "unknown",
 never "idle". Query (b) excludes completed MCP task history while preserving runless native children.
 The reaper reads complete historical activity separately, including archived threads.
@@ -29,6 +29,7 @@ import datetime
 import json
 import math
 import os
+import socket
 import time
 import tempfile
 import urllib.error
@@ -45,6 +46,8 @@ CONTROL_CFGS = tuple(
 )
 # The control API's page cap. A full page is not proof of completeness, so we check `total` too.
 CONTROL_PAGE = 500
+CONTROL_MAX_PAGES = 400
+CONTROL_TRAVERSAL_TIMEOUT = 180
 # How far back a provider-native or delegated child still counts as possibly holding a checkout. The janitor's idle
 # threshold is 60 min; a child idle for two days owns nothing live.
 NATIVE_WINDOW_MS = 48 * 60 * 60 * 1000
@@ -113,28 +116,134 @@ def _control_get(path, timeout=20):
         return 0, str(e)
 
 
-def _control_threads(query, timeout, label):
-    """One thread query as {threadId: summary}, or (None, error). The API has no cursor and caps a page at 500,
-    so a result larger than one page is reported incomplete rather than read partly."""
-    status, body = _control_get(query, timeout)
-    if status == 0 and isinstance(body, str):
-        return None, f"control api {label}: {body}"
-    if status != 200 or not isinstance(body, dict) or body.get("ok") is not True:
-        return None, f"control api {label}: status {status}"
-    threads = body.get("threads")
-    total = body.get("total")
-    if not isinstance(threads, list) or not isinstance(total, int):
-        return None, f"control api {label}: unreadable thread list"
-    if total > len(threads):
-        return None, f"control api {label}: {total} threads, only {len(threads)} returned (truncated)"
-    if total != len(threads) or any(not isinstance(t, dict) or not isinstance(t.get("threadId"), str)
-                                    or not t["threadId"] or t.get("state") not in {"idle", "running", "queued", "waiting", "needs-input"}
-                                    for t in threads):
-        return None, f"control api {label}: malformed roster"
-    mapped = {t["threadId"]: t for t in threads}
-    if len(mapped) != total:
-        return None, f"control api {label}: duplicate thread ids"
-    return mapped, None
+def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_TIMEOUT, stats=None):
+    """Complete cursor walk plus one catch-up, or (None, reason); never publish a partial roster.
+
+    Old servers without nextCursor retain the single-page completeness checks.
+    Short coverage retries once; all attempts share the deadline and page budget.
+    """
+    started = time.monotonic()
+    counts = {'pages': 0, 'rows': 0, 'catch_up_pages': 0, 'catch_up_rows': 0, 'retried': False}
+    phase = 'walk'
+
+    def record_total(key, total):
+        seen = counts.setdefault(key, {'first': total, 'last': total, 'min': total, 'max': total})
+        seen.update(last=total, min=min(seen['min'], total), max=max(seen['max'], total))
+
+    def check_deadline():
+        if time.monotonic() - started >= traversal_timeout:
+            raise ValueError('traversal deadline exceeded')
+
+    def walk(path, legacy_allowed=False):
+        mapped, cursors = {}, set()
+        cursor, total = None, None
+        while True:
+            check_deadline()
+            if counts['pages'] >= CONTROL_MAX_PAGES:
+                raise ValueError(f'page cap exceeded ({CONTROL_MAX_PAGES})')
+            page_path = path + '&' + urllib.parse.urlencode({'cursor': cursor}) if cursor else path
+            status, body = _control_get(page_path, timeout)
+            counts['pages'] += 1
+            if phase == 'catch-up':
+                counts['catch_up_pages'] += 1
+            check_deadline()
+            if status == 0 and isinstance(body, str):
+                raise ValueError(body)
+            if status != 200:
+                raise ValueError(f'status {status}')
+            if not isinstance(body, dict) or body.get('ok') is not True:
+                raise ValueError('malformed response')
+            rows, page_total = body.get('threads'), body.get('total')
+            if not isinstance(rows, list) or type(page_total) is not int or page_total < 0:
+                raise ValueError('unreadable thread list')
+            counts['rows'] += len(rows)
+            if phase == 'catch-up':
+                counts['catch_up_rows'] += len(rows)
+            total = page_total
+            record_total('totals' if phase == 'walk' else 'catch_up_totals', total)
+            legacy = 'nextCursor' not in body
+            if legacy and not (legacy_allowed and cursor is None):
+                raise ValueError('nextCursor missing during traversal')
+            if legacy and total > len(rows):
+                raise ValueError(f'{total} threads, only {len(rows)} returned (truncated)')
+            if (legacy and total != len(rows)) or any(
+                    not isinstance(row, dict) or not isinstance(row.get('threadId'), str)
+                    or not row['threadId'] or row.get('state') not in
+                    ('idle', 'running', 'queued', 'waiting', 'needs-input') for row in rows):
+                raise ValueError('malformed roster')
+            for row in rows:
+                tid = row['threadId']
+                if legacy:
+                    mapped[tid] = row
+                    continue
+                # Cursor ordering and duplicate reconciliation require comparable timestamps.
+                try:
+                    stamp = datetime.datetime.fromisoformat(row['updatedAt'].replace('Z', '+00:00'))
+                    if stamp.tzinfo is None:
+                        raise ValueError('timezone missing')
+                    updated = stamp.timestamp()
+                except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+                    raise ValueError('updatedAt unavailable') from None
+                previous = mapped.get(tid)
+                if previous is None or updated >= previous[0]:
+                    mapped[tid] = (updated, row)
+            if legacy:
+                if len(mapped) != total:
+                    raise ValueError('duplicate thread ids')
+                return mapped, total, True
+            cursor = body['nextCursor']
+            if cursor is None:
+                return {tid: value[1] for tid, value in mapped.items()}, total, False
+            if not isinstance(cursor, str) or not cursor:
+                raise ValueError('invalid nextCursor')
+            if cursor in cursors:
+                raise ValueError('repeated cursor')
+            cursors.add(cursor)
+
+    try:
+        for attempt in range(2):
+            phase = 'walk'
+            t0 = int(time.time() * 1000)
+            counts['retried'] = attempt == 1
+            mapped, total, legacy = walk(query, legacy_allowed=attempt == 0)
+            counts['total'] = total
+            catch_up_short = 0
+            if not legacy:
+                # A row updated while walking can jump ahead of our cursor. Read
+                # that interval once more before judging coverage of this attempt.
+                phase = 'catch-up'
+                parts = urllib.parse.urlsplit(query)
+                params = dict(urllib.parse.parse_qsl(parts.query))
+                params.pop('cursor', None)
+                params['updatedSince'] = str(t0 - 5000)
+                catch_query = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(params)))
+                fresh, catch_up_total, _ = walk(catch_query)
+                counts['catch_up_unique_rows'] = len(fresh)
+                catch_up_short = max(0, catch_up_total - len(fresh))
+                mapped.update(fresh)
+            phase = 'catch-up' if catch_up_short else 'completeness'
+            counts['unique_rows'] = len(mapped)
+            check_deadline()
+            # The main roster can contain stale paths for rows missed by catch-up,
+            # and new ids can hide a missing row in the union's count.
+            if catch_up_short:
+                if attempt:
+                    raise ValueError(f'catch-up short by {catch_up_short} after retry')
+                continue
+            # Total can grow through creation or shrink through archive/deletion.
+            # Only coverage against the newest main page proves a count gap.
+            if len(mapped) >= total:
+                return mapped, None
+            if attempt:
+                raise ValueError(f'short by {total - len(mapped)} after retry')
+    except ValueError as exc:
+        reason = f'control api {label}: {exc}'
+        counts.update(error=reason, failure_phase=phase)
+        return None, reason
+    finally:
+        counts['seconds'] = round(time.monotonic() - started, 3)
+        if stats is not None:
+            stats.update(counts)
 
 
 def robob_active(timeout=20, now_ms=None):
@@ -247,30 +356,82 @@ def checked_snapshot(timeout=20):
                         problems=[f"active sessions: {type(exc).__name__}"])
 
 
-def opencode_directories(ids, timeout=20):
-    """Resolve the active service ids through its supported session endpoint."""
+def opencode_directories(ids, timeout=20, *, overall_timeout=300, max_attempts=3, stats=None):
+    """Resolve every active id, with bounded transient retries; never return a partial map."""
+    if not 1 <= max_attempts <= 3:
+        raise ValueError('max_attempts must be between 1 and 3')
+    started = time.monotonic()
+    deadline = started + overall_timeout
+    ids = sorted(ids)
+    counts = dict(attempts=0, opencode_ids=len(ids), resolved=0, seconds=0,
+                  per_id_max_s=0, last_error=None)
     result = {}
-    for sid in ids:
-        try:
-            req = urllib.request.Request(OC_SERVICE_URL.rstrip("/") + "/api/session/" +
-                                         urllib.parse.quote(sid, safe=""))
-            pw = _password()
-            if pw:
-                req.add_header("Authorization", "Basic " + base64.b64encode(f"opencode:{pw}".encode()).decode())
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                data = json.load(response).get("data")
-            if not isinstance(data, dict) or not isinstance((data.get("location") or {}).get("directory", data.get("directory")), str) or not (data.get("location") or {}).get("directory", data.get("directory")):
-                return None, "opencode-service: session directory unavailable"
-            result[sid] = (data.get("location") or {}).get("directory", data.get("directory"))
-        except Exception as exc:
-            return None, f"opencode-service directory: {type(exc).__name__}"
-    return result, None
+    try:
+        for sid in ids:
+            id_started = time.monotonic()
+            attempts = 0
+
+            def reason(cause):
+                elapsed = time.monotonic() - id_started
+                return f"opencode-service directory: {sid[:8]} {cause} after {attempts} attempts, {elapsed:.1f} s"
+
+            try:
+                for attempt in range(max_attempts):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        counts['last_error'] = reason('overall deadline exceeded')
+                        return None, counts['last_error']
+                    attempts += 1
+                    counts['attempts'] += 1
+                    try:
+                        body = opencode_get('/api/session/' + urllib.parse.quote(sid, safe=''),
+                                            timeout=min(timeout, remaining))
+                        if time.monotonic() >= deadline:
+                            counts['last_error'] = reason('overall deadline exceeded')
+                            return None, counts['last_error']
+                        data = body.get('data') if isinstance(body, dict) else None
+                        location = data.get('location') if isinstance(data, dict) else None
+                        if location is not None and not isinstance(location, dict):
+                            raise ValueError('session directory unavailable')
+                        directory = (location.get('directory', data.get('directory'))
+                                     if isinstance(location, dict) else data.get('directory')
+                                     if isinstance(data, dict) else None)
+                        if not isinstance(directory, str) or not directory:
+                            raise ValueError('session directory unavailable')
+                        result[sid] = directory
+                        counts['resolved'] += 1
+                        break
+                    except Exception as exc:
+                        # HTTP errors (including 404) and malformed payloads do not
+                        # prove an active session is gone. Only transport failures retry.
+                        transport_error = isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError)
+                        cause = exc.reason if transport_error else exc
+                        label = (f'HTTPError {exc.code}' if isinstance(exc, urllib.error.HTTPError) else
+                                 'session directory unavailable' if isinstance(exc, ValueError) else
+                                 type(cause).__name__ if isinstance(cause, Exception) else type(exc).__name__)
+                        counts['last_error'] = reason(label)
+                        if time.monotonic() >= deadline:
+                            counts['last_error'] = reason(f'overall deadline exceeded ({label})')
+                            return None, counts['last_error']
+                        transient = isinstance(cause, (TimeoutError, socket.timeout, ConnectionError)) or transport_error
+                        if not transient or attempts >= max_attempts:
+                            return None, counts['last_error']
+                        time.sleep(min((2, 5)[attempt], max(0, deadline - time.monotonic())))
+            finally:
+                counts['per_id_max_s'] = max(counts['per_id_max_s'], time.monotonic() - id_started)
+        return result, None
+    finally:
+        counts['seconds'] = round(time.monotonic() - started, 3)
+        counts['per_id_max_s'] = round(counts['per_id_max_s'], 3)
+        if stats is not None:
+            stats.update(counts)
 
 
-def directories(snap):
+def directories(snap, timeout=20, *, overall_timeout=300, max_attempts=3, stats=None):
     if not snap["complete"]:
         return None, "; ".join(snap["problems"]) or "active set incomplete"
-    oc, err = opencode_directories(snap["opencode"])
+    oc, err = opencode_directories(snap["opencode"], timeout=timeout, overall_timeout=overall_timeout,
+                                  max_attempts=max_attempts, stats=stats)
     if err:
         return None, err
     return {**oc, **{"thread:" + tid: path for tid, path in snap["workspaces"].items()}}, None
@@ -383,17 +544,29 @@ def session_history(cache_path=None, write_cache=False, now=None):
         return None, {}, f'opencode history: {type(exc).__name__}: {exc}'
 
 
-def project_activity(project_id, root, since_ms):
-    """Recent history for one project, including archived threads. A cap only disables that repo's reaping."""
+def project_activity(project_id, root, since_ms, stats=None, *, traversal_timeout=CONTROL_TRAVERSAL_TIMEOUT):
+    """Complete recent live and archived history; a failed read only disables this repo's reaping."""
+    started = time.monotonic()
     activity = {}
+    stats = {} if stats is None else stats
+    stats.update(pages=0, rows=0, archived_rows=0, catch_up_rows=0, seconds=0, listings={})
     for archived in (False, True):
         query = {'projectId': project_id, 'includeSubagents': 'true', 'updatedSince': since_ms,
                  'limit': CONTROL_PAGE}
         if archived:
             query['archived'] = 'true'
+        listing = {}
         threads, err = _control_threads('/threads?' + urllib.parse.urlencode(query), NATIVE_TIMEOUT,
-                                        f'history {project_id} archived={archived}')
+                                        f'history {project_id} archived={archived}',
+                                        traversal_timeout=traversal_timeout, stats=listing)
+        stats['listings'][str(archived).lower()] = listing
+        for key in ('pages', 'rows', 'catch_up_rows'):
+            stats[key] += listing.get(key, 0)
+        if archived:
+            stats['archived_rows'] += listing.get('rows', 0)
+        stats['seconds'] = round(time.monotonic() - started, 3)
         if err:
+            stats['error'] = err
             return None, err
         for thread in threads.values():
             path = thread.get('worktreePath') or root
@@ -402,8 +575,10 @@ def project_activity(project_id, root, since_ms):
                 updated = max(datetime.datetime.fromisoformat(t.replace('Z', '+00:00')).timestamp()
                               for t in stamps if t is not None)
             except (ValueError, TypeError):
-                return None, 'control history: updatedAt unavailable'
+                stats['error'] = 'control history: updatedAt unavailable'
+                return None, stats['error']
             activity[path.rstrip('/')] = max(activity.get(path.rstrip('/'), 0), updated)
+    stats['seconds'] = round(time.monotonic() - started, 3)
     return activity, None
 
 

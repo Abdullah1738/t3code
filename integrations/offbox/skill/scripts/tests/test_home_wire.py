@@ -61,6 +61,7 @@ class Wire(Isolated):
     def test_the_retry_flag_reaches_the_server_only_when_asked(self):
         box = self.srv.make_box("ardud")
         a = api.cmd_start(box, "make test", meta={"repo": "r", "kind": "make test", "run_id": "run-1"}, retry_interrupted=True)
+        self.end(box, a['processId'], 0)
         b = api.cmd_start(box, "make deploy")
         rows = {r["pid"]: r for r in self.srv.con.execute("SELECT * FROM commands WHERE box_id=?", (box,))}
         self.assertEqual((rows[a["processId"]]["retry_interrupted"], rows[b["processId"]]["retry_interrupted"]), (1, 0))
@@ -127,7 +128,12 @@ class Wire(Isolated):
                     boatd.reconcile(self.srv.con)
                 status=api.cmd_status(box,pid)
                 if name!='recovered':
-                    self.assertIsNone(status['metrics'])
+                    if name == 'interrupted':
+                        self.assertEqual(status['metrics']['interruption']['cleanup'], 'clean')
+                        self.assertNotIn('wall_s', status['metrics'])
+                    else:
+                        self.assertEqual(status['metrics']['kill']['cleanup'], 'clean')
+                        self.assertNotIn('wall_s', status['metrics'])
                     self.assertEqual(status['endedAt'],boatd.iso(3710))
                 # Both existing response paths must retain only an observed execution duration.
                 self.assertEqual(api.command_execution_ms(box,pid,f'cmd_{pid}'),duration)
@@ -178,6 +184,49 @@ class Wire(Isolated):
                                  runs.STEP_RESULT.findall(second)])
                 row = misc._run_row(run_id)
                 self.assertEqual(row['status'], 'infra' if expected == 90 else 'done' if expected == 0 else 'failed')
+
+    def test_three_step_run_stream_drop_mid_step_reattaches_and_keeps_every_result(self):
+        real_attach=api.cmd_attach
+        for final_rc in (0,7):
+            with self.subTest(final_rc=final_rc):
+                box=self.srv.box(bid=f'bx_d1f8{final_rc:04d}')
+                pid=self.srv.cmd(box)
+                run_id=f'run-d1f8-{final_rc}'
+                self.srv.con.execute('UPDATE commands SET run_id=? WHERE box_id=? AND pid=?',(run_id,box,pid))
+                err_file=boatd.cmd_dir(box)/f'{pid}.err'
+                err_file.write_text('offbox step 1 rc=0: first\noffbox step 2 rc=0: second\n'
+                                    'Error: Lost connection to the event listener: websocket: close 1006\n')
+                c=boatd.cmd_row(self.srv.con,box,pid)
+                result=dict(attempt=1,started_at=c['started_at'],interruption=boatd.interruption(c,'exec_stream_lost'))
+                self.assertEqual(boatd.settle_transport(self.srv.con,c,result,
+                    view=dict(readable=True,pids=[101215],box_rc=None)),'following')
+                self.con.execute("INSERT INTO runs(run_id,box_id,command_id,process_id,status,mode,pulls,step_count) "
+                                 "VALUES (?,?,?,?,'running','bg','[]',3)",(run_id,box,f'cmd_{pid}',pid))
+                self.con.commit()
+                path=common.LOGS_DIR/f'{run_id}.log'
+                reattached=[]
+                def attach(*args,**kwargs):
+                    for frame in real_attach(*args,**kwargs):
+                        yield frame
+                        if frame.get('type')=='stderr' and 're-attached' in frame.get('data','') and not reattached:
+                            self.assertEqual(runs.step_results(path),[(1,0),(2,0)])
+                            self.assertEqual(api.cmd_status(box,pid)['running'],True)
+                            self.assertEqual(boatd.held_runs(self.srv.con,box),[run_id])
+                            reattached.append(True)
+                            with err_file.open('a') as f:
+                                f.write(f'offbox step 3 rc={final_rc}: third\n')
+                            with patch.object(boatd,'command_probe',return_value=dict(readable=True,pids=[],box_rc=final_rc)):
+                                self.assertEqual(boatd.settle_cmd(self.srv.con,boatd.cmd_row(self.srv.con,box,pid)),'finalized')
+                err=io.StringIO()
+                with patch.object(api,'cmd_attach',side_effect=attach),patch.object(lease,'touch'), \
+                     patch.object(lease,'idle_ttl'),patch.object(runs,'settle_docker'), \
+                     contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(err):
+                    self.assertEqual(misc.wait(run_id,None),final_rc)
+                self.assertEqual(reattached,[True])
+                self.assertEqual(runs.step_results(path),[(1,0),(2,0),(3,final_rc)])
+                self.assertEqual(misc._run_row(run_id)['exit_code'],final_rc)
+                self.assertEqual(api.cmd_status(box,pid)['exitCode'],final_rc)
+                self.assertNotIn('steps incomplete',err.getvalue())
 
     def test_interrupted_step_run_uses_completeness_without_changing_plain_exit_94(self):
         for index, step_count in enumerate((0, 2)):

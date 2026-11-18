@@ -4,6 +4,8 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from urllib.parse import parse_qs, urlsplit
+from janitor_test_safety import JanitorTestCase
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/scripts'))
@@ -38,7 +40,7 @@ OPAQUE_RELATIVE_TOKENS = [
 ]
 
 
-class ProcessTests(unittest.TestCase):
+class ProcessTests(JanitorTestCase):
     def detect(self, rows=None, roster=None, owner=None, details=None, **kwargs):
         rows = lp.parse_ps(PS) if rows is None else rows
         return lp.detect(rows, lp.parse_top(TOP), {}, ROSTER if roster is None else roster,
@@ -322,14 +324,194 @@ class ProcessTests(unittest.TestCase):
                 self.assertTrue(lp.mcp(command))
 
     def test_owner_binding_and_recovery_api_shapes(self):
-        responses = [{'thread': {'threadId': 'owner'}}, {'thread': OWNER['thread']},
-                     {'threads': [{'threadId': 'owner', **OWNER['recovery']}], 'nextCursor': None}]
-        with patch.object(lp, 'control', side_effect=responses) as api:
+        responses = [{'thread': OWNER['thread']}, {'thread': OWNER['thread']},
+                     {'threads': [{'threadId': 'owne0'}, {'threadId': 'owne1'},
+                                  {'threadId': 'owner', **OWNER['recovery']}], 'nextCursor': 'owner'}]
+        with patch.object(lp, 'control', side_effect=responses) as api, \
+                patch.object(lp, 'RECOVERY_PAGE_LIMIT', 3):
             result = lp.owner({'CLAUDE_CODE_SESSION_ID': 'native'})
             self.assertEqual(result['thread'], OWNER['thread'])
             self.assertEqual(result['recovery']['heldWork'], False)
+            self.assertTrue(lp.owner_clear(result, ROSTER))
+            self.assertEqual(parse_qs(urlsplit(api.call_args_list[2].args[0]).query),
+                             {'active': ['false'], 'cursor': ['owne'], 'limit': [str(lp.RECOVERY_PAGE_LIMIT)]})
         self.assertIn('driver=claudeAgent', api.call_args_list[0].args[0])
-        self.assertIn('active=false', api.call_args_list[2].args[0])
+        self.assertIn('&view=owner', api.call_args_list[0].args[0])
+
+    def test_owner_absent_from_recovery_page_stays_unknown_and_keeps_process(self):
+        pages = [[], [{'threadId': f'other-{i}'} for i in range(lp.RECOVERY_PAGE_LIMIT)]]
+        for entries in pages:
+            responses = [(200, {'ok': True, **body}) for body in (
+                {'thread': OWNER['thread']}, {'thread': OWNER['thread']},
+                {'threads': entries, 'nextCursor': 'more-threads'})]
+            with self.subTest(rows=len(entries)), patch.object(lp.active_sessions, '_control_get',
+                    side_effect=responses * 2) as api:
+                self.assertIsNone(lp.owner(DETAILS['binding']))
+                report = lp.detect(lp.parse_ps(PS), lp.parse_top(TOP), {}, ROSTER,
+                                   inspect=lambda row: DETAILS)
+                self.assertEqual(report['candidates'], [])
+                self.assertEqual(report['inventory'][0]['keep_reason'], 'unknown_owner')
+                self.assertEqual(api.call_count, 6)
+                self.assertEqual(parse_qs(urlsplit(api.call_args.args[0]).query),
+                                 {'active': ['false'], 'cursor': ['owne'],
+                                  'limit': [str(lp.RECOVERY_PAGE_LIMIT)]})
+
+    def test_recovery_timeout_or_failure_keeps_process(self):
+        for status, body in ((0, 'timed out'), (503, None)):
+            responses = [(200, {'ok': True, 'thread': OWNER['thread']})] * 2 + [(status, body)]
+            with self.subTest(status=status), patch.object(lp.active_sessions, '_control_get',
+                    side_effect=responses):
+                report = lp.detect(lp.parse_ps(PS), lp.parse_top(TOP), {}, ROSTER,
+                                   inspect=lambda row: DETAILS)
+                self.assertEqual(report['candidates'], [])
+                self.assertTrue(report['inventory'][0]['keep_reason'].startswith('observation_unavailable:'))
+                self.assertEqual(report['owner_calls']['recovery']['failures'], {str(status): 1})
+
+    def test_owner_view_keep_matrix_never_reads_detail_or_recovery(self):
+        forms = [
+            ({'state': 'running', 'status': 'completed'}, 'owner_has_work_or_not_ended'),
+            ({'state': 'idle', 'status': 'running'}, 'owner_has_work_or_not_ended'),
+            ({'state': 'idle', 'status': 'queued'}, 'owner_has_work_or_not_ended'),
+            ({'status': 'completed'}, 'owner_has_work_or_not_ended'),
+            ({'state': 'idle'}, 'owner_has_work_or_not_ended'),
+            ({'state': None, 'status': None}, 'owner_has_work_or_not_ended'),
+            ({'state': 'idle', 'status': 'completed', 'deleted': True}, 'owner_deleted'),
+            ({'state': 'running', 'status': 'running', 'deleted': True}, 'owner_deleted'),
+        ]
+        for view, reason in forms:
+            with self.subTest(view=view), patch.object(lp.active_sessions, '_control_get',
+                    return_value=(200, {'ok': True, 'thread': {'threadId': 'owner', **view}})) as api:
+                report = lp.detect(lp.parse_ps(PS), lp.parse_top(TOP), {}, ROSTER,
+                                   inspect=lambda row: DETAILS)
+                self.assertEqual(report['candidates'], [])
+                self.assertEqual(report['inventory'][0]['owner'], 'owner')
+                self.assertEqual(report['inventory'][0]['keep_reason'], reason)
+                self.assertEqual(api.call_count, 1)
+                self.assertEqual(report['owner_calls']['by_native']['count'], 1)
+                self.assertEqual(report['owner_calls']['detail']['count'], 0)
+                self.assertEqual(report['owner_calls']['recovery']['count'], 0)
+
+    def test_owner_view_urls_for_both_native_drivers(self):
+        for key, driver in lp.NATIVE_KEYS.items():
+            with self.subTest(key=key), patch.object(lp, 'control', return_value={
+                    'thread': {'threadId': 'owner', 'state': 'running'}}) as api:
+                lp.owner({key: 'native/id:%'})
+                self.assertEqual(api.call_args.args[0],
+                    '/threads/by-native/native%2Fid%3A%25?driver=' + driver + '&view=owner')
+
+    def test_owner_view_conflicting_bindings_stay_unknown(self):
+        for deleted in (False, True):
+            view = {'threadId': 'owner', 'state': 'running', 'deleted': deleted}
+            forms = [
+                ({'CLAUDE_CODE_SESSION_ID': 'a', 'T3_THREAD_ID': 'other'}, [view]),
+                ({'CLAUDE_CODE_SESSION_ID': 'a', 'CODEX_THREAD_ID': 'b'},
+                 [view, {**view, 'threadId': 'other'}]),
+                ({'T3_THREAD_ID': 'owner', 'ROBOB_THREAD_ID': 'other'}, []),
+            ]
+            for binding, views in forms:
+                with self.subTest(binding=binding, deleted=deleted), patch.object(lp, 'control',
+                        side_effect=[{'thread': v} for v in views]) as api:
+                    self.assertIsNone(lp.owner(binding))
+                    self.assertEqual(api.call_count, len(views))
+
+    def test_idle_terminal_view_still_requires_full_clear_proof(self):
+        for status in sorted(lp.TERMINAL):
+            for held in (False, True):
+                own = copy.deepcopy(OWNER)
+                own['thread']['status'] = status
+                own['recovery']['heldWork'] = held
+                responses = [(200, {'ok': True, **body}) for body in (
+                    {'thread': own['thread']}, {'thread': own['thread']},
+                    {'threads': [{'threadId': 'owner', **own['recovery']}]})]
+                rows = lp.parse_ps(PS)
+                with self.subTest(status=status, held=held), patch.object(lp.active_sessions, '_control_get',
+                        side_effect=responses * 2) as api:
+                    report = lp.detect(rows, lp.parse_top(TOP), {}, ROSTER,
+                        inspect=lambda row: DETAILS, refresh=lambda pid: {pid: rows[pid]},
+                        refresh_roster=lambda: ROSTER)
+                    self.assertEqual(len(report['candidates']), 0 if held else 1)
+                    self.assertEqual(api.call_count, 3 if held else 6)
+                    for call in api.call_args_list:
+                        self.assertEqual(call.kwargs, {'timeout': lp.OWNER_CALL_TIMEOUT})
+
+    def test_final_recheck_keep_marker_cannot_match_clear_owner(self):
+        for view in ({'state': 'running'}, {'deleted': True}):
+            responses = [{'thread': OWNER['thread']}, {'thread': OWNER['thread']},
+                         {'threads': [{'threadId': 'owner', **OWNER['recovery']}]},
+                         {'thread': {**OWNER['thread'], **view}}]
+            rows = lp.parse_ps(PS)
+            with self.subTest(view=view), patch.object(lp, 'control', side_effect=responses) as api:
+                report = lp.detect(rows, lp.parse_top(TOP), {}, ROSTER,
+                    inspect=lambda row: DETAILS, refresh=lambda pid: {pid: rows[pid]},
+                    refresh_roster=lambda: ROSTER)
+                self.assertEqual(report['candidates'], [])
+                self.assertEqual(report['inventory'][0]['keep_reason'], 'changed_before_report')
+                self.assertEqual(api.call_count, 4)
+
+    def test_owner_call_counts_percentiles_and_failure_statuses(self):
+        idle = {'ok': True, 'thread': OWNER['thread']}
+        script = iter([
+            (10, 200, {'ok': True, 'thread': {'threadId': 'owner', 'state': 'running'}}),
+            (20, 200, idle), (100, 503, None),
+            (30, 200, idle), (200, 200, idle), (1000, 0, None),
+            (40, 404, None), (50, 200, {'ok': False}),
+            (60, 200, idle), (300, 200, idle), (2000, 200, {'ok': True, 'threads': []}),
+            (70, 200, idle), (400, 200, idle),
+            (3000, 200, {'ok': True, 'threads': [{'threadId': 'owner', **OWNER['recovery']}]}),
+        ])
+        clock = [0]
+        def api(path, timeout):
+            duration, status, body = next(script)
+            clock[0] += duration / 1000
+            return status, body
+        rows = {pid: {'pid': pid, 'ppid': 1, 'start': 'old', 'tty': '??',
+                      'args': 'python3 -m http.server'} for pid in range(20, 27)}
+        with patch.object(lp.time, 'perf_counter', side_effect=lambda: clock[0]), \
+                patch.object(lp.active_sessions, '_control_get', side_effect=api):
+            report = lp.detect(rows, {}, {}, ROSTER, keep=[DETAILS['cwd']],
+                inspect=lambda row: {**DETAILS, 'binding': {'CODEX_THREAD_ID': str(row['pid'])}})
+        self.assertEqual(report['owner_calls'], {
+            'by_native': dict(count=7, p50_ms=40, p95_ms=70, max_ms=70,
+                              failures={'404': 1, '200': 1}),
+            'detail': dict(count=4, p50_ms=200, p95_ms=400, max_ms=400, failures={'503': 1}),
+            'recovery': dict(count=3, p50_ms=2000, p95_ms=3000, max_ms=3000, failures={'0': 1}),
+        })
+        self.assertEqual(report['candidates'], [])
+
+    def test_owner_call_metrics_are_per_scan_and_include_only_actual_cached_calls(self):
+        rows = {pid: {'pid': pid, 'ppid': 1, 'start': 'old', 'tty': '??',
+                      'args': 'python3 -m http.server'} for pid in (20, 30)}
+        with patch.object(lp.active_sessions, '_control_get', return_value=(200, {
+                'ok': True, 'thread': {'threadId': 'owner', 'state': 'running'}})) as api:
+            for _ in range(2):
+                report = lp.detect(rows, {}, {}, ROSTER, inspect=lambda row: DETAILS)
+                self.assertEqual(report['checked'], 2)
+                self.assertEqual(report['owner_calls']['by_native']['count'], 1)
+            self.assertEqual(api.call_count, 2)
+
+    def test_owner_call_exception_is_counted_as_status_zero(self):
+        with patch.object(lp.active_sessions, '_control_get', side_effect=OSError('unavailable')), \
+                patch.object(lp.time, 'perf_counter', side_effect=[0, .025]):
+            report = lp.detect(lp.parse_ps(PS), {}, {}, ROSTER, inspect=lambda row: DETAILS)
+        self.assertEqual(report['owner_calls']['by_native'],
+                         dict(count=1, p50_ms=25, p95_ms=25, max_ms=25, failures={'0': 1}))
+        self.assertEqual(report['candidates'], [])
+
+    def test_scan_uses_budget_constant_and_keeps_empty_metrics_on_inventory_failure(self):
+        with patch.object(lp, 'processes', return_value={}), \
+                patch.object(lp, 'launch_services', return_value={}), \
+                patch.object(lp, 'run', return_value=TOP), \
+                patch.object(lp, 'cwd_inventory', return_value={}), \
+                patch.object(lp, 'detect', return_value={}) as detect, \
+                patch.object(lp.time, 'monotonic', return_value=100), \
+                patch.object(lp, 'OBSERVATION_BUDGET', 321):
+            lp.scan(ROSTER, cursor=42)
+            self.assertEqual(detect.call_args.kwargs['deadline'], 421)
+            self.assertEqual(detect.call_args.kwargs['cursor'], 42)
+        with patch.object(lp, 'processes', side_effect=RuntimeError):
+            report = lp.scan(ROSTER)
+        self.assertEqual(report['owner_calls'], {kind: dict(count=0, p50_ms=None,
+                         p95_ms=None, max_ms=None, failures={}) for kind in lp.OWNER_ENDPOINTS})
 
     def test_observation_budget_keeps_remaining_processes(self):
         rows = lp.parse_ps(PS)
@@ -387,12 +569,17 @@ class ProcessTests(unittest.TestCase):
             cursor = report['next_cursor']
         self.assertEqual(runs, [[20, 40], [50, 30], [20, 40], [50, 30]])
 
-    def test_process_module_has_no_signal_or_delete_primitives(self):
+    def test_signal_primitive_is_only_in_opt_in_stop_and_deletion_stays_forbidden(self):
         import ast
         tree = ast.parse(Path(lp.__file__).read_text())
         forbidden = {'kill', 'killpg', 'unlink', 'remove', 'rmdir', 'rmtree'}
+        stop = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'stop_xcode_builds')
+        send_default = stop.args.kw_defaults[stop.args.kwonlyargs.index(
+            next(arg for arg in stop.args.kwonlyargs if arg.arg == 'send'))]
+        self.assertIsInstance(send_default, ast.Attribute)
+        self.assertEqual(ast.unparse(send_default), 'os.kill')
         for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute):
+            if isinstance(node, ast.Attribute) and node is not send_default:
                 self.assertNotIn(node.attr, forbidden)
 
 

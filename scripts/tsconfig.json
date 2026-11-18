@@ -5,5 +5,9 @@
     "types": ["node"],
     "lib": ["ESNext", "esnext.disposable"]
   },
-  "include": ["**/*.ts"]
+  "include": [
+    "**/*.ts",
+    "../apps/server/src/ardud/persistence/historyArchiveSql.ts",
+    "../packages/shared/src/sqlDiagnostics.ts"
+  ]
 }

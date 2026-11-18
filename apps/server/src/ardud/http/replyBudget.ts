@@ -10,8 +10,8 @@ export class ReplyTooLarge extends Error {
   }
 }
 
-/** Count before stringify/TextEncoder, where a second full-size copy can exhaust the heap. */
-export const jsonExceedsBudget = (value: unknown, limit = MAX_REPLY_BYTES): boolean => {
+/** Count without allocating JSON; stop once the limit is exceeded. */
+export const jsonBytesUpToLimit = (value: unknown, limit = MAX_REPLY_BYTES): number => {
   let bytes = 0;
   const stringBytes = (text: string) => {
     let size = Buffer.byteLength(text, "utf8") + 2;
@@ -68,5 +68,9 @@ export const jsonExceedsBudget = (value: unknown, limit = MAX_REPLY_BYTES): bool
     }
     return bytes > limit;
   };
-  return visit(value);
+  visit(value);
+  return bytes;
 };
+
+export const jsonExceedsBudget = (value: unknown, limit = MAX_REPLY_BYTES): boolean =>
+  jsonBytesUpToLimit(value, limit) > limit;

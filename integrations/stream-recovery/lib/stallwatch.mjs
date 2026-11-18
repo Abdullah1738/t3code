@@ -1,4 +1,4 @@
-import { emit, observed, recoveryIo } from './logging.mjs';
+import { emit, recoveryIo, timedScan } from './logging.mjs';
 // Stall watch: one pass over OpenCode's active sessions per scan. Spots
 // sessions that stay "running" with nothing changing, interrupts them, follows
 // up until they are clear, then reports once. The caller loads and saves state.
@@ -48,10 +48,10 @@ async function mapLimit(items, limit, fn) {
 const errText = (err) => String(err?.message || err).slice(0, 300);
 
 export async function stallScan(options, io = realIo) {
-  return observed('stream-recovery', 'stall.scan', () => stallScanImpl(options, io));
+  return timedScan('stall', io, timed => stallScanImpl(options, timed));
 }
 
-async function stallScanImpl({ state, now, dryRun = false, verbose = false, log }, io = realIo) {
+async function stallScanImpl({ state, now, dryRun = false, verbose = false, log, save = () => {} }, io = realIo) {
   assertRecoveryActive(io);
   io = recoveryIo(guardRecoveryIo(io));
   const scanStart = performance.now();
@@ -123,6 +123,9 @@ async function stallScanImpl({ state, now, dryRun = false, verbose = false, log 
     }
     assertRecoveryActive(io);
     stall.ocTries = (stall.ocTries ?? 0) + 1;
+    // Replica recovery runs concurrently and must see our exclusion record
+    // before it can discover the cancellation caused by this interrupt.
+    save();
     try {
       stall.ocInterrupted = await io.ocInterrupt(stall.ses);
       stall.ocTried = now;
@@ -255,8 +258,9 @@ async function stallScanImpl({ state, now, dryRun = false, verbose = false, log 
         throw err;
       }
     } else {
+      save();
       try {
-        const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId ?? undefined });
+        const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId ?? undefined, cancelReason: 'task_stalled' });
         stall.robobResult = res.result ?? null;
         if (res.result === "interrupt_requested") {
           stall.runId = res.runId ?? stall.runId;
@@ -346,8 +350,9 @@ async function stallScanImpl({ state, now, dryRun = false, verbose = false, log 
         finish(id, stall, "report");
         continue;
       }
+      save();
       try {
-        const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}`, expectedRunId: t.activeRunId });
+        const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}`, expectedRunId: t.activeRunId, cancelReason: 'task_stalled' });
         stall.robobResult = res.result ?? null;
         if (res.result === "interrupt_requested") {
           // Track the run we verified, not whatever run the server reports back.

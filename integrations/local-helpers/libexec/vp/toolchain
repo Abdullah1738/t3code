@@ -1,0 +1,104 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import {
+  checkToolchain,
+  git,
+  loadToolchain,
+  syncToolchain,
+  toolchainPath,
+} from "./toolchain-state.mjs";
+
+async function match(dir) {
+  try {
+    process.chdir(dir);
+    checkToolchain(dir, dir, await loadToolchain(dir));
+    return true;
+  } catch (error) {
+    console.error(`vp toolchain: ${error.message}`);
+    return false;
+  }
+}
+
+function run(command, args, cwd) {
+  const result = spawnSync(command, args, { cwd, stdio: "inherit" });
+  if (result.error || result.status !== 0)
+    throw new Error(`${command} failed (${result.error?.message ?? result.status})`);
+}
+
+async function install(dir) {
+  if (await match(dir)) return;
+  const { packageManager } = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+  if (!/^pnpm@\d+\.\d+\.\d+$/.test(packageManager))
+    throw new Error("expected a pinned pnpm packageManager");
+  // Installs are gated on every harness. The explicit maintenance command owns this exemption.
+  run("offbox", ["local", "--reason", "vp toolchain copy", "--ttl", "30m"], dir);
+  // Skip prepare: vp config can install shared git hooks. fmt/lint use shipped prebuilds.
+  // The root importer alone omits the local lint plugin's runtime dependencies.
+  run(
+    "corepack",
+    [
+      packageManager,
+      "--filter",
+      ".",
+      "--filter",
+      "./oxlint-plugin-t3code",
+      "install",
+      "--frozen-lockfile",
+      "--ignore-scripts",
+    ],
+    dir,
+  );
+  if (!(await match(dir)))
+    throw new Error("installed toolchain does not match; inspect the install output");
+}
+
+try {
+  const [command, ...args] = process.argv.slice(2);
+  if (
+    !["init", "sync", "status"].includes(command) ||
+    (command === "init"
+      ? args.length > 1
+      : command === "sync"
+        ? args.length > 1 || (args.length && args[0] !== "--install")
+        : args.length)
+  )
+    throw new Error("usage: toolchain init [dir] | sync [--install] | status");
+  const root = git(process.cwd(), ["rev-parse", "--show-toplevel"]);
+  let dir;
+  if (command === "init") {
+    dir = path.resolve(args[0] ?? "/Volumes/ExternalSSD/.vp-toolchain/t3code-fork");
+    git(root, ["worktree", "add", "--detach", dir, "origin/main"], 60000);
+    dir = toolchainPath(root, dir);
+    git(root, ["config", "vp.toolchain", dir]);
+    await install(dir);
+  } else {
+    try {
+      dir = git(root, ["config", "--get", "vp.toolchain"]);
+    } catch {
+      throw new Error("vp.toolchain is unset; run: ~/.local/libexec/vp/toolchain init");
+    }
+    dir = toolchainPath(root, dir);
+    if (command === "sync") {
+      git(root, ["fetch", "origin", "main"], 60000);
+      const state = syncToolchain(root, dir);
+      if (state === "locked") throw new Error("sync lock held; try again later");
+      console.log(`vp toolchain: ${state}`);
+      if (args[0] === "--install") await install(dir);
+    } else {
+      console.log(`path: ${dir}`);
+      const head = git(dir, ["rev-parse", "HEAD"]);
+      const origin = git(root, ["rev-parse", "refs/remotes/origin/main"]);
+      console.log(
+        `HEAD: ${head}\norigin/main: ${origin}\ncurrent: ${head === origin ? "yes" : "no"}`,
+      );
+      console.log(`toolchain match: ${(await match(dir)) ? "yes" : "no"}`);
+      if (fs.existsSync(path.join(dir, "node_modules"))) run("du", ["-sh", "node_modules"], dir);
+      else console.log("node_modules: missing");
+    }
+  }
+} catch (error) {
+  console.error(`vp toolchain: ${error.message}`);
+  process.exitCode = 1;
+}

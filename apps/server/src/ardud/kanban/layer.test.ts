@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
+import { RunId, type OrchestrationV2DomainEvent } from "@t3tools/contracts";
 
 import { boardEventRoute, threadEventOf, startTimeoutOf } from "./layer.ts";
 
@@ -10,20 +10,52 @@ const event = (type: string, payload: object = {}) =>
   ({ type, threadId: "thread-1", payload }) as unknown as OrchestrationV2DomainEvent;
 
 describe("boardEventRoute", () => {
+  it.each(["thread.pull-request-link-updated", "thread.pull-request-synced"])(
+    "refreshes card PR chips on %s without a work turn",
+    (type) => {
+      assert.strictEqual(boardEventRoute(event(type)), "pullRequestsChanged");
+      assert.strictEqual(threadEventOf(event(type)), "thread-1");
+    },
+  );
+  it.each([
+    {
+      type: "run_interrupt_request",
+      runId: "early",
+      cancelReason: "user_stop",
+      expected: "cancelReason",
+    },
+    { type: "run_interrupt_request", runId: "early", expected: null },
+    { type: "run_interrupt_request", runId: null, cancelReason: "task_cancel", expected: null },
+    { type: "run_interrupt_result", runId: "early", cancelReason: "user_stop", expected: null },
+    { type: "assistant_message", runId: "early", expected: null },
+  ])("routes cancellation metadata without replaying turn end: %s", ({ expected, ...payload }) => {
+    const request = event("turn-item.updated", payload);
+    assert.strictEqual(boardEventRoute(request), expected);
+    assert.strictEqual(threadEventOf(request), expected === "cancelReason" ? "thread-1" : null);
+  });
   it("retains the expired start identity even after FIFO promotion changes the active run", () => {
     const payload = {
       type: "error",
       status: "failed",
-      runId: "expired",
+      runId: RunId.make("expired"),
       failure: {
         code: "provider_start_timeout",
         message: "The provider never started this run (waited 10 min).",
       },
     };
     assert.deepEqual(startTimeoutOf(event("turn-item.updated", payload)), {
-      runId: "expired",
+      runId: RunId.make("expired"),
       reason: payload.failure.message,
     });
+    assert.deepEqual(
+      startTimeoutOf(
+        event("turn-item.updated", {
+          ...payload,
+          failure: { code: "restart_admission_timeout", message: "Restart admission expired" },
+        }),
+      ),
+      { runId: RunId.make("expired"), reason: "Restart admission expired", restartAdmission: true },
+    );
     assert.isUndefined(
       startTimeoutOf(
         event("turn-item.updated", { ...payload, failure: { ...payload.failure, code: "other" } }),
@@ -35,6 +67,56 @@ describe("boardEventRoute", () => {
     assert.strictEqual(
       boardEventRoute(event("run.updated", { status: "running" })),
       "threadChanged",
+    );
+  });
+  it("routes lost native events to the owning run failure without claiming it never started", () => {
+    assert.deepEqual(
+      startTimeoutOf(
+        event("turn-item.updated", {
+          type: "error",
+          status: "failed",
+          runId: RunId.make("lost"),
+          failure: {
+            code: "provider_events_lost",
+            message: "Native session native-123 produced output that was not ingested",
+            retryable: false,
+          },
+        }),
+      ),
+      {
+        runId: RunId.make("lost"),
+        reason: "Native session native-123 produced output that was not ingested",
+      },
+    );
+  });
+
+  it("forwards admission details with the expired run identity", () => {
+    const admission = {
+      queuedAtMs: 1_000,
+      waitedMs: 7_200_000,
+      positionAtFailure: 2,
+      totalAtFailure: 3,
+      rule: "absolute_backstop" as const,
+    };
+    assert.deepEqual(
+      startTimeoutOf(
+        event("turn-item.updated", {
+          type: "error",
+          status: "failed",
+          runId: RunId.make("expired"),
+          failure: {
+            code: "restart_admission_timeout",
+            message: "Restart admission expired",
+            admission,
+          },
+        }),
+      ),
+      {
+        runId: RunId.make("expired"),
+        reason: "Restart admission expired",
+        restartAdmission: true,
+        admission,
+      },
     );
   });
 

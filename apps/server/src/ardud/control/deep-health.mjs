@@ -110,6 +110,7 @@ export function summarizeLag(tail, now = Date.now()) {
   return {
     status: reasons.length ? "unknown" : "complete",
     reasons,
+    sampleCount: recent.length,
     stalls1s: recent.filter((row) => row.delay >= 1000).length,
     stalls5s: severe.length,
     severeMinutes: new Set(severe.map((row) => Math.floor(row.time / 60_000))).size,
@@ -157,6 +158,54 @@ function safeFileError(error) {
   return ["ENOENT", "EACCES", "EPERM", "EIO"].includes(error?.code) ? error.code : "read failed";
 }
 
+function safeFailure(error) {
+  const fields = {};
+  // fetch wraps socket errors in cause; bound traversal even for cyclic causes.
+  for (let depth = 0; error && depth < 4; depth++, error = error.cause) {
+    if (fields.code === undefined) {
+      if (
+        typeof error.code === "string" &&
+        (Object.hasOwn(NodeOS.constants.errno, error.code) ||
+          [
+            "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+            "ERR_INVALID_ARG_TYPE",
+            "ERR_OUT_OF_RANGE",
+          ].includes(error.code))
+      )
+        fields.code = error.code;
+      else if (Number.isInteger(error.code) && error.code > 0 && error.code <= 255)
+        fields.code = error.code;
+    }
+    // spawn errors can append the executable's full path to the syscall.
+    const syscall = typeof error.syscall === "string" ? error.syscall.split(" ")[0] : null;
+    if (
+      fields.syscall === undefined &&
+      [
+        "open",
+        "read",
+        "stat",
+        "fstat",
+        "close",
+        "kill",
+        "spawn",
+        "connect",
+        "getaddrinfo",
+      ].includes(syscall)
+    )
+      fields.syscall = syscall;
+    if (
+      fields.path === undefined &&
+      typeof error.path === "string" &&
+      !error.path.includes("://")
+    ) {
+      const basename = NodePath.win32.basename(NodePath.basename(error.path.split(/[?#]/)[0]));
+      if (/^[\w.-]{1,255}$/.test(basename) && ![".", ".."].includes(basename))
+        fields.path = basename;
+    }
+  }
+  return fields;
+}
+
 export async function readRuntimeState(file) {
   const fd = await NodeFSP.open(file, NodeFS.constants.O_RDONLY | NodeFS.constants.O_NONBLOCK);
   try {
@@ -164,7 +213,12 @@ export async function readRuntimeState(file) {
     if (!stat.isFile() || stat.size > 8192) return null;
     const buffer = Buffer.alloc(8192);
     const { bytesRead } = await fd.read(buffer, 0, buffer.length, 0);
-    return JSON.parse(buffer.toString("utf8", 0, bytesRead));
+    try {
+      return JSON.parse(buffer.toString("utf8", 0, bytesRead));
+    } catch (error) {
+      if (error instanceof SyntaxError) return null;
+      throw error;
+    }
   } finally {
     await fd.close();
   }
@@ -212,47 +266,82 @@ export async function ownsListener(
       signal?.removeEventListener("abort", abort);
       reject(error);
     }
-  }).catch((error) => {
-    if (error?.name === "TimeoutError") throw error;
-    return null;
   });
-  if (output === null) return false;
   const owners = new Set(output.split("\n").filter((line) => /^p\d+$/.test(line)));
   // Check both address families: another owner could be a loopback tunnel.
   return owners.size === 1 && owners.has(`p${pid}`);
 }
 
-async function matchesLocalRuntime(url, connection, runtime, checkListener) {
+async function matchesLocalRuntime(url, connection, runtime, checkListener, stages) {
+  const result = (reason, stage = "runtime", code = stages[stage]?.code ?? null) => ({
+    ok: reason === null,
+    reason,
+    stage,
+    code,
+  });
+  if (stages.runtime.status === "skipped") return result("deadline-exhausted");
+  if (stages.runtime.status !== "ok")
+    return result(stages.runtime.status === "timeout" ? "runtime-timeout" : "runtime-unreadable");
+  if (!runtime || typeof runtime !== "object") return result("runtime-invalid");
+  let target;
+  let expected;
   try {
-    const target = new URL(url);
-    const expected = new URL(runtime.origin);
-    const loopback = (host) => ["localhost", "127.0.0.1", "[::1]"].includes(host);
-    if (
-      !["http:", "https:"].includes(expected.protocol) ||
-      !loopback(target.hostname) ||
-      !loopback(expected.hostname) ||
-      target.protocol !== expected.protocol ||
-      target.port !== expected.port ||
-      target.pathname !== "/" ||
-      target.search
-    )
-      return false;
-    const recorded = Date.parse(runtime.startedAt);
-    if (!Number.isFinite(recorded) || !Number.isInteger(runtime.pid) || runtime.pid <= 0)
-      return false;
-    process.kill(runtime.pid, 0);
-    // HTTP cannot identify its boot while blocked. Preserve local evidence only
-    // when the OS independently confirms the persisted process owns the listener.
-    if (connection.status !== "ok") {
-      const port = Number(expected.port || (expected.protocol === "https:" ? 443 : 80));
-      return (await checkListener({ pid: runtime.pid, port })) === true;
-    }
-    const started = Date.parse(connection.serverStartedAt);
-    return Number.isFinite(started) && Math.abs(started - recorded) <= 60_000;
+    target = new URL(url);
+    expected = new URL(runtime.origin);
   } catch {
-    return false;
+    return result("runtime-invalid");
   }
+  const loopback = (host) => ["localhost", "127.0.0.1", "[::1]"].includes(host);
+  if (!loopback(target.hostname) || !loopback(expected.hostname)) return result("non-loopback");
+  if (
+    !["http:", "https:"].includes(expected.protocol) ||
+    target.protocol !== expected.protocol ||
+    target.port !== expected.port ||
+    target.pathname !== "/" ||
+    target.search
+  )
+    return result("origin-mismatch");
+  const recorded = typeof runtime.startedAt === "string" ? Date.parse(runtime.startedAt) : NaN;
+  if (!Number.isFinite(recorded) || !Number.isInteger(runtime.pid) || runtime.pid <= 0)
+    return result("runtime-invalid");
+  try {
+    process.kill(runtime.pid, 0);
+  } catch (error) {
+    return result(
+      error?.code === "ESRCH" ? "pid-mismatch" : "pid-unverified",
+      "runtime",
+      safeFailure(error).code ?? null,
+    );
+  }
+  // Route initialization and ready-time publication can be minutes apart.
+  if (
+    connection.status === "ok" &&
+    connection.bootId !== undefined &&
+    runtime.bootId !== undefined
+  ) {
+    if (!validBootId(runtime.bootId)) return result("runtime-invalid");
+    return result(connection.bootId === runtime.bootId ? null : "bootid-mismatch");
+  }
+  // Older or blocked servers cannot identify their boot over HTTP. Confirm
+  // the persisted process owns the listener within the same deadline instead.
+  const port = Number(expected.port || (expected.protocol === "https:" ? 443 : 80));
+  const owned = await checkListener({ pid: runtime.pid, port });
+  const status = stages.listener.status;
+  if (status !== "ok")
+    return result(
+      status === "timeout"
+        ? "listener-timeout"
+        : status === "error"
+          ? "listener-error"
+          : "deadline-exhausted",
+      "listener",
+    );
+  return result(owned === true ? null : "listener-not-owner", "listener");
 }
+
+const validBootId = (value) =>
+  typeof value === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 
 export const deepHealthBudget = (timeoutMs = 10_000) => Math.max(1, Math.min(timeoutMs, 10_000));
 
@@ -287,6 +376,7 @@ export async function deepHealth({
     controllers.push(controller);
     let timer;
     let status = "ok";
+    let failure = {};
     try {
       return await Promise.race([
         Promise.resolve().then(() => run({ signal: controller.signal, timeoutMs: limit })),
@@ -302,10 +392,11 @@ export async function deepHealth({
     } catch (error) {
       // Never include server bodies, credentials or arbitrary I/O error messages.
       status = error?.name === "TimeoutError" ? "timeout" : "error";
+      failure = { ...safeFailure(error), ...(status === "timeout" ? { code: "ETIMEDOUT" } : {}) };
       return fallback;
     } finally {
       clearTimeout(timer);
-      stages[name] = { status, ms: Math.round(performance.now() - start) };
+      stages[name] = { status, ms: Math.round(performance.now() - start), ...failure };
     }
   };
   const probe = async (name, route, valid) => {
@@ -329,6 +420,7 @@ export async function deepHealth({
             serverStartedAt: Number.isFinite(Date.parse(response.serverStartedAt))
               ? new Date(response.serverStartedAt).toISOString()
               : undefined,
+            bootId: validBootId(response.bootId) ? response.bootId : undefined,
           }
         : {}),
     };
@@ -345,16 +437,24 @@ export async function deepHealth({
     () => readRuntime(NodePath.join(NodePath.dirname(logPath), "..", "server-runtime.json")),
     null,
   );
-  const local = await matchesLocalRuntime(client.url, connection, runtime, (identity) =>
-    stage("listener", (options) => checkListener({ ...identity, ...options }), false),
+  const localIdentity = await matchesLocalRuntime(
+    client.url,
+    connection,
+    runtime,
+    (identity) => stage("listener", (options) => checkListener({ ...identity, ...options }), false),
+    stages,
   );
-  const tail = local
+  const tail = localIdentity.ok
     ? await stage("lagTail", () => readTail(logPath), {
         text: "",
         bytesRead: 0,
         error: "lagTail unavailable",
       })
-    : { text: "", bytesRead: 0, error: "local runtime identity unverified" };
+    : {
+        text: "",
+        bytesRead: 0,
+        error: `local runtime identity unverified (${localIdentity.reason}${localIdentity.code ? ` ${localIdentity.code}` : ""}) at ${localIdentity.stage}`,
+      };
   for (const controller of controllers) controller.abort();
   const now = Date.now();
   const lag = summarizeLag(tail, now);
@@ -363,6 +463,7 @@ export async function deepHealth({
     at: new Date(now).toISOString(),
     connection,
     lag,
+    localIdentity,
     roundTrip,
     stages,
     ...healthVerdict(lag, connection, roundTrip),

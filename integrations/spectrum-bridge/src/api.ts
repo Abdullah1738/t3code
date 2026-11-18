@@ -1,3 +1,5 @@
+import { markAnswered } from "./unanswered.ts";
+import { parseHealthSidecar } from "./health-receipts.ts";
 import { messageLengthError } from "./message-length.ts";
 import { toolError } from "./toollog.ts";
 import { newFormKeys } from "./secret-crypto.ts";
@@ -11,7 +13,7 @@ import { forgetSecret, newToken, putSecretRequest, readSecret, SECRET_REQUEST_TT
 import { sessionMatches } from "./session.ts";
 import { mayBounce, noteBounce, noteSent } from "./replyCheck.ts";
 import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
-import type { OutboxApp, OutboxOperation, Store } from "./store.ts";
+import type { OutboxApp, OutboxOperation, ReplyAttribution, Store } from "./store.ts";
 
 type Options = {
   store: Store;
@@ -128,7 +130,7 @@ type SessionContent = Omit<OutboxOperation, "id" | "kind" | "sessionId" | "gener
 
 /** Session-bound, idempotent enqueue shared by every agent-authored conversation route. */
 function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId: string,
-  content: SessionContent, prepare?: () => void, output: SessionContent = content, attribution?: { inboundId?: string }): { id: string; created: boolean } {
+  content: SessionContent, prepare?: () => void, output: SessionContent = content, attribution?: ReplyAttribution): { id: string; created: boolean } {
   const id = `${prefix}:${hash(dedupeKey)}`;
   const created = store.db.transaction(() => {
     const route = store.get<{ id: string; generation: number } | null>("route");
@@ -298,7 +300,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       if (!enabled() || !chat) throw new ApiError(503);
 
       if (path === "/files") {
-        fields(body, ["base64", "name", "mimeType", "text", "dedupeKey", "sessionId"]);
+        fields(body, ["base64", "name", "mimeType", "text", "dedupeKey", "sessionId", "healthReceipt"]);
         const { base64, name, mimeType, dedupeKey, sessionId } = body;
         const text = body.text === undefined ? "" : body.text;
         if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
@@ -315,7 +317,10 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         if (data.toString("base64") !== base64 || data.length === 0) throw new ApiError(400);
         if (data.length > MAX_FILE_BYTES) throw new ApiError(413);
         const attachment = { sha256: createHash("sha256").update(data).digest("hex"), name, mimeType, size: data.length };
-        const { id, created } = queueSession(store, "file", dedupeKey, sessionId, { text, attachment }, () => store.putBlob(data));
+        const healthReceipt = body.healthReceipt === undefined ? undefined : parseHealthSidecar(body.healthReceipt, attachment.sha256);
+        if (body.healthReceipt !== undefined && !healthReceipt) throw new ApiError(400);
+        const { id, created } = queueSession(store, "file", dedupeKey, sessionId,
+          { text, attachment, ...(healthReceipt ? { healthReceipt } : {}) }, () => store.putBlob(data));
         // Durable queue acceptance only; upload and delivery happen outside this handler.
         return json({ id, created, chat: "owner" }, created ? 202 : 200);
       }
@@ -348,8 +353,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const operationId = `send:${hash(dedupeKey)}`;
         if (store.get<boolean>(`cancelledSend:${operationId}`)) throw new ApiError(409);
         // Folding can outlive this turn or overlap its replacement in the same session.
-        const turn = store.get<{ id: string; generation: number; inboundId?: string; replyInboundId?: string } | null>("activeTurn");
-        const attribution = { inboundId: turn?.id === route.id && turn.generation === route.generation ? turn.replyInboundId ?? turn.inboundId : undefined };
+        const attribution = store.replyAttribution(route.id, route.generation);
         let folded = text;
         try { folded = await foldText?.(text, operationId) ?? text; } catch { /* Optional folds never block a send. */ }
         const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content, () => {
@@ -419,6 +423,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         // generation keeps a key reused after an in-place /new from replaying the
         // previous conversation's form.
         const asked = currentRoute();
+        const attribution = store.replyAttribution(asked.id, asked.generation);
         const spec = JSON.stringify({ purpose, fields: formFields, sessionId: asked.id, generation: asked.generation });
         const replay = () => {
           const saved = store.get<SavedSecretRequest>(savedKey);
@@ -444,7 +449,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
           putSecretRequest(store, token, { sessionId: route.id, generation: route.generation, purpose, fields: formFields,
             createdAt: now, expiresAt: result.expiresAt, state: "open", encryption });
           store.enqueue({ id, kind: "conversation", text: "", sessionId: route.id, generation: route.generation,
-            app: { url: result.url, caption: "Secure form" } });
+            app: { url: result.url, caption: "Secure form" } }, attribution);
           store.set(savedKey, { spec, result } satisfies SavedSecretRequest);
           return { result, created: true };
         }).immediate();
@@ -461,7 +466,10 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const inbound = store.db.query<{ id: string }, [string]>("SELECT id FROM inbound WHERE id = ?").get(target);
         if (!inbound && !store.byProviderId(target)) throw new ApiError(403);
         const id = `reaction:${hash(target + kind)}`;
+        // A tapback answers its target, including when another steer arrives during delivery.
+        const covered = [target];
         await photon.react(chat, target, kind as ReactionKind, id);
+        markAnswered(store, covered);
         return json({ id });
       }
 

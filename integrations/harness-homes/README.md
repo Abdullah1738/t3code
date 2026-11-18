@@ -21,7 +21,7 @@ instance's environment, and OAuth state stays in the home it was created in.
   idempotently (atomic writes, one line per changed file). `check [--home-root DIR]`
   compares their owned contents with the manifest and catalog. `mcp-diff`
   compares the manifest's MCPs with OpenCode's (see "MCP parity with OpenCode").
-- `vendor/codex-models-0.166.0.json`: Codex's model catalog at rust-v0.166.0
+- `vendor/codex-models-0.169.1.json`: Codex's model catalog at rust-v0.169.1
   (Apache-2.0). `vendor/README.md` has the URL and sha256.
 - `overlays/claude.md`, `overlays/codex.md`, `overlays/codex-cu.md`:
   per-harness instructions. `codex-cu` gets the shared Codex overlay first,
@@ -170,7 +170,7 @@ the homes until the release; the evaluator installs them.
 - Refuses a home inside `~/.claude`, `~/.codex` or `/Volumes/ExternalSSD/codex`.
 - Skill links never delete a real directory or a symlink pointing elsewhere.
   Two skills with the same name stop the run with both paths.
-- The Codex catalog changes only the three extended slugs. The CU catalog retains
+- The Codex catalog changes only the extended slugs (GPT-6.2 Sol/Astra, 6 Astra, 6.1 Sol/Terra). The CU catalog retains
   those entries, raises Terra to 1,050,000, and adds its prefixed alias using
   the original Terra metadata. Compaction is 450,000.
 - Shared MCPs, skills and Codex-scoped hooks also go to `codex-cu`; native
@@ -180,3 +180,5 @@ the homes until the release; the evaluator installs them.
   `harness` string (`claude` or `codex`) restricts them; `codex` also selects
   `codex-cu`.
 - `t3-code` is never in the manifest: Robob injects it per thread.
+
+Writes to `opencode.jsonc`, `plugin/` and `lib/` reload OpenCode live and can drop in-flight sessions for about 20 seconds. Installers wait for a quiet window (up to `OPENCODE_RELOAD_WAIT`, default 600 seconds); `--allow-reload` explicitly overrides the wait. Install in this order: opencode-plugins → harness-homes. Identical bytes are left untouched.

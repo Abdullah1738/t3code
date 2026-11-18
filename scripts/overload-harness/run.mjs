@@ -19,17 +19,24 @@ NodeModule.registerHooks({
     return { ...loaded, source: source.replace(needle, probe) };
   },
 });
-await import("../../apps/server/scripts/overload-harness.ts");
-
-const destination =
-  process.argv.find((arg) => arg.startsWith("--out="))?.slice(6) ?? "overload-result";
-const profilePath = NodePath.join(destination, "middle.cpuprofile");
+// Effect.runPromise does not retain Node while scoped resources finish cleanup.
+// Match runMain's process lifetime so unref'd workers cannot discard the report.
+const keepAlive = setInterval(() => {}, 2_147_483_647);
 try {
-  const profile = JSON.parse(await NodeFSP.readFile(profilePath, "utf8"));
-  await NodeFSP.writeFile(
-    NodePath.join(destination, "profile-shares.md"),
-    profileMarkdown(profile),
-  );
-} catch (cause) {
-  if (cause?.code !== "ENOENT") throw cause;
+  await import("../../apps/server/scripts/overload-harness.ts");
+
+  const destination =
+    process.argv.find((arg) => arg.startsWith("--out="))?.slice(6) ?? "overload-result";
+  const profilePath = NodePath.join(destination, "middle.cpuprofile");
+  try {
+    const profile = JSON.parse(await NodeFSP.readFile(profilePath, "utf8"));
+    await NodeFSP.writeFile(
+      NodePath.join(destination, "profile-shares.md"),
+      profileMarkdown(profile),
+    );
+  } catch (cause) {
+    if (cause?.code !== "ENOENT") throw cause;
+  }
+} finally {
+  clearInterval(keepAlive);
 }

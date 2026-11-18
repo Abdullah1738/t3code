@@ -51,6 +51,7 @@ function setup(slug: "owner" | "moni" = "owner") {
     sendText: async () => ({ handle: "sent-fixture" }), sendApp: async () => ({ handle: "app-fixture" }),
     upload: async () => "https://cdn.example/file", getMessage: async () => undefined,
     react: async () => {}, typing: async () => {}, read: async () => {}, requestLocation: async () => {},
+    setOptOut: async () => {},
     location: async () => undefined, download: async () => ({ data: new Uint8Array(), name: "file", mimeType: "text/plain" }),
   };
   const access = { people: [{ name: "Moni", role: "admin" as const, addresses: [moni] }], groups: [] };
@@ -106,11 +107,12 @@ test.each(["owner", "moni"].flatMap(slug => batchForms.map(form => ({ slug: slug
     expect(rollup?.chains[slug]).toMatchObject({ received: texts.length, turnStarted: 1, replySent: 1, completed: 1,
       receivedToStartMs: { p50: 1000, p95: 1000 }, receivedToReplyMs: { p50: 2000, p95: 2000 } });
   });
-  expect(logs.find(l => l.name === "msg.received")?.ids).toMatchObject({ chat: slug, messageId: "inbound-fixture" });
+  expect(logs.find(l => l.name === "msg.received")?.ids).toMatchObject({ chat: slug, messageId: "inbound-fixture", inboundId: "inbound-fixture" });
   for (const name of ["turn.start", "turn.end", "reply.sent"]) {
     expect(logs.find(l => l.name === name)?.ids).toMatchObject({ chat: slug, inboundId: "inbound-fixture" });
   }
   expect(logs.find(l => l.name === "turn.start")?.props?.batchSize).toBe(texts.length);
+  expect(logs.find(l => l.name === "msg.batched")).toMatchObject({ ids: { inboundId: "inbound-fixture" }, props: { route: "new_turn", leaderKind: "human" } });
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
 });
 

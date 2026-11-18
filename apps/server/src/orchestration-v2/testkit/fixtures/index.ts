@@ -1630,6 +1630,7 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         driver: ProviderDriverKind.make("pi"),
         transcriptFile: new URL("./turn_interrupt_mid_tool/pi_transcript.ndjson", import.meta.url),
         modelSelection: PI_MODEL_SELECTION,
+        finalProviderSessionStatus: "stopped",
         assertOutput: assertTurnInterruptMidToolPiOutput,
       },
     ],

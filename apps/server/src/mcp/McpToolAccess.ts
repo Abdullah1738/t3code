@@ -105,6 +105,7 @@ const refuseReadOnlyClient = McpInvocationContext.McpInvocationContext.pipe(
     scope.client?.access === "read-only"
       ? Effect.fail(
           new OrchestratorMcpFailure({
+            reason: "read_only_client",
             code: "capability_denied",
             message:
               "This tool changes the environment, and this MCP client was approved for read-only access.",
@@ -131,15 +132,63 @@ const requireThreadCaller = McpInvocationContext.McpInvocationContext.pipe(
 export const reads = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
   declare((params: P) => handle(params));
 
-export const readsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
-  declare((params: P) => requireThreadCaller.pipe(Effect.flatMap(() => handle(params))));
+type InputCheck<P> = (params: P) => OrchestratorMcpFailure | undefined;
 
-export const actsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
+const checkInput = <P>(params: P, check?: InputCheck<P>) =>
+  Effect.suspend(() => {
+    const failure = check?.(params);
+    return failure === undefined ? Effect.void : Effect.fail(failure);
+  });
+
+export const readsAsCaller = <P, A, E, R>(
+  handle: (params: P) => Effect.Effect<A, E, R>,
+  check?: InputCheck<P>,
+) =>
   declare((params: P) =>
     requireThreadCaller.pipe(
+      Effect.andThen(checkInput(params, check)),
+      Effect.flatMap(() => handle(params)),
+    ),
+  );
+
+export const actsAsCaller = <P, A, E, R>(
+  handle: (params: P) => Effect.Effect<A, E, R>,
+  check?: InputCheck<P>,
+) =>
+  declare((params: P) =>
+    requireThreadCaller.pipe(
+      // Stateless refusals must not queue behind the caller's SQLite reader.
+      Effect.andThen(checkInput(params, check)),
       Effect.flatMap(() => writingCaller),
       Effect.flatMap(() => handle(params)),
     ),
+  );
+
+/** Bug intake retains token attribution when the live caller check is unavailable. */
+export const reportsBug = <P, A, E, R>(
+  handle: (
+    params: P,
+    reporter: {
+      readonly threadId: ThreadId;
+      readonly unverifiedReason?: "caller_unresolved" | "parent_not_active" | undefined;
+    },
+  ) => Effect.Effect<A, E, R>,
+) =>
+  declare((params: P) =>
+    Effect.gen(function* () {
+      const scope = yield* requireThreadCaller;
+      yield* refuseReadOnlyClient;
+      const unverifiedReason = yield* writingCaller.pipe(
+        Effect.as(undefined),
+        Effect.catchTags({
+          OrchestratorMcpFailure: (error) =>
+            error.code === "caller_unresolved" || error.code === "parent_not_active"
+              ? Effect.succeed(error.code)
+              : Effect.fail(error),
+        }),
+      );
+      return yield* handle(params, { threadId: scope.thread.threadId, unverifiedReason });
+    }),
   );
 
 export const writes = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
@@ -161,9 +210,10 @@ export const writesThreads = <P, A, E, R>(
       const caller = yield* writingCaller;
       for (const threadId of threads(params)) {
         if (threadId === undefined || threadId === caller.scope.thread?.threadId) continue;
-        const target = yield* caller.threads
-          .getThreadShell(threadId)
-          .pipe(Effect.mapError(unavailable));
+        const target = yield* SendAcknowledgement.waitingOn(
+          caller.threads.getThreadShell(threadId).pipe(Effect.mapError(unavailable)),
+          `target permission read for thread ${threadId}`,
+        );
         if (target !== null && target.deletedAt === null) {
           yield* assertTargetWithinLimits(caller.limits, target);
         }
@@ -185,6 +235,12 @@ export const writesThreads = <P, A, E, R>(
     }),
   );
 
+/** Keep permission reads inside a capability toolkit's operation budget. */
+export const bound = <P, A, E, R, EB, RB>(
+  declaration: Declaration<(params: P) => Effect.Effect<A, E, R>>,
+  budget: (operation: Effect.Effect<A, E, R>) => Effect.Effect<A, EB, RB>,
+) => declare((params: P) => budget(checkedHandler(declaration)(params)));
+
 /** Includes access reads in the send deadline without bypassing their checks. */
 export const boundedThreadSend = <
   P extends { readonly clientRequestId?: string | undefined },
@@ -204,6 +260,7 @@ export const boundedThreadSend = <
 
 const escalationDenied = (refusal: DispatchModeRefusal) =>
   new OrchestratorMcpFailure({
+    reason: refusal.mode === "runtime" ? "runtime_mode_escalation" : "interaction_mode_escalation",
     code:
       refusal.mode === "runtime"
         ? "runtime_mode_escalation_denied"

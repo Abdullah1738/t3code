@@ -22,6 +22,7 @@ code here, test here, then sync it over.
 | `local-helpers` | `~/.local/libexec/{mail,card-preview,qcard}`, `~/.local/bin/{himalaya-heal,mailsearch,qcard}` | `local.ardud.otp-watch`, `local.ardud.otp-idle`, `local.ardud.mail-token-refresh` (mail OAuth heal, OTP watcher, card helpers; deploy via `local-helpers/install.zsh`) |
 | `tail-gateway` | `~/.local/share/tail-gateway`, `~/.local/bin/tailname` | `com.ardud.tail-gateway-{node,dns,proxy}` (friendly `https://<name>.tail` names for local services, tailnet only; deploy via `tail-gateway/install.zsh`) |
 | `robob-cards` | none (runs from the repo; builds and enrollments in `~/.local/share/robob-cards`) | none (iMessage card app; `bin/robob-cards-build`, `bin/robob-cards-enroll`) |
+| `venice-x402` | `~/.local/share/venice-x402` | `com.ardud.venice-x402` (OpenAI-compatible proxy on 127.0.0.1:43402 paying Venice AI via x402 from a Keychain wallet, spend caps, Mullvad egress gate; deploy via `venice-x402/install.zsh`) |
 
 Never add credentials, SQLite state, logs, `data/`, virtualenvs, watcher
 state (`robob-watch/watchers`, `archive`) or `.bak` files here. Runtime state
@@ -36,4 +37,10 @@ stays in `~/.config/<name>` and `~/.local/share/<name>/data`.
 
 `deploy.zsh` rsyncs source files only and never deletes runtime state on the
 live side. Run the package's own checks first (`bun test` / `bun run check`
-for the bridges and robob-watch, `pytest` for memory-system).
+for the bridges and robob-watch, the Python tests below for the rest).
+
+Python tests are stdlib unittest; pytest isn't installed in agent shells and
+isn't needed (offbox's include-filter cases are the one pytest suite, and they
+skip without it). Run one file with `python3 <path/to/test_x.py>`, or a package's
+suite with `python3 -m unittest discover -s integrations/<pkg>/<tests dir>`
+(the dir is `tests` or `test`, e.g. `integrations/memory-system/tests`).

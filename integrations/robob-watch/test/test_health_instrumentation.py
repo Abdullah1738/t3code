@@ -1,14 +1,18 @@
 """Run real entry points with isolated files and fake external services."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import ast
 import contextlib
 import datetime as dt
 import io
 import json
-import os
 from pathlib import Path
 import shutil
 import site
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import types
@@ -100,6 +104,86 @@ class InstrumentationTests(unittest.TestCase):
         self.assertEqual(row['ok'], status == 0)
         if status:
             self.assertIn('error', row)
+
+    def test_real_watcher_run_triggers_and_fold_override(self):
+        for value in ('schedule', 'retry', 'manual', 'unknown', 'private-trigger'):
+            expected = value if value in toollog.TRIGGERS else 'unknown'
+            with mock.patch.dict(os.environ, HEALTH_TOOLLOG_TRIGGER=value):
+                for component in ('meds-nag', 'gym-nudge'):
+                    with self.subTest(component=component, value=value):
+                        self.assertEqual(self.run_script(PACKAGE / 'watchers' / component / 'check.py'), 0)
+                        row = [r for r in self.rows() if r['component'] == component and r['name'] == 'watcher.run'][-1]
+                        self.assertEqual(row['props']['trigger'], expected)
+                self.assertEqual(self.run_script(PACKAGE / 'watchers/meds-nag/check.py', ['--fold']), 0)
+                self.assertEqual([r for r in self.rows() if r['name'] == 'watcher.run'][-1]['props']['trigger'], 'chained')
+        with mock.patch.dict(os.environ, {}, clear=True):
+            # Keep explicit test destinations while exercising the emitter's manual default.
+            os.environ.update(HEALTH_TOOLLOG_DIR=str(self.logs), WATCH_DIR=str(self.watch))
+            self.assertEqual(self.run_script(PACKAGE / 'watchers/meds-nag/check.py'), 0)
+            self.assertEqual([r for r in self.rows() if r['name'] == 'watcher.run'][-1]['props']['trigger'], 'manual')
+
+    def test_real_vault_sync_and_nutrition_trigger_boundaries(self):
+        if not self.vault.exists():
+            self.skipTest('set HEALTH_VAULT_TEST_COPY')
+        nutrition = self.vault / 'nutrition'
+        (nutrition / 'watch.off').touch()
+        try:
+            for value in ('schedule', 'retry', 'chained', 'manual', 'private-trigger'):
+                expected = value if value in toollog.TRIGGERS else 'unknown'
+                with mock.patch.dict(os.environ, HEALTH_TOOLLOG_TRIGGER=value):
+                    for arg in ('nudge', 'checkin'):
+                        self.assertEqual(self.run_script(nutrition / 'watch_check.py', [arg]), 0)
+                        self.assertEqual([r for r in self.rows() if r['name'] == 'watcher.run'][-1]['props']['trigger'], expected)
+                    def fixture(g):
+                        g['_sync'] = lambda *a, **kw: None
+                    self.assertEqual(self.run_script(self.vault / 'whoop/whoop.py', ['sync'], fixture), 0)
+                    self.assertEqual([r for r in self.rows() if r['name'] == 'sync.run'][-1]['props']['trigger'], expected)
+            # OAuth backfill calls the Python sync function directly, as a chained tool.
+            def callback(g):
+                g['_sync'] = lambda *a, **kw: None
+                g['main'] = lambda args: g['sync'](full=True, trigger='chained')
+            self.assertEqual(self.run_script(self.vault / 'whoop/whoop.py', ['serve'], callback), 0)
+            self.assertEqual([r for r in self.rows() if r['name'] == 'sync.run'][-1]['props']['trigger'], 'chained')
+        finally:
+            (nutrition / 'watch.off').unlink()
+
+    def test_recovery_watcher_marks_its_child_sync_chained(self):
+        vault = self.root / 'recovery-vault'
+        (vault / 'whoop').mkdir(parents=True)
+        cards = self.root / 'cards'
+        cards.mkdir()
+        result = self.root / 'child-trigger'
+        (vault / 'whoop/whoop.py').write_text(
+            'import os\nfrom pathlib import Path\nPath(os.environ["TRIGGER_RESULT"]).write_text(os.environ.get("HEALTH_TOOLLOG_TRIGGER", "unknown"))\n')
+        db = vault / 'health.db'
+        with sqlite3.connect(str(db)) as con:
+            con.executescript('''
+                CREATE TABLE whoop_recovery(cycle_id INTEGER PRIMARY KEY, sleep_id TEXT, score_state TEXT,
+                                            created_at_api TEXT, raw_json TEXT);
+                CREATE TABLE whoop_sleep(sleep_id TEXT PRIMARY KEY, start_utc TEXT, end_utc TEXT,
+                                         is_nap INTEGER, score_state TEXT, created_at_api TEXT, raw_json TEXT);
+            ''')
+        env = dict(os.environ, VAULT_DIR=str(vault), CARDS_DIR=str(cards), WATCH_DIR=str(self.watch),
+                   HEALTH_DB=str(db), NOW_DXB='2026-11-13T12:00', TRIGGER_RESULT=str(result),
+                   HEALTH_TOOLLOG_TRIGGER='schedule')
+        env.pop('NO_SYNC', None)
+        run = subprocess.run(['/bin/zsh', str(PACKAGE / 'watchers/whoop-recovery-card/check.sh')],
+                             env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stderr, '')
+        self.assertEqual(result.read_text(), 'chained')
+
+    def test_forge_run_trigger(self):
+        latest = self.root / 'forge.json'
+        latest.write_text('{}')
+        report = types.ModuleType('report')
+        report.LATEST, report.last_change_ms = str(latest), lambda w: 0
+        report.load_doc = lambda **kw: {'payload': {'workouts': []}}
+        with mock.patch.dict(sys.modules, report=report):
+            for value in ('schedule', 'manual', 'retry'):
+                with mock.patch.dict(os.environ, HEALTH_TOOLLOG_TRIGGER=value):
+                    self.assertEqual(self.run_script(PACKAGE / 'watchers/forge-workouts/check.py'), 0)
+                    self.assertEqual([r for r in self.rows() if r['name'] == 'watcher.run'][-1]['props']['trigger'], value)
 
     def test_each_vault_cli_success_and_failure(self):
         if not self.vault.exists():

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from janitor_test_safety import JanitorTestCase
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill/scripts'
@@ -15,7 +16,11 @@ import worktree_reaper as reaper
 GOOD = dict(complete=True, threads={}, opencode=set(), workspaces={'native': '/work/app'}, problems=[])
 
 
-class LivenessTests(unittest.TestCase):
+class LivenessTests(JanitorTestCase):
+    def setUp(self):
+        self.sleep = patch.object(reaper.time, 'sleep').start()
+        self.addCleanup(patch.stopall)
+
     def test_both_scripts_use_same_api_workspaces_and_service_directories(self):
         with patch.object(active, 'snapshot', return_value={**GOOD, 'opencode': {'ses_test'}}), \
                 patch.object(active, 'opencode_directories', return_value=({'ses_test': '/work/service'}, None)):
@@ -101,7 +106,7 @@ class LivenessTests(unittest.TestCase):
                 patch.object(janitor, 'LOG_DIR', tmp), patch.object(janitor, 'audit') as audit:
             self.assertEqual(janitor.process_cursor(), 0)
             report = dict(ts=1, liveness_unavailable=None, processes=dict(next_cursor={"priority": 0, "pid": 30}, checked=1,
-                          skipped=2, budget_skipped=2, candidates=[], problems=[]))
+                          skipped=2, budget_skipped=2, candidates=[], problems=[], owner_calls={}))
             janitor.record_report(report)
             self.assertEqual(janitor.process_cursor(), {"priority": 0, "pid": 30})
             self.assertEqual(audit.call_args.args[0]['processes']['checked'], 1)

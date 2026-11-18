@@ -9,6 +9,7 @@ import {
   MessageId,
   ProjectId,
   ProviderInstanceId,
+  ProviderSessionId,
   NodeId,
   ProviderThreadId,
   ProviderTurnId,
@@ -41,7 +42,11 @@ const run = {
   contextHandoffId: null,
 } satisfies OrchestrationV2Run;
 
-function commandItem(id: string, output = "done", ordinal = 1): OrchestrationV2TurnItem {
+function commandItem(
+  id: string,
+  output = "done",
+  ordinal = 1,
+): Extract<OrchestrationV2TurnItem, { type: "command_execution" }> {
   return {
     id: TurnItemId.make(id),
     threadId,
@@ -107,6 +112,55 @@ const emptyProjection = {
 } as OrchestrationV2ThreadProjection;
 
 describe("applyOrchestrationV2ProjectionEvent", () => {
+  it.each(
+    (
+      [
+        "thread_archive",
+        "thread_settle",
+        "thread_reset",
+        "workspace_change",
+        "runtime_mode_change",
+        "superseded",
+        "session_detach",
+      ] as const
+    ).flatMap((cancelReason) =>
+      (["running", "completed"] as const).flatMap((status) =>
+        [true, false].map((matches) => ({ cancelReason, status, matches })),
+      ),
+    ),
+  )(
+    "detach stamps only bound active runs ($cancelReason / $status / $matches)",
+    ({ cancelReason, status, matches }) => {
+      const sessionId = ProviderSessionId.make("detach-session");
+      const providerThreadId = ProviderThreadId.make("detach-provider-thread");
+      const projection = {
+        ...emptyProjection,
+        runs: [{ ...run, status, providerThreadId }],
+        providerThreads: [
+          {
+            id: providerThreadId,
+            providerSessionId: sessionId,
+          } as OrchestrationV2ThreadProjection["providerThreads"][number],
+        ],
+      };
+      const next = applyOrchestrationV2ProjectionEvent(projection, {
+        id: EventId.make("detach-source"),
+        type: "provider-session.detached",
+        threadId,
+        occurredAt: now,
+        payload: {
+          providerSessionId: matches ? sessionId : ProviderSessionId.make("other-session"),
+          detachedAt: now,
+          cancelReason,
+          reason: "D".repeat(501),
+        },
+      })!;
+      const stamps = matches && status === "running";
+      expect(next.runs[0]?.status).toBe(status);
+      expect(next.runs[0]?.cancelReason).toBe(stamps ? cancelReason : undefined);
+      expect(next.runs[0]?.cancelDetail).toBe(stamps ? "D".repeat(500) : undefined);
+    },
+  );
   it("applies a compact PR sync without replacing other links or thread metadata", () => {
     const link = (number: number): ThreadPullRequestLink => ({
       host: "github.com",
@@ -588,4 +642,113 @@ it("removes redacted command output from both item collections", () => {
   const next = applyOrchestrationV2ProjectionEvent(projection, event);
   expect(JSON.stringify(next).includes("eyJFAKE.fixture-only")).toBe(false);
   expect(next?.turnItems[0]).toMatchObject({ id: item.id, input: "pwd", status: "completed" });
+});
+
+describe("cancellation provenance", () => {
+  it.each(
+    (["run.created", "run.updated"] as const).flatMap((type) =>
+      ([undefined, "provider_cancelled", "provider_interrupted"] as const).map((cancelReason) => ({
+        type,
+        cancelReason,
+      })),
+    ),
+  )("keeps a specific cause through $type with $cancelReason", ({ type, cancelReason }) => {
+    const specific = {
+      ...run,
+      status: "cancelled" as const,
+      cancelReason: "server_shutdown" as const,
+      cancelDetail: "Server shut down.",
+    };
+    const next = applyOrchestrationV2ProjectionEvent(
+      { ...emptyProjection, runs: [specific] },
+      {
+        id: EventId.make("stale-cancel"),
+        type,
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: { ...run, status: "cancelled", cancelReason },
+      },
+    )!;
+    expect(next.runs[0]?.cancelReason).toBe("server_shutdown");
+    expect(next.runs[0]?.cancelDetail).toBe("Server shut down.");
+  });
+  it.each(
+    (["interrupted", "cancelled"] as const).flatMap((status) =>
+      (
+        [undefined, "provider_cancelled", "provider_interrupted", "server_shutdown"] as const
+      ).flatMap((previous) =>
+        (
+          [
+            "user_stop",
+            "task_cancel",
+            "thread_reset",
+            "card_stop",
+            "delegated_parent_cancelled",
+            "superseded",
+            "task_stalled",
+          ] as const
+        ).flatMap((cancelReason) =>
+          [false, true].map((partialTimeline) => ({
+            status,
+            previous,
+            cancelReason,
+            partialTimeline,
+          })),
+        ),
+      ),
+    ),
+  )(
+    "records a late request without changing $status ($previous -> $cancelReason, partial=$partialTimeline)",
+    ({ status, previous, cancelReason, partialTimeline }) => {
+      let next = applyOrchestrationV2ProjectionEvent(
+        {
+          ...emptyProjection,
+          runs: [
+            {
+              ...run,
+              status,
+              cancelReason: previous,
+              cancelDetail: previous === "server_shutdown" ? "Server shut down." : undefined,
+            },
+          ],
+          turnItems: [commandItem("newer", "done", 100)],
+        },
+        {
+          id: EventId.make("late-request"),
+          type: "turn-item.updated",
+          threadId,
+          runId,
+          occurredAt: now,
+          payload: {
+            ...commandItem("request"),
+            type: "run_interrupt_request",
+            cancelReason,
+            message: "Stop before provider start.",
+          },
+        },
+        { partialTimeline, latestLocalTurnOrdinal: 100 },
+      )!;
+      next = applyOrchestrationV2ProjectionEvent(next, {
+        id: EventId.make("late-stale-terminal"),
+        type: "run.updated",
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: {
+          ...run,
+          status,
+          cancelReason: status === "cancelled" ? "provider_cancelled" : "provider_interrupted",
+        },
+      })!;
+      expect(next.runs[0]?.status).toBe(status);
+      expect(next.turnItems.some((item) => item.id === "request")).toBe(!partialTimeline);
+      expect(next.runs[0]?.cancelReason).toBe(
+        previous === "server_shutdown" ? previous : cancelReason,
+      );
+      expect(next.runs[0]?.cancelDetail).toBe(
+        previous === "server_shutdown" ? "Server shut down." : "Stop before provider start.",
+      );
+    },
+  );
 });

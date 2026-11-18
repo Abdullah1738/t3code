@@ -47,7 +47,7 @@ class DecisionTests(unittest.TestCase):
                     state_file = Path(d) / 'state.json'
                     guard.atomic_json(state_file, previous)
                     hold = None if hold_kind == 'absent' else dict(
-                        by='install', pid=2, beatAt=now - (90 if hold_kind == 'stale' else 0))
+                        by='install', pid=2, startedAt=now, beatAt=now - (90 if hold_kind == 'stale' else 0))
                     state, statuses, action = guard.decide(
                         guard.read_state(state_file), now=now, up=False, boot_time=boot,
                         hold=hold, hold_pid_alive=hold_kind != 'dead')
@@ -100,14 +100,14 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(state['down_count'], 1)
         self.assertEqual(guard.decide(state, now=boot + 330, up=False, boot_time=boot)[2], 'reopen')
     def test_hold_corpus(self):
-        rows=[(dict(by='install',pid=2,beatAt=10000),True,True),
-              (dict(by='install',pid=2,beatAt=9910),True,False),
-              (dict(by='install',pid=2,beatAt=9999),False,False),
-              (dict(by='install',pid=2,beatAt=10001),True,False),
-              (dict(by='install',pid=-1,beatAt=10000),True,False),
-              (dict(by='install',pid=True,beatAt=10000),True,False),
-              (dict(by='install',pid=2,beatAt=float('nan')),True,False),
-              (dict(by='install',pid=2,beatAt='10000'),True,False),({},True,False),([],True,False)]
+        rows=[(dict(by='install',pid=2,startedAt=10000,beatAt=10000),True,True),
+              (dict(by='install',pid=2,startedAt=10000,beatAt=9910),True,False),
+              (dict(by='install',pid=2,startedAt=10000,beatAt=9999),False,False),
+              (dict(by='install',pid=2,startedAt=10000,beatAt=10001),True,False),
+              (dict(by='install',pid=-1,startedAt=10000,beatAt=10000),True,False),
+              (dict(by='install',pid=True,startedAt=10000,beatAt=10000),True,False),
+              (dict(by='install',pid=2,startedAt=10000,beatAt=float('nan')),True,False),
+              (dict(by='install',pid=2,startedAt=10000,beatAt='10000'),True,False),({},True,False),([],True,False)]
         for hold,alive,fresh in rows:
             with self.subTest(hold=hold,alive=alive):
                 s,status,a=guard.decide(dict(guard.initial_state(),down_count=1),now=10000,up=False,boot_time=0,hold=hold,hold_pid_alive=alive)
@@ -139,18 +139,57 @@ class DecisionTests(unittest.TestCase):
         self.tick();self.assertEqual(self.tick()[1],'reopen');self.tick(0,up=True);self.tick(0)
         self.assertEqual(self.tick(0)[1],'backoff')
     def test_hold_resets_intentional_downtime(self):
-        self.opened();self.tick(200,hold=dict(by='install',pid=2,beatAt=self.now+200),hold_pid_alive=True)
+        self.opened();self.tick(200,hold=dict(by='install',pid=2,startedAt=10000,beatAt=self.now+200),hold_pid_alive=True)
         self.assertEqual(self.state['failed_reopens'],0);self.assertEqual(self.tick()[1],'none');self.assertEqual(self.tick()[1],'reopen')
 
 class IOTests(unittest.TestCase):
+    def test_bounded_process_diagnostics_and_failed_reads(self):
+        output = "malformed\n1 0 /sbin/launchd /sbin/launchd\n42 1 %s desktop\n" % guard.EXECUTABLE
+        output += "\n".join("%s 43 %s %s" % (pid, guard.EXECUTABLE, "x" * 300) for pid in range(43, 53))
+        with patch('quit_reason.registered_desktop_pids',return_value={42}), \
+                patch('guard.subprocess.run',return_value=subprocess.CompletedProcess('ps',0,stdout=output)):
+            detail=json.loads(guard.process_diagnostics().removeprefix('processes='))
+        self.assertEqual(detail['lsappinfo_pid'],42)
+        self.assertTrue(detail['lsappinfo_alive'])
+        self.assertEqual([p['pid'] for p in detail['robob_processes']],list(range(43,48)))
+        self.assertTrue(all(len(p['args'])==160 and p['ppid']==43 for p in detail['robob_processes']))
+        with patch('quit_reason.registered_desktop_pids',side_effect=OSError('lsa')), \
+                patch('guard.subprocess.run',side_effect=subprocess.TimeoutExpired('ps',5)):
+            detail=guard.process_diagnostics()
+        self.assertIn('"lsappinfo_alive":"unknown"',detail)
+        self.assertIn('"lsappinfo_error":"OSError"',detail)
+        self.assertIn('"processes_error":"TimeoutExpired"',detail)
+
+    def test_check_error_notification_text(self):
+        with patch('guard.subprocess.run') as run:
+            self.assertTrue(guard.notify(Path('/fake'),'robob-guard:10000:check-error',dict(kind='check-error',at=10090)))
+        command=run.call_args.args[0]
+        message=command[command.index('--text')+1]
+        self.assertIn('checks keep failing',message)
+        self.assertIn('guard.log',message)
+        self.assertEqual(command[-1],'robob-guard:10000:check-error')
+
+    def test_check_error_state_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'state'
+            state=guard.initial_state()
+            guard.record_check_error(state,10000,False)
+            for now in [10030,10060,10090]:guard.record_check_error(state,now,False)
+            guard.atomic_json(path,state)
+            self.assertEqual(guard.read_state(path),state)
+            for key,value in [('check_error_count',-1),('check_error_count',True),('check_error_since','bad')]:
+                with self.subTest(key=key,value=value):
+                    guard.atomic_json(path,dict(state,**{key:value}))
+                    self.assertEqual(guard.read_state(path),guard.initial_state())
+
     def test_exact_process(self):
         self.assertTrue(guard.robob_present(' 12 '+guard.EXECUTABLE+'\n'))
         for value in ['Robob',guard.EXECUTABLE+' Helper','python script Robob',guard.EXECUTABLE+'-old']:
             self.assertFalse(guard.robob_present(' 12 '+value))
     def test_clean_background_open(self):
-        with patch.dict(os.environ,{'BUN_INSPECT':'1','TMUX':'x'}),patch('guard.subprocess.run') as run:
+        with patch.dict(os.environ,{'BUN_INSPECT':'1','TMUX':'x'}),patch('guard.time.time',return_value=10000),patch('guard.subprocess.run') as run:
             guard.reopen(Path('/fake'));args,kw=run.call_args
-            self.assertEqual(args[0],['/usr/bin/open','-g','-a',guard.APP]);self.assertEqual(set(kw['env']),{'HOME','USER','PATH'});self.assertEqual(kw['cwd'],'/')
+            self.assertEqual(args[0],['/usr/bin/open','-g','-a',guard.APP,'--env','ROBOB_LAUNCH_INITIATOR=guard:10000000']);self.assertEqual(set(kw['env']),{'HOME','USER','PATH'});self.assertEqual(kw['cwd'],'/')
     def test_notification_failure(self):
         with patch('guard.subprocess.run',side_effect=subprocess.TimeoutExpired('bun',30)) as run:
             self.assertFalse(guard.notify(Path('/fake'),'key',dict(kind='crash-loop',at=10000)))
@@ -170,23 +209,23 @@ class IOTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             home=Path(d);p=home/'.local/state/robob-guard/state.json'
             guard.atomic_json(p,dict(guard.initial_state(),down_count=1))
-            with patch('guard.process_up',return_value=False),patch('guard.boot_epoch',return_value=0),patch('guard.reopen') as opened,patch('guard.notify') as notified:
+            with patch('guard.backend_ready',return_value=False),patch('guard.process_up',return_value=False),patch('guard.boot_epoch',return_value=0),patch('guard.reopen') as opened,patch('guard.notify') as notified:
                 guard.check(home);opened.assert_called_once_with(home);notified.assert_not_called()
-                guard.atomic_json(home/'.robob/install-hold.json',dict(by='test',pid=os.getpid(),beatAt=__import__('time').time()))
+                guard.atomic_json(home/'.robob/install-hold.json',dict(by='test',pid=os.getpid(),startedAt=__import__('time').time(),beatAt=__import__('time').time()))
                 guard.check(home);self.assertEqual(opened.call_count,1)
                 self.assertIn('hold:test',(p.parent/'guard.log').read_text())
     def test_process_failure_never_opens(self):
-        with tempfile.TemporaryDirectory() as d,patch('guard.process_up',side_effect=OSError('ps')),patch('guard.reopen') as opened:
+        with tempfile.TemporaryDirectory() as d,patch('guard.backend_ready',return_value=False),patch('guard.process_up',side_effect=OSError('ps')),patch('guard.reopen') as opened:
             guard.check(Path(d));opened.assert_not_called()
     def test_heartbeat_arriving_during_recheck_never_records_open(self):
         for beat in [10000,10000.5,10001]:
             with self.subTest(beat=beat),tempfile.TemporaryDirectory() as d:
                 home=Path(d);p=home/'.local/state/robob-guard/state.json'
                 guard.atomic_json(p,dict(guard.initial_state(),down_count=1))
-                def process():
-                    guard.atomic_json(home/'.robob/install-hold.json',dict(by='arriving',pid=os.getpid(),beatAt=beat))
+                def process(home):
+                    guard.atomic_json(home/'.robob/install-hold.json',dict(by='arriving',pid=os.getpid(),startedAt=10000,beatAt=beat))
                     return False
-                with patch('guard.process_up',side_effect=process),patch('guard.boot_epoch',return_value=0),patch('guard.time.time',side_effect=[10000,10001]),patch('guard.reopen') as opened:
+                with patch('guard.backend_ready',side_effect=process),patch('guard.boot_epoch',return_value=0),patch('guard.time.time',side_effect=[10000,10001]),patch('guard.reopen') as opened:
                     guard.check(home);opened.assert_not_called()
                 state=guard.read_state(p)
                 self.assertEqual(state['history'],[]);self.assertFalse(state['awaiting_reopen'])

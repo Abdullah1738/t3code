@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,6 +26,7 @@ appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(args)+"\\n
     const db = new Database(process.env.ROBOB_WATCH_BRIDGE_DB);
     db.exec("create table kv(key text primary key,value text)");
     db.query("insert into kv values (?,?)").run("route",JSON.stringify({id:"ses_test",generation:1}));
+    db.query("insert into kv values (?,?)").run("sbChats",JSON.stringify({"dm:+971500000001":{slug:"moni"},"dm:+971500000002":{slug:"second-person"},"group:fixture":{slug:"family-trip"}}));
     db.close();
     const calls = join(root, "calls");
     const stub = join(root, "bridge.ts");
@@ -47,7 +48,7 @@ appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(args)+"\\n
     function add(id, extra={}) {
       const dir = lib.watcherDir(id);
       mkdirSync(dir, {recursive:true});
-      lib.writeJson(join(dir,"watcher.json"), lib.normalize({id,title:id,check:'if [[ -f event ]]; then cat event; rm event; fi; true',context:'{}',mode:'wake',interval_s:5,max_fires:0,...extra}));
+      lib.writeJson(join(dir,"watcher.json"), lib.normalize({id,title:id,check:'if [[ -f event ]]; then cat event; rm event; fi; true',context:'{}',mode:'wake',interval_s:5,max_fires:0,chat:extra.mode === 'notify' ? undefined : 'moni',...extra}));
     }
     function addReplyWatcher(id, extra={}) {
       const replyCheck=extra.check ?? 'if [[ -f event ]]; then cat event; rm event; fi; true';
@@ -79,11 +80,14 @@ appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(args)+"\\n
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
     if (code) throw new Error(stderr + stdout);
     const result = JSON.parse(stdout.trim().split("\n").at(-1)!);
-    return result;
+    const logs = (existsSync(join(root, "logs")) ? readdirSync(join(root, "logs")) : []).filter(file => file.endsWith(".ndjson"))
+      .flatMap(file => readFileSync(join(root, "logs", file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)));
+    if (process.env.TOOLLOG_SAMPLES) for (const row of logs.filter(row => ["watch.fire", "wake.sent", "wake.batch_opened", "wake.batch_sealed", "wake.urgent", "watch.grace_started", "watch.grace_ended", "watch.removed"].includes(row.name))) console.log("RELAY_LOG_SAMPLE " + JSON.stringify(row));
+    return { ...result, logs };
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
-for (const chat of [undefined, "moni", "family-trip"]) {
+for (const chat of ["moni", "second-person"]) {
   test(`six person-chat fires batch once, oldest first (${chat ?? "owner"})`, async () => {
     const result = await scenario(`
       add("batch", ${JSON.stringify(chat ? { chat } : {})});
@@ -101,6 +105,34 @@ for (const chat of [undefined, "moni", "family-trip"]) {
     for (let i = 0; i < 6; i++) expect(text).toContain(`${i + 1}. event-${i}`);
     expect(result.state.fires).toBe(6);
     expect(result.state.batch).toBeUndefined();
+    expect(result.logs.filter(row => row.name === "wake.batch_opened")).toHaveLength(1);
+    expect(result.logs.filter(row => row.name === "wake.batch_sealed")).toMatchObject([{ props: { events: 6, spanMs: 150000, archived: false, frozenContext: false } }]);
+    expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([{ props: { count: 6, events: 6, batched: true, urgent: false, route: "person", waitMs: 150000, closing: false } }]);
+    expect(result.logs.filter(row => row.name === "wake.sent")).toMatchObject([{ ok: true, props: { via: "wake", events: 6 }, durationMs: 0 }]);
+    const sentLog = result.logs.find(row => row.name === "wake.sent");
+    const digest = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+    expect(sentLog.ids).toEqual({ watcher: "batch", chat: digest("person").slice(0, 24), key: digest("wake:" + digest(args[args.indexOf("--key") + 1])).slice(0, 24) });
+    expect(result.logs.find(row => row.name === "watch.fire").ids.key).toBe(sentLog.ids.key);
+    for (let i = 0; i < 6; i++) expect(JSON.stringify(result.logs)).not.toContain(`event-${i}`);
+  });
+}
+
+for (const chat of [undefined, "family-trip", "unknown-slug"]) {
+  test('owner/group/unknown wake is immediate: ' + (chat ?? 'owner'), async () => {
+    const result = await scenario(`
+      add("immediate", {chat:${JSON.stringify(chat) ?? "undefined"}});
+      await fire("immediate", "immediate event");
+      const immediate=sent(); clock+=150000; await tickOne("immediate");
+      console.log(JSON.stringify({immediate,sent:sent(),state:state("immediate")}));
+    `);
+    expect(result.immediate).toHaveLength(1);
+    expect(result.sent).toHaveLength(1);
+    expect(result.state.batch).toBeUndefined();
+    expect(result.logs.filter(row => row.name.startsWith("wake.batch_"))).toEqual([]);
+    expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([{ props: { count: 1, events: 1, batched: false, urgent: false, route: chat === undefined ? "owner" : chat === "family-trip" ? "group" : "other", waitMs: 0, closing: false } }]);
+    expect(JSON.stringify(result.logs)).not.toContain("immediate event");
+    if (chat) expect(result.immediate[0]).toContain(chat);
+    else expect(result.immediate[0]).not.toContain("--chat");
   });
 }
 
@@ -238,7 +270,7 @@ for (const edge of ["queued-retarget", "failed-retry", "fire-cap", "accepted-ack
       const marker=join(root,"crashed");
       const edge=${JSON.stringify(edge)};
       const check='if [[ -f retry-failure ]]; then exit 7; fi; '+wa.poll+'; if [[ -f ack-failure ]]; then rm .run-ok; mkdir .run-ok; fi; if [[ ! -f '+shell([marker])+' ]]; then touch '+shell([marker])+'; kill -KILL "$PPID"; fi; true';
-      add("crash-edge",{check,context:"original-context",...(edge==="failed-retry" ? {} : {inflight_check:wa.poll}),max_fires:2});
+      add("crash-edge",{chat:"second-person",check,context:"original-context",...(edge==="failed-retry" ? {} : {inflight_check:wa.poll}),max_fires:2});
       wa.prime("crash-edge"); wa.insert("original-reply");
       if(edge==="fire-cap")lib.saveState("crash-edge",{...state("crash-edge"),batch:{at:clock,events:["earlier-event"],watcher:lib.loadWatcher("crash-edge")}});
       const child=Bun.spawn([process.execPath,"-e",'Date.now=()=>'+clock+'; const {tickOne}=await import('+JSON.stringify(runnerModule)+'); await tickOne("crash-edge");'],{env:process.env,stdout:"ignore",stderr:"pipe"});
@@ -278,6 +310,7 @@ for (const edge of ["queued-retarget", "failed-retry", "fire-cap", "accepted-ack
     }else{
       expect(result.sent.filter((args:string[])=>args.join(" ").includes("original-reply"))).toHaveLength(1);
       expect(text).toContain("original-context"); expect(text).not.toContain("replacement-context");
+      expect(result.sent.flat()).toContain("second-person");
       expect(result.sent.flat()).not.toContain("moni");
     }
     if(edge==="fire-cap")expect(result.state.status).toBe("done");
@@ -304,7 +337,7 @@ test("a surviving wrapper cannot write its outbox after recovery acknowledgement
     if(Bun.spawnSync(["mkfifo",gate,done]).exitCode)throw new Error("mkfifo failed");
     const completed=Bun.spawn(["cat",done],{stdout:"pipe",stderr:"ignore"});
     const check=wa.poll+'; '+cliShell+' add --json '+shell([replacement])+' --replace >/dev/null; '+cliShell+' rm survivor >/dev/null; kill -KILL "$PPID"; read -r line < '+shell([gate])+'; '+wa.poll+'; echo done > '+shell([done]);
-    add("survivor",{check,inflight_check:wa.poll,context:"original-context"});
+    add("survivor",{chat:"second-person",check,inflight_check:wa.poll,context:"original-context"});
     writeFileSync(replacement,JSON.stringify({...lib.loadWatcher("survivor"),chat:"moni",context:"replacement-context",check:wa.poll}));
     wa.prime("survivor"); wa.insert("original-private-reply");
     const child=Bun.spawn([process.execPath,"-e",'Date.now=()=>'+clock+'; const {tickOne}=await import('+JSON.stringify(runnerModule)+'); await tickOne("survivor");'],{env:process.env,stdout:"ignore",stderr:"ignore"});
@@ -319,6 +352,7 @@ test("a surviving wrapper cannot write its outbox after recovery acknowledgement
   expect(result.after).toBe(result.before);
   expect(result.after).not.toContain("late-private-reply");
   expect(result.sent).toHaveLength(1);
+  expect(result.sent[0]).toContain("second-person");
   expect(result.sent[0]).not.toContain("moni");
 },20_000);
 
@@ -360,6 +394,14 @@ test("an urgent JSON fire wakes immediately while the other five keep their orig
   for (const i of [0, 1, 2, 4, 5]) expect(result.sent[1].join(" ")).toContain(`event-${i}`);
   expect(result.sent[1].join(" ")).not.toContain("slot offered");
   expect(result.state.fires).toBe(6);
+  expect(result.logs.filter(row => row.name === "wake.urgent")).toMatchObject([{ props: { batchOpen: true } }]);
+  expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([
+    { props: { count: 1, events: 1, batched: false, urgent: true, route: "person", waitMs: 0 } },
+    { props: { count: 6, events: 5, batched: true, urgent: false, route: "person", waitMs: 150000 } },
+  ]);
+  expect(result.logs.filter(row => row.name === "wake.batch_opened")).toHaveLength(1);
+  expect(result.logs.filter(row => row.name === "wake.batch_sealed")).toHaveLength(1);
+  expect(JSON.stringify(result.logs)).not.toContain("slot offered");
 });
 
 test("notify is immediate and JSON urgent:false stays batched", async () => {
@@ -370,6 +412,7 @@ test("notify is immediate and JSON urgent:false stays batched", async () => {
   `);
   expect(result.sent).toHaveLength(1);
   expect(result.sent[0][0]).toBe("send");
+  expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([{ props: { route: "owner", batched: false, urgent: false, events: 1 } }]);
   expect(result.state.batch.events).toHaveLength(1);
 });
 
@@ -394,6 +437,16 @@ test("large batches retain every full event and failed deliveries retry the same
   expect(result.batch.events.map((s: string) => s.length)).toEqual([5000, 5000]);
   expect(result.state.status).toBe("done");
   expect(result.retained).toBe(true);
+  expect(result.logs.filter(row => row.name === "wake.batch_sealed")).toMatchObject([{ props: { events: 2, spanMs: 150000, archived: true, frozenContext: false } }]);
+  expect(result.logs.filter(row => row.name === "wake.sent")).toMatchObject([
+    { ok: false, kind: "error", error: { tag: "wake.delivery_failed" }, props: { via: "none", events: 2 } },
+    { ok: true, kind: "perf", props: { via: "wake", events: 2 } },
+  ]);
+  expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([{ props: { events: 2, route: "person", waitMs: 155000 } }]);
+  const attempts = result.logs.filter(row => row.name === "wake.sent");
+  expect(attempts[0].ids.key).toBe(attempts[1].ids.key);
+  expect(JSON.stringify(result.logs)).not.toContain("a".repeat(100));
+  expect(JSON.stringify(result.logs)).not.toContain("b".repeat(100));
 });
 
 test("context writers merge keys, nested objects and lists under a lock, and replace is explicit", async () => {
@@ -496,9 +549,9 @@ test("a check failure pause does not strand events already accepted into its bat
 
 
 for (const [before, after] of [[null, "moni"], ["moni", null], ["moni", "family-trip"], ["family-trip", "moni"]]) {
-  test(`queued private events retain their accepted destination ${before} -> ${after}`, async () => {
+  test(`private events retain their accepted destination ${before} -> ${after}`, async () => {
     const result = await scenario(`
-      add("target",{context:"original-context",...${JSON.stringify(before ? {chat:before} : {})}}); await fire("target","private-reply");
+      add("target",{context:"original-context",chat:${JSON.stringify(before ?? undefined) ?? "undefined"}}); await fire("target","private-reply");
       const current=lib.loadWatcher("target"); delete current.chat;
       lib.writeJson(join(lib.watcherDir("target"),"watcher.json"),{...current,context:"new-private-context",${after ? 'chat:'+JSON.stringify(after) : ''}});
       clock+=150000; await tickOne("target");
@@ -574,7 +627,7 @@ test("changing wake to notify does not turn an accepted private batch into a dir
 
 test("a check completing after retargeting uses the destination admitted with the check", async () => {
   const result = await scenario(`
-    add("admitted",{context:"old-context",check:process.execPath+' ./retarget.ts'});
+    add("admitted",{chat:undefined,context:"old-context",check:process.execPath+' ./retarget.ts'});
     writeFileSync(join(lib.watcherDir("admitted"),"retarget.ts"),'import {readFileSync,writeFileSync} from "node:fs"; import {join} from "node:path"; const file=join(process.env.WATCH_DIR,"watcher.json"); const w=JSON.parse(readFileSync(file,"utf8")); w.chat="moni"; w.context="new-private-context"; writeFileSync(file,JSON.stringify(w)); console.log("old-private-reply");');
     await tickOne("admitted"); clock+=150000; await tickOne("admitted");
     console.log(JSON.stringify({sent:sent()}));
@@ -607,7 +660,7 @@ for (const urgent of [false, true]) {
       add("snapshot",{context:original});
       lib.saveState("snapshot",{...state("snapshot"),fires:1,last_fire_at:lib.iso()});
       await fire("snapshot",JSON.stringify({urgent:${urgent},event:"private reply"}));
-      const next=lib.loadWatcher("snapshot"); next.chat="moni"; next.context="NEW CHAT PRIVATE CONTEXT";
+      const next=lib.loadWatcher("snapshot"); next.chat="second-person"; next.context="NEW CHAT PRIVATE CONTEXT";
       lib.writeJson(join(lib.watcherDir("snapshot"),"watcher.json"),next);
       clock+=150000; await tickOne("snapshot");
       const file=join(root,"archive","contexts",lib.hash(original)+".json");
@@ -727,7 +780,7 @@ for (const status of ["active", "done", "expired"]) {
 test("explicit in-flight polling never reruns the normal outreach check and freezes its reply command", async () => {
   const result = await scenario(`
     const marker=join(root,"outreach-ran");
-    add("reply-only",{check:'echo run >> '+marker+'; echo unsafe',
+    add("reply-only",{chat:undefined,check:'echo run >> '+marker+'; echo unsafe',
       inflight_check:'[[ "$WATCH_CLOSING" = 1 ]] || exit 7; if [[ -f event ]]; then cat event; rm event; fi; true'});
     lib.saveState("reply-only",{...state("reply-only"),status:"done",fires:1});
     lib.removeWatcher("reply-only");
@@ -823,7 +876,7 @@ for (const [before, after] of [[undefined,"moni"],["moni",undefined],["moni","fa
           'if [[ -f event ]]; then mv event outbox; echo "$WATCH_RUN" > outbox-run; cat outbox; fi',
           'if [[ -f mutate ]]; then rm mutate; '+cliShell+' add --json '+shell([replacement])+' --replace >/dev/null; '+cliShell+' rm replay >/dev/null; fi'
         ].join("\\n"));
-        addReplyWatcher("replay",{check,...${JSON.stringify(before ? {chat:before} : {})}});
+        addReplyWatcher("replay",{check,chat:${JSON.stringify(before ?? undefined) ?? "undefined"}});
         writeFileSync(replacement,JSON.stringify({...lib.loadWatcher("replay"),chat:${JSON.stringify(after) ?? "undefined"}}));
         writeFileSync(join(lib.watcherDir("replay"),"mutate"),"");
         await fire("replay",${JSON.stringify(urgent ? JSON.stringify({urgent:true,event:"private-old-chat-reply"}) : "private-old-chat-reply")});
@@ -876,10 +929,10 @@ for(const options of [
   test(`shipped poller handoff ${options.before ?? "owner"} -> ${options.after ?? "owner"} ${options.mode ?? "wake"} retry=${!!options.retry} boundary=${!!options.boundary} resume=${!!options.resume} silent=${!!options.silent} ackFail=${!!options.ackFail}`, async()=>{
     const result=await scenario(`
       const options=${JSON.stringify(options)}; const wa=setupWhatsApp();
-      const reply='[[ "$WATCH_CLOSING" = 1 ]] || exit 8; [[ ! -f reply-fail ]] || exit 7; '+wa.poll+(options.ackFail?'; if [[ ! -f blocked-ack ]]; then touch blocked-ack; rm .run-ok; mkdir .run-ok; fi':'');
+      const reply=(options.ackFail?'[[ ! -f .run-ok ]] || cp .run-ok ack-observed; ':'')+'[[ "$WATCH_CLOSING" = 1 ]] || exit 8; [[ ! -f reply-fail ]] || exit 7; '+wa.poll+(options.ackFail?'; if [[ ! -f blocked-ack ]]; then touch blocked-ack; rm .run-ok; mkdir .run-ok; fi':'');
       const replacement=join(root,"replacement.json");
       const check=wa.poll+(options.silent?' >/dev/null':'')+'; '+cliShell+' add --json '+shell([replacement])+' --replace >/dev/null; '+cliShell+' rm handoff >/dev/null; echo arbitrary-canceled-normal-output';
-      add("handoff",{check,inflight_check:reply,context:"original-private-context",mode:options.mode??"wake",...(options.before?{chat:options.before}:{})});
+      add("handoff",{check,inflight_check:reply,context:"original-private-context",mode:options.mode??"wake",chat:options.before??undefined});
       const next={...lib.loadWatcher("handoff"),context:"replacement-private-context"};
       if(options.after)next.chat=options.after; else delete next.chat;
       writeFileSync(replacement,JSON.stringify(next));
@@ -896,14 +949,16 @@ for(const options of [
       const replayed=existsSync(wa.outbox("handoff"))?JSON.parse(readFileSync(wa.outbox("handoff"),"utf8")):null;
       if(options.ackFail){if(state("handoff").reply_handoff?.accepted_run!==replayed.run)throw new Error("acceptance not recorded"); rmSync(join(lib.watcherDir("handoff"),".run-ok"),{recursive:true}); await restarted.tickOne("handoff")}
       const ackAfter=readFileSync(join(lib.watcherDir("handoff"),".run-ok"),"utf8").trim();
+      const ackObserved=existsSync(join(lib.watcherDir("handoff"),"ack-observed"))?readFileSync(join(lib.watcherDir("handoff"),"ack-observed"),"utf8").trim():null;
       clock+=150000; await restarted.tickOne("handoff"); clock+=5000; await restarted.tickOne("handoff");
       const first=sent();
       if(!options.boundary){wa.insert("provider-reply-after-handoff"); clock+=5000; await restarted.tickOne("handoff"); clock+=150000; await restarted.tickOne("handoff")}
-      console.log(JSON.stringify({old,ackBefore,replayed,ackAfter,first,sent:sent()}));
+      console.log(JSON.stringify({old,ackBefore,replayed,ackAfter,ackObserved,first,sent:sent()}));
     `);
     expect(result.ackBefore).not.toBe(result.old.run);
     expect(result.replayed?.run).not.toBe(result.old.run);
-    expect(result.ackAfter).toBe(result.replayed?.run);
+    // An immediate delivery can run a fresh poll in this tick; that poll must observe the restored acknowledgement.
+    expect([result.ackAfter,result.ackObserved]).toContain(result.replayed?.run);
     expect(result.first).toHaveLength(1);
     const first=result.first[0];
     if(options.before)expect(first[first.indexOf("--chat")+1]).toBe(options.before); else expect(first).not.toContain("--chat");
@@ -954,7 +1009,7 @@ for (const ownChecker of [false,true]) {
     const result=await scenario(`
       const replacement=join(root,"replacement.json");
       const oldReply='echo admitted-private-reply';
-      add("checker-owner",{context:"admitted-context",${ownChecker?'inflight_check:oldReply,':''}check:cliShell+' add --json '+shell([replacement])+' --replace >/dev/null; '+cliShell+' rm checker-owner >/dev/null; echo canceled-stdout'});
+      add("checker-owner",{chat:undefined,context:"admitted-context",${ownChecker?'inflight_check:oldReply,':''}check:cliShell+' add --json '+shell([replacement])+' --replace >/dev/null; '+cliShell+' rm checker-owner >/dev/null; echo canceled-stdout'});
       writeFileSync(replacement,JSON.stringify({...lib.loadWatcher("checker-owner"),chat:"moni",context:"replacement-context",inflight_check:'echo replacement-private-reply'}));
       await tickOne("checker-owner"); const handoff=state("checker-owner").reply_handoff;
       lib.saveState("checker-owner",{...state("checker-owner"),closing_until:clock+900000});
@@ -1176,4 +1231,107 @@ test("a matching reply command uses closing state admitted under the removal loc
   `);
   expect(result.reply.code).toBe(0);
   expect(result.reply.stdout.trim()).toBe("1");
+});
+
+
+test("grace lifecycle logs a relayed reply once and expires with its count", async () => {
+  const result = await scenario(`
+    addReplyWatcher("grace-log",{context:"private-context-never-log"});
+    lib.removeWatcher("grace-log"); lib.removeWatcher("grace-log");
+    const until=state("grace-log").closing_until;
+    await fire("grace-log","private-reply-never-log",300000);
+    clock+=150000; await tickOne("grace-log");
+    clock=until; await tickOne("grace-log"); await tickOne("grace-log");
+    console.log(JSON.stringify({exists:!!lib.loadWatcher("grace-log")}));
+  `);
+  expect(result.exists).toBe(false);
+  expect(result.logs.filter(row => row.name === "watch.grace_started")).toMatchObject([{ props: { graceMs: 900000 } }]);
+  expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([{ props: { events: 1, closing: true, route: "person" } }]);
+  expect(result.logs.filter(row => row.name === "watch.grace_ended")).toMatchObject([{ props: { reason: "expired", relays: 1 } }]);
+  expect(JSON.stringify(result.logs)).not.toContain("private-reply-never-log");
+  expect(JSON.stringify(result.logs)).not.toContain("private-context-never-log");
+});
+
+for (const action of ["resume", "now"]) {
+  test(`grace ends once on ${action} and a new grace resets its relay count`, async () => {
+    const result = await scenario(`
+      addReplyWatcher("end-grace"); lib.removeWatcher("end-grace");
+      await fire("end-grace",JSON.stringify({urgent:true,event:"private-urgent-reply"}),5000);
+      cli(...${JSON.stringify(action === 'resume' ? ['resume','end-grace'] : ['rm','end-grace','--now'])});
+      if(${action === "resume"}) { lib.removeWatcher("end-grace"); cli("rm","end-grace","--now"); }
+      console.log(JSON.stringify({sent:sent()}));
+    `);
+    expect(result.logs.filter(row => row.name === "watch.grace_ended")).toMatchObject(action === "resume" ? [
+      { props: { reason: "resume", relays: 1 } }, { props: { reason: "now", relays: 0 } },
+    ] : [{ props: { reason: "now", relays: 1 } }]);
+    expect(result.logs.filter(row => row.name === "watch.removed")).toMatchObject([{ props: { grace: false, reason: "now" } }]);
+    expect(result.logs.filter(row => row.name === "wake.urgent")).toMatchObject([{ props: { batchOpen: false } }]);
+    expect(JSON.stringify(result.logs)).not.toContain("private-urgent-reply");
+  });
+}
+
+for (const options of [{ args: ["rm", "immediate-log", "--now"], extra: {}, reason: "now" },
+  { args: ["rm", "immediate-log"], extra: {}, reason: "no_inflight_check" },
+  { args: ["rm", "immediate-log"], extra: { paused: true }, reason: "paused" }]) {
+  test(`immediate removal logs ${options.reason} without starting grace`, async () => {
+    const result = await scenario(`
+      add("immediate-log",${JSON.stringify(options.extra)}); cli(...${JSON.stringify(options.args)});
+      console.log(JSON.stringify({exists:!!lib.loadWatcher("immediate-log")}));
+    `);
+    expect(result.exists).toBe(false);
+    expect(result.logs.filter(row => row.name === "watch.removed")).toMatchObject([{ props: { grace: false, reason: options.reason } }]);
+    expect(result.logs.filter(row => row.name.startsWith("watch.grace_"))).toEqual([]);
+  });
+}
+
+test("a frozen batch reports its snapshot without logging it", async () => {
+  const result = await scenario(`
+    add("frozen-log",{context:"private-frozen-context"});
+    const w=lib.loadWatcher("frozen-log"),s=state("frozen-log");
+    lib.queueEvent(w,s,"private-frozen-event",false,true); lib.saveState(w.id,s);
+    clock+=150000; await tickOne(w.id);
+    console.log(JSON.stringify({sent:sent()}));
+  `);
+  expect(result.logs.filter(row => row.name === "wake.batch_sealed")).toMatchObject([{ props: { frozenContext: true, archived: false, events: 1, spanMs: 150000 } }]);
+  expect(JSON.stringify(result.logs)).not.toContain("private-frozen");
+});
+
+
+const pendingMetadataCases = [
+  { name: "absent", pending: null, events: 1, route: "other" },
+  { name: "matching", pending: { key: "direct-key", count: 6, route: "person" }, events: 6, route: "person" },
+  { name: "unrelated", pending: { key: "old-batch-key", count: 6, route: "person" }, events: 1, route: "other" },
+  { name: "legacy matching", pending: { key: "direct-key" }, events: 1, route: "other" },
+];
+for (const entry of pendingMetadataCases) {
+  test(`direct delivery uses only correlated pending metadata: ${entry.name}`, async () => {
+    const result = await scenario(`
+      add("direct-log"); const w=lib.loadWatcher("direct-log"),s=state("direct-log");
+      const pending=${JSON.stringify(entry.pending)};
+      if(pending)s.pending={event:"private-pending-payload",at:lib.iso(),...pending};
+      const before=JSON.stringify(s);
+      const delivery=await lib.deliver(w,"private-direct-payload","direct-key",s,true);
+      console.log(JSON.stringify({delivery,unchanged:JSON.stringify(s)===before}));
+    `);
+    expect(result.unchanged).toBe(true);
+    expect(result.delivery.route).toBe(entry.route);
+    expect(result.logs.filter(row => row.name === "wake.sent")).toMatchObject([{ ok: true, props: { events: entry.events, via: "wake" } }]);
+    const digest = new Bun.CryptoHasher("sha256").update(entry.route).digest("hex").slice(0, 24);
+    expect(result.logs.find(row => row.name === "wake.sent").ids.chat).toBe(digest);
+    expect(JSON.stringify(result.logs)).not.toContain("private-");
+  });
+}
+
+test("CLI fire-test logs one event while an unrelated six-event batch is pending", async () => {
+  const result = await scenario(`
+    add("test-log"); const s=state("test-log");
+    s.pending={key:"old-batch-key",count:6,route:"person",event:"private-batch-payload",at:lib.iso()};
+    lib.saveState("test-log",s); const before=JSON.stringify(state("test-log"));
+    cli("fire-test","test-log");
+    console.log(JSON.stringify({unchanged:JSON.stringify(state("test-log"))===before}));
+  `);
+  expect(result.unchanged).toBe(true);
+  expect(result.logs.filter(row => row.name === "wake.sent")).toMatchObject([{ ok: true, props: { events: 1 } }]);
+  expect(result.logs.filter(row => row.name === "watch.fire")).toEqual([]);
+  expect(JSON.stringify(result.logs)).not.toContain("private-batch-payload");
 });

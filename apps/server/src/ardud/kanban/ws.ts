@@ -51,7 +51,8 @@ export const makeKanbanWsHandlers = (
 
   const updateBoard = (input: KanbanBoardUpdateInput) => {
     const { boardId, ...patch } = input;
-    return service.updateBoard(boardId, definedOnly(patch) as BoardPatch);
+    const update = service.updateBoard(boardId, definedOnly(patch) as BoardPatch, OWNER);
+    return patch.archived === undefined ? update : asOwner(update);
   };
 
   return {
@@ -87,6 +88,9 @@ export const makeKanbanWsHandlers = (
     [M.boardCreate]: (input: Parameters<KanbanServiceShape["createBoard"]>[0]) =>
       service.createBoard(input),
     [M.boardUpdate]: updateBoard,
+    [M.boardPurge]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["purgeBoard"]>[0];
+    }) => asOwner(service.purgeBoard(input.boardId, OWNER)),
     [M.standingApprovalRevoke]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["revokeStandingApproval"]>[0];
       readonly id: string;
@@ -129,12 +133,20 @@ export const makeKanbanWsHandlers = (
       readonly model: Parameters<KanbanServiceShape["setPool"]>[1];
       readonly slots?: number | undefined;
       readonly replaces?: string | undefined;
-    }) => service.setPool(input.boardId, input.model, input.slots, { replaces: input.replaces }),
+    }) =>
+      service.setPool(input.boardId, input.model, input.slots, {
+        replaces: input.replaces,
+        actor: { actorKind: "owner", actorId: null },
+      }),
     [M.poolRemove]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["removePool"]>[0];
       readonly model: Parameters<KanbanServiceShape["removePool"]>[1];
       readonly replaces?: string | undefined;
-    }) => service.removePool(input.boardId, input.model, { replaces: input.replaces }),
+    }) =>
+      service.removePool(input.boardId, input.model, {
+        replaces: input.replaces,
+        actor: { actorKind: "owner", actorId: null },
+      }),
     [M.discussionCreate]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["createDiscussion"]>[0];
       readonly title: string;

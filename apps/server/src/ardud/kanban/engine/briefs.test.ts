@@ -78,9 +78,26 @@ const card: KanbanCard = {
 };
 
 describe("board briefs", () => {
-  it("tells workers to watch PR CI and end the turn, and wait inside it for other work", () => {
+  it("keeps cross-card packet handoffs with the evaluator", () => {
+    expect(evaluatorBrief(board, { kind: "check" })).toContain(
+      "then mark it done. A work thread can change and post only on its own cards (the server refuses the rest), so a packet never tells it to post on, tick, move or edit another card; make that an evaluator subtask.",
+    );
+    expect(workBrief(board, card, null)).toContain(
+      '(kind "request" only). The ones that change things work only on your own cards. If your task says to post on or change another card, put what you have in your own card (card_update or its discussion) and leave carrying it over to the evaluator.',
+    );
+  });
+
+  it("asks for a quick re-record after a gate clears, conditional on the same head", () => {
+    const head = "d37243cdc055a1cb81d8deccefa943af6527f8e1";
+    expect(reviewBrief(board, card, null, null, [], false, head)).toContain(
+      `Your earlier verdict at ${head} was refused by a gate that is now gone: re-check quickly and record it again if the head is unchanged.`,
+    );
+    expect(reviewBrief(board, card, null, null, [])).not.toContain("was refused by a gate");
+  });
+  it("tells workers to end their turn for pending wakes without sleeping or polling", () => {
+    expect(nudgeWorkText([card])).toContain("end your turn now and let it wake you");
     expect(nudgeWorkText([card])).toContain(
-      "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.",
+      "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. If something you started will wake you (an async delegate_task child, a background shell command, an offbox run started in the background), end your turn now and let it wake you; don't sleep, poll task_status, or loop on exec waits or offbox wait/logs. For a longer wait (a durable watcher, offbox runs you're blocked on, another card, a time), set it yourself with card_wait on your card (on time with until, script, or card) and end your turn; clear it if something else wakes you first. Wait inside your turn only for a short step that nothing can wake you for.",
     );
   });
 
@@ -89,7 +106,9 @@ describe("board briefs", () => {
     expect(brief).toContain(
       "Waiting on CI for an open or draft PR: call watch_pull_request on it and end your turn; the watch wakes you on CI and review changes, and the board waits for up to 6 hours since your last run while the watch is on.",
     );
-    expect(brief).toContain("For a deploy or anything else, wait inside your turn.");
+    expect(brief).toContain(
+      "If something you started will wake you (an async delegate_task child, a background shell command, an offbox run started in the background), end your turn now and let it wake you; don't sleep, poll task_status, or loop on exec waits or offbox wait/logs. For a longer wait (a durable watcher, offbox runs you're blocked on, another card, a time), set it yourself with card_wait on your card (on time with until, script, or card) and end your turn; clear it if something else wakes you first. Wait inside your turn only for a short step that nothing can wake you for.",
+    );
     expect(brief).not.toContain("Never end a turn while a card of yours is in Working");
     expect(brief).not.toContain("Wait for CI or a deploy inside the turn");
     expect(brief).not.toContain("Each time you stop with a card in Working you are nudged");
@@ -136,6 +155,12 @@ describe("board briefs", () => {
       evaluatorBrief(board, { kind: "check" }),
     ]) {
       expect(brief).toContain("use T3 `delegate_task` with role `review`");
+      expect(brief).toContain("send later rounds with t3_thread_send to the same childThreadId");
+      expect(brief).toContain("with mode='queue'");
+      expect(brief).toContain(
+        "Start a new child only if the previous child failed, was cancelled or its model must change",
+      );
+      expect(brief).not.toContain("Use one new task per review round");
       expect(brief).toContain("Preserve the routed model and effort exactly in target.options");
       expect(brief).toContain("Do not pass an `agent` selector");
       expect(brief).toContain("The board review thread alone records card_review_result");
@@ -276,8 +301,9 @@ it("nightly review requires complete reads, a fresh cursor and recovery from fai
     "Keep since unchanged while paging",
     "continue until hasMore is false",
     "Do not choose a starting card number or skip early cards",
-    "Read every supplied active discussion through the window",
-    "skim each active card thread",
+    'digest:"discussions"',
+    'digest:"threads"',
+    "deep reads done/needed",
     "read the pages relevant to this review by slug or slugs",
     "retry the same read once",
     "continue the other reads either way",
@@ -288,5 +314,36 @@ it("nightly review requires complete reads, a fresh cursor and recovery from fai
   ]) {
     expect(brief).toContain(text);
   }
-  expect(brief.indexOf("Complete the read pass")).toBeLessThan(brief.indexOf("1. Information gaps"));
+  expect(brief.indexOf("Complete the read pass")).toBeLessThan(
+    brief.indexOf("1. Information gaps"),
+  );
+});
+
+it("nightly review pins the recorded run's ISO window and uses digest coverage", () => {
+  const recorded = {
+    ...board,
+    nightlyReview: {
+      enabled: true,
+      timeOfDay: "00:00",
+      timeZone: "Asia/Dubai",
+      model,
+      lastRunAt: "2026-11-15T20:00:00.000Z",
+      lastRunDay: "2026-11-16",
+      lastDiscussionId: null,
+    },
+  };
+  const brief = evaluatorBrief(recorded, { kind: "nightly" });
+  expect(brief).toContain('use since: "2026-11-14T20:00:00.000Z"');
+  expect(brief).toContain('until: "2026-11-15T20:00:00.000Z"');
+  expect(brief).toContain('digest:"discussions"');
+  expect(brief).toContain('digest:"threads"');
+  expect(brief).toContain("run_failed, restarted, stalled or refused_call");
+  expect(brief).toContain("Call it partial only if one of those required reads is missing");
+  expect(brief).not.toContain("Read every supplied active discussion");
+  const queued = evaluatorBrief(recorded, {
+    kind: "nightly",
+    lastRunAt: "2026-11-14T20:00:00.000Z",
+  });
+  expect(queued).toContain('use since: "2026-11-13T20:00:00.000Z"');
+  expect(brief.indexOf("2. Improvements")).toBeLessThan(brief.indexOf("3. Cross-board routing"));
 });

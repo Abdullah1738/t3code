@@ -10,6 +10,7 @@ import * as References from "effect/References";
 import * as Schema from "effect/Schema";
 
 import * as ProcessRunner from "./processRunner.ts";
+import { bootId } from "./ardud/fast-install/report.ts";
 import * as ServerOwnership from "./serverOwnership.ts";
 import * as ServerRuntimeState from "./serverRuntimeState.ts";
 
@@ -129,6 +130,7 @@ describe("serverRuntimeState", () => {
       const state: ServerRuntimeState.PersistedServerRuntimeState = {
         version: 1,
         pid: 123,
+        bootId,
         host: "127.0.0.1",
         port: 4_971,
         origin: "http://127.0.0.1:4971",
@@ -152,12 +154,14 @@ describe("serverRuntimeState", () => {
 
       assert.equal(state.devUrl, "http://localhost:5733/");
       assert.equal(state.origin, "http://127.0.0.1:13773");
+      assert.equal(state.bootId, bootId);
 
       const withoutDev = yield* ServerRuntimeState.makePersistedServerRuntimeState({
         config: { host: undefined, devUrl: undefined },
         port: 13_773,
       });
       assert.isFalse("devUrl" in withoutDev);
+      assert.equal(withoutDev.bootId, state.bootId);
     }),
   );
 

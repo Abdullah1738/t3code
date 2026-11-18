@@ -1586,6 +1586,7 @@ describe("PiAdapterV2", () => {
         environmentId: EnvironmentId.make("environment-pi-mcp"),
         threadId: THREAD_ID,
         providerSessionId: "mcp-session-pi",
+        runtimeProviderSessionId: SESSION_ID,
         providerInstanceId: PI_INSTANCE_ID,
         endpoint: "http://127.0.0.1:43123/mcp",
         authorizationHeader: "Bearer secret-pi-token",
@@ -2096,6 +2097,59 @@ describe("PiAdapterV2", () => {
         forkFile,
       );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(
+    ["bash", "powershell", "mcp__test__empty"].flatMap((toolName) =>
+      [undefined, [], [{ type: "text", text: "" }]].map((content) => ({
+        toolName,
+        content,
+        label: JSON.stringify(content) ?? "absent",
+      })),
+    ),
+  )(
+    "retains completion evidence for failed $toolName with $label content",
+    ({ toolName, content }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_start" });
+        for (const type of ["tool_execution_start", "tool_execution_end"] as const) {
+          yield* fake.emit({
+            type,
+            toolCallId: "empty-failure",
+            toolName,
+            args: { command: "empty failed command" },
+            result: content === undefined ? {} : { content },
+            isError: true,
+          });
+          const event = yield* takeEvent(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              (event.turnItem.type === "command_execution" ||
+                event.turnItem.type === "dynamic_tool"),
+          );
+          if (
+            event.type !== "turn_item.updated" ||
+            (event.turnItem.type !== "command_execution" && event.turnItem.type !== "dynamic_tool")
+          )
+            return yield* Effect.die("Expected a tool item");
+          const item = event.turnItem;
+          assert.equal(item.status, type === "tool_execution_end" ? "failed" : "running");
+          assert.equal(item.toolResultIncomplete, type !== "tool_execution_end");
+          assert.isUndefined(item.output);
+          if (item.type === "command_execution") {
+            assert.isUndefined(item.exitCode);
+          }
+        }
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
   it.effect("presents explicitly namespaced MCP extension tools", () =>

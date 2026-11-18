@@ -310,6 +310,37 @@ class RecallTest(unittest.TestCase):
                     expected = rc.lineage_exclusions(caller)
                 self.assertEqual(rc.lineage_exclusions(caller), expected)
 
+    def test_stale_rebuild_lineage_accepts_every_existing_caller_form(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        started = (now - timedelta(seconds=30)).isoformat()
+        with closing(sqlite3.connect(rc.STATE_DB)) as writer, writer:
+            old_updated = writer.execute("SELECT value FROM ardud_readonly_meta WHERE key='updated_at'").fetchone()[0]
+            writer.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("updated_at", (now - timedelta(minutes=10)).isoformat()),
+                ("rebuild_kind", "full"), ("rebuild_started_at", started), ("rebuild_finished_at", ""),
+            ])
+        sidecar = rc.STATE_DB.with_name(rc.STATE_DB.name + ".rebuild.json")
+        sidecar.write_text(json.dumps({
+            "replica_identity": list(rc.robob_readonly.file_identity(rc.STATE_DB)),
+            "rebuild_started_at": started, "rebuild_finished_at": "",
+            "rebuild_progress": json.dumps({"kind": "full", "event": "progress"}),
+        }))
+        try:
+            # Thread, provider, subagent, direct import and resumed migration aliases.
+            for caller in ("thread-0", "native-50", "native-0:agent:agent-1", "ses_resume_old",
+                           "ses_migration_new", "ses_unmapped_old"):
+                with self.subTest(caller=caller):
+                    self.assertIn(caller, rc.lineage_exclusions(caller))
+            with self.assertRaisesRegex(rc.UnknownCaller, "thread newer than replica snapshot"):
+                rc.lineage_exclusions("thread:new-after-snapshot")
+        finally:
+            sidecar.unlink()
+            with closing(sqlite3.connect(rc.STATE_DB)) as writer, writer:
+                writer.execute("UPDATE ardud_readonly_meta SET value=? WHERE key='updated_at'", (old_updated,))
+                writer.execute("DELETE FROM ardud_readonly_meta WHERE key IN ('rebuild_kind','rebuild_started_at','rebuild_finished_at')")
+            rc.robob_readonly.reset_replica_warnings()
+
     def test_cross_stream_provider_native_change_uses_payload_owner(self):
         rc._state_snapshot = None
         writer = sqlite3.connect(rc.STATE_DB)
@@ -1785,6 +1816,16 @@ class RecallTest(unittest.TestCase):
             from starlette.testclient import TestClient
         except ImportError:
             self.skipTest("recall server dependencies not installed in this Python")
+        # Executor threads are reused: a prior request's snapshot warning must not leak.
+        def stale_result():
+            rc.robob_readonly._warnings.snapshots = {
+                "fixture": {"warning": "replica as of fixture; rebuild in progress since fixture"},
+            }
+            return "fixture result"
+
+        with patch.object(server, "fence"), patch.object(server.rc, "ROOT", Path(self.tmp.name)):
+            self.assertIn("replica as of fixture", server._fenced_work(stale_result))
+            self.assertEqual(server._fenced_work(lambda: "next result"), "next result")
         app = server.server.streamable_http_app(streamable_http_path="/mcp", stateless_http=True, json_response=True,
                                                  host="127.0.0.1")
         headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
@@ -1804,11 +1845,66 @@ class RecallTest(unittest.TestCase):
                 self.assertIn("ses_resume_old", ask.call_args.kwargs["exclude"])
                 client.post("/mcp", headers=headers, json=ask_request)
                 self.assertEqual(ask.call_args.kwargs["exclude"], [])
+            def stale_answer(*args, **kwargs):
+                stale_result()
+                return {"answer": "fixture answer", "sources": []}
+
+            with patch.object(server.ra, "ask", side_effect=stale_answer):
+                stale = client.post("/api/ask", json={"question": "fixture"})
+                self.assertIn("replica as of fixture", stale.json()["answer"])
+                self.assertTrue(stale.json()["replica_warnings"])
+            with patch.object(server.ra, "ask", return_value={"answer": "fresh answer", "sources": []}):
+                fresh = client.post("/api/ask", json={"question": "fixture"})
+                self.assertEqual(fresh.json()["answer"], "fresh answer")
+                self.assertNotIn("replica_warnings", fresh.json())
         self.assertIn("ses_resume_old", anonymous.text)
         self.assertNotIn("ses_resume_old", own.text)
         self.assertIn("caller identity is unknown", unknown.text)
         self.assertIn("empty caller identity", empty.text)
         self.assertIn("ses_resume_old", again.text)
+
+    def test_stale_rebuild_mcp_headers_distinguish_new_callers_from_driver_mismatch(self):
+        import recall_server as server
+        from datetime import datetime, timedelta, timezone
+        from starlette.testclient import TestClient
+        now = datetime.now(timezone.utc)
+        started = (now - timedelta(seconds=30)).isoformat()
+        with closing(sqlite3.connect(rc.STATE_DB)) as writer, writer:
+            old_updated = writer.execute("SELECT value FROM ardud_readonly_meta WHERE key='updated_at'").fetchone()[0]
+            writer.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("updated_at", (now - timedelta(minutes=10)).isoformat()),
+                ("rebuild_kind", "full"), ("rebuild_started_at", started), ("rebuild_finished_at", ""),
+            ])
+        sidecar = rc.STATE_DB.with_name(rc.STATE_DB.name + ".rebuild.json")
+        sidecar.write_text(json.dumps({
+            "replica_identity": list(rc.robob_readonly.file_identity(rc.STATE_DB)),
+            "rebuild_started_at": started, "rebuild_finished_at": "",
+            "rebuild_progress": json.dumps({"kind": "full", "event": "progress"}),
+        }))
+        app = server.server.streamable_http_app(streamable_http_path="/mcp", stateless_http=True, json_response=True,
+                                                host="127.0.0.1")
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "recall_search", "arguments": {"query": "risk lane walrus"}}}
+        headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+        try:
+            with TestClient(server._no_standalone_sse(app), base_url="http://127.0.0.1:18765") as client:
+                for driver in ("codex", "claudeAgent"):
+                    for native in (None, "native:new-after-snapshot"):
+                        with self.subTest(driver=driver, native=native):
+                            identity = {"X-Robob-Thread": "thread:new-after-snapshot", "X-Robob-Driver": driver}
+                            if native:
+                                identity["X-Robob-Native"] = native
+                            result = client.post("/mcp", headers={**headers, **identity}, json=request)
+                            self.assertIn("thread newer than replica snapshot", result.text)
+                mismatch = client.post("/mcp", headers={**headers, "X-Robob-Thread": "thread-0",
+                                                       "X-Robob-Driver": "wrong-driver"}, json=request)
+                self.assertIn("caller driver does not match", mismatch.text)
+        finally:
+            sidecar.unlink()
+            with closing(sqlite3.connect(rc.STATE_DB)) as writer, writer:
+                writer.execute("UPDATE ardud_readonly_meta SET value=? WHERE key='updated_at'", (old_updated,))
+                writer.execute("DELETE FROM ardud_readonly_meta WHERE key IN ('rebuild_kind','rebuild_started_at','rebuild_finished_at')")
+            rc.robob_readonly.reset_replica_warnings()
 
     def test_view_formats(self):
         import recall_cli as cli

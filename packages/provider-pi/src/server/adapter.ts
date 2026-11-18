@@ -73,6 +73,8 @@ import {
 } from "./mcpInjection.ts";
 import { PI_FILE_CHANGE_TOOLS } from "./mcpExtensionSource.ts";
 
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
+
 export const PI_PROVIDER = ProviderDriverKind.make("pi");
 const PI_DRIVER_KIND = PI_PROVIDER;
 const PI_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(PI_DRIVER_KIND);
@@ -445,7 +447,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
     ) {
       const scope = yield* Effect.scope;
       const cwd = input.runtimePolicy.cwd ?? host.paths.cwd;
-      const mcpSession = yield* mcpSessions.read(input.threadId);
+      const mcpSession = yield* McpProviderSessions.readForRuntime(
+        mcpSessions,
+        input.threadId,
+        input.providerSessionId,
+        PI_PROVIDER,
+      );
       const provideCacheFs = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) =>
         effect.pipe(
           Effect.provideService(FileSystem.FileSystem, fileSystem),
@@ -1031,6 +1038,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               ...shared,
               title: toolName,
               type: "command_execution",
+              toolResultIncomplete: !completed,
               input: recordString(args, "command") ?? "",
               ...(outputText.length > 0 ? { output: outputText } : {}),
               ...(exitCode === undefined ? {} : { exitCode }),
@@ -1068,6 +1076,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             ...shared,
             title: toolName,
             type: "dynamic_tool",
+            toolResultIncomplete: !completed,
             ...mcpToolPresentation({ toolName }),
             toolName,
             input: args ?? {},
@@ -2700,7 +2709,11 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               return;
             }
             if (turn === null || turn.providerTurn.id !== interruptInput.providerTurnId) {
-              return yield* protocolError(`Pi turn ${interruptInput.providerTurnId} is not active`);
+              return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+                driver: PI_PROVIDER,
+                providerThreadId: interruptInput.providerThread.id,
+                providerTurnId: interruptInput.providerTurnId,
+              });
             }
             const requiresProcessStop =
               interruptInput.requestRuntimeRestart === true ||
@@ -2742,14 +2755,15 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           },
           (effect, interruptInput) =>
             effect.pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterInterruptError({
-                    driver: PI_PROVIDER,
-                    providerThreadId: interruptInput.providerThread.id,
-                    providerTurnId: interruptInput.providerTurnId,
-                    cause,
-                  }),
+              Effect.mapError((cause) =>
+                isTurnNotActiveError(cause)
+                  ? cause
+                  : new ProviderAdapter.ProviderAdapterInterruptError({
+                      driver: PI_PROVIDER,
+                      providerThreadId: interruptInput.providerThread.id,
+                      providerTurnId: interruptInput.providerTurnId,
+                      cause,
+                    }),
               ),
             ),
         ),

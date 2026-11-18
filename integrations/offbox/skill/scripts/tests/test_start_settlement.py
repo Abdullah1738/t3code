@@ -2,6 +2,7 @@
 import contextlib
 import io
 import os
+import signal
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -171,9 +172,11 @@ class StartPaths(Isolated):
         a = cli.build_parser().parse_args(['run', '--remote', '--bg', '--', 'go test ./...'])
         with patch.object(api, 'cmd_start', return_value={'processId': 1001, 'commandId': 'cmd-own'}), \
                 patch.object(api, 'get', return_value={'state': 'running'}), \
+                patch.object(runs.Runner, 'stream', side_effect=lambda **kw: signal.raise_signal(signal.SIGTERM)), \
                 patch.object(lease, 'ensure_ttl'), contextlib.redirect_stdout(io.StringIO()), \
+                patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(cli.cmd_run(a, self.me), 0)
+            self.assertEqual(cli.cmd_run(a, self.me), common.EXIT_DETACHED)
         row = self.con.execute('SELECT * FROM runs ORDER BY rowid DESC LIMIT 1').fetchone()
         self.assertEqual((row['process_id'], row['command_id'], row['wrapper_pid']), (1001, 'cmd-own', None))
 
@@ -233,6 +236,27 @@ class StartPaths(Isolated):
             self.assertIn('offbox ssh bx', output)
             self.assertGreater(lease.active_runs(self.con, 'bx'), 0)
             self.assertIn(row['run_id'], row['error'])
+
+    def test_disk_refusal_releases_foreground_and_background_without_ssh_and_allows_failover(self):
+        from offbox_lib import home, disk_pressure
+        for bg in (False, True):
+            with self.subTest(bg=bg), contextlib.ExitStack() as stack:
+                self.con.execute('DELETE FROM runs')
+                stack.enter_context(patch.object(api, 'BACKEND', 'server'))
+                stack.enter_context(patch.object(disk_pressure, 'remember'))
+                stack.enter_context(patch.object(home, 'before_run'))
+                stack.enter_context(patch.object(home, 'active', return_value=True))
+                stack.enter_context(patch.object(home, 'may_fail_over', return_value=True))
+                failover = stack.enter_context(patch.object(home, 'fail_over', return_value=False))
+                code, row, output, send = self.run_cli(
+                    api.ApiError(503, 'server_disk_low', 'offbox 1 GiB free'), start_check.Result(), bg)
+                self.assertEqual(self.check_calls, 0, output)
+                self.assertEqual(code, 90)
+                self.assertEqual(lease.active_runs(self.con, 'bx'), 0)
+                self.assertNotIn('start unknown', output)
+                self.assertNotIn('may have started', output)
+                self.assertEqual(send.call_count, 1)
+                failover.assert_called_once()
 
     def test_refused_and_cf_do_not_ssh_check(self):
         for status in (409, *api.CF_NOT_DELIVERED):
@@ -412,7 +436,7 @@ class RecoveryPaths(ShellChecks):
         for route in ('wait','reap'):
             path = route + '.txt'
             self.con.execute("UPDATE runs SET status='starting',exit_code=NULL,end_at=NULL,remote_dir='w/r', "
-                             "rel_cwd='.',local_cwd=?,pulls=? WHERE run_id='run-dead'",
+                             "rel_cwd='.',local_cwd=?,pulls=?,pull_state=NULL,pull_owner=NULL,pull_summary=NULL WHERE run_id='run-dead'",
                              (self.tmp.name, '["' + path + '"]'))
             self.con.commit()
             def pull(box,remote,rel,path,dest,**opts):

@@ -50,7 +50,7 @@ def log_run(started, found, killed, ok):
 
 
 IDLE_MIN = int(os.environ.get("DEV_JANITOR_IDLE_MIN", "60"))
-LOG_DIR = os.path.expanduser("~/.local/share/dev-janitor")
+LOG_DIR = os.path.expanduser(os.environ.get("DEV_JANITOR_LOG_DIR", "~/.local/share/dev-janitor"))
 AUDIT = os.path.join(LOG_DIR, "audit.jsonl")
 LAST = os.path.join(LOG_DIR, "last.json")
 KEEP_FILE = os.path.expanduser("~/.config/opencode/dev-janitor-keep.txt")
@@ -107,7 +107,8 @@ def keep_list():
 
 def running_sessions(snap=None):
     snap = active_sessions.checked_snapshot(timeout=20) if snap is None else snap
-    dirs, err = active_sessions.directories(snap)
+    # The hourly scan keeps its existing one-request-per-id liveness budget.
+    dirs, err = active_sessions.directories(snap, max_attempts=1)
     if err:
         return None, {}, err
     return set(snap["opencode"]), dirs, None
@@ -260,7 +261,27 @@ def record_report(st):
     with open(LAST, "w") as report:
         json.dump(st, report, indent=1)
     audit({"ts": st["ts"], "event": "report", "liveness_unavailable": st["liveness_unavailable"],
-           "processes": {key: st["processes"][key] for key in ("candidates", "problems", "checked", "skipped", "budget_skipped")}})
+           "processes": leftover_processes.report_summary(st["processes"])})
+
+
+def close_browser_candidates(st):
+    report = st.get("processes", {}).get("agent_browser")
+    if report is None:
+        return
+    report["actions"] = leftover_processes.reap_agent_browsers(
+        report, rescan=lambda: leftover_processes.scan_agent_browsers(active_sessions.checked_snapshot(), keep_list()))
+    for entry in report["actions"]:
+        audit({"ts": int(time.time()), "event": "agent_browser_close", **entry})
+
+
+def stop_xcode_candidates(st):
+    report = st.get("processes", {}).get("xcode_builds")
+    if report is None:
+        return
+    report["actions"] = leftover_processes.stop_xcode_builds(
+        report, rescan=lambda: leftover_processes.scan_xcode_builds(active_sessions.checked_snapshot(), keep_list()))
+    for entry in report["actions"]:
+        audit({"ts": int(time.time()), "event": "xcode_build_stop", **entry})
 
 
 def audit(entry):

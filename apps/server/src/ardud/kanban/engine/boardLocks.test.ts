@@ -1,5 +1,9 @@
 import { assert, it, vi } from "@effect/vitest";
 import * as Logger from "effect/Logger";
+import * as Layer from "effect/Layer";
+import { Analytics } from "../../analytics/Analytics.ts";
+import type { AnalyticsEvent } from "@t3tools/contracts";
+import * as Metric from "effect/Metric";
 import * as References from "effect/References";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -8,12 +12,240 @@ import * as Fiber from "effect/Fiber";
 import * as Cause from "effect/Cause";
 import * as Semaphore from "effect/Semaphore";
 import * as TestClock from "effect/testing/TestClock";
+import * as Clock from "effect/Clock";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { KanbanError } from "@t3tools/contracts";
 
 import * as BoardLocks from "./boardLocks.ts";
+import * as SavedWrite from "./savedWrite.ts";
 import * as SavedReply from "../tools/savedReply.ts";
 import { McpSchema } from "effect/ai";
+
+it.effect("#1747 an arbitrary child cannot release the owning fiber's gate", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    yield* locks.board(
+      "a",
+      Effect.gen(function* () {
+        const child = yield* locks.outside(locks.holders, undefined, true).pipe(Effect.forkChild);
+        assert.isTrue(
+          (yield* Fiber.join(child)).some(
+            (holder) => holder.boardId === "a" && holder.lock === "gate",
+          ),
+        );
+      }),
+    );
+    assert.deepEqual(yield* locks.holders, []);
+  }),
+);
+
+it.effect.each(["independent", "fresh", "background"] as const)(
+  "#1747 %s work leaves the mutation's SELECT exemption behind",
+  (scope) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const read = locks.board(
+        "a",
+        SavedWrite.read(Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))),
+      );
+      const detached = scope === "background" ? SavedWrite.background(read) : locks[scope](read);
+      const pending = yield* SavedWrite.maskedWrite(detached).pipe(Effect.exit, Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(2_000);
+      assert.isDefined(pending.pollUnsafe());
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(pending)));
+      assert.deepEqual(yield* locks.holders, []);
+    }),
+);
+
+it.effect("#1747 long holds retain the dependency at the threshold after it finishes", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const finishRead = yield* Deferred.make<void>();
+    const second = yield* Deferred.make<void>();
+    const finish = yield* Deferred.make<void>();
+    const warnings: unknown[] = [];
+    const pending = yield* locks
+      .board(
+        "robob",
+        Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(finishRead)),
+            Effect.withSpan("KanbanThreads.find"),
+          );
+          yield* Deferred.succeed(second, undefined).pipe(
+            Effect.andThen(Deferred.await(finish)),
+            Effect.withSpan("KanbanService.publish"),
+          );
+        }),
+      )
+      .pipe(
+        Effect.provideService(BoardLocks.operationName, "turnEnded"),
+        Effect.provide(
+          Logger.layer([Logger.make(({ message }) => warnings.push(message))], {
+            mergeWithExisting: false,
+          }),
+        ),
+        Effect.forkChild,
+      );
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(6_000);
+    yield* Deferred.succeed(finishRead, undefined);
+    yield* Deferred.await(second);
+    yield* TestClock.adjust(1_000);
+    yield* Deferred.succeed(finish, undefined);
+    yield* Fiber.join(pending);
+    const row = warnings.find((message) =>
+      String(message).includes('"event":"kanban board lock long hold"'),
+    );
+    assert.deepInclude(JSON.parse(String(row)), {
+      threshold: { observedAtMs: 5_000, awaited: "KanbanThreads.find", readers: [] },
+      subSteps: [
+        { subStep: "KanbanThreads.find", ms: 6_000 },
+        { subStep: "KanbanService.publish", ms: 1_000 },
+      ],
+    });
+  }),
+);
+
+it.effect.each(["tick", "turnEnded"])(
+  "#1747 a %s reader wait releases its gate without retrying the stalled dependency",
+  (name) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const reader = yield* Semaphore.make(1);
+      const held = yield* Deferred.make<void>();
+      const holder = yield* reader
+        .withPermits(1)(
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(held);
+      let attempts = 0;
+      const pending = yield* locks
+        .run(
+          Effect.gen(function* () {
+            attempts++;
+            yield* locks.access("a", Effect.void);
+            yield* SavedWrite.read(
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(reader.withPermits(1)(Effect.void)),
+              ),
+            );
+          }),
+        )
+        .pipe(
+          Effect.provideService(BoardLocks.operationName, `test1747.${name}`),
+          Effect.exit,
+          Effect.forkChild,
+        );
+      yield* Deferred.await(entered);
+      const written = yield* Deferred.make<void>();
+      const writer = yield* locks
+        .board("a", locks.access("a", Deferred.succeed(written, undefined), true))
+        .pipe(Effect.forkChild);
+      const other = yield* SavedReply.protect(
+        locks.board(
+          "b",
+          locks.access("b", Effect.succeed(new McpSchema.CallToolResult({ content: [] })), true),
+        ),
+        "card_update",
+      );
+      assert.isFalse((other as McpSchema.CallToolResult).isError ?? false);
+      yield* TestClock.adjust(2_000);
+      assert.isTrue(yield* Deferred.isDone(written));
+      assert.isDefined(pending.pollUnsafe());
+      assert.isUndefined(holder.pollUnsafe());
+      assert.equal(attempts, 1);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(holder);
+      yield* Fiber.join(writer);
+      const result = yield* Fiber.join(pending);
+      assert.isTrue(Exit.isFailure(result));
+      if (Exit.isFailure(result))
+        assert.instanceOf(Cause.squash(result.cause), BoardLocks.DispatchReadBudgetExceeded);
+      assert.deepEqual(yield* locks.holders, []);
+    }),
+);
+
+it.effect.each(
+  (["gate", "card", "migration"] as const).flatMap((lock) =>
+    [4_900, 5_000, 8_195].map((heldMs) => ({ lock, heldMs })),
+  ),
+)("#1539 logs a $lock hold of $heldMs ms as a complete holder row", ({ lock, heldMs }) => {
+  const logs: Array<{ line: string; annotations: Readonly<Record<string, unknown>> }> = [];
+  const logger = Logger.make(({ fiber, message }) => {
+    if (String(message).includes('"event":"kanban board lock long hold"'))
+      logs.push({
+        line: String(message),
+        annotations: fiber.getRef(References.CurrentLogAnnotations),
+      });
+  });
+  return Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const finish = yield* Deferred.make<void>();
+    const body = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish)));
+    const hold =
+      lock === "migration"
+        ? locks.exclusive(body)
+        : lock === "card"
+          ? locks.run(locks.access("robob", Effect.void).pipe(Effect.andThen(body)), "card-1539")
+          : locks.board("robob", body);
+    const holder = yield* Effect.forkChild(
+      hold.pipe(Effect.provideService(BoardLocks.operationName, "card.reviewResult")),
+    );
+    yield* Deferred.await(entered);
+    const waiter = yield* Effect.forkChild(
+      lock === "card"
+        ? locks.run(locks.access("robob", Effect.void), "card-1539")
+        : locks.board("robob", Effect.void),
+    );
+    yield* TestClock.adjust(0);
+    assert.isUndefined(waiter.pollUnsafe());
+    yield* TestClock.adjust(heldMs);
+    yield* Deferred.succeed(finish, undefined);
+    yield* Fiber.join(holder);
+    yield* Fiber.join(waiter);
+    assert.deepStrictEqual(yield* locks.holders, []);
+    if (heldMs < 5_000) {
+      assert.lengthOf(logs, 0);
+      return;
+    }
+    assert.lengthOf(logs, 1);
+    const fields = {
+      "board.observed_at_ms": heldMs,
+      "board.id": lock === "migration" ? "*" : "robob",
+      "board.holder": "card.reviewResult",
+      "board.card_id": lock === "card" ? "card-1539" : null,
+      "board.lock": lock,
+      "board.mode": "exclusive",
+      "board.acquired_at_ms": 0,
+      "board.held_ms": heldMs,
+      "board.waiters": 1,
+      ...(lock === "migration"
+        ? {}
+        : {
+            subSteps: [{ subStep: "card.reviewResult", ms: heldMs }],
+            threshold: { awaited: "card.reviewResult", readers: [], observedAtMs: 5_000 },
+          }),
+    };
+    assert.deepStrictEqual(JSON.parse(logs[0]!.line), {
+      event: "kanban board lock long hold",
+      ...fields,
+    });
+    assert.deepInclude(logs[0]!.annotations, { ...fields, "board.lock_log": true });
+    assert.notProperty(logs[0]!.annotations, "board.waiting_on");
+  }).pipe(
+    Effect.provideService(References.MinimumLogLevel, "None"),
+    Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+  );
+});
 
 it.effect("#566 a committed re-acquire timeout never advertises a safe retry", () =>
   Effect.gen(function* () {
@@ -555,6 +787,126 @@ it.effect("a stale read-only operation reruns before any write or external side 
   }),
 );
 
+it.effect.each(["initial", "reacquire"] as const)(
+  "#1941 %s validation can read outside its gate without re-entering itself",
+  (stage) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      let depth = 0;
+      let validations = 0;
+      let reads = 0;
+      yield* locks.run(
+        Effect.gen(function* () {
+          yield* locks.scopeDispatch(
+            "a",
+            ["card:target"],
+            Effect.gen(function* () {
+              assert.strictEqual(++depth, 1, "validation re-entered before its read returned");
+              validations++;
+              if (stage === "initial" || validations > 1) {
+                yield* locks.outsideRead(
+                  "view:worker",
+                  () => 0,
+                  Effect.sync(() => {
+                    reads++;
+                  }),
+                );
+              }
+              return true;
+            }).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  depth--;
+                }),
+              ),
+            ),
+          );
+          yield* locks.outside(Effect.void, undefined, true);
+        }),
+        "target",
+      );
+      assert.strictEqual(validations, 2);
+      assert.strictEqual(reads, stage === "initial" ? 2 : 1);
+      assert.deepEqual(yield* locks.holders, []);
+    }),
+);
+
+it.effect.each(["none", "unrelated", "card", "slot", "migration"] as const)(
+  "#1941 validation retries its snapshot after an outside read overlaps %s changes",
+  (change) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let free = true;
+      let depth = 0;
+      let attempts = 0;
+      let reads = 0;
+      let sent = 0;
+      const dispatch = yield* locks
+        .run(
+          Effect.gen(function* () {
+            attempts++;
+            yield* locks.scopeDispatch(
+              "a",
+              ["card:target"],
+              Effect.gen(function* () {
+                assert.strictEqual(++depth, 1, "validation re-entered before its read returned");
+                const snapshot = free;
+                yield* locks.outsideRead(
+                  "view:worker",
+                  () => 0,
+                  Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Deferred.await(resume)),
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        reads++;
+                      }),
+                    ),
+                  ),
+                );
+                return snapshot;
+              }).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    depth--;
+                  }),
+                ),
+              ),
+            );
+            yield* locks.outside(
+              Effect.sync(() => {
+                sent++;
+              }),
+            );
+          }),
+          "target",
+        )
+        .pipe(Effect.exit, Effect.forkChild);
+      yield* Deferred.await(entered);
+      if (change === "migration") yield* locks.exclusive(Effect.void);
+      else if (change !== "none") {
+        yield* locks.run(
+          locks.access(
+            "a",
+            Effect.sync(() => {
+              if (change === "slot") free = false;
+            }),
+            true,
+            change === "card" ? "card:target" : change === "slot" ? "slots:worker" : "card:other",
+          ),
+        );
+      }
+      yield* Deferred.succeed(resume, undefined);
+      const result = yield* Fiber.join(dispatch);
+      assert.strictEqual(Exit.isSuccess(result), change !== "slot");
+      assert.strictEqual(sent, change === "slot" ? 0 : 1);
+      assert.strictEqual(attempts, change === "none" ? 1 : change === "slot" ? 9 : 2);
+      assert.strictEqual(reads, change === "slot" ? 1 : 2);
+      assert.deepEqual(yield* locks.holders, []);
+    }),
+);
+
 it.effect.each(["validation", "read"] as const)(
   "#1397 pending dispatch %s releases the gate within its read budget",
   (stage) =>
@@ -565,15 +917,17 @@ it.effect.each(["validation", "read"] as const)(
       let free = true;
       let sent = 0;
       let first = true;
-      const pending = Effect.suspend(() =>
-        first
-          ? Effect.sync(() => {
-              first = false;
-            }).pipe(
-              Effect.andThen(Deferred.succeed(entered, undefined)),
-              Effect.andThen(Deferred.await(resume)),
-            )
-          : Effect.void,
+      const pending = SavedWrite.read(
+        Effect.suspend(() =>
+          first
+            ? Effect.sync(() => {
+                first = false;
+              }).pipe(
+                Effect.andThen(Deferred.succeed(entered, undefined)),
+                Effect.andThen(Deferred.await(resume)),
+              )
+            : Effect.void,
+        ),
       );
       const dispatch = yield* Effect.forkChild(
         locks
@@ -641,11 +995,15 @@ it.effect("#1397 reads share one hold budget and a timeout does not immediately 
             yield* locks.scopeDispatch("a", ["card:target"], Effect.succeed(true));
             yield* locks.access(
               "a",
-              Deferred.succeed(first, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+              SavedWrite.read(
+                Deferred.succeed(first, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+              ),
             );
             yield* locks.access(
               "a",
-              Deferred.succeed(second, undefined).pipe(Effect.andThen(Deferred.await(pending))),
+              SavedWrite.read(
+                Deferred.succeed(second, undefined).pipe(Effect.andThen(Deferred.await(pending))),
+              ),
             );
             sent = true;
           }),
@@ -840,6 +1198,8 @@ const staleOnce = (bumpFenceDuringRead: boolean) =>
       ),
     );
     yield* Deferred.await(entered);
+    // An outside read keeps its own budget after releasing the board gate.
+    yield* TestClock.adjust(10_000);
     // Another writer on the board while the read is out: the operation is stale.
     yield* locks.run(locks.access("a", Effect.void, true), "card-b");
     if (bumpFenceDuringRead) fence += 1;
@@ -1095,7 +1455,10 @@ it.effect.each(["migration", "gate", "card"] as const)(
       const hold =
         lock === "migration"
           ? locks.exclusive(body)
-          : locks.run(locks.access("crpko", body), lock === "card" ? "907" : undefined);
+          : locks.run(
+              locks.access("crpko", Effect.void).pipe(Effect.andThen(body)),
+              lock === "card" ? "907" : undefined,
+            );
       const holder = yield* Effect.forkChild(hold.pipe(Effect.withSpan("test.longHolder")));
       yield* Deferred.await(entered);
       const waiter = yield* Effect.forkChild(
@@ -1120,7 +1483,7 @@ it.effect.each(["migration", "gate", "card"] as const)(
         assert.strictEqual((error as KanbanError).saved, false);
         assert.include(
           String(error),
-          "Board busy: not written (held 2m14s by test.longHolder). Safe to retry once.",
+          "Board busy: not written (held 134000ms by test.longHolder; waited 134000ms behind 0; most time: test.longHolder 134s). Safe to retry once.",
         );
       }
       const refusals = logs.filter((log) =>
@@ -1134,6 +1497,16 @@ it.effect.each(["migration", "gate", "card"] as const)(
         "board.waiting_on": lock,
         "board.waited_ms": 134_000,
         "board.waiters": 1,
+        "board.queue_ahead_at_admission": 0,
+        "board.wait_by_label": [
+          {
+            label: "test.longHolder",
+            lock: lock === "migration" ? "migration" : "gate",
+            ms: 134_000,
+            holds: 1,
+          },
+        ],
+        "board.wait_accounted_ms": 134_000,
       });
       const blockers = refusals[0]!.annotations["board.blockers"] as Array<Record<string, unknown>>;
       assert.lengthOf(blockers, 1);
@@ -1278,7 +1651,10 @@ it.effect(
       const result = yield* Fiber.join(waiter);
       assert.isTrue(Exit.isFailure(result));
       if (Exit.isFailure(result))
-        assert.include(String(Cause.squash(result.cause)), "by gate.first +1 more");
+        assert.include(
+          String(Cause.squash(result.cause)),
+          "most time: gate.first 0s, gate.second 0s",
+        );
       assert.lengthOf(messages, 1);
       assert.include(messages[0]!, '"event":"kanban board write refused"');
       assert.include(messages[0]!, '"board.waiting_on":"gate"');
@@ -1289,4 +1665,490 @@ it.effect(
       assert.deepStrictEqual(yield* locks.holders, []);
     }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
   },
+);
+
+// McpCall.ts:49 keeps board-busy classification independent of the diagnostic suffix.
+const boardBusyPrefix =
+  /^(?:Missions board conflict: )?(?:Board busy: not written|Not saved \(board busy\))/;
+
+const captureWaitLogs = () => {
+  const logs: Array<Readonly<Record<string, unknown>>> = [];
+  const logger = Logger.make(({ fiber, message }) => {
+    if (/kanban board (write refused|lock held too long)/.test(String(message)))
+      logs.push(fiber.getRef(References.CurrentLogAnnotations));
+  });
+  return { logs, layer: Logger.layer([logger], { mergeWithExisting: false }) };
+};
+
+it.effect("#1472 attributes a queued refusal to sequential gate holders", () => {
+  const { logs, layer } = captureWaitLogs();
+  return Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const holders = [];
+    for (const label of [
+      "KanbanService.tick",
+      "KanbanService.wakeBoardNudges",
+      "KanbanService.tickStep:missingThread",
+    ]) {
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const fiber = yield* Effect.forkChild(
+        locks
+          .board(
+            "robob",
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish))),
+          )
+          .pipe(Effect.provideService(BoardLocks.operationName, label)),
+      );
+      holders.push({ fiber, entered, finish });
+      if (holders.length === 1) yield* Deferred.await(entered);
+      else yield* TestClock.adjust(0);
+    }
+    const waiter = yield* Effect.forkChild(
+      locks
+        .board("robob", Effect.die("must not write"))
+        .pipe(Effect.provideService(BoardLocks.writeWaitMs, 20_000), Effect.exit),
+    );
+    yield* TestClock.adjust(8_000);
+    yield* Deferred.succeed(holders[0]!.finish, undefined);
+    yield* Fiber.join(holders[0]!.fiber);
+    yield* Deferred.await(holders[1]!.entered);
+    yield* TestClock.adjust(5_000);
+    yield* Deferred.succeed(holders[1]!.finish, undefined);
+    yield* Fiber.join(holders[1]!.fiber);
+    yield* Deferred.await(holders[2]!.entered);
+    yield* TestClock.adjust(7_000);
+    const result = yield* Fiber.join(waiter);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      const error = Cause.squash(result.cause) as KanbanError;
+      assert.strictEqual(
+        error.detail,
+        "Board busy: not written (held 7000ms by KanbanService.tickStep:missingThread; waited 20000ms behind 2; most time: tick 8s, missingThread 7s, wakeBoardNudges 5s). Safe to retry once.",
+      );
+      assert.match(error.detail, boardBusyPrefix);
+    }
+    assert.lengthOf(logs, 1);
+    assert.deepInclude(logs[0], {
+      "board.queue_ahead_at_admission": 2,
+      "board.waiters": 1,
+      "board.wait_accounted_ms": 20_000,
+      "board.wait_by_label": [
+        { label: "tick", lock: "gate", ms: 8_000, holds: 1 },
+        { label: "missingThread", lock: "gate", ms: 7_000, holds: 1 },
+        { label: "wakeBoardNudges", lock: "gate", ms: 5_000, holds: 1 },
+      ],
+    });
+    yield* Deferred.succeed(holders[2]!.finish, undefined);
+    yield* Fiber.join(holders[2]!.fiber);
+    const snapshot = (yield* Metric.snapshot).find(
+      (metric) => metric.id === "kanban_board_gate_hold_ms" && metric.attributes?.label === "tick",
+    );
+    assert.strictEqual(snapshot?.type, "Histogram");
+    if (snapshot?.type === "Histogram") {
+      assert.strictEqual(snapshot.state.count, 1);
+      assert.strictEqual(snapshot.state.sum, 8_000);
+    }
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect.each(["gate", "migration"] as const)(
+  "#1472 clips a %s holder to the wait interval",
+  (lock) => {
+    const { logs, layer } = captureWaitLogs();
+    return Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const hold = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+      const holder = yield* Effect.forkChild(
+        (lock === "migration" ? locks.exclusive(hold) : locks.board("robob", hold)).pipe(
+          Effect.provideService(BoardLocks.operationName, "KanbanService.tickStep:beforeWait"),
+        ),
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(10_000);
+      const waiter = yield* Effect.forkChild(
+        locks
+          .board("robob", Effect.void)
+          .pipe(Effect.provideService(BoardLocks.writeWaitMs, 20_000), Effect.exit),
+      );
+      yield* TestClock.adjust(20_000);
+      yield* Fiber.join(waiter);
+      assert.deepInclude(logs[0], {
+        "board.wait_accounted_ms": 20_000,
+        "board.wait_by_label": [{ label: "beforeWait", lock, ms: 20_000, holds: 1 }],
+      });
+      yield* Fiber.interrupt(holder);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("#1472 the 257th gate release evicts the oldest, only on its own board", () => {
+  const { logs, layer } = captureWaitLogs();
+  return Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const holder = yield* Effect.forkChild(
+      locks
+        .run(
+          locks
+            .access("robob", Effect.void)
+            .pipe(
+              Effect.andThen(Deferred.succeed(entered, undefined)),
+              Effect.andThen(Effect.never),
+            ),
+          "blocked",
+        )
+        .pipe(Effect.provideService(BoardLocks.operationName, "KanbanService.blocker")),
+    );
+    yield* Deferred.await(entered);
+    const waiter = yield* Effect.forkChild(
+      locks.run(locks.access("robob", Effect.void), "blocked"),
+    );
+    yield* TestClock.adjust(0);
+    for (let i = 0; i < 256; i++) {
+      yield* locks
+        .run(locks.access("robob", TestClock.adjust(1)), "other")
+        .pipe(
+          Effect.provideService(
+            BoardLocks.operationName,
+            i === 0 ? "KanbanService.oldest" : "KanbanService.repeated",
+          ),
+        );
+    }
+    // Other boards' releases must not evict this board's history.
+    for (let i = 0; i < 257; i++) yield* locks.board("elsewhere", Effect.void);
+    yield* TestClock.adjust(60_000 - 256);
+    assert.deepInclude(logs[0], {
+      "board.queue_ahead_at_admission": 0,
+      "board.wait_accounted_ms": 60_256,
+      "board.wait_by_label": [
+        { label: "blocker", lock: "gate", ms: 60_000, holds: 1 },
+        { label: "repeated", lock: "gate", ms: 255, holds: 255 },
+        { label: "oldest", lock: "gate", ms: 1, holds: 1 },
+      ],
+    });
+    yield* locks
+      .run(locks.access("robob", TestClock.adjust(1)), "other")
+      .pipe(Effect.provideService(BoardLocks.operationName, "KanbanService.repeated"));
+    yield* TestClock.adjust(29_999);
+    assert.deepInclude(logs[1], {
+      "board.wait_accounted_ms": 90_256,
+      "board.wait_by_label": [
+        { label: "blocker", lock: "gate", ms: 90_000, holds: 1 },
+        { label: "repeated", lock: "gate", ms: 256, holds: 256 },
+      ],
+    });
+    yield* Fiber.interrupt(waiter);
+    yield* Fiber.interrupt(holder);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect(
+  "#1472 limits attribution to eight labels while accounting for all overlapping gate holds",
+  () => {
+    const { logs, layer } = captureWaitLogs();
+    return Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const holders = [];
+      for (let i = 0; i < 10; i++) {
+        const entered = yield* Deferred.make<void>();
+        holders.push(
+          yield* Effect.forkChild(
+            locks
+              .run(
+                locks
+                  .access("robob", Effect.void)
+                  .pipe(
+                    Effect.andThen(Deferred.succeed(entered, undefined)),
+                    Effect.andThen(Effect.never),
+                  ),
+                `card-${i}`,
+              )
+              .pipe(Effect.provideService(BoardLocks.operationName, `KanbanService.label${i}`)),
+          ),
+        );
+        yield* Deferred.await(entered);
+      }
+      const waiter = yield* Effect.forkChild(
+        locks
+          .board("robob", Effect.void)
+          .pipe(Effect.provideService(BoardLocks.writeWaitMs, 20_000), Effect.exit),
+      );
+      yield* TestClock.adjust(20_000);
+      const result = yield* Fiber.join(waiter);
+      if (Exit.isFailure(result))
+        assert.include(
+          String(Cause.squash(result.cause)),
+          "most time: label0 20s, label1 20s, label2 20s",
+        );
+      assert.deepInclude(logs[0], { "board.wait_accounted_ms": 200_000 });
+      assert.deepStrictEqual(
+        logs[0]!["board.wait_by_label"],
+        Array.from({ length: 8 }, (_, i) => ({
+          label: `label${i}`,
+          lock: "gate",
+          ms: 20_000,
+          holds: 1,
+        })),
+      );
+      for (const holder of holders) yield* Fiber.interrupt(holder);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("#1472 retains the holder fallback when the wait has no positive overlap", () => {
+  const { logs, layer } = captureWaitLogs();
+  return Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const holder = yield* Effect.forkChild(
+      locks
+        .board("robob", Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)))
+        .pipe(Effect.provideService(BoardLocks.operationName, "KanbanService.tick")),
+    );
+    yield* Deferred.await(entered);
+    const waiter = yield* Effect.forkChild(
+      locks
+        .board("robob", Effect.void)
+        .pipe(Effect.provideService(BoardLocks.writeWaitMs, 0), Effect.exit),
+    );
+    yield* TestClock.adjust(0);
+    const result = yield* Fiber.join(waiter);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      const error = Cause.squash(result.cause) as KanbanError;
+      assert.strictEqual(
+        error.detail,
+        "Board busy: not written (held 0ms by KanbanService.tick; waited 0ms). Safe to retry once.",
+      );
+      assert.match(error.detail, boardBusyPrefix);
+    }
+    assert.deepInclude(logs[0], { "board.wait_accounted_ms": 0, "board.wait_by_label": [] });
+    yield* Fiber.interrupt(holder);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect.each(["card_update", "discussion_post", "report_bug"] as const)(
+  "#1412 %s outer reply deadline names the active holder and actual admission wait",
+  (tool) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const beforeAdmission = yield* Deferred.make<void>();
+      const admit = yield* Deferred.make<void>();
+      const holder = yield* locks
+        .board("a", Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))))
+        .pipe(Effect.provideService(BoardLocks.operationName, "slow-holder"), Effect.forkChild);
+      yield* Deferred.await(held);
+      let written = false;
+      const waiter = yield* SavedReply.protect(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(beforeAdmission, undefined);
+          yield* Deferred.await(admit);
+          yield* locks.board(
+            "a",
+            locks.access(
+              "a",
+              Effect.sync(() => {
+                written = true;
+              }),
+              true,
+            ),
+          );
+          return new McpSchema.CallToolResult({ content: [] });
+        }),
+        tool,
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(beforeAdmission);
+      yield* TestClock.adjust(10_000);
+      yield* Deferred.succeed(admit, undefined);
+      yield* TestClock.adjust(15_000);
+      const result = yield* Fiber.join(waiter);
+      assert.instanceOf(result, McpSchema.CallToolResult);
+      const text = JSON.stringify(result);
+      assert.include(text, "held 25000ms by slow-holder");
+      assert.include(text, "waited 15000ms");
+      assert.notInclude(text, "Not saved (board busy)");
+      assert.isFalse(written);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(holder);
+      yield* locks.board("a", Effect.void);
+      assert.isFalse(written);
+    }),
+);
+
+it.effect("#1412 a bounded read releases its lock without immediately retrying", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    let reads = 0;
+    const read = yield* locks
+      .step(
+        locks.boundedReads(
+          locks.access(
+            "a",
+            SavedWrite.read(
+              Effect.gen(function* () {
+                reads += 1;
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(yield* Deferred.make<void>());
+              }),
+            ),
+          ),
+        ),
+      )
+      .pipe(Effect.exit, Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(2_000);
+    const result = yield* Fiber.join(read);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result))
+      assert.instanceOf(Cause.squash(result.cause), BoardLocks.BoardReadBudgetExceeded);
+    yield* locks.board("a", Effect.void);
+    assert.strictEqual(reads, 1);
+    assert.deepStrictEqual(yield* locks.holders, []);
+  }),
+);
+
+it.effect("#1412 lock holds retain board and step attribution in metrics and analytics", () =>
+  Effect.gen(function* () {
+    const rows: AnalyticsEvent[] = [];
+    yield* Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      const hold = yield* locks
+        .step(
+          locks.access(
+            "offbox",
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+          ),
+          undefined,
+          "KanbanService.tickStep:wakeDiscussionNudges",
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(1_500);
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(hold);
+      assert.deepInclude(rows[0], {
+        kind: "kanban.lock_hold",
+        boardId: "offbox",
+        durationMs: 1_500,
+        props: { phase: "wakeDiscussionNudges" },
+      });
+      const histogram = (yield* Metric.snapshot).find(
+        (row) =>
+          row.id === "kanban_board_lock_hold_duration" &&
+          row.attributes?.boardId === "offbox" &&
+          row.attributes?.name === "KanbanService.tickStep:wakeDiscussionNudges",
+      );
+      assert.isDefined(histogram);
+    }).pipe(
+      Effect.provide(
+        Layer.mock(Analytics)({
+          record: (event) =>
+            Effect.sync(() => {
+              rows.push(event);
+            }),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect.each(["read.card", "syncPrs.fetch", "syncPrs.write", "apply"] as const)(
+  "long holds and active holder warnings name the %s sub-step",
+  (phase) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const lines: Array<Record<string, unknown>> = [];
+      const clock = yield* Clock.Clock;
+      let observing = 0;
+      const logger = Logger.make(({ message }) => {
+        const line = String(message);
+        if (line.startsWith('{"event":"kanban board lock')) lines.push(JSON.parse(line));
+      });
+      yield* Effect.gen(function* () {
+        const holder = yield* Effect.forkChild(
+          SavedWrite.subSteps(
+            "tickStep:landing",
+            locks.board(
+              "a",
+              Effect.gen(function* () {
+                const observe = yield* NodeSqliteClient.ReaderSnapshotObserver;
+                const stop = observe?.(() => ({
+                  db: "boards",
+                  connection: "reader",
+                  lane: "background",
+                  slot: 0,
+                  stage: "slot",
+                  queueDepth: 2,
+                  oldestInFlightAgeMs: clock.currentTimeMillisUnsafe(),
+                  holder: "KanbanAskFeed.read",
+                }));
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release).pipe(Effect.ensuring(Effect.sync(() => stop?.())));
+              }).pipe(
+                Effect.withSpan("KanbanStore.read", {
+                  attributes: { "kanban.operation": "read card" },
+                }),
+                Effect.withSpan(phase),
+              ),
+            ),
+          ),
+        );
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust(60_000);
+        const active = yield* locks.holders;
+        assert.deepEqual(active.find((holder) => holder.lock === "gate")?.subSteps, [
+          { subStep: phase, ms: 60_000 },
+        ]);
+        assert.deepEqual(
+          (yield* locks.holders).find((holder) => holder.lock === "gate")?.subSteps,
+          [{ subStep: phase, ms: 60_000 }],
+        );
+        assert.strictEqual(observing, 1);
+        const waiter = yield* Effect.forkChild(locks.board("a", Effect.void));
+        yield* TestClock.adjust(0);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(holder);
+        yield* Fiber.join(waiter);
+        const hold = lines.find((line) => line.event === "kanban board lock long hold");
+        assert.deepEqual(hold?.subSteps, [{ subStep: phase, ms: 60_000 }]);
+        assert.deepEqual(hold?.threshold, {
+          observedAtMs: 5_000,
+          awaited: "KanbanStore.read.card",
+          readers: [
+            {
+              db: "boards",
+              connection: "reader",
+              lane: "background",
+              slot: 0,
+              stage: "slot",
+              queueDepth: 2,
+              oldestInFlightAgeMs: 5_000,
+              holder: "KanbanAskFeed.read",
+            },
+          ],
+        });
+        const warning = lines.find((line) => line.event === "kanban board lock held too long");
+        const blockers = warning?.["board.blockers"] as Array<{ subSteps?: unknown }> | undefined;
+        assert.deepEqual(blockers?.[0]?.subSteps, [{ subStep: phase, ms: 60_000 }]);
+        assert.strictEqual(observing, 0);
+        assert.deepEqual(yield* locks.holders, []);
+      }).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.provideService(NodeSqliteClient.ReaderSnapshotObserver, () => {
+          observing += 1;
+          return () => {
+            observing -= 1;
+          };
+        }),
+      );
+    }),
 );

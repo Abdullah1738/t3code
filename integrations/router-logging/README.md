@@ -5,6 +5,27 @@ Both dependency-free writers hash IDs, allowlist scalar metadata, and replace ra
 error messages with stable tags. They share retention and cap markers across
 processes and languages. Writes are best effort with no tool-work lock.
 
+The existing `com.ardud.9router-log-poll` LaunchAgent runs an independent guard
+every 15 seconds. It checks launchd and a TCP connection, restores an absent job,
+and kickstarts a loaded job after 60 seconds of continuous refused connections.
+It logs listener transitions and backs off repair attempts to five minutes. The
+guard sends one local Telegram alert after two minutes down and a recovery note
+using the same incident key prefix. Delivery retries retain that key across guard
+restarts. The HTTP snapshot runs in a separate child every five minutes.
+
+`~/.local/state/9router/deploy.json` coordinates the guard with the router's
+installer and release script. Only a `status: running` marker younger than five
+minutes suppresses repair; failed markers permit repair immediately. The shared
+directory lock prevents concurrent launchctl actions for up to five minutes.
+The guard reclaims a dead owner's lock once its marker expires. At five minutes
+it logs `guard.lock_override` with `ownerPid` (`unknown` if unavailable) and
+`lockAgeMs`, then repairs even if the owner is alive or its PID was reused.
+Lock age uses the acquisition file's modification time, so later marker updates
+cannot prolong the ceiling. Deferral never suppresses outage alerts.
+The installer, release helper and guard serialize lock-directory changes through
+the persistent `deploy.json.coord` flock file. Takeover checks the retired
+directory's identity before removing it, preserving a replacement acquisition.
+
 The five-minute poll uses the existing local CLI authentication in memory and
 only GETs `/api/providers`, `/api/usage/logs`, and `/api/usage/stats?period=today`.
 It never calls a provider test, refresh, OAuth, reset, settings or account mutation.
@@ -22,24 +43,40 @@ these cumulative snapshots must not be summed as hourly spend.
 
 `9router-log-rollup [--day YYYY-MM-DD]` defaults to yesterday UTC. It streams a
 fixture or real day file and writes a private `rollup-YYYY-MM-DD.json` with name
-and kind counts, rates, duration percentiles and top error tags. The poller makes
+and kind counts, rates, duration percentiles and top error tags. `supervisor`
+counts starts, stops, exits, reloads and deploy actions. `listener` contains
+outage windows and their total/max duration clipped to the requested UTC day;
+their start and end retain the actual transition timestamps. Open windows end
+at generation time or UTC midnight for duration calculation. The poller makes
 yesterday's rollup on its first successful run after 00:05 UTC. Invalid lines
 are counted and skipped.
+`complete` means `generatedAt` is on or after the next UTC midnight; incomplete rollups are regenerated after 00:05Z, and lock `distinct` counts dedupe account/provider/model/deadline-minute while `count` keeps raw lines.
+
+`account.lock` and `account.unlock` carry hashed account IDs, scope, classifier
+cause, deadline and the source request ID when known. DB expiry is recorded on
+the next connection read; `until` is the actual deadline, not the observation
+time. Legacy locks without duration/cause metadata leave duration unknown.
+`account.locked` samples the active deadlines already exposed by `/api/providers`
+on each poll. RAM-only quota locks appear in router events, not that snapshot.
+The rollup's `locks` section groups sets by provider/model/cause with duration
+percentiles and the five accounts with the most lock sets; snapshots and unlocks
+do not increase lock counts.
 
 Image CLI behavior is unchanged: no paid fallback is enabled. Its request
 function instruments an existing caller-supplied OpenRouter fallback if supplied.
 The reauth supervisor remains notification-only in production. Its unreachable
 future recovery paths are instrumented and exercised only by synthetic tests.
 
-After review and owner deploy approval, deploy `router-logging` first, then
+After review, deploy `router-logging` first, then
 `catalog-guard`, `stream-recovery`, `local-helpers`. The local-helpers installer
-ships the CLI wrappers, key helper, image helper and five-minute LaunchAgent;
+ships the CLI wrappers, key helper, image helper and guard LaunchAgent;
 it backs up the old image script before linking the shared skill entry point.
 The supervisor's existing reviewed installer is a separate required step:
 `integrations/deploy.zsh 9router-reauth` (the code-only watcher installer).
 Do not deploy the entire watcher integration to ship this one watcher.
-No existing service restart is needed for these short-lived processes; the
-local-helpers installer loads/reloads its managed LaunchAgents. The watcher
+The local-helpers installer loads/reloads its managed LaunchAgents. For later
+guard code updates, restart `com.ardud.9router-log-poll` after copying the code.
+The watcher
 runner picks up the new supervisor on its next tick. No 9router restart.
 
 Focused checks (run offbox):

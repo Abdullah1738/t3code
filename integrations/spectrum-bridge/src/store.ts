@@ -1,3 +1,5 @@
+import { deliveredReplyCoverage, humanRow, markControlAcked, markAnswered, type AnsweredInput } from "./unanswered.ts";
+import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
@@ -6,6 +8,7 @@ const steerSourceKey = (sessionId: string, generation: number, inboundId: string
   `steer-reply-source:${createHash("sha256").update(JSON.stringify([sessionId, generation, inboundId])).digest("hex")}`;
 
 export type FileAttachment = { sha256: string; name: string; mimeType: string; size: number };
+export type ReplyAttribution = { inboundId?: string; covered?: string[] };
 export type OutboxPoll = { title: string; options: string[] };
 export type OutboxApp = {
   url: string; caption: string; subcaption?: string; trailingCaption?: string; trailingSubcaption?: string; summary?: string;
@@ -28,11 +31,14 @@ export type OutboxOperation = {
   id: string;
   // "notification" survives only for reference lookup of historical rows.
   kind: "notification" | "conversation" | "control";
+  /** A direct command response, such as /status, can complete its own inbound row. */
+  answersInbound?: true;
   text: string;
   sessionId?: string;
   generation?: number;
   replyTo?: string;
   attachment?: FileAttachment;
+  healthReceipt?: HealthSidecar;
   /** SDK effect name, such as "confetti"; applies to the first text chunk only. */
   effect?: string;
   subject?: string;
@@ -138,6 +144,26 @@ export class Store {
       .get(...wanted) !== null;
   }
 
+  groupAudience(): string[] {
+    const rosters = this.db.query<{ rowid: number; participants: string }, []>(`SELECT rowid, json_extract(payload, '$.participants') AS participants
+      FROM inbound WHERE json_type(payload, '$.participants') = 'array'
+      AND json_array_length(payload, '$.participants') > 0 ORDER BY rowid DESC`);
+    let members: string[] = [];
+    let since = 0;
+    // Select and normalize in JS: SQLite TRIM does not recognize all JS whitespace.
+    // Exhaust the cached query before selecting a roster; Bun 1.4.1 leaves a broken-out iterator active.
+    for (const roster of rosters.all()) {
+      members = (JSON.parse(roster.participants) as unknown[])
+        .filter((address): address is string => typeof address === "string").map(address => address.trim()).filter(Boolean);
+      if (members.length) { since = roster.rowid; break; }
+    }
+    // Rosterless messages can reveal members added since the last reported roster.
+    const observed = this.db.query<{ sender: string }, [number]>(`SELECT DISTINCT json_extract(payload, '$.sender') AS sender
+      FROM inbound WHERE rowid >= ? AND json_type(payload, '$.sender') = 'text'
+      ORDER BY sender`).all(since).map(row => row.sender.trim()).filter(Boolean);
+    return [...new Set([...members, ...observed])];
+  }
+
   pendingInbound(): InboundRecord[] {
     return this.db.query<Omit<InboundRecord, "payload"> & { payload: string }, []>(
       "SELECT id, payload, state FROM inbound WHERE state IN ('pending', 'processing') ORDER BY rowid",
@@ -145,6 +171,13 @@ export class Store {
   }
 
   updateInbound(id: string, state: string, payload?: unknown, failure?: InboundFailure): void {
+    if (payload !== undefined) {
+      const previous = this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+      const saved = previous ? JSON.parse(previous.payload) as AnsweredInput : undefined;
+      if (saved?.answeredAt !== undefined || saved?.unanswered !== undefined) payload = { ...payload as object,
+        ...(saved.answeredAt !== undefined ? { answeredAt: saved.answeredAt } : {}),
+        ...(saved.unanswered ? { unanswered: { ...saved.unanswered, ...(payload as AnsweredInput).unanswered } } : {}) };
+    }
     const detail = failure ?? (state === "failed" ? { stage: "state-transition", message: "No failure detail supplied", threadId: null, at: Date.now() } : undefined);
     const result = this.db.query(`UPDATE inbound SET state = ?, payload = COALESCE(?, payload), failure = COALESCE(?, failure)
       WHERE id = ?`).run(state, payload === undefined ? null : json(payload), detail ? json(detail) : null, id);
@@ -166,13 +199,22 @@ export class Store {
     ).all().map(row => ({ ...row, payload: JSON.parse(row.payload) }));
   }
 
-  enqueue(op: OutboxOperation, attribution?: { inboundId?: string }): boolean {
+  replyAttribution(sessionId?: string, generation?: number): ReplyAttribution & { covered: string[] } {
+    const turn = this.get<{ id: string; generation: number; covered?: string[]; inboundId?: string; replyInboundId?: string } | null>("activeTurn");
+    if (!turn || turn.id !== sessionId || turn.generation !== generation) return { covered: [] };
+    const root = turn.inboundId && !/^(wake:|reset:|secret:)/.test(turn.inboundId) ? turn.inboundId : undefined;
+    const members = root ? this.get<{ batchIds?: string[] }>(`batch:${root}`)?.batchIds ?? [root] : [];
+    return { inboundId: turn.replyInboundId ?? turn.inboundId, covered: [...new Set([...members, ...turn.covered ?? []])] };
+  }
+
+  enqueue(op: OutboxOperation, attribution?: ReplyAttribution): boolean {
     // Normalize property order and omit unrelated caller fields before comparing content.
     const payload = json({
-      id: op.id, kind: op.kind, text: op.text, sessionId: op.sessionId,
+      id: op.id, kind: op.kind, ...(op.answersInbound ? { answersInbound: true } : {}), text: op.text, sessionId: op.sessionId,
       generation: op.generation, replyTo: op.replyTo,
       attachment: op.attachment ? { sha256: op.attachment.sha256, name: op.attachment.name,
         mimeType: op.attachment.mimeType, size: op.attachment.size } : undefined,
+      ...(op.healthReceipt ? { healthReceipt: op.healthReceipt } : {}),
       effect: op.effect, subject: op.subject,
       poll: op.poll ? { title: op.poll.title, options: [...op.poll.options] } : undefined,
       app: op.app ? { url: op.app.url, caption: op.app.caption, subcaption: op.app.subcaption,
@@ -183,6 +225,11 @@ export class Store {
       const result = this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
         ON CONFLICT(id) DO NOTHING`).run(op.id, payload);
       if (result.changes) {
+        this.set(`reply-covered:${op.id}`, (attribution?.covered ?? [...new Set([
+          ...this.replyAttribution(op.sessionId, op.generation).covered,
+          ...(op.replyTo ? this.get<{ batchIds?: string[] }>(`batch:${op.replyTo}`)?.batchIds ?? [op.replyTo] : []),
+        ])]).filter(humanRow));
+        if (op.kind === "control" && !op.answersInbound) deliveredReplyCoverage(this, op);
         if (op.app?.updateOf) this.set(`app-latest:${op.app.updateOf}`, op.id);
         toolLog.capture(() => {
           this.set(`log-queued:${op.id}`, Date.now());
@@ -211,17 +258,20 @@ export class Store {
   /** A steer can commit before its HTTP response, so its already queued replies need the confirmed human source. */
   attributeSteeredReplies(inboundId: string, sessionId: string, generation: number, afterOutbox: number, rootInboundId?: string): void {
     const input = this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(inboundId);
-    if (!input || !rootInboundId || !/^(?:secret|wake|reset):/.test(rootInboundId)) return;
+    if (!input || !rootInboundId) return;
     // An API fold may have captured the old source before confirmation and enqueue after this transaction.
     const key = steerSourceKey(sessionId, generation, rootInboundId);
+    const priorSource = this.get<string>(key);
     if (this.get(key) === undefined) this.set(key, inboundId);
     const receivedAt = (JSON.parse(input.payload) as { receivedAt?: number }).receivedAt;
     const rows = this.db.query<{ id: string; state: string }, [number, string, number]>(
-      "SELECT id, state FROM outbox WHERE rowid > ? AND json_extract(payload, '$.sessionId') = ? AND json_extract(payload, '$.generation') = ?",
+      "SELECT id, state FROM outbox WHERE rowid > ? AND json_extract(payload, '$.kind') = 'conversation' AND json_extract(payload, '$.sessionId') = ? AND json_extract(payload, '$.generation') = ?",
     ).all(afterOutbox, sessionId, generation);
     for (const row of rows) {
       const previous = this.get<string>(`log-inbound-id:${row.id}`);
-      if (previous !== rootInboundId) continue;
+      if (previous !== undefined && previous !== rootInboundId && previous !== priorSource) continue;
+      // Outbox order cannot prove a tool send answered a steer that was not yet confirmed.
+      // Its captured coverage stays authoritative even when logging gains a better source.
       this.set(`log-inbound-id:${row.id}`, inboundId);
       if (typeof receivedAt === "number" && Number.isFinite(receivedAt)) this.set(`log-inbound-at:${row.id}`, receivedAt);
       // Health may have consumed the acceptance receipt while its source was still uncertain.
@@ -265,6 +315,12 @@ export class Store {
         state = ?, providerId = COALESCE(?, providerId) WHERE id = ?`
       ).run(state, state, providerId ?? null, id);
       if (!result.changes) throw new Error(`Unknown outbox operation: ${id}`);
+      if (state === "sent") {
+        const op = this.getOperation(id)!;
+        if (op.kind === "control" && !op.answersInbound) markControlAcked(this, op);
+        else markAnswered(this, deliveredReplyCoverage(this, op));
+      }
+      rememberHealthReceipt(this, id, state);
     }).immediate();
   }
 

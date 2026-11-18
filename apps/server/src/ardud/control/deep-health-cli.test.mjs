@@ -10,6 +10,63 @@ import * as NodePath from "node:path";
 const cli = NodeURL.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url));
 // oxlint-disable-next-line t3code/no-global-process-runtime -- POSIX FIFO fixtures in standalone Node CLI tests.
 const fifoUnsupported = process.platform === "win32";
+
+for (const json of [false, true])
+  test(`CLI IPC preserves safe identity failure details (JSON: ${json})`, async () => {
+    const hook = `
+      import { registerHooks } from 'node:module';
+      registerHooks({ load(url, context, next) {
+        const result = next(url, context);
+        if (!url.endsWith('/deep-health.mjs') && !url.endsWith('/client.mjs')) return result;
+        let source = Buffer.from(result.source).toString();
+        if (url.endsWith('/client.mjs')) {
+          source = source.replace('async request(method, path, body, options = {}) {',
+            'async request(method, path, body, options = {}) { ' +
+            'return path === "/health" ? {ok:true,status:"healthy"} : {threads:[]};');
+        } else {
+          source = source.replace('readRuntime = readRuntimeState,',
+            'readRuntime = async () => { throw Object.assign(new Error("fixture-secret /private/fixture/server-runtime.json"), ' +
+            '{code:"EPERM",syscall:"open",path:"/private/fixture/server-runtime.json"}); },');
+        }
+        return {...result,source};
+      }});
+    `;
+    const result = await NodeUtil.promisify(NodeChildProcess.execFile)(
+      process.execPath,
+      [
+        "--import",
+        `data:text/javascript,${encodeURIComponent(hook)}`,
+        cli,
+        "health",
+        "--deep",
+        ...(json ? ["--json"] : []),
+        "--url",
+        "http://127.0.0.1:1",
+        "--token",
+        "fixture-secret",
+      ],
+      { timeout: 5000, killSignal: "SIGKILL" },
+    ).catch((error) => error);
+    NodeAssert.equal(result.code, 1, result.stderr);
+    const report = JSON.parse(
+      json ? result.stdout : result.stdout.slice(result.stdout.indexOf("\n") + 1),
+    );
+    NodeAssert.deepEqual(report.localIdentity, {
+      ok: false,
+      reason: "runtime-unreadable",
+      stage: "runtime",
+      code: "EPERM",
+    });
+    NodeAssert.equal(report.stages.runtime.status, "error");
+    NodeAssert.equal(report.stages.runtime.code, "EPERM");
+    NodeAssert.equal(report.stages.runtime.syscall, "open");
+    NodeAssert.equal(report.stages.runtime.path, "server-runtime.json");
+    NodeAssert.match(report.summary, /runtime-unreadable EPERM.*at runtime/);
+    if (!json) NodeAssert.equal(result.stdout.split("\n")[0], report.summary);
+    NodeAssert.equal(result.stderr, "");
+    NodeAssert.doesNotMatch(result.stdout, /fixture-secret|\/private\//);
+  });
+
 for (const [name, timeoutMs, holdWriter] of [
   ["FIFO open without a writer", 200, false],
   ["FIFO read without data", 200, true],
@@ -76,11 +133,11 @@ for (const stage of ["config", "connection", "roundTrip", "runtime", "listener",
             'if (path === "/health") { ' +
             (${JSON.stringify(stage)} === 'listener'
               ? 'throw new Error("fixture transport failure");'
-              : 'return {ok:true,status:"healthy",serverStartedAt:"2026-11-14T00:00:00Z"};') +
+              : 'return {ok:true,status:"healthy",bootId:"8d0efaf9-5dd4-400f-9db1-8308e5a591b0",serverStartedAt:"2026-11-14T00:00:00Z"};') +
             '} return {threads:[]};');
         } else if (url.endsWith('/deep-health.mjs')) {
           source = source.replace('readRuntime = readRuntimeState,',
-            'readRuntime = async () => ({origin:"http://127.0.0.1:1",pid:process.pid,startedAt:"2026-11-14T00:00:00Z"}),');
+            'readRuntime = async () => ({origin:"http://127.0.0.1:1",pid:process.pid,bootId:"8d0efaf9-5dd4-400f-9db1-8308e5a591b0",startedAt:"2026-11-14T00:00:00Z"}),');
           source = source.replace('onStage(name);',
             'onStage(name); if (name === ${JSON.stringify(stage)}) process.getBuiltinModule("node:fs").readFileSync(process.env.T3_TEST_NATIVE_FIFO);');
         }

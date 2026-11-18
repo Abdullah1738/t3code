@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sqlite3
@@ -64,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     lr = sp.add_parser("log-rollup", help="roll up shared tool logs for a UTC day")
     lr.add_argument("--day", metavar="YYYY-MM-DD")
+    lr.add_argument("--live-only", action="store_true", help="exclude fixture run IDs; report excluded records")
 
     lg = sp.add_parser("logs")
     lg.add_argument("run_id")
@@ -79,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     lo.add_argument("--list", action="store_true")
     lo.add_argument("--clear", action="store_true")
 
-    li = sp.add_parser("list")
+    li = sp.add_parser("list", aliases=["ps"])
     li.add_argument("--all", action="store_true")
     li.add_argument("--json", action="store_true")
     kl = sp.add_parser("kill", help="stop your box run, including while queued or still syncing/starting",
@@ -90,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("box_id", nargs="?")
     rl.add_argument("--mine", action="store_true")
     rl.add_argument("--delete", action="store_true", help="delete instead of stop (loses the warm disk)")
+    rl.add_argument("--override-protection", action="store_true", help="explicitly stop or delete a pinned or held box")
     sh = sp.add_parser("ssh")
     sh.add_argument("box_id", nargs="?")
     sh.add_argument("cmd", nargs=argparse.REMAINDER)
@@ -106,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     po.add_argument("--reverse", action="store_true",
                     help="expose the Mac's 127.0.0.1:<--local> on the box at 127.0.0.1:<port> instead")
     sp.add_parser("whoami")
-    sp.add_parser("status")
+    sp.add_parser("status", aliases=["doctor"]).add_argument("run_id", nargs="?")
 
     s = sp.add_parser("spend")
     s.add_argument("--json", action="store_true")
@@ -127,10 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
     b = sp.add_parser("base")
     b.add_argument("action", choices=["rm"])
     b.add_argument("name")
-    k = sp.add_parser("keep", help="pin this lease so the reaper never deletes it")
+    k = sp.add_parser("keep", help="protect this lease from cleanup and reuse until its pin expires")
     k.add_argument("--days", type=float, default=30)
-    k.add_argument("--box", help="clear your pin on a previous box (with --days 0)")
+    k.add_argument("--box", help="pin a specific box, or clear your pin with --days 0")
 
+    bx = sp.add_parser("box")
+    bx.add_argument("action", choices=["release-disk-full", "suspect", "clear"])
+    bx.add_argument("box_id")
+    bx.add_argument("--reason")
+    ev = sp.add_parser("events")
+    ev.add_argument("run_id")
+    ev.add_argument("--json", action="store_true")
     t = sp.add_parser("template")
     t.add_argument("action", choices=["build", "list"])
     t.add_argument("name", nargs="?")
@@ -194,13 +204,16 @@ def cmd_run(a, me) -> int:
         data["ok"] = code == 0
         data["props"].update(exitCode=code, fallback=a.log_fallback)
         if code in (90, 91, 92, 93):
+            reason = {90: "infra", 91: "cap", 92: "busy", 93: "person_home_down"}[code]
+            if code == EXIT_HOME_DOWN and a.base and not a.fresh and not common.person():
+                reason = "base_home_down"
             toollog.emit("run", "run.error", kind="error", ok=False, tag="exit_" + str(code),
-                         props={"exitCode": code, "reason": {90: "infra", 91: "cap", 92: "busy", 93: "person_home_down"}[code]})
+                         props={"exitCode": code, "reason": reason})
         return code
 
 
 def _cmd_run(a, me) -> int:
-    from . import capacity, fallback, runs
+    from . import runs
     if a.cmd and a.cmd[0] == "--":
         a.cmd = a.cmd[1:]
     if a.step and a.cmd:
@@ -219,86 +232,157 @@ def _cmd_run(a, me) -> int:
 
 
 def _run_with_retries(a, me) -> int:
+    from . import allocation, home
+    with home.run_identity(), home.wait_budget(), allocation.queue_retries():
+        return _run_with_wait_budget(a, me)
+
+
+def _run_with_wait_budget(a, me) -> int:
     from . import capacity, fallback, runs
     # No local-first lane any more (owner, 13 Nov 2026): it existed to save boat.dev minutes, and home boxes cost
     # nothing. Every `offbox run` goes to a box; --remote stays as "never fall back to the Mac".
     log("remote")
     from . import home
+    from .base_catalog import full_name
+    explicit_base = full_name(a.base, me['repo_key']) if a.base and not a.fresh else None
+    wait_explicit_base = home.active() and home.base_needs_home(explicit_base)
     home.WAIT_STARTED = time.monotonic()
-    if home.may_fail_over():
-        home.before_run(getattr(a, "argv", None) or sys.argv[1:])
-    elif (home.on_standby() and not os.environ.get(home.FAILOVER_ENV)
-          and common._BACKEND_REASON != "boat-only-base"):
-        st = common.home_state()
-        toollog.emit("backend", "backend.failover", duration_ms=0, ok=True, props={"from": "home", "to": "boat", "reason": "home_down", "waitMs": 0})
-        say(f"home offbox server is down ({st.get('reason') or 'marked down by the health monitor'}); "
-            "this run is on Boat")
-    from . import api, outage, pool
+    from . import allocation, api, outage, pool
     waited_from = None
+    wait_end = None
     capacity_since = capacity_last_say = None
     capacity_round = None
     last_outage = None
+    last_home_outage = None
+    preflight_done = False
     reprobed = False
     try:
         while True:
             try:
+                allocation.check_retry_queue()
                 if waited_from is None:
+                    if not preflight_done:
+                        preflight_done = True
+                        home.before_run(getattr(a, "argv", None) or sys.argv[1:], explicit_base=explicit_base)
                     return _remote_once(a, me)
-                remaining = outage.window_seconds() - (time.monotonic() - waited_from)
+                remaining = wait_end - time.monotonic()
                 if remaining <= 0:
                     raise last_outage
                 if capacity_round is not None:
                     pause = outage.CAPACITY_RETRY_S - (time.monotonic() - capacity_round)
                     if pause > 0:
+                        queue_left = allocation.check_retry_queue()
+                        if queue_left is not None:
+                            pause = min(pause, queue_left)
                         time.sleep(min(pause, remaining))
-                        remaining = outage.window_seconds() - (time.monotonic() - waited_from)
+                        allocation.check_retry_queue()
+                        remaining = wait_end - time.monotonic()
                         if remaining <= 0:
                             raise last_outage
                     capacity_round = time.monotonic()
-                with outage.allocation_budget(remaining):
-                    return _remote_once(a, me)
+                with outage.allocation_budget(remaining, pause_queue=capacity_since is None) as idle:
+                    try:
+                        return _remote_once(a, me)
+                    finally:
+                        wait_end += idle['seconds']
+            except home.FailbackReady as ready:
+                # Runner signal handlers and all queue/box scopes must unwind before transferring to a new client.
+                return home.fail_back(ready, getattr(a, "argv", None) or sys.argv[1:])
             except OffboxError as e:
+                if home.active() and os.environ.get(home.RETURNED_HOME_ENV) and home.unreachable(e):
+                    # This invocation already left Boat's queue once. Remain at home through subsequent outages.
+                    say("home offbox server is unavailable again; this run stays queued on home")
+                    runs.retry_background(e, run_id=e.run_id)
+                    if e.run_id:
+                        os.environ[home.RUN_ID_ENV] = e.run_id
+                    time.sleep(home.failback_probe_seconds())
+                    continue
                 runs.retry_background(e)
-                if isinstance(e, pool.PoolBusyError) and waited_from is not None and last_outage is not None and \
-                        time.monotonic() - waited_from >= outage.window_seconds() and not e.started:
+                run_id = e.run_id or os.environ.get(runs.BACKGROUND_RUN_ENV, '')
+                if isinstance(e, pool.PoolBusyError) and not e.queue_expired and waited_from is not None and \
+                        last_outage is not None and time.monotonic() >= wait_end and not e.started:
                     raise last_outage
                 if home.active() and home.unreachable(e):
+                    last_home_outage = e
                     # Nothing was accepted by the home server. Ordinary work goes to Boat for this one run; a
                     # person's work waits for the home server; a pinned backend keeps today's waiting.
-                    if home.may_fail_over():
-                        if not reprobed and not home.recent_failure() and home.network_failure(e):
+                    if not getattr(a, "_suspect_exclude", None) and home.may_fail_over(explicit_base):
+                        why = None
+                        if not reprobed and home.network_failure(e):
                             reprobed = True
-                            if api.probe_backend("server", home.PROBE_TIMEOUT_S) is None:
+                            try:
+                                why = home.preflight_reason()
+                            except home.StartWaitFailed as wait_error:
+                                e, why = wait_error, str(wait_error)
+                            if why is None:
                                 continue
-                        home.fail_over(str(e), getattr(a, "argv", None) or sys.argv[1:])
+                        phase = home.error_phase(e) if why is None else None
+                        if phase:
+                            why = home.wait_while_starting(phase, e.run_id or "", checkpoint="post", box=e.box)
+                            if why is None:
+                                continue
+                            e = home.StartWaitFailed(why, run_id, e.box)
+                        else:
+                            why = why or str(e)
+                        home.fail_over(why, getattr(a, "argv", None) or sys.argv[1:], run_id,
+                                       explicit_base=explicit_base)
+                    else:
+                        decision = ('wait_person' if common.person() else 'wait_explicit_base'
+                                    if wait_explicit_base else 'wait_pinned')
+                        home.failover_decision(decision, 'unreachable', explicit_base, run_id)
                     if common.person():
                         raise OffboxError(f"the home offbox server is down ({e}); {common.person()}'s tasks wait "
                                           "until it is back. Nothing ran and nothing was sent to Boat",
                                           code=EXIT_HOME_DOWN) from e
+                    if isinstance(e, home.StartWaitFailed):
+                        raise
                 machine_capacity = isinstance(e, api.BoatAtCapacity)
                 if machine_capacity:
                     if e.started or not (a.no_fallback or a.remote or a.bg or
                                          not fallback.allowed(a.cmd, e, os.getcwd())):
                         raise
-                elif not _outage_wait_applies(a, e):
+                elif not (wait_explicit_base and home.unreachable(e)) and not _outage_wait_applies(a, e):
                     raise
                 if waited_from is None:
                     waited_from = time.monotonic()
+                    wait_end = (home.wait_deadline(min(outage.window_seconds(), home.wait_seconds()), clock=time.monotonic)
+                                if wait_explicit_base else waited_from + outage.window_seconds())
                 last_outage = e
                 if machine_capacity:
                     if capacity_since is None:
                         capacity_since = outage.now()
                         capacity_round = time.monotonic()
+                    capacity_end = wait_end
+                    queue_left = allocation.check_retry_queue()
+                    if queue_left is not None:
+                        capacity_end = min(capacity_end, time.monotonic() + queue_left)
                     retry, capacity_last_say = outage.wait_for_capacity(
-                        waited_from, capacity_since, capacity_last_say, outage.window_seconds())
+                        waited_from, capacity_since, capacity_last_say, capacity_end - waited_from)
                     if retry:
                         continue
+                    allocation.check_retry_queue()
                     raise
-                left = outage.window_seconds() - (time.monotonic() - waited_from)
-                if left > 0 and outage.wait_until_up(outage.reason_of(e), left):
-                    continue
+                left = wait_end - time.monotonic()
+                queue_left = allocation.retry_queue_left()
+                if queue_left is not None:
+                    left = min(left, queue_left)
+                service = {'service': 'home offbox server'} if wait_explicit_base else {}
+                with home.pre_start(run_id) if wait_explicit_base else contextlib.nullcontext():
+                    if left > 0 and outage.wait_until_up(outage.reason_of(e), left, **service):
+                        continue
+                allocation.check_retry_queue()
+                if wait_explicit_base and home.unreachable(e):
+                    raise home.base_down_error(explicit_base, str(e)) from e
                 raise outage.down_error(e, time.monotonic() - waited_from) from e
     except OffboxError as e:
+        if e.code == EXIT_INFRA and not e.started and allocation.retry_queue_left() == 0:
+            e = pool.PoolBusyError("allocation queue timed out; nothing ran", queue_expired=True)
+        # A retry's local deadline can expire after a successful probe without carrying an outage flag.
+        if wait_explicit_base and not e.started and (home.unreachable(e) or
+                (last_home_outage is not None and e.code == EXIT_INFRA and api.client_budget_expired(e))):
+            e = home.base_down_error(explicit_base, str(e))
+        if os.environ.get(runs.BACKGROUND_RUN_ENV):
+            runs.queue_lifecycle.failed(os.environ[runs.BACKGROUND_RUN_ENV], e)
         if e.code not in (EXIT_INFRA, EXIT_CAP, EXIT_BUSY):
             say(str(e))
             return e.code
@@ -310,7 +394,7 @@ def _run_with_retries(a, me) -> int:
             say(f"remote run {e.run_id or 'unknown'} on {e.box or 'unknown box'} failed after the command may have "
                 f"started: {e}. Not re-running locally (it may have side effects). Check: {check}")
             return e.code
-        if a.no_fallback or a.remote:
+        if a.no_fallback or a.remote or explicit_base:
             say(str(e))
             return e.code
         if a.bg:
@@ -334,7 +418,7 @@ def _run_with_retries(a, me) -> int:
 
 
 # Commands that never talk to a box: they work for a person's lease even while the home server is down.
-LOCAL_ONLY = ("whoami", "local", "list", "status", "spend", "stats", "reap", "bases", "log-rollup")
+LOCAL_ONLY = ("whoami", "local", "list", "status", "spend", "stats", "reap", "bases", "log-rollup", "events", "box")
 
 
 def _reap_other_backend(dry_run: bool) -> None:
@@ -355,6 +439,12 @@ def _reap_other_backend(dry_run: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from . import home
+    with home.wait_budget():
+        return _main_with_trace(argv)
+
+
+def _main_with_trace(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     name = argv[0] if argv else "help"
     if name not in {"wait", "logs", "kill", "save", "status", "ssh", "reap", "local", "log-rollup"}:
@@ -369,6 +459,7 @@ def main(argv: list[str] | None = None) -> int:
 def _main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     a = parse_args(argv)
+    a.sub = {"ps": "list", "doctor": "status"}.get(a.sub, a.sub)
     if not a.sub:
         build_parser().print_help()
         return 2
@@ -377,11 +468,17 @@ def _main(argv: list[str] | None = None) -> int:
     from .redact import redact_argv, warn_env_values
     try:
         if a.sub == "log-rollup":
-            print(json.dumps(toollog.rollup(a.day), sort_keys=True))
+            print(json.dumps(toollog.rollup(a.day, live_only=a.live_only), sort_keys=True))
             return 0
         if a.sub == "reap":
             toollog.rollup_previous()
+            toollog.rollup_today()
         me = whoami()
+        import offbox_protection
+        offbox_protection.CALLER.set(offbox_protection.caller('client:' + a.sub, holder=me['owner'],
+                                                            thread_id=me.get('thread') or me.get('thread_id') or
+                                                            offbox_protection.caller().get('thread_id')))
+        log('client_command ' + json.dumps(offbox_protection.caller()))
         if a.sub == "exec":
             from . import execute
             return execute.command(a, me)
@@ -405,15 +502,24 @@ def _main(argv: list[str] | None = None) -> int:
         if a.sub == "logs":
             return misc.logs(a.run_id, a.follow)
         if a.sub == "wait":
-            return misc.wait(a.run_id, a.timeout)
+            return misc.wait(a.run_id, a.timeout, summary=True)
         if a.sub == "local":
             misc.local_exempt(me, a.reason, a.ttl, a.list, a.clear)
+        elif a.sub == "events":
+            misc.run_events(a.run_id, a.json)
         elif a.sub == "list":
             misc.list_leases(me, a.all, a.json)
         elif a.sub == "kill":
             return misc.kill_run(a.run_id, me)
+        elif a.sub == "box":
+            from . import box_disk
+            if a.action == "release-disk-full":
+                box_disk.release(me, a.box_id)
+            else:
+                from . import unfit
+                unfit.command(me, a.box_id, a.action, a.reason)
         elif a.sub == "release":
-            misc.release(me, a.box_id, a.mine, a.delete)
+            misc.release(me, a.box_id, a.mine, a.delete, override=a.override_protection)
         elif a.sub == "ssh":
             box, cmd = a.box_id, list(a.cmd)
             if box and not box.startswith("bx_"):
@@ -426,7 +532,7 @@ def _main(argv: list[str] | None = None) -> int:
         elif a.sub == "whoami":
             print(json.dumps(me, indent=1))
         elif a.sub == "status":
-            misc.status(me)
+            misc.status(me, a.run_id)
         elif a.sub == "spend":
             out = spend.check() if a.check else spend.compute()
             spend.print_report(out, a.json)

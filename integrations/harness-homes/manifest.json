@@ -20,7 +20,7 @@
     {"id": "inbody", "url": "http://127.0.0.1:18767/mcp", "toolTimeoutSec": 120, "startupTimeoutSec": 30, "opencodeTimeoutMs": 120000},
     {"id": "flighty", "url": "http://127.0.0.1:18766/mcp", "toolTimeoutSec": 120, "startupTimeoutSec": 30, "opencodeTimeoutMs": 120000},
     {"id": "cua-driver", "command": "/Users/ardud/.local/bin/cua-driver", "args": ["mcp"], "env": {}, "toolTimeoutSec": 120, "startupTimeoutSec": 30},
-    {"id": "dia", "command": "/Users/ardud/.nvm/versions/node/v26.2.0/bin/node", "args": ["/Users/ardud/.config/opencode/dia-agent-bridge/src/server.js"], "env": {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"}, "toolTimeoutSec": 120, "startupTimeoutSec": 30}
+    {"id": "dia", "command": "/Users/ardud/.nvm/versions/node/v26.2.0/bin/node", "args": ["--max-semi-space-size=1", "/Users/ardud/.config/opencode/dia-agent-bridge/src/server.js"], "env": {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"}, "toolTimeoutSec": 120, "startupTimeoutSec": 30}
   ],
   "mcpParity": {
     "opencodeConfig": "~/.config/opencode/opencode.jsonc",
@@ -30,20 +30,23 @@
     "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
     "/Users/ardud/.local/share/quint-guard/bin"
   ],
-  "shellPath": ["/Users/ardud/.bun/bin", "/Users/ardud/.nvm/versions/node/v26.2.0/bin", "/Users/ardud/.cargo/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/Users/ardud/.local/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"],
+  "shellPath": ["/Users/ardud/.bun/bin", "/Users/ardud/.nvm/versions/node/v26.2.0/bin", "/Users/ardud/.cargo/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/Users/ardud/.local/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", "/Users/ardud/.safe-chain/bin"],
   "hooks": [
     {"harness": "claude", "event": "PreToolUse", "matcher": "Bash|bash|shell|exec_command|shell_command", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
     {"harness": "claude", "event": "PreToolUse", "matcher": "mcp__betterstack__.*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
     {"harness": "claude", "event": "PreToolUse", "matcher": "mcp__.*__(exec_command|shell_command|shell|bash)", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py --shell-mcp", "timeoutSec": 10},
-    {"harness": "claude", "event": "PreToolUse", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
+    {"harness": "claude", "event": "PreToolUse", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 30},
     {"harness": "claude", "event": "PostToolUse", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
     {"harness": "claude", "event": "PostToolUse", "matcher": ".*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py --card-mask", "timeoutSec": 10},
     {"harness": "claude", "event": "PostToolUseFailure", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
     {"harness": "claude", "event": "SessionStart", "matcher": null, "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
+    {"harness": "claude", "event": "Stop", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
+    {"harness": "claude", "event": "SubagentStop", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
+    {"harness": "claude", "event": "SessionEnd", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
     {"harness": "codex", "event": "PreToolUse", "matcher": "Bash|bash|shell|exec_command|shell_command", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py", "timeoutSec": 10},
     {"harness": "codex", "event": "PreToolUse", "matcher": "mcp__betterstack__.*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py", "timeoutSec": 10},
     {"harness": "codex", "event": "PreToolUse", "matcher": "mcp__.*__(exec_command|shell_command|shell|bash)", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py --shell-mcp", "timeoutSec": 10},
-    {"harness": "codex", "event": "PreToolUse", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py", "timeoutSec": 10},
+    {"harness": "codex", "event": "PreToolUse", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py", "timeoutSec": 30},
     {"harness": "codex", "event": "PostToolUse", "matcher": "mcp__cua-driver__.*|mcp__cua_driver__.*|mcp__node_repl__js", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py", "timeoutSec": 10},
     {"harness": "codex", "event": "PostToolUse", "matcher": ".*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/codex.py --card-mask", "timeoutSec": 10},
     {"harness": "claude", "event": "UserPromptSubmit", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness claude", "timeoutSec": 15},
@@ -64,6 +67,16 @@
     {"harness": "codex", "event": "SessionEnd", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/memory-system/hooks/recall_hook.py --harness codex", "timeoutSec": 15}
   ],
   "paritySources": {
+    "phone-adb": [
+      "../harness-hooks/src/phone_adb_guard.py",
+      "../harness-hooks/src/rootwide_search_guard.py",
+      "../harness-hooks/src/statev2_guard.py",
+      "../harness-hooks/src/engine.py",
+      {
+        "source": "../opencode-plugins/plugin/phone-adb-guard.ts",
+        "installed": "~/.config/opencode/plugin/phone-adb-guard.ts"
+      }
+    ],
     "hook-adapters": [
       "../harness-hooks/src/claude.py",
       "../harness-hooks/src/codex.py"
@@ -74,6 +87,18 @@
       {
         "source": "../opencode-plugins/plugin/rootwide-search-guard.ts",
         "installed": "~/.config/opencode/plugin/rootwide-search-guard.ts"
+      }
+    ],
+    "shared-dependencies": [
+      "../harness-hooks/src/shared_deps_guard.py",
+      "../harness-hooks/src/engine.py",
+      {
+        "source": "../local-helpers/libexec/repo-node-pin/shared-deps.sh",
+        "installed": "~/.local/libexec/repo-node-pin/shared-deps.sh"
+      },
+      {
+        "source": "../opencode-plugins/plugin/shared-deps-guard.ts",
+        "installed": "~/.config/opencode/plugin/shared-deps-guard.ts"
       }
     ],
     "quint-verify": [
@@ -148,16 +173,16 @@
     ]
   },
   "codexModels": {
-    "catalogSource": "vendor/codex-models-0.166.0.json",
-    "extended": ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"],
+    "catalogSource": "vendor/codex-models-0.169.1.json",
+    "extended": ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"],
     "contextWindow": 872000,
-    "autoCompactTokenLimit": 450000
+    "autoCompactTokenLimit": 250000
   },
   "codexCu": {
     "model": "gpt-6.1-terra",
     "prefixedModel": "cx/gpt-6.1-terra",
     "contextWindow": 1050000,
-    "autoCompactTokenLimit": 450000
+    "autoCompactTokenLimit": 250000
   },
   "claude": {
     "mcpTimeoutMs": 15000,

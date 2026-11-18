@@ -4,6 +4,7 @@ import { resolveManagedCodexHomeLayout } from "../../provider/CodexManagedHome.t
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as SharedObservability from "@t3tools/shared/observability";
+import * as ServerLogFile from "../observability/serverLogFile.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as Exit from "effect/Exit";
 import * as Cause from "effect/Cause";
@@ -217,7 +218,14 @@ const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const writer = yield* SqlClient.SqlClient;
   const replica = yield* ReadonlyReplica.ReadonlyReplica;
-  const traces = yield* SharedObservability.TraceStorageMaintenance;
+  const traceMaintenance = yield* SharedObservability.TraceStorageMaintenance;
+  const serverLogs = yield* Effect.serviceOption(ServerLogFile.Maintenance);
+  const traces = {
+    withMaintenance: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      traceMaintenance.withMaintenance(
+        Option.isSome(serverLogs) ? serverLogs.value.withMaintenance(effect) : effect,
+      ),
+  };
   const snapshotGate = yield* Effect.serviceOption(ArchiveSnapshotGate);
   const storeCleanup = makeStoreCleanup();
   const withSnapshot = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -1184,6 +1192,15 @@ const make = Effect.gen(function* () {
                                               updates.push([
                                                 "updated_at",
                                                 revisions.get(String(row.turn_item_id))!.at,
+                                              ]);
+                                            else if (
+                                              !isTurnItemTable(table.name) &&
+                                              updates.length > 0 &&
+                                              table.fields.includes("updated_at")
+                                            )
+                                              updates.push([
+                                                "updated_at",
+                                                advanceRevision(row.updated_at, at),
                                               ]);
                                             if (updates.length) {
                                               const keys = table.keys.length

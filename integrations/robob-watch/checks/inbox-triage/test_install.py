@@ -1,7 +1,10 @@
 """Deploy only source while preserving private files, runtime state and pause state."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import importlib.util
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -87,8 +90,13 @@ class InstallTests(unittest.TestCase):
                 definition = json.loads(run.call_args.kwargs['input'])
             scratch = Path(tmp) / 'isolated' / 'scratch'
             shutil.copytree(live.parent / 'inbox-triage-fastpath', scratch)
+            fake_home = Path(tmp) / 'home'
+            helpers = fake_home / '.local/share/robob-watch/helpers'
+            helpers.mkdir(parents=True)
+            for name in ('redact.py', 'toollog.py'):
+                shutil.copy2(installer.SOURCE.parents[1] / 'helpers' / name, helpers / name)
             result = subprocess.run(['/bin/zsh', '-c', definition['check'] + ' --help'], cwd=scratch,
-                                    capture_output=True, text=True, timeout=5)
+                                    capture_output=True, text=True, timeout=5, env=dict(os.environ, HOME=str(fake_home)))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('--fast-only', result.stdout)
             self.assertFalse((scratch / 'cursor.json').exists())

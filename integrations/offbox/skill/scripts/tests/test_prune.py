@@ -1033,7 +1033,7 @@ class ReleaseTests(NoNetwork):
                 patch.object(spend.api, "get", return_value={"state": "archived"}), \
                 patch.object(spend, "db", return_value=self.con):
             spend.stop_all("test")
-        self.assertEqual(self._held(), 0)
+        self.assertEqual(self._held(), 1, 'automatic spend cleanup must not stop a held box')
 
     def test_stop_all_pending_stop_keeps_hold(self):
         from offbox_lib import spend
@@ -1129,7 +1129,7 @@ class RetirementTests(NoNetwork):
         with patch.object(lease, "keep_images"), \
                 patch.object(lease.api, "stop", side_effect=lease.api.ApiError(404, "not_found", "gone")), \
                 patch.object(lease.api, "get", side_effect=lease.api.ApiError(503, "unavailable", "boat down")):
-            lease.stop_box(self.con, "bx", "test", wait=False, images=False)
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False, override=True)
         self.assertEqual(self._held(), 1, "a failed confirmation must keep the hold")
         self.assertEqual(self._state(), "running", "the lease must not be retired before its hold is released")
         # The reaper still lists the held lease, so the next pass can reconcile it.
@@ -1141,7 +1141,7 @@ class RetirementTests(NoNetwork):
         with patch.object(lease, "keep_images"), \
                 patch.object(lease.api, "stop", side_effect=lease.api.ApiError(404, "not_found", "gone")), \
                 patch.object(lease.api, "get", return_value=None):
-            lease.stop_box(self.con, "bx", "test", wait=False, images=False)
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False, override=True)
         self.assertEqual(self._held(), 0)
         self.assertEqual(self._state(), "deleted")
 
@@ -1262,12 +1262,12 @@ class HoldClearTests(NoNetwork):
         with patch.object(lease, "keep_images"), patch.object(lease.api, "stop", return_value={}), \
                 patch.object(lease.api, "get", return_value={"state": "running"}), \
                 patch.object(lease.ssh_sync, "close_master"):
-            lease.stop_box(self.con, "bx", "test", wait=False, images=False)
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False, override=True)
         self.assertEqual(self._held(), 1, "a stop merely accepted must keep the hold")
         with patch.object(lease, "keep_images"), patch.object(lease.api, "stop", return_value={}), \
                 patch.object(lease.api, "get", return_value={"state": "archived"}), \
                 patch.object(lease.ssh_sync, "close_master"):
-            lease.stop_box(self.con, "bx", "test", wait=False, images=False)
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False, override=True)
         self.assertEqual(self._held(), 0, "a box boat reports archived has no remote process left")
 
     def test_stop_box_404_clears_hold_through_locked_caller(self):
@@ -1280,7 +1280,7 @@ class HoldClearTests(NoNetwork):
                 patch.object(lease, "keep_images"), \
                 patch.object(lease.api, "stop", side_effect=lease.api.ApiError(404, "not_found", "gone")), \
                 patch.object(lease.api, "get", return_value=None):  # boat: the box is gone
-            lease.stop_box(self.con, "bx", "test", wait=False, images=False, locked=True)
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False, locked=True, override=True)
         self.assertEqual(self._held(), 0, "a box that is already gone has no remote process left")
         state = self.con.execute("SELECT state FROM leases WHERE box_id='bx'").fetchone()[0]
         self.assertEqual(state, "deleted", "the lease is deleted, so the reaper will not revisit the box")
@@ -1294,7 +1294,7 @@ class HoldClearTests(NoNetwork):
                 patch.object(lease, "keep_images"), patch.object(lease.api, "stop", return_value={}), \
                 patch.object(lease.api, "get", return_value={"state": "archived"}), \
                 patch.object(lease.ssh_sync, "close_master"):
-            lease.stop_box(self.con, "bx", "test", wait=False, images=False, locked=True)
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False, locked=True, override=True)
         self.assertEqual(self._held(), 0)
 
     def test_stop_box_locked_caller_keeps_hold_while_stop_pending(self):
@@ -1305,7 +1305,7 @@ class HoldClearTests(NoNetwork):
                 patch.object(lease, "keep_images"), patch.object(lease.api, "stop", return_value={}), \
                 patch.object(lease.api, "get", return_value={"state": "ready"}), \
                 patch.object(lease.ssh_sync, "close_master"):
-            lease.stop_box(self.con, "bx", "test", wait=False, images=False, locked=True)
+            lease.stop_box(self.con, "bx", "test", wait=False, images=False, locked=True, override=True)
         self.assertEqual(self._held(), 1, "a stop accepted but not confirmed keeps the hold")
 
     def test_delete_box_clears_hold(self):
@@ -1313,7 +1313,7 @@ class HoldClearTests(NoNetwork):
         self._hold()
         with patch.object(lease, "ssh_sync"), patch.object(lease.api, "delete", return_value={"operation": {"id": "op"}}), \
                 patch("offbox_lib.spend.record_final_usage"):
-            lease.delete_box(self.con, "bx", "test")
+            lease.delete_box(self.con, "bx", "test", override=True)
         self.assertEqual(self._held(), 0)
 
     def test_reaper_forgets_gone_box_and_clears_hold(self):

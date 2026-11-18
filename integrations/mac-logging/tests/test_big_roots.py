@@ -49,6 +49,11 @@ class BigRootTests(unittest.TestCase):
         self.assertFalse(root['ok'])
         self.assertEqual(root['props']['failure'], 'partial')
         self.assertEqual(root['props']['failedCount'], 1)
+        self.assertEqual((root['props']['deniedCount'], root['props']['partialChildCount']), (0, 1))
+        summary = self.rows('disk.inventory.root')[-1]['props']
+        self.assertEqual((summary['deniedCount'], summary['partialChildCount']), (0, 1))
+        self.assertTrue(summary['partial'])
+        self.assertEqual(self.rows('disk.inventory')[-1]['props']['rootsDenied'], 0)
         child = [r for r in self.rows('disk.inventory.source') if r['props']['source'].endswith('/slow')][0]
         self.assertEqual(child['props']['failure'], 'timeout')
         self.assertNotIn('private', json.dumps(self.rows('disk.inventory.source')))
@@ -73,7 +78,7 @@ class BigRootTests(unittest.TestCase):
             (self.big/child).mkdir()
         jobs.directory_inventory([self.big], run)
         self.assertEqual(jobs.read_state('disk-inventory')['sizes'][str(self.big)], 84*1024)
-        self.assertTrue(self.rows('disk.inventory.source')[-1]['ok'])
+        self.assertFalse(self.rows('disk.inventory.root')[-1]['props']['partial'])
 
     def test_partial_coverage_cannot_become_a_grower(self):
         for value, partial in [(1, True), (100, False), (200, True), (300, False), (400, False)]:
@@ -172,7 +177,7 @@ class BigRootTests(unittest.TestCase):
             windows.append((a,b))
             raise subprocess.TimeoutExpired('log',60)
         self.assertFalse(collector.collect(now, [], fail))
-        self.assertEqual(jobs.read_state('crashes')['unified'], now-86400)
+        self.assertEqual(jobs.read_state('crashes')['unified'], now-5400)
         row = self.rows('crash.source')[-1]
         self.assertEqual(row['props']['windowS'], 5400)
         self.assertEqual(row['props']['skippedS'], 81000)
@@ -181,9 +186,10 @@ class BigRootTests(unittest.TestCase):
             windows.append((a,b))
             return {}
         self.assertTrue(collector.collect(now+7200, [], success))
-        self.assertEqual(windows[0], windows[1])
+        self.assertEqual(windows[1][0], now+1800)
+        self.assertEqual(self.rows('crash.unified.skip')[-1]['props']['skippedS'], 7200)
         self.assertEqual(jobs.read_state('crashes')['unified'], now+7200)
-        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'],1800)
+        self.assertEqual(sum(r['props']['skippedS'] for r in self.rows('crash.source')[1:]),7200)
         self.assertTrue(collector.collect(now+10800, [], success))
         self.assertEqual(jobs.read_state('crashes')['unified'], now+10800)
         row = self.rows('crash.source')[-1]

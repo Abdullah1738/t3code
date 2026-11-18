@@ -1,4 +1,5 @@
 import * as RunStartDeadline from "./RunStartDeadline.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 import * as DelegatedTaskProgressGuard from "./DelegatedTaskProgressGuard.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
@@ -44,6 +45,7 @@ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryService.ts";
+import { forkParked } from "../serverActivation.ts";
 import * as ProviderSwitchService from "./ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
@@ -141,6 +143,7 @@ const layerContextHandoffServiceProvided = ContextHandoffService.layer.pipe(
 
 const layerProviderAdapterRegistryProvided =
   ProviderAdapterRegistry.layerFromProviderInstanceRegistry;
+const layerStartProgress = ProviderStartProgress.layer.pipe(Layer.provide(KanbanStore.layer));
 const layerProviderSwitchServiceProvided = ProviderSwitchService.layer.pipe(
   Layer.provide(layerProviderAdapterRegistryProvided),
 );
@@ -155,6 +158,7 @@ const layerProviderSessionManagerProvided = ProviderSessionManager.layer.pipe(
       layerCommandOutputHubProvided,
       layerProviderAdapterRegistryProvided,
       layerEventSinkProvided,
+      EffectOutbox.layer,
       IdAllocator.layer,
       layerProviderEventIngestorProvided,
       ProjectionStore.layer,
@@ -184,6 +188,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
 const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
+      KanbanStore.layer,
       layerContextHandoffServiceProvided,
       layerEventSinkProvided,
       IdAllocator.layer,
@@ -197,7 +202,9 @@ const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pip
 );
 
 const layerProviderTurnControlServiceProvided = ProviderTurnControlService.layer.pipe(
-  Layer.provide(Layer.merge(ProjectionStore.layer, layerProviderSessionManagerProvided)),
+  Layer.provide(
+    Layer.mergeAll(KanbanStore.layer, ProjectionStore.layer, layerProviderSessionManagerProvided),
+  ),
 );
 const layerRuntimeRequestServiceProvided = RuntimeRequestService.layer.pipe(
   Layer.provide(Layer.merge(ProjectionStore.layer, layerProviderSessionManagerProvided)),
@@ -234,6 +241,7 @@ const layerOrchestratorProvided = Orchestrator.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerCheckpointServiceProvided,
+      layerCommandOutputHubProvided,
       CommandPolicy.layer,
       layerStores,
       layerEventSinkProvided,
@@ -402,6 +410,7 @@ const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
     Layer.mergeAll(
       layerEventSinkProvided,
       ProjectionStore.layer,
+      EffectOutbox.layer,
       layerRestartPacingProvided,
       layerRunFinalizationServiceProvided,
       layerCheckpointRollbackServiceProvided,
@@ -448,7 +457,13 @@ export const layer = Layer.mergeAll(
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,
   DelegatedTaskProgressGuard.layer.pipe(
-    Layer.provide(Layer.mergeAll(layerOrchestratorProvided, layerThreadManagementProvided)),
+    Layer.provide(
+      Layer.mergeAll(
+        layerOrchestratorProvided,
+        layerThreadManagementProvided,
+        layerCommandOutputHubProvided,
+      ),
+    ),
   ),
   RunStartDeadline.layer.pipe(
     Layer.provide(Layer.merge(layerOrchestratorProvided, layerEventSinkProvided)),
@@ -460,9 +475,17 @@ export const layer = Layer.mergeAll(
   layerProjectionMaintenanceProvided,
   layerLegacyV1ThreadImporterProvided,
   layerArdudOpenCodeImporterProvided,
-);
+).pipe(Layer.provideMerge(layerStartProgress));
 
 export const layerProduction = Layer.mergeAll(
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      // Snapshot before activation so a new timeout cannot be mistaken for a previous process's work.
+      const pending = yield* threads.snapshotDelegationTimeouts();
+      yield* forkParked(threads.sweepDelegationTimeouts(pending));
+    }),
+  ).pipe(Layer.provide(layerThreadManagementProvided)),
   layer.pipe(Layer.provide(layerProjectService)),
   layerProjectService,
   layerManagedProjectFoldersProvided,
@@ -486,4 +509,5 @@ export const layerProduction = Layer.mergeAll(
   Layer.provide(ResourceCleanupService.layer.pipe(Layer.provide(layerScheduledTaskProvided))),
   Layer.provide(Scheduler.layer),
   Layer.provideMerge(layerEventInfrastructure),
+  Layer.provideMerge(layerStartProgress),
 );

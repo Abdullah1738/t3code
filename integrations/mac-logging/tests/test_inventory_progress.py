@@ -81,9 +81,11 @@ class InventoryProgressTests(unittest.TestCase):
             return {}
         with patch.object(collector.time,'monotonic',side_effect=lambda: clock[0]):
             self.assertTrue(collector.collect(13600,[],reader,deadline=290))
-        self.assertEqual(calls,[(9100,10000),(10000,10900),(10900,11800),(11800,12700),(12700,13600)])
+        self.assertEqual((calls[0][0], calls[-1][1]), (9100, 13600))
+        self.assertIn(10000, [a for a,b in calls])
+        self.assertEqual([b for a,b in calls[:-1]], [a for a,b in calls[1:]])
         self.assertEqual(jobs.read_state('crashes')['unified'],13600)
-        self.assertEqual(self.rows('crash.source')[-1]['props']['lagS'],125)
+        self.assertLessEqual(self.rows('crash.source')[-1]['props']['lagS'],135)
 
     def test_twelve_hours_slow_chunks_have_bounded_lag_and_exact_gaps(self):
         for cost in (30,60):
@@ -206,7 +208,9 @@ class InventoryProgressTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stderr='', stdout=''.join(
                 str(1024**2 if Path(p).name in ('0001','0002','0003') else 1)+'\t'+p+'\n' for p in cmd[2:]))
         jobs.directory_inventory([root], run)
-        self.assertEqual(len(self.rows('disk.inventory.source')), 4)
+        self.assertEqual({r['props']['source'] for r in self.rows('disk.inventory.source')},
+                         {str(root/n) for n in ('0001', '0002', '0003')})
+        self.assertEqual(len(self.rows('disk.inventory.root')), 1)
 
     def test_timeout_with_denied_stderr_does_not_invent_a_finished_child(self):
         root = self.root/'interrupted-denial'
@@ -243,8 +247,8 @@ class InventoryProgressTests(unittest.TestCase):
         (good/'child').mkdir()
         entry=SimpleNamespace(path=str(bad/'child'),is_dir=lambda **kw: (_ for _ in ()).throw(OSError('fixture')))
         listing=jobs.inventory_listing
-        def entries(path,deadline):
-            return ([entry],True) if path==bad else listing(path,deadline)
+        def entries(path,deadline,source_failures=None):
+            return ([entry],True) if path==bad else listing(path,deadline,source_failures)
         def run(cmd,**kw):
             return SimpleNamespace(returncode=0,stdout='1\t'+cmd[-1]+'\n',stderr='')
         with patch.object(jobs,'inventory_listing',side_effect=entries):
@@ -256,7 +260,7 @@ class InventoryProgressTests(unittest.TestCase):
     def test_unavailable_root_never_logs_a_zero_total(self):
         root=self.root/'unavailable'
         listing=jobs.inventory_listing
-        with patch.object(jobs,'inventory_listing',side_effect=lambda p,d: ([],False) if p==root else listing(p,d)), \
+        with patch.object(jobs,'inventory_listing',side_effect=lambda p,d,f=None: ([],False) if p==root else listing(p,d,f)), \
              patch.object(jobs,'confirmed_absent',return_value=False):
             jobs.directory_inventory([root],lambda *a,**k:self.fail('unavailable'))
         rows=[r for r in self.rows('disk.inventory.source') if r['props']['source']==str(root)]
@@ -356,31 +360,31 @@ class InventoryProgressTests(unittest.TestCase):
                     self.assertLessEqual(clock[0],150)
 
     def test_interruption_in_fresh_query_does_not_replay_reported_gap(self):
-        for interrupted_at in (11800,12700,13600,14500,15400,16300):
-            with self.subTest(interrupted_at=interrupted_at), \
-                 patch.dict(os.environ,TOOLLOG_DIR=str(self.root/str(interrupted_at))):
+        for interrupt_after in range(3):
+            with self.subTest(interrupt_after=interrupt_after), \
+                 patch.dict(os.environ,TOOLLOG_DIR=str(self.root/str(interrupt_after))), \
+                 patch.object(collector.time, 'monotonic', return_value=0):
                 jobs.save_state('crashes',dict(unified=9100,unifiedRetry=dict(windowStart=9100,windowEnd=10000,skippedS=82800)))
                 completed=[]
                 def success(a,b):
                     completed.append((a,b))
                     return {}
                 def interrupt(a,b):
-                    if a>=interrupted_at:
+                    if len(completed) == interrupt_after:
                         raise SystemExit('fresh query interrupted')
                     return success(a,b)
                 with self.assertRaises(SystemExit):
                     collector.collect(17200,[],interrupt)
                 state=jobs.read_state('crashes')
-                if interrupted_at==11800:
-                    self.assertNotIn('unifiedRetry',state)
-                else:
-                    self.assertEqual(state['unifiedRetry'],dict(windowStart=interrupted_at,windowEnd=17200,skippedS=1800))
+                self.assertEqual(state['unified'], completed[-1][1] if completed else 11800)
+                if completed:
+                    self.assertEqual(state['unifiedRetry'],dict(windowStart=completed[-1][1],windowEnd=17200,skippedS=0))
                 collector.collect(17200,[],success)
-                rows=[r for p in (self.root/str(interrupted_at)).glob('*.ndjson')
+                rows=[r for p in (self.root/str(interrupt_after)).glob('*.ndjson')
                       for r in map(json.loads,p.read_text().splitlines()) if r['name']=='crash.source']
-                self.assertEqual([r['props']['skippedS'] for r in rows],[82800,1800])
-                self.assertEqual(completed,[(9100,10000),(11800,12700),(12700,13600),
-                                            (13600,14500),(14500,15400),(15400,16300),(16300,17200)])
+                self.assertEqual([r['props']['skippedS'] for r in rows],[85500,0])
+                self.assertEqual((completed[0][0], completed[-1][1]), (11800,17200))
+                self.assertEqual([b for a,b in completed[:-1]], [a for a,b in completed[1:]])
                 self.assertNotIn('unifiedRetry',jobs.read_state('crashes'))
 
     def test_limited_child_is_excluded_from_every_batch_position(self):

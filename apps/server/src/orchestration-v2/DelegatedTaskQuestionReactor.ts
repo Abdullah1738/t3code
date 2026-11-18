@@ -117,6 +117,8 @@ const make = Effect.gen(function* () {
         if (queued !== undefined) {
           yield* engine.dispatch({
             type: "queued-run.cancel",
+            reason: "superseded",
+            detail: "Delegated question resolved before its notification was delivered.",
             commandId: CommandId.make(`server:delegated-task-question-cancel:${key}`),
             threadId: parentThreadId,
             runId: queued.id,

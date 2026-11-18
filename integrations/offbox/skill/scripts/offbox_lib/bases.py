@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import api, base_catalog, capacity, common, lease, ssh_sync
 from .identity import require_proven
-from .common import (BASES_SOFT_LIMIT, DATA_KEEP_S, DEFAULT_OWNER, RUN_TTL_S, TEMPLATES, TEMPLATES_DIR, OffboxError,
+from .common import (BASES_SOFT_LIMIT, DATA_KEEP_S, DEFAULT_OWNER, TEMPLATES, TEMPLATES_DIR, OffboxError,
                      ago, db, event, file_lock, iso, iso_ts, kv_get, kv_set, mine, new_id, now, owner_scoped, say,
                      require_mine, token_owner, write)
 
@@ -84,7 +84,7 @@ def _save(me: dict, name: str = "default", make_default: bool = False, note: str
         api.rename(bid, f"offbox base {full}")
     except OffboxError:
         pass
-    api.stop(bid)
+    lease.request_stop(con, bid, 'saved base ready')
     api.wait_state(bid, api.STOPPED_STATES, timeout=900)
     snap = api.latest_snapshot(bid) or {}
     with file_lock("bases"):
@@ -208,7 +208,7 @@ def keep_saved(con, table: str, name: str, box_id: str, sname: str, snaps: list[
             used = max(int((allowance or {}).get("used") or 0), len(listed)) + len(held)
             left = int((allowance or {}).get("included") or (allowance or {}).get("free") or 0) - used
             if sname not in listed and left <= 0:
-                say(f"note: no free saved-snapshot slot for {table[:-1]} {name}; the reaper keeps its box alive instead")
+                say(f"note: no free saved-snapshot slot for {table[:-1] if table else 'pin'} {name}")
                 event(con, box_id, "saved_no_slot", f"{name} {sname}")
                 return False
             # Written before the request: an accepted save whose response is lost must still hold its slot.
@@ -234,13 +234,47 @@ def keep_saved(con, table: str, name: str, box_id: str, sname: str, snaps: list[
                     raise OffboxError(f"saved snapshot {sname}: still {snap.get('status') or 'pending'}")
                 time.sleep(2)
     except OffboxError as e:
-        say(f"warning: could not keep {table[:-1]} {name} as saved snapshot {sname}: {e}")
+        say(f"warning: could not keep {table[:-1] if table else 'pin'} {name} as saved snapshot {sname}: {e}")
         event(con, box_id, "saved_failed", f"{name} {sname}: {e}")
         return False
-    con.execute(f"UPDATE {table} SET saved=?, expired_at=NULL WHERE name=? AND box_id=?", (sname, name, box_id))
+    if table:
+        con.execute(f"UPDATE {table} SET saved=?, expired_at=NULL WHERE name=? AND box_id=?", (sname, name, box_id))
+    else:
+        kv_set(con, 'pin_saved:' + box_id, sname)
     con.commit()
     event(con, box_id, "saved", f"{name} -> {sname}")
     return True
+
+
+def keep_pin_saved(con, box_id):
+    """Boat deletes stopped disks after 14 days. Saving preserves them without an automatic resume/stop."""
+    name = saved_name('pin', box_id)
+    if kv_get(con, 'pin_saved:' + box_id) == name:
+        saved = api.saved_get(name)
+        if saved and saved.get('status') == 'ready' and saved.get('sourceSandboxId') == box_id:
+            return True
+    return keep_saved(con, None, box_id, box_id, name, timeout=30)
+
+
+def retain_pin(con, box_id, state):
+    """A full saved allowance must not turn an existing pin into silent data loss."""
+    if state in api.STOPPED_STATES:
+        if keep_pin_saved(con, box_id):
+            return
+        with file_lock('pin-' + box_id, timeout=120):
+            until = lease.pinned_until(con, box_id)
+            if until <= now():
+                return
+            if lease.active_runs(con, box_id):
+                raise OffboxError(f'{box_id} has a live holder; retention resume deferred')
+            ttl = max(60, int(until-now())+60)
+            lease._resume_confirmed(con, box_id, ttl, None)
+            api.wait_state(box_id, api.LIVE_STATES, timeout=60)
+            con.execute("UPDATE leases SET state='running' WHERE box_id=?", (box_id,))
+            con.commit()
+            event(con, box_id, 'pin_retention_resume', 'saved allowance unavailable; keeping pinned disk running')
+    if not lease.ensure_ttl(box_id, max(60, int(lease.pinned_until(con, box_id)-now())+60)):
+        raise OffboxError(f'{box_id}: pinned disk retention TTL was not acknowledged')
 
 
 def _add_status(rows: list[dict]) -> None:
@@ -397,8 +431,6 @@ def keep(me: dict, days: float, box_id: str | None = None) -> None:
         raise OffboxError("keep --days expiry is out of range", code=2) from None
     if box_id:
         require_proven(me, "clear pin")
-        if days != 0:
-            raise OffboxError("keep --box clears a previous pin; pass --days 0", code=2)
         con = db()
         require_mine(con, box_id)
         row = con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone()
@@ -419,6 +451,32 @@ def keep(me: dict, days: float, box_id: str | None = None) -> None:
         if current_until > now() and (by or box_id) and by != me['owner']:
             raise OffboxError(f"{row['box_id']} is pinned by {by or 'an unknown thread (legacy pin)'} until {iso(current_until)}; "
                               "only that thread can change or clear its pin", code=2)
+        foreign_holds = [h for h in lease.protection(con, row['box_id'])['holds'] if h['holder'] != me['owner']]
+        if days and foreign_holds:
+            raise OffboxError(f"{row['box_id']} is held by {foreign_holds[0]['holder']} "
+                              f"(run {foreign_holds[0]['run_id']}); cannot pin another holder's box", code=2)
+        if api.BACKEND == 'server':
+            import offbox_protection
+            token = offbox_protection.CALLER.set(offbox_protection.caller(holder=me['owner']))
+            try:
+                # Old boatd accepts pinned=True while discarding expiry and holder. Detect it before writing.
+                lease.remote_protection(row['box_id'])
+                body = dict(pinned=bool(days), pinUntil=until if days else None)
+                if by == me['owner'] and current_until > now():
+                    body['pinReconcile'] = dict(holder=by, until=current_until)
+                reply = api.call('PATCH', f"/sandboxes/{row['box_id']}", body)
+                pin = (reply.get('sandbox') or {}).get('protection', {}).get('pin', {})
+                if (pin.get('active') is not bool(days) or pin.get('holder') != me['owner'] or
+                        (days and abs((iso_ts(pin.get('until')) or 0) - until) >= 1) or
+                        (not days and pin.get('until') is not None)):
+                    raise OffboxError('server did not acknowledge the exact pin holder and expiry; local pin unchanged', code=2)
+            finally:
+                offbox_protection.CALLER.reset(token)
+        elif days:
+            if row['state'] == 'running' and not lease.ensure_ttl(row['box_id'], max(60, int(until-now())+60), pin_locked=True):
+                raise OffboxError('provider did not acknowledge pin lifetime; local pin unchanged', code=2)
+            if row['state'] == 'stopped' and not keep_pin_saved(con, row['box_id']):
+                raise OffboxError('cannot retain stopped pinned disk without a free saved-snapshot slot; local pin unchanged', code=2)
         con.execute("UPDATE leases SET pinned_until=? WHERE box_id=?", (until if days else None, row["box_id"]))
         if days:
             con.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)", ('pin_owner:' + row['box_id'], json.dumps(me['owner']), now()))
@@ -427,7 +485,7 @@ def keep(me: dict, days: float, box_id: str | None = None) -> None:
         con.commit()
         event(con, row["box_id"], "keep" if days else "unpin", f"{days}d owner={me['owner']}")
     if days:
-        print(f"pinned {row['box_id']} for {days:g} days (it still stops when idle, which is free; it won't be deleted)")
+        print(f"pinned {row['box_id']} until {iso(until)}; cleanup and other workers leave it alone")
     else:
         print(f"cleared pin on {row['box_id']}")
 
@@ -447,7 +505,9 @@ def recipe(name: str) -> tuple[str, str]:
         for spec in ("20", ">=22.13 <23", "24"):
             node_bootstrap += node_version.block((node_version.parse_range(spec), f"crpko-node recipe {spec}"), require_nvm=True) + "\n"
     # Shared download helpers must precede bootstrap and every recipe that uses them.
-    body = ((TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n" + node_bootstrap +
+    fetch = (TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n"
+    sqlite = "bash -c " + shlex.quote(fetch + (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) + " || exit 1\n"
+    body = (fetch + sqlite + node_bootstrap +
             (TEMPLATES_DIR / "common-env.sh").read_text() + "\n# ---- recipe ----\n" + (crpko_tools + fdb_tools + p.read_text()) +
             "\n# ---- keep docker images ----\n(\n" + (TEMPLATES_DIR / "docker-images.sh").read_text() + "\n)\n")
     return body, hashlib.sha256(body.encode()).hexdigest()[:12]
@@ -506,12 +566,12 @@ def build_template(name: str) -> dict:
         ssh_sync.ssh(bid, "sync", timeout=120)
     except BaseException:
         try:
-            api.stop(bid)
+            lease.request_stop(con, bid, 'template build failed')
         except OffboxError:
             pass
         event(con, bid, "template_build_failed", name)
         raise
-    api.stop(bid)
+    lease.request_stop(con, bid, 'template build complete')
     api.wait_state(bid, api.STOPPED_STATES, timeout=900)
     snap = api.latest_snapshot(bid) or {}
     old = con.execute("SELECT * FROM templates WHERE name=?", (name,)).fetchone()
@@ -602,9 +662,9 @@ def _upkeep(con, live: dict, dry: bool, actions: list[str], act) -> None:
         return
     if not dry and kv_get(con, "saved_upkeep", max_age=3600) is None:
         try:
-            snaps, allowance = api.saved_list()
+            snaps, _ = api.saved_list()
         except OffboxError as e:
-            snaps, allowance = None, {}
+            snaps = None
             actions.append(f"saved snapshot list failed: {e}")
         if snaps is not None:
             kv_set(con, "saved_upkeep", now())

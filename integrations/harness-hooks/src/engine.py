@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import random
 import re
 import secrets
 import shlex
@@ -28,17 +29,26 @@ import card_mask
 import desktop_lease
 import statev2_guard
 import snapshot_guard
+import shared_deps_guard
 import quint_verify_guard
 import rootwide_search_guard
+import phone_adb_guard
 
 
 import toollog
 
+GATE_LIGHT_SAMPLE = 20
+
 
 def _tool_log(**fields):
     try:
-        from offbox_toollog import emit
         props = fields.get("props", {})
+        if (fields.get("kind") == "perf" and fields.get("ok") is True
+                and props.get("decision") == "allowed" and props.get("commandClass") == "light"):
+            if not random.random() < 1 / GATE_LIGHT_SAMPLE:
+                return
+            props["sample"] = GATE_LIGHT_SAMPLE
+        from offbox_toollog import emit
         if props.get("harness") == "claude":
             props["harness"] = "claudeAgent"
         emit("gate", "gate.decision", **fields)
@@ -81,13 +91,15 @@ _LOG_RULES = {
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
     "live-database-snapshot",
-    "rootwide-search", "quint-verify", "card-mask",
+    "rootwide-search", "quint-verify", "shared-dependencies", "card-mask",
+    "phone-adb-state", "phone-adb-forward", "phone-adb-state-unleased", "phone-adb-forward-unleased", "phone-adb-unavailable",
 }
 _LOG_ERRORS = {
+    "phone-lock-unavailable",
     "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
     "identity-unavailable", "identity-pending", "identity-ambiguous", "TimeoutExpired",
     "ValueError", "TypeError", "OSError", "RuntimeError", "PermissionError", "FileNotFoundError",
-    "TimeoutError", "HTTPError", "URLError", "JSONDecodeError", "CalledProcessError",
+    "TimeoutError", "ConnectionRefusedError", "HTTPError", "URLError", "JSONDecodeError", "CalledProcessError",
 }
 
 
@@ -99,7 +111,7 @@ def _log(**record):
     try:
         rule = _log_enum(record.get("rule"), _LOG_RULES) or "no-policy"
         guard = ("statev2" if rule.startswith("live-database") else "betterstack-scope" if rule == "betterstack-scope"
-                 else "quint-verify" if rule == "quint-verify" else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
+                 else "phone-adb" if rule.startswith("phone-adb") else "quint-verify" if rule == "quint-verify" else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
                      "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
                      "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
                      "docker-run", "docker-container-run", "docker-build", "docker-buildx-build", "docker-compose-up", "docker-compose-v1",
@@ -113,7 +125,8 @@ def _log(**record):
                      _log_enum(record.get("error"), _LOG_ERRORS),
                      ids={"threadId": record.get("robobThreadId"), "sessionId": record.get("sessionId"),
                           "nativeAgentId": record.get("nativeAgentId"),
-                          "cardNumber": record.get("cardNumber")}, cwd=record.get("cwd"), matched=record.get("matchedRoot"))
+                          "cardNumber": record.get("cardNumber")}, cwd=record.get("cwd"), matched=record.get("matchedRoot"),
+                     identity_source=_log_enum(record.get("identity_source"), {"cache", "control", "negative-cache"}))
         path = _state()
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         thread_id = record.get("robobThreadId")
@@ -140,10 +153,15 @@ def _log(**record):
             "cmd": None,
             "ms": record.get("ms") if type(record.get("ms")) in (int, float) else 0,
             "error": _log_enum(record.get("error"), _LOG_ERRORS),
-            "identity_source": _log_enum(record.get("identity_source"), {"cache", "control"}),
+            "identity_source": _log_enum(record.get("identity_source"), {"cache", "control", "negative-cache"}),
             "cause": record.get("cause")[:240] if record.get("rule") == "live-database-script-unresolved" and isinstance(record.get("cause"), str) else None,
             "audit_error": audit_error,
         }
+        if guard == "desktop-lease":
+            row.update(record.get("desktop_timing") or {})
+            call_id = record.get("toolUseId")
+            if isinstance(call_id, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", call_id):
+                row["toolUseId"] = call_id
         fd = os.open(path / "decisions.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -246,7 +264,7 @@ def _get_unbounded(path, deadline, *, timeout=1.2):
 def _native(event, harness):
     session = event.get("session_id")
     agent = event.get("agent_id")
-    if harness == "codex":
+    if harness in {"codex", "codex-cu"}:
         # The hook inherits the app-server's environment, not the tool shell's.
         # Only payload IDs identify the executing agent; shim fallbacks pass
         # CODEX_THREAD_ID explicitly as their synthetic event's session_id.
@@ -466,7 +484,8 @@ def _command_with_context(command, identity):
 
 
 _IDENTITY_BINDING_TTL = 30 * 60
-_CLAUDE_IDENTITY_TTL = 12 * 60 * 60
+_IDENTITY_FALLBACK_TTL = 12 * 60 * 60
+_IDENTITY_UNAVAILABLE_TTL = 30
 _IDENTITY_LOOKUP_BUDGET = 4.5
 _IDENTITY_CALL_TIMEOUT = 3.0
 
@@ -477,7 +496,7 @@ def _identity_transport_error(error):
     return isinstance(error, (TimeoutError, ConnectionError, urllib.error.URLError))
 
 
-def _lookup_identity(path, harness):
+def _lookup_identity(path, harness, *, retry=True):
     # Leave room for the 3s classifier and 1.5s lineage walk in the 10s hook.
     deadline = time.monotonic() + _IDENTITY_LOOKUP_BUDGET
     for attempt in range(2):
@@ -485,8 +504,23 @@ def _lookup_identity(path, harness):
             return _get(path, deadline=min(deadline, time.monotonic() + _IDENTITY_CALL_TIMEOUT),
                         timeout=_IDENTITY_CALL_TIMEOUT)
         except Exception as error:
-            if attempt or not _identity_transport_error(error) or time.monotonic() >= deadline:
+            if not retry or attempt or not _identity_transport_error(error) or time.monotonic() >= deadline:
                 raise
+
+
+def _write_identity_state(path, value):
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="identity-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(value, f)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    except OSError:
+        pass
 
 
 def resolve_identity(event, harness, *, fresh=False):
@@ -494,8 +528,8 @@ def resolve_identity(event, harness, *, fresh=False):
 
     Claude children need the hook's agent_id. A shell with only the session id
     identifies the parent, not necessarily the shell's executing child.
-    During transport outages Claude can reuse a binding for 12h, but never its
-    model for a fresh policy check. Authoritative misses invalidate the binding.
+    During transport outages native hooks can reuse a binding for 12h, but never
+    its model for a fresh policy check. Authoritative misses invalidate the binding.
     """
     native, agent, driver = _native(event, harness)
     if not isinstance(native, str) or not native or (agent is not None and not isinstance(agent, str)):
@@ -505,6 +539,7 @@ def resolve_identity(event, harness, *, fresh=False):
         instance = os.environ.get("HARNESS_HOOKS_PROVIDER_INSTANCE", "")
         key = hashlib.sha256(json.dumps([base, driver, instance, native, agent], separators=(",", ":")).encode()).hexdigest()
         cache_file = _state() / "identity" / (key + ".json")
+        unavailable_file = cache_file.with_suffix(".unavailable")
         cached = _read_json(cache_file, {})
         at = cached.get("at") if isinstance(cached, dict) else None
         age = time.time() - at if type(at) in (int, float) else float("inf")
@@ -519,19 +554,27 @@ def resolve_identity(event, harness, *, fresh=False):
             if age >= 60:
                 binding.pop("model", None)
             return binding
+        fallback_cache = harness in {"claude", "codex", "codex-cu"} and valid_cache and 0 <= age < _IDENTITY_FALLBACK_TTL
+        unavailable = _read_json(unavailable_file, {})
+        failed_at = unavailable.get("at") if isinstance(unavailable, dict) else None
+        if not fallback_cache and type(failed_at) in (int, float) and 0 <= time.time() - failed_at < _IDENTITY_UNAVAILABLE_TTL:
+            return {"resolution": "unavailable", "identity_source": "negative-cache"}
         params = {"nativeId": native, "driver": driver}
         if agent:
             params["agentId"] = agent
         if instance:
             params["instance"] = instance
         try:
-            resolved = _lookup_identity("/identity/resolve?" + urllib.parse.urlencode(params), harness).get("identity")
+            resolved = _lookup_identity("/identity/resolve?" + urllib.parse.urlencode(params), harness,
+                                        retry=not fallback_cache).get("identity")
         except Exception as error:
             fallback_age = time.time() - at if type(at) in (int, float) else float("inf")
-            if harness == "claude" and _identity_transport_error(error) and valid_cache and 0 <= fallback_age < _CLAUDE_IDENTITY_TTL:
-                binding = {**identity, "identity_source": "cache"}
-                binding.pop("model", None)
-                return binding
+            if _identity_transport_error(error):
+                if fallback_cache and 0 <= fallback_age < _IDENTITY_FALLBACK_TTL:
+                    binding = {**identity, "identity_source": "cache"}
+                    binding.pop("model", None)
+                    return binding
+                _write_identity_state(unavailable_file, {"at": time.time()})
             raise
         if not isinstance(resolved, dict):
             raise ValueError("identity-response")
@@ -545,19 +588,12 @@ def resolve_identity(event, harness, *, fresh=False):
             raise ValueError("identity-driver-mismatch")
         if identity.get("resolution") == "resolved" and instance and identity.get("providerInstanceId") not in (None, instance):
             raise ValueError("identity-instance-mismatch")
+        try:
+            unavailable_file.unlink(missing_ok=True)
+        except OSError:
+            pass
         if identity.get("resolution") == "resolved" and identity.get("robobThreadId"):
-            try:
-                cache_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                fd, tmp = tempfile.mkstemp(prefix="identity-", dir=cache_file.parent)
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump({"at": time.time(), "identity": identity}, f)
-                    os.replace(tmp, cache_file)
-                finally:
-                    if os.path.exists(tmp):
-                        os.unlink(tmp)
-            except OSError:
-                pass
+            _write_identity_state(cache_file, {"at": time.time(), "identity": identity})
         else:
             cache_file.unlink(missing_ok=True)
         return {**identity, "identity_source": "control"}
@@ -738,6 +774,7 @@ def _shell_input_field(event, harness):
 
 def decide(event, harness):
     """Return {decision, reason, context}; JSONL-log every call, including failures."""
+    desktop_timing = {}
     start = time.monotonic()
     command = None
     identity = {}
@@ -768,9 +805,9 @@ def decide(event, harness):
             # This policy must not enter the general engine's fail-open identity path.
             try:
                 if kind == "PreToolUse":
-                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control, _state())
+                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control, _state(), desktop_timing)
                 else:
-                    rule, error_type = desktop_lease.finish(event, harness, _control, _state())
+                    rule, error_type = desktop_lease.finish(event, harness, _control, _state(), desktop_timing)
                     decision, reason = "allow", ""
                 result = {"decision": decision, "reason": reason, "context": {"rule": rule}}
             except Exception as error:
@@ -789,6 +826,31 @@ def decide(event, harness):
             inp = event.get("tool_input", {})
             command_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
             cwd = command_cwd
+            try:
+                phone = phone_adb_guard.classify(command)
+            except Exception:
+                # A phone-parser failure must not bypass the independent
+                # search, database or offbox guards below.
+                phone = {"matched": False, "reason": None, "rule": "phone-adb-unavailable", "error": "phone-lock-unavailable"}
+            if phone['reason']:
+                error_type = phone['error']
+                result = {"decision": "deny", "reason": phone['reason'], "context": {"rule": phone['rule']}}
+                return result
+            if phone['matched'] or phone['error']:
+                # Admission continues through the independent guards. Keep a
+                # separate phone decision so unleased calls remain countable.
+                _log(harness=harness, event=kind, tool=tool, command=command, cwd=cwd,
+                     rule=phone['rule'], decision="allow", error=phone['error'])
+            try:
+                shared_reason = shared_deps_guard.classify(command, command_cwd)
+            except Exception as error:
+                # This policy must not disable the independent database and offbox guards.
+                error_type = type(error).__name__
+                shared_reason = None
+            if shared_reason:
+                result = {"decision": "deny", "reason": shared_reason,
+                          "context": {"rule": "shared-dependencies"}}
+                return result
             if quint_verify_guard.classify(command, command_cwd):
                 result = {"decision": "deny", "reason": quint_verify_guard.REASON,
                           "context": {"rule": "quint-verify"}}
@@ -832,8 +894,8 @@ def decide(event, harness):
             return result
         native, _, _ = _native(event, harness)
         if native:
-            # Claude shell calls need only the binding used to sign command context.
-            binding_only = (harness == "claude" and kind == "PreToolUse" and
+            # Shell calls need only the binding used to sign command context.
+            binding_only = (kind == "PreToolUse" and
                             _shell_input_field(event, harness) and _command(event))
             identity = resolve_identity(event, harness, fresh=not binding_only)
             if identity.get("resolution") != "resolved":
@@ -911,7 +973,8 @@ def decide(event, harness):
         _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
              tool=log_tool or (event.get("tool_name") if isinstance(event, dict) else None),
              robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
-             identity_source=identity.get("identity_source"), cause=result["context"].get("cause"),
+             identity_source=identity.get("identity_source"), cause=result["context"].get("cause"), desktop_timing=desktop_timing,
+             toolUseId=event.get("tool_use_id") if isinstance(event, dict) else None,
              sessionId=_native(event, harness)[0] if isinstance(event, dict) else None,
              nativeAgentId=event.get("agent_id") if harness == "claude" and isinstance(event, dict) else None,
              cardNumber=identity.get("cardNumber"), cwd=cwd, matchedRoot=matched_root,

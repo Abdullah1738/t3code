@@ -33,13 +33,15 @@ describe("standard-mode policy", () => {
     const text = source.replace(/\\(["'])/g, "$1");
     expect(text).not.toMatch(/["']?fastMode["']?\s*:\s*true/);
     expect(text).not.toMatch(/["']?serviceTier["']?\s*:\s*["']priority["']/);
+    expect(text).not.toMatch(/["']?effort["']?\s*:\s*["']max["']/);
+    expect(text).not.toMatch(/["']?reasoningEffort["']?\s*:\s*["']max["']/);
     expect(text).toContain("Standard mode only");
     expect(text).toContain("never fast mode");
   });
 
   it("keeps every vendored Codex model off priority by default", () => {
     const catalog = decodeCatalog(
-      JSON.parse(readRepoFile("integrations/harness-homes/vendor/codex-models-0.166.0.json")),
+      JSON.parse(readRepoFile("integrations/harness-homes/vendor/codex-models-0.169.1.json")),
     );
 
     expect(catalog.models.length).toBeGreaterThan(0);

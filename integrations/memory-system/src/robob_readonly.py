@@ -1,9 +1,11 @@
 """Outside readers use the server export, never the server's writable database."""
 
 import os
+import json
 import sqlite3
 import stat
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +24,107 @@ class ReplicaReplaced(sqlite3.OperationalError):
 
 class _ReplicaConnection(sqlite3.Connection):
     pass
+
+
+_warnings = threading.local()
+
+
+def reset_replica_warnings():
+    _warnings.snapshots = {}
+
+
+def replica_warnings():
+    return list(getattr(_warnings, "snapshots", {}).values())
+
+
+def replica_warning(path):
+    return getattr(_warnings, "snapshots", {}).get(str(Path(path).expanduser().resolve()))
+
+
+def annotate_result(result):
+    snapshots = replica_warnings()
+    if isinstance(result, dict):
+        snapshots = list({snapshot["warning"]: snapshot for snapshot in
+                          [*result.get("replica_warnings", []), *snapshots]}.values())
+    notices = [snapshot["warning"] for snapshot in snapshots]
+    if not notices:
+        return result
+    notice = "\n".join(notices)
+    if isinstance(result, str):
+        return f"{notice}\n\n{result}"
+    if isinstance(result, dict):
+        result = {**result, "replica_warnings": snapshots}
+        if isinstance(result.get("answer"), str) and not result["answer"].startswith(notice):
+            result["answer"] = f"{notice}\n\n{result['answer']}"
+        if isinstance(result.get("note"), str):
+            from recall_note import bounded_note
+            original = bounded_note(result["note"])
+            if original and original.startswith(notice):
+                result["note"] = original
+            else:
+                result["note"] = bounded_note(f"{notice}\n\n{original or ''}")
+                if result["note"] is None:
+                    # Optional history can be omitted; never cut an instruction
+                    # or let the native hook silently discard the stale label.
+                    result["note"] = bounded_note(notice)
+                    result["sources"] = []
+    return result
+
+
+def _timestamp(value):
+    at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if at.tzinfo is None:
+        raise ValueError("timestamp has no timezone")
+    return at
+
+
+def _live_rebuild(con, metadata, age, now):
+    if age >= 6 * 60 * 60:
+        return None, "age_cap"
+    started = metadata.get("rebuild_started_at")
+    if not started:
+        return None, "no_rebuild"
+    try:
+        start = _timestamp(started)
+        if start > now:
+            return None, "invalid_rebuild_time"
+        if metadata.get("rebuild_finished_at") and _timestamp(metadata["rebuild_finished_at"]) >= start:
+            return None, "rebuild_finished"
+        sql_progress = json.loads(metadata.get("rebuild_progress") or "{}")
+        if sql_progress.get("event") in ("abort", "publish"):
+            return None, "sql_rebuild_terminal"
+        sidecar = con.replica_path.with_name(con.replica_path.name + ".rebuild.json")
+        with sidecar.open() as handle:
+            info = os.fstat(handle.fileno())
+            diagnostics = json.loads(handle.read(16_384))
+        if not -30 <= now.timestamp() - info.st_mtime < 300:
+            return None, "sidecar_stale"
+        if diagnostics.get("replica_identity") != list(con.replica_identity):
+            return None, "identity_mismatch"
+        if diagnostics.get("rebuild_started_at") != started:
+            return None, "start_mismatch"
+        if diagnostics.get("rebuild_finished_at") and _timestamp(diagnostics["rebuild_finished_at"]) >= start:
+            return None, "rebuild_finished"
+        progress = json.loads(diagnostics["rebuild_progress"])
+        # A private full build keeps its published parent metadata across gaps.
+        nested_reset = progress.get("kind") == "events_reset" and metadata.get("rebuild_kind") == "full"
+        if not nested_reset and (progress.get("kind") != "full" or metadata.get("rebuild_kind", "full") != "full"):
+            return None, "not_full_rebuild"
+        if progress.get("event") not in ("start", "progress"):
+            return None, "not_in_progress"
+        return {"rebuild_started_at": started, "table": progress.get("table") or "pending",
+                "rows": progress.get("rows", 0)}, None
+    except FileNotFoundError:
+        return None, "sidecar_missing"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None, "invalid_rebuild_evidence"
+
+
+def _log_stale(event, metadata, age, source, details=None, reason=None):
+    print(json.dumps({"component": "readonly-replica", "event": event, "source": source,
+                      "age_s": age, "rebuild_started_at": metadata.get("rebuild_started_at"),
+                      **(details or {}), **({"reason": reason} if reason else {})}),
+          file=sys.stderr, flush=True)
 
 
 def file_identity(path):
@@ -109,6 +212,7 @@ def connect_ro(path, *, timeout=30, check_same_thread=True):
     con = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=timeout,
                          check_same_thread=check_same_thread, factory=_ReplicaConnection)
     con.replica_identity = info.st_dev, info.st_ino
+    con.replica_path = path
     try:
         ensure_same_file(con, path)
     except Exception:
@@ -117,42 +221,98 @@ def connect_ro(path, *, timeout=30, check_same_thread=True):
     return con
 
 
-def ready_generation(con, *, max_age=120, source="Robob", schema_version=None, require_destructive=False):
-    """The exporter clears ready while paging, then publishes a new watermark."""
+def _rebuild_status(con, metadata):
+    if not metadata.get("rebuild_started_at") or metadata.get("rebuild_finished_at"):
+        return ""
+    # This sidecar advances outside the publication transaction. It explains a
+    # rejected read; it never supplies readiness, generation or freshness.
+    try:
+        with con.replica_path.with_name(con.replica_path.name + ".rebuild.json").open() as diagnostic:
+            diagnostics = json.loads(diagnostic.read(16_384))
+        if (diagnostics.get("replica_identity") == list(con.replica_identity)
+                and diagnostics.get("rebuild_started_at") == metadata.get("rebuild_started_at")):
+            metadata = {**metadata, **{key: diagnostics[key] for key in (
+                "rebuild_started_at", "rebuild_finished_at", "rebuild_progress")}}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    if not metadata.get("rebuild_started_at") or metadata.get("rebuild_finished_at"):
+        return ""
+    rebuilding = f"; rebuilding since {metadata['rebuild_started_at']}"
+    try:
+        progress = json.loads(metadata.get("rebuild_progress", "{}"))
+        if progress.get("event") == "abort":
+            rebuilding = f"; rebuild aborted since {metadata['rebuild_started_at']}"
+        rebuilding += f" (table {progress.get('table') or 'pending'}, {progress.get('rows', 0)} rows)"
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return rebuilding
+
+
+def ready_generation(con, *, max_age=120, source="Robob", schema_version=None, require_destructive=False,
+                     allow_rebuild=False):
+    """Pin readiness to the snapshot; only opted-in content reads may use a live rebuild."""
+    metadata = {}
+    age = None
     try:
         metadata = dict(con.execute(
             "SELECT key,value FROM ardud_readonly_meta "
-            "WHERE key IN ('schema_version','destructive_ready','updated_at','ready','generation')"))
+            "WHERE key IN ('schema_version','destructive_ready','updated_at','ready','generation',"
+            "'rebuild_kind','rebuild_started_at','rebuild_progress','rebuild_finished_at')"))
         if schema_version is not None and metadata.get("schema_version") != schema_version:
             raise ValueError("unsupported export schema")
         if require_destructive and metadata.get("destructive_ready") != "1":
             raise ValueError("native metadata changed during validation")
-        updated = metadata["updated_at"]
-        if not isinstance(updated, str):
-            raise ValueError("timestamp is not text")
-        at = datetime.fromisoformat(updated.replace("Z", "+00:00"))
-        if at.tzinfo is None:
-            raise ValueError("timestamp has no timezone")
-        age = (datetime.now(timezone.utc) - at).total_seconds()
+        updated = metadata.get("updated_at", "missing")
+        if hasattr(con, "replica_identity"):
+            con.replica_warning = None
+        now = datetime.now(timezone.utc)
+        if metadata.get("ready") == "1":
+            if not isinstance(updated, str):
+                raise ValueError("timestamp is not text")
+            at = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            if at.tzinfo is None:
+                raise ValueError("timestamp has no timezone")
+            age = (now - at).total_seconds()
         if metadata.get("ready") != "1" or not -30 <= age <= max_age:
+            reason = "not_ready" if metadata.get("ready") != "1" else "not_allowed"
+            details = None
+            if metadata.get("ready") == "1" and age > max_age and allow_rebuild and not require_destructive:
+                details, reason = _live_rebuild(con, metadata, age, now)
+            if details is not None:
+                warning = (f"replica as of {updated}; rebuild in progress since {details['rebuild_started_at']} "
+                           f"({details['table']}, {details['rows']} rows)")
+                con.replica_warning = warning
+                snapshots = getattr(_warnings, "snapshots", {})
+                snapshots[str(con.replica_path)] = {"updated_at": updated, **details, "warning": warning}
+                _warnings.snapshots = snapshots
+                if getattr(con, "_last_stale_warning", None) != warning:
+                    _log_stale("stale-served", metadata, age, source, details)
+                    con._last_stale_warning = warning
+                return updated
+            _log_stale("stale-refused", metadata, age, source, reason=reason)
+            rebuilding = _rebuild_status(con, metadata)
+            status = "not ready" if metadata.get("ready") != "1" else "stale"
             raise ReplicaNotReady(
-                f"{source} recall replica not ready (generation {metadata.get('generation', 'unknown')}, "
-                f"updated_at {updated}, ready {metadata.get('ready', 'missing')}); retry later")
+                f"{source} recall replica {status} (generation {metadata.get('generation', 'unknown')}, "
+                f"updated_at {updated}, ready {metadata.get('ready', 'missing')}){rebuilding}; retry later")
     except ReplicaNotReady:
         raise
     except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
         # The lineage retry boundary classifies interrupts as timeouts.
         if isinstance(exc, sqlite3.OperationalError) and "interrupt" in str(exc).lower():
             raise
+        _log_stale("stale-refused", metadata, age, source, reason="invalid_readiness")
         raise UnsafeStateDatabase(f"{source} read-only replica missing readiness or stale (>{max_age}s); waiting for server export") from exc
+    if hasattr(con, "replica_path"):
+        getattr(_warnings, "snapshots", {}).pop(str(con.replica_path), None)
     return updated
 
 
-def state_ro(path, *, timeout=30, check_same_thread=True):
+def state_ro(path, *, timeout=30, check_same_thread=True, allow_rebuild=False):
     con = connect_ro(path, timeout=timeout, check_same_thread=check_same_thread)
     try:
         con.execute("BEGIN")
-        ready_generation(con)
+        ready_generation(con, allow_rebuild=allow_rebuild)
     except Exception:
         con.close()
         raise

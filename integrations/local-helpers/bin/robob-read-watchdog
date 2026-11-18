@@ -9,6 +9,14 @@ state_dir=${ROBOB_WD_STATE:-$HOME/.local/state/robob-read-watchdog}
 app_cmd=${ROBOB_WD_APP_RUNNING:-"pgrep -f '^/Applications/Robob[.]app/Contents/MacOS/Robob([[:space:]]|$)'"}
 restart_cmd=${ROBOB_WD_RESTARTING:-'tmux -L restart has-session -t robob-restart'}
 sleep_cmd=${ROBOB_WD_SLEEP:-sleep}
+probe_deadline=${ROBOB_WD_PROBE_DEADLINE:-20}
+[[ $probe_deadline == <-> ]] && (( probe_deadline > 0 )) || {
+  print -u2 'ROBOB_WD_PROBE_DEADLINE must be a positive number of seconds'
+  exit 2
+}
+# Probe deadlines use elapsed time even when the incident clock is overridden.
+typeset -F SECONDS=0
+zmodload zsh/system
 
 run_command() {
   local cmd=$1
@@ -40,12 +48,85 @@ while (( $# )); do
 done
 [[ -n $sustain ]] || { (( every == 30 && give_up == 1800 )) || usage }
 
+mkdir -p "$state_dir"
 probe_err=$(mktemp "${TMPDIR:-/tmp}/robob-read-watchdog.XXXXXX")
 trap 'rm -f "$probe_err"' EXIT
 last_error='healthy read window not completed'
-probe() {
-  local line
-  if run_command "$probe_cmd" > /dev/null 2> "$probe_err"; then return 0; fi
+probe_start() {
+  local value
+  value=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null) || return 1
+  [[ -n ${value//[[:space:]]/} ]] || return 1
+  print -r -- "$value"
+}
+probe_may_live() {
+  local current
+  kill -0 "$1" 2>/dev/null || return 1
+  # An unreadable identity is not proof of PID reuse. Keep suppressing retries.
+  [[ $2 != unknown ]] || return 0
+  current=$(probe_start "$1") || return 0
+  [[ $current == "$2" ]]
+}
+probe_time() {
+  local -a fields
+  fields=(${=1})
+  print -r -- "${fields[-2][1,5]}"
+}
+stuck_error() {
+  if [[ $3 == unknown ]]; then
+    last_error="$1 (start time unavailable; pid $2)"
+  else
+    last_error="$1 since $(probe_time "$3") UTC (pid $2)"
+  fi
+}
+record_probe() {
+  local record
+  record=$(mktemp "$state_dir/.stuck_probe.XXXXXX")
+  print -r -- "$1 $2" > "$record"
+  mv -f "$record" "$state_dir/stuck_probe"
+}
+bounded_probe() {
+  local prior_pid='' prior_start='' record_line='' current_start pid start_time line
+  local -F budget=$1 deadline grace
+  if [[ -f $state_dir/stuck_probe ]]; then
+    IFS= read -r record_line < "$state_dir/stuck_probe" || true
+    prior_pid=${record_line%% *}
+    prior_start=${record_line#* }
+    if [[ $prior_pid == <-> && -n $prior_start ]] && (( prior_pid > 1 )) &&
+        probe_may_live "$prior_pid" "$prior_start"; then
+      stuck_error 'prior probe still stuck' "$prior_pid" "$prior_start"
+      return 1
+    fi
+    rm -f "$state_dir/stuck_probe"
+  fi
+
+  deadline=$(( SECONDS + budget ))
+  /bin/zsh -f -c "exec $probe_cmd" > /dev/null 2> "$probe_err" &
+  pid=$!
+  start_time=$(probe_start "$pid") || start_time=unknown
+  # Persist before waiting so an interrupted parent cannot leave an untracked child.
+  record_probe "$pid" "$start_time"
+  while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 0.25
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    current_start=$(probe_start "$pid") || current_start=''
+    if [[ $start_time != unknown && $current_start == "$start_time" ]]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      grace=$(( SECONDS + 2 ))
+      while kill -0 "$pid" 2>/dev/null && (( SECONDS < grace )); do
+        sleep 0.25
+      done
+    fi
+    if probe_may_live "$pid" "$start_time"; then
+      stuck_error 'probe stuck' "$pid" "$start_time"
+      return 1
+    fi
+    rm -f "$state_dir/stuck_probe"
+    last_error="probe timed out after ${budget%.*}s"
+    return 1
+  fi
+  rm -f "$state_dir/stuck_probe"
+  if wait "$pid" 2>/dev/null; then return 0; fi
   # t3ctl owns the credential. Never read it here; discard credential-labelled diagnostics before saving.
   line=$(head -n 1 "$probe_err" | LC_ALL=C tr -d '\000-\010\013-\037\177' | sed -E \
     -e 's/([Bb][Ee][Aa][Rr][Ee][Rr]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Tt][Oo][Kk][Ee][Nn]).*/\1 [redacted]/' \
@@ -54,14 +135,35 @@ probe() {
   [[ -n $last_error ]] || last_error='probe failed without stderr'
   return 1
 }
+probe() {
+  local probe_lockfd
+  : >> "$state_dir/probe.lock"
+  if ! zsystem flock -t 0 -f probe_lockfd "$state_dir/probe.lock" 2>/dev/null; then
+    last_error='another probe is running'
+    return 1
+  fi
+  {
+    bounded_probe "${1:-$probe_deadline}"
+  } always {
+    zsystem flock -u "$probe_lockfd"
+  }
+}
 
 if [[ -n $sustain ]]; then
   started=$(now)
+  typeset -F sustain_deadline=$(( SECONDS + give_up )) probe_budget
   healthy_since=''
   failing_since=$started
   while true; do
     sample_start=$(now)
-    if probe; then
+    probe_budget=$(( give_up - (sample_start - started) ))
+    (( probe_budget <= probe_deadline )) || probe_budget=$probe_deadline
+    (( probe_budget <= sustain_deadline - SECONDS )) || probe_budget=$(( sustain_deadline - SECONDS ))
+    if (( probe_budget <= 0 )); then
+      print -r -- "installed but reads still failing since $(local_time "$failing_since" '%H:%M') ($last_error)"
+      exit 1
+    fi
+    if probe "$probe_budget"; then
       tick=$(now)
       [[ -n $healthy_since ]] || healthy_since=$tick
       if (( tick - started <= give_up && tick - healthy_since >= sustain )); then
@@ -73,7 +175,7 @@ if [[ -n $sustain ]]; then
       healthy_since=''
       tick=$(now)
     fi
-    if (( tick - started >= give_up )); then
+    if (( tick - started >= give_up || SECONDS >= sustain_deadline )); then
       print -r -- "installed but reads still failing since $(local_time "$failing_since" '%H:%M') ($last_error)"
       exit 1
     fi
@@ -81,17 +183,16 @@ if [[ -n $sustain ]]; then
     (( delay >= 0 )) || delay=0
     remaining=$(( give_up - (tick - started) ))
     (( delay <= remaining )) || delay=$remaining
+    (( delay <= sustain_deadline - SECONDS )) || delay=$(( sustain_deadline - SECONDS ))
     run_command "$sleep_cmd" "$delay"
   done
 fi
 
-mkdir -p "$state_dir"
 clear_state() {
   rm -f "$state_dir/first_fail" "$state_dir/last_error" "$state_dir/alerted" \
     "$state_dir/attention_text" "$state_dir/recovery_text"
 }
 # launchd serializes ticks; the lock also keeps a manual tick from duplicating an alert.
-zmodload zsh/system
 : >> "$state_dir/tick.lock"
 zsystem flock -t 0 -f lockfd "$state_dir/tick.lock" 2>/dev/null || exit 0
 

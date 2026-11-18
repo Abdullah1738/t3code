@@ -1,5 +1,16 @@
 import { createHash } from "node:crypto";
 
+export type DependencyBusy = { dependency: string; detail: string };
+export const safeDependency = (value: unknown): value is string => typeof value === "string"
+  && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(value) && !/\d{5}/.test(value);
+export function dependencyBusy(code: number | null | undefined, stderr: string): DependencyBusy | undefined {
+  if (code !== 75) return;
+  const last = stderr.trimEnd().split("\n").at(-1) ?? "";
+  const match = /^busy: ([a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}): (\S[^\r\n]*)$/.exec(last);
+  if (!match || !safeDependency(match[1])) return;
+  return { dependency: match[1]!, detail: match[2]!.slice(0, 500) };
+}
+
 // Keep these patterns and normalization in sync with helpers/toollog.py.
 const patterns = [
   ["usage_error", /(?:^|\n)\s*usage:|unrecognized arguments?|unknown (?:option|argument)|invalid (?:option|choice)|argument .*required|not (?:an exact trip UUID|a bridge chat slug)|no bridge chat|unsafe display name|invalid command arguments|duplicate command option|unexpected positional arguments|--[a-z-]+ (?:is required|must be)/i],
@@ -16,6 +27,7 @@ const patterns = [
 export class StderrCause {
   private line = "";
   private last = "";
+  private lastNonempty = "";
   private lines = 0;
   private rank: number = patterns.length;
 
@@ -28,25 +40,32 @@ export class StderrCause {
       if (i < parts.length - 1) {
         this.lines++;
         this.last = this.line.replace(/\r$/, "");
+        if (this.last.trim()) this.lastNonempty = this.last;
         this.line = "";
       }
     }
   }
 
-  props(timedOut = false) {
+  busy(code: number | null | undefined): DependencyBusy | undefined {
+    return dependencyBusy(code, this.line.trim() ? this.line : this.lastNonempty);
+  }
+
+  props(timedOut = false, code?: number | null) {
     const last = this.line || this.last;
+    const busy = this.busy(code);
     const normalized = last.replace(/"(?:[A-Za-z]:\\|\/|\.\.?\/|~\/)[^"]*"|'(?:[A-Za-z]:\\|\/|\.\.?\/|~\/)[^']*'|(?:[A-Za-z]:\\|\/|\.\.?\/|~\/)[^\s'"<>]*/g, "<path>")
       .replace(/\d+/g, "#");
     return {
-      stderrClass: timedOut ? "timeout" : patterns[this.rank]?.[0] ?? "unknown",
+      stderrClass: busy ? "dependency_busy" : timedOut ? "timeout" : patterns[this.rank]?.[0] ?? "unknown",
+      ...(busy ? { dependency: busy.dependency } : {}),
       stderrLines: this.lines + (this.line ? 1 : 0),
       stderrHash: createHash("sha256").update(normalized).digest("hex").slice(0, 16),
     };
   }
 }
 
-export function stderrCause(text: string, timedOut = false) {
+export function stderrCause(text: string, timedOut = false, code?: number | null) {
   const cause = new StderrCause();
   cause.add(text);
-  return cause.props(timedOut);
+  return cause.props(timedOut, code);
 }

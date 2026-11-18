@@ -1,32 +1,4 @@
 #!/bin/sh
 set -eu
-
-if [ "${REPO_VP_SHIM_ACTIVE:-}" = 1 ]; then
-  echo 'vp: recursive shim; run offbox run -- vp instead' >&2
-  exit 127
-fi
-export REPO_VP_SHIM_ACTIVE=1
-
-root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-dir=$(pwd -P)
-while :; do
-  candidate=$dir/node_modules/.bin/vp
-  if [ -x "$candidate" ] && ! [ "$candidate" -ef "$0" ]; then
-    exec "$candidate" "$@"
-  fi
-  [ "$dir" = / ] && break
-  [ "$dir" = "$root" ] && break
-  dir=${dir%/*}
-  [ -n "$dir" ] || dir=/
-done
-
-if [ -n "$root" ] && [ ! -e "$root/node_modules" ]; then
-  common=$(git rev-parse --path-format=absolute --git-common-dir)
-  main=${common%/.git}
-  if [ "$main" != "$root" ] && [ -x "$main/node_modules/.bin/vp" ]; then
-    here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-    exec node "$here/../libexec/vp/worktree.mjs" "$root" "$main" "$@"
-  fi
-fi
-echo "vp: no checkout-local node_modules/.bin/vp; run offbox run -- vp $*" >&2
-exit 127
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+exec node "$here/../libexec/vp/launcher.mjs" "$@"

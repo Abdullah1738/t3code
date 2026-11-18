@@ -1,6 +1,11 @@
 import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  KanbanBoardId,
+  KanbanCardId,
+  KanbanDiscussionId,
+  KanbanScriptId,
+  type KanbanDiscussion,
   MessageId,
   type ModelSelection,
   NodeId,
@@ -39,6 +44,8 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
+import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
+import * as Sqlite from "../persistence/Sqlite.ts";
 
 const driver = ProviderDriverKind.make("codex");
 const providerInstanceId = ProviderInstanceId.make("codex");
@@ -224,6 +231,8 @@ it.effect(
           listCutoverCandidates: () => Effect.die("unused listCutoverCandidates"),
           getLiveSharedProviderSessions: () => Effect.die("unused getLiveSharedProviderSessions"),
           getLimitRecoveryCandidates: () => Effect.die("unused getLimitRecoveryCandidates"),
+          pageActiveThreadIds: () => Effect.die("unused pageActiveThreadIds"),
+          listActiveThreadIds: () => Effect.die("unused listActiveThreadIds"),
           getShellSnapshot: () => Effect.die("unused getShellSnapshot"),
           readShellSnapshot: () => Effect.die("unused readShellSnapshot"),
           getThreadListCandidates: () => Effect.die("unused getThreadListCandidates"),
@@ -250,6 +259,8 @@ it.effect(
           getNextTurnItemOrdinal: () => Effect.die("unused ordinal read"),
           getTurnItem: () => Effect.die("unused turn item read"),
           getThreadRecords: () => Effect.die("unused record read"),
+          getPullRequestSyncSnapshot: () => Effect.die("unused PR metadata read"),
+          getProviderThreadsByNativeIds: () => Effect.die("unused native ID read"),
           getRuntimeRequest: () => Effect.die("unused getRuntimeRequest"),
           getRunningTurnContext: () => Effect.die("unused getRunningTurnContext"),
           getThreadProviderContext: () => Effect.die("unused getThreadProviderContext"),
@@ -586,4 +597,175 @@ it.effect("steers with cited assistant quotes expanded for the provider", () =>
 
     assert.deepEqual(yield* Ref.get(steered), [expandAssistantCitationsForProvider(text)]);
   }),
+);
+
+it.effect.each([
+  "pending",
+  "read-through pending",
+  "answered",
+  "answered then newer",
+  "settled",
+  "archived",
+  "invalid identity",
+] as const)("#1603 native recovery steering rechecks %s at execution", (state) =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make("thread:steer-citation");
+    const providerSessionId = ProviderSessionId.make("provider-session:steer-citation");
+    const providerTurnId = ProviderTurnId.make("provider-turn:steer-citation");
+    const attemptId = RunAttemptId.make("run-attempt:steer-citation");
+    const providerThread: OrchestrationV2ProviderThread = {
+      id: ProviderThreadId.make("provider-thread:steer-citation"),
+      driver,
+      providerInstanceId,
+      providerSessionId,
+      appThreadId: threadId,
+      ownerNodeId: null,
+      nativeThreadRef: { driver, nativeId: "native-thread:steer-citation", strength: "strong" },
+      nativeConversationHeadRef: null,
+      status: "idle",
+      firstRunOrdinal: 1,
+      lastRunOrdinal: 1,
+      handoffIds: [],
+      forkedFrom: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const projection = makeProjection({ now, threadId, providerThread, providerTurnId, attemptId });
+    const text = "Retained original script body";
+    const store = yield* KanbanStore.KanbanStore;
+    const discussion: KanbanDiscussion = {
+      id: KanbanDiscussionId.make("disc-steer-1603"),
+      boardId: KanbanBoardId.make("robob"),
+      cardId: KanbanCardId.make("card-steer-1603"),
+      title: "Recovery steering",
+      evaluatorThreadId: threadId,
+      participants: [],
+      lastSeq: 1,
+      lastMessageAt: null,
+      createdBy: { _tag: "owner" },
+      createdAt: DateTime.formatIso(now),
+      archivedAt: null,
+      titleEditedAt: null,
+      settledAt: null,
+      snoozedUntil: null,
+      pinnedAt: null,
+      reopenedAt: null,
+    };
+    const post = {
+      discussionId: discussion.id,
+      seq: 1,
+      author: { _tag: "script", scriptId: KanbanScriptId.make("script-steer-1603") } as const,
+      authorName: "Sweep",
+      blocks: [{ _tag: "md", text }] as const,
+      answers: [],
+      createdAt: discussion.createdAt,
+    };
+    yield* store.putDiscussion(discussion);
+    yield* store.putMessage(post);
+    const message = {
+      id: MessageId.make(
+        state === "invalid identity"
+          ? "kanban:post-recovery:%:1:retained"
+          : `kanban:post-recovery:${discussion.id}:1:retained`,
+      ),
+      text,
+      attachments: [],
+      createdBy: "user",
+      creationSource: "web",
+    } as unknown as OrchestrationV2ConversationMessage;
+    const steered = yield* Ref.make<ReadonlyArray<string>>([]);
+    const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+      instanceId: providerInstanceId,
+      driver,
+      providerSessionId,
+      providerSession: {
+        id: providerSessionId,
+        driver,
+        providerInstanceId,
+        status: "running",
+        cwd: "/workspace",
+        model: modelSelection.model,
+        capabilities: CodexProviderCapabilitiesV2,
+        createdAt: now,
+        updatedAt: now,
+        lastError: null,
+      },
+      events: Stream.empty,
+      ensureThread: () => Effect.die("unused ensureThread"),
+      resumeThread: () => Effect.die("unused resumeThread"),
+      startTurn: () => Effect.die("unused startTurn"),
+      steerTurn: (input) => Ref.update(steered, (texts) => [...texts, input.message.text]),
+      interruptTurn: () => Effect.die("unused interruptTurn"),
+      respondToRuntimeRequest: () => Effect.die("unused respondToRuntimeRequest"),
+      readThreadSnapshot: () => Effect.die("unused readThreadSnapshot"),
+      rollbackThread: () => Effect.die("unused rollbackThread"),
+      forkThread: () => Effect.die("unused forkThread"),
+    };
+    const layerControl = ProviderTurnControlService.layer.pipe(
+      Layer.provide(
+        Layer.merge(
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getProviderControlContext: () =>
+              Effect.succeed({
+                providerThread,
+                providerTurn: projection.providerTurns[0],
+                attempt: projection.attempts[0],
+                message,
+                run: { id: RunId.make("run:steer-citation") } as OrchestrationV2Run,
+              }),
+          }),
+          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+            get: () =>
+              Effect.gen(function* () {
+                // The durable steering effect already captured this message. Its
+                // reply/closure lands while that effect loads the live session.
+                if (state.startsWith("answered"))
+                  yield* store.putMessage({
+                    ...post,
+                    seq: 2,
+                    author: { _tag: "evaluator", threadId },
+                  });
+                if (state === "read-through pending" || state === "answered then newer")
+                  yield* store.putMessage({ ...post, seq: 3, author: { _tag: "owner" } });
+                yield* store.putDiscussion({
+                  ...discussion,
+                  lastSeq:
+                    state === "read-through pending" || state === "answered then newer"
+                      ? 3
+                      : state === "answered"
+                        ? 2
+                        : 1,
+                  participants: [
+                    {
+                      actor: { _tag: "evaluator", threadId },
+                      name: "Evaluator",
+                      lastReadSeq: 3,
+                      typingUntil: null,
+                      owes: "asked",
+                    },
+                  ],
+                  settledAt: state === "settled" ? discussion.createdAt : null,
+                  archivedAt: state === "archived" ? discussion.createdAt : null,
+                });
+                return Option.some(runtime);
+              }).pipe(Effect.orDie),
+          }),
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+      yield* control.steer({
+        threadId,
+        providerSessionId,
+        providerThreadId: providerThread.id,
+        providerTurnId,
+        messageId: message.id,
+      });
+    }).pipe(Effect.provide(layerControl));
+
+    assert.deepEqual(yield* Ref.get(steered), state.endsWith("pending") ? [text] : []);
+  }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provide(Sqlite.layerMemory)))),
 );

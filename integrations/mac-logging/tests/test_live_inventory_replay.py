@@ -37,7 +37,7 @@ class LiveCostReplay(support.unittest.TestCase):
         failures = [0]
         timeout_cutoffs = []
         stored, events = {}, []
-        def listing(path, deadline):
+        def listing(path, deadline, source_failures=None):
             return [SimpleNamespace(path=str(p), is_dir=lambda **kw:True) for p in topology[Path(path)]], True
         def run(cmd, **kw):
             rows, stderr, elapsed = [], [], 0

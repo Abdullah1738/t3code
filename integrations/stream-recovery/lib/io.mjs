@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { emit, failure, tagConnectionFailure, recordConnectionFailure, connectionWebSocket } from './logging.mjs';
 import { assertRecoveryActive, loadControl, recoveryElapsed } from './pause.mjs';
 import { isOpenCodeSessionId, parseCutoverStatus } from './harness.mjs';
 import { assertReplicaPath, guardReplica, registerReplica, replicaPath } from './readonly-db.mjs';
@@ -28,7 +29,7 @@ const parse = (text) => {
   }
 };
 
-// ---------- Robob state DB (read-only, indexed lookups only) ----------
+// ---------- Robob replica (read-only; discovery scans and indexed row lookups) ----------
 
 export function openDb(path = PATHS.db) {
   const safePath = assertReplicaPath(path);
@@ -393,16 +394,53 @@ export async function harnessCutoverStatus({ withClaims = false } = {}) {
   return parseCutoverStatus(await ctl('GET', `/harness-cutover/status${withClaims ? '?claims=1' : ''}`));
 }
 
+const staleSocketTags = new Set(['EPIPE', 'ECONNRESET', 'UND_ERR_SOCKET', 'UND_ERR_CLOSED']);
+const responseAttempts = new WeakMap();
+async function responseText(response, url) {
+  try { return await response.text(); }
+  catch (error) { throw tagConnectionFailure(error, url, responseAttempts.get(response) ?? 1); }
+}
+
+export async function fetchIdempotent(target, url, init = {}, timeoutMs) {
+  // Keep fetch looked up at call time so node:test can replace it, as the other
+  // transport tests do. Each attempt owns a fresh timeout signal.
+  let attemptNo = 0;
+  const attempt = async () => {
+    attemptNo++;
+    try {
+      const response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+      responseAttempts.set(response, attemptNo);
+      return response;
+    }
+    catch (error) { throw tagConnectionFailure(error, url, attemptNo); }
+  };
+  try { return await attempt(); }
+  catch (error) {
+    if ((init.method ?? 'GET').toUpperCase() !== 'GET' || init.body != null
+      || !(error instanceof TypeError) || error.message !== 'fetch failed') throw error;
+    const tag = failure(error).tag;
+    if (!staleSocketTags.has(tag) || error.cause?.code !== tag) throw error;
+    recordConnectionFailure('stream-recovery', 'http.attempt', error, {props:{step:`${target}.fetch`}});
+    let ok = false;
+    try {
+      const response = await attempt();
+      ok = response.ok;
+      return response;
+    } finally {
+      emit('stream-recovery', 'http.retry', { props:{target,tag,ok} });
+    }
+  }
+}
+
 async function api(method, path, body) {
   const { url, token } = control();
   if (method !== "GET") assertRecoveryActive({ readControl });
-  const res = await fetch(`${url}${path}`, {
+  const res = await fetchIdempotent('control', `${url}${path}`, {
     method,
     headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(15_000),
-  });
-  const data = parse(await res.text());
+  }, 15_000);
+  const data = parse(await responseText(res, `${url}${path}`));
   if (!res.ok || data.ok === false) {
     const e = new Error(`control ${method} ${path}: ${res.status} ${data.error?.message || data.message || ""}`.trim());
     e.status = res.status;
@@ -424,7 +462,8 @@ export async function robobHealthy() {
   try {
     await ctl("GET", "/health");
     return true;
-  } catch {
+  } catch (error) {
+    recordConnectionFailure('stream-recovery', 'health.check', error, {props:{step:'robobHealthy'}});
     return false;
   }
 }
@@ -490,9 +529,9 @@ export async function threadByNative(ses) {
   }
 }
 
-export async function interruptThread(threadId, { clientRequestId, reason, expectedRunId } = {}) {
+export async function interruptThread(threadId, { clientRequestId, reason, expectedRunId, cancelReason } = {}) {
   assertRecoveryActive({ readControl });
-  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason, expectedRunId });
+  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason, expectedRunId, cancelReason });
 }
 
 // Live top-level threads (running, waiting, queued, needs-input).
@@ -506,7 +545,7 @@ export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
   const { url, token } = control();
   const wsUrl = `${url.replace(/^http/, "ws")}/ws?orchestrationProtocol=2`;
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl, { headers: { authorization: `Bearer ${token}` } });
+    const ws = connectionWebSocket(wsUrl, { headers: { authorization: `Bearer ${token}` } });
     ws.binaryType = "arraybuffer";
     let done = false;
     const finish = (fn, v) => {
@@ -536,7 +575,8 @@ export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
         } else if (msg._tag === "Defect") finish(reject, new Error(`ws ${command.type}: defect ${JSON.stringify(msg).slice(0, 300)}`));
       }
     });
-    ws.addEventListener("error", (ev) => finish(reject, new Error(`ws ${command.type}: ${ev.message || "error"}`)));
+    ws.addEventListener("error", (ev) => finish(reject, tagConnectionFailure(
+      new Error(`ws ${command.type}: socket error`, {cause:ev.error ?? ev}), wsUrl)));
     ws.addEventListener("close", () => finish(reject, new Error(`ws ${command.type}: closed before reply`)));
   });
 }
@@ -551,14 +591,13 @@ async function oc(path, init = {}) {
   }
   ocAuth ??= "Basic " + Buffer.from(`opencode:${readFileSync(PATHS.ocPassword, "utf8").trim()}`).toString("base64");
   if (init.method && init.method !== "GET") assertRecoveryActive({ readControl });
-  const res = await fetch(`${OC_URL}${path}`, {
+  const res = await fetchIdempotent('opencode', `${OC_URL}${path}`, {
     ...init,
     headers: { authorization: ocAuth, ...(init.headers || {}) },
-    signal: AbortSignal.timeout(20_000),
-  });
+  }, 20_000);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`opencode ${path}: ${res.status}`);
-  return parse(await res.text());
+  return parse(await responseText(res, `${OC_URL}${path}`));
 }
 
 export async function activeSessions() {
@@ -632,31 +671,51 @@ export function telegram({ text, severity = "info", key }) {
 export const readControl = () => loadControl(PATHS.dataDir);
 
 const statePath = () => join(PATHS.dataDir, "state.json");
+const stallStatePath = () => join(PATHS.dataDir, "stall-state.json");
+const stallState = (s = {}) => ({
+  watch: s.watch ?? {}, stalls: s.stalls ?? {}, ghosts: s.ghosts ?? {}, lastStallScan: s.lastStallScan ?? null,
+});
 
 export function loadState() {
-  if (!existsSync(statePath())) return { handled: {}, lastScan: null, lastStallScan: null, watch: {}, stalls: {}, servers: [], ghosts: {} };
+  if (!existsSync(statePath())) return { handled: {}, lastScan: null, servers: [] };
   const s = parse(readFileSync(statePath(), "utf8"));
   return {
-    handled: s.handled ?? {}, lastScan: s.lastScan ?? null, lastStallScan: s.lastStallScan ?? null, watch: s.watch ?? {}, stalls: s.stalls ?? {},
-    servers: s.servers ?? [], ghosts: s.ghosts ?? {},
+    handled: s.handled ?? {}, lastScan: s.lastScan ?? null, servers: s.servers ?? [],
   };
 }
 
-export function saveState(state, now = Date.now()) {
-  mkdirSync(PATHS.dataDir, { recursive: true });
-  for (const key of ["handled", "stalls"]) {
-    for (const [id, v] of Object.entries(state[key] ?? {})) {
-      if (v.done && recoveryElapsed({ readControl }, Date.parse(v.at), now) > 14 * 86_400_000) delete state[key][id];
-    }
-  }
-  const tmp = `${statePath()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2));
-  renameSync(tmp, statePath());
+export function loadStallState() {
+  // Once published, the stall ledger is authoritative, even if an old scan
+  // later finishes and writes its pre-migration state.json snapshot.
+  const path = existsSync(stallStatePath()) ? stallStatePath() : statePath();
+  return stallState(existsSync(path) ? parse(readFileSync(path, "utf8")) : {});
 }
 
-export function acquireLock(now = Date.now()) {
+function saveLedger(path, state, key, now) {
   mkdirSync(PATHS.dataDir, { recursive: true });
-  const lock = join(PATHS.dataDir, "scan.lock");
+  for (const [id, v] of Object.entries(state[key] ?? {})) {
+    if (v.done && recoveryElapsed({ readControl }, Date.parse(v.at), now) > 14 * 86_400_000) delete state[key][id];
+  }
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2));
+  renameSync(tmp, path);
+}
+
+export function saveState(state, now = Date.now()) {
+  // A replica scan may finish before the stall job's first run. Preserve the
+  // on-disk migration source until that job has published its own ledger.
+  const legacy = !existsSync(stallStatePath()) && existsSync(statePath())
+    ? stallState(parse(readFileSync(statePath(), "utf8"))) : {};
+  saveLedger(statePath(), { ...legacy, handled: state.handled, lastScan: state.lastScan, servers: state.servers }, "handled", now);
+}
+
+export function saveStallState(state, now = Date.now()) {
+  saveLedger(stallStatePath(), stallState(state), "stalls", now);
+}
+
+export function acquireLock(now = Date.now(), name = 'scan') {
+  mkdirSync(PATHS.dataDir, { recursive: true });
+  const lock = join(PATHS.dataDir, `${name}.lock`);
   if (existsSync(lock)) {
     const { pid, at } = parse(readFileSync(lock, "utf8"));
     let alive = false;

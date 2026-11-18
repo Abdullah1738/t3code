@@ -1,5 +1,6 @@
 """Replay the existing transport fixtures and verify observable diagnostic coverage."""
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -7,6 +8,14 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+
+
+if importlib.util.find_spec('cryptography') is None:
+    raise ImportError(
+        "app-api-cli tests need `cryptography`; run them with the commerce CLI's interpreter "
+        f"({Path.home() / '.local/share/uv/tools/mitmproxy/bin/python'}) "
+        "or install test/requirements.txt in the test environment"
+    )
 
 
 class LaneLogs(unittest.TestCase):
@@ -28,6 +37,12 @@ class LaneLogs(unittest.TestCase):
             rows = [json.loads(line) for p in (Path(temp)/'orders').glob('*.ndjson') for line in p.read_text().splitlines()]
             for row in rows:
                 if row['name'].startswith(('provider.', 'track.')):
+                    if row['name'].startswith('provider.'):
+                        self.assertIn(row['props']['caller'], {'money-cases', 'order-watch', 'commerce-cmd', 'delivery-card', 'other'})
+                        self.assertIn('trigger', row['props'])
+                        if row['name'] == 'provider.orders':
+                            self.assertIs(type(row['props']['pagesFetched']), int)
+                            self.assertIs(type(row['props']['rowsReturned']), int)
                     self.assertIn(row['props']['merchant'], {'noon', 'careem', 'amazon', 'uber', 'other', 'unknown'})
             return rows
 

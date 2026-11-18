@@ -104,7 +104,7 @@ test("e: high load triples a 1s timeout, allowing a 2s check to succeed", async 
 }, 15_000);
 
 test("f: four high-load checks never overlap more than two at once", async () => {
-  const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9", ROBOB_WATCH_MAX_CONCURRENT_UNDER_LOAD: "2" }), ids = ["one", "two", "three", "four"];
+  const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9", ROBOB_WATCH_LOAD_DWELL_MS: "0", ROBOB_WATCH_MAX_CONCURRENT_UNDER_LOAD: "2" }), ids = ["one", "two", "three", "four"];
   for (const id of ids) f.add(id, { timeout_s: 5, check: 'zmodload zsh/datetime; print "$EPOCHREALTIME start $WATCH_ID" >> "$WATCH_DIR/../../timeline"; sleep 0.3; print "$EPOCHREALTIME end $WATCH_ID" >> "$WATCH_DIR/../../timeline"' });
   const child = f.start(); await until(() => ids.every(id => existsSync(f.path(id, ".run-ok")))); await f.stop(child);
   const events = readFileSync(join(f.root, "timeline"), "utf8").trim().split("\n").map(line => line.split(" ")).sort((a, b) => Number(a[0]) - Number(b[0]));
@@ -160,8 +160,8 @@ test.each(["0.1", "9"])("load at either endpoint grants timeout immunity: starts
   const child = f.start(preload); await until(() => existsSync(f.path("edge", "started"))); writeFileSync(control, initial === "9" ? "0.1" : "9");
   await until(() => f.state("edge").load_timeouts === 1); await f.stop(child);
   expect(f.state("edge").consecutive_failures).toBe(0); expect(f.state("edge").last_error).toContain("9.0/core"); expect(f.calls()).toHaveLength(0);
-  expect(f.readLog(child).match(/host load mode started/g)).toHaveLength(1);
-  if (initial === "9") expect(f.readLog(child).match(/host load mode ended/g)).toHaveLength(1);
+  expect(f.readLog(child)).not.toContain("host load mode started");
+  expect(f.readLog(child)).not.toContain("host load mode ended");
 }, 15_000);
 
 test("CLI preserves timeout_s on flag replacement and uses it for scratch tests", async () => {

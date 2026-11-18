@@ -2,6 +2,7 @@
 import contextlib
 import hashlib
 import io
+import json
 from pathlib import Path
 import sys
 import threading
@@ -14,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from offbox_lib import api, common, misc, pool, reap, runs
 from offbox_lib.common import OffboxError
 from test_capacity import Isolated
+from test_live_logs import both_history_orders
 
 HISTORY_LOGS = api.history_logs
 
@@ -22,7 +24,7 @@ class LogCatchupTests(Isolated):
     def setUp(self):
         super().setUp()
         self.stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('offline: no API calls')))
-        self.stack.enter_context(patch.object(api, 'get', side_effect=AssertionError('must not inspect or wake box')))
+        self.stack.enter_context(patch.object(api, 'get', return_value=dict(state='archived')))
         self.stack.enter_context(patch.object(runs.lease, 'touch'))
         self.stack.enter_context(patch.object(runs.lease, 'idle_ttl'))
         self.stack.enter_context(patch.object(runs, 'settle_docker'))
@@ -471,7 +473,7 @@ class LogCatchupTests(Isolated):
                 self.assertIn('is still running', err)
                 self.assertIn('7 bytes, last written ', err)
                 self.assertIn('includes the output fetched so far', err)
-                self.assertIn('offbox logs --follow run-x', err)
+                self.assertIn('`offbox wait run-x` using the remote-compute skill', err)
                 self.assertEqual(self.path.stat().st_mtime_ns, before.st_mtime_ns)
                 self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
         self.history.assert_not_called()
@@ -619,15 +621,245 @@ class LogCatchupTests(Isolated):
         self.assertEqual(common.checkpoint(self.path)['stdoutOffset'], 7)
 
     def test_timeout_preserves_original_and_is_forwarded_to_transport(self):
+        for backend, deadline in (('boat', 1005), ('server', 1010)):
+            with self.subTest(backend=backend):
+                clock = [1000.0]
+                def history(*args, **kwargs):
+                    self.assertEqual(kwargs['deadline'], deadline)
+                    clock[0] = deadline + 1
+                    raise OffboxError('deadline expired')
+                self.history.side_effect = history
+                with patch.object(api, 'BACKEND', backend), \
+                        patch.object(misc.time, 'time', side_effect=lambda: clock[0]):
+                    self.assertEqual(misc._catch_up_log(self.row(), budget=10), 'incomplete:timeout')
+                self.assertEqual(self.path.read_bytes(), b'prefix\n')
+
+    def fetch_events(self):
+        rows = self.con.execute("SELECT detail FROM events WHERE kind='logs_fetch'").fetchall()
+        events = [json.loads(row[0]) for row in rows]
+        lines = [json.loads(line.split('logs_fetch bx_a ', 1)[1])
+                 for line in common.LOG_PATH.read_text().splitlines() if 'logs_fetch bx_a ' in line]
+        self.assertEqual(lines, events)
+        return events
+
+    def test_live_budget_keeps_pages_offsets_and_reports_progress_with_fetch_stats(self):
+        self.state('running', None)
         clock = [1000.0]
-        def history(*args, **kwargs):
-            self.assertEqual(kwargs['deadline'], 1010)
-            clock[0] = 1011
-            raise OffboxError('deadline expired')
+        timing = threading.local()
+        def monotonic():
+            return getattr(timing, 'now', 1000.0) if threading.current_thread().name.startswith('offbox-history-') else clock[0]
+        def history(box, cmd, which, offset, **kw):
+            self.assertEqual(kw['deadline'], 1010)
+            clock[0] = kw['deadline']
+            timing.now = clock[0]
+            return dict(data='more', nextOffset=offset + 4, size=100, done=False)
         self.history.side_effect = history
-        with patch.object(misc.time, 'time', side_effect=lambda: clock[0]):
-            self.assertEqual(misc._catch_up_log(self.row(), budget=10), 'incomplete:timeout')
-        self.assertEqual(self.path.read_bytes(), b'prefix\n')
+        with patch.object(misc, '_refresh_running_ttl'), \
+                patch.object(misc.time, 'time', lambda: clock[0]), \
+                patch.object(misc.time, 'monotonic', monotonic), \
+                patch.object(misc, 'monotonic', monotonic):
+            code, out, err = self.invoke()
+        self.assertEqual((code, out), (0, 'prefix\nmoremore'))
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=11, stderrOffset=4, logBytes=15))
+        self.assertIn('is still running', err)
+        self.assertNotIn('incomplete', err)
+        event, = self.fetch_events()
+        self.assertEqual(event, dict(run='run-x', live=True, result='incomplete:more output available', seconds=10,
+                                    pages=[1, 1], bytes=8, slowest_ms=10000, lock_wait_ms=0, budget=10,
+                                    page_ms=[[10000], [10000]], page_ms_omitted=[0, 0]))
+
+    def test_queued_only_log_reports_utc_queue_time_without_incomplete_or_running(self):
+        lines = [
+            b'offbox-server: waiting for earlier runs in the queue\n',
+            b'offbox-server: waiting for memory (this kind peaks ~15.5 GB, 6.5 GB free after reserve)\n',
+            b'offbox-server: waiting; position 2 of 2; behind bx_head/1 queued 60 s; the head runner to admit; waited 60 s\n',
+            b'offbox-server: waiting; position 1 of 1; memory; waited 60 s\n',
+            b'offbox-server: waiting; position 1 of 1; max_running cap 1/1; waited 60 s\n',
+            b'offbox-server: waiting; position 1 of 1; host CPU pressure; waited 60 s\n',
+            b'offbox-server: waiting; position 1 of 1; memory; waited 60 s\n' * 20,
+        ]
+        for status in ('starting', 'running', 'queued'):
+            for line in lines:
+                with self.subTest(status=status, line=line[:100]):
+                    self.state(status, None)
+                    self.prefix(line, out=0, err=len(line))
+                    def timeout(*args, **kwargs):
+                        raise OffboxError('timeout')
+                    self.history.side_effect = timeout
+                    with patch.object(misc, '_refresh_running_ttl'), patch.object(misc, 'now', return_value=1000):
+                        code, out, err = self.invoke()
+                    self.assertEqual((code, out), (0, self.path.read_text()))
+                    self.assertIn('is queued on the server (since 1970-01-01T00:15:00Z, 100s)', err)
+                    self.assertIn('nothing has run yet', err)
+                    self.assertNotIn('behind earlier runs', err)
+                    self.assertNotIn('incomplete', err)
+                    self.assertNotIn('still running', err)
+
+    def test_live_log_notice_uses_displayed_copy_and_authoritative_status(self):
+        self.state('running', None)
+        shown = self.path.with_suffix('.log.takeover')
+        shown.write_bytes(b'offbox-server: waiting; position 1 of 1; memory\n')
+        output = []
+        with patch.object(misc, 'say', side_effect=output.append):
+            self.assertTrue(misc._live_log_notice(self.row(), shown, 'n/a', 0))
+        self.assertIn('is queued on the server', output[0])
+        common.atomic_write_json(common.LOGS_DIR / 'run-x.home-read.json', dict(status='running'))
+        output = []
+        with patch.object(misc, 'say', side_effect=output.append):
+            self.assertFalse(misc._live_log_notice(self.row(), shown, 'n/a', 0))
+        self.assertEqual(output, [])
+        (common.LOGS_DIR / 'run-x.home-read.json').unlink()
+        shown.write_bytes(shown.read_bytes() + b'offbox-command-started: yes\n')
+        with patch.object(misc, 'say') as say:
+            self.assertFalse(misc._live_log_notice(self.row(), shown, 'n/a', 0))
+        say.assert_not_called()
+
+    @both_history_orders
+    def test_first_logs_fetch_notices_home_queue_without_preseeded_evidence(self):
+        from offbox_lib import home_run_observation as observation
+        self.state('running', None)
+        common.BACKEND_STATE.parent.mkdir(parents=True, exist_ok=True)
+        common.BACKEND_STATE.write_text(json.dumps(dict(state='home_down', since=1794728800)))
+        with patch.object(common, '_BACKEND', 'server'), patch.object(api, 'BACKEND', 'server'), \
+                patch.dict('os.environ', {'OFFBOX_BACKEND': 'server'}), patch.object(misc, '_refresh_running_ttl'), \
+                patch.object(observation.toollog, 'emit') as event:
+            for remote, text, expected in [(None, b'offbox-server: waiting; position 1 of 1; memory\n', True),
+                                           ('queued', b'', True),
+                                           ('queued', b'offbox-server: waiting; position 1 of 1\n', True),
+                                           ('running', b'offbox-server: waiting; position 1 of 1\n', False),
+                                           ('running', b'', False)]:
+                with self.subTest(remote=remote, text=text):
+                    (common.LOGS_DIR / 'run-x.home-read.json').unlink(missing_ok=True)
+                    (common.LOGS_DIR / 'run-x.home-queue-notice').unlink(missing_ok=True)
+                    self.prefix(b'', out=0, err=0)
+                    self.streams(b'', text)
+                    history = self.history.side_effect
+                    self.history.side_effect = lambda *a, **kw: dict(history(*a, **kw), **(
+                        dict(status=remote, attempt=2) if remote else {}))
+                    event.reset_mock()
+                    observation.observe('run-x', 'accepted')
+                    code, out, err = self.invoke()
+                    self.assertEqual(code, 0)
+                    self.assertEqual(out, text.decode())
+                    read = common.read_json(common.LOGS_DIR / 'run-x.home-read.json', {})
+                    self.assertEqual(read['status'], remote)
+                    self.assertEqual(read['attempt'], 2 if remote else None)
+                    self.assertEqual(err.count('it will not move to Boat'), int(expected))
+                    self.assertEqual(event.call_count, int(expected))
+                    if expected:
+                        self.assertEqual(event.call_args.args[1], 'run.queue.home_down_notice')
+                    self.assertNotIn('it will not move to Boat', self.invoke()[2])
+
+    def test_settled_logs_and_wait_timeout_keep_wording_and_record_fetch(self):
+        for wait in (False, True):
+            with self.subTest(wait=wait):
+                clock = [1000.0]
+                def history(*args, **kwargs):
+                    clock[0] += 31
+                    raise OffboxError('deadline expired')
+                self.history.side_effect = history
+                with patch.object(api, 'BACKEND', 'server'), \
+                        patch.object(misc.time, 'time', lambda: clock[0]), \
+                        patch.object(misc, 'monotonic', lambda: clock[0]):
+                    code, out, err = self.invoke(wait=wait)
+                self.assertEqual(code, 0)
+                self.assertIn("offbox: run-x local log stops at 7 bytes and the rest couldn't be fetched "
+                              "(timeout); this output is incomplete\n", err)
+                self.assertIn('offbox: run-x run ended done exit=0\n', err)
+                event = self.fetch_events()[-1]
+                self.assertEqual((event['live'], event['result'], event['bytes'], event['pages']),
+                                 (False, 'incomplete:timeout', 0, [1, 0]))
+                self.assertEqual((event['seconds'], event['slowest_ms'], event['budget']), (31, 31000, None))
+
+    @both_history_orders
+    def test_caught_up_live_fetch_records_both_streams_without_warning(self):
+        self.state('running', None)
+        self.prefix(b'prefix\n')
+        self.streams(b'prefix\nrest\n', b'error\n')
+        with patch.object(misc, '_refresh_running_ttl'):
+            code, out, err = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertIn(out, ('prefix\nrest\nerror\n', 'prefix\nerror\nrest\n'))
+        self.assertNotIn('incomplete', err)
+        self.assertNotIn('more output is on the server', err)
+        event = self.fetch_events()[-1]
+        self.assertEqual((event['result'], event['pages'], event['bytes']), ('caught_up', [1, 1], 11))
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=12, stderrOffset=6, logBytes=18))
+
+    def test_log_lock_wait_is_measured_separately(self):
+        clock = [1000.0]
+        @contextlib.contextmanager
+        def lock(*args, **kwargs):
+            clock[0] += 0.25
+            yield False
+        with patch.object(runs, 'log_lock', lock), patch.object(misc, 'monotonic', lambda: clock[0]):
+            self.assertEqual(misc._catch_up_log(self.row(), lock_wait=10), 'caught_up')
+        event, = self.fetch_events()
+        self.assertEqual((event['lock_wait_ms'], event['seconds']), (250, 0.25))
+
+    def test_history_error_and_held_lock_still_record_fetch_outcomes(self):
+        self.history.side_effect = OffboxError('history unavailable')
+        self.assertEqual(misc._catch_up_log(self.row()), 'incomplete:history unavailable')
+        with common.file_lock('log-run-x', timeout=0):
+            self.assertEqual(misc._catch_up_log(self.row()), 'n/a')
+        error, locked = self.fetch_events()
+        self.assertEqual((error['pages'], error['bytes']), ([1, 0], 0))
+        self.assertEqual((locked['result'], locked['pages'], locked['bytes']), ('n/a', [0, 0], 0))
+
+    def test_per_page_timing_samples_are_bounded_but_totals_cover_every_page(self):
+        self.streams(b'prefix\n' + b'x' * 12, b'', page=1)
+        self.assertEqual(misc._catch_up_log(self.row()), 'caught_up')
+        event, = self.fetch_events()
+        self.assertEqual(event['pages'], [12, 1])
+        self.assertEqual([len(times) for times in event['page_ms']], [8, 1])
+        self.assertEqual(event['page_ms_omitted'], [4, 0])
+
+    def test_fetch_diagnostics_do_not_wait_for_a_database_writer(self):
+        row = self.row()
+        connect = common.sqlite3.connect
+        timeouts = []
+        def connection(*args, **kwargs):
+            con = connect(*args, **kwargs)
+            timeouts.append(con.execute('PRAGMA busy_timeout').fetchone()[0])
+            return con
+        self.con.execute('BEGIN IMMEDIATE')
+        try:
+            with common.file_lock('log-run-x', timeout=0), patch.object(common, 'DB_TIMEOUT', 0.05), \
+                    patch.object(misc.sqlite3, 'connect', side_effect=connection):
+                self.assertEqual(misc._catch_up_log(row, budget=0), 'n/a')
+            self.assertEqual(timeouts, [0])
+            self.assertEqual(self.con.execute("SELECT count(*) FROM events WHERE kind='logs_fetch'").fetchone()[0], 0)
+            line, = [line for line in common.LOG_PATH.read_text().splitlines() if 'logs_fetch bx_a ' in line]
+            event = json.loads(line.split('logs_fetch bx_a ', 1)[1])
+            self.assertEqual((event['run'], event['result'], event['budget']), ('run-x', 'n/a', 0))
+        finally:
+            self.con.rollback()
+
+    def test_fetch_byte_count_uses_only_a_valid_local_prefix(self):
+        cases = [
+            ('missing', None, True, 'caught_up', 12),
+            ('empty', b'', True, 'caught_up', 12),
+            ('short', b'pre', True, 'incomplete:invalid checkpoint', 0),
+            ('valid', b'prefix\n', True, 'caught_up', 5),
+            ('uncommitted suffix', b'prefix\njunk', True, 'caught_up', 5),
+            ('empty without checkpoint', b'', False, 'caught_up', 12),
+            ('legacy bytes without checkpoint', b'prefix\n', False, 'incomplete:no checkpoint', 0),
+        ]
+        for name, content, saved_checkpoint, expected_result, added in cases:
+            with self.subTest(name=name):
+                self.prefix(b'prefix\n')
+                if content is None:
+                    self.path.unlink()
+                else:
+                    self.path.write_bytes(content)
+                if not saved_checkpoint:
+                    common.offsets_path(self.path).unlink()
+                self.assertEqual(misc._catch_up_log(self.row()), expected_result)
+                event = self.fetch_events()[-1]
+                self.assertEqual(event['bytes'], added)
+                if expected_result == 'caught_up':
+                    self.assertEqual(self.path.read_bytes(), b'prefix\nrest\n')
+                    self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=12, stderrOffset=0, logBytes=12))
 
     def test_stale_takeover_cannot_shrink_completed_log(self):
         takeover = self.path.with_name(self.path.name + '.takeover')
@@ -715,6 +947,27 @@ class LogCatchupTests(Isolated):
         with patch.object(misc.time, 'time', lambda: clock[0]):
             self.assertEqual(misc._catch_up_log(self.row()), 'incomplete:timeout')
         self.assertEqual(self.path.read_bytes(), b'prefix\n')
+
+    def test_retained_copy_budget_includes_the_checkpointed_history_being_verified(self):
+        prefix, total, page_size = 40_000_000, 50_000_000, 1_000_000
+        with self.path.open('wb') as f:
+            f.truncate(prefix)
+        common.atomic_write_json(common.offsets_path(self.path),
+                                 dict(stdoutOffset=prefix, stderrOffset=0, logBytes=prefix))
+        Path(str(self.path) + '.remote').write_bytes(b'\0')
+        common.atomic_write_json(Path(str(self.path) + '.remote.json'), dict(source='process log', merged=False))
+        clock = [1000.0]
+        def history(box, cmd, which, offset, **kw):
+            clock[0] += 1
+            size = total if which == 'stdout' else 0
+            nxt = min(size, offset + page_size)
+            return dict(data='\0' * (nxt - offset), nextOffset=nxt, size=size, done=nxt == size)
+        with patch.object(api, 'history_logs', history), patch.object(misc.time, 'time', lambda: clock[0]):
+            self.assertEqual(misc._catch_up_log(self.row()), 'caught_up')
+        self.assertGreater(clock[0], 1030)
+        self.assertEqual(self.path.stat().st_size, total)
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=total, stderrOffset=0, logBytes=total))
+        self.assertEqual(misc._shown_log(self.path), self.path)
 
     def test_streaming_log_preserves_utf8_across_file_chunks(self):
         content = 'x' * 65535 + '€' + 'y' * 65535 + 'é'

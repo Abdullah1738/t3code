@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from rollup import rollup
+from listener_rollup import windows as listener_windows
 from toollog import directory, emit
 
 BASE = 'http://127.0.0.1:20128'
@@ -86,6 +87,23 @@ def snapshot(providers, logs, previous, now):
         state = c.get('testStatus')
         state = state if state in ('active', 'expired', 'error', 'disabled', 'limited', 'rate_limited', 'locked', 'unknown') else 'unknown'
         emit('poller', 'account.health', ok=True, ids={'account': c['id']}, props=dict(enabled=c.get('isActive') is True, state=state, locked=any(locked(v, now) for k, v in c.items() if k.startswith('modelLock_')), limited=locked(c.get('rateLimitedUntil'), now), reloginNeeded=bool(c.get('reauthRequiredAt'))))
+        for key, value in c.items():
+            if not (key.startswith('modelLock_') or key == 'rateLimitedUntil') or not locked(value, now):
+                continue
+            # Only canonical ISO deadlines leave this endpoint; never carry a raw value.
+            try:
+                if isinstance(value, bool):
+                    continue
+                deadline = dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc) if isinstance(value, (int, float)) else dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+                until = deadline.astimezone(dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+            except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+                continue
+            account_wide = key in ('modelLock___all', 'rateLimitedUntil')
+            model = 'account-wide' if account_wide else key[len('modelLock_'):]
+            metadata = c.get('modelLockCause_' + key[len('modelLock_'):], {}) if key.startswith('modelLock_') else {}
+            cause = metadata.get('cause') if isinstance(metadata, dict) and metadata.get('until') == value else None
+            cause = cause if cause in ('quota', 'rate_limit', 'overloaded', 'auth', 'monthly_usage', 'other') else 'other'
+            emit('poller', 'account.locked', ok=True, ids={'account': c['id']}, props=dict(provider=c.get('provider', 'unknown'), model=model, scope='account' if account_wide else 'model', cause=cause, until=until))
     current = Counter()
     counts = Counter()
     unresolved = 0
@@ -128,6 +146,29 @@ def save_state(path, state):
             os.unlink(tmp)
 
 
+def rollup_complete(path):
+    try:
+        return json.loads(path.read_text()).get('complete') is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def refresh_listener_rollups(root, now):
+    # Daily counters are final, but a recovery can close an older listener window.
+    for report in root.glob('rollup-????-??-??.json'):
+        day = report.stem.removeprefix('rollup-')
+        if day >= now.date().isoformat():
+            continue
+        try:
+            dt.date.fromisoformat(day)
+            previous = json.loads(report.read_text()).get('listener', {})
+            pending = any(row.get('end') is None for row in previous.get('windows', []))
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+        if pending and listener_windows(day, root, now) != previous:
+            rollup(day, root, now=now)
+
+
 def poll(get=None, root=None, now=None):
     start = time.monotonic()
     root = Path(root) if root is not None else directory()
@@ -141,16 +182,24 @@ def poll(get=None, root=None, now=None):
         except FileNotFoundError:
             state = {}
         yesterday = (now.date() - dt.timedelta(days=1)).isoformat()
-        if (now.hour > 0 or now.minute >= 5) and not (root / ('rollup-' + yesterday + '.json')).exists():
-            rollup(yesterday, root)
+        if (now.hour > 0 or now.minute >= 5) and (state.get('finalizedDay') != yesterday or not rollup_complete(root / ('rollup-' + yesterday + '.json'))):
+            rollup(yesterday, root, now=now)
+            state['finalizedDay'] = yesterday
+            save_state(state_path, state)
             emit('poller', 'log.rollup', kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000)
+        hour = now.strftime('%Y-%m-%dT%H')
+        if state.get('rollupHour') != hour:
+            rollup(now.date().isoformat(), root, now=now)
+            state['rollupHour'] = hour
+            save_state(state_path, state)
+            emit('poller', 'log.rollup', kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000)
+        refresh_listener_rollups(root, now)
         get = get or Router().get
         providers = get('/api/providers')
         logs = get('/api/usage/logs')
         seen = snapshot(providers, logs, state.get('seen', {}), now)
         state['seen'] = seen
         save_state(state_path, state)
-        hour = now.strftime('%Y-%m-%dT%H')
         if state.get('spendHour') != hour:
             # This endpoint supplies today's cumulative cost, not hourly buckets.
             # Keep the real per-connection cost as an hourly snapshot; never call it hourly spend.

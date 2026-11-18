@@ -37,7 +37,7 @@ class TrackedIgnoredTests(unittest.TestCase):
         self.write("docs/forced.md", "force-added\n")
         self.write("config/.env", "SECRET=1\n")              # tracked, ignored and secret: stays home
         self.write("config/.env.example", "SECRET=\n")       # tracked, ignored, a safe template: goes
-        self.write("vendor/node_modules/x/index.js", "1\n")  # tracked under a heavy exclude: stays home
+        self.write("vendor/node_modules/x/index.js", "1\n")  # tracked nested fixture: goes
         self.git("add", "-f", ".")
         self.git("commit", "-qm", "base")
         self.write("dist/local.js", "build output\n")        # ignored and untracked: never sent
@@ -97,8 +97,22 @@ class TrackedIgnoredTests(unittest.TestCase):
 
     def test_untracked_ignored_secret_and_heavy_files_stay_home(self):
         self.push()
-        for rel in ("dist/local.js", "docs/untracked.md", "config/.env", "vendor/node_modules/x/index.js"):
+        for rel in ("dist/local.js", "docs/untracked.md", "config/.env"):
             self.assertFalse(self.on_box(rel), rel)
+
+    def test_tracked_blocker_shims_sync_without_include(self):
+        paths = [f'integrations/offbox/skill/scripts/blockers/{name}'
+                 for name in ('docker', 'himalaya', 'himalaya-heal', 'wacli')]
+        blockers = Path(__file__).resolve().parents[1] / 'blockers'
+        for rel in paths:
+            self.write(rel, (blockers / Path(rel).name).read_text())
+            (self.src / rel).chmod(0o755)
+        self.git('add', '--', *paths)
+        self.push()
+        for rel in paths:
+            with self.subTest(path=rel):
+                self.assertEqual((self.remote / rel).read_bytes(), (self.src / rel).read_bytes())
+                self.assertTrue(os.access(self.remote / rel, os.X_OK))
 
     def test_secret_tracked_file_still_needs_include(self):
         self.push(includes=["config/.env"])
@@ -115,7 +129,7 @@ class TrackedIgnoredTests(unittest.TestCase):
 
     def test_one_rsync_when_nothing_tracked_is_skipped(self):
         self.git("rm", "-q", "--cached", "package-lock.json", "src/api/test/route.js", "docs/KEEP.md",
-                 "docs/forced.md", "config/.env.example")
+                 "docs/forced.md", "config/.env.example", "vendor/node_modules/x/index.js")
         self.git("commit", "-qm", "untrack")
         st = self.push()
         self.assertEqual(len(self.rsyncs), 1)
@@ -214,7 +228,7 @@ class TrackedIgnoredTests(unittest.TestCase):
     def test_note_counts_the_rest(self):
         st = {"tracked_ignored": 7, "tracked_ignored_first": ["a", "b", "c", "d", "e"], "tracked_ignored_sent": 1}
         self.assertEqual(ssh_sync.tracked_ignored_note(st),
-                         "also synced 7 git-tracked file(s) that .gitignore matches: a, b, c, d, e (+2 more)")
+                         "also synced 7 git-tracked file(s) that sync filters match: a, b, c, d, e (+2 more)")
 
     def test_offbox_skips(self):
         for rel in ("a/.aws/creds", "b/.docker/config.json", "x/node_modules/y.js", "c/.env", "k.pem"):

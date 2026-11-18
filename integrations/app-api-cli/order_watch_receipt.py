@@ -50,12 +50,13 @@ def parse(stdout, returncode, recipient, tracker_id):
     return exit_ok, {'for': recipient, 'tracker_id': tracker_id, 'watcher_registered': True,
                      'moni_notified': notified, 'moni_notice_failed': notified.startswith('failed'),
                      'moni_notice_held': notified.startswith('held'), 'delivery_card': row.get('delivery_card'),
-                     'chat': row.get('chat')}
+                     'chat': row.get('chat'), **({'bridge_error': row['bridge_error']} if row.get('bridge_error') else {})}
 
 
 def fields(registration):
     """Receipt fields copied into a lane's final success output."""
     registration = registration if isinstance(registration, dict) else {}
-    return {key: registration.get(key) for key in
+    return {**{key: registration.get(key) for key in
             ('for', 'tracker_id', 'watcher_registered', 'moni_notified', 'moni_notice_failed',
-              'moni_notice_held', 'delivery_card', 'chat')}
+              'moni_notice_held', 'delivery_card', 'chat')},
+            **({'bridge_error': registration['bridge_error']} if registration.get('bridge_error') else {})}

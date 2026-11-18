@@ -54,6 +54,8 @@ def mail_hits():
     try:
         out = subprocess.run(["/Users/ardud/.local/bin/msgs", "search", q, "--json", "--limit", "100"],
                              capture_output=True, text=True, timeout=20).stdout
+    except subprocess.TimeoutExpired:
+        raise
     except Exception:
         return {}
     hits = {}
@@ -78,7 +80,11 @@ def main():
     with ThreadPoolExecutor(8) as ex:
         res = dict(zip([a["email"] for a in todo],
                        ex.map(lambda a: usage(toks[a["conn"]]) if toks.get(a["conn"]) else {"_err": "no token"}, todo)))
-    mail = mail_hits()
+    try:
+        mail = mail_hits()
+    except subprocess.TimeoutExpired:
+        print("busy: msgs: search gave up after 20s", file=sys.stderr)
+        return 75
     new, errs = [], 0
     for a in todo:
         e = a["email"]; s, why = api_status(res[e])

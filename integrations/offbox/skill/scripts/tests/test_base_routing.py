@@ -8,12 +8,14 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
-from offbox_lib import api, base_catalog, bases, cli, common, home, identity, pool
+from offbox_lib import allocation, api, base_catalog, bases, cli, common, fallback, home, identity, lease, outage, pool
 
 
 class BaseRouting(unittest.TestCase):
@@ -26,6 +28,8 @@ class BaseRouting(unittest.TestCase):
         self.stack.enter_context(patch.dict(os.environ, {k: v for k, v in os.environ.items()
                                                        if not k.startswith('OFFBOX_')}, clear=True))
         for name, value in [('STATE', self.root), ('SERVER_CFG', self.root / 'server.json'),
+                            ('LOCKS_DIR', self.root / 'locks'), ('LOG_PATH', self.root / 'offbox.log'),
+                            ('HOME_FAILURES', self.root / 'home-failures.jsonl'),
                             ('BACKEND_STATE', self.root / 'backend-state.json'),
                             ('BACKEND_PATH', self.root / 'backend'), ('DB_PATH', self.root / 'offbox-home.db'), ('_BACKEND', None), ('_BACKEND_REASON', None)]:
             self.stack.enter_context(patch.object(common, name, value))
@@ -34,6 +38,7 @@ class BaseRouting(unittest.TestCase):
         self.cons = {}
         for backend in ('server', 'boat'):
             con = sqlite3.connect(common.db_path_for(backend))
+            con.row_factory = sqlite3.Row
             common.ensure_schema(con)
             self.cons[backend] = con
             self.addCleanup(con.close)
@@ -41,12 +46,432 @@ class BaseRouting(unittest.TestCase):
         self.stack.enter_context(patch.object(identity, 'whoami', return_value=self.me))
         self.stack.enter_context(patch.object(identity, 'repo_root', return_value=Path('/repo')))
         self.stack.enter_context(patch.object(identity, 'repo_key', return_value='torssh'))
+        self.real_acquire = pool.acquire
         for module, name in [(api, '_key'), (api, 'get'), (api, 'create'), (api, 'fork'), (pool, 'acquire')]:
             self.stack.enter_context(patch.object(module, name, side_effect=AssertionError('allocation/network forbidden')))
+        self.stack.enter_context(patch.object(home, 'probe', return_value=None))
+        self.stack.enter_context(patch.object(api, 'probe_backend', return_value=None))
         self.stack.enter_context(patch.object(home, 'person_gate'))
         self.logs = []
         self.stack.enter_context(patch.object(cli, 'log', side_effect=self.logs.append))
+        self.real_emit = cli.toollog.emit
         self.events = self.stack.enter_context(patch.object(cli.toollog, 'emit'))
+
+    class Exec(BaseException):
+        pass
+
+    def run_outage(self, *args):
+        argv = ['run', *args, '--', 'true']
+        common.select_backend(common.entry_backend(argv))
+        error = api.ApiError(503, 'server_not_ready', 'fixture home down')
+        error.run_id = 'run-fixture'
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), patch.object(home, 'probe', return_value=None), \
+                patch.object(api, 'probe_backend', return_value=None), \
+                patch.object(cli, '_remote_once', side_effect=error) as remote, \
+                patch.object(outage, 'wait_until_up', return_value=False) as wait, \
+                patch.object(os, 'execve', side_effect=self.Exec) as execute:
+            try:
+                code = cli.main(argv)
+            except self.Exec:
+                code = 'exec'
+        return code, err.getvalue(), remote, wait, execute
+
+    def decisions(self):
+        return [c.kwargs for c in self.events.call_args_list
+                if c.args[:2] == ('home', 'home.failover_decision')]
+
+    def test_named_base_startup_and_outage_share_one_wait_bound(self):
+        from test_home_start_wait import Clock, STARTING, READY
+        self.add('server', 'warm')
+        # Both orders, plus refusals during allocation and while holding a pool queue place.
+        for checkpoint in ('preflight', 'allocation', 'queue', 'outage-probe', 'startup-then-outage'):
+            with self.subTest(checkpoint=checkpoint), contextlib.ExitStack() as stack:
+                clock = Clock()
+                clock.now = 1000
+                for name, replacement in (('monotonic', clock.time), ('time', clock.time), ('sleep', clock.sleep)):
+                    stack.enter_context(patch.object(home.time, name, replacement))
+                stack.enter_context(patch.dict(os.environ, OFFBOX_HOME_START_WAIT_S='10', OFFBOX_OUTAGE_WAIT_SECONDS='60'))
+                stack.enter_context(patch.object(api, 'BACKEND', 'server'))
+                stack.enter_context(patch.object(outage, 'PROBE_EVERY_S', 3))
+                stack.enter_context(patch.object(api, '_key', return_value='fixture'))
+                health = [STARTING, READY] if checkpoint == 'startup-then-outage' else []
+                def read(timeout):
+                    return health.pop(0) if health else STARTING
+                stack.enter_context(patch.object(home, '_health', side_effect=read))
+                if checkpoint in ('preflight', 'startup-then-outage'):
+                    stack.enter_context(patch.object(home, 'probe', side_effect=home._probe))
+                def refuse(request, **kwargs):
+                    raise urllib.error.HTTPError(request.full_url, 503, 'starting', {}, io.BytesIO(json.dumps({
+                        'code': 'server_not_ready', 'starting': True, 'phase': 'waiting for incus',
+                        'message': 'waiting for incus'}).encode()))
+                send = stack.enter_context(patch.object(api, '_open', side_effect=refuse))
+                if checkpoint == 'queue':
+                    self.cons['server'].execute("DELETE FROM bases WHERE name='torssh:warm'")
+                    self.cons['server'].commit()
+                    self.full_home_pool()
+                    stack.enter_context(patch.object(pool, 'acquire', side_effect=self.real_acquire))
+                    stack.enter_context(patch.dict(os.environ, OFFBOX_POOL_SIZE='1', OFFBOX_POOL_WAIT_SECONDS='120'))
+                    stack.enter_context(patch.object(pool, '_refresh_background'))
+                    stack.enter_context(patch.object(pool, '_recheck_prune_holds'))
+                    probes = [0]
+                    def probe():
+                        probes[0] += 1
+                        return None if probes[0] == 1 else home._probe()
+                    stack.enter_context(patch.object(home, 'probe', side_effect=probe))
+                def remote(a, me):
+                    if checkpoint == 'queue':
+                        return pool.acquire(me, base=a.base)
+                    if checkpoint == 'allocation':
+                        with home.pre_start('run-fixture'):
+                            return api.call('GET', '/limits', retries=0)
+                    raise api.NetworkError('home stopped answering')
+                attempt = stack.enter_context(patch.object(cli, '_remote_once', side_effect=remote))
+                execute = stack.enter_context(patch.object(os, 'execve'))
+                local = stack.enter_context(patch.object(fallback, 'run_local'))
+                output = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                self.assertEqual(cli.main(['run', '--base', 'warm', '--', 'true']), 93, output.getvalue())
+                if checkpoint == 'queue':
+                    self.assertGreaterEqual(clock.now - 1000, 10)
+                    self.assertLessEqual(clock.now - 1000, 10 + 2 * outage.PROBE_EVERY_S)
+                else:
+                    self.assertEqual(clock.now - 1000, 10)
+                self.assertIn('home still starting after 10 s', output.getvalue())
+                self.assertEqual(send.call_count, 1 if checkpoint in ('allocation', 'outage-probe', 'startup-then-outage') else 0)
+                self.assertEqual(attempt.call_count, 0 if checkpoint == 'preflight' else 1)
+                execute.assert_not_called()
+                local.assert_not_called()
+                self.assertIsNone(home.WAIT_BUDGET.get())
+                for table in ('pool_waiters', 'pool_pending', 'pool_cap_callers'):
+                    self.assertEqual(self.cons['server'].execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0], 0)
+
+    def test_explicit_home_base_waits_then_exits_93_without_boat_or_local(self):
+        self.add('server', 'warm')
+        for args in (['--base', 'warm'], ['--base=torssh:warm'], ['--bas', 'warm'],
+                     ['--base', 'ignored', '--base', 'warm'], ['--base', 'warm', '--bg', '--no-fallback']):
+            with self.subTest(args=args):
+                self.events.reset_mock()
+                code, err, remote, wait, execute = self.run_outage(*args)
+                self.assertEqual(code, 93, err)
+                self.assertIn("saved base 'torssh:warm'", err)
+                self.assertIn('Nothing ran and nothing was sent to Boat', err)
+                self.assertNotIn('goes to Boat instead', err)
+                wait.assert_called_once()
+                execute.assert_not_called()
+                remote.assert_called_once()
+                decision, = self.decisions()
+                self.assertEqual(decision['props']['decision'], 'wait_explicit_base')
+                self.assertEqual(decision['props']['base'], 'torssh:warm')
+                self.assertEqual(decision['ids']['run'], 'run-fixture')
+        self.assert_no_allocations()
+
+    def test_monitor_down_still_routes_explicit_home_base_to_home(self):
+        self.add('server', 'warm')
+        common.BACKEND_STATE.write_text('{"state":"home_down"}')
+        self.assertEqual(common.entry_backend(['run', '--base', 'warm', '--', 'true']), 'server')
+        self.assertEqual(self.run_outage('--base', 'warm')[0], 93)
+
+    def test_implicit_default_still_fails_over_and_uses_recipe(self):
+        self.add('server', 'warm', default=True)
+        code, err, _, wait, execute = self.run_outage()
+        self.assertEqual(code, 'exec', err)
+        self.assertIn('this run goes to Boat instead', err)
+        wait.assert_not_called()
+        self.assertEqual(self.decisions()[0]['props']['decision'], 'boat')
+        self.assertIsNone(self.decisions()[0]['props']['base'])
+        with patch.dict(os.environ, execute.call_args.args[2]):
+            common.select_backend('boat')
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output), patch.object(lease, '_fit_new', return_value='default'), \
+                    patch.object(lease, 'pick_template', return_value=('crpko-node', 'package.json')), \
+                    patch.object(lease, 'report_template'), patch.object(api, 'create', return_value={'id': 'new'}):
+                result = lease._new_box(self.cons['boat'], self.me, None, None, None, False)
+            self.assertEqual(result[1], 'recipe:crpko-node')
+            self.assertIn('using the repo template or recipe for this run', output.getvalue())
+
+    def test_explicit_base_on_both_backends_is_preserved_on_boat(self):
+        self.add('server', 'warm')
+        self.add('boat', 'warm')
+        code, err, _, wait, execute = self.run_outage('--base', 'warm')
+        self.assertEqual(code, 'exec', err)
+        wait.assert_not_called()
+        failure = json.loads(common.HOME_FAILURES.read_text().splitlines()[-1])
+        self.assertEqual((failure['base'], failure['base_kept']), ('torssh:warm', True))
+        with patch.dict(os.environ, execute.call_args.args[2]):
+            common.select_backend('boat')
+            with patch.object(lease, '_fit_new', return_value='default'), \
+                    patch.object(lease, '_start_from', return_value={'id': 'from-base'}) as start, \
+                    patch.object(lease, 'report_template'):
+                result = lease._new_box(self.cons['boat'], self.me, None, None, 'warm', False)
+            self.assertEqual(result[1], 'base:torssh:warm')
+            self.assertEqual(start.call_args.args[2]['name'], 'torssh:warm')
+
+    def test_new_box_cannot_drop_an_explicit_home_only_base_on_boat(self):
+        self.add('server', 'warm')
+        with patch.dict(os.environ, OFFBOX_BACKEND='boat', OFFBOX_FAILOVER='unreachable'):
+            common.select_backend('boat')
+            with self.assertRaises(common.OffboxError) as caught:
+                lease._new_box(self.cons['boat'], self.me, None, None, 'warm', False)
+        self.assertEqual(caught.exception.code, 93)
+        self.assertIn('torssh:warm', str(caught.exception))
+        self.assert_no_allocations()
+
+    def test_explicit_base_wait_retries_home_when_it_returns(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        argv = ['run', '--base', 'warm', '--', 'true']
+        with patch.object(cli, '_remote_once', side_effect=[api.NetworkError('unreachable'), 7]) as remote, \
+                patch.object(outage, 'wait_until_up', return_value=True) as wait, \
+                patch.object(os, 'execve', side_effect=AssertionError('must stay home')):
+            self.assertEqual(cli.main(argv), 7)
+        self.assertEqual(remote.call_count, 2)
+        wait.assert_called_once()
+        self.assertEqual(wait.call_args.kwargs['service'], 'home offbox server')
+
+    def test_outage_retry_deadlines_keep_the_home_base_restriction(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        for shape in ('budget', 'wrapped_budget', 'pool_deadline'):
+            for flags in ([], ['--bg'], ['--remote'], ['--no-fallback']):
+                with self.subTest(shape=shape, flags=flags):
+                    clock = [1000.0]
+                    budget = api.BudgetExpired('allocation budget exhausted')
+                    error = budget
+                    if shape == 'wrapped_budget':
+                        error = common.OffboxError('wrapped allocation failure')
+                        error.__cause__ = budget
+                    elif shape == 'pool_deadline':
+                        error = pool.PoolBusyError('allocation wait expired; nothing ran')
+                    attempts = []
+                    def remote(*args):
+                        attempts.append(outage.allocation_left())
+                        if len(attempts) == 1:
+                            raise api.NetworkError('home is unreachable')
+                        clock[0] += 61
+                        raise error
+                    with patch.object(cli, '_remote_once', side_effect=remote), \
+                            patch.object(cli, 'time', types.SimpleNamespace(monotonic=lambda: clock[0])), \
+                            patch.object(outage, 'time', types.SimpleNamespace(monotonic=lambda: clock[0])), \
+                            patch.object(outage, 'window_seconds', return_value=60), \
+                            patch.object(outage, 'wait_until_up', return_value=True) as wait, \
+                            patch.object(fallback, 'run_local', return_value=17) as local, \
+                            patch.object(os, 'execve') as execute, contextlib.redirect_stderr(io.StringIO()) as err:
+                        code = cli.main(['run', '--base', 'warm', *flags, '--', 'true'])
+                    self.assertEqual(code, 93, err.getvalue())
+                    self.assertIn("saved base 'torssh:warm'", err.getvalue())
+                    self.assertEqual(attempts, [None, 60])
+                    wait.assert_called_once()
+                    local.assert_not_called()
+                    execute.assert_not_called()
+
+    def test_a_named_base_never_falls_back_locally_on_prestart_errors(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        for boat_copy in (False, True):
+            if boat_copy:
+                self.add('boat', 'warm')
+            for error in (api.BudgetExpired('client budget'), pool.PoolBusyError('full pool'),
+                          common.OffboxError('setup failure')):
+                with self.subTest(error=type(error).__name__, boat_copy=boat_copy), \
+                        patch.object(cli, '_remote_once', side_effect=error), \
+                        patch.object(fallback, 'run_local', return_value=17) as local, \
+                        patch.object(fallback, 'note_infra_failure'), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(cli.main(['run', '--base', 'warm', '--', 'true']), error.code)
+                    local.assert_not_called()
+
+    def test_fresh_keeps_local_fallback_when_the_named_base_is_ignored(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        with patch.object(cli, '_remote_once', side_effect=api.BudgetExpired('client budget')), \
+                patch.object(fallback, 'run_local', return_value=17) as local, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(['run', '--base', 'warm', '--fresh', '--', 'true']), 17)
+        local.assert_called_once()
+
+    def full_home_pool(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        con = self.cons['server']
+        con.execute("INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,source) "
+                    "VALUES ('busy','other','/other','torssh','w/other','running','default','base:torssh:warm')")
+        con.execute("INSERT INTO pool_members VALUES ('busy','torssh')")
+        con.execute("INSERT INTO runs(run_id,box_id,status,mode) VALUES ('busy-run','busy','running','fg')")
+        con.commit()
+
+    def test_home_outage_is_checked_before_entering_a_full_pool(self):
+        self.full_home_pool()
+        for state, health, auth in (('home_down', 'server says it cannot take runs', None),
+                                    ('home_up', 'server says it cannot take runs', None),
+                                    ('home_up', None, 'authenticated API did not answer')):
+            for flags in ([], ['--bg']):
+                with self.subTest(state=state, health=health, flags=flags):
+                    common.BACKEND_STATE.write_text(json.dumps({'state': state}))
+                    clock = [1000.0]
+                    def advance(seconds):
+                        clock[0] += seconds
+                    def pool_sleep(seconds):
+                        clock[0] += pool.HOME_WAIT_S
+                    pool_clock = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=pool_sleep)
+                    wait_clock = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+                    with patch.object(home, 'probe', return_value=health) as health_probe, \
+                            patch.object(api, 'probe_backend', return_value=auth), \
+                            patch.object(api, 'probe', return_value='no answer') as probe, \
+                            patch.object(outage, 'window_seconds', return_value=60), \
+                            patch.object(cli, 'time', wait_clock), patch.object(outage, 'time', wait_clock), \
+                            patch.object(pool, 'time', pool_clock), patch.object(allocation, 'time', pool_clock), \
+                            patch.dict(os.environ, OFFBOX_POOL_SIZE='1'), \
+                            patch.object(pool, '_refresh_background'), patch.object(pool, '_recheck_prune_holds'), \
+                            patch.object(pool, 'acquire', side_effect=self.real_acquire) as acquire, \
+                            patch.object(cli, '_remote_once', side_effect=lambda a, me: pool.acquire(me, base=a.base)), \
+                            patch.object(fallback, 'run_local', return_value=17) as local, \
+                            patch.object(os, 'execve') as execute, contextlib.redirect_stderr(io.StringIO()) as err:
+                        code = cli.main(['run', '--base', 'warm', *flags, '--', 'true'])
+                    self.assertEqual(code, 93, err.getvalue())
+                    self.assertIn("saved base 'torssh:warm'", err.getvalue())
+                    self.assertLessEqual(clock[0] - 1000, 60)
+                    health_probe.assert_called_once()
+                    self.assertGreater(probe.call_count, 0)
+                    acquire.assert_not_called()
+                    local.assert_not_called()
+                    execute.assert_not_called()
+
+    def test_healthy_preflight_then_outage_interrupts_named_base_queue_waits(self):
+        self.full_home_pool()
+        for contention, queue_wait in (('full_pool', '120'), ('pool_lock', '120'),
+                                       ('full_pool', '8'), ('pool_lock', '8')):
+            for failure in ('health', 'authenticated_api'):
+                for flags in ([], ['--bg']):
+                    with self.subTest(contention=contention, wait=queue_wait, failure=failure, flags=flags):
+                        clock = [1000.0]
+                        def advance(seconds):
+                            clock[0] += seconds
+                        fake_time = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+                        real_lock = common.file_lock
+                        @contextlib.contextmanager
+                        def pool_lock(name, timeout=600):
+                            if contention == 'pool_lock' and name == pool.lock_name('torssh'):
+                                advance(timeout)
+                                raise common.OffboxError('timed out waiting for lock ' + name)
+                            with real_lock(name, timeout=timeout):
+                                yield
+                        def health():
+                            # A slow health request must not hold the shared pool lock.
+                            with real_lock(pool.lock_name('torssh'), timeout=0):
+                                pass
+                            return 'server says it cannot take runs' if failure == 'health' and clock[0] > 1000 else None
+                        def auth(*args):
+                            return 'authenticated API did not answer' if failure == 'authenticated_api' and clock[0] > 1000 else None
+                        with contextlib.ExitStack() as stack:
+                            health_probe = stack.enter_context(patch.object(home, 'probe', side_effect=health))
+                            remote = stack.enter_context(patch.object(cli, '_remote_once',
+                                side_effect=lambda a, me: pool.acquire(me, base=a.base)))
+                            local = stack.enter_context(patch.object(fallback, 'run_local'))
+                            execute = stack.enter_context(patch.object(os, 'execve'))
+                            err = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                            for mocked in (
+                                patch.object(api, 'probe_backend', side_effect=auth),
+                                patch.object(api, 'probe', return_value='no answer'),
+                                patch.object(outage, 'window_seconds', return_value=60),
+                                patch.object(cli, 'time', fake_time), patch.object(outage, 'time', fake_time),
+                                patch.object(pool, 'time', fake_time), patch.object(allocation, 'time', fake_time),
+                                patch.dict(os.environ, OFFBOX_POOL_SIZE='1', OFFBOX_POOL_WAIT_SECONDS=queue_wait),
+                                patch.object(pool, 'file_lock', pool_lock),
+                                patch.object(pool, '_refresh_background'), patch.object(pool, '_recheck_prune_holds'),
+                                patch.object(pool, 'acquire', side_effect=self.real_acquire),
+                            ):
+                                stack.enter_context(mocked)
+                            code = cli.main(['run', '--base', 'warm', *flags, '--', 'true'])
+                        expired = int(queue_wait) < 60
+                        self.assertEqual(code, 92 if expired else 93, err.getvalue())
+                        self.assertIn('queue timed out' if expired else "saved base 'torssh:warm'", err.getvalue())
+                        self.assertLessEqual(clock[0] - 1000, int(queue_wait) if expired else 60 + pool.LOCK_WAIT_S)
+                        self.assertGreaterEqual(health_probe.call_count, 1 if expired else 2)
+                        remote.assert_called_once()
+                        local.assert_not_called()
+                        execute.assert_not_called()
+                        for table in ('pool_waiters', 'pool_pending', 'pool_cap_callers'):
+                            self.assertEqual(self.cons['server'].execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0], 0)
+                        self.assertEqual(self.cons['server'].execute("SELECT status FROM runs WHERE run_id='busy-run'").fetchone()[0], 'running')
+
+    def test_healthy_named_base_keeps_its_queue_place_until_a_slot_frees(self):
+        self.full_home_pool()
+        con = self.cons['server']
+        con.execute('UPDATE bases SET is_default=1')
+        con.commit()
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                con.execute("INSERT OR REPLACE INTO runs(run_id,box_id,status,mode) VALUES ('busy-run','busy','running','fg')")
+                con.commit()
+                clock = [1000.0]
+                seen_waiters = []
+                def advance(seconds):
+                    clock[0] += seconds
+                    if clock[0] >= 1018:
+                        con.execute("DELETE FROM runs WHERE run_id='busy-run'")
+                        con.commit()
+                def health():
+                    seen_waiters.append(tuple(row[0] for row in con.execute('SELECT token FROM pool_waiters')))
+                    return None
+                fake_time = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+                got = []
+                def remote(a, me):
+                    row = pool.acquire(me, base=a.base)
+                    got.append(row['box_id'])
+                    pool.release_guard(row)
+                    return 7
+                with patch.object(home, 'probe', side_effect=health), \
+                        patch.object(cli, 'time', fake_time), patch.object(pool, 'time', fake_time), \
+                        patch.object(allocation, 'time', fake_time), \
+                        patch.dict(os.environ, OFFBOX_POOL_SIZE='1', OFFBOX_POOL_WAIT_SECONDS='120'), \
+                        patch.object(pool, '_refresh_background'), patch.object(pool, '_recheck_prune_holds'), \
+                        patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)), \
+                        patch.object(pool, 'acquire', side_effect=self.real_acquire), \
+                        patch.object(cli, '_remote_once', side_effect=remote), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    args = ['--base', 'warm'] if explicit else []
+                    self.assertEqual(cli.main(['run', *args, '--', 'true']), 7)
+                self.assertEqual(got, ['busy'])
+                self.assertEqual(seen_waiters[0], ())
+                if explicit:
+                    self.assertGreaterEqual(len(seen_waiters), 2)
+                    self.assertEqual(len({token for sample in seen_waiters[1:] for token in sample}), 1)
+                else:
+                    self.assertEqual(len(seen_waiters), 1, 'implicit defaults retain preflight-only probing')
+
+    def test_fresh_ignores_named_base_during_failover(self):
+        self.add('server', 'warm')
+        code, err, _, wait, _ = self.run_outage('--base', 'warm', '--fresh')
+        self.assertEqual(code, 'exec', err)
+        wait.assert_not_called()
+        self.assertIsNone(self.decisions()[0]['props']['base'])
+
+    def test_an_accepted_run_with_explicit_base_is_never_retried(self):
+        self.add('server', 'warm')
+        common.select_backend('server')
+        error = api.NetworkError('unreachable after accept')
+        error.started = True
+        with patch.object(cli, '_remote_once', side_effect=error), \
+                patch.object(outage, 'wait_until_up') as wait, \
+                patch.object(os, 'execve') as execute, patch('offbox_lib.fallback.note_infra_failure'), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(['run', '--base', 'warm', '--', 'true']), 90)
+        wait.assert_not_called()
+        execute.assert_not_called()
+        self.assertEqual(self.decisions(), [])
+
+    def test_failover_decisions_reach_the_tool_log(self):
+        self.add('server', 'warm', default=True)
+        # Undo the fixture's emit mock: exercise the real event sanitizer and NDJSON sink.
+        with patch.object(home.toollog, 'emit', self.real_emit), \
+                patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.root / 'tool-logs')):
+            self.assertEqual(self.run_outage('--base', 'warm')[0], 93)
+            self.assertEqual(self.run_outage()[0], 'exec')
+        events = [json.loads(line) for path in (self.root / 'tool-logs').glob('*.ndjson')
+                  for line in path.read_text().splitlines()]
+        decisions = [row for row in events if row['name'] == 'home.failover_decision']
+        self.assertEqual([row['props']['decision'] for row in decisions], ['wait_explicit_base', 'boat'])
+        self.assertEqual([row['props']['base'] for row in decisions], ['torssh:warm', None])
 
     def add(self, backend, short, *, repo='torssh', default=False, expired=None, owner='ardud', saved='snapshot'):
         self.cons[backend].execute('''INSERT INTO bases
@@ -117,7 +542,7 @@ class BaseRouting(unittest.TestCase):
         self.assertFalse(any(call.args[:2] == ('backend', 'backend.failover') for call in self.events.call_args_list))
         self.assert_no_allocations()
 
-    def test_automatic_failover_keeps_home_base_recipe_fallback(self):
+    def test_forwarded_base_is_validated_before_allocation_safety_net(self):
         self.add('server', 'warm')
         argv = ['run', '--base', 'torssh:warm', '--', 'true']
         with patch.dict(os.environ, OFFBOX_BACKEND='boat', OFFBOX_FAILOVER='unreachable'):

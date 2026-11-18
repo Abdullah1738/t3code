@@ -1,6 +1,10 @@
 import { assert, it } from "@effect/vitest";
 import {
+  EventId,
   MessageId,
+  type OrchestrationV2ExecutionNode,
+  type OrchestrationV2ProviderTurn,
+  type OrchestrationV2DomainEvent,
   NodeId,
   ProviderInstanceId,
   ProviderThreadId,
@@ -10,10 +14,19 @@ import {
   ThreadId,
   TurnItemId,
   type OrchestrationV2Run,
+  type OrchestrationV2ThreadProjection,
   type OrchestrationV2AssistantPhase,
+  type OrchestrationV2Notification,
 } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
-import { makeSubagentConversationArtifacts, subagentResultForRun } from "./subagentProjection.ts";
+import {
+  endRunlessRootTurns,
+  endRunlessProviderTurns,
+  makeSubagentConversationArtifacts,
+  subagentResultForRun,
+  delegatedTaskResultRun,
+} from "./subagentProjection.ts";
 
 const now = DateTime.makeUnsafe("2026-11-05T17:52:25Z");
 const run: OrchestrationV2Run = {
@@ -33,6 +46,22 @@ const run: OrchestrationV2Run = {
   checkpointId: null,
   contextHandoffId: null,
 };
+type Message = OrchestrationV2ThreadProjection["messages"][number];
+const makeMessage = (overrides: Partial<Message> & Pick<Message, "runId">): Message => ({
+  id: run.userMessageId,
+  threadId: run.threadId,
+  createdBy: "agent",
+  creationSource: "server",
+  nodeId: null,
+  role: "user",
+  text: "Background work completed",
+  phase: "unknown",
+  attachments: [],
+  streaming: false,
+  createdAt: now,
+  updatedAt: now,
+  ...overrides,
+});
 const cases: ReadonlyArray<{
   finish: string | null | undefined;
   phase: OrchestrationV2AssistantPhase;
@@ -129,5 +158,463 @@ it.each(
     } else {
       assert.equal(result.text, text);
     }
+  },
+);
+
+const assistantArtifacts = (phase?: OrchestrationV2AssistantPhase) => {
+  const artifacts = makeSubagentConversationArtifacts({
+    messageId: MessageId.make("assistant"),
+    turnItemId: TurnItemId.make("assistant"),
+    threadId: run.threadId,
+    rootNodeId: run.rootNodeId!,
+    providerThreadId: run.providerThreadId,
+    providerTurnId: null,
+    nativeItemRef: null,
+    role: "assistant",
+    text:
+      phase === "answer" ? "All checks passed." : "I'll continue reviewing the remaining files.",
+    ordinal: 1,
+    now: DateTime.makeUnsafe("2026-11-05T17:14:25Z"),
+  });
+  if (artifacts.turnItem.type !== "assistant_message") throw new Error("Expected assistant item");
+  return {
+    message: {
+      ...artifacts.message,
+      runId: run.id,
+      ...(phase === undefined ? {} : { phase }),
+    },
+    turnItem: {
+      ...artifacts.turnItem,
+      runId: run.id,
+      ...(phase === undefined ? {} : { phase }),
+    },
+  };
+};
+
+it.each(
+  (["cancelled", "interrupted"] as const).flatMap((status) =>
+    (["narration", "answer", "unknown", undefined] as const).flatMap((phase) =>
+      (["both", "message", "turn_item"] as const).map((source) => ({ status, phase, source })),
+    ),
+  ),
+)("reports $status with labelled partial findings (phase=$phase source=$source)", (test) => {
+  const artifacts = assistantArtifacts(test.phase);
+  const result = subagentResultForRun(
+    {
+      messages: test.source === "turn_item" ? [] : [artifacts.message],
+      turnItems: test.source === "message" ? [] : [artifacts.turnItem],
+      providerTurns: [
+        {
+          id: ProviderTurnId.make("finished-step"),
+          providerThreadId: run.providerThreadId!,
+          nodeId: run.rootNodeId!,
+          runAttemptId: run.activeAttemptId,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "completed",
+          startedAt: artifacts.message.createdAt,
+          completedAt: artifacts.message.createdAt,
+          finish: "end_turn",
+        },
+      ],
+    },
+    { ...run, status: test.status },
+  );
+  assert.deepEqual(result, {
+    text: `Child task ${test.status}; no final report.\n\nPartial assistant findings (not a final report):\n${artifacts.message.text}`,
+    incomplete: `the child task was ${test.status} without a final report`,
+    messageId: artifacts.message.id,
+    turnItemId: test.source === "message" ? null : artifacts.turnItem.id,
+  });
+  assert.notProperty(result, "finalReport");
+});
+
+it.each(["cancelled", "interrupted"] as const)(
+  "reports %s without an assistant result or a started attempt",
+  (status) => {
+    const artifacts = assistantArtifacts("answer");
+    const otherRunId = RunId.make("other-run");
+    const result = subagentResultForRun(
+      {
+        messages: [makeMessage({ runId: run.id }), { ...artifacts.message, runId: otherRunId }],
+        turnItems: [{ ...artifacts.turnItem, runId: otherRunId }],
+        providerTurns: [],
+      },
+      { ...run, status, startedAt: null, activeAttemptId: null, rootNodeId: null },
+    );
+    assert.equal(result.text, `Child task ${status}; no final report.`);
+    assert.isNotNull(result.incomplete);
+    assert.isNull(result.messageId);
+    assert.isNull(result.turnItemId);
+  },
+);
+
+const cancellationMetadata: ReadonlyArray<{
+  metadata: Pick<OrchestrationV2Run, "cancelReason" | "cancelDetail">;
+  suffix: string;
+}> = [
+  {
+    metadata: {
+      cancelReason: "task_cancel",
+      cancelDetail: " \n The parent cancelled this task. \n ",
+    },
+    suffix: "\nReason: task_cancel\nDetail: The parent cancelled this task.",
+  },
+  {
+    metadata: { cancelReason: "provider_interrupted" },
+    suffix: "\nReason: provider_interrupted",
+  },
+  {
+    metadata: { cancelDetail: " Provider connection closed. " },
+    suffix: "\nDetail: Provider connection closed.",
+  },
+  {
+    metadata: { cancelReason: "unknown", cancelDetail: " \n " },
+    suffix: "\nReason: unknown",
+  },
+  { metadata: { cancelDetail: "" }, suffix: "" },
+];
+it.each(
+  (["cancelled", "interrupted"] as const).flatMap((status) =>
+    cancellationMetadata.map((test) => ({ ...test, status })),
+  ),
+)("reports $status with cancellation metadata $metadata", ({ status, metadata, suffix }) => {
+  const result = subagentResultForRun(
+    { messages: [], turnItems: [], providerTurns: [] },
+    { ...run, status, ...metadata },
+  );
+  assert.equal(result.text, `Child task ${status}; no final report.${suffix}`);
+  assert.isNotNull(result.incomplete);
+  assert.isNull(result.messageId);
+  assert.isNull(result.turnItemId);
+});
+
+it("keeps provider errors ahead of narration for failed runs", () => {
+  const artifacts = assistantArtifacts("narration");
+  const failure = {
+    class: "provider_error" as const,
+    message: "The provider rejected the request.",
+    code: null,
+    retryable: false,
+  };
+  const error = {
+    ...artifacts.turnItem,
+    id: TurnItemId.make("failure"),
+    type: "error" as const,
+    ordinal: 2,
+    failure,
+  };
+  const result = subagentResultForRun(
+    {
+      messages: [artifacts.message],
+      turnItems: [error, artifacts.turnItem],
+      providerTurns: [],
+    },
+    { ...run, status: "failed" },
+  );
+  assert.deepEqual(result, {
+    text: failure.message,
+    incomplete: null,
+    messageId: null,
+    turnItemId: error.id,
+  });
+});
+
+const root: OrchestrationV2ExecutionNode = {
+  id: NodeId.make("runless-root"),
+  threadId: run.threadId,
+  runId: null,
+  parentNodeId: null,
+  rootNodeId: NodeId.make("runless-root"),
+  kind: "root_turn",
+  status: "running",
+  countsForRun: false,
+  providerThreadId: run.providerThreadId,
+  providerTurnId: ProviderTurnId.make("runless-turn"),
+  nativeItemRef: null,
+  runtimeRequestId: null,
+  checkpointScopeId: null,
+  startedAt: now,
+  completedAt: null,
+};
+const runlessTurn: OrchestrationV2ProviderTurn = {
+  id: root.providerTurnId!,
+  nodeId: root.id,
+  providerThreadId: root.providerThreadId!,
+  runAttemptId: null,
+  nativeTurnRef: null,
+  ordinal: 1,
+  status: "running",
+  startedAt: now,
+  completedAt: null,
+};
+const endInput = {
+  threadId: run.threadId,
+  providerInstanceId: run.providerInstanceId,
+  now,
+  emitted: [] as ReadonlyArray<OrchestrationV2DomainEvent>,
+  allocateEventId: () => Effect.succeed(EventId.make("end-runless")),
+};
+it.effect("ends the active root, streaming item and every runless turn together", () =>
+  Effect.gen(function* () {
+    const item = makeSubagentConversationArtifacts({
+      messageId: MessageId.make("stream"),
+      turnItemId: TurnItemId.make("stream"),
+      threadId: run.threadId,
+      rootNodeId: root.id,
+      providerThreadId: root.providerThreadId,
+      providerTurnId: runlessTurn.id,
+      nativeItemRef: null,
+      role: "assistant",
+      text: "Working",
+      ordinal: 1,
+      now,
+    }).turnItem;
+    const events = yield* endRunlessRootTurns({
+      ...endInput,
+      status: "cancelled",
+      projection: {
+        nodes: [root],
+        turnItems: [{ ...item, status: "running", completedAt: null }],
+        providerTurns: [
+          runlessTurn,
+          { ...runlessTurn, id: ProviderTurnId.make("pending"), status: "pending" },
+        ],
+      },
+    });
+    assert.deepEqual(
+      events.map((e) => e.type),
+      ["node.updated", "turn-item.updated", "provider-turn.updated", "provider-turn.updated"],
+    );
+    for (const event of events) {
+      if (
+        event.type === "node.updated" ||
+        event.type === "turn-item.updated" ||
+        event.type === "provider-turn.updated"
+      ) {
+        assert.equal(event.payload.status, "cancelled");
+        assert.deepEqual(event.payload.completedAt, now);
+      }
+    }
+  }),
+);
+it.effect.each(["cancelled", "completed", "failed", "interrupted"] as const)(
+  "repairs a %s root using its own completion time",
+  (status) =>
+    Effect.gen(function* () {
+      const completedAt = DateTime.makeUnsafe("2026-10-03T02:53:13.220Z");
+      const events = yield* endRunlessRootTurns({
+        ...endInput,
+        status: "cancelled",
+        projection: {
+          nodes: [{ ...root, status, completedAt }],
+          providerTurns: [runlessTurn],
+          turnItems: [],
+        },
+      });
+      assert.equal(events.length, 1);
+      assert.equal(events[0]?.type, "provider-turn.updated");
+      const event = events[0];
+      if (event?.type !== "provider-turn.updated") throw new Error("Expected provider turn update");
+      assert.equal(event.payload.status, status);
+      assert.deepEqual(event.payload.completedAt, completedAt);
+    }),
+);
+it.effect("preserves attached, already ended, already emitted and live-owned turns", () =>
+  Effect.gen(function* () {
+    const terminalRoot = { ...root, status: "cancelled" as const };
+    const event: OrchestrationV2DomainEvent = {
+      id: EventId.make("prior"),
+      type: "provider-turn.updated",
+      threadId: run.threadId,
+      occurredAt: now,
+      payload: { ...runlessTurn, status: "cancelled", completedAt: now },
+    };
+    for (const turn of [
+      { ...runlessTurn, runAttemptId: run.activeAttemptId },
+      { ...runlessTurn, status: "completed" as const, completedAt: now },
+    ]) {
+      assert.deepEqual(
+        yield* endRunlessRootTurns({
+          ...endInput,
+          status: "cancelled",
+          projection: { nodes: [terminalRoot], providerTurns: [turn], turnItems: [] },
+        }),
+        [],
+      );
+    }
+    assert.deepEqual(
+      yield* endRunlessRootTurns({
+        ...endInput,
+        emitted: [event],
+        status: "cancelled",
+        projection: { nodes: [terminalRoot], providerTurns: [runlessTurn], turnItems: [] },
+      }),
+      [],
+    );
+    assert.deepEqual(
+      yield* endRunlessProviderTurns({
+        ...endInput,
+        projection: { nodes: [root], providerTurns: [runlessTurn] },
+      }),
+      [],
+    );
+    const events = yield* endRunlessProviderTurns({
+      ...endInput,
+      projection: { nodes: [terminalRoot], providerTurns: [runlessTurn] },
+    });
+    const repaired = events[0];
+    if (repaired?.type !== "provider-turn.updated")
+      throw new Error("Expected provider turn update");
+    assert.deepEqual(repaired.payload.completedAt, now);
+  }),
+);
+
+it.each([
+  "single",
+  "wake",
+  "cancelled",
+  "foreign",
+  "foreign_then_wake",
+  "monitor",
+  "unstarted",
+  "rolled_back",
+  "active_tagged",
+  "latest_tagged",
+] as const)("selects a delegated task's result run: %s", (scenario) => {
+  const taskId = NodeId.make("result-task");
+  const tagged = { ...run, delegatedTaskId: taskId };
+  const later = {
+    ...run,
+    id: RunId.make("wake"),
+    ordinal: 2,
+    status:
+      scenario === "cancelled"
+        ? ("cancelled" as const)
+        : scenario === "active_tagged"
+          ? ("running" as const)
+          : scenario === "rolled_back"
+            ? ("rolled_back" as const)
+            : ("completed" as const),
+    ...(scenario === "foreign" || scenario === "foreign_then_wake"
+      ? { delegatedTaskId: NodeId.make("other-task") }
+      : scenario === "latest_tagged" || scenario === "active_tagged"
+        ? { delegatedTaskId: taskId }
+        : {}),
+    startedAt: scenario === "unstarted" ? null : now,
+  };
+  const projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages"> = {
+    runs:
+      scenario === "single"
+        ? [tagged]
+        : scenario === "foreign_then_wake"
+          ? [tagged, later, { ...run, id: RunId.make("foreign-wake"), ordinal: 3 }]
+          : [tagged, later],
+    messages:
+      scenario === "monitor"
+        ? [
+            makeMessage({
+              runId: later.id,
+              notification: {
+                source: { kind: "monitor" },
+                outcome: "completed",
+                summary: "Background work completed",
+              },
+            }),
+          ]
+        : [],
+  };
+  assert.equal(
+    delegatedTaskResultRun(projection, taskId)?.id,
+    ["wake", "cancelled", "latest_tagged", "active_tagged"].includes(scenario)
+      ? later.id
+      : tagged.id,
+  );
+});
+
+it.each([
+  { source: "command", status: "cancelled", selected: true },
+  { source: "subagent", status: "cancelled", selected: true },
+  { source: "delegated_task", status: "cancelled", selected: true },
+  { source: "background_task", status: "cancelled", selected: true },
+  { source: "system", status: "cancelled", selected: false },
+  { source: "monitor", status: "cancelled", selected: false },
+  { source: undefined, status: "cancelled", selected: false },
+  { source: "command", status: "completed", selected: false },
+  { source: "command", status: "failed", selected: false },
+  { source: "command", status: "interrupted", selected: false },
+  { source: "command", status: "rolled_back", selected: false },
+] as const)("selects an unstarted $status continuation from $source: $selected", (entry) => {
+  const taskId = NodeId.make("result-task");
+  const tagged = { ...run, delegatedTaskId: taskId };
+  const later = {
+    ...run,
+    id: RunId.make("wake"),
+    ordinal: 2,
+    status: entry.status,
+    startedAt: null,
+  };
+  const source: OrchestrationV2Notification["source"] | undefined =
+    entry.source === "delegated_task"
+      ? { kind: entry.source, taskIds: [taskId] }
+      : entry.source === undefined
+        ? undefined
+        : { kind: entry.source };
+  const messages =
+    source === undefined
+      ? []
+      : [
+          makeMessage({
+            id: later.userMessageId,
+            runId: later.id,
+            notification: { source, outcome: "completed", summary: "Background work completed" },
+          }),
+        ];
+  const projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages"> = {
+    runs: [tagged, later],
+    messages,
+  };
+  assert.equal(
+    delegatedTaskResultRun(projection, taskId)?.id,
+    entry.selected ? later.id : tagged.id,
+  );
+  assert.equal(
+    delegatedTaskResultRun(
+      { ...projection, runs: [tagged, { ...later, delegatedTaskId: NodeId.make("other-task") }] },
+      taskId,
+    )?.id,
+    tagged.id,
+  );
+  assert.equal(
+    delegatedTaskResultRun(
+      {
+        ...projection,
+        runs: [
+          tagged,
+          {
+            ...run,
+            id: RunId.make("foreign"),
+            ordinal: 2,
+            delegatedTaskId: NodeId.make("other-task"),
+          },
+          { ...later, ordinal: 3 },
+        ],
+      },
+      taskId,
+    )?.id,
+    tagged.id,
+  );
+});
+
+it.each(["server_restart", "server_shutdown"] as const)(
+  "leaves %s output to restart completion",
+  (cancelReason) => {
+    const artifacts = assistantArtifacts("narration");
+    const result = subagentResultForRun(
+      { messages: [artifacts.message], turnItems: [artifacts.turnItem], providerTurns: [] },
+      { ...run, status: "cancelled", cancelReason },
+    );
+    assert.include(result.text, artifacts.message.text);
+    assert.notInclude(result.text, "Child task cancelled; no final report.");
   },
 );

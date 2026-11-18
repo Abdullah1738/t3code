@@ -1,3 +1,4 @@
+import { DeletedBoardsDialog } from "./BoardDeletion";
 import { askNotificationsRef } from "./needsYou/useAskTiming";
 import { Link, useMatchRoute, useParams, useSearch } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
@@ -70,6 +71,7 @@ export function BoardsSidebarGroup() {
         </button>
         <NewBoardDialog open={creating} onOpenChange={setCreating} />
       </div>
+      <DeletedBoardsDialog />
       {live.length > 0 ? <NeedsYouRow onNavigate={onNavigate} /> : null}
       {expanded && live.length > 0 ? (
         <ul className="flex flex-col gap-0.5 pb-3.5">

@@ -1,9 +1,12 @@
-import { expect, test } from "bun:test";
+import { expect, test, setDefaultTimeout } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Delivery, State, Watcher } from "../src/lib.ts";
+import type { LogEntry } from "../src/toollog.ts";
+
+setDefaultTimeout(30_000);
 
 const projectThread = "thread:project:work:abcd1234-5678-4000-8000-123456789abc";
 const ownerThread = "ardud-control:thread:11111111-2222-4000-8000-123456789abc";
@@ -16,11 +19,24 @@ type Fixture = {
   statusError?: boolean;
   nativeError?: boolean;
   sendError?: boolean;
+  requireSendJournal?: boolean;
+  sendAmbiguous?: boolean;
+  strictWakeKey?: boolean;
+  wakeAmbiguousOnce?: boolean;
+  sendSleep?: boolean;
+  sendSpawnError?: boolean;
   wakeError?: boolean;
   imessageError?: boolean;
   telegramError?: boolean;
   noOverride?: boolean;
   missingCli?: boolean;
+  nativeOutput?: string;
+  statusOutput?: string;
+  nativeSleep?: boolean;
+  statusSleep?: boolean;
+  statusSleepOnce?: boolean;
+  nativeSleepOnce?: boolean;
+  statusEmptyError?: boolean;
 };
 
 // Each delivery runs in a fresh process: caches, bridge rows, logs and every CLI stay inside its fixture.
@@ -34,14 +50,39 @@ async function fixture(options: Fixture = {}, body = "await deliver(watcher, 'ev
     const stub = (cli: string) => {
       const file = join(dir, `${cli}.ts`);
       writeFileSync(file, `#!${process.execPath}
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ cli: ${JSON.stringify(cli)}, args }) + '\\n');
 const config = JSON.parse(readFileSync(${JSON.stringify(config)}, 'utf8'));
 if (${JSON.stringify(cli)} === 't3ctl') {
-  if (config[args[0] + 'Error']) { console.error(args[0] + ' stub failure'); process.exit(1); }
-  console.log(JSON.stringify(args[0] === 'send' ? { ok: true, duplicate: false } : { ok: true, thread: config.status }));
+  if (args[0] === 'send' && config.requireSendJournal) {
+    const state = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'root/watchers/route-test/state.json'))}, 'utf8'));
+    if (state.pending?.creatorSend?.thread !== args[1] || !(state.pending.creatorSend.sentAt <= Date.now())) process.exit(1);
+  }
+  if (args[0] === 'send' && config.sendAmbiguous) process.exit(4);
+  if (args[0] === 'status' && config.sendSpawnError) unlinkSync(import.meta.path);
+  if (config[args[0] + 'SleepOnce']) {
+    delete config[args[0] + 'SleepOnce'];
+    writeFileSync(${JSON.stringify(config)}, JSON.stringify(config));
+    console.error('probe waiting'); await Bun.sleep(10_000);
+  }
+  if (config[args[0] + 'Sleep']) { console.error('probe waiting'); await Bun.sleep(10_000); }
+  if (args[0] === 'status' && config.statusEmptyError) process.exit(1);
+  if (config[args[0] + 'Error']) { console.error((args[0] === 'status' ? 'not_found: ' : '') + args[0] + ' stub failure'); process.exit(1); }
+  console.log(config[args[0] + 'Output'] ?? JSON.stringify(args[0] === 'send' ? { ok: true, duplicate: false } : { ok: true, thread: config.status }));
 } else {
+  if (args[0] === 'wake' && config.strictWakeKey) {
+    const file = ${JSON.stringify(join(dir, 'accepted-wake.json'))};
+    let previous;
+    try { previous = JSON.parse(readFileSync(file, 'utf8')); } catch {}
+    if (previous && JSON.stringify(previous) !== JSON.stringify(args)) process.exit(9);
+    writeFileSync(file, JSON.stringify(args));
+  }
+  if (args[0] === 'wake' && config.wakeAmbiguousOnce) {
+    delete config.wakeAmbiguousOnce;
+    writeFileSync(${JSON.stringify(config)}, JSON.stringify(config));
+    process.exit(4);
+  }
   if (args[0] === 'wake' && config.wakeError || args[0] === 'send' && config.imessageError
     || ${JSON.stringify(cli)} === 'telegram' && config.telegramError) process.exit(1);
   console.log(JSON.stringify({ ok: true }));
@@ -62,7 +103,8 @@ if (${JSON.stringify(cli)} === 't3ctl') {
     const code = `
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { deliver, normalize, loadState, saveState, sameDestination, queueEvent, sealBatch, testEnv } from ${JSON.stringify(libPath)};
+import { Database } from 'bun:sqlite';
+import { deliver, normalize, loadState, saveState, confirmWakes, wakeInboundId, sameDestination, queueEvent, sealBatch, testEnv } from ${JSON.stringify(libPath)};
 const watcher = normalize({ id: 'route-test', title: 'Routing event', check: 'true', mode: 'wake',
   context: 'Handle this event in its work thread.', max_fires: 0, created_by_session: ${JSON.stringify(projectThread)},
   ...${JSON.stringify(options.watcher ?? {})} });
@@ -74,11 +116,29 @@ console.log(JSON.stringify(await (async () => (${body}))()));`;
     const env = { ...process.env, ROBOB_TEST: "1", ROBOB_WATCH_ROOT: join(dir, "root"),
       ROBOB_WATCH_BRIDGE_DB: dbPath, ROBOB_WATCH_SPECTRUM_CLI: spectrum, ROBOB_WATCH_TELEGRAM_CLI: telegram,
       ROBOB_WATCH_T3CTL: options.noOverride ? undefined : options.missingCli ? join(dir, "missing-cli") : t3ctl,
+      ROBOB_WATCH_TEST_CREATOR_TIMEOUT_MS: "2000",
+      ROBOB_WATCH_TEST_CREATOR_SEND_TIMEOUT_MS: "2000",
       ROBOB_WATCH_LOAD_OVERRIDE: "0.1", TOOLLOG_DIR: join(dir, "logs") };
-    const child = Bun.spawn([process.execPath, "-e", code], { env, stdout: "pipe", stderr: "pipe" });
-    const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-    expect(exitCode, stderr).toBe(0);
-    return { result: JSON.parse(stdout) as Delivery & { state: State; held: State; same: boolean; env: string },
+    // LaunchAgent sends stdout to runner.log; exercise that same file redirection.
+    const runnerLogPath = join(dir, "runner.log");
+    const fd = openSync(runnerLogPath, "w");
+    try {
+      const child = Bun.spawn([process.execPath, "-e", code], { env, stdout: fd, stderr: "pipe" });
+      const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+      expect(exitCode, stderr).toBe(0);
+    } finally { closeSync(fd); }
+    const stdout = readFileSync(runnerLogPath, "utf8");
+    const lines = stdout.trim().split("\n");
+    const logsDir = join(dir, "logs");
+    return { result: JSON.parse(lines.pop()!) as Delivery & { state: State; held: State; before: State; same: boolean; env: string; deliveries: Delivery[] },
+      sentLogs: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson"))
+        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry))
+        .filter(row => row.name === "wake.sent") : [],
+      runnerLog: lines.join("\n"),
+      logs: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson")).flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry)) : [],
+      fallbacks: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson"))
+        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry))
+        .filter(row => row.name === "wake.creator_fallback") : [],
       calls: existsSync(callsFile) ? readFileSync(callsFile, "utf8").trim().split("\n").map(line => JSON.parse(line) as Call) : [],
       log: existsSync(join(watcherDir, "log")) ? readFileSync(join(watcherDir, "log"), "utf8") : "" };
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -87,8 +147,11 @@ console.log(JSON.stringify(await (async () => (${body}))()));`;
 const wakeText = (calls: Call[]) => calls.find(c => c.cli === "spectrum" && c.args[0] === "wake")!.args.find(a => a.startsWith("--text="))!.slice(7);
 
 test("a project creator gets one queued send with its event key, context and provenance, without a bridge wake", async () => {
-  const { result, calls } = await fixture({ status: { recentRuns: [{ data: "x".repeat(2000) }] } });
-  expect(result).toMatchObject({ ok: true, via: "thread:abcd1234" });
+  const { result, calls, fallbacks, runnerLog, log } = await fixture({ status: { recentRuns: [{ data: "x".repeat(2000) }] } });
+  expect(fallbacks).toHaveLength(0);
+  expect(runnerLog).not.toContain("creator wake fallback");
+  expect(log).not.toContain("creator wake fallback");
+  expect(result).toMatchObject({ ok: false, accepted: true, confirmed: "pending", via: "thread:abcd1234" });
   expect(calls.map(c => c.cli)).toEqual(["t3ctl", "t3ctl"]);
   expect(calls[0]!.args).toEqual(["status", projectThread]);
   const [send] = calls.filter(c => c.args[0] === "send");
@@ -96,6 +159,29 @@ test("a project creator gets one queued send with its event key, context and pro
   expect(send!.args[2]).toStartWith("[Watcher event from robob-watch route-test, not typed by anyone in this thread.]\n");
   expect(send!.args[2]).toContain("event happened");
   expect(send!.args[2]).toContain("Handle this event in its work thread.");
+});
+
+test.each([
+  { name: "exit", sendError: true, reason: "exit:1" },
+    { name: "spawn error", sendSpawnError: true, reason: "error" },
+])("creator send $name logs one fallback and wakes the owner once", async ({ name, reason, ...options }) => {
+  const { result, calls, fallbacks, runnerLog, log } = await fixture(options);
+  expect(result).toMatchObject({ ok: false, accepted: true, via: "wake:owner-fallback", route: "owner" });
+  expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(1);
+  expect(calls.filter(c => c.cli === "telegram")).toHaveLength(0);
+  expect(calls.filter(c => c.cli === "t3ctl").map(c => c.args[0]))
+    .toEqual(options.sendSpawnError ? ["status"] : ["status", "send"]);
+  expect(wakeText(calls)).toStartWith("(meant for thread abcd1234, which could not be reached)\n");
+  expect(calls.find(c => c.cli === "spectrum")!.args).toContain("--key=robob-watch:route-test:1:stable-event");
+  expect(log).toContain(`creator wake fallback thread=${projectThread} send `);
+  expect(runnerLog.split("\n")).toHaveLength(1);
+  expect(runnerLog).toContain(`creator wake fallback watcher=route-test thread=${projectThread} reason=${reason}`);
+  expect(fallbacks).toHaveLength(1);
+  expect(fallbacks[0]!.props!.durationMs).toBeGreaterThanOrEqual(0);
+  expect(fallbacks[0]!.durationMs).toBe(fallbacks[0]!.props!.durationMs);
+  if (options.sendSleep) expect(fallbacks[0]!.durationMs).toBeLessThan(5_000);
+  expect(fallbacks[0]).toMatchObject({ component: "wakes", kind: "error", ok: false, ids: { watcher: "route-test" },
+    props: { step: "send", reason, durationMs: expect.any(Number) } });
 });
 
 test.each([
@@ -131,12 +217,11 @@ test.each([null, "", "   "])("no creator (%j) keeps the owner path without t3ctl
 test.each([
   { name: "archived", status: { archived: true }, reason: "thread is archived" },
   { name: "missing", statusError: true, reason: "status stub failure" },
-  { name: "invalid status", status: { archived: null }, reason: "invalid thread status" },
-  { name: "send failure", sendError: true, reason: "send stub failure" },
-  { name: "spawn failure", missingCli: true, reason: "status:" },
+    { name: "send failure", sendError: true, reason: "send stub failure" },
+  { name: "spawn failure", missingCli: true, reason: "send error after" },
 ])("$name falls back to the owner wake with the intended thread and a logged reason", async ({ name, reason, ...options }) => {
   const { result, calls, log } = await fixture(options);
-  expect(result).toMatchObject({ ok: true, via: "wake" });
+  expect(result).toMatchObject({ ok: false, accepted: true, via: "wake:owner-fallback" });
   expect(wakeText(calls)).toStartWith("(meant for thread abcd1234, which could not be reached)\n");
   expect(log).toContain(`creator wake fallback thread=${projectThread}`);
   expect(log).toContain(reason);
@@ -150,11 +235,83 @@ test("a resolved ses_ creator goes to its Robob thread", async () => {
   expect(calls[2]!.args.slice(0, 2)).toEqual(["send", projectThread]);
 });
 
-test("an unresolved ses_ creator keeps today's owner path", async () => {
-  const { result, calls } = await fixture({ watcher: { created_by_session: "ses_gone" }, nativeError: true });
-  expect(result.via).toBe("wake");
-  expect(calls.filter(c => c.cli === "t3ctl").map(c => c.args)).toEqual([["native", "ses_gone"]]);
+test.each([
+  { name: "exit", nativeError: true, reason: "exit:1" },
+  { name: "spawn", missingCli: true, reason: "exit:127" },
+  ...["not json", "null", "[]", "{}", '{"thread":null}', '{"thread":[]}',
+    '{"thread":{"threadId":12}}', '{"thread":{"threadId":""}}', '{"thread":{"threadId":"   "}}']
+    .map(nativeOutput => ({ name: `invalid ${nativeOutput}`, nativeOutput, reason: "invalid" })),
+])("native $name logs one fallback and delivers once to the owner", async ({ name, reason, ...options }) => {
+  const session = "ses_gone_123456789";
+  const { result, calls, fallbacks, runnerLog } = await fixture({ watcher: { created_by_session: session }, ...options });
+  expect(result).toMatchObject({ ok: false, accepted: true, via: "wake" });
+  expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(1);
+  expect(calls.filter(c => c.cli === "t3ctl").map(c => c.args)).toEqual(options.missingCli ? [] : [["native", session]]);
   expect(wakeText(calls)).not.toContain("meant for thread");
+  expect(runnerLog.split("\n")).toHaveLength(1);
+  expect(runnerLog).toEndWith(`creator lookup failed watcher=route-test session=${session.slice(0, 12)} reason=${reason}`);
+  expect(fallbacks).toHaveLength(1);
+  expect(fallbacks[0]!.props!.durationMs).toBeGreaterThanOrEqual(0);
+  expect(fallbacks[0]).toMatchObject({ component: "wakes", ok: false, ids: { watcher: "route-test" },
+    props: { step: "native", reason } });
+  if (options.nativeSleep) expect(fallbacks[0]!.durationMs).toBeLessThan(5_000);
+});
+
+test.each([
+  { name: "exit", statusError: true, reason: "exit:1" },
+  { name: "archived", status: { archived: true }, reason: "archived" },
+])("status $name logs one fallback and keeps the intended-thread prefix", async ({ name, reason, ...options }) => {
+  const { result, calls, fallbacks, runnerLog } = await fixture(options);
+  expect(result).toMatchObject({ ok: false, accepted: true, via: "wake:owner-fallback" });
+  expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(1);
+  expect(wakeText(calls)).toStartWith("(meant for thread abcd1234, which could not be reached)\n");
+  expect(runnerLog).toContain(`creator lookup failed watcher=route-test session=${projectThread.slice(0, 12)} reason=${reason}`);
+  expect(fallbacks).toHaveLength(1);
+  expect(fallbacks[0]!.props!.durationMs).toBeGreaterThanOrEqual(0);
+  expect(fallbacks[0]).toMatchObject({ component: "wakes", ok: false, ids: { watcher: "route-test" },
+    props: { step: "status", reason } });
+});
+
+test.each([
+  { name: "native invalid", nativeOutput: "not json", watcher: { created_by_session: "ses_old" } },
+  { name: "status unreachable", statusError: true },
+])("$name is cached once, then looked up again after 30 seconds", async ({ name, ...options }) => {
+  const { result, calls, fallbacks } = await fixture(options, `(async () => {
+    const originalNow = Date.now;
+    let at = originalNow();
+    Date.now = () => at;
+    const deliveries = [await deliver(watcher, 'first', key, state)];
+    at += 29_000;
+    deliveries.push(await deliver(watcher, 'cached', key + ':2', state));
+    writeFileSync(configPath, JSON.stringify({ status: ${JSON.stringify({ threadId: projectThread, projectId: "work", origin: null, archived: false })} }));
+    at += 2_000;
+    deliveries.push(await deliver(watcher, 'recovered', key + ':3', state));
+    return { deliveries };
+  })()`);
+  expect(result.deliveries.map(d => d.via)).toEqual([options.watcher ? "wake" : "wake:owner-fallback", options.watcher ? "wake" : "wake:owner-fallback", "thread:abcd1234"]);
+  expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(2);
+  expect(calls.filter(c => c.args[0] === (options.watcher ? "native" : "status"))).toHaveLength(2);
+  expect(fallbacks).toHaveLength(1);
+});
+
+test("successful native resolution is cached for three minutes", async () => {
+  const { result, calls, fallbacks } = await fixture({ watcher: { created_by_session: "ses_old" } }, `(async () => {
+    const originalNow = Date.now;
+    let at = originalNow();
+    Date.now = () => at;
+    const deliveries = [await deliver(watcher, 'first', key, state)];
+    at += 179_000;
+    deliveries.push(await deliver(watcher, 'cached', key + ':2', state));
+    at += 2_000;
+    deliveries.push(await deliver(watcher, 'refreshed', key + ':3', state));
+    return { deliveries };
+  })()`);
+  expect(result.deliveries.every(d => d.via === "thread:abcd1234")).toBe(true);
+  expect(calls.filter(c => c.args[0] === "native")).toHaveLength(2);
+  expect(calls.filter(c => c.args[0] === "status")).toHaveLength(2);
+  expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(0);
+  expect(calls.map(c => c.args[0])).toEqual(["native", "status", "send", "send", "native", "status", "send"]);
+  expect(fallbacks).toHaveLength(0);
 });
 
 test("a retried pending event reuses its request ID and cached creator resolution", async () => {
@@ -171,6 +328,7 @@ test("a retried pending event reuses its request ID and cached creator resolutio
     return { held, state: loadState(watcher.id) };
   })()`);
   expect(result.held.pending?.key).toBe("robob-watch:route-test:1:stable-event");
+  expect(result.held.pending?.creatorSend).toBeUndefined();
   expect(result.state.last_delivery).toBe("thread:abcd1234");
   expect(result.state.pending).toBeUndefined();
   const sends = calls.filter(c => c.cli === "t3ctl" && c.args[0] === "send");
@@ -187,7 +345,7 @@ test("creator status is refreshed after the cache expires", async () => {
     Date.now = () => originalNow() + 4 * 60_000;
     return await deliver(watcher, 'second', key + ':2', state);
   })()`);
-  expect(result.via).toBe("wake");
+  expect(result.via).toBe("wake:owner-fallback");
   expect(calls.filter(c => c.args[0] === "status")).toHaveLength(2);
   expect(calls.filter(c => c.cli === "t3ctl" && c.args[0] === "send")).toHaveLength(1);
 });
@@ -214,7 +372,7 @@ test("creator changes invalidate the cache and keep pending batches on their acc
     const next = { ...watcher, created_by_session: 'thread:project:work:ffff0000' };
     writeFileSync(configPath, JSON.stringify({ status: { threadId: next.created_by_session, projectId: 'work', origin: null, archived: false } }));
     queueEvent(watcher, state, 'held', false);
-    sealBatch(next, state);
+    if (state.batch) sealBatch(next, state);
     const same = sameDestination(watcher, next);
     const delivery = await deliver(next, 'second', key + ':2', state);
     return { ...delivery, same, state };
@@ -243,4 +401,328 @@ test("the runner records thread delivery without adding a spectrum heads-up row"
 test("the t3ctl stub override is forwarded to child helpers", async () => {
   const { result } = await fixture({}, "({ env: testEnv().ROBOB_WATCH_T3CTL })");
   expect(result.env).toEndWith("/t3ctl.ts");
+});
+
+
+test("direct creator and owner fallback deliveries log one attempt each", async () => {
+  for (const sendError of [false, true]) {
+    const { result, sentLogs } = await fixture({ sendError });
+    expect(result.route).toBe(sendError ? "owner" : "creator");
+    expect(sentLogs).toHaveLength(1);
+    expect(sentLogs[0]).toMatchObject({ component: "wakes", kind: "event", ok: false,
+      ids: { watcher: "route-test" }, props: { via: sendError ? "wake:owner-fallback" : "thread:abcd1234", confirmed: "pending", accepted: true, events: 1 } });
+    expect(sentLogs[0]!.durationMs).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(sentLogs)).not.toContain("event happened");
+    expect(JSON.stringify(sentLogs)).not.toContain("Handle this event");
+  }
+});
+
+for (const entry of [
+  { name: 'one status timeout', statusSleepOnce: true, probes: 2 },
+  { name: 'two status timeouts', statusSleep: true, probes: 2 },
+  { name: 'empty failing status', statusEmptyError: true, probes: 2 },
+  { name: 'malformed JSON', statusOutput: 'not json', probes: 1 },
+  { name: 'malformed status', status: { archived: null }, probes: 1 },
+  { name: 'one native timeout', nativeSleepOnce: true, watcher: { created_by_session: 'ses_old' }, probes: 1 },
+]) {
+  test(`${entry.name} still queues to creator`, async () => {
+    const { result, calls, log } = await fixture(entry);
+    expect(result).toMatchObject({ ok: false, accepted: true, confirmed: 'pending', via: 'thread:abcd1234' });
+    expect(calls.filter(call => call.args[0] === 'status')).toHaveLength(entry.probes);
+    expect(calls.filter(call => call.args[0] === 'send' && call.cli === 't3ctl')).toHaveLength(1);
+    expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+    if (entry.statusSleep) {
+      expect(log).toContain('status timeout after');
+      expect(log).toContain('retry timeout after');
+      expect(log).toContain('probe waiting');
+    }
+  });
+}
+
+const confirmBody = (body: string) => `(async () => {
+  state.pending = { key, event: 'event happened', at: new Date().toISOString(), watcher };
+  saveState(watcher.id, state);
+  const { tickOne } = await import(${JSON.stringify(runnerPath)});
+  await tickOne(watcher.id);
+  const before = loadState(watcher.id);
+  const base = before.confirm.sentAt;
+  const at = base + 10 * 60_000 + 1;
+  Date.now = () => at;
+  ${body}
+  return { before, state: loadState(watcher.id) };
+})()`;
+
+test.each([false, true])('an unconfirmed send escalates once, including a send timeout (%j)', async sendSleep => {
+  const { result, calls, logs, runnerLog, log } = await fixture({ sendSleep }, confirmBody(`
+    await tickOne(watcher.id);
+    Date.now = () => at + 31_000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.before.confirm).toMatchObject({ key: 'robob-watch:route-test:1:stable-event', thread: projectThread, attempts: 0 });
+  expect(result.before.pending).toBeUndefined();
+  expect(result.state.confirm).toMatchObject({ escalated: true, ownerFallback: true });
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(1);
+  expect(calls.filter(call => call.cli === 'telegram')[0]!.args).toContain('--severity=attention');
+  expect(calls.filter(call => call.cli === 'spectrum' && call.args[0] === 'wake')).toHaveLength(1);
+  expect(calls.filter(call => call.cli === 'spectrum')[0]!.args).toContain('--key=robob-watch:route-test:1:stable-event');
+  expect(calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send')).toHaveLength(1);
+  expect(logs.filter(row => row.name === 'wake.unconfirmed')).toHaveLength(1);
+  expect(runnerLog).toContain('wake unconfirmed');
+  expect(log).toContain('wake unconfirmed');
+});
+
+for (const status of [
+  { recentRuns: [{ requestedAt: 'future' }] },
+  { runs: [{ startedAt: 'future' }] },
+  { run: { requestedAt: 'future' } },
+  { state: 'running' },
+]) {
+  test.each([false, true])(`a new run confirms via ${Object.keys(status)[0]} (send timeout: %j)`, async sendSleep => {
+    const { result, calls, logs, log } = await fixture({ sendSleep }, confirmBody(`
+      const status = JSON.parse(JSON.stringify(${JSON.stringify(status)}).replaceAll('future', new Date(base).toISOString()));
+      writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false, ...status } }));
+      await tickOne(watcher.id);
+    `));
+    expect(result.state.confirm).toBeUndefined();
+    expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+    expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(1);
+    expect(logs.find(row => row.name === 'wake.confirmed')!.durationMs).toBeGreaterThanOrEqual(600_000);
+    expect(log).toContain('wake confirmed after');
+  });
+}
+
+test('owner fallback confirms when the inbound row moves from pending to processing; show includes confirmation and route', async () => {
+  const { result, calls, logs, log } = await fixture({ statusError: true }, confirmBody(`
+    const db = new Database(process.env.ROBOB_WATCH_BRIDGE_DB);
+    db.query('insert into inbound values (?, ?)').run(wakeInboundId(key), 'pending');
+    Date.now = () => base + 1_000;
+    await tickOne(watcher.id);
+    if (!loadState(watcher.id).confirm) throw new Error('pending row confirmed too early');
+    const show = Bun.spawnSync([process.execPath, ${JSON.stringify(join(import.meta.dir, '../src/cli.ts'))}, 'show', watcher.id]);
+    if (!show.stdout.toString().includes('wake:owner-fallback') || !show.stdout.toString().includes('"confirm"')) throw new Error('show omitted delivery state');
+    db.query('update inbound set state = ?').run('processing');
+    db.close();
+    Date.now = () => base + 32_000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toBeUndefined();
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(0);
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(1);
+  expect(log).toContain('via=wake:owner-fallback meant_for=abcd1234 confirmed=pending');
+});
+
+test('native timeouts hold the event, retry resolution on ticks and escalate once without an immediate owner wake', async () => {
+  const { result, calls, logs } = await fixture({ nativeSleep: true, watcher: { created_by_session: 'ses_old' } }, confirmBody(`
+    if (before.last_delivery !== 'native:pending') throw new Error('native timeout escaped to owner');
+    await tickOne(watcher.id);
+    Date.now = () => at + 31_000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.before.confirm).toMatchObject({ nativeSession: 'ses_old' });
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(1);
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(1);
+  expect(logs.filter(row => row.name === 'wake.unconfirmed')).toHaveLength(1);
+});
+
+test('native lookup recovers after two timeouts and confirms the creator run without owner fallback', async () => {
+  const { result, calls, logs } = await fixture({ nativeSleep: true, watcher: { created_by_session: 'ses_old' } }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: ${JSON.stringify(projectThread)}, archived: false, recentRuns: [{ requestedAt: new Date(at).toISOString() }] } }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toBeUndefined();
+  expect(calls.filter(call => call.args[0] === 'send' && call.cli === 't3ctl')).toHaveLength(1);
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(1);
+});
+
+test('an old run does not confirm, and multiple fires retain separate once-only escalation across reloads', async () => {
+  const { result, calls, logs } = await fixture({ status: { recentRuns: [{ requestedAt: '2020-01-01T00:00:00Z' }] } }, confirmBody(`
+    const second = await deliver(watcher, 'second event', key + ':second', loadState(watcher.id));
+    const fresh = loadState(watcher.id);
+    fresh.confirmations = [second.confirmation];
+    fresh.status = 'done';
+    saveState(watcher.id, fresh);
+    await tickOne(watcher.id);
+    Date.now = () => at + 10 * 60_000 + 1;
+    await tickOne(watcher.id);
+    Date.now = () => at + 11 * 60_000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm?.escalated).toBe(true);
+  expect(result.state.confirmations?.[0]?.escalated).toBe(true);
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(2);
+  expect(logs.filter(row => row.name === 'wake.unconfirmed')).toHaveLength(2);
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(0);
+});
+
+test('a slow confirmation probe yields to runner timers and a done watcher still confirms', async () => {
+  const { result, calls } = await fixture({}, confirmBody(`
+    const fresh = loadState(watcher.id);
+    fresh.status = 'done';
+    saveState(watcher.id, fresh);
+    writeFileSync(configPath, JSON.stringify({ statusSleep: true }));
+    let timerRan = false;
+    const timer = setTimeout(() => { timerRan = true; }, 10);
+    Date.now = () => base + 1_000;
+    await tickOne(watcher.id);
+    clearTimeout(timer);
+    if (!timerRan) throw new Error('confirmation blocked timers');
+  `));
+  expect(result.state.confirm?.attempts).toBe(1);
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+});
+
+test('t3ctl exit 4 reconciles the creator run without an owner wake', async () => {
+  const { result, calls, logs } = await fixture({ sendAmbiguous: true }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false,
+      recentRuns: [{ requestedAt: new Date(base).toISOString() }] } }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.before.last_delivery).toBe('thread:abcd1234');
+  expect(result.state.confirm).toBeUndefined();
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(1);
+});
+
+test.each([true, false])('escalation preserves the accepted owner-wake payload (creator fallback: %j)', async statusError => {
+  const { result, calls } = await fixture({ statusError, strictWakeKey: true,
+    ...(statusError ? {} : { watcher: { created_by_session: null } }) }, confirmBody(`await tickOne(watcher.id);`));
+  const wakes = calls.filter(call => call.cli === 'spectrum' && call.args[0] === 'wake');
+  expect(wakes).toHaveLength(2);
+  expect(wakes[0]!.args).toEqual(wakes[1]!.args);
+  expect(calls.filter(call => call.cli === 'spectrum' && call.args[0] === 'send')).toHaveLength(0);
+  expect(result.state.confirm?.fallbackDone).toBe(true);
+});
+
+test.each(['alert', 'fallback'])('interrupted escalation resumes only the unfinished %s action', async unfinished => {
+  const { result, calls, logs } = await fixture({}, confirmBody(`
+    const fresh = loadState(watcher.id);
+    Object.assign(fresh.confirm, { escalated: true, unconfirmedAt: at, alertDone: ${unfinished !== 'alert'}, fallbackDone: ${unfinished !== 'fallback'} });
+    saveState(watcher.id, fresh);
+    await tickOne(watcher.id);
+    Date.now = () => at + 31_000;
+    await tickOne(watcher.id);
+  `));
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(unfinished === 'alert' ? 1 : 0);
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(unfinished === 'fallback' ? 1 : 0);
+  expect(logs.filter(row => row.name === 'wake.unconfirmed')).toHaveLength(0);
+  expect(result.state.confirm).toMatchObject({ alertDone: true, fallbackDone: true });
+});
+
+test.each([false, true])('quiet hours defer native recovery and escalation event sends (%j)', async native => {
+  const { result, calls } = await fixture(native ? { nativeSleep: true, watcher: { created_by_session: 'ses_old' } } : {}, confirmBody(`
+    const hour = new Date(at).getUTCHours();
+    const quiet = { start: hour, end: (hour + 1) % 24, time_zone: 'UTC' };
+    const path = join(process.env.ROBOB_WATCH_ROOT, 'watchers', watcher.id, 'watcher.json');
+    writeFileSync(path, JSON.stringify({ ...watcher, quiet }));
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: ${JSON.stringify(projectThread)}, archived: false } }));
+    await tickOne(watcher.id);
+  `));
+  expect(calls.filter(call => call.cli === 'telegram' || call.cli === 'spectrum')).toHaveLength(0);
+  expect(calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send')).toHaveLength(native ? 0 : 1);
+  expect(result.state.confirm).toBeDefined();
+});
+
+test('native recovery cannot confirm from an unrelated run before its actual send', async () => {
+  const { result, calls, logs } = await fixture({ nativeSleep: true, watcher: { created_by_session: 'ses_old' } }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ sendAmbiguous: true, status: { threadId: ${JSON.stringify(projectThread)}, archived: false,
+      recentRuns: [{ requestedAt: new Date(base + 1).toISOString() }] } }));
+    Date.now = () => base + 60_000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm?.sentAt).toBeGreaterThan(result.before.confirm!.sentAt);
+  expect(result.state.confirm?.deadlineAt).toBe(result.before.confirm!.sentAt);
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(0);
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+});
+
+test('ambiguous native-to-owner recovery preserves its route and payload at the escalation deadline', async () => {
+  const { result, calls } = await fixture({ nativeSleep: true, watcher: { created_by_session: 'ses_old' } }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ strictWakeKey: true, wakeAmbiguousOnce: true,
+      status: { threadId: ${JSON.stringify(projectThread)}, archived: false, origin: 'imessage' } }));
+    await tickOne(watcher.id);
+    Date.now = () => at + 31_000;
+    await tickOne(watcher.id);
+  `));
+  const wakes = calls.filter(call => call.cli === 'spectrum' && call.args[0] === 'wake');
+  expect(wakes).toHaveLength(2);
+  expect(wakes[0]!.args).toEqual(wakes[1]!.args);
+  expect(calls.filter(call => call.cli === 'spectrum' && call.args[0] === 'send')).toHaveLength(0);
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(1);
+  expect(result.state.confirm).toMatchObject({ ownerFallback: true, alertDone: true, fallbackDone: true });
+});
+
+test.each([{ sendError: true }, { sendSpawnError: true }])('native recovery falls back after a rejected send even when the creator is running (%j)', async failure => {
+  const { result, calls, logs } = await fixture({ nativeSleep: true, watcher: { created_by_session: 'ses_old' } }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ ...${JSON.stringify(failure)}, status: { threadId: ${JSON.stringify(projectThread)}, archived: false, state: 'running' } }));
+    Date.now = () => base + 60_000;
+    await tickOne(watcher.id);
+  `));
+  expect(calls.filter(call => call.cli === 'spectrum' && call.args[0] === 'wake')).toHaveLength(1);
+  expect(result.state.confirm).toMatchObject({ ownerFallback: true, thread: projectThread });
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(0);
+});
+
+test.each([{ sendSleep: true }, { sendAmbiguous: true }])('native recovery keeps ambiguous sends pending without an owner fallback (%j)', async failure => {
+  const { result, calls, logs } = await fixture({ nativeSleep: true, watcher: { created_by_session: 'ses_old' } }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ ...${JSON.stringify(failure)}, status: { threadId: ${JSON.stringify(projectThread)}, archived: false } }));
+    Date.now = () => base + 60_000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toMatchObject({ thread: projectThread });
+  expect(result.state.confirm?.ownerFallback).not.toBe(true);
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(0);
+});
+
+for (const outcome of ['completed', 'failed', 'cancelled', 'five newer runs']) {
+  test(`restart preserves the first send time when replaying a ${outcome} run`, async () => {
+    const { result, calls, logs } = await fixture({}, `(async () => {
+      state.pending = { key, event: 'event happened', at: new Date().toISOString(), watcher };
+      saveState(watcher.id, state);
+      await deliver(watcher, 'event happened', key, state);
+      // The runner stopped after acceptance; the original attempt survives with the pending event.
+      const originalAt = loadState(watcher.id).pending.creatorSend.sentAt;
+      const run = { runId: 'original-run', status: ${JSON.stringify(outcome === 'five newer runs' ? 'completed' : outcome)},
+        requestedAt: new Date(originalAt).toISOString(), startedAt: new Date(originalAt + 1).toISOString() };
+      const recentRuns = ${outcome === 'five newer runs'} ? Array.from({ length: 5 }, (_, i) => ({
+        runId: 'newer-' + i, status: 'completed', requestedAt: new Date(originalAt + 100 + i).toISOString() })) : [run];
+      writeFileSync(configPath, JSON.stringify({ sendOutput: JSON.stringify({ ok: true, runId: 'original-run', status: run.status }),
+        status: { threadId: watcher.created_by_session, archived: false, recentRuns } }));
+      const restartTick = async at => {
+        const code = 'Date.now = () => ' + at + '; const { tickOne } = await import(' + ${JSON.stringify(JSON.stringify(runnerPath))} + '); await tickOne("route-test");';
+        const child = Bun.spawn([process.execPath, '-e', code], { env: process.env, stdout: 'pipe', stderr: 'pipe' });
+        const [output, error, codeValue] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+        if (codeValue) throw new Error(error);
+        process.stdout.write(output);
+      };
+      await restartTick(originalAt + 60_000);
+      const before = loadState(watcher.id);
+      if (before.confirm.sentAt !== originalAt) throw new Error('replay replaced the persisted first attempt');
+      await restartTick(originalAt + 11 * 60_000);
+      return { before, state: loadState(watcher.id) };
+    })()`);
+    const sends = calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send');
+    expect(sends).toHaveLength(2);
+    expect(sends[0]!.args).toEqual(sends[1]!.args);
+    expect(result.state.confirm).toBeUndefined();
+    expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(1);
+    expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+  });
+}
+
+test('the first send time is persisted before dispatch even when the send times out', async () => {
+  const { result, calls } = await fixture({ sendSleep: true, requireSendJournal: true }, `(async () => {
+    state.pending = { key, event: 'event happened', at: new Date().toISOString(), watcher };
+    saveState(watcher.id, state);
+    const beforeAt = Date.now();
+    const delivery = await deliver(watcher, 'event happened', key, state);
+    const pending = loadState(watcher.id).pending;
+    if (!pending.creatorSend || pending.creatorSend.sentAt < beforeAt) throw new Error('send attempt was not persisted');
+    if (delivery.confirmation.sentAt !== pending.creatorSend.sentAt) throw new Error('confirmation lost the attempt');
+    return { ...delivery, state: loadState(watcher.id) };
+  })()`);
+  expect(result.accepted).toBe(true);
+  expect(result.state.pending?.creatorSend?.thread).toBe(projectThread);
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
 });
