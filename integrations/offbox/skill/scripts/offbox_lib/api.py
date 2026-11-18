@@ -24,6 +24,8 @@ from .common import (OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, l
                      token_owner, person)
 from . import capacity
 
+_HISTORY_PHASE = contextvars.ContextVar('history_phase', default=None)
+
 BACKEND = backend()
 NAME = "offbox server" if BACKEND == "server" else "boat"
 
@@ -532,6 +534,9 @@ def _own_box(path: str) -> None:
 def _call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
     global _DEADLINE
+    phase = _HISTORY_PHASE.get()
+    if phase is not None:
+        phase['phase'] = 'ownership'
     _own_box(path)
     from . import home
     scope = _REQUEST_SCOPE.get()
@@ -706,8 +711,15 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             if scope is not None:
                 scope.check()
             check_start_queue(request_id)
+            phase = _HISTORY_PHASE.get()
+            if phase is not None:
+                phase['phase'] = 'connect_headers'
             with _open(req, timeout=req_timeout) as r:
+                if phase is not None:
+                    phase['phase'] = 'body'
                 raw = _read_response(r, deadline)
+                if phase is not None:
+                    phase['phase'] = 'decode'
                 result = json.loads(raw) if raw.strip() else {}
                 if scope is not None:
                     scope.acknowledge()
@@ -1309,11 +1321,25 @@ def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0, timeou
 
 
 def history_logs(box_id: str, command_id: str, which: str, offset: int = 0,
-                 *, deadline: float | None = None) -> dict:
-    qs = urllib.parse.urlencode({"stream": which, "offset": offset})
-    result = call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}", deadline=deadline)
-    remember_execution(box_id, result, command_id=command_id)
-    return result
+                 *, deadline: float | None = None, limit_bytes: int | None = None) -> dict:
+    query = {"stream": which, "offset": offset}
+    if limit_bytes is not None and BACKEND == 'server':
+        query['limitBytes'] = limit_bytes
+    qs = urllib.parse.urlencode(query)
+    phase = dict(box=box_id, command=command_id, stream=which, offset=offset, phase='preflight', result='error')
+    token = _HISTORY_PHASE.set(phase)
+    started = time.monotonic()
+    try:
+        result = call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}", deadline=deadline)
+        phase['result'] = 'ok'
+        remember_execution(box_id, result, command_id=command_id)
+        return result
+    finally:
+        _HISTORY_PHASE.reset(token)
+        phase['ms'] = round((time.monotonic() - started) * 1000, 3)
+        if phase['ms'] >= 1000 or phase['result'] != 'ok':
+            with contextlib.suppress(OSError):
+                log('history_read ' + json.dumps(phase, separators=(',', ':')))
 
 
 def history_get(box_id: str, command_id: str) -> dict:
