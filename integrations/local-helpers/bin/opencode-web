@@ -4,8 +4,8 @@
 # can always reach an agent when those are down. A copy he started by hand in a terminal may already hold the
 # port; then this waits and takes over when that one exits, rather than killing it (and the agents inside it).
 port=${OPENCODE_WEB_PORT:-4096}
-bin=${OPENCODE_WEB_BIN:-/opt/homebrew/bin/opencode}
 lsof=${OPENCODE_WEB_LSOF:-/usr/sbin/lsof}
+service_config="${0:A:h}/../libexec/opencode/service-bin.zsh"
 # The OpenCode server's inspector port leaks into children; bun can't bind it twice.
 unset BUN_INSPECT
 busy() { "$lsof" -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1 }
@@ -13,8 +13,36 @@ if busy; then
   print "$(date '+%F %T') port $port is held by another server; waiting for it to exit"
   while busy; do sleep 20; done
 fi
-print "$(date '+%F %T') starting $bin serve on 127.0.0.1:$port"
 cd "$HOME" || exit 1
 # Same environment as a terminal (PATH with nvm/bun, code mode, ~/.zshrc exports) so agents behave the same.
 # `serve` serves the same web UI as `web` without opening a browser on every restart.
-exec /bin/zsh -lic "exec ${(q)bin} serve --hostname 127.0.0.1 --port $port" </dev/null
+exec /bin/zsh -lic '
+  source "$2" || exit 1
+  bin=${OPENCODE_WEB_BIN:-$service_bin}
+  port=$1
+  # Validate after login startup too: .zshrc can change the override and inspector environment.
+  unset BUN_INSPECT
+  version_pair() {
+    local pattern="^(opencode )?v?([0-9]+)\.([0-9]+)\.[0-9]+([-+][0-9A-Za-z.+-]+)?$"
+    [[ "$1" =~ $pattern ]] || return 1
+    REPLY="${match[2]}.${match[3]}"
+  }
+  service_version=unavailable
+  service_pair=unknown
+  if value=$("$service_bin" --version 2>/dev/null) && version_pair "$value"; then
+    service_version=$value
+    service_pair=$REPLY
+  fi
+  bin_version=unavailable
+  bin_pair=unknown
+  if value=$("$bin" --version 2>/dev/null) && version_pair "$value"; then
+    bin_version=$value
+    bin_pair=$REPLY
+  fi
+  if [[ $service_pair == unknown || $bin_pair == unknown || $service_pair != $bin_pair ]]; then
+    print -ru2 -- "opencode-web: refusing $bin ($bin_version); service $service_bin ($service_version); major.minor versions must match"
+    exit 1
+  fi
+  print -r -- "$(date "+%F %T") starting $bin serve on 127.0.0.1:$port"
+  exec "$bin" serve --hostname 127.0.0.1 --port "$port"
+' opencode-web "$port" "$service_config" </dev/null
