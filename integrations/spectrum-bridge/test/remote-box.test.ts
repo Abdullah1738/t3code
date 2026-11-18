@@ -6,7 +6,9 @@ import { join } from "node:path";
 import { RemoteBox, remoteBoxConfig, type RemoteBoxConfig } from "../src/remote-box.ts";
 import { opaqueId } from "../src/remote-protocol.ts";
 import { Store } from "../src/store.ts";
-import { BoxRunner } from "../../moni-box-runner/src/runner.ts";
+import { BoxRunner, type Harness } from "../../moni-box-runner/src/runner.ts";
+import { claudeHarness } from "../../moni-box-runner/src/claude.ts";
+import { AgentBus, agentWakeId } from "../src/agent-bus.ts";
 import { ChatRegistry, createAgentBus, createSbApi } from "../src/runtime.ts";
 import { chatKey, LineError, type Line } from "../src/line.ts";
 import { parseCommand } from "../src/cli.ts";
@@ -18,7 +20,7 @@ import { createToolLog, toolLog } from "../src/toollog.ts";
 import { summarizeLog } from "../src/log-rollup.ts";
 const roots: string[] = [], closes: (() => void)[] = [];
 afterEach(() => { closes.splice(0).forEach(f => f()); roots.splice(0).forEach(p => rmSync(p, { recursive: true, force: true })); });
-function setup() {
+function setup(harness?: (root: string) => Harness) {
   const root = mkdtempSync(join(tmpdir(), "remote-box-test-")); roots.push(root);
   const mac = join(root, "mac"), box = join(root, "box"); mkdirSync(mac); mkdirSync(box);
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
@@ -32,7 +34,7 @@ function setup() {
   let now = 1000, online = true, dropAck = false, active = true;
   let afterStatus: (()=>Promise<void>) | undefined;
   const store = new Store(join(mac, "state.sqlite")); closes.push(() => store.close());
-  const runner = new BoxRunner({ root: box, boxId: config.boxId, epoch: config.epoch, token, callbackToken, privateKey: keys.privateKey, callbackUrl: "http://127.0.0.1:12346", system: "system" }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, { now: () => now, modelReady: async () => routerReady, callbackReady: async () => callbackReady, fetch: (async () => Response.json({ epoch: "test", accepted: true })) });
+  const runner = new BoxRunner({ root: box, boxId: config.boxId, epoch: config.epoch, token, callbackToken, privateKey: keys.privateKey, callbackUrl: "http://127.0.0.1:12346", system: "system" }, harness?.(box) ?? { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, { now: () => now, modelReady: async () => routerReady, callbackReady: async () => callbackReady, fetch: (async () => Response.json({ epoch: "test", accepted: true })) });
   closes.push(() => runner.db.close());
   const io = { now: () => now, active: () => active,
     ownerAlert: async (_severity: "attention", text: string, key: string): Promise<boolean> => { alerts.push({ text, key }); return true; },
@@ -1089,6 +1091,41 @@ test("remote bus confirmation requires ack and reports pickup from the box witho
   expect(s.texts.join()).toContain(privateText);
   expect(files(s.mac)).not.toContain(privateText);
   expect(s.logs.join()).not.toContain(privateText);
+});
+
+test("an acknowledged remote bus request with a failed Claude launch never reports work started", async () => {
+  const s = setup(root => {
+    mkdirSync(join(root, "work"));
+    const keyFile = join(root, "router-key"); writeFileSync(keyFile, "test-router-key", { mode: 0o600 });
+    return claudeHarness(root, join(root, "missing-claude"), "test", { routerKeyFile: keyFile });
+  });
+  const owner = { slug: "owner", title: "Owner", kind: "owner" as const, key: chatKey.dm("owner") };
+  const moni = { slug: "moni", title: "Moni", kind: "dm" as const, key: chatKey.dm("moni") };
+  const notices = new Map<string, string>(), logs: string[] = []; let now = 1_000;
+  const bus = new AgentBus({ db: s.store.db, policyPath: join(s.mac, "agent-policy.json"), now: () => now,
+    forSession: id => id === "owner-session" ? owner : undefined, bySlug: slug => slug === "moni" ? moni : owner, groupMembers: () => [],
+    deliver: (target, text, key, _receipt, expiresAt) => {
+      const id = agentWakeId(key);
+      if (target.slug === "moni") { s.remote.accept(id, { id, text, agentExpiresAt: expiresAt }); return { id, remote: true, ...s.remote.delivery(id) }; }
+      notices.set(key, text); return { id, remote: false, confirmed: true };
+    },
+    delivery: (target, key) => target.slug === "moni" ? { id: agentWakeId(key), remote: true, ...s.remote.delivery(agentWakeId(key)) }
+      : { id: agentWakeId(key), remote: false, confirmed: notices.has(key) },
+    receipt: () => undefined, log: (event, detail) => logs.push(`${event} ${detail ?? ""}`),
+  });
+  const ask = bus.ask({ sessionId: "owner-session", to: "moni", text: "PRIVATE_BUS_TEXT", dedupeKey: "launch-failure" });
+  expect(ask.status).toBe(202); const id = (ask.body as { id: string }).id;
+  await s.remote.tick(); bus.sweep();
+  await s.runner.tick(); s.advance(); now += 65_000; await s.remote.tick(); bus.sweep();
+  expect(s.remote.delivery(agentWakeId(`agent-ask:${id}`))).toEqual({ retained: true, confirmed: true });
+  expect(s.store.db.query("SELECT delivered_at FROM agent_requests WHERE id=?").get(id)).toEqual({ delivered_at: null });
+  expect(logs.some(line => line.startsWith("agent-deliver "))).toBe(true);
+  expect(logs.some(line => line.startsWith("agent-delivered "))).toBe(false);
+  expect(notices.has(`agent-progress:${id}`)).toBe(false);
+  now = 601_001; bus.sweep();
+  expect(notices.get(`agent-timeout:${id}`)).toContain("was not delivered to a target turn");
+  expect(notices.get(`agent-timeout:${id}`)).not.toContain("no answer");
+  expect(logs.join()).not.toContain("PRIVATE_BUS_TEXT");
 });
 
 

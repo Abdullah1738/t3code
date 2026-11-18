@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { jsonBody, object, opaqueId, tokenMatches, unseal, validId, type Fetch, type Sealed } from "../../spectrum-bridge/src/remote-protocol.ts";
 import { HarnessFailure } from "./harness-failure.ts";
 
-export type Harness = { ready?(): boolean; run(input: { id: string; session: string; resume: boolean; text: string; system: string; signal?: AbortSignal }): Promise<string> };
+export type Harness = { ready?(): boolean; run(input: { id: string; session: string; resume: boolean; text: string; system: string; signal?: AbortSignal; onStarted?: () => void }): Promise<string> };
 export type RunnerConfig = { root: string; boxId: string; epoch: string; token: string; privateKey: string;
   callbackToken: string; callbackUrl: string; system: string };
 class AttachmentFailure extends Error {
@@ -224,16 +224,26 @@ export class BoxRunner {
       if (!modelReady || !callbackReady || !this.active()) return;
       if (this.harness.ready && !this.harness.ready()) return;
       if (this.expired(row.id)) return;
-      this.db.query("UPDATE inbox SET state='running',delivered_at=COALESCE(delivered_at,?) WHERE id=?").run(this.now(), row.id);
-      if (busWake(input) || humanInput(input)) this.db.query("INSERT OR REPLACE INTO settings VALUES ('bus-yield-human',?)").run(busWake(input) ? "true" : "false");
+      this.db.query("UPDATE inbox SET state='running' WHERE id=?").run(row.id);
       const session = this.db.query<{ value: string }, []>("SELECT value FROM settings WHERE key='session'").get()!.value;
       const resume = !!this.db.query("SELECT 1 FROM settings WHERE key='started'").get();
-      this.db.exec("INSERT OR IGNORE INTO settings VALUES ('started','true')");
+      let pickedUp = false;
+      const onStarted = () => {
+        if (pickedUp) return;
+        this.db.transaction(() => {
+          this.db.query("UPDATE inbox SET delivered_at=COALESCE(delivered_at,?) WHERE id=?").run(this.now(), row.id);
+          this.db.exec("INSERT OR IGNORE INTO settings VALUES ('started','true')");
+          if (busWake(input) || humanInput(input)) this.db.query("INSERT OR REPLACE INTO settings VALUES ('bus-yield-human',?)").run(busWake(input) ? "true" : "false");
+        }).immediate();
+        pickedUp = true;
+      };
       this.turnAbort = new AbortController();
-      const output = await this.harness.run({ id: row.id, session, resume, text, system: this.config.system, signal: this.turnAbort.signal });
+      const output = await this.harness.run({ id: row.id, session, resume, text, system: this.config.system, signal: this.turnAbort.signal, onStarted });
       // A harness that races its abort must not commit a result after losing authority.
       if (!this.active()) this.turnAbort.abort("authority-expired");
       this.turnAbort.signal.throwIfAborted();
+      // A completed result proves handoff even for a harness without early acknowledgement.
+      onStarted();
       const reply = output.trim();
       this.db.transaction(() => {
         if (reply && reply !== "NO_REPLY" && !reply.endsWith("\nNO_REPLY")) {
