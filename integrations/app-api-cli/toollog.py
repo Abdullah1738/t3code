@@ -82,7 +82,7 @@ _NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exi
             'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
             'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms',
             'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
-            'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'dataless_files', 'edeadlk_skips_before'}
+            'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'eintr_retries', 'dataless_files', 'edeadlk_skips_before'}
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
 _MONEY_PROPS = {
@@ -97,7 +97,7 @@ _MONEY_PROPS = {
                   'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
                   'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by',
                   'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
-                  'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'dataless_files', 'edeadlk_skips_before', 'owner_result'},
+                  'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'eintr_retries', 'dataless_files', 'dataless_error', 'edeadlk_skips_before', 'owner_result'},
 }
 _COMMANDS = {'test-talabat-shops', 'capabilities', 'restaurant-cart-contract', 'item-options', 'cart',
              'clear-cart', 'menu', 'choices', 'inspect', 'open-flows', 'recover-payment',
@@ -590,7 +590,12 @@ def _fields(props):
         elif key in _BOOLS and type(value) is bool:
             result[key] = value
         elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12 \
-                and (not (key.endswith('_ms') or key.startswith('msgs_') or key == 'writes_n' or key.startswith('owner_') or key.startswith('edeadlk_') or key == 'dataless_files') or value >= 0):
+                and (not (key.endswith('_ms') or key.startswith('msgs_') or key == 'writes_n' or key.startswith('owner_') or key.startswith('edeadlk_') or key in {'eintr_retries', 'dataless_files'}) or value >= 0):
+            result[key] = value
+        elif key == 'dataless_files' and value is None:
+            result[key] = None
+        elif key == 'dataless_error' and isinstance(value, str) \
+                and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]{0,80} errno=(?:None|-?\d{1,6})', value):
             result[key] = value
         elif key == 'hours' and type(value) in (int, float) and math.isfinite(value) and 0 < value <= 24:
             result[key] = value

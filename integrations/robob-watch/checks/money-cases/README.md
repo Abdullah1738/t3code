@@ -192,24 +192,29 @@ Declined daily items retain a reason until their revision, cycle or charge evide
 DATA stays at `~/Documents/assistant/money-cases` (or `MONEY_CASES_DIR`).
 Book and cache reads, lock opens/flocks, and atomic writes retry EDEADLK after
 one bounded `brctl download` attempt. Backoffs and the download share the
-remaining check/phase deadline. Other I/O errors keep their existing behavior.
+remaining check/phase deadline. Interrupted I/O retries immediately at most three
+times within that deadline; other I/O errors keep their existing behavior.
 An unreadable dependency aborts before any further save; it is never treated as
 an empty book. Temporary JSON files are renamed only after a complete write.
 
 The runner counts **every nonzero exit**, including 75, as a failure. There is no
-skip code. On EDEADLK exhaustion, `check` therefore prints one diagnostic line
+skip code. On EDEADLK exhaustion or a data I/O deadline, `check` prints one diagnostic line
 and returns 0 with no event. It retains pings.json and its outbox. The runner
 advances its acknowledgement; the next check resumes from money-cases' retained
 state. The existing busy-check.lock exit 75 is unchanged. Other CLI commands
 return 75 for an unavailable data file.
 
 Each skip records `skip_streak`, `first_skip_at` / `last_skip_at` (Unix seconds),
-`last_file`, `edeadlk_retries` and `edeadlk_ms` in `data-skips.json` in WATCH_DIR,
+`last_file`, `last_reason` (`edeadlk` or `deadline`), `edeadlk_retries` and `edeadlk_ms` in `data-skips.json` in WATCH_DIR,
 **outside DATA**. A streak at least two hours old exits 1 to trigger the normal
 failure/alert path. A clean run removes that file and records the preceding
-streak as `timing.edeadlk_skips_before`. Successful pings.json timing also includes
-`edeadlk_retries`, `edeadlk_ms`, and a metadata-only startup `dataless_files` count
-(SF_DATALESS, 0x40000000); those counters are allowed in check.run tool logs too.
+streak and its last file, reason and first timestamp in timing. Each skipped run
+also leaves its exit code, file, reason and phase in `runs.jsonl`.
+Successful pings.json timing includes `edeadlk_retries`, `edeadlk_ms`,
+`eintr_retries`, and a metadata-only startup `dataless_files` count (SF_DATALESS,
+0x40000000). The census has a separate 100 ms budget; failure records a null count
+and `dataless_error` (class and errno) without aborting or skipping the check.
+Those diagnostics are allowed in check.run tool logs too.
 
 ### Keep Downloaded
 
