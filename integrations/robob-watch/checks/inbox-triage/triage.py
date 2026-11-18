@@ -1296,6 +1296,8 @@ def run_mail(account, request):
     path = wd / f'mail-progress-{account}.json'
     if dry:
         scratch_destination(path, wd)
+        # A prior replay's result must not hide this run's credential or fetch failure.
+        atomic(path, {'cursor_before': request.get('cursor'), 'stage': 'credential', 'result': None})
     payload['progress_path'] = str(path)
     def saved():
         record = read_json(path, {}) if path else {}

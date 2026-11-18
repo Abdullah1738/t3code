@@ -362,6 +362,9 @@ class DryRunTests(unittest.TestCase):
             with self.subTest(fast=fast), t.dry_environment(types.SimpleNamespace(dry_run_hours=1, report=None)), \
                  patch.object(t, 'prepare_mail_credentials', return_value='fixture') as credentials, \
                  patch.object(t, 'run_mail_fetch', side_effect=t.MailAuthRejected('fixture')) as fetch:
+                t.atomic(self.scratch / 'mail-progress-gmail.json', {
+                    'cursor_before': None, 'stage': 'fetch',
+                    'result': {'scanned': 1, 'cursor': {'uid': 99}, 'items': [], 'drops': {}}})
                 before = snapshot(self.root, self.scratch)
                 with self.assertRaisesRegex(RuntimeError, 'cached credential rejected') as caught:
                     t.run_mail('gmail', {'since': self.now - 3600, 'now': self.now, 'fast': fast,
@@ -372,6 +375,25 @@ class DryRunTests(unittest.TestCase):
                 self.assertTrue(credentials.call_args.kwargs['dry'])
                 self.assertEqual(fetch.call_args.args[1]['progress_path'], str(self.scratch.resolve() / 'mail-progress-gmail.json'))
                 self.assertEqual(caught.exception.mail_progress['credential_refresh_attempts'], 0)
+
+    def test_dry_mail_recovers_only_current_fetch_progress(self):
+        result = {'items': [], 'scanned': 8, 'cursor': {'validity': 1, 'uid': 8}, 'drops': {}}
+        for fast in (False, True):
+            with self.subTest(fast=fast), t.dry_environment(types.SimpleNamespace(dry_run_hours=1, report=None)):
+                def fetch(account, request, **kwargs):
+                    t.atomic(Path(request['progress_path']), {'cursor_before': request.get('cursor'),
+                             'stage': 'fetch', 'result': result})
+                    raise subprocess.TimeoutExpired(['offline-worker'], 12)
+                with patch.object(t, 'prepare_mail_credentials', return_value='fixture') as credentials, \
+                     patch.object(t, 'run_mail_fetch', side_effect=fetch):
+                    before = snapshot(self.root, self.scratch)
+                    got = t.run_mail('gmail', {'now': self.now, 'since': self.now - 3600, 'fast': fast})
+                    self.assertEqual(snapshot(self.root, self.scratch), before)
+                self.assertEqual(got['cursor'], result['cursor'])
+                self.assertEqual(got['scanned'], 8)
+                self.assertTrue(got['mail_progress']['timed_out'])
+                self.assertEqual(got['mail_progress']['credential_refresh_attempts'], 0)
+                self.assertEqual(credentials.call_count, 1)
 
     def test_live_money_entry_points_keep_default_live_books(self):
         charge = self.item('mail:charge', 'EmiratesNBD',
