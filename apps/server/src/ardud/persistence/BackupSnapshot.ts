@@ -2,6 +2,11 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeWorkerThreads from "node:worker_threads";
+import {
+  workerMemoryLimits,
+  workerMemoryHeartbeatSource,
+  trackWorkerMemory,
+} from "@t3tools/shared/workerMemory";
 import type * as NodeSqlite from "node:sqlite";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Cause from "effect/Cause";
@@ -110,9 +115,13 @@ export const layerWithOptions = (options: Options) =>
                 const worker = yield* Effect.acquireRelease(
                   Effect.try({
                     try: () =>
-                      new NodeWorkerThreads.Worker(
-                        `(${backupSnapshotWorker.toString()})(require('node:sqlite'),require('node:fs'),require('node:worker_threads').parentPort)`,
-                        { eval: true, execArgv: [] },
+                      trackWorkerMemory(
+                        new NodeWorkerThreads.Worker(
+                          workerMemoryHeartbeatSource("backup") +
+                            `(${backupSnapshotWorker.toString()})(require('node:sqlite'),require('node:fs'),require('node:worker_threads').parentPort)`,
+                          { eval: true, execArgv: [], resourceLimits: workerMemoryLimits.backup },
+                        ),
+                        "backup",
                       ),
                     catch: (cause) => new BackupSnapshotError({ table, cause }),
                   }),
