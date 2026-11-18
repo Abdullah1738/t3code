@@ -60,6 +60,8 @@ import * as InputValidation from "./inputValidation.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
 import * as McpBoardReplies from "../engine/mcpBoardReplies.ts";
 import * as Activity from "../engine/activity.ts";
+import * as ActivityReadMetrics from "../../analytics/ActivityReadMetrics.ts";
+import * as ActivityRead from "./activityRead.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
 
 const askGateNote = (
@@ -615,9 +617,14 @@ const handlers = {
               window.startsWith("until") ? "until" : "since",
             );
           const read = yield* service.activity(board.id, window);
-          const byCard = Activity.groupEvents(read.events);
-          const rows = Activity.activeCards(read.cards, byCard, window).map((card) =>
-            Activity.compactRow(card, byCard.get(card.id) ?? [], window),
+          const rows = yield* ActivityReadMetrics.step(
+            "compact",
+            Effect.sync(() => {
+              const byCard = Activity.groupEvents(read.events);
+              return Activity.activeCards(read.cards, byCard, window).map((card) =>
+                Activity.compactRow(card, byCard.get(card.id) ?? [], window),
+              );
+            }),
           );
           const at = DateTime.formatIso(yield* DateTime.now);
           return McpBoardReplies.page(
@@ -676,8 +683,7 @@ const handlers = {
           const page = yield* service.activityDigest(board.id, window, input.digest, input.after);
           return { activity: { boardId: board.id, window, digest: input.digest, ...page } };
         }
-        const read = yield* service.activity(board.id, window);
-        return { activity: { boardId: board.id, ...Activity.rollup({ window, ...read }) } };
+        return yield* ActivityRead.read(service, board.id, window);
       }),
     ),
   ),

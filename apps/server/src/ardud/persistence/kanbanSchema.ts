@@ -1,6 +1,16 @@
 import * as Effect from "effect/Effect";
 import type * as SqlClient from "effect/sql/SqlClient";
 
+// Shared literally with the boundary seeks so SQLite can use the partial indexes.
+// Keep the legacy edited-wait prefix width: it is part of activity's history semantics.
+export const activityMarkers = {
+  stage:
+    "json_extract(json, '$.toStage') IS NOT NULL AND json_extract(json, '$.toStage') IS NOT json_extract(json, '$.fromStage')",
+  wait: "json_extract(json, '$.kind') IN ('wait_set', 'wait_cleared', 'wait_expired') OR (json_extract(json, '$.kind') = 'edited' AND (substr(json_extract(json, '$.body'), 1, length('Wait expired: ')) GLOB 'Waiting *' OR substr(json_extract(json, '$.body'), 1, length('Wait expired: ')) GLOB 'Wait ended: *' OR substr(json_extract(json, '$.body'), 1, length('Wait expired: ')) GLOB 'Wait expired: *'))",
+  stall:
+    "json_extract(json, '$.kind') IN ('flagged', 'moved', 'review', 'wait_set') OR (json_extract(json, '$.toStage') IS NOT NULL AND json_extract(json, '$.toStage') IS NOT json_extract(json, '$.fromStage')) OR (json_extract(json, '$.kind') = 'edited' AND substr(json_extract(json, '$.body'), 1, length('Wait expired: ')) GLOB 'Waiting *')",
+};
+
 // Legacy board copies can lack the older ask/open indexes too. Fetch their
 // payload pages before CREATE INDEX takes the writer, without parsing JSON.
 export const initializeKanbanSchema = Effect.fn("initializeKanbanSchema")(function* (
@@ -95,6 +105,13 @@ export const kanbanDDL = [
   // Board activity reads a time window of events (board_get since, board_activity).
   `CREATE INDEX IF NOT EXISTS ardud_kanban_card_events_at
     ON ardud_kanban_card_events (json_extract(json, '$.at'))`,
+  ...Object.entries(activityMarkers).map(
+    ([marker, predicate]) =>
+      `CREATE INDEX IF NOT EXISTS ardud_kanban_card_events_activity_${marker}
+      ON ardud_kanban_card_events (card_id, id, json_extract(json, '$.at')) WHERE ${predicate}`,
+  ),
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_card_events_activity_after
+    ON ardud_kanban_card_events (card_id, json_extract(json, '$.at'), id) WHERE ${activityMarkers.stage}`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_goals (
     id TEXT PRIMARY KEY, board_id TEXT NOT NULL, json TEXT NOT NULL
   )`,
