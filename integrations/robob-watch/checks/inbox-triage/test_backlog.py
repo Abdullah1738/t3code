@@ -539,7 +539,6 @@ class BacklogTests(unittest.TestCase):
         self.assertEqual(normal, fast)
 
     def test_real_oauth_refresh_lock_completes_while_watcher_guard_is_held(self):
-        (self.root / f'mail-progress-{account}.json').unlink(missing_ok=True)
         helper_path = Path(t.__file__).resolve().parents[3] / 'local-helpers/libexec/mail/mail_oauth.py'
         oauth = t.load_module('guard_test_oauth', helper_path)
         calls = []

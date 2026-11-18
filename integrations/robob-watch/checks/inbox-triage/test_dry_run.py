@@ -450,7 +450,7 @@ class DrySQLiteTests(unittest.TestCase):
                         self.assertEqual(wa.resolve(reader, '1@s.whatsapp.net'), ['1@s.whatsapp.net', '99@lid'])
                         self.assertEqual(wa.name_of(reader, '1@s.whatsapp.net'), 'Fixture contact')
                 self.assertEqual(self.unchanged(), before)
-                self.assertEqual({p for p in self.root.rglob('*') if p != self.scratch and self.scratch not in p.parents}, names)
+                self.assertEqual(set(self.root.rglob('*')), names)
                 self.assertEqual(Path(str(path) + '-shm').exists(), wal)
 
     def test_archive_search_and_show_use_same_boundary_in_isolated_worker(self):
