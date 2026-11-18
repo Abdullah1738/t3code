@@ -11,7 +11,7 @@ const SKEW_MS = 2_000;
 const BEGINNING = -8640000000000000;
 const OVERLAP_MS = 30_000;
 type Tick = { id: string; ready: Promise<void>; messages: Map<string, Snapshot>; summaries: Map<string, ThreadSummary>;
-  details: Map<string, Promise<ThreadDetail>>; evidence: Map<string, Promise<RunEvidence>>; accepted: Set<string>; failed: Set<string> };
+  details: Map<string, Promise<ThreadDetail>>; evidence: Map<string, Promise<RunEvidence>>; accepted: Set<string>; deferred: Set<string>; failed: Set<string> };
 
 /** Marker snapshots share messages and metadata; run evidence is shared for one tick only. */
 export class MessageCache {
@@ -44,7 +44,7 @@ export class MessageCache {
       this.details.delete(id);
       this.archived.delete(id);
     }
-    const tick: Tick = { id: randomUUID(), ready: Promise.resolve(), messages: new Map(), summaries: new Map(), details: new Map(), evidence: new Map(), accepted: new Set(), failed: new Set() };
+    const tick: Tick = { id: randomUUID(), ready: Promise.resolve(), messages: new Map(), summaries: new Map(), details: new Map(), evidence: new Map(), accepted: new Set(), deferred: new Set(), failed: new Set() };
     this.tick = tick;
     for (const id of threadIds) if (this.archived.has(id) && this.entries.has(id)) {
       tick.messages.set(id, this.entries.get(id)!);
@@ -286,6 +286,8 @@ export class MessageCache {
 
   accept(threadId: string, promptId: string): void { this.tick?.accepted.add(`${threadId}\0${promptId}`); }
   accepted(threadId: string, promptId: string): boolean { return this.tick?.accepted.has(`${threadId}\0${promptId}`) ?? false; }
+  deferReconciliation(threadId: string, operationId: string): void { this.tick?.deferred.add(`${threadId}\0${operationId}`); }
+  reconciliationDeferred(threadId: string, operationId: string): boolean { return this.tick?.deferred.has(`${threadId}\0${operationId}`) ?? false; }
 
   routeChange(threadId?: string): void {
     if (threadId !== undefined) {

@@ -2195,6 +2195,58 @@ test("marker polling: sibling chat backends share the marker pass and native ali
   expect(new URL("http://test" + pollingCalls(control.calls)[0]!.path).searchParams.get("ids")).toBe(chats.map(chat => chat.id).join(","));
 });
 
+test.each((["auto", "steer"] as const).flatMap(mode => [false, true].flatMap(landed => [0, 500, 503].map(status => ({ mode, landed, status })))))
+  ("marker polling: ambiguous $mode ($status, landed=$landed) waits for the next snapshot without another GET", async ({ mode, landed, status }) => {
+  const { control, backend, chats, tick } = await markerFixture(1, true);
+  const chat = chats[0]!, prompt = `msg_${"f".repeat(64)}`;
+  const request = backend.client.request.bind(backend.client);
+  const lost = new ControlError(status, "unavailable", status === 503 ? { reason: "reader_unavailable", retrySafe: false } : {});
+  let posts = 0;
+  const post = spyOn(backend.client, "request").mockImplementation(async function<T>(...args: Parameters<ControlClient["request"]>): Promise<T> {
+    if (args[0] !== "POST" || !args[1].endsWith("/send")) return request<T>(...args);
+    posts++;
+    if (landed) await request<T>(...args);
+    throw lost;
+  });
+  try {
+    const sending = mode === "auto" ? backend.prompt(chat.id, chat.directory, prompt, "follow up") : backend.steer(chat.id, chat.directory, prompt, "follow up");
+    await expect(sending).rejects.toBe(lost);
+    expect(lost.reconciled).not.toBe(true);
+    await expect(backend.promptAccepted(chat.id, chat.directory, prompt)).rejects.toBeInstanceOf(ControlError);
+    expect(control.calls.filter(call => call.method === "GET")).toHaveLength(0);
+    await tick();
+    expect(await backend.promptAccepted(chat.id, chat.directory, prompt)).toBe(landed);
+    expect(pollingCalls(control.calls).length).toBeLessThanOrEqual(2);
+    expect(posts).toBe(1);
+    expect(control.threads.get(chat.id)!.messages.filter(row => row.text === "follow up")).toHaveLength(landed ? 1 : 0);
+  } finally { post.mockRestore(); }
+});
+
+test.each(["approval", "question", "dismiss"] as const)("marker polling: ambiguous %s response waits for fresh request detail", async kind => {
+  const { control, backend, chats, tick } = await markerFixture(1, true);
+  const chat = chats[0]!, thread = control.threads.get(chat.id)!;
+  thread.pending.push({ requestId: "pending-one", kind: kind === "approval" ? "approval" : "question", requestKind: "command",
+    questions: [{ id: "q1", header: "Choose", question: "Which?", options: [{ label: "yes" }] }] });
+  await tick(); control.calls.length = 0;
+  const request = backend.client.request.bind(backend.client), lost = new ControlError(0);
+  const post = spyOn(backend.client, "request").mockImplementation(async function<T>(...args: Parameters<ControlClient["request"]>): Promise<T> {
+    if (args[0] !== "POST" || !args[1].endsWith("/respond")) return request<T>(...args);
+    await request<T>(...args); throw lost;
+  });
+  try {
+    const sending = kind === "approval" ? backend.permissionReply(chat.id, "pending-one", chat.directory, "once")
+      : kind === "dismiss" ? backend.cancelQuestion(chat.id, "pending-one", chat.directory)
+      : backend.questionReply((await backend.questions(chat.id))[0]!, chat.directory, [["yes"]]);
+    await expect(sending).rejects.toBe(lost);
+    expect(lost.reconciled).not.toBe(true);
+    await expect(backend.responseResolved(chat.id, chat.directory, "pending-one")).rejects.toBeInstanceOf(ControlError);
+    expect(control.calls.filter(call => call.method === "GET")).toHaveLength(0);
+    await tick();
+    expect(await backend.responseResolved(chat.id, chat.directory, "pending-one")).toBe(true);
+    expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(1);
+  } finally { post.mockRestore(); }
+});
+
 test.each(["transport", "reader_unavailable", "server_error"].flatMap(reason => [false, true].map(restart => ({ reason, restart }))))("deferred steer refusal releases its wire mode ($reason, restart=$restart)", async ({ reason, restart }) => {
   const { control, backend, store, router } = delegatedRouter(); backend.trackFirstTurns(store);
   store.acceptInbound("root", { id: "root", text: "Original", attachments: [], isAudioMessage: false, receivedAt: Date.now() });

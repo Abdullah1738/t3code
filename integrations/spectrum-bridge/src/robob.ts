@@ -650,6 +650,7 @@ export class RobobBackend implements ChatBackend {
     const threadId = await this.resolve(id);
     if (await this.messageCache.prepared(threadId)) {
       if (this.messageCache.accepted(threadId, messageId)) return true;
+      if (this.messageCache.reconciliationDeferred(threadId, messageId)) throw new ControlError(0, "acceptance_pending");
       const messages = await this.messageCache.read(threadId, "accepted");
       return messages.some(message => message.role === "user" && promptId(threadId, message) === messageId);
     }
@@ -661,7 +662,9 @@ export class RobobBackend implements ChatBackend {
   async responseResolved(id: string, _directory: string, requestId: string): Promise<boolean> {
     // /respond changes a runtime request, never a chat message. Only a successful
     // thread read can prove that the formerly pending request is now resolved.
-    const thread = await this.detail(id);
+    const threadId = await this.resolve(id);
+    if (this.messageCache.reconciliationDeferred(threadId, `respond:${requestId}`)) throw new ControlError(0, "response_pending");
+    const thread = await this.detail(threadId);
     return !thread.pendingRequests.some(request => request.requestId === requestId);
   }
 
@@ -670,6 +673,11 @@ export class RobobBackend implements ChatBackend {
       // A reader during the POST may have repopulated the same-tick snapshot before admission.
       this.messageCache.afterWrite(threadId);
       const accepted = await this.promptAccepted(threadId, "", messageId);
+      // The marker snapshot predates this POST. Absence cannot prove rejection until the next tick.
+      if (!accepted && await this.messageCache.prepared(threadId)) {
+        this.messageCache.deferReconciliation(threadId, messageId);
+        throw error;
+      }
       if (error instanceof ControlError) error.reconciled = true;
       return accepted;
     } catch (readError) {
@@ -866,6 +874,10 @@ export class RobobBackend implements ChatBackend {
     catch (error) {
       toolError("robob", "robob.respond_failed", error);
       if (controlDisposition(error) === "reconcile") {
+        if (await this.messageCache.prepared(threadId)) {
+          this.messageCache.deferReconciliation(threadId, `respond:${requestId}`);
+          throw error;
+        }
         try {
           await this.responseResolved(threadId, "", requestId);
           if (error instanceof ControlError) error.reconciled = true;
