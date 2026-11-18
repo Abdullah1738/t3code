@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clip, escalationText, inQuiet, MAX_WAKE, normalize, runCheck, sameContact, sendNotes, wakeText } from "../src/lib.ts";
@@ -19,9 +19,20 @@ test("a timeout kills the whole process group, including grandchildren", async (
 
 test("the result never waits on a child that keeps its pipes open after the kill", async () => {
   // A process outside the check's group that inherited stdout keeps the pipe open; runCheck still returns.
-  const result = await runCheck(watcher(`/usr/bin/perl -e 'setpgrp; sleep 20' & sleep 30`), dir, {}, 500);
-  expect(result.timedOut).toBe(true);
-  expect(result.ms).toBeLessThan(7_000);
+  const pidFile = join(dir, "escaped.pid");
+  try {
+    const result = await runCheck(watcher(`/usr/bin/perl -e 'setpgrp; open my $f, ">", "$ENV{WATCH_DIR}/escaped.pid" or die $!; print $f $$; close $f; sleep 20' & sleep 30`), dir, {}, 500);
+    expect(result.timedOut).toBe(true);
+    expect(result.ms).toBeLessThan(7_000);
+  } finally {
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      if (Number.isSafeInteger(pid) && pid > 1) {
+        try { process.kill(pid, "SIGKILL"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      }
+    }
+  }
 }, 15_000);
 
 test("a wake carries the start of its context, and the whole context only on the day's first fire", () => {
@@ -45,11 +56,11 @@ test("a wake carries the start of its context, and the whole context only on the
 });
 
 test("watcher check children inherit replica overrides", async () => {
-  const names = ["ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "SEND_APPROVAL_STATE_DB", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
+  const names = ["ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "SEND_APPROVAL_STATE_DB", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME", "SPECTRUM_BRIDGE_CONFIG"];
   const before = names.map(name => process.env[name]);
   for (const name of names) process.env[name] = `/replica/${name}`;
   try {
-    const result = await runCheck(watcher('print -r -- "$ROBOB_READONLY_DB|$MONEY_CASES_STATE_DB|$SEND_APPROVAL_STATE_DB|$ROBOB_HOME|$T3CODE_HOME|$XDG_DATA_HOME"'), dir);
+    const result = await runCheck(watcher('print -r -- "$ROBOB_READONLY_DB|$MONEY_CASES_STATE_DB|$SEND_APPROVAL_STATE_DB|$ROBOB_HOME|$T3CODE_HOME|$XDG_DATA_HOME|$SPECTRUM_BRIDGE_CONFIG"'), dir);
     expect(result.code).toBe(0);
     expect(result.stdout.trim()).toBe(names.map(name => `/replica/${name}`).join("|"));
   } finally {

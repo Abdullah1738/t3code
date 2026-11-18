@@ -7,7 +7,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   withRelayLock, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
-  trackConfirmation, confirmWakes, inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
+  trackConfirmation, confirmWakes, inboundState, inQuiet, iso, installCheckShutdown, killRunningChecks, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
@@ -18,6 +18,7 @@ const TICK_MS = 1_000;
 /** By default a trigger-file change never runs the same check more often than this (watcher.trigger_gap_s overrides). */
 const TRIGGER_MIN_GAP_MS = 2_000;
 const running = new Set<string>();
+let shuttingDown = false;
 let maintenance: Maintenance | undefined;
 let ssdMounted = true;
 const loadMode = new LoadMode();
@@ -77,7 +78,9 @@ async function runPendingCheck(watcher: Watcher, at: number, mainChecked = false
   const instance = watcherInstance(watcher.id);
   if (!watcher.pending_check || !instance) return;
   await slots.run(async timing => {
+    if (shuttingDown) return;
     const result = await withRelayLock(() => {
+      if (shuttingDown) return;
       const current = loadWatcher(watcher.id);
       const state = loadState(watcher.id);
       if (!current || watcherInstance(watcher.id) !== instance || held(current) || current.paused || !current.pending_check
@@ -88,7 +91,7 @@ async function runPendingCheck(watcher: Watcher, at: number, mainChecked = false
         { WATCH_PENDING: "1", WATCH_RUN: `pending-${at.toString(36)}`, ...(mainChecked ? { WATCH_MAIN_CHECKED: "1" } : {}) },
         checkTimeout(current, sampleLoad()), instance);
     });
-    if (!result) return;
+    if (!result || shuttingDown) return;
     log(watcher.id, `pending check exit=${result.code} timeout=${result.timedOut}`);
   }, { watcher: watcher.id, operation: "pending", dueAt: at, intervalMs: watcher.interval_s * 1_000 });
 }
@@ -397,11 +400,14 @@ function recoverAdmission(id: string, instance: string | undefined): void {
 }
 
 export async function tickOne(id: string): Promise<void> {
+  if (shuttingDown) return;
   applyOwnerAlertResults(id);
   try { await tickWatcher(id); }
   finally {
-    applyOwnerAlertResults(id);
-    dispatchOwnerAlerts(id);
+    if (!shuttingDown) {
+      applyOwnerAlertResults(id);
+      dispatchOwnerAlerts(id);
+    }
   }
 }
 
@@ -530,11 +536,12 @@ async function tickWatcher(id: string): Promise<void> {
   const trigger = finalCheck ? "final" : state.consecutive_failures || state.load_timeouts ? "retry" : triggered ? "trigger" : "schedule";
   let lateMs = 0, loadModeAtAdmission = false;
   const result = await slots.run(async timing => {
+    if (shuttingDown) return;
     slotTiming = timing;
     lateMs = Math.max(0, now() - dueAt);
     loadModeAtAdmission = loadMode.high;
     return withRelayLock(() => {
-    if (!sameInstance()) return undefined;
+    if (shuttingDown || !sameInstance()) return undefined;
     recoverAdmission(id, instance);
     const recovery = loadState(id);
     const unacked = recovery.discarded_run ?? recovery.reply_handoff?.accepted_run
@@ -566,7 +573,7 @@ async function tickWatcher(id: string): Promise<void> {
     });
   }, { watcher: id, run: attemptId, operation: "check", intervalMs: watcher.interval_s * 1_000,
     dueAt, lane });
-  if (!result) return;
+  if (!result || shuttingDown) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
   const failed = runTimedOut || result.code !== 0;
   toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: result.busy ? "busy" : runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", ...(result.busy ? { stderrClass: "dependency_busy", dependency: result.busy.dependency } : {}), exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs: Math.max(0, now() - t - result.ms), ...slotTiming, dueAt, lateMs, lane, loadMode: loadModeAtAdmission, intervalMs: watcher.interval_s * 1_000, trigger }, ...(failed ? { error: { tag: result.busy ? "watch.dependency_busy" : runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
@@ -701,6 +708,7 @@ function recordCadence(watcher: Watcher): void {
   toolLog({ component: "runner", kind: "event", name: "watch.cadence", ids: { watcher: watcher.id }, props: { intervalMs: watcher.interval_s * 1_000 } });
 }
 export async function tick(): Promise<void> {
+  if (shuttingDown) return;
   previousDayRollup();
   sampleLoad();
   const mounted = isMounted(SSD_PATH);
@@ -728,6 +736,12 @@ export async function tick(): Promise<void> {
   void Promise.all(jobs);
 }
 
+let tickTimer: ReturnType<typeof setInterval> | undefined;
+installCheckShutdown(() => {
+  shuttingDown = true;
+  if (tickTimer) clearInterval(tickTimer);
+});
+
 if (import.meta.main) {
   ensureDirs();
   // Only one runner at a time, even if launchd and a manual run overlap.
@@ -739,11 +753,12 @@ if (import.meta.main) {
     const command = alive ? Bun.spawnSync(["/bin/ps", "-o", "command=", "-p", String(other)]).stdout.toString() : "";
     if (alive && command.includes("robob-watch/src/runner.ts")) {
       log(null, `another runner is live (pid ${other}); exiting`);
+      await killRunningChecks();
       process.exit(0);
     }
   }
   writeFileSync(pidPath, `${process.pid}\n`);
   log(null, `robob-watch runner started pid=${process.pid} host load=${hostLoad().toFixed(1)}/core`);
   await tick().catch(() => toolError("runner", "watch.tick_failed"));
-  setInterval(() => void tick().catch(() => toolError("runner", "watch.tick_failed")), TICK_MS);
+  if (!shuttingDown) tickTimer = setInterval(() => void tick().catch(() => toolError("runner", "watch.tick_failed")), TICK_MS);
 }
