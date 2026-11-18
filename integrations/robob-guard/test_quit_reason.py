@@ -1,4 +1,6 @@
 import json
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import subprocess
@@ -26,7 +28,7 @@ class QuitReasonTests(unittest.TestCase):
                 44: EXECUTABLE, 45: EXECUTABLE + " Helper"}, '"pid"=42', 42, False),
             ("no app", {}, "", None, False),
             ("orphaned backend only", {43: EXECUTABLE}, "", None, False),
-            ("stale registration", {}, "pid = 42", None, True),
+            ("stale registration", {}, "pid = 42", None, False),
             ("wrong executable", {42: "/bin/other"}, "pid = 42", None, True),
             ("multiple registrations", {42: EXECUTABLE, 43: EXECUTABLE},
                 "pid = 42\npid = 43", None, True),
@@ -36,7 +38,8 @@ class QuitReasonTests(unittest.TestCase):
                 if command[0] == "/usr/bin/lsappinfo":
                     return Mock(stdout=info)
                 self.assertEqual(command[:2], ["/bin/ps", "-p"])
-                return Mock(stdout=processes.get(int(command[2]), ""))
+                value = processes.get(int(command[2]), "")
+                return subprocess.CompletedProcess(command, 0 if value else 1, stdout=value)
             with self.subTest(name=name), patch("sys.argv", ["quit_reason", "--initiator", "installer", "--reason", "release .13"]), \
                     patch("quit_reason.subprocess.run", side_effect=run), patch("quit_reason.write_reason") as write:
                 if invalid:
@@ -57,8 +60,41 @@ class QuitReasonTests(unittest.TestCase):
                 desktop_pid()
             write.assert_not_called()
 
+    def test_ps_failure_corpus(self):
+        for code, output, expected in [(1, "", None), (0, EXECUTABLE, 42),
+                                       (0, "/bin/other", ValueError), (0, "", ValueError),
+                                       (2, "", subprocess.CalledProcessError),
+                                       (1, EXECUTABLE, subprocess.CalledProcessError)]:
+            with self.subTest(code=code, output=output), patch("quit_reason.registered_desktop_pids", return_value={42}), \
+                    patch("quit_reason.subprocess.run", return_value=subprocess.CompletedProcess("ps", code, stdout=output)):
+                if isinstance(expected, type):
+                    with self.assertRaises(expected):
+                        desktop_pid()
+                else:
+                    self.assertEqual(desktop_pid(), expected)
+
+    def test_stale_pid_cli_is_clean_and_reports_no_desktop(self):
+        output = io.StringIO()
+        with patch("sys.argv", ["quit_reason", "--initiator", "installer", "--reason", "test"]), \
+                patch("quit_reason.subprocess.run", side_effect=[
+                    subprocess.CompletedProcess("lsappinfo", 0, stdout="pid = 42"),
+                    subprocess.CompletedProcess("ps", 1, stdout="")]), \
+                patch("quit_reason.write_reason") as write, redirect_stdout(output):
+            self.assertIsNone(main())
+        self.assertEqual(output.getvalue(), "no desktop\n")
+        write.assert_not_called()
+
+    def test_watchdog_hold_without_desktop_keeps_hold_without_quit_reason(self):
+        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", side_effect=lambda pid: pid in (12, 12345)), \
+                patch("hold.subprocess.Popen", return_value=Mock(pid=12345)), \
+                patch("hold.desktop_pid", return_value=None), patch("hold.write_reason") as write:
+            holds = Holds(Path(directory))
+            self.assertEqual(holds.start("overload-restart", 12), 12345)
+            self.assertTrue(holds.path.exists())
+            write.assert_not_called()
+
     def test_watchdog_hold_hands_off_before_returning(self):
-        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", return_value=True), \
+        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", side_effect=lambda pid: pid in (12, 12345)), \
                 patch("hold.subprocess.Popen", return_value=Mock(pid=12345)), \
                 patch("hold.desktop_pid", return_value=42), \
                 patch("hold.write_reason") as write:
@@ -67,13 +103,13 @@ class QuitReasonTests(unittest.TestCase):
             write.assert_called_once_with(home, "watchdog", "overload-restart", 12, 42)
 
     def test_preflight_install_hold_is_not_quit_evidence(self):
-        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", return_value=True), \
+        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", side_effect=lambda pid: pid in (12, 12345)), \
                 patch("hold.subprocess.Popen", return_value=Mock(pid=12345)), patch("hold.write_reason") as write:
             Holds(Path(directory)).start("install-robob", 12)
             write.assert_not_called()
 
     def test_reused_watchdog_hold_refreshes_the_reason(self):
-        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", return_value=True), \
+        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", side_effect=lambda pid: pid in (12, 12345)), \
                 patch("hold.subprocess.Popen", return_value=Mock(pid=12345)), \
                 patch("hold.desktop_pid", return_value=42), patch("hold.write_reason") as write:
             holds = Holds(Path(directory))
@@ -81,6 +117,15 @@ class QuitReasonTests(unittest.TestCase):
             with patch.object(holds, "beater_is_ours", return_value=True):
                 holds.start("overload-restart", 12)
             self.assertEqual(write.call_count, 2)
+
+    def test_captured_target_is_not_replaced_by_a_new_registered_desktop(self):
+        with tempfile.TemporaryDirectory() as directory, patch("sys.argv", [
+                "quit_reason", "--initiator", "guard", "--reason", "backend-unready", "--target-pid", "42"]), \
+                patch("quit_reason.Path.home", return_value=Path(directory)), \
+                patch("quit_reason.desktop_pid") as lookup, patch("quit_reason.write_reason") as write:
+            main()
+            lookup.assert_not_called()
+            self.assertEqual(write.call_args.args[-1], 42)
 
     def test_shell_helper_locates_its_script_when_sourced(self):
         with tempfile.TemporaryDirectory() as directory:

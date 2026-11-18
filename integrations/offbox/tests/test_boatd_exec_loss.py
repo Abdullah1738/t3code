@@ -151,7 +151,9 @@ class ExecLoss(Base):
                 if rc is not None:
                     boatd.write_json(boatd.result_path(b,p),dict(attempt=1,status='exited',exit_code=rc,ended_at=110))
                 with patch.object(boatd.threading,'Thread',CapturedThread),patch.object(boatd,'run_processes',return_value=[]):
-                    boatd.delete_box(self.con,b)
+                    token=boatd.offbox_protection.CALLER.set(dict(override=True,holder='ardud',actor='client:release'))
+                    try: boatd.delete_box(self.con,b)
+                    finally: boatd.offbox_protection.CALLER.reset(token)
                 missing=subprocess.CompletedProcess([],1,b'',b'Error: Instance not found\n')
                 def probe(c):
                     with patch.object(boatd,'incus',return_value=missing):
@@ -223,8 +225,11 @@ class ExecLoss(Base):
             def start(self): pass
         with patch.object(boatd.threading,'Thread',CapturedThread),patch.object(boatd,'run_processes',return_value=[]), \
              patch.object(boatd,'incus',return_value=subprocess.CompletedProcess([],1,b'',b'Error: Incus is shutting down')):
-            with self.assertRaises(boatd.Fail):
-                boatd.delete_box(self.con,b)
+            token=boatd.offbox_protection.CALLER.set(dict(override=True,holder='ardud',actor='client:release'))
+            try:
+                with self.assertRaises(boatd.Fail) as failed: boatd.delete_box(self.con,b)
+                self.assertEqual(failed.exception.code,'incus_failed')
+            finally: boatd.offbox_protection.CALLER.reset(token)
         self.assertIsNone(self.state(b)['deleted_at'])
         with patch.object(boatd,'command_probe',return_value={'reason':'incus_unavailable'}):
             boatd.settle_cmd(self.con,self.status(b,p))

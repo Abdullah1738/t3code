@@ -25,7 +25,7 @@ sys.modules[_spec.name] = test_boatd
 _spec.loader.exec_module(test_boatd)
 
 boatd = test_boatd.boatd
-REMOTE_COMMANDS_BUSY = lease.remote_commands_busy
+BOX_PROTECTION = api.box_protection
 
 
 class Wire(Isolated):
@@ -44,7 +44,7 @@ class Wire(Isolated):
             # Use the actual per-command cgroup layout, not a mocked liveness answer.
             command_dir=cgroup/'boatd'/str(pid); command_dir.mkdir(parents=True)
             (command_dir/'cgroup.procs').write_text('129844\n')
-            stack.enter_context(patch.object(lease,'remote_commands_busy',REMOTE_COMMANDS_BUSY))
+            stack.enter_context(patch.object(api,'box_protection',BOX_PROTECTION))
             stack.enter_context(patch.object(pool,'wait_seconds',return_value=0))
             stack.enter_context(patch.dict('os.environ',OFFBOX_POOL_SIZE='1'))
             stack.enter_context(patch.object(lease,'cap_check'))
@@ -59,7 +59,7 @@ class Wire(Isolated):
             self.assertTrue(api.call('GET',f'/sandboxes/{box}/commands/busy')['busy'])
             with self.assertRaises(api.ApiError) as rejected:
                 api.cmd_start(box,'true',meta={'run_id':'run-1115-101239-cf3b'})
-            self.assertEqual(rejected.exception.api_code,'commands_busy')
+            self.assertEqual(rejected.exception.api_code,'box_held')
             (command_dir/'cgroup.procs').write_text('')
             self.assertFalse(api.call('GET',f'/sandboxes/{box}/commands/busy')['busy'])
             # Once the cgroup is empty, the same queued request can be admitted.
@@ -99,9 +99,10 @@ class Wire(Isolated):
     def test_the_retry_flag_reaches_the_server_only_when_asked(self):
         box = self.srv.make_box("ardud")
         a = api.cmd_start(box, "make test", meta={"repo": "r", "kind": "make test", "run_id": "run-1"}, retry_interrupted=True)
-        b = api.cmd_start(self.srv.make_box("ardud"), "make deploy")
-        rows = list(self.srv.con.execute("SELECT * FROM commands ORDER BY rowid"))
-        self.assertEqual((rows[0]["retry_interrupted"], rows[1]["retry_interrupted"]), (1, 0))
+        self.end(box, a['processId'], 0)
+        b = api.cmd_start(box, "make deploy")
+        rows = {r["pid"]: r for r in self.srv.con.execute("SELECT * FROM commands WHERE box_id=?", (box,))}
+        self.assertEqual((rows[a["processId"]]["retry_interrupted"], rows[b["processId"]]["retry_interrupted"]), (1, 0))
         st = api.cmd_status(box, a["processId"])
         self.assertEqual((st["attempt"], st["retryInterrupted"], st["bootId"]), (1, True, "boot-2"))
 

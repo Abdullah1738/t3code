@@ -36,6 +36,7 @@ const harnessHash = hash([
   ),
   await fileHash(resolve("apps/server/scripts/acp-mock-agent.ts")),
   await fileHash(resolve("apps/server/scripts/acpMockCancellationState.ts")),
+  await fileHash(resolve("apps/server/scripts/acpMockRequestLog.ts")),
 ]);
 const runtimeHash = hash({ node: process.version, sqlite: process.versions.sqlite });
 const hardwareHash = hash({

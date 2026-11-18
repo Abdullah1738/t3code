@@ -19,7 +19,7 @@ from test_pool_lock import pool_lock_free
 class PoolRecycleTests(Isolated):
     def setUp(self):
         super().setUp()
-        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_TOOL_LOG_DIR': str(Path(self.tmp.name)/'tools')}))
+        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_LOG_DIR': str(Path(self.tmp.name)/'tools')}))
         self.box('old', member=True, used=common.now()-100)
         self.box('busy', member=True)
         self.busy('busy')
@@ -229,7 +229,7 @@ class PoolRecycleTests(Isolated):
 
     def test_recycle_events_reach_tool_logs_and_rollup(self):
         logs = Path(self.tmp.name)/'tools'
-        with patch.dict(os.environ, {'OFFBOX_TOOL_LOG_DIR': str(logs)}), \
+        with patch.dict(os.environ, {'OFFBOX_LOG_DIR': str(logs)}), \
                 patch.object(lease, 'stop_box', side_effect=self.stop), \
                 patch.object(lease, 'acquire_private', side_effect=self.create):
             got = pool.acquire(self.me, template='generic', run_id='request')

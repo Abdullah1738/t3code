@@ -244,6 +244,8 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   currentRunId: Schema.optional(Schema.NullOr(RunId)),
   currentRunStatus: Schema.optional(Schema.NullOr(OrchestrationV2RunStatus)),
   status: OrchestratorMcpDelegatedTaskStatus,
+  resumable: Schema.optional(Schema.Boolean),
+  resumeThreadId: Schema.optional(ThreadId),
   failure: Schema.optional(
     Schema.NullOr(
       Schema.Struct({

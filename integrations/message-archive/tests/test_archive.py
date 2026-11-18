@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 ROOT = tempfile.mkdtemp(prefix="msgs-test-")
 os.environ["MSGS_ROOT"] = ROOT
+os.environ["MSGS_LOG_DIR"] = os.path.join(ROOT, "logs")
 os.environ["MSGS_ADDRESSBOOK"] = os.path.join(ROOT, "ab")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 

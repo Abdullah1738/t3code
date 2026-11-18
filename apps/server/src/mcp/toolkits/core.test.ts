@@ -342,17 +342,27 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
   ),
 );
 
-it.effect("returns invalid parameter errors through the production registration", () =>
+it.effect("returns structured input rejections through the production registration", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
-    const error = yield* server
+    const result = yield* server
       .callTool({ name: "t3_thread_organize", arguments: { action: "invalid" } })
       .pipe(
         Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
         Effect.provideService(McpSchema.McpServerClient, client),
-        Effect.flip,
       );
-    expect(error._tag).toBe("InvalidParams");
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      code: "invalid_request",
+      invalidFields: ["action"],
+    });
+    const part = result.content[0];
+    if (part?.type !== "text") throw new Error("missing input rejection text");
+    expect(part.text).toContain('action must be "pin" or "unpin"');
+    expect(part.text).toContain('"mark_unread" (got string)');
+    expect(result.structuredContent).toMatchObject({ message: part.text });
+    expect(part.text.length).toBeLessThanOrEqual(300);
+    expect(part.text).not.toMatch(/[\r\n]/);
   }).pipe(
     Effect.provide(
       layerThreadToolkit.pipe(

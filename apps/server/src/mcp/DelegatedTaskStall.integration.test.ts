@@ -23,6 +23,7 @@ import {
 import * as TestClock from "effect/testing/TestClock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -31,6 +32,7 @@ import * as Stream from "effect/Stream";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { ClaudeProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
+import * as CommandOutputHub from "../orchestration-v2/CommandOutputHub.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -59,6 +61,9 @@ it.effect.each([
   "silent",
   "post_tool_recovery",
   "first_event_recovery",
+  "first_event_recovery_terminal_completed",
+  "first_event_recovery_terminal_cancelled",
+  "first_event_recovery_terminal_failed",
   "first_event_adapter_owned_claude",
   "first_event_recovery_continuation_queued",
   "first_event_recovery_continuation_preparing",
@@ -70,6 +75,11 @@ it.effect.each([
   "post_tool_recovery_race",
   "first_event_recovery_race",
   "reasoning_no_recovery",
+  "expired_command",
+  "command_output",
+  "failed_command",
+  "cancelled_partial",
+  "interrupted_partial",
   "command_execution",
   "dynamic_tool",
   "file_change",
@@ -88,6 +98,13 @@ it.effect.each([
 ] as const)("delegated stall commit: %s", (race) => {
   const recovering =
     (race.startsWith("post_tool") || race.startsWith("first_event")) && !race.endsWith("claude");
+  const interruptedStatus = race.endsWith("_completed")
+    ? "completed"
+    : race.endsWith("_cancelled") || race === "cancelled_partial"
+      ? "cancelled"
+      : race.endsWith("_failed")
+        ? "failed"
+        : "interrupted";
   const recoveryRace = race.includes("_race");
   const firstEvent = race.startsWith("first_event");
   const postTool = race.startsWith("post_tool");
@@ -189,7 +206,7 @@ it.effect.each([
                       runAttemptId: entry.turn.attemptId,
                       nativeTurnRef: null,
                       ordinal: entry.turn.providerTurnOrdinal,
-                      status: "interrupted",
+                      status: interruptedStatus,
                       startedAt: now,
                       completedAt: yield* DateTime.now,
                     },
@@ -200,9 +217,19 @@ it.effect.each([
                     providerThreadId: entry.turn.providerThread.id,
                     providerTurnId,
                     runOrdinal: entry.turn.runOrdinal,
-                    status: "interrupted",
-                    failure: null,
                     threadDisposition: "reusable",
+                    ...(interruptedStatus === "failed"
+                      ? {
+                          status: "failed" as const,
+                          failureItemOrdinal: 101,
+                          failure: {
+                            class: "provider_error" as const,
+                            message: "Old attempt failed during restart",
+                            code: null,
+                            retryable: false,
+                          },
+                        }
+                      : { status: interruptedStatus, failure: null }),
                   });
                 }),
               respondToRuntimeRequest: () => Effect.die("unused"),
@@ -369,7 +396,13 @@ it.effect.each([
             payload: partial,
           });
         }
-        if (postTool || race === "reasoning_no_recovery") {
+        if (
+          postTool ||
+          race === "reasoning_no_recovery" ||
+          race === "expired_command" ||
+          race === "command_output" ||
+          race === "failed_command"
+        ) {
           const item = {
             ...partial,
             id: TurnItemId.make("last-model-event"),
@@ -380,7 +413,16 @@ it.effect.each([
                   input: {},
                   output: "[]",
                 }
-              : { type: "reasoning" as const, text: "Thinking" }),
+              : race === "expired_command" || race === "command_output" || race === "failed_command"
+                ? {
+                    type: "command_execution" as const,
+                    input: "offbox wait run-proof --timeout 570",
+                    timeoutMs: 600_000,
+                    ...(race !== "failed_command"
+                      ? { status: "running" as const, completedAt: null }
+                      : { status: "failed" as const, exitCode: 137, output: "Exit code 137" }),
+                  }
+                : { type: "reasoning" as const, text: "Thinking" }),
           };
           const stored = yield* watch(
             (event) => event.type === "turn-item.updated" && event.payload.id === item.id,
@@ -414,10 +456,144 @@ it.effect.each([
         const before = yield* service.taskStatus(scope, task.id);
         assert.equal(
           before.lastProgressKind,
-          firstEvent ? "run_started" : postTool ? "dynamic_tool_finished" : "assistant_text",
+          firstEvent
+            ? "run_started"
+            : postTool
+              ? "dynamic_tool_finished"
+              : race === "expired_command" || race === "command_output"
+                ? "command_execution_started"
+                : race === "failed_command"
+                  ? "command_execution_finished"
+                  : "assistant_text",
         );
         assert.equal(before.lastProgressAt, DateTime.formatIso(now));
-        yield* TestClock.adjust("16 minutes");
+        if (race === "cancelled_partial" || race === "interrupted_partial") {
+          const ended = yield* watch(
+            (event) =>
+              event.type === "subagent.updated" &&
+              event.payload.id === task.id &&
+              ["cancelled", "interrupted", "failed", "completed"].includes(event.payload.status),
+          );
+          yield* service.cancelTask(scope, {
+            taskId: task.id,
+            clientRequestId: "cancel-with-partial",
+          });
+          yield* worker.drain();
+          yield* Fiber.join(ended);
+          const after = yield* service.taskStatus(scope, task.id);
+          assert.equal(after.status, interruptedStatus);
+          assert.include(after.summary!, `Child task ${interruptedStatus}; no final report.`);
+          assert.include(after.summary!, "Partial assistant findings (not a final report):");
+          assert.include(after.summary!, partial.text);
+          assert.notProperty(after, "finalReport");
+          const parentAfter = yield* orchestrator.getThreadProjection(parentThreadId);
+          assert.include(parentAfter.subagents[0]!.result!, "Partial assistant findings");
+          assert.equal(parentAfter.subagents[0]!.completionDelivery?.state, "disposed");
+          return;
+        }
+        if (race === "command_output") {
+          yield* TestClock.adjust(959_000);
+          const item = (yield* orchestrator.getThreadProjection(
+            task.childThreadId!,
+          )).turnItems.find((item) => item.id === TurnItemId.make("last-model-event"))!;
+          const received = yield* watch(
+            (event) =>
+              event.type === "turn-item.updated" &&
+              event.payload.id === item.id &&
+              event.payload.title === "output delivered",
+          );
+          const entry = turns.findLast((entry) => entry.turn.threadId === task.childThreadId)!;
+          yield* Queue.offer(entry.events, {
+            type: "command_output.delta",
+            driver,
+            threadId: task.childThreadId!,
+            itemId: item.id,
+            chunk: "still making progress\n",
+          });
+          yield* Queue.offer(entry.events, {
+            type: "turn_item.updated",
+            driver,
+            turnItem: { ...item, title: "output delivered" },
+          });
+          yield* Fiber.join(received);
+          yield* TestClock.adjust("1 second");
+          yield* guard.check();
+          assert.equal(interrupts, 0);
+          const rejectedStall = yield* orchestrator
+            .dispatch({
+              type: "run.interrupt",
+              commandId: CommandId.make("stale-output-stall"),
+              threadId: task.childThreadId!,
+              runId: childRun.id,
+              fenced: true,
+              delegatedTaskStall: {
+                idleTimeoutMs: 900_000,
+                lastProgressAt: now,
+                lastProgressKind: "command_execution_timeout",
+              },
+            })
+            .pipe(Effect.result);
+          assert.equal(rejectedStall._tag, "Failure");
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs.find(
+              (run) => run.id === childRun.id,
+            )!.status,
+            "running",
+          );
+          assert.equal(
+            DateTime.formatIso(
+              (yield* orchestrator.getThreadProjection(task.childThreadId!)).turnItems.find(
+                (candidate) => candidate.id === item.id,
+              )!.updatedAt,
+            ),
+            DateTime.formatIso(item.updatedAt),
+          );
+          yield* TestClock.adjust("1 minute");
+          const hub = yield* CommandOutputHub.CommandOutputHub;
+          const append = hub.append;
+          const outputReceived = yield* Deferred.make<void>();
+          const sink = yield* EventSink.EventSinkV2;
+          const commit = sink.commitCommand;
+          let injected = false;
+          Object.assign(hub, {
+            append: (input: Parameters<typeof append>[0]) =>
+              append(input).pipe(Effect.andThen(Deferred.succeed(outputReceived, undefined))),
+          });
+          Object.assign(sink, {
+            commitCommand: (input: Parameters<typeof commit>[0]) =>
+              Effect.gen(function* () {
+                if (input.commandType === "run.interrupt" && !injected) {
+                  injected = true;
+                  yield* Queue.offer(entry.events, {
+                    type: "command_output.delta",
+                    driver,
+                    threadId: task.childThreadId!,
+                    itemId: item.id,
+                    chunk: "output raced the stall commit\n",
+                  });
+                  yield* Deferred.await(outputReceived);
+                }
+                return yield* commit(input);
+              }),
+          });
+          yield* guard.check().pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                Object.assign(hub, { append });
+                Object.assign(sink, { commitCommand: commit });
+              }),
+            ),
+          );
+          assert.isTrue(injected);
+          assert.equal(interrupts, 0);
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs.find(
+              (run) => run.id === childRun.id,
+            )!.status,
+            "running",
+          );
+          yield* TestClock.adjust("1 minute");
+        } else yield* TestClock.adjust("16 minutes");
         let stalledAt = now;
         if (!codex && (firstEvent || postTool)) {
           const threads = yield* ThreadManagementService.ThreadManagementService;
@@ -500,7 +676,24 @@ it.effect.each([
             );
             yield* worker.drain();
             yield* Fiber.join(running);
-            recovered = (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs[0]!;
+            const restartedProjection = yield* orchestrator.getThreadProjection(
+              task.childThreadId!,
+            );
+            recovered = restartedProjection.runs[0]!;
+            assert.equal(recovered.status, "running");
+            assert.lengthOf(restartedProjection.attempts, 2);
+            assert.equal(
+              restartedProjection.attempts.find(
+                (attempt) => attempt.id === childRun.activeAttemptId,
+              )?.status,
+              "superseded",
+            );
+            assert.equal(
+              restartedProjection.providerTurns.find(
+                (turn) => turn.runAttemptId === childRun.activeAttemptId,
+              )?.status,
+              interruptedStatus,
+            );
             assert.equal(recovered.id, childRun.id);
             assert.equal(recovered.providerThreadId, childRun.providerThreadId);
             assert.notEqual(recovered.activeAttemptId, childRun.activeAttemptId);
@@ -612,7 +805,14 @@ it.effect.each([
           });
           yield* TestClock.adjust("16 minutes");
         }
-        if (!recovering && race !== "silent" && race !== "reasoning_no_recovery") {
+        if (
+          !recovering &&
+          race !== "silent" &&
+          race !== "reasoning_no_recovery" &&
+          race !== "expired_command" &&
+          race !== "command_output" &&
+          race !== "failed_command"
+        ) {
           const sink = yield* EventSink.EventSinkV2;
           const originalCommit = sink.commitCommand;
           let injected = false;
@@ -783,11 +983,15 @@ it.effect.each([
         const after = yield* service.taskStatus(scope, task.id);
         assert.equal(after.status, "failed");
         assert.equal(after.failureReason, "stalled");
-        assert.match(after.summary!, /^stalled: no model output for 16 min/);
+        assert.include(
+          after.summary!,
+          `stalled: no model output for ${race === "command_output" ? 18 : 16} min`,
+        );
         assert.isTrue(after.resultLooksIncomplete);
         if (!firstEvent)
           assert.include(after.incompleteReason!, "its last text was a progress note");
         assert.include(after.summary!, DateTime.formatIso(stalledAt));
+        if (race === "failed_command") assert.include(after.summary!, "exit 137");
         if (!firstEvent) assert.include(after.summary!, "I checked the first file.");
         if (recovering)
           assert.equal(

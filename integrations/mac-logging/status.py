@@ -17,6 +17,7 @@ LAUNCHD_LABELS = (
     'com.abdullah.mac-deep-inventory',
     'com.abdullah.mac-memory',
     'com.abdullah.mac-cpu',
+    'com.abdullah.mac-ssd-read-probe',
 )
 # Logging shipped on 2026-11-13 UTC (#10); older days cannot prove silence.
 CADENCES = {
@@ -39,6 +40,8 @@ CADENCES = {
     # cpu.spike is conditional evidence, never a scheduled job to mark silent.
     # launchd/com.abdullah.mac-cpu.plist: StartInterval=60; allow three minutes.
     'cpu.sample': dict(name='cpu.sample', target=None, gapHours=.05, since='2026-11-15'),
+    # launchd/com.abdullah.mac-ssd-read-probe.plist: independent StartInterval=60.
+    'disk.ssd_read_probe': dict(name='disk.ssd_read_probe', target=None, gapHours=.05, since='2026-11-17'),
     # launchd/com.abdullah.mac-tailnet.plist: StartInterval=60.
     'tailnet.sample': dict(name='tailnet.sample', target=None, gapHours=.05, since='2026-11-15'),
     # launchd/com.abdullah.mac-deep-inventory.plist: daily 03:30 local

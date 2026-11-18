@@ -16,12 +16,18 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import commerce_cli as cli
+import card_status
+import order_card
 from owner_go_support import approve_test_flows
 
 
 class BasketCLITests(unittest.TestCase):
     def setUp(self):
         approve_test_flows(self)
+        for module, key, value in ((order_card, 'LAST4', '2342'),
+                (order_card, 'NETWORK', 'mastercard'), (cli, 'ORDER_CARD_LAST4', '2342')):
+            card = patch.object(module, key, value)
+            card.start(); self.addCleanup(card.stop)
         binding = patch.object(cli.journal, 'binding', return_value={
             'app':'noon', 'vertical':'minutes', 'scope_hash':'b'*64})
         binding.start(); self.addCleanup(binding.stop)
@@ -34,7 +40,7 @@ class BasketCLITests(unittest.TestCase):
         self.flow.prepare_only.return_value = {
             'flow_id': self.flow.flow_id,
             'prepared_only': True,
-            'review': {'payable_minor': 123456, 'quantity': 42, 'card_last4':'2342'},
+            'review': {'payable_minor': 123456, 'quantity': 42, 'card_last4':order_card.LAST4},
             'readback': {'manifest_verified': True},
         }
 

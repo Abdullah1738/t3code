@@ -689,6 +689,9 @@ export const criticalReleaseReason = (note: string | null): string | null => {
   return reason.length >= 10 ? reason : null;
 };
 
+export const releaseBuildCommit = (note: string | null): string | undefined =>
+  note?.match(/\bbuildCommit\s*[:=]?\s*`?([a-f0-9]{7,40})\b`?/i)?.[1]?.toLowerCase();
+
 export const releaseWindow = (
   standing: Pick<StandingReleaseContext, "approvals" | "ledger" | "boardId" | "at">,
   service?: string,
@@ -958,12 +961,21 @@ export interface SubtaskInput {
 export const PACKET_SUBTASK =
   "Write the packet: read what the card points at (sessions, PRs, the code, the architecture) and rewrite its prompt with card_edit so the cheapest model can do it: scope, files, steps, tests, and when it's done. Add the rest of the plan.";
 
-/** Puts the packet first; every step the inputs set moves one later. */
+/** Puts the packet first; supplied steps and ids move one later. */
 export const withPacketStep = (
   inputs: ReadonlyArray<SubtaskInput>,
 ): ReadonlyArray<SubtaskInput> => [
   { step: 1, text: PACKET_SUBTASK, owner: "evaluator" },
-  ...inputs.map((input) => (input.step === undefined ? input : { ...input, step: input.step + 1 })),
+  ...inputs.map((input) => {
+    const id = input.id?.trim();
+    // Reserve s1 for the packet. Shifting supplied ids as well as generated ones
+    // preserves the caller's numbering without giving two subtasks the same id.
+    return {
+      ...input,
+      ...(id && subtaskId.test(id) ? { id: `s${idNumber(id) + 1}` } : {}),
+      ...(input.step === undefined ? {} : { step: input.step + 1 }),
+    };
+  }),
 ];
 
 /** A thread's or a script's card waits for an evaluator to write its packet. */

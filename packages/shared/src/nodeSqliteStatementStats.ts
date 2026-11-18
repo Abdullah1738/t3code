@@ -12,6 +12,8 @@ export interface StatementCompletion {
   readonly calls?: number;
   readonly failures?: number;
   readonly maxMs?: number;
+  /** Approximate decoded bytes, measured in the worker before cloning. */
+  readonly resultBytes?: number;
 }
 
 /** Synchronous, in-memory observation, including statements with tracing disabled. */
@@ -45,6 +47,8 @@ export function makeStatementStats(diagnostic = false, capacity = 512) {
       maxMs: number;
       rows: number;
       failures: number;
+      maxResultBytes: number;
+      maxResultRows: number;
       sql?: string;
     }
   >();
@@ -85,6 +89,8 @@ export function makeStatementStats(diagnostic = false, capacity = 512) {
               maxMs: 0,
               rows: 0,
               failures: 0,
+              maxResultBytes: 0,
+              maxResultRows: 0,
             }
           : {
               database,
@@ -96,6 +102,8 @@ export function makeStatementStats(diagnostic = false, capacity = 512) {
               maxMs: 0,
               rows: 0,
               failures: 0,
+              maxResultBytes: 0,
+              maxResultRows: 0,
             };
       summaries.set(bucket, summary);
     }
@@ -107,12 +115,36 @@ export function makeStatementStats(diagnostic = false, capacity = 512) {
     summary.maxMs = Math.max(summary.maxMs, completion.maxMs ?? elapsed);
     summary.rows += completion.rows;
     summary.failures += completion.failures ?? Number(completion.failed);
+    if (completion.resultBytes !== undefined && completion.resultBytes > summary.maxResultBytes) {
+      summary.maxResultBytes = completion.resultBytes;
+      summary.maxResultRows = completion.rows;
+    }
   };
   return {
     record,
     drain() {
       const result = Array.from(summaries.values());
       summaries.clear();
+      const largest = result.reduce<(typeof result)[number] | undefined>(
+        (largest, entry) =>
+          entry.maxResultBytes > (largest?.maxResultBytes ?? 0) ? entry : largest,
+        undefined,
+      );
+      if (largest !== undefined) {
+        try {
+          // @effect-diagnostics-next-line globalConsole:off -- One local log per existing minute drain; no result payload is traversed.
+          console.info("sqlite.worker-result", {
+            database: largest.database,
+            lane: largest.lane,
+            fingerprint: largest.fingerprint,
+            family: largest.family,
+            maxResultBytes: largest.maxResultBytes,
+            rows: largest.maxResultRows,
+          });
+        } catch {
+          /* Logging cannot discard the interval's counters. */
+        }
+      }
       return result;
     },
   };

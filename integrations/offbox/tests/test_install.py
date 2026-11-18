@@ -31,7 +31,8 @@ class InstallTest(unittest.TestCase):
         self.package = self.repo / "integrations/offbox"
         for relative in ("install.zsh", "lib/toollog.ts", "plugin/offbox-gate.ts", "bin/boat",
                          "launchd/com.ardud.offbox-monitor.plist", "launchd/com.ardud.offbox-home-monitor.plist",
-                         "skill/SKILL.md", "skill/scripts/offbox.py"):
+                         "skill/SKILL.md", "skill/scripts/offbox.py", "home-repair/delete-idle-boxes.sh",
+                         "home-repair/idle-boxes-list.py"):
             target = self.package / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(OFFBOX / relative, target)

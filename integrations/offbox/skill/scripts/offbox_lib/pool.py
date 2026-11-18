@@ -12,7 +12,7 @@ import traceback
 from pathlib import Path
 import time
 
-from . import common, capacity, prepare, home, unfit
+from . import api, common, capacity, prepare, home, unfit
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_LOCAL, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      busy, db_retry, iso, kv_get, kv_set, local_error, log, now, say, write)
 from .common import backend, owner_scoped, token_owner
@@ -39,6 +39,11 @@ def _pin_available(con, box_id, me=None, *, record=True):
     from . import lease
     pin = lease.foreign_pin(con, box_id, me)
     if not pin:
+        lease.reconcile_holds(con, box_id)
+        if con.execute('SELECT 1 FROM runs WHERE box_id=? AND ' + lease.uncertain_holder_sql(), (box_id,)).fetchone():
+            return False
+        if api.BACKEND == 'server' and not con.in_transaction and not lease.active_runs(con, box_id):
+            return not lease.remote_reuse_blocked(box_id, holder=(me or {}).get('owner'))
         return True
     seen = _PIN_SKIPS.get()
     if record and seen is not None and box_id not in seen['boxes']:
@@ -133,16 +138,9 @@ def pool_cap(con, key, *, locked=False):
         for row in con.execute("SELECT * FROM pool_cap_callers WHERE pool_key=?", (key,)).fetchall():
             if row['granted'] and row['run_id']:
                 # Match lease.active_runs for this caller's run, rather than another run that reused its box.
-                active = con.execute("SELECT 1 FROM runs WHERE run_id=? AND box_id IS NOT NULL AND "
-                                     "(status IN ('starting','running') OR EXISTS "
-                                     "(SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id) OR "
-                                     "(pulls IS NOT NULL AND pulls!='[]' AND "
-                                     "(pull_state IS NULL OR pull_state IN ('pending','running')) AND "
-                                     "(pull_state='running' OR NOT EXISTS (SELECT 1 FROM kv "
-                                     "WHERE k='lost_confirmed:' || runs.run_id AND v='fenced' "
-                                     "AND runs.status='lost' AND runs.exit_code IS NULL))) OR "
-                                     "(status='lost' AND exit_code IS NULL AND NOT EXISTS "
-                                     "(SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)))",
+                from . import lease
+                active = con.execute("SELECT 1 FROM runs WHERE run_id=? AND box_id IS NOT NULL AND (" +
+                                     lease.reserved_run_sql() + ")",
                                      (row['run_id'],)).fetchone() is not None
             else:
                 active = _alive(row['pid'])
@@ -1472,7 +1470,7 @@ def _try_warm(me, size, source, exclude, run_id):
                     current, _ = candidates(con, key, size, source, me)
                     row = next((r for r in current if r['box_id'] == bid), None)
                     if (row is None or row['state'] != 'running' or row['size'] != size or
-                            lease.active_runs(con, bid) or lease.remote_commands_busy(bid)):
+                            lease.active_runs(con, bid) or lease.remote_reuse_blocked(bid, holder=me['owner'])):
                         continue
                     if con.execute("SELECT 1 FROM events WHERE box_id=? AND kind='cold_home' AND ts>? LIMIT 1",
                                    (bid, now() - 15 * 60)).fetchone():
@@ -1568,6 +1566,16 @@ def _recheck_prune_holds(con, key) -> bool:
 
 def _claim(con, me, row, run_id, *, pending_token=None):
     bid = row["box_id"]
+    from . import lease
+    import offbox_protection
+    snapshot = lease.protection(con, bid)
+    snapshot['holds'] = [h for h in snapshot['holds'] if h.get('run_id') != run_id or run_id is None]
+    refusal = offbox_protection.blocked(snapshot, automatic=False, reuse=True, holder=me['owner'])
+    if not refusal and api.BACKEND == 'server':
+        remote = lease.remote_protection(bid)
+        refusal = offbox_protection.blocked(remote, automatic=False, reuse=True, holder=me['owner'])
+    if refusal:
+        raise OffboxError(f'{bid} is {refusal}; repository pool hand-out refused', code=2)
     row["remote_dir"] = remote_dir_for(me["repo_root"])
     row["_new_checkout"] = con.execute(
         "SELECT 1 FROM pool_callers WHERE owner=? AND repo_root=? AND box_id=?",
@@ -1605,6 +1613,9 @@ def _claim(con, me, row, run_id, *, pending_token=None):
                         (bid, row["remote_dir"], row["size"], run_id))
         if pending_token is not None:
             con.execute("DELETE FROM pool_pending WHERE token=?", (pending_token,))
+    common.event(con, bid, 'hand_out', json.dumps(offbox_protection.envelope(
+        'hand_out', 'repository pool claim', snapshot, run_id=run_id, holder=me['owner'], pool_key=me['repo_key'])),
+        limit=None)
 
 
 def _refresh_background(con, key, pull_artifacts=True):

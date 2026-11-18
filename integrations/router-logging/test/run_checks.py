@@ -11,7 +11,7 @@ with tempfile.TemporaryDirectory(prefix='9router-fixtures-') as scratch:
     root = Path(scratch)
     capture = root / 'capture.ndjson'
     env = dict(os.environ, ROUTER_LOG_DIR=str(root / 'logs'), ROUTER_LOG_CAPTURE=str(capture))
-    subprocess.run([sys.executable, '-I', str(repo / 'integrations/router-logging/test/test_logging.py')], cwd=repo, env=env, check=True)
+    subprocess.run([sys.executable, '-I', '-m', 'unittest', 'discover', '-s', str(repo / 'integrations/router-logging/test'), '-p', 'test_*.py'], cwd=repo, env=env, check=True)
     files = [str(p) for package in ['router-logging', 'catalog-guard', 'stream-recovery'] for p in (repo / 'integrations' / package / 'test').glob('*.test.mjs')]
     subprocess.run(['node', '--test', *files], cwd=repo, env=env, check=True)
     samples = {}

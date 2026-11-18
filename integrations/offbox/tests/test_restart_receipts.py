@@ -16,6 +16,80 @@ else:
 
 
 class RestartReceipts(Base):
+    def test_interrupted_output_commit_resumes_without_duplicating_published_bytes(self):
+        for cut in ('journal', 'partial-write', 'before-cursor', 'after-cursor'):
+            for streams in ('out', 'err', 'both'):
+                for writer in ('none', 'note', 'file'):
+                    with self.subTest(cut=cut,streams=streams,writer=writer):
+                        b=self.box(bid='bx_output_'+cut.replace('-','_')+'_'+streams+'_'+writer); p=self.cmd(b)
+                        c=self.status(b,p); d=boatd.cmd_dir(b)
+                        payloads={'out':b'once\n', 'err':b'warning\n'}
+                        payloads={name:(data if streams in (name,'both') else b'') for name,data in payloads.items()}
+                        for name in payloads: (d/f'{p}.{name}').write_bytes(b'host prefix\n')
+                        cursor=d/f'{p}.cursor.json'; pending=d/f'{p}.output-pending.json'
+                        write_json=boatd.write_json; path_open=Path.open
+                        def checkpoint(path,value):
+                            if cut=='before-cursor' and path==cursor: raise SystemExit('follower died')
+                            write_json(path,value)
+                            if (cut=='journal' and path==pending) or (cut=='after-cursor' and path==cursor):
+                                raise SystemExit('follower died')
+                        class PartialWrite:
+                            def __init__(self,file): self.file=file
+                            def __enter__(self): return self
+                            def __exit__(self,*args): self.file.close()
+                            def seek(self,*args): return self.file.seek(*args)
+                            def write(self,data):
+                                self.file.write(data[:2]); self.file.flush()
+                                raise SystemExit('follower died during write')
+                        def opening(path,*args,**kwargs):
+                            file=path_open(path,*args,**kwargs)
+                            return PartialWrite(file) if cut=='partial-write' and args and args[0]=='r+b' else file
+                        with self.guest_files(b,p,code=7) as receipt:
+                            for name,data in payloads.items(): (receipt/name).write_bytes(data)
+                            with patch.object(boatd,'write_json',side_effect=checkpoint), patch.object(Path,'open',opening):
+                                with self.assertRaises(SystemExit): boatd.guest_command(c)
+                            # These prefixes may already be visible to #217's host-offset reader.
+                            seen={name:(d/f'{p}.{name}').read_bytes() for name in payloads}
+                            note=b'\noffbox-server: cleanup remains unknown\n' if writer!='none' else b''
+                            if writer=='note':
+                                boatd._note(b,p,'cleanup remains unknown')
+                            elif writer=='file':
+                                with (d/f'{p}.err').open('ab') as stream:
+                                    boatd.write_stderr(b,p,note,stream)
+                            published={name:(d/f'{p}.{name}').read_bytes() for name in payloads}
+                            boatd.guest_command(c)
+                            boatd.guest_command(c)
+                        for name,data in payloads.items():
+                            output=(d/f'{p}.{name}').read_bytes()
+                            expected=b'host prefix\n'+data+(note if name=='err' else b'')
+                            self.assertEqual(output,expected)
+                            self.assertTrue(output.startswith(seen[name]))
+                            self.assertTrue(output.startswith(published[name]))
+                            self.assertEqual(published[name]+output[len(published[name]):],expected)
+                        self.assertEqual(json.loads(cursor.read_text()),[len(payloads['out']),len(payloads['err'])])
+                        self.assertFalse(pending.exists())
+
+    def test_shared_protection_retains_unsettled_rows_and_cached_live_guests(self):
+        for status in ('queued', 'running'):
+            with self.subTest(status=status):
+                b=self.box(bid='bx_unsettled_'+status); p=self.cmd(b,status=status)
+                self.con.execute('INSERT INTO meta VALUES (?,?)', (f'holder_gone:{b}:{p}:1','old proof'))
+                snapshot=boatd.box_protection(self.con,b)
+                self.assertTrue(snapshot['holds'])
+                with self.assertRaisesRegex(boatd.Fail,'box_held'):
+                    boatd.queue_cmd(self.con,b,dict(command='true',detached=True),None)
+        b=self.box(bid='bx_cached_live'); p=self.cmd(b,status='exited')
+        self.con.execute('INSERT INTO meta VALUES (?,?)', (f'holder_gone:{b}:{p}:1','old proof'))
+        with patch.object(boatd,'_cg_pids',return_value=[129844]):
+            snapshot=boatd.box_protection(self.con,b)
+            self.assertTrue(snapshot['holds'])
+            with self.assertRaisesRegex(boatd.Fail,'box_held'):
+                boatd.require_unprotected(self.con,b,reuse=True)
+        with patch.object(boatd,'commands_busy',side_effect=boatd.Fail(503,'incus_failed','shutting down')):
+            with self.assertRaises(boatd.Fail):
+                boatd.box_protection(self.con,b)
+        self.assertEqual(self.status(b,p)['status'],'exited')
+
     def test_exit_first_observed_by_kill_drain_beats_only_the_synthetic_fallback(self):
         for code in (0,7,141,143):
             for held in (False,True):
@@ -309,7 +383,8 @@ class RestartReceipts(Base):
             with self.subTest(status=status,sync=sync):
                 b=self.box(bid=f'bx_race{i}'); p=self.cmd(b,status=status)
                 self.con.execute('UPDATE commands SET sync=? WHERE box_id=? AND pid=?',(sync,b,p))
-                with patch.object(boatd,'commands_busy',return_value=False):
+                with patch.object(boatd,'commands_busy',return_value=False), \
+                        patch.object(boatd,'require_unprotected',return_value={}):
                     with self.assertRaises(boatd.Fail) as error:
                         boatd.start_cmd(self.con,b,{'command':'true','detached':True,'meta':{'run_id':'new-run'}})
                 self.assertEqual(error.exception.code,'commands_busy')

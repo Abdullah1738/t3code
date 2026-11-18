@@ -295,7 +295,7 @@ class GenerateTests(HarnessTestCase):
 
         models = json.loads((self.codex / "models.json").read_text())
         by_slug = {x["slug"]: x for x in models["models"]}
-        for slug in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"):
+        for slug in ("gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"):
             self.assertEqual(by_slug[slug]["context_window"], 872000)
             self.assertEqual(by_slug[slug]["max_context_window"], 872000)
             self.assertEqual(by_slug[slug]["auto_compact_token_limit"], 250000)
@@ -577,9 +577,9 @@ class GenerateTests(HarnessTestCase):
 
     def test_models_json_untouched_for_unlisted_entries(self) -> None:
         self.run_gen()
-        raw = json.loads((PKG / "vendor/codex-models-0.166.0.json").read_text())
+        raw = json.loads((PKG / "vendor/codex-models-0.169.1.json").read_text())
         generated = json.loads((self.codex / "models.json").read_text())
-        extended = {"gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"}
+        extended = {"gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"}
         others_raw = [m for m in raw["models"] if m["slug"] not in extended]
         others_gen = [m for m in generated["models"] if m["slug"] not in extended]
         self.assertTrue(others_raw)
@@ -885,7 +885,7 @@ class GenerateTests(HarnessTestCase):
 
     def test_cu_catalog_extends_original_terra_without_losing_metadata(self) -> None:
         self.run_gen()
-        upstream = json.loads((PKG / "vendor/codex-models-0.166.0.json").read_text())
+        upstream = json.loads((PKG / "vendor/codex-models-0.169.1.json").read_text())
         plain = json.loads((self.codex / "models.json").read_text())
         cu = json.loads((self.codex_cu / "models.json").read_text())
         cu_models = {m["slug"]: m for m in cu["models"]}
