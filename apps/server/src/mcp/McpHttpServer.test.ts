@@ -57,6 +57,8 @@ import { MAX_REPLY_BYTES } from "../ardud/http/replyBudget.ts";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
+import { KanbanArgumentKeys } from "../ardud/kanban/tools/tools.ts";
+import { MainThreadWatchdog, makeRegistry } from "../observability/MainThreadWatchdog.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -178,6 +180,111 @@ const callTool = (name: string, args: Record<string, unknown>) =>
   });
 
 const callSnapshot = (args: Record<string, unknown>) => callTool("preview_snapshot", args);
+
+it.effect.each([
+  "success",
+  "handler error",
+  "defect",
+  "interruption",
+  "invalid field",
+  "unknown field",
+] as const)("watchdog registry releases MCP calls after %s", (scenario) =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const registry = makeRegistry();
+    const snapshot = () =>
+      JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(registry.shared, 16, new Int32Array(registry.shared, 8, 2)[1]),
+        ),
+      );
+    let registrations = 0;
+    let releases = 0;
+    let handlerCalls = 0;
+    const toolkit = Toolkit.make(
+      Tool.make("watchdog_probe", {
+        parameters: Schema.Struct({ boardId: Schema.String }),
+        success: Schema.Struct({ ready: Schema.Boolean }),
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }).annotate(KanbanArgumentKeys, ["boardId"]),
+    );
+    const registration = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        watchdog_probe: McpToolAccess.reads(() =>
+          Effect.gen(function* () {
+            handlerCalls++;
+            expect(snapshot()).toEqual([
+              expect.objectContaining({
+                tool: "watchdog_probe",
+                boardId: "board-test",
+                callerThreadId: threadId,
+              }),
+            ]);
+            if (scenario === "handler error")
+              return yield* Effect.fail(
+                new OrchestratorMcpFailure({ code: "invalid_request", message: "fixture" }),
+              );
+            if (scenario === "defect") return yield* Effect.die("fixture defect");
+            if (scenario === "interruption") {
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+            }
+            return { ready: true };
+          }),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(
+        Layer.succeed(
+          MainThreadWatchdog,
+          MainThreadWatchdog.of({
+            enter: (tool, args, caller) => {
+              registrations++;
+              const finish = registry.enter(tool, args, caller);
+              expect(snapshot()).toHaveLength(1);
+              return () => {
+                releases++;
+                finish();
+              };
+            },
+          }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const args =
+        scenario === "invalid field"
+          ? { boardId: 42 }
+          : scenario === "unknown field"
+            ? { boardId: "board-test", privateField: "private prompt" }
+            : { boardId: "board-test" };
+      const call = callTool("watchdog_probe", args);
+      if (scenario === "interruption") {
+        const pending = yield* call.pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        expect(snapshot()).toHaveLength(1);
+        yield* Fiber.interrupt(pending);
+      } else {
+        const result = yield* call;
+        expect(result.isError === true).toBe(scenario !== "success");
+        if (scenario === "invalid field")
+          expect(result.structuredContent).toMatchObject({ invalidFields: ["boardId"] });
+        if (scenario === "unknown field")
+          expect(result.structuredContent).toMatchObject({ invalidFields: ["input"] });
+      }
+      expect(handlerCalls).toBe(
+        scenario === "invalid field" || scenario === "unknown field" ? 0 : 1,
+      );
+      expect(registrations).toBe(1);
+      expect(releases).toBe(1);
+      expect(snapshot()).toEqual([]);
+    }).pipe(Effect.provide(registration));
+  }),
+);
 
 const delegationTaskId =
   "node:delegated-task:command%3Amcp%3Adelegate-task%3Aenv%3Aparent%3Arequest";
@@ -618,7 +725,9 @@ it.effect("returns a clear bounded tool error before serializing a giant result"
     BigToolkit,
     McpToolAccess.toLayer(BigToolkit, {
       big_board: McpToolAccess.reads(() =>
-        Effect.succeed({ cards: Array(40).fill({ description: "x".repeat(1024 * 1024) }) }),
+        Effect.succeed({
+          cards: Array.from({ length: 40 }, () => ({ description: "x".repeat(1024 * 1024) })),
+        }),
       ),
     }),
   ).pipe(Layer.provideMerge(McpServer.McpServer.layer));

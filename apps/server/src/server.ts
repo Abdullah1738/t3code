@@ -135,6 +135,7 @@ import * as SourceControlRepositoryService from "./sourceControl/SourceControlRe
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as Observability from "./observability/Observability.ts";
 import * as HeapSnapshot from "./observability/HeapSnapshot.ts";
+import * as MainThreadWatchdog from "./observability/MainThreadWatchdog.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
 import * as LargeReplyLog from "./observability/LargeReplyLog.ts";
 import * as ReplyBuilders from "./ardud/http/ReplyBuilders.ts";
@@ -234,7 +235,10 @@ const HTTP_ROUTER_CONFIG = {
 // already closes the websocket gracefully.
 const HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS = 0;
 const layerResourceAttribution = ResourceAttribution.layer;
-const layerApplicationObservability = EventLoopMonitor.layer.pipe(
+const layerApplicationObservability = Layer.mergeAll(
+  EventLoopMonitor.layer,
+  MainThreadWatchdog.layer,
+).pipe(
   Layer.provideMerge(HttpSocketTelemetry.layer),
   Layer.provideMerge(Observability.layer),
   Layer.provideMerge(layerResourceAttribution),
