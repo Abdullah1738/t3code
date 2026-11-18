@@ -1,8 +1,10 @@
 import { join } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
 import type { Harness } from "./runner.ts";
+import { HarnessFailure, stderrTail, type HarnessExit } from "./harness-failure.ts";
 import { readRouterKey, routerConfig, routerSettings, startRouterGate, ROUTER_KEY_ERROR } from "./router-auth.ts";
 
-export function claudeHarness(root: string, executable: string, model: string, config: Parameters<typeof routerConfig>[0], log: (code: string) => void = () => {}): Harness {
+export function claudeHarness(root: string, executable: string, model: string, config: Parameters<typeof routerConfig>[0], log: (code: string, detail?: HarnessExit) => void = () => {}): Harness {
   const router = routerConfig(config);
   let refused = false;
   const unavailable = () => { if (!refused) log(ROUTER_KEY_ERROR); refused = true; };
@@ -11,8 +13,13 @@ export function claudeHarness(root: string, executable: string, model: string, c
     catch { unavailable(); return false; }
   };
   return { ready, async run(input) {
+    input.signal?.throwIfAborted();
     if (!ready()) throw new Error(ROUTER_KEY_ERROR);
     const settings = routerSettings(root, router.routerKeyFile);
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    const command = [process.execPath, join(import.meta.dir, "harness-failure.ts"), "--tool", root, input.id].map(quote).join(" ");
+    writeFileSync(settings, JSON.stringify({ ...JSON.parse(readFileSync(settings, "utf8")),
+      hooks: { PreToolUse: [{ matcher: "*", hooks: [{ type: "command", command }] }] } }), { mode: 0o600 });
     const gate = startRouterGate(router, unavailable);
     try {
     const child = Bun.spawn([executable, "-p", "--output-format", "json", "--model", model,
@@ -23,18 +30,31 @@ export function claudeHarness(root: string, executable: string, model: string, c
         CLAUDE_CONFIG_DIR: join(root, "claude"), MONI_RUNNER_CONFIG: process.env.MONI_RUNNER_CONFIG,
         ANTHROPIC_BASE_URL: gate.url.origin,
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1" },
-      stdin: "pipe", stdout: "pipe", stderr: "ignore",
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
     const abort = () => child.kill("SIGTERM");
     input.signal?.addEventListener("abort", abort, { once: true });
     if (input.signal?.aborted) abort();
-    child.stdin.write(input.text); child.stdin.end();
-    let output: string, exit: number;
-    try { [output, exit] = await Promise.all([new Response(child.stdout).text(), child.exited]); }
-    finally { input.signal?.removeEventListener("abort", abort); }
-    if (exit !== 0) throw new Error("Harness failed");
-    const result = JSON.parse(output);
-    if (result.is_error || typeof result.result !== "string") throw new Error("Invalid harness output");
+    const resultRead = Promise.all([new Response(child.stdout).text(), child.exited, stderrTail(child.stderr)]);
+    let output: string, exit: number, tail: Uint8Array;
+    try {
+      input.signal?.throwIfAborted();
+      child.stdin.write(input.text); await child.stdin.end();
+      input.onStarted?.();
+      [output, exit, tail] = await resultRead;
+    } catch (error) {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await resultRead.catch(() => {});
+      throw error;
+    } finally {
+      input.signal?.removeEventListener("abort", abort);
+    }
+    const detail = { exitCode: exit, signal: child.signalCode ?? null, stderrBytes: tail.length };
+    let result: { is_error?: boolean; result?: unknown } | undefined;
+    try { if (exit === 0) result = JSON.parse(output); } catch { /* Private output never enters an exception. */ }
+    if (!result || result.is_error || typeof result.result !== "string") {
+      log("harness-exit", detail); throw new HarnessFailure(detail);
+    }
     return result.result;
     } finally { gate.stop(true); }
   } };

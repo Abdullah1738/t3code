@@ -53,7 +53,8 @@ class StatusTests(unittest.TestCase):
         self.write('disk.sample', NOW - dt.timedelta(minutes=1), False)
         result = self.report()
         self.assertEqual(result['missingJobs'], [])
-        self.assertEqual({row['status'] for row in result['jobs'].values()}, {'OK'})
+        self.assertEqual({row['status'] for row in result['jobs'].values()}, {'OK', 'PENDING'})
+        self.assertEqual(result['jobs']['disk.ssd_read_probe']['status'], 'PENDING')
         row = result['jobs']['disk.sample']
         self.assertEqual(row['lastSeen'], '2026-11-15T11:59:00.000Z')
         self.assertFalse(row['lastOk'])
@@ -121,16 +122,18 @@ class StatusTests(unittest.TestCase):
             self.write(key, ok=False)
         result = self.report()
         self.assertEqual(result['missingJobs'], [])
-        self.assertTrue(all(row['lastOk'] is False for row in result['jobs'].values()))
+        self.assertTrue(all(row['lastOk'] is False for row in result['jobs'].values()
+                            if row['status'] != 'PENDING'))
         path = self.root / '2026-11-15.ndjson'
         path.write_text('')
         result = self.report()
-        self.assertEqual(set(result['missingJobs']), set(status.CADENCES))
+        self.assertEqual(set(result['missingJobs']), set(status.CADENCES) - {'disk.ssd_read_probe'})
         self.assertEqual(result['missingFiles'], ['2026-11-14.ndjson'])
         path.unlink()
         result = self.report()
         self.assertEqual(result['missingFiles'], ['2026-11-14.ndjson', '2026-11-15.ndjson'])
-        self.assertTrue(all(row['status'] == 'SILENT' for row in result['jobs'].values()))
+        self.assertTrue(all(row['status'] == 'SILENT' for key, row in result['jobs'].items()
+                            if key != 'disk.ssd_read_probe'))
         self.assertEqual(list(self.root.iterdir()), [])  # status never writes, even on missing inputs.
 
     def test_timestamp_forms(self):
@@ -248,7 +251,8 @@ class StatusTests(unittest.TestCase):
         result = self.report()
         self.assertEqual(result['malformed'], len(bad) + 1)
         self.assertEqual(result['missingJobs'], [])
-        self.assertTrue(all(row['lines'] == 1 for row in result['jobs'].values()))
+        self.assertTrue(all(row['lines'] == 1 for row in result['jobs'].values()
+                            if row['status'] != 'PENDING'))
 
     def test_gap_since_and_silence_boundaries(self):
         for hours, expected in [(2, 'OK'), (2.001, 'LATE'), (36, 'LATE'), (36.001, 'SILENT')]:
@@ -363,7 +367,8 @@ class StatusTests(unittest.TestCase):
                    diskInventory=dict(scans=0, rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0, scanMs=0),
                    diskWait=dict(runs=0, maxStuckForS=None, latestStuckUnmountMountPoint=None,
                                  busyRuns=0, topBusyComms=[]))
-        self.assertEqual({k: v for k, v in result.items() if k not in ('jobs', 'missingJobs', 'cpuSpikes')}, old)
+        self.assertEqual({k: v for k, v in result.items() if k not in ('jobs', 'missingJobs', 'cpuSpikes', 'diskBudgets')}, old)
+        self.assertEqual(result['diskBudgets'], dict(pathsMeasured=0, topOverBudget=[]))
         self.assertEqual(result['cpuSpikes'], dict(minutes=0, highestLoad=[]))
         health = result['jobs']['backup.run:health']
         self.assertEqual(health['lastSeen'], '2026-11-14T16:00:00.000Z')
@@ -450,6 +455,34 @@ class StatusTests(unittest.TestCase):
         row = self.report(NOW + dt.timedelta(minutes=4))['jobs']['cpu.sample']
         self.assertEqual(row['status'], 'OK')
         self.assertFalse(row['lastOk'])
+
+    def test_ssd_probe_cadence_loaded_fresh_late_silent_and_failed_rows(self):
+        now = dt.datetime(2026, 11, 17, 12, tzinfo=UTC)
+        cases = [
+            ('fresh', 1, True, 'OK', True),
+            ('deadline', 3, True, 'OK', True),
+            ('late', 3+1/60, True, 'LATE', False),
+            ('silent', None, True, 'SILENT', False),
+            ('failed-row', 1, False, 'OK', True),
+        ]
+        for name, age, outcome, expected, live_ok in cases:
+            with self.subTest(name=name):
+                root = self.root/name
+                root.mkdir()
+                with patch.object(self, 'root', root):
+                    for key in status.CADENCES:
+                        if key != 'disk.ssd_read_probe':
+                            self.write(key, now-dt.timedelta(minutes=1))
+                    if age is not None:
+                        self.write('disk.ssd_read_probe', now-dt.timedelta(minutes=age), outcome)
+                    with patch.object(status, 'launchd_status', return_value=dict.fromkeys(status.LAUNCHD_LABELS, 'loaded')):
+                        result = status.live_report(now, self.root)
+                row = result['jobs']['disk.ssd_read_probe']
+                self.assertEqual(row['status'], expected)
+                self.assertEqual(row['gapMaxMin'], 3)
+                self.assertEqual(row['lastOk'], outcome if age is not None else None)
+                self.assertEqual(result['ok'], live_ok)
+                self.assertEqual(result['missingJobs'], [] if live_ok else ['disk.ssd_read_probe'])
 
     def test_tailnet_three_minute_cadence_and_failed_check_liveness(self):
         self.seed()
@@ -544,9 +577,9 @@ class LaunchdStatusTests(unittest.TestCase):
 
     def test_one_timeout_does_not_hide_other_labels(self):
         outcomes = iter([subprocess.TimeoutExpired('launchctl', 2),
-                         subprocess.CompletedProcess([], 113, '', 'Could not find service'),
-                         subprocess.CompletedProcess([], 0, '', ''),
-                         subprocess.CompletedProcess([], 0, '', '')])
+                         subprocess.CompletedProcess([], 113, '', 'Could not find service')]
+                        + [subprocess.CompletedProcess([], 0, '', '')
+                           for _ in status.LAUNCHD_LABELS[2:]])
 
         def runner(*args, **kwargs):
             outcome = next(outcomes)
@@ -555,7 +588,7 @@ class LaunchdStatusTests(unittest.TestCase):
             return outcome
 
         self.assertEqual(list(status.launchd_status(runner, uid=123).values()),
-                         ['unknown', 'not-loaded', 'loaded', 'loaded'])
+                         ['unknown', 'not-loaded'] + ['loaded'] * (len(status.LAUNCHD_LABELS)-2))
 
     def test_historical_rollup_does_not_probe_live_launchd(self):
         with tempfile.TemporaryDirectory() as root, \

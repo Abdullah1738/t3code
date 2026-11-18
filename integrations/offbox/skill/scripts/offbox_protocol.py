@@ -65,6 +65,16 @@ class Protocol:
         return any((marker := self.parse(line)) and marker.kind == 'command_started'
                    for line in text.split('\n'))
 
+    def after_start(self, text):
+        """Return output following the first authenticated start, or None."""
+        offset = 0
+        for line in text.split('\n'):
+            offset += len(line) + 1
+            marker = self.parse(line)
+            if marker and marker.kind == 'command_started':
+                return text[offset:]
+        return None
+
     def ambiguous_start(self, text):
         # A glued stderr line cannot prove start, but cannot authorize replay either (#308).
         expected = f'{COMMAND_STARTED_MARKER} {self.run_id}' + (f' [n={self.nonce}]' if self.nonce else '')

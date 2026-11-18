@@ -25,7 +25,7 @@ import toollog
 
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_BUSY, EXIT_INFRA, EXIT_NOT_STARTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
-                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, kv_get, log, month_key, now,
+                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, kv_get, log, now,
                      delivered_bytes, offsets_path, out, read_json, record_delivery, require_mine, say, silence, size_summary)
 from .common import mine as token_mine  # release() has its own `mine` flag
 from .identity import require_proven
@@ -131,7 +131,7 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
               f"ago runs:{d['active_runs']}{pin}{note}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
 
 
-def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
+def release(me: dict, box_id: str | None, mine: bool, delete: bool, *, override=False) -> None:
     # An explicit box id still ends another caller's lease, so it is refused for an unproven caller too.
     require_proven(me, "release")
     con = db()
@@ -159,13 +159,13 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
         return
     for r in rows:
         lease.release_hold_if_worker_gone(con, r["box_id"])
-        if _report_prune_hold(con, r["box_id"]):
+        if not override and _report_prune_hold(con, r["box_id"]):
             continue
         # A foreground run holds box-<id> while it streams, so a hung run shows up as a lock timeout. Name the active
         # runs on that path too; the recheck under the lock still decides before any mutation.
         try:
-            with file_lock('box-'+r['box_id'], timeout=1):
-                _release_one(con, r, delete, me)
+            with contextlib.nullcontext() if override else file_lock('box-'+r['box_id'], timeout=1):
+                _release_one(con, r, delete, me, override=override)
         except OffboxError as e:
             if "timed out waiting for lock" not in str(e):
                 raise
@@ -187,28 +187,31 @@ def _report_prune_hold(con, box_id: str) -> bool:
 
 def _report_active_runs(con, box_id: str, lock_held: bool = False) -> bool:
     """Name the starting/running runs on a box and suggest kill. Returns False when there are none."""
-    ids = [x[0] for x in con.execute("SELECT run_id FROM runs WHERE box_id=? AND status IN ('starting','running') "
+    ids = [f"{x[0]} (holder {x[1] or 'unknown holder'})" for x in con.execute(
+                                     "SELECT run_id,owner FROM runs WHERE box_id=? AND (" + lease.reserved_run_sql() + ") "
                                      "ORDER BY start_at", (box_id,))]
     if not ids:
         return False
     where = " (the box lock is held by a live client)" if lock_held else ""
     say(f"{box_id}: run in progress, not released{where}: {', '.join(ids)}. If it is hung, stop it with "
-        "`offbox kill <run>` and release again.")
+        "`offbox kill <run>` and release again, or explicitly use --override-protection.")
     return True
 
 
-def _release_one(con, r, delete, me=None):
-        if _report_prune_hold(con, r["box_id"]):
+def _release_one(con, r, delete, me=None, *, override=False):
+        if not override and _report_prune_hold(con, r["box_id"]):
             return
-        if lease.active_runs(con, r["box_id"]):
+        if not override and lease.active_runs(con, r["box_id"]):
             _report_active_runs(con, r["box_id"])
             return
+        if delete or r['state'] in ('running', 'resume_stalled'):
+            lease.check_protection(con, r['box_id'], override=override)
         if delete:
-            lease.delete_box(con, r["box_id"], "release --delete")
+            lease.delete_box(con, r["box_id"], "release --delete", **({'override': True} if override else {}))
             print(f"deleted {r['box_id']}")
         else:
             if r["state"] in ("running", "resume_stalled"):
-                lease.stop_box(con, r["box_id"], "release")
+                lease.stop_box(con, r["box_id"], "release", **({'override': True} if override else {}))
             if r['state'] == 'resume_stalled':
                 print(f"stop requested for {r['box_id']} (disk kept; remains set aside)")
                 return
@@ -591,8 +594,21 @@ def status(me: dict, run_id: str | None = None) -> None:
         if line:
             print(line)
         return
-    from . import box_disk, unfit
+    from . import unfit
     with db() as disk_con:
+        for row in disk_con.execute("SELECT * FROM leases WHERE pinned_until>? AND pinned_until<=? "
+                                    "AND state!='deleted' ORDER BY pinned_until", (now(), now()+86400)):
+            holder = kv_get(disk_con, 'pin_owner:' + row['box_id']) or row['owner'] or 'unknown holder'
+            print(f"{row['box_id']}: pin expires {iso(row['pinned_until'])}; holder {holder}")
+            saved = kv_get(disk_con, 'pin_saved:' + row['box_id'])
+            if saved:
+                print(f"    retained disk snapshot: {saved}")
+        for row in disk_con.execute("SELECT * FROM events WHERE json_valid(detail) AND "
+                                    "json_extract(detail,'$.version')=1 ORDER BY ts DESC LIMIT 5"):
+            detail = json.loads(row['detail'])
+            who = detail['caller']
+            print(f"{iso(row['ts'])} {row['box_id'] or '-'} {detail['action']}: {detail['reason']} "
+                  f"actor={who['actor']} pid={who.get('pid')} thread={who.get('thread_id') or '-'}")
         for row in disk_con.execute("SELECT box_id FROM leases WHERE state != 'deleted'"):
             mark = unfit.get(disk_con, row['box_id'])
             if mark:
@@ -602,7 +618,7 @@ def status(me: dict, run_id: str | None = None) -> None:
             print(f"{row['box_id']}: disk_full " + ', '.join(
                 f"{name} {value.get('free_bytes', '?')} bytes free"
                 for name, value in info.get('space', {}).items()))
-    from . import common, home
+    from . import common
     con = db()
     cap = read_json(CAP_PATH, {})
     if common.home_config() is not None:
@@ -659,6 +675,14 @@ def status(me: dict, run_id: str | None = None) -> None:
             if retained and (retained['note'] or '').startswith(pool.RECYCLED_NOTE):
                 held += f" detached [{retained['note']}]"
             print(f"  {b['id']:<12} {b.get('state'):<9} {b.get('type'):<8} {(b.get('name') or '')[:60]}{held}")
+            pin = (b.get('protection') or {}).get('pin') or {}
+            expiry = common.iso_ts(pin.get('until'))
+            if pin.get('active') and expiry is not None and now() < expiry <= now()+86400:
+                print(f"    pin expires {pin['until']}; holder {pin.get('holder') or 'unknown holder'}")
+            if b.get('lastEvent'):
+                e = b['lastEvent']
+                print(f"    {e['action']}: {e['reason']} actor={e['caller']['actor']} "
+                      f"pid={e['caller'].get('pid')} run={e['caller'].get('run_id') or '-'}")
     except OffboxError as e:
         print(f"boxes: boat API unreachable ({e})")
     for row in con.execute("SELECT r.* FROM runs r JOIN kv k ON k.k='failover_queue:' || r.run_id "
@@ -1060,7 +1084,117 @@ def _preamble_first(dst, stdout_bytes, run_id):
     dst.seek(end)
 
 
+def _recover_live_suffix(r, path, ck, length, deadline, stats):
+    from . import live_logs
+    from .runs import _commit
+    staged = path.with_name(path.name + '.recovery')
+    source = path.stat()
+    identity = dict(checkpoint=ck, box=r['box_id'], command=r['command_id'], inode=[source.st_dev, source.st_ino])
+    saved = read_json(offsets_path(staged), {})
+    prior = None
+    with contextlib.suppress(ValueError, TypeError):
+        prior = checkpoint(staged)
+    valid = (isinstance(saved, dict) and saved.get('base') == identity and prior is not None and staged.exists()
+             and prior['stdoutOffset'] >= ck['stdoutOffset'] and prior['stderrOffset'] >= ck['stderrOffset']
+             and 0 <= prior['logBytes'] <= staged.stat().st_size
+             and prior['logBytes'] == prior['stdoutOffset'] + prior['stderrOffset'] - ck['stdoutOffset'] - ck['stderrOffset'])
+    if not valid:
+        staged.write_bytes(b'')
+        prior = dict(stdoutOffset=ck['stdoutOffset'], stderrOffset=ck['stderrOffset'], logBytes=0)
+        atomic_write_json(offsets_path(staged), dict(prior, base=identity))
+    # Only checkpointed staging bytes can be reused after an interrupted page write. The original raw suffix
+    # stays intact until accumulated history covers it, including when several frames interleave past a failed commit.
+    with staged.open('r+b') as dst:
+        dst.truncate(prior['logBytes'])
+    result = _catch_up_live(r, staged, max(0, deadline - time.time()), stats, recovery_base=identity)
+    recovered = checkpoint(staged)
+    size = recovered['logBytes']
+    if size < length - ck['logBytes']:
+        live_logs.note(r['run_id'], 'recovery_staged', staged_bytes=size,
+                       remaining_uncommitted_bytes=length - ck['logBytes'] - size)
+        return 'incomplete:uncommitted suffix remains' if size else 'incomplete:history behind local log'
+    with staged.open('rb') as src, path.open('r+b') as dst:
+        dst.seek(ck['logBytes'])
+        left = size
+        while left:
+            chunk = src.read(min(left, 64 * 1024))
+            if not chunk:
+                raise OSError('short recovery file')
+            dst.write(chunk)
+            left -= len(chunk)
+        dst.truncate()
+        dst.flush()
+        published = dict(stdoutOffset=recovered['stdoutOffset'], stderrOffset=recovered['stderrOffset'], logBytes=dst.tell())
+        _commit(path, published['stdoutOffset'], published['stderrOffset'], published['logBytes'])
+    live_logs.note(r['run_id'], 'flush', bytes=size, **published)
+    if checkpoint(path) == published:
+        for temporary in (staged, offsets_path(staged)):
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+    return result if result.startswith('incomplete:') else 'caught_up'
+
+
+def _catch_up_live(r, path, budget, stats, *, recovery_base=None):
+    from . import live_logs
+    from .runs import _commit, remember_interruption
+    deadline = time.time() + (10 if budget is None else budget)
+    ck = checkpoint(path)
+    length = path.stat().st_size
+    if ck is None:
+        if length:
+            return 'incomplete:no checkpoint'
+        ck = dict(stdoutOffset=0, stderrOffset=0, logBytes=0)
+    if min(ck.values()) < 0 or length < ck['logBytes']:
+        return 'incomplete:invalid checkpoint'
+    if _remote_copy(path):
+        return 'incomplete:retained copy needs settled verification'
+    if length > ck['logBytes']:
+        return _recover_live_suffix(r, path, ck, length, deadline, stats)
+    offsets = [ck['stdoutOffset'], ck['stderrOffset']]
+    errors, behind, wrote, attempted = [], [0, 0], False, set()
+    with path.open('r+b') as dst:
+        dst.seek(ck['logBytes'])
+        def flush(i, data):
+            nonlocal wrote
+            dst.write(data)
+            dst.flush()
+            offsets[i] += len(data)
+            if recovery_base is None:
+                _commit(path, *offsets, dst.tell())
+            else:
+                atomic_write_json(offsets_path(path), dict(stdoutOffset=offsets[0], stderrOffset=offsets[1],
+                                                          logBytes=dst.tell(), base=recovery_base))
+            wrote = True
+            live_logs.note(r['run_id'], 'flush' if recovery_base is None else 'recovery_staged', bytes=len(data),
+                           stdoutOffset=offsets[0], stderrOffset=offsets[1],
+                           **{('logBytes' if recovery_base is None else 'staged_bytes'): dst.tell()})
+        with contextlib.closing(live_logs.pages(r['box_id'], r['command_id'], offsets, until=deadline, stats=stats)) as history:
+            for i, page, error in history:
+                attempted.add(i)
+                if error:
+                    errors.append(error)
+                    continue
+                remember_interruption(r['run_id'], page)
+                if api.BACKEND == 'server' and page.get('status'):
+                    from .home_run_observation import observe
+                    observe(r['run_id'], page['status'], status=page['status'], attempt=page.get('attempt'))
+                data = (page.get('data') or '').encode()
+                observed = int(page.get('nextOffset', offsets[i] + len(data)))
+                if data:
+                    flush(i, data)
+                behind[i] = max(0, int(page['size']) - observed) if page.get('size') is not None else 0
+        if len(attempted) < 2:
+            errors.append('timeout')
+    if errors or any(behind):
+        if any(behind):
+            live_logs.note(r['run_id'], 'backlog', remaining_bytes=sum(behind))
+        return 'incomplete:' + ('more output available' if any(behind) else ','.join(errors))
+    return 'caught_up' if wrote else 'complete'
+
+
 def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
+    if live:
+        return _catch_up_live(r, path, budget, stats)
     from .runs import remember_interruption
     started = time.time()
     deadline = started + (30 if budget is None else budget)
@@ -1438,6 +1572,18 @@ def logs(run_id: str, do_follow: bool) -> int:
         started = monotonic()
         result = _catch_up_log(r, budget=10, live=True) if r['status'] == 'running' else 'n/a'
         _tail(_shown_log(p), 0, True)
+        follower = read_json(LOGS_DIR / f"{r['run_id']}.follower.json", {})
+        if follower:
+            last = follower.get('last_write')
+            age = f"{max(0, int(now() - last))} s ago" if last is not None else 'never'
+            observed = follower.get('server_output_at')
+            detail = f'; server output observed {max(0, int(now() - observed))} s ago' if observed is not None else ''
+            if follower.get('remaining_bytes'):
+                age_at_fetch = max(0, int(now() - follower['backlog_at']))
+                detail += f"; at least {follower['remaining_bytes']} bytes behind at fetch {age_at_fetch} s ago"
+            if follower.get('event') == 'recovery_staged':
+                detail += f"; recovered {follower.get('staged_bytes', 0)} uncommitted bytes"
+            say(f"follower last wrote {age}; last event: {follower.get('event', 'unknown')}{detail}")
         notified = _incomplete_log(r, result, seconds=monotonic() - started)
         if r['mode'] != 'local' and not notified:
             if not r['box_id'] or not r['process_id']:
@@ -1472,6 +1618,7 @@ def logs(run_id: str, do_follow: bool) -> int:
     if killed is not None and killed['process_id']:
         return report_killed(killed, p)
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
+    _report_deps_hint(r, code, p)
     _incomplete_log(_validated_step_row(r, code), result)
     if code is None:
         from .run_evidence import report
@@ -1479,7 +1626,7 @@ def logs(run_id: str, do_follow: bool) -> int:
     from . import native_crash
     native_crash.readback(r, code, _raw_log(p), report=True)
     from .runs import space_result
-    effective = space_result(r['run_id'], code, p, report=True)
+    space_result(r['run_id'], code, p, report=True)
     import offbox_disk_space
     if (offbox_disk_space.result(_raw_log(p), code).get('infra_failure') or
             read_json(LOGS_DIR / f"{r['run_id']}.state.json", {}).get('infra_failure')):
@@ -1874,6 +2021,7 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_
         _tail_selected(log_path, pos, echo)
         return complete_killed(killed, log_path, pulls=json.loads(r['pulls'] or '[]'), until=deadline)
     code = settled_steps_code(r, code, log_path=log_path, until=deadline)
+    _report_deps_hint(r, code, log_path)
     from . import resources
     resources.finalize(r)
     _tail_selected(log_path, pos, echo)
@@ -2085,6 +2233,8 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=
     A deadline, a lost stream (unknown exit) or any error removes the temp files and keeps the original."""
     from .runs import log_lock
     with log_lock(cur['run_id'], until=deadline):
+        from .live_logs import note
+        note(cur['run_id'], 'takeover')
         ck = checkpoint(log_path)
         if ck is not None:
             start, keep = (ck['stdoutOffset'], ck['stderrOffset']), ck['logBytes']
@@ -2173,13 +2323,11 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
 
 
 def _report_deps_hint(r, code, log_path) -> None:
-    from .runs import box_deps_hint, step_results
-    results = step_results(log_path, r)
-    failed_code = next((rc for _, rc in results if rc), code)
-    if code != 127 and failed_code != 127 and (code not in (0, None) or any(rc != 0 for _, rc in results)):
+    from .runs import box_deps_hint, report_box_hint, step_results
+    results = step_results(_raw_log(log_path), r)
+    if code not in (0, None) or any(rc != 0 for _, rc in results):
         hint = box_deps_hint(Path(r['repo_root'] or '.'), log_path)
-        if hint:
-            say(hint)
+        report_box_hint(code, results, hint)
 
 
 def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) -> int:
@@ -2207,7 +2355,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
     quarantine_pending = code == 97
     failure_tail_shown = False
     try:
-        from .runs import killed_result, report_killed, complete_killed
+        from .runs import killed_result, complete_killed
         killed = killed_result(r['run_id'], wait=True, until=until, row=r, known_code=code) if code in (None, 137, 143) else None
         if killed is not None and killed['process_id']:
             _tail_selected(log_path, delivered, echo)
@@ -2285,7 +2433,6 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
 
 def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None, *, show_failure=False):
     """Non-takeover wait (the lock was free, or this process holds it): follow, then record the end."""
-    from .runs import follow  # noqa: F401  (kept so the module-level patch points stay valid)
     if r['status'] not in ('starting','running'):
         return _settled(r, echo=echo, locked=True, until=until, show_failure=show_failure)
     log_path = LOGS_DIR / f"{r['run_id']}.log"
@@ -2330,7 +2477,8 @@ def run_events(run_id, as_json=False):
         rows = [dict(r) for r in con.execute("SELECT * FROM events WHERE "
                 "CASE WHEN json_valid(detail) THEN json_extract(detail,'$.run_id')=? "
                 "OR json_extract(detail,'$.old_run_id')=? OR json_extract(detail,'$.new_run_id')=? "
-                "ELSE detail LIKE ? END ORDER BY ts", (run_id, run_id, run_id, run_id + ' %'))]
+                "OR json_extract(detail,'$.caller.run_id')=? "
+                "ELSE detail LIKE ? END ORDER BY ts", (run_id, run_id, run_id, run_id, run_id + ' %'))]
     if as_json:
         print(json.dumps(rows))
     else:

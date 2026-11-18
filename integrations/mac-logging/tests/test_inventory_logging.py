@@ -101,10 +101,14 @@ class InventoryLoggingTests(unittest.TestCase):
         entries, run = self.fixture()
         with patch.object(jobs, 'inventory_listing', return_value=(entries, True)):
             deep_inventory.run_pass([self.root], run, budget=100)
-        self.assertEqual(len(self.rows('disk.inventory.source')), 3)
+        sources = self.rows('disk.inventory.source')
+        attempts = [r for r in sources if 'cpuS' in r['props']]
+        self.assertGreater(len(attempts), 0)
+        self.assertEqual(sum(r['props'].get('completedCount', 1) for r in attempts), 1000)
+        self.assertTrue(all(r['props']['allowanceS'] > 0 for r in attempts))
         self.assertEqual(len(self.rows('disk.inventory.root')), 1)
         self.assertEqual(len(self.rows('disk.deep.root')), 1)
-        self.assertEqual(len(self.rows()), 7)  # root + three notable + deep start/root/end
+        self.assertEqual(len(self.rows()), len(sources)+4)
         props = self.rows('disk.inventory.root')[0]['props']
         self.assertEqual(props['childrenMeasured'], 1000)
         self.assertEqual(props['childrenCached'], 1000)
@@ -163,7 +167,8 @@ class InventoryLoggingTests(unittest.TestCase):
                 '%d\t%s\n' % (1024**2 if key.endswith('/large') else 1, key) for key in cmd[2:]))
         deep_inventory.run_pass([self.root], run, budget=100)
         sources = self.rows('disk.inventory.source')
-        self.assertEqual({r['props']['source'] for r in sources}, {str(child/'large'), str(child)})
+        self.assertEqual({r['props']['source'] for r in sources},
+                         {str(child/'large'), str(child/'small'), str(child)})
         self.assertEqual(len(self.rows('disk.inventory.root')), 1)
         self.assertEqual(self.rows('disk.inventory.root')[0]['props']['childrenMeasured'], 1)
 
@@ -177,7 +182,8 @@ class InventoryLoggingTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stderr='', stdout=''.join(
                 '%d\t%s\n' % (800*1024, key) for key in cmd[2:]))
         deep_inventory.run_pass([self.root], run, budget=100)
-        self.assertEqual([r['props']['source'] for r in self.rows('disk.inventory.source')], [str(child)])
+        self.assertEqual([r['props']['source'] for r in self.rows('disk.inventory.source')],
+                         [str(child/'part'), str(child)])
 
     def test_parts_baseline_survives_multiple_turns(self):
         child = self.root/'giant'
@@ -206,6 +212,7 @@ class InventoryLoggingTests(unittest.TestCase):
                 rows = [r for p in (self.logs/str(new)).glob('*.ndjson')
                         for r in map(json.loads, p.read_text().splitlines())]
                 self.assertEqual(sum(r['name'] == 'disk.inventory.source' and r['props']['source'] == str(child)
+                                     and 'cpuS' not in r['props']
                                      for r in rows), int(notable))
                 self.assertEqual(len(calls), 2)
 
@@ -231,7 +238,8 @@ class InventoryLoggingTests(unittest.TestCase):
                 before = jobs.read_state('disk-inventory')
                 with jobs.inventory_lock():
                     if deep:
-                        deep_inventory.run_pass([self.root], lambda *a, **k: self.fail('locked'))
+                        with patch.object(deep_inventory, 'DEEP_LOCK_WAIT_S', 0):
+                            deep_inventory.run_pass([self.root], lambda *a, **k: self.fail('locked'))
                     else:
                         jobs.directory_inventory([self.root], lambda *a, **k: self.fail('locked'))
                 self.assertEqual(jobs.read_state('disk-inventory'), before)

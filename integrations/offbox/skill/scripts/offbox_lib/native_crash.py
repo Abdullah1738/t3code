@@ -30,14 +30,14 @@ def after_start_code(row, code, path):
     if code >= 128:
         return code
     if path.exists():
-        _, started, output = path.read_text(errors='replace').partition(runs.COMMAND_STARTED_MARKER)
-        if started and 'SIGSEGV' in output:
+        output = protocol.for_run(row, path).after_start(path.read_text(errors='replace'))
+        if output is not None and 'SIGSEGV' in output:
             return code
     if dict(row).get('command_id'):
         stderr = runs.complete_stream(row, 'stderr')
         if stderr is not None:
-            _, started, output = stderr.partition(runs.COMMAND_STARTED_MARKER)
-            if started:
+            output = protocol.for_run(row, path).after_start(stderr)
+            if output is not None:
                 stdout = runs.complete_stream(row, 'stdout') if 'SIGSEGV' not in output else ''
                 if 'SIGSEGV' in output or stdout is not None and 'SIGSEGV' in stdout:
                     return code

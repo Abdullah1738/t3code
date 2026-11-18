@@ -2885,6 +2885,200 @@ it.effect("#1574 assignment queue preserves a busy run and replays once", () => 
   );
 });
 
+it.effect.each(
+  (["sql", "memory"] as const).flatMap((storage) =>
+    (["codex", "claudeAgent"] as const).map((provider) => ({ storage, provider })),
+  ),
+)(
+  "short T3 $provider children hold through completion delivery ($storage)",
+  ({ storage, provider }) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const parentId = ThreadId.make("short-parent");
+      const childId = ThreadId.make("short-child");
+      const quiet = at("2026-11-17T00:00:00.000Z");
+      const finished = at("2026-11-17T00:05:00.000Z");
+      for (const id of [parentId, childId])
+        yield* projections.apply({
+          id: EventId.make(`create:${id}`),
+          type: "thread.created",
+          threadId: id,
+          occurredAt: quiet,
+          payload: idleThreadProjection(liveThreadShell(id)).thread,
+        });
+      const childRun = {
+        id: RunId.make("short-child-run"),
+        threadId: childId,
+        ordinal: 1,
+        providerInstanceId: ProviderInstanceId.make(provider),
+        modelSelection: {
+          instanceId: ProviderInstanceId.make(provider),
+          model: provider === "codex" ? "gpt-6.1-sol" : "claude-sonnet-5-5",
+        },
+        providerThreadId: null,
+        userMessageId: MessageId.make("child-input"),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "running" as const,
+        requestedAt: quiet,
+        startedAt: quiet,
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+        lastActivityAt: quiet,
+      } satisfies OrchestrationV2Run;
+      yield* projections.apply({
+        id: EventId.make("parent-ended"),
+        type: "run.updated",
+        threadId: parentId,
+        occurredAt: quiet,
+        payload: {
+          ...childRun,
+          id: RunId.make("short-parent-run"),
+          threadId: parentId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+          status: "completed",
+          completedAt: quiet,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("child-started"),
+        type: "run.updated",
+        threadId: childId,
+        occurredAt: quiet,
+        payload: childRun,
+      });
+      const task = {
+        id: NodeId.make("short-task"),
+        threadId: parentId,
+        runId: null,
+        parentNodeId: NodeId.make("parent-root"),
+        origin: "app_owned" as const,
+        createdBy: "agent" as const,
+        driver: ProviderDriverKind.make(provider),
+        providerInstanceId: childRun.providerInstanceId,
+        providerThreadId: null,
+        childThreadId: childId,
+        nativeTaskRef: null,
+        prompt: "Review the head",
+        title: null,
+        model: childRun.modelSelection.model,
+        status: "running" as const,
+        idleTimeoutMs: 15 * 60_000,
+        completionDelivery: { state: "pending" as const, observedByRunId: null },
+        result: null,
+        startedAt: quiet,
+        completedAt: null,
+        updatedAt: quiet,
+      } satisfies OrchestrationV2Subagent;
+      yield* projections.apply({
+        id: EventId.make("task-started"),
+        type: "subagent.updated",
+        threadId: parentId,
+        occurredAt: quiet,
+        payload: task,
+      });
+      const taskItem = {
+        id: TurnItemId.make("short-task-item"),
+        threadId: parentId,
+        runId: RunId.make("short-parent-run"),
+        nodeId: task.id,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "running" as const,
+        title: null,
+        startedAt: quiet,
+        completedAt: null,
+        updatedAt: quiet,
+        type: "subagent" as const,
+        subagentId: task.id,
+        origin: task.origin,
+        driver: task.driver,
+        providerInstanceId: task.providerInstanceId,
+        childThreadId: childId,
+        prompt: task.prompt,
+        result: null,
+      } satisfies OrchestrationV2TurnItem;
+      yield* projections.apply({
+        id: EventId.make("task-item-started"),
+        type: "turn-item.updated",
+        threadId: parentId,
+        occurredAt: quiet,
+        payload: taskItem,
+      });
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: (id) => projections.getThreadShell(id).pipe(Effect.orDie),
+        getThreadRecords: (id, fields, filter) =>
+          projections.getThreadRecords(id, fields, filter).pipe(Effect.orDie),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        const live = yield* threads.find(parentId);
+        expect(live?.backgroundWork).toBe(1);
+        expect(waitingOnBackground(live!, Date.parse("2026-11-17T00:04:00Z"))).toBe(true);
+        expect(waitingOnBackground(live!, Date.parse("2026-11-17T01:00:00Z"))).toBe(false);
+        yield* projections.apply({
+          id: EventId.make("child-ended"),
+          type: "run.updated",
+          threadId: childId,
+          occurredAt: finished,
+          payload: { ...childRun, status: "completed", completedAt: finished },
+        });
+        yield* projections.apply({
+          id: EventId.make("task-item-ended"),
+          type: "turn-item.updated",
+          threadId: parentId,
+          occurredAt: finished,
+          payload: { ...taskItem, status: "completed", completedAt: finished, updatedAt: finished },
+        });
+        for (const state of ["pending", "claimed", "delivered", "acknowledged"] as const) {
+          yield* projections.apply({
+            id: EventId.make(`task:${state}`),
+            type: "subagent.updated",
+            threadId: parentId,
+            occurredAt: finished,
+            payload: {
+              ...task,
+              status: "completed",
+              completedAt: finished,
+              updatedAt: finished,
+              result: "Review complete",
+              completionDelivery: { state, observedByRunId: null },
+            },
+          });
+          const shell = yield* projections.getThreadShell(parentId);
+          expect(shell?.pendingBackgroundTasks).toEqual([]);
+          const view = yield* threads.find(parentId);
+          const owed = state === "pending" || state === "claimed";
+          expect(view?.backgroundWork).toBe(owed ? 1 : 0);
+          for (const second of [1, 6, 10, 15, 22, 43])
+            expect(
+              waitingOnBackground(view!, Date.parse("2026-11-17T00:05:00Z") + second * 1000),
+            ).toBe(owed);
+          expect(waitingOnBackground(view!, Date.parse("2026-11-17T01:05:00Z"))).toBe(false);
+        }
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }).pipe(
+      Effect.provide(
+        storage === "sql"
+          ? ProjectionStore.layer.pipe(Layer.provide(Sqlite.layerMemory))
+          : ProjectionStore.layerMemory,
+      ),
+    ),
+);
+
 it.effect.each(["sql", "memory"] as const)(
   "find holds live child progress and pending final-summary delivery (%s)",
   (storage) =>

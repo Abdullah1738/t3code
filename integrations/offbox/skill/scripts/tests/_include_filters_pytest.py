@@ -574,7 +574,8 @@ def test_full_push_preserves_tracked_set_and_pull(repo, local_push, monkeypatch)
     write(dest, "tmp/box-only/cache", "keep")
     write(dest, f"{included}/stale.txt", "delete")
     result = ssh_sync.push("testbox", repo, str(dest), includes=[included])
-    assert baseline_stats["verified"] == result["verified"] == 5
+    assert baseline_stats["verified"] == result["verified"] == 6
+    assert (dest / "tmp/memory/node_modules/x").exists()
     assert baseline_stats["repaired"] == result["repaired"] == 0
     files = lambda root: {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()}
     assert files(dest) == files(baseline) | {f"{included}/run.sh", "tmp/box-only/cache"}

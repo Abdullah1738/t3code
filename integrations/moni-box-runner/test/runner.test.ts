@@ -34,6 +34,7 @@ test("fake harness replies are durably queued and callback payloads stay on the 
   const inputs: string[] = []; const s = setup({ run: async ({ text }) => { inputs.push(text); return "reply"; } });
   await s.lease(); s.runner.enqueue(opaqueId("event"), { text: "input" }); await s.runner.tick();
   expect(inputs).toEqual(["input"]); expect(s.calls.find(c => c.path.endsWith("/send"))?.body.text).toBe("reply");
+  expect(s.calls.find(c => c.path.endsWith("/send"))?.body.inboxId).toBe(opaqueId("event"));
   expect(s.runner.db.query<{ state: string }, []>("SELECT state FROM inbox").get()!.state).toBe("done");
 });
 test("Claude CLI uses the box home, router helper environment and explicit resume id", async () => {
@@ -126,6 +127,25 @@ test.each([false, true])("events expose only fence metadata with hasSend=%s; res
   expect(await (await s.runner.handle(s.request("/events", {}))).json()).toEqual({ events: [] });
 });
 
+test.each(["automatic", "manual-done", "resumed-no-reply", "resumed-replied"])("automatic retry distinguishes an automatic tombstone from %s completion", async completion => {
+  let attempts = 0;
+  const harness = { run: async () => { if (++attempts === 1) throw new Error("interrupted"); return completion === "resumed-replied" ? "reply" : "NO_REPLY"; } };
+  const s = setup(harness), id = opaqueId("wake"), dm = opaqueId("dm");
+  await s.lease(); s.runner.enqueue(id, { kind: "wake", text: "private" }); s.runner.enqueue(dm, { kind: "inbound", text: "dm" });
+  await s.runner.tick();
+  const automatic = { id, state: "done", reconciled: true, autoFailMs: 0 };
+  if (completion === "automatic") expect((await s.runner.handle(s.request("/resolve", automatic))).status).toBe(200);
+  else {
+    expect((await s.runner.handle(s.request("/resolve", { id, state: completion === "manual-done" ? "done" : "pending", reconciled: true }))).status).toBe(200);
+    if (completion !== "manual-done") await s.runner.tick();
+  }
+  if (completion === "resumed-replied") expect(s.calls.filter(c => c.path.endsWith("/send"))).toHaveLength(1);
+  const reopened = new BoxRunner(s.runner.config, harness, { callbackReady: async () => true }); clean.push(() => reopened.db.close());
+  await reopened.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  expect((await reopened.handle(s.request("/resolve", automatic))).status).toBe(completion === "automatic" ? 200 : 409);
+  expect(reopened.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)?.state).toBe("done");
+});
+
 test("legacy schema upgrades timestamp crash interruption and recognize old reply actions without exposing text", async () => {
   const s = setup({ run: async () => "NO_REPLY" }), root = join(s.root, "legacy"); mkdirSync(root);
   const db = new Database(join(root, "agent.sqlite")), id = opaqueId("legacy");
@@ -136,9 +156,11 @@ test("legacy schema upgrades timestamp crash interruption and recognize old repl
     const runner = new BoxRunner({ ...s.runner.config, root }, { run: async () => "NO_REPLY" }, { now: () => now, callbackReady: async () => true });
     clean.push(() => runner.db.close());
     await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
-    expect(await (await runner.handle(s.request("/events", {}))).json()).toEqual({ events: [
+    const metadata = await (await runner.handle(s.request("/events", {}))).text();
+    expect(metadata).not.toContain("PRIVATE_OLD");
+    expect(JSON.parse(metadata)).toEqual({ events: [
       { id, state: "interrupted", failure: null, kind: "wake", interruptedAt: 1234, hasSend: true },
-    ] });
+    ], actions: [{ id: opaqueId(`reply:${id}:0`).slice(0, 12), path: "/send", attempts: 0, lastStatus: null, nextAt: null, inboxId: null }] });
   }
 });
 
@@ -198,19 +220,25 @@ test("head-only probe skips more than a page of attachment failures and counts t
   for (const headOnly of ["true", 1, null]) expect((await s.runner.handle(s.request("/events", { headOnly }))).status).toBe(400);
 });
 
-test("permanent scope refusals fail one action while temporary unavailability retains it", async () => {
+test("permanent scope refusals fail reactions while temporary unavailability backs off without holding the inbox", async () => {
   for (const status of [400, 403, 404, 413, 422, 503]) {
-    const s = setup({ run: async () => "NO_REPLY" }); let available = false; const texts: string[] = [];
+    const s = setup({ run: async () => "NO_REPLY" }); let available = false, now = 1000; const texts: string[] = [];
     const r = new BoxRunner({ ...s.runner.config, root: join(s.root, `scope-${status}`) }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, {
+      now: () => now,
       callbackReady: async () => true,
       fetch: async url => String(url).endsWith("/react") && !available ? new Response("", { status }) : Response.json({ accepted: true }),
     }); clean.push(() => r.db.close());
     await r.action(opaqueId("refused-reaction"), "/react", { target: "unknown", kind: "love" });
     r.enqueue(opaqueId("following"), { text: "next" }); await r.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
     await r.tick();
-    expect(texts).toEqual(status === 503 ? [] : ["next"]);
+    expect(texts).toEqual(["next"]);
     expect(r.db.query<{ state: string }, []>("SELECT state FROM actions WHERE path='/react'").get()!.state).toBe(status === 503 ? "pending" : "failed");
     available = true; await r.tick(); expect(texts).toEqual(["next"]);
+    if (status === 503) {
+      expect(r.db.query("SELECT attempts,last_status,next_at,state FROM actions WHERE path='/react'").get()).toEqual({ attempts: 1, last_status: 503, next_at: 6000, state: "pending" });
+      now = 6000; await r.tick();
+      expect(r.db.query<{ state: string }, []>("SELECT state FROM actions WHERE path='/react'").get()!.state).toBe("done");
+    }
   }
 });
 
@@ -274,4 +302,140 @@ test("empty attachment succeeds and resolution of an unknown event refuses", asy
   r.enqueue(opaqueId("empty"), { text: "empty", attachments: [{ guid: "https://media.example/empty" }] }); await r.tick();
   expect(texts).toHaveLength(1);
   expect((await r.handle(s.request("/resolve", { id: opaqueId("unknown"), state: "done", reconciled: true }))).status).toBe(409);
+});
+
+
+test("delivery status exposes only requested ids and pickup times, including completed turns", async () => {
+  const s = setup({ run: async () => "NO_REPLY" }); await s.lease();
+  const id = opaqueId("bus-status");
+  s.runner.enqueue(id, { text: "PRIVATE_BUS_TEXT", agentExpiresAt: Date.now() + 600_000 });
+  const status = () => s.runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }));
+  expect(await (await status()).json()).toEqual({ deliveries: [{ id, accepted: true, deliveredAt: null }] });
+  await s.runner.tick();
+  const body = await (await status()).text();
+  expect(JSON.parse(body)).toEqual({ deliveries: [{ id, accepted: true, deliveredAt: expect.any(Number) }] });
+  expect(body).not.toContain("PRIVATE_BUS_TEXT");
+  expect((await s.runner.handle(s.request("/delivery-status", { ids: [id], epoch: "wrong" }))).status).toBe(400);
+  expect((await s.runner.handle(s.request("/delivery-status", { ids: Array(51).fill(id), epoch: "test" }))).status).toBe(400);
+});
+
+test.each(["missing-executable", "not-executable", "missing-workdir"])("Claude %s failure never confirms bus pickup", async failure => {
+  const s = setup({ run: async () => "NO_REPLY" });
+  const root = join(s.root, "launch-failure"); mkdirSync(root);
+  if (failure !== "missing-workdir") mkdirSync(join(root, "work"));
+  const keyFile = join(root, "router-key"); writeFileSync(keyFile, "test-router-key", { mode: 0o600 });
+  const executable = join(root, "fake-claude");
+  if (failure !== "missing-executable") writeFileSync(executable, '#!/bin/sh\ncat >/dev/null\nprintf \'{"result":"NO_REPLY"}\'\n', { mode: failure === "not-executable" ? 0o600 : 0o700 });
+  const runner = new BoxRunner({ ...s.runner.config, root }, claudeHarness(root, executable, "test", { routerKeyFile: keyFile }), {
+    callbackReady: async () => true, modelReady: async () => true, fetch: async () => Response.json({ accepted: true }),
+  }); clean.push(() => runner.db.close());
+  await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  const id = opaqueId(failure); runner.enqueue(id, { id: `wake:agent-bus:${failure}`, text: "PRIVATE_BUS_TEXT", agentExpiresAt: Date.now() + 600_000 });
+  await runner.tick();
+  expect(runner.db.query("SELECT state,delivered_at FROM inbox WHERE id=?").get(id)).toEqual({ state: "interrupted", delivered_at: null });
+  expect(runner.db.query("SELECT 1 FROM settings WHERE key='started'").get()).toBeNull();
+  expect(runner.db.query("SELECT 1 FROM settings WHERE key='bus-yield-human'").get()).toBeNull();
+  const status = await (await runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }))).text();
+  expect(JSON.parse(status)).toEqual({ deliveries: [{ id, accepted: true, deliveredAt: null }] });
+  expect(status).not.toContain("PRIVATE_BUS_TEXT");
+});
+
+test.each([false, true])("an unfinished harness reports pickup only after handoff (fails=%s)", async fails => {
+  const entered = Promise.withResolvers<void>(), handoff = Promise.withResolvers<void>(), acknowledged = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  const s = setup({ run: async ({ onStarted }) => {
+    entered.resolve(); await handoff.promise; onStarted!(); onStarted!(); acknowledged.resolve(); await finish.promise;
+    if (fails) throw new Error("PRIVATE_HARNESS_FAILURE");
+    return "NO_REPLY";
+  } }); await s.lease();
+  const id = opaqueId("delayed-handoff"); s.runner.enqueue(id, { id: "wake:agent-bus:handoff", text: "PRIVATE_BUS_TEXT" });
+  const status = async () => (await (await s.runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }))).json()).deliveries[0].deliveredAt;
+  const tick = s.runner.tick();
+  try {
+    await entered.promise; expect(await status()).toBeNull();
+    expect(s.runner.db.query("SELECT 1 FROM settings WHERE key='started'").get()).toBeNull();
+    handoff.resolve(); await acknowledged.promise;
+    const pickedUpAt = await status(); expect(pickedUpAt).toBeGreaterThan(0);
+    expect(s.runner.db.query("SELECT value FROM settings WHERE key='bus-yield-human'").get()).toEqual({ value: "true" });
+    finish.resolve(); await tick;
+    expect(await status()).toBe(pickedUpAt);
+    expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)?.state).toBe(fails ? "interrupted" : "done");
+  } finally { handoff.resolve(); finish.resolve(); await tick; }
+});
+
+test.each([false, true])("Claude handoff is confirmed before its result, including later failure=%s", async fails => {
+  const s = setup({ run: async () => "NO_REPLY" });
+  const root = join(s.root, "handoff"); mkdirSync(join(root, "work"), { recursive: true });
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() { entered.resolve(); await finish.promise; return new Response(); } });
+  clean.push(() => server.stop(true));
+  const keyFile = join(root, "router-key"); writeFileSync(keyFile, "test-router-key", { mode: 0o600 });
+  const executable = join(root, "fake-claude");
+  writeFileSync(executable, `#!${process.execPath}\nawait Bun.stdin.text();\nawait fetch("http://127.0.0.1:${server.port}");\n${fails ? "process.exit(7);" : 'console.log(JSON.stringify({ result: "NO_REPLY" }));'}\n`, { mode: 0o700 });
+  const runner = new BoxRunner({ ...s.runner.config, root }, claudeHarness(root, executable, "test", { routerKeyFile: keyFile }), {
+    callbackReady: async () => true, fetch: async () => Response.json({ accepted: true }),
+  }); clean.push(() => runner.db.close());
+  await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  const id = opaqueId("real-handoff"); runner.enqueue(id, { id: "wake:agent-bus:real-handoff", text: "PRIVATE_BUS_TEXT" });
+  const tick = runner.tick();
+  try {
+    await Promise.race([entered.promise, tick.then(() => { throw new Error("Harness ended before the result gate"); })]);
+    const before = await (await runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }))).json();
+    expect(before.deliveries[0].deliveredAt).toBeGreaterThan(0);
+    expect(runner.db.query("SELECT state FROM inbox WHERE id=?").get(id)).toEqual({ state: "running" });
+    finish.resolve(); await tick;
+    expect(await (await runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }))).json()).toEqual(before);
+    expect(runner.db.query("SELECT state FROM inbox WHERE id=?").get(id)).toEqual({ state: fails ? "interrupted" : "done" });
+  } finally { finish.resolve(); await tick; }
+});
+
+test("expired bus input never starts a new target turn", async () => {
+  let calls = 0; const s = setup({ run: async () => { calls++; return "NO_REPLY"; } }); await s.lease();
+  const id = opaqueId("bus-expired"); s.runner.enqueue(id, { text: "PRIVATE", agentExpiresAt: Date.now() - 1 });
+  await s.runner.tick(); expect(calls).toBe(0);
+  const body = await (await s.runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }))).json();
+  expect(body).toEqual({ deliveries: [{ id, accepted: true, deliveredAt: null }] });
+});
+
+
+test("a readiness check crossing the bus deadline does not start expired work", async () => {
+  const s = setup({ run: async () => "NO_REPLY" }); let now = 1_000, calls = 0, checks = 0;
+  const runner = new BoxRunner({ ...s.runner.config, root: join(s.root, "expiry-ready") }, { run: async () => { calls++; return "NO_REPLY"; } }, {
+    now: () => now, callbackReady: async () => true, fetch: async () => Response.json({ accepted: true }),
+    modelReady: async () => { if (++checks > 1) now = 3_000; return true; },
+  }); clean.push(() => runner.db.close());
+  await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  runner.enqueue(opaqueId("expires-during-readiness"), { text: "PRIVATE", agentExpiresAt: 2_000 });
+  await runner.tick(); expect(runner.active()).toBe(true); expect(calls).toBe(0);
+});
+
+test.each([false, true])("a human gets the next separate box turn between bus turns, restart=%s", async restart => {
+  const texts: string[] = []; const harness = { run: async ({ text }: { text: string }) => { texts.push(text); return "NO_REPLY"; } };
+  const s = setup(harness); await s.lease();
+  for (const id of ["wake:agent-bus:a", "wake:agent-bus:b", "human-next"]) s.runner.enqueue(opaqueId(id), { id, text: id, receivedAt: Date.now() - 120_000 });
+  await s.runner.tick();
+  const runner = restart ? new BoxRunner(s.runner.config, harness, { callbackReady: async () => true, fetch: async () => Response.json({ accepted: true }) }) : s.runner;
+  if (restart) { clean.push(() => runner.db.close()); await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" })); }
+  await runner.tick(); await runner.tick();
+  expect(texts.map(text => text.split("\n").at(-1))).toEqual(["wake:agent-bus:a", "human-next", "wake:agent-bus:b"]);
+});
+
+test("continuous box human traffic gives an overdue bus the next free turn, then a human", async () => {
+  const texts: string[] = []; const s = setup({ run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }); await s.lease();
+  for (const id of ["human-first", "human-second", "wake:agent-bus:due", "wake:agent-bus:next"]) s.runner.enqueue(opaqueId(id), { id, text: id, receivedAt: Date.now() - 61_000 });
+  await s.runner.tick(); await s.runner.tick();
+  expect(texts.map(text => text.split("\n").at(-1))).toEqual(["wake:agent-bus:due", "human-first"]);
+});
+
+test("legacy box asks wait for authoritative deadline metadata across repeated upgrades", async () => {
+  let calls = 0; const s = setup({ run: async () => { calls++; return "NO_REPLY"; } });
+  const id = opaqueId("legacy-deadline"), payload = { id: "wake:agent-bus:legacy", text: `[Agent request areq_${"a".repeat(64)} from Owner's assistant]PRIVATE`, receivedAt: Date.now() - 700_000 };
+  s.runner.db.query("INSERT INTO inbox(id,payload,state) VALUES (?,?,'pending')").run(id, JSON.stringify(payload));
+  for (let upgrade = 0; upgrade < 2; upgrade++) {
+    const runner = new BoxRunner(s.runner.config, { run: async () => { calls++; return "NO_REPLY"; } }, { callbackReady: async () => true }); clean.push(() => runner.db.close());
+    await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" })); await runner.tick(); expect(calls).toBe(0);
+    const expiresAt = Date.now() - 1;
+    expect((await runner.handle(s.request("/delivery-status", { epoch: "test", ids: [id], deadlines: [{ id, expiresAt }] }))).status).toBe(200);
+    await runner.tick(); expect(calls).toBe(0);
+    expect(runner.db.query<{ state: string; delivered_at: number | null }, [string]>("SELECT state,delivered_at FROM inbox WHERE id=?").get(id)).toEqual({ state: "done", delivered_at: null });
+  }
 });

@@ -22,7 +22,7 @@ import * as Semaphore from "effect/Semaphore";
  *   A page is at most 500 rows (0.7 MB on the synthetic fixture, about 1.3 MB in the
  *   live traces; rows are not capped in bytes), so three at once stay cheap.
  * - poll: control thread detail reads, isolated from lists, snapshots and MCP.
- * - controlRead: control message reads on foreground readers. One request
+ * - controlRead: control messages, lists, recovery and run evidence on foreground readers. One request
  *   at a time leaves the other foreground reader available to the UI, even
  *   when an all=true read hydrates a large imported transcript.
  * - mcp: a whole large MCP read (t3_thread_read, board/card reads...).
@@ -56,7 +56,7 @@ export class ReplyBuilders extends Context.Service<
 >()("t3/ardud/http/ReplyBuilders") {}
 
 // Lanes are shared across connections, not allocated per board or request.
-// The control read permit includes hydration and SQL, so even all=true reads
+// The control read permit includes list enrichment, hydration and SQL, so even all=true reads
 // cannot take both foreground readers. Response encoding uses the agent lane.
 export const PERMITS: { readonly [K in Lane]: number } = {
   interactive: 2,

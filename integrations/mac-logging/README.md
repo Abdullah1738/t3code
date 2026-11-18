@@ -103,11 +103,13 @@ and checkpoints the next root to visit, so interrupted passes rotate fairly.
 Cheap batches can share a turn; known timeouts follow healthy discovery and
 refresh work after one early part attempt per root. Ordinary children that will expire
 during the pass are refreshed before more parts work can crowd them out.
-Individual probes use 1.5 times the child's last successful duration, or twice
-its root's median successful duration, bounded to 15–120 seconds. Roots with
-no timing data start at 15 seconds. A short probe timeout doubles the next
-probe and keeps the child in ordinary discovery; only a full probe of at least
-60 seconds establishes a timeout for descent. Legacy timeouts with no recorded
+Individual probes use 1.5 times the child's last successful duration, bounded
+to 15–120 seconds. Children without timing data start at 60 seconds; legacy
+short probes get at least 60 seconds or twice their last allowance, up to 120.
+A known-cost probe below 60 seconds gets one doubled retry per pass and stays
+in ordinary discovery. Only a full probe of at least 60 seconds establishes a
+timeout for descent. Deep batches first learn a cost, then reserve twice the
+estimated work within their deadline. Legacy timeouts with no recorded
 allowance or parts get one probe conversion. Batch deadlines fall back to
 individual probes. A confirmed timed-out child is split into immediate entries,
 with each completed part checkpointed and at most ten minutes per child per
@@ -543,6 +545,29 @@ absolute budget. The disk tooling probe follows, then inventory uses what remain
 No log command starts once its shared budget is exhausted. No live configuration
 or schedule change is needed for this order.
 
+## Folder budgets
+
+`disk-budgets.json`, installed beside the collector, assigns folder budgets in
+GiB to owner boards. The hourly collector emits `disk.budget` for every path,
+using complete inventory child/parts caches or root sums. `~/.robob/userdata`
+is excluded from its parent sum; symlinked targets are never measured. Missing
+paths report zero, while unavailable or incomplete measurements report a stale
+last complete size (or null). `sizeAgeS` is the measurement's age, rather than
+the last collector run's age.
+
+Targets outside those cached levels are measured only by the daily deep pass,
+using its existing lock, wall budget, per-folder cap and checkpointed scanner.
+`disk.budget.over` follows three consecutive UTC hourly over-budget samples,
+at most once per path per UTC day. Stale/missing observations and gaps reset
+the streak. These events do not send notifications.
+
+`mac-log-rollup` includes `diskBudgets.topOverBudget`, ordered by excess at each
+path's latest fresh daily observation. Growth uses the nearest fresh sample to
+24 hours earlier (within two hours), using measurement times from `sizeAgeS`;
+it is null when that baseline is missing. `sizeTs` and `growthWindowS` record
+the measurement time and actual comparison interval. Overlapping parent and
+child budgets are independent and must not be added together.
+
 ## diskutil hangs
 
 Each hourly collector run emits `disk.tooling_probe`: a 20 s `diskutil list
@@ -698,3 +723,45 @@ This event is attribution evidence, never authority to kill or throttle a PID.
 A process may exit between the argv read and lsof. Missing cwd
 prevents classification of relative operands. Crawls shorter than 30 seconds
 or wholly between minute samples are outside this detector's coverage.
+
+### Launchd SSD read probe
+
+The separate `com.abdullah.mac-ssd-read-probe` job runs every 60 seconds through
+`/bin/zsh -fc 'exec /usr/bin/python3 "$@"' -- <script> sample`, the same granted
+identity as guard and read-watchdog. It measures what the real jobs can read,
+without creating another ungranted TCC requester. CPU/U inventory cannot hold
+this schedule even if its lsof child is stuck forever.
+`mac-log-status` also checks for missing probe rows, allowing three minutes
+before reporting the detector late or silent.
+
+The reader stats and reads 4 KiB from `/Volumes/ExternalSSD/.mac-upkeep/probe.bin`
+(created by `install.zsh`). Both share a three-second Popen/poll deadline. A
+stalled child is abandoned without kill/wait and its PID plus exact `ps lstart`
+suppresses the next reader (`stuckPrior=true`). State and child output remain
+on the internal disk under `~/.local/state/mac-upkeep`.
+The job uses `AbandonProcessGroup=true` so launchd preserves these children when
+the minute parent exits; later runs use their saved identities to avoid pile-up.
+
+Every run also discovers sandboxd with `pgrep -x sandboxd` and counts `ps -M -p`
+rows minus the header. Both commands share a two-second deadline; an abandoned
+helper's PID plus kernel birth time suppresses new helpers until it clears.
+`sandboxdThreads` is null when unavailable. A read can pass during an approval
+jam, so a count of 20 or more also counts as a failed run. The event retains
+read outcome (`ok`, `slow` above 500 ms, `timeout`, `error`), separate `statMs` and
+`readMs`, symbolic errno, ProcessType, nice and loadavg1 alongside that count.
+
+Two consecutive failed runs atomically write
+`~/.local/state/mac-upkeep/ssd-launchd-read-blocked` with `since`, `lastOutcome`,
+`errno`, `sandboxdThreads` and nullable `promptingPath`; `lastOutcome=jam` when only the thread count tripped. The latch
+queues one deduplicated Telegram alert naming the cause through the collector's
+notification path. Only the first latch run captures tccd AUTHREQ_PROMPTING
+messages from the last five minutes, bounded at 15 seconds with Popen/abandon;
+its last responsible path, if found, is saved as `promptingPath` in the marker.
+It never runs that capture each minute. Restart tools must check the marker.
+
+An `ok` read with a known count below 20 removes the marker and queues one
+recovery line. Slow reads or an unavailable thread inventory cannot clear an
+existing interlock. Notification retries preserve exact keys/text and never
+write alerts to stdout. The evaluator loads only the new probe label after
+review; the CPU job retains its original launcher. Installer tests set
+`MAC_LOG_SSD_PROBE_FILE` for fixture init/check; live reads use the fixed target.

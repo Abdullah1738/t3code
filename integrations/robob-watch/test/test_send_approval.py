@@ -1,7 +1,10 @@
 """send-approval against fake bridge stores, a fake Robob state db, the real bridge formatter (bun), a scripted
 judge and scripted Sendblue statuses. No network."""
-import json
 import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
+import json
 import sqlite3
 import subprocess
 import tempfile

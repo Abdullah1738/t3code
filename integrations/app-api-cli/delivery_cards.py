@@ -583,7 +583,28 @@ def log_render(started, ok, *, chat=None, outcome=None, failure_code=None):
         pass
 
 
-def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
+def build(cfg, data, meta=None, outdir=None, url=None, *, public=False, _checkout_projected=False):
+    if cfg.get('app') == 'amazon' and cfg.get('checkout') and not _checkout_projected:
+        from amazon_checkout import card_key, card_view, remember_card_terminal
+        path = ROOT / 'cards' / (card_key(cfg) + '.json')
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with path.with_suffix('.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = read(path)
+            cfg, data = card_view(cfg, data, state)
+            meta = {**(meta or {}), **cfg.get('card_meta', {})}
+            live_folder = APPS / (state.get('slug') or card_slug(cfg))
+            live = outdir is None or Path(outdir).resolve() == live_folder.resolve()
+            if live:
+                outdir = live_folder
+                url = url or state.get('url')
+                public = ((cfg.get('delivery_card') or {}).get('chat') or cfg.get('chat') or cfg.get('for')) != 'owner'
+            result = build(cfg, data, meta, outdir, url, public=public, _checkout_projected=True)
+            if live:
+                state.update(result)
+                remember_card_terminal(cfg, data, state, time.time())
+                atomic(path, state)
+            return result
     started = time.monotonic()
     ok = False
     completed = False
@@ -653,6 +674,8 @@ def op_ids(args):
     key = args[args.index('--key') + 1]
     slug = args[args.index('--to') + 1] if '--to' in args else 'owner'
     h = lambda s: hashlib.sha256(s.encode()).hexdigest()
+    if args[0] == 'agent-ask':
+        return slug, {'to': 'areq_' + h(json.dumps(['owner', key], separators=(',', ':')))}
     return slug, {'to': f'{kind}:{h(slug + ":" + key)}', 'self': f'{kind}:{h(key)}'}
 
 
@@ -695,6 +718,17 @@ def ops(args):
     Owner cards first saved without --to sat in the owner's session-bound queue, so both of
     the owner's routes are read."""
     slug, ids = op_ids(args)
+    if args[0] == 'agent-ask':
+        with sqlite3.connect(f'{chat_store("owner").as_uri()}?mode=ro', uri=True, timeout=2) as con:
+            row = con.execute('select to_slug, status from agent_requests where id = ?', (ids['to'],)).fetchone()
+        if not row:
+            return None, {}
+        if row[0] != slug:
+            raise ValueError('bridge_bus_target_conflict')
+        # The request row is committed before its wake. Only an answer proves
+        # receipt; an open row permits replay of the original idempotent ask.
+        kind = 'live' if row[1] in ('pending', 'done', 'done_late') else 'retry' if row[1] == 'open' else 'maybe'
+        return None, {ids['to']: (kind, row[1])}
     wanted = list(ids.values()) if slug == 'owner' else [ids['to']]
     con = sqlite3.connect(f'{chat_store(slug).as_uri()}?mode=ro', uri=True, timeout=2)
     try:
@@ -723,7 +757,7 @@ def open_attempts(holder, field):
         return list(holder['open'])
     # Saved before per-attempt records: only its last attempt can still be open.
     args = holder.get(field)
-    return [{'args': list(args)}] if args and holder.get('status') != 'sent' and not holder.get('refused') else []
+    return [{'args': list(args)}] if args and holder.get('status') not in ('sent', 'relayed') and not holder.get('refused') else []
 
 
 def waiting(holder, field):
@@ -754,13 +788,22 @@ def reconcile(args, holder=None, field='send_args'):
         _, seen = ops(args)
         kinds = {kind for kind, _ in seen.values()}
         if 'live' in kinds:
-            return 'sent', args
+            if args[0] == 'agent-ask':
+                holder['agent_request_id'] = mine(args)
+            return accepted_status(args), args
         if 'maybe' in kinds:
             return 'failed:may_have_sent_check_chat', args
+        if 'retry' in kinds:
+            if any(mine(a['args']) != mine(args) for a in waiting(holder, field)):
+                return 'failed:may_have_sent_check_chat', args
+            holder['agent_request_id'] = mine(args)
+            return None, args  # Same key/text only: AgentBus.ask replays its deduped wake.
         held = {mine(a['args']): a['args'] for a in waiting(holder, field)}
         if len(held) > 1:
             return 'failed:may_have_sent_check_chat', args
         if held:
+            if any(a[0] == 'agent-ask' for a in held.values()):
+                return 'failed:may_have_sent_check_chat', args
             return None, list(next(iter(held.values())))
         moved = owner_to(args, holder)
         if moved != args:
@@ -785,12 +828,52 @@ def owner_to(args, last=None):
 
 
 class BridgeError(ValueError):
-    def __init__(self, err):
+    def __init__(self, err, exit_code=None):
         super().__init__('bridge_request_failed')
+        self.detail = toollog.bridge_error(err, exit_code)
+        self.stderr = self.detail['stderr']
+        self.exit_code = self.detail['exit_code']
+        self.http = self.detail['http']
+        self.remote_chat = self.http == 403 and 'Use agent-ask to reach this chat on its box' in self.detail['stderr']
+        err = err.decode('utf-8', errors='replace') if isinstance(err, bytes) else err
         # A clear "no" from the bridge (or a request the CLI never sent): nothing was queued.
         self.refused = bool(re.search(r'\(HTTP (4\d\d|503)\)|Invalid command arguments', err or ''))
         # An older bridge that doesn't know --to for this command.
         self.no_to = bool(re.search(r'Invalid command arguments|\(HTTP 400\)', err or ''))
+
+
+def accepted_status(args):
+    return 'relayed' if args[0] == 'agent-ask' else 'sent'
+
+
+def relay_args(args):
+    """The remote assistant owns its sends; retain one downstream key for the handoff too."""
+    if args[0] != 'send' or '--to' not in args:
+        return None
+    content = next((arg[len('--text='):] for arg in args if arg.startswith('--text=')), None)
+    if content is None:
+        return None
+    key = args[args.index('--key') + 1]
+    target = args[args.index('--to') + 1]
+    request = ('Send this order notice once in your own chat, using bridge send with dedupe key '
+               + json.dumps(key) + '. Keep that same key on any retry; reconcile an ambiguous send. '
+               'The exact message is the JSON string below. Answer done only after bridge acceptance; '
+               'otherwise answer declined with the send error.\n' + json.dumps(content))
+    return ['agent-ask', '--to', target, '--text=' + request, '--session',
+            args[args.index('--session') + 1], '--key', key]
+
+
+def remember_bridge_error(holder, exc):
+    if isinstance(exc, BridgeError):
+        holder['bridge_error'] = {**exc.detail, 'at': dt.datetime.now(dt.timezone.utc).isoformat()}
+    elif isinstance(exc, (OSError, subprocess.TimeoutExpired)):
+        holder['bridge_error'] = {**toollog.bridge_error(getattr(exc, 'stderr', None) or type(exc).__name__),
+                                  'at': dt.datetime.now(dt.timezone.utc).isoformat()}
+
+
+def log_bridge_error(exc, args):
+    toollog.emit('order-watch', 'bridge.error', kind='error', ok=False, error='BRIDGE_REQUEST_FAILED',
+                 props={'bridgeCommand': args[0], 'bridgeError': exc.detail})
 
 
 def attempt(holder, field, save):
@@ -805,10 +888,35 @@ def attempt(holder, field, save):
         save()
         try:
             ack = bridge(holder[field])
+        except (FileNotFoundError, PermissionError) as exc:
+            # exec failed before Bun could contact the bridge. Older attempts
+            # remain unresolved; only this invocation is proven not to have sent.
+            holder['open'].remove(entry)
+            remember_bridge_error(holder, exc)
+            raise
         except BridgeError as exc:
+            remember_bridge_error(holder, exc)
             if exc.refused:
                 holder['open'].remove(entry)  # a clear no for this request: it queued nothing
             args = holder[field]
+            relay = relay_args(args) if exc.remote_chat else None
+            if n == 1 and relay:
+                # Switching transports uses a different dedupe store. Read each older
+                # attempt once: a missing row can still appear after this snapshot.
+                for prior in holder['open']:
+                    _, seen = ops(prior['args'])
+                    kinds = {kind for kind, _ in seen.values()}
+                    if 'live' in kinds:
+                        holder[field] = prior['args']
+                        return accepted_status(prior['args'])
+                    if kinds & {'maybe', 'retry'}:
+                        return 'failed:may_have_sent_check_chat'
+                    if mine(prior['args']) not in seen:
+                        break
+                else:
+                    holder[field] = relay
+                    save()
+                    continue
             if n == 1 and exc.no_to and args[0] == 'app' and args[-2:] == ['--to', 'owner']:
                 holder['no_to'] = True
                 final, holder[field] = reconcile(args[:-2], holder, field)
@@ -817,10 +925,14 @@ def attempt(holder, field, save):
                 holder[field] = live_session(holder[field])
                 continue
             raise
-        holder['open'] = [a for a in holder['open'] if mine(a['args']) != mine(holder[field])]
-        if not isinstance(ack.get('id'), str) or not isinstance(ack.get('created'), bool):
+        if not isinstance(ack, dict) or not isinstance(ack.get('id'), str) or not isinstance(ack.get('created'), bool):
             raise ValueError('card_send_bad_ack')
+        if holder[field][0] == 'agent-ask' and ack['id'] != mine(holder[field]):
+            raise ValueError('card_bus_bad_ack')
         holder['bridge_id'] = ack['id']
+        if holder[field][0] == 'agent-ask':
+            holder['agent_request_id'] = ack['id']
+        holder['created'] = ack['created']
         if ack['created'] is False:
             # The bridge already had this op: a send only if that op is still going.
             had = ops(holder[field])[1].get(mine(holder[field]))
@@ -828,7 +940,10 @@ def attempt(holder, field, save):
                 raise ValueError('bridge_outbox_unclear')  # the same key again can't post twice
             if had[0] == 'dead':
                 raise ValueError('bridge_had_this_key_dropped')  # the next try takes a fresh key
-        return 'sent'
+            if had[0] == 'maybe':
+                return 'failed:may_have_sent_check_chat'
+        holder['open'] = [a for a in holder['open'] if mine(a['args']) != mine(holder[field])]
+        return accepted_status(holder[field])
 
 
 
@@ -843,10 +958,25 @@ def public_url(url):
 
 def bridge(args, timeout=12):
     env = {k: v for k, v in os.environ.items() if k not in ('BUN_INSPECT', 'BUN_OPTIONS', 'NODE_OPTIONS')}
-    p = subprocess.run([BUN, BRIDGE, *args], capture_output=True, text=True, timeout=timeout, env=env)
+    try:
+        p = subprocess.run([BUN, BRIDGE, *args], capture_output=True, text=True, timeout=timeout, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log_bridge_error(BridgeError(getattr(exc, 'stderr', None) or type(exc).__name__), args)
+        raise
     if p.returncode:
-        raise BridgeError(p.stderr)
+        exc = BridgeError(p.stderr, p.returncode)
+        log_bridge_error(exc, args)
+        raise exc
     return json.loads(p.stdout)
+
+
+def recorded_bridge(args, holder, save, **kwargs):
+    try:
+        return bridge(args, **kwargs)
+    except (BridgeError, OSError, subprocess.TimeoutExpired) as exc:
+        remember_bridge_error(holder, exc)
+        save()
+        raise
 
 
 def prune_completed_shares():
@@ -855,6 +985,10 @@ def prune_completed_shares():
     by_app = {r['app']: r for r in records if isinstance(r,dict) and isinstance(r.get('app'),str)}
     for path in sorted((ROOT / 'cards').glob('*.json')):
         state = read(path)
+        cfg = read(ROOT / 'orders' / path.name)
+        if cfg.get('checkout') and (state.get('checkout_terminal_id') != cfg['checkout']
+                                    or state.get('checkout_terminal_status') not in ('delivered', 'cancelled')):
+            continue
         finished = state.get('terminal_at')
         if not finished or time.time() - finished < 3600 or state.get('unshared'):
             continue
@@ -864,7 +998,7 @@ def prune_completed_shares():
         # A stable-origin link is permanent: retiring it would break the URL already sent. Only an explicit unshare ends it.
         if shared.get('permanent'):
             continue
-        bridge(['unshare', '--app', state['slug']], timeout=2)
+        recorded_bridge(['unshare', '--app', state['slug']], state, lambda: atomic(path, state), timeout=2)
         state['unshared'] = True
         atomic(path, state)
         return  # Bound maintenance latency per new registration.
@@ -924,18 +1058,30 @@ def stage_update(state, rendered, folder, save):
         state.pop('update_error', None)
     except (OSError, ValueError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
         state['update_error'] = 'failed:' + type(exc).__name__
+        remember_bridge_error(state, exc)
 
 
 def sync(cfg, data, *, send=False, recover=False, update=False):
+    checkout = cfg.get('app') == 'amazon' and cfg.get('checkout')
+    if checkout:
+        # Every watcher refreshes the one checkout card. Only its leader may
+        # publish placement; sibling discovery must never create another send.
+        from amazon_checkout import card_key, card_view, remember_card_terminal
+        member = cfg['order'] != cfg.get('checkout_leader')
+        if member and send:
+            return {'status': 'skipped', 'rendered': False}
     settings = cfg.get('delivery_card')
     if not isinstance(settings, dict):
         return {'status': 'legacy_not_enrolled', 'rendered': False}
-    key = cfg['watcher']
+    key = card_key(cfg) if checkout else cfg['watcher']
     statepath = ROOT / 'cards' / (key + '.json')
     statepath.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with statepath.with_suffix('.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = read(statepath)
+        if checkout:
+            cfg, data = card_view(cfg, data, state)
+            settings = cfg.get('delivery_card', {})
         recipient = settings.get('chat') or cfg.get('chat') or cfg['for']
         # Public shares get a separate allowlisted directory. Legacy items.json
         # and arbitrary files must never become public through directory reuse.
@@ -950,8 +1096,10 @@ def sync(cfg, data, *, send=False, recover=False, update=False):
                 state.update(status='failed:public_directory_has_extra_files')
                 atomic(statepath, state)
                 return {'status': state['status'], 'slug': public_slug, 'rendered': False}
-        rendered = build(cfg, data, outdir=folder, url=state.get('url'), public=recipient != 'owner')
+        rendered = build(cfg, data, outdir=folder, url=state.get('url'), public=recipient != 'owner', _checkout_projected=True)
         state.update(rendered)
+        if checkout:
+            remember_card_terminal(cfg, data, state, time.time())
         if rendered['stage'] in ('Delivered', 'Cancelled'):
             state.setdefault('terminal_at', time.time())
         if state.get('status') == 'sent' and state.get('send_args') and (not state.get('bridge_confirmed') or not state.get('bridge_id')):
@@ -970,9 +1118,9 @@ def sync(cfg, data, *, send=False, recover=False, update=False):
             except (OSError, ValueError, sqlite3.Error):
                 pass  # unreadable: keep what the ack said
         if not send or settings.get('held') or (settings.get('skip_send') and not recover):
-            if state.get('status') != 'sent':
+            if state.get('status') not in ('sent', 'relayed'):
                 state['status'] = 'held:payment_unconfirmed' if settings.get('held') else 'skipped' if settings.get('skip_send') else state.get('status', 'not_sent')
-        elif state.get('status') != 'sent':
+        elif state.get('status') not in ('sent', 'relayed'):
             # Never deliver a forgotten placement days later after a restart.
             registered = instant(cfg.get('registered_at'))
             if not recover and (not registered or time.time() - registered.timestamp() > 6*3600):
@@ -983,7 +1131,8 @@ def sync(cfg, data, *, send=False, recover=False, update=False):
                         if recipient != 'owner':
                             try:
                                 prune_completed_shares()
-                            except Exception:
+                            except Exception as exc:
+                                remember_bridge_error(state, exc)
                                 pass  # Maintenance cannot block this order's card.
                         published = bridge(['publish' if recipient == 'owner' else 'share', '--app', rendered['slug'],
                                             *(['--days', str(share_days(cfg))] if recipient != 'owner' else [])],
@@ -999,7 +1148,7 @@ def sync(cfg, data, *, send=False, recover=False, update=False):
                             raise ValueError('public_card_url_required')
                         state['url'] = url
                         atomic(statepath, state)
-                        build(cfg, data, outdir=folder, url=url, public=recipient != 'owner')
+                        build(cfg, data, outdir=folder, url=url, public=recipient != 'owner', _checkout_projected=True)
                     final = None
                     if not state.get('send_args'):
                         state['open'] = []
@@ -1027,6 +1176,7 @@ def sync(cfg, data, *, send=False, recover=False, update=False):
                         state['status'] = 'attempting'
                         state['status'] = attempt(state, 'send_args', lambda: atomic(statepath, state))
                 except (OSError, ValueError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
+                    remember_bridge_error(state, exc)
                     state['status'] = 'failed:' + (str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
         state.pop('update_pending', None)
         if (update and recipient == 'owner' and state.get('status') == 'sent'
@@ -1037,66 +1187,90 @@ def sync(cfg, data, *, send=False, recover=False, update=False):
                 state['update_pending'] = True
         # Quick-tunnel links can change after bridge restart. Report a broken
         # original link for repair, without sending another progress message.
-        if state.get('status') == 'sent' and recipient != 'owner' and not state.get('unshared') and time.time() - state.get('link_checked_at', 0) > 300:
+        if state.get('status') in ('sent', 'relayed') and recipient != 'owner' and not state.get('unshared') and time.time() - state.get('link_checked_at', 0) > 300:
             try:
                 shared = bridge(['shares'], timeout=2)
                 records = shared if isinstance(shared, list) else shared.get('shares', [])
                 live = next((r for r in records if r.get('app') == public_slug), None)
                 state['link_health'] = 'ok' if live and live.get('live') and live.get('url') == state.get('url') else 'needs_repair'
-            except (OSError, ValueError, subprocess.TimeoutExpired):
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                remember_bridge_error(state, exc)
                 state['link_health'] = 'unknown'
             state['link_checked_at'] = time.time()
         atomic(statepath, state)
         statepath.chmod(0o600)
         # Placement failures remain retryable even when this refresh rendered successfully.
-        return {**{k: state.get(k) for k in ('status', 'slug', 'url', 'link_health', 'update_error', 'update_pending')}, 'rendered': True}
+        return {**{k: state.get(k) for k in ('status', 'slug', 'url', 'link_health', 'update_error', 'update_pending', 'bridge_error', 'agent_request_id')}, 'rendered': True}
 
 
 def repair_link(cfg, data):
     """Explicit replacement for a confirmed-sent link; never a progress ping."""
+    checkout = cfg.get('app') == 'amazon' and cfg.get('checkout')
+    if checkout:
+        from amazon_checkout import card_key, card_view
+    key = card_key(cfg) if checkout else cfg['watcher']
+    path = ROOT / 'cards' / (key + '.json')
+    with path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read(path)
+        if checkout:
+            cfg, data = card_view(cfg, data, state)
+        return _repair_link(cfg, data, path, state)
+
+
+def _repair_link(cfg, data, path, state):
     settings = cfg.get('delivery_card', {})
     recipient = settings.get('chat') or cfg.get('chat') or cfg.get('for')
     if recipient == 'owner' or settings.get('held') or settings.get('skip_send'):
         raise ValueError('public_sent_card_required')
-    path = ROOT / 'cards' / (cfg['watcher'] + '.json')
-    with path.with_suffix('.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        state = read(path)
-        if state.get('status') != 'sent' or not state.get('url'):
-            raise ValueError('public_sent_card_required')
-        repair = state.get('repair')
-        if not repair or repair.get('status') == 'sent':
-            shared = bridge(['shares']).get('shares', [])
-            current = next((r for r in shared if r.get('app') == state['slug'] and r.get('live')), None)
-            url = current.get('url') if current else None
-            if not url:
-                url = bridge(['share','--app',state['slug'],'--days',str(share_days(cfg))],timeout=65).get('url')
-            if not isinstance(url,str) or not public_url(url):
-                raise ValueError('public_card_url_required')
-            if url == state['url']:
-                state['link_health'] = 'ok'; atomic(path,state)
-                return {'status':'unchanged','url':url}
-            key = 'delivery-card-repair:' + cfg['watcher'] + ':' + hashlib.sha256(url.encode()).hexdigest()[:12]
-            repair = {'status':'attempting','url':url,'open':[],'args':['send','--to',recipient,'--text='+url,
-                      '--session',route(),'--key',key]}
-            state['repair'] = repair
-            atomic(path,state)
-        build(cfg,data,outdir=APPS/state['slug'],url=repair['url'],public=True)
-        final = None
-        if repair.get('tried'):
-            final, repair['args'] = reconcile(repair['args'], repair, 'args')
-        if not final:
-            repair['args'] = live_session(repair['args'])
-            repair['tried'] = True
-            final = attempt(repair, 'args', lambda: atomic(path, state))
-        if final != 'sent':
-            repair['status'] = final
-            atomic(path,state)
-            raise ValueError('repair_may_have_sent_check_chat')
-        repair.update(status='sent')
-        state.update(url=repair['url'],link_health='ok',link_checked_at=time.time())
+    if state.get('status') not in ('sent', 'relayed') or not state.get('url'):
+        raise ValueError('public_sent_card_required')
+    repair = state.get('repair')
+    if not repair or repair.get('status') in ('sent', 'relayed'):
+        shared = recorded_bridge(['shares'], state, lambda: atomic(path, state)).get('shares', [])
+        current = next((r for r in shared if r.get('app') == state['slug'] and r.get('live')), None)
+        url = current.get('url') if current else None
+        if not url:
+            url = recorded_bridge(['share','--app',state['slug'],'--days',str(share_days(cfg))], state,
+                                  lambda: atomic(path, state), timeout=65).get('url')
+        if not isinstance(url,str) or not public_url(url):
+            raise ValueError('public_card_url_required')
+        if url == state['url']:
+            state.update(build(cfg,data,outdir=APPS/state['slug'],url=url,public=True,_checkout_projected=True))
+            from amazon_checkout import remember_card_terminal
+            remember_card_terminal(cfg, data, state, time.time())
+            state['link_health'] = 'ok'; atomic(path,state)
+            return {'status':'unchanged','url':url}
+        key = 'delivery-card-repair:' + cfg['watcher'] + ':' + hashlib.sha256(url.encode()).hexdigest()[:12]
+        repair = {'status':'attempting','url':url,'open':[],'args':['send','--to',recipient,'--text='+url,
+                  '--session',route(),'--key',key]}
+        state['repair'] = repair
         atomic(path,state)
-        return {'status':'sent','url':state['url']}
+    state.update(build(cfg,data,outdir=APPS/state['slug'],url=repair['url'],public=True,_checkout_projected=True))
+    from amazon_checkout import remember_card_terminal
+    remember_card_terminal(cfg, data, state, time.time())
+    atomic(path,state)
+    final = None
+    if repair.get('tried'):
+        final, repair['args'] = reconcile(repair['args'], repair, 'args')
+    if not final:
+        repair['args'] = live_session(repair['args'])
+        repair['tried'] = True
+        try:
+            final = attempt(repair, 'args', lambda: atomic(path, state))
+        except (BridgeError, OSError, subprocess.TimeoutExpired) as exc:
+            remember_bridge_error(repair, exc)
+            repair['status'] = 'failed:bridge_request_failed'
+            atomic(path, state)
+            raise
+    if final not in ('sent', 'relayed'):
+        repair['status'] = final
+        atomic(path,state)
+        raise ValueError('repair_may_have_sent_check_chat')
+    repair.update(status=final)
+    state.update(url=repair['url'],link_health='ok',link_checked_at=time.time())
+    atomic(path,state)
+    return {'status':final,'url':state['url']}
 
 
 def safe_sync(cfg, data, *, send=False, recover=False, update=False):
@@ -1105,7 +1279,9 @@ def safe_sync(cfg, data, *, send=False, recover=False, update=False):
     except Exception as exc:
         # Card failures must not suppress tracker evidence or financial receipts.
         traceback.print_exc()
-        return {'status': 'failed:' + type(exc).__name__ + ':' + str(exc), 'rendered': False}
+        result = {'status': 'failed:' + type(exc).__name__ + ':' + str(exc), 'rendered': False}
+        remember_bridge_error(result, exc)
+        return result
 
 
 @toollog.entrypoint('delivery-card', 'delivery-card')

@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import faulthandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import signal
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.parse import parse_qs, urlparse
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -92,14 +94,29 @@ def configure_fixture(root, backend):
             stream.write(meta['run_id'] + '\n')
         return dict(processId=42, commandId='cmd-fake')
 
-    pool.acquire = acquire
-    api.cmd_start = start
-    def attach(*args, **kw):
+    def attach(box, pid, out, err, **kwargs):
+        output = 'background output\n'
         rid = os.environ[runs.BACKGROUND_RUN_ENV]
         with contextlib.closing(common.db()) as con:
             row = con.execute('SELECT protocol_nonce FROM runs WHERE run_id=?', (rid,)).fetchone()
-        return iter([dict(type='stderr',data=f'{runs.COMMAND_STARTED_MARKER} {rid} [n={row[0]}]\n')])
+        marker = f'{runs.COMMAND_STARTED_MARKER} {rid} [n={row[0]}]\n'
+        if err < len(marker):
+            yield dict(type='stderr', data=marker[err:], nextOffset=len(marker))
+        if out < len(output):
+            yield dict(type='stdout', data=output[out:], nextOffset=len(output))
+        _publish(root / 'following', str(os.getpid()))
+        while True:
+            signal.pause()
+
+    pool.acquire = acquire
+    api.cmd_start = start
     api.cmd_attach = attach
+    if os.environ.get('OFFBOX_TEST_HTTP_URL'):
+        api.API = os.environ['OFFBOX_TEST_HTTP_URL']
+        api._key = lambda: 'fixture'
+        api._own_box = lambda *args: None
+        api.cmd_attach = lambda box, pid, out, err, **kw: api.stream(
+            f'/sandboxes/{box}/commands/{pid}/stream?stdoutOffset={out}&stderrOffset={err}', **kw)
     runs._ttl_keeper = lambda *args: None
     return a, me
 
@@ -194,7 +211,7 @@ class BackgroundQueueTests(Isolated):
                              for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGKILL)):
             with self.subTest(backend=backend, signal=sig), contextlib.ExitStack() as cleanup:
                 root = Path(self.tmp.name)
-                for name in ('returned', 'waiting', 'starts', 'ttl'):
+                for name in ('returned', 'waiting', 'starts', 'ttl', 'following'):
                     (root / name).unlink(missing_ok=True)
                 with common.file_lock('fixture-slot'):
                     proc, row = self.launch(backend=backend, cleanup=cleanup.callback)
@@ -227,6 +244,112 @@ class BackgroundQueueTests(Isolated):
         self.assertEqual(out.decode().strip(), row['run_id'])
         self.assertIn(f'offbox wait {row["run_id"]}', err.decode())
         self.assertEqual((root / 'starts').read_text().splitlines(), [row['run_id']])
+
+    def test_detached_client_keeps_writing_after_returning_the_run_id(self):
+        for backend in ('boat', 'server'):
+            with self.subTest(backend=backend), contextlib.ExitStack() as cleanup:
+                root = Path(self.tmp.name)
+                for name in ('returned', 'waiting', 'starts', 'ttl', 'following'):
+                    (root / name).unlink(missing_ok=True)
+                proc, row = self.launch(backend=backend, cleanup=cleanup.callback)
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate(timeout=5)
+                self.until(lambda: (root / 'following').exists())
+                self.assertEqual(int((root / 'following').read_text()), row['client_pid'])
+                path = root / 'LOGS_DIR' / f"{row['run_id']}.log"
+                marker = f"{runs.COMMAND_STARTED_MARKER} {row['run_id']} [n={row['protocol_nonce']}]\n"
+                self.assertEqual(path.read_text(), marker + 'background output\n')
+                self.assertEqual(common.checkpoint(path), dict(stdoutOffset=18, stderrOffset=len(marker), logBytes=18 + len(marker)))
+                self.assertTrue(misc._client_alive(row['client_pid'], row['start_at']))
+                current = self.con.execute('SELECT status,exit_code FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
+                self.assertEqual(tuple(current), ('running', None))
+
+    def test_detached_queue_admission_recovers_silent_http_and_resumes_both_backends(self):
+        for backend in ('boat', 'server'):
+            for first in ('stdout', 'stderr'):
+                with self.subTest(backend=backend, first=first), contextlib.ExitStack() as cleanup:
+                    root = Path(self.tmp.name)
+                    for name in ('returned', 'waiting', 'starts', 'ttl', 'following'):
+                        (root / name).unlink(missing_ok=True)
+                    attached, produced, resumed, close = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+                    release_history = threading.Event()
+                    cleanup.callback(close.set)
+                    cleanup.callback(release_history.set)
+                    queue, live, resume = 'queued\n', 'admitted output\n', 'resumed output\n'
+                    requests = []
+                    class Handler(BaseHTTPRequestHandler):
+                        def log_message(self, *args):
+                            pass
+                        def do_GET(self):
+                            parsed = urlparse(self.path)
+                            query = parse_qs(parsed.query)
+                            requests.append((parsed.path, query))
+                            try:
+                                if '/command-history/' in parsed.path and query['stream'][0] != first:
+                                    if not release_history.wait(10):
+                                        return
+                                self.send_response(200)
+                                self.send_header('Content-Type', 'application/json')
+                                self.end_headers()
+                                if parsed.path.endswith('/stream'):
+                                    out, err = int(query['stdoutOffset'][0]), int(query['stderrOffset'][0])
+                                    frames = [dict(type='hello')]
+                                    if not err:
+                                        frames.append(dict(type='stderr', data=queue, nextOffset=len(queue)))
+                                    if attached.is_set():
+                                        resumed.set()
+                                        # Admission may return on stderr before the stdout history page is consumed.
+                                        data = (live + resume)[out:]
+                                        frames.append(dict(type='stdout', data=data, nextOffset=len(live + resume)))
+                                    for frame in frames:
+                                        self.wfile.write((json.dumps(frame) + '\n').encode())
+                                        self.wfile.flush()
+                                    attached.set()
+                                    close.wait(15)
+                                    return
+                                if '/command-history/' in parsed.path:
+                                    stream, offset = query['stream'][0], int(query['offset'][0])
+                                    marker = f"{runs.COMMAND_STARTED_MARKER} {row['run_id']} [n={row['protocol_nonce']}]\n" if produced.is_set() else ''
+                                    data = ((live + resume if resumed.is_set() else live) if produced.is_set() else '') if stream == 'stdout' else queue + marker
+                                    page = dict(data=data[offset:], nextOffset=len(data), size=len(data), done=False)
+                                else:
+                                    page = dict(status='running', running=True)
+                                self.wfile.write(json.dumps(page).encode())
+                            except (BrokenPipeError, ConnectionResetError):
+                                pass
+                    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+                    cleanup.callback(server.server_close)
+                    cleanup.callback(server.shutdown)
+                    serving = threading.Thread(target=server.serve_forever, daemon=True)
+                    serving.start()
+                    with patch.dict(os.environ, OFFBOX_TEST_HTTP_URL=f'http://127.0.0.1:{server.server_port}'):
+                        with common.file_lock('fixture-slot'):
+                            proc, row = self.launch(backend=backend, cleanup=cleanup.callback)
+                            os.killpg(proc.pid, signal.SIGKILL)
+                            proc.communicate(timeout=5)
+                        self.assertTrue(attached.wait(5))
+                        began = time.monotonic()
+                        produced.set()
+                        path = root / 'LOGS_DIR' / f"{row['run_id']}.log"
+                        marker = f"{runs.COMMAND_STARTED_MARKER} {row['run_id']} [n={row['protocol_nonce']}]\n"
+                        prefix = (queue + (live if first == 'stdout' else marker)).encode()
+                        self.until(lambda: path.exists() and path.read_bytes().startswith(prefix))
+                        release_history.set()
+                        expected = (queue + live + marker + resume if first == 'stdout' else queue + marker + live + resume).encode()
+                        self.until(lambda: path.read_bytes() == expected)
+                        elapsed = time.monotonic() - began
+                        self.assertLess(elapsed, 10)
+                        self.assertEqual(common.checkpoint(path), dict(stdoutOffset=len(live + resume), stderrOffset=len(queue + marker), logBytes=len(expected)))
+                        self.assertTrue(misc._client_alive(row['client_pid'], row['start_at']))
+                        streams = [q for p, q in requests if p.endswith('/stream')]
+                        self.assertEqual((int(streams[-1]['stdoutOffset'][0]), int(streams[-1]['stderrOffset'][0])),
+                                         (len(live) if first == 'stdout' else 0, len(queue + marker)))
+                        histories = [q for p, q in requests if '/command-history/' in p]
+                        self.assertTrue(histories)
+                        self.assertTrue(all(('limitBytes' in query) == (backend == 'server') for query in histories))
+                        events = (root / 'LOGS_DIR' / f"{row['run_id']}.client.log").read_text()
+                        self.assertIn('"event":"stream_silent"', events)
+                        print(f'live HTTP recovery backend={backend} first={first} seconds={elapsed:.3f} bytes={len(expected)}', flush=True)
 
     def test_kill_queued_run_stops_detached_client(self):
         with common.file_lock('fixture-slot'):
@@ -779,10 +902,11 @@ class BackgroundRetryTests(Isolated):
                     patch.object(outage, 'wait_until_up', side_effect=waiting) as retry, \
                     patch.object(outage, 'wait_for_capacity', side_effect=lambda *a: (waiting(), None)) as capacity_retry, \
                     patch.object(outage, 'CAPACITY_RETRY_S', 0), patch.object(api, 'get', return_value={'state': 'running'}), \
+                    patch.object(runs.Runner, 'stream', side_effect=lambda **kw: signal.raise_signal(signal.SIGTERM)), \
                     patch.object(lease, 'ensure_ttl'), contextlib.redirect_stdout(io.StringIO()), \
                     patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                     contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(runs.background_client(a, self.me), 0)
+                self.assertEqual(runs.background_client(a, self.me), common.EXIT_DETACHED)
             self.assertEqual(attempts, ['run-retry', 'run-retry'])
             self.assertEqual(retry.call_count + capacity_retry.call_count, 1)
 
@@ -846,9 +970,10 @@ class BackgroundFailoverTests(Isolated):
                 patch.object(home, '_forward_background') as forward, patch.object(os, 'execve') as execute, \
                 patch.object(runs.Runner, 'start', start), patch.object(outage, 'wait_until_up', side_effect=waiting) as wait, \
                 patch.object(api, 'get', return_value={'state': 'running'}), patch.object(lease, 'ensure_ttl'), \
+                patch.object(runs.Runner, 'stream', side_effect=lambda **kw: signal.raise_signal(signal.SIGTERM)), \
                 patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
-            self.assertEqual(runs.background_client(a, self.me), 0)
+            self.assertEqual(runs.background_client(a, self.me), common.EXIT_DETACHED)
         self.assertEqual(attempts, ['run-stays-home', 'run-stays-home'])
         self.assertEqual([call.args[0] for call in probes.call_args_list], ['server', 'boat'])
         wait.assert_called_once()

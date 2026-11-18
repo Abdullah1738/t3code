@@ -3,6 +3,17 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+const { tagConnectionFailure = error => error, connectionWebSocket = (url, options) => new WebSocket(url, options),
+} = await import('../../router-logging/toollog.mjs').catch(() => ({}));
+
+async function request(url, init) {
+  try { return await fetch(url, init); }
+  catch (error) { throw tagConnectionFailure(error, url); }
+}
+async function responseText(response, url) {
+  try { return await response.text(); }
+  catch (error) { throw tagConnectionFailure(error, url); }
+}
 
 const HOME = process.env.HOME || homedir();
 export const PATHS = {
@@ -24,7 +35,7 @@ export const INSTANCE_ID = process.env.CATALOG_GUARD_INSTANCE || 'opencode';
 export function configuredWatch(env = process.env) {
   const required = env.CATALOG_GUARD_REQUIRED === undefined ? undefined : JSON.parse(env.CATALOG_GUARD_REQUIRED);
   if (required !== undefined && (!Array.isArray(required) || !required.every((s) => typeof s === 'string' && s.length))) {
-    throw new Error('CATALOG_GUARD_REQUIRED must be a JSON array of model slugs');
+    throw Object.assign(new Error('CATALOG_GUARD_REQUIRED must be a JSON array of model slugs'), { code: 'CATALOG_REQUIREMENTS_INVALID' });
   }
   return { required, prefix: env.CATALOG_GUARD_PREFIX };
 }
@@ -57,9 +68,9 @@ export function writeState(state, path = PATHS.state) {
 export async function serviceSlugs({ directory = PROBE_DIRECTORY, timeoutMs = 20_000 } = {}) {
   const auth = 'Basic ' + Buffer.from(`opencode:${readFileSync(PATHS.ocPassword, 'utf8').trim()}`).toString('base64');
   const url = `${OC_URL}/api/model?${new URLSearchParams({ 'location[directory]': directory })}`;
-  const res = await fetch(url, { headers: { authorization: auth }, signal: AbortSignal.timeout(timeoutMs) });
-  if (!res.ok) throw new Error(`opencode /api/model: HTTP ${res.status}`);
-  const body = parse(await res.text());
+  const res = await request(url, { headers: { authorization: auth }, signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok) throw Object.assign(new Error(`opencode /api/model: HTTP ${res.status}`), { code: 'OPENCODE_HTTP', httpStatus: res.status });
+  const body = parse(await responseText(res, url));
   const data = Array.isArray(body?.data) ? body.data : [];
   return data.map((m) => `${m.providerID}/${m.id}`);
 }
@@ -71,7 +82,7 @@ function control() {
     : PATHS.control.length === 1
       ? PATHS.control[0]
       : PATHS.control.find((path) => existsSync(path));
-  if (file && statSync(file).mode & 0o077) throw new Error(`${file} must be chmod 600`);
+  if (file && statSync(file).mode & 0o077) throw Object.assign(new Error(`${file} must be chmod 600`), { code: 'CONTROL_CONFIG_PERMISSIONS' });
   const cfg = (file && readJson(file)) ?? {};
   return {
     url: (process.env.T3_CONTROL_URL || cfg.url || 'http://127.0.0.1:3773').replace(/\/$/, ''),
@@ -81,16 +92,17 @@ function control() {
 
 export async function harnessCutoverStatus({ timeoutMs = 15_000 } = {}) {
   const { url, token } = control();
-  if (!token) throw new Error('no control token');
-  const response = await fetch(`${url}/api/ardud/control/harness-cutover/status`, {
+  if (!token) throw Object.assign(new Error('no control token'), { code: 'CONTROL_AUTH_MISSING' });
+  const response = await request(`${url}/api/ardud/control/harness-cutover/status`, {
     headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(timeoutMs),
   });
-  const body = parse(await response.text());
+  const body = parse(await responseText(response, url));
+  if (!response.ok || body?.ok === false) throw Object.assign(new Error('control request failed'), { code: 'CONTROL_HTTP', httpStatus: response.status });
   const cutover = body?.cutover;
   if (!response.ok || body?.ok !== true || typeof cutover?.active !== 'boolean' || typeof cutover.completed !== 'boolean'
     || (cutover.retainedOpenCodeModels !== undefined && (!Array.isArray(cutover.retainedOpenCodeModels)
       || !cutover.retainedOpenCodeModels.every((s) => typeof s === 'string')))) {
-    throw new Error('harness-cutover status unavailable or invalid; catalog refresh held');
+    throw Object.assign(new Error('harness-cutover status unavailable or invalid; catalog refresh held'), { code: 'CUTOVER_STATUS_INVALID' });
   }
   return cutover;
 }
@@ -101,12 +113,12 @@ export async function harnessCutoverStatus({ timeoutMs = 15_000 } = {}) {
  * Resolves with the refreshed instance's model slugs.
  */
 export function refreshProviders({ instanceId = INSTANCE_ID, timeoutMs = 90_000 } = {}) {
-  if (instanceId !== 'opencode') return Promise.reject(new Error('OpenCode service comparator cannot refresh a native provider'));
+  if (instanceId !== 'opencode') return Promise.reject(Object.assign(new Error('OpenCode service comparator cannot refresh a native provider'), { code: 'CATALOG_INSTANCE_INVALID' }));
   const { url, token } = control();
-  if (!token) return Promise.reject(new Error('no control token'));
+  if (!token) return Promise.reject(Object.assign(new Error('no control token'), { code: 'CONTROL_AUTH_MISSING' }));
   const wsUrl = `${url.replace(/^http/, 'ws')}/ws?orchestrationProtocol=2`;
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl, { headers: { authorization: `Bearer ${token}` } });
+    const ws = connectionWebSocket(wsUrl, { headers: { authorization: `Bearer ${token}` } });
     ws.binaryType = 'arraybuffer';
     let done = false;
     const finish = (fn, v) => {
@@ -118,7 +130,7 @@ export function refreshProviders({ instanceId = INSTANCE_ID, timeoutMs = 90_000 
       } catch {}
       fn(v);
     };
-    const timer = setTimeout(() => finish(reject, new Error('refreshProviders: timeout')), timeoutMs);
+    const timer = setTimeout(() => finish(reject, Object.assign(new Error('refreshProviders: timeout'), { code: 'CONTROL_WS_TIMEOUT' })), timeoutMs);
     ws.addEventListener('open', () =>
       ws.send(JSON.stringify({ _tag: 'Request', id: '1', tag: 'server.refreshProviders', payload: { instanceId }, headers: [] })),
     );
@@ -131,7 +143,7 @@ export function refreshProviders({ instanceId = INSTANCE_ID, timeoutMs = 90_000 
         else if (msg._tag === 'Exit') {
           if (msg.exit?._tag !== 'Success') {
             // The failure body can echo request details; keep only its tag.
-            finish(reject, new Error(`refreshProviders: ${msg.exit?._tag ?? 'failed'}`));
+            finish(reject, Object.assign(new Error(`refreshProviders: ${msg.exit?._tag ?? 'failed'}`), { code: 'CONTROL_WS_EXIT' }));
             continue;
           }
           const providers = msg.exit.value?.providers ?? [];
@@ -140,10 +152,11 @@ export function refreshProviders({ instanceId = INSTANCE_ID, timeoutMs = 90_000 
             status: provider?.status ?? null,
             slugs: (provider?.models ?? []).map((m) => m.slug),
           });
-        } else if (msg._tag === 'Defect') finish(reject, new Error('refreshProviders: defect'));
+        } else if (msg._tag === 'Defect') finish(reject, Object.assign(new Error('refreshProviders: defect'), { code: 'CONTROL_WS_DEFECT' }));
       }
     });
-    ws.addEventListener('error', () => finish(reject, new Error('refreshProviders: socket error')));
-    ws.addEventListener('close', () => finish(reject, new Error('refreshProviders: closed before reply')));
+    ws.addEventListener('error', ev => finish(reject, tagConnectionFailure(
+      Object.assign(new Error('refreshProviders: socket error', {cause:ev.error ?? ev}), { code: 'CONTROL_WS_ERROR' }), wsUrl)));
+    ws.addEventListener('close', () => finish(reject, Object.assign(new Error('refreshProviders: closed before reply'), { code: 'CONTROL_WS_CLOSED' })));
   });
 }

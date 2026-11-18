@@ -9,6 +9,34 @@ import * as McpDeadline from "./McpDeadline.ts";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
 
+it.effect.each(["identity caller row", "background caller shell"])(
+  "a caller timeout names the statev2 %s and preserves retry identity",
+  (wait) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const pending = yield* McpDeadline.withDeadline(
+        McpDeadline.waitingOn(
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+          `statev2 ${wait}`,
+        ),
+        {
+          code: "caller_unresolved",
+          threadId: ThreadId.make("caller"),
+          stage: "caller",
+          requestKey: "same-key",
+        },
+      ).pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("10 seconds");
+      const failure = yield* Fiber.join(pending);
+      assert.equal(failure.code, "caller_unresolved");
+      assert.equal(
+        failure.message,
+        `Caller resolution timed out during caller for thread caller. Waiting on "statev2 ${wait}". Nothing was saved; retry the same call. Retry only with the same clientRequestId: same-key.`,
+      );
+    }),
+);
+
 it.effect("a fail-fast caller error retains the same-key retry instruction", () =>
   Effect.gen(function* () {
     const error = yield* McpDeadline.withDeadline(
@@ -68,7 +96,10 @@ it.effect("an outer deadline reports the nested caller read that is still pendin
     yield* Deferred.succeed(advance, undefined);
     yield* Deferred.await(entered);
     yield* TestClock.adjust("8 seconds");
-    assert.equal((yield* Fiber.join(pending)).code, "caller_unresolved");
+    const failure = yield* Fiber.join(pending);
+    assert.equal(failure.code, "caller_unresolved");
+    assert.include(failure.message, 'Waiting on "statev2 background caller shell".');
+    assert.notInclude(failure.message, "foreground");
     assert.deepEqual(logs, [
       [
         "MCP operation timed out",
@@ -155,7 +186,7 @@ it.effect("returns a typed deadline even while cancellation is deferred", () =>
     assert.equal(error.code, "caller_unresolved");
     assert.equal(
       error.message,
-      "Caller resolution timed out during caller for thread caller. Nothing was saved; retry the same call.",
+      'Caller resolution timed out during caller for thread caller. Waiting on "caller". Nothing was saved; retry the same call.',
     );
   }),
 );
@@ -185,7 +216,7 @@ it.effect("logs a delegated caller's pending foreground read without changing it
     assert.equal(failure.code, "caller_unresolved");
     assert.equal(
       failure.message,
-      `Caller resolution timed out during caller for thread ${threadId}. Nothing was saved; retry the same call.`,
+      `Caller resolution timed out during caller for thread ${threadId}. Waiting on "statev2 foreground caller row". Nothing was saved; retry the same call.`,
     );
     assert.deepEqual(logs, [
       [
@@ -231,7 +262,7 @@ it.effect.each([
     stage: "records",
     taskId: "task",
     message:
-      "Caller resolution timed out during records for thread caller. Task task was accepted; use task_status to recover it. Retry only with the same clientRequestId: retry.",
+      'Caller resolution timed out during records for thread caller. Waiting on "records". Task task was accepted; use task_status to recover it. Retry only with the same clientRequestId: retry.',
   },
 ] as const)("preserves $code text during $stage", ({ code, stage, taskId, message }) =>
   Effect.gen(function* () {
@@ -552,6 +583,7 @@ it.effect.each(["blocked", "defect"] as const)(
       );
       const result = yield* McpDeadline.awaitInterruptibly(Effect.succeed("saved"), {
         onTimeout: "detach",
+        startedAt: 0n,
         requestKey: "retry",
         deadline: { firedAt: 0n },
       }).pipe(

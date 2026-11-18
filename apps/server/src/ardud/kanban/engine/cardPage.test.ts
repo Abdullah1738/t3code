@@ -258,17 +258,54 @@ it.effect("resumes after a 4 MiB cut without gaps or duplicates, counting UTF-8 
   }).pipe(Effect.provide(testLayer())),
 );
 
-it.effect("returns a single 5 MiB card and advances to the following card", () =>
+it.effect.each([
+  { name: "just below", bytes: 4 * 1024 * 1024 - 1, admitted: true },
+  { name: "exactly at", bytes: 4 * 1024 * 1024, admitted: true },
+  { name: "just above", bytes: 4 * 1024 * 1024 + 1, admitted: false },
+  { name: "well above", bytes: 5 * 1024 * 1024, admitted: false },
+])("paginates cards $name the 4 MiB hydration limit", ({ bytes, admitted }) =>
   Effect.gen(function* () {
     const service = yield* KanbanService.KanbanService;
-    const big = { ...fixture(1), prompt: "x".repeat(5 * 1024 * 1024) };
+    const empty = { ...fixture(1), prompt: "" };
+    const big = {
+      ...empty,
+      prompt: "x".repeat(bytes - Buffer.byteLength(JSON.stringify(empty))),
+    };
+    assert.strictEqual(Buffer.byteLength(JSON.stringify(big)), bytes);
     yield* seed([big, fixture(2)]);
-    const first = yield* service.cardPage({ board: boardId, limit: 500 });
-    assert.deepStrictEqual(first.cards, [big]);
-    assert.deepStrictEqual(first.page, { limit: 500, hasMore: true, nextAfter: 1 });
-    const last = yield* service.cardPage({ board: boardId, after: first.page.nextAfter! });
-    assert.deepStrictEqual(last.cards, [fixture(2)]);
-    assert.isFalse(last.page.hasMore);
+    const first = yield* service.cardPage({ board: boardId, limit: 1 });
+    assert.deepStrictEqual(first.cards, [admitted ? big : fixture(2)]);
+    assert.deepStrictEqual(first.page, {
+      limit: 1,
+      hasMore: admitted,
+      nextAfter: admitted ? 1 : 2,
+    });
+    if (admitted) {
+      const last = yield* service.cardPage({ board: boardId, after: first.page.nextAfter! });
+      assert.deepStrictEqual(last.cards, [fixture(2)]);
+      assert.isFalse(last.page.hasMore);
+    }
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("skips oversized cards before and between pages without hiding valid cards", () =>
+  Effect.gen(function* () {
+    const service = yield* KanbanService.KanbanService;
+    const oversized = (number: number) => ({
+      ...fixture(number),
+      prompt: "x".repeat(4 * 1024 * 1024),
+    });
+    yield* seed([oversized(1), fixture(2), oversized(3), fixture(4), oversized(5)]);
+    const first = yield* service.cardPage({ board: boardId, limit: 1 });
+    assert.deepStrictEqual(first.cards, [fixture(2)]);
+    assert.deepStrictEqual(first.page, { limit: 1, hasMore: true, nextAfter: 2 });
+    const last = yield* service.cardPage({
+      board: boardId,
+      after: first.page.nextAfter!,
+      limit: 1,
+    });
+    assert.deepStrictEqual(last.cards, [fixture(4)]);
+    assert.deepStrictEqual(last.page, { limit: 1, hasMore: false, nextAfter: 4 });
   }).pipe(Effect.provide(testLayer())),
 );
 

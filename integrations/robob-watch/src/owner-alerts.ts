@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { imessage, iso, loadState, loadWatcher, now, saveState, watcherInstance, withRelayLock, type State, type Watcher } from "./lib.ts";
+import { CheckShutdownError, imessage, iso, loadState, loadWatcher, now, saveState, watcherInstance, withRelayLockAsync, type State, type Watcher } from "./lib.ts";
 import { toolError, toolLog } from "./toollog.ts";
 
 export type OwnerAlertEpisode = {
@@ -53,10 +53,10 @@ const sending = new Map<string, Promise<void>>();
 const completed = new Map<string, { instance?: string; key: string; kind: "pause" | "failing" | "recovered"; retryKey?: string }>();
 
 // Apply between checks: an async send must never race a check's state.json snapshot.
-export function applyOwnerAlertResults(id: string): void {
+export async function applyOwnerAlertResults(id: string): Promise<void> {
   const result = completed.get(id);
   if (!result) return;
-  withRelayLock(() => {
+  await withRelayLockAsync(() => {
     if (!loadWatcher(id) || watcherInstance(id) !== result.instance) return;
     const state = loadState(id);
     const episode = state.owner_imessage_episodes?.find(episode => episode.key === result.key);
@@ -79,7 +79,7 @@ export function applyOwnerAlertResults(id: string): void {
 
 async function flush(id: string): Promise<void> {
   const instance = watcherInstance(id);
-  const pending = withRelayLock(() => {
+  const pending = await withRelayLockAsync(() => {
     const watcher = loadWatcher(id);
     if (!watcher || !enabled(watcher) || watcherInstance(id) !== instance) return;
     const state = loadState(id);
@@ -116,7 +116,7 @@ async function flush(id: string): Promise<void> {
 /** Separate from checks and Telegram: each receipt/route lookup is bounded to 10s, the send to 20s. */
 export function dispatchOwnerAlerts(id: string): void {
   if (sending.has(id) || completed.has(id)) return;
-  const job = flush(id).catch(() => toolError("runner", "alert.imessage.dispatch_failed", { watcher: id }))
+  const job = flush(id).catch(error => { if (!(error instanceof CheckShutdownError)) toolError("runner", "alert.imessage.dispatch_failed", { watcher: id }); })
     .finally(() => { sending.delete(id); });
   sending.set(id, job);
 }

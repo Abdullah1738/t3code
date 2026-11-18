@@ -48,6 +48,14 @@ For manual release/restart scripts, call `robob-watch log-marker --service robob
 
 ## Tests
 
+`ride-card send` relays public link text through `agent-ask` for chats configured with
+`chatBackends.<slug>.kind = remote-box`, with a fallback for the bridge's explicit remote-chat
+403 refusal. The journal records `relayed` after bus acceptance, not final delivery. The same
+trip/recipient key is used by the bus and the recipient's send; unresolved direct attempts
+block a transport switch. `--dry-run` reports the route without sending or publishing.
+`bridge.error` and `relay` tool events retain command/error classifications and hashed
+recipient, key and acknowledgement identifiers. Abdullah's card still uses `app`.
+
 Run from `integrations/robob-watch`. Bun: `bun test test/`. Python uses unittest; pytest is not installed on the Mac.
 
 ```sh
@@ -66,4 +74,4 @@ For all top-level Python suites, use `-p 'test_*.py'` in the first example; it d
 
 Discovery inserts its top directory into `sys.path` under `-I`; `-t .` lets top-level suites use this repo's `test` package instead of the stdlib package. For meds-nag and check directories, the top defaults to the start directory so sibling imports work.
 
-Always set `ROBOB_TEST=1` for the send guards: `conftest.py` sets it only under pytest, and unittest does not load that file.
+The send guards refuse live sends under `ROBOB_TEST=1`. Every Python test module sets it as its first statement, so unittest and direct runs are guarded without `conftest.py` (pytest only); `test/test_robob_test_marker.py` fails for a module that doesn't. Keep that first statement in new test files.

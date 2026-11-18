@@ -37,14 +37,17 @@ class LifecycleTests(Isolated):
     def test_handoff_records_identity_and_atexit_in_both_logs(self):
         proc, row = self.launch()
         rid = row['run_id']
+        self.until(lambda: any(r['reason'] == 'following' for r in self.records(rid)), proc)
+        self.assertFalse(any(r['event'] == 'end' for r in self.records(rid)))
+        os.kill(row['client_pid'], signal.SIGTERM)
         self.until(lambda: any(r['reason'] == 'atexit' for r in self.records(rid)), proc)
         records = self.records(rid)
         start = next(r for r in records if r['event'] == 'start')
         self.assertEqual(start['pid'], row['client_pid'])
         for key in ('ppid', 'pgid', 'sid'):
             self.assertIsInstance(start[key], int)
-        self.assertIn('handoff', [r['reason'] for r in records])
-        self.assertIn('client end: handoff', queue_lifecycle.last_end(rid))
+        self.assertIn('following', [r['reason'] for r in records])
+        self.assertIn('client end: SIGTERM', queue_lifecycle.last_end(rid))
         log = common.LOG_PATH.read_text()
         for r in records:
             self.assertIn(json.dumps(r, separators=(',', ':')), log)

@@ -1,5 +1,8 @@
 """Card #14: mailsend refuses a real draft or send under a test run, and a stubbed himalaya still runs."""
 import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import subprocess
 import tempfile
 import unittest

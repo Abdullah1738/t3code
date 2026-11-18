@@ -24,6 +24,7 @@ import {
   PACKET_SUBTASK,
   passReview,
   reviewRoundStartedAt,
+  releaseBuildCommit,
   planSubtasks,
   pendingWakeNote,
   subtaskLines,
@@ -32,6 +33,22 @@ import {
 } from "./subtasks.ts";
 
 const owner = { _tag: "owner" } as const;
+
+it.each([
+  ["Installed; buildCommit d86aed779b94", "d86aed779b94"],
+  ["buildCommit: `ABCDEF123456`", "abcdef123456"],
+  ["buildCommit=abcdef1", "abcdef1"],
+  [
+    "buildCommit abcdef1234567890abcdef1234567890abcdef12",
+    "abcdef1234567890abcdef1234567890abcdef12",
+  ],
+  ["Reviewed abcdef1; installed", undefined],
+  ["buildCommit abcdef", undefined],
+  ["buildCommit abcdef1234567890abcdef1234567890abcdef12345", undefined],
+  [null, undefined],
+])("release receipt extracts only an explicitly named commit from %s", (note, commit) => {
+  expect(releaseBuildCommit(note)).toBe(commit);
+});
 const at = "2026-10-26T12:00:00.000Z";
 const torsshReview =
   "Review (single GPT-6 Astra xhigh, design chain): torrc injection impossible, token fresh per launch and never logged, only the policy FD inherited, no bridge fallback on PT failure/relaunch, snowflake consent rechecked, #30/#36/#56 lyrebird gates unchanged";
@@ -2579,6 +2596,50 @@ describe("marking subtasks", () => {
 });
 
 describe("withPacketStep", () => {
+  it.each([
+    { ids: ["s1", "s2", "s3"], expected: ["s1", "s2", "s3", "s4"], seq: 4 },
+    { ids: ["s7", undefined, "s2"], expected: ["s1", "s8", "s9", "s3"], seq: 9 },
+    { ids: [undefined, "s4", undefined], expected: ["s1", "s2", "s5", "s6"], seq: 6 },
+    { ids: [undefined, undefined, undefined], expected: ["s1", "s2", "s3", "s4"], seq: 4 },
+    { ids: [" s1 ", "s2", "s3"], expected: ["s1", "s2", "s3", "s4"], seq: 4 },
+  ])("shifts new ids past the packet: $ids", ({ ids, expected, seq }) => {
+    const plan = planSubtasks(
+      [],
+      withPacketStep(
+        ids.map((id, index) => ({
+          ...(id === undefined ? {} : { id }),
+          step: index + 1,
+          text: `Task ${index}`,
+          owner: "work",
+        })),
+      ),
+    );
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.subtasks.map(({ id }) => id)).toEqual(expected);
+    expect(plan.subtasks.map(({ step }) => step)).toEqual([1, 2, 3, 4]);
+    expect(plan.subtaskSeq).toBe(seq);
+    const continued = planSubtasks(
+      plan.subtasks,
+      [...plan.subtasks.map(({ id }) => ({ id })), { text: "Follow-up", owner: "work" }],
+      plan.subtaskSeq,
+    );
+    expect(continued.ok).toBe(true);
+    if (continued.ok) expect(continued.subtasks.at(-1)?.id).toBe(`s${seq + 1}`);
+  });
+
+  it.each(["foo", "S1", "s0", "s01", "s 1", "s", "1", "s1x"])(
+    "keeps malformed id %j for validation",
+    (id) => {
+      expect(planSubtasks([], withPacketStep([{ id, text: "Task", owner: "work" }]))).toMatchObject(
+        {
+          ok: false,
+          reason: `"${id}" is not a subtask id; use s1, s2, ...`,
+        },
+      );
+    },
+  );
+
   it("puts the evaluator's packet first and moves the given steps one later", () => {
     const plan = planSubtasks(
       [],

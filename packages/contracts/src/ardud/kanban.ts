@@ -1053,6 +1053,15 @@ export const KanbanCard = Schema.Struct({
   activeRole: Schema.NullOr(Schema.Literals(["work", "review"])),
   /** Pool key (instance/model#level) the active thread holds a slot in. */
   activePool: Schema.NullOr(Schema.String),
+  /** Attachment released by a blocking owner ask; only this live thread may resume it. */
+  ownerPark: Schema.optional(
+    Schema.Struct({
+      stage: KanbanStage,
+      threadId: Schema.NullOr(ThreadId),
+      pool: Schema.NullOr(Schema.String),
+      startedAt: Schema.NullOr(IsoDateTime),
+    }),
+  ),
   workThreadId: Schema.NullOr(ThreadId),
   reviewThreadId: Schema.NullOr(ThreadId),
   discussionId: Schema.NullOr(KanbanDiscussionId),
@@ -2098,6 +2107,7 @@ export type KanbanStandingApproval = typeof KanbanStandingApproval.Type;
 export const KanbanRelease = Schema.Struct({
   service: Schema.optional(Schema.String),
   postHoc: Schema.optional(Schema.Boolean),
+  buildCommit: Schema.optional(Schema.String),
   boardId: KanbanBoardId,
   cardId: KanbanCardId,
   cardNumber: Schema.Number,
@@ -2127,6 +2137,8 @@ export const KanbanBoard = Schema.Struct({
   releaseLedger: Schema.optional(Schema.Array(KanbanRelease)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  /** Evidence from unmarked history is reported without becoming gate input. */
+  historicalReleaseLedger: Schema.optional(Schema.Array(KanbanRelease)),
   standingApprovals: Schema.Array(KanbanStandingApproval).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),

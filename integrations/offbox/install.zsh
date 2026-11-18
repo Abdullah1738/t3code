@@ -60,12 +60,16 @@ pushed() {
 [[ -d "$here/skill" ]] || { print -u2 "offbox: missing source directory: $here/skill"; exit 1 }
 for src in "$here"/skill/**/*(DN.) "$here/lib/toollog.ts" "$here/plugin/offbox-gate.ts" "$here/bin/boat" \
            "$here/launchd/$label.plist" "$here/launchd/$home_label.plist" "$quint_source" \
+           "$here/home-repair/delete-idle-boxes.sh" "$here/home-repair/idle-boxes-list.py" \
            "$reload_helper" "$repo/integrations/local-helpers/libexec/toollog/toollog.py"; do
   [[ -f "$src" && -r "$src" ]] || { print -u2 "offbox: missing or unreadable source: $src"; exit 1 }
 done
 
 if [[ $mode == check ]]; then
   rc=0
+  for source in "$here"/home-repair/*; do
+    cmp -s "$source" "$HOME/.local/share/offbox/home-repair/${source:t}" || { print -u2 "offbox: repair source differs: ${source:t}"; rc=1 }
+  done
   pushed || rc=1
   # Content and modes only: mtimes differ after every install and mean nothing here.
   if [[ ! -d "$skill" ]]; then
@@ -131,6 +135,13 @@ fi
 if (( ${#dry} )); then
   exit 0
 fi
+mkdir -p "$HOME/.local/share/offbox/home-repair"
+for source in "$here"/home-repair/*; do
+  destination="$HOME/.local/share/offbox/home-repair/${source:t}"
+  staging=$(mktemp "$destination.XXXXXX")
+  cp -p "$source" "$staging"
+  mv -f "$staging" "$destination"
+done
 
 # The monitor imports the skill's scripts, so restart it to pick up new code.
 if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then

@@ -775,7 +775,14 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
             summary: text || item.reason,
           };
         } else {
-          turnItem = { ...base, ...museToolPresentation(item, status) };
+          const presentation = museToolPresentation(item, status);
+          turnItem = {
+            ...base,
+            ...presentation,
+            ...(presentation.type === "command_execution" || presentation.type === "dynamic_tool"
+              ? { toolResultIncomplete: item.status === "inProgress" }
+              : {}),
+          };
         }
         yield* emit({
           type: "node.updated",

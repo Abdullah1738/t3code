@@ -14,7 +14,8 @@ appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) +
   const env: Record<string, string | undefined> = { ...process.env, BUN_INSPECT: undefined, ROBOB_WATCH_TEST_BATCH_MS: "0", ROBOB_WATCH_ROOT: root,
     ROBOB_WATCH_TELEGRAM_CLI: stub, ROBOB_WATCH_SPECTRUM_CLI: stub,
     ROBOB_WATCH_BRIDGE_DB: join(sandbox, "absent.sqlite"), WACLI_STORE_DIR: join(sandbox, "wacli"),
-    ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_CHECK_TIMEOUT_MS: "40", ...options };
+    // macOS loads the owner's noninteractive shell hooks before even a `true` check can run.
+    ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_CHECK_TIMEOUT_MS: process.platform === "darwin" ? "400" : "40", ...options };
   const path = (id: string, file: string) => join(root, "watchers", id, file);
   const state = (id: string): State => JSON.parse(readFileSync(path(id, "state.json"), "utf8"));
   const save = (id: string, s: State) => writeFileSync(path(id, "state.json"), JSON.stringify(s));
@@ -72,7 +73,7 @@ test("b: repeated load timeouts never count, alert, escalate or pause", async ()
   for (let n = 1; n <= 6; n++) await f.run("loaded", s => s.load_timeouts === n);
   const s = f.state("loaded"); expect(s.consecutive_failures).toBe(0); expect(s.failing_since).toBeUndefined();
   expect(s.failure_paused_at).toBeUndefined(); expect(s.failure_escalated).toBeUndefined(); expect(f.calls()).toHaveLength(0);
-  expect(s.load_timeout_since).toBeString(); expect(s.last_error).toBe("timed out after 0.12s under host load 9.0/core");
+  expect(s.load_timeout_since).toBeString(); expect(s.last_error).toBe(`timed out after ${Number(f.env.ROBOB_WATCH_CHECK_TIMEOUT_MS) * 3 / 1000}s under host load 9.0/core`);
   expect(s.next_at! - Date.now()).toBeGreaterThan(115_000); expect(s.next_at! - Date.now()).toBeLessThanOrEqual(120_000);
   for (const args of [["list"], ["show", "loaded"]]) expect(f.cli(...args).stdout.toString()).toContain("load-timeouts 6");
   expect(f.cli("resume", "loaded").exitCode).toBe(0); expect(f.state("loaded").load_timeouts).toBeUndefined(); expect(f.state("loaded").load_timeout_since).toBeUndefined();
@@ -82,7 +83,7 @@ test("c: a 61-minute load timeout streak enters the normal failure path", async 
   const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9" }); f.add("hung");
   f.save("hung", { ...f.state("hung"), load_timeouts: 10, load_timeout_since: new Date(Date.now() - 61 * 60_000).toISOString() });
   await f.run("hung", s => s.consecutive_failures === 1);
-  expect(f.state("hung").last_error).toBe("timed out after 0.12s"); expect(f.state("hung").failing_since).toBeString();
+  expect(f.state("hung").last_error).toBe(`timed out after ${Number(f.env.ROBOB_WATCH_CHECK_TIMEOUT_MS) * 3 / 1000}s`); expect(f.state("hung").failing_since).toBeString();
 });
 
 test("grace safety valve still alerts, pauses and escalates a hung wake check", async () => {
@@ -94,7 +95,7 @@ test("grace safety valve still alerts, pauses and escalates a hung wake check", 
 
 test("d: low-load timeouts count as failures", async () => {
   const f = fixture(); f.add("low"); await f.run("low", s => s.consecutive_failures === 1);
-  expect(f.state("low").last_error).toBe("timed out after 0.04s"); expect(f.state("low").load_timeouts).toBeUndefined();
+  expect(f.state("low").last_error).toBe(`timed out after ${Number(f.env.ROBOB_WATCH_CHECK_TIMEOUT_MS) / 1000}s`); expect(f.state("low").load_timeouts).toBeUndefined();
 });
 
 test("e: high load triples a 1s timeout, allowing a 2s check to succeed", async () => {
@@ -104,7 +105,7 @@ test("e: high load triples a 1s timeout, allowing a 2s check to succeed", async 
 }, 15_000);
 
 test("f: four high-load checks never overlap more than two at once", async () => {
-  const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9", ROBOB_WATCH_MAX_CONCURRENT_UNDER_LOAD: "2" }), ids = ["one", "two", "three", "four"];
+  const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9", ROBOB_WATCH_LOAD_DWELL_MS: "0", ROBOB_WATCH_MAX_CONCURRENT_UNDER_LOAD: "2" }), ids = ["one", "two", "three", "four"];
   for (const id of ids) f.add(id, { timeout_s: 5, check: 'zmodload zsh/datetime; print "$EPOCHREALTIME start $WATCH_ID" >> "$WATCH_DIR/../../timeline"; sleep 0.3; print "$EPOCHREALTIME end $WATCH_ID" >> "$WATCH_DIR/../../timeline"' });
   const child = f.start(); await until(() => ids.every(id => existsSync(f.path(id, ".run-ok")))); await f.stop(child);
   const events = readFileSync(join(f.root, "timeline"), "utf8").trim().split("\n").map(line => line.split(" ")).sort((a, b) => Number(a[0]) - Number(b[0]));
@@ -160,8 +161,8 @@ test.each(["0.1", "9"])("load at either endpoint grants timeout immunity: starts
   const child = f.start(preload); await until(() => existsSync(f.path("edge", "started"))); writeFileSync(control, initial === "9" ? "0.1" : "9");
   await until(() => f.state("edge").load_timeouts === 1); await f.stop(child);
   expect(f.state("edge").consecutive_failures).toBe(0); expect(f.state("edge").last_error).toContain("9.0/core"); expect(f.calls()).toHaveLength(0);
-  expect(f.readLog(child).match(/host load mode started/g)).toHaveLength(1);
-  if (initial === "9") expect(f.readLog(child).match(/host load mode ended/g)).toHaveLength(1);
+  expect(f.readLog(child)).not.toContain("host load mode started");
+  expect(f.readLog(child)).not.toContain("host load mode ended");
 }, 15_000);
 
 test("CLI preserves timeout_s on flag replacement and uses it for scratch tests", async () => {

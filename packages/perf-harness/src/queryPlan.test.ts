@@ -208,7 +208,7 @@ NodeTest.test("stale archive exceptions require the same recorded history tables
         [finding],
         exceptions.map((e) => ({
           route: e.route,
-          queryHash: e.queryHash,
+          ...(e.queryHash !== undefined ? { queryHash: e.queryHash } : {}),
           pattern: e.pattern,
           reason: e.reason,
         })),

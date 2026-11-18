@@ -36,6 +36,7 @@ if __name__ == '__main__':
     names = [
         'test_owner_go',
         'test_owner_go_delegation',
+        'test_owner_go_standing',
         'test_owner_go_gates',
         'test_install_cli',
         'test_commerce_journal',
@@ -59,7 +60,6 @@ if __name__ == '__main__':
         'test_commerce_preorder_release',
         'test_commerce_purchase_guards',
         'test_commerce_reconcile',
-        'test_commerce_talabat',
         'test_food_capture_close',
         'test_marketplace_cleanup',
         'test_minutes_cart_recovery',
@@ -67,11 +67,6 @@ if __name__ == '__main__':
         'test_noon_food_financial',
         'test_nownow_active_orders',
         'test_nownow_cleanup',
-        'test_talabat_duplicate',
-        'test_talabat_fresh_review',
-        'test_talabat_order_adapter',
-        'test_talabat_payment_outcome',
-        'test_talabat_submit_journal',
     ]
     result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromNames(names))
     sys.exit(not result.wasSuccessful())

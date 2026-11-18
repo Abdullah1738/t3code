@@ -1,3 +1,4 @@
+import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Cause from "effect/Cause";
@@ -11,6 +12,7 @@ import type * as Option from "effect/Option";
 import * as HttpServerRequest from "effect/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import type * as HttpRouter from "effect/http/HttpRouter";
+import * as HttpServerError from "effect/http/HttpServerError";
 
 import * as Analytics from "../analytics/Analytics.ts";
 import { recordServerAnalytics } from "../../observability/RpcInstrumentation.ts";
@@ -19,20 +21,263 @@ import * as ReplyBuilders from "../http/ReplyBuilders.ts";
 export const CONTROL_REQUEST_ID_HEADER = "x-request-id";
 const validRequestId = /^[A-Za-z0-9._:-]{1,64}$/;
 
-interface RequestRecord {
+export const HttpObserver = Context.Reference<
+  | {
+      readonly start: (
+        route: { readonly path: string; readonly method: string } | undefined,
+        requestId: string,
+      ) => void;
+      readonly complete: (props: NonNullable<AnalyticsEvent["props"]>) => void;
+    }
+  | undefined
+>("t3/ardud/control/HttpObserver", { defaultValue: () => undefined });
+
+export interface FailureDetails {
+  readonly errorTag: string;
+  readonly reason: string;
+}
+
+type SendMode = "auto" | "queue" | "steer" | "restart";
+interface RequestDetails {
   method: string;
   requestId: string;
-  threadId?: string;
-  serializationMs: number;
   itemCount?: number;
   itemsTotal?: number;
   responseBytes?: number;
+  serializationMs: number;
+  threadId?: string | undefined;
+  mode?: SendMode;
+  clientRequestId?: string | undefined;
+  failure?: FailureDetails & { readonly code: string };
 }
-
-const RequestMethod = Context.Reference<RequestRecord | undefined>(
-  "t3/ardud/control/RequestMethod",
+const RequestContext = Context.Reference<RequestDetails | undefined>(
+  "t3/ardud/control/RequestContext",
   { defaultValue: () => undefined },
 );
+
+// Match only server-owned invariant templates. The interpolated IDs and all other
+// text (including previously persisted rejection details) stay out of logs.
+const dispatchReason = (cause: unknown): string | undefined => {
+  if (typeof cause !== "string" || cause.length > 8192) return;
+  switch (cause) {
+    case "Context compaction must run as a separate turn. Queue it or wait for the active turn to finish.":
+      return "compaction_requires_separate_turn";
+    case "Signing out must run as a separate turn. Queue it or wait for the active turn to finish.":
+      return "sign_out_requires_separate_turn";
+    case "Goal commands must run as a separate turn. Queue it or wait for the active turn to finish.":
+      return "goal_requires_separate_turn";
+    case "Wait for context compaction to finish before steering the thread.":
+      return "context_compaction_in_progress";
+    case "Wait for sign-out to finish before steering the thread.":
+      return "sign_out_in_progress";
+    case "Active-turn-only steering cannot restart the turn.":
+      return "active_turn_only_restart_forbidden";
+    case "Silent child recovery is no longer safe or was already attempted.":
+      return "silent_recovery_not_safe";
+    case "The active ACP session does not expose a model-switch capability.":
+      return "model_switch_unsupported";
+  }
+  if (/^Target run \S+ is stopping and cannot be steered\.$/.test(cause)) return "run_stopping";
+  if (/^Target run \S+ was not found\.$/.test(cause)) return "target_run_not_found";
+  if (/^Target run \S+ has no root node\.$/.test(cause)) return "target_run_missing_root";
+  if (
+    /^Target run \S+ is (?:queued|starting|waiting|completed|failed|interrupted|cancelled) and cannot be steered\.$/.test(
+      cause,
+    )
+  )
+    return "target_run_not_running";
+  if (/^Target run \S+ does not belong to thread \S+\.$/.test(cause)) return "run_thread_mismatch";
+  if (/^Run \S+ is not running in this thread\.$/.test(cause)) return "run_thread_mismatch";
+  if (/^Thread \S+ was stopped\.$/.test(cause)) return "thread_stopped";
+  if (/^No running provider(?:InstanceId)? turn found for active run \S+\.$/.test(cause))
+    return "no_running_provider_turn";
+  if (/^Provider thread \S+ has no active provider session for steering\.$/.test(cause))
+    return "no_active_provider_session";
+  if (/^Provider session \S+ is not active\.$/.test(cause)) return "provider_session_inactive";
+  if (cause === "Delivery was revoked before dispatch.") return "delivery_revoked";
+  // Rejected receipts retain the friendly policy message, without its typed cause.
+  if (/^.+ cannot queue messages behind an active run\.$/.test(cause))
+    return "unsupported_queued_messages";
+  if (/^.+ cannot redirect an active run\. Stop it first, then send the message\.$/.test(cause))
+    return "unsupported_active_steering";
+  if (
+    /^.+ cannot restart an active run\. Use t3_thread_interrupt, then send the message\.$/.test(
+      cause,
+    )
+  )
+    return "unsupported_interrupt_restart_steering";
+  if (/^.+ cannot stop a run once it has started\.$/.test(cause)) return "unsupported_interrupt";
+  if (/^.+ cannot fork this thread natively\.$/.test(cause)) return "unsupported_native_fork";
+  if (/^.+ cannot fork from an earlier point in this thread\.$/.test(cause))
+    return "unsupported_fork_from_turn";
+  if (
+    /^.+ cannot rewind its conversation, so this checkpoint cannot be restored on this thread\.$/.test(
+      cause,
+    )
+  )
+    return "unsupported_rollback";
+  if (
+    /^.+ did not report its rewound conversation state, so the checkpoint was not restored\.$/.test(
+      cause,
+    )
+  )
+    return "unsupported_rollback_snapshot";
+  if (/^.+ cannot receive the context handoff needed for this switch\.$/.test(cause))
+    return "unsupported_context_handoff";
+  if (/^.+ cannot confirm when its runs finish reliably enough for this\.$/.test(cause))
+    return "unsupported_strong_terminal_status";
+  if (/^.+ cannot deliver a message that way right now\.$/.test(cause))
+    return "dispatch_mode_unsupported";
+};
+
+// Error tags are an allowlist, never a copy of an arbitrary defect's tag/message.
+export const failureDetails = (cause: unknown, depth = 0): FailureDetails => {
+  const unknown = { errorTag: "UnknownError", reason: "unknown_failure" };
+  if (depth >= 8 || typeof cause !== "object" || cause === null || !("_tag" in cause))
+    return unknown;
+  const errorTag = cause._tag;
+  switch (errorTag) {
+    case "ThreadManagementNoSteerableRunError":
+      return { errorTag, reason: "no_steerable_run" };
+    case "ThreadManagementThreadNotFoundError":
+      return { errorTag, reason: "thread_not_found" };
+    case "ThreadManagementRunNotFoundError":
+      return { errorTag, reason: "run_thread_mismatch" };
+    case "ThreadManagementThreadArchivedError":
+      return { errorTag, reason: "thread_archived" };
+    case "ThreadManagementThreadNotInterruptibleError":
+      return { errorTag, reason: "run_not_interruptible" };
+    case "ThreadManagementProviderInstanceDisabledError":
+      return { errorTag, reason: "provider_disabled" };
+    case "ThreadManagementDurableRunProjectionError":
+      return { errorTag, reason: "durable_run_missing" };
+    case "OrchestratorCommandIdConflictError":
+      return { errorTag, reason: "command_id_conflict" };
+    case "OrchestratorThreadAlreadyExistsError":
+      return { errorTag, reason: "thread_already_exists" };
+    case "OrchestratorSubagentThreadReadOnlyError":
+      return { errorTag, reason: "subagent_read_only" };
+    case "OrchestratorThreadAboveModeLimitError":
+      return { errorTag, reason: "mode_limit" };
+    case "OrchestratorThreadNotIdleError":
+      return { errorTag, reason: "thread_not_idle" };
+    case "AttachmentClaimError":
+      return {
+        errorTag,
+        reason:
+          "message" in cause && cause.message === "Duplicate attachment ids are not allowed."
+            ? "duplicate_attachment_id"
+            : "attachment_claim_failed",
+      };
+    case "OrchestratorMcpFailure":
+      return {
+        errorTag,
+        reason:
+          "code" in cause && cause.code === "send_timeout"
+            ? "send_timeout"
+            : "orchestrator_failure",
+      };
+    case "ServerRuntimeStartupError":
+      return { errorTag, reason: "startup_unavailable" };
+    case "CommandPolicyCapabilityUnsupportedError": {
+      const capability = "capability" in cause ? cause.capability : undefined;
+      switch (capability) {
+        case "queued_messages":
+        case "active_steering":
+        case "interrupt":
+        case "interrupt_restart_steering":
+        case "native_fork":
+        case "fork_from_turn":
+        case "rollback":
+        case "rollback_snapshot":
+        case "context_handoff":
+        case "strong_terminal_status":
+          return { errorTag, reason: `unsupported_${capability}` };
+        default:
+          return { errorTag, reason: "capability_unsupported" };
+      }
+    }
+    case "CommandPolicyUnsupportedError": {
+      const mode = "requestedMode" in cause ? cause.requestedMode : undefined;
+      return {
+        errorTag,
+        reason:
+          mode === "steer_active"
+            ? "steer_target_not_active"
+            : mode === "restart_active"
+              ? "restart_target_not_active"
+              : "dispatch_mode_unsupported",
+      };
+    }
+    case "OrchestratorCommandPreviouslyRejectedError":
+      return {
+        errorTag,
+        reason:
+          dispatchReason("detail" in cause ? cause.detail : undefined) ?? "previously_rejected",
+      };
+    case "OrchestratorDispatchError":
+    case "OrchestratorCommandRejectedError":
+    case "OrchestratorProjectionError":
+    case "OrchestratorProviderAdapterError":
+    case "ThreadManagementProjectionLoadError":
+    case "CommandPolicyMessageDispatchError": {
+      const underlying = "cause" in cause ? cause.cause : undefined;
+      const reason = dispatchReason(underlying);
+      if (reason !== undefined) return { errorTag, reason };
+      const nested = failureDetails(underlying, depth + 1);
+      if (nested.errorTag !== "UnknownError") return nested;
+      return {
+        errorTag,
+        reason:
+          errorTag === "OrchestratorCommandRejectedError"
+            ? "command_rejected"
+            : errorTag === "OrchestratorDispatchError"
+              ? "dispatch_failed"
+              : errorTag === "OrchestratorProviderAdapterError"
+                ? "provider_adapter_failed"
+                : errorTag === "CommandPolicyMessageDispatchError"
+                  ? "message_dispatch_failed"
+                  : "projection_failed",
+      };
+    }
+    default:
+      return unknown;
+  }
+};
+
+const boundedId = (value: unknown): string | undefined =>
+  typeof value === "string" && value.length <= 512 && /^[a-zA-Z0-9_.:/#@%+!~'()*-]+$/.test(value)
+    ? value
+    : undefined;
+
+// These setters share the request span; none creates another tracing boundary.
+export const requestThread = Effect.fnUntraced(function* (threadId: string | undefined) {
+  const request = yield* RequestContext;
+  if (request) request.threadId = boundedId(threadId);
+});
+
+export const sendInput = Effect.fnUntraced(function* (input: unknown) {
+  const request = yield* RequestContext;
+  if (request?.method !== "control.send" || typeof input !== "object" || input === null) return;
+  const mode = "mode" in input ? input.mode : "auto";
+  if (mode === "auto" || mode === "queue" || mode === "steer" || mode === "restart") {
+    request.mode = mode;
+  }
+  request.clientRequestId = boundedId(
+    "clientRequestId" in input ? input.clientRequestId : undefined,
+  );
+});
+
+export const sendRequestId = Effect.fnUntraced(function* (clientRequestId: string) {
+  const request = yield* RequestContext;
+  if (request) request.clientRequestId = boundedId(clientRequestId);
+});
+
+export const failure = Effect.fnUntraced(function* (code: string, details?: FailureDetails) {
+  const request = yield* RequestContext;
+  if (request)
+    request.failure = { code, ...(details ?? { errorTag: "ControlError", reason: code }) };
+});
 
 // Route layers supply services while building handlers, before the HTTP request fiber exists.
 export const make = Effect.gen(function* () {
@@ -61,20 +306,19 @@ export const observeRoutes = Effect.fn("ArdudControl.observeRoutes")(function* <
 });
 
 // The HTTP route already owns the span; only its decoded mode enters analytics.
-export const sendMode = Effect.fnUntraced(function* (mode: "auto" | "queue" | "steer" | "restart") {
-  const request = yield* RequestMethod;
-  if (request) request.method = `control.send.${mode}`;
+export const sendMode = Effect.fnUntraced(function* (mode: SendMode) {
+  const request = yield* RequestContext;
+  if (request) {
+    request.method = `control.send.${mode}`;
+    request.mode = mode;
+  }
 });
 
-// Only decoded route parameters enter correlation, never arbitrary URL text.
-export const thread = Effect.fnUntraced(function* (threadId: string) {
-  const request = yield* RequestMethod;
-  if (request) request.threadId = threadId;
-});
+export const thread = requestThread;
 
 // Counts belong to the request span alongside encoding, without another span per page.
 export const items = Effect.fnUntraced(function* (count: number, total?: number) {
-  const request = yield* RequestMethod;
+  const request = yield* RequestContext;
   if (request) {
     request.itemCount = count;
     if (total !== undefined) request.itemsTotal = total;
@@ -85,7 +329,7 @@ export const items = Effect.fnUntraced(function* (count: number, total?: number)
 export const encoding = Effect.fnUntraced(function* <E, R>(
   effect: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>,
 ) {
-  const request = yield* RequestMethod;
+  const request = yield* RequestContext;
   if (!request) return yield* effect;
   const clock = yield* Clock.Clock;
   const started = clock.monotonicTimeNanosUnsafe();
@@ -116,10 +360,11 @@ export const observe = Effect.fnUntraced(function* <E, R>(
   const clock = yield* Clock.Clock;
   const started = clock.monotonicTimeNanosUnsafe();
   const startedAt = DateTime.formatIso(yield* DateTime.now);
+  const httpObserver = yield* HttpObserver;
   const httpRequest = yield* Effect.serviceOption(HttpServerRequest.HttpServerRequest);
   const incomingId =
     httpRequest._tag === "Some" ? httpRequest.value.headers[CONTROL_REQUEST_ID_HEADER] : undefined;
-  const request: RequestRecord = {
+  const request: RequestDetails = {
     method,
     requestId:
       incomingId !== undefined && validRequestId.test(incomingId)
@@ -129,6 +374,7 @@ export const observe = Effect.fnUntraced(function* <E, R>(
           ),
     serializationMs: 0,
   };
+  httpObserver?.start(route, request.requestId);
   let waitMs = 0;
   const readerTimings = new Map<
     string,
@@ -153,7 +399,7 @@ export const observe = Effect.fnUntraced(function* <E, R>(
     Effect.map((response) =>
       HttpServerResponse.setHeader(response, CONTROL_REQUEST_ID_HEADER, request.requestId),
     ),
-    Effect.provideService(RequestMethod, request),
+    Effect.provideService(RequestContext, request),
     Effect.provideService(NodeSqliteClient.ReaderWaitObserver, (ms, lane) => {
       waitMs += ms;
       timing(lane ?? "unknown").waitMs += ms;
@@ -180,19 +426,88 @@ export const observe = Effect.fnUntraced(function* <E, R>(
     }),
     Effect.onExit((exit) =>
       Effect.gen(function* () {
-        const status = Exit.isSuccess(exit) ? exit.value.status : undefined;
+        const status = Exit.isSuccess(exit)
+          ? exit.value.status
+          : Cause.hasInterruptsOnly(exit.cause)
+            ? exit.cause.reasons
+                .findLast((reason) => reason._tag === "Interrupt")
+                ?.annotations.has(HttpServerError.ClientAbort.key)
+              ? 499
+              : 503
+            : 500;
         const durationMs = Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6);
         yield* Effect.annotateCurrentSpan({
           "control.duration_ms": durationMs,
-          ...(status === undefined ? {} : { "http.response.status_code": status }),
+          "http.response.status_code": status,
         });
         const outcome = Exit.isFailure(exit)
           ? Cause.hasInterrupts(exit.cause)
             ? ("interrupted" as const)
             : ("error" as const)
-          : status !== undefined && status >= 400
+          : status < 200 || status >= 300
             ? ("error" as const)
             : ("ok" as const);
+        const failure =
+          request.failure ??
+          (Exit.isFailure(exit)
+            ? {
+                code: outcome === "interrupted" ? "interrupted" : "internal",
+                errorTag:
+                  outcome === "interrupted"
+                    ? "Interrupted"
+                    : Cause.hasDies(exit.cause)
+                      ? "Defect"
+                      : "UnknownError",
+                reason: outcome === "interrupted" ? "interrupted" : "unexpected_failure",
+              }
+            : undefined);
+        if (status < 200 || status >= 300) {
+          yield* Effect.logWarning("ardud control request rejected", {
+            requestId: request.requestId,
+            httpRoute: route?.path ?? null,
+            httpMethod: route?.method ?? null,
+            threadId: request.threadId ?? null,
+            mode: request.mode ?? null,
+            clientRequestId: request.clientRequestId ?? null,
+            status,
+            code: failure?.code ?? (outcome === "interrupted" ? "interrupted" : "unknown"),
+            errorTag:
+              failure?.errorTag ??
+              (outcome === "interrupted" ? "Interrupted" : "ControlRequestError"),
+            reason: failure?.reason ?? (outcome === "interrupted" ? "interrupted" : "http_error"),
+            durationMs,
+          }).pipe(Effect.catchCause(() => Effect.void));
+        }
+        const props: NonNullable<AnalyticsEvent["props"]> = {
+          method: request.method,
+          requestId: request.requestId,
+          ...(outcome === "interrupted" || request.responseBytes === undefined
+            ? {}
+            : {
+                responseBytes: request.responseBytes,
+                ...(request.itemCount === undefined ? {} : { itemCount: request.itemCount }),
+                ...(request.itemsTotal === undefined ? {} : { itemsTotal: request.itemsTotal }),
+              }),
+          ...(route === undefined ? {} : { httpMethod: route.method, httpRoute: route.path }),
+          phase: "unary",
+          waitMs,
+          readerTimings: [...readerTimings.values()],
+          replyAdmissions,
+          serializationMs: request.serializationMs,
+          readerHolders: [...readerHolders.values()]
+            .sort((a, b) => b.holdMs - a.holdMs)
+            .slice(0, 8),
+          ...(status === undefined ? {} : { status }),
+          ...(outcome === "ok"
+            ? {}
+            : {
+                errorTag:
+                  failure?.errorTag ??
+                  (outcome === "interrupted" ? "Interrupted" : "ControlRequestError"),
+                ...(failure === undefined ? {} : { code: failure.code, reason: failure.reason }),
+              }),
+        };
+        httpObserver?.complete({ ...props, handlerMs: durationMs });
         if (analytics._tag === "None") return;
         yield* recordServerAnalytics(analytics.value, {
           ts: DateTime.formatIso(yield* DateTime.now),
@@ -203,30 +518,7 @@ export const observe = Effect.fnUntraced(function* <E, R>(
           ...(request.threadId === undefined ? {} : { threadId: request.threadId }),
           durationMs,
           outcome,
-          props: {
-            method: request.method,
-            requestId: request.requestId,
-            ...(outcome === "interrupted" || request.responseBytes === undefined
-              ? {}
-              : {
-                  responseBytes: request.responseBytes,
-                  ...(request.itemCount === undefined ? {} : { itemCount: request.itemCount }),
-                  ...(request.itemsTotal === undefined ? {} : { itemsTotal: request.itemsTotal }),
-                }),
-            ...(route === undefined ? {} : { httpMethod: route.method, httpRoute: route.path }),
-            phase: "unary",
-            waitMs,
-            readerTimings: [...readerTimings.values()],
-            replyAdmissions,
-            serializationMs: request.serializationMs,
-            readerHolders: [...readerHolders.values()]
-              .sort((a, b) => b.holdMs - a.holdMs)
-              .slice(0, 8),
-            ...(status === undefined ? {} : { status }),
-            ...(outcome === "ok"
-              ? {}
-              : { errorTag: outcome === "interrupted" ? "Interrupted" : "ControlRequestError" }),
-          },
+          props,
         });
       }),
     ),

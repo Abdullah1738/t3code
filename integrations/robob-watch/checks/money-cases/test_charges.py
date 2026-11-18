@@ -1,9 +1,12 @@
 """Reading card alerts and finding what explains a charge: receipts, his own words, a merchant he pays."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import datetime as dt
 from collections import Counter
 import importlib.util
 import json
-import os
 import re
 from pathlib import Path
 import http.server

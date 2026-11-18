@@ -44,8 +44,13 @@ def isolate_boat(stack):
 
 
 def isolate_home(stack, root, *, guard_failover=True):
-    from offbox_lib import common, home
+    from offbox_lib import api, common, home
 
+    # Offline pool fixtures have no remote commands unless the test supplies that boundary.
+    stack.enter_context(patch.object(api, 'box_protection', return_value=
+        dict(ok=True, pin=dict(active=False, holder=None, until=None), holds=[])))
+
+    stack.enter_context(patch.dict(os.environ, OFFBOX_TEST="1", OFFBOX_LOG_DIR=str(Path(root) / "tool-logs")))
     root = Path(root) / "home-backend"
     for name, filename in (("SERVER_CFG", "server.json"), ("BACKEND_STATE", "backend-state.json"),
                            ("BACKEND_PATH", "backend"), ("HOME_FAILURES", "home-failures.jsonl")):

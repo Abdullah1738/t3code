@@ -26,8 +26,12 @@ DELEGATION_REASONS = {'NO_STANDING_DELEGATION', 'DUPLICATE_DELEGATED_RECORD',
     'BUS_REQUEST_MISSING', 'BUS_WRONG_SENDER', 'BUS_WRONG_TARGET', 'BUS_REQUEST_CLOSED',
     'BUS_REQUEST_STALE', 'BUS_UNREADABLE', 'INVALID_LIFETIME', 'UNSUPPORTED_DELEGATION',
     'DELEGATED_RECORD_INVALID'}
+STANDING_REASONS = {'STANDING_NOT_FOUND', 'NOT_STANDING', 'STANDING_REVOKED',
+    'STANDING_CURRENCY_MISMATCH', 'STANDING_CAP_EXCEEDED', 'INVALID_AMOUNT',
+    'INVALID_LIFETIME', 'STANDING_RECORD_INVALID'}
 _NAMES = {
     'record.refused',
+    'standing.created', 'standing_record.created', 'standing_record.refused',
     'delegate.created', 'delegate.revoked', 'delegated_record.created', 'delegated_record.refused',
     'moni_go.bus_checked', 'moni_go.bus_refused',
     'cmd.start', 'cmd.end', 'cmd.error', 'guard.refused', 'payment.may_have_sent',
@@ -40,13 +44,16 @@ _NAMES = {
     'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
     'order_watch.item_drop_check', 'order_watch.can_report',
     'collector.hold_seen', 'collector.hold_cleared',
+    'bridge.error',
+    'track.checkout_link', 'track.checkout_auto_add', 'track.checkout_mismatch',
 }
 _ENUMS = {
     'route': {'cdp', 'phone', 'unspecified'},
     'field': {'card_name', 'card_number', 'card_expiry', 'card_cvc'},
     'cardNickname': {'Marriott', 'MashreqNoon', 'Skywards', 'Mashreq'},
-    'reason': DELEGATION_REASONS | {'expired_at_write'},
-    'refusal': {'none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage'},
+    'reason': DELEGATION_REASONS | STANDING_REASONS | {'expired_at_write'},
+    'refusal': {'none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage',
+                'checkout_unavailable', 'checkout_untracked'},
     'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
              'quik', 'shops', 'box', 'same-day'},
@@ -246,13 +253,59 @@ SUPERMALL_SILENT_DELIVERY_NOT_ACTIVE TALABAT_ADDRESS_CHECK_FAILED TALABAT_RETIRE
 UNSUPPORTED_NATIVE_MARKETPLACE_QUIET_DELIVERY UNSUPPORTED_QUIET_OPTION_SEMANTICS
 """.split())
 
-_KNOWN_TAGS = _GUARD_TAGS | DELEGATION_REASONS | frozenset("""
+_KNOWN_TAGS = _GUARD_TAGS | DELEGATION_REASONS | STANDING_REASONS | frozenset("""
+BRIDGE_REQUEST_FAILED
 OPERATION_FAILED LOG_CAP TRACK_REGISTRATION_FAILED TRACK_POLL_SOURCE_ERROR
 AUTH_EXPIRED AUTH_FORBIDDEN ACCOUNT_CAPTURE_REQUIRED INVALID_ORDER_ID INVALID_ARGUMENTS
 DIA_BRIDGE_UNAVAILABLE DIA_INVALID_RESPONSE DIA_TRANSPORT_FAILED FAILED SOURCE_ERRORS
 PAYMENT_WAIT_TIMEOUT PAYMENT_WAIT_UNCONFIRMED
 DEADLINE_REASON_REQUIRED CHARGE_DUPLICATE_CANDIDATE CORROBORATE_MISMATCH
 """.split())
+
+
+def bridge_error(stderr, exit_code=None):
+    """Bridge stderr contains fixed refusals, but scrub accidental credentials before persistence."""
+    value = stderr.decode('utf-8', errors='replace') if isinstance(stderr, bytes) else str(stderr or '')
+    status = re.search(r'\(HTTP ([1-5][0-9]{2})\)', value)
+    credential = r'[a-z_]*(?:token|secret|password|api[_-]?key)[a-z_]*'
+
+    def scrub(raw):
+        if isinstance(raw, dict):
+            return {k: '[redacted]' if re.fullmatch(credential + r'|authorization|cookie|set-cookie', k, re.I) else scrub(v)
+                    for k, v in raw.items()}
+        if isinstance(raw, list):
+            return [scrub(v) for v in raw]
+        if not isinstance(raw, str):
+            return raw
+        raw = re.sub(r'(?im)\b(?:set-cookie|cookie|authorization)\s*["\']?\s*[:=][^\r\n]*', '[redacted]', raw)
+        raw = re.sub(r'(?i)\bbearer\s+[^\s"\']+', 'Bearer [redacted]', raw)
+        raw = re.sub(r'''(?ix)\b''' + credential + r'''["']?\s*[:=]\s*
+                     (?:"(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\])*'?|[^\s,"'}]+)''', '[redacted]', raw)
+        raw = re.sub(r'https?://[^\s"\']+', '[url]', raw)
+        return re.sub(r'\b[A-Za-z0-9_+./=-]{24,}\b', '[redacted]', raw)
+
+    # Decode JSON before scrubbing strings so escaped quotes cannot hide a secret.
+    def scrub_json(raw):
+        try:
+            return json.dumps(scrub(json.loads(raw)))
+        except ValueError:
+            return scrub(raw)
+
+    try:
+        value = json.dumps(scrub(json.loads(value)))
+    except ValueError:
+        value = '\n'.join(scrub_json(line) for line in value.splitlines())
+    value = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', ' ', value).strip()[:2048]
+    message = value
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict) and isinstance(parsed.get('error'), str):
+            message = parsed['error']
+    except ValueError:
+        pass
+    return {'http': int(status[1]) if status else None,
+            'exit_code': exit_code if type(exit_code) is int else None,
+            'message': message, 'stderr': value}
 
 
 def tag(value):
@@ -629,7 +682,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher', 'vendorId', 'itemId', 'cardId'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'standingId', 'watcher', 'vendorId', 'itemId', 'cardId'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):
@@ -695,6 +748,15 @@ def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, 
             code = tag(error)
             detail = cause or context.get('failure') or context.get('last') or _cause(error)
             row['error'] = _error(code, detail)
+        if name == 'bridge.error':
+            detail = (props or {}).get('bridgeError', {})
+            safe = bridge_error(detail.get('stderr'), detail.get('exit_code')) if isinstance(detail, dict) else bridge_error('')
+            if isinstance(detail, dict) and type(detail.get('http')) is int and 100 <= detail['http'] <= 599:
+                safe['http'] = detail['http']
+            command = (props or {}).get('bridgeCommand')
+            row['props'] = {'bridgeCommand': command if command in {'send', 'app', 'agent-ask', 'publish', 'share', 'shares', 'unshare'} else 'other',
+                            'bridgeError': safe}
+            row['error'] = {'tag': 'BRIDGE_REQUEST_FAILED', 'message': safe['message']}
         pending = _PENDING.get()
         if pending is not None:
             pending.append(row)
@@ -1051,12 +1113,12 @@ def consumed(fn):
 
 def registration(fn):
     @functools.wraps(fn)
-    def wrapped(argv=None, _locked=False):
+    def wrapped(argv=None, _locked=False, **kwargs):
         import sys
         args = sys.argv[1:] if argv is None else argv
         with deferred():
             try:
-                return fn(argv, _locked=_locked)
+                return fn(argv, _locked=_locked, **kwargs)
             except Exception as exc:
                 if args[:1] == ['add'] and not _locked:
                     def option(flag, default=None):

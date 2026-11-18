@@ -66,7 +66,9 @@ class SearchRefusalTests(unittest.TestCase):
             self.assertEqual(talabat_auth.main(['status']), talabat_retired.EXIT)
         self.assertEqual(json.loads(out.getvalue())['error'], 'TALABAT_RETIRED')
 
-    @unittest.skipUnless(shutil.which('node'), 'node not on PATH')
+    @unittest.skipUnless(shutil.which('node') and all(
+        (Path.home() / '.config/opencode/dia-agent-bridge/src' / name).is_file()
+        for name in ('cdp.js', 'dia.js')), 'search.mjs requires the Mac-only Dia bridge and Node')
     def test_search_cli_refuses_talabat_modes(self):
         for argv in (['talabat', 'sushi', '--json'], ['talabat', 'orders', '--json'],
                      ['menu', '717327', '--json'], ['groceries', 'milk', '--json']):

@@ -672,6 +672,10 @@ const handlers = {
             "bad_time",
             window.startsWith("until") ? "until" : "since",
           );
+        if (input.digest !== undefined) {
+          const page = yield* service.activityDigest(board.id, window, input.digest, input.after);
+          return { activity: { boardId: board.id, window, digest: input.digest, ...page } };
+        }
         const read = yield* service.activity(board.id, window);
         return { activity: { boardId: board.id, ...Activity.rollup({ window, ...read }) } };
       }),
@@ -1590,6 +1594,7 @@ const handlers = {
         return {
           pools: yield* service.setPool(board.id, model, input.slots, {
             replaces: input.replaces,
+            actor: { actorKind: "evaluator", actorId: caller.threadId },
           }),
         };
       }),
@@ -1636,7 +1641,11 @@ const handlers = {
         const board = yield* boardFor(service, caller, input.boardId);
         const apply = yield* selectionRoutingEnabled;
         const model = yield* modelOf(input.model, apply);
-        return { pools: yield* service.removePool(board.id, model) };
+        return {
+          pools: yield* service.removePool(board.id, model, {
+            actor: { actorKind: "evaluator", actorId: caller.threadId },
+          }),
+        };
       }),
     ),
   ),

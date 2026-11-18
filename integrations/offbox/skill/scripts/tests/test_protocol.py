@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import offbox_protocol as protocol
-from offbox_lib import cli, common, runs, run_evidence
+from offbox_lib import cli, common, runs, run_evidence, quint_tools, native_crash
 from test_capacity import Isolated
 
 NONCE = '1234567890abcdef'
@@ -29,6 +29,50 @@ class ProtocolTests(Isolated):
 
     def result(self, n, rc):
         return f'offbox step {n} rc={rc} [n={NONCE}]: test'
+
+    def test_setup_consumers_use_authenticated_start_and_retry_boundaries(self):
+        start = f'offbox-command-started: {RUN} [n={NONCE}]'
+        retry = ('offbox-server: the server restarted while this run was going (attempt 1 is lost); '
+                 f'it is queued again as attempt 2 [run={RUN} n={NONCE}]')
+        failure = quint_tools.PREFIX + json.dumps(dict(attempt='result', result='failed', trigger='command'))
+        setup = (f'offbox-nvm-sh: {RUN} failed\n{failure}\n'
+                 'offbox: toolchain unavailable: fixture; nothing ran (exit 99)\n')
+        forms = [(start, True), (start + '\r', True),
+                 (start.replace(NONCE, 'wrongnonce'), False),
+                 (f'offbox-command-started: {RUN}', False),
+                 (start.replace(RUN, 'run-other'), False),
+                 ('prefix ' + start, True), (start + ' suffix', True)]
+        for line, blocks in forms:
+            with self.subTest(line=line):
+                self.path.write_text(setup + line + '\n')
+                self.assertEqual(runs.nvm_receipt(RUN, self.path), None if blocks else 'failed')
+                self.assertEqual(quint_tools.failed_setup(self.path, run=self.row), not blocks)
+                self.assertEqual(runs.toolchain_setup_failed(99, self.path, self.row), not blocks)
+        for line, clears in ((retry, True), (retry.replace(NONCE, 'wrongnonce'), False),
+                             (retry.split(' [run=')[0], False)):
+            with self.subTest(retry=line):
+                self.path.write_text(setup + line + '\n')
+                self.assertEqual(runs.nvm_receipt(RUN, self.path), None if clears else 'failed')
+                self.assertEqual(quint_tools.failed_setup(self.path, run=self.row), not clears)
+                self.assertEqual(runs.toolchain_setup_failed(99, self.path, self.row), not clears)
+                events = list(quint_tools.setup_events(self.path, self.row))
+                self.assertEqual([attempt for attempt, _ in events], [1])
+                self.path.write_text(self.path.read_text() + failure + '\n')
+                self.assertEqual(list(quint_tools.setup_events(self.path, self.row))[-1][0], 2 if clears else 1)
+
+    def test_native_crash_start_partition_ignores_spoofed_markers(self):
+        start = f'offbox-command-started: {RUN} [n={NONCE}]'
+        forms = [(start, True), (start + '\r', True),
+                 (start.replace(NONCE, 'wrongnonce'), False),
+                 (f'offbox-command-started: {RUN}', False),
+                 (start.replace(RUN, 'run-other'), False),
+                 ('prefix ' + start, False), (start + ' suffix', False),
+                 ('prefix\v' + start, False)]
+        for line, accepted in forms:
+            with self.subTest(line=line), \
+                    patch.object(native_crash.disk, 'result', return_value=dict(setup_native_crash=True)):
+                self.path.write_text(line + '\nSIGSEGV\n')
+                self.assertEqual(native_crash.after_start_code(self.row, 1, self.path), 1 if accepted else None)
 
     def test_reporter_six_steps_with_suite_fixtures_keep_real_failure(self):
         lines = (Path(__file__).parent / 'fixtures/run-1117-080716-markers.txt').read_text().splitlines()

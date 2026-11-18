@@ -13,14 +13,16 @@ WRAPPERS = command_usage.SHELLS | frozenset(('env', 'exec', 'command', 'sudo', '
                                            'stdbuf', 'xvfb-run', 'corepack', 'npx', 'pnpm', 'npm', 'yarn', 'bunx'))
 
 
-def _words_need_java(words, cwd):
+def _words_need_java(words, cwd, word_pattern=JAVA_WORD):
     words = list(words)
     while words:
         if command_usage.ASSIGNMENT.match(words[0]):
             words = words[1:]
             continue
+        if words[0].startswith('-'):
+            return False
         first = Path(words[0]).name
-        if JAVA_WORD.search(words[0]):
+        if word_pattern.search(words[0]):
             return True
         if first not in WRAPPERS:
             return False
@@ -39,26 +41,29 @@ def _words_need_java(words, cwd):
             if not (words[0].startswith('-') or first in command_usage.SHELLS and words[0].startswith('+')
                     or lease._DURATION.fullmatch(words[0])):
                 break
+            if first == 'command' and re.fullmatch(r'-[pVv]*[Vv][pVv]*', words[0]):
+                return False
             option, sep, inline = words[0].partition('=')
             if ((first in command_usage.SHELLS and re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', words[0]))
-                    or shell_runner and option in ('-c', '--call') or first == 'env' and option == '-S'):
+                    or shell_runner and option in ('-c', '--call')
+                    or first == 'env' and option in ('-S', '--split-string')):
                 body = inline if sep else words[1] if len(words) > 1 else ''
-                return bool(body) and _command_needs_java(body, cwd)
+                return bool(body) and _command_needs_java(body, cwd, word_pattern)
             takes_value = option in value_options or (first in command_usage.SHELLS and
                                                       re.fullmatch(r'[-+][A-Za-z]*[oO]', option))
             words = words[2:] if takes_value and not sep else words[1:]
     return False
 
 
-def _command_needs_java(command, cwd):
+def _command_needs_java(command, cwd, word_pattern=JAVA_WORD):
     sources = []
     parsed, _, _ = command_usage.segments(command, cwd, sources)
-    if any(_words_need_java(segment.words, segment.cwd) for segment in parsed):
+    if any(_words_need_java(segment.words, segment.cwd, word_pattern) for segment in parsed):
         return True
     # Sanitized groups retain wrapper options and substitution bodies without re-reading comments as code.
     for source in sources:
         try:
-            if _words_need_java(shlex.split(source), cwd):
+            if _words_need_java(shlex.split(source), cwd, word_pattern):
                 return True
         except ValueError:
             pass

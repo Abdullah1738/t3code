@@ -1061,6 +1061,11 @@ def main():
         directory_inventory(deadline=deadline)
     except Exception:
         emit('disk', 'error', 'disk.inventory', ok=False, error_tag='disk.inventory_failed')
+    try:
+        from disk_budgets import sample
+        sample()
+    except Exception:
+        emit('disk', 'error', 'disk.budget.failed', ok=False, error_tag='disk.budget_failed')
 
 
 if __name__ == '__main__':

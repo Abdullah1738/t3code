@@ -41,12 +41,14 @@ export class OrchestrationEffectExecutionError extends Schema.TaggedError<Orches
     effectId: Schema.String,
     effectType: Schema.String,
     providerAccepted: Schema.optional(Schema.Boolean),
+    followUpPending: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
     deferMs: Schema.optional(Schema.Number),
   },
 ) {}
 
 export const isOrchestrationEffectExecutionError = Schema.is(OrchestrationEffectExecutionError);
+const isProviderSessionEndedError = Schema.is(ProviderSessionManager.ProviderSessionEndedError);
 
 /**
  * Do not apply this to `provider-turn.restart`: that compound effect also runs
@@ -96,6 +98,7 @@ export const layerExecutor: Layer.Layer<
   | McpSessionRegistry.McpSessionRegistry
   | EventSink.EventSinkV2
   | ProjectionStore.ProjectionStoreV2
+  | EffectOutbox.EffectOutboxV2
   | RestartPacing.RestartPacing
 > = Layer.effect(
   OrchestrationEffectExecutorV2,
@@ -114,11 +117,59 @@ export const layerExecutor: Layer.Layer<
     const mcpRegistry = yield* McpSessionRegistry.McpSessionRegistry;
     const eventSink = yield* EventSink.EventSinkV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
     const pacing = yield* RestartPacing.RestartPacing;
     return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
+          case "provider-session.reconcile-root":
+            return threads
+              .dispatch({
+                type: "thread.provider-root.settle",
+                commandId: CommandId.make(`${effect.id}:settle:${effect.attemptCount}`),
+                threadId: effect.threadId,
+                providerThreadId: effect.request.providerThreadId,
+                nodeId: effect.request.nodeId,
+                startedAt: effect.request.startedAt,
+              })
+              .pipe(
+                Effect.asVoid,
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
+          case "provider-session.reconcile-turn":
+            return threads
+              .dispatch({
+                type: "thread.background-work.settle",
+                runOnly: true,
+                ...(effect.request.releasedAt === undefined
+                  ? {}
+                  : { releasedAt: effect.request.releasedAt }),
+                preserveBackgroundWork: effect.request.preserveBackgroundWork === true,
+                // Rejected planning has a durable receipt; a new attempt must plan again.
+                commandId: CommandId.make(`${effect.id}:settle:${effect.attemptCount}`),
+                threadId: effect.threadId,
+                providerThreadId: effect.request.providerThreadId,
+                providerTurnId: effect.request.providerTurnId,
+              })
+              .pipe(
+                Effect.asVoid,
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
           case "provider-runtime.continue": {
             const { sourceRunId, queued } = effect.request;
             const source = {
@@ -446,17 +497,21 @@ export const layerExecutor: Layer.Layer<
             const request = effect.request;
             return Effect.suspend(() => {
               let providerAccepted = request.providerAccepted === true;
-              return (
-                providerAccepted
-                  ? Effect.void
-                  : providerTurnControl.steer({
-                      threadId: effect.threadId,
-                      providerSessionId: request.providerSessionId,
-                      providerThreadId: request.providerThreadId,
-                      providerTurnId: request.providerTurnId,
-                      messageId: request.messageId,
-                    })
-              ).pipe(
+              let followUpPending = request.followUpPending === true && !providerAccepted;
+              return Effect.gen(function* () {
+                if (providerAccepted) return;
+                if (followUpPending)
+                  return yield* new ProviderSessionManager.ProviderSessionEndedError({
+                    providerSessionId: request.providerSessionId,
+                  });
+                yield* providerTurnControl.steer({
+                  threadId: effect.threadId,
+                  providerSessionId: request.providerSessionId,
+                  providerThreadId: request.providerThreadId,
+                  providerTurnId: request.providerTurnId,
+                  messageId: request.messageId,
+                });
+              }).pipe(
                 Effect.tap(() =>
                   Effect.sync(() => {
                     providerAccepted = true;
@@ -483,15 +538,31 @@ export const layerExecutor: Layer.Layer<
                 ),
                 Effect.catch((error) =>
                   Effect.gen(function* () {
+                    if (providerAccepted) return yield* error;
+                    const sessionEnded =
+                      followUpPending ||
+                      ("cause" in error && isProviderSessionEndedError(error.cause)) ||
+                      Option.isSome(
+                        yield* outbox.get(`effect:session-ended:${request.providerTurnId}`),
+                      );
+                    // A steer can commit after release captured its pending effects.
+                    const queueFollowUp =
+                      sessionEnded ||
+                      ("turnEnded" in error && error.turnEnded === true && !error.turnCompleted);
                     if (
-                      !("turnCompleted" in error) ||
-                      !error.turnCompleted ||
+                      !(
+                        ("turnCompleted" in error && error.turnCompleted) ||
+                        ("steerNotDelivered" in error && error.steerNotDelivered) ||
+                        queueFollowUp
+                      ) ||
                       effect.request.type !== "provider-turn.steer"
                     ) {
                       return yield* error;
                     }
                     // Board-held workers may hear a live steer but must never be woken by it.
                     if (effect.request.activeTurnOnly) return;
+                    // Once recovery owns the saved input, storage failures cannot abandon it.
+                    followUpPending = queueFollowUp;
                     const projection = yield* threads.getThreadRecords(
                       effect.threadId,
                       ["messages", "runs"],
@@ -501,12 +572,21 @@ export const layerExecutor: Layer.Layer<
                     const message = projection.messages.find((item) => item.id === messageId);
                     const run = projection.runs.find((item) => item.id === message?.runId);
                     if (message === undefined || run === undefined) return yield* error;
-                    // Reuse the message identity and a stable command receipt so an outbox
-                    // retry cannot append a duplicate message or start a second follow-up.
+                    // A live mailbox claim stays with its terminal/session recovery path.
+                    if (
+                      message.delegatedCompletion !== undefined &&
+                      !("turnCompleted" in error && error.turnCompleted) &&
+                      !queueFollowUp
+                    )
+                      return yield* error;
+                    // A prior attempt may have queued this message before its outbox ack failed.
+                    if (queueFollowUp && run.userMessageId === message.id) return;
                     yield* threads
                       .dispatch({
                         type: "message.dispatch",
-                        commandId: CommandId.make(`command:steer-follow-up:${effect.id}`),
+                        commandId: CommandId.make(
+                          `command:steer-follow-up:${effect.id}${queueFollowUp ? `:${effect.attemptCount}` : ""}`,
+                        ),
                         threadId: effect.threadId,
                         messageId: message.id,
                         text: message.text,
@@ -517,6 +597,8 @@ export const layerExecutor: Layer.Layer<
                           : { modelSelection: run.modelSelection }),
                         dispatchMode: {
                           type:
+                            !queueFollowUp &&
+                            !("steerNotDelivered" in error && error.steerNotDelivered) &&
                             message.delegatedCompletion === undefined &&
                             message.notification === undefined
                               ? "start_immediately"
@@ -560,7 +642,7 @@ export const layerExecutor: Layer.Layer<
                 ),
                 Effect.tapError(() =>
                   // Mailbox bookkeeping can fail after the provider accepted the input.
-                  willRetry || providerAccepted
+                  willRetry || providerAccepted || followUpPending
                     ? Effect.void
                     : SteerDeliveryFailure.persist(effect).pipe(
                         Effect.provideService(EventSink.EventSinkV2, eventSink),
@@ -580,15 +662,17 @@ export const layerExecutor: Layer.Layer<
                       effectId: effect.id,
                       effectType: effect.request.type,
                       providerAccepted,
+                      followUpPending,
                       cause,
                     }),
                 ),
                 Effect.catchDefect((cause) =>
-                  providerAccepted
+                  providerAccepted || followUpPending
                     ? new OrchestrationEffectExecutionError({
                         effectId: effect.id,
                         effectType: request.type,
-                        providerAccepted: true,
+                        providerAccepted,
+                        followUpPending,
                         cause,
                       })
                     : Effect.die(cause),
@@ -1025,6 +1109,9 @@ export const layerWithOptions = (
                   steerAccepted:
                     effect.request.type === "provider-turn.steer" &&
                     effect.request.providerAccepted === true,
+                  steerFollowUpPending:
+                    effect.request.type === "provider-turn.steer" &&
+                    effect.request.followUpPending === true,
                   refundAttempt,
                 })
                 .pipe(
@@ -1099,7 +1186,11 @@ export const layerWithOptions = (
           if (lane === "start") {
             // Idle lane probes must not queue write claims behind useful work.
             // The claim remains authoritative if another worker wins after this read.
-            const next = yield* outbox.nextStartClaimableAt;
+            const next = yield* outbox.nextStartClaimableAt.pipe(
+              Effect.withSpan("EffectWorker.startPreflight", {
+                attributes: { lane, "worker.id": workerId },
+              }),
+            );
             if (
               Option.isNone(next) ||
               DateTime.toEpochMillis(next.value) > DateTime.toEpochMillis(yield* DateTime.now)
@@ -1107,24 +1198,42 @@ export const layerWithOptions = (
               return false;
           }
           const claimExit = yield* Effect.exit(
-            outbox.claimNext({
-              workerId,
-              ...(threadId === undefined ? {} : { threadId }),
-              leaseDurationMs,
-              excludeRestartContinuations,
-              ...(lane === "control"
-                ? { onlyEffectTypes: EffectOutbox.CONTROL_LANE_EFFECT_TYPES }
-                : lane === "start"
-                  ? { onlyEffectTypes: EffectOutbox.START_LANE_EFFECT_TYPES }
-                  : threadId !== undefined
-                    ? {
-                        onlyEffectTypes: [
-                          "provider-runtime.continue",
-                          "provider-turn.start",
-                        ] as const,
-                      }
-                    : {}),
-            }),
+            outbox
+              .claimNext({
+                workerId,
+                ...(threadId === undefined ? {} : { threadId }),
+                leaseDurationMs,
+                excludeRestartContinuations,
+                ...(lane === "control"
+                  ? { onlyEffectTypes: EffectOutbox.CONTROL_LANE_EFFECT_TYPES }
+                  : lane === "start"
+                    ? { onlyEffectTypes: EffectOutbox.START_LANE_EFFECT_TYPES }
+                    : threadId !== undefined
+                      ? {
+                          onlyEffectTypes: [
+                            "provider-runtime.continue",
+                            "provider-turn.start",
+                          ] as const,
+                        }
+                      : {}),
+              })
+              .pipe(
+                Effect.tap((claimed) =>
+                  Effect.annotateCurrentSpan({
+                    result: Option.isSome(claimed) ? "claimed" : "empty",
+                    ...(Option.isSome(claimed)
+                      ? {
+                          "effect.id": claimed.value.id,
+                          "effect.type": claimed.value.request.type,
+                          "thread.id": claimed.value.threadId,
+                        }
+                      : {}),
+                  }),
+                ),
+                Effect.withSpan("EffectWorker.claim", {
+                  attributes: { lane, "worker.id": workerId },
+                }),
+              ),
           );
           yield* increment(orchestrationEffectClaimsTotal, {
             lane,
@@ -1172,11 +1281,19 @@ export const layerWithOptions = (
           }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
           if (cancelledBeforeExecution) return true;
 
-          // Accepted input cannot be resent; give its bookkeeping a separate bounded budget.
+          // Recovery owns the last path out for work whose provider can no longer report.
           const acceptance = isAcceptance(effect);
+          const durableRecovery =
+            effect.request.type === "provider-session.reconcile-turn" ||
+            effect.request.type === "provider-session.reconcile-root" ||
+            (effect.request.type === "provider-turn.steer" &&
+              !acceptance &&
+              effect.request.followUpPending === true);
           const execution = executor
             .execute(effect, {
-              willRetry: effect.attemptCount < (acceptance ? maxAcceptedAttempts : maxAttempts),
+              willRetry:
+                durableRecovery ||
+                effect.attemptCount < (acceptance ? maxAcceptedAttempts : maxAttempts),
             })
             .pipe(
               Effect.provideService(EffectOutbox.ExecutingEffect, effect),
@@ -1208,10 +1325,22 @@ export const layerWithOptions = (
             effect.request.type === "provider-turn.steer" &&
             (effect.request.providerAccepted === true ||
               Option.exists(failure, (failure) => failure.providerAccepted === true));
-          // Acceptance must survive rescheduling, including its error-recovery path.
+          const recoveringSteer =
+            effect.request.type === "provider-turn.steer" &&
+            !acceptedSteer &&
+            (effect.request.followUpPending === true ||
+              Option.exists(failure, (failure) => failure.followUpPending === true));
+          // Delivery ownership must survive rescheduling, including its error-recovery path.
           const retryEffect =
-            acceptedSteer && effect.request.type === "provider-turn.steer"
-              ? { ...effect, request: { ...effect.request, providerAccepted: true } }
+            effect.request.type === "provider-turn.steer" && (acceptedSteer || recoveringSteer)
+              ? {
+                  ...effect,
+                  request: {
+                    ...effect.request,
+                    providerAccepted: acceptedSteer,
+                    followUpPending: recoveringSteer,
+                  },
+                }
               : effect;
 
           if (Option.isSome(failure) && failure.value.deferMs !== undefined) {
@@ -1223,6 +1352,7 @@ export const layerWithOptions = (
                 delayMs: failure.value.deferMs,
                 refundAttempt: true,
                 steerAccepted: acceptedSteer,
+                steerFollowUpPending: recoveringSteer,
               })
               .pipe(Effect.onError((cause) => requeueClaim(retryEffect, cause, true)));
             if (!deferred && !(yield* wasCancelled(effect.id)))
@@ -1245,8 +1375,10 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >=
-                (acceptance || acceptedSteer ? maxAcceptedAttempts : maxAttempts)
+            : !durableRecovery &&
+                !recoveringSteer &&
+                effect.attemptCount >=
+                  (acceptance || acceptedSteer ? maxAcceptedAttempts : maxAttempts)
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
@@ -1257,6 +1389,7 @@ export const layerWithOptions = (
                     error,
                     delayMs: Math.min(30_000, 100 * 2 ** Math.max(0, effect.attemptCount - 1)),
                     steerAccepted: acceptedSteer,
+                    steerFollowUpPending: recoveringSteer,
                   })
                   .pipe(Effect.onError((cause) => requeueClaim(retryEffect, cause)));
           if (!updated) {

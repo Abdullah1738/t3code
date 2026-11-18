@@ -843,7 +843,7 @@ it.effect("a slow verdict collector attributes a timed-out PR fetch to syncPrs.f
   Effect.gen(function* () {
     const reports: Array<ReadonlyArray<SavedWrite.SubStep>> = [];
     const result = yield* refreshPr("verdict", "view", "timeoutDiagnostic").pipe(
-      Effect.provideService(SavedWrite.subStepReporter, (steps) => reports.push(steps)),
+      Effect.provideService(SavedWrite.callSubStepReporter, (steps) => reports.push(steps)),
     );
     assert.equal(result.stage, "in_review");
     assert.deepInclude(reports.flat(), { subStep: "syncPrs.fetch", ms: 100 });

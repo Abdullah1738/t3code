@@ -16,6 +16,7 @@ from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUS
                      SshHostKeyMismatch, file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner, write)
 from .identity import remote_dir_for
 from .home import StartWaitFailed
+import offbox_protection
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
 ARCHIVING_WAIT_S = 120
@@ -406,9 +407,13 @@ def find_lease(con, owner: str, root: str):
                        "ORDER BY last_used_at DESC LIMIT 1", (owner, root)).fetchone()
 
 
-def active_runs(con, box_id: str) -> int:
-    # Command completion can precede the pull claim, including receipts from older clients.
-    return con.execute("SELECT COUNT(*) FROM runs WHERE box_id=? AND (status IN ('starting','running') "
+UNCERTAIN_HOLDER_SQL = """((status IN ('infra','lost') OR (status='failed' AND
+    (error LIKE '%1006%' OR error LIKE '%websocket%' OR error LIKE '%remote process lost%')))
+    AND (process_id IS NOT NULL OR command_id IS NOT NULL)
+    AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id
+                    AND v IN ('not_admitted','fenced'))
+    AND NOT EXISTS (SELECT 1 FROM kv WHERE k='holder_gone:' || runs.run_id))"""
+BASE_RESERVED_RUN_SQL = ("status IN ('starting','running') "
                        "OR (pulls IS NOT NULL AND pulls!='[]' AND "
                        "(pull_state IS NULL OR pull_state IN ('pending','running')) AND "
                        "(pull_state='running' OR NOT EXISTS (SELECT 1 FROM kv "
@@ -416,8 +421,95 @@ def active_runs(con, box_id: str) -> int:
                        "AND runs.status='lost' AND runs.exit_code IS NULL))) "
                        "OR EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id) "
                        "OR (status='lost' AND exit_code IS NULL AND NOT EXISTS "
-                       "(SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)))",
+                       "(SELECT 1 FROM kv WHERE k IN ('lost_confirmed:' || runs.run_id, 'holder_gone:' || runs.run_id))) "
+                       "OR 0")
+
+
+def uncertain_holder_sql():
+    # Boat has its own liveness protocol; the command_probe fence belongs to the home server.
+    return UNCERTAIN_HOLDER_SQL if api.BACKEND == 'server' else '0'
+
+
+def reserved_run_sql():
+    return BASE_RESERVED_RUN_SQL + ' OR ' + uncertain_holder_sql()
+
+
+def active_runs(con, box_id: str) -> int:
+    # Command completion can precede the pull claim, including receipts from older clients.
+    return con.execute('SELECT COUNT(*) FROM runs WHERE box_id=? AND (' + reserved_run_sql() + ')',
                        (box_id,)).fetchone()[0]
+
+
+def reconcile_holds(con, box_id):
+    """Only the server's existing receipt/process probe can release an uncertain terminal holder."""
+    # Queue progress reads use a stable SQLite snapshot. Reconcile at selection, outside that snapshot.
+    if con.in_transaction:
+        return
+    rows = con.execute('SELECT * FROM runs WHERE box_id=? AND ' + uncertain_holder_sql(),
+                       (box_id,)).fetchall()
+    for row in rows:
+        try:
+            if api.BACKEND != 'server':
+                continue
+            if not holder_gone(box_id, row['run_id']):
+                continue
+        except OffboxError:
+            continue
+        with write(con):
+            snapshot = protection(con, box_id)
+            con.execute('DELETE FROM kv WHERE k=?', ('start_unknown:' + row['run_id'],))
+            common.event_once(con, box_id, 'lease_free', json.dumps(offbox_protection.envelope(
+                'lease_free', 'server receipt/process probe confirmed holder gone', snapshot,
+                run_id=row['run_id'], holder=row['owner'])), 'holder_gone:' + row['run_id'])
+
+
+def holder_gone(box_id, run_id):
+    from urllib.parse import quote
+    result = api.call('GET', f'/sandboxes/{box_id}/protection?run_id={quote(run_id)}', timeout=5, retries=0)
+    return isinstance(result, dict) and result.get('confirmedGone') is True
+
+
+def protection(con, box_id):
+    until = pinned_until(con, box_id)
+    holds = [dict(run_id=r['run_id'], holder=r['owner'], state=r['status']) for r in con.execute(
+        'SELECT * FROM runs WHERE box_id=? AND (' + reserved_run_sql() + ')',
+        (box_id,))]
+    holds += [dict(run_id=r['run_id'], holder='checkout cleanup', state='unconfirmed') for r in con.execute(
+        'SELECT run_id FROM prune_holds WHERE box_id=?', (box_id,))]
+    return dict(pin=dict(active=until > now(), until=iso(until) if until else None,
+                         holder=kv_get(con, 'pin_owner:' + box_id)), holds=holds)
+
+
+def check_protection(con, box_id, *, override=False, reuse=False, holder=None):
+    reconcile_holds(con, box_id)
+    snapshot = protection(con, box_id)
+    reason = offbox_protection.blocked(snapshot, holder=holder, automatic=not override, override=override, reuse=reuse)
+    if reason:
+        raise PinnedLeaseError(f'{box_id} is {reason}; refusing to stop, delete or reuse it. '
+                               'Only an explicit release --override-protection can override protection', code=2)
+    return snapshot
+
+
+def remote_protection(box_id):
+    snapshot = api.box_protection(box_id)
+    if (not isinstance(snapshot, dict) or snapshot.get('ok') is not True or
+            type(snapshot.get('pin', {}).get('active')) is not bool or not isinstance(snapshot.get('holds'), list)):
+        raise OffboxError(f'{box_id}: server protection unavailable; reuse refused', code=2)
+    return snapshot
+
+
+def remote_reuse_blocked(box_id, holder=None):
+    if api.BACKEND != 'server':
+        return False
+    try:
+        snapshot = remote_protection(box_id)
+        return offbox_protection.blocked(snapshot, automatic=False, reuse=True,
+                                         holder=holder or offbox_protection.caller().get('holder')) is not None
+    except api.ApiError as error:
+        # A confirmed deletion must reach reuse's existing lease retirement path.
+        return not (error.status == 404 and error.api_code == 'sandbox_not_found')
+    except OffboxError:
+        return True
 
 
 def box_name(me: dict, repo_key: str) -> str:
@@ -425,10 +517,19 @@ def box_name(me: dict, repo_key: str) -> str:
     return f"offbox {repo_key} | {who}"
 
 
-def ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> bool:
+def ensure_ttl(box_id: str, ttl: int, s: dict | None = None, *, pin_locked=False) -> bool:
+    with (file_lock('pin-' + box_id, timeout=120) if api.BACKEND != 'server' and not pin_locked
+          else contextlib.nullcontext()):
+        return _ensure_ttl(box_id, ttl, s)
+
+
+def _ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> bool:
     """Make the boat auto-stop deadline at least `ttl` seconds away (PATCH resets it to now+ttl).
     True when the deadline is far enough already or the PATCH succeeded; False when the PATCH failed (warned)."""
     try:
+        if api.BACKEND != 'server':
+            with contextlib.closing(db()) as con:
+                ttl = max(ttl, int(pinned_until(con, box_id) - now()) + 60)
         if s and s.get("archiveAfter"):
             from .common import iso_ts
             left = (iso_ts(s["archiveAfter"]) or 0) - now()
@@ -458,15 +559,15 @@ def idle_ttl(box_id: str) -> None:
         # Grace past the reaper's limit so its stop (which archives Docker images first) usually wins over boat's ttl.
         ttl += 300
     try:
-        api.set_ttl(box_id, ttl)
+        ensure_ttl(box_id, ttl)
     except OffboxError:
         pass
 
 
 def bootstrap_fresh(box_id: str) -> None:
     """Fresh box (not from a template/base): put tool caches under $HOME so stop/fork keep them."""
-    script = ("bash -c " + shlex.quote((TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n" +
-                                     (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) +
+    fetch = (TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n"
+    script = (fetch + "bash -c " + shlex.quote(fetch + (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) +
               " || exit 1\n" + (TEMPLATES_DIR / "common-env.sh").read_text()).encode()
     p = ssh_sync.ssh(box_id, "bash -s", input=script, timeout=120)
     if p.returncode != 0:
@@ -719,6 +820,14 @@ def _check_held(box_id, remote):
     if remote and remote.get('heldRuns'):
         from . import allocation
         raise allocation.Busy(f"{box_id} is held by an unfinished command: {', '.join(remote['heldRuns'])}")
+    if api.BACKEND == 'server' and remote:
+        import offbox_protection
+        snapshot = remote.get('protection') or remote_protection(box_id)
+        reason = offbox_protection.blocked(snapshot, automatic=False, reuse=True,
+                                          holder=offbox_protection.caller().get('holder'))
+        if reason:
+            from . import allocation
+            raise allocation.Busy(f'{box_id} is {reason}')
 
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
@@ -748,6 +857,7 @@ def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_h
 
 def refresh_box(con, box_id: str) -> None:
     """Resume and stop a stopped box: boat counts its 14-day data limit from the last stop."""
+    check_protection(con, box_id)
     from . import unfit
     if unfit.get(con, box_id):
         return
@@ -759,7 +869,7 @@ def refresh_box(con, box_id: str) -> None:
     capacity.check(con)
     _resume_confirmed(con, box_id, 600, None)
     api.wait_state(box_id, api.LIVE_STATES, timeout=60)
-    api.stop(box_id)
+    request_stop(con, box_id, 'retention refresh')
     event(con, box_id, "refresh", "resume + stop restarts boat's 14-day data limit")
 
 
@@ -980,8 +1090,18 @@ class _ResumeExpired(Exception):
 
 def _forget_expired(con, box_id: str, why: str) -> None:
     """boat deleted this stopped box's data (14 days after its stop): nothing to resume, a new box replaces it."""
+    _pin_disk_unavailable(con, box_id, why)
     forget_box(con, box_id, "lease_expired", why)
     say(f"lease {box_id} expired ({why}); starting a new box")
+
+
+def _pin_disk_unavailable(con, box_id, why):
+    if pinned_until(con, box_id) > now():
+        saved = kv_get(con, 'pin_saved:' + box_id)
+        reason = (f'{box_id}: pinned disk unavailable ({why}); ' +
+                  (f'saved snapshot {saved} requires explicit restoration' if saved else 'no saved snapshot is recorded'))
+        event(con, box_id, 'pin_restore_required', reason)
+        raise PinnedLeaseError(reason, code=2)
 
 
 class DiskTooBig(OffboxError):
@@ -1401,7 +1521,10 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
         if watch is not None:
             watch.sent()
         try:
-            api.resume(box_id, ttl, size)
+            con.execute('DELETE FROM kv WHERE k=?', ('pin_saved:' + box_id,))
+            con.commit()
+            request_ttl = max(ttl, int(pinned_until(con, box_id)-now())+60) if api.BACKEND != 'server' else ttl
+            api.resume(box_id, request_ttl, size)
         except OffboxError as e:
             if isinstance(e, api.NetworkError) or (isinstance(e, api.ApiError) and e.status in (502, 504, 520, 524)):
                 return e
@@ -1521,6 +1644,8 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
     if not unfit.available(con, row['box_id']):
         return None
     check_deletion(con, row['box_id'])
+    if remote_reuse_blocked(row['box_id']):
+        return None
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
     if not current or current['state'] not in ('running', 'stopped') or \
@@ -1593,6 +1718,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
             raise ResumeUnresolved(f"could not read {box_id} before resume; nothing ran: {error}", error) from error
         raise
     if s is None or s.get("state") in ("error", "cancelled"):
+        _pin_disk_unavailable(con, box_id, f"state={s and s.get('state')}")
         forget_box(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
     _check_held(box_id, s)
@@ -1634,7 +1760,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
         # Keep the grow intent across the pool's archiving skip, even if a smaller caller resumes next.
         con.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)", (f"resize_size:{box_id}", want, now()))
         con.commit()
-        api.stop(box_id)
+        request_stop(con, box_id, f'resize: {have} -> {want}')
         con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
         con.commit()
         event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
@@ -1867,16 +1993,33 @@ def release_hold_if_worker_gone(con, box_id: str) -> bool:
         return False
 
 
+@offbox_protection.reasoned
+def request_stop(con, box_id, reason):
+    """Direct snapshot/resize callers still serialize their decision with keep."""
+    with file_lock('pin-' + box_id, timeout=120):
+        snapshot = check_protection(con, box_id)
+        result = api.stop(box_id)
+        event(con, box_id, 'stop', json.dumps(offbox_protection.envelope('stop', reason, snapshot)), limit=None)
+        return result
+
+
+@offbox_protection.reasoned
 def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True, locked: bool = False,
-             pin_locked: bool = False) -> bool:
+             pin_locked: bool = False, override: bool = False) -> bool:
+    with contextlib.nullcontext() if pin_locked else file_lock('pin-' + box_id, timeout=120):
+        return _stop_box(con, box_id, reason, wait, images, locked, True, override)
+
+
+def _stop_box(con, box_id, reason, wait, images, locked, pin_locked, override):
     """Stop a box. locked=True when the caller already holds 'box-<id>' (reap, release, save); then the hold is
     released with _release_locked, since the lock is not reentrant. pin_locked=True also requires 'pin-<id>'
     held, including when a 404 settles the missing lease."""
+    snapshot = check_protection(con, box_id, override=override)
     if images:
         keep_images(box_id)
     release = _release_locked if locked else release_if_confirmed
     try:
-        api.stop(box_id)
+        api.stop(box_id, **({'override': True} if override else {}))
         if wait:
             api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
     except api.ApiError as e:
@@ -1896,13 +2039,15 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
     # Clear the hold only after boat confirms the box is stopped; a stop merely accepted, or a box resumed in the
     # meantime, keeps its hold.
     release(con, box_id)
-    event(con, box_id, "stop", reason)
+    event(con, box_id, "stop", json.dumps(offbox_protection.envelope('stop', reason, snapshot, override=override)), limit=None)
     return True
 
 
-def delete_box(con, box_id: str, reason: str, *, usage: bool = True) -> bool:
+@offbox_protection.reasoned
+def delete_box(con, box_id: str, reason: str, *, usage: bool = True, override: bool = False) -> bool:
     from .spend import record_final_usage
-    with unpinned(con, box_id):
+    with file_lock('pin-' + box_id, timeout=120) if override else unpinned(con, box_id):
+        snapshot = check_protection(con, box_id, override=override)
         if usage:
             record_final_usage(con, box_id)
         ssh_sync.close_master(box_id)
@@ -1910,14 +2055,15 @@ def delete_box(con, box_id: str, reason: str, *, usage: bool = True) -> bool:
         # an explicit retry may delete this same box again, but cannot pin new work onto the doomed disk.
         kv_set(con, 'delete_pending:' + box_id, reason)
         event(con, box_id, 'delete_pending', reason)
-        d = api.delete(box_id)
+        d = api.delete(box_id, **({'override': True} if override else {}))
         op = (d.get("operation") or {}).get("id")
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
         from . import allocation
         allocation.clear_resume(con, box_id)
         con.execute("DELETE FROM kv WHERE k=?", ('delete_pending:' + box_id,))
         clear_prune_hold(con, box_id)  # deleted: no remote process survives
-        event(con, box_id, "delete", f"{reason} op={op}")
+        event(con, box_id, "delete", json.dumps(offbox_protection.envelope('delete', reason, snapshot,
+                                                                         operation=op, override=override)), limit=None)
     return True
 
 

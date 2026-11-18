@@ -28,6 +28,9 @@ export const ROUTER_UNAVAILABLE_LIMIT_MS = 15 * 60_000;
 // with 90s scheduling slack. Check execution can outlive our own 45s timer.
 export const ROUTER_STREAK_GAP_MS = 12 * 60_000;
 export const SUPERVISOR_DEADLINE_MS = 45_000;
+// Skip persistence is one atomic journal write (file + directory fsync).
+export const SAVE_RESERVE_MS = 5_000;
+export const MIN_FETCH_BUDGET_MS = 3_000;
 
 function newState() { return { version: 1, incidents: [], active: null }; }
 
@@ -60,7 +63,7 @@ export function readState(path) {
       if (!i || attempt < 1 || !['prepared', 'sent', 'finishing'].includes(a.phase) || (a.holdReason !== undefined && !['worker-terminal-uncertain', 'partial-accept', 'run-changed'].includes(a.holdReason)) || typeof a.leaseId !== 'string' || !/^[a-zA-Z0-9-]{1,80}$/.test(a.leaseId) || a.requestId !== `9router-claude-reauth:${i.id}:attempt:${attempt}` || a.threadId !== threadIdFor(a.requestId) || !Number.isInteger(a.sends) || a.sends < 0 || a.sends > MAX_SENDS || (a.phase === 'prepared' && a.sends !== 0) || (a.phase === 'sent' && a.sends < 1) || !Number.isFinite(a.nextSendAt) || a.nextSendAt < 0 || (a.runId !== null && typeof a.runId !== 'string')) throw new Error('invalid active attempt');
     }
     return s;
-  } catch (e) { if (e.code === 'ENOENT') return newState(); throw new Error('state unavailable or invalid'); }
+  } catch (e) { if (e.code === 'ENOENT') return newState(); throw Object.assign(new Error('state unavailable or invalid'), { code: 'REAUTH_STATE_INVALID' }); }
 }
 
 export function writeState(path, state) {
@@ -80,14 +83,14 @@ export function writeState(path, state) {
 function validMarker(x) { return typeof x === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(x) && !Number.isNaN(Date.parse(x)); }
 
 export function pendingConnections(payload) {
-  if (!payload || !Array.isArray(payload.connections)) throw new Error('invalid provider response');
+  if (!payload || !Array.isArray(payload.connections)) throw Object.assign(new Error('invalid provider response'), { code: 'REAUTH_PROVIDERS_INVALID' });
   const result = [];
   const ids = new Set();
   for (const c of payload.connections) {
-    if (!c || typeof c !== 'object' || typeof c.provider !== 'string') throw new Error('invalid provider record');
-    if (c.provider === 'claude' && (typeof c.authType !== 'string' || typeof c.isActive !== 'boolean' || typeof c.id !== 'string' || !c.id)) throw new Error('incomplete Claude record');
+    if (!c || typeof c !== 'object' || typeof c.provider !== 'string') throw Object.assign(new Error('invalid provider record'), { code: 'REAUTH_PROVIDERS_INVALID' });
+    if (c.provider === 'claude' && (typeof c.authType !== 'string' || typeof c.isActive !== 'boolean' || typeof c.id !== 'string' || !c.id)) throw Object.assign(new Error('incomplete Claude record'), { code: 'REAUTH_PROVIDERS_INVALID' });
     if (c.provider !== 'claude' || c.authType !== 'oauth' || c.isActive !== true || !c.reauthRequiredAt) continue;
-    if (typeof c.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(c.id) || !validMarker(c.reauthRequiredAt) || ids.has(c.id)) throw new Error('invalid effective reauth record');
+    if (typeof c.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(c.id) || !validMarker(c.reauthRequiredAt) || ids.has(c.id)) throw Object.assign(new Error('invalid effective reauth record'), { code: 'REAUTH_PROVIDERS_INVALID' });
     ids.add(c.id); result.push({ accountId: c.id, marker: c.reauthRequiredAt });
   }
   return result;
@@ -98,7 +101,7 @@ export function pendingConnections(payload) {
 export function assertIncident(payload, accountId, marker) {
   const list = pendingConnections(payload);
   const matches = payload.connections.filter(c => c.id === accountId);
-  if (matches.length > 1) throw new Error('ambiguous connection');
+  if (matches.length > 1) throw Object.assign(new Error('ambiguous connection'), { code: 'REAUTH_CONNECTION_INVALID' });
   return list.some(c => c.accountId === accountId && c.marker === marker);
 }
 
@@ -106,9 +109,9 @@ export function assertCleared(payload, accountId) {
   // Validate all records and duplicate effective IDs before asserting anything.
   pendingConnections(payload);
   const matches = payload.connections.filter(c => c.id === accountId);
-  if (matches.length !== 1) throw new Error('connection missing or ambiguous');
+  if (matches.length !== 1) throw Object.assign(new Error('connection missing or ambiguous'), { code: 'REAUTH_CONNECTION_INVALID' });
   const c = matches[0];
-  if (c.provider !== 'claude' || c.authType !== 'oauth' || c.isActive !== true) throw new Error('connection not active Claude OAuth');
+  if (c.provider !== 'claude' || c.authType !== 'oauth' || c.isActive !== true) throw Object.assign(new Error('connection not active Claude OAuth'), { code: 'REAUTH_CONNECTION_INVALID' });
   return !c.reauthRequiredAt;
 }
 
@@ -153,9 +156,9 @@ export function telegramHealthy(body) {
   return body?.status === 'healthy' && body.ready === true && body.paired === true && body.enabled === true && body.telegramConnected === true;
 }
 export function notificationState(body, key) {
-  if (!body || !Array.isArray(body.notifications)) throw new Error('notification delivery failed or unknown');
+  if (!body || !Array.isArray(body.notifications)) throw Object.assign(new Error('notification delivery failed or unknown'), { code: 'REAUTH_DELIVERY_UNKNOWN' });
   const matches = body.notifications.filter(n => n?.id === notificationId(key));
-  if (matches.length !== 1 || !['pending', 'sending', 'sent'].includes(matches[0].state)) throw new Error('notification delivery failed or unknown');
+  if (matches.length !== 1 || !['pending', 'sending', 'sent'].includes(matches[0].state)) throw Object.assign(new Error('notification delivery failed or unknown'), { code: 'REAUTH_DELIVERY_UNKNOWN' });
   return matches[0].state;
 }
 const alertKey = i => `${i.kind === 'detector' ? '9router-claude-detector' : '9router-claude-reauth'}:${i.id}`;
@@ -164,17 +167,17 @@ async function checkAlert(ctx, state, i) {
   if (!i.notified || i.alertState === 'sent') return;
   let status;
   try { status = await ctx.notificationState(alertKey(i)); }
-  catch { throw new Error('notification delivery failed or unknown'); }
+  catch { throw Object.assign(new Error('notification delivery failed or unknown'), { code: 'REAUTH_DELIVERY_UNKNOWN' }); }
   if (status === 'sent') { i.alertState = 'sent'; ctx.save(state); }
-  else if (status !== 'pending' && status !== 'sending') throw new Error('notification delivery failed or unknown');
+  else if (status !== 'pending' && status !== 'sending') throw Object.assign(new Error('notification delivery failed or unknown'), { code: 'REAUTH_DELIVERY_UNKNOWN' });
 }
 async function alertOnce(ctx, state, i, text = alertText(i)) {
   if (!i.notified) {
     // Queue acceptance is not delivery. On ambiguity replay the same key/text.
     const key = alertKey(i);
     let reply;
-    try { reply = await ctx.notify(key, text); } catch { throw new Error('notification queue unavailable'); }
-    if (!reply || reply.id !== notificationId(key) || typeof reply.created !== 'boolean') throw new Error('notification queue unavailable');
+    try { reply = await ctx.notify(key, text); } catch { throw Object.assign(new Error('notification queue unavailable'), { code: 'REAUTH_NOTIFY_UNAVAILABLE' }); }
+    if (!reply || reply.id !== notificationId(key) || typeof reply.created !== 'boolean') throw Object.assign(new Error('notification queue unavailable'), { code: 'REAUTH_NOTIFY_UNAVAILABLE' });
     i.notified = true; i.alertState = 'pending'; ctx.save(state);
   }
   await checkAlert(ctx, state, i);
@@ -270,7 +273,7 @@ async function detectOnly(ctx, state, payload) {
         if (i.firstEnqueuedAt === undefined) i.firstEnqueuedAt = ctx.now();
         ctx.save(state);
         const key = alertKey(i), reply = await ctx.notify(key, detectorAlertText(i));
-        if (!reply || reply.id !== notificationId(key) || typeof reply.created !== 'boolean') throw new Error('notification queue unavailable');
+        if (!reply || reply.id !== notificationId(key) || typeof reply.created !== 'boolean') throw Object.assign(new Error('notification queue unavailable'), { code: 'REAUTH_NOTIFY_UNAVAILABLE' });
         i.notified = true; i.alertState = 'pending'; ctx.save(state);
         if (ctx.now() < i.firstEnqueuedAt || ctx.now() - i.firstEnqueuedAt >= DELIVERY_DEADLINE) unknown = true;
       } catch { unknown = true; }
@@ -278,7 +281,7 @@ async function detectOnly(ctx, state, payload) {
   }
   // An older in-flight recovery is not silently forgotten during migration.
   if (state.active) unknown = true;
-  if (unknown) throw new Error('detector notification delivery or prior recovery unknown');
+  if (unknown) throw Object.assign(new Error('detector notification delivery or prior recovery unknown'), { code: 'REAUTH_DETECTOR_UNKNOWN' });
 }
 
 async function holdActive(ctx, state, i, a, reason) {
@@ -291,10 +294,10 @@ async function releaseActive(ctx, state, active) {
   // Only the exact owner may remove a lease. An incomplete lease remains held.
   const owner = ctx.leaseOwner();
   if (owner?.kind === 'auto' && owner.id === active.leaseId) {
-    if (!ctx.releaseLease({ kind: 'auto', id: active.leaseId })) throw new Error('lease release failed');
+    if (!ctx.releaseLease({ kind: 'auto', id: active.leaseId })) throw Object.assign(new Error('lease release failed'), { code: 'REAUTH_LEASE_RELEASE_FAILED' });
   }
   // If a manual owner acquired after a previous successful release, never touch it.
-  else if (owner && owner.kind !== 'manual') throw new Error('recovery lease owner uncertain');
+  else if (owner && owner.kind !== 'manual') throw Object.assign(new Error('recovery lease owner uncertain'), { code: 'REAUTH_LEASE_UNKNOWN' });
   state.active = null; ctx.save(state);
 }
 
@@ -369,11 +372,11 @@ async function tickImpl(ctx) {
   if (!state.active) {
     const owner = ctx.leaseOwner();
     if (owner?.kind === 'manual') return;
-    if (owner) throw new Error('orphaned recovery lease');
+    if (owner) throw Object.assign(new Error('orphaned recovery lease'), { code: 'REAUTH_LEASE_ORPHANED' });
     const i = state.incidents.find(x => stillBad(list, x) && !x.blocked && x.nextAt <= ctx.now());
     if (!i) return;
-    if (!await ctx.available()) throw new Error('control service unavailable');
-    if (!await ctx.notificationAvailable()) throw new Error('notification service unavailable');
+    if (!await ctx.available()) throw Object.assign(new Error('control service unavailable'), { code: 'REAUTH_CONTROL_UNAVAILABLE' });
+    if (!await ctx.notificationAvailable()) throw Object.assign(new Error('notification service unavailable'), { code: 'REAUTH_NOTIFY_UNAVAILABLE' });
     i.attempts++;
     const requestId = `9router-claude-reauth:${i.id}:attempt:${i.attempts}`;
     state.active = { incidentId: i.id, leaseId: randomUUID(), requestId, threadId: threadIdFor(requestId), phase: 'prepared', sends: 0, nextSendAt: 0, runId: null };
@@ -409,10 +412,10 @@ async function tickImpl(ctx) {
 
   let detail;
   try { detail = await ctx.thread(a.threadId); }
-  catch (e) { if (e?.status === 404) detail = null; else throw new Error('control status unavailable'); }
+  catch (e) { if (e?.status === 404) detail = null; else throw Object.assign(new Error('control status unavailable'), { code: 'REAUTH_CONTROL_STATUS_UNAVAILABLE' }); }
   if (detail !== null) {
     const t = detail.thread;
-    if (!t || t.threadId !== a.threadId || typeof t.state !== 'string') throw new Error('invalid control status');
+    if (!t || t.threadId !== a.threadId || typeof t.state !== 'string') throw Object.assign(new Error('invalid control status'), { code: 'REAUTH_CONTROL_STATUS_INVALID' });
     if (a.phase === 'prepared') {
       // Even a supposedly unsent key can name a pre-existing command if the
       // journal was restored from backup or the server was independently used.
@@ -430,7 +433,7 @@ async function tickImpl(ctx) {
     if (t.state === 'idle' && t.run && TERMINAL.has(t.run.status) && t.run.status !== 'completed') { await holdActive(ctx, state, i, a, 'worker-terminal-uncertain'); return; }
     // Only a reported, wrong selection proves a mismatch. An absent model is
     // uncertainty, not permission to continue or accuse a particular provider.
-    if (!t.model || (t.run && !t.run.model)) throw new Error('model selection unavailable');
+    if (!t.model || (t.run && !t.run.model)) throw Object.assign(new Error('model selection unavailable'), { code: 'REAUTH_MODEL_UNAVAILABLE' });
     const modelOkay = matchingModel(t.model) && (!t.run || matchingModel(t.run.model));
     if (BUSY.has(t.state)) {
       if (i.blocked && !i.notified) await alertOnce(ctx, state, i);
@@ -438,7 +441,7 @@ async function tickImpl(ctx) {
       if (t.state === 'needs-input') { i.blocked = true; ctx.save(state); await alertOnce(ctx, state, i); }
       return;
     }
-    if (t.state !== 'idle' || !t.run || !TERMINAL.has(t.run.status)) throw new Error('thread state is not conclusively terminal');
+    if (t.state !== 'idle' || !t.run || !TERMINAL.has(t.run.status)) throw Object.assign(new Error('thread state is not conclusively terminal'), { code: 'REAUTH_THREAD_NOT_TERMINAL' });
     // Restart recovery can resume failed/cancelled/interrupted runs later.
     // Keep the lease even if the marker is already gone or a later run starts.
     if (t.run.status !== 'completed') { await holdActive(ctx, state, i, a, 'worker-terminal-uncertain'); return; }
@@ -446,7 +449,7 @@ async function tickImpl(ctx) {
     // a second exact terminal/single-run status before releasing the lease.
     const fresh = pendingConnections(await ctx.providers());
     let confirm;
-    try { confirm = (await ctx.thread(a.threadId))?.thread; } catch { throw new Error('control status unavailable'); }
+    try { confirm = (await ctx.thread(a.threadId))?.thread; } catch { throw Object.assign(new Error('control status unavailable'), { code: 'REAUTH_CONTROL_STATUS_UNAVAILABLE' }); }
     if (!confirm || confirm.threadId !== a.threadId || confirm.state !== 'idle' || confirm.run?.runId !== a.runId || confirm.run?.status !== 'completed' || !Array.isArray(confirm.recentRuns) || confirm.recentRuns.length !== 1 || confirm.recentRuns[0]?.runId !== a.runId || !matchingModel(confirm.model) || !matchingModel(confirm.run.model)) { await holdActive(ctx, state, i, a, 'run-changed'); return; }
     const current = fresh.find(c => c.accountId === i.accountId);
     emit('reauth', current ? 'relogin.fail' : 'relogin.ok', { kind: current ? 'error' : 'perf', ok: !current, ids: { account: i.accountId }, durationMs: Math.max(0, ctx.now() - (a.nextSendAt - REPLAY_DELAY)), props: { tag: current ? 'marker_remains' : 'marker_cleared' }, ...(current ? { error: { tag: 'marker_remains' } } : {}) });
@@ -465,12 +468,12 @@ async function tickImpl(ctx) {
     return;
   }
 
-  if (a.leaseMismatch) throw new Error('recovery lease owner uncertain');
+  if (a.leaseMismatch) throw Object.assign(new Error('recovery lease owner uncertain'), { code: 'REAUTH_LEASE_UNKNOWN' });
   if (i.blocked) { await alertOnce(ctx, state, i); return; }
   if (a.phase === 'sent' && a.sends >= MAX_SENDS) { i.blocked = true; ctx.save(state); await alertOnce(ctx, state, i); return; }
   // The relay could have accepted a launch even if its thread is temporarily
   // absent. If Telegram is down, don't create an unseen worker or replay yet.
-  if (!await ctx.notificationAvailable()) throw new Error('notification service unavailable');
+  if (!await ctx.notificationAvailable()) throw Object.assign(new Error('notification service unavailable'), { code: 'REAUTH_NOTIFY_UNAVAILABLE' });
   // A prepared attempt provably has not sent: it is safe to abandon if the
   // current effective mark changed. A sent one is ambiguous even on a 404.
   const fresh = pendingConnections(await ctx.providers());
@@ -486,13 +489,13 @@ async function tickImpl(ctx) {
   const launchStart = performance.now();
   emit('reauth', 'relogin.start', { ids: { account: i.accountId }, props: { tag: 'worker_launch', attempt: i.attempts } });
   try { created = await ctx.create(createInput(i, a, ctx.leasePath)); }
-  catch { emit('reauth', 'relogin.fail', { kind: 'error', ok: false, ids: { account: i.accountId }, durationMs: performance.now() - launchStart, error: { tag: 'launch_unknown' } }); throw new Error('control launch outcome unknown'); }
-  if (!created || typeof created.threadId !== 'string' || !created.model) throw new Error('launch outcome not verified');
+  catch { emit('reauth', 'relogin.fail', { kind: 'error', ok: false, ids: { account: i.accountId }, durationMs: performance.now() - launchStart, error: { tag: 'launch_unknown' } }); throw Object.assign(new Error('control launch outcome unknown'), { code: 'REAUTH_LAUNCH_UNKNOWN' }); }
+  if (!created || typeof created.threadId !== 'string' || !created.model) throw Object.assign(new Error('launch outcome not verified'), { code: 'REAUTH_LAUNCH_UNVERIFIED' });
   if (created.threadId !== a.threadId || !matchingModel(created.model)) {
     // Defer the notice until status is queried and the mark rechecked. The
     // worker may already have finished and cleared it despite a bad response.
     i.blocked = true; ctx.save(state);
-    throw new Error('launch identity or model not verified');
+    throw Object.assign(new Error('launch identity or model not verified'), { code: 'REAUTH_LAUNCH_UNVERIFIED' });
   }
   if (created.runId) a.runId = created.runId;
   ctx.save(state);
@@ -506,6 +509,7 @@ async function tickImpl(ctx) {
 export class RouterUnavailableError extends Error {
   constructor(attemptMs) {
     super('router slow/unavailable');
+    this.code = 'ROUTER_UNAVAILABLE';
     this.attemptMs = attemptMs;
   }
 }
@@ -517,33 +521,66 @@ function transientFetchError(error) {
     || error?.message === 'socket hang up';
 }
 
-export async function liveProviders({ data = join(homedir(), '.9router'), url = 'http://127.0.0.1:20128/api/providers', timeoutMs = 6_000, retryTimeoutMs = 15_000, phase = () => {}, fetch: fetchProvider = fetch, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = () => performance.now(), log = () => {} } = {}) {
+function abortable(work, signal) {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) { signal.removeEventListener('abort', abort); abort(); return; }
+    Promise.resolve().then(work).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+export async function liveProviders({ data = join(homedir(), '.9router'), url = 'http://127.0.0.1:20128/api/providers', timeoutMs = 6_000, retryTimeoutMs = 15_000, phase = () => {}, fetch: fetchProvider = fetch, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = () => performance.now(), log = () => {}, deadlineAt = Infinity, signal, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  const attemptMs = [];
+  const remaining = () => Math.max(0, deadlineAt - now());
+  const budgetLog = (tag, ms) => {
+    emit('reauth', 'providers.fetch.budget', { durationMs: ms, props: { tag } });
+    log(`9router Claude detector: providers fetch budget ${tag} (${Math.floor(ms)}ms remaining)`);
+  };
+  const exhausted = tag => { budgetLog(tag, remaining()); return new RouterUnavailableError(attemptMs); };
+  if (remaining() < MIN_FETCH_BUDGET_MS) throw exhausted('below_minimum');
   phase('providers:credentials');
   const raw = readFileSync(join(data, 'machine-id'), 'utf8').trim();
   const secret = readFileSync(join(data, 'auth', 'cli-secret'), 'utf8').trim();
-  if (!raw || !secret) throw new Error('router auth unavailable');
+  if (!raw || !secret) throw Object.assign(new Error('router auth unavailable'), { code: 'REAUTH_AUTH_MISSING' });
   const token = createHash('sha256').update(raw + '9r-cli-auth' + secret).digest('hex').substring(0, 16);
-  const attemptMs = [];
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (remaining() < MIN_FETCH_BUDGET_MS || signal?.aborted) throw exhausted('below_minimum');
     phase(attempt ? 'providers:fetch:retry' : 'providers:fetch');
     const started = now();
-    let retryable = false, payload, failure;
+    const requestedMs = attempt ? retryTimeoutMs : timeoutMs;
+    const allowedMs = Math.min(requestedMs, remaining());
+    if (allowedMs < requestedMs) budgetLog(attempt ? 'retry_shortened' : 'first_shortened', allowedMs);
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal.reason);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    const timer = setTimer(() => controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), Math.ceil(allowedMs));
+    let retryable = false, payload, failure, response;
     try {
-      const signal = AbortSignal.timeout(attempt ? retryTimeoutMs : timeoutMs);
-      const r = await fetchProvider(url, { headers: { 'x-9r-cli-token': token, accept: 'application/json' }, cache: 'no-store', signal });
+      const r = await abortable(() => fetchProvider(url, { headers: { 'x-9r-cli-token': token, accept: 'application/json' }, cache: 'no-store', signal: controller.signal }), controller.signal);
+      response = r;
       if (!r.ok) {
         retryable = [502, 503, 504].includes(r.status);
-        // Error bodies are not needed and may keep a socket open indefinitely.
-        void r.body?.cancel().catch(() => {});
-        throw new Error('router unavailable');
+        throw Object.assign(new Error('router unavailable'), { code: 'ROUTER_HTTP', httpStatus: r.status });
       }
-      if (!(r.headers.get('content-type') ?? '').includes('application/json')) throw new Error('invalid provider content type');
+      if (!(r.headers.get('content-type') ?? '').includes('application/json')) throw Object.assign(new Error('invalid provider content type'), { code: 'REAUTH_PROVIDERS_INVALID' });
       phase(attempt ? 'providers:body:retry' : 'providers:body');
-      payload = await r.json();
+      payload = await abortable(() => r.json(), controller.signal);
       pendingConnections(payload);
+      if (remaining() <= 0 || signal?.aborted) throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
     } catch (error) {
       failure = error;
-      retryable ||= transientFetchError(error);
+      retryable ||= transientFetchError(error) || error instanceof RouterUnavailableError;
+    } finally {
+      // Rejected headers leave the body unread. Close its socket before
+      // retiring both abort paths, or a streaming error can outlive the tick.
+      if (response?.body && !response.bodyUsed) {
+        void response.body.cancel().catch(() => {});
+        controller.abort();
+      }
+      clearTimer(timer);
+      signal?.removeEventListener('abort', abort);
     }
     attemptMs.push(Math.round(now() - started));
     if (attempt) {
@@ -553,9 +590,14 @@ export async function liveProviders({ data = join(homedir(), '.9router'), url = 
     }
     if (!failure) return payload;
     if (!retryable) throw failure;
+    if (remaining() <= 0 || signal?.aborted) throw exhausted('exhausted');
     if (attempt) throw new RouterUnavailableError(attemptMs);
+    if (remaining() < 1_000 + MIN_FETCH_BUDGET_MS) throw exhausted('retry_dropped');
     phase('providers:backoff');
-    await sleep(1_000);
+    if (signal) {
+      try { await abortable(() => sleep(1_000), signal); }
+      catch (error) { if (signal.aborted) throw exhausted('exhausted'); throw error; }
+    } else await sleep(1_000);
   }
 }
 
@@ -575,25 +617,25 @@ export function runBoundedCommand(command, args, { timeoutMs = 8_000, signal, en
       child.unref();
       if (error) reject(error); else resolve(output);
     };
-    const abort = () => finish(new Error('notification service aborted'));
-    const timer = setTimeout(() => finish(new Error('notification service timed out')), timeoutMs);
+    const abort = () => finish(Object.assign(new Error('notification service aborted'), { code: 'REAUTH_NOTIFY_ABORTED' }));
+    const timer = setTimeout(() => finish(Object.assign(new Error('notification service timed out'), { code: 'REAUTH_NOTIFY_TIMEOUT' })), timeoutMs);
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', chunk => {
       bytes += Buffer.byteLength(chunk);
-      if (bytes > 256 * 1024) finish(new Error('notification response too large'));
+      if (bytes > 256 * 1024) finish(Object.assign(new Error('notification response too large'), { code: 'REAUTH_NOTIFY_TOO_LARGE' }));
       else output += chunk;
     });
-    child.on('error', () => finish(new Error('notification service unavailable')));
-    child.on('exit', code => finish(code === 0 ? null : new Error('notification service unavailable')));
+    child.on('error', () => finish(Object.assign(new Error('notification service unavailable'), { code: 'REAUTH_NOTIFY_UNAVAILABLE' })));
+    child.on('exit', code => finish(code === 0 ? null : Object.assign(new Error('notification service unavailable'), { code: 'REAUTH_NOTIFY_UNAVAILABLE' })));
   });
 }
 
 export async function telegramCommand(args, { phase = () => {}, signal } = {}) {
   phase(`telegram:${args[0]}`);
   const output = await runBoundedCommand(join(homedir(), '.bun/bin/bun'), [join(homedir(), '.local/share/telegram-bridge/src/cli.ts'), ...args], { signal });
-  try { return JSON.parse(output); } catch { throw new Error('notification response invalid'); }
+  try { return JSON.parse(output); } catch { throw Object.assign(new Error('notification response invalid'), { code: 'REAUTH_NOTIFY_INVALID' }); }
 }
 
 function stderrLine(line) {
@@ -601,10 +643,13 @@ function stderrLine(line) {
   try { writeSync(2, line + '\n'); } catch { /* marker still survives */ }
 }
 
-export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_PHASE, stderr = stderrLine } = {}) {
+export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_PHASE, stderr = stderrLine, startedAt = Number(process.env.WATCH_STARTED_AT), now = () => performance.now(), wallNow = Date.now, log = () => {} } = {}) {
   const path = join(watchDir, '.phase');
-  let phase = 'start', since = performance.now();
-  const durations = [];
+  const bootMs = Number.isFinite(startedAt) && startedAt > 0 ? Math.max(0, wallNow() - startedAt) : 0;
+  let phase = 'start', since = now();
+  const durations = [`boot=${bootMs.toFixed(1)}ms`];
+  emit('reauth', 'supervisor.boot', { durationMs: bootMs });
+  log(`9router Claude detector: phase durations: boot=${bootMs.toFixed(1)}ms`);
   let previousStall;
   try {
     const old = JSON.parse(previous ?? readFileSync(path, 'utf8'));
@@ -614,9 +659,9 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
     }
   } catch { /* no valid previous marker */ }
   const mark = next => {
-    const now = performance.now();
-    durations.push(`${phase}=${(now - since).toFixed(1)}ms`);
-    phase = next; since = now;
+    const at = now();
+    durations.push(`${phase}=${(at - since).toFixed(1)}ms`);
+    phase = next; since = at;
     try { writeFileSync(path, JSON.stringify({ phase, t: Date.now() }) + '\n', { mode: 0o600 }); } catch { /* observability must not change detector safety */ }
   };
   mark('start');
@@ -628,7 +673,7 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
   return {
     mark, previousStall,
     failure: reason => {
-      stderr(`phase durations: ${[...durations, `${phase}=${(performance.now() - since).toFixed(1)}ms`].join(', ')}`);
+      stderr(`phase durations: ${[...durations, `${phase}=${(now() - since).toFixed(1)}ms`].join(', ')}`);
       // The runner keeps only the last 500 stderr characters on failure.
       if (previousStall) stderr(previousStall);
       stderr(`9router Claude detector: ${phase} ${reason}`);
@@ -638,28 +683,67 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
 }
 
 // Synthetic callers inject IO; live() retains all deployment and identity fences.
-export async function runObserved(ctx, { watchDir, deadlineMs = SUPERVISOR_DEADLINE_MS, previous, stderr, phase, onDeadline = () => {} } = {}) {
-  const report = phase ?? phaseReporter(watchDir, { previous, stderr });
-  const started = performance.now();
-  const deadline = () => {
+export async function runObserved(ctx, { watchDir, deadlineMs = SUPERVISOR_DEADLINE_MS, startedAt = Number(process.env.WATCH_STARTED_AT), previous, stderr, phase, onDeadline = () => {}, now = () => performance.now(), wallNow = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, exit = code => process.exit(code) } = {}) {
+  const report = phase ?? phaseReporter(watchDir, { previous, stderr, startedAt, now, wallNow, log: ctx.log });
+  const bootMs = Number.isFinite(startedAt) && startedAt > 0 ? Math.max(0, wallNow() - startedAt) : 0;
+  const remainingMs = Math.max(1, deadlineMs - bootMs);
+  const deadlineAt = now() + remainingMs;
+  let fetching, fetchSkipped = false, firstFetch = true, currentPhase = 'start', deadlineFailed = false;
+  const mark = next => { currentPhase = next; report.mark(next); };
+  const hardDeadline = () => {
+    deadlineFailed = true;
     report.failure('exceeded deadline');
-    try { onDeadline(); } finally { process.exit(1); }
+    try { onDeadline(); } finally { exit(1); }
   };
-  const timer = setTimeout(deadline, deadlineMs);
+  const deadline = () => {
+    if (fetching && /^providers:(fetch|body|backoff)(:|$)/.test(currentPhase)) {
+      fetching.abort(new RouterUnavailableError([]));
+      // Let the skip's synchronous journal commit finish. Any subsequent async
+      // work is still stopped at the supervisor deadline.
+      timer = setTimer(hardDeadline, 0);
+    } else hardDeadline();
+  };
+  let timer = setTimer(deadline, remainingMs);
   try {
     await tick({
       ...ctx,
-      load: () => { report.mark('load'); return ctx.load(); },
-      providers: () => { report.mark('providers'); return ctx.providers(report.mark); },
-      save: state => { report.mark('save'); return ctx.save(state); },
+      load: () => { mark('load'); return ctx.load(); },
+      providers: async () => {
+        mark('providers');
+        // Only the initial snapshot can skip: later reads follow state changes.
+        if (!firstFetch) return ctx.providers(mark);
+        firstFetch = false;
+        const controller = new AbortController();
+        fetching = controller;
+        const budgetMs = Math.max(0, deadlineAt - now() - SAVE_RESERVE_MS);
+        const budgetTimer = setTimer(() => {
+          if (/^providers:(fetch|body|backoff)(:|$)/.test(currentPhase)) controller.abort(new RouterUnavailableError([]));
+        }, budgetMs);
+        try {
+          return await abortable(() => ctx.providers(mark, { deadlineAt: deadlineAt - SAVE_RESERVE_MS, signal: controller.signal, now, setTimer, clearTimer }), controller.signal);
+        } catch (error) {
+          fetchSkipped = error instanceof RouterUnavailableError;
+          throw error;
+        } finally { fetching = undefined; clearTimer(budgetTimer); }
+      },
+      save: state => {
+        mark('save');
+        const before = now();
+        const result = ctx.save(state);
+        if (now() >= deadlineAt && (!fetchSkipped || now() - before >= SAVE_RESERVE_MS)) hardDeadline();
+        return result;
+      },
     });
-    if (performance.now() - started >= deadlineMs) deadline();
-    report.mark('done');
+    if (now() >= deadlineAt && !fetchSkipped) hardDeadline();
+    mark('done');
   } catch (error) {
+    // Marker/delivery code can catch IO errors internally. A late result after
+    // a valid snapshot must still report the deadline, even on that error path.
+    if (!deadlineFailed && now() >= deadlineAt && !fetchSkipped) hardDeadline();
     if (error instanceof RouterUnavailableError) report.mark('providers:fetch:retry');
     report.failure(`failed; router, notification delivery, journal or prior-worker state unavailable.${error.sustainedMinutes === undefined ? '' : ` for ${error.sustainedMinutes} min`}`);
     throw error;
-  } finally { clearTimeout(timer); }
+  } finally { clearTimer(timer); }
 }
 
 // Import and instantiate only if a future, explicitly fenced recovery path
@@ -676,21 +760,18 @@ async function live() {
   if (process.env.WATCH_DIR !== ROOT || process.env.WATCH_ID !== '9router-claude-reauth' || !process.env.WATCH_RUN || ROOT !== join(homedir(), '.local/share/robob-watch/watchers/9router-claude-reauth') || existsSync(join(ROOT, 'ENABLE_REQUIRED'))) throw new Error('live execution refused');
   // This exported function can also be imported for synthetic tests: the
   // live side additionally checks the runner-only environment and hold.
-  const report = phaseReporter(process.env.WATCH_DIR);
   // Successful stderr/stdout are not a safe diagnostic channel: the runner
   // discards stderr and treats stdout as a wake event.
   const log = line => {
     try { appendFileSync(join(ROOT, 'log'), `${new Date().toISOString()} ${line}\n`, { mode: 0o600 }); } catch { /* tool log remains available */ }
   };
+  const report = phaseReporter(process.env.WATCH_DIR, { log });
   const commands = new AbortController();
   const command = args => telegramCommand(args, { phase: report.mark, signal: commands.signal });
   const control = lazyControlClient();
-  // The shell timestamp includes interpreter startup; it never extends 45s.
-  const startedAt = Number(process.env.WATCH_STARTED_AT);
-  const deadlineMs = Number.isFinite(startedAt) && startedAt > 0 ? Math.min(SUPERVISOR_DEADLINE_MS, Math.max(1, SUPERVISOR_DEADLINE_MS - (Date.now() - startedAt))) : SUPERVISOR_DEADLINE_MS;
   await runObserved({
     enforceSafetyFence: true,
-    now: Date.now, load: () => readState(STATE), save: s => writeState(STATE, s), providers: phase => liveProviders({ phase, log }), log,
+    now: Date.now, load: () => readState(STATE), save: s => writeState(STATE, s), providers: (phase, budget) => liveProviders({ phase, log, ...budget }), log,
     leasePath: DEFAULT_LEASE, leaseOwner: () => leaseOwner(DEFAULT_LEASE),
     acquireLease: id => acquireLease(DEFAULT_LEASE, 'auto', id), releaseLease: o => releaseLease(DEFAULT_LEASE, o),
     available: async () => (await (await control()).health())?.ok === true,
@@ -700,7 +781,7 @@ async function live() {
     notify: (key, text) => command(['notify', '--source', '9router Claude recovery', '--severity', 'attention', '--text', text, '--key', key]),
     notificationState: async key => notificationState(await command(['notifications']), key),
     notificationSnapshot: () => command(['notifications']),
-  }, { phase: report, deadlineMs, onDeadline: () => commands.abort() });
+  }, { phase: report, onDeadline: () => commands.abort() });
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

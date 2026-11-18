@@ -588,7 +588,7 @@ class QueuedOutageTests(OutageBase):
 
     def test_resume_event_fields_survive_persistence(self):
         logdir = Path(self.tmp.name) / 'tool-logs'
-        with patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(logdir)), patch('toollog.emit', wraps=self.real_emit):
+        with patch.dict(os.environ, OFFBOX_LOG_DIR=str(logdir)), patch('toollog.emit', wraps=self.real_emit):
             code, snapshots, start = self.run_queued()
         self.assertEqual(code, 0, self.err.getvalue())
         records = [json.loads(line) for path in logdir.glob('*.ndjson') for line in path.read_text().splitlines()]

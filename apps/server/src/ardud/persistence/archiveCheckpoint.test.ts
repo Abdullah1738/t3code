@@ -6,6 +6,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
+import * as Logger from "effect/Logger";
 import { afterEach, vi } from "vite-plus/test";
 import {
   ErrorObserver,
@@ -15,11 +16,15 @@ import {
 import { ServerActivation } from "../../serverActivation.ts";
 import { archiveCheckpointLayer, HistoryArchiveDurability } from "./archiveCheckpoint.ts";
 
-vi.mock("node:worker_threads", () => ({ Worker: vi.fn() }));
+vi.mock("node:worker_threads", async (importOriginal) => ({
+  ...(await importOriginal<typeof NodeWorkerThreads>()),
+  Worker: vi.fn(),
+}));
 afterEach(() => vi.resetAllMocks());
 
 type Request = { id: number; operation: "checkpoint" | "flush-main" | "maintenance" };
 class CheckpointWorker extends NodeEvents.EventEmitter {
+  readonly threadId = 1;
   readonly requests: Request[] = [];
   readonly waiting: Array<(request: Request) => void> = [];
   readonly sent: Request[] = [];
@@ -54,6 +59,99 @@ class CheckpointWorker extends NodeEvents.EventEmitter {
     });
   }
 }
+
+it.effect(
+  "#1747 archive warnings separate semaphore queueing from worker time and board locks",
+  () => {
+    const worker = new CheckpointWorker();
+    vi.mocked(NodeWorkerThreads.Worker).mockImplementation(function () {
+      return worker as unknown as NodeWorkerThreads.Worker;
+    });
+    const warnings: unknown[] = [];
+    return Effect.gen(function* () {
+      const durability = yield* HistoryArchiveDurability;
+      const flush = yield* durability.flushHistorySource.pipe(Effect.forkChild);
+      const first = yield* worker.next();
+      const archive = yield* durability.syncArchive.pipe(Effect.forkChild);
+      yield* TestClock.adjust(500);
+      worker.reply(first, true);
+      assert.isTrue(yield* Fiber.join(flush));
+      const checkpoint = yield* worker.next();
+      yield* TestClock.adjust(1_000);
+      worker.emit("message", {
+        id: checkpoint.id,
+        ok: false,
+        file: "/isolated/archive.sqlite",
+        checkpoint: { busy: 1, log: 10, checkpointed: 8 },
+      });
+      yield* TestClock.adjust(250);
+      const retry = yield* worker.next();
+      worker.reply(retry, true);
+      assert.isTrue(yield* Fiber.join(archive));
+      assert.lengthOf(warnings, 1);
+      assert.deepInclude(JSON.parse(String(warnings[0])), {
+        operation: "checkpoint",
+        durationMs: 1_500,
+        queueMs: 500,
+        workerWaitMs: 1_000,
+        reason: "checkpoint_busy",
+        db: "history-archive",
+        connection: "archive-checkpoint",
+        separateConnection: true,
+        sharesBoardLock: false,
+        "db.wal.checkpoint_busy": 1,
+      });
+    }).pipe(
+      Effect.provide(archiveCheckpointLayer("/isolated/statev2.sqlite")),
+      Effect.provideService(ErrorObserver, () => {}),
+      Effect.provideService(ServerActivation, Effect.never),
+      Effect.provide(
+        Logger.layer([Logger.make(({ message }) => warnings.push(message))], {
+          mergeWithExisting: false,
+        }),
+      ),
+      Effect.scoped,
+    );
+  },
+);
+
+it.effect("#1747 an archive worker timeout keeps the 30 second budget and states its cause", () => {
+  const worker = new CheckpointWorker();
+  vi.mocked(NodeWorkerThreads.Worker).mockImplementation(function () {
+    return worker as unknown as NodeWorkerThreads.Worker;
+  });
+  const warnings: unknown[] = [];
+  return Effect.gen(function* () {
+    const durability = yield* HistoryArchiveDurability;
+    const pending = yield* durability.flushHistorySource.pipe(Effect.forkChild);
+    yield* worker.next();
+    yield* TestClock.adjust(29_999);
+    assert.isUndefined(pending.pollUnsafe());
+    yield* TestClock.adjust(1);
+    assert.isFalse(yield* Fiber.join(pending));
+    assert.isTrue(worker.terminated);
+    assert.lengthOf(warnings, 1);
+    assert.deepInclude(JSON.parse(String(warnings[0])), {
+      durationMs: 30_000,
+      queueMs: 0,
+      workerWaitMs: 30_000,
+      reason: "timeout",
+      db: "statev2",
+      connection: "archive-checkpoint",
+      sharesBoardLock: false,
+    });
+  }).pipe(
+    Effect.provide(archiveCheckpointLayer("/isolated/statev2.sqlite")),
+    Effect.provideService(ErrorObserver, () => {}),
+    Effect.provideService(ServerActivation, Effect.never),
+    Effect.provide(
+      Logger.layer([Logger.make(({ message }) => warnings.push(message))], {
+        mergeWithExisting: false,
+      }),
+    ),
+    Effect.scoped,
+  );
+});
 
 it.effect(
   "queues an archive barrier behind a busy worker and records faults without restoring checkpoint backoff",
