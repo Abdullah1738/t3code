@@ -139,14 +139,19 @@ def labels(data):
 
 
 def summary(data):
-    def fmt(value):
+    def fmt(value, unknown='?'):
         n = number(value)
-        return f'{n:.1f}'.removesuffix('.0') if n is not None else '?'
+        return f'{n:.1f}'.removesuffix('.0') if n is not None else unknown
     def pair(kind, mode):
         p = data.get('psi', {}).get(kind, {}).get(mode, {})
         return f"{fmt(p.get('avg_pct'))}%/{fmt(p.get('peak_avg10_pct'))}%"
     host = data.get('host_boxes') or {}
-    suffix = f"host boxes {fmt(host.get('start'))}→{fmt(host.get('end'))} running"
+    if 'incus_unavailable' in (host.get('start_reason'), host.get('end_reason')):
+        suffix = 'host boxes unknown (Incus unavailable)'
+    elif all(number(host.get(k)) is None for k in ('start', 'end')):
+        suffix = 'host boxes unknown'
+    else:
+        suffix = f"host boxes {fmt(host.get('start'), 'unknown')}→{fmt(host.get('end'), 'unknown')} running"
     if data.get('status') != 'available':
         return SUMMARY + 'unavailable · ' + suffix
     cpu = data.get('cpu') or {}
@@ -290,6 +295,12 @@ def finalize(row):
                     data['host_boxes'] = host
             save_run_state(run_id, resources=data)
             line = summary(data) + '\n'
+            if api.BACKEND == 'boat' and row.get('mode') == 'bg':
+                code = row.get('exit_code')
+                if code is None:
+                    code = saved.get('exit_code', saved.get('command_exit_code'))
+                if code is not None:
+                    line += f"offbox: remote exit {code}\n"
             if not path.exists() or not text.endswith(line):
                 if not ck or not (ck.get('stdoutOffset', 0) + ck.get('stderrOffset', 0)):
                     return  # A footer must never turn an empty, recoverable log into uncheckpointed output.

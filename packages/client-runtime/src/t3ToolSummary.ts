@@ -166,6 +166,16 @@ export function summarizeT3ToolCalls(
         quantity(countEntities(threadIds), "thread"),
       );
       break;
+    case "exec-sessions":
+      label = phrase("Listed", "list", `background exec sessions ${times}`);
+      break;
+    case "exec-session-stop":
+      label = phrase(
+        "Stopped",
+        "stop",
+        quantity(countEntities(entityIds("sessionId")), "background exec session"),
+      );
+      break;
     case "workflow-stop":
       label = phrase(
         "Requested stops for",

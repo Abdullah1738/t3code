@@ -952,6 +952,7 @@ export class PullRequestUnavailableError extends Schema.TaggedError<PullRequestU
   {
     reason: PullRequestUnavailableReason,
     provider: Schema.optional(SourceControlProviderKind),
+    detail: Schema.optional(Schema.String),
     cause: Schema.optional(Schema.Defect()),
   },
   { httpApiStatus: 503 },
@@ -961,6 +962,7 @@ export class PullRequestUnavailableError extends Schema.TaggedError<PullRequestU
   }
 
   override get message(): string {
+    if (this.detail) return this.detail;
     const requirement =
       this.provider === undefined ? undefined : PROVIDER_REQUIREMENT.get(this.provider);
     switch (this.reason) {

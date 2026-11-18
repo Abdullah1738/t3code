@@ -146,7 +146,7 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(result['errorRate'], .01)
         self.assertEqual(result['durationMs']['cli.run'], {'p50': 50, 'p95': 95, 'max': 100})
         self.assertEqual(result['topErrors'], [{'tag': 'io_error', 'count': 1, 'sampleId': 'a' * 32,
-                                              'exceptionClass': None, 'exitCode': None}])
+                                              'exceptionClass': None, 'exitCode': None, 'reason': None, 'rejected': []}])
         self.assertEqual(result['malformedCount'], 1)
         self.assertEqual(stat.S_IMODE(next(self.root.glob('rollup-*.json')).stat().st_mode), 0o600)
 
@@ -413,6 +413,148 @@ class IsolationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'tool failure'):
                 with log.run('food'):
                     raise ValueError('tool failure')
+
+
+class ReasonRollupTests(unittest.TestCase):
+    setUp = ToolLogTests.setUp
+    tearDown = ToolLogTests.tearDown
+    rows = ToolLogTests.rows
+    def test_reason_allowlist_and_types(self):
+        for reason in log.FOOD_EXIT_REASONS:
+            log.emit('food', 'cli.run', props={'reason': reason, 'candidateCount': 2, 'queryLen': 9})
+            self.assertEqual(self.rows()[-1]['props'], {'reason': reason, 'candidateCount': 2, 'queryLen': 9})
+        for value in ('PrivateValueToken', True, [], {'private': 'text'}):
+            log.emit('food', 'cli.run', props={'reason': value, 'candidateCount': value, 'queryLen': value})
+            self.assertNotIn('props', self.rows()[-1])
+        self.assertNotIn('PrivateValueToken', json.dumps(self.rows()))
+
+    def test_rollup_groups_reason_and_includes_legacy_null(self):
+        for reason in ('food_not_found', 'food_ambiguous', 'PrivateValueToken'):
+            with self.assertRaises(SystemExit):
+                with log.run('food', ['log']) as span:
+                    span.props['reason'] = reason
+                    raise SystemExit(2)
+        result = log.rollup(log.utcnow().date().isoformat())
+        self.assertEqual({r['reason'] for r in result['topErrors']}, {'food_not_found', 'food_ambiguous', None})
+        self.assertNotIn('PrivateValueToken', json.dumps(result))
+
+    def test_delivery_unmarked_exact_definition(self):
+        log.emit('cards', 'card.render', props={'kind': 'nutrition'}, run_id='a' * 32, ok=True)
+        log.emit('cards', 'card.render', props={'kind': 'nutrition'}, run_id='b' * 32, ok=False)
+        log.emit('food', 'food.warning', props={'warning': 'unverified', 'count': 5}, run_id='a' * 32)
+        log.emit('food', 'food.warning', props={'warning': 'no_time', 'count': 1}, run_id='a' * 32)
+        log.emit('meds-nag', 'nag.sent', props={'count': 3}, run_id='c' * 32)
+        for _ in range(2):
+            log.emit('cards', 'card.render', props={'kind': 'nutrition'})
+        log.delivery('card', 'a' * 32)
+        log.delivery('nag', 'c' * 32, ok=False)
+        log.delivery('nag', 'c' * 32, ok=True)
+        log.delivery('warning', 'd' * 32, ok=False)
+        delivery = log.rollup(log.utcnow().date().isoformat())['delivery']
+        self.assertEqual({k: v for k, v in delivery.items() if k != 'unmarkedMeaning'},
+                         {'sent': 2, 'failed': 1, 'unmarked': 4, 'autoReceipts': 0, 'manualReceipts': 3})
+        self.assertEqual(delivery['unmarkedMeaning'], log.UNMARKED_MEANING)
+        self.assertIn('including failed renders', delivery['unmarkedMeaning'])
+        self.assertIn('UTC day file', delivery['unmarkedMeaning'])
+
+
+
+
+class ArgumentDiagnosticsTests(unittest.TestCase):
+    setUp = ToolLogTests.setUp
+    rows = ToolLogTests.rows
+
+    def test_shared_parser_matrix_keeps_values_private(self):
+        import argparse
+        cases = [
+            (['unknown-command'], 'unknown_subcommand', ['unknown-command']),
+            (['PrivateValueToken'], 'unknown_subcommand', ['<redacted>']),
+            (['two words'], 'unknown_subcommand', ['<redacted>']),
+            (['a' * 32], 'unknown_subcommand', ['<redacted>']),
+            (['known', '--bogus=PrivateValueToken'], 'bad_arguments', ['--bogus']),
+            (['known', '-z'], 'bad_arguments', ['<redacted>']),
+            (['known', '--number'], 'missing_required', ['--number']),
+            (['known', '--number', 'PrivateValueToken'], 'bad_value', ['--number']),
+            (['known', '--choice', 'PrivateValueToken'], 'bad_value', ['--choice']),
+            (['known', '--note=--PrivateValueToken', '--number', 'bad'], 'bad_value', ['--number']),
+            (['known', 'PrivateValueToken'], 'bad_arguments', ['<redacted>']),
+            (['known', '--', '--PrivateValueToken'], 'bad_arguments', ['<redacted>']),
+            ([], 'missing_required', []),
+        ]
+        for args, reason, rejected in cases:
+            with self.subTest(args=args), self.assertRaises(SystemExit) as caught:
+                with log.run('food', args) as span:
+                    parser = log.LoggedArgumentParser(log_span=span, prog='fixture')
+                    sub = parser.add_subparsers(dest='cmd', required=True)
+                    known = sub.add_parser('known')
+                    known.add_argument('--number', type=int)
+                    known.add_argument('--choice', choices=['one', 'two'])
+                    known.add_argument('--note')
+                    with contextlib.redirect_stderr(__import__('io').StringIO()):
+                        parser.parse_args(args)
+            self.assertEqual(caught.exception.code, 2)
+            row = self.rows()[-1]
+            self.assertEqual(row['props']['reason'], reason)
+            self.assertEqual(row['props']['rejected'], rejected)
+            self.assertEqual(row['props']['argc'], len(args))
+            self.assertNotIn('PrivateValueToken', json.dumps(row))
+
+    def test_required_group_and_conflicting_options(self):
+        for args, required, reason, names in [([], True, 'missing_required', ['--first', '--second']),
+                (['--first', '--second'], False, 'bad_arguments', ['--second'])]:
+            with self.assertRaises(SystemExit), log.run('cards', args) as span:
+                parser = log.LoggedArgumentParser(log_span=span)
+                group = parser.add_mutually_exclusive_group(required=required)
+                group.add_argument('--first', action='store_true')
+                group.add_argument('--second', action='store_true')
+                with contextlib.redirect_stderr(__import__('io').StringIO()):
+                    parser.parse_args(args)
+            row = self.rows()[-1]
+            self.assertEqual(row['props']['reason'], reason)
+            self.assertEqual(row['props']['rejected'], names)
+
+    def test_rejected_schema_and_top_three_grouped_by_tag_reason(self):
+        entries = [('SystemExit', 2, ['--one=PrivateValueToken', '--two', '--three', '--four']),
+                   ('ValueError', 1, ['--one', '--two']), ('SystemExit', 2, ['--one'])]
+        for cls, code, names in entries:
+            log.emit('food', 'cli.run', 'error', ok=False, tag='invalid_arguments',
+                     props={'command': 'food', 'subcommand': 'log', 'reason': 'bad_arguments',
+                            'exceptionClass': cls, 'exitCode': code, 'rejected': names, 'argc': 4})
+        log.emit('food', 'cli.run', 'error', ok=False, tag='invalid_arguments',
+                 props={'reason': 'unknown_subcommand', 'rejected': ['valid-token', 'PrivateValueToken']})
+        result = log.rollup(log.utcnow().date().isoformat())
+        first, second = result['topErrors']
+        self.assertEqual(first['count'], 3)
+        self.assertEqual(first['reason'], 'bad_arguments')
+        self.assertIsNone(first['exceptionClass'])
+        self.assertIsNone(first['exitCode'])
+        self.assertEqual(first['rejected'], [{'name': '--one', 'count': 3}, {'name': '--two', 'count': 2},
+                                            {'name': '--four', 'count': 1}])
+        self.assertEqual(second['rejected'], [{'name': '<redacted>', 'count': 1}, {'name': 'valid-token', 'count': 1}])
+        self.assertNotIn('PrivateValueToken', json.dumps(self.rows()) + json.dumps(result))
+        log.emit('food', 'cli.run', props={'reason': 'private', 'rejected': ['private'], 'argc': True})
+        self.assertEqual(self.rows()[-1]['props'], {'rejected': ['<redacted>']})
+
+    def test_repeat_burst_windows(self):
+        for seconds, expected in [([0, .1, .2, .4, 1], 1), ([0, 2, 5], 1),
+                                  ([0, 2, 5.001], 0), ([0, 4, 6, 8], 1),
+                                  ([0, 1, 2, 6, 7, 8], 2), ([0, 1], 0),
+                                  ([0, 6, 12], 0)]:
+            stamps = [dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc) + dt.timedelta(seconds=x) for x in seconds]
+            self.assertEqual(log._repeat_bursts(list(reversed(stamps))), expected, seconds)
+        day = log.utcnow().date()
+        stamp = dt.datetime.combine(day, dt.time(1), tzinfo=dt.timezone.utc)
+        for second in [1, .4, .2, 0, .1]:
+            log.emit('food', 'cli.run', 'error', ok=False, tag='invalid_arguments',
+                     props={'command': 'food', 'subcommand': 'meals-count', 'reason': 'bad_arguments'},
+                     _now=stamp + dt.timedelta(seconds=second))
+        for command, sub, reason in [('food', 'log', 'bad_arguments'), ('whoop', 'meals-count', 'bad_arguments'),
+                                     ('food', 'meals-count', 'missing_required')]:
+            for _ in range(2):
+                log.emit(command, 'cli.run', 'error', ok=False, tag='invalid_arguments',
+                         props={'command': command, 'subcommand': sub, 'reason': reason}, _now=stamp)
+        self.assertEqual(log.rollup(day.isoformat())['repeatBurst'], 1)
+
 
 
 if __name__ == '__main__':

@@ -28,7 +28,11 @@ export class ThreadMetadataMcpService extends Context.Service<
 >()("t3/mcp/ThreadMetadataMcpService") {}
 
 function failure(code: OrchestratorMcpFailure["code"], message: string): OrchestratorMcpFailure {
-  return new OrchestratorMcpFailure({ code, message });
+  return new OrchestratorMcpFailure({
+    reason: code === "invalid_request" ? "invalid_args" : "capability_missing",
+    code,
+    message,
+  });
 }
 
 function errorMessage(error: unknown): string {

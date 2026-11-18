@@ -42,7 +42,7 @@ import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
 
 it.live.each(
   (["codex", "claudeAgent"] as const).flatMap((provider) =>
-    (["queue", "auto"] as const).map((mode) => ({ provider, mode })),
+    (["queue", "auto", "steer"] as const).map((mode) => ({ provider, mode })),
   ),
 )(
   "$provider $mode control send saves with background and queued startup work held",
@@ -123,6 +123,7 @@ it.live.each(
                 Layer.provide(Layer.succeed(NodeSqliteClient.ReaderLane, "background")),
                 Layer.provide(
                   Layer.mergeAll(
+                    replay,
                     Layer.mock(EnvironmentAuth.EnvironmentAuth)({
                       authenticateHttpRequest: () =>
                         Effect.succeed({
@@ -132,6 +133,7 @@ it.live.each(
                           scopes: ["orchestration:read", "orchestration:operate"],
                         }),
                     }),
+                    // Override the replay harness's partial mock with the real management service.
                     Layer.succeed(ThreadManagementService.ThreadManagementService, {
                       ...threads,
                       sendToThread: (input) =>
@@ -140,7 +142,6 @@ it.live.each(
                           Effect.tap(() => Deferred.await(releasePostCommit)),
                         ),
                     }),
-                    replay,
                     database,
                     settings,
                     Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),

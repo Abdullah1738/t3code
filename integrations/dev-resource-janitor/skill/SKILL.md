@@ -103,14 +103,19 @@ Temporary HTTP/serve/vite/next servers require an exact terminal and
 settled/archived owner, no queued/background/delegated work, and positive
 command evidence that this is a temporary server. Only allowlisted native/thread
 ids are read from process metadata. Exact native ids resolve through the control
-API; recovery reads prove held-work and child state. Unavailable or ambiguous
-bindings stay kept. New owner probes stop after a two-minute observation budget
+API's lightweight owner view; deleted or live owners stay kept without further
+reads. Idle, terminal owners still require full detail and recovery proof of held-work
+and child state. Unavailable or ambiguous bindings stay kept. Each owner API call
+has a 20-second timeout. New owner probes stop after a ten-minute observation budget
 (already-started bounded reads can finish); unexamined processes stay kept. Temporary-server commands, PPID-1 processes,
 and temporary/deleted working directories are examined first. The whole priority-ordered cycle
 resumes after the last examined priority/PID stored in the report state, so a busy
 urgent prefix cannot starve later urgent or ordinary entries; read-only scans never
 advance that state. Reports and log lines include checked, skipped and budget-skipped
-counts (checked means an owner/binding check was attempted, including unknowns). Cua/Dia/Perplexity stdio children additionally require that
+counts (checked means an owner/binding check was attempted, including unknowns).
+`owner_calls` reports count, nearest-rank p50/p95/max milliseconds (including failures),
+and failures by status for by-native, detail and recovery calls, without ids or URLs.
+Cua/Dia/Perplexity stdio children additionally require that
 binding and at least two hours since the owner's last activity.
 
 PID/start/args/tty, cwd, listeners/clients, native binding, owner and complete

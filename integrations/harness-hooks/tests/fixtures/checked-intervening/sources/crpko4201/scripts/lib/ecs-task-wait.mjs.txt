@@ -1,0 +1,37 @@
+// Follows one ECS task until it stops or the caller's time budget runs out. Every
+// blocking step (each describe call and each pause between polls) is capped by the
+// time left, so the caller gets its answer at the bound instead of whenever a
+// fixed-length waiter happens to return. Following a task never stops or restarts it.
+export const DEFAULT_TASK_POLL_MS = 5_000;
+export const MAX_DESCRIBE_MS = 30_000;
+
+export function waitForTaskStop({ describeTask, budgetMs, now = () => Date.now(), sleep = sleepSync, pollMs = DEFAULT_TASK_POLL_MS }) {
+  const deadline = now() + budgetMs;
+  let task = null;
+  let lastError = null;
+  for (;;) {
+    const remaining = deadline - now();
+    if (remaining <= 0) {
+      return { stopped: false, task, lastError };
+    }
+    const described = describeTask(Math.min(remaining, MAX_DESCRIBE_MS));
+    if (described.error) {
+      lastError = described.error;
+    } else {
+      lastError = null;
+      task = described.task ?? task;
+      if (task?.lastStatus === "STOPPED") {
+        return { stopped: true, task, lastError };
+      }
+    }
+    const left = deadline - now();
+    if (left <= 0) {
+      return { stopped: false, task, lastError };
+    }
+    sleep(Math.min(pollMs, left));
+  }
+}
+
+export function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}

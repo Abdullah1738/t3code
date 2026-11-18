@@ -38,9 +38,9 @@ test("a sibling bounded timeout retains its existing cause bucket", async () => 
   const h = setup();
   h.log.write({ component: "router", kind: "error", name: "bridge.catch", ok: false,
     error: { tag: "router.catch49", cause: new BoundedTimeout(10_000) } });
-  expect(h.lines()[0].error).toMatchObject({ name: "BoundedTimeout", causeKey: "background_watch" });
+  expect(h.lines()[0].error).toMatchObject({ name: "BoundedTimeout", code: "timeout", causeKey: "code.timeout" });
   const result = await h.log.rollup("2026-11-15");
-  expect(result?.topCauses).toContainEqual({ tag: "router.catch49", causeKey: "background_watch", count: 1 });
+  expect(result?.topCauses).toContainEqual({ tag: "router.catch49", causeKey: "code.timeout", count: 1 });
   expect(result?.countsByKind.error).toBe(1);
 });
 

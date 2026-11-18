@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer } from 'node:http';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,25 +46,34 @@ for (const unavailable of ['missing', 'not-ready', 'stale', 'live-override']) {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     t.after(() => new Promise((resolve) => server.close(resolve)));
     const url = `http://127.0.0.1:${server.address().port}`;
-    const child = spawn(process.execPath, [cli, 'scan', '--json'], {
-      env: { ...process.env, HOME: home, STREAM_RECOVERY_DATA: data, STREAM_RECOVERY_DB: path,
+    const env = { ...process.env, HOME: home, STREAM_RECOVERY_DATA: data, STREAM_RECOVERY_DB: path,
         ROBOB_HOME: join(home, '.robob'), T3CODE_HOME: join(home, '.t3'),
         XDG_DATA_HOME: join(home, '.local/share'), OPENCODE_SERVICE_URL: url,
-        T3_CONTROL_URL: url, T3_CONTROL_TOKEN: 'fixture-token' },
-    });
-    let stdout = '', stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += chunk; });
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
-    const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+        T3_CONTROL_URL: url, T3_CONTROL_TOKEN: 'fixture-token' };
+    async function command(cmd) {
+      const child = spawn(process.execPath, [cli, cmd, '--json'], { env });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += chunk; });
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+      return { code, stdout, stderr };
+    }
+    const { code, stdout, stderr } = await command('scan');
     assert.equal(code, 1, stderr);
     const report = JSON.parse(stdout);
     assert.match(report.recoveryError, /ENOENT|not ready|stale|refusing live/);
-    assert.deepEqual(report.stalls, []);
+    assert.equal('stalls' in report, false);
+    assert.deepEqual(requests, []);
+    assert.equal(existsSync(join(data, 'stall-state.json')), false);
+    const stalled = await command('stall');
+    assert.equal(stalled.code, 0, stalled.stderr);
+    assert.deepEqual(JSON.parse(stalled.stdout), { stalls: [] });
     assert.ok(requests.includes('/api/session/active'));
     assert.ok(requests.some((path) => path.startsWith('/api/ardud/control/threads?')));
     const state = JSON.parse(readFileSync(join(data, 'state.json'), 'utf8'));
     assert.equal(state.lastScan, lastScan);
-    assert.ok(Date.parse(state.lastStallScan) > Date.parse(lastScan));
+    const stallState = JSON.parse(readFileSync(join(data, 'stall-state.json'), 'utf8'));
+    assert.ok(Date.parse(stallState.lastStallScan) > Date.parse(lastScan));
     assert.deepEqual(state.handled, {});
   });
 }

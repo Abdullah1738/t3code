@@ -1,5 +1,6 @@
 export class BoundedTimeout extends Error {
   readonly name = "BoundedTimeout";
+  readonly code = "timeout";
   constructor(readonly boundMs: number) { super("Router request timed out"); }
 }
 

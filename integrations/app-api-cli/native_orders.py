@@ -5,6 +5,7 @@ Talabat tracking uses a separately verified account; catalog credentials remain 
 Careem order credentials are not yet captured.
 Talabat --ui is an explicit opt-in to the separate original-phone UI reader.
 """
+import toollog
 import argparse
 import datetime as dt
 import gzip
@@ -276,6 +277,7 @@ def noon_marketplace_track(order, timeout):
     return out
 
 
+@toollog.entrypoint('commerce-cmd', 'native-orders', cli=True, command_index=1)
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('app', choices=['noon', 'talabat', 'careem'])

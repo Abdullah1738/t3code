@@ -36,7 +36,16 @@ export class ImessageSendService extends Context.Service<
 >()("t3/ardud/imessage/ImessageSendService") {}
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
-  new OrchestratorMcpFailure({ code, message });
+  new OrchestratorMcpFailure({
+    reason:
+      code === "invalid_request"
+        ? "invalid_args"
+        : code === "capability_denied"
+          ? "imessage_thread_required"
+          : undefined,
+    code,
+    message,
+  });
 
 /**
  * The thread whose chat a caller serves: its root when the root has the

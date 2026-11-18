@@ -27,8 +27,12 @@ import argparse, fcntl, json, os, re, shutil, subprocess, sys, time
 
 def user_tmp():
     # robob-watch runs checks with only HOME/PATH/LANG, so TMPDIR is often unset.
-    path = os.environ.get("TMPDIR") or subprocess.run(
-        ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True).stdout.strip()
+    try:
+        path = os.environ.get("TMPDIR") or subprocess.run(
+            ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True,
+            check=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return ""
     return os.path.realpath(path) if path else ""
 
 
@@ -36,7 +40,7 @@ TMP = user_tmp()
 OPENCODE = os.path.join(TMP, "opencode")
 TEST_IDLE_HOURS = float(os.environ.get("TMPDIR_PRUNE_TEST_HOURS", "24"))
 OPENCODE_IDLE_DAYS = float(os.environ.get("TMPDIR_PRUNE_OPENCODE_DAYS", "3"))
-LOG_DIR = os.path.expanduser("~/.local/share/dev-janitor")
+LOG_DIR = os.path.expanduser(os.environ.get("DEV_JANITOR_LOG_DIR", "~/.local/share/dev-janitor"))
 AUDIT = os.path.join(LOG_DIR, "tmpdir-audit.jsonl")
 KEEP_FILE = os.path.expanduser("~/.config/opencode/dev-janitor-keep.txt")
 NANOID = re.compile(r"^[A-Za-z0-9_-]{21}$")
@@ -47,12 +51,17 @@ GUARD_PREFIXES = (
 )
 
 
+class UsageUnavailable(Exception):
+    def __init__(self, skipped, reason):
+        self.skipped, self.reason = skipped, reason
+
+
 def walk(path):
     """(newest mtime, bytes on disk, files) for a tree, without following symlinks."""
     try:
         st = os.lstat(path)
-    except OSError:
-        return 0.0, 0, 0
+    except OSError as err:
+        raise UsageUnavailable("tree_unavailable", type(err).__name__) from err
     newest, size, files = st.st_mtime, st.st_blocks * 512, 0
     stack = [path] if os.path.isdir(path) and not os.path.islink(path) else []
     if not stack:
@@ -61,14 +70,14 @@ def walk(path):
         d = stack.pop()
         try:
             it = os.scandir(d)
-        except OSError:
-            continue
+        except OSError as err:
+            raise UsageUnavailable("tree_unavailable", type(err).__name__) from err
         with it:
             for e in it:
                 try:
                     s = e.stat(follow_symlinks=False)
-                except OSError:
-                    continue
+                except OSError as err:
+                    raise UsageUnavailable("tree_unavailable", type(err).__name__) from err
                 newest = max(newest, s.st_mtime)
                 size += s.st_blocks * 512
                 if e.is_dir(follow_symlinks=False):
@@ -80,14 +89,45 @@ def walk(path):
 
 def in_use():
     """Paths under $TMPDIR that a process has as cwd or holds open."""
-    r = subprocess.run(["/usr/sbin/lsof", "-n", "-w", "-F", "n", "+c0"],
-                       capture_output=True, text=True, timeout=120)
+    try:
+        r = subprocess.run(["/usr/sbin/lsof", "-n", "-w", "-F", "n", "+c0"],
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as err:
+        raise UsageUnavailable("lsof_unavailable", "timed out after 120 seconds") from err
+    except (OSError, subprocess.SubprocessError, UnicodeError) as err:
+        raise UsageUnavailable("lsof_unavailable", type(err).__name__) from err
+    if r.returncode != 0:
+        raise UsageUnavailable("lsof_unavailable", f"exited {r.returncode}")
+    if (r.stderr or not isinstance(r.stdout, str) or not r.stdout.strip()
+            or not r.stdout.endswith("\n") or "\x00" in r.stdout):
+        raise UsageUnavailable("lsof_unavailable", "unreadable output or diagnostics")
     used = set()
+    process, file, named = False, False, False
     for line in r.stdout.splitlines():
+        # -F n also emits process/file delimiters. Reject incomplete/foreign output rather than
+        # treating an unreadable snapshot as proof that no temporary files are open.
+        if re.fullmatch(r"p[0-9]+", line):
+            if process and not named:
+                raise UsageUnavailable("lsof_unavailable", "incomplete process record")
+            process, file, named = True, False, False
+        elif line.startswith("f") and len(line) > 1 and process:
+            if file and not named:
+                raise UsageUnavailable("lsof_unavailable", "incomplete file record")
+            if line[1:].upper() in {"ERR", "NOFD"}:
+                raise UsageUnavailable("lsof_unavailable", "unreadable file descriptors")
+            file, named = True, False
+        elif line.startswith("n") and file:
+            # macOS NPOLICY descriptors have an explicit empty name. That is a complete record;
+            # a missing name field still leaves the file's use unknown.
+            named = True
+        else:
+            raise UsageUnavailable("lsof_unavailable", "unreadable output")
         if line.startswith("n") and TMP in line:
             p = line[1:]
             p = p[p.index(TMP):] if TMP in p else p
             used.add(p)
+    if not named:
+        raise UsageUnavailable("lsof_unavailable", "incomplete final record")
     return used
 
 
@@ -101,8 +141,10 @@ def keep_list():
         with open(KEEP_FILE) as f:
             return {os.path.realpath(os.path.expanduser(l.strip())) for l in f
                     if l.strip() and not l.startswith("#")}
-    except OSError:
+    except FileNotFoundError:
         return set()
+    except (OSError, UnicodeError) as err:
+        raise UsageUnavailable("keep_list_unavailable", type(err).__name__) from err
 
 
 def linked_worktree(path, depth=4):
@@ -137,6 +179,15 @@ def classify(name, path):
 
 
 def scan():
+    try:
+        return scan_available()
+    except UsageUnavailable as err:
+        return {"skipped": err.skipped, "reason": err.reason}
+    except OSError as err:
+        return {"skipped": "tree_unavailable", "reason": type(err).__name__}
+
+
+def scan_available():
     now = time.time()
     used, keep = in_use(), keep_list()
     out = {"tmpdir": TMP, "classes": {}, "candidates": [], "kept_in_use": 0, "kept_young": 0,
@@ -182,12 +233,21 @@ def scan():
 
 def apply():
     os.makedirs(LOG_DIR, exist_ok=True)
-    lock = open(os.path.join(LOG_DIR, "tmpdir-prune.lock"), "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return {"skipped": "another prune is running"}
+    with open(os.path.join(LOG_DIR, "tmpdir-prune.lock"), "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"skipped": "another prune is running"}
+        return apply_locked()
+
+
+def apply_locked():
     res = scan()
+    if "skipped" in res:
+        entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": "tmpdir_prune", **res}
+        with open(AUDIT, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        return entry
     removed, failed, freed = 0, [], 0
     for c in res["candidates"]:
         p = c["path"]
@@ -215,23 +275,34 @@ def apply():
 
 
 def main():
+    from io_priority import throttle_disk
+    throttle_disk()
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["scan", "apply"])
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
+    if not TMP:
+        if a.cmd == "apply":
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(AUDIT, "a") as f:
+                f.write(json.dumps({"event": "tmpdir_prune", "skipped": "tmpdir_unavailable",
+                                    "reason": "could not resolve user temp directory"}) + "\n")
+        return 0
     if not TMP.startswith("/private/var/folders/"):
         print(f"tmpdir_prune: refusing to run on {TMP or 'an unknown dir'}", file=sys.stderr)
         return 2
     if a.cmd == "scan":
         res = scan()
-        res["total_bytes"] = sum(c["bytes"] for c in res["classes"].values())
-        if not a.list:
+        if "skipped" not in res:
+            res["total_bytes"] = sum(c["bytes"] for c in res["classes"].values())
+        if "skipped" not in res and not a.list:
             res["candidates"] = len(res["candidates"])
             res["kept_worktrees"] = len(res["kept_worktrees"])
             res["opencode_stale"]["top"] = res["opencode_stale"]["top"][:10]
         print(json.dumps(res, indent=1))
     else:
-        print(json.dumps(apply(), indent=1))
+        apply()
+    return 0
 
 
 if __name__ == "__main__":

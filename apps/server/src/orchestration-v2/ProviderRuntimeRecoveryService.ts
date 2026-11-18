@@ -479,7 +479,14 @@ export const make = Effect.gen(function* () {
           runId: run.id,
           providerInstanceId: run.providerInstanceId,
           occurredAt: now,
-          payload: { ...run, status: "cancelled", queuePosition: null, completedAt: now },
+          payload: {
+            ...run,
+            status: "cancelled",
+            cancelReason: trigger === "startup" ? "server_restart" : "server_shutdown",
+            cancelDetail: detail,
+            queuePosition: null,
+            completedAt: now,
+          },
         });
         for (const attempt of projection.attempts.filter(
           (candidate) =>

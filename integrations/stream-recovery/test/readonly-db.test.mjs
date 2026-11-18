@@ -14,7 +14,7 @@ function fixture(t, { ready = 1, updated = new Date().toISOString(), schema = '1
   const db = new DatabaseSync(path);
   db.exec('create table ardud_readonly_meta(key text primary key, value text not null)');
   const insert = db.prepare('insert into ardud_readonly_meta values (?,?)');
-  for (const [key, value] of Object.entries({ ready: String(ready), updated_at: updated, schema_version: schema })) insert.run(key, value);
+  for (const [key, value] of Object.entries({ ready: String(ready), updated_at: updated, schema_version: schema, generation: '42' })) insert.run(key, value);
   db.close();
   return { home, path };
 }
@@ -107,7 +107,7 @@ test('missing metadata, not-ready, invalid, future and stale snapshots refuse', 
   const db = new DatabaseSync(path);
   db.exec('drop table ardud_readonly_meta');
   db.close();
-  assert.throws(() => openDb(path), /no such table/);
+  assert.throws(() => openDb(path), e => e.code === 'REPLICA_NOT_READY');
 });
 
 test('a connection cannot borrow freshness from a replacement export', (t) => {
@@ -139,10 +139,24 @@ test('each query checks the cached snapshot and an incomplete export cannot mix 
 });
 
 test('a live thread updated after the export is deferred even when its latest run is unchanged', (t) => {
-  const { path } = fixture(t);
+  const now = Date.parse('2026-11-15T10:00:00Z');
+  t.mock.method(Date, 'now', () => now);
+  const snapshotMs = now - 1_000;
+  const { path } = fixture(t, { updated: new Date(snapshotMs).toISOString() });
   const db = openDb(path);
   t.after(() => db.close());
-  assert.doesNotThrow(() => assertThreadInReplica(db, { latestRunId: 'run:1', updatedAt: new Date(Date.now() - 10_000).toISOString() }));
-  assert.throws(() => assertThreadInReplica(db, { latestRunId: 'run:1', updatedAt: new Date(Date.now() + 1).toISOString() }), /newer than Robob replica/);
-  assert.throws(() => assertThreadInReplica(db, {}), /newer than Robob replica/);
+  for (const offset of [-1, 0]) assert.doesNotThrow(() => assertThreadInReplica(db,
+    { latestRunId: 'run:1', updatedAt: new Date(snapshotMs + offset).toISOString() }));
+  for (const [updatedAt, ahead] of [[new Date(snapshotMs + 1).toISOString(), 1],
+    [new Date(now + 500).toISOString(), 1_500], [undefined, 'unknown'], [null, 'unknown'],
+    ['', 'unknown'], ['not-a-date', 'unknown']]) {
+    assert.throws(() => assertThreadInReplica(db, { latestRunId:'run:1', updatedAt }), error => {
+      assert.equal(error.message, 'thread is newer than Robob replica; recovery deferred');
+      assert.equal(error.code, 'REPLICA_BEHIND_THREAD');
+      assert.equal(error.replicaGeneration, 42);
+      assert.equal(error.replicaAgeMs, 1_000);
+      assert.equal(error.threadAheadMs, ahead);
+      return true;
+    });
+  }
 });

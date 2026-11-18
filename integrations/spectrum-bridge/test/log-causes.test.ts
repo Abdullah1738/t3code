@@ -6,9 +6,23 @@ import { createToolLog, cardKind, logCardRender } from "../src/toollog.ts";
 import { renderCounts } from "../src/log-render-store.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { parseLocalCommand, runLocalCommand } from "../src/cli.ts";
+import { bounded } from "../src/router.ts";
+import { toolError } from "../src/toollog.ts";
 
 const day = "2026-11-14";
 const privateText = "+971501234567 /Users/private/PRIVATE.pdf https://private.test/?token=PRIVATE";
+
+test("bounded timeout carries code.timeout through the log and rollup", async () => {
+  const rows = await captureLogs(async () => {
+    try { await bounded(new Promise<never>(() => {}), 0); }
+    catch (error) {
+      expect(error).toMatchObject({ name: "BoundedTimeout", code: "timeout" });
+      toolError("router", "router.catch1", error);
+    }
+  });
+  expect(rows.find(row => row.error?.tag === "router.catch1")?.error)
+    .toMatchObject({ name: "BoundedTimeout", code: "timeout", causeKey: "code.timeout" });
+});
 
 test.each([false, true])("generic causes survive every sanitization pass, defer=%s", async defer => {
   const root = mkdtempSync(join(tmpdir(), "log-causes-"));

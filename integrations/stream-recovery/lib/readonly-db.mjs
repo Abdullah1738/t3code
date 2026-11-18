@@ -4,6 +4,19 @@ import { join, resolve } from 'node:path';
 
 export const MAX_REPLICA_AGE_MS = 45_000;
 
+export function isReplicaUnavailable(error) {
+  return error?.code === 'REPLICA_UNAVAILABLE' || error?.code === 'REPLICA_NOT_READY'
+    || error?.code === 'REPLICA_BEHIND_THREAD';
+}
+
+function replicaError(message, code, { generation, updatedMs } = {}, now = Date.now()) {
+  return Object.assign(new Error(message), {
+    code,
+    replicaGeneration: generation ?? 'unknown',
+    replicaAgeMs: Number.isFinite(updatedMs) ? now - updatedMs : 'unknown',
+  });
+}
+
 export function replicaPath(env = process.env, home = env.HOME || homedir()) {
   return env.STREAM_RECOVERY_DB || env.ROBOB_READONLY_DB || join(home, '.robob/userdata/readonly/state.sqlite');
 }
@@ -40,8 +53,8 @@ export function assertReplicaPath(path, home = process.env.HOME || homedir(), en
 const snapshots = new WeakMap();
 
 export function registerReplica(db, path) {
-  const updatedMs = replicaTimestamp(db);
-  snapshots.set(db, { db, path, updatedMs });
+  const meta = replicaMetadata(db);
+  snapshots.set(db, { db, path, ...meta });
   assertReplicaFresh(db);
 }
 
@@ -70,29 +83,42 @@ export function guardReplica(db) {
   return guarded;
 }
 
-function replicaTimestamp(db) {
-  const meta = Object.fromEntries(db.prepare(
-    "select key, value from ardud_readonly_meta where key in ('ready','updated_at','schema_version')",
-  ).all().map(({ key, value }) => [key, value]));
+function replicaMetadata(db, now = Date.now()) {
+  let meta;
+  try {
+    meta = Object.fromEntries(db.prepare(
+      "select key, value from ardud_readonly_meta where key in ('ready','updated_at','schema_version','generation')",
+    ).all().map(({ key, value }) => [key, value]));
+  } catch (cause) {
+    throw Object.assign(replicaError('Robob replica is not ready', 'REPLICA_NOT_READY', {}, now), { cause });
+  }
+  const generation = typeof meta.generation === 'string' && /^\d+$/.test(meta.generation)
+    && Number.isSafeInteger(Number(meta.generation)) ? Number(meta.generation) : 'unknown';
   const updatedMs = typeof meta.updated_at === 'string' && /T.*(?:Z|[+-]\d\d:\d\d)$/.test(meta.updated_at)
     ? Date.parse(meta.updated_at) : NaN;
   if (meta.ready !== '1' || meta.schema_version !== '1' || !Number.isFinite(updatedMs)) {
-    throw new Error('Robob replica is not ready');
+    throw replicaError('Robob replica is not ready', 'REPLICA_NOT_READY', { generation, updatedMs }, now);
   }
-  return updatedMs;
+  return { updatedMs, generation };
 }
 
 // The timestamp belongs to the opened snapshot, not a newer file renamed over it.
 export function assertReplicaFresh(db, now = Date.now()) {
   const snapshot = snapshots.get(db);
-  if (!snapshot) throw new Error('unverified Robob replica');
+  if (!snapshot) throw replicaError('unverified Robob replica', 'REPLICA_UNAVAILABLE', {}, now);
   const age = now - snapshot.updatedMs;
   try {
-    replicaTimestamp(snapshot.db);
-    if (age < -5_000 || age > MAX_REPLICA_AGE_MS) throw new Error('Robob replica is stale; recovery deferred');
+    replicaMetadata(snapshot.db, now);
+    if (age < -5_000 || age > MAX_REPLICA_AGE_MS) {
+      throw replicaError('Robob replica is stale; recovery deferred', 'REPLICA_UNAVAILABLE', snapshot, now);
+    }
     assertReplicaPath(snapshot.path);
   } catch (e) {
-    e.code = 'REPLICA_UNAVAILABLE';
+    if (e.code !== 'REPLICA_NOT_READY') {
+      e.code = 'REPLICA_UNAVAILABLE';
+      e.replicaGeneration = snapshot.generation;
+      e.replicaAgeMs = age;
+    }
     throw e;
   }
 }
@@ -101,8 +127,12 @@ export function assertReplicaFresh(db, now = Date.now()) {
 // proves the replica cannot yet know whether that mutation was a Stop.
 export function assertThreadInReplica(db, thread) {
   assertReplicaFresh(db);
+  const snapshot = snapshots.get(db);
   const updatedMs = Date.parse(thread?.updatedAt);
-  if (!Number.isFinite(updatedMs) || updatedMs > snapshots.get(db).updatedMs) {
-    throw Object.assign(new Error('thread is newer than Robob replica; recovery deferred'), { code: 'REPLICA_UNAVAILABLE' });
+  if (!Number.isFinite(updatedMs) || updatedMs > snapshot.updatedMs) {
+    throw Object.assign(replicaError('thread is newer than Robob replica; recovery deferred',
+      'REPLICA_BEHIND_THREAD', snapshot), {
+      threadAheadMs: Number.isFinite(updatedMs) ? updatedMs - snapshot.updatedMs : 'unknown',
+    });
   }
 }

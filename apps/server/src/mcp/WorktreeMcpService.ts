@@ -38,7 +38,11 @@ export class WorktreeMcpService extends Context.Service<
 >()("t3/mcp/WorktreeMcpService") {}
 
 function failure(code: WorktreeMcpFailure["code"], message: string): WorktreeMcpFailure {
-  return new WorktreeMcpFailure({ code, message });
+  return new WorktreeMcpFailure({
+    reason: code === "invalid_request" ? "invalid_args" : "capability_missing",
+    code,
+    message,
+  });
 }
 
 function errorMessage(error: unknown): string {

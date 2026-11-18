@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,10 +7,11 @@ import { Delivery } from "../src/delivery.ts";
 import type { Access } from "../src/chats.ts";
 import { chatKey, GROUP_APP_REFUSAL, LineError, type Line, type LineInbound, type LineOutbound } from "../src/line.ts";
 import { TransportError } from "../src/photon.ts";
-import { ChatRegistry, createSbApi, optOutHealth, type ChatCore } from "../src/runtime.ts";
+import { ChatRegistry, createAgentBus, createSbApi, optOutHealth, type ChatCore } from "../src/runtime.ts";
 import { handleInbound, runIngress, type IngressDeps } from "../src/sb-ingress.ts";
 import { Shares } from "../src/share.ts";
 import { Store, type OutboxOperation } from "../src/store.ts";
+import type { BackendKind } from "../src/backend.ts";
 
 const owner = "+15555550123";
 const moni = "+15555550199";
@@ -59,9 +60,9 @@ function setup(realApi = false) {
   stores.push(ownerStore);
   const line = fakeLine();
   const built: ChatCore[] = [];
-  const registry = (store = ownerStore) => {
+  const registry = (store = ownerStore, backend?: BackendKind) => {
     const made = new ChatRegistry<Parts>({
-      line, owner, ownerStore: store, stateRoot, access: () => access,
+      line, owner, ownerStore: store, stateRoot, access: () => access, backend,
       build: chat => {
         built.push(chat);
         if (chat.store !== store) stores.push(chat.store);
@@ -557,6 +558,180 @@ describe("Sendblue socket API", () => {
     return { ...env, chats, moniChat, handler, post };
   }
 
+  test("agent bus routes deliver requests and a single answer using current sessions", async () => {
+    const { post, chats, moniChat } = api();
+    const input = { sessionId: "ses_owner", to: "moni", text: "question", dedupeKey: "q" };
+    const asked = await post("/agent-ask", input);
+    expect(asked.status).toBe(202);
+    const request = asked.body.id;
+    expect(await post("/agent-ask", input)).toEqual({ status: 200, body: { id: request, created: false } });
+    expect(moniChat.store.pendingInbound().filter(row => row.id.startsWith("wake:"))).toHaveLength(1);
+    expect((await post("/agent-answer", { sessionId: "ses_owner", request, text: "forged" })).status).toBe(403);
+    expect((await post("/agent-answer", { sessionId: "ses_moni@1", request, text: "stale" })).status).toBe(409);
+    expect((await post("/agent-answer", { sessionId: "ses_moni@2", request, text: "waiting", status: "pending" })).status).toBe(202);
+    expect((await post("/agent-answer", { sessionId: "ses_moni", request, text: "answer" })).status).toBe(202);
+    expect((await post("/agent-answer", { sessionId: "ses_moni", request, text: "again" })).status).toBe(409);
+    expect(chats.owner.store.pendingInbound()).toHaveLength(2);
+    expect((await post("/agent-requests", { sessionId: "ses_moni" })).body.requests).toEqual([
+      expect.objectContaining({ id: request, from: "owner", to: "moni", hop: 1, status: "done" }),
+    ]);
+    const stranger = chats.open(chatKey.dm("+15555550888")); stranger.store.set("route", { id: "ses_stranger", generation: 1 });
+    expect((await post("/agent-requests", { sessionId: "ses_stranger" })).body.requests).toEqual([]);
+  });
+
+  test.each([false, true])("a committed answer wake repairs metadata on sweep, late = %s", async late => {
+    setSystemTime(1_000);
+    const { post, chats, moniChat } = api();
+    const originalWake = chats.wake.bind(chats);
+    try {
+      const asked = await post("/agent-ask", { sessionId: "ses_moni", to: "owner", text: "q", dedupeKey: "crash" });
+      const request = asked.body.id;
+      if (late) setSystemTime(601_001);
+      chats.wake = (chat, text, key, receipt) => {
+        const result = originalWake(chat, text, key, receipt);
+        if (key.endsWith(":final")) throw new Error("crash after target insert");
+        return result;
+      };
+      expect((await post("/agent-answer", { sessionId: "ses_owner", request, text: "answer" })).status).toBe(500);
+      expect(moniChat.store.pendingInbound().filter(row => row.id.startsWith("wake:"))).toHaveLength(late ? 2 : 1);
+      chats.wake = originalWake;
+      setSystemTime(1_201_001);
+      createAgentBus(chats).sweep();
+      expect((await post("/agent-requests", { sessionId: "ses_moni" })).body.requests).toEqual([
+        expect.objectContaining({ id: request, status: late ? "done_late" : "done",
+          answeredAt: late ? 601_001 : 1_000, timedOutAt: late ? 601_001 : null }),
+      ]);
+      expect((await post("/agent-answer", { sessionId: "ses_owner", request, text: "again" })).status).toBe(409);
+      expect(moniChat.store.pendingInbound().filter(row => row.id.startsWith("wake:"))).toHaveLength(late ? 2 : 1);
+    } finally { chats.wake = originalWake; setSystemTime(); }
+  });
+
+  test("default bus pairs are explicit; group forwarding stays audience scoped", async () => {
+    const { post, chats } = api();
+    const family = chats.open(chatKey.group("GRP-Allowed-123"));
+    family.store.acceptInbound("written", { sender: "moni@example.com", text: "hi" });
+    expect((await post("/agent-ask", { sessionId: "ses_moni", to: family.info.slug, text: "q", dedupeKey: "group" })).status).toBe(403);
+    family.store.set("route", { id: "ses_group", generation: 1 });
+    expect((await post("/agent-ask", { sessionId: "ses_group", to: "moni", text: "q", dedupeKey: "group" })).status).toBe(202);
+    const stranger = chats.open(chatKey.dm("+15555550888"));
+    stranger.store.set("route", { id: "ses_stranger", generation: 1 });
+    expect((await post("/agent-ask", { sessionId: "ses_stranger", to: "owner", text: "q", dedupeKey: "guest" })).status).toBe(403);
+  });
+
+  test("notify rules require the current owner session and are visible to the next bus wake", async () => {
+    const { post, chats, stateRoot } = api();
+    const add = { action: "add", text: "tell me when Moni orders" };
+    for (const [sessionId, status] of [[undefined, 400], ["stale", 409], ["ses_owner@0", 409], ["ses_moni", 403]] as const) {
+      for (const action of [add, { action: "list" }, { action: "rm", id: 1 }]) {
+        expect((await post("/notify-rule", { ...action, sessionId })).status).toBe(status);
+      }
+    }
+    const added = await post("/notify-rule", { ...add, sessionId: "ses_owner@1" });
+    expect(added.status).toBe(200);
+    const rule = added.body.rule;
+    expect((await post("/notify-rule", { action: "list", sessionId: "ses_owner" })).body.notify).toEqual([rule]);
+    expect(JSON.parse(readFileSync(join(stateRoot, "agent-policy.json"), "utf8")).notify).toEqual([rule]);
+    await post("/agent-ask", { sessionId: "ses_moni", to: "owner", text: "q", dedupeKey: "notify" });
+    expect(JSON.stringify(chats.owner.store.pendingInbound())).toContain(add.text);
+    expect((await post("/notify-rule", { action: "rm", id: (rule as { id: number }).id, sessionId: "ses_owner" })).status).toBe(200);
+    expect((await post("/notify-rule", { action: "list", sessionId: "ses_owner" })).body.notify).toEqual([]);
+    for (const bad of [{ action: "add", text: "" }, { action: "add", text: "x", id: 1 }, { action: "rm", id: "1" },
+      { action: "rm", id: 0 }, { action: "list", text: "x" }, { action: "unknown" }, { action: "list", extra: true }]) {
+      expect((await post("/notify-rule", { ...bad, sessionId: "ses_owner" })).status).toBe(400);
+    }
+  });
+
+  test.each(["roster", "seen-senders", "blank-roster", "unknown"])("group bus audience uses %s from that group's store", async source => {
+    const { post, chats, moniChat, line, ownerStore } = api();
+    const key = chatKey.group("GRP-Allowed-123");
+    const family = chats.open(key, "Family Trip");
+    const sink = chats.sink(async () => {});
+    const deps = { line, owner, ownerStore, access: async () => access, sink };
+    if (source !== "unknown") {
+      for (const [handle, from] of [["first", owner], ["second", "moni@example.com"], ["third", moni]] as const) {
+        await handleInbound(deps, message({ handle, chat: key, from,
+          participants: source === "roster" ? [owner, moni, "silent@example.com"] : source === "blank-roster" ? [" "] : [] }));
+      }
+    }
+    const other = chats.open(chatKey.group("other"));
+    other.store.acceptInbound("unrelated", { sender: "OTHER_GROUP_SECRET" });
+    family.store.set("route", { id: "ses_group", generation: 1 });
+    expect((await post("/agent-ask", { sessionId: "ses_group", to: "moni", text: "question", dedupeKey: "audience" })).status).toBe(202);
+    const wake = moniChat.store.pendingInbound().find(row => row.id.startsWith("wake:agent-bus:"))!.payload as { text: string };
+    expect(wake.text).toContain('This answer will be posted in the group "Family Trip"');
+    if (source === "unknown") expect(wake.text).toContain("members: unknown");
+    else {
+      expect(wake.text).toContain("Abdullah");
+      expect(wake.text.match(/Moni/g)).toHaveLength(1);
+      expect(wake.text.includes("silent@example.com")).toBe(source === "roster");
+    }
+    expect(wake.text).not.toContain("OTHER_GROUP_SECRET");
+  });
+
+  const audienceUpdates = [
+    { label: "omitted participants", participants: undefined, refreshed: false },
+    { label: "empty participants", participants: [], refreshed: false },
+    ...[0x9, 0xa, 0xb, 0xc, 0xd, 0x20, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005,
+      0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff].map(code => ({
+      label: `blank participants U+${code.toString(16).toUpperCase().padStart(4, "0")}`, participants: ["", String.fromCodePoint(code)], refreshed: false,
+    })),
+    { label: "new roster", participants: [owner, moni, "new-silent@example.com"], refreshed: true },
+  ];
+  test.each(audienceUpdates)("group bus reconciles newer senders after a roster: $label", async ({ participants, refreshed }) => {
+    const { post, chats, moniChat, line, ownerStore } = api();
+    const key = chatKey.group("GRP-Allowed-123");
+    const family = chats.open(key, "Family Trip");
+    const sam = "+15555550222";
+    access.people.push({ name: "Sam", role: "person", addresses: [sam] });
+    const deps = { line, owner, ownerStore, access: async () => access, sink: chats.sink(async () => {}) };
+    await handleInbound(deps, message({ handle: "before-roster", chat: key, from: "old@example.com" }));
+    await handleInbound(deps, message({ handle: "roster", chat: key, from: owner, participants: [owner, moni, "silent@example.com"] }));
+    await handleInbound(deps, message({ handle: "new-member", chat: key, from: sam, participants: [] }));
+    await handleInbound(deps, message({ handle: "alias", chat: key, from: "moni@example.com", ...(participants ? { participants } : {}) }));
+    family.store.acceptInbound("machine-wake", { text: "not a participant" });
+    family.store.acceptInbound("blank-sender", { sender: "\t\n\u00a0" });
+    const expected = refreshed ? [owner, moni, "new-silent@example.com", "moni@example.com"]
+      : [owner, moni, "silent@example.com", sam, "moni@example.com"];
+    for (let read = 0; read < 3; read++) expect(family.store.groupAudience().sort()).toEqual(expected.sort());
+    family.store.set("route", { id: "ses_group", generation: 1 });
+    for (let request = 0; request < 2; request++) {
+      expect((await post("/agent-ask", { sessionId: "ses_group", to: "moni", text: "question", dedupeKey: `updated-audience-${request}` })).status).toBe(202);
+      const wakes = moniChat.store.pendingInbound().filter(row => row.id.startsWith("wake:agent-bus:"));
+      expect(wakes).toHaveLength(request + 1);
+      const wake = wakes[request]!.payload as { text: string };
+      expect(wake.text).toContain('This answer will be posted in the group "Family Trip"');
+      expect(wake.text.match(/\(members: ([^)]+)\)\./)?.[1]?.split(", ").sort()).toEqual(
+        (refreshed ? ["Abdullah", "Moni", "new-silent@example.com"] : ["Abdullah", "Moni", "Sam", "silent@example.com"]).sort());
+      expect(wake.text).not.toContain("old@example.com");
+      expect(wake.text).toContain("Share only what is fine for everyone there to read.");
+    }
+  });
+
+  test("agent routes validate bodies, reject missing/stale sessions, and respect readiness", async () => {
+    const { post } = api(); const disabled = api(false).post;
+    const request = `areq_${"a".repeat(64)}`;
+    const cases: [string, Record<string, unknown>][] = [
+      ["/agent-ask", { sessionId: "ses_owner", to: "moni", text: "q", dedupeKey: "k" }],
+      ["/agent-answer", { sessionId: "ses_moni", request, text: "a" }],
+      ["/agent-requests", { sessionId: "ses_owner" }],
+    ];
+    for (const [path, body] of cases) {
+      expect((await post(path, { ...body, sessionId: undefined })).status).toBe(400);
+      expect((await post(path, { ...body, sessionId: "stale" })).status).toBe(409);
+      expect((await post(path, { ...body, surprise: "x" })).status).toBe(400);
+      expect((await disabled(path, body)).status).toBe(503);
+    }
+    for (const value of ["", " ", "x".repeat(12_001), 1, null]) {
+      expect((await post("/agent-ask", { ...cases[0]![1], text: value })).status).toBe(400);
+      expect((await post("/agent-answer", { ...cases[1]![1], text: value })).status).toBe(400);
+    }
+    for (const to of ["bad slug", "bad\nslug", "", 1, null]) expect((await post("/agent-ask", { ...cases[0]![1], to })).status).toBe(400);
+    for (const parent of ["bad", 1, null]) expect((await post("/agent-ask", { ...cases[0]![1], parent })).status).toBe(400);
+    for (const status of ["timed_out", "", null, 1]) expect((await post("/agent-answer", { ...cases[1]![1], status })).status).toBe(400);
+    expect((await post("/agent-ask", { ...cases[0]![1], to: "unknown" })).status).toBe(404);
+    expect((await post("/agent-ask", { ...cases[0]![1], to: "owner" })).status).toBe(400);
+  });
+
   test("messages reads only the caller's chat or permitted cross-chat history", async () => {
     const { post, chats, moniChat } = api();
     chats.owner.store.acceptInbound("o-1", { text: "owner", receivedAt: 1 });
@@ -804,6 +979,25 @@ test("recipient sends, wakes and guest sends report their own message length lim
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: `message too long: ${(limit + 412).toLocaleString("en-US")} chars, limit ${limit.toLocaleString("en-US")}; split it or send as a card` });
   }
+});
+
+test.each(["robob", "openchamber", undefined] as const)("Sendblue receipts identify backend %s for owner and Moni", async backend => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const h = setup();
+    const deps: IngressDeps = { line: h.line, owner, ownerStore: h.ownerStore, access: async () => access,
+      sink: h.registry(h.ownerStore, backend).sink(async () => {}) };
+    for (const from of [owner, moni]) for (const source of ["live", "backfill"] as const) {
+      const input = message({ handle: `backend-${from === owner ? "owner" : "moni"}-${source}`, from, chat: chatKey.dm(from), text: "PRIVATE_INBOUND" });
+      expect(await handleInbound(deps, input, source)).toBe(true);
+      expect(await handleInbound(deps, input, source)).toBe(false);
+    }
+  });
+  expect(logs.filter(line => line.name === "msg.received").map(line => [line.ids?.chat, line.props?.source, line.props?.backend])).toEqual([
+    ["owner", "live", backend ?? "unknown"], ["owner", "backfill", backend ?? "unknown"],
+    ["moni", "live", backend ?? "unknown"], ["moni", "backfill", backend ?? "unknown"],
+  ]);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_INBOUND");
 });
 
 test("accepted live and backfill ingress logs canonical chat ids and failure tags", async () => {

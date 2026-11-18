@@ -45,7 +45,7 @@ def setup(root, backend='boat'):
         api.probe_backend = lambda *args: None
     destination = root / 'synced'
     # Exercise the real snapshot and sync orchestration through an isolated local transport.
-    def files(box, source, remote, with_git, *args):
+    def files(box, source, remote, with_git, *args, dirty=None):
         destination.mkdir(exist_ok=True)
         shutil.copy2(source / 'tracked.txt', destination / 'tracked.txt')
         return dict(files=1, sent=1)
@@ -133,6 +133,9 @@ class ExecBoundaryTests(Isolated):
             out, err = proc.communicate(timeout=25)
             self.assertEqual(proc.returncode, 0, err.decode())
             rid = out.decode().strip()
+            self.assertIn(f"Hand off `offbox wait {rid}` using the remote-compute skill’s Waiting for a run route, "
+                          "then end your turn; completion wakes you.", err.decode())
+            self.assertNotIn('logs ' + rid + ' --follow', err.decode())
             row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
             self.assertIsNotNone(row)
             self.addCleanup(self.stop_child, row['client_pid'], proc.pid)

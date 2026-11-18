@@ -191,6 +191,26 @@ const withHarness = <A, E>(body: (h: Effect.Success<typeof makeHarness>) => Effe
   Effect.scoped(Effect.flatMap(makeHarness, body)).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("control interrupt", () => {
+  it.effect.each([undefined, "user_stop", "task_stalled", "superseded"] as const)(
+    "forwards a typed interruption source from the control caller (%s)",
+    (cancelReason) =>
+      withHarness(({ post, calls }) =>
+        Effect.gen(function* () {
+          const response = yield* post({ cancelReason, expectedRunId: "run-new" });
+          assert.equal(response.status, 200);
+          assert.equal((yield* Ref.get(calls))[0]?.cancelReason, cancelReason);
+        }),
+      ),
+  );
+  it.effect("rejects an unrecognized interruption source before dispatch", () =>
+    withHarness(({ post, calls }) =>
+      Effect.gen(function* () {
+        const response = yield* post({ cancelReason: "automatic-ish" });
+        assert.equal(response.status, 400);
+        assert.isEmpty(yield* Ref.get(calls));
+      }),
+    ),
+  );
   it.effect("keeps the unguarded behavior", () =>
     withHarness(({ post, calls, dispatched, reads }) =>
       Effect.gen(function* () {
@@ -217,6 +237,13 @@ describe("control interrupt", () => {
         const response = yield* post({ expectedRunId: "run-old" });
         assert.strictEqual(response.status, 409);
         assert.strictEqual(response.body.error.code, "conflict");
+        assert.strictEqual(response.body.error.reason, "run_not_interruptible");
+        assert.strictEqual(response.body.error.retrySafe, false);
+        assert.deepStrictEqual(response.body.error.holder, {
+          threadId,
+          runId: "run-old",
+          status: null,
+        });
         assert.strictEqual((yield* Ref.get(calls))[0]?.runId, "run-old");
         assert.deepStrictEqual(yield* Ref.get(dispatched), []);
       }),
@@ -253,6 +280,9 @@ describe("control interrupt", () => {
         assert.deepStrictEqual(response.body.error, {
           code: "conflict",
           message: "Run run-new is on attempt att-2, not att-1.",
+          reason: "attempt_changed",
+          retrySafe: false,
+          holder: { threadId, runId: "run-new", status: "running" },
         });
         assert.deepStrictEqual(yield* Ref.get(calls), []);
         assert.deepStrictEqual(yield* Ref.get(dispatched), []);
@@ -293,6 +323,8 @@ describe("control interrupt", () => {
         const missing = yield* post({ expectedRunId: "run-missing", expectedAttemptId: "att-1" });
         assert.strictEqual(missing.status, 409);
         assert.strictEqual(missing.body.error.code, "conflict");
+        assert.strictEqual(missing.body.error.reason, "run_not_found");
+        assert.strictEqual(missing.body.error.retrySafe, false);
         assert.deepStrictEqual(
           (yield* Ref.get(calls)).map((input) => input.runId),
           [RunId.make("run-done"), RunId.make("run-missing")],

@@ -267,6 +267,7 @@ def minutes_track(data, order):
 
 def minutes_list(data):
     rows = data.get('orders')
+    toollog.order_page(rows)
     if not isinstance(rows, list):
         raise NoonError('SCHEMA_CHANGED')
     out = []
@@ -307,6 +308,7 @@ def eta_window(placed_at, value):
 
 def marketplace_cards(data):
     rows = data.get('data')
+    toollog.order_page(rows)
     if not isinstance(rows, list):
         raise NoonError('SCHEMA_CHANGED')
     out = []

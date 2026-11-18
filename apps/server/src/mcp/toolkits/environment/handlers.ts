@@ -35,6 +35,7 @@ const access = Effect.gen(function* () {
   const descriptor = yield* environment.getDescriptor;
   if (descriptor.environmentId !== context.scope.environmentId)
     return yield* new OrchestratorMcpFailure({
+      reason: "environment_mismatch",
       code: "capability_denied",
       message: "This credential belongs to another environment.",
     });

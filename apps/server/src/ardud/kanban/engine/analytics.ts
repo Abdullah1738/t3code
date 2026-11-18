@@ -8,7 +8,23 @@ export const elapsed = (at: string, since: string) => {
   return Number.isFinite(value) ? Math.max(0, value) : 0;
 };
 
-export function reasonClass(text: string, category?: string): string {
+export function reasonClass(text: string, category?: string, source?: KanbanActor["_tag"]): string {
+  if (source !== undefined && source !== "system") return "manual_flag";
+  switch (category) {
+    case "content_filter":
+      return "provider_blocked";
+    case "model_invalid":
+      return "model_unavailable";
+    case "context_exhausted":
+      return "context_exhausted";
+    case "auth_expired":
+      return "authentication";
+    case "quota":
+    case "transient":
+      return "provider_capacity";
+    case "config":
+      return "configuration";
+  }
   if (text === "Stale queued runs on the thread") return "stale_queued_runs";
   if (text === "Run went silent twice") return "run_silent";
   if (text === "No project set for this card") return "missing_project";
@@ -27,23 +43,7 @@ export function reasonClass(text: string, category?: string): string {
   if (/timeout|timed out/i.test(text)) return "timeout";
   if (/thread start failed/i.test(text)) return "thread_start";
   if (/run failed/i.test(text)) return "run_failed";
-  switch (category) {
-    case "content_filter":
-      return "provider_blocked";
-    case "model_invalid":
-      return "model_unavailable";
-    case "context_exhausted":
-      return "context_exhausted";
-    case "auth_expired":
-      return "authentication";
-    case "quota":
-    case "transient":
-      return "provider_capacity";
-    case "config":
-      return "configuration";
-    default:
-      return "other";
-  }
+  return "other";
 }
 
 // Compare committed card snapshots so every entry point and reverse transition is covered.
@@ -85,7 +85,7 @@ export function cardEvents(
           number: after.number,
           actor: before.stalled.by._tag,
           from: before.stage,
-          reasonClass: reasonClass(before.stalled.reason),
+          reasonClass: reasonClass(before.stalled.reason, undefined, before.stalled.by._tag),
           ageMs: elapsed(after.updatedAt, before.stalled.at),
         },
       });
@@ -98,7 +98,7 @@ export function cardEvents(
           number: after.number,
           actor: after.stalled.by._tag,
           from: after.stage,
-          reasonClass: reasonClass(after.stalled.reason),
+          reasonClass: reasonClass(after.stalled.reason, undefined, after.stalled.by._tag),
           ageMs: 0,
         },
       });
@@ -127,6 +127,12 @@ export function cardEvents(
       kind: label(ask.kind ?? "question"),
       blocking: ask.blocking,
       createdAt: ask.at,
+      ...(ask.timing?.openAsksAtCreation === undefined
+        ? {}
+        : { openAsksAtCreation: ask.timing.openAsksAtCreation }),
+      ...(ask.timing?.openNoticesAtCreation === undefined
+        ? {}
+        : { openNoticesAtCreation: ask.timing.openNoticesAtCreation }),
     };
     if (ask.closedAt === null && (!old || old.closedAt !== null))
       events.push({ ...common, kind: "kanban.ask_opened", props });

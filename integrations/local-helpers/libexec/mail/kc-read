@@ -1,3 +1,2 @@
 #!/bin/sh
-# usage: kc-read <service>  -> prints secret stored in login keychain (account "ortie")
-exec /usr/bin/security find-generic-password -a "${2:-ortie}" -s "$1" -w
+exec /usr/bin/python3 -I -S "$(dirname "$0")/kc_helpers.py" read "$@"

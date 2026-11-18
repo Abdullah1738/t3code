@@ -1,15 +1,15 @@
-import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import { useToolLogFixture } from "./toollog-fixture.ts";
 import { Attention } from "../src/attention.ts";
 import { createApi } from "../src/api.ts";
 import { backendKind } from "../src/config.ts";
-import type { PendingRequest, ThreadSummary } from "../src/control.ts";
+import { ControlError, type ControlEventFrame, type PendingRequest, type ThreadState, type ThreadSummary } from "../src/control.ts";
 import { ActiveThreadsBoard, boardEntry, RobobAlertBackend, runOrdinal, type RobobAlertOptions } from "../src/robob.ts";
 import { Store } from "../src/store.ts";
 
 type Thread = {
   threadId: string; projectId: string; title: string; origin: string | null; runtimeMode: string; worktreePath: string | null;
-  parentThreadId: string | null; state: string; latestRunId: string | null; settled?: boolean; archived?: boolean; pending: PendingRequest[];
+  parentThreadId: string | null; relationshipToParent?: string | null; activeRunId?: string | null; state: string; latestRunId: string | null; settled?: boolean; archived?: boolean; pending: PendingRequest[];
 };
 type Call = { method: string; path: string; body?: any };
 
@@ -53,7 +53,7 @@ function fakeControl(events: string[] = [], options: Pick<RobobAlertOptions, "no
     if (path === "/threads") {
       let list = [...threads.values()];
       if (searchParams.get("active") === "true") list = list.filter(thread => thread.state !== "idle");
-      if (searchParams.get("includeSubagents") !== "true") list = list.filter(thread => !thread.parentThreadId);
+      if (searchParams.get("includeSubagents") !== "true") list = list.filter(thread => thread.relationshipToParent !== "subagent");
       return ok({ total: list.length, threads: list.map(summary) });
     }
     const thread = threads.get(parts[1] ?? "");
@@ -67,7 +67,7 @@ function fakeControl(events: string[] = [], options: Pick<RobobAlertOptions, "no
   } });
   servers.push(server);
   const add = (thread: Partial<Thread> & { threadId: string }) => threads.set(thread.threadId, {
-    projectId: "p1", title: thread.threadId, origin: null, runtimeMode: "approval-required", worktreePath: null, parentThreadId: null,
+    projectId: "p1", title: thread.threadId, origin: null, runtimeMode: "approval-required", worktreePath: null, parentThreadId: null, relationshipToParent: null,
     state: "idle", latestRunId: null, pending: [], ...thread,
   });
   const backend = new RobobAlertBackend({ url: server.url.origin, token: "test-token", ...options });
@@ -91,20 +91,26 @@ function cachedBoard() {
     nativeSessionId: null, runtimeMode: "approval-required", parentThreadId: null, rootThreadId: "t", worktreePath: "/repo",
     latestRunId: null, pendingRequest: null, createdAt: null, updatedAt: null,
   };
-  const state = { threads: [thread], read: async () => ({ total: state.threads.length, threads: state.threads }) };
+  const state = { threads: [thread], read: async () => ({ total: state.threads.length, threads: state.threads }),
+    readThread: async (): Promise<{ thread: ThreadSummary }> => ({ thread }) };
+  const threadReads: number[] = [];
   const warnings: string[] = [];
   const client = { listThreads: async (filters: unknown) => {
     expect(filters).toEqual({ active: true, limit: 500 });
     calls++;
     return state.read();
-  } };
+  }, thread: async () => { threadReads.push(at); return state.readThread(); } };
   const board = new ActiveThreadsBoard(client, { of: async () => "/repo" }, { now: () => at, log: event => warnings.push(event) });
-  return { board, state, thread, warnings, calls: () => calls, time: (value: number) => { at = value; } };
+  return { board, state, thread, warnings, threadReads, calls: () => calls, time: (value: number) => { at = value; } };
 }
 
 test("board reads are cached until 30 seconds old, with safe telemetry only", async () => {
   const h = cachedBoard();
-  const counters = { fetchesByReason: { cold: 0, age: 0, hard: 0, soft: 0 }, dirtyEventsByType: {}, windowStartedAt: new Date(0).toISOString() };
+  const counters = { fetchesByReason: { cold: 0, age: 0, hard: 0, soft: 0 }, dirtyEventsByType: {}, windowStartedAt: new Date(0).toISOString(),
+    threadReads: 0, threadReadErrors: 0, threadReadsByReason: { run: 0, state: 0, followup: 0, created: 0 },
+    streamConnects: 0, streamEndsByKind: { errorFrame: 0, clean: 0, thrown: 0, aborted: 0 },
+    streamLastConnectedMs: null, streamMinConnectedMs: null, streamMaxConnectedMs: null,
+    streamErrorCodes: {}, lastStreamEndAt: null, lastStreamEndKind: null };
   expect(h.board.status()).toEqual({ boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null, ...counters });
   const first = await h.board.snapshot();
   for (const at of [1, 3_000, 10_000, 29_999]) {
@@ -302,7 +308,7 @@ test.each([false, true])("steady idle/metadata-churn fetch count, churn=%j", asy
   expect(h.calls()).toBe(churn ? 12 : 6);
 });
 
-test.each([[30_000, 12], [20_000, 18]])("mixed unknown events each second and busy/idle flips every %i ms produce %i fetches in three minutes", async (flipGap, expected) => {
+test.each([[30_000, 12], [20_000, 12]])("mixed unknown events each second and busy/idle flips every %i ms produce %i fetches in three minutes", async (flipGap, expected) => {
   const h = cachedBoard();
   const control = fakeControl([], { board: h.board });
   control.add({ threadId: "t", state: "running" });
@@ -316,6 +322,728 @@ test.each([[30_000, 12], [20_000, 18]])("mixed unknown events each second and bu
   }
   expect(h.calls()).toBe(expected!);
   if (flipGap === 30_000) expect(h.calls() / 3).toBeLessThanOrEqual(4);
+});
+
+test.each<{ initial: ThreadState; state: ThreadState; kind: string }>([
+  { initial: "running", state: "running", kind: "same" },
+  { initial: "running", state: "waiting", kind: "move" },
+  { initial: "running", state: "queued", kind: "move" },
+  { initial: "queued", state: "needs-input", kind: "move" },
+  { initial: "waiting", state: "running", kind: "move" },
+  { initial: "running", state: "idle", kind: "leave" },
+  { initial: "idle", state: "running", kind: "join" },
+  { initial: "idle", state: "idle", kind: "offboard" },
+])("status cache matrix: $initial -> $state ($kind)", async ({ initial, state, kind }) => {
+  const h = cachedBoard();
+  h.thread.state = initial;
+  if (initial === "idle") h.state.threads = [];
+  const first = await h.board.snapshot();
+  h.time(1_000);
+  h.thread.state = state;
+  h.board.applyStatus("t", state);
+  expect(await h.board.snapshot()).toBe(first);
+  const present = initial !== "idle" && state !== "idle";
+  expect(first.entries).toEqual(present ? [boardEntry({ ...h.thread, state }, "/repo")] : []);
+  expect(h.board.status().dirtyEventsByType).toEqual({ [`thread.status:${kind}`]: {
+    hard: 0, soft: 0, local: 1,
+  } });
+  h.state.threads = state === "idle" ? [] : [{ ...h.thread, state }];
+  for (const at of [3_000, 14_999]) {
+    h.time(at);
+    await h.board.snapshot();
+    expect(h.calls()).toBe(1);
+  }
+  for (const at of [15_000, 29_999]) {
+    h.time(at);
+    await h.board.snapshot();
+    expect(h.calls()).toBe(kind === "join" ? 2 : 1);
+  }
+  h.time(30_000);
+  expect((await h.board.snapshot()).entries).toEqual(state === "idle" ? [] : [boardEntry({ ...h.thread, state }, "/repo")]);
+  expect(h.calls()).toBe(2);
+  expect(h.board.status().fetchesByReason).toEqual({ cold: 1, age: kind === "join" ? 0 : 1, hard: 0, soft: kind === "join" ? 1 : 0 });
+});
+
+test("raw queued and needs-input states stay distinct from their running board projection", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  for (const state of ["queued", "queued", "needs-input", "needs-input", "running", "running"] as const) h.board.applyStatus("t", state);
+  expect(h.board.status().dirtyEventsByType).toEqual({
+    "thread.status:move": { hard: 0, soft: 0, local: 3 }, "thread.status:same": { hard: 0, soft: 0, local: 3 },
+  });
+});
+
+test("known iMessage roots are offboard even for non-idle statuses", async () => {
+  const h = cachedBoard();
+  h.thread.origin = "imessage";
+  expect((await h.board.snapshot()).entries).toEqual([]);
+  h.board.applyStatus("t", "needs-input");
+  for (const at of [3_000, 15_000, 29_999]) {
+    h.time(at);
+    expect((await h.board.snapshot()).entries).toEqual([]);
+    expect(h.calls()).toBe(1);
+  }
+  expect(h.board.status().dirtyEventsByType).toEqual({ "thread.status:offboard": { hard: 0, soft: 0, local: 1 } });
+});
+
+test("cold status is HARD and the first read discovers its folder immediately", async () => {
+  const h = cachedBoard();
+  h.board.applyStatus("t", "running");
+  expect(h.board.status().dirtyEventsByType).toEqual({ "thread.status:join": { hard: 1, soft: 0 } });
+  expect((await h.board.snapshot()).entries).toEqual([boardEntry(h.thread, "/repo")]);
+  for (const at of [3_000, 15_000, 29_999, 30_000]) {
+    h.time(at);
+    await h.board.snapshot();
+    expect(h.calls()).toBe(at === 30_000 ? 2 : 1);
+  }
+});
+
+test.each([false, true])("in-flight status survives an old roster; warm=%j", async warm => {
+  const h = cachedBoard();
+  if (warm) await h.board.snapshot();
+  h.time(30_000);
+  let resolve!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { resolve = done; });
+  const pending = h.board.snapshot();
+  h.board.applyStatus("t", "idle");
+  resolve({ total: 1, threads: [h.thread] });
+  expect((await pending).entries).toEqual([]);
+  expect(h.board.status().dirtyEventsByType).toEqual({ [`thread.status:${warm ? "leave" : "offboard"}`]: { hard: 1, soft: 0 } });
+  h.state.read = async () => ({ total: 0, threads: [] });
+  const calls = h.calls();
+  h.time(32_999);
+  expect((await h.board.snapshot()).entries).toEqual([]);
+  expect(h.calls()).toBe(calls);
+  for (const at of [33_000, 45_000, 60_000]) {
+    h.time(at);
+    expect((await h.board.snapshot()).entries).toEqual([]);
+    expect(h.calls()).toBe(calls + 1);
+  }
+});
+
+test("the latest in-flight status wins for moves and joins", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  h.time(30_000);
+  let resolve!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { resolve = done; });
+  const pending = h.board.snapshot();
+  h.board.applyStatus("t", "idle");
+  h.board.applyStatus("t", "queued");
+  h.board.applyStatus("t", "waiting");
+  h.board.applyStatus("new", "running");
+  h.board.applyStatus("new", "needs-input");
+  resolve({ total: 2, threads: [h.thread, { ...h.thread, threadId: "new", state: "waiting" }] });
+  expect((await pending).entries.map(entry => [entry.sessionId, entry.state, entry.status])).toEqual([
+    ["t", "waiting", "idle"], ["new", "running", "busy"],
+  ]);
+});
+
+test("unknown in-flight joins retain HARD refresh even when absent from the old roster", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  h.time(30_000);
+  let resolve!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { resolve = done; });
+  const pending = h.board.snapshot();
+  h.board.applyStatus("new", "queued");
+  resolve({ total: 1, threads: [h.thread] });
+  expect((await pending).entries.map(entry => entry.sessionId)).toEqual(["t"]);
+  h.state.read = async () => ({ total: 2, threads: [h.thread, { ...h.thread, threadId: "new", state: "queued" }] });
+  h.time(32_999);
+  expect((await h.board.snapshot()).entries).toHaveLength(1);
+  h.time(33_000);
+  expect((await h.board.snapshot()).entries.map(entry => entry.sessionId)).toEqual(["t", "new"]);
+});
+
+test("a status received while resolving folders is replayed before the snapshot is published", async () => {
+  const h = cachedBoard();
+  let entered!: () => void;
+  const loading = new Promise<void>(done => { entered = done; });
+  let release!: (value: string) => void;
+  const board = new ActiveThreadsBoard({ listThreads: async () => ({ total: 1, threads: [h.thread] }) }, {
+    of: () => { entered(); return new Promise(done => { release = done; }); },
+  });
+  const pending = board.snapshot();
+  await loading;
+  board.applyStatus("t", "idle");
+  release("/repo");
+  expect((await pending).entries).toEqual([]);
+});
+
+test("status patches remain in the cached roster after an in-flight refresh fails", async () => {
+  const h = cachedBoard();
+  const cached = await h.board.snapshot();
+  h.time(30_000);
+  let reject!: (error: Error) => void;
+  h.state.read = () => new Promise((_resolve, fail) => { reject = fail; });
+  const pending = h.board.snapshot();
+  h.board.applyStatus("t", "idle");
+  reject(new Error("unavailable"));
+  await expect(pending).rejects.toThrow("unavailable");
+  expect((await h.board.snapshot()).entries).toEqual([]);
+  expect(cached.entries).toEqual([]);
+  h.state.read = async () => ({ total: 1, threads: [{ ...h.thread, state: "running" }] });
+  h.time(35_000);
+  expect((await h.board.snapshot()).entries).toHaveLength(1);
+});
+
+const runA = "run:thread:t:ordinal:1";
+const runB = "run:thread:t:ordinal:2";
+
+const lineageCases = [
+  { label: "root", parentThreadId: null, relationshipToParent: null, listed: true },
+  { label: "fork", parentThreadId: "parent", relationshipToParent: "fork", listed: true },
+  { label: "legacy parented (missing relationship)", parentThreadId: "parent", relationshipToParent: undefined, listed: true },
+  { label: "legacy parented (null relationship)", parentThreadId: "parent", relationshipToParent: null, listed: true },
+  { label: "future relationship", parentThreadId: "parent", relationshipToParent: "future", listed: true },
+  { label: "subagent", parentThreadId: "parent", relationshipToParent: "subagent", listed: false },
+];
+
+test("an unknown subagent is read once, including across age refreshes and repeated run statuses", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  h.state.readThread = async () => ({ thread: { ...h.thread, threadId: "sub", parentThreadId: "t", relationshipToParent: "subagent" } });
+  h.time(1_000);
+  h.board.applyStatus("sub", "running");
+  await h.board.snapshot();
+  for (const at of [2_000, 15_000, 29_999, 30_000, 31_000, 60_000, 61_000]) {
+    h.time(at);
+    h.board.applyStatus("sub", "running", `run:sub:ordinal:${at}`);
+    expect((await h.board.snapshot()).entries.map(entry => entry.sessionId)).toEqual(["t"]);
+    expect(h.calls()).toBe(1 + Math.floor(at / 30_000));
+    expect(h.threadReads).toEqual([1_000]);
+  }
+  expect(h.board.status().fetchesByReason.soft).toBe(0);
+});
+
+test("remembered subagents evict the oldest identity after two thousand", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  for (let index = 0; index <= 2_000; index++) {
+    const threadId = `sub-${index}`;
+    h.state.readThread = async () => ({ thread: { ...h.thread, threadId, relationshipToParent: "subagent" } });
+    h.board.applyStatus(threadId, "running");
+    await h.board.snapshot();
+  }
+  h.time(4_000);
+  h.board.applyStatus("sub-1", "running");
+  await h.board.snapshot();
+  expect(h.threadReads).toHaveLength(2_001);
+  h.state.readThread = async () => ({ thread: { ...h.thread, threadId: "sub-0", relationshipToParent: "subagent" } });
+  h.board.applyStatus("sub-0", "running");
+  await h.board.snapshot();
+  expect(h.threadReads).toHaveLength(2_002);
+  expect(h.calls()).toBe(1);
+});
+
+test("a burst during the first subagent read learns permanent lineage without a followup", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  let done!: (value: { thread: ThreadSummary }) => void;
+  h.state.readThread = () => new Promise(resolve => { done = resolve; });
+  for (let index = 0; index < 10; index++) h.board.applyStatus("sub", "running");
+  done({ thread: { ...h.thread, threadId: "sub", relationshipToParent: "subagent" } });
+  await h.board.snapshot();
+  h.time(4_000);
+  h.board.applyStatus("sub", "running", runB);
+  await h.board.snapshot();
+  expect(h.threadReads).toHaveLength(1);
+  expect(h.calls()).toBe(1);
+});
+
+test("an unknown join read failure still rediscovers through SOFT within fifteen seconds", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  h.state.readThread = async () => { throw new Error("unavailable"); };
+  h.state.threads.push({ ...h.thread, threadId: "new" });
+  h.time(1_000);
+  h.board.applyStatus("new", "running");
+  await h.board.snapshot();
+  h.time(3_000);
+  expect((await h.board.snapshot()).entries).toHaveLength(1);
+  h.time(15_000);
+  expect((await h.board.snapshot()).entries).toHaveLength(2);
+  expect(h.board.status()).toMatchObject({ threadReadErrors: 1, fetchesByReason: { soft: 1, hard: 0 } });
+});
+
+test.each(lineageCases)("an unknown $label join reads canonically and rediscovers only listed shapes within 15 s", async lineage => {
+  let at = 0;
+  const control = fakeControl([], { now: () => at });
+  await control.backend.sessionBoard();
+  control.add({ threadId: "new", state: "running", parentThreadId: lineage.parentThreadId, relationshipToParent: lineage.relationshipToParent });
+  at = 1_000;
+  await control.backend.notification({ type: "thread.status", threadId: "new", state: "running" });
+  for (at of [3_000, 14_999]) {
+    expect((await control.backend.sessionBoard()).entries).toEqual([]);
+    expect(control.backend.boardStatus()?.boardFetches).toBe(1);
+  }
+  at = 15_000;
+  expect((await control.backend.sessionBoard()).entries.map(entry => entry.sessionId)).toEqual(lineage.listed ? ["new"] : []);
+  expect(control.backend.boardStatus()).toMatchObject({ boardFetches: lineage.listed ? 2 : 1, threadReads: 1 });
+});
+
+test.each([
+  ...lineageCases.map(lineage => ({ ...lineage, state: "running", origin: null })),
+  { label: "idle root", parentThreadId: null, relationshipToParent: null, listed: false, state: "idle", origin: null },
+  { label: "iMessage root", parentThreadId: null, relationshipToParent: null, listed: false, state: "running", origin: "imessage" },
+])("thread.created reads a $label and fetches only active listed shapes within 3 s", async shape => {
+  let at = 0;
+  const control = fakeControl([], { now: () => at });
+  await control.backend.sessionBoard();
+  control.add({ ...shape, threadId: "new", worktreePath: "/repo/new" });
+  at = 1_000;
+  // parentThreadId alone cannot distinguish a fork from a subagent.
+  expect(await control.backend.notification({ type: "thread.created", threadId: "new", parentThreadId: shape.parentThreadId })).toEqual({ type: "wake" });
+  for (at of [2_999, 3_000]) {
+    const entries = (await control.backend.sessionBoard()).entries;
+    expect(entries.map(entry => [entry.sessionId, entry.directory])).toEqual(shape.listed && at === 3_000 ? [["new", "/repo/new"]] : []);
+    expect(control.backend.boardStatus()?.boardFetches).toBe(shape.listed && at === 3_000 ? 2 : 1);
+  }
+  expect(control.backend.boardStatus()?.threadReadsByReason.created).toBe(1);
+  if (shape.state === "idle") {
+    control.threads.get("new")!.state = "running";
+    at = 5_000;
+    await control.backend.notification({ type: "thread.status", threadId: "new", state: "running" });
+    await control.backend.sessionBoard();
+    at = 15_000;
+    expect((await control.backend.sessionBoard()).entries[0]?.sessionId).toBe("new");
+  }
+});
+
+test("a failed created read retains HARD, and a missing thread reader retains the same fallback", async () => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  h.time(1_000);
+  h.state.readThread = async () => { throw new Error("unavailable"); };
+  h.board.created("new");
+  await h.board.snapshot();
+  expect(h.calls()).toBe(1);
+  h.time(3_000);
+  await h.board.snapshot();
+  expect(h.board.status()).toMatchObject({ threadReadErrors: 1, fetchesByReason: { hard: 1 } });
+
+  let calls = 0;
+  let at = 0;
+  const board = new ActiveThreadsBoard({ listThreads: async () => { calls++; return { total: 0, threads: [] }; } }, { of: async () => "/repo" }, { now: () => at });
+  await board.snapshot();
+  at = 3_000;
+  board.created("new");
+  await board.snapshot();
+  expect(calls).toBe(2);
+  expect(board.status().threadReads).toBe(0);
+  expect(board.status().dirtyEventsByType["thread.created"]).toEqual({ hard: 1, soft: 0 });
+});
+
+test.each(["pending", "cooldown"])("created retains HARD when coalesced with a %s status read", async phase => {
+  const h = cachedBoard();
+  await h.board.snapshot();
+  const thread = { ...h.thread, threadId: "new" };
+  h.state.threads.push(thread);
+  h.time(1_000);
+  let done!: (value: { thread: ThreadSummary }) => void;
+  h.state.readThread = () => new Promise(resolve => { done = resolve; });
+  h.board.applyStatus("new", "running");
+  if (phase === "pending") h.board.created("new");
+  done({ thread });
+  await h.board.snapshot();
+  if (phase === "cooldown") h.board.created("new");
+  h.state.readThread = async () => ({ thread });
+  h.time(phase === "pending" ? 3_000 : 4_000);
+  expect((await h.board.snapshot()).entries.map(entry => entry.sessionId)).toEqual(["t", "new"]);
+  expect(h.board.status().fetchesByReason.hard).toBe(1);
+  expect(h.threadReads).toHaveLength(phase === "pending" ? 1 : 2);
+});
+
+test("an unknown join without a thread reader still uses SOFT rediscovery", async () => {
+  let at = 0;
+  const h = cachedBoard();
+  const state = { threads: [] as ThreadSummary[] };
+  const board = new ActiveThreadsBoard({ listThreads: async () => ({ total: state.threads.length, threads: state.threads }) }, { of: async () => "/repo" }, { now: () => at });
+  await board.snapshot();
+  state.threads.push(h.thread);
+  board.applyStatus("t", "running");
+  at = 3_000;
+  expect((await board.snapshot()).entries).toEqual([]);
+  at = 15_000;
+  expect((await board.snapshot()).entries[0]?.sessionId).toBe("t");
+});
+
+const completionBoundaryCases = ["root", "fork"].flatMap(lineage =>
+  ["idle", "running", "error"].flatMap(outcome =>
+    ["state", "run", "created"].map(event => ({ lineage, outcome, event }))));
+
+test.each(completionBoundaryCases)("a $event at the $outcome read cleanup boundary rediscovers a $lineage", async ({ lineage, outcome, event }) => {
+  let at = 0;
+  let lists = 0;
+  let reads = 0;
+  let rows: ThreadSummary[] = [];
+  const thread: ThreadSummary = { ...cachedBoard().thread, threadId: "new", state: "running",
+    parentThreadId: lineage === "fork" ? "parent" : null, relationshipToParent: lineage === "fork" ? "fork" : null };
+  const firstRead = Promise.withResolvers<{ thread: ThreadSummary }>();
+  const board = new ActiveThreadsBoard({
+    listThreads: async () => { lists++; return { total: rows.length, threads: rows }; },
+    thread: () => ++reads === 1 ? firstRead.promise : Promise.resolve({ thread }),
+  }, { of: async () => "/repo/new" }, { now: () => at });
+  await board.snapshot();
+  at = 1_000;
+  board.applyStatus("new", "running");
+  if (outcome === "error") {
+    firstRead.reject(new Error("unavailable"));
+    await firstRead.promise.catch(() => {});
+  } else {
+    firstRead.resolve({ thread: { ...thread, state: outcome as "idle" | "running" } });
+    // The board awaited this promise first, so its result is now applied;
+    // its catch/finally chain has not yet removed the coalescing task.
+    await firstRead.promise;
+  }
+  at = 1_100;
+  rows = [thread];
+  if (event === "created") board.created("new");
+  else board.applyStatus("new", "running", event === "run" ? runB : undefined);
+  expect((await board.snapshot()).entries).toEqual([]);
+  at = 3_999;
+  expect((await board.snapshot()).entries).toEqual([]);
+  expect(reads).toBe(1);
+  at = 4_000;
+  const afterCooldown = await board.snapshot();
+  expect(reads).toBe(2);
+  expect(afterCooldown.entries.map(entry => entry.sessionId)).toEqual(event === "created" ? ["new"] : []);
+  at = 15_000;
+  expect((await board.snapshot()).entries.map(entry => [entry.sessionId, entry.directory])).toEqual([["new", "/repo/new"]]);
+  expect(lists).toBe(2);
+  expect(board.status().fetchesByReason).toMatchObject({ hard: event === "created" ? 1 : 0, soft: event === "created" ? 0 : 1 });
+});
+
+test.each(lineageCases)("board roster and reconciliation follow the server lineage predicate: $label", async lineage => {
+  let at = 0;
+  const control = fakeControl([], { now: () => at });
+  control.add({ threadId: "t", state: "running", activeRunId: runA, latestRunId: runA,
+    parentThreadId: lineage.parentThreadId, relationshipToParent: lineage.relationshipToParent });
+  const first = await control.backend.sessionBoard();
+  expect(first.entries.map(entry => entry.sessionId)).toEqual(lineage.listed ? ["t"] : []);
+  control.threads.get("t")!.state = "waiting";
+  await control.backend.notification({ type: "thread.status", threadId: "t", runId: runA, state: "waiting" });
+  const next = await control.backend.sessionBoard();
+  expect(next.entries.map(entry => [entry.sessionId, entry.state, entry.status])).toEqual(lineage.listed ? [["t", "waiting", "idle"]] : []);
+  expect(control.backend.boardStatus()?.boardFetches).toBe(1);
+  if (lineage.listed) {
+    expect(control.backend.boardStatus()?.threadReads).toBe(1);
+    at = 15_000;
+    expect((await control.backend.sessionBoard()).entries).toHaveLength(1);
+    expect(control.backend.boardStatus()?.boardFetches).toBe(1);
+  }
+});
+
+test.each(lineageCases.filter(lineage => lineage.listed))("a deferred canonical $label missing from the cache schedules SOFT rediscovery", async lineage => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA,
+    parentThreadId: lineage.parentThreadId, relationshipToParent: lineage.relationshipToParent });
+  await h.board.snapshot();
+  h.time(1_000);
+  h.board.applyStatus("t", "waiting", runB);
+  await h.board.snapshot();
+  h.time(1_500);
+  h.board.applyStatus("t", "waiting", runB);
+  // A local leave can precede the already-scheduled canonical reconciliation.
+  h.board.applyStatus("t", "idle");
+  const canonical = { ...h.thread, state: "waiting" as const };
+  h.state.readThread = async () => ({ thread: canonical });
+  h.state.threads = [canonical];
+  h.time(4_000);
+  expect((await h.board.snapshot()).entries).toEqual([]);
+  expect(h.board.status().threadReads).toBe(2);
+  for (const at of [7_000, 14_999]) {
+    h.time(at);
+    expect((await h.board.snapshot()).entries).toEqual([]);
+    expect(h.calls()).toBe(1);
+  }
+  h.time(15_000);
+  expect((await h.board.snapshot()).entries).toEqual([boardEntry(canonical, "/repo")]);
+  expect(h.board.status().fetchesByReason).toEqual({ cold: 1, age: 0, hard: 0, soft: 1 });
+});
+
+test.each([
+  ["completed", "idle"], ["failed", "idle"], ["cancelled", "idle"], ["interrupted", "idle"], ["rolled_back", "idle"],
+  ["waiting", "waiting"], ["queued", "queued"], ["preparing", "running"], ["running", "running"],
+] as const)("foreign run %s cannot replace active run A with %s", async (_status, state) => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  const canonical = { ...h.thread, latestRunId: runB };
+  h.state.readThread = async () => ({ thread: canonical });
+  h.board.applyStatus("t", state, runB);
+  expect((await h.board.snapshot()).entries).toEqual([boardEntry(canonical, "/repo")]);
+  expect(h.calls()).toBe(1);
+  expect(h.board.status()).toMatchObject({ threadReads: 1, threadReadErrors: 0, threadReadsByReason: { run: 1, state: 0, followup: 0 } });
+});
+
+test.each<ThreadState>(["running", "waiting", "queued", "needs-input", "idle"])("a finishing active run uses canonical thread state %s", async state => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  const canonical = { ...h.thread, state, latestRunId: runB };
+  h.state.readThread = async () => ({ thread: canonical });
+  h.board.applyStatus("t", "idle", runA);
+  expect((await h.board.snapshot()).entries).toEqual(state === "idle" ? [] : [boardEntry(canonical, "/repo")]);
+  expect(h.calls()).toBe(1);
+});
+
+test.each(["before", "after"])("canonical run status received %s the old list wins the fetch race", async order => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  h.time(30_000);
+  let list!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  let read!: (value: { thread: ThreadSummary }) => void;
+  h.state.read = () => new Promise(done => { list = done; });
+  h.state.readThread = () => new Promise(done => { read = done; });
+  const pending = h.board.snapshot();
+  h.board.applyStatus("t", "idle", runB);
+  const canonical = { ...h.thread, latestRunId: runB };
+  if (order === "before") read({ thread: canonical });
+  list({ total: 1, threads: [{ ...h.thread }] });
+  if (order === "after") read({ thread: canonical });
+  expect((await pending).entries).toEqual([boardEntry(canonical, "/repo")]);
+});
+
+test("run reconciliation coalesces bursts and waits three seconds before a followup read", async () => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  h.time(1_000);
+  let read!: (value: { thread: ThreadSummary }) => void;
+  h.state.readThread = () => new Promise(done => { read = done; });
+  for (let index = 0; index < 20; index++) h.board.applyStatus("t", "idle", runB);
+  expect(h.threadReads).toEqual([1_000]);
+  // A newer report invalidates this old read rather than allowing a stale leave.
+  h.board.applyStatus("t", "running", runA);
+  read({ thread: { ...h.thread, state: "idle" } });
+  expect((await h.board.snapshot()).entries).toHaveLength(1);
+  h.state.readThread = async () => ({ thread: { ...h.thread, latestRunId: runB } });
+  for (const at of [2_000, 3_999]) {
+    h.time(at);
+    h.board.applyStatus("t", "idle", runB);
+    expect((await h.board.snapshot()).entries).toHaveLength(1);
+    expect(h.threadReads).toEqual([1_000]);
+  }
+  h.time(4_000);
+  expect((await h.board.snapshot()).entries[0]?.workRevision).toBe(2);
+  expect(h.threadReads).toEqual([1_000, 4_000]);
+  expect(h.board.status().threadReadsByReason).toEqual({ run: 1, state: 0, followup: 1, created: 0 });
+});
+
+test("state-only events preserve pending canonical run metadata over an old list", async () => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  const first = await h.board.snapshot();
+  h.time(30_000);
+  let list!: (value: { total: number; threads: ThreadSummary[] }) => void;
+  h.state.read = () => new Promise(done => { list = done; });
+  h.state.readThread = async () => ({ thread: { ...h.thread, latestRunId: runB } });
+  const control = fakeControl([], { board: h.board });
+  control.add({ threadId: "t", state: "running" });
+  const pending = h.board.snapshot();
+  // The directory read is an observable network milestone after reconciliation.
+  await control.backend.notification({ type: "thread.status", threadId: "t", runId: runB, state: "idle" });
+  expect(first.entries[0]?.workRevision).toBe(2);
+  await control.backend.notification({ type: "thread.status", threadId: "t", runId: runA, state: "running" });
+  expect(h.board.status().threadReads).toBe(1);
+  list({ total: 1, threads: [{ ...h.thread }] });
+  expect((await pending).entries[0]?.workRevision).toBe(2);
+});
+
+test("expiry preserves recent cooldowns and deferred followups after two thousand identities", async () => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  h.state.readThread = async () => ({ thread: { ...h.thread, latestRunId: runB } });
+  h.board.applyStatus("t", "idle", runB);
+  await h.board.snapshot();
+  h.thread.latestRunId = runB;
+  for (let index = 1; index <= 1_999; index++) {
+    h.time(index * 4_000);
+    const thread = { ...h.thread, threadId: `old-${index}`, latestRunId: runA };
+    h.state.threads = [h.thread, thread];
+    h.board.markDirty();
+    await h.board.snapshot();
+    h.state.readThread = async () => ({ thread: { ...thread, latestRunId: runB } });
+    h.board.applyStatus(thread.threadId, "idle", runB);
+    await h.board.snapshot();
+  }
+  const recent = 1_999 * 4_000 + 3_000;
+  h.time(recent);
+  h.state.readThread = async () => ({ thread: h.thread });
+  h.board.applyStatus("t", "idle", runB);
+  await h.board.snapshot();
+  h.board.applyStatus("t", "idle", runB);
+  const before = h.board.status().threadReads;
+  h.time(recent + 100);
+  const next = { ...h.thread, threadId: "new", latestRunId: runA };
+  h.state.threads = [h.thread, next];
+  h.board.markDirty();
+  await h.board.snapshot();
+  h.state.readThread = async () => ({ thread: { ...next, latestRunId: runB } });
+  h.board.applyStatus("new", "idle", runB);
+  await h.board.snapshot();
+  h.board.applyStatus("t", "idle", runB);
+  await h.board.snapshot();
+  expect(h.board.status().threadReads).toBe(before + 1);
+  h.time(recent + 3_000);
+  h.state.readThread = async () => ({ thread: h.thread });
+  await h.board.snapshot();
+  expect(h.board.status().threadReads).toBe(before + 2);
+  expect(h.threadReads.slice(-3)).toEqual([recent, recent + 100, recent + 3_000]);
+});
+
+test("failed canonical reads fall back to SOFT and preserve the cached row", async () => {
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  h.time(1_000);
+  h.state.readThread = async () => { throw new Error("unavailable"); };
+  h.board.applyStatus("t", "idle", runB);
+  for (const at of [3_000, 14_999]) {
+    h.time(at);
+    expect((await h.board.snapshot()).entries).toHaveLength(1);
+    expect(h.calls()).toBe(1);
+  }
+  h.time(15_000);
+  await h.board.snapshot();
+  expect(h.board.status()).toMatchObject({ threadReads: 1, threadReadErrors: 1,
+    fetchesByReason: { cold: 1, soft: 1, hard: 0, age: 0 } });
+});
+
+test("a slow canonical read does not delay status attention or its five second prompt", async () => {
+  setSystemTime(now);
+  const h = cachedBoard();
+  Object.assign(h.thread, { activeRunId: runA, latestRunId: runA });
+  await h.board.snapshot();
+  let read!: (value: { thread: ThreadSummary }) => void;
+  h.state.readThread = () => new Promise(done => { read = done; });
+  const control = fakeControl([], { board: h.board });
+  control.add({ threadId: "t", state: "needs-input", pending: [{ requestId: "q-run", kind: "question", requestKind: "user_input",
+    canRespond: true, questions: [{ id: "env", header: "Env", question: "Where?", options: [{ label: "dev" }] }] }] });
+  await control.backend.directoryOf("t");
+  const { store, attention: alerts } = attention(control.backend);
+  alerts.processNotification((await control.backend.notification({ type: "thread.status", threadId: "t", runId: runB, state: "running" }))!);
+  await alerts.tick();
+  expect(store.pendingSessionNotices()).toHaveLength(1);
+  setSystemTime(now + 5_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text)).toEqual([expect.stringContaining("Where?")]);
+  read({ thread: { ...h.thread, state: "needs-input", latestRunId: runB } });
+  await h.board.snapshot();
+});
+
+test.each([false, true])("live-shaped 180 s replay; retain assistant invalidation=%j", async retainAssistantInvalidation => {
+  let at = 0;
+  const control = fakeControl([], { now: () => at });
+  for (let index = 0; index < 10; index++) control.add({ threadId: `private-${index}`, title: "PRIVATE_TITLE", state: "running",
+    activeRunId: `run:thread:private-${index}:ordinal:1`, latestRunId: `run:thread:private-${index}:ordinal:1` });
+  let statuses = 0;
+  let messages = 0;
+  let created = 0;
+  for (at = 0; at < 180_000; at += 250) {
+    // 32 status reports/minute, 62 completions/minute, 2.5 creations/minute.
+    if (at >= (statuses + 1) * 60_000 / 32) {
+      const thread = control.threads.get(`private-${statuses % 10}`)!;
+      if (statuses % 3 === 0) thread.state = thread.state === "running" ? "waiting" : "running";
+      await control.backend.notification({ type: "thread.status", threadId: thread.threadId, state: thread.state, runId: thread.activeRunId });
+      statuses++;
+    }
+    if (at >= (messages + 1) * 60_000 / 62) {
+      if (retainAssistantInvalidation) control.backend.markDirty("soft");
+      await control.backend.notification({ type: "message.completed", threadId: "private-0", role: "assistant" });
+      messages++;
+    }
+    if (at > 0 && at % 24_000 === 0) {
+      const threadId = `created-${created++}`;
+      control.add({ threadId, state: "running" });
+      await control.backend.notification({ type: "thread.created", threadId });
+    }
+    if (at > 0 && at % 60_000 === 0) {
+      const thread = control.threads.get("private-9")!;
+      thread.state = thread.state === "idle" ? "running" : "idle";
+      await control.backend.notification({ type: "thread.status", threadId: thread.threadId, state: thread.state, runId: thread.activeRunId });
+    }
+    await control.backend.sessionBoard();
+  }
+  const telemetry = control.backend.boardStatus()!;
+  expect([statuses, messages, created]).toEqual([95, 185, 7]);
+  if (retainAssistantInvalidation) expect(telemetry.boardFetches / 3).toBe(5);
+  else {
+    expect(telemetry.boardFetches).toBe(10);
+    expect(telemetry.boardFetches / 3).toBeLessThanOrEqual(4);
+  }
+  expect(telemetry.dirtyEventsByType["message.completed:assistant"]).toEqual({ hard: 0, soft: 0, local: 185 });
+  expect(telemetry.boardFetchErrors).toBe(0);
+  // Seven active-root creations and two returning roots now read canonically.
+  expect(telemetry.threadReads).toBe(41);
+  expect(telemetry.threadReads / 3).toBeLessThanOrEqual(14);
+  expect(telemetry.threadReadErrors).toBe(0);
+  expect(telemetry.dirtyEventsByType["thread.status:same"]!.local).toBeGreaterThan(0);
+  expect(telemetry.dirtyEventsByType["thread.status:move"]!.local).toBeGreaterThan(0);
+  expect(telemetry.dirtyEventsByType["thread.status:leave"]!.local).toBeGreaterThan(0);
+  expect(JSON.stringify(telemetry)).not.toMatch(/private-|PRIVATE_TITLE|created-/);
+});
+
+test("subagent-heavy live-shaped 180 s replay stays below four lists and twelve thread reads per minute", async () => {
+  let at = 0;
+  const control = fakeControl([], { now: () => at });
+  for (let index = 0; index < 10; index++) control.add({ threadId: `private-${index}`, title: "PRIVATE_TITLE", state: "running",
+    activeRunId: `run:thread:private-${index}:ordinal:1`, latestRunId: `run:thread:private-${index}:ordinal:1` });
+  for (let index = 0; index < 6; index++) control.add({ threadId: `sub-${index}`, state: "running", parentThreadId: "private-0", relationshipToParent: "subagent" });
+  let statuses = 0;
+  let joins = 0;
+  let messages = 0;
+  let created = 0;
+  for (at = 0; at < 180_000; at += 250) {
+    // 32 total statuses/minute: 18 listed-thread reports and 14 subagent joins.
+    if (at >= (statuses + 1) * 60_000 / 18) {
+      const thread = control.threads.get(`private-${statuses % 10}`)!;
+      if (statuses % 3 === 0) thread.state = thread.state === "running" ? "waiting" : "running";
+      // Both state-only and run-scoped reports occur on the control stream.
+      await control.backend.notification({ type: "thread.status", threadId: thread.threadId, state: thread.state,
+        ...(statuses % 2 === 0 ? { runId: thread.activeRunId } : {}) });
+      statuses++;
+    }
+    if (at >= (joins + 1) * 60_000 / 14) {
+      await control.backend.notification({ type: "thread.status", threadId: `sub-${joins % 6}`, state: "running" });
+      joins++;
+    }
+    if (at >= (messages + 1) * 60_000 / 62) {
+      await control.backend.notification({ type: "message.completed", threadId: "private-0", role: "assistant" });
+      messages++;
+    }
+    // User messages and their metadata arrive in turn-sized bursts: 7 and 4/min.
+    const minuteOffset = at % 60_000;
+    if ([2_000, 3_000, 4_000, 25_000, 26_000, 27_000, 50_000].includes(minuteOffset)) {
+      await control.backend.notification({ type: "message.completed", threadId: "private-0", role: "user" });
+    }
+    if ([3_000, 4_000, 26_000, 27_000].includes(minuteOffset)) {
+      await control.backend.notification({ type: "thread.updated", threadId: "private-0", change: "thread.metadata-updated" });
+    }
+    if (at > 0 && at % 24_000 === 0) {
+      const threadId = `created-${created++}`;
+      const subagent = created % 4 !== 0;
+      control.add({ threadId, state: "running", parentThreadId: subagent ? "private-0" : null, relationshipToParent: subagent ? "subagent" : null });
+      await control.backend.notification({ type: "thread.created", threadId, parentThreadId: subagent ? "private-0" : null });
+    }
+    if (at > 0 && at % 60_000 === 0) {
+      const thread = control.threads.get("private-9")!;
+      thread.state = thread.state === "idle" ? "running" : "idle";
+      await control.backend.notification({ type: "thread.status", threadId: thread.threadId, state: thread.state, runId: thread.activeRunId });
+    }
+    await control.backend.sessionBoard();
+  }
+  const telemetry = control.backend.boardStatus()!;
+  console.info("subagent-heavy replay", JSON.stringify({ listsPerMinute: telemetry.boardFetches / 3, threadReadsPerMinute: telemetry.threadReads / 3 }));
+  expect([statuses, joins, messages, created]).toEqual([53, 41, 185, 7]);
+  expect(telemetry.boardFetches / 3).toBeLessThanOrEqual(4);
+  expect(telemetry.threadReads / 3).toBeLessThanOrEqual(12);
+  expect(telemetry.boardFetchErrors + telemetry.threadReadErrors).toBe(0);
+  expect(JSON.stringify(telemetry)).not.toMatch(/private-|PRIVATE_TITLE|created-|sub-/);
 });
 
 test("the full 500-row roster is mapped and warns once per ten minutes, before filtering iMessage", async () => {
@@ -336,7 +1064,7 @@ test("the full 500-row roster is mapped and warns once per ten minutes, before f
   expect(h.warnings).toEqual(["board-roster-at-limit", "board-roster-at-limit"]);
 });
 
-test("plain message wakes wait for the soft gap; status events use the hard gap", async () => {
+test("plain message wakes wait for the soft gap while cached status moves need no fetch", async () => {
   let at = now;
   const control = fakeControl([], { now: () => at });
   control.add({ threadId: "t", state: "running" });
@@ -355,22 +1083,46 @@ test("plain message wakes wait for the soft gap; status events use the hard gap"
     await control.backend.notification({ type: "thread.status", threadId: "t", state: "queued" });
     await control.backend.sessionBoard();
   }
-  expect(reads()).toBe(2);
+  expect(reads()).toBe(1);
   at += 3_000;
   await control.backend.sessionBoard();
-  expect(reads()).toBe(3);
+  expect(reads()).toBe(1);
+  at = now + 15_000;
+  await control.backend.sessionBoard();
+  expect(reads()).toBe(2);
+});
+
+test("assistant completions are counted without fetching inside thirty seconds", async () => {
+  let at = 0;
+  const control = fakeControl([], { now: () => at });
+  control.add({ threadId: "private-thread", title: "PRIVATE_TITLE", state: "running" });
+  const first = await control.backend.sessionBoard();
+  for (const time of [1_000, 3_000, 15_000, 29_999]) {
+    at = time;
+    expect(await control.backend.notification({ type: "message.completed", threadId: "private-thread", role: "assistant" })).toBeUndefined();
+    expect(await control.backend.sessionBoard()).toBe(first);
+    expect(control.backend.boardStatus()?.boardFetches).toBe(1);
+  }
+  const store = new Store(":memory:");
+  stores.push(store);
+  const api = createApi({ store, enabled: () => true, chatId: () => 100, timezone: "UTC", health: () => ({ board: control.backend.boardStatus() }) });
+  const health = await (await api(new Request("http://bridge/health"))).json();
+  expect(health.board.dirtyEventsByType).toEqual({ "message.completed:assistant": { hard: 0, soft: 0, local: 4 } });
+  expect(JSON.stringify(health)).not.toMatch(/private-thread|PRIVATE_TITLE/);
+  at = 30_000;
+  expect(await control.backend.sessionBoard()).not.toBe(first);
+  expect(control.backend.boardStatus()?.fetchesByReason).toEqual({ cold: 1, age: 1, hard: 0, soft: 0 });
 });
 
 type DirtyEvent = [Record<string, unknown>, boolean];
 test.each<DirtyEvent>([
   [{ type: "ready" }, true],
   [{ type: "thread.created" }, true],
-  ...["running", "waiting", "idle", "queued", "needs-input"].map<DirtyEvent>(state => [{ type: "thread.status", state }, true]),
   ...["request.opened", "request.resolved"].map<DirtyEvent>(type => [{ type, kind: "approval", requestId: "r" }, true]),
   ...["thread.archived", "thread.unarchived", "thread.deleted", "thread.settled", "thread.unsettled",
     "thread.runtime-mode-updated", "run.created", "run.updated", "runtime-request.updated"].map<DirtyEvent>(change => [{ type: "thread.updated", change }, true]),
   ...["thread.model-selection-updated", "thread.interaction-mode-updated", "thread.renamed", "message.updated"].map<DirtyEvent>(change => [{ type: "thread.updated", change }, false]),
-  ...["user", "assistant"].map<DirtyEvent>(role => [{ type: "message.completed", role }, false]),
+  [{ type: "message.completed", role: "user" }, false],
   [{ type: "thread.status", state: "future-state" }, false],
   [{ type: "future.event" }, false],
   [{ type: "constructor" }, false],
@@ -382,7 +1134,8 @@ test.each<DirtyEvent>([
   at += 3_000;
   await control.backend.notification({ threadId: "t", ...data });
   const eventKey = data.type === "thread.updated" ? `thread.updated:${data.change}` : String(data.type);
-  expect(control.backend.boardStatus()?.dirtyEventsByType).toEqual({ [eventKey]: { hard: dirty ? 1 : 0, soft: dirty ? 0 : 1 } });
+  expect(control.backend.boardStatus()?.dirtyEventsByType).toEqual({ [eventKey]: data.type === "thread.created"
+    ? { hard: 0, soft: 0, local: 1 } : { hard: dirty ? 1 : 0, soft: dirty ? 0 : 1 } });
   await control.backend.sessionBoard();
   expect(control.backend.boardStatus()?.boardFetches).toBe(dirty ? 2 : 1);
   at += 11_999;
@@ -588,7 +1341,7 @@ test("while nothing is pending, requests are read once a minute; an open notice 
   setSystemTime(now);
   const control = fakeControl();
   control.add({ threadId: "a", title: "Build", state: "running" });
-  control.add({ threadId: "sub", title: "Helper", state: "running", parentThreadId: "a" });
+  control.add({ threadId: "sub", title: "Helper", state: "running", parentThreadId: "a", relationshipToParent: "subagent" });
   const reads = () => control.calls.filter(call => call.path === "/requests").length;
   const { store, attention: alerts } = attention(control.backend);
   await alerts.tick();
@@ -614,7 +1367,7 @@ test("a request in a folder the board does not list is still found, such as a su
   setSystemTime(now);
   const control = fakeControl();
   control.add({ threadId: "a", title: "Build", state: "running" });
-  control.add({ threadId: "sub", title: "Helper", state: "running", parentThreadId: "a", worktreePath: "/repo/child",
+  control.add({ threadId: "sub", title: "Helper", state: "running", parentThreadId: "a", relationshipToParent: "subagent", worktreePath: "/repo/child",
     pending: [{ requestId: "perm-sub", kind: "approval", requestKind: "command", title: "bash", prompt: "ls", canRespond: true }] });
   const { store, attention: alerts } = attention(control.backend);
   await alerts.tick();
@@ -706,4 +1459,155 @@ test.each([
   await control.backend.sessionBoard();
 });
 
-useToolLogFixture();
+const streamLogs = useToolLogFixture();
+
+
+type StreamScript = (abort: AbortController) => AsyncGenerator<ControlEventFrame, void, unknown>;
+async function scriptedStreams(scripts: StreamScript[]) {
+  const control = fakeControl([], { now: () => now });
+  const abort = new AbortController();
+  const resumes: Array<number | undefined> = [];
+  const delays: number[] = [];
+  let index = 0;
+  control.backend.client.events = async function* (options) {
+    resumes.push(options.after);
+    const script = scripts[index++];
+    if (!script) { abort.abort(); return; }
+    yield* script(abort);
+  };
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, delay: number) => {
+    delays.push(delay);
+    callback();
+    return 0;
+  }) as unknown as typeof setTimeout);
+  const events = [];
+  let callbacks = 0;
+  try {
+    for await (const event of control.backend.notifications(abort.signal, () => { callbacks++; })) events.push(event);
+  } finally { timer.mockRestore(); }
+  return { control, events, callbacks, resumes, delays };
+}
+
+test("stream ends record first-frame lifetimes, clean and error-frame ends, and preserve replay/backoff", async () => {
+  let at = now;
+  // Use the injected wall clock for both the board window and connection durations.
+  const control = fakeControl([], { now: () => at });
+  const abort = new AbortController();
+  let connection = 0;
+  const resumes: Array<number | undefined> = [];
+  control.backend.client.events = async function* (options) {
+    resumes.push(options.after);
+    if (connection++ === 0) {
+      yield { id: "5", data: { type: "ready", threadId: "thread:PRIVATE_ID", title: "PRIVATE_TITLE" } };
+      at += 10;
+      yield { id: "6", data: { type: "future.event", text: "PRIVATE_PAYLOAD" } };
+      at += 75;
+      yield { id: "7", data: { type: "error", code: "replica_lag", token: "PRIVATE_TOKEN" } };
+    } else if (connection === 2) {
+      at += 100;
+      yield { id: "8", data: { type: "ready" } };
+      at += 25;
+    } else { abort.abort(); }
+  };
+  const delays: number[] = [];
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, delay: number) => {
+    delays.push(delay); callback(); return 0;
+  }) as unknown as typeof setTimeout);
+  let callbacks = 0;
+  try { for await (const event of control.backend.notifications(abort.signal, () => { callbacks++; })) void event; }
+  finally { timer.mockRestore(); }
+  const stats = control.backend.boardStatus()!;
+  expect(stats).toMatchObject({ streamConnects: 2, streamEndsByKind: { errorFrame: 1, clean: 1, thrown: 0, aborted: 1 },
+    streamLastConnectedMs: 25, streamMinConnectedMs: 25, streamMaxConnectedMs: 85, streamErrorCodes: { replica_lag: 1 },
+    lastStreamEndAt: new Date(at).toISOString(), lastStreamEndKind: "aborted", windowStartedAt: new Date(now).toISOString(),
+    dirtyEventsByType: { ready: { hard: 2, soft: 0 }, error: { hard: 0, soft: 1 } } });
+  expect(callbacks).toBe(4);
+  expect(resumes).toEqual([undefined, 7, 8]);
+  // The no-frame abort still follows the existing reconnect sleep path.
+  expect(delays).toEqual([1000, 1000, 2000]);
+  expect(streamLogs.entries().filter(row => row.name === "tg.robob.streamEnd").map(row => row.props)).toEqual([
+    { kind: "errorFrame", connectedMs: 85, code: "replica_lag" },
+    { kind: "clean", connectedMs: 25, code: "none" },
+    { kind: "aborted", connectedMs: null, code: "none" },
+  ]);
+  const { attention: alerts } = attention(control.backend);
+  expect(alerts.status().board).toEqual(stats);
+  const store = new Store(":memory:"); stores.push(store);
+  const api = createApi({ store, enabled: () => true, chatId: () => 100, timezone: "UTC", health: () => ({ board: control.backend.boardStatus() }) });
+  const health = await (await api(new Request("http://bridge/health"))).json();
+  expect(health.board).toEqual(stats);
+  expect(JSON.stringify(health) + streamLogs.text()).not.toContain("PRIVATE_");
+  stats.streamEndsByKind.clean = 100;
+  stats.streamErrorCodes.replica_lag = 100;
+  expect(control.backend.boardStatus()?.streamEndsByKind.clean).toBe(1);
+  expect(control.backend.boardStatus()?.streamErrorCodes.replica_lag).toBe(1);
+});
+
+test("stream throws retain toolError and aborts override thrown and error-frame outcomes", async () => {
+  const result = await scriptedStreams([
+    async function* () { yield { data: { type: "ready" } }; throw new Error("PRIVATE_ERROR"); },
+    async function* (abort) { yield { data: { type: "error", code: "replica_lag" } }; abort.abort(); throw new Error("PRIVATE_ABORT"); },
+  ]);
+  expect(result.control.backend.boardStatus()).toMatchObject({ streamConnects: 2,
+    streamEndsByKind: { errorFrame: 0, clean: 0, thrown: 1, aborted: 1 }, lastStreamEndKind: "aborted" });
+  expect(result.delays).toEqual([1000]);
+  expect(streamLogs.entries().filter(row => row.error?.tag === "tg.robob.notifications")).toHaveLength(2);
+  expect(streamLogs.entries().filter(row => row.name === "tg.robob.streamEnd").map(row => row.props?.kind)).toEqual(["thrown", "aborted"]);
+  expect(streamLogs.text()).not.toContain("PRIVATE_");
+});
+
+test("stream auth failures still escape and record a thrown attempt with no connected lifetime", async () => {
+  const control = fakeControl();
+  const error = new ControlError(401, "unauthorized");
+  control.backend.client.events = async function* () { throw error; };
+  const stream = control.backend.notifications(new AbortController().signal);
+  await expect(stream.next()).rejects.toBe(error);
+  expect(control.backend.boardStatus()).toMatchObject({ streamConnects: 0,
+    streamEndsByKind: { thrown: 1 }, streamLastConnectedMs: null, streamMinConnectedMs: null, streamMaxConnectedMs: null });
+  expect(streamLogs.entries().filter(row => row.error?.tag === "tg.robob.notifications")).toHaveLength(1);
+});
+
+test("error-frame codes are bounded, private payloads are excluded, and only the final frame determines clean ends", async () => {
+  const result = await scriptedStreams([async function* () {
+    yield { data: { type: "ready" } };
+    for (const code of ["replica_lag", undefined, "PRIVATE_TITLE", "x".repeat(41), "", 123, "bad code", "__proto__", "constructor",
+      ...Array.from({ length: 25 }, (_, index) => `code-${index}`), "replica_lag"]) {
+      yield { data: { type: "error", code, threadId: "thread:PRIVATE_ID", title: "PRIVATE_TITLE", text: "PRIVATE_PAYLOAD" } };
+    }
+    yield { data: { type: "ready" } };
+  }]);
+  const stats = result.control.backend.boardStatus()!;
+  expect(stats.streamConnects).toBe(1);
+  expect(stats.streamEndsByKind).toEqual({ errorFrame: 0, clean: 1, thrown: 0, aborted: 1 });
+  expect(Object.keys(stats.streamErrorCodes)).toHaveLength(21);
+  expect(stats.streamErrorCodes).toMatchObject({ replica_lag: 2, none: 6, constructor: 1, ["__proto__"]: 1, other: 9 });
+  expect(JSON.stringify(stats) + streamLogs.text()).not.toContain("PRIVATE_");
+  const fresh = fakeControl().backend.boardStatus()!;
+  expect(fresh.streamConnects).toBe(0);
+  expect(fresh.streamErrorCodes).toEqual({});
+});
+
+
+test.each([
+  ["replica_lag", "replica_lag"], ["a.b-c_9", "a.b-c_9"], ["x".repeat(40), "x".repeat(40)],
+  ["__proto__", "__proto__"], ["constructor", "constructor"], ["other", "other"],
+  [undefined, "none"], [null, "none"], [123, "none"], ["", "none"], ["x".repeat(41), "none"],
+  ["PRIVATE_TITLE", "none"], ["bad code", "none"], ["thread:private-id", "none"], ["line\n", "none"],
+] satisfies Array<[unknown, string]>)("final error code %p is counted and logged as %s", async (code, expected) => {
+  const result = await scriptedStreams([async function* () { yield { data: { type: "ready" } }; yield { data: { type: "error", code } }; }]);
+  expect(result.control.backend.boardStatus()?.streamEndsByKind.errorFrame).toBe(1);
+  expect(result.control.backend.boardStatus()?.streamErrorCodes).toEqual({ [expected]: 1 });
+  const end = streamLogs.entries().find(row => row.name === "tg.robob.streamEnd");
+  expect(end?.props).toEqual({ kind: "errorFrame", connectedMs: 0, code: expected });
+});
+
+test("overflow error code logs as other and aborting a clean iterator records only aborted", async () => {
+  const result = await scriptedStreams([async function* (abort) {
+    for (let index = 0; index < 25; index++) yield { data: { type: "error", code: `code-${index}` } };
+    abort.abort();
+  }]);
+  expect(result.control.backend.boardStatus()?.streamEndsByKind).toEqual({ errorFrame: 0, clean: 0, thrown: 0, aborted: 1 });
+  expect(streamLogs.entries().find(row => row.name === "tg.robob.streamEnd")?.props).toEqual({ kind: "aborted", connectedMs: 0, code: "other" });
+  const empty = await scriptedStreams([async function* (abort) { abort.abort(); }]);
+  expect(empty.control.backend.boardStatus()).toMatchObject({ streamConnects: 0, streamEndsByKind: { aborted: 1 }, streamLastConnectedMs: null });
+});

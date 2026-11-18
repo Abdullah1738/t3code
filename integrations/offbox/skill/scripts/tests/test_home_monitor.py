@@ -32,7 +32,7 @@ NO_INTERNET = dict(ONLINE, online=False, internet=False, internet_detail="1.1.1.
 GOOD = {"mode": "ok", "reasons": [], "pool": "ONLINE", "mdraid": "ok", "boot_id": "boot-a", "version": "1.0",
         "uptime_s": 86400, "boatd_uptime_s": 86000}
 BACKEND_KEYS = {"state", "since", "good_streak", "bad_streak", "last_check", "last_ok", "reason", "outage_id",
-                "degraded"}
+                "degraded", "disk", "last_outcome", "class", "last_answer", "boot_id", "slow_since", "flaps_today"}
 
 
 class FakeEffects:
@@ -107,7 +107,7 @@ class Sim:
             return {"ok": ok, "error": "" if ok else error, "health": health or (GOOD if ok else {})}
 
         return hm.tick(self.dir, dry_run=dry_run, clock=lambda: self.now, check=check,
-                       mac=lambda url: dict(mac), effects=effects or self.fx)
+                       mac=lambda url: dict(mac), effects=effects or self.fx, tcp=lambda url: False)
 
     def down(self):
         """One good check, then the two failures that mean down."""
@@ -249,7 +249,7 @@ class StateMachineTests(Base):
                        "home-incidents.md", URL + "/health"):
             self.assertIn(needle, prompt)
         telegram = sim.fx.telegrams[0]["text"]
-        for needle in ("Home offbox is down", "Runs moved to Boat", "A repair agent is on it"):
+        for needle in ("Home offbox is down", "Only new submissions may fail over to Boat", "A repair agent is on it"):
             self.assertIn(needle, telegram)
 
     def test_one_fail_then_good_is_nothing(self):
@@ -360,7 +360,9 @@ class StateMachineTests(Base):
         self.assertEqual(sim.tick()["state"], "home_down")
         self.assertEqual(sim.fx.sent, [])
         restarted = dict(GOOD, boot_id="boot-b", uptime_s=95)
-        result = sim.tick(health=restarted)
+        self.assertEqual(sim.tick(health=restarted)["good_streak"], 0)
+        for _ in range(3):
+            result = sim.tick(health=restarted)
         self.assertEqual((result["state"], result["events"], result["good_streak"]), ("home_up", ["up"], 3))
         backend = sim.backend()
         self.assertEqual((backend["state"], backend["since"], backend["reason"], backend["outage_id"]),
@@ -476,6 +478,35 @@ class StateMachineTests(Base):
         sim.fx.open[sim.fx.created[0]["thread"]] = True
         sim.tick(ok=False)
         self.assertEqual(len([item for item in sim.fx.sent if ":down:" in item["request_id"]]), 1)
+
+    def test_loop_stall_alert_dedupes_changing_age_and_logs_recovery(self):
+        sim = Sim(self)
+        for age in (180, 240, 5400):
+            problem = f"reaper has not completed a pass for {age} s (disk I/O error)"
+            health = dict(GOOD, degraded=True, mode="degraded", reasons=[problem],
+                          loops={"reaper": {"stalled": True, "problem": problem}})
+            result = sim.tick(health=health)
+            self.assertEqual((result["state"], result["bad_streak"]), ("home_up", 0))
+        self.assertEqual(len(sim.fx.telegrams), 1)
+        self.assertIn("offbox-home-degraded:reaper:", sim.fx.telegrams[0]["key"])
+        self.assertEqual(sim.fx.created, [])
+        self.assertIn("class=degraded", sim.log())
+        self.assertIn("loop=reaper", sim.log())
+        sim.tick(health=dict(GOOD, loops={"reaper": {"stalled": False}}))
+        self.assertIn("loop_recovered loop=reaper", sim.log())
+        sim.tick(health=health)
+        self.assertEqual(len(sim.fx.telegrams), 2)
+
+    def test_loop_alert_retry_keeps_key_and_original_text(self):
+        sim = Sim(self)
+        sim.fx.fail.add("telegram")
+        for age in (180, 240):
+            problem = f"sampler has not completed a pass for {age} s (disk)"
+            sim.tick(health=dict(GOOD, mode="degraded", degraded=True, reasons=[problem],
+                                loops={"sampler": {"stalled": True, "problem": problem}}))
+            sim.fx.fail.clear()
+        self.assertEqual(len(sim.fx.telegrams), 1)
+        self.assertIn("180 s", sim.fx.telegrams[0]["text"])
 
     def test_degraded_but_serving(self):
         sim = Sim(self)
@@ -597,16 +628,16 @@ class StateMachineTests(Base):
         sim.down()
         sim.up()
         log = sim.log()
-        for needle in ("check-fail class=timeout verdict=bad bad_streak=1", "state=home_down outage=",
+        for needle in ("class=hard", "verdict=bad state=home_up bad_streak=1", "state=home_down outage=",
                        "action=thread-create ok=True", "action=telegram-down ok=True", "state=home_up",
                        "action=thread-send-up ok=True"):
             self.assertIn(needle, log)
         self.assertNotIn("Rules in short", log)
-        # Steady good checks are not logged.
+        # Every check is logged, including steady good replies.
         size = len(log)
         for _ in range(5):
             sim.tick()
-        self.assertEqual(len(sim.log()), size)
+        self.assertGreater(len(sim.log()), size)
 
     def test_step_is_pure(self):
         state = hm.fresh_state(1000.0)
@@ -706,6 +737,20 @@ def serve(case, route):
 
 
 class HttpTests(Base):
+    def test_degraded_health_is_serving_even_if_ok_false_but_hard_failures_win(self):
+        body = {"ok": False, "degraded": True, "mode": "degraded", "reasons": [],
+                "loops": {"sampler": {"stalled": True, "problem": "sampler stalled", "last_ok": 100}}}
+        _, base = serve(self, lambda *args: (200, body))
+        url = base + "/api/v1"
+        result = hm.check_health(url)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["health"]["loops"]["sampler"]["stalled"])
+        body["disk_full"] = True
+        self.assertEqual(hm.check_health(url)["error"], "disk_full")
+        del body["disk_full"]
+        body["reasons"] = ["incus is not answering"]
+        self.assertFalse(hm.check_health(url)["ok"])
+
     def test_health_check_against_a_real_socket(self):
         answers = {}
         server, base = serve(self, lambda method, path, body: answers["next"])
@@ -718,7 +763,7 @@ class HttpTests(Base):
         self.assertEqual((result["ok"], result["error"]), (True, ""))
         self.assertEqual(result["health"], {"mode": "ok", "reasons": [], "pool": "ONLINE", "mdraid": "ok",
                                             "boot_id": "b-1", "version": "0.3", "uptime_s": 123,
-                                            "boatd_uptime_s": 45, "starting": False, "phase": "", "startedAt": None})
+                                            "boatd_uptime_s": 45, "starting": False, "phase": "", "startedAt": None, "snapshot_age_s": None, "refresh_stage": "", "degraded": False})
         del full["boatd_uptime_s"]   # not in the contract: fine without it
         self.assertIsNone(hm.check_health(url)["health"]["boatd_uptime_s"])
         seen = server.seen[-1]
@@ -923,6 +968,221 @@ class InstallTests(unittest.TestCase):
         for needle in ("WIPE-EVERYTHING", "zpool destroy", "home-incidents.md", "OFFBOX_KVM_URL", "offbox-status"):
             self.assertIn(needle, runbook)
         self.assertIn("com.ardud.offbox-home-monitor", (OFFBOX / "README.md").read_text())
+
+
+
+
+class SlowHealth(unittest.TestCase):
+    def test_slow_grace_recovery_and_no_outage_actions(self):
+        sim = Sim(self)
+        sim.tick()
+        for _ in range(2):
+            sim.now += 60
+            result = hm.tick(sim.dir, clock=lambda: sim.now, effects=sim.fx,
+                             check=lambda u: dict(ok=False, error="timeout", health={}),
+                             retry=lambda u: dict(ok=False, error="timeout", health={}),
+                             mac=lambda u: dict(ONLINE, peer_online=True, peer_path="direct"), tcp=lambda u: True)
+            self.assertEqual(result["state"], "home_slow")
+        self.assertEqual(sim.fx.calls, [])
+        sim.tick()
+        self.assertEqual(sim.backend()["state"], "home_up")
+        log = (sim.dir / "home-monitor.log").read_text()
+        self.assertIn("flap class=slow lasted_s=120.0", log)
+        self.assertIn("ms=", log)
+        self.assertIn("peer_path=direct", log)
+        self.assertIn("boot_id=boot-a", log)
+        self.assertEqual(sim.backend()["flaps_today"]["slow"], 1)
+
+    def test_silence_after_bound_alerts_and_slow_retry_can_recover(self):
+        sim = Sim(self)
+        sim.tick()
+        def tick(retry_ok=False):
+            sim.now += 60
+            return hm.tick(sim.dir, clock=lambda: sim.now, effects=sim.fx,
+                           check=lambda u: dict(ok=False, error="timeout", health={}),
+                           retry=lambda u: dict(ok=retry_ok, error="" if retry_ok else "timeout", health=GOOD),
+                           mac=lambda u: dict(ONLINE, peer_online=True), tcp=lambda u: True)
+        self.assertEqual(tick(True)["verdict"], "good")
+        for _ in range(5):
+            result = tick()
+        self.assertEqual(result["state"], "home_down")
+        self.assertEqual(len(sim.fx.created), 1)
+        self.assertEqual(len(sim.fx.telegrams), 1)
+        self.assertIn("slow_ms=", (sim.dir / "home-monitor.log").read_text())
+
+    def test_boot_change_is_hard_then_normal_checks_recover(self):
+        sim = Sim(self)
+        sim.tick()
+        changed = dict(GOOD, boot_id="boot-b")
+        result = sim.tick(health=changed)
+        self.assertEqual(result["bad_streak"], 1)
+        sim.tick(ok=False, error="refused")
+        self.assertEqual(sim.backend()["state"], "home_down")
+        for _ in range(3):
+            sim.tick(health=changed)
+        self.assertEqual(sim.backend()["state"], "home_up")
+
+    def test_daily_summary_and_live_counts(self):
+        state = hm.load_state(Path("/nonexistent-offbox-test"), 1_800_000_000)
+        events = []
+        day = hm.flap_counts(state, 1_800_000_000, events)
+        hm.account_flap(state, "slow", 1_800_000_000, day, events, True)
+        hm.account_flap(state, "slow", 1_800_000_030, day, events, False)
+        self.assertEqual((day["slow"], day["slow_max_s"], day["slow_total_s"]), (1, 30, 30))
+        hm.flap_counts(state, 1_800_086_400, events)
+        self.assertTrue(any(e.startswith("flap-summary day=") and "slow=1" in e for e in events))
+        self.assertEqual(state["flaps_today"]["slow"], 0)
+
+
+class SlowMonitorEvidence(unittest.TestCase):
+    def test_offline_peer_is_hard_without_long_probe(self):
+        sim = Sim(self)
+        sim.tick()
+        for _ in range(2):
+            sim.now += 60
+            with patch.object(hm, "check_health", side_effect=AssertionError("offline peer needs no retry")):
+                result = hm.tick(sim.dir, clock=lambda: sim.now, effects=sim.fx,
+                                 check=lambda u: dict(ok=False, error="timeout", health={}),
+                                 mac=lambda u: dict(ONLINE, peer_online=False), tcp=lambda u: True)
+        self.assertEqual(result["state"], "home_down")
+        self.assertEqual(sim.backend()["flaps_today"]["down"], 1)
+
+    def test_rollover_writes_one_summary_and_emits_daily_toollog(self):
+        import datetime as dt
+        sim = Sim(self)
+        sim.now = dt.datetime(2026, 11, 14, 23, 57, tzinfo=hm.DUBAI).timestamp()
+        sim.tick()
+        sim.tick(ok=False, error="refused")
+        with patch("toollog.emit") as emit:
+            sim.tick(ok=False, error="refused")
+        log = sim.log()
+        self.assertEqual(log.count("flap-summary day=2026-11-14"), 1)
+        self.assertTrue(any(c.args[:2] == ("backend", "backend.home_flaps_daily") for c in emit.call_args_list))
+        self.assertEqual(hm.status(sim.dir)["flaps_today"]["day"], "2026-11-15")
+
+    def test_stale_snapshot_remains_good_and_logs_age_and_stage(self):
+        sim = Sim(self)
+        sim.tick(health=dict(GOOD, snapshot_age_s=90, refresh_stage="incus"))
+        self.assertEqual(sim.backend()["state"], "home_up")
+        self.assertIn("snapshot_age_s=90 refresh_stage=incus", sim.log())
+
+
+class ReviewMonitorRegressions(unittest.TestCase):
+    def test_down_starting_slow_good_preserves_three_check_recovery(self):
+        sim = Sim(self)
+        sim.down()
+        sim.tick(ok=False, health={"starting": True, "phase": "reconciling"})
+        calls = len(sim.fx.calls)
+        sim.now += 60
+        result = hm.tick(sim.dir, clock=lambda: sim.now, effects=sim.fx,
+                         check=lambda u: dict(ok=False, error="timeout", health={}),
+                         retry=lambda u: dict(ok=False, error="timeout", health={}),
+                         mac=lambda u: dict(ONLINE, peer_online=True), tcp=lambda u: True)
+        self.assertEqual(result["state"], "home_slow")
+        self.assertEqual(len(sim.fx.calls), calls)
+        self.assertEqual(sim.tick()["state"], "home_down")
+        self.assertEqual(sim.tick()["state"], "home_down")
+        self.assertEqual(sim.tick()["state"], "home_up")
+        state = json.loads((sim.dir / "home-monitor.json").read_text())
+        self.assertIsNotNone(state["outage"]["recovered_at"])
+        self.assertTrue(sim.fx.sent)
+
+    def test_boot_change_log_uses_current_response_evidence(self):
+        sim = Sim(self)
+        sim.tick()
+        sim.tick(health=dict(GOOD, boot_id="boot-b", boatd_uptime_s=3))
+        line = sim.log().splitlines()[-1]
+        self.assertIn("boot_id=boot-b boatd_uptime_s=3", line)
+        self.assertIn("class=hard", line)
+
+    def test_down_notices_distinguish_existing_runs_from_new_submits(self):
+        sim = Sim(self)
+        sim.down()
+        state = json.loads((sim.dir / "home-monitor.json").read_text())
+        for text in (hm.telegram_down_text(state, True), hm.down_text(state, URL, True), hm.down_text(state, URL, False)):
+            self.assertIn("Running and queued home runs stay on home", text)
+            self.assertIn("Only new submissions may fail over", text)
+            self.assertIn("Do not kill an existing run because of this alert", text)
+            self.assertNotIn("Runs moved to Boat", text)
+
+    def test_real_toollog_keeps_health_and_daily_fields(self):
+        import toollog
+        sim = Sim(self)
+        with patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(sim.dir / "tools")):
+            sim.tick()
+            toollog.emit("backend", "backend.home_flaps_daily", props=dict(day="2026-11-15", slow=2,
+                         slow_max_s=120.0, slow_total_s=180.0, starting=1, starting_max_s=8.0, down=0))
+        rows = [json.loads(line) for path in (sim.dir / "tools").glob("*.ndjson") for line in path.read_text().splitlines()]
+        check = next(r for r in rows if r["name"] == "backend.health_check")["props"]
+        self.assertEqual((check["class"], check["outcome"], check["boot_id"]), ("good", "good", "boot-a"))
+        self.assertIn("ms", check)
+        daily = next(r for r in rows if r["name"] == "backend.home_flaps_daily")["props"]
+        self.assertEqual((daily["day"], daily["slow"], daily["slow_max_s"]), ("2026-11-15", 2, 120.0))
+
+
+class RecoveryTransitions(unittest.TestCase):
+    def test_recovered_expired_startup_does_not_poison_a_later_slow_flap(self):
+        sim = Sim(self)
+        sim.down()
+        with patch.dict(os.environ, OFFBOX_HOME_START_WAIT_S="60"):
+            for _ in range(3):
+                sim.tick(ok=False, health={"starting": True, "phase": "reconcile"})
+        self.assertEqual(sim.backend()["state"], "home_down")
+        sim.up()
+        self.assertEqual(sim.backend()["state"], "home_up")
+        sim.now += 60
+        hm.tick(sim.dir, clock=lambda: sim.now, effects=sim.fx,
+                check=lambda u: dict(ok=False, error="timeout", health={}),
+                retry=lambda u: dict(ok=False, error="timeout", health={}),
+                mac=lambda u: dict(ONLINE, peer_online=True), tcp=lambda u: True)
+        self.assertEqual(sim.tick()["state"], "home_up")
+
+    def test_last_ok_is_when_the_reply_arrived(self):
+        sim = Sim(self)
+        def check(url):
+            sim.now += 15
+            return dict(ok=True, error="", health=GOOD)
+        hm.tick(sim.dir, clock=lambda: sim.now, effects=sim.fx, check=check,
+                mac=lambda u: ONLINE, tcp=lambda u: False)
+        self.assertEqual(sim.backend()["last_ok"], sim.now)
+
+
+class DownProvenanceMatrix(unittest.TestCase):
+    def test_flap_mode_sequences_preserve_alert_recovery_hysteresis(self):
+        sequences = [("slow", "starting"), ("starting", "slow"), ("slow", "starting", "slow"),
+                     ("starting", "slow", "starting")]
+        for sequence in sequences:
+            sim = Sim(self)
+            sim.down()
+            with self.subTest(sequence=sequence), patch.dict(os.environ, OFFBOX_HOME_SLOW_DOWN_AFTER_S="600"):
+                for mode in sequence:
+                    sim.now += 60
+                    check = dict(ok=False, error="timeout" if mode == "slow" else "not_ok",
+                                 health={} if mode == "slow" else {"starting": True, "phase": "reconcile"})
+                    hm.tick(sim.dir, clock=lambda: sim.now, effects=sim.fx, check=lambda u: check,
+                            retry=lambda u: check, mac=lambda u: dict(ONLINE, peer_online=True), tcp=lambda u: True)
+                self.assertEqual(sim.tick()["state"], "home_down")
+                self.assertEqual(sim.tick()["state"], "home_down")
+                self.assertEqual(sim.tick()["state"], "home_up")
+                state = json.loads((sim.dir / "home-monitor.json").read_text())
+                self.assertFalse(state.get("starting_from_down") or state.get("slow_from_down"))
+
+
+class StartupAnswerSilence(unittest.TestCase):
+    def test_recent_startup_answer_refreshes_slow_grace_and_suppresses_alerts(self):
+        sim = Sim(self)
+        sim.tick()
+        for _ in range(4):
+            sim.tick(ok=False, health={"starting": True, "phase": "reconcile"})
+        sim.now += 60
+        result = hm.tick(sim.dir, clock=lambda: sim.now, effects=sim.fx,
+                         check=lambda u: dict(ok=False, error="timeout", health={}),
+                         retry=lambda u: dict(ok=False, error="timeout", health={}),
+                         mac=lambda u: dict(ONLINE, peer_online=True), tcp=lambda u: True)
+        self.assertEqual(result["state"], "home_slow")
+        self.assertEqual(sim.fx.calls, [])
+        self.assertIn("silent_s=60.0", sim.log())
+        self.assertEqual(sim.tick()["state"], "home_up")
 
 
 if __name__ == "__main__":

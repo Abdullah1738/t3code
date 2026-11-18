@@ -9,6 +9,8 @@ import {
   RESTART_RESUMED_REASON,
 } from '../lib/detect.mjs';
 import { restartScan, RESTART_SETTLE_MS, RESTART_RESUME_WINDOW_MS } from '../lib/restartwatch.mjs';
+import { fixture as logFixture } from '../../router-logging/test/support.mjs';
+import { assertScanProps } from './scan-props.mjs';
 
 // Fixtures modelled on the 15 Oct 18:17Z restart (statev2 rows, OpenCode messages).
 const T0 = Date.parse('2026-10-15T18:17:44.747Z');
@@ -157,7 +159,7 @@ function fakeIo({ subs = [], delegated = [], runs = [], threads, later = {}, oc 
     OC_URL: 'http://oc',
     assertReplicaFresh: () => {},
     assertThreadInReplica: () => {},
-    serverRuntime: () => ({ pid: 81615, procStartMs: Date.parse('2026-10-15T18:16:17Z'), readyMs: Date.parse('2026-10-15T18:17:53.316Z') }),
+    loadStallState: () => ({ stalls: {} }), serverRuntime: () => ({ pid: 81615, procStartMs: Date.parse('2026-10-15T18:16:17Z'), readyMs: Date.parse('2026-10-15T18:17:53.316Z') }),
     openCodeRuntime: () => null,
     restartRunsSince: () => runs,
     restartNoteRun: () => null,
@@ -406,7 +408,7 @@ test('stall-watch interrupts are not treated as lost delegated tasks', async () 
       { ses: 'ses_stalled', action: 'opencode', interruptedAt: T0 },
       { threadId: row.child_thread_id, action: 'robob', interruptedAt: T0 },
     ]) {
-      const report = await restartScan(scanArgs({ handled: {}, servers: [], stalls: { stall } }, { db }), io);
+      const report = await restartScan(scanArgs({ handled: {}, servers: [] }, { db }), { ...io, loadStallState: () => ({ stalls: { stall } }) });
       assert.equal(report.length, 0);
     }
     assert.equal(calls.send.length + calls.telegram.length, 0);
@@ -494,18 +496,18 @@ test('restartScan sends one note per affected thread and one summary, then never
   assert.equal(calls.telegram.length, 1);
 });
 
-test('an unavailable or expired replica never causes recovery or consumes retries', async () => {
+for (const code of ['REPLICA_UNAVAILABLE', 'REPLICA_NOT_READY', 'REPLICA_BEHIND_THREAD']) test(`${code} never causes recovery or consumes retries`, async () => {
   const fake = fakeIo({ subs: restartBurst(), threads });
   const state = { handled: {}, servers: [] };
-  const unavailable = () => { throw Object.assign(new Error('replica stale'), { code: 'REPLICA_UNAVAILABLE' }); };
+  const unavailable = () => { throw Object.assign(new Error('replica deferred'), { code }); };
   fake.io.assertReplicaFresh = unavailable;
-  await assert.rejects(restartScan(scanArgs(state), fake.io), /replica stale/);
+  await assert.rejects(restartScan(scanArgs(state), fake.io), e => e.code === code);
   assert.deepEqual(state.handled, {});
   assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
 
   let checks = 0;
   fake.io.assertReplicaFresh = () => { if (++checks > 1) unavailable(); };
-  await assert.rejects(restartScan(scanArgs(state), fake.io), /replica stale/);
+  await assert.rejects(restartScan(scanArgs(state), fake.io), e => e.code === code);
   assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
   assert.equal(Object.values(state.handled).some((h) => h.done), false);
 });
@@ -513,12 +515,86 @@ test('an unavailable or expired replica never causes recovery or consumes retrie
 test('a newer control thread defers recovery without sending or consuming failure retries', async () => {
   const fake = fakeIo({ subs: restartBurst(), threads });
   fake.io.assertThreadInReplica = () => {
-    throw Object.assign(new Error('thread newer than replica'), { code: 'REPLICA_UNAVAILABLE' });
+    throw Object.assign(new Error('thread newer than replica'), { code: 'REPLICA_BEHIND_THREAD' });
   };
   const state = { handled: {}, servers: [] };
-  await assert.rejects(restartScan(scanArgs(state), fake.io), /thread newer than replica/);
+  await restartScan(scanArgs(state), fake.io);
   assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
   assert.equal(Object.values(state.handled).some((entry) => entry.done || entry.failures), false);
+});
+
+test('an ahead delegated child defers its initial parent note while another parent recovers', async t => {
+  const { rows } = logFixture(t);
+  const { db, task } = delegatedFixture();
+  t.after(() => db.close());
+  const child = task('ahead-initial');
+  const childId = child.child_thread_id;
+  const { io, calls } = fakeIo({runs:[run('healthy')],delegated:dbIo.cancelledDelegatedTasksSince(db, iso(T0)),threads:{
+    batch:{threadId:'batch'}, healthy:{threadId:'healthy'}, [childId]:{threadId:childId},
+  }});
+  io.assertThreadInReplica = (_db, thread) => {
+    if (thread.threadId === childId) throw Object.assign(new Error('thread is newer than Robob replica; recovery deferred'), {
+      code:'REPLICA_BEHIND_THREAD',replicaGeneration:42,replicaAgeMs:1_000,threadAheadMs:1_500,
+    });
+  };
+  const state = {handled:{},servers:[]};
+  await restartScan(scanArgs(state), io);
+  assert.deepEqual(calls.send.map(call => call.threadId), ['healthy']);
+  const entry = Object.values(state.handled)[0];
+  assert.deepEqual(entry.threads.batch, {});
+  assert.equal(entry.done, false);
+  assert.equal(calls.telegram.length, 0);
+  const row = rows().find(row => row.name === 'restart.scan');
+  assert.equal(row.ok, true);
+  assertScanProps(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
+});
+
+for (const target of ['parent', 'child']) test(`a late ${target} deferral leaves its tasks pending and recovers another parent`, async t => {
+  const { rows } = logFixture(t);
+  const { db, task } = delegatedFixture();
+  t.after(() => db.close());
+  const delegated = [];
+  const childId = 'thread:delegated-task:ahead-late';
+  const { io, calls } = fakeIo({runs:[run('batch'),run('healthy')],delegated,threads:{
+    batch:{threadId:'batch',title:'Batch'}, healthy:{threadId:'healthy',title:'Healthy'},
+    [childId]:{threadId:childId},
+  }});
+  io.serverRuntime = () => ({pid:7,procStartMs:T0-30_000,readyMs:T0+10_000});
+  let blocked = 'healthy';
+  io.assertThreadInReplica = (_db, thread) => {
+    if (thread.threadId === blocked) throw Object.assign(new Error('thread is newer than Robob replica; recovery deferred'), {
+      code:'REPLICA_BEHIND_THREAD',replicaGeneration:42,replicaAgeMs:1_000,threadAheadMs:1_500,
+    });
+  };
+  const state = {handled:{},servers:[]};
+  await restartScan(scanArgs(state, {now:T0+30_000}), io);
+  assert.deepEqual(calls.send.map(call => call.threadId), ['batch']);
+  task('ahead-late');
+  const [late] = dbIo.cancelledDelegatedTasksSince(db, iso(T0));
+  delegated.push({...late,completed_at:iso(T0+40_000)});
+  const entry = Object.values(state.handled)[0];
+  entry.threads.batch.lateFailures = 2;
+  blocked = target === 'parent' ? 'batch' : childId;
+  for (const at of [65_000,70_000,95_000]) {
+    await restartScan(scanArgs(state, {now:T0+at}), io);
+    const progress = Object.values(state.handled)[0].threads.batch;
+    assert.equal(progress.done, false);
+    assert.equal(progress.lateOnly, true);
+    assert.equal(progress.lateFailures, 2);
+    assert.ok(!progress.lateExhausted);
+    assert.deepEqual(progress.deliveredDelegated, []);
+    assert.equal(calls.telegram.length, 0);
+    assert.deepEqual(calls.send.map(call => call.threadId), ['batch','healthy']);
+    const row = rows().filter(row => row.name === 'restart.scan').at(-1);
+    assert.equal(row.ok, true);
+    assertScanProps(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
+  }
+  blocked = null;
+  await restartScan(scanArgs(state, {now:T0+100_000}), io);
+  assert.deepEqual(calls.send.map(call => call.threadId), ['batch','healthy','batch']);
+  assert.match(calls.send.at(-1).text, /Task ahead-late/);
+  assert.equal(Object.values(state.handled)[0].done, true);
+  assert.equal(calls.telegram.length, 1);
 });
 
 test('restartScan waits only briefly to settle, never for the installer, and never acts on a dry run or seed', async () => {
@@ -671,7 +747,7 @@ test('cancels from the stall watch interrupting a session are not a restart', as
   const subs = [sub('a', 'x', 0), sub('b', 'y', 10), sub('c', 'z', 20)];
   const stalls = Object.fromEntries(['a', 'b', 'c'].map((k) => [`st-${k}`, { ses: `ses_${k}`, action: 'opencode', interruptedAt: T0 - 2_000 }]));
   const { io, calls } = fakeIo({ subs, threads: {} });
-  const report = await restartScan(scanArgs({ handled: {}, servers: [], stalls }), io);
+  const report = await restartScan(scanArgs({ handled: {}, servers: [] }), { ...io, loadStallState: () => ({ stalls }) });
   assert.equal(report.length, 0);
   assert.equal(calls.telegram.length, 0);
 });
@@ -970,6 +1046,8 @@ test('held queues drop only stale coordination pulses and keep old owner message
   assert.deepEqual(calls.commands.map((c) => [c.type, c.runId]), [
     ['queued-run.cancel', 'run:20'], ['queue.resume', undefined],
   ]);
+  assert.equal(calls.commands[0].reason, 'superseded');
+  assert.match(calls.commands[0].detail, /Stale coordination pulse/);
   assert.match(calls.send[0].text, /run:20, queued/);
   assert.match(calls.send[0].text, /held 3 queued message/);
   assert.equal(result.results[0].queueOk, true);

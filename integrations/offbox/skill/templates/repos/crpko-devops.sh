@@ -7,7 +7,8 @@ export DEBIAN_FRONTEND=noninteractive
 terraform_version=$(python3 - "${OFFBOX_REPO_ROOT:?}/.github/workflows/terraform-dev.yml" <<'PY'
 from pathlib import Path
 import re, sys
-text = Path(sys.argv[1]).read_text()
+path = Path(sys.argv[1])
+text = path.read_text() if path.exists() else ''
 versions = set()
 for line in text.splitlines():
     match = re.fullmatch(r"\s*terraform_version:\s*([^#]*)(?:#.*)?", line)
@@ -16,11 +17,20 @@ for line in text.splitlines():
         value = value[1:-1]
     if re.fullmatch(r"\d+\.\d+\.\d+", value):
         versions.add(value)
-if len(versions) != 1:
-    sys.exit('offbox: terraform requires one unambiguous literal CI pin in terraform-dev.yml')
-print(versions.pop())
+if len(versions) == 1:
+    print(versions.pop())
+else:
+    print('no literal terraform_version' if not versions else 'several pins ' + ','.join(sorted(versions)))
 PY
 ) || exit 98
+terraform_state=$terraform_version
+case $terraform_version in
+  'no literal '*|'several pins '*)
+    printf 'offbox: Terraform skipped: %s in .github/workflows/terraform-dev.yml; commands that need terraform will fail\n' "$terraform_version" >&${OFFBOX_REPO_STATUS_FD:-2}
+    terraform_version=
+    terraform_state=skipped
+    ;;
+esac
 
 terraform_ready() {
   [ -x /usr/local/bin/terraform ] && [ "$(terraform version -json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["terraform_version"])' 2>/dev/null)" = "$terraform_version" ]
@@ -183,15 +193,23 @@ gnu_time_ready() {
   [ -x "$OFFBOX_GNU_TIME" ] && "$OFFBOX_GNU_TIME" -p true >/dev/null 2>&1
 }
 
-if [ "${1:-}" = --check ]; then
-  offbox_crpko_tools_ready && terraform_ready && gnu_time_ready && tf_provider_mirror_ready
-  exit $?
+toolchain_ready() {
+  offbox_crpko_tools_ready && gnu_time_ready &&
+    { [ -z "$terraform_version" ] || { terraform_ready && tf_provider_mirror_ready; }; } &&
+    grep -qxF "export OFFBOX_TERRAFORM_STATE=$terraform_state" "$HOME/.offbox/repo-env/crpko-devops.sh" 2>/dev/null
+}
+
+if [ "${1:-}" = --check ] || [ "${1:-}" = --ensure ]; then
+  if toolchain_ready; then exit 0; fi
+  if [ "${1:-}" = --check ]; then exit 1; fi
 fi
 
+echo 'offbox: setting up crpko-devops toolchain on this box (first run here, a few minutes)' >&${OFFBOX_REPO_STATUS_FD:-2}
+offbox_t0=$SECONDS
 offbox_crpko_tools
 gnu_time_ready || offbox_apt_install time || { echo 'offbox: GNU time install failed' >&2; exit 98; }
 gnu_time_ready || { echo 'offbox: GNU time install failed' >&2; exit 98; }
-if ! terraform_ready; then
+if [ -n "$terraform_version" ] && ! terraform_ready; then
   case $(uname -m) in
     x86_64) arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
@@ -219,44 +237,48 @@ PY
   sudo install -m 0755 "$stage/terraform" /usr/local/bin/terraform
 fi
 hash -r
-for tool in vector aws terraform ruby gh; do
+for tool in vector aws ruby gh ${terraform_version:+terraform}; do
   command -v "$tool" >/dev/null || { echo "offbox: required tool missing on command PATH: $tool" >&2; exit 98; }
 done
 [ -x /usr/bin/ruby ] || { echo 'offbox: required tool missing: /usr/bin/ruby' >&2; exit 98; }
-offbox_crpko_tools_ready && terraform_ready || { echo 'offbox: Crpko toolchain version check failed' >&2; exit 98; }
-mkdir -p "$HOME/.offbox/tf-provider-mirror"
-if ! tf_provider_mirror_ready; then
-  (
-    mkdir -p "$HOME/.offbox"
-    mirror_work=$(mktemp -d "$HOME/.offbox/tf-provider-mirror-stage.XXXXXX")
-    trap 'rm -rf "$mirror_work"' EXIT
-    tf_provider_mirror fill "$mirror_work"
-  ) || :
-fi
+offbox_crpko_tools_ready && { [ -z "$terraform_version" ] || terraform_ready; } || { echo 'offbox: Crpko toolchain version check failed' >&2; exit 98; }
 mirror_enabled=false
-tf_provider_mirror_ready && mirror_enabled=true
-python3 - "$HOME" "$mirror_enabled" <<'PY'
+if [ -n "$terraform_version" ]; then
+  mkdir -p "$HOME/.offbox/tf-provider-mirror"
+  if ! tf_provider_mirror_ready; then
+    (
+      mkdir -p "$HOME/.offbox"
+      mirror_work=$(mktemp -d "$HOME/.offbox/tf-provider-mirror-stage.XXXXXX")
+      trap 'rm -rf "$mirror_work"' EXIT
+      tf_provider_mirror fill "$mirror_work"
+    ) || :
+  fi
+  tf_provider_mirror_ready && mirror_enabled=true
+fi
+python3 - "$HOME" "$mirror_enabled" "$terraform_state" <<'PY'
 import json, os, sys, tempfile
 from pathlib import Path
 home = Path(sys.argv[1])
 content = ('provider_installation {\n  filesystem_mirror {\n    path = '
            + json.dumps(str(home / '.offbox/tf-provider-mirror')) + '\n  }\n  direct {}\n}\n')
 # An explicit test config can ignore this file; the repo's mirror hook covers those callers.
-fd, tmp = tempfile.mkstemp(prefix='.offbox-terraformrc-', dir=home)
-try:
-    with os.fdopen(fd, 'w') as stream:
-        stream.write(content)
+if sys.argv[3] != 'skipped':
+    fd, tmp = tempfile.mkstemp(prefix='.offbox-terraformrc-', dir=home)
     try:
-        os.link(tmp, home / '.terraformrc')
-    except FileExistsError:
-        pass
-finally:
-    Path(tmp).unlink(missing_ok=True)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(content)
+        try:
+            os.link(tmp, home / '.terraformrc')
+        except FileExistsError:
+            pass
+    finally:
+        Path(tmp).unlink(missing_ok=True)
 env = home / '.offbox/repo-env'
 env.mkdir(parents=True, exist_ok=True)
 fd, tmp = tempfile.mkstemp(prefix='.crpko-devops-', dir=env)
 try:
     with os.fdopen(fd, 'w') as stream:
+        stream.write('export OFFBOX_TERRAFORM_STATE=' + sys.argv[3] + '\n')
         if sys.argv[2] == 'true':
             stream.write('export TERRAFORM_PROVIDER_MIRROR="$HOME/.offbox/tf-provider-mirror"\n')
         else:
@@ -265,3 +287,4 @@ try:
 finally:
     Path(tmp).unlink(missing_ok=True)
 PY
+echo "offbox: crpko-devops toolchain ready ($((SECONDS - offbox_t0))s)" >&${OFFBOX_REPO_STATUS_FD:-2}

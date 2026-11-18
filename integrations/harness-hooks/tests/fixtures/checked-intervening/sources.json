@@ -1,0 +1,90 @@
+{
+  "mac40": [
+    {
+      "path": "integrations/dev-resource-janitor/tests/test_active_sessions.py",
+      "snapshot": "sources/mac40/integrations/dev-resource-janitor/tests/test_active_sessions.py.txt"
+    },
+    {
+      "path": "integrations/dev-resource-janitor/tests/test_api_liveness.py",
+      "snapshot": "sources/mac40/integrations/dev-resource-janitor/tests/test_api_liveness.py.txt"
+    }
+  ],
+  "robob1457": [
+    {
+      "path": "apps/server/src/ardud/control/t3ctl-live-cli.test.mjs",
+      "snapshot": "sources/robob1457/apps/server/src/ardud/control/t3ctl-live-cli.test.mjs.txt"
+    },
+    {
+      "path": "apps/server/src/ardud/control/t3ctl.test.ts",
+      "snapshot": "sources/robob1457/apps/server/src/ardud/control/t3ctl.test.ts.txt"
+    }
+  ],
+  "crpko4364": [
+    {
+      "path": "src/harness/completion/reader_grants.py",
+      "snapshot": "sources/crpko4364/src/harness/completion/reader_grants.py.txt"
+    },
+    {
+      "path": "src/harness/qa_access.py",
+      "snapshot": "sources/crpko4364/src/harness/qa_access.py.txt"
+    },
+    {
+      "path": "tests/test_completion_reader_grants.py",
+      "snapshot": "sources/crpko4364/tests/test_completion_reader_grants.py.txt"
+    }
+  ],
+  "mac54": [
+    {
+      "path": "integrations/mac-logging/jobs.py",
+      "snapshot": "sources/mac54/integrations/mac-logging/jobs.py.txt"
+    },
+    {
+      "path": "integrations/mac-logging/tests/test_deep_probe.py",
+      "snapshot": "sources/mac54/integrations/mac-logging/tests/test_deep_probe.py.txt"
+    }
+  ],
+  "crpko4201": [
+    {
+      "path": "scripts/runbooks/../lib/ecs-task-wait.mjs",
+      "snapshot": "sources/crpko4201/scripts/runbooks/../lib/ecs-task-wait.mjs.txt"
+    },
+    {
+      "path": "scripts/runbooks/../lib/kafka-acl-apply.mjs",
+      "snapshot": "sources/crpko4201/scripts/runbooks/../lib/kafka-acl-apply.mjs.txt"
+    },
+    {
+      "path": "scripts/runbooks/../lib/kafka-acl-evidence.mjs",
+      "snapshot": "sources/crpko4201/scripts/runbooks/../lib/kafka-acl-evidence.mjs.txt"
+    },
+    {
+      "path": "scripts/runbooks/../lib/kafka-acl-probe-plan.mjs",
+      "snapshot": "sources/crpko4201/scripts/runbooks/../lib/kafka-acl-probe-plan.mjs.txt"
+    },
+    {
+      "path": "scripts/runbooks/../lib/kafka-client-snapshot.mjs",
+      "snapshot": "sources/crpko4201/scripts/runbooks/../lib/kafka-client-snapshot.mjs.txt"
+    },
+    {
+      "path": "scripts/runbooks/../lib/kafka-onbox-admin.mjs",
+      "snapshot": "sources/crpko4201/scripts/runbooks/../lib/kafka-onbox-admin.mjs.txt"
+    },
+    {
+      "path": "scripts/runbooks/../lib/rebuild-admission.mjs",
+      "snapshot": "sources/crpko4201/scripts/runbooks/../lib/rebuild-admission.mjs.txt"
+    },
+    {
+      "path": "scripts/runbooks/kafka-acl-probes.mjs",
+      "snapshot": "sources/crpko4201/scripts/runbooks/kafka-acl-probes.mjs.txt"
+    }
+  ],
+  "crpko4156": [
+    {
+      "path": "scripts/ci_offline_policy.json",
+      "snapshot": "sources/crpko4156/scripts/ci_offline_policy.json.txt"
+    },
+    {
+      "path": "tests/test_ephemeral_producer_latch.py",
+      "snapshot": "sources/crpko4156/tests/test_ephemeral_producer_latch.py.txt"
+    }
+  ]
+}

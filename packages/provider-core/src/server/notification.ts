@@ -164,14 +164,32 @@ function delegatedCompletionNotification(
   tasks: ReadonlyArray<OrchestrationV2Subagent>,
 ): OrchestrationV2Notification {
   const taskIds = completion.taskIds;
-  const reports = taskIds.map((taskId) =>
-    delegatedTaskReport(tasks.find((task) => task.id === taskId)),
-  );
+  const reports = taskIds.map((taskId) => {
+    const task = tasks.find((task) => task.id === taskId);
+    const report = delegatedTaskReport(task);
+    const previous = task?.lastAnnouncedStatus;
+    return {
+      ...report,
+      label: report.label || taskId,
+      correction:
+        previous === undefined || previous === task?.status || report.outcome === "unknown"
+          ? undefined
+          : `previously ${previous === "completed" ? "finished" : previous === "failed" ? "failed" : "stopped"}, now ${task?.status === "completed" ? "finished" : task?.status === "failed" ? "failed" : "stopped"}: ${task?.failureReason ?? task?.cancelReason ?? "child terminal status changed"}`,
+    };
+  });
   const delegatedByRun = tasks.filter(
     (task) => task.origin === "app_owned" && task.runId === completion.parentRunId,
   ).length;
   const outcome = combinedOutcome(reports.map((report) => report.outcome));
-  const verb = outcome === "failed" ? "failed" : outcome === "cancelled" ? "stopped" : "finished";
+  const verbFor = (status: NotificationOutcome) =>
+    status === "failed"
+      ? "failed"
+      : status === "cancelled"
+        ? "stopped"
+        : status === "completed"
+          ? "finished"
+          : "status unknown";
+  const verb = verbFor(outcome);
   const [only] = reports;
   if (reports.length === 1 && only !== undefined) {
     const label = reportLabel(only.label);
@@ -182,7 +200,7 @@ function delegatedCompletionNotification(
         ...(only.childThreadId === undefined ? {} : { childThreadId: only.childThreadId }),
       },
       outcome,
-      summary: `Delegated task${label === undefined ? "" : ` "${label}"`} ${verb}`,
+      summary: `Delegated task${label === undefined ? "" : ` "${label}"`} ${only.correction ?? verb}`,
     };
   }
   const labels = reports.flatMap((report) => reportLabel(report.label) ?? []);
@@ -193,7 +211,16 @@ function delegatedCompletionNotification(
   return {
     source: { kind: "delegated_task", taskIds },
     outcome,
-    summary: `${count} delegated tasks ${verb}${labels.length === 0 ? "" : `: ${labels.join(", ")}`}`,
+    summary: reports.every(
+      (report) => report.outcome === reports[0]?.outcome && report.correction === undefined,
+    )
+      ? `${count} delegated tasks ${verb}${labels.length === 0 ? "" : `: ${labels.join(", ")}`}`
+      : reports
+          .map(
+            (report, i) =>
+              `${i === 0 ? "Delegated" : "delegated"} task "${reportLabel(report.label)}" ${report.correction ?? verbFor(report.outcome)}`,
+          )
+          .join("; "),
   };
 }
 

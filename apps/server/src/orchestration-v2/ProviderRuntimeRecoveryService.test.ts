@@ -269,7 +269,11 @@ it.effect("awaits the stale OpenCode abort before committing startup recovery", 
     assert.equal(commits.length, 1);
     assert.isTrue(
       commits[0]!.events.some(
-        (event) => event.type === "run.updated" && event.payload.status === "cancelled",
+        (event) =>
+          event.type === "run.updated" &&
+          event.payload.status === "cancelled" &&
+          event.payload.cancelReason === "server_restart" &&
+          event.payload.cancelDetail?.includes("server restarted") === true,
       ),
     );
     assert.deepEqual(
@@ -334,7 +338,14 @@ it.effect("does not abort stale OpenCode sessions during shutdown", () =>
     assert.equal(summary.terminalizedRuns, 1);
     assert.equal(summary.staleOpenCodeAborted, 0);
     assert.equal(summary.staleOpenCodeAbortFailed, 0);
-    assert.isTrue(commits[0]!.events.some((event) => event.type === "run.updated"));
+    assert.isTrue(
+      commits[0]!.events.some(
+        (event) =>
+          event.type === "run.updated" &&
+          event.payload.cancelReason === "server_shutdown" &&
+          event.payload.cancelDetail?.includes("server shut down") === true,
+      ),
+    );
   }),
 );
 
@@ -1377,9 +1388,16 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
   }).pipe(Effect.provide(layer));
 });
 
-it.effect(
-  "cancels the complete in-flight subtree and stops its persisted session without reopening it",
-  () => {
+it.effect.each([
+  { driver: "codex", nativeTurnId: "codex-native-turn" },
+  { driver: "acp-test", nativeTurnId: "persisted-session:turn:1" },
+  {
+    driver: "acp-test",
+    nativeTurnId: "persisted-session:attempt:attempt_recovery_cancel:start:uuid",
+  },
+])(
+  "cancels the complete in-flight subtree using its persisted turn identity: %s",
+  ({ driver, nativeTurnId }) => {
     const threadId = ThreadId.make("thread_recovery_cancel");
     const runId = RunId.make("run_recovery_cancel");
     const attemptId = RunAttemptId.make("attempt_recovery_cancel");
@@ -1395,22 +1413,27 @@ it.effect(
       providerSessions: [
         {
           id: providerSessionId,
-          driver: ProviderDriverKind.make("codex"),
-          providerInstanceId: ProviderInstanceId.make("codex"),
+          driver: ProviderDriverKind.make(driver),
+          providerInstanceId: ProviderInstanceId.make(driver),
           status: "ready",
         },
       ],
       providerThreads: [
         {
           id: providerThreadId,
-          driver: ProviderDriverKind.make("codex"),
-          providerInstanceId: ProviderInstanceId.make("codex"),
+          driver: ProviderDriverKind.make(driver),
+          providerInstanceId: ProviderInstanceId.make(driver),
           status: "active",
         },
       ],
       providerTurns: [
         {
           id: providerTurnId,
+          nativeTurnRef: {
+            driver: ProviderDriverKind.make(driver),
+            nativeId: nativeTurnId,
+            strength: "weak",
+          },
           runAttemptId: attemptId,
           nodeId: rootNodeId,
           status: "running",
@@ -1421,7 +1444,7 @@ it.effect(
           id: runId,
           status: "starting",
           providerThreadId,
-          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerInstanceId: ProviderInstanceId.make(driver),
         },
       ],
       attempts: [
@@ -1500,6 +1523,9 @@ it.effect(
           ["provider-session.updated", "stopped"],
         ],
       );
+      const turnEvent = events.find((event) => event.type === "provider-turn.updated");
+      assert.equal(turnEvent?.payload.id, providerTurnId);
+      assert.equal(turnEvent?.payload.nativeTurnRef?.nativeId, nativeTurnId);
       const messageEvent = events.find((event) => event.type === "message.updated");
       assert.isFalse(messageEvent?.type === "message.updated" && messageEvent.payload.streaming);
     }).pipe(Effect.provide(layer));

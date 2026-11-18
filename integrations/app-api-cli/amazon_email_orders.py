@@ -561,6 +561,8 @@ def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_read
         if process.returncode and not errors:
             errors.append(_error('mailsearch_nonzero_exit'))
         hits = data['hits']
+        if hits or any(account['ok'] for account in coverage['accounts'].values()):
+            toollog.order_page(hits)
     except subprocess.TimeoutExpired:
         errors.append(_error('search_deadline_exceeded'))
     except (OSError, ValueError, TypeError):
@@ -661,6 +663,7 @@ def track(order_id, **options):
     return {**result, **order, 'coverage': {**result['coverage'], 'order': order_coverage}}
 
 
+@toollog.entrypoint('commerce-cmd', 'amazon-orders', cli=True)
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)

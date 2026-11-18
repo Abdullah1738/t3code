@@ -1,4 +1,6 @@
+import { writeAdmitted } from "../../analytics/McpCall.ts";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Metric from "effect/Metric";
 import * as References from "effect/References";
@@ -8,14 +10,17 @@ import * as Effect from "effect/Effect";
 import * as TickTimings from "./tickTimings.ts";
 import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
+import * as Fiber from "effect/Fiber";
 import { KanbanError } from "@t3tools/contracts";
 
 import * as SavedWrite from "./savedWrite.ts";
 import * as Metrics from "../../../observability/Metrics.ts";
+import { Analytics } from "../../analytics/Analytics.ts";
+import { recordServerAnalytics } from "../../../observability/RpcInstrumentation.ts";
 
 // A board-wide writer excludes card writers; independent card writers share the gate.
 const BOARD_PERMITS = 1_000_000;
-const LONG_HOLD_MS = 5_000;
+const LONG_HOLD_MS = SavedWrite.LONG_HOLD_MS;
 const RELEASE_HISTORY_SIZE = 256;
 
 const shortLabel = (label: string) => label.replace(/^KanbanService\.(?:tickStep:)?/, "");
@@ -33,6 +38,8 @@ interface Holder {
   readonly mode: "shared" | "exclusive";
   readonly acquiredAtMs: number;
 }
+
+type WaitingOn = Pick<Holder, "boardId" | "lock" | "cardId">;
 
 interface BoardLock {
   waiters: number;
@@ -64,7 +71,11 @@ interface Operation {
   readonly fiberId: number;
   readonly cardId: string | undefined;
   held: Held | undefined;
+  boardId: string | undefined;
+  waiting: { readonly target: WaitingOn; readonly started: number } | undefined;
   stale: boolean;
+  readBudgetExceeded: "dispatch" | "board" | undefined;
+  readonly staleFences: Array<string>;
   committed: boolean;
   sideEffect: boolean;
   readonly dependencies: Map<string, Map<string, number>>;
@@ -106,7 +117,20 @@ export class BoardStateChanged {
 }
 
 // A budget miss gives the next writer a turn instead of immediately retrying the start.
-export class DispatchReadBudgetExceeded extends BoardStateChanged {}
+export class BoardReadBudgetExceeded extends BoardStateChanged {}
+export class DispatchReadBudgetExceeded extends BoardReadBudgetExceeded {}
+const readHoldBudgetMs = Context.Reference<number | undefined>("KanbanBoardReadHoldBudget", {
+  defaultValue: () => undefined,
+});
+
+// The reply watchdog snapshots this before cancelling a contended admission.
+export const admissionObserver = Context.Reference<
+  (detail: Effect.Effect<string>, fiberId: number) => () => void
+>("KanbanBoardAdmissionObserver", { defaultValue: () => () => () => {} });
+export const staleObserver = Context.Reference<
+  (detail: { readonly reruns: number; readonly fences: ReadonlyArray<string> }) => void
+>("KanbanBoardStaleObserver", { defaultValue: () => () => {} });
+
 const DISPATCH_READ_HOLD_MS = 2_000;
 
 export const MAY_HAVE_APPLIED =
@@ -129,6 +153,7 @@ export const REPLAY_MAX_MS = 30_000;
 
 /** State locks are never held across another service's I/O. A stale continuation cannot write. */
 export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
+  const analytics = yield* Effect.serviceOption(Analytics);
   const boards = new Map<string, BoardLock>();
   const migrationHolders = new Map<symbol, Holder>();
   const migrationHistory: Pick<BoardLock, "releasedHolds" | "nextRelease"> = {
@@ -166,7 +191,15 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     return op?.fiberId === (yield* Effect.fiberId) ? op : undefined;
   });
   const check = (op: Operation) =>
-    op.stale ? Effect.die(new BoardStateChanged(op.committed)) : Effect.void;
+    op.readBudgetExceeded !== undefined
+      ? Effect.die(
+          op.readBudgetExceeded === "dispatch"
+            ? new DispatchReadBudgetExceeded(op.committed)
+            : new BoardReadBudgetExceeded(op.committed),
+        )
+      : op.stale
+        ? Effect.die(new BoardStateChanged(op.committed))
+        : Effect.void;
   // These helpers share the caller's operation span; the hot admission loop adds no spans.
   const label = Effect.map(Effect.option(Effect.currentSpan), (span) => {
     if (Option.isNone(span)) return "KanbanBoardLocks.run";
@@ -182,21 +215,25 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       ? `${parent?._tag === "Span" ? parent.name : nearest.name} (${nearest.attributes.get("serial.queue") ?? "serial"})`
       : nearest.name;
   });
+  const holdSteps = new Map<number, SavedWrite.SubStepCollection>();
+  const holderAt = (holder: Holder, now: number) => ({
+    ...holder,
+    cardId: holder.cardId ?? null,
+    heldForMs: Math.max(0, now - holder.acquiredAtMs),
+    ...(now - holder.acquiredAtMs >= LONG_HOLD_MS && holdSteps.has(holder.fiberId)
+      ? { subSteps: holdSteps.get(holder.fiberId)!.snapshot() }
+      : {}),
+  });
   const holdersAt = (now: number) =>
     [
       ...[...boards.values()].flatMap((board) => [...board.holders.values()]),
       ...[...migrationHolders.values()].filter((holder) => holder.mode === "exclusive"),
-    ].map((holder) => ({
-      ...holder,
-      cardId: holder.cardId ?? null,
-      heldForMs: Math.max(0, now - holder.acquiredAtMs),
-    }));
+    ].map((holder) => holderAt(holder, now));
   const waitingOn = (boardId: string, lock: Holder["lock"], cardId?: string) => ({
     boardId,
     lock,
     cardId,
   });
-  type WaitingOn = ReturnType<typeof waitingOn>;
   const blockersAt = (target: WaitingOn, now: number) =>
     (target.lock === "migration"
       ? [...migrationHolders.values()]
@@ -205,22 +242,39 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             holder.lock === target.lock &&
             (target.lock !== "card" || holder.cardId === target.cardId),
         )
-    ).map((holder) => ({
-      ...holder,
-      cardId: holder.cardId ?? null,
-      heldForMs: Math.max(0, now - holder.acquiredAtMs),
-    }));
-  const recordHold = Effect.fnUntraced(function* (holder: Holder, waiters: number) {
+    ).map((holder) => holderAt(holder, now));
+  const recordHold = Effect.fnUntraced(function* (
+    holder: Holder,
+    waiters: number,
+    finish?: SavedWrite.SubStepCollection,
+    threshold?: SavedWrite.AwaitedDependency & { readonly observedAtMs: number },
+  ) {
     const now = yield* Clock.currentTimeMillis;
     const heldMs = Math.max(0, now - holder.acquiredAtMs);
+    const subSteps = finish?.(heldMs >= LONG_HOLD_MS);
     yield* Metric.update(
       Metric.withAttributes(
         Metrics.kanbanBoardLockHoldDuration,
-        Metrics.metricAttributes({ name: holder.label }),
+        Metrics.metricAttributes({ name: holder.label, boardId: holder.boardId }),
       ),
       Duration.millis(heldMs),
     );
+    if (
+      heldMs >= 1_000 &&
+      analytics._tag === "Some" &&
+      holder.label.startsWith("KanbanService.tickStep:")
+    )
+      yield* recordServerAnalytics(analytics.value, {
+        ts: DateTime.formatIso(DateTime.makeUnsafe(holder.acquiredAtMs + heldMs)),
+        kind: "kanban.lock_hold",
+        surface: "server",
+        route: "board",
+        boardId: holder.boardId,
+        durationMs: heldMs,
+        props: { phase: holder.label.slice("KanbanService.tickStep:".length) },
+      });
     if (heldMs < LONG_HOLD_MS) return;
+    if (subSteps !== undefined) (yield* SavedWrite.subStepReporter)(subSteps);
     yield* Metrics.increment(Metrics.kanbanBoardLockLongHoldTotal, { name: holder.label });
     const fields = {
       "board.observed_at_ms": now,
@@ -232,6 +286,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       "board.acquired_at_ms": holder.acquiredAtMs,
       "board.held_ms": heldMs,
       "board.waiters": waiters,
+      ...(subSteps === undefined ? {} : { subSteps }),
+      ...(threshold === undefined ? {} : { threshold }),
     };
     yield* Effect.logWarning(
       // Fixed internal diagnostic fields; encoding must not add a failure to lock release.
@@ -339,58 +395,71 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       yield* Metrics.increment(Metrics.kanbanBoardBusyRefusedTotal, { refused: op.label });
     return { blockers, waitedMs, waitByLabel };
   });
-  const wait = <A>(
+  const wait = Effect.fn("KanbanBoardLocks.wait")(function* <A>(
     op: Operation,
     target: WaitingOn,
     started: number,
     queueAheadAtAdmission: number,
     effect: Effect.Effect<A>,
-  ) =>
-    Effect.flatMap(writeWaitMs, (duration) =>
-      effect.pipe(
-        // Only contended admissions start this monitor; it dies with the waiter.
-        Effect.raceFirst(
-          Effect.forever(
-            warning(op, target, started, queueAheadAtAdmission, false).pipe(
-              Effect.andThen(Effect.sleep(30_000)),
+  ) {
+    const summary = (
+      blockers: ReturnType<typeof blockersAt>,
+      waitedMs: number,
+      waitByLabel: ReadonlyArray<{ label: string; ms: number }> = [],
+    ) => {
+      const oldest = blockers.sort((a, b) => b.heldForMs - a.heldForMs)[0];
+      const holder = oldest
+        ? `held ${oldest.heldForMs}ms by ${oldest.label}${blockers.length > 1 ? ` +${blockers.length - 1} more` : ""}`
+        : "holder released at deadline";
+      const queue =
+        waitByLabel.length > 0
+          ? ` behind ${queueAheadAtAdmission}; most time: ${waitByLabel
+              .slice(0, 3)
+              .map((entry) => `${entry.label} ${Math.floor(entry.ms / 1_000)}s`)
+              .join(", ")}`
+          : "";
+      return `Board busy: not written (${holder}; waited ${waitedMs}ms${queue}). Safe to retry once.`;
+    };
+    const detail = Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      return summary(blockersAt(target, now), Math.max(0, now - started));
+    });
+    const observe = yield* admissionObserver;
+    return yield* Effect.acquireUseRelease(
+      Effect.sync(() => observe(detail, op.fiberId)),
+      () =>
+        Effect.flatMap(writeWaitMs, (duration) =>
+          effect.pipe(
+            Effect.raceFirst(
+              Effect.forever(
+                warning(op, target, started, queueAheadAtAdmission, false).pipe(
+                  Effect.andThen(Effect.sleep(30_000)),
+                ),
+              ),
             ),
+            Effect.timeoutOrElse({
+              duration,
+              orElse: () =>
+                warning(op, target, started, queueAheadAtAdmission, true).pipe(
+                  Effect.flatMap(({ blockers, waitedMs, waitByLabel }) =>
+                    Effect.die(
+                      new KanbanError({
+                        code: "conflict",
+                        reasonClass: "board_busy",
+                        saved: op.committed ? null : false,
+                        detail: op.committed
+                          ? MAY_HAVE_APPLIED
+                          : summary(blockers, waitedMs, waitByLabel),
+                      }),
+                    ),
+                  ),
+                ),
+            }),
           ),
         ),
-        Effect.timeoutOrElse({
-          duration,
-          orElse: Effect.fnUntraced(function* () {
-            const { blockers, waitedMs, waitByLabel } = yield* warning(
-              op,
-              target,
-              started,
-              queueAheadAtAdmission,
-              true,
-            );
-            const oldest = blockers.sort((a, b) => b.heldForMs - a.heldForMs)[0];
-            const seconds = Math.floor((oldest?.heldForMs ?? 0) / 1_000);
-            const heldFor = `${Math.floor(seconds / 60)}m${seconds % 60}s`;
-            const summary =
-              waitByLabel.length > 0
-                ? ` (waited ${Math.floor(waitedMs / 1_000)}s behind ${queueAheadAtAdmission}; most time: ${waitByLabel
-                    .slice(0, 3)
-                    .map((entry) => `${entry.label} ${Math.floor(entry.ms / 1_000)}s`)
-                    .join(", ")})`
-                : oldest
-                  ? ` (held ${heldFor} by ${oldest.label}${blockers.length > 1 ? ` +${blockers.length - 1} more` : ""})`
-                  : " (holder released at deadline)";
-            return yield* Effect.die(
-              new KanbanError({
-                code: "conflict",
-                saved: op.committed ? null : false,
-                detail: op.committed
-                  ? MAY_HAVE_APPLIED
-                  : `Board busy: not written${summary}. Safe to retry once.`,
-              }),
-            );
-          }),
-        }),
-      ),
+      (leave) => Effect.sync(leave),
     );
+  });
   const version = (held: Held) =>
     held.cardId === undefined
       ? held.board.generation
@@ -412,6 +481,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         if (target.lock === "migration") migrationWaiters += 1;
         return Effect.gen(function* () {
           const started = yield* Clock.currentTimeMillis;
+          op.waiting = { target, started };
           while (!(yield* semaphore.takeIfAvailable(permits))) {
             // withPermits owns cancellation cleanup while waiting. The actual transfer
             // happens masked, so an interrupt cannot land between take and ownership.
@@ -460,12 +530,38 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           // existing release path owns all holder cleanup and permit ordering.
           const primary =
             target.lock === "card" || (target.lock === "gate" && op.cardId === undefined);
+          const finish = primary
+            ? (yield* SavedWrite.subStepObserver)?.hold(op.fiberId)
+            : undefined;
+          if (finish) holdSteps.set(op.fiberId, finish);
+          let threshold: (SavedWrite.AwaitedDependency & { observedAtMs: number }) | undefined;
+          // One sample at the threshold, while the dependency is still pending.
+          const monitor =
+            finish === undefined
+              ? undefined
+              : yield* Effect.forkChild(
+                  Effect.sleep(LONG_HOLD_MS).pipe(
+                    Effect.andThen(
+                      Effect.map(Clock.currentTimeMillis, (observedAtMs) => {
+                        threshold = {
+                          ...finish.dependencySnapshot(),
+                          observedAtMs,
+                        };
+                      }),
+                    ),
+                  ),
+                );
           return primary
-            ? Effect.suspend(() => recordHold(holder, board.waiters)).pipe(Effect.andThen(release))
+            ? Effect.suspend(() => recordHold(holder, board.waiters, finish, threshold)).pipe(
+                Effect.ensuring(monitor === undefined ? Effect.void : Fiber.interrupt(monitor)),
+                Effect.ensuring(Effect.sync(() => holdSteps.delete(op.fiberId))),
+                Effect.andThen(release),
+              )
             : release;
         }).pipe(
           Effect.ensuring(
             Effect.sync(() => {
+              op.waiting = undefined;
               board.waiters -= 1;
               if (target.lock === "migration") migrationWaiters -= 1;
             }),
@@ -473,19 +569,47 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         );
       }),
     );
-  // Shares the caller's span: this check runs on every scoped dispatch read.
-  const dispatchRead = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
-    const op = yield* operation;
+  // Only the SELECT enters a timeout child. Ownership and outside/generation
+  // decisions must already have run in the operation's own fiber.
+  const readWithBudget = Effect.fnUntraced(function* <A, E, R>(
+    op: Operation | undefined,
+    effect: Effect.Effect<A, E, R>,
+  ) {
     const held = op?.held;
-    if (!op || !held || !op.scopes.has(held.boardId)) return yield* effect;
-    const remaining = held.acquiredAtMs + DISPATCH_READ_HOLD_MS - (yield* Clock.currentTimeMillis);
+    if (!op || !held) return yield* effect;
+    const scopedBudget = yield* readHoldBudgetMs;
+    const budget = scopedBudget ?? DISPATCH_READ_HOLD_MS;
+    const remaining = held.acquiredAtMs + budget - (yield* Clock.currentTimeMillis);
+    const observe = (yield* SavedWrite.traceObserver)?.readDeadline;
+    const expired = Effect.sync(() => {
+      // An enclosing helper can time out while this read is still cancelling.
+      op.stale = true;
+      op.readBudgetExceeded =
+        scopedBudget === undefined || op.scopes.has(held.boardId) ? "dispatch" : "board";
+      try {
+        observe?.(budget);
+      } catch {
+        // A diagnostic callback must not extend the read budget.
+      }
+      return Option.none<A>();
+    });
     const result =
       remaining <= 0
-        ? Option.none<A>()
-        : yield* effect.pipe(Effect.interruptible, Effect.timeoutOption(remaining));
+        ? yield* expired
+        : yield* effect.pipe(
+            Effect.interruptible,
+            Effect.map(Option.some),
+            Effect.raceFirst(Effect.sleep(remaining).pipe(Effect.andThen(expired))),
+          );
     if (Option.isSome(result)) return result.value;
-    op.stale = true;
-    return yield* Effect.die(new DispatchReadBudgetExceeded(op.committed));
+    return yield* Effect.die(
+      op.readBudgetExceeded === "dispatch"
+        ? new DispatchReadBudgetExceeded(op.committed)
+        : new BoardReadBudgetExceeded(op.committed),
+    );
+  });
+  const dispatchRead = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+    return yield* readWithBudget(yield* operation, effect);
   });
 
   const release = Effect.fn("KanbanBoardLocks.release")(function* (op: Operation) {
@@ -501,6 +625,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         yield* check(op);
         if (op.held?.boardId === boardId) return;
         yield* release(op);
+        op.boardId = boardId;
         const board = boardOf(boardId);
         const cardId = op.cardId;
         let mutex: Semaphore.Semaphore | undefined;
@@ -532,19 +657,29 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           acquiredAtMs: yield* Clock.currentTimeMillis,
         };
         op.held = held;
+        yield* writeAdmitted();
         const seen = versions.get(op)!;
         const expected = seen.get(boardId);
         const scoped = op.scopes.get(boardId);
         if (scoped || !reconcile) {
-          if (!scoped && expected !== undefined && expected !== version(held)) op.stale = true;
+          if (!scoped && expected !== undefined && expected !== version(held)) {
+            op.stale = true;
+            op.staleFences.push(`board:${boardId}:${expected}->${version(held)}`);
+          }
           for (const [key, value] of op.dependencies.get(boardId) ?? []) {
-            if ((board.resources.get(key) ?? 0) !== value) op.stale = true;
+            const actual = board.resources.get(key) ?? 0;
+            if (actual !== value) {
+              op.stale = true;
+              op.staleFences.push(`resource:${key}:${value}->${actual}`);
+            }
           }
         } else {
           // The explicit continuation validates its inputs under this new snapshot.
           op.dependencies.delete(boardId);
         }
-        if (scoped && !(yield* dispatchRead(scoped.valid))) op.stale = true;
+        // Revalidation remains a bounded admission read when a masked write reacquires.
+        if (scoped && !(yield* scoped.valid.pipe(Effect.provideService(SavedWrite.writing, false))))
+          op.stale = true;
         if (!scoped && (expected !== undefined || !op.dependencies.has(boardId)))
           seen.set(boardId, version(held));
         yield* check(op);
@@ -572,7 +707,11 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           cardId,
           diagnosticCardId: cardId,
           held: undefined,
+          boardId: undefined,
+          waiting: undefined,
           stale: false,
+          readBudgetExceeded: undefined,
+          staleFences: [],
           committed: false,
           sideEffect: false,
           dependencies: new Map(),
@@ -584,8 +723,21 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           replayed: 0,
         };
         versions.set(op, new Map());
+        const stopObserving = (yield* SavedWrite.traceObserver)?.observeLocks?.((now) => ({
+          "board.waiter": op.label,
+          "board.operation": op.label,
+          ...(op.boardId === undefined ? {} : { "board.id": op.boardId }),
+          ...(op.diagnosticCardId === undefined ? {} : { "board.card_id": op.diagnosticCardId }),
+          "board.waiter_fiber_id": op.fiberId,
+          "board.waiting_on": op.waiting?.target.lock ?? null,
+          ...(op.waiting ? { "board.waited_ms": Math.max(0, now - op.waiting.started) } : {}),
+          "board.holders": holdersAt(now).filter(
+            (holder) => holder.boardId === op.boardId || holder.boardId === "*",
+          ),
+          "board.blockers": op.waiting ? blockersAt(op.waiting.target, now) : [],
+        }));
         if (attempt > 0) yield* Effect.annotateCurrentSpan("board.rerun_attempt", attempt);
-        return yield* restore(effect).pipe(
+        const guarded = restore(effect).pipe(
           Effect.ensuring(
             Effect.suspend(() =>
               op.replayed > 0
@@ -595,6 +747,9 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           ),
           Effect.tap(() => check(op)),
           Effect.provideService(current, op),
+          // Timeout helpers inherit the deadline, never ownership of the permit.
+          Effect.provideService(SavedWrite.readGuard, (read) => readWithBudget(op, read)),
+          Effect.provideService(SavedWrite.subStepFiber, op.fiberId),
           Effect.ensuring(
             release(op).pipe(
               Effect.andThen(Effect.sync(() => dispatches.delete(op))),
@@ -605,22 +760,35 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
               ),
             ),
           ),
-          Effect.catchCause((cause) => {
-            const defect = cause.reasons.find((reason) => reason._tag === "Die")?.defect;
-            return defect instanceof BoardStateChanged &&
-              !(defect instanceof DispatchReadBudgetExceeded) &&
-              !defect.committed &&
-              !op.committed &&
-              !op.sideEffect &&
-              attempt < policy.reruns
-              ? restore(
-                  policy.backoffMs > 0
-                    ? Effect.sleep(policy.backoffMs * 2 ** attempt)
-                    : Effect.void,
-                ).pipe(Effect.andThen(run(effect, cardId, attempt + 1, replay, policy, op.label)))
-              : Effect.failCause(cause);
-          }),
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              const defect = cause.reasons.find((reason) => reason._tag === "Die")?.defect;
+              const canRetry =
+                defect instanceof BoardStateChanged &&
+                !(defect instanceof BoardReadBudgetExceeded) &&
+                !defect.committed &&
+                !op.committed &&
+                !op.sideEffect &&
+                attempt < policy.reruns;
+              if (defect instanceof BoardStateChanged)
+                (yield* staleObserver)({
+                  reruns: attempt + (canRetry ? 1 : 0),
+                  fences: op.staleFences,
+                });
+              return yield* canRetry
+                ? restore(
+                    policy.backoffMs > 0
+                      ? Effect.sleep(policy.backoffMs * 2 ** attempt)
+                      : Effect.void,
+                  ).pipe(Effect.andThen(run(effect, cardId, attempt + 1, replay, policy, op.label)))
+                : Effect.failCause(cause);
+            }),
+          ),
+          Effect.ensuring(Effect.sync(() => stopObserving?.())),
         );
+        return yield* (yield* SavedWrite.subStepObserver) === undefined
+          ? SavedWrite.subSteps(op.label, guarded)
+          : guarded;
       }),
     );
 
@@ -656,9 +824,12 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         // Mark before entering masked SQL: a timeout must not promise a safe retry
         // while a transaction or its cleanup can still apply the write.
         const result = yield* write
-          ? SavedWrite.stage(SavedWrite.committing.pipe(Effect.andThen(effect)), "commit")
-          : restore(dispatchRead(effect));
+          ? SavedWrite.stage(SavedWrite.committing.pipe(Effect.andThen(effect)), "commit").pipe(
+              Effect.provideService(SavedWrite.writing, true),
+            )
+          : restore(effect);
         if (write) {
+          yield* SavedWrite.committed();
           op.committed = true;
           const held = op.held!;
           const parents: Array<readonly [Operation, boolean]> = [];
@@ -720,6 +891,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     abandoned?: (value: A) => Effect.Effect<void>,
     readOnly = false,
     reconcile?: Effect.Effect<boolean, E2, R2>,
+    options: { readonly writesTrackedInside?: boolean } = {},
   ) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
@@ -738,7 +910,10 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         const external = restore(Effect.interruptible(effect));
         const result = yield* Effect.exit(
           SavedWrite.stage(
-            readOnly ? external : SavedWrite.committing.pipe(Effect.andThen(external)),
+            // Serial lanes keep the retry guard above; their nested writes own commit evidence.
+            readOnly || options.writesTrackedInside
+              ? external
+              : SavedWrite.committing.pipe(Effect.andThen(external)),
             readOnly ? "read" : "commit",
           ),
         );
@@ -834,6 +1009,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
 
   return {
     holders: Effect.map(Clock.currentTimeMillis, holdersAt),
+    boundedReads: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(Effect.provideService(readHoldBudgetMs, 2_000)),
     run,
     // Dispatch alone replaces its planning snapshot with the card and slot it will take.
     // Collection reads inside that dispatch must not silently restore a board-wide dependency.
@@ -858,9 +1035,25 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           }),
         ),
       );
-      if (!(yield* dispatchRead(valid))) {
+      if (!(yield* valid.pipe(Effect.provideService(SavedWrite.writing, false)))) {
         op.stale = true;
         yield* check(op);
+      }
+    }),
+    // A persisted card write also invalidates collections containing that card.
+    invalidate: Effect.fn("KanbanBoardLocks.invalidate")(function* (
+      boardId: string,
+      resource: string,
+    ) {
+      const op = yield* operation;
+      if (!op) return;
+      yield* acquire(op, boardId);
+      const board = boardOf(boardId);
+      const previous = board.resources.get(resource) ?? 0;
+      board.resources.set(resource, previous + 1);
+      for (let current: Operation | undefined = op; current; current = current.parent) {
+        const dependencies = current.dependencies.get(boardId);
+        if (dependencies?.get(resource) === previous) dependencies.set(resource, previous + 1);
       }
     }),
     resourceVersion: (boardId: string, resource: string) =>
@@ -873,16 +1066,21 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     // Only the metadata persistence is marked; publication and its follow-ups keep normal conflicts.
     dispatchMetadata: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(Effect.provideService(dispatchMetadata, true)),
-    step: <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string, operationLabel?: string) =>
+    step: <A, E, R>(
+      effect: Effect.Effect<A, E, R>,
+      cardId?: string,
+      operationLabel?: string,
+      reruns = 2,
+    ) =>
       run(effect, cardId, 0, undefined, undefined, operationLabel).pipe(
-        Effect.provideService(retryPolicy, { reruns: 2, backoffMs: 10 }),
+        Effect.provideService(retryPolicy, { reruns, backoffMs: 10 }),
       ),
     access,
     outside,
     // Compensation must run without permits even after the snapshot became stale.
     unlock: Effect.flatMap(operation, (op) => (op ? release(op) : Effect.void)),
     outsideRead,
-    // Lock-location lookups must share the start's read budget too.
+    // Pure SELECT seam, also exposed for SQL adapters and focused fixtures.
     dispatchRead,
     launched: Effect.fn("KanbanBoardLocks.launched")(function* (
       id: string,
@@ -921,12 +1119,16 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     // Detached work owns compensation even after the request that forked it ends.
     independent: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(
+        Effect.provideService(SavedWrite.writing, false),
+        Effect.provideService(SavedWrite.readGuard, undefined),
         Effect.provideService(current, undefined),
         Effect.provideService(ancestor, undefined),
       ),
     fresh: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.flatMap(current, (parent) =>
         effect.pipe(
+          Effect.provideService(SavedWrite.writing, false),
+          Effect.provideService(SavedWrite.readGuard, undefined),
           Effect.provideService(current, undefined),
           Effect.provideService(ancestor, parent),
         ),

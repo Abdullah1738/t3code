@@ -12,7 +12,7 @@ import { useBoardAction, useHeaderInset, useNowMs } from "../common/hooks";
 import { BoardView } from "./BoardView";
 import { CardDetail } from "./CardDetail";
 import { useBoardFilter } from "./boardFilterStore";
-import { kanbanClient, useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
+import { kanbanClient, useKanbanBoard, useKanbanBoardFeed, useKanbanBoards } from "./kanbanStore";
 import { boardLayout, cardPaneWidth, type KanbanBoardParams } from "./logic";
 import { useKanbanNav } from "./nav";
 
@@ -35,6 +35,8 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
   const nowMs = useNowMs();
   const boardId = route.params?.boardId?.trim() ?? "";
   const state = useKanbanBoard(boardId);
+  const boards = useKanbanBoards();
+  const missing = boards !== undefined && !boards.some((entry) => entry.board.id === boardId);
   const feed = useKanbanBoardFeed(boardId);
   const nav = useKanbanNav(boardId);
   const [width, setWidth] = useState(0);
@@ -48,8 +50,9 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
   const filter = useBoardFilter(boardId);
 
   let body: React.ReactNode;
-  if (boardId === "") body = <EmptyLine label="This link does not open a board." />;
-  else if (state?.board.archivedAt != null) body = <EmptyLine label="This link does not open a board." />;
+  if (boardId === "" || missing) body = <EmptyLine label="This link does not open a board." />;
+  else if (state?.board.archivedAt != null)
+    body = <EmptyLine label="This link does not open a board." />;
   else if (state === undefined)
     body = feed.failure ? (
       <FeedError what="the board" feed={feed} nowMs={nowMs} />

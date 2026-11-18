@@ -5,12 +5,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from janitor_test_safety import JanitorTestCase
 import io
 from unittest.mock import Mock, patch
 
@@ -21,7 +23,7 @@ import dev_janitor  # noqa: E402
 import janitor_watch  # noqa: E402
 
 
-class WorkerTests(unittest.TestCase):
+class WorkerTests(JanitorTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -92,7 +94,9 @@ class WorkerTests(unittest.TestCase):
 
     def test_worker_keeps_liveness_and_report_only_findings_in_audit(self):
         processes = {"candidates": [{"pid": 42}], "problems": ["control api timed out"],
-                     "checked": 8, "skipped": 1, "budget_skipped": 2}
+                     "checked": 8, "skipped": 1, "budget_skipped": 2,
+                     "owner_calls": {"by_native": {"count": 3, "p50_ms": 10, "p95_ms": 20,
+                                                   "max_ms": 20, "failures": {"404": 1}}}}
         report = {"ts": 123, "resources": [], "candidates": [], "processes": processes,
                   "liveness_unavailable": "control api projects: timed out"}
         with (self.state_dir / "lock").open("a+") as lock, \
@@ -101,6 +105,7 @@ class WorkerTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(janitor_watch.worker(lock.fileno()), 0)
         self.assertEqual(out.getvalue(), "")
+        self.assertEqual(janitor_watch.read_state()['processes'], processes)
         entry = json.loads((self.root / "audit.jsonl").read_text())
         self.assertEqual(entry, {"ts": 123, "event": "report", "processes": processes,
                                  "liveness_unavailable": report["liveness_unavailable"]})
@@ -177,7 +182,7 @@ def record_report(scan): pass
         self.assertEqual(list((home / ".config/opencode/skills").glob("*.bak-*")), [])
 
 
-class QuietCheckTests(unittest.TestCase):
+class QuietCheckTests(JanitorTestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -271,6 +276,20 @@ sys.exit(rc)
         worker = self.check()
         worker.assert_called_once()
         self.assertEqual((self.calls(), self.audits()), ([], []))
+
+    def test_production_defaults_still_use_live_audit_and_telegram(self):
+        with patch.dict(os.environ):
+            for key in ('DEV_JANITOR_LOG_DIR', 'DEV_JANITOR_WATCH_STATE', 'DEV_JANITOR_TELEGRAM_CMD'):
+                os.environ.pop(key, None)
+            default_log = Path.home() / '.local/share/dev-janitor'
+            defaults = runpy.run_path(str(SCRIPTS / 'dev_janitor.py'))
+            self.assertEqual(defaults['AUDIT'], str(default_log / 'audit.jsonl'))
+            defaults = runpy.run_path(str(SCRIPTS / 'janitor_watch.py'))
+            self.assertEqual(defaults['STATE_DIR'], default_log / 'hourly')
+            with patch.object(janitor_watch.subprocess, 'run', return_value=Mock(returncode=0)) as run:
+                janitor_watch.alert('default_command', 'production default command')
+            self.assertEqual(run.call_args.args[0][3:5], [
+                '/Users/ardud/.bun/bin/bun', '/Users/ardud/.local/share/telegram-bridge/src/cli.ts'])
 
     def test_empty_problem_only_and_candidate_reports_never_notify(self):
         for processes, liveness in [

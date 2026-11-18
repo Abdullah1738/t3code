@@ -32,6 +32,7 @@ import { getModelSelectionStringOptionValue, modelSelectionsEqual } from "@t3too
 import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as EventSink from "./EventSink.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -753,6 +754,25 @@ export const layer: Layer.Layer<
                 eventCount: events.length,
                 cause,
               });
+            const effects: EffectOutbox.PendingOrchestrationEffectV2[] = [];
+            if (
+              input.event.type === "provider_turn.updated" &&
+              input.event.providerTurn.promptAcceptedAt !== undefined &&
+              input.runId !== undefined &&
+              input.nodeId !== undefined &&
+              input.event.providerTurn.nodeId === input.nodeId &&
+              (input.event.threadId === undefined || input.event.threadId === input.threadId)
+            ) {
+              const message = yield* projections.getRunMessage(input.threadId, input.runId).pipe(
+                Effect.retry({
+                  schedule: transientReadRetrySchedule(),
+                  while: isTransientSqliteReadFailure,
+                }),
+                Effect.mapError(mapWriteError),
+              );
+              if (message?.delegatedCompletion !== undefined)
+                effects.push(EffectOutbox.nativeNoticeAcceptanceEffect(input.threadId, message.id));
+            }
             if (input.writeIfProviderThreadOwner !== undefined) {
               const ownerResult = yield* eventSink
                 .writeIfProviderThreadOwner({
@@ -765,13 +785,16 @@ export const layer: Layer.Layer<
               return ownerResult.storedEvents;
             }
             if (input.writeIfRunCurrent === undefined) {
-              return yield* eventSink
-                .write({
-                  guardPendingUserInputCancellations: true,
-                  ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-                  events,
-                })
-                .pipe(Effect.mapError(mapWriteError));
+              const write = {
+                guardPendingUserInputCancellations: true,
+                ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+                events,
+              };
+              return yield* (
+                effects.length === 0
+                  ? eventSink.write(write)
+                  : eventSink.writeWithEffects({ ...write, effects })
+              ).pipe(Effect.mapError(mapWriteError));
             }
             const result = yield* eventSink
               .writeIfRunCurrent({
@@ -780,6 +803,7 @@ export const layer: Layer.Layer<
                 threadId: input.threadId,
                 ...input.writeIfRunCurrent,
                 events,
+                effects,
               })
               .pipe(Effect.mapError(mapWriteError));
             return result.storedEvents;

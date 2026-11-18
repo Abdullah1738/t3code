@@ -14,6 +14,10 @@ FLOW = '10000000-0000-4000-8000-000000000001'
 class RedirectTests(unittest.TestCase):
     def setUp(self):
         approve_test_flows(self)
+        import order_card
+        for field, value in (('LAST4', '2342'), ('NETWORK', 'mastercard')):
+            card = patch.object(order_card, field, value)
+            card.start(); self.addCleanup(card.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = patch.object(j, 'ROOT', Path(self.temp.name) / 'commerce')

@@ -677,9 +677,9 @@ export class RobobBackend implements ChatBackend {
     } finally { this.messageCache.afterWrite(threadId); }
   }
 
-  async abort(id: string, _directory?: string): Promise<boolean> {
+  async abort(id: string, _directory?: string, cancelReason?: Parameters<ChatBackend["abort"]>[2]): Promise<boolean> {
     const threadId = await this.resolve(id);
-    const result = await this.client.request<{ interrupted?: unknown }>("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, {});
+    const result = await this.client.request<{ interrupted?: unknown }>("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, cancelReason === undefined ? {} : { cancelReason });
     return result.interrupted === true;
   }
 

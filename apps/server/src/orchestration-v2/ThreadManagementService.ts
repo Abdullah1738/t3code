@@ -15,8 +15,10 @@ import type {
   ProjectionRecords,
 } from "./ProjectionStore.ts";
 import {
+  ControlRejectionHolder,
   type ChatAttachment,
   CommandId,
+  AnalyticsEvent,
   isProviderNativeSubagentThread,
   MessageId,
   OrchestrationV2StopWorkflowError,
@@ -48,6 +50,7 @@ import {
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { McpCall } from "../ardud/analytics/McpCall.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
 import { runningBackgroundWork } from "../ardud/context-reset/backgroundWork.ts";
@@ -72,6 +75,7 @@ import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimi
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
+import { delegationCreateFailure } from "../ardud/orchestration/delegationCreateFailure.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
 const isDispatchError = Schema.is(Orchestrator.OrchestratorDispatchError);
@@ -151,6 +155,8 @@ export type ThreadManagementTerminalRunStatus = Extract<
 >;
 
 export interface ThreadManagementSendInput {
+  /** Internal observer notified by the atomic message commit before projection reads. */
+  readonly onAccepted?: () => void;
   readonly isStale?: () => boolean;
   readonly projectId: ProjectId;
   readonly commandId: CommandId;
@@ -163,6 +169,7 @@ export interface ThreadManagementSendInput {
   readonly modelSelection?: ModelSelection;
   readonly mode: ThreadManagementSendMode;
   readonly activeTurnOnly?: boolean;
+  readonly delegatedTaskStallRecovery?: OrchestrationV2Run["delegatedTaskStallRecovery"];
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
   /** ardud: start the message on a fresh provider thread (context reset). */
@@ -204,6 +211,7 @@ export interface ThreadManagementInterruptInput {
   readonly attemptId?: RunAttemptId;
   readonly delegatedTaskStall?: NonNullable<OrchestrationV2Run["delegatedTaskStall"]>;
   readonly reason?: string;
+  readonly cancelReason?: OrchestrationV2Run["cancelReason"];
 }
 
 export type ThreadManagementInterruptResult =
@@ -267,6 +275,7 @@ export class ThreadManagementNoSteerableRunError extends Schema.TaggedError<Thre
   {
     threadId: ThreadId,
     mode: Schema.Literals(["steer", "restart"]),
+    holder: Schema.optional(ControlRejectionHolder),
   },
 ) {
   override get message(): string {
@@ -350,7 +359,41 @@ export type ThreadManagementError = typeof ThreadManagementError.Type;
 
 type ThreadManagementFailure = ThreadManagementError | Orchestrator.OrchestratorV2Error;
 
+interface AbandonedDelegation {
+  readonly status: "abandoned";
+  readonly reason: string;
+  readonly elapsedSeconds: number;
+  readonly at: DateTime.Utc;
+}
+
+export interface DetachedDelegationOutcome {
+  readonly outcome: "committed" | "failed" | "capped";
+  readonly reason?: string;
+  readonly stage: string;
+  readonly elapsedSeconds: number;
+}
+const decodeTimeoutAnalytics = Schema.decodeUnknownEffect(Schema.fromJsonString(AnalyticsEvent));
+const lostCreateReceiptId = (id: CommandId) => CommandId.make(`delegation-lost:${id}`);
+
 export interface ThreadManagementServiceShape {
+  readonly recordDelegationTimeout: CommandReceiptStore.CommandReceiptStoreV2Shape["saveDelegationTimeout"];
+  readonly clearDelegationTimeout: CommandReceiptStore.CommandReceiptStoreV2Shape["removeDelegationTimeout"];
+  readonly reconcileDelegationTimeout: (
+    commandId: CommandId,
+    attemptId: string,
+  ) => Effect.Effect<boolean>;
+  readonly snapshotDelegationTimeouts: () => Effect.Effect<
+    ReadonlyArray<CommandReceiptStore.DelegationTimeout>
+  >;
+  readonly settleDelegationTimeout: (
+    commandId: CommandId,
+    outcome: DetachedDelegationOutcome,
+    afterRestart?: boolean,
+    attemptId?: string,
+  ) => Effect.Effect<AnalyticsEvent["detachedOutcomeWake"]>;
+  readonly sweepDelegationTimeouts: (
+    records?: ReadonlyArray<CommandReceiptStore.DelegationTimeout>,
+  ) => Effect.Effect<void>;
   readonly promoteQueuedMessages: Orchestrator.OrchestratorV2["Service"]["promoteQueuedMessages"];
   readonly searchThreadStream: (
     input: OrchestrationV2SearchThreadInput,
@@ -406,6 +449,7 @@ export interface ThreadManagementServiceShape {
     readonly projectId: ProjectId;
     readonly threadId: ThreadId;
   }) => Effect.Effect<OrchestrationV2ThreadProjection, ThreadManagementError>;
+  readonly pageActiveThreadIds: Orchestrator.OrchestratorV2["Service"]["pageActiveThreadIds"];
   readonly listActiveThreadIds: Orchestrator.OrchestratorV2["Service"]["listActiveThreadIds"];
   readonly getShellSnapshot: (options?: {
     readonly summaryOnly?: boolean;
@@ -456,9 +500,18 @@ export interface ThreadManagementServiceShape {
   readonly getDelegationCommandState: (
     commandId: CommandId,
   ) => Effect.Effect<
-    CommandReceiptStore.CommandReceiptV2 | { readonly status: "pending" | "never_saved" },
+    | CommandReceiptStore.CommandReceiptV2
+    | { readonly status: "pending" | "never_saved"; readonly reason?: string }
+    | AbandonedDelegation,
     CommandReceiptStore.CommandReceiptStoreV2Error
   >;
+  readonly requestCancelOnArrival: (
+    commandId: CommandId,
+    input: {
+      readonly reason: string;
+      readonly onArrival: (requestedAt: bigint) => Effect.Effect<void>;
+    },
+  ) => Effect.Effect<"cancel_pending" | "not_pending" | "capacity">;
   readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
   readonly findMcpThreadCreations: CommandReceiptStore.CommandReceiptStoreV2["Service"]["findMcpThreadCreations"];
   readonly waitForThread: (
@@ -483,6 +536,13 @@ export interface ThreadManagementServiceShape {
     { readonly sequence: number } | { readonly settlesWhenTurnEnds: true },
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
   >;
+  readonly getDelegatedRetryCheck?: (input: {
+    readonly threadId: ThreadId;
+    readonly runId: RunId;
+    readonly attemptId: OrchestrationV2Run["activeAttemptId"];
+    readonly noResponseBudgetMs: number;
+    readonly flapLimit: number;
+  }) => Effect.Effect<Effect.Effect<boolean> | undefined>;
   readonly interruptThread: (
     input: ThreadManagementInterruptInput,
   ) => Effect.Effect<ThreadManagementInterruptResult, ThreadManagementFailure>;
@@ -493,6 +553,7 @@ export interface ThreadManagementServiceShape {
     readonly threadId: ThreadId;
     readonly commandId: CommandId;
     readonly reason?: string | undefined;
+    readonly cancelReason?: OrchestrationV2Run["cancelReason"];
   }) => Effect.Effect<
     void,
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
@@ -586,8 +647,25 @@ const make = Effect.gen(function* () {
   // Orchestrator's lock is not reentrant. This separate lock covers the
   // preflight + selection update + send across callers of this service.
   const selectionDispatchLock = yield* KeyedLock.make<ThreadId>();
+  // The create lock preserves same-id serialization; the dispatch lock only
+  // fences cancellation registration against the post-commit handoff. A stalled
+  // create must not keep task_cancel waiting for the create lock.
+  const delegationCreateLock = yield* KeyedLock.make<CommandId>();
   const delegationDispatchLock = yield* KeyedLock.make<CommandId>();
+  // Restart interrupts in-flight creates too; restart-cut children are handled
+  // separately, so cancellation registrations need not survive a restart.
+  const cancelsOnArrival = new Map<
+    CommandId,
+    {
+      readonly requestedAt: bigint;
+      readonly reason: string;
+      readonly onArrival: (requestedAt: bigint) => Effect.Effect<void>;
+      generation: number;
+    }
+  >();
   const pendingDelegations = yield* Ref.make<ReadonlyMap<CommandId, number>>(new Map());
+  // Only diagnostics are retained: receipts and active retries always take precedence.
+  const abandonedDelegations = new Map<CommandId, AbandonedDelegation>();
   const getDelegationCommandState = Effect.fn("ThreadManagementService.getDelegationCommandState")(
     function* (commandId: CommandId) {
       const receipt = yield* receipts.getByCommandId(commandId);
@@ -596,19 +674,207 @@ const make = Effect.gen(function* () {
         return { status: "pending" as const };
       }
       // Fence the second read against a create starting or finishing after the first read.
-      // The dispatch holds this key through commit and interruption cleanup.
-      return yield* delegationDispatchLock.withLock(
+      // Keep receipt I/O off the short cancellation-registration lock.
+      return yield* delegationCreateLock.withLock(
         commandId,
         Effect.gen(function* () {
           const latest = yield* receipts.getByCommandId(commandId);
           if (Option.isSome(latest)) return latest.value;
+          if ((yield* Ref.get(pendingDelegations)).has(commandId))
+            return { status: "pending" as const };
+          const abandoned = abandonedDelegations.get(commandId);
+          if (abandoned !== undefined) return abandoned;
+          const lost = yield* receipts.getByCommandId(lostCreateReceiptId(commandId));
           return {
-            status: (yield* Ref.get(pendingDelegations)).has(commandId)
-              ? ("pending" as const)
-              : ("never_saved" as const),
+            status: "never_saved" as const,
+            ...(Option.isSome(lost) ? { reason: "lost in server restart" } : {}),
           };
         }),
       );
+    },
+  );
+
+  const requestCancelOnArrival: ThreadManagementServiceShape["requestCancelOnArrival"] = Effect.fn(
+    "ThreadManagementService.requestCancelOnArrival",
+  )(function* (commandId, input) {
+    const requestedAt = yield* Clock.monotonicTimeNanos;
+    return yield* delegationDispatchLock.withLock(
+      commandId,
+      Effect.gen(function* () {
+        if (!(yield* Ref.get(pendingDelegations)).has(commandId)) return "not_pending" as const;
+        return yield* Effect.sync(() => {
+          if (cancelsOnArrival.has(commandId)) return "cancel_pending" as const;
+          // The limit spans keys. Check and insert without yielding, and never
+          // evict an acknowledged cancel while its create can still land.
+          if (cancelsOnArrival.size >= 500) return "capacity" as const;
+          cancelsOnArrival.set(commandId, { ...input, requestedAt, generation: 0 });
+          return "cancel_pending" as const;
+        });
+      }),
+    );
+  });
+
+  const snapshotDelegationTimeouts = Effect.fn(
+    "ThreadManagementService.snapshotDelegationTimeouts",
+  )(() =>
+    receipts.listDelegationTimeouts().pipe(
+      Effect.tapError((cause) =>
+        Effect.logWarning("delegation timeout startup read failed; retrying", { cause }).pipe(
+          Effect.andThen(Effect.sleep("1 second")),
+        ),
+      ),
+      Effect.eventually,
+    ),
+  );
+
+  const settleDelegationTimeout: ThreadManagementServiceShape["settleDelegationTimeout"] =
+    Effect.fn("ThreadManagementService.settleDelegationTimeout")(function* (
+      commandId,
+      outcome,
+      afterRestart = false,
+      attemptId,
+    ) {
+      let completedWake: AnalyticsEvent["detachedOutcomeWake"];
+      let notificationAttempted = false;
+      // A saved retry must win before a failure notification commits.
+      // Receipt and wake I/O must stay off the cancellation registration lock.
+      return yield* delegationCreateLock
+        .withLock(
+          commandId,
+          Effect.gen(function* () {
+            const pending = yield* receipts.getDelegationTimeout(commandId, attemptId);
+            if (Option.isNone(pending)) return completedWake ?? ("suppressed_definite" as const);
+            const record = pending.value;
+            if (completedWake !== undefined) {
+              yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
+              return completedWake;
+            }
+            const wakeId = `delegation-create-failure:${encodeURIComponent(record.parentThreadId)}:${encodeURIComponent(record.clientRequestId)}`;
+            const delivered = yield* receipts.getByCommandId(CommandId.make(`command:${wakeId}`));
+            const alreadyDelivered =
+              Option.isSome(delivered) && delivered.value.status === "accepted";
+            const receipt = yield* receipts.getByCommandId(commandId);
+            const parent = yield* orchestrator.getThreadShell(record.parentThreadId);
+            let wake: AnalyticsEvent["detachedOutcomeWake"];
+            if (alreadyDelivered && notificationAttempted) {
+              wake = afterRestart ? "sent_after_restart" : "sent";
+            } else if (Option.isSome(receipt) && receipt.value.status === "accepted") {
+              wake = "suppressed_retry_saved";
+            } else if (parent === null || parent.archivedAt !== null || parent.deletedAt !== null) {
+              yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
+              return undefined;
+            } else {
+              const records = yield* orchestrator.getThreadRecords(record.parentThreadId, [
+                "subagents",
+              ]);
+              if (
+                records.subagents.some(
+                  (task) => task.id === record.taskId && task.childThreadId !== null,
+                )
+              ) {
+                wake = "suppressed_retry_saved";
+              } else {
+                if (alreadyDelivered) {
+                  yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
+                  return undefined;
+                }
+                const abandoned = abandonedDelegations.get(commandId);
+                const detail = afterRestart
+                  ? "lost in server restart"
+                  : Option.isSome(receipt) && receipt.value.status === "rejected"
+                    ? `rejected: ${receipt.value.error ?? outcome.reason ?? "No reason recorded"}`
+                    : abandoned !== undefined
+                      ? `abandoned after ${abandoned.elapsedSeconds} s at ${outcome.stage} (${abandoned.reason})`
+                      : `never saved${outcome.reason === undefined ? "" : `: ${outcome.reason}`}`;
+                const now = yield* DateTime.now;
+                const elapsedSeconds = afterRestart
+                  ? Math.max(
+                      0,
+                      Math.round(
+                        (DateTime.toEpochMillis(now) - Date.parse(record.createdAt)) / 1_000,
+                      ),
+                    )
+                  : outcome.elapsedSeconds;
+                if (afterRestart)
+                  yield* receipts.upsert({
+                    commandId: lostCreateReceiptId(commandId),
+                    threadId: record.parentThreadId,
+                    commandType: "delegation.create-lost",
+                    acceptedAt: yield* DateTime.now,
+                    resultSequence: 0,
+                    status: "rejected",
+                    error: detail,
+                  });
+                // The command receipt commits with the notification. A crash before cleanup replays it.
+                notificationAttempted = true;
+                yield* orchestrator.dispatch(
+                  {
+                    type: "message.dispatch",
+                    commandId: CommandId.make(`command:${wakeId}`),
+                    threadId: record.parentThreadId,
+                    messageId: MessageId.make(`message:${wakeId}`),
+                    text: `Async delegation ${record.clientRequestId}\nTask ${record.taskId}\n${detail}\nAfter ${elapsedSeconds} s at ${outcome.stage}\nNothing ran. Retry delegate_task with the same clientRequestId.`,
+                    notification: {
+                      source: { kind: "background_task" },
+                      outcome: "failed",
+                      summary: `Delegation ${record.clientRequestId}: ${detail}`,
+                    },
+                    attachments: [],
+                    dispatchMode: { type: "queue_after_active" },
+                    createdBy: "agent",
+                    creationSource: "server",
+                  },
+                  { retryPlanningFailures: true },
+                );
+                wake = afterRestart ? "sent_after_restart" : "sent";
+              }
+            }
+            completedWake = wake;
+            yield* Effect.annotateCurrentSpan("t3.delegate.detached_outcome_wake", wake);
+            if (
+              (afterRestart || outcome.stage === "outcome_admission") &&
+              record.analyticsJson !== null
+            ) {
+              const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+              const now = yield* DateTime.now;
+              if (Option.isSome(analytics))
+                yield* decodeTimeoutAnalytics(record.analyticsJson).pipe(
+                  Effect.flatMap((event) =>
+                    analytics.value.record({
+                      ...event,
+                      ts: DateTime.formatIso(now),
+                      detachedOutcomeWake: wake,
+                    }),
+                  ),
+                  Effect.ignoreCause,
+                );
+            }
+            yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
+            return wake;
+          }),
+        )
+        .pipe(
+          // Retry outside the lock so storage trouble cannot prevent a same-key retry from saving.
+          Effect.tapError((cause) =>
+            Effect.logWarning("delegation timeout recovery failed; retrying", {
+              commandId,
+              cause,
+            }).pipe(Effect.andThen(Effect.sleep("1 second"))),
+          ),
+          Effect.eventually,
+          Effect.map((wake) => wake ?? completedWake),
+        );
+    });
+  const sweepDelegationTimeouts = Effect.fn("ThreadManagementService.sweepDelegationTimeouts")(
+    function* (records?: ReadonlyArray<CommandReceiptStore.DelegationTimeout>) {
+      for (const record of records ?? (yield* snapshotDelegationTimeouts())) {
+        yield* settleDelegationTimeout(
+          record.commandId,
+          { outcome: "failed", stage: "dispatch", elapsedSeconds: 0 },
+          true,
+          record.attemptId,
+        );
+      }
     },
   );
 
@@ -1056,16 +1322,85 @@ const make = Effect.gen(function* () {
           const next = new Map(current);
           next.set(command.commandId, (current.get(command.commandId) ?? 0) + 1);
           return next;
-        }),
-        () =>
-          delegationDispatchLock.withLock(command.commandId, dispatchUnchanged(command, options)),
-        () =>
-          Ref.update(pendingDelegations, (current) => {
-            const next = new Map(current);
-            const remaining = (current.get(command.commandId) ?? 1) - 1;
-            if (remaining === 0) next.delete(command.commandId);
-            else next.set(command.commandId, remaining);
-            return next;
+        }).pipe(Effect.andThen(Clock.monotonicTimeNanos)),
+        () => delegationCreateLock.withLock(command.commandId, dispatchUnchanged(command, options)),
+        (startedAt, exit) =>
+          Effect.gen(function* () {
+            const cancel = yield* delegationDispatchLock.withLock(
+              command.commandId,
+              Effect.gen(function* () {
+                if (exit._tag === "Failure") {
+                  const now = yield* Clock.monotonicTimeNanos;
+                  const at = yield* DateTime.now;
+                  abandonedDelegations.delete(command.commandId);
+                  abandonedDelegations.set(command.commandId, {
+                    status: "abandoned",
+                    reason: delegationCreateFailure(exit.cause),
+                    elapsedSeconds: Math.round(Number(now - startedAt) / 1_000_000_000),
+                    at,
+                  });
+                  if (abandonedDelegations.size > 500)
+                    abandonedDelegations.delete(abandonedDelegations.keys().next().value!);
+                } else {
+                  abandonedDelegations.delete(command.commandId);
+                }
+                yield* Ref.update(pendingDelegations, (current) => {
+                  const next = new Map(current);
+                  const remaining = (current.get(command.commandId) ?? 1) - 1;
+                  if (remaining === 0) next.delete(command.commandId);
+                  else next.set(command.commandId, remaining);
+                  return next;
+                });
+                const requested = cancelsOnArrival.get(command.commandId);
+                if (requested === undefined) return undefined;
+                if (exit._tag === "Success") cancelsOnArrival.delete(command.commandId);
+                return { requested, generation: ++requested.generation };
+              }),
+            );
+            if (cancel !== undefined) {
+              const { requested, generation } = cancel;
+              // Do not inherit the caller's foreground SQLite lane. Cancellation
+              // runs after commit and outside both locks, and cannot fail create.
+              const followUp = Effect.gen(function* () {
+                if (exit._tag === "Failure") {
+                  // Interruption can be delivered after a masked commit saved.
+                  // Reconcile off the dispatch fiber before forgetting its cancel.
+                  const receipt = yield* receipts.getByCommandId(command.commandId);
+                  const committed = yield* delegationDispatchLock.withLock(
+                    command.commandId,
+                    Effect.gen(function* () {
+                      if (cancelsOnArrival.get(command.commandId) !== requested) return false;
+                      if (Option.isSome(receipt) && receipt.value.status === "accepted") {
+                        cancelsOnArrival.delete(command.commandId);
+                        return true;
+                      }
+                      // A missing receipt can predate a retry's masked commit.
+                      // Only the latest settlement may discard this cancel;
+                      // a pending retry will reconcile its own receipt on exit.
+                      if (
+                        requested.generation === generation &&
+                        !(yield* Ref.get(pendingDelegations)).has(command.commandId)
+                      )
+                        cancelsOnArrival.delete(command.commandId);
+                      return false;
+                    }),
+                  );
+                  if (!committed) return;
+                }
+                yield* requested.onArrival(requested.requestedAt);
+              });
+              yield* followUp.pipe(
+                NodeSqliteClient.backgroundReads,
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("delegated task cancellation on arrival failed", {
+                    commandId: command.commandId,
+                    reason: requested.reason,
+                    cause,
+                  }),
+                ),
+                Effect.forkIn(layerScope, { uninterruptible: false }),
+              );
+            }
           }),
       );
     }
@@ -1211,12 +1546,30 @@ const make = Effect.gen(function* () {
           : ["runs", "providerTurns"],
     );
     const steerableRun = input.mode === "queue" ? undefined : latestSteerableRun(target);
+    const observedRun =
+      input.mode === "queue"
+        ? undefined
+        : (latestActiveRun(target) ??
+          target.runs.reduce<OrchestrationV2Run | undefined>(
+            (latest, run) => (latest === undefined || run.ordinal > latest.ordinal ? run : latest),
+            undefined,
+          ));
+    const holder = {
+      threadId: input.threadId,
+      runId: observedRun?.id ?? null,
+      status: observedRun?.status ?? null,
+    };
     // Replays must reach the orchestrator even after the run finishes or the thread archives.
     const preflightError =
       target.thread.archivedAt !== null
         ? new ThreadManagementThreadArchivedError({ threadId: input.threadId })
-        : (input.mode === "steer" || input.mode === "restart") && steerableRun === undefined
-          ? new ThreadManagementNoSteerableRunError({ threadId: input.threadId, mode: input.mode })
+        : (input.mode === "restart" || (input.mode === "steer" && input.activeTurnOnly)) &&
+            steerableRun === undefined
+          ? new ThreadManagementNoSteerableRunError({
+              threadId: input.threadId,
+              mode: input.mode,
+              holder,
+            })
           : undefined;
     const readReceipt = (commandId: CommandId) =>
       receipts.getByCommandId(commandId).pipe(
@@ -1259,11 +1612,14 @@ const make = Effect.gen(function* () {
     } else if (interruptedForRestart) {
       // A retry can arrive after interrupt committed but before the message did.
       dispatchMode = { type: "queue_after_active" };
+    } else if (input.mode === "steer" && steerableRun === undefined && !input.activeTurnOnly) {
+      dispatchMode = { type: "queue_after_active" };
     } else if (input.mode === "steer" || input.mode === "restart") {
       if (steerableRun === undefined) {
         return yield* new ThreadManagementNoSteerableRunError({
           threadId: input.threadId,
           mode: input.mode,
+          holder,
         });
       }
       const providerThread =
@@ -1280,6 +1636,7 @@ const make = Effect.gen(function* () {
           : undefined;
       if (
         input.mode === "restart" &&
+        input.delegatedTaskStallRecovery === undefined &&
         capabilities?.supportsSteeringByInterruptRestart === false &&
         capabilities.supportsInterrupt &&
         capabilities.supportsQueuedMessages
@@ -1288,6 +1645,7 @@ const make = Effect.gen(function* () {
           {
             type: "run.interrupt",
             commandId: interruptCommandId,
+            cancelReason: "superseded",
             threadId: input.threadId,
             runId: steerableRun.id,
             fenced: true,
@@ -1326,6 +1684,9 @@ const make = Effect.gen(function* () {
           ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
           text: input.text,
           attachments: input.attachments,
+          ...(input.delegatedTaskStallRecovery === undefined
+            ? {}
+            : { delegatedTaskStallRecovery: input.delegatedTaskStallRecovery }),
           ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
           dispatchMode,
           createdBy: input.createdBy,
@@ -1511,6 +1872,40 @@ const make = Effect.gen(function* () {
     return { sequence: result.sequence };
   });
 
+  const getDelegatedRetryCheck = Effect.fn("ThreadManagementService.getDelegatedRetryCheck")(
+    function* (
+      input: Parameters<NonNullable<ThreadManagementServiceShape["getDelegatedRetryCheck"]>>[0],
+    ) {
+      const records = yield* orchestrator.getThreadRecords(input.threadId, [
+        "runs",
+        "providerThreads",
+      ]);
+      const run = records.runs.find((run) => run.id === input.runId);
+      if (run?.status !== "running" || run.activeAttemptId !== input.attemptId) return undefined;
+      const provider = records.providerThreads.find(
+        (provider) => provider.id === run.providerThreadId,
+      );
+      if (provider?.driver !== "claudeAgent" || provider.providerSessionId === null)
+        return Effect.succeed(false);
+      const runtime = yield* sessions.get(provider.providerSessionId);
+      if (Option.isNone(runtime)) return undefined;
+      if (runtime.value.checkRetryHealth === undefined) return Effect.succeed(false);
+      return runtime.value
+        .checkRetryHealth(input)
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("delegated retry check failed", { cause }).pipe(Effect.as(false)),
+          ),
+        );
+    },
+    (effect) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("delegated retry lookup failed", { cause }).pipe(Effect.as(undefined)),
+        ),
+      ),
+  );
+
   const interruptThread: ThreadManagementServiceShape["interruptThread"] = Effect.fn(
     "ThreadManagementService.interruptThread",
   )(function* (input) {
@@ -1555,6 +1950,7 @@ const make = Effect.gen(function* () {
         commandId: input.commandId,
         threadId: input.threadId,
         runId: interruptibleRun.id,
+        cancelReason: input.cancelReason,
         ...(input.delegatedTaskStall === undefined
           ? {}
           : { delegatedTaskStall: input.delegatedTaskStall }),
@@ -1686,6 +2082,7 @@ const make = Effect.gen(function* () {
       yield* dispatch({
         type: "thread.stop",
         commandId: CommandId.make(`${input.commandId}:stop:${threadId}`),
+        cancelReason: input.cancelReason ?? "delegated_parent_cancelled",
         threadId,
         ...(input.reason === undefined ? {} : { reason: input.reason }),
       }).pipe(
@@ -1747,6 +2144,7 @@ const make = Effect.gen(function* () {
     getProjectThreadRecords,
     getProjectThread,
     listActiveThreadIds: orchestrator.listActiveThreadIds,
+    pageActiveThreadIds: orchestrator.pageActiveThreadIds,
     getShellSnapshot: orchestrator.getShellSnapshot,
     readShellSnapshot: orchestrator.readShellSnapshot,
     getCallerRow: orchestrator.getCallerRow,
@@ -1758,7 +2156,25 @@ const make = Effect.gen(function* () {
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
     hasReceipt,
+    recordDelegationTimeout: receipts.saveDelegationTimeout,
+    clearDelegationTimeout: receipts.removeDelegationTimeout,
+    snapshotDelegationTimeouts,
+    reconcileDelegationTimeout: Effect.fn("ThreadManagementService.reconcileDelegationTimeout")(
+      (commandId, attemptId) =>
+        // Worker death cannot prove COMMIT failed. A fresh reader must resolve the attempt
+        // before a definite response; never queue this proof behind another create's writer.
+        receipts.getDelegationTimeout(commandId, attemptId).pipe(
+          NodeSqliteClient.requireReader,
+          NodeSqliteClient.foregroundReads,
+          Effect.onError(() => Effect.sleep("1 second")),
+          Effect.eventually,
+          Effect.map(Option.isSome),
+        ),
+    ),
+    settleDelegationTimeout,
+    sweepDelegationTimeouts,
     getDelegationCommandState,
+    requestCancelOnArrival,
     findMcpThreadCreations: receipts.findMcpThreadCreations,
     getCommandReceipt: Effect.fn("ThreadManagementService.getCommandReceipt")(
       receipts.getByCommandId,
@@ -1767,6 +2183,7 @@ const make = Effect.gen(function* () {
     settleAfterRun,
     settleThread,
     interruptThread,
+    getDelegatedRetryCheck,
     stopDelegatedTasks,
     stopWorkflow,
     getThreadEventSequence: orchestrator.getThreadEventSequence,

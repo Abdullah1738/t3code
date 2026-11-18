@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 args = sys.argv[1:]
@@ -41,14 +42,25 @@ if sub == "ssh":
         result = queued.pop(0)
         with open(responses, "w") as f:
             json.dump(queued, f)
-        sys.stdout.write(result.get("stdout", ""))
-        sys.stderr.write(result.get("stderr", ""))
-        sys.exit(result["exit"])
+        if not result.get("passthrough"):
+            sys.stdout.write(result.get("stdout", ""))
+            sys.stderr.write(result.get("stderr", ""))
+            sys.exit(result["exit"])
     cmd = remote_cmd(args)
     if "bash ~/person/session.sh" in cmd:
         sys.exit(0)
-    env = {**os.environ, "HOME": os.environ["FAKE_BOXHOME"]}
-    sys.exit(subprocess.call(["bash", "-c", cmd], env=env))
+    env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV") and not k.startswith("BASH_FUNC_")}
+    env["HOME"] = os.environ["FAKE_BOXHOME"]
+    data = sys.stdin.buffer.read()
+    if data and os.environ.get("FAKE_OFFBOX_STDIN_MATCH", "") in cmd:
+        counter = Path(os.environ["FAKE_LOG"] + ".stdin-count")
+        count = int(counter.read_text()) + 1 if counter.exists() else 1
+        counter.write_text(str(count))
+        if count <= int(os.environ.get("FAKE_OFFBOX_DROP_STDIN", "0")):
+            data = b""
+        elif count <= int(os.environ.get("FAKE_OFFBOX_TRUNCATE_STDIN", "0")):
+            data = data[:len(data) // 2]
+    sys.exit(subprocess.run(["bash", "-c", cmd], env=env, input=data).returncode)
 
 if sub == "ports" and "--reverse" in args:
     while True:

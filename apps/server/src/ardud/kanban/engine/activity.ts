@@ -6,10 +6,24 @@
  */
 import {
   KANBAN_BACKLOG,
+  kanbanCardModels,
+  kanbanEvaluatorStep,
+  kanbanScriptStep,
+  kanbanWorkStep,
+  kanbanWaiting,
+  kanbanWithoutWait,
+  kanbanWithoutDeciding,
+  kanbanRetryNotBefore,
+  kanbanAskKind,
+  kanbanStepSubtasks,
+  KANBAN_DECIDE_MS,
+  type KanbanBoard,
   type KanbanCard,
   type KanbanCardEvent,
+  type KanbanDiscussion,
   type KanbanOwnerAsk,
   type KanbanPool,
+  type KanbanPoolChange,
   type KanbanStage,
   type KanbanThreadLink,
 } from "@t3tools/contracts";
@@ -17,9 +31,11 @@ import * as DateTime from "effect/DateTime";
 
 import { COMPACT_READ_CHARS } from "../../compactRead.ts";
 export { COMPACT_READ_CHARS } from "../../compactRead.ts";
+import type { SlotEvent } from "../store/KanbanStore.ts";
 
 import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
+import type { boardReleaseSummary } from "./boardReplies.ts";
 import { waitEventOf } from "./waits.ts";
 
 /** The longest window one read covers. */
@@ -29,7 +45,7 @@ export const ACTIVITY_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** Events card_get returns when no events page is asked for. */
 export const CARD_EVENTS_DEFAULT = 20;
 export const CARD_EVENTS_MAX = 200;
-/** Characters one card_get reply stays under (oldest events are dropped whole to fit). */
+/** Character budget for event pages; the first read always keeps the full card and threads. */
 export const CARD_GET_CHARS = 60_000;
 /** Open cards over this long in one stage are listed. */
 const LONG_OPEN_MS = 24 * 60 * 60 * 1000;
@@ -39,7 +55,8 @@ const OLD_ASK_MS = 6 * 60 * 60 * 1000;
 const EVALUATOR_STARTS_LISTED = 2;
 /** Rows per rollup list at most; lists shrink together until the rollup fits ROLLUP_CHARS. */
 const LIST_MAX = 150;
-const ROLLUP_CHARS = 55_000;
+// Leave room for the tool's activity/boardId wrapper inside the 50,000-character reply.
+const ROLLUP_CHARS = 49_000;
 
 export interface ActivityWindow {
   readonly since: string;
@@ -61,6 +78,185 @@ const minutesBetween = (from: string, to: string) =>
 const hours = (ms: number) => Math.round((ms / HOUR) * 100) / 100;
 const inWindow = (iso: string | null | undefined, window: ActivityWindow): iso is string =>
   iso !== null && iso !== undefined && iso >= window.since && iso < window.until;
+
+/** Shared with the nightly launch's supplied discussion IDs. Messages decide inclusion in the exact window. */
+export const discussionSources = (
+  discussions: ReadonlyArray<KanbanDiscussion>,
+  since: string,
+  exclude?: string,
+) =>
+  discussions.filter(
+    (source) =>
+      source.id !== exclude &&
+      Date.parse(source.lastMessageAt ?? source.createdAt) >= Date.parse(since),
+  );
+
+interface DiscussionDigestMessage {
+  readonly at: string;
+  readonly author: string;
+  readonly text: string;
+}
+
+export const discussionDigestRow = (
+  discussion: KanbanDiscussion,
+  card: KanbanCard | undefined,
+  messages: ReadonlyArray<DiscussionDigestMessage>,
+  window: ActivityWindow,
+) => {
+  const matching = messages.filter((message) => inWindow(message.at, window));
+  const last = matching.at(-1);
+  if (last === undefined) return null;
+  return {
+    discussionId: discussion.id,
+    ...(card === undefined ? {} : { card: card.number }),
+    title: oneLine(card?.title ?? discussion.title, 200),
+    messagesInWindow: matching.length,
+    ownerMessages: matching
+      .filter((message) => message.author === "owner")
+      .map((message) => ({ at: message.at, text: oneLine(message.text, 300) })),
+    // Pin priority to the cutoff so later ask closures cannot shift an index cursor.
+    openAsks: (card?.asks ?? [])
+      .filter(
+        (ask) => ask.at < window.until && (ask.closedAt === null || ask.closedAt >= window.until),
+      )
+      .map((ask) => ask.id),
+    last: { at: last.at, author: last.author, text: oneLine(last.text, 200) },
+  };
+};
+
+export const discussionDigestRows = (
+  rows: ReadonlyArray<NonNullable<ReturnType<typeof discussionDigestRow>>>,
+) =>
+  rows
+    .toSorted(
+      (left, right) =>
+        Number(right.ownerMessages.length > 0 || right.openAsks.length > 0) -
+          Number(left.ownerMessages.length > 0 || left.openAsks.length > 0) ||
+        right.last.at.localeCompare(left.last.at) ||
+        left.discussionId.localeCompare(right.discussionId),
+    )
+    .flatMap((row) => {
+      // Preserve every owner message even when one busy discussion exceeds a page.
+      // Continuations carry the same id and an offset; ordinary discussions stay one row.
+      const parts: Array<
+        typeof row & { ownerMessagesOffset?: number; ownerMessagesTotal?: number }
+      > = [];
+      let part = { ...row, ownerMessages: [] as typeof row.ownerMessages };
+      let offset = 0;
+      for (const message of row.ownerMessages) {
+        const next = { ...part, ownerMessages: [...part.ownerMessages, message] };
+        if (part.ownerMessages.length > 0 && JSON.stringify(next).length > 25_000) {
+          parts.push({
+            ...part,
+            ownerMessagesOffset: offset,
+            ownerMessagesTotal: row.ownerMessages.length,
+          });
+          offset += part.ownerMessages.length;
+          part = { ...row, ownerMessages: [message] };
+        } else part = next;
+      }
+      parts.push(
+        parts.length === 0
+          ? part
+          : { ...part, ownerMessagesOffset: offset, ownerMessagesTotal: row.ownerMessages.length },
+      );
+      return parts;
+    });
+
+type ThreadDigestFlag = "run_failed" | "restarted" | "stalled" | "refused_call";
+
+export const threadDigestRows = (
+  cards: ReadonlyArray<KanbanCard>,
+  threads: ReadonlyArray<KanbanThreadLink>,
+  events: ReadonlyArray<KanbanCardEvent>,
+  window: ActivityWindow,
+  threadCards: ReadonlyMap<string, ReadonlyArray<KanbanCard["id"]>> = new Map(),
+) => {
+  const byCard = new Map(cards.map((card) => [card.id, card]));
+  const associated = new Map(
+    threads.map((link) => [
+      link.threadId,
+      [
+        ...new Set([
+          ...(link.cardId === null ? [] : [link.cardId]),
+          ...(threadCards.get(link.threadId) ?? []),
+        ]),
+      ].flatMap((id) => {
+        const card = byCard.get(id);
+        return card === undefined ? [] : [card];
+      }),
+    ]),
+  );
+  return threads
+    .flatMap((link) => {
+      const carried = associated.get(link.threadId) ?? [];
+      const card = carried[0];
+      if (
+        card === undefined ||
+        link.startedAt >= window.until ||
+        (link.endedAt !== null && link.endedAt < window.since)
+      )
+        return [];
+      const flags = new Set<ThreadDigestFlag>();
+      for (const event of events) {
+        if (!carried.some((entry) => entry.id === event.cardId) || !inWindow(event.at, window))
+          continue;
+        if (isFailure(event)) flags.add("run_failed");
+        if (isStall(event)) flags.add("stalled");
+        if (
+          failureKind(event) === "verdict_refused" ||
+          event.body?.startsWith(Retries.REFUSED_VERDICT_PREFIX)
+        )
+          flags.add("refused_call");
+      }
+      if (
+        inWindow(link.startedAt, window) &&
+        threads.some(
+          (other) =>
+            link.cardId !== null &&
+            other.cardId === link.cardId &&
+            other.role === link.role &&
+            other.startedAt < link.startedAt,
+        )
+      )
+        flags.add("restarted");
+      return [
+        {
+          threadId: link.threadId,
+          card: card.number,
+          ...(carried.length > 1 ? { cards: carried.map((entry) => entry.number) } : {}),
+          role: link.role,
+          model: link.model,
+          startedAt: link.startedAt,
+          endedAt: link.endedAt,
+          flags: [...flags],
+        },
+      ];
+    })
+    .toSorted(
+      (left, right) =>
+        Number(right.flags.length > 0) - Number(left.flags.length > 0) ||
+        right.startedAt.localeCompare(left.startedAt) ||
+        left.threadId.localeCompare(right.threadId),
+    );
+};
+
+/** Index cursor, unlike board_get's card-number cursor: priority order isn't card order. */
+export const digestPage = <R>(rows: ReadonlyArray<R>, after = 0) => {
+  const items: Array<R> = [];
+  let chars = 0;
+  for (const row of rows.slice(after)) {
+    const size = JSON.stringify(row).length + 1;
+    if (items.length >= 40 || (items.length > 0 && chars + size > 29_000)) break;
+    items.push(row);
+    chars += size;
+  }
+  const hasMore = after + items.length < rows.length;
+  return {
+    rows: items,
+    page: { limit: 40, hasMore, nextAfter: hasMore ? after + items.length : null },
+  };
+};
 
 export const isPass = (event: KanbanCardEvent) =>
   event.kind === "review" && event.body?.trim() === "clear";
@@ -116,6 +312,7 @@ const endsStall = (event: KanbanCardEvent) =>
 
 /** When the owner answered: the typed answer's time; plain asks keep only closedAt and count as closed. */
 const answeredAt = (ask: KanbanOwnerAsk): string | null => ask.answer?.at ?? null;
+const isNotice = Rules.isNotice;
 
 const askTouched = (ask: KanbanOwnerAsk, window: ActivityWindow) =>
   ask.closedAt === null ||
@@ -155,6 +352,7 @@ const askRow = (ask: KanbanOwnerAsk, until: string) => {
   const end = answered ?? (ask.closedAt === null ? until : null);
   return {
     id: ask.id,
+    ...(ask.kind !== undefined ? { kind: ask.kind } : {}),
     askedAt: stamp(ask.at),
     ...(answered !== null ? { answeredAt: stamp(answered) } : {}),
     ...(ask.closedAt !== null && answered === null ? { closedAt: stamp(ask.closedAt) } : {}),
@@ -236,13 +434,17 @@ export const pageRows = <R extends { readonly number: number }>(
   after: number,
   limit: number,
   maxChars = COMPACT_READ_CHARS,
+  fitRow?: (row: R, maxChars: number) => R,
 ) => {
   const out: Array<R> = [];
   let chars = 0;
   const rest = rows.filter((row) => row.number > after);
-  for (const row of rest) {
-    const size = JSON.stringify(row).length + 1;
-    if (out.length >= limit || (out.length > 0 && chars + size > maxChars)) break;
+  for (const source of rest) {
+    if (out.length >= limit) break;
+    const sourceSize = JSON.stringify(source).length + 1;
+    const row = fitRow && sourceSize > maxChars ? fitRow(source, maxChars) : source;
+    const size = row === source ? sourceSize : JSON.stringify(row).length + 1;
+    if (out.length > 0 && chars + size > maxChars) break;
     out.push(row);
     chars += size;
   }
@@ -262,11 +464,13 @@ export const pageRowsInReply = <R extends { readonly number: number }, Reply>(
     page: ReadonlyArray<R>,
     cursor: { readonly hasMore: boolean; readonly nextAfter: number | null },
   ) => Reply,
+  fitRow?: (row: R, maxChars: number) => R,
 ): Reply => {
   const wrapper = JSON.stringify(
     reply([], { hasMore: true, nextAfter: Number.MAX_SAFE_INTEGER }),
   ).length;
-  const page = pageRows(rows, after, limit, COMPACT_READ_CHARS - wrapper);
+  const maxChars = COMPACT_READ_CHARS - wrapper;
+  const page = pageRows(rows, after, limit, maxChars, fitRow);
   return reply(page.rows, { hasMore: page.hasMore, nextAfter: page.nextAfter });
 };
 
@@ -282,6 +486,7 @@ interface Span {
 
 /** Stages where time spent with no move still says something: held by a thread, or queued for one or for the owner. */
 const SAT_STAGES: ReadonlySet<KanbanStage> = new Set([
+  "todo",
   "working",
   "in_review",
   "needs_review",
@@ -295,35 +500,48 @@ export const stageSpans = (
   window: ActivityWindow,
   /** Each card's last stage change before the window, for the first span's real start. */
   prior: ReadonlyMap<string, KanbanCardEvent> = new Map(),
+  after: ReadonlyMap<string, KanbanCardEvent> = new Map(),
 ): Array<Span> => {
   const spans: Array<Span> = [];
   for (const card of cards) {
+    if (
+      card.createdAt >= window.until ||
+      (card.settledAt !== null && card.settledAt <= window.since)
+    )
+      continue;
     const transitions = (byCard.get(card.id) ?? []).filter(isTransition);
+    const before = prior.get(card.id);
+    const settled =
+      card.settledAt !== null && card.settledAt < window.until ? card.settledAt : null;
+    const limit = settled ?? window.until;
     if (transitions.length === 0) {
-      // Nothing moved it: it sat in one stage all window. Held and queue stages count then.
-      if (card.settledAt === null && card.createdAt < window.until && SAT_STAGES.has(card.stage))
+      const stage = before?.toStage ?? after.get(card.id)?.fromStage ?? card.stage;
+      if (SAT_STAGES.has(stage))
         spans.push({
           card,
-          stage: card.stage,
+          stage,
           from: card.createdAt > window.since ? card.createdAt : window.since,
-          to: null,
-          start: card.movedAt,
+          to: settled,
+          start: before?.at ?? (card.movedAt < window.until ? card.movedAt : null),
         });
       continue;
     }
     const first = transitions[0]!;
     let stage: KanbanStage | null = first.fromStage;
-    let from = window.since;
-    const before = prior.get(card.id);
+    let from = card.createdAt > window.since ? card.createdAt : window.since;
     let start: string | null = before !== undefined && before.toStage === stage ? before.at : null;
     for (const event of transitions) {
-      if (stage !== null && event.at > from) spans.push({ card, stage, from, to: event.at, start });
+      const to = event.at < limit ? event.at : limit;
+      if (stage !== null && to > from) spans.push({ card, stage, from, to, start });
+      if (event.at >= limit) {
+        from = limit;
+        break;
+      }
       stage = event.toStage;
       from = event.at;
       start = event.at;
     }
-    if (stage !== null && card.settledAt === null)
-      spans.push({ card, stage, from, to: null, start });
+    if (stage !== null && from < limit) spans.push({ card, stage, from, to: settled, start });
   }
   return spans;
 };
@@ -340,71 +558,6 @@ const threadAt = (
     .findLast((link) => link.endedAt === null || link.endedAt >= at);
 
 /**
- * When a card in working or in_review held a pool slot, as near as its history
- * tells: while the role's thread was alive inside the span, minus time parked
- * on a wait (no thread runs a waiting card). A thread never marked ended runs
- * to the window's end only when it is the card's active thread; an older one
- * ends when the role's next thread started; the last one runs to the end of a
- * span that closed, and in a span still open with no active thread (the board
- * shows the card there, but no model runs it) only to the last event that
- * thread wrote.
- */
-const slotTimes = (
-  span: Span,
-  since: string,
-  until: string,
-  events: ReadonlyArray<KanbanCardEvent>,
-  threadsByCard: ReadonlyMap<string, ReadonlyArray<KanbanThreadLink>>,
-): Array<{
-  readonly pool: string;
-  readonly thread: string;
-  readonly from: number;
-  readonly to: number;
-}> => {
-  const role = span.stage === "in_review" ? "review" : "work";
-  const spanFrom = time(span.from);
-  const spanTo = time(span.to ?? until);
-  const lastWrittenBy = (thread: string) => {
-    const last = events.findLast(
-      (event) =>
-        event.actor._tag === "thread" && event.actor.threadId === thread && event.at >= span.from,
-    );
-    return last === undefined ? spanFrom : time(last.at);
-  };
-  const waits = waitIntervals(span.card, events, since, until);
-  const links = (threadsByCard.get(span.card.id) ?? []).filter((link) => link.role === role);
-  const out: Array<{ pool: string; thread: string; from: number; to: number }> = [];
-  for (const [index, link] of links.entries()) {
-    const next = links[index + 1];
-    const end =
-      link.endedAt !== null
-        ? time(link.endedAt)
-        : link.threadId === span.card.activeThreadId
-          ? spanTo
-          : next !== undefined
-            ? time(next.startedAt)
-            : span.to !== null
-              ? spanTo
-              : lastWrittenBy(link.threadId);
-    const from = Math.max(spanFrom, time(link.startedAt));
-    const to = Math.min(spanTo, end);
-    if (to <= from) continue;
-    const pool = link.model
-      ? Rules.poolKey(link.model)
-      : (span.card.activePool ?? Rules.poolKey(span.card.model));
-    let cursor = from;
-    for (const [waitStart, waitEnd] of waits.toSorted((left, right) => left[0] - right[0])) {
-      if (waitEnd <= cursor || waitStart >= to) continue;
-      if (waitStart > cursor)
-        out.push({ pool, thread: link.threadId, from: cursor, to: waitStart });
-      cursor = Math.max(cursor, waitEnd);
-    }
-    if (cursor < to) out.push({ pool, thread: link.threadId, from: cursor, to });
-  }
-  return out;
-};
-
-/**
  * A card's waits in the window, from each wait set to the next wait end (both
  * stored forms, see waitEventOf). A wait already set when the window opened
  * counts from the window's start.
@@ -419,13 +572,24 @@ const waitIntervals = (
     const mark = waitEventOf(event);
     return mark === null ? [] : [{ mark, at: time(event.at) }];
   });
-  const waitingAtStart =
-    marks.length > 0
-      ? marks[0]!.mark === "end"
-      : card.wait !== undefined && card.wait.expiredAt === null && card.wait.at < since;
+  const wait = card.wait;
+  if (wait !== undefined) {
+    const at = time(wait.at);
+    if (!marks.some((mark) => mark.mark === "set" && mark.at === at))
+      marks.push({ mark: "set", at });
+    const end = Math.min(
+      time(wait.expiredAt ?? until),
+      card.movedAt > wait.at ? time(card.movedAt) : time(until),
+    );
+    if (end < time(until)) marks.push({ mark: "end", at: end });
+  }
+  marks.sort((a, b) => a.at - b.at);
+  const prior = marks.findLast((mark) => mark.at < time(since));
+  const inside = marks.filter((mark) => mark.at >= time(since) && mark.at < time(until));
+  const waitingAtStart = prior !== undefined ? prior.mark === "set" : inside[0]?.mark === "end";
   const waits: Array<readonly [number, number]> = [];
   let waitFrom: number | null = waitingAtStart ? time(since) : null;
-  for (const { mark, at } of marks) {
+  for (const { mark, at } of inside) {
     if (mark === "set" && waitFrom === null) waitFrom = at;
     else if (mark === "end" && waitFrom !== null) {
       waits.push([waitFrom, at]);
@@ -436,32 +600,412 @@ const waitIntervals = (
   return waits;
 };
 
-/** Merges overlapping intervals, so a thread carrying several cards counts once. */
-const union = (intervals: ReadonlyArray<readonly [number, number]>) => {
-  const merged: Array<[number, number]> = [];
-  for (const [from, to] of intervals.toSorted((left, right) => left[0] - right[0])) {
-    const lastMerged = merged.at(-1);
-    if (lastMerged && from <= lastMerged[1]) lastMerged[1] = Math.max(lastMerged[1], to);
-    else merged.push([from, to]);
-  }
-  return merged;
-};
-
 const percentile = (sorted: ReadonlyArray<number>, p: number) =>
   sorted.length === 0 ? null : sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))]!;
+
+const answerSummary = (minutes: ReadonlyArray<number>) => {
+  const sorted = minutes.toSorted((left, right) => left - right);
+  return {
+    count: sorted.length,
+    p50: percentile(sorted, 0.5),
+    p90: percentile(sorted, 0.9),
+    max: sorted.at(-1) ?? null,
+  };
+};
 
 const capped = <T>(items: ReadonlyArray<T>, max: number) =>
   items.length > max ? { items: items.slice(0, max), more: items.length - max } : { items };
 
 export interface RollupInput {
   readonly window: ActivityWindow;
+  readonly release?: ReturnType<typeof boardReleaseSummary>;
+  readonly currentAt?: string;
+  readonly idleEvaluatorBoard?: Rules.IdleEvaluatorBoard;
+  readonly lastEventAtByCard?: ReadonlyMap<string, string>;
+  readonly currentSlots?: ReadonlyArray<SlotEvent>;
+  readonly board?: KanbanBoard | Pick<KanbanBoard, "pause" | "setup" | "archivedAt"> | null;
+  readonly dispatchCards?: ReadonlyArray<KanbanCard>;
+  readonly holds?: ReadonlyMap<string, string>;
+  readonly dispatchPools?: ReadonlyArray<KanbanPool>;
+  readonly reviews?: ReadonlyMap<string, Rules.ReviewEvidence>;
+  readonly workThreadHomes?: ReadonlyMap<string, KanbanCard | null>;
+  readonly assignmentWakeRetries?: ReadonlyMap<string, Rules.AssignmentWakeRetry>;
   readonly cards: ReadonlyArray<KanbanCard>;
   readonly events: ReadonlyArray<KanbanCardEvent>;
   readonly threads: ReadonlyArray<KanbanThreadLink>;
   readonly pools: ReadonlyArray<KanbanPool>;
+  readonly poolChanges?: ReadonlyArray<KanbanPoolChange> | undefined;
+  /** Last event per slot before since, then all events in the window, ordered by id. */
+  readonly slotHistory?: {
+    readonly events: ReadonlyArray<SlotEvent>;
+    readonly recordedSince: string | null;
+  };
   /** Each active card's last stage change before the window (see stageSpans). */
   readonly prior?: ReadonlyArray<KanbanCardEvent> | undefined;
+  readonly readinessBefore?: ReadonlyArray<KanbanCardEvent>;
+  /** First stage change at or after the window, for cards with no earlier stage history. */
+  readonly after?: ReadonlyArray<KanbanCardEvent>;
 }
+
+const holderStep = (card: KanbanCard | undefined) => {
+  if (card === undefined || kanbanStepSubtasks(card).length === 0) return "none";
+  if (kanbanWorkStep(card)) return "work";
+  if (kanbanEvaluatorStep(card)) return "evaluator";
+  if (kanbanScriptStep(card)) return "script";
+  return "review";
+};
+
+const currentHolders = (input: RollupInput) => {
+  const cards = input.dispatchCards ?? input.cards;
+  const holding = Rules.poolThreads(cards, input.holds);
+  const linked = new Map<string, KanbanCard>();
+  for (const card of cards) {
+    if (card.activeThreadId !== null && card.activePool !== null)
+      linked.set(`${card.activePool}:${card.activeThreadId}`, card);
+  }
+  const takes = new Map<string, string>();
+  const currentAt = input.currentAt ?? input.window.until;
+  for (const event of [...(input.currentSlots ?? input.slotHistory?.events ?? [])].sort(
+    (a, b) => a.id - b.id,
+  )) {
+    if (event.at > currentAt) continue;
+    const key = `${event.poolKey}:${event.threadId}`;
+    if (event.kind === "take") takes.set(key, event.at);
+    else takes.delete(key);
+  }
+  const pools = new Map(input.pools.map((pool) => [pool.key, pool.slots]));
+  for (const pool of holding.keys()) if (!pools.has(pool)) pools.set(pool, 0);
+  return new Map(
+    [...pools]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([pool, slots]) => {
+        const holders = [...(holding.get(pool) ?? [])]
+          .map((thread) => {
+            const card = linked.get(`${pool}:${thread}`);
+            const take = takes.get(`${pool}:${thread}`);
+            const heldSince =
+              take !== undefined && take >= input.window.since
+                ? take
+                : (card?.analyticsStageEnteredAt ?? card?.movedAt ?? null);
+            return {
+              card: card?.number ?? null,
+              role: card?.activeRole === "review" ? "review" : "work",
+              stage: card?.stage ?? null,
+              thread: thread.slice(-8),
+              heldSince,
+              heldForH:
+                heldSince === null ? null : hours(Math.max(0, time(currentAt) - time(heldSince))),
+              openStep: holderStep(card),
+              turn: "unknown",
+            };
+          })
+          .sort(
+            (a, b) =>
+              (a.heldSince ?? "~").localeCompare(b.heldSince ?? "~") ||
+              a.thread.localeCompare(b.thread),
+          );
+        return [pool, { pool, slots, holders }] as const;
+      }),
+  );
+};
+
+/** Replay thread identities, preserving ledger order even when timestamps tie. */
+const ledgerUsage = (
+  input: RollupInput,
+  hourStarts: ReadonlyArray<number>,
+  spans: ReadonlyArray<Span>,
+) => {
+  const { window, pools } = input;
+  const since = time(window.since),
+    until = time(window.until);
+  const history = input.slotHistory;
+  const recordedSince = history?.recordedSince ?? null;
+  const coverage = recordedSince === null ? until : Math.max(since, time(recordedSince));
+  const holding = new Map<string, Set<string>>();
+  const used = new Map<string, number[]>();
+  const slotHours = new Map<string, number[]>();
+  const queueWait = new Map<string, number[]>();
+  const row = (rows: Map<string, number[]>, key: string) => {
+    let values = rows.get(key);
+    if (!values) rows.set(key, (values = hourStarts.map(() => 0)));
+    return values;
+  };
+  const hourIndex = (at: number) => Math.floor(at / HOUR) - Math.floor(since / HOUR);
+  const addHours = (
+    rows: Map<string, number[]>,
+    pool: string,
+    from: number,
+    to: number,
+    count = 1,
+  ) => {
+    hourStarts.forEach((start, i) => {
+      const overlap = Math.min(to, start + HOUR) - Math.max(from, start, coverage);
+      if (overlap > 0) row(rows, pool)[i]! += (overlap * count) / HOUR;
+    });
+  };
+  const events = (history?.events ?? [])
+    .filter((event) => event.at < window.until)
+    .toSorted((a, b) => a.id - b.id);
+  const apply = (event: SlotEvent) => {
+    const threads = holding.get(event.poolKey) ?? new Set<string>();
+    if (event.kind === "take") threads.add(event.threadId);
+    else threads.delete(event.threadId);
+    holding.set(event.poolKey, threads);
+  };
+  for (const event of events) if (event.at < window.since) apply(event);
+  // Split full-pool intervals on readiness changes as well as slot changes.
+  const cuts = new Set([coverage, until]);
+  for (const event of input.events)
+    if (event.at >= window.since && event.at < window.until) cuts.add(time(event.at));
+  for (const card of input.cards) {
+    for (const at of [
+      card.createdAt,
+      card.movedAt,
+      card.settledAt,
+      card.stalled?.at,
+      card.wait?.at,
+      card.wait?.expiredAt,
+      card.deciding?.since,
+      ...(card.retries ?? []).map((retry) => retry.at),
+      ...card.asks.flatMap((ask) => [ask.at, ask.closedAt]),
+    ]) {
+      if (at != null && time(at) > coverage && time(at) < until) cuts.add(time(at));
+    }
+    for (const at of [
+      kanbanRetryNotBefore(card),
+      card.deciding === undefined ? null : time(card.deciding.since) + KANBAN_DECIDE_MS,
+    ]) {
+      if (at !== null && at > coverage && at < until) cuts.add(at);
+    }
+  }
+  const boundaries = [...cuts].filter((at) => at >= coverage && at <= until).sort((a, b) => a - b);
+  const spansByCard = new Map<string, Span[]>();
+  for (const span of spans) {
+    const list = spansByCard.get(span.card.id) ?? [];
+    list.push(span);
+    spansByCard.set(span.card.id, list);
+  }
+  const beforeStages = new Map(
+    (input.prior ?? []).map((event) => [event.cardId as string, event.toStage]),
+  );
+  const afterStages = new Map(
+    (input.after ?? []).map((event) => [event.cardId as string, event.fromStage]),
+  );
+  const atStage = (card: KanbanCard, at: number) =>
+    card.settledAt !== null && time(card.settledAt) <= at
+      ? "verified"
+      : (spansByCard
+          .get(card.id)
+          ?.find((span) => time(span.from) <= at && time(span.to ?? window.until) > at)?.stage ??
+        beforeStages.get(card.id) ??
+        afterStages.get(card.id) ??
+        card.stage);
+  const currentById = new Map(input.cards.map((card) => [card.id as string, card]));
+  const readiness = groupEvents([...(input.readinessBefore ?? []), ...input.events]);
+  const flags = new Map([...readiness].map(([id, events]) => [id, events.filter(endsStall)]));
+  const stalledAt = (card: KanbanCard, at: number) => {
+    const last = flags.get(card.id)?.findLast((event) => time(event.at) <= at);
+    const snapshot = card.stalled;
+    if (
+      snapshot !== null &&
+      time(snapshot.at) <= at &&
+      (last === undefined || snapshot.at > last.at)
+    )
+      return snapshot;
+    return last !== undefined && isStall(last)
+      ? { at: last.at, by: last.actor, reason: last.body ?? "" }
+      : null;
+  };
+  const todoSpans = spans
+    .filter((span) => span.stage === "todo")
+    .map((span) => {
+      const card = span.card;
+      const ownEvents = readiness.get(card.id) ?? [];
+      const models =
+        card.workThreadId === null && card.models.length > 0
+          ? [...card.models].sort((a, b) => b.weight - a.weight).map((entry) => entry.model)
+          : [card.model];
+      const routes = [...new Set(models.map((model) => Rules.poolOf(pools, model)))];
+      const dependencies = new Set<string>();
+      const visit = (id: string) => {
+        if (dependencies.has(id)) return;
+        dependencies.add(id);
+        for (const next of currentById.get(id)?.blockedBy ?? []) visit(next);
+      };
+      for (const id of card.blockedBy) visit(id);
+      return {
+        span,
+        dependencies,
+        waits: waitIntervals(card, ownEvents, window.since, window.until),
+        routes,
+      };
+    });
+  const configured = new Map(pools.map((pool) => [pool.key, pool.slots]));
+  const queued = (from: number, to: number) => {
+    if (input.board?.archivedAt != null || input.board?.setup?.status === "running") return;
+    for (const { span, waits, routes, dependencies } of todoSpans) {
+      const card = span.card;
+      if (input.board?.pause && !input.board.pause.keep.includes(card.id)) continue;
+      if (
+        time(span.from) > from ||
+        time(span.to ?? window.until) <= from ||
+        time(card.createdAt) > from
+      )
+        continue;
+      if (
+        stalledAt(card, from) !== null ||
+        waits.some(([a, b]) => a <= from && b > from) ||
+        card.asks.some(
+          (ask) =>
+            ask.blocking &&
+            time(ask.at) <= from &&
+            (ask.closedAt === null || time(ask.closedAt) > from),
+        )
+      )
+        continue;
+      const candidate = {
+        ...kanbanWithoutWait(
+          card.deciding !== undefined && time(card.deciding.since) > from
+            ? kanbanWithoutDeciding(card)
+            : card,
+        ),
+        stage: "todo" as const,
+        activeThreadId: null,
+        activePool: null,
+        stalled: null,
+        settledAt: null,
+        asks: [],
+        retries: card.retries?.filter((retry) => time(retry.at) <= from),
+      };
+      const blockers = new Map<string, KanbanCard>();
+      for (const id of dependencies) {
+        const blocker = currentById.get(id);
+        if (blocker && time(blocker.createdAt) <= from)
+          blockers.set(id, {
+            ...blocker,
+            stage: atStage(blocker, from),
+            stalled: stalledAt(blocker, from),
+          });
+      }
+      if (!Rules.cardFlow(candidate, blockers, new Map(), from).ready) continue;
+      // A weighted alternative with room (or a reusable held thread) is not pool wait.
+      const candidates = routes.filter((key) => (configured.get(key) ?? 0) > 0);
+      if (candidates.length === 0) continue;
+      if (
+        candidates.some(
+          (key) =>
+            holding.get(key)?.has(card.workThreadId ?? "") ||
+            (holding.get(key)?.size ?? 0) < configured.get(key)!,
+        )
+      )
+        continue;
+      // Attribute a multi-model card once, to its highest-weight enabled route.
+      addHours(queueWait, candidates[0]!, from, to);
+    }
+  };
+  let cursor = coverage;
+  let boundaryIndex = 0;
+  const advance = (end: number) => {
+    if (end <= cursor) return;
+    while (boundaryIndex < boundaries.length && boundaries[boundaryIndex]! < end) {
+      const cut = boundaries[boundaryIndex++]!;
+      if (cut <= cursor) continue;
+      segment(cursor, cut);
+      cursor = cut;
+    }
+    segment(cursor, end);
+    cursor = end;
+  };
+  const segment = (from: number, to: number) => {
+    for (const [pool, threads] of holding) {
+      addHours(slotHours, pool, from, to, threads.size);
+      hourStarts.forEach((start, i) => {
+        if (Math.min(to, start + HOUR) > Math.max(from, start))
+          row(used, pool)[i] = Math.max(row(used, pool)[i]!, threads.size);
+      });
+    }
+    queued(from, to);
+  };
+  for (const event of events) {
+    if (event.at < window.since) continue;
+    const at = Math.max(cursor, time(event.at));
+    advance(at);
+    apply(event);
+    if (at >= coverage && at < until) {
+      const i = hourIndex(at);
+      row(used, event.poolKey)[i] = Math.max(
+        row(used, event.poolKey)[i]!,
+        holding.get(event.poolKey)!.size,
+      );
+    }
+  }
+  advance(until);
+  const values = (rows: Map<string, number[]>) =>
+    Object.fromEntries(
+      [...rows].map(([key, values]) => [
+        key,
+        values.map((value, i) =>
+          hourStarts[i]! + HOUR <= coverage ? null : Math.round(value * 100) / 100,
+        ),
+      ]),
+    );
+  return {
+    slots: Object.fromEntries(pools.map((pool) => [pool.key, pool.slots])),
+    hours: hourStarts.map((at) => `${isoOf(at).slice(0, 13)}Z`),
+    recordedSince,
+    used: values(used),
+    slotHours: values(slotHours),
+    queueWait: values(queueWait),
+    queueWaitBasis:
+      "Ready todo card-hours while every routed pool was full; recorded stages/waits/flags, current board policy, routing, capacities, priority, subtasks and retry/evaluator holds. Multi-model cards count once on their highest-weight enabled route.",
+  };
+};
+
+const stallKind = (reason: string, by: KanbanCard["createdBy"]) =>
+  reason.startsWith("Run failed") || (by._tag === "system" && reason === Retries.NO_VERDICT_REASON)
+    ? "run_failed"
+    : by._tag === "system" && reason.startsWith(Retries.REFUSED_VERDICT_PREFIX)
+      ? "verdict_refused"
+      : "flagged";
+
+export const withoutThreadReason = (
+  card: KanbanCard,
+  context: {
+    readonly byId: ReadonlyMap<string, KanbanCard>;
+    readonly pools: ReadonlyArray<KanbanPool>;
+    readonly board?: RollupInput["board"];
+  },
+): string => {
+  const board = context.board && "reviewChains" in context.board ? context.board : undefined;
+  if (card.wait?.expiredAt === null && kanbanWaiting(card)) return `wait:${card.wait.on}`;
+  const reviewed =
+    card.stage === "in_review" &&
+    Rules.reviewFinished(card, board ? (Rules.chainFor(board, card)?.steps.length ?? 1) : 1);
+  // A passed review waits for its tracked PRs even without card_wait. An expired wait must stay visible.
+  if (card.wait?.expiredAt == null && reviewed && !Rules.prsLanded(card)) return "wait:merge";
+  if (card.asks.some((ask) => ask.closedAt === null && ask.blocking)) return "owner_ask";
+  if (Rules.isBlocked(card, context.byId)) return "blocked";
+  const models =
+    card.stage === "working" && card.workThreadId === null
+      ? kanbanCardModels(card).map((entry) => entry.model)
+      : [board ? Rules.nextModel(board, card) : card.model];
+  const pools = models.map((model) => Rules.poolFor(context.pools, model));
+  if (card.priority === KANBAN_BACKLOG) return "backlog";
+  if (
+    (context.board?.pause != null && !context.board.pause.keep.includes(card.id)) ||
+    pools.every((pool) => pool !== undefined && pool.slots <= 0)
+  )
+    return "paused";
+  if (
+    card.stage === "in_review"
+      ? reviewed && Rules.inReviewEvaluatorStepsOnly(card)
+      : !kanbanWorkStep(card) && (kanbanEvaluatorStep(card) || kanbanScriptStep(card))
+  )
+    return "evaluator_step";
+  if (card.stalled !== null) return `stalled:${stallKind(card.stalled.reason, card.stalled.by)}`;
+  // Detached-card pool_full is out of scope; queued cards use dispatcher reservations.
+  return "none";
+};
 
 /** What a parked card waits on, as a category only: the wait kind, a blocker, a stall, the owner. */
 const waitKind = (card: KanbanCard): string | null =>
@@ -477,9 +1021,9 @@ const waitKind = (card: KanbanCard): string | null =>
 /**
  * The window's rollup: ask-to-answer times and old open asks, review rounds,
  * time in each stage with dwell percentiles, open cards long in one stage,
- * stalls, run failures by model, thread starts, restarts and evaluator wakes,
- * cards left in working or in_review with no thread, and an estimate of pool
- * slots held per hour (see slotTimes). No card titles or text: numbers, stages,
+ * stalls, individual run failures by card/thread/model, a server-wide restart-admission analytics pointer,
+ * thread starts, restarts and evaluator wakes,
+ * cards left in working or in_review with no thread, and ledger pool usage. No card titles or text: numbers, stages,
  * kinds and times only (run failure reasons are the provider's error words).
  */
 export const rollup = (input: RollupInput) => {
@@ -487,6 +1031,7 @@ export const rollup = (input: RollupInput) => {
   const until = window.until;
   const byCard = groupEvents(input.events);
   const active = activeCards(input.cards, byCard, window);
+  const threadsById = new Map(input.threads.map((link) => [link.threadId as string, link]));
   const threadsByCard = new Map<string, Array<KanbanThreadLink>>();
   for (const link of input.threads) {
     if (link.cardId === null) continue;
@@ -498,12 +1043,15 @@ export const rollup = (input: RollupInput) => {
     list.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
 
   type AskItem = ReturnType<typeof askRow> & { readonly card: number };
-  // Asks answered in the window are all listed; the rest (open, closed without
-  // an answer) are listed newest first and cut first when the rollup is long.
+  // Prefer keeping every answered ask; the rest put open decisions first,
+  // then newest first, and are cut first when the rollup is long.
   const answeredItems: Array<AskItem> = [];
   const otherAsks: Array<AskItem> = [];
   const answeredMinutes: Array<number> = [];
+  const minutesByKind = new Map<string, Array<number>>();
+  const minutesByBlocking = { blocking: [] as Array<number>, async: [] as Array<number> };
   let open = 0;
+  let openNotices = 0;
   let closedNoAnswer = 0;
   for (const card of active) {
     for (const ask of card.asks) {
@@ -513,12 +1061,20 @@ export const rollup = (input: RollupInput) => {
       const answered = answeredAt(ask);
       if (answered !== null && inWindow(answered, window)) {
         answeredItems.push(row);
-        answeredMinutes.push(row.minutes ?? 0);
+        const minutes = row.minutes ?? 0;
+        answeredMinutes.push(minutes);
+        const kind = kanbanAskKind(ask);
+        const bucket = minutesByKind.get(kind);
+        if (bucket) bucket.push(minutes);
+        else minutesByKind.set(kind, [minutes]);
+        minutesByBlocking[ask.blocking ? "blocking" : "async"].push(minutes);
         continue;
       }
       otherAsks.push(row);
-      if (ask.closedAt === null) open++;
-      else if (answered === null && inWindow(ask.closedAt, window)) closedNoAnswer++;
+      if (ask.closedAt === null) {
+        if (isNotice(ask)) openNotices++;
+        else open++;
+      } else if (answered === null && inWindow(ask.closedAt, window)) closedNoAnswer++;
     }
   }
   answeredItems.sort(
@@ -526,9 +1082,20 @@ export const rollup = (input: RollupInput) => {
       (left.answeredAt ?? "").localeCompare(right.answeredAt ?? "") || left.card - right.card,
   );
   otherAsks.sort(
-    (left, right) => right.askedAt.localeCompare(left.askedAt) || left.card - right.card,
+    (left, right) =>
+      Number(right.open === true && !isNotice(right)) -
+        Number(left.open === true && !isNotice(left)) ||
+      right.askedAt.localeCompare(left.askedAt) ||
+      left.card - right.card,
   );
   answeredMinutes.sort((left, right) => left - right);
+  const kindSummaries = [...minutesByKind].map(
+    ([kind, minutes]) => [kind, answerSummary(minutes)] as const,
+  );
+  const answerMinutesByBlocking = {
+    blocking: answerSummary(minutesByBlocking.blocking),
+    async: answerSummary(minutesByBlocking.async),
+  };
 
   const reviewCards: Array<{
     card: number;
@@ -553,7 +1120,8 @@ export const rollup = (input: RollupInput) => {
 
   // Stages and pool slot use
   const prior = new Map((input.prior ?? []).map((event) => [event.cardId as string, event]));
-  const spans = stageSpans(input.cards, byCard, window, prior);
+  const after = new Map((input.after ?? []).map((event) => [event.cardId as string, event]));
+  const spans = stageSpans(input.cards, byCard, window, prior, after);
   const stages: Record<
     string,
     {
@@ -566,10 +1134,20 @@ export const rollup = (input: RollupInput) => {
   const hourStarts: Array<number> = [];
   for (let at = Math.floor(time(window.since) / HOUR) * HOUR; at < time(until); at += HOUR)
     hourStarts.push(at);
-  const used = new Map<string, Array<number>>();
   // Cards the board shows in working or in_review that no live thread runs.
-  const idle: Array<{ card: number; stage: string; since: string }> = [];
-  const slotsByThread = new Map<string, Array<readonly [number, number]>>();
+  const idle: Array<{
+    card: number;
+    stage: string;
+    since: string;
+    reason: string;
+    hours: number;
+    expiredWait?: NonNullable<KanbanCard["wait"]>["on"];
+  }> = [];
+  const reasonContext = {
+    byId: new Map(input.cards.map((card) => [card.id as string, card])),
+    pools: input.pools,
+    ...(input.board === undefined ? {} : { board: input.board }),
+  };
   for (const span of spans) {
     const from = time(span.from);
     const to = time(span.to ?? until);
@@ -584,33 +1162,49 @@ export const rollup = (input: RollupInput) => {
       else dwells.set(span.stage, [ms]);
     }
     if (span.stage !== "working" && span.stage !== "in_review") continue;
-    const held = slotTimes(
-      span,
-      window.since,
-      until,
-      byCard.get(span.card.id) ?? [],
-      threadsByCard,
-    );
-    if (span.to === null && span.card.activeThreadId === null)
-      idle.push({ card: span.card.number, stage: span.stage, since: stamp(span.card.movedAt) });
-    for (const slot of held) {
-      const key = `${slot.pool}\u0000${slot.thread}`;
-      const list = slotsByThread.get(key);
-      if (list) list.push([slot.from, slot.to]);
-      else slotsByThread.set(key, [[slot.from, slot.to]]);
+    if (
+      span.to === null &&
+      span.card.stage === span.stage &&
+      span.card.movedAt < until &&
+      span.card.activeThreadId === null
+    ) {
+      const card = span.card;
+      const role = span.stage === "in_review" ? "review" : "work";
+      const threadId = role === "work" ? card.workThreadId : card.reviewThreadId;
+      const linked = threadId === null ? undefined : threadsById.get(threadId);
+      // A carried card shares its worker's link, whose primary cardId can name another card.
+      const last =
+        linked?.role === role
+          ? linked
+          : threadsByCard.get(card.id)?.findLast((link) => link.role === role);
+      const lastWritten = (byCard.get(card.id) ?? []).findLast(
+        (event) => event.actor._tag === "thread" && event.actor.threadId === last?.threadId,
+      );
+      // A role's thread can end without a stage move; stage age would overstate its idle time.
+      const since = Math.max(
+        time(card.movedAt),
+        time(last?.endedAt ?? lastWritten?.at ?? card.movedAt),
+      );
+      idle.push({
+        card: card.number,
+        stage: span.stage,
+        since: stamp(isoOf(since)),
+        reason: withoutThreadReason(card, reasonContext),
+        hours: hours(Math.max(0, time(until) - since)),
+        ...(card.wait?.expiredAt != null ? { expiredWait: card.wait.on } : {}),
+      });
     }
   }
-  for (const [key, intervals] of slotsByThread) {
-    const pool = key.slice(0, key.indexOf("\u0000"));
-    let row = used.get(pool);
-    if (!row) used.set(pool, (row = hourStarts.map(() => 0)));
-    for (const [from, to] of union(intervals))
-      hourStarts.forEach((start, index) => {
-        const overlap = Math.min(to, start + HOUR) - Math.max(from, start);
-        if (overlap > 0) row[index]! += overlap / HOUR;
-      });
-  }
-  idle.sort((left, right) => left.since.localeCompare(right.since));
+  const poolUsage = ledgerUsage(input, hourStarts, spans);
+  idle.sort(
+    (left, right) =>
+      Number(right.reason === "none") - Number(left.reason === "none") ||
+      left.since.localeCompare(right.since) ||
+      left.card - right.card,
+  );
+  const none = idle.filter((row) => row.reason === "none");
+  const byReason: Record<string, number> = {};
+  for (const row of idle) byReason[row.reason] = (byReason[row.reason] ?? 0) + 1;
   const evaluatorOnly = input.cards
     .filter(Rules.inReviewEvaluatorStepsOnly)
     .map((card) => ({
@@ -674,7 +1268,13 @@ export const rollup = (input: RollupInput) => {
   const stallItems: Array<{
     card: number;
     at: string;
-    kind: "run_failed" | "flagged" | "verdict_refused";
+    kind: "run_failed" | "flagged" | "verdict_refused" | "idle_evaluator";
+    stage?: KanbanStage;
+    step?: number;
+    openEvaluatorSubtasks?: string[];
+    idleHours?: number;
+    lastEventAt?: string;
+    evaluatorThreadAlive?: boolean;
     until?: string;
     minutes?: number;
     ongoing?: true;
@@ -704,9 +1304,50 @@ export const rollup = (input: RollupInput) => {
     });
   }
 
+  const nowMs = Date.parse(input.currentAt ?? until);
+  const idleBoard =
+    input.idleEvaluatorBoard ??
+    (input.board && "standingApprovals" in input.board ? input.board : undefined);
+  if (idleBoard)
+    for (const card of input.cards) {
+      const lastEventAt =
+        input.lastEventAtByCard?.get(card.id) ?? byCard.get(card.id)?.at(-1)?.at ?? card.updatedAt;
+      const idle = Rules.idleEvaluatorStall({ ...card, lastEventAt }, nowMs, idleBoard);
+      if (!idle) continue;
+      stallItems.push({
+        kind: "idle_evaluator",
+        card: card.number,
+        at: stamp(lastEventAt),
+        stage: card.stage,
+        step: idle.step,
+        openEvaluatorSubtasks: idle.openEvaluatorSubtasks,
+        idleHours: Math.round(((nowMs - Date.parse(lastEventAt)) / HOUR) * 10) / 10,
+        lastEventAt,
+        evaluatorThreadAlive: (threadsByCard.get(card.id) ?? []).some(
+          (link) => link.role === "evaluator" && link.endedAt === null,
+        ),
+      });
+    }
+  const stallsByKind: Record<string, number> = {};
+  for (const item of stallItems) stallsByKind[item.kind] = (stallsByKind[item.kind] ?? 0) + 1;
+
   // Run failures by the model of the thread that failed.
   const failures: Record<string, { count: number; reasons: Array<string> }> = {};
   const failuresByKind: Partial<Record<FailureKind, number>> = {};
+  const failureRows: Array<{
+    card: number;
+    kind: FailureKind;
+    role: "work" | "review";
+    pool: string;
+    threadId: string | null;
+    runId: string | null;
+    at: string;
+    reason: string;
+    repeat: number;
+    admission: KanbanCardEvent["admission"] | null;
+  }> = [];
+  const repeats = new Map<number, number>();
+  const admissionCards = new Set<number>();
   let failureCount = 0;
   for (const card of active) {
     for (const event of byCard.get(card.id) ?? []) {
@@ -725,8 +1366,40 @@ export const rollup = (input: RollupInput) => {
       entry.count++;
       const reason = failureReason(event, 120);
       if (entry.reasons.length < 3 && !entry.reasons.includes(reason)) entry.reasons.push(reason);
+      repeats.set(card.number, (repeats.get(card.number) ?? 0) + 1);
+      if (event.admission || /restart admission queue never released/.test(event.body ?? ""))
+        admissionCards.add(card.number);
+      // A terminal event can be written after the link ended, and carried cards
+      // share a primary card's link. Persisted identity survives both boundaries.
+      const sourceThread =
+        event.failedThreadId === undefined ? thread : threadsById.get(event.failedThreadId);
+      failureRows.push({
+        card: card.number,
+        kind,
+        role:
+          sourceThread?.role === "work" || sourceThread?.role === "review"
+            ? sourceThread.role
+            : role,
+        pool: sourceThread?.model ? Rules.poolKey(sourceThread.model) : pool,
+        threadId: event.failedThreadId ?? thread?.threadId ?? null,
+        runId: event.runId ?? null,
+        at: event.at,
+        reason,
+        repeat: 0,
+        admission: event.admission ?? null,
+      });
     }
   }
+
+  failureRows.sort((a, b) => b.at.localeCompare(a.at) || a.card - b.card);
+  for (const row of failureRows) row.repeat = repeats.get(row.card)!;
+  const admissionDays: string[] = [];
+  for (
+    let day = time(window.since.slice(0, 10) + "T00:00:00.000Z");
+    day < time(until);
+    day += 24 * HOUR
+  )
+    admissionDays.push(isoOf(day).slice(0, 10));
 
   // Threads started in the window; a card with a second thread for the same role restarted.
   const started: Record<string, Record<string, number>> = {};
@@ -772,10 +1445,15 @@ export const rollup = (input: RollupInput) => {
     hours: number;
     blocking?: true;
   }> = [];
+  let noticesOver6h = 0;
   for (const card of input.cards) {
     if (card.settledAt !== null) continue;
-    for (const ask of card.asks)
-      if (ask.closedAt === null && time(until) - time(ask.at) > OLD_ASK_MS)
+    for (const ask of card.asks) {
+      if (ask.closedAt === null && time(until) - time(ask.at) > OLD_ASK_MS) {
+        if (isNotice(ask)) {
+          noticesOver6h++;
+          continue;
+        }
         oldAsks.push({
           card: card.number,
           ask: ask.id,
@@ -783,11 +1461,49 @@ export const rollup = (input: RollupInput) => {
           hours: hours(time(until) - time(ask.at)),
           ...(ask.blocking ? { blocking: true as const } : {}),
         });
+      }
+    }
   }
   oldAsks.sort((left, right) => right.hours - left.hours || left.card - right.card);
 
-  const build = (max: number) => ({
+  const holders = currentHolders(input);
+  const heldRows = (pool: string | undefined, max: number) =>
+    capped(pool === undefined ? [] : (holders.get(pool)?.holders ?? []), Math.min(50, max));
+  const queueRows = (rows: typeof queued, max: number) =>
+    rows.map((row) => {
+      if (row.held === undefined) return row;
+      const held = heldRows(row.pool, max);
+      return {
+        ...row,
+        held: held.items,
+        ...(held.more === undefined ? {} : { heldMore: held.more }),
+      };
+    });
+  const queued =
+    input.board && "reviewChains" in input.board
+      ? Rules.dispatchQueueStatus(
+          input.board,
+          input.dispatchCards ?? input.cards,
+          input.dispatchPools ?? input.pools,
+          input.holds,
+          time(until),
+          input.reviews,
+          input.workThreadHomes,
+          input.assignmentWakeRetries,
+        ).toSorted((a, b) => b.hours - a.hours || a.card - b.card)
+      : [];
+  const queuedByReason: Record<string, number> = {};
+  for (const row of queued) queuedByReason[row.reason] = (queuedByReason[row.reason] ?? 0) + 1;
+  const stageStartByNumber = new Map(
+    input.cards.map((card) => [card.number, time(card.analyticsStageEnteredAt ?? card.movedAt)]),
+  );
+  const queuedOver6h = queued.filter(
+    (row) => time(until) - stageStartByNumber.get(row.card)! > 6 * HOUR,
+  );
+
+  const build = (max: number, answeredMax: number, kindMax: number) => ({
     window: { since: window.since, until },
+    ...input.release,
     cards: {
       active: active.length,
       settled: active.filter((card) => card.settledAt !== null).length,
@@ -795,15 +1511,25 @@ export const rollup = (input: RollupInput) => {
     asks: {
       answered: answeredMinutes.length,
       open,
+      openNotices,
       closedWithoutAnswer: closedNoAnswer,
       answerMinutes: {
         p50: percentile(answeredMinutes, 0.5),
         p90: percentile(answeredMinutes, 0.9),
         max: answeredMinutes.at(-1) ?? null,
       },
-      answeredItems,
+      answerMinutesByKind: Object.fromEntries(capped(kindSummaries, kindMax).items),
+      ...(kindMax < kindSummaries.length
+        ? { answerMinutesByKindMore: kindSummaries.length - kindMax }
+        : {}),
+      answerMinutesByBlocking,
+      answeredItems: capped(answeredItems, answeredMax).items,
+      ...(answeredMax < answeredItems.length
+        ? { answeredItemsMore: answeredItems.length - answeredMax }
+        : {}),
       others: capped(otherAsks, max),
       openOver6h: { count: oldAsks.length, ...capped(oldAsks, max) },
+      noticesOver6h: { count: noticesOver6h },
     },
     reviews: {
       rounds: reviewCards.reduce((sum, row) => sum + row.rounds, 0),
@@ -815,14 +1541,42 @@ export const rollup = (input: RollupInput) => {
       hours: stages,
       longest,
       openOver24h: { count: longOpen.length, byStage: longOpenByStage, ...capped(longOpen, max) },
-      withoutThread: { count: idle.length, ...capped(idle, max) },
+      withoutThread: {
+        count: idle.length,
+        byReason,
+        none: { count: none.length, ...capped(none, max) },
+        ...capped(idle, max),
+      },
+      queued: {
+        count: queued.length,
+        byReason: queuedByReason,
+        ...capped(queueRows(queued, max), max),
+      },
+      queuedOver6h: { count: queuedOver6h.length, ...capped(queueRows(queuedOver6h, max), max) },
       inReviewNoThreadWithEvaluatorStepsOnly: {
         count: evaluatorOnly.length,
         ...capped(evaluatorOnly, max),
       },
     },
-    stalls: { count: stallItems.length, ...capped(stallItems, max) },
-    failures: { count: failureCount, byKind: failuresByKind, byPool: failures },
+    stalls: { count: stallItems.length, byKind: stallsByKind, ...capped(stallItems, max) },
+    failures: {
+      count: failureCount,
+      byKind: failuresByKind,
+      byPool: failures,
+      rows: failureRows.slice(0, Math.min(50, max)),
+      ...(failureRows.length > Math.min(50, max)
+        ? { more: failureRows.length - Math.min(50, max) }
+        : {}),
+    },
+    restartAdmission: {
+      scope: "server-wide" as const,
+      source: "analytics_read" as const,
+      section: "restartAdmission" as const,
+      days: admissionDays,
+      note: "Read each UTC day without board/card/kind filters; hour buckets can extend beyond this window. Queue depth and active are observed maxima; loaded time share is unavailable.",
+      boardFailures: [...admissionCards].sort((a, b) => a - b).slice(0, max),
+      ...(admissionCards.size > max ? { more: admissionCards.size - max } : {}),
+    },
     threads: {
       started,
       restarts: capped(restarts, max),
@@ -839,22 +1593,39 @@ export const rollup = (input: RollupInput) => {
         ),
       },
     },
-    pools: {
-      slots: Object.fromEntries(input.pools.map((pool) => [pool.key, pool.slots])),
-      hours: hourStarts.map((start) => `${isoOf(start).slice(0, 13)}Z`),
-      note: "used is an estimate (an upper bound): the board records no slot takes or releases, so it counts each thread's time running a card in working or in_review, less waits.",
-      /** Average slots held per hour, per pool. */
-      used: Object.fromEntries(
-        [...used].map(([pool, row]) => [pool, row.map((value) => Math.round(value * 100) / 100)]),
-      ),
-    },
+    poolChanges: capped(
+      (input.poolChanges ?? []).filter((row) => inWindow(row.at, window)),
+      max,
+    ),
+    pools: poolUsage,
+    holders: capped(
+      [...holders.values()].map(({ pool, slots }) => {
+        const held = heldRows(pool, max);
+        return {
+          pool,
+          slots,
+          holders: held.items,
+          ...(held.more === undefined ? {} : { more: held.more }),
+        };
+      }),
+      max,
+    ),
   });
   let max = LIST_MAX;
-  let result = build(max);
-  // A busy window shortens every list alike (counts stay exact) so one call never overflows.
-  while (max > 10 && JSON.stringify(result).length > ROLLUP_CHARS) {
+  let answeredMax = answeredItems.length;
+  let kindMax = kindSummaries.length;
+  let result = build(max, answeredMax, kindMax);
+  // Long IDs can make the answered rows alone exceed the budget. Trim them
+  // only after the other lists shrink; all counts and latency samples stay exact.
+  while (
+    (max > 0 || answeredMax > 0 || kindMax > 0) &&
+    JSON.stringify(result).length > ROLLUP_CHARS
+  ) {
+    // Custom kind names are unrestricted; even their aggregate map can be oversized.
+    if (max === 0 && answeredMax === 0) kindMax = Math.floor(kindMax * 0.7);
+    if (max <= 10) answeredMax = Math.floor(answeredMax * 0.7);
     max = Math.floor(max * 0.7);
-    result = build(max);
+    result = build(max, answeredMax, kindMax);
   }
   return result;
 };
@@ -866,19 +1637,31 @@ export type CardEventsRequest =
 
 /**
  * card_get's events page: the newest `limit` (default 20) before `before`,
- * oldest first. Oldest events are dropped whole until the reply (card and
- * threads included, never trimmed) fits CARD_GET_CHARS; olderEvents is the
- * `before` that reads the page before, null at the start. "all" returns every
+ * oldest first. Oldest events are dropped whole until the reply (the full card
+ * and threads on first read, a card header when paging) fits CARD_GET_CHARS;
+ * olderEvents is the `before` that reads the page before, null at the start. "all" returns every
  * event, which can be more than a client takes.
  */
 export const pageCardEvents = (
   rest: unknown,
   events: ReadonlyArray<KanbanCardEvent>,
   request: CardEventsRequest,
-) => {
+): {
+  events: ReadonlyArray<KanbanCardEvent>;
+  eventsTotal: number;
+  olderEvents: number | null;
+  note?: string;
+} => {
   const total = events.length;
   if (request === "all") return { events, eventsTotal: total, olderEvents: null };
   const before = request?.before;
+  const cursor = (value: number | null) =>
+    before !== undefined && value !== null && value >= before
+      ? {
+          olderEvents: null,
+          note: 'Paging stopped because the cursor would not move backward; events: "all" returns every event.',
+        }
+      : { olderEvents: value };
   const limit = Math.min(Math.max(request?.limit ?? CARD_EVENTS_DEFAULT, 1), CARD_EVENTS_MAX);
   const older = before === undefined ? events : events.filter((event) => event.id < before);
   let page = older.slice(-limit);
@@ -900,7 +1683,7 @@ export const pageCardEvents = (
     return {
       events: page,
       eventsTotal: total,
-      olderEvents: older.some((event) => event.id < first.id) ? first.id : null,
+      ...cursor(older.some((event) => event.id < first.id) ? first.id : null),
     };
   }
   const newest = older.at(-1);
@@ -909,14 +1692,14 @@ export const pageCardEvents = (
     return {
       events: [],
       eventsTotal: total,
-      olderEvents: older.length > 1 ? newest.id : null,
       note: `Event ${newest.id} is too big to send with the card; events: "all" returns it.`,
+      ...cursor(older.length > 1 ? newest.id : null),
     };
   return {
     events: [],
     eventsTotal: total,
-    olderEvents: newest.id + 1,
-    note: 'The card alone fills the reply; events: "all" returns its events.',
+    note: "The card and threads fill the reply; use events {before: olderEvents} to read events with a short card header.",
+    ...cursor(newest.id + 1),
   };
 };
 
