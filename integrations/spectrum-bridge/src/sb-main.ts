@@ -327,7 +327,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     maxRequestBodySize: 28 * 1024 * 1024,
     fetch: createSbApi({ registry: chats, line, agentBus, accessPath: accessFile, enabled: ready, health: () => ({}) }, remoteCallback),
   }) : undefined;
-  process.once("exit", () => callbackServer?.stop(true));
+  process.once("exit", () => { callbackServer?.stop(true); remoteCallback?.stop(); toolLog.flush(); });
 
   // Unknown senders: one Telegram note per address, so the owner can allow them.
   const note = async (address: string, text: string) => {
@@ -413,8 +413,11 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     clearInterval(timer);
     clearInterval(unansweredTimer);
     await server.stop(true);
+    await callbackServer?.stop(true);
     await apps?.stop().catch((caughtError) => { toolError("sb-main", "sb-main.catch17", caughtError);});
     await shares.stopAll().catch((caughtError) => { toolError("sb-main", "sb-main.catch18", caughtError);});
+    for (const chat of chats.all()) chat.parts.remote?.stop();
+    toolLog.flush();
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.
     process.exit(0);
   };

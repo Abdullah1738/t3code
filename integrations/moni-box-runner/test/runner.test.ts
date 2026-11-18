@@ -156,9 +156,11 @@ test("legacy schema upgrades timestamp crash interruption and recognize old repl
     const runner = new BoxRunner({ ...s.runner.config, root }, { run: async () => "NO_REPLY" }, { now: () => now, callbackReady: async () => true });
     clean.push(() => runner.db.close());
     await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
-    expect(await (await runner.handle(s.request("/events", {}))).json()).toEqual({ events: [
+    const metadata = await (await runner.handle(s.request("/events", {}))).text();
+    expect(metadata).not.toContain("PRIVATE_OLD");
+    expect(JSON.parse(metadata)).toEqual({ events: [
       { id, state: "interrupted", failure: null, kind: "wake", interruptedAt: 1234, hasSend: true },
-    ] });
+    ], actions: [{ id: opaqueId(`reply:${id}:0`).slice(0, 12), path: "/send", attempts: 0, lastStatus: null, nextAt: null, inboxId: null }] });
   }
 });
 
@@ -218,19 +220,25 @@ test("head-only probe skips more than a page of attachment failures and counts t
   for (const headOnly of ["true", 1, null]) expect((await s.runner.handle(s.request("/events", { headOnly }))).status).toBe(400);
 });
 
-test("permanent scope refusals fail one action while temporary unavailability retains it", async () => {
+test("permanent scope refusals fail reactions while temporary unavailability backs off without holding the inbox", async () => {
   for (const status of [400, 403, 404, 413, 422, 503]) {
-    const s = setup({ run: async () => "NO_REPLY" }); let available = false; const texts: string[] = [];
+    const s = setup({ run: async () => "NO_REPLY" }); let available = false, now = 1000; const texts: string[] = [];
     const r = new BoxRunner({ ...s.runner.config, root: join(s.root, `scope-${status}`) }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, {
+      now: () => now,
       callbackReady: async () => true,
       fetch: async url => String(url).endsWith("/react") && !available ? new Response("", { status }) : Response.json({ accepted: true }),
     }); clean.push(() => r.db.close());
     await r.action(opaqueId("refused-reaction"), "/react", { target: "unknown", kind: "love" });
     r.enqueue(opaqueId("following"), { text: "next" }); await r.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
     await r.tick();
-    expect(texts).toEqual(status === 503 ? [] : ["next"]);
+    expect(texts).toEqual(["next"]);
     expect(r.db.query<{ state: string }, []>("SELECT state FROM actions WHERE path='/react'").get()!.state).toBe(status === 503 ? "pending" : "failed");
     available = true; await r.tick(); expect(texts).toEqual(["next"]);
+    if (status === 503) {
+      expect(r.db.query("SELECT attempts,last_status,next_at,state FROM actions WHERE path='/react'").get()).toEqual({ attempts: 1, last_status: 503, next_at: 6000, state: "pending" });
+      now = 6000; await r.tick();
+      expect(r.db.query<{ state: string }, []>("SELECT state FROM actions WHERE path='/react'").get()!.state).toBe("done");
+    }
   }
 });
 
