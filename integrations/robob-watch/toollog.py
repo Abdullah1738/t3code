@@ -45,7 +45,8 @@ ARGUMENT_REASONS = {'bad_arguments', 'unknown_subcommand', 'missing_required', '
 WHOOP_EXIT_REASONS = {'completed', 'sync_failed', 'not_authorized', 'reauth_needed',
                       'login_expired', 'backfill_failed', 'setup_failed', 'auth_failed',
                       'serve_failed', 'report_failed'}
-CLI_EXIT_REASONS = FOOD_EXIT_REASONS | ARGUMENT_REASONS | WHOOP_EXIT_REASONS
+WHOOP_AUTH_REASONS = {'token_missing', 'refresh_rejected', 'refresh_network', 'api_401', 'auth_failed'}
+CLI_EXIT_REASONS = FOOD_EXIT_REASONS | ARGUMENT_REASONS | WHOOP_EXIT_REASONS | WHOOP_AUTH_REASONS
 UNMARKED_MEANING = (
     'Distinct (run ID, kind) obligations from card.render (including failed renders), '
     'nag.sent, or food.warning with no matching delivery.result in this UTC day file; '
@@ -70,6 +71,9 @@ ERROR_SCHEMA = {'exceptionClass': 'identifier', 'exitCode': 'exit_code', 'stage'
 ENDPOINT_SCHEMA = {'httpStatus': 'status', 'rawCount': int, 'keptCount': int, 'fetchComplete': bool,
                    'scoreStates': {k: int for k in ('SCORED', 'PENDING_SCORE', 'UNSCORABLE', 'OTHER')},
                    'newestRecordEnd': 'iso', 'newestScoredRecordEnd': 'iso', 'tokenExpiresInS': 'seconds'}
+AUTH_SCHEMA = {'authStage': {'token_load', 'token_refresh', 'api_fetch'},
+               'authSource': {'keychain', 'file', 'env'}, 'refreshHttpStatus': 'status',
+               'apiHttpStatus': 'status', 'oauthError': 'oauth_code', 'attempt': int, 'retried': bool}
 SCHEMAS = {
     'food.order_log': {'vertical': {'food', 'nownow', 'minutes', 'main', 'supermall'},
         'outcome': {'logged', 'partial', 'fetch_failed', 'no_items', 'unmatched', 'bad_exclude', 'bad_portion', 'duplicate'},
@@ -78,9 +82,9 @@ SCHEMAS = {
     'cli.run': {'command': set(COMMANDS), 'subcommand': set(' '.join(COMMANDS.values()).split()) | {'unknown', 'none', 'help'},
                 'failCount': int, 'failedCheckIds': 'check_ids',
                 'reason': CLI_EXIT_REASONS, 'candidateCount': int, 'queryLen': int,
-                'argc': int, 'rejected': 'rejected'},
+                'argc': int, 'rejected': 'rejected', **AUTH_SCHEMA},
     'watcher.run': {'trigger': 'trigger'}, 'sync.run': {'trigger': 'trigger', 'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
-        'lastScoredSleep': 'iso', 'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool,
+        'lastScoredSleep': 'iso', 'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool, 'reason': WHOOP_AUTH_REASONS, **AUTH_SCHEMA,
         **{k: ENDPOINT_SCHEMA for k in ('sleep', 'recovery', 'cycle', 'body')}},
     'sync.gap': {'count': int, 'lastSleepEnd': 'iso', 'lastRecoveryEnd': 'iso', 'gapHours': 'seconds'},
     'card.render': {'kind': {'morning', 'nutrition'}, 'runIdRef': 'run'},
@@ -159,6 +163,11 @@ def _fields(schema, props):
             out[key] = value
         elif spec == 'iso':
             out[key] = iso_stamp(value)
+        elif spec == 'oauth_code' and key in props:
+            out[key] = (value if value is None or isinstance(value, str) and re.fullmatch(r'[a-z_]{1,40}', value)
+                        else '<redacted>')
+        elif spec == 'status' and key in ('refreshHttpStatus', 'apiHttpStatus') and key not in props:
+            continue
         elif spec == 'status' and (value is None or type(value) is int and 100 <= value <= 599):
             out[key] = value
         elif spec == 'seconds' and (value is None or type(value) in (int, float) and math.isfinite(value) and -10**9 <= value <= 10**9):
@@ -718,6 +727,7 @@ def _run_summary(runs, start, end, interval=None):
               'firstRunTs': timestamps[0].isoformat().replace('+00:00', 'Z') if timestamps else None,
               'lastRunTs': timestamps[-1].isoformat().replace('+00:00', 'Z') if timestamps else None,
               'medianGapSeconds': median, 'maxGapSeconds': max(seconds for _, seconds in gaps),
+              'gapThresholdSeconds': threshold,
               'gapsOver': [{'startTs': stamp.isoformat().replace('+00:00', 'Z'), 'seconds': seconds}
                            for stamp, seconds in sorted(gaps, key=lambda gap: -gap[1])
                            if threshold is not None and seconds > threshold][:10]}
@@ -764,6 +774,7 @@ def rollup(day=None):
         rejected_top, diagnostics, burst_times = defaultdict(Counter), defaultdict(set), defaultdict(list)
         malformed = 0
         zero_sleep, last_scored = 0, None
+        auth_failures, whoop_runs = Counter(), []
         food_errors, delivered, expected = Counter(), {}, set()
         receipt_sources = {}
         nag_latency, open_slots = [], {}
@@ -799,6 +810,14 @@ def rollup(day=None):
                             dubai = dt.timezone(dt.timedelta(hours=4))
                             ended = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone(dubai).date() - dt.timedelta(days=1)
                             open_slots[str(ended)] = props['slotsOpen']
+                    if r['name'] == 'sync.run' and component == 'whoop-sync':
+                        if r.get('ok') is False and props.get('authStage') and props.get('reason') in WHOOP_AUTH_REASONS:
+                            auth_failures[(props['authStage'], props['reason'])] += 1
+                        stamp = iso_stamp(r.get('ts'))
+                        if stamp and type(r.get('ok')) is bool:
+                            timestamp = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+                            if start <= timestamp < day_end:
+                                whoop_runs.append((timestamp, len(whoop_runs), r['ok']))
                     if r['name'] == 'sync.run':
                         saved = props.get('lastScoredSleep')
                         if saved:
@@ -842,6 +861,10 @@ def rollup(day=None):
                             samples.setdefault(cause, candidate)
                 except (ValueError, TypeError, AttributeError):
                     malformed += 1
+        consecutive, max_consecutive = 0, 0
+        for _, _, ok in sorted(whoop_runs):
+            consecutive = 0 if ok else consecutive + 1
+            max_consecutive = max(max_consecutive, consecutive)
         total = sum(names.values())
         rated = sum(outcomes.values())
         result = {'day': day.isoformat(), 'tool': 'health', 'total': total, 'malformedCount': malformed,
@@ -852,7 +875,10 @@ def rollup(day=None):
                   'durationMs': {}, 'topErrors': [],
                   'components': {component: _run_summary(run_times[component], start, end, intervals.get(component))
                                  for component in sorted(set(run_times) | set(intervals))},
-                  'whoop': {'lastScoredSleep': last_scored, 'zeroSleepRuns': zero_sleep},
+                  'whoop': {'lastScoredSleep': last_scored, 'zeroSleepRuns': zero_sleep,
+                            'authFailures': [{'authStage': stage, 'reason': reason, 'count': count}
+                                             for (stage, reason), count in sorted(auth_failures.items())],
+                            'consecutiveFailures': max_consecutive},
                   'food': {'errorsBySubcommand': dict(food_errors)},
                   'nag': {'firstNagToTookSeconds': {
                       'median': statistics.median(nag_latency) if nag_latency else None,

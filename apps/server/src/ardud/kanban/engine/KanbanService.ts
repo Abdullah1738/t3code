@@ -204,7 +204,34 @@ const encodeWakeIdentity = Schema.encodeSync(Schema.fromJsonString(Schema.Unknow
 const isKanbanThreadError = Schema.is(KanbanThreadError);
 const assignmentRolledBack = (event: KanbanCardEvent) =>
   /^Assignment wake did not complete(?:$|:)/.test(event.body ?? "") ||
-  event.body === "Assignment changed after wake was accepted";
+  event.body === "Assignment changed after wake was accepted" ||
+  event.body?.startsWith("Wake rolled back: ") === true;
+
+const assignmentFailureReasons = {
+  pending_stop: "pending stop on thread",
+  card_missing: "card missing",
+  card_assignment_changed: "card assignment changed",
+  board_missing: "board missing",
+  board_archived: "board archived",
+  board_setup: "board setting up",
+  board_paused: "board paused",
+  board_assignment_changed: "board assignment changed",
+  review_model_changed: "review model changed",
+  pool_unavailable: "pool unavailable",
+  pool_shrunk: "pool capacity reduced",
+  pool_model_changed: "pool model changed",
+  pool_capacity: "pool full before assignment",
+  paused_sibling: "another card on this thread is paused",
+  blocked: "card blocked",
+  dispatch_ineligible: "card no longer eligible",
+  dispatch_role_changed: "assignment role changed",
+  dispatch_model_changed: "assignment model changed",
+  dispatch_requires_fresh_thread: "assignment requires a new thread",
+} as const;
+interface AssignmentValidationFailure {
+  readonly failedCheck: keyof typeof assignmentFailureReasons;
+  readonly changedKeys?: ReadonlyArray<string>;
+}
 
 const wakeKey = (threadId: string, at: string) =>
   `wake:${NodeCrypto.createHash("sha256").update(`${threadId}|${at}`).digest("hex").slice(0, 32)}`;
@@ -10269,6 +10296,7 @@ const make = Effect.gen(function* () {
       newThread: boolean;
       expectedCard: KanbanCard;
       valid: Effect.Effect<boolean>;
+      failedValidation: AssignmentValidationFailure | undefined;
       skipReason: string | undefined;
     },
     pass: ReturnType<typeof dispatchCardPass>,
@@ -10816,8 +10844,40 @@ const make = Effect.gen(function* () {
                   const attempts = (previous?.movedAt === card.movedAt ? previous.attempts : 0) + 1;
                   const failedAt = yield* nowMillis;
                   const reason = superseded
-                    ? "Assignment changed after wake was accepted"
+                    ? destination.failedValidation === undefined
+                      ? "Wake rolled back: assignment validation unavailable"
+                      : destination.failedValidation.failedCheck === "card_assignment_changed" ||
+                          destination.failedValidation.failedCheck === "board_assignment_changed"
+                        ? "Assignment changed after wake was accepted"
+                        : `Wake rolled back: ${assignmentFailureReasons[destination.failedValidation.failedCheck]}`
                     : `Assignment wake did not complete: ${failureTag} (attempt ${attempts})`;
+                  const diagnostic = {
+                    key,
+                    attempt: attempts,
+                    accepted: pending.accepted,
+                    touched: pending.touched,
+                    failedCheck: destination.failedValidation?.failedCheck ?? "delivery_incomplete",
+                    ...(destination.failedValidation?.changedKeys === undefined
+                      ? {}
+                      : { changedKeys: destination.failedValidation.changedKeys }),
+                    reason,
+                  };
+                  yield* Effect.logWarning("kanban.assignment_wake.rollback", {
+                    cardId: card.id,
+                    threadId: reused,
+                    ...diagnostic,
+                  });
+                  yield* recordAnalytics({
+                    kind: "kanban.assignment_wake.rollback",
+                    boardId: board.id,
+                    cardId: card.id,
+                    threadId: reused,
+                    props: {
+                      ...diagnostic,
+                      reason: diagnostic.failedCheck,
+                      rollbackReason: reason,
+                    },
+                  });
                   const restored: KanbanCard = {
                     ...current,
                     // An undelivered hand-off must not consume the old wait's requested wake.
@@ -11498,6 +11558,7 @@ const make = Effect.gen(function* () {
                 const destination = {
                   skipReason: "start_deferred" as string | undefined,
                   valid: Effect.succeed(true),
+                  failedValidation: undefined as AssignmentValidationFailure | undefined,
                   expectedCard: card,
                   newThread:
                     dispatch.fresh ||
@@ -11557,45 +11618,59 @@ const make = Effect.gen(function* () {
                               ? row.instructions.escalation.trim()
                               : null,
                       });
+                      const invalid = (
+                        failedCheck: AssignmentValidationFailure["failedCheck"],
+                        changedKeys?: ReadonlyArray<string>,
+                      ) => {
+                        destination.failedValidation = {
+                          failedCheck,
+                          ...(changedKeys === undefined ? {} : { changedKeys }),
+                        };
+                        return false;
+                      };
                       destination.valid = Effect.gen(function* () {
+                        destination.failedValidation = undefined;
                         if (
                           sourceThreadId !== null &&
                           (yield* Effect.result(refusePendingStop(sourceThreadId)))._tag ===
                             "Failure"
                         )
-                          return false;
+                          return invalid("pending_stop");
                         const currentBoard = (yield* rawStore.boards).find(
                           (row) => row.id === board.id,
                         );
                         const currentCard = yield* rawStore.card(card.id);
-                        if (
-                          currentCard === null ||
-                          !NodeUtil.isDeepStrictEqual(
-                            assignmentState(currentCard),
-                            assignmentState(destination.expectedCard),
-                          )
-                        )
-                          return false;
-                        if (
-                          !currentBoard ||
-                          currentBoard.archivedAt !== null ||
-                          settingUp.has(board.id) ||
-                          currentBoard.setup?.status === "running" ||
-                          (currentBoard.pause && !currentBoard.pause.keep.includes(card.id))
-                        )
-                          return false;
+                        if (currentCard === null) return invalid("card_missing");
+                        const actual = assignmentState(currentCard);
+                        const expected = assignmentState(destination.expectedCard);
+                        if (!NodeUtil.isDeepStrictEqual(actual, expected)) {
+                          const changedKeys = (
+                            [
+                              ...new Set([...Object.keys(actual), ...Object.keys(expected)]),
+                            ] as Array<keyof typeof actual>
+                          ).filter(
+                            (key) => !NodeUtil.isDeepStrictEqual(actual[key], expected[key]),
+                          );
+                          return invalid("card_assignment_changed", changedKeys);
+                        }
+                        if (!currentBoard) return invalid("board_missing");
+                        if (currentBoard.archivedAt !== null) return invalid("board_archived");
+                        if (settingUp.has(board.id) || currentBoard.setup?.status === "running")
+                          return invalid("board_setup");
+                        if (currentBoard.pause && !currentBoard.pause.keep.includes(card.id))
+                          return invalid("board_paused");
                         if (
                           !NodeUtil.isDeepStrictEqual(
                             boardAssignmentState(currentBoard),
                             boardAssignmentState(board),
                           )
                         )
-                          return false;
+                          return invalid("board_assignment_changed");
                         if (
                           dispatch.role === "review" &&
                           !modelSelectionsEqual(Rules.nextModel(currentBoard, card), dispatch.model)
                         )
-                          return false;
+                          return invalid("review_model_changed");
                         const cards = yield* pass.read;
                         const pools = Rules.maskDownPools(
                           yield* rawStore.pools(board.id),
@@ -11606,16 +11681,26 @@ const make = Effect.gen(function* () {
                           pool === undefined ||
                           pool.slots <= 0 ||
                           currentPool === undefined ||
-                          currentPool.slots < pool.slots ||
-                          !NodeUtil.isDeepStrictEqual(currentPool.model, pool.model)
+                          currentPool.slots <= 0
                         )
-                          return false;
+                          return invalid("pool_unavailable");
+                        if (currentPool.slots < pool.slots) return invalid("pool_shrunk");
+                        if (!NodeUtil.isDeepStrictEqual(currentPool.model, pool.model))
+                          return invalid("pool_model_changed");
+                        const claimed =
+                          currentCard.activeThreadId !== null &&
+                          currentCard.activeThreadId === destination.expectedCard.activeThreadId &&
+                          currentCard.activeRole === dispatch.role &&
+                          currentCard.stage ===
+                            (dispatch.role === "work" ? "working" : "in_review");
+                        // Occupancy admits new claims; unrelated reservations cannot revoke a claim that owns its slot.
                         if (
+                          !claimed &&
                           (Rules.poolThreads(cards, yield* boardHolds(board.id, key)).get(
                             dispatch.pool,
                           )?.size ?? 0) > currentPool.slots
                         )
-                          return false;
+                          return invalid("pool_capacity");
                         if (
                           dispatch.role === "work" &&
                           !destination.newThread &&
@@ -11627,24 +11712,20 @@ const make = Effect.gen(function* () {
                               !currentBoard.pause!.keep.includes(other.id),
                           )
                         )
-                          return false;
-                        // Once the claim commits, it owns its slot. Re-planning it as
-                        // unassigned can reject the accepted wake against its own hold.
-                        // Card/board/model/pool and stop fences above still revoke it.
-                        if (
-                          currentCard.activeThreadId !== null &&
-                          currentCard.activeThreadId === destination.expectedCard.activeThreadId &&
-                          currentCard.activeRole === dispatch.role &&
-                          currentCard.stage === (dispatch.role === "work" ? "working" : "in_review")
-                        )
-                          return (
-                            dispatch.role === "review" ||
-                            !Rules.isBlocked(
+                          return invalid("paused_sibling");
+                        // Card/board/model/pool and stop fences above still revoke committed claims.
+                        if (claimed) {
+                          if (
+                            dispatch.role === "work" &&
+                            Rules.isBlocked(
                               currentCard,
                               new Map(cards.map((row) => [row.id as string, row])),
                               currentCard.activeThreadId,
                             )
-                          );
+                          )
+                            return invalid("blocked");
+                          return true;
+                        }
                         // Keep siblings for blockers and capacity without planning their starts.
                         const selected = {
                           ...card,
@@ -11674,12 +11755,14 @@ const make = Effect.gen(function* () {
                           yield* workThreadHomes(cards, true),
                           assignmentWakeRetries,
                         ).find((entry) => entry.cardId === card.id);
-                        return (
-                          eligible !== undefined &&
-                          eligible.role === dispatch.role &&
-                          modelSelectionsEqual(eligible.model, dispatch.model) &&
-                          (destination.newThread || !eligible.fresh)
-                        );
+                        if (eligible === undefined) return invalid("dispatch_ineligible");
+                        if (eligible.role !== dispatch.role)
+                          return invalid("dispatch_role_changed");
+                        if (!modelSelectionsEqual(eligible.model, dispatch.model))
+                          return invalid("dispatch_model_changed");
+                        if (!destination.newThread && eligible.fresh)
+                          return invalid("dispatch_requires_fresh_thread");
+                        return true;
                       }).pipe(Effect.orDie);
                       yield* locks.scopeDispatch(
                         board.id,
