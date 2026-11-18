@@ -147,7 +147,8 @@ async function main(): Promise<void> {
   });
   const makeRouter = () => chatGuid ? new Router(store, backend, photon, {
     ...config, chatGuid, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
-    transcribe: input => transcribe(input), notifyFailure: notifyFailedInbound, log, recoverAttachment,
+    medsFold: {},
+    transcribe: input => transcribe(input), notifyUnanswered: (severity, text, key) => outlet.notify(severity, text, key), notifyFailure: notifyFailedInbound, log, recoverAttachment,
   }) : undefined;
   router = makeRouter();
   const health = { photonLastOk: 0, backendLastOk: 0, lastError: "", startedAt: Date.now() };
@@ -222,7 +223,7 @@ async function main(): Promise<void> {
         let complete = false;
         for await (const event of photon.catchUp(store.get<number>("photonCursor"))) {
           if (stopping) break;
-          if (ingest(store, event, config.owner, config.enabled)) {
+          if (ingest(store, event, config.owner, config.enabled, kind)) {
             ingressRevision++;
             controlsPending = true;
             chatGuid = store.get<string>("chatGuid");
@@ -287,6 +288,9 @@ async function main(): Promise<void> {
     }
   }
   let routerBusy = false;
+  const unansweredTimer = setInterval(() => {
+    if (ready()) void router?.checkUnanswered().catch(error => toolError("main", "unanswered.check", error));
+  }, 60_000);
   const timer = setInterval(() => {
     void delivery.tick().catch((caughtError) => { toolError("main", "main.catch12", caughtError); return log("sender-failed"); });
     if (ready()) void router?.checkCompletion();
@@ -307,6 +311,7 @@ async function main(): Promise<void> {
     stopping = true;
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     clearInterval(timer);
+    clearInterval(unansweredTimer);
     await server.stop(true);
     await apps?.stop().catch((caughtError) => { toolError("main", "main.catch16", caughtError);});
     await shares.stopAll().catch((caughtError) => { toolError("main", "main.catch17", caughtError);});

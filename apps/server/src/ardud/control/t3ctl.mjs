@@ -27,6 +27,8 @@ const HELP = `t3ctl <command> [options]
   projects                             list projects
   models                               default model and available models
   usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]
+        [--cursor CURSOR] [--timeout-ms MS]  per-page deadline (default 30000ms)
+        --all-pages defaults to 1000 rows per page
   threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--cursor C] [--all-kinds]
   create [--prompt P] [--title T] [--dir D | --project ID] [--model M] [--instance I]
          [--variant V] [--option K=V ...] [--mode full-access|approval-required|...] [--origin O] [--plan]
@@ -49,6 +51,7 @@ const HELP = `t3ctl <command> [options]
   harness-cutover plan|run|status       plan, start/resume the paced job, or inspect cutover
   desktop-lease acquire --task ID --scope TARGET --mode native|cua-driver [--driver D --native-id ID --agent-id ID]
   desktop-lease heartbeat|release --ticket TICKET [--driver D --native-id ID --agent-id ID]
+    release also withdraws your queued ticket
   desktop-lease reconcile --ticket TICKET --evidence TEXT   requires environment:maintain
 
 Global: --request-timeout SECONDS      HTTP request deadline (default 30s for ordinary requests)
@@ -66,6 +69,53 @@ T3_CONTROL_TOKEN_FILE, else the first found of ${TOKEN_FILE} and
 ${SHARED_TOKEN_FILE}.`;
 
 const shellQuote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
+
+export async function readUsage(
+  client,
+  filters,
+  { allPages = false, timeoutMs = client.timeoutMs ?? 30_000 } = {},
+) {
+  const items = [];
+  const seen = new Set(filters.cursor ? [filters.cursor] : []);
+  let cursor = filters.cursor;
+  let first;
+  let pageNumber = 1;
+  while (true) {
+    let page;
+    try {
+      page = await client.usage({ ...filters, cursor }, { timeoutMs });
+      if (
+        !page ||
+        !Array.isArray(page.items) ||
+        (page.nextCursor !== null && typeof page.nextCursor !== "string")
+      ) {
+        throw new Error("invalid usage page");
+      }
+      if (allPages && page.nextCursor !== null && seen.has(page.nextCursor)) {
+        throw new Error("usage pagination returned a repeated cursor");
+      }
+    } catch (cause) {
+      const failure =
+        cause?.name === "AbortError" || cause?.name === "TimeoutError"
+          ? `timed out after ${timeoutMs} ms`
+          : `failed: ${cause?.code ? `${cause.code}: ` : ""}${cause?.message ?? String(cause)}`;
+      const resume = cursor
+        ? `resume with --cursor ${shellQuote(cursor)}`
+        : "retry without --cursor";
+      throw new Error(
+        `usage page ${pageNumber} ${failure}; cursor ${cursor ?? "<start>"}; ${items.length} items read; ${resume}`,
+        { cause },
+      );
+    }
+    first ??= page;
+    if (!allPages) return page;
+    items.push(...page.items);
+    if (page.nextCursor === null) return { ...first, items, nextCursor: null };
+    seen.add(page.nextCursor);
+    cursor = page.nextCursor;
+    pageNumber++;
+  }
+}
 const shellOption = (name, value) =>
   value.startsWith("-") ? `--${name}=${shellQuote(value)}` : `--${name} ${shellQuote(value)}`;
 
@@ -150,6 +200,7 @@ async function main() {
       drain: { type: "boolean" },
       timeout: { type: "string" },
       "request-timeout": { type: "string" },
+      "timeout-ms": { type: "string" },
       "request-id": { type: "string" },
       active: { type: "boolean" },
       state: { type: "string" },
@@ -266,7 +317,7 @@ async function main() {
     component: "t3ctl",
     timeoutMs: requestTimeoutMs,
   });
-  if (requestTimeoutMs !== undefined) {
+  if (requestTimeoutMs !== undefined && command !== "usage") {
     // wait() normally gives its long-poll an extra 30s; an explicit deadline wins.
     const request = client.request.bind(client);
     client.request = (method, path, body, options = {}) =>
@@ -282,32 +333,32 @@ async function main() {
     case "models":
       return print(await client.models());
     case "usage": {
+      const pageTimeoutMs =
+        flags["timeout-ms"] === undefined
+          ? (requestTimeoutMs ?? 30_000)
+          : Number(flags["timeout-ms"]);
+      if (
+        !Number.isSafeInteger(pageTimeoutMs) ||
+        pageTimeoutMs < 1 ||
+        pageTimeoutMs > 2_147_483_647
+      ) {
+        throw new Error(
+          "--timeout-ms must be a positive integer of at most 2147483647 milliseconds",
+        );
+      }
       const filters = {
         since: need(flags.since, "--since"),
         until: flags.until,
         boardId: flags.board,
-        limit: flags.limit,
+        limit: flags.limit ?? (flags["all-pages"] ? "1000" : undefined),
+        cursor: flags.cursor,
       };
-      const first = await client.usage(filters);
-      if (!flags["all-pages"]) return print(first);
-      const items = [];
-      const seen = new Set();
-      let page = first;
-      while (true) {
-        if (
-          !page ||
-          !Array.isArray(page.items) ||
-          (page.nextCursor !== null && typeof page.nextCursor !== "string")
-        ) {
-          throw new Error("invalid usage page");
-        }
-        for (const item of page.items) items.push(item);
-        const cursor = page.nextCursor;
-        if (cursor === null) return print({ ...first, items, nextCursor: null });
-        if (seen.has(cursor)) throw new Error("usage pagination returned a repeated cursor");
-        seen.add(cursor);
-        page = await client.usage({ ...filters, cursor });
-      }
+      return print(
+        await readUsage(client, filters, {
+          allPages: flags["all-pages"],
+          timeoutMs: pageTimeoutMs,
+        }),
+      );
     }
     case "harness-cutover": {
       const action = need(args[0], "harness-cutover action");

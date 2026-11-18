@@ -20,8 +20,8 @@ else:
 class DatabaseMerge(Isolated):
     def test_step_wrapper_exit_is_not_authoritative_before_validation(self):
         rid = 'steps-pull-lock'
-        self.con.execute("INSERT INTO runs(run_id,box_id,status,mode,step_count) "
-                         "VALUES (?,'box','running','fg',2)", (rid,))
+        self.con.execute("INSERT INTO runs(run_id,box_id,status,mode,step_count,pulls) "
+                         "VALUES (?,'box','running','fg',2,'[\"artifact\"]')", (rid,))
         log = runs.LOGS_DIR / (rid + '.log')
         log.write_text('offbox step 1 rc=0: first\n')
         runner = SimpleNamespace(run_id=rid, box='box', started=True, registered=True, remote_code=None,
@@ -279,10 +279,10 @@ class DatabaseMerge(Isolated):
                 patch.object(common, 'home_config', return_value={'url':'https://unused.invalid/api/v1'}), \
                 patch.object(common, 'backend_pinned', return_value=None), \
                 patch.object(common, 'home_state', return_value={'state':'home_down'}), \
-                patch.object(home, 'probe') as probe, self.assertRaises(common.OffboxError) as error:
+                patch.object(home, 'probe', return_value='no answer (TimeoutError)') as probe, self.assertRaises(common.OffboxError) as error:
             home.person_gate()
         self.assertEqual(error.exception.code, 93)
-        probe.assert_not_called()
+        probe.assert_called_once_with()
         local = common.local_error(sqlite3.OperationalError('database is locked'))
         self.assertEqual(local.code, 96)
         self.assertIn('nothing ran, safe to retry', str(local))

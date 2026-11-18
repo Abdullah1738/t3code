@@ -101,10 +101,14 @@ class InventoryLoggingTests(unittest.TestCase):
         entries, run = self.fixture()
         with patch.object(jobs, 'inventory_listing', return_value=(entries, True)):
             deep_inventory.run_pass([self.root], run, budget=100)
-        self.assertEqual(len(self.rows('disk.inventory.source')), 3)
+        sources = self.rows('disk.inventory.source')
+        attempts = [r for r in sources if 'cpuS' in r['props']]
+        self.assertGreater(len(attempts), 0)
+        self.assertEqual(sum(r['props'].get('completedCount', 1) for r in attempts), 1000)
+        self.assertTrue(all(r['props']['allowanceS'] > 0 for r in attempts))
         self.assertEqual(len(self.rows('disk.inventory.root')), 1)
         self.assertEqual(len(self.rows('disk.deep.root')), 1)
-        self.assertEqual(len(self.rows()), 7)  # root + three notable + deep start/root/end
+        self.assertEqual(len(self.rows()), len(sources)+4)
         props = self.rows('disk.inventory.root')[0]['props']
         self.assertEqual(props['childrenMeasured'], 1000)
         self.assertEqual(props['childrenCached'], 1000)
@@ -156,14 +160,15 @@ class InventoryLoggingTests(unittest.TestCase):
         for name in ('small', 'large'):
             (child/name).mkdir()
         jobs.save_state('disk-inventory', dict(duMode='links', childState={str(self.root): {
-            str(child): dict(partial=True, timeouts=1, attemptedAt=1)}}))
+            str(child): dict(partial=True, timeouts=1, lastTimeoutS=60, attemptedAt=1)}}))
         def run(cmd, **kw):
             self.clock += .01
             return SimpleNamespace(returncode=0, stderr='', stdout=''.join(
                 '%d\t%s\n' % (1024**2 if key.endswith('/large') else 1, key) for key in cmd[2:]))
         deep_inventory.run_pass([self.root], run, budget=100)
         sources = self.rows('disk.inventory.source')
-        self.assertEqual({r['props']['source'] for r in sources}, {str(child/'large'), str(child)})
+        self.assertEqual({r['props']['source'] for r in sources},
+                         {str(child/'large'), str(child/'small'), str(child)})
         self.assertEqual(len(self.rows('disk.inventory.root')), 1)
         self.assertEqual(self.rows('disk.inventory.root')[0]['props']['childrenMeasured'], 1)
 
@@ -177,7 +182,8 @@ class InventoryLoggingTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stderr='', stdout=''.join(
                 '%d\t%s\n' % (800*1024, key) for key in cmd[2:]))
         deep_inventory.run_pass([self.root], run, budget=100)
-        self.assertEqual([r['props']['source'] for r in self.rows('disk.inventory.source')], [str(child)])
+        self.assertEqual([r['props']['source'] for r in self.rows('disk.inventory.source')],
+                         [str(child/'part'), str(child)])
 
     def test_parts_baseline_survives_multiple_turns(self):
         child = self.root/'giant'
@@ -185,7 +191,10 @@ class InventoryLoggingTests(unittest.TestCase):
         parts = [child/('%04d'%i) for i in range(129)]
         for part in parts:
             part.mkdir()
-        own = ((child.stat().st_blocks*512+1023)//1024)*1024
+        # Keep the exact 20% boundary independent of delayed directory-block
+        # allocation between the fixture's stat and the scanner's later lstat.
+        metadata = child.stat()
+        own = ((metadata.st_blocks*512+1023)//1024)*1024
         for old, new, notable in [(1024, 1024, False), (500, 400, True),
                                   (500, 600, True), (500, 405, False)]:
             with self.subTest(old=old, new=new), patch.dict(os.environ, TOOLLOG_DIR=str(self.logs/str(new))):
@@ -198,10 +207,12 @@ class InventoryLoggingTests(unittest.TestCase):
                     return SimpleNamespace(returncode=0, stderr='', stdout=''.join(
                         '%d\t%s\n' % ((new*1024**2-own)//1024 if key == str(parts[0]) else 0, key)
                         for key in cmd[2:]))
-                deep_inventory.run_pass([self.root], run, budget=100)
+                with patch.object(jobs.os, 'lstat', return_value=metadata):
+                    deep_inventory.run_pass([self.root], run, budget=100)
                 rows = [r for p in (self.logs/str(new)).glob('*.ndjson')
                         for r in map(json.loads, p.read_text().splitlines())]
                 self.assertEqual(sum(r['name'] == 'disk.inventory.source' and r['props']['source'] == str(child)
+                                     and 'cpuS' not in r['props']
                                      for r in rows), int(notable))
                 self.assertEqual(len(calls), 2)
 
@@ -209,7 +220,7 @@ class InventoryLoggingTests(unittest.TestCase):
         child = self.root/'file'
         child.touch()
         jobs.save_state('disk-inventory', dict(duMode='links', childState={str(self.root): {
-            str(child): dict(partial=True, timeouts=1, attemptedAt=1)}}))
+            str(child): dict(partial=True, timeouts=1, lastTimeoutS=60, attemptedAt=1)}}))
         def run(cmd, **kw):
             self.clock += 40
             raise subprocess.TimeoutExpired(cmd, 40)

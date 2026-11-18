@@ -44,7 +44,11 @@ it.effect(
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const version = yield* sql<{ version: string }>`SELECT sqlite_version() AS version`;
-      assert.equal(version[0]?.version, runtime.sqlite, "Pinned SQLite planner version");
+      assert.equal(
+        version[0]?.version,
+        runtime.sqlite,
+        `Pinned SQLite planner version: expected SQLite ${runtime.sqlite}; install/select Node ${runtime.node} as specified in packages/perf-harness/runtime.json and put its bin directory first on PATH (check node --version), then run from the repo root: cd apps/server && ../../node_modules/.bin/vp test run src/ardud/perf/queryPlan.test.ts`,
+      );
       const projection = yield* Projection.ProjectionStoreV2;
       const store = yield* Store.KanbanStore;
       const now = DateTime.makeUnsafe("2026-01-01T00:00:00Z");
@@ -96,6 +100,21 @@ it.effect(
           | SqlError.SqlError
         >;
       }> = [
+        { route: "recovery.active-page", run: projection.pageActiveThreadIds("a", 501) },
+        { route: "recovery.live-page", run: control.pageLiveThreadIds("a", 501) },
+        {
+          route: "recovery.records",
+          run: projection.getThreadRecords(
+            threadId,
+            ["runs", "runtimeRequests", "providerThreads", "subagents"],
+            {
+              currentRunOnly: true,
+              pendingRuntimeRequestsOnly: true,
+              subagentsWithChildThreadOnly: true,
+              providerThreadIds: [],
+            },
+          ),
+        },
         { route: "shell.runs", run: ShellQueries.selectShellRunRows(sql, ids) },
         { route: "shell.archive", run: projection.getShellSnapshot({ location: "archive" }) },
         { route: "shell.counts", run: ShellQueries.selectShellRunItemCounts(sql, ids) },
@@ -232,7 +251,9 @@ it.effect(
           )
             assert.isAtMost(
               (statement.match(/\?/g) ?? []).length,
-              entry.route === "control.threads-updated-since" ? 4 : 2,
+              entry.route === "control.threads-updated-since" || entry.route.startsWith("recovery.")
+                ? 4
+                : 2,
               `${entry.route} bind count`,
             );
           const plan = yield* sql.unsafe<{ detail: string }>(
@@ -266,6 +287,21 @@ it.effect(
             JSON.stringify({ route: entry.route, queryHash: hash(statement), plan, findings }),
           );
           const remaining = unreviewed(query, findings, queryPlanExceptions);
+          if (findings.length && !remaining.length) {
+            // A comment changes the SQL hash while preserving the captured plan.
+            const changedSql = `${statement}\n-- stale exception fixture`;
+            const changedHash = hash(changedSql);
+            assert.deepEqual(
+              unreviewed(
+                { ...query, sql: changedSql, queryHash: changedHash },
+                findings,
+                queryPlanExceptions,
+              ),
+              [
+                `STALE EXCEPTION route=${entry.route} oldHash=${query.queryHash} newHash=${changedHash}: SQL changed; diff the plans and re-review (see #1607)`,
+              ],
+            );
+          }
           if (remaining.length)
             rejected.push({ route: entry.route, queryHash: hash(statement), findings: remaining });
         }

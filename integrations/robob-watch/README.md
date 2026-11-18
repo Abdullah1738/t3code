@@ -2,7 +2,9 @@
 
 Durable watcher runner for Robob. Watchers run a check command on an interval (default every 15s, minimum 5s) or within about a second of a trigger file changing.
 
-Wake events go to the creating Robob thread (`created_by_session`) in queue mode, with the event key as the request ID for safe retries. Watchers created in iMessage keep following the live chat through rotation and `/new`; an explicit `chat` still wakes only that chat. Without a creator, or when an old native session cannot be resolved, wakes use the live owner route. Missing, archived or unreachable creator threads fall back to that route with a note naming the intended thread. Owner wakes use spectrum-bridge `wake`, then bridge `send`, then Telegram `notify` as fallbacks. Only owner wakes enter the opt-in 120s heads-up tracking.
+Wake events go to the creating Robob thread (`created_by_session`) in queue mode. Watchers created in iMessage follow the live chat through rotation and `/new`; an explicit `chat` still wakes only that chat. Missing or archived creators fall back to the owner route. Slow status checks retry once with a longer timeout, then try the known thread anyway. Native lookup timeouts retry once and remain pending if the thread cannot yet be identified.
+
+A queued wake remains `confirmed=pending` until the thread reports a new run, or the owner-chat router consumes its inbound row. A send timeout also stays pending: it may have queued on the server. After ten minutes without confirmation, the runner alerts once and tries the owner fallback with the same event key. `robob-watch show ID` includes `last_delivery` and pending confirmations. Owner fallbacks use spectrum-bridge `wake`, then bridge `send`, then Telegram `notify`. Explicit chat watchers and opt-in 120s heads-ups keep their existing behavior.
 
 Failed checks back off, with a failure notice from the 2nd failure in a row (`failure_notice_after`), pause and alert after 5 (`max_consecutive_failures`). Set `failure_notice_after` to 1 to notify on every failure, or `max_consecutive_failures` to 0 to keep retrying without pausing. Timed-out checks need 10 minutes of failures before either notice or pause; host-load timeout grace still applies. Wake watchers escalate at pause or after 15 minutes of failures. A successful check resets the streak.
 
@@ -36,6 +38,13 @@ Approval against an explicit snapshot still revalidates current owner messages
 through the control API before succeeding.
 
 Install/sync: copy `src test helpers package.json tsconfig.json` to `~/.local/share/robob-watch`, the wrapper to `~/.local/bin/robob-watch`, the plist to `~/Library/LaunchAgents/`, the skill to `~/.config/opencode/skills/robob-watchers/`, then `launchctl kickstart -k gui/$(id -u)/com.ardud.robob-watch`.
+
+Log analysis: `robob-watch log-rollup --day YYYY-MM-DD` keeps the daily report.
+The runner writes yesterday’s report after 00:30 UTC so late-day markers have their full comparison window. Reports written before the UTC day ended are redone; reports written at or after day end are kept.
+For a release window use `robob-watch log-rollup --since 2026-11-13T18:24:00Z --until 2026-11-14T00:00:00Z [--out /path/window.json]`.
+Windows include the start and exclude the end, require a timezone, and print JSON without writing a daily report.
+Reports include hourly error sources, run failures/timeouts and p95 durations. Each release marker compares error events in the 30 minutes before and after it; a comparison has `complete: false` until its end time has passed; missing log periods contribute zero, so use complete logs for release readback.
+For manual release/restart scripts, call `robob-watch log-marker --service robob-watch --sha <git-sha> --step restart.complete || true` after success. Service/step are short identifiers; SHA is hex. Markers retain no IDs or free text and failures never interrupt the script.
 
 ## Tests
 

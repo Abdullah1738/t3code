@@ -87,6 +87,9 @@ function runShellEnvironment(input: {
     | { output: string; exitCode: number }
     | Effect.Effect<ChildProcessSpawner.ChildProcessHandle, PlatformError.PlatformError>;
   readonly failure?: PlatformError.PlatformError;
+  readonly checkHydration?: (
+    hydration: DesktopShellEnvironment.DesktopShellEnvironment["Service"]["pathHydration"],
+  ) => void;
 }) {
   const layerEnvironment = Layer.succeed(
     DesktopEnvironment.DesktopEnvironment,
@@ -112,6 +115,7 @@ function runShellEnvironment(input: {
     const shellEnvironment = yield* DesktopShellEnvironment.DesktopShellEnvironment;
     const prepared = yield* shellEnvironment.installIntoProcess;
     assert.equal(yield* shellEnvironment.installIntoProcess, prepared);
+    input.checkHydration?.(shellEnvironment.pathHydration);
     return prepared;
   }).pipe(
     Effect.provide(
@@ -134,6 +138,135 @@ function runShellEnvironment(input: {
 }
 
 describe("DesktopShellEnvironment", () => {
+  it.effect("does not report PATH prepared after a failed macOS probe and empty launchctl", () =>
+    Effect.gen(function* () {
+      const env = { SHELL: "/bin/zsh", PATH: "/usr/bin:/bin:/usr/sbin:/sbin" };
+      const inheritedPath = env.PATH;
+      const prepared = yield* runShellEnvironment({
+        env,
+        platform: "darwin",
+        userShell: "/bin/zsh",
+        handler: (command) =>
+          command._tag === "StandardCommand" && command.command === "/bin/launchctl"
+            ? ""
+            : { output: "", exitCode: 1 },
+      }).pipe(Effect.provide(Logger.layer([])));
+      assert.isFalse(prepared);
+      assert.equal(env.PATH, inheritedPath);
+    }),
+  );
+
+  it.effect("does not report PATH prepared after a macOS probe timeout and empty launchctl", () =>
+    Effect.gen(function* () {
+      const env = { SHELL: "/bin/zsh", PATH: "/usr/bin:/bin:/usr/sbin:/sbin" };
+      const inheritedPath = env.PATH;
+      const started = yield* Deferred.make<void>();
+      const install = yield* Effect.forkChild(
+        runShellEnvironment({
+          env,
+          platform: "darwin",
+          userShell: "/bin/zsh",
+          checkHydration: (hydration) => {
+            assert.equal(hydration.source, "none");
+            assert.deepInclude(hydration.probes[0], {
+              probe: "login-shell",
+              timedOut: true,
+              elapsedMs: 5000,
+              failureTag: "DesktopShellEnvironmentCommandTimeoutError",
+            });
+          },
+          handler: (command) => {
+            if (command._tag === "StandardCommand" && command.command === "/bin/launchctl")
+              return "";
+            return Deferred.succeed(started, undefined).pipe(
+              Effect.as(
+                ChildProcessSpawner.makeHandle({
+                  ...makeProcess(""),
+                  stdout: Stream.never,
+                  all: Stream.never,
+                  exitCode: Effect.never,
+                  isRunning: Effect.succeed(true),
+                }),
+              ),
+            );
+          },
+        }).pipe(Effect.provide(Logger.layer([]))),
+      );
+      yield* Deferred.await(started);
+      yield* TestClock.adjust("5 seconds");
+      assert.isFalse(yield* Fiber.join(install));
+      assert.equal(env.PATH, inheritedPath);
+    }),
+  );
+
+  it.effect.each([
+    { probe: "login-shell", path: "/usr/bin:/bin:/usr/sbin:/sbin" },
+    { probe: "login-shell", path: "/sbin:/usr/sbin:/bin:/usr/bin" },
+    { probe: "login-shell", path: "/USR/BIN:/BIN:/USR/SBIN:/SBIN" },
+    { probe: "login-shell", path: ":/usr/bin::/usr/bin:/bin:" },
+    { probe: "login-shell", path: "/usr/bin/:/bin/.:/usr//sbin:/sbin/" },
+    { probe: "launchctl", path: "/usr/bin:/bin:/usr/sbin:/sbin" },
+    { probe: "launchctl", path: "  " },
+    ...[
+      "/System/Cryptexes/App/usr/bin",
+      "/system/cryptexes/app/usr/bin",
+      "/System/Volumes/Preboot/Cryptexes/App/usr/bin",
+      "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin",
+      "/private/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin",
+      "/Library/Apple/usr/bin",
+    ].flatMap((applePath) =>
+      (["login-shell", "launchctl"] as const).map((probe) => ({
+        probe,
+        path: `${applePath}:/usr/bin:/bin:/usr/sbin:/sbin`,
+      })),
+    ),
+  ] as const)("does not mark a bare macOS probe prepared: %s", (scenario) =>
+    Effect.gen(function* () {
+      const env = { SHELL: "/bin/zsh", PATH: "/usr/bin:/bin:/usr/sbin:/sbin" };
+      const started = yield* Deferred.make<void>();
+      const install = yield* Effect.forkChild(
+        runShellEnvironment({
+          env,
+          platform: "darwin",
+          userShell: "/bin/zsh",
+          checkHydration: (hydration) => assert.equal(hydration.source, "none"),
+          handler: (command) => {
+            if (command._tag === "StandardCommand" && command.command === "/bin/launchctl")
+              return scenario.path;
+            if (scenario.probe === "login-shell") return envOutput({ PATH: scenario.path });
+            return Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never));
+          },
+        }).pipe(Effect.provide(Logger.layer([]))),
+      );
+      if (scenario.probe === "launchctl") {
+        yield* Deferred.await(started);
+        yield* TestClock.adjust("5 seconds");
+      }
+      assert.isFalse(yield* Fiber.join(install));
+      assert.equal(env.PATH, "/usr/bin:/bin:/usr/sbin:/sbin");
+    }),
+  );
+
+  it.effect.each([
+    "/custom/bin",
+    "/System/Cryptexes-tools/bin",
+    "/var/run/com.apple.security.cryptexd-tools/bin",
+    "/System/Volumes/Data/opt/homebrew/bin",
+  ])("validates the merged macOS PATH including inherited CLI directory %s", (cliPath) =>
+    Effect.gen(function* () {
+      const env = { SHELL: "/bin/zsh", PATH: `${cliPath}:/usr/bin` };
+      assert.isTrue(
+        yield* runShellEnvironment({
+          env,
+          platform: "darwin",
+          userShell: "/bin/zsh",
+          handler: () => envOutput({ PATH: "/usr/bin:/bin" }),
+        }),
+      );
+      assert.equal(env.PATH, `/usr/bin:/bin:${cliPath}`);
+    }),
+  );
+
   // Explicit opt-in keeps real shell coverage independent of globally installed tools.
   it.effect.runIf(process.env.T3_TEST_NU_PATH !== undefined)(
     "hydrates the desktop through a renamed Nushell symlink with native export conversions",
@@ -282,9 +415,10 @@ describe("DesktopShellEnvironment", () => {
       };
       const commands: ChildProcess.Command[] = [];
 
-      yield* runShellEnvironment({
+      const prepared = yield* runShellEnvironment({
         env,
         platform: "darwin",
+        checkHydration: (hydration) => assert.equal(hydration.source, "desktop-shell"),
         handler: (command) => {
           commands.push(command);
           return envOutput({
@@ -295,6 +429,7 @@ describe("DesktopShellEnvironment", () => {
         },
       });
 
+      assert.isTrue(prepared);
       assert.equal(commands.length, 1);
       assert.equal(commands[0]?._tag === "StandardCommand" ? commands[0].command : "", "/bin/zsh");
       assert.equal(env.PATH, "/opt/homebrew/bin:/usr/bin:/Users/test/.local/bin");
@@ -507,9 +642,10 @@ describe("DesktopShellEnvironment", () => {
       };
       const commands: string[] = [];
 
-      yield* runShellEnvironment({
+      const prepared = yield* runShellEnvironment({
         env,
         platform: "darwin",
+        checkHydration: (hydration) => assert.equal(hydration.source, "desktop-launchctl"),
         handler: (command) => {
           if (command._tag !== "StandardCommand") return "";
           commands.push(command.command);
@@ -517,6 +653,7 @@ describe("DesktopShellEnvironment", () => {
         },
       });
 
+      assert.isTrue(prepared);
       assert.deepEqual(commands, ["/opt/homebrew/bin/nu", "/bin/zsh", "/bin/launchctl"]);
       assert.equal(env.PATH, "/opt/homebrew/bin:/usr/bin");
     }),

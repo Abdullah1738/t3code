@@ -42,7 +42,9 @@ then six exact order details, including two multi-item orders:
 No multi-shipment order occurred in that bounded history sample. Synthetic split-
 shipment validation is tested, not claimed as live coverage. Quantity >1,
 bundles, localized invoice labels, returns and mixed terminal states are not
-certified. Cancelled marketplace items stay unknown for order-level status.
+certified by this study. Cancelled marketplace items stay unknown in the
+merchandise-detail projection used by money-cases; the separate tracking
+projection's all-cancelled inventory rule is not money-cases coverage proof.
 
 `manifest_complete=true` now requires the full order envelope, nonempty groups,
 exact order/item/shipment identities, unique item IDs, consistent group/item
@@ -159,7 +161,7 @@ verticals. Route `NN...` explicitly to NowNow **before** generic marketplace
 `N...` dispatch. Marketplace routing here rejects `NN...`. Parent may add
 `--service nownow`; do not probe services for an ID.
 
-Marketplace order-detail reads now provide actual whole-order proof only when
+Marketplace merchandise-detail reads used by money-cases provide proof only when
 both manifest flags are true and `status=delivered`. Preserve existing exact
 item/shipment evidence; if it conflicts with a delivered manifest, keep unknown
 rather than overriding the conflict. A failed/incomplete manifest must not erase
@@ -324,7 +326,91 @@ the sampled third-page order returned `2026-10-22T10:33:08+04:00`). Its view
 `children` at 7354109 reads `createdAt`, `invoice`, and `itemGroups` from the
 same full-order object. Whole-order delivery still requires the existing
 independent invoice-count/complete-manifest proof described above. Details now
-expose that proof for cache eligibility. Cancellation/failure remains scoped
-and unproven for the whole order; neither freezes cached totals nor establishes
-a clean negative. Active rows without known placement times still block
+expose that proof for cache eligibility. Cancellation/failure remains unproven
+for whole-order money-cases coverage; neither freezes cached totals nor establishes
+a clean negative there. Active rows without known placement times still block
 coverage until read, and Marketplace must exhaust history to prove absence.
+
+### Cancellation and alternative history investigation (15 November 2026)
+
+The installed APK was pulled again without opening or changing the app. HBC98
+source hash remains `5b3d2a34efdc976ed0775abe14f49a8fd9c69cb8`; all anchors
+below refer to that dump. This investigation **does not establish** a new
+whole-order cancellation/failure contract or a placement-ordered prefix.
+
+The order screen's `getOrder` at 6216060 calls `getOrderDetailsV2` with
+`props.orderNumber`; the service at 3016311 makes the exact GET. The view at
+7354109 reads `cancellationMessage` from the order envelope into environment
+slot 6, independently of `itemGroups`. Its header renderer at 7907582 tests
+that slot's truthiness through `renderIf` (7907643); it does not reduce item
+statuses to derive the message. No sampled live response included that field.
+The inspected view therefore supplies no usable whole-order cancellation
+predicate for these responses.
+
+`renderPayments` at 6216937 reads `order.trackActions.view_refund_tracking`
+(6216960) and renders its control when the action is nonempty (6217018).
+This is a refund-navigation affordance, not a whole-order status. The live
+mixed-order counterexample below and two all-delivered inventories have it too.
+The similarly named
+`isOrderCancelled` at 4151496 reads `timeline[].status.highStatusCode`;
+the inspected full-order response shapes have no such timeline. Its name alone cannot
+promote a shipment tracking result to an order-level result.
+
+Read-only history traversal reached `hasMore=false`: 20 pages, 197 cards,
+115 distinct orders. Exact GETs read all 115 orders, yielding 87 all-delivered
+inventories, 27 all-cancelled inventories, and one mixed inventory. None had
+`cancellationMessage` or top-level `status`, `subStatus`, `orderStatus`, or
+`statusCode`. Sample labels below are local encounter ordinals, not order IDs.
+
+| Sample | Item states | Invoice units / observed units | Refund action | Order cancellation field |
+|---|---|---|---|---|
+| 7 | 2 cancelled | 2 / 2 | present | absent |
+| 8 | 1 cancelled | 1 / 1 | present | absent |
+| 9 | 1 cancelled | 1 / 1 | present | absent |
+| 114 | 2 cancelled, 5 delivered | 7 / 7 | present | absent |
+
+All four reconcile under the existing manifest checks and carry zoned
+`createdAt`. Local archive searches for exact-order noon mail found no rows
+for samples 7-9. Sample 114 had four rows, including one cancellation subject
+and two delivery subjects. These metadata corroborate its mixed state; they
+do not establish cancellation or refund settlement for the other samples.
+
+The missing Part A evidence is an app-defined whole-order cancellation rule
+with a live order-level discriminator, or an app reduction that explicitly
+defines the whole-order outcome, together with positive and mixed controls.
+Inventory agreement alone and the existing tracking projection's reduction
+are insufficient for that requested proof. No `whole_order_status` is exposed,
+no failure status is inferred, and cancellation detail is not made cacheable.
+
+Part B inspected `getOrdersHistory` (3016057): its query fields are `cursor`,
+`limit`, `q`, `status`, `service`, `date_from`, and `date_to`. There is no
+placement sort argument. The 115 exact creation times encountered in the
+live cursor chain contained nine adjacent newest-first inversions; page 2
+was not strictly older than page 1. Neither a prefix nor a date-filter
+interpretation is certified.
+
+The older `getOrdersV2` at 3015887 uses `GET /_svc/order-v2/orders?year=...`.
+Shape 23856 (key-buffer offset 355010, buffer file offset 9404404) decodes to
+`year`, with no page, cursor, or sort key. `getOrders` at 6206825 selects that
+year and `updateStateFromResponse` at 6206882 consumes `dataGroups`; the
+feature-gated older path remains visible in `loadOrders` at 6663460.
+Live year reads returned empty `processing` groups and `completed` groups
+of 102 cards (2026) and 64 cards (2025). Cards still carry item/shipment IDs,
+and expose neither `createdAt` nor pagination. This verifies the older
+grouped route exists, not placement ordering or an exhaustive coverage
+contract. No separate reader form is enabled. Nano's separate active/history
+constants do not prove coverage of this Marketplace account history either.
+
+The full cold cursor-and-detail experiment took 76,553 ms, including four
+local archive metadata searches. Replaying the 20-page chain with all creation
+times already held in memory took 10,383 ms; a separate history-only traversal
+took 11,562 ms. The warm figure is an optimistic lower bound: no per-order
+validation, account re-verification, or production process startup is included.
+It already exceeds the money-cases lane's 8,000 ms maximum (7,800 ms for the
+child before startup costs). No in-check budget is raised and no cross-run cursor
+is retained. Money-cases instead refreshes a placement-date snapshot in a detached
+process. Each refresh starts a new full cursor walk; a completed walk dates the
+snapshot's proof. Checks use that snapshot and cached whole-delivered receipts,
+holding charges near every other placement and limiting charges whose match
+window ends after the walk began. This does not establish cancellation proof or
+a placement-ordered prefix.

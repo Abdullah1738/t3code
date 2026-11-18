@@ -1,0 +1,295 @@
+// Pure helpers for scripts/runbooks/apply-kafka-acls.mjs: approval checks, parsing
+// `kafka-acls.sh --list`, diffing against the generated ACL manifest and planning the
+// `kafka-acls.sh --add` calls. Nothing here talks to AWS or a broker.
+
+import { createHash } from "node:crypto";
+import { aclClusterIdFor, aclManifestDigest } from "./kafka-acl-manifest.mjs";
+
+export const ACL_APPROVAL_SCHEMA_ID = "crpko.kafka.acl-approval.v1";
+export const ACL_APPROVAL_PATH = (environment) => `plan/kafka/acl-approval.${environment}.v1.json`;
+
+// Principals with rows on every registry or browse topic. Their rows go last: written first,
+// they would put a row on every topic and deny every application principal until its own
+// rows land.
+export const LAST_PRINCIPALS = ["User:kafbat-v1", "User:telemetry", "User:topic_provisioner"];
+
+const RESOURCE_FLAGS = { TOPIC: "--topic", GROUP: "--group", CLUSTER: "--cluster", TRANSACTIONAL_ID: "--transactional-id" };
+const OPERATION_NAMES = {
+  READ: "Read",
+  WRITE: "Write",
+  CREATE: "Create",
+  DELETE: "Delete",
+  ALTER: "Alter",
+  DESCRIBE: "Describe",
+  CLUSTER_ACTION: "ClusterAction",
+  DESCRIBE_CONFIGS: "DescribeConfigs",
+  ALTER_CONFIGS: "AlterConfigs",
+  IDEMPOTENT_WRITE: "IdempotentWrite"
+};
+
+function fail(message) {
+  throw new Error(message);
+}
+
+export function aclKey(row) {
+  return [row.principal, row.host, row.resource_type, row.resource_name, row.pattern_type, row.permission_type, row.operation].join("|");
+}
+
+const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+const APPROVAL_FIELDS = ["approval_identity", "approved_at", "environment", "expires_at", "manifest_sha256", "schema"];
+
+function timestamp(approval, field) {
+  const value = approval[field];
+  if (typeof value !== "string" || !RFC3339_UTC.test(value)) fail(`ACL approval ${field} must be an RFC 3339 UTC timestamp`);
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) fail(`ACL approval ${field} is not a valid timestamp`);
+  return parsed;
+}
+
+// Refuses unless the manifest digest is intact, the cluster id is the known one for the
+// environment and a matching, unexpired approval with exactly the documented fields exists.
+export function validateApproval({ manifest, approval, environment, now = new Date() }) {
+  const clusterId = aclClusterIdFor(environment);
+  if (clusterId === undefined) fail(`no cluster id for environment ${String(environment)}`);
+  if (!manifest || manifest.environment !== environment) fail(`ACL manifest is not for ${environment}`);
+  if (clusterId !== manifest.cluster_id) fail(`ACL manifest cluster_id ${manifest.cluster_id} does not match ${environment}`);
+  const digest = aclManifestDigest(manifest);
+  if (typeof manifest.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(manifest.sha256)) fail("ACL manifest sha256 must be 64 lowercase hex");
+  if (manifest.sha256 !== digest) fail(`ACL manifest sha256 ${manifest.sha256} does not match its content (${digest})`);
+  if (!approval) fail(`no ACL approval file ${ACL_APPROVAL_PATH(environment)}; Security approval is required before any row is written`);
+  if (typeof approval !== "object" || Array.isArray(approval)) fail("ACL approval must be a JSON object");
+  const fields = Object.keys(approval).sort();
+  const unknown = fields.filter((field) => !APPROVAL_FIELDS.includes(field));
+  const absent = APPROVAL_FIELDS.filter((field) => !fields.includes(field));
+  if (unknown.length > 0) fail(`ACL approval has unknown fields: ${unknown.join(", ")}`);
+  if (absent.length > 0) fail(`ACL approval is missing fields: ${absent.join(", ")}`);
+  if (approval.schema !== ACL_APPROVAL_SCHEMA_ID) fail(`ACL approval schema must be ${ACL_APPROVAL_SCHEMA_ID}`);
+  if (approval.environment !== environment) fail(`ACL approval is not for ${environment}`);
+  if (typeof approval.manifest_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(approval.manifest_sha256)) fail("ACL approval manifest_sha256 must be 64 lowercase hex");
+  if (approval.manifest_sha256 !== manifest.sha256) fail(`ACL approval covers ${approval.manifest_sha256}, not the current manifest ${manifest.sha256}`);
+  if (typeof approval.approval_identity !== "string" || approval.approval_identity.trim() === "") fail("ACL approval has no approval_identity");
+  const approvedAt = timestamp(approval, "approved_at");
+  const expires = timestamp(approval, "expires_at");
+  if (approvedAt > now.getTime()) fail(`ACL approval approved_at ${approval.approved_at} is in the future`);
+  if (approvedAt >= expires) fail("ACL approval approved_at must be before expires_at");
+  if (expires <= now.getTime()) fail(`ACL approval expired at ${approval.expires_at}`);
+  return { approval_identity: approval.approval_identity, approved_at: approval.approved_at, expires_at: approval.expires_at, manifest_sha256: manifest.sha256 };
+}
+
+// Parses `kafka-acls.sh --list` output into rows keyed like the manifest. Fails closed: every
+// non-blank line must be a resource header or an ACL entry, and a repeated row is an error,
+// so a truncated or unexpected listing can never read as "no rows".
+export function parseAclList(text) {
+  if (/SecurityDisabledException|No Authorizer is configured/i.test(text)) {
+    fail("the broker has no authorizer configured; ACL rows can only be written after step 4 turns StandardAuthorizer on");
+  }
+  const rows = [];
+  const seen = new Set();
+  let resource = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (line.trim() === "") continue;
+    const header = line.match(/^Current ACLs for resource `ResourcePattern\(resourceType=([A-Z_]+), name=([^,()\s]+), patternType=([A-Z]+)\)`:\s*$/);
+    if (header) {
+      resource = { resource_type: header[1], resource_name: header[2], pattern_type: header[3] };
+      continue;
+    }
+    const entry = line.match(/^\s+\(principal=([^,()\s]+), host=([^,()\s]+), operation=([A-Z_]+), permissionType=([A-Z]+)\)\s*$/);
+    if (!entry) fail(`unrecognized kafka-acls --list line: ${line.trim()}`);
+    if (!resource) fail(`ACL entry without a resource header: ${line.trim()}`);
+    const row = { principal: entry[1], host: entry[2], operation: entry[3], permission_type: entry[4], ...resource };
+    const key = aclKey(row);
+    if (seen.has(key)) fail(`duplicate ACL row in listing: ${key}`);
+    seen.add(key);
+    rows.push(row);
+  }
+  return rows;
+}
+
+export function diffAcls(expectedRows, actualRows) {
+  const expected = new Map(expectedRows.map((row) => [aclKey(row), row]));
+  const actual = new Map(actualRows.map((row) => [aclKey(row), row]));
+  const missing = [...expected.entries()].filter(([key]) => !actual.has(key)).map(([, row]) => row);
+  const extra = [...actual.entries()].filter(([key]) => !expected.has(key)).map(([, row]) => row);
+  return { missing, extra };
+}
+
+function principalRank(principal) {
+  const index = LAST_PRINCIPALS.indexOf(principal);
+  return index === -1 ? 0 : index + 1;
+}
+
+// Groups rows into `kafka-acls.sh` calls. One call covers one principal, one host, one
+// permission, one resource type, one pattern type and the exact operation set of every resource
+// in it, so a call never grants or removes an operation the rows do not list for that resource.
+// Application principals go first, one resource at a time; LAST_PRINCIPALS go at the end.
+// Adds only take manifest rows (ALLOW, host *); removals take whatever the broker listed.
+export function planAclCalls(rows, { action = "add" } = {}) {
+  if (!["add", "remove"].includes(action)) fail(`unsupported action ${action}`);
+  const perResource = new Map();
+  for (const row of rows) {
+    if (!["ALLOW", "DENY"].includes(row.permission_type)) fail(`unsupported permission ${aclKey(row)}`);
+    if (action === "add" && row.permission_type !== "ALLOW") fail(`only ALLOW rows are added: ${aclKey(row)}`);
+    if (action === "add" && row.host !== "*") fail(`only host * is added: ${aclKey(row)}`);
+    if (typeof row.host !== "string" || !/^[A-Za-z0-9.:*-]+$/.test(row.host)) fail(`unsupported host ${aclKey(row)}`);
+    if (!RESOURCE_FLAGS[row.resource_type]) fail(`unsupported resource_type ${row.resource_type}`);
+    if (!OPERATION_NAMES[row.operation]) fail(`unsupported operation ${row.operation}`);
+    const key = [row.principal, row.host, row.permission_type, row.resource_type, row.pattern_type, row.resource_name].join("|");
+    if (!perResource.has(key)) {
+      perResource.set(key, { principal: row.principal, host: row.host, permission_type: row.permission_type, resource_type: row.resource_type, pattern_type: row.pattern_type, resource_name: row.resource_name, operations: new Set() });
+    }
+    perResource.get(key).operations.add(row.operation);
+  }
+  const calls = new Map();
+  for (const entry of perResource.values()) {
+    const operations = [...entry.operations].sort();
+    const key = [entry.principal, entry.host, entry.permission_type, entry.resource_type, entry.pattern_type, operations.join(",")].join("|");
+    if (!calls.has(key)) {
+      calls.set(key, { principal: entry.principal, host: entry.host, permission_type: entry.permission_type, resource_type: entry.resource_type, pattern_type: entry.pattern_type, operations, resources: [] });
+    }
+    calls.get(key).resources.push(entry.resource_name);
+  }
+  return [...calls.values()]
+    .map((call) => ({ ...call, resources: call.resources.sort() }))
+    .sort((a, b) => principalRank(a.principal) - principalRank(b.principal)
+      || a.principal.localeCompare(b.principal)
+      || a.resources[0].localeCompare(b.resources[0])
+      || a.resource_type.localeCompare(b.resource_type)
+      || a.permission_type.localeCompare(b.permission_type)
+      || a.host.localeCompare(b.host)
+      || a.operations.join(",").localeCompare(b.operations.join(",")));
+}
+
+// Arguments for one `kafka-acls.sh` call (without --bootstrap-server/--command-config).
+export function aclCallArgs(call, action = "add") {
+  if (!["add", "remove"].includes(action)) fail(`unsupported action ${action}`);
+  const permission = call.permission_type ?? "ALLOW";
+  if (action === "add" && permission !== "ALLOW") fail("only ALLOW rows are added");
+  const side = permission === "DENY" ? "deny" : "allow";
+  const args = [`--${action}`, `--${side}-principal`, call.principal, `--${side}-host`, call.host ?? "*"];
+  for (const operation of call.operations) args.push("--operation", OPERATION_NAMES[operation]);
+  args.push("--resource-pattern-type", call.pattern_type.toLowerCase());
+  for (const resource of call.resources) {
+    if (call.resource_type === "CLUSTER") args.push("--cluster");
+    else args.push(RESOURCE_FLAGS[call.resource_type], resource);
+  }
+  if (action === "remove") args.push("--force");
+  return args;
+}
+
+// The bootstrap line of the remote shell. The default resolves the broker's own name on the
+// box; an operator value must be a plain host:port and is single-quoted, never interpolated.
+export function bootstrapShellLine(value) {
+  if (value === undefined || value === null) return 'BOOT="$(hostname -f):9094"';
+  if (typeof value !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}[A-Za-z0-9])?:[0-9]{1,5}$/.test(value)) {
+    fail(`--bootstrap-server must be host:port, got ${JSON.stringify(value)}`);
+  }
+  const port = Number(value.slice(value.lastIndexOf(":") + 1));
+  if (port < 1 || port > 65535) fail(`--bootstrap-server port out of range: ${value}`);
+  return `BOOT='${value}'`;
+}
+
+export const MAX_BATCH_CALLS = 50;
+
+// Splits calls into SSM batches capped by call count and by the rendered shell size. A call
+// that does not fit on its own is an error, not an oversized command.
+export function batchCalls(calls, { maxCalls, maxChars, render }) {
+  if (!Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > MAX_BATCH_CALLS) fail(`batch size must be 1-${MAX_BATCH_CALLS}`);
+  const out = [];
+  let current = [];
+  for (const call of calls) {
+    if (render([call]).length > maxChars) fail(`one kafka-acls call for ${call.principal} renders larger than ${maxChars} characters`);
+    const next = [...current, call];
+    if (current.length > 0 && (next.length > maxCalls || render(next).length > maxChars)) {
+      out.push(current);
+      current = [call];
+    } else {
+      current = next;
+    }
+  }
+  if (current.length > 0) out.push(current);
+  return out;
+}
+
+// Digest of a set of rows, independent of order. Used to bind --remove-extra to the exact
+// extra rows the operator reviewed in a verify run.
+export function rowSetDigest(rows) {
+  return createHash("sha256").update([...new Set(rows.map(aclKey))].sort().join("\n")).digest("hex");
+}
+
+// Checks one chunked listing payload: the base64 text must have the length and sha256 the
+// broker reported before it was split into SSM-sized pieces.
+export function verifyListPayload({ encoded, length, sha256 }) {
+  if (!Number.isInteger(length) || length < 0) fail("ACL listing has no length sentinel");
+  if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256)) fail("ACL listing has no sha256 sentinel");
+  if (encoded.length !== length) fail(`ACL listing is ${encoded.length} characters, broker reported ${length}; output was truncated`);
+  const actual = createHash("sha256").update(encoded).digest("hex");
+  if (actual !== sha256) fail(`ACL listing sha256 ${actual} does not match the broker's ${sha256}`);
+  return encoded;
+}
+
+// Runs one verify or apply pass. `listRows()` returns the live rows, `runBatch(calls, action,
+// index)` sends one batch. Once any batch has been sent, a failure still reads the broker back
+// and reports the partial state before the error is raised.
+export function runAclPass({ manifestRows, listRows, runBatch, mode, removeExtra = false, expectExtraSha256 = null, maxCalls, maxChars, render }) {
+  if (!["verify", "apply"].includes(mode)) fail(`unsupported mode ${mode}`);
+  if (removeExtra && mode !== "apply") fail("--remove-extra needs --mode apply");
+  if (removeExtra && !expectExtraSha256) fail("--remove-extra needs --expect-extra-sha256 from a verify run");
+  const before = diffAcls(manifestRows, listRows());
+  const report = { before: { missing: before.missing.length, extra: before.extra.length, extra_sha256: rowSetDigest(before.extra) } };
+  let mutated = false;
+  try {
+    if (mode === "apply") {
+      if (removeExtra && rowSetDigest(before.extra) !== expectExtraSha256) {
+        fail(`extra rows on the broker (${rowSetDigest(before.extra)}) are not the reviewed set ${expectExtraSha256}; run verify again`);
+      }
+      const addCalls = planAclCalls(before.missing);
+      const addBatches = batchCalls(addCalls, { maxCalls, maxChars, render: (calls) => render(calls, "add") });
+      for (const [index, batch] of addBatches.entries()) {
+        mutated = true;
+        runBatch(batch, "add", index);
+      }
+      report.added_rows = before.missing.length;
+      report.add_calls = addCalls.length;
+      if (removeExtra && before.extra.length > 0) {
+        // Re-read right before deleting: only the reviewed extra set may go.
+        const fresh = diffAcls(manifestRows, listRows());
+        if (rowSetDigest(fresh.extra) !== expectExtraSha256) {
+          fail(`extra rows changed to ${rowSetDigest(fresh.extra)} before removal; nothing removed`);
+        }
+        const removeCalls = planAclCalls(fresh.extra, { action: "remove" });
+        const removeBatches = batchCalls(removeCalls, { maxCalls, maxChars, render: (calls) => render(calls, "remove") });
+        for (const [index, batch] of removeBatches.entries()) {
+          mutated = true;
+          runBatch(batch, "remove", index);
+        }
+        report.removed_rows = fresh.extra.length;
+      }
+    }
+  } catch (error) {
+    if (mutated) {
+      try {
+        const partial = diffAcls(manifestRows, listRows());
+        report.after = { missing: partial.missing.length, extra: partial.extra.length, extra_sha256: rowSetDigest(partial.extra) };
+        report.partial = true;
+      } catch (readError) {
+        report.readback_error = readError.message;
+      }
+    }
+    error.report = report;
+    throw error;
+  }
+  const after = mode === "apply" ? diffAcls(manifestRows, listRows()) : before;
+  report.after = { missing: after.missing.length, extra: after.extra.length, extra_sha256: rowSetDigest(after.extra) };
+  report.missing_sample = after.missing.slice(0, 20).map(aclKey);
+  report.extra_sample = after.extra.slice(0, 20).map(aclKey);
+  report.ok = after.missing.length === 0 && after.extra.length === 0;
+  return report;
+}
+
+// One chunk of the on-broker listing file. dd reads a bounded byte range on its own, so the
+// command has no pipeline that could end in SIGPIPE under `set -o pipefail`.
+export function listChunkCommand(file, start, size) {
+  if (!/^\/tmp\/kafka-acls-list\.[A-Za-z0-9]{6,}$/.test(file)) throw new Error(`unexpected listing file ${file}`);
+  if (!Number.isInteger(start) || start < 0 || !Number.isInteger(size) || size < 1) throw new Error("listing chunk start/size must be non-negative integers");
+  return ["set -euo pipefail", `F='${file}'`, `dd if="$F" bs=1 skip=${start} count=${size} 2>/dev/null`].join("\n");
+}

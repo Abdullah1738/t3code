@@ -63,6 +63,7 @@ const inertThreads = Layer.succeed(
   KanbanThreads.KanbanThreads,
   KanbanThreads.KanbanThreads.of({
     liveThreadIds: () => Effect.succeed([]),
+    remove: () => Effect.void,
     pendingUserInputs: () => Effect.succeed([]),
     claimContext: () => Effect.succeed(null),
     view: () => Effect.succeed(null),
@@ -71,6 +72,7 @@ const inertThreads = Layer.succeed(
     lastFailure: () => Effect.succeed(null),
     findLastFailure: () => Effect.succeed(null),
     latestRun: () => Effect.succeed(null),
+    backgroundStoppedSince: () => Effect.succeed(false),
     runSettled: () => Effect.succeed(true),
     compactRun: () => Effect.succeed(null),
     launch: () => Effect.die("split migration tests launch no thread"),

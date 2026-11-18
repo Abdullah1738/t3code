@@ -64,8 +64,12 @@ class Reporter1006Tests(unittest.TestCase):
                         if tool == 'exec_command' and call.get('workdir'):
                             event['tool_input']['workdir'] = call['workdir']
                         with self.subTest(case=row['case_number'], reporter=row['reporter_id'], command=call.get('label'), harness=harness, tool=tool):
-                            self.check(event, call.get('expected'), harness)
-                            if not call.get('expected'):
+                            # This call runs non-isolated Python before Node's
+                            # parse-only mode, leaving the executable unproved.
+                            expected = UNRESOLVED if (row['case_number'] in {1, 4, 5, 8, 21, 23, 27, 28} or
+                                                     row['case_number'] == 14 and 'python3 tmp/card-3903/port.py' in call['cmd']) else call.get('expected')
+                            self.check(event, expected, harness)
+                            if not expected:
                                 key = 'cmd' if tool == 'exec_command' else 'command'
                                 event['tool_input'][key] += '\npython3 -c ' + shlex.quote(f'open({LIVE!r}).read()')
                                 self.check(event, READ, harness)
@@ -84,7 +88,7 @@ class Reporter1006Tests(unittest.TestCase):
 
     def test_create_then_run_family(self):
         for name, body, invocations in [
-            ('x.py', "print('safe')\n", ['python3 x.py', f'python3 {self.root}/x.py']),
+            ('x.py', "print('safe')\n", ['python3 -I x.py', f'python3 -I {self.root}/x.py']),
             ('x.sh', 'echo safe\n', ['bash x.sh', 'sh x.sh', 'chmod +x x.sh && ./x.sh']),
         ]:
             self.assertFalse((self.root / name).exists())
@@ -97,7 +101,7 @@ class Reporter1006Tests(unittest.TestCase):
 
     def test_temporary_system_alias_create_then_run(self):
         path = self.root / 'alias.py'
-        command = f"cat > {path} <<'PY'\nprint('safe')\nPY\npython3 {path}"
+        command = f"cat > {path} <<'PY'\nprint('safe')\nPY\npython3 -I {path}"
         # Model /tmp -> /private/tmp even on hosts without that system alias.
         realpath = os.path.realpath
         def resolve(value, *args, **kwargs):

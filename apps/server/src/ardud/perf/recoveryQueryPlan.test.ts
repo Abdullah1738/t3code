@@ -82,7 +82,10 @@ it.effect("startup recovery query registry uses hot indexed thread worksets", ()
     )!;
     const bindings = new Array((providerQuery.match(/\?/g) ?? []).length).fill(threadId);
     const selected = yield* sql.unsafe<{ payload_json: string }>(providerQuery, bindings);
-    assert.deepEqual(selected.map((r) => JSON.parse(r.payload_json)).sort(), ["via-child", "via-owner"]);
+    assert.deepEqual(selected.map((r) => JSON.parse(r.payload_json)).sort(), [
+      "via-child",
+      "via-owner",
+    ]);
 
     for (const statement of statements) {
       assert.notMatch(
@@ -91,6 +94,16 @@ it.effect("startup recovery query registry uses hot indexed thread worksets", ()
         "recovery must never open transcript archives",
       );
       const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${statement}`);
+      if (statement.includes("UNION ALL")) {
+        const failedLookup = plan.find((row) =>
+          row.detail.includes("orchestration_v2_projection_turn_items_failed_error_idx"),
+        );
+        assert.match(
+          failedLookup?.detail ?? "",
+          /thread_id=\?.*run_id=\?.*node_id=\?/,
+          "failed root errors must be looked up by the active run, not thread history order",
+        );
+      }
       console.log(JSON.stringify({ route: "startup.recovery", statement, plan }));
       assert.deepEqual(
         plan.filter((p) => /\bSCAN\b/i.test(p.detail)),

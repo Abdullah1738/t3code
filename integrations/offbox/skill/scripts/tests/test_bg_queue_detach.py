@@ -15,8 +15,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get('OFFBOX_TEST_SCRIPTS', str(Path(__file__).resolve().parents[1])))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, cli, common, home, lease, misc, outage, pool, reap, runs
+from offbox_lib import api, cli, common, fallback, home, lease, misc, outage, pool, reap, runs
 from test_capacity import Isolated
+
+
+def _publish(path, text):
+    pending = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    pending.write_text(text)
+    os.replace(pending, path)
 
 
 def configure_fixture(root, backend):
@@ -32,14 +38,20 @@ def configure_fixture(root, backend):
     os.environ['OFFBOX_TEST_ROOT'] = str(root)
     me = dict(owner='worker', repo_key='repo', repo_root=str(root), session='s', thread='t')
     a = SimpleNamespace(bg=True, no_sync=True, cmd=['proof'], steps=[], pull=[], env=[], size=None,
-                        template=None, base=None, fresh=False, git=False)
+                        template=None, base=None, fresh=False, git=False, no_fallback=True, remote=True)
     if os.environ.get('OFFBOX_TEST_ENTRY'):
         a.cmd = ['proof' + 'x' * 300000]
     pool.release_guard = lambda row: None
-    lease.ensure_ttl = lambda *args: (root / 'ttl').write_text('extended')
+    lease.ensure_ttl = lambda *args: _publish(root / 'ttl', 'extended')
     api.get = lambda *args: {'state': 'running'}
     lease.touch = lease.idle_ttl = lambda *args: None
-    lease.auto_size = lambda *args: ('large', '')
+    if os.environ.get('OFFBOX_TEST_REQUESTED_SIZE'):
+        a.size = os.environ['OFFBOX_TEST_REQUESTED_SIZE']
+        a.cmd = ['true']
+        if sys.argv[1:2] == ['_bg-queue']:
+            lease.auto_size = lambda *args: (_ for _ in ()).throw(AssertionError('child recomputed size'))
+    else:
+        lease.auto_size = lambda *args: ('large', '')
     runs.Runner._log_pool = lambda *args: None
     runs.Runner._prepare_box = lambda *args: None
     runs._keep_ttl = lambda *args: contextlib.nullcontext()
@@ -58,9 +70,22 @@ def configure_fixture(root, backend):
         runs.Runner.register_pending = aged
 
     def acquire(*args, **kwargs):
-        (root / 'waiting').write_text(str(os.getpid()))
+        if os.environ.get('OFFBOX_TEST_REQUESTED_SIZE'):
+            _publish(root / 'acquired-size', kwargs['size'])
+        _publish(root / 'waiting', str(os.getpid()))
         with common.file_lock('fixture-slot', timeout=15):
-            return dict(box_id='box-fake', size='large', remote_dir='repo')
+            outcome = os.environ.get('OFFBOX_TEST_QUEUE_OUTCOME')
+            if outcome == 'exception':
+                raise ValueError('fixture queue exception')
+            if outcome == 'limit':
+                raise pool.PoolBusyError('fixture queue limit; nothing ran', queue_expired=True)
+            if outcome == 'caller':
+                runs.identity.require_proven(dict(proven=False, driver='codex', resolution='unavailable',
+                                                 lookupError='fixture endpoint down'), 'run')
+            if outcome == 'settled':
+                with contextlib.closing(common.db()) as con:
+                    con.execute("UPDATE runs SET status='killed',exit_code=130 WHERE run_id=?", (kwargs['run_id'],))
+            return dict(box_id='box-fake', size=kwargs.get('size') or 'large', remote_dir='repo')
 
     def start(box, command, *, meta, **kwargs):
         with (root / 'starts').open('a') as stream:
@@ -69,6 +94,9 @@ def configure_fixture(root, backend):
 
     pool.acquire = acquire
     api.cmd_start = start
+    api.cmd_attach = lambda *args, **kw: iter([dict(type='stderr',
+        data=f'{runs.COMMAND_STARTED_MARKER} {os.environ[runs.BACKGROUND_RUN_ENV]}\n')])
+    runs._ttl_keeper = lambda *args: None
     return a, me
 
 
@@ -83,15 +111,17 @@ def fixture(root, bg, backend):
         def interrupted(signum, frame):
             nonlocal interruptions
             interruptions += 1
-            (root / 'caller-interrupted').write_text(str(interruptions))
+            _publish(root / 'caller-interrupted', str(interruptions))
         signal.signal(signal.SIGINT, interrupted)
         signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT,))
     if os.environ.get('OFFBOX_TEST_READY_TIMEOUT'):
         runs.BG_READY_TIMEOUT_S = float(os.environ['OFFBOX_TEST_READY_TIMEOUT'])
     code = runs.run_remote(a, me)
     if masked:
-        (root / 'mask-restored').write_text(str(signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ())))
-    (root / 'returned').write_text(str(code))
+        _publish(root / 'mask-restored', str(signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ())))
+    _publish(root / 'returned', str(code))
+    if os.environ.get('OFFBOX_TEST_RETURN'):
+        return
     while True:
         if masked:
             time.sleep(.01)
@@ -100,19 +130,29 @@ def fixture(root, bg, backend):
 
 
 class BackgroundQueueTests(Isolated):
-    def launch(self, *, bg=True, backend='boat', old_registration=False):
+    def launch(self, *, bg=True, backend='boat', old_registration=False, cleanup=None):
+        cleanup = self.addCleanup if cleanup is None else cleanup
+        last_row = self.con.execute('SELECT COALESCE(MAX(rowid), 0) FROM runs').fetchone()[0]
         proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '--fixture',
                                  self.tmp.name, str(int(bg)), backend], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, start_new_session=True,
                                 env=dict(os.environ, OFFBOX_TEST_OLD_REGISTRATION='1' if old_registration else ''))
-        self.addCleanup(self.stop, proc)
+        cleanup(self.stop_fixture, proc, last_row)
         self.until(lambda: (Path(self.tmp.name) / ('returned' if bg else 'waiting')).exists(), proc)
         row = self.con.execute('SELECT * FROM runs ORDER BY start_at DESC LIMIT 1').fetchone()
         self.assertIsNotNone(row)
-        self.addCleanup(self.stop_child, row['client_pid'], proc.pid)
         if bg:
             self.assertEqual((Path(self.tmp.name) / 'returned').read_text(), '0')
         return proc, dict(row)
+
+    def stop_fixture(self, proc, last_row):
+        try:
+            self.stop(proc)
+        finally:
+            # launch() can fail before reading the row; stop the caller before looking up its detached child.
+            rows = self.con.execute('SELECT client_pid FROM runs WHERE rowid > ?', (last_row,)).fetchall()
+            for row in rows:
+                self.stop_child(row['client_pid'], proc.pid)
 
     def stop(self, proc):
         if proc.poll() is None:
@@ -148,12 +188,12 @@ class BackgroundQueueTests(Isolated):
     def test_full_pool_survives_caller_group_signals_on_both_backends(self):
         for backend, sig in ((backend, sig) for backend in ('boat', 'server')
                              for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGKILL)):
-            with self.subTest(backend=backend, signal=sig):
+            with self.subTest(backend=backend, signal=sig), contextlib.ExitStack() as cleanup:
                 root = Path(self.tmp.name)
                 for name in ('returned', 'waiting', 'starts', 'ttl'):
                     (root / name).unlink(missing_ok=True)
                 with common.file_lock('fixture-slot'):
-                    proc, row = self.launch(backend=backend)
+                    proc, row = self.launch(backend=backend, cleanup=cleanup.callback)
                     self.until(lambda: (root / 'waiting').exists(), proc)
                     self.assertNotEqual(row['client_pid'], proc.pid)
                     self.assertEqual(os.getsid(row['client_pid']), row['client_pid'])
@@ -164,7 +204,8 @@ class BackgroundQueueTests(Isolated):
                     out, err = proc.communicate(timeout=5)
                     self.assertEqual(out.decode().strip(), row['run_id'])
                     self.assertIn('queued in background', err.decode())
-                    self.assertIn('Follow:', err.decode())
+                    self.assertIn(f"Hand off `offbox wait {row['run_id']}` using the remote-compute skill’s Waiting for a run route, "
+                                  "then end your turn; completion wakes you.", err.decode())
                     self.assertTrue(misc._client_alive(row['client_pid'], row['start_at']))
                 self.until(lambda: (root / 'ttl').exists())
                 self.assertEqual((root / 'starts').read_text().splitlines(), [row['run_id']])
@@ -339,6 +380,158 @@ class BackgroundQueueTests(Isolated):
 
 
 class NeverStartedTests(Isolated):
+    def infra_row(self, *, error, exit_code=None, steps=0, **fields):
+        row = dict(run_id='run-refused', mode='bg', status='infra', error=error,
+                   exit_code=exit_code, step_count=steps)
+        row.update(fields)
+        self.con.execute('DELETE FROM runs')
+        self.con.execute(f"INSERT INTO runs({','.join(row)}) VALUES ({','.join('?' for _ in row)})", tuple(row.values()))
+        return self.con.execute('SELECT * FROM runs').fetchone()
+
+    def assert_refusal(self, code, reason, *, safe=True, log_exists=True):
+        path = misc.LOGS_DIR / 'run-refused.log'
+        if log_exists:
+            path.touch()
+        else:
+            path.unlink(missing_ok=True)
+        for command in (lambda: misc.logs('run-refused', False), lambda: misc.logs('run-refused', True),
+                        lambda: misc.wait('run-refused', 1)):
+            with self.subTest(command=command), contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()) as err, \
+                    patch.object(misc, '_catch_up_log', side_effect=AssertionError('nothing to fetch')):
+                self.assertEqual(command(), code)
+                text = err.getvalue()
+                self.assertIn('never started: ' + reason, text)
+                self.assertEqual('nothing ran, safe to rerun' in text, safe)
+                for forbidden in ('server history is unavailable', 'steps incomplete', 'remote exit unknown'):
+                    self.assertNotIn(forbidden, text)
+                self.assertEqual(out.getvalue(), '')
+                if log_exists:
+                    self.assertEqual(path.read_bytes(), b'')
+                else:
+                    self.assertFalse(path.exists())
+        return text
+
+    def test_infra_refusals_keep_reason_exit_and_client_tail(self):
+        failover = ('home offbox server not reachable (offbox server API 503 server_not_ready: reconciling); '
+                    'this run goes to Boat instead')
+        (misc.LOGS_DIR / 'run-refused.client.log').write_text(f'{failover}\nqueue ended with exit 92\n')
+        reasons = [
+            ('repository pool busy/full; remote queue timed out. Nothing ran (exit 92)', 92, 92),
+            ('bx_b5j336sn was resumed but did not become ready; nothing ran: deadline passed', None, 90),
+            ('bx_h9e63dqs has an unanswered resume; nothing ran', None, 90),
+            ('repository pool busy/full; remote queue timed out. Nothing ran (exit 92): retry, or wait', None, 92),
+            ('Nothing ran (exit 92), stored exit takes precedence', 7, 7),
+            ('Nothing ran (exit 92), stored exit takes precedence', 0, 0),
+            ('box bx_test734f went to error: incus config device set timed out', 90, 90),
+        ]
+        for error, stored, expected in reasons:
+            for steps in (0, 4):
+                with self.subTest(error=error, steps=steps):
+                    self.infra_row(error=error, exit_code=stored, steps=steps)
+                    self.con.execute("INSERT OR REPLACE INTO kv(k,v) VALUES ('start_claim:run-refused','1')")
+                    text = self.assert_refusal(expected, error)
+                    self.assertIn(failover, text)
+                    self.assertIn('queue ended with exit 92', text)
+                    self.assertNotIn('may be incomplete; retry', text)
+
+    def test_foreground_readiness_refusal_with_missing_or_empty_log(self):
+        error = ('bx_dy7k32aj was resumed but did not become ready; nothing ran: '
+                 'client deadline passed before GET /sandboxes/bx_dy7k32aj')
+        for steps in (0, 2):
+            for log_exists in (False, True):
+                with self.subTest(steps=steps, log_exists=log_exists):
+                    self.infra_row(error=error, mode='fg', steps=steps)
+                    self.con.execute("INSERT OR REPLACE INTO kv(k,v) VALUES ('start_claim:run-refused','1')")
+                    text = self.assert_refusal(90, error, log_exists=log_exists)
+                    self.assertNotIn('retry', text.lower())
+
+    def test_exit_two_pool_refusals_keep_their_own_remedy_verbatim(self):
+        for backend in ('boat', 'server'):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, OFFBOX_BACKEND=backend))
+                stack.enter_context(patch.object(common, '_BACKEND', backend))
+                stack.enter_context(patch.object(common, 'DB_PATH', common.db_path_for(backend)))
+                con = stack.enter_context(contextlib.closing(common.db()))
+                stack.enter_context(patch.object(self, 'con', con))
+                self.assertEqual(Path(con.execute('PRAGMA database_list').fetchone()['file']), common.DB_PATH.resolve())
+                for source, count in (('template:generic', '8/8'), ('base:recall-backup', '12/8')):
+                    error = (f'pool is full ({count} boxes, none from {source}), so waiting cannot help; '
+                             'nothing ran. Run without --base/--template or choose a matching source.')
+                    for steps in (0, 2):
+                        with self.subTest(backend=backend, source=source, steps=steps):
+                            self.infra_row(error=error, exit_code=2, steps=steps)
+                            text = self.assert_refusal(2, error, safe=False)
+                            self.assertEqual(text.splitlines()[0], f'offbox: run-refused: never started: {error}')
+                            self.assertIn('client log ends with no end record', text)
+                            self.assertNotIn('retry', text.lower())
+                            self.assertNotIn('safe to rerun', text)
+
+    def test_infra_reason_is_one_line_and_at_most_300_characters(self):
+        error = 'NOTHING RAN\n' + 'reason ' * 70
+        self.infra_row(error=error, exit_code=7)
+        reason = ' '.join(error.split())[:300]
+        text = self.assert_refusal(7, reason)
+        self.assertEqual(text.splitlines()[0], f'offbox: run-refused: never started: {reason}; nothing ran, safe to rerun')
+        self.assertIn('client log ends with no end record', text)
+
+    def test_started_local_and_recovery_marked_infra_are_not_never_started(self):
+        for error in ('nothing ran', 'box bx_test734f went to error: timed out'):
+            for fields, mark in ((dict(command_id='cmd-known'), None), (dict(process_id=42), None),
+                                 (dict(mode='local'), None), ({}, 'start_unattached'), ({}, 'start_unknown')):
+                with self.subTest(error=error, fields=fields, mark=mark):
+                    self.con.execute('DELETE FROM kv')
+                    row = self.infra_row(error=error, **fields)
+                    if mark:
+                        self.con.execute('INSERT INTO kv(k,v) VALUES (?,?)', (mark + ':run-refused', '1'))
+                    self.assertFalse(misc._never_started(row))
+        self.con.execute('DELETE FROM kv')
+        self.assertFalse(misc._never_started(self.infra_row(error='unexplained infrastructure error')))
+        self.assertFalse(misc._never_started(self.infra_row(error='box bx_734f went to error: timeout', box_id='bx_734f')))
+        self.assertTrue(misc._never_started(self.infra_row(error='nothing ran', box_id='bx_ready_failed')))
+
+    def test_forwarded_logs_and_wait_name_last_move_before_child(self):
+        reason = 'offbox server API 503 server_not_ready: reconciling (after start)'
+        line = f'home offbox server not reachable ({reason}); this run goes to Boat instead\n'
+        path = misc.LOGS_DIR / 'run-refused.client.log'
+        variants = [
+            ('boat', line, reason),
+            ('boat', line + 'unrelated\n' + line.replace(reason, 'last reason'), 'last reason'),
+            ('boat', 'offbox: home offbox server is low on disk (100 MiB free); this run is going to Boat\n',
+             'low on disk (100 MiB free)'),
+            ('boat', 'offbox: home server out of disk; this run is going to Boat\n', 'out of disk'),
+            ('boat', 'no routing line\n', '(reason not in the client log)'),
+            ('boat', line + 'x' * (64 * 1024), '(reason not in the client log)'),
+            ('boat', None, '(reason not in the client log)'),
+            ('server', line + 'offbox: home offbox server is back; this run leaves the Boat queue '
+             '(waited 12 s, #1 of 2) and goes back to home\n', 'home offbox server is back'),
+            ('server', line, '(reason not in the client log)'),
+        ]
+        for backend, content, expected in variants:
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(content)
+            self.infra_row(error=backend, status='forwarded')
+            for command in ('logs', 'follow', 'wait'):
+                with self.subTest(backend=backend, content=expected, command=command), \
+                        contextlib.redirect_stderr(io.StringIO()) as err, \
+                        patch.dict(os.environ, {'OFFBOX_BACKGROUND_RUN': 'old'}):
+                    def child(args, *, env):
+                        source = 'Boat' if backend == 'server' else 'the home offbox server'
+                        self.assertEqual(err.getvalue(), f'offbox: run-refused moved from {source} to {backend}: {expected}\n')
+                        self.assertEqual(args[:4], [sys.executable, str(Path(misc.__file__).resolve().parents[1] / 'offbox.py'),
+                                                   'wait' if command == 'wait' else 'logs', 'run-refused'])
+                        self.assertEqual(env['OFFBOX_BACKEND'], backend)
+                        self.assertNotIn('OFFBOX_BACKGROUND_RUN', env)
+                        self.assertEqual('--follow' in args, command == 'follow')
+                        self.assertEqual('--timeout' in args, command == 'wait')
+                        return 92
+                    with patch.object(misc.subprocess, 'call', side_effect=child) as forwarded:
+                        code = misc.wait('run-refused', 3) if command == 'wait' else misc.logs('run-refused', command == 'follow')
+                    self.assertEqual(code, 92)
+                    forwarded.assert_called_once()
+
     def test_empty_client_log_does_not_guess_caller_interruption(self):
         self.con.execute("INSERT INTO runs(run_id,mode,status) VALUES ('run-empty-client','bg','lost')")
         (misc.LOGS_DIR / 'run-empty-client.client.log').touch()
@@ -378,7 +571,8 @@ class NeverStartedTests(Isolated):
                             patch.object(misc, '_catch_up_log', side_effect=AssertionError('nothing ran')):
                         self.assertEqual(command(), 130)
                         self.assertIn('killed while queued; never started; nothing ran, safe to rerun', err.getvalue())
-                        self.assertEqual(len(err.getvalue().splitlines()), 1)
+                        self.assertEqual(len(err.getvalue().splitlines()), 2)
+                        self.assertIn('client log ends with no end record', err.getvalue())
                         self.assertEqual(out.getvalue(), '')
                         self.assertNotIn('incomplete', err.getvalue())
                         self.assertNotIn('history', err.getvalue())
@@ -389,7 +583,7 @@ class NeverStartedTests(Isolated):
             self.con.execute('DELETE FROM runs')
             self.con.execute("INSERT INTO runs(run_id,mode,status,start_at,client_pid) "
                              "VALUES ('run-race','bg','starting',100,111)")
-            def alive(pid, began):
+            def alive(pid, began, **diagnostics):
                 if pid == 111:
                     self.con.execute("UPDATE runs SET client_pid=222,start_at=200 WHERE run_id='run-race'")
                     return False
@@ -459,6 +653,70 @@ class NeverStartedTests(Isolated):
 
 
 class BackgroundRetryTests(Isolated):
+    def test_prebox_queue_timeout_preserves_exit_in_background_and_foreground(self):
+        for bg, steps in ((False, []), (True, []), (False, ['proof', 'proof2']), (True, ['proof', 'proof2'])):
+            for code, message, stored in ((92, 'pool busy. Nothing ran (exit 92)', 92),
+                                          (90, 'readiness failed; nothing ran', 90),
+                                          (90, 'unknown infrastructure failure', None),
+                                          (2, "pool is full (12/8 boxes, none from base:recall-backup), "
+                                           "so waiting can't help. Nothing ran. Run without --base/--template.", 2),
+                                          (2, 'invalid argument', None)):
+                self.con.execute('DELETE FROM runs')
+                a = cli.build_parser().parse_args(['run', '--no-sync', '--no-fallback', *(['--bg'] if bg else []), '--', 'proof'])
+                a.steps = steps
+                with self.subTest(bg=bg, steps=steps, code=code, message=message), contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: 'run-timeout'} if bg else {}))
+                    stack.enter_context(patch.object(runs.Runner, '_log_pool'))
+                    stack.enter_context(patch.object(lease, 'auto_size', return_value=('large', '')))
+                    stack.enter_context(patch.object(runs, 'remote_script', return_value='proof'))
+                    stack.enter_context(patch.object(runs.node_version, 'want', return_value=None))
+                    stack.enter_context(patch.object(runs.pnpm_version, 'want', return_value=None))
+                    stack.enter_context(patch.object(pool, 'acquire', side_effect=common.OffboxError(message, code=code)))
+                    stack.enter_context(patch.object(api, 'cmd_start', side_effect=AssertionError('must not start')))
+                    stack.enter_context(patch.object(fallback, 'note_infra_failure'))
+                    stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                    stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                    if bg:
+                        self.assertEqual(runs.background_client(a, self.me), code)
+                    else:
+                        with self.assertRaises(common.OffboxError) as caught:
+                            runs._run_attempt(a, self.me)
+                        self.assertEqual(caught.exception.code, code)
+                row = self.con.execute('SELECT * FROM runs').fetchone()
+                self.assertIsNone(row['box_id'])
+                self.assertIsNone(row['command_id'])
+                self.assertIsNone(row['process_id'])
+                self.assertEqual(row['exit_code'], code if bg else stored)
+                self.assertEqual(row['status'], 'busy' if not bg and code == 92 else 'infra')
+                if stored in (2, 92):
+                    for command in (lambda: misc.wait(row['run_id'], 1), lambda: misc.logs(row['run_id'], False)):
+                        with contextlib.redirect_stderr(io.StringIO()) as err, \
+                                patch.object(misc, '_catch_up_log', side_effect=AssertionError('nothing to fetch')):
+                            self.assertEqual(command(), code)
+                            self.assertIn('never started: ' + message, err.getvalue())
+                            self.assertNotIn('steps incomplete', err.getvalue())
+                            if code == 2:
+                                self.assertNotIn('safe to rerun', err.getvalue())
+                                self.assertNotIn('retry', err.getvalue())
+
+    def test_busy_settlement_with_identity_or_recovery_still_validates_missing_steps(self):
+        for field, marker in (('command_id', None), ('process_id', None), ('box_id', None),
+                              (None, 'start_unknown'), (None, 'start_unattached')):
+            with self.subTest(field=field, marker=marker):
+                self.con.execute('DELETE FROM runs')
+                self.con.execute('DELETE FROM kv')
+                self.con.execute("INSERT INTO runs(run_id,mode,status,step_count,error) "
+                                 "VALUES ('run-uncertain','bg','starting',2,'nothing ran')")
+                if field:
+                    self.con.execute(f'UPDATE runs SET {field}=?', (42 if field == 'process_id' else 'known',))
+                if marker:
+                    self.con.execute('INSERT INTO kv(k,v) VALUES (?,?)', (marker + ':run-uncertain', '1'))
+                with contextlib.redirect_stderr(io.StringIO()), patch.object(misc, '_catch_up_log', return_value='n/a'):
+                    self.assertIsNone(runs.finish('run-uncertain', 92, 'busy', catch_up=False, bookkeeping=False))
+                row = self.con.execute('SELECT * FROM runs').fetchone()
+                self.assertIsNone(row['exit_code'])
+                self.assertFalse(misc._never_started(row))
+
     def test_accepted_start_is_never_retried(self):
         a = cli.build_parser().parse_args(['run', '--bg', '--', 'proof'])
         a.steps = []
@@ -518,6 +776,7 @@ class BackgroundRetryTests(Isolated):
                     patch.object(outage, 'wait_for_capacity', side_effect=lambda *a: (waiting(), None)) as capacity_retry, \
                     patch.object(outage, 'CAPACITY_RETRY_S', 0), patch.object(api, 'get', return_value={'state': 'running'}), \
                     patch.object(lease, 'ensure_ttl'), contextlib.redirect_stdout(io.StringIO()), \
+                    patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                     contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(runs.background_client(a, self.me), 0)
             self.assertEqual(attempts, ['run-retry', 'run-retry'])
@@ -583,6 +842,7 @@ class BackgroundFailoverTests(Isolated):
                 patch.object(home, '_forward_background') as forward, patch.object(os, 'execve') as execute, \
                 patch.object(runs.Runner, 'start', start), patch.object(outage, 'wait_until_up', side_effect=waiting) as wait, \
                 patch.object(api, 'get', return_value={'state': 'running'}), patch.object(lease, 'ensure_ttl'), \
+                patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(runs.background_client(a, self.me), 0)
         self.assertEqual(attempts, ['run-stays-home', 'run-stays-home'])
@@ -651,7 +911,7 @@ if __name__ == '__main__' and len(sys.argv) > 1:
         root = Path(os.environ['OFFBOX_TEST_ROOT'])
         configure_fixture(root, payload['backend'])
         if os.environ.get('OFFBOX_TEST_HANDOFF'):
-            (root / 'handoff').write_text(str(os.getpid()))
+            _publish(root / 'handoff', str(os.getpid()))
             with common.file_lock('fixture-handoff', timeout=15):
                 pass
         sys.exit(runs.background_queue(sys.argv[2], payload))

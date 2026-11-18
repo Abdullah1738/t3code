@@ -71,6 +71,9 @@ export function askTimingProps(ask: KanbanOwnerAsk): NonNullable<AnalyticsEvent[
     ...(notifiedAt === undefined ? {} : { notifiedAt }),
     ...(firstSeenAt === undefined ? {} : { firstSeenAt, firstSeenBySurface }),
     ...(ask.answer === undefined ? {} : { answeredAt: ask.answer.at }),
+    ...(ask.timing?.openNoticesAtCreation === undefined
+      ? {}
+      : { openNoticesAtCreation: ask.timing.openNoticesAtCreation }),
     ...(ask.timing?.openAsksAtCreation === undefined
       ? {}
       : { openAsksAtCreation: ask.timing.openAsksAtCreation }),

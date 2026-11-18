@@ -1,6 +1,9 @@
 import type { KanbanCard, KanbanThreadLink } from "@t3tools/contracts";
 
 export const EVALUATOR_LIMITS = {
+  requestReuseMs: 5 * 60_000,
+  requestMerges: 4,
+  requestDuplicateMs: 30 * 60_000,
   reuseMs: 30 * 60_000,
   cardSpawnMs: 10 * 60_000,
   boardWindowMs: 60_000,
@@ -12,14 +15,18 @@ const tokens = (text: string, pattern: RegExp) => [...text.matchAll(pattern)].ma
 export const requestThreadIds = (text: string) =>
   tokens(text, /t3-thread:\/\/(?:v1\/)?([^\s)\]<>"']+)/g);
 
+export const requestCardReferences = (text: string) => ({
+  numbers: new Set(tokens(text, /(?:^|[^\p{L}\p{N}_])#(\d+)\b/gu).map(Number)),
+  ids: tokens(text, /\b(card-[a-zA-Z0-9-]+)\b/g),
+});
+
 /** Only explicit references and exact incident evidence count; titles are not fuzzy matched. */
 export const matchingCards = (
   text: string,
   cards: ReadonlyArray<KanbanCard>,
   links: ReadonlyArray<KanbanThreadLink>,
 ) => {
-  const numbers = new Set(tokens(text, /(?:^|[^\p{L}\p{N}_])#(\d+)\b/gu).map(Number));
-  const ids = tokens(text, /\b(card-[a-zA-Z0-9-]+)\b/g);
+  const { numbers, ids } = requestCardReferences(text);
   const threads = requestThreadIds(text);
   const quotes = tokens(text, /["“'‘`]([^"”'’`\n]{24,})["”'’`]/g);
   const paths = tokens(text.replaceAll("file://", ""), /(?:^|[\s"'`(])(\/(?:[^\s"'`()<>]+))/g).map(

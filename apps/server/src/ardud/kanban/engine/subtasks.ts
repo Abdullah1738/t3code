@@ -1,3 +1,4 @@
+import type { McpDenyReason } from "@t3tools/contracts";
 /**
  * A card's subtasks: its flow as steps (write the PR, review, merge and
  * deploy, tell the reporter, read back). Pure rules; KanbanService applies them.
@@ -11,6 +12,7 @@ import {
   type KanbanAskOption,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanCardEvent,
   type KanbanOwnerAsk,
   type KanbanSubtask,
   type KanbanStandingApproval,
@@ -295,6 +297,72 @@ const harmlessFollowup = (task: string, target: string): boolean => {
   return !/(?:[.!]|\b(?:a|an|the))$/i.test(action) && approvalAction(action) === target;
 };
 
+const approvalVerb = String.raw`(?:approve(?:d)?|go(?:\s+ahead)?|ship|yes|ok|tick)`;
+const bareApprovalVerb = String.raw`(?:yes|approve|approved|sign off|sign-off|signoff|signed off|go|go ahead|go for it|ok|okay|do it|proceed)`;
+const bareApproval = new RegExp(`^${bareApprovalVerb}$`, "i");
+const referenceCommand = new RegExp(
+  String.raw`^${bareApprovalVerb}\s+(?:both|all|it|them|everything)\b`,
+  "i",
+);
+const referenceApproval = new RegExp(
+  String.raw`^${bareApprovalVerb}\s+(?:both|all(?:\s+of\s+(?:it|them))?|it|them|everything|(?:all|both)\s+(?:[1-9]|one|two|three|four|five|six|seven|eight|nine|ten))[.!?]*$`,
+  "i",
+);
+
+const subtaskApproval = (label: string) => {
+  const approval = new RegExp(String.raw`^${approvalVerb}(?:\s*[,.:;–—-]\s*|\s+)(.+)$`, "i").exec(
+    label
+      .trim()
+      .replace(/[.!]+$/, "")
+      .trim(),
+  );
+  if (!approval) return undefined;
+  const remainder = approval[1]!.replace(/^(?:tick|clear|do|approve|close)\s+(?=s\d+\b)/i, "");
+  const startsWithId = /^s\d+\b/i.test(remainder);
+  const references =
+    /^(s\d+(?:(?:\s*[,;/&+]\s*(?:and\s+)?|\s+(?:and\s+)?)s\d+)*)(?:\s*:\s*(.+)|\s+now)?$/i.exec(
+      remainder,
+    );
+  return {
+    // Invalid lists still name the refusal's scope; a description never adds ids.
+    ids: startsWithId
+      ? ((references?.[1] ?? remainder.split(":", 1)[0]!).toLowerCase().match(/\bs\d+\b/g) ?? [])
+      : [],
+    step: startsWithId ? references?.[2] : remainder,
+    valid: !startsWithId || references !== null,
+  };
+};
+
+const matchesApprovalStep = (step: string | undefined, task: string): boolean =>
+  step !== undefined &&
+  !isNegativeOption(step) &&
+  !/\b(?:no|not|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead|hold|skip|wait|stop|cancel)\b/i.test(
+    step,
+  ) &&
+  approvalAction(step) === approvalAction(task);
+
+const refusalWord = /\b(?:decline|refuse|deny|defer|postpone|delay|pause|suspend|abort)\b/i;
+
+const approvalCommand = (label: string): string =>
+  label
+    .replace(/^(?:yes|ok|okay)(?:\s*[,.:;–—-]\s*|\s+)/i, "")
+    .replace(/^(?:(?:please|go ahead and)\s+)+/i, "");
+
+const isReferenceApproval = (label: string): boolean => {
+  const words = label
+    .trim()
+    .replace(/[.!]+$/, "")
+    .trim();
+  return referenceApproval.test(words) || referenceApproval.test(approvalCommand(words));
+};
+
+// Extra prose around a refusal word requires an unambiguous ID-only approval instead.
+const exactResourceTarget = (label: string, task: string): boolean =>
+  approvalAction(label) === approvalAction(task) &&
+  /^(?:Deploy the (?:on-hold build|delay queue|(?:decline|refuse|deny|defer|postpone|delay|pause|suspend|abort) worker)|Purchase the (?:hold|decline|refuse|deny|defer|postpone|delay|pause|suspend|abort) service|Use the (?:decline|refuse|deny|defer|postpone|delay|pause|suspend|abort) secret)$/i.test(
+    label,
+  );
+
 export const approvesGate = (
   label: string,
   gate: NonNullable<KanbanSubtask["gate"]>,
@@ -311,15 +379,26 @@ export const approvesGate = (
     /\b(?:if|unless|after|before|once|when|pending|first|then)\b/i.test(words)
   )
     return false;
-  const command = words
-    .replace(/^(?:yes|ok|okay)(?:\s*[,.:;–—-]\s*|\s+)/i, "")
-    .replace(/^(?:(?:please|go ahead and)\s+)+/i, "");
-  if (
-    /^(?:yes|approve|approved|sign off|sign-off|signoff|signed off|go|go ahead|go for it|ok|okay|do it|proceed)$/i.test(
-      command,
+  if (scope === "subtask") {
+    if (
+      approvalQualifier.test(words) ||
+      (isNegativeChoice(words) && !exactResourceTarget(words, task))
     )
-  )
-    return true;
+      return false;
+    if (referenceCommand.test(words) || referenceCommand.test(approvalCommand(words)))
+      return isReferenceApproval(words);
+    const approval = subtaskApproval(words);
+    if (approval) {
+      if (!approval.valid) return false;
+      const step = approval.step;
+      const exactStep = matchesApprovalStep(step, task) || exactResourceTarget(words, task);
+      // An id list narrows the pick; arbitrary continuations must not reach the go/hold fallback.
+      if (approval.ids.length > 0) return step === undefined || exactStep;
+      if (exactStep) return true;
+    }
+  }
+  const command = approvalCommand(words);
+  if (bareApproval.test(command)) return true;
   // Retaining one merge cannot grant permission for future deployments.
   if (
     scope === "subtask" &&
@@ -378,25 +457,22 @@ const optionScopeIds = (
   option: Pick<KanbanAskOption, "label" | "approves">,
 ): ReadonlyArray<string> | undefined => {
   if (option.approves !== undefined) return option.approves;
-  if (!/^(?:yes|ok|approve|approved|go\s+ahead)\b/i.test(option.label.trim())) return undefined;
-  const ids = option.label.match(/\bs\d+\b/g);
-  if (!ids) return undefined;
+  const ids = subtaskApproval(option.label)?.ids;
+  if (!ids?.length) return undefined;
   return ids.filter((id) => card.subtasks.some((subtask) => subtask.id === id));
 };
 
-const refusalWord = /\b(?:decline|refuse|deny|defer|postpone|delay|pause|suspend|abort)\b/i;
+const approvalQualifier =
+  /\b(?:if|unless|after|before|once|when|pending|first|then|not|no|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead)\b/i;
+
+export const optionLabelRefusesApproval = (label: string) =>
+  isNegativeOption(label) || approvalQualifier.test(label);
 
 export const optionApprovalIds = (
   card: Pick<KanbanCard, "subtasks">,
   option: Pick<KanbanAskOption, "label" | "approves">,
 ): ReadonlyArray<string> | undefined => {
-  if (
-    isNegativeOption(option.label) ||
-    /\b(?:if|unless|after|before|once|when|pending|first|then|not|no|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead)\b/i.test(
-      option.label,
-    )
-  )
-    return undefined;
+  if (optionLabelRefusesApproval(option.label)) return undefined;
   if (option.approves !== undefined) {
     if (!isNegativeChoice(option.label)) return option.approves;
     // Exact action targets can contain refusal words, such as an "on-hold build".
@@ -409,14 +485,25 @@ export const optionApprovalIds = (
       ? option.approves
       : undefined;
   }
-  // Label shorthand accepts a direct id list, never additional clauses or qualifications.
+  const approval = subtaskApproval(option.label);
+  if (!approval?.valid || approval.ids.length === 0) return undefined;
+  const ids = optionScopeIds(card, option)!;
   if (
-    !/^(?:yes|ok|approve|approved|go\s+ahead)\b[\s,.:;–—-]+(?:(?:tick|clear|do|approve)\s+)?s\d+(?:(?:\s*[,;/&+]\s*(?:and\s+)?|\s+(?:and\s+)?)s\d+)*(?:\s+now)?[.!]*$/i.test(
-      option.label.trim(),
-    )
+    approval.step !== undefined &&
+    (ids.length === 0 ||
+      !ids.every((id) => {
+        const subtask = card.subtasks.find((candidate) => candidate.id === id);
+        const gate = subtask && gateOf(subtask);
+        return (
+          subtask &&
+          (gate !== undefined
+            ? approvesGate(option.label, gate, subtask.text, [], "subtask")
+            : !isNegativeChoice(option.label) && matchesApprovalStep(approval.step, subtask.text))
+        );
+      }))
   )
     return undefined;
-  return optionScopeIds(card, option);
+  return ids;
 };
 
 const isNegativeChoice = (label: string): boolean => {
@@ -426,6 +513,28 @@ const isNegativeChoice = (label: string): boolean => {
     if (isNegativeOption(label.slice(word.index))) return true;
   }
   return false;
+};
+
+const pickedApprovalIds = (
+  card: Pick<KanbanCard, "subtasks">,
+  ask: KanbanOwnerAsk,
+): ReadonlyArray<string> | undefined => {
+  const answer = ask.answer;
+  if (answer?.verdict !== "picked" && answer?.verdict !== "approved") return undefined;
+  const picked = answer.optionIds ?? [];
+  if (
+    picked.length === 0 ||
+    (picked.length > 1 && ask.options?.some((option) => option.approves !== undefined))
+  )
+    return undefined;
+  const scopes = picked.map((id) => {
+    const option = ask.options?.find((candidate) => candidate.id === id);
+    return option && optionApprovalIds(card, option);
+  });
+  // Multiple legacy labels must each approve their own targets, with no refused pick mixed in.
+  if (scopes.some((ids) => ids === undefined || (picked.length > 1 && ids.length === 0)))
+    return undefined;
+  return scopes.flatMap((ids) => ids ?? []);
 };
 
 const askWording = (ask: KanbanOwnerAsk) =>
@@ -462,15 +571,33 @@ export const askGateWarning = (
     return subtask.state === "open" && gate !== undefined ? [{ subtask, gate }] : [];
   });
   const scoped = ask.options?.some((option) => optionScopeIds(card, option) !== undefined);
-  if (
-    gated.length === 0 ||
-    gated.some(({ subtask, gate }) =>
-      scoped
-        ? ask.options?.some((option) => optionApprovalIds(card, option)?.includes(subtask.id))
-        : askConcerns(card, ask, subtask, gate, guessedGates, ask.at),
-    )
-  )
-    return undefined;
+  if (gated.length === 0) return undefined;
+  const concerned = gated.filter(({ subtask, gate }) =>
+    scoped
+      ? ask.options?.some((option) => optionScopeIds(card, option)?.includes(subtask.id))
+      : askConcerns(card, ask, subtask, gate, guessedGates, ask.at),
+  );
+  if (concerned.length > 0) {
+    const options = ask.options;
+    if (!options?.length) return undefined;
+    const warnings = concerned.flatMap(({ subtask, gate }) => {
+      if (options.some((option) => approvingOption(card, ask, option, gate, subtask))) return [];
+      const labels = ["Approve", `Approve ${subtask.id}`].filter((label) => {
+        const option = { id: "gate-suggestion", label };
+        return approvingOption(
+          card,
+          { ...ask, options: [...options, option] },
+          option,
+          gate,
+          subtask,
+        );
+      });
+      return [
+        `No option here clears ${subtask.id} (${gate}); a go option labelled ${labels.map((label) => `"${label}"`).join(" or ")} or carrying approves: [${subtask.id}] would.`,
+      ];
+    });
+    return warnings.length > 0 ? warnings.join(" ") : undefined;
+  }
   const steps = gated.map(({ subtask, gate }) => `${subtask.id} (${gate})`).join(", ");
   const target = gated.length === 1 ? gated[0]!.subtask.id : "the intended subtask id";
   return `This ask won't clear ${steps}. Name ${target} in the text if it should.`;
@@ -490,6 +617,34 @@ export const secretKindApprovalWarning = (
   return `Kind "secret" asks Abdullah to type a secret value. To approve ${ids.join(", ")}, ask a decision naming ${target} instead.`;
 };
 
+const approvingLabel = (
+  label: string,
+  gate: NonNullable<KanbanSubtask["gate"]>,
+  task: string,
+  others: readonly string[],
+): boolean =>
+  !approvalQualifier.test(label) &&
+  (approvesGate(label, gate, task, [], "subtask") ||
+    (!isNegativeChoice(label) && approvesGate(label, gate, task, others, "subtask")));
+
+const approvingOption = (
+  card: Pick<KanbanCard, "subtasks">,
+  ask: KanbanOwnerAsk,
+  option: KanbanAskOption,
+  gate: NonNullable<KanbanSubtask["gate"]>,
+  subtask: KanbanSubtask,
+  singlePick = true,
+): boolean => {
+  if (ask.options?.some((entry) => optionScopeIds(card, entry) !== undefined))
+    return optionApprovalIds(card, option)?.includes(subtask.id) === true;
+  // A reference approves one choice, never a new combination of picks.
+  if (!singlePick && isReferenceApproval(option.label)) return false;
+  const others = singlePick
+    ? (ask.options ?? []).filter((entry) => entry.id !== option.id).map((entry) => entry.label)
+    : [];
+  return approvingLabel(option.label, gate, subtask.text, others);
+};
+
 const approvingAnswer = (
   card: Pick<KanbanCard, "subtasks">,
   ask: KanbanOwnerAsk,
@@ -497,24 +652,14 @@ const approvingAnswer = (
   subtask: KanbanSubtask,
 ): boolean => {
   const answer = ask.answer;
-  // Multiple picks keep the strict paths; the go/hold fallback needs a single choice.
-  const others =
-    answer?.optionIds?.length === 1
-      ? (ask.options ?? [])
-          .filter((option) => !answer.optionIds!.includes(option.id))
-          .map((option) => option.label)
-      : [];
   const scoped = ask.options?.some((option) => optionScopeIds(card, option) !== undefined);
-  const explicitlyApproved =
-    (answer?.verdict === "picked" || answer?.verdict === "approved") &&
-    answer.optionIds?.length === 1 &&
-    ask.options?.some(
-      (option) =>
-        option.id === answer.optionIds?.[0] &&
-        optionApprovalIds(card, option)?.includes(subtask.id),
-    );
   const approved = scoped
-    ? explicitlyApproved
+    ? pickedApprovalIds(card, ask) !== undefined &&
+      ask.options?.some(
+        (option) =>
+          answer?.optionIds?.includes(option.id) &&
+          approvingOption(card, ask, option, gate, subtask),
+      )
     : (answer?.verdict === "approved" && !answer.optionIds?.length) ||
       ((answer?.verdict === "picked" || answer?.verdict === "approved") &&
         Boolean(answer.optionIds?.length) &&
@@ -522,9 +667,7 @@ const approvingAnswer = (
           const option = ask.options?.find((entry) => entry.id === id);
           return (
             option !== undefined &&
-            (approvesGate(option.label, gate, subtask.text, [], "subtask") ||
-              (!isNegativeChoice(option.label) &&
-                approvesGate(option.label, gate, subtask.text, others, "subtask")))
+            approvingOption(card, ask, option, gate, subtask, answer.optionIds!.length === 1)
           );
         }));
   return Boolean(approved);
@@ -536,6 +679,8 @@ export interface StandingReleaseContext {
   readonly boardId: string;
   readonly at: string;
   readonly note: string | null;
+  readonly releasedAt?: string | undefined;
+  readonly boardNames?: ReadonlyMap<string, string> | undefined;
 }
 
 export const criticalReleaseReason = (note: string | null): string | null => {
@@ -544,12 +689,18 @@ export const criticalReleaseReason = (note: string | null): string | null => {
   return reason.length >= 10 ? reason : null;
 };
 
+export const releaseBuildCommit = (note: string | null): string | undefined =>
+  note?.match(/\bbuildCommit\s*[:=]?\s*`?([a-f0-9]{7,40})\b`?/i)?.[1]?.toLowerCase();
+
 export const releaseWindow = (
   standing: Pick<StandingReleaseContext, "approvals" | "ledger" | "boardId" | "at">,
+  service?: string,
 ) => {
   const approval = standing.approvals.find((entry) => entry.revokedAt === null);
   const last = standing.ledger
-    .filter((entry) => entry.boardId === standing.boardId)
+    .filter((entry) =>
+      service === undefined ? entry.boardId === standing.boardId : entry.service === service,
+    )
     .toSorted((a, b) => a.at.localeCompare(b.at))
     .at(-1);
   if (!approval || !last) return null;
@@ -574,7 +725,9 @@ export const approvalProblem = (
   const cleared =
     gate === "deploy" && !subtask.ownerOnly && approvals.some((entry) => entry.revokedAt === null);
   const window =
-    cleared && subtask.interrupting && context && intent === "do" ? releaseWindow(context) : null;
+    cleared && subtask.interrupting && context && !context.releasedAt && intent === "do"
+      ? releaseWindow(context, subtask.service)
+      : null;
   if (cleared && (!window || criticalReleaseReason(context?.note ?? null))) return null;
   const standingReason =
     gate !== "deploy"
@@ -584,31 +737,87 @@ export const approvalProblem = (
         : " (this board has no standing deploy approval)";
   const since = subtask.createdAt ?? card.createdAt;
   const decisions = card.asks
-    .filter((ask) => {
-      if (ask.kind === "notice" || ask.respond?.ack) return false;
+    .flatMap((ask) => {
+      if (ask.kind === "notice" || ask.respond?.ack) return [];
       const answer = ask.answer;
-      if (!ask.closedAt || !answer || answer.at < since) return false;
+      if (!ask.closedAt || !answer || answer.at < since) return [];
       if (answer.verdict !== "dropped") {
-        if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
-        if (ask.draft) return false;
+        // Closing clears handedAt; direct-to-evaluator asks retain their `to` instead.
+        const handedSkip =
+          intent === "skip" &&
+          answer.verdict === "handed" &&
+          answer.by._tag === "evaluator" &&
+          ask.to !== "evaluator";
+        if ((answer.by._tag !== "owner" && !handedSkip) || (ask.revisedAt ?? ask.at) < since)
+          return [];
+        if (ask.draft) return [];
+        if (handedSkip) {
+          const wording = `${askWording(ask)} ${answer.text ?? ""} ${answer.note ?? ""}`;
+          return new Set(wording.match(/\bs\d+\b/g) ?? []).has(subtask.id)
+            ? [{ ask, refusalOnly: false }]
+            : [];
+        }
       }
+      const scoped = ask.options?.some((option) => optionScopeIds(card, option) !== undefined);
+      const others =
+        answer.optionIds?.length === 1
+          ? (ask.options ?? [])
+              .filter((option) => !answer.optionIds!.includes(option.id))
+              .map((option) => option.label)
+          : [];
+      const refusals =
+        answer.verdict === "picked" || answer.verdict === "approved"
+          ? (ask.options ?? []).filter((option) => {
+              if (
+                !answer.optionIds?.includes(option.id) ||
+                (!isNegativeChoice(option.label) && !approvalQualifier.test(option.label))
+              )
+                return false;
+              const ids = scoped ? optionApprovalIds(card, option) : undefined;
+              return !card.subtasks.some((target) => {
+                const targetGate = gateOf(target, guessedGates);
+                const targetSince = target.createdAt ?? card.createdAt;
+                return (
+                  targetGate !== undefined &&
+                  answer.at >= targetSince &&
+                  (ask.revisedAt ?? ask.at) >= targetSince &&
+                  (scoped
+                    ? ids?.includes(target.id) === true
+                    : askConcerns(card, ask, target, targetGate, guessedGates, answer.at) &&
+                      approvingLabel(option.label, targetGate, target.text, others))
+                );
+              });
+            })
+          : [];
+      // A refusal can name its target after the negation; positive scope remains leading-only.
+      if (
+        (answer.verdict === "rejected" || refusals.length > 0) &&
+        (askConcerns(card, ask, subtask, gate, guessedGates, answer.at) ||
+          refusals.some((option) =>
+            option.label
+              .toLowerCase()
+              .match(/\bs\d+\b/g)
+              ?.includes(subtask.id.toLowerCase()),
+          ))
+      )
+        return [{ ask, refusalOnly: true }];
       // Explicit scopes replace wording matching for the entire ask, including other options.
-      if (ask.options?.some((option) => optionScopeIds(card, option) !== undefined)) {
-        const selected =
-          (answer.verdict === "picked" || answer.verdict === "approved") &&
-          answer.optionIds?.length === 1
-            ? ask.options.find((option) => option.id === answer.optionIds?.[0])
-            : undefined;
-        const selectedIds = selected ? optionApprovalIds(card, selected) : undefined;
+      if (scoped) {
+        const selectedIds = pickedApprovalIds(card, ask);
         // A refusal concerns the whole ask; a scoped go choice concerns only its own ids.
-        return selectedIds !== undefined
-          ? selectedIds.includes(subtask.id)
-          : ask.options.some((option) => optionScopeIds(card, option)?.includes(subtask.id));
+        const concerns =
+          selectedIds !== undefined
+            ? selectedIds.includes(subtask.id)
+            : ask.options?.some((option) => optionScopeIds(card, option)?.includes(subtask.id));
+        return concerns ? [{ ask, refusalOnly: false }] : [];
       }
-      return askConcerns(card, ask, subtask, gate, guessedGates, answer.at);
+      return askConcerns(card, ask, subtask, gate, guessedGates, answer.at)
+        ? [{ ask, refusalOnly: false }]
+        : [];
     })
-    .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
-  const latest = decisions.at(-1);
+    .toSorted((a, b) => a.ask.answer!.at.localeCompare(b.ask.answer!.at));
+  const latestDecision = decisions.at(-1);
+  const latest = latestDecision?.ask;
   const answer = latest?.answer;
   const unnamedApproval = card.asks
     .filter(
@@ -634,20 +843,32 @@ export const approvalProblem = (
       : `; for a guessed gate on an evaluator/script step, an evaluator can pass clearGate with a reason on ${subtask.id}; a gate set on purpose still needs Abdullah's answer naming ${subtask.id}`;
   const noDecisionReason = unnamedApproval
     ? `${unnamedApproval.id} was approved but doesn't name ${subtask.id}; ask again naming the subtask id (e.g. "Approve ${subtask.id}")`
-    : `no owner answer on a ${gate} ask since ${since}; ask with card_ask naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
+    : `no owner answer on a ${gate} ask since ${since}; ask with card_ask naming ${subtask.id} (e.g. "Approve ${subtask.id}")`;
   if (intent === "skip") {
-    if (answer && answer.verdict !== "dropped" && answer.by._tag === "owner") return null;
+    if (
+      answer &&
+      answer.verdict !== "dropped" &&
+      (answer.by._tag === "owner" || answer.verdict === "handed")
+    )
+      return null;
     const reason =
       answer?.verdict === "dropped"
         ? `the latest decision, ${latest!.id}, was dropped (a dropped ask is not approval)`
         : `${noDecisionReason}; no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask or set approves: [${subtask.id}] on the go option`;
-    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}${standingReason}${clearGuidance}`.replace(
+    const handedGuidance =
+      answer?.verdict !== "dropped" && card.asks.some((ask) => ask.answer?.verdict === "handed")
+        ? "; a handed answer must name the subtask id and come from an ask the owner handed to the evaluator"
+        : "";
+    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}${standingReason}${clearGuidance}${handedGuidance}`.replace(
       /[\r\n]+/g,
       " ",
     );
   }
   const scoped = latest?.options?.some((option) => optionScopeIds(card, option) !== undefined);
-  const approved = latest !== undefined && approvingAnswer(card, latest, gate, subtask);
+  const approved =
+    latest !== undefined &&
+    !latestDecision?.refusalOnly &&
+    approvingAnswer(card, latest, gate, subtask);
   if (
     approved &&
     (!window || (askWording(latest!).match(/\bs\d+\b/g) ?? []).some((id) => id === subtask.id))
@@ -655,7 +876,16 @@ export const approvalProblem = (
     return null;
   if (window) {
     const time = (at: string) => `${at.slice(11, 16)}Z`;
-    return `card #${card.number} ${subtask.id} (interrupting) is inside the ${window.hours} h release window: last release #${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override`;
+    const service = subtask.service;
+    const source =
+      window.last.boardId === context?.boardId
+        ? ""
+        : `${context?.boardNames?.get(window.last.boardId) ?? window.last.boardId} `;
+    const guidance =
+      service === undefined
+        ? `; set service on ${subtask.id} (card_edit) so only releases of the same service count`
+        : "";
+    return `card #${card.number} ${subtask.id} (interrupting${service ? `, ${service}` : ""}) is inside the ${window.hours} h release window: last ${service ? `${service} ` : ""}release ${source}#${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override${guidance}; if this step records release #${window.last.cardNumber} that already happened, tick it with releasedAt: "${window.last.at}" (or the real restart time); it is recorded then and starts no new window`;
   }
   let reason: string;
   if (!latest || !answer) {
@@ -667,13 +897,25 @@ export const approvalProblem = (
       .map((id) => latest.options?.find((option) => option.id === id)?.label ?? id)
       .join(", ");
     reason = `the latest decision, ${latest.id}, picked "${labels}", which doesn't read as approving ${gate}; ask again with an Approve option or an action ask`;
+    if (
+      (answer.optionIds ?? []).some((id) => {
+        const label = latest.options?.find((option) => option.id === id)?.label;
+        return (
+          label !== undefined &&
+          isNegativeChoice(label) &&
+          (subtaskApproval(label) !== undefined ||
+            card.subtasks.some((target) => approvalAction(label) === approvalAction(target.text)))
+        );
+      })
+    )
+      reason += `; use an ID-only option (e.g. "Approve ${subtask.id}")`;
   } else if (scoped && answer.verdict === "approved") {
     reason = `the latest decision, ${latest.id}, approved without one scoped go option; pick exactly one option naming ${subtask.id} or carrying approves: [${subtask.id}]`;
   } else {
     reason = `the latest decision, ${latest.id}, was ${answer.verdict}`;
   }
   if (latest && unnamedApproval) {
-    reason += `; ${unnamedApproval.id} (approved later) doesn't name ${subtask.id}, so it doesn't count; ask again naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
+    reason += `; ${unnamedApproval.id} (approved later) doesn't name ${subtask.id}, so it doesn't count; ask again naming ${subtask.id} (e.g. "Approve ${subtask.id}") or set approves: [${subtask.id}] on the go option`;
   }
   return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval: ${reason}${standingReason}${clearGuidance}`.replace(
     /[\r\n]+/g,
@@ -683,6 +925,16 @@ export const approvalProblem = (
 
 export const MAX_SUBTASKS = 30;
 export const MAX_TEXT = 500;
+
+// Only complete generic instructions have unambiguous sentence punctuation; arguments stay literal.
+const approvalProse =
+  /^(?:(?:deploy|install) the (?:build|release)|restart the (?:helper|service|server)|pay the invoice|rotate the API key)[.!;:]*$/;
+
+const approvalText = (text: string) => {
+  const normalized = text.trim().replace(/\s+/g, " ");
+  const prose = normalized.replace(/^\w+/, (verb) => verb.toLowerCase());
+  return approvalProse.test(prose) ? prose.replace(/[.!;:]+$/, "") : normalized;
+};
 
 export interface SubtaskInput {
   /** An existing id alone keeps the subtask unchanged; leave out for a new one. */
@@ -695,8 +947,10 @@ export interface SubtaskInput {
   readonly clearGate?: string | undefined;
   readonly ownerOnly?: boolean | undefined;
   readonly interrupting?: boolean | undefined;
+  readonly service?: string | null | undefined;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
+  readonly holdsDependents?: boolean | undefined;
 }
 
 /**
@@ -707,13 +961,26 @@ export interface SubtaskInput {
 export const PACKET_SUBTASK =
   "Write the packet: read what the card points at (sessions, PRs, the code, the architecture) and rewrite its prompt with card_edit so the cheapest model can do it: scope, files, steps, tests, and when it's done. Add the rest of the plan.";
 
-/** Puts the packet first; every step the inputs set moves one later. */
+/** Puts the packet first; supplied steps and ids move one later. */
 export const withPacketStep = (
   inputs: ReadonlyArray<SubtaskInput>,
 ): ReadonlyArray<SubtaskInput> => [
   { step: 1, text: PACKET_SUBTASK, owner: "evaluator" },
-  ...inputs.map((input) => (input.step === undefined ? input : { ...input, step: input.step + 1 })),
+  ...inputs.map((input) => {
+    const id = input.id?.trim();
+    // Reserve s1 for the packet. Shifting supplied ids as well as generated ones
+    // preserves the caller's numbering without giving two subtasks the same id.
+    return {
+      ...input,
+      ...(id && subtaskId.test(id) ? { id: `s${idNumber(id) + 1}` } : {}),
+      ...(input.step === undefined ? {} : { step: input.step + 1 }),
+    };
+  }),
 ];
+
+/** A thread's or a script's card waits for an evaluator to write its packet. */
+export const needsPacketStep = (actor: KanbanActor): boolean =>
+  actor._tag === "thread" || actor._tag === "script";
 
 export type SubtaskPlan =
   | {
@@ -722,7 +989,16 @@ export type SubtaskPlan =
       /** The card's counter after this plan; store it with the card. */
       readonly subtaskSeq: number;
     }
-  | { readonly ok: false; readonly reason: string; readonly code?: "denied" };
+  | {
+      readonly ok: false;
+      readonly reason: string;
+      readonly code?: "denied";
+      readonly denyReason:
+        | "invalid_args"
+        | "subtask_not_found"
+        | "approval_required"
+        | "subtask_owner_mismatch";
+    };
 
 /**
  * Who is marking a subtask. Evaluators can mark any; a worker only its own
@@ -730,17 +1006,25 @@ export type SubtaskPlan =
  */
 export type SubtaskRole = "work" | "review" | "evaluator" | "script";
 
-export type MarkCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+export type MarkCheck =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string; readonly denyReason: McpDenyReason };
 
-const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
+/** The number in an `s<N>` subtask id; 0 for anything else. */
+export const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
+
+/** The ids the board hands out: s1, s2, ... */
+const subtaskId = /^s[1-9]\d*$/;
 
 /**
  * Replaces a card's plan with `inputs`. An id alone keeps that subtask;
  * omitted text, owner and step on open ids keep their stored values. New
- * entries need text and owner and get the next id. Listed done and skipped
- * subtasks stay unchanged, and omitted ones stay: what happened isn't rewritten.
+ * entries need text and owner; a new entry may name its own `s<N>` id that the
+ * card does not have yet, and otherwise gets the next one. Listed done and skipped
+ * subtasks keep their history (but may clear a guessed gate), and omitted ones stay.
  * `seq` is the card's counter of ids ever handed out, so an open subtask dropped
- * from the plan never has its id reused by a later entry.
+ * from the plan never has its id reused by a later entry, and naming an id moves
+ * it past that number.
  */
 export function planSubtasks(
   existing: ReadonlyArray<KanbanSubtask>,
@@ -759,9 +1043,13 @@ export function planSubtasks(
     known?: KanbanSubtask,
   ) => {
     const previousGate = known && gateOf(known, guessedGates);
+    const inferredGate = inferGate(text);
+    // A sticky guess may differ from the wording that was cleared.
     const keepClear =
       known?.gateCleared !== undefined &&
-      text === known.text &&
+      (inferredGate === undefined ||
+        inferredGate === known.gateCleared.gate ||
+        inferredGate === inferGate(known.text)) &&
       input.gate == null &&
       input.ownerOnly !== true &&
       input.interrupting !== true;
@@ -787,6 +1075,65 @@ export function planSubtasks(
             : ("guessed" as const);
     return { gate, gateSource, previousGate, keepClear };
   };
+  const planClear = (
+    known: KanbanSubtask,
+    reason: string,
+    owner: KanbanSubtask["owner"],
+    text: string,
+    ownerOnly: boolean | undefined,
+    interrupting: boolean | undefined,
+    gate: KanbanSubtask["gate"],
+  ):
+    | { readonly ok: true; readonly gateCleared: KanbanSubtask["gateCleared"] }
+    | Extract<SubtaskPlan, { ok: false }> => {
+    if (
+      owner === "work" ||
+      owner === "review" ||
+      known.owner === "work" ||
+      known.owner === "review"
+    )
+      return {
+        ok: false,
+        code: "denied",
+        denyReason: "subtask_owner_mismatch",
+        reason: `subtask ${known.id} must be owned by the evaluator or a script to clear a guessed gate`,
+      };
+    if (
+      gate === undefined ||
+      (gateOf(known, guessedGates) === undefined &&
+        known.gate === undefined &&
+        known.gateCleared === undefined)
+    ) {
+      return known.gateCleared
+        ? { ok: true, gateCleared: { ...known.gateCleared, text } }
+        : {
+            ok: false,
+            denyReason: "invalid_args",
+            reason: `subtask ${known.id} has no gate to clear`,
+          };
+    }
+    // Rewording in the same edit cannot turn a deliberate gate into a guessed one.
+    if (
+      known.gateSource === "set" ||
+      known.ownerOnly ||
+      known.interrupting ||
+      ownerOnly ||
+      interrupting
+    )
+      return {
+        ok: false,
+        code: "denied",
+        denyReason: "approval_required",
+        reason: `subtask ${known.id} has a ${gate} gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
+      };
+    if (!actor || !at)
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "clearGate needs the clearing actor and time",
+      };
+    return { ok: true, gateCleared: { gate, reason, by: actor, at, text } };
+  };
   const byId = new Map(existing.map((subtask) => [subtask.id, subtask]));
   // Cards saved before the counter existed start from the highest id still on them.
   let nextId = existing.reduce((max, subtask) => Math.max(max, idNumber(subtask.id)), seq);
@@ -797,64 +1144,155 @@ export function planSubtasks(
     const id = input.id?.trim();
     const reason = input.clearGate?.trim();
     if (reason !== undefined) {
-      if (!id) return { ok: false, reason: "clearGate needs an existing subtask id" };
+      if (!id)
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate needs an existing subtask id",
+        };
       if (input.gate != null)
-        return { ok: false, reason: "clearGate cannot be combined with an explicit gate" };
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate cannot be combined with an explicit gate",
+        };
       if (reason.length < 10 || reason.length > 300)
-        return { ok: false, reason: "clearGate needs a reason of 10–300 characters" };
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate needs a reason of 10–300 characters",
+        };
     }
     const known = id ? byId.get(id) : undefined;
     if (id) {
-      if (!known)
+      if (listed.has(id))
+        return { ok: false, denyReason: "invalid_args", reason: `subtask ${id} is listed twice` };
+      // An s<N> id the card does not have yet names a new subtask below.
+      if (!known && !subtaskId.test(id))
         return {
           ok: false,
-          reason: `the card has no subtask ${id}. Existing subtask ids: ${subtaskIds(existing) || "none"}`,
+          denyReason: "invalid_args",
+          reason: `"${id}" is not a subtask id; use s1, s2, ...`,
         };
-      if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
+      if (!known && reason !== undefined)
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate needs an existing subtask id",
+        };
       listed.add(id);
-      // An id alone also preserves script bindings and approval timestamps.
-      if (
-        known.state !== "open" ||
-        (input.text === undefined &&
-          input.owner === undefined &&
-          input.step === undefined &&
-          input.gate === undefined &&
-          input.clearGate === undefined &&
-          input.ownerOnly === undefined &&
-          input.interrupting === undefined &&
-          input.script === undefined)
-      ) {
-        planned.push(known);
-        step = known.step;
-        continue;
+      if (known) {
+        if (known.state !== "open" && reason !== undefined) {
+          const clear = planClear(
+            known,
+            reason,
+            known.owner,
+            known.text,
+            known.ownerOnly,
+            known.interrupting,
+            gateOf(known, guessedGates),
+          );
+          if (!clear.ok) return clear;
+          const { gate: _gate, gateSource: _source, ...rest } = known;
+          planned.push({ ...rest, gateCleared: clear.gateCleared });
+          step = known.step;
+          continue;
+        }
+        // An id or hold-only patch preserves script bindings and approval timestamps.
+        if (
+          known.state !== "open" ||
+          (input.text === undefined &&
+            input.owner === undefined &&
+            input.step === undefined &&
+            input.gate === undefined &&
+            input.clearGate === undefined &&
+            input.ownerOnly === undefined &&
+            input.interrupting === undefined &&
+            input.service === undefined &&
+            input.script === undefined)
+        ) {
+          if (known.state === "open" && input.holdsDependents !== undefined) {
+            if (input.holdsDependents && (known.owner === "work" || known.owner === "review")) {
+              return {
+                ok: false,
+                denyReason: "invalid_args",
+                reason: "a step holding dependents must be owned by the evaluator or a script",
+              };
+            }
+            planned.push({ ...known, holdsDependents: input.holdsDependents });
+          } else {
+            planned.push(known);
+          }
+          step = known.step;
+          continue;
+        }
       }
     }
     const rawText = input.text ?? known?.text;
     const owner = input.owner ?? known?.owner;
     if (rawText === undefined || owner === undefined) {
-      return { ok: false, reason: "a new subtask needs text and owner" };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "a new subtask needs text and owner",
+      };
     }
     const text = rawText.trim();
-    if (text.length === 0) return { ok: false, reason: "a subtask needs text" };
+    if (text.length === 0)
+      return { ok: false, denyReason: "invalid_args", reason: "a subtask needs text" };
     if (text.length > MAX_TEXT) {
-      return { ok: false, reason: `a subtask is at most ${MAX_TEXT} characters` };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: `a subtask is at most ${MAX_TEXT} characters`,
+      };
     }
     if (owner === "work" && input.gate != null) {
       return {
         ok: false,
+        denyReason: "invalid_args",
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
+    const holdsDependents = input.holdsDependents ?? known?.holdsDependents;
+    if (holdsDependents === true && (owner === "work" || owner === "review")) {
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "a step holding dependents must be owned by the evaluator or a script",
+      };
+    }
     const interrupting = input.interrupting ?? known?.interrupting;
+    const service =
+      input.service === null ? undefined : (input.service ?? known?.service)?.trim().toLowerCase();
+    if (service !== undefined && !/^[a-z0-9._-]{1,64}$/.test(service)) {
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "service must be 1–64 characters using a-z, 0-9, dot, underscore or hyphen",
+      };
+    }
+    if (input.service != null && !interrupting) {
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "service requires interrupting: true",
+      };
+    }
     if (interrupting && (owner === "work" || owner === "review")) {
       return {
         ok: false,
+        denyReason: "invalid_args",
         reason: "an interrupting step must be owned by the evaluator or a script",
       };
     }
     const ownerOnly = input.ownerOnly ?? known?.ownerOnly;
     if (ownerOnly && (owner === "work" || owner === "review")) {
-      return { ok: false, reason: "an owner-only step must be owned by the evaluator or a script" };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "an owner-only step must be owned by the evaluator or a script",
+      };
     }
     const { gate, gateSource, previousGate, keepClear } = planGate(
       input,
@@ -869,48 +1307,42 @@ export function planSubtasks(
     if (script && owner !== "script") {
       return {
         ok: false,
+        denyReason: "invalid_args",
         reason: `subtask "${text}" names a script, so its owner must be "script"`,
       };
     }
     if (input.step !== undefined && (!Number.isInteger(input.step) || input.step < 1)) {
-      return { ok: false, reason: "a subtask's step is a whole number from 1" };
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "a subtask's step is a whole number from 1",
+      };
     }
     step = input.step ?? known?.step ?? step + 1;
     if (known) {
       const {
         script: _old,
+        service: _oldService,
         gate: _oldGate,
         gateSource: _oldSource,
         gateCleared: _oldClear,
         ...rest
       } = known;
-      // Rewording in the same edit cannot turn a deliberate gate into a guessed one.
-      const clearing =
-        reason !== undefined && owner !== "work" && owner !== "review"
-          ? (previousGate ?? gate)
-          : undefined;
-      if (
-        clearing &&
-        (known.gateSource === "set" ||
-          known.ownerOnly ||
-          known.interrupting ||
-          ownerOnly ||
-          interrupting)
-      ) {
-        return {
-          ok: false,
-          code: "denied",
-          reason: `subtask ${known.id} has a ${clearing} gate set on purpose; only Abdullah's answer clears it (card_ask naming ${known.id})`,
-        };
-      }
-      if (clearing && (!actor || !at))
-        return { ok: false, reason: "clearGate needs the clearing actor and time" };
+      const clear =
+        reason === undefined
+          ? undefined
+          : planClear(known, reason, owner, text, ownerOnly, interrupting, previousGate ?? gate);
+      if (clear && !clear.ok) return clear;
+      const clearing = reason !== undefined;
       const gateCleared =
-        clearing && actor && at
-          ? { gate: clearing, reason: reason!, by: actor, at, text }
-          : keepClear
-            ? known.gateCleared
-            : undefined;
+        clear?.gateCleared ?? (keepClear ? { ...known.gateCleared!, text } : undefined);
+      // Cosmetic edits keep the approval's time bound, including its absence on legacy plans.
+      const approvalChanged =
+        gate !== previousGate ||
+        (interrupting ? service : undefined) !== known.service ||
+        (input.gate != null && gateSource === "set" && known.gateSource !== "set") ||
+        script !== known.script ||
+        approvalText(text) !== approvalText(known.text);
       planned.push({
         ...rest,
         step,
@@ -918,32 +1350,33 @@ export function planSubtasks(
         owner,
         ...(ownerOnly === undefined ? {} : { ownerOnly }),
         ...(interrupting === undefined ? {} : { interrupting }),
+        ...(interrupting && service !== undefined ? { service } : {}),
         ...(gate === undefined || clearing ? {} : { gate, gateSource }),
         ...(gateCleared ? { gateCleared } : {}),
-        ...((text !== known.text ||
-          script !== known.script ||
-          ownerOnly !== known.ownerOnly ||
-          interrupting !== known.interrupting ||
-          gate !== previousGate ||
-          !previousGate) &&
-        gate &&
-        at
-          ? { createdAt: at }
-          : {}),
+        ...(approvalChanged && gate && !clearing && at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
+        ...(holdsDependents === undefined ? {} : { holdsDependents }),
       });
     } else {
-      nextId += 1;
+      // An explicit id names the new subtask; the counter still moves past it so
+      // a later entry without one never reuses the number.
+      if (id === undefined) nextId += 1;
+      else nextId = Math.max(nextId, idNumber(id));
+      const newId = id ?? `s${nextId}`;
+      // Tracked so a later entry cannot name the same id again, whichever way it was made.
+      listed.add(newId);
       planned.push({
-        id: `s${nextId}`,
+        id: newId,
         step,
         text,
         owner,
         ...(ownerOnly === undefined ? {} : { ownerOnly }),
         ...(interrupting === undefined ? {} : { interrupting }),
+        ...(interrupting && service !== undefined ? { service } : {}),
         ...(gate === undefined ? {} : { gate, gateSource }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
+        ...(input.holdsDependents === undefined ? {} : { holdsDependents: input.holdsDependents }),
         state: "open",
         note: null,
         doneBy: null,
@@ -960,7 +1393,11 @@ export function planSubtasks(
     });
   const subtasks = [...planned, ...kept].toSorted((a, b) => a.step - b.step);
   if (subtasks.length > MAX_SUBTASKS) {
-    return { ok: false, reason: `a card has at most ${MAX_SUBTASKS} subtasks` };
+    return {
+      ok: false,
+      denyReason: "invalid_args",
+      reason: `a card has at most ${MAX_SUBTASKS} subtasks`,
+    };
   }
   return { ok: true, subtasks, subtaskSeq: nextId };
 }
@@ -973,28 +1410,49 @@ export function checkMark(
   role: SubtaskRole,
   note: string | null,
   scriptName: string | null = null,
+  correctingRelease = false,
 ): MarkCheck {
   const subtask = card.subtasks.find((candidate) => candidate.id === id);
   if (!subtask)
     return {
       ok: false,
+      denyReason: "subtask_not_found",
       reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
     };
-  if (subtask.state === state) return { ok: false, reason: `subtask ${id} is already ${state}` };
+  if (
+    subtask.state === state &&
+    !(correctingRelease && role === "evaluator" && subtask.interrupting && state === "done")
+  )
+    return {
+      ok: false,
+      denyReason: "subtask_state_unchanged",
+      reason: `subtask ${id} is already ${state}`,
+    };
   if (state === "skipped" && !note?.trim()) {
-    return { ok: false, reason: "say why the subtask is skipped" };
+    return {
+      ok: false,
+      denyReason: "skip_note_required",
+      reason: "say why the subtask is skipped",
+    };
   }
   if (role === "evaluator") return { ok: true };
   if (role === "review") {
     return {
       ok: false,
+      denyReason: "review_verdict_required",
       reason: "a review ticks its subtasks with its verdict (card_review_result)",
     };
   }
-  if (state === "open") return { ok: false, reason: "only an evaluator reopens a subtask" };
+  if (state === "open")
+    return {
+      ok: false,
+      denyReason: "role_not_allowed",
+      reason: "only an evaluator reopens a subtask",
+    };
   if (subtask.owner !== role) {
     return {
       ok: false,
+      denyReason: "subtask_owner_mismatch",
       reason: `subtask ${id} is for the ${OWNER_NAMES[subtask.owner]}, not you`,
     };
   }
@@ -1003,11 +1461,16 @@ export function checkMark(
     subtask.script !== undefined &&
     subtask.script.toLowerCase() !== (scriptName ?? "").toLowerCase()
   ) {
-    return { ok: false, reason: `subtask ${id} is for the script "${subtask.script}"` };
+    return {
+      ok: false,
+      denyReason: "subtask_script_mismatch",
+      reason: `subtask ${id} is for the script "${subtask.script}"`,
+    };
   }
   if (subtask.step !== kanbanOpenStep(card)) {
     return {
       ok: false,
+      denyReason: "subtask_not_in_current_step",
       reason: `subtask ${id} is in step ${subtask.step}; finish step ${kanbanOpenStep(card)} first`,
     };
   }
@@ -1025,19 +1488,39 @@ export function checkHandBack(
   if (!subtask)
     return {
       ok: false,
+      denyReason: "subtask_not_found",
       reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
     };
-  if (!note.trim()) return { ok: false, reason: "say what failed or didn't match" };
-  if (subtask.owner !== "script") return { ok: false, reason: `subtask ${id} isn't a script's` };
+  if (!note.trim())
+    return {
+      ok: false,
+      denyReason: "handoff_note_required",
+      reason: "say what failed or didn't match",
+    };
+  if (subtask.owner !== "script")
+    return {
+      ok: false,
+      denyReason: "subtask_owner_mismatch",
+      reason: `subtask ${id} isn't a script's`,
+    };
   if (subtask.state !== "open") {
-    return { ok: false, reason: `subtask ${id} is already ${subtask.state}` };
+    return {
+      ok: false,
+      denyReason: "subtask_not_open",
+      reason: `subtask ${id} is already ${subtask.state}`,
+    };
   }
   if (subtask.script !== undefined && subtask.script.toLowerCase() !== scriptName.toLowerCase()) {
-    return { ok: false, reason: `subtask ${id} is for the script "${subtask.script}"` };
+    return {
+      ok: false,
+      denyReason: "subtask_script_mismatch",
+      reason: `subtask ${id} is for the script "${subtask.script}"`,
+    };
   }
   if (subtask.step !== kanbanOpenStep(card)) {
     return {
       ok: false,
+      denyReason: "subtask_not_in_current_step",
       reason: `subtask ${id} is in step ${subtask.step}; finish step ${kanbanOpenStep(card)} first`,
     };
   }
@@ -1079,8 +1562,35 @@ export const markSubtask = (
         };
   });
 
-export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
-  const current = kanbanOpenStep(card);
+export function reviewRoundStartedAt(events: ReadonlyArray<KanbanCardEvent>, reviewStep: number) {
+  let remaining = reviewStep;
+  let startedAt: string | undefined;
+  // Dispatch retries and later reviewers belong to the same round until its
+  // passed chain steps are exhausted; a final verdict or return to work ends it.
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]!;
+    if (event.kind === "review") {
+      if (remaining === 0 || event.body !== "clear" || event.toStage !== "needs_review") break;
+      remaining--;
+    } else if (event.kind === "moved" && event.toStage === "in_review") {
+      startedAt = event.at;
+    } else if (event.toStage === "todo" || event.toStage === "working") {
+      break;
+    }
+  }
+  // Incomplete legacy history cannot establish a whole-round cutoff.
+  return remaining === 0 ? startedAt : undefined;
+}
+
+export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">, roundStartedAt?: string) {
+  // Without a known start, older callers keep judging the plan as it stands.
+  const startedAt = roundStartedAt === undefined ? undefined : Date.parse(roundStartedAt);
+  const subtasks = card.subtasks.map((subtask) =>
+    startedAt !== undefined && subtask.doneAt !== null && Date.parse(subtask.doneAt) > startedAt
+      ? { ...subtask, state: "open" as const }
+      : subtask,
+  );
+  const current = kanbanOpenStep({ subtasks });
   if (current === null) return [];
   const open = card.subtasks.filter(
     (subtask) => subtask.owner === "review" && subtask.state === "open",
@@ -1089,7 +1599,7 @@ export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
   // Unfinished work in the current step can already have been reviewed, but
   // future work must get its turn before its review can pass.
   if (
-    card.subtasks.some(
+    subtasks.some(
       (subtask) =>
         subtask.owner === "work" &&
         subtask.state === "open" &&
@@ -1106,8 +1616,9 @@ export function passReview(
   card: Pick<KanbanCard, "subtasks">,
   by: KanbanActor,
   at: string,
+  roundStartedAt?: string,
 ): ReadonlyArray<KanbanSubtask> {
-  const ids = new Set(reviewSubtasksToPass(card).map((subtask) => subtask.id));
+  const ids = new Set(reviewSubtasksToPass(card, roundStartedAt).map((subtask) => subtask.id));
   return card.subtasks.map((subtask) =>
     ids.has(subtask.id)
       ? { ...subtask, state: "done", note: "Review passed", doneBy: by, doneAt: at }
@@ -1158,7 +1669,8 @@ export function subtaskLines(card: Pick<KanbanCard, "subtasks">): string | null 
       subtask.script === undefined
         ? OWNER_NAMES[subtask.owner]
         : `${OWNER_NAMES[subtask.owner]} "${subtask.script}"`;
-    return `- ${subtask.id} step ${subtask.step}, ${owner} (${mark}${note}): ${subtask.text}`;
+    const hold = subtask.holdsDependents === true ? " [holds dependents]" : "";
+    return `- ${subtask.id} step ${subtask.step}, ${owner}${hold} (${mark}${note}): ${subtask.text}`;
   });
   return `Subtasks (same step means any order; a step opens when the ones before are done or skipped):\n${rows.join("\n")}`;
 }

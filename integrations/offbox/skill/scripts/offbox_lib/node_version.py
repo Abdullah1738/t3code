@@ -7,6 +7,7 @@ tests/test_node_version.py).
 import json
 import re
 import shlex
+from collections import Counter
 from pathlib import Path
 
 TOP = 10**12
@@ -76,21 +77,38 @@ else
       fi
       [ "${actual%% *}" = "$__offbox_sum" ]
     }
-    if ! __offbox_archive_ok "$__offbox_archive"; then
+    __offbox_verify_archive() {
+      if __offbox_archive_ok "$__offbox_archive"; then return 0; fi
       __offbox_curl -fsSL "https://nodejs.org/dist/$__offbox_install/$__offbox_slug.$__offbox_compression" -o "$__offbox_archive.tmp" || exit 1
       __offbox_archive_ok "$__offbox_archive.tmp" || { echo 'offbox: Node archive checksum mismatch' >&2; exit 1; }
       mv "$__offbox_archive.tmp" "$__offbox_archive" || exit 1
-    fi
+    }
+    __offbox_verify_archive
     # nvm 0.40.3 can fall through a checksum error. Supply only our independently verified archive.
     nvm_remote_version() { echo "$__offbox_install"; }
     nvm_download_artifact() { echo "$__offbox_archive"; }
     nvm_download() { return 1; }
     unset NVM_OFFLINE
-    nvm install -b "$__offbox_install" || exit 1
+    for __offbox_attempt in 1 2; do
+      __offbox_unpack_rc=0
+      __offbox_unpack_attempt "$__offbox_stage/install.log" nvm install -b "$__offbox_install" || __offbox_unpack_rc=$?
+      # nvm can return success after tar failed with a partially executable installation.
+      if ! __offbox_signature=$(__offbox_native_crash "$__offbox_stage/install.log" "$__offbox_unpack_rc"); then
+        [ "$__offbox_unpack_rc" = 0 ] && break
+        exit 1
+      fi
+      if [ "$__offbox_attempt" = 2 ]; then
+        __offbox_infra_stop native_crash toolchain_unpack_crash "box ${OFFBOX_BOX_ID:-<box>} crashed unpacking a checksum-verified Node $__offbox_install archive twice ($__offbox_signature); this is a box/host fault, not your repo."
+      fi
+      echo "offbox: Node $__offbox_install unpack crashed on this box ($__offbox_signature); retrying once" >&2
+      rm -rf -- "$NVM_DIR/versions/node/$__offbox_install" "$NVM_DIR/src" "$NVM_DIR/tmp" "$__offbox_cache/files" \
+        "$NVM_DIR/.cache/src/node-$__offbox_install" "$NVM_DIR/.cache/tmp/node-$__offbox_install" || exit 1
+      __offbox_verify_archive
+    done
     [ "$("$NVM_DIR/versions/node/$__offbox_install/bin/node" --version)" = "$__offbox_install" ] || exit 1
     mkdir -p "$__offbox_nvm_home/versions/node" || exit 1
     mv "$NVM_DIR/versions/node/$__offbox_install" "$__offbox_nvm_home/versions/node/$__offbox_install" || exit 1
-  ) >&2 || __offbox_stop "$__offbox_reason: nvm install $__offbox_install failed"
+  ) >&2 || { [ "$?" != 90 ] || exit 90; __offbox_stop "$__offbox_reason: nvm install $__offbox_install failed"; }
   export PATH="$NVM_DIR/versions/node/$__offbox_install/bin:$PATH"
   __offbox_actual=$(node --version 2>/dev/null) || __offbox_actual=
   [[ "$__offbox_actual" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && __offbox_in "$(__offbox_nk "$__offbox_actual")" ||
@@ -100,10 +118,73 @@ else
 fi
 __offbox_actual=$(node --version 2>/dev/null) || __offbox_stop "$__offbox_want: selected Node cannot execute"
 [[ "$__offbox_actual" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && __offbox_in "$(__offbox_nk "$__offbox_actual")" || __offbox_stop "$__offbox_want: selected Node $__offbox_actual does not match"
-__offbox_pin_command node "$(command -v node)"
+# Keep a real nvm entry so nvm use can replace it in place.
+__offbox_node_executable=$(command -v node)
+if [ -n "${__offbox_node_commands:-}" ] && [ "$__offbox_node_executable" = "$__offbox_node_commands/node" ]; then
+  __offbox_node_executable=$(readlink "$__offbox_node_executable") || __offbox_stop 'cannot resolve selected Node'
+fi
+# Symlink targets must survive cd even when the original PATH entry was relative.
+__offbox_node_dir=$(CDPATH= builtin cd -L -- "$(dirname "$__offbox_node_executable")" && pwd -L) ||
+  __offbox_stop 'cannot resolve selected Node directory'
+__offbox_node_bin=$(CDPATH= builtin cd -P -- "$__offbox_node_dir" && pwd -P) ||
+  __offbox_stop 'cannot resolve selected Node directory'
+# nvm trims trailing slashes, and a relative root would stop working after cd.
+# Keep its logical spelling (including directory symlinks), but make it absolute.
+__offbox_original_nvm_dir=${NVM_DIR:-$HOME/.nvm}
+__offbox_nvm_dir=$(CDPATH= builtin cd -L -- "$__offbox_original_nvm_dir" 2>/dev/null && pwd -L) || __offbox_nvm_dir=
+__offbox_nvm_root=
+if [ -n "$__offbox_nvm_dir" ]; then
+  export NVM_DIR=$__offbox_nvm_dir
+  __offbox_nvm_root=$(CDPATH= builtin cd -P -- "$NVM_DIR" && pwd -P) || __offbox_nvm_root=
+fi
+# Use nvm's old-style bin shape so nvm use/deactivate can replace/remove
+# these links, while nvm current still identifies the selected Node correctly.
+__offbox_node_nvm_dir=${__offbox_node_dir%/versions/node/*/bin}
+__offbox_node_suffix=
+# A version or bin directory may link outside NVM_DIR. Check ownership from
+# the original path's nvm root before following those installation symlinks.
+if [ -n "$__offbox_nvm_root" ] && [ "$__offbox_node_nvm_dir" != "$__offbox_node_dir" ] &&
+   [ "$(CDPATH= builtin cd -P -- "$__offbox_node_nvm_dir" && pwd -P)" = "$__offbox_nvm_root" ]; then
+  __offbox_node_suffix=${__offbox_node_dir#"$__offbox_node_nvm_dir"}
+elif [ -n "$__offbox_nvm_root" ] && [[ "$__offbox_node_bin" == "$__offbox_nvm_root"/versions/node/*/bin ]]; then
+  __offbox_node_nvm_dir=
+  __offbox_node_suffix=${__offbox_node_bin#"$__offbox_nvm_root"}
+else
+  __offbox_node_nvm_dir=
+fi
+if [ -n "$__offbox_node_suffix" ]; then
+  # Keep nvm's own path spelling so use/deactivate can also strip the real bin.
+  __offbox_node_bin="$NVM_DIR$__offbox_node_suffix"
+  export __offbox_node_commands="${NVM_DIR:-$HOME/.nvm}/.offbox-${OFFBOX_RUN_ID:-current}/bin"
+else
+  export __offbox_node_commands="$HOME/.offbox/toolchains/node/${OFFBOX_RUN_ID:-current}/bin"
+fi
+__offbox_node_path=; __offbox_sep=; __offbox_tail=$PATH
+while :; do
+  __offbox_entry=${__offbox_tail%%:*}
+  case "$__offbox_entry" in
+    "$__offbox_node_bin"|"$__offbox_node_commands"|"${NVM_DIR:-$HOME/.nvm}"/versions/node/*/bin|"$__offbox_original_nvm_dir"/versions/node/*/bin|"$__offbox_nvm_root"/versions/node/*/bin|"$__offbox_node_nvm_dir"/versions/node/*/bin) ;;
+    *) __offbox_node_path="$__offbox_node_path$__offbox_sep$__offbox_entry"; __offbox_sep=: ;;
+  esac
+  [[ $__offbox_tail == *:* ]] || break
+  __offbox_tail=${__offbox_tail#*:}
+done
+export PATH="$__offbox_node_bin${__offbox_sep:+:}$__offbox_node_path"
+mkdir -p "$__offbox_node_commands" || __offbox_stop 'cannot create Node command directory'
+for __offbox_command in node npm npx corepack; do
+  if [ -x "$__offbox_node_bin/$__offbox_command" ]; then
+    ln -sf "$__offbox_node_bin/$__offbox_command" "$__offbox_node_commands/$__offbox_command" ||
+      __offbox_stop "cannot activate $__offbox_command"
+  else
+    rm -f "$__offbox_node_commands/$__offbox_command" || __offbox_stop "cannot clear $__offbox_command"
+  fi
+done
+export PATH="$__offbox_node_commands:$PATH"
+hash -r
 [ "${__offbox_installed:-}" = 1 ] || echo "offbox: node $__offbox_actual ($__offbox_want)" >&2
 unset -f __offbox_nk __offbox_in
 unset __offbox_want __offbox_best __offbox_bk __offbox_have __offbox_d __offbox_v __offbox_k __offbox_cur __offbox_actual __offbox_installed __offbox_install __offbox_reason __offbox_index __offbox_rest
+unset __offbox_original_nvm_dir __offbox_nvm_dir __offbox_nvm_root __offbox_node_executable __offbox_node_dir __offbox_node_bin __offbox_node_nvm_dir __offbox_node_suffix __offbox_node_path __offbox_sep __offbox_tail __offbox_entry __offbox_command
 """
 
 
@@ -267,7 +348,7 @@ def parse_nvmrc(text):
     p = _partial(line)
     if not p:
         return None
-    return [(_lower(p), _key(p[0] + 1))]
+    return [(_lower(p), _lower(p) + 1 if len(p) == 3 else _upper(p))]
 
 
 def _read(p):
@@ -316,7 +397,8 @@ def _want(root, cwd):
         if text is None and eng is None:
             continue
         nv = parse_nvmrc(text) if text is not None else None
-        nv_label = f"{prefix}{name} {_first_line(text)}" if nv else None
+        exact = bool(nv and len(nv) == 1 and nv[0][1] == nv[0][0] + 1)
+        nv_label = f"{prefix}{name} {_first_line(text)}" + (" (exact)" if exact else "") if nv else None
         en = parse_range(eng) if eng else None
         en_label = f"{prefix}package.json engines {eng}" if en is not None else None
         if nv is not None and en is not None:
@@ -398,7 +480,17 @@ def _ci_values(text):
     return entries
 
 
-def _ci_want(root):
+def _major_ranges(ranges):
+    merged = []
+    for lo, hi in sorted((lo // 1_000_000, (hi - 1) // 1_000_000 + 1) for lo, hi in ranges):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _ci_want(root, *, within=None):
     signals = []
     workflows = root / '.github/workflows'
     for path in sorted([*workflows.glob('*.yml'), *workflows.glob('*.yaml')]):
@@ -414,30 +506,66 @@ def _ci_want(root):
             if parsed:
                 ranges.extend(parsed)
                 versions.append(value)
+        if within is not None:
+            ranges = _isect(ranges, within)
         if ranges:
             signals.append((ranges, f"{path.relative_to(root).as_posix()} node-version {', '.join(dict.fromkeys(versions))}"))
     if not signals:
         return None
-    # Matrices remain a union; conflicting workflows use the one with the highest major.
-    majors = {max(lo for lo, _ in ranges) // 1_000_000 for ranges, _ in signals}
-    if len(majors) > 1:
-        highest = max(majors)
-        signals = [(ranges, label) for ranges, label in signals
-                   if max(lo for lo, _ in ranges) // 1_000_000 == highest]
-        suffix = f'; workflows disagree, highest major {highest}'
-    else:
-        suffix = ''
+    # Agreeing matrices remain unions; each workflow votes once per supported major.
+    candidates = {major for ranges, _ in signals for lo, hi in ranges
+                  for major in ([lo // 1_000_000, (hi - 1) // 1_000_000]
+                                if hi != TOP else [lo // 1_000_000])}
+    support = [{major for major in candidates
+                if _isect(ranges, [(_key(major), _key(major + 1))])}
+               for ranges, _ in signals]
+    majors = Counter(major for choices in support for major in choices)
+    coverage = [_major_ranges(ranges) for ranges, _ in signals]
+    minority = ''
+    if any(major_ranges != coverage[0] for major_ranges in coverage[1:]):
+        chosen = max(majors, key=lambda major: (majors[major], major))
+        excluded = Counter(max(choices) for choices in support if chosen not in choices)
+        signals = [(_isect(ranges, [(_key(chosen), _key(chosen + 1))]), label)
+                   for (ranges, label), choices in zip(signals, support) if chosen in choices]
+        minority = '; ' + ', '.join(f'{count} workflow{"s" if count != 1 else ""} '
+                                   f'{"use" if count != 1 else "uses"} {major}'
+                                   for major, count in sorted(excluded.items())) if excluded else ''
     label = signals[0][1]
-    if len(signals) > 1:
-        label += f' (+{len(signals) - 1} workflows)'
-    return sorted({r for ranges, _ in signals for r in ranges}), label + suffix
+    if len(signals) > 1 or minority:
+        extra = f'+{len(signals) - 1} workflows' if len(signals) > 1 else ''
+        label += f' ({extra}{minority if extra else minority[2:]})'
+    return sorted({r for ranges, _ in signals for r in ranges}), label
+
+
+def _open_range(ranges):
+    """Whether the union admits more than one major (upper bounds are exclusive)."""
+    return bool(ranges) and (any(hi == TOP for _, hi in ranges) or
+                             min(lo for lo, _ in ranges) // 1_000_000 !=
+                             max(hi - 1 for _, hi in ranges) // 1_000_000)
+
+
+def _selection_label(ranges, label):
+    return label + ('; open range, newest on this box' if _open_range(ranges) else '')
 
 
 def want(root: Path, cwd: Path):
     """(ranges, label) for the repo at root as seen from cwd, or None. Never raises."""
     try:
         root = Path(root)
-        return _want(root, Path(cwd)) or _ci_want(root)
+        pin = _want(root, Path(cwd))
+        if pin is None:
+            return _ci_want(root)
+        ranges, label = pin
+        if _open_range(ranges):
+            try:
+                ci = _ci_want(root, within=ranges)
+            except Exception:
+                return pin
+            if ci is not None:
+                narrowed = _isect(ranges, ci[0])
+                if narrowed:
+                    return narrowed, f'{label}, narrowed by {ci[1]}'
+        return pin
     except Exception:
         return None
 
@@ -447,6 +575,7 @@ def block(w, *, require_nvm=False) -> str:
     if w is None:
         return NO_PIN_BLOCK
     ranges, label = w
+    label = _selection_label(ranges, label)
     rng = " ".join(f"{lo} {hi}" for lo, hi in ranges)
     return toolchain.SHELL + f"__offbox_require_nvm={int(require_nvm)}\n" + (BLOCK.replace("@RANGES@", rng)
             .replace("@WANT@", shlex.quote(label)))

@@ -6,6 +6,9 @@ import {
   NodeId,
   type OrchestrationV2ServerCommand as OrchestrationCommand,
   PullRequestOperationError,
+  PullRequestUnavailableError,
+  SourceControlProviderKind,
+  type PullRequestDetail,
   type OrchestrationProjectShell,
   type PullRequestRef,
   type PullRequestReviewGuideResult,
@@ -17,14 +20,19 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as Tracer from "effect/Tracer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 import type { Tool } from "effect/ai";
 
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
@@ -35,10 +43,14 @@ import {
 } from "../../../orchestration-v2/testkit/pullRequestFixtures.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
+import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
+import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as McpToolAccessTestkit from "../../McpToolAccess.testkit.ts";
+import * as McpDeadline from "../../McpDeadline.ts";
+import * as McpCall from "../../../ardud/analytics/McpCall.ts";
 import { listThreadPullRequests } from "./handlers.ts";
 import * as PullRequestsHandlers from "./handlers.ts";
 import { PullRequestLinkFailedError, PullRequestsToolkit } from "./tools.ts";
@@ -74,7 +86,7 @@ function makeProject(
       remoteName: "origin",
       remoteUrl: "git@github.com:T3Tools/T3Code.git",
     },
-    provider: "github",
+    provider: SourceControlProviderKind.make("github"),
     displayName: "T3Tools/T3Code",
     owner: "T3Tools",
     name: "T3Code",
@@ -144,12 +156,32 @@ function makeLink(
   };
 }
 
+const watch = {
+  startedAt: "2026-08-20T00:00:00.000Z",
+  headSha: null,
+  failedChecks: [],
+  passed: false,
+  passedChecks: [],
+  passedPending: [],
+  remarksThrough: "2026-08-20T00:00:00.000Z",
+  remarkIds: [],
+  conflicting: false,
+  conflictHead: null,
+  conflictWokeFor: null,
+  wakes: 0,
+};
+
 interface HarnessOptions {
+  readonly detail?: PullRequestService.PullRequestService["Service"]["detail"];
   readonly callerLayer?: Layer.Layer<ThreadManagement.ThreadManagementService>;
   readonly thread?: PullRequestTestThread | null;
   readonly project?: OrchestrationProjectShell | null;
   readonly reject?: (command: OrchestrationCommand) => string | null;
   readonly projects?: ReadonlyArray<OrchestrationProjectShell>;
+  readonly dispatch?: Orchestrator.OrchestratorV2Shape["dispatch"];
+  readonly getThreadShell?: Orchestrator.OrchestratorV2Shape["getThreadShell"];
+  readonly getProjectShell?: () => Effect.Effect<Option.Option<OrchestrationProjectShell>>;
+  readonly getGuide?: PullRequestReviewGuideService.PullRequestReviewGuideService["Service"]["get"];
   readonly generate?: (
     input: PullRequestRef,
   ) => Effect.Effect<
@@ -158,12 +190,61 @@ interface HarnessOptions {
   >;
 }
 
+const READABLE_PR: PullRequestDetail = {
+  provider: SourceControlProviderKind.make("github"),
+  capabilities: {
+    diff: true,
+    comment: true,
+    actions: [],
+    mergeMethods: [],
+    search: false,
+    review: { inlineComment: false, reply: false, resolve: false, verdicts: [] },
+    reviewers: { request: false, listCandidates: false },
+  },
+  viewerPermissions: {
+    actions: [],
+    comment: true,
+    resolve: true,
+    verdicts: [],
+    requestReviewers: false,
+  },
+  projectId: ProjectId.make("forgejo-project"),
+  projectTitle: "Watch",
+  workspaceRoot: "/workspace/watch",
+  repository: "acme/web",
+  number: 9,
+  title: "Watched PR",
+  body: "",
+  url: "https://github.com/acme/web/pull/9",
+  author: null,
+  state: "open",
+  isDraft: false,
+  mergeability: "mergeable",
+  additions: 1,
+  deletions: 0,
+  changedFiles: 1,
+  headBranch: "feature",
+  headSha: "head-1",
+  headBranchSha: "head-1",
+  checksHeadSha: "head-1",
+  baseBranch: "main",
+  createdAt: "2026-11-12T00:00:00.000Z",
+  updatedAt: "2026-11-12T00:00:00.000Z",
+  mergedAt: null,
+  closedAt: null,
+  reviewers: [],
+  labels: [],
+  checks: [{ name: "lint", status: "success", required: true, description: null, url: null }],
+  mergeCapabilities: { merge: true, squash: true, rebase: true },
+};
+
 const NO_GUIDE: PullRequestReviewGuideResult = { guide: null, run: null, currentHeadSha: "head-1" };
 
 const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
   options: HarnessOptions = {},
 ) {
   const commands = yield* Ref.make<ReadonlyArray<OrchestrationCommand>>([]);
+  const detailRequests = yield* Ref.make<ReadonlyArray<PullRequestRef>>([]);
   const guideRequests = yield* Ref.make<ReadonlyArray<PullRequestRef>>([]);
   const thread = options.thread === undefined ? makeThread([]) : options.thread;
   const project = options.project === undefined ? makeProject() : options.project;
@@ -180,15 +261,21 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
       return { sequence: 1, storedEvents: [] };
     });
   const layerDependencies = Layer.mergeAll(
+    Layer.mock(PullRequestService.PullRequestService)({
+      detail: (input) =>
+        Ref.update(detailRequests, (recorded) => [...recorded, input]).pipe(
+          Effect.andThen(options.detail?.(input) ?? Effect.succeed(READABLE_PR)),
+        ),
+    }),
     Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
       resolve: () => Effect.succeed(null),
     }),
     Layer.mock(ProjectService.ProjectService)({
-      getShell: () => Effect.succeed(Option.fromNullishOr(project)),
+      getShell: options.getProjectShell ?? (() => Effect.succeed(Option.fromNullishOr(project))),
       listShells: () => Effect.succeed(options.projects ?? (project ? [project] : [])),
     }),
     Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({
-      get: () => Effect.succeed(NO_GUIDE),
+      get: options.getGuide ?? (() => Effect.succeed(NO_GUIDE)),
       generate: (input) =>
         Ref.update(guideRequests, (recorded) => [...recorded, input]).pipe(
           Effect.andThen(
@@ -206,9 +293,10 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
         ),
     }),
     Layer.mock(Orchestrator.OrchestratorV2)({
-      getThreadShell: (id) =>
-        Effect.succeed(id === THREAD_ID && thread ? v2PullRequestThread(thread) : null),
-      dispatch,
+      getThreadShell:
+        options.getThreadShell ??
+        ((id) => Effect.succeed(id === THREAD_ID && thread ? v2PullRequestThread(thread) : null)),
+      dispatch: options.dispatch ?? dispatch,
     }),
     Layer.succeed(Crypto.Crypto, testCrypto),
     options.callerLayer ?? McpToolAccessTestkit.liveThreadsLayer,
@@ -224,6 +312,7 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
     name: Name,
     params: Parameters<typeof toolkit.handle<Name>>[1],
     capabilities: ReadonlyArray<McpInvocationContext.McpCapability> = ["pull-requests"],
+    scope: McpInvocationContext.McpInvocationScope = invocation(capabilities),
   ) =>
     toolkit.handle(name, params).pipe(
       Stream.unwrap,
@@ -231,80 +320,198 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
       Effect.map(
         (chunk) => chunk.at(-1)!.result as Tool.Success<(typeof PullRequestsToolkit.tools)[Name]>,
       ),
-      Effect.provideService(McpInvocationContext.McpInvocationContext, invocation(capabilities)),
+      Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
       Effect.provide(layerDependencies),
     );
-  return { commands, guideRequests, call };
+  return { commands, detailRequests, guideRequests, call };
 });
 
 describe("pull request toolkit handlers", () => {
-  it.effect("links a delegated caller's PR while the background reader is pinned", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "delegated-pr-caller-" });
-      yield* Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        yield* sql`PRAGMA journal_mode = WAL`;
-        yield* sql`CREATE TABLE entries(value INTEGER)`;
-        yield* sql`INSERT INTO entries VALUES (1)`;
-        const held = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<void>();
-        const holder = yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              yield* sql`SELECT * FROM entries`;
-              yield* Deferred.succeed(held, undefined);
-              yield* Deferred.await(release);
-            }),
-          )
-          .pipe(SqliteClient.readOnly, SqliteClient.backgroundReads, Effect.forkChild);
-        yield* Deferred.await(held);
-        let callerReads = 0;
-        const harness = yield* makeHarness({
-          callerLayer: Layer.mock(ThreadManagement.ThreadManagementService)({
-            getCallerRow: (id) =>
-              Effect.gen(function* () {
-                expect(yield* SqliteClient.ReaderLane).toBe("foreground");
-                yield* sql
-                  .withTransaction(sql`SELECT * FROM entries`)
-                  .pipe(SqliteClient.readOnly, Effect.orDie);
-                callerReads++;
-                return {
-                  ...McpToolAccessTestkit.liveThreadShell(id),
-                  forkedFrom: { type: "node" as const, nodeId: NodeId.make("delegated-task") },
-                };
-              }),
-            getThreadShell: () => Effect.die("live delegated caller must not load its full shell"),
-          }),
-        });
+  it.effect(
+    "links a delegated caller's PR through handler and dispatch reads while the background reader is pinned",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "delegated-pr-caller-" });
         yield* Effect.gen(function* () {
-          const result = yield* harness.call("link_pull_request", {
-            url: "https://github.com/t3tools/t3code/pull/123",
-          });
-          expect(result.alreadyLinked).toBe(false);
-          expect(yield* Ref.get(harness.commands)).toMatchObject([
-            {
-              type: "thread.pull-request.link",
-              threadId: THREAD_ID,
-              number: 123,
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`PRAGMA journal_mode = WAL`;
+          yield* sql`CREATE TABLE entries(value INTEGER)`;
+          yield* sql`INSERT INTO entries VALUES (1)`;
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const holder = yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* sql`SELECT * FROM entries`;
+                yield* Deferred.succeed(held, undefined);
+                yield* Deferred.await(release);
+              }),
+            )
+            .pipe(SqliteClient.readOnly, SqliteClient.backgroundReads, Effect.forkChild);
+          yield* Deferred.await(held);
+          const milestone = yield* Deferred.make<"linked" | "background-slot">();
+          const tracer = Tracer.make({
+            span(options) {
+              const span = new Tracer.NativeSpan(options);
+              const attribute = span.attribute.bind(span);
+              span.attribute = (key, value) => {
+                attribute(key, value);
+                if (
+                  key === "db.reader.acquire_stage" &&
+                  value === "slot" &&
+                  span.attributes.get("db.reader.requested_lane") === "background"
+                )
+                  Deferred.doneUnsafe(milestone, Effect.succeed("background-slot"));
+              };
+              return span;
             },
-          ]);
-          expect(callerReads).toBe(1);
-          expect(yield* Deferred.isDone(release)).toBe(false);
-        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
-        yield* Fiber.join(holder);
-      }).pipe(
-        Effect.provide(
-          SqliteClient.layer({
-            filename: path.join(directory, "state.sqlite"),
-            readerWorker: true,
-            foregroundReaderSlots: 1,
-            backgroundReaderSlots: 1,
-          }),
+          });
+          let callerReads = 0;
+          const stages: Array<string> = [];
+          const read = (stage: string) =>
+            Effect.gen(function* () {
+              yield* sql`SELECT * FROM entries`.pipe(SqliteClient.readOnly, Effect.orDie);
+              stages.push(stage);
+            });
+          const harness = yield* makeHarness({
+            getThreadShell: () =>
+              read("thread").pipe(Effect.as(v2PullRequestThread(makeThread([])))),
+            getProjectShell: () => read("project").pipe(Effect.as(Option.some(makeProject()))),
+            dispatch: (command) =>
+              Effect.gen(function* () {
+                yield* read("receipt");
+                yield* sql.withTransaction(sql`INSERT INTO entries VALUES (2)`).pipe(Effect.orDie);
+                expect(yield* Deferred.isDone(release)).toBe(false);
+                expect(command.type).toBe("thread.pull-request.link");
+                return { sequence: 1, storedEvents: [] };
+              }),
+            callerLayer: Layer.mock(ThreadManagement.ThreadManagementService)({
+              getCallerRow: (id) =>
+                Effect.gen(function* () {
+                  expect(yield* SqliteClient.ReaderLane).toBe("identity");
+                  yield* sql
+                    .withTransaction(sql`SELECT * FROM entries`)
+                    .pipe(SqliteClient.readOnly, Effect.orDie);
+                  callerReads++;
+                  return {
+                    ...McpToolAccessTestkit.liveThreadShell(id),
+                    forkedFrom: { type: "node" as const, nodeId: NodeId.make("delegated-task") },
+                  };
+                }),
+              getThreadShell: () =>
+                Effect.die("live delegated caller must not load its full shell"),
+            }),
+          });
+          const pending = yield* harness
+            .call("link_pull_request", {
+              url: "https://github.com/t3tools/t3code/pull/123",
+            })
+            .pipe(
+              Effect.tap(() => Deferred.succeed(milestone, "linked")),
+              Effect.provideService(Statement.SpanPropagationEnabled, true),
+              Effect.withTracer(tracer),
+              Effect.forkChild,
+            );
+          yield* Effect.gen(function* () {
+            expect(yield* Deferred.await(milestone)).toBe("linked");
+            const result = yield* Fiber.join(pending);
+            expect(result.alreadyLinked).toBe(false);
+            expect(stages).toEqual(["thread", "project", "receipt"]);
+            expect(callerReads).toBe(1);
+            expect(yield* Deferred.isDone(release)).toBe(false);
+          }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+          yield* Fiber.join(holder);
+        }).pipe(
+          Effect.provide(
+            SqliteClient.layer({
+              filename: path.join(directory, "state.sqlite"),
+              readerWorker: true,
+              identityReaderProcess: true,
+              foregroundReaderSlots: 1,
+              backgroundReaderSlots: 1,
+            }),
+          ),
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect.each([
+    "link_pull_request",
+    "unlink_pull_request",
+    "watch_pull_request",
+    "unwatch_pull_request",
+  ] as const)("%s records successful saved state and phase durations", (tool) =>
+    Effect.gen(function* () {
+      const readEntered = yield* Deferred.make<void>();
+      const readRelease = yield* Deferred.make<void>();
+      const dispatchEntered = yield* Deferred.make<void>();
+      const dispatchRelease = yield* Deferred.make<void>();
+      const resultEntered = yield* Deferred.make<void>();
+      const resultRelease = yield* Deferred.make<void>();
+      const watching = tool === "watch_pull_request" || tool === "unwatch_pull_request";
+      const shell = v2PullRequestThread(
+        makeThread(
+          tool === "unlink_pull_request"
+            ? [makeLink(9)]
+            : tool === "unwatch_pull_request"
+              ? [makeLink(9, { watch })]
+              : [],
         ),
       );
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      let reads = 0;
+      const harness = yield* makeHarness({
+        getThreadShell: () =>
+          (++reads === 1
+            ? Deferred.succeed(readEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(readRelease)),
+              )
+            : Deferred.succeed(resultEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(resultRelease)),
+              )
+          ).pipe(Effect.as(shell)),
+        dispatch: () =>
+          Deferred.succeed(dispatchEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(dispatchRelease)),
+            Effect.as({ sequence: 1, storedEvents: [] }),
+          ),
+      });
+      const callState = McpCall.McpCall.of({
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        saved: "unknown",
+      });
+      const pending = yield* harness
+        .call(tool, { repository: "t3tools/t3code", number: 9 })
+        .pipe(Effect.provideService(McpCall.McpCall, callState), Effect.forkChild);
+      yield* Deferred.await(readEntered);
+      yield* TestClock.adjust("100 millis");
+      yield* Deferred.succeed(readRelease, undefined);
+      yield* Deferred.await(dispatchEntered);
+      yield* TestClock.adjust("200 millis");
+      yield* Deferred.succeed(dispatchRelease, undefined);
+      if (watching) {
+        yield* Deferred.await(resultEntered);
+        yield* TestClock.adjust("300 millis");
+        yield* Deferred.succeed(resultRelease, undefined);
+      }
+      const result = yield* Fiber.join(pending);
+      expect(callState.replyPhases).toEqual({
+        admission: 0,
+        read: 100,
+        mutate: 200,
+        ack: watching ? 300 : 0,
+      });
+      expect(
+        McpCall.callOutcome(
+          Exit.succeed({ content: [{ type: "text" as const, text: JSON.stringify(result) }] }),
+          callState,
+        ),
+      ).toMatchObject({ outcome: "ok", saved: true });
+    }),
   );
 
   it.effect("refuses a credential without the pull-requests capability", () =>
@@ -348,6 +555,169 @@ describe("pull request toolkit handlers", () => {
     }),
   );
 
+  it.effect.each(["cli-missing", "cli-unauthenticated", "provider-unsupported"] as const)(
+    "watch preflight refuses an unavailable host (%s) without dispatching",
+    (reason) =>
+      Effect.gen(function* () {
+        const thread = makeThread([makeLink(9)]);
+        const unavailable = new PullRequestUnavailableError({
+          reason,
+          provider: SourceControlProviderKind.make("github"),
+        });
+        const harness = yield* makeHarness({ thread, detail: () => Effect.fail(unavailable) });
+        const error = yield* harness
+          .call("watch_pull_request", {
+            url: "https://github.com/T3Tools/T3Code/pull/9/files",
+          })
+          .pipe(Effect.flip);
+        expect(error).toMatchObject({
+          _tag: "PullRequestWatchUnavailableError",
+          host: "github.com",
+          reason,
+        });
+        expect(error.message).toContain(unavailable.message);
+        expect(error.message).toContain(
+          "The watch was not started; check the PR with your own tools instead.",
+        );
+        expect(yield* Ref.get(harness.commands)).toEqual([]);
+        expect(thread.pullRequests?.[0]?.watch).toBeUndefined();
+        expect(yield* Ref.get(harness.detailRequests)).toEqual([
+          {
+            projectId: PROJECT_ID,
+            host: "github.com",
+            repository: "t3tools/t3code",
+            number: 9,
+            allowStale: false,
+          },
+        ]);
+      }),
+  );
+
+  it.effect.each(["rate-limited", "failed"] as const)(
+    "watch preflight registers despite a transient provider error (%s)",
+    (reason) =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          detail: () =>
+            Effect.fail(
+              new PullRequestOperationError({
+                operation: "detail",
+                detail:
+                  reason === "failed"
+                    ? "The GitHub CLI could not hand over a credential"
+                    : "Rate limited",
+                cause: new PullRequestProviderError({
+                  provider: SourceControlProviderKind.make("github"),
+                  operation: "getChangeRequest",
+                  reason,
+                  detail: "Transient gh spawn or host failure",
+                }),
+              }),
+            ),
+        });
+        yield* harness.call("watch_pull_request", { repository: "t3tools/t3code", number: 9 });
+        expect(yield* Ref.get(harness.detailRequests)).toHaveLength(1);
+        expect(yield* Ref.get(harness.commands)).toMatchObject([
+          { type: "thread.pull-request.watch", watching: true },
+        ]);
+      }),
+  );
+
+  it.effect("watch preflight times out and still dispatches before the operation deadline", () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        detail: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      const pending = yield* harness
+        .call("watch_pull_request", {
+          repository: "t3tools/t3code",
+          number: 9,
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("3 seconds");
+      expect(yield* Fiber.join(pending)).toMatchObject({ wasWatching: false });
+      expect(yield* Ref.get(harness.commands)).toMatchObject([
+        { type: "thread.pull-request.watch", watching: true },
+      ]);
+    }),
+  );
+
+  it.effect.each(["ok", "unavailable", "skipped-error", "timeout"] as const)(
+    "watch preflight records %s and logs only refusals",
+    (outcome) =>
+      Effect.gen(function* () {
+        const spans: Tracer.NativeSpan[] = [];
+        const logs: unknown[] = [];
+        const tracer = Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            spans.push(span);
+            return span;
+          },
+        });
+        const entered = yield* Deferred.make<void>();
+        const harness = yield* makeHarness({
+          detail: () =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined);
+              switch (outcome) {
+                case "unavailable":
+                  return yield* new PullRequestUnavailableError({ reason: "cli-missing" });
+                case "skipped-error":
+                  return yield* new PullRequestOperationError({
+                    operation: "detail",
+                    detail: "Rate limited",
+                  });
+                case "timeout":
+                  return yield* Effect.never;
+                case "ok":
+                  return READABLE_PR;
+              }
+            }),
+        });
+        const pending = yield* harness
+          .call("watch_pull_request", { repository: "t3tools/t3code", number: 9 })
+          .pipe(
+            Effect.result,
+            Effect.withTracer(tracer),
+            Effect.provide(
+              Logger.layer([
+                Logger.make(({ message }) => {
+                  logs.push(message);
+                }),
+              ]),
+            ),
+            Effect.forkChild,
+          );
+        yield* Deferred.await(entered);
+        if (outcome === "timeout") yield* TestClock.adjust("3 seconds");
+        yield* Fiber.join(pending);
+        expect(
+          spans
+            .find((span) => span.name === "PullRequestsToolkit.setWatching")
+            ?.attributes.get("pullRequest.watch.preflight"),
+        ).toBe(outcome);
+        expect(logs).toEqual(
+          outcome === "unavailable"
+            ? [
+                [
+                  "pull request watch preflight refused",
+                  {
+                    host: "github.com",
+                    repository: "t3tools/t3code",
+                    number: 9,
+                    reason: "cli-missing",
+                    threadId: THREAD_ID,
+                  },
+                ],
+              ]
+            : [],
+        );
+      }),
+  );
+
   it.effect("watching an unlinked pull request links it first", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
@@ -366,26 +736,567 @@ describe("pull request toolkit handlers", () => {
     }),
   );
 
+  for (const tool of ["link_pull_request", "unlink_pull_request"] as const) {
+    it.effect.each(["thread", "project", "dispatch", "masked dispatch"] as const)(
+      `${tool} bounds a stalled $0 and reports whether a write may have started`,
+      (stage) =>
+        Effect.gen(function* () {
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const exited = yield* Deferred.make<void>();
+          const blocked = Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.ensuring(Deferred.succeed(exited, undefined)),
+          );
+          const shell = v2PullRequestThread(
+            makeThread(tool === "unlink_pull_request" ? [makeLink(9)] : []),
+          );
+          const harness = yield* makeHarness({
+            getThreadShell: () =>
+              stage === "thread" ? blocked.pipe(Effect.as(shell)) : Effect.succeed(shell),
+            getProjectShell: () =>
+              stage === "project"
+                ? blocked.pipe(Effect.as(Option.some(makeProject())))
+                : Effect.succeed(Option.some(makeProject())),
+            dispatch: () =>
+              (stage === "masked dispatch" ? Effect.uninterruptible(blocked) : blocked).pipe(
+                Effect.as({ sequence: 1, storedEvents: [] }),
+              ),
+          });
+          const callState = McpCall.McpCall.of({
+            callerResolved: true,
+            callerResolveMs: 0,
+            readerLane: "foreground",
+            phase: "handler",
+            saved: "unknown",
+          });
+          const pending = yield* harness
+            .call(tool, { repository: "t3tools/t3code", number: 9 })
+            .pipe(Effect.provideService(McpCall.McpCall, callState), Effect.flip, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust(McpDeadline.OPERATION_TIMEOUT);
+          const saved = stage.includes("dispatch") ? "unknown" : false;
+          const error = yield* Fiber.join(pending);
+          expect(error).toMatchObject({ _tag: "PullRequestToolTimeoutError", tool, saved });
+          expect(error.message).toContain("list_thread_pull_requests to check before retrying");
+          expect(error.message).toContain("is safe (it is a no-op");
+          expect(error.message).toContain(
+            saved === false ? "Nothing was saved" : "may have been saved",
+          );
+          expect(callState).toMatchObject({
+            saved,
+            phase: stage.includes("dispatch") ? "dispatch" : "handler",
+          });
+          const replyPhases = { ...callState.replyPhases };
+          expect(replyPhases[stage.includes("dispatch") ? "mutate" : "read"]).toBe(10000);
+          yield* Deferred.succeed(release, undefined);
+          yield* Deferred.await(exited);
+          expect(callState.replyPhases).toEqual(replyPhases);
+        }),
+    );
+
+    it.effect.each(["same thread", "other thread", "oauth"] as const)(
+      `${tool} includes an explicit target's $0 access checks in its deadline`,
+      (credential) =>
+        Effect.gen(function* () {
+          const entered = yield* Deferred.make<void>();
+          const target = credential === "same thread" ? THREAD_ID : ThreadId.make("target-thread");
+          let permissionReads = 0;
+          let handlerReads = 0;
+          const blocked = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+          const scope =
+            credential === "oauth"
+              ? {
+                  ...invocation(["pull-requests"]),
+                  thread: undefined,
+                  client: { sessionId: "session", label: "test", access: "full-access" as const },
+                }
+              : invocation(["pull-requests"]);
+          const harness = yield* makeHarness({
+            callerLayer: Layer.mock(ThreadManagement.ThreadManagementService)({
+              getCallerRow: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
+              getThreadShell: () => {
+                permissionReads++;
+                return blocked;
+              },
+            }),
+            getThreadShell: () => {
+              handlerReads++;
+              return blocked;
+            },
+          });
+          const pending = yield* harness
+            .call(
+              tool,
+              {
+                threadId: target,
+                repository: "t3tools/t3code",
+                number: 9,
+              },
+              ["pull-requests"],
+              scope,
+            )
+            .pipe(Effect.flip, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust(McpDeadline.OPERATION_TIMEOUT);
+          expect(yield* Fiber.join(pending)).toMatchObject({
+            _tag: "PullRequestToolTimeoutError",
+            tool,
+            saved: false,
+          });
+          expect(permissionReads).toBe(credential === "same thread" ? 0 : 1);
+          expect(handlerReads).toBe(credential === "same thread" ? 1 : 0);
+          expect(yield* Ref.get(harness.commands)).toEqual([]);
+        }),
+    );
+  }
+
+  it.effect.each(["implicit", "explicit"] as const)(
+    "list bounds a stalled thread read with an %s target",
+    (target) =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        const harness = yield* makeHarness({
+          getThreadShell: () =>
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        });
+        const pending = yield* harness
+          .call(
+            "list_thread_pull_requests",
+            target === "explicit" ? { threadId: ThreadId.make("other-thread") } : {},
+          )
+          .pipe(Effect.flip, Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust(McpDeadline.OPERATION_TIMEOUT);
+        const error = yield* Fiber.join(pending);
+        expect(error).toMatchObject({
+          _tag: "PullRequestToolTimeoutError",
+          tool: "list_thread_pull_requests",
+          saved: false,
+        });
+        expect(error.message).toContain("Server busy, nothing changed; retry shortly");
+        expect(yield* Ref.get(harness.commands)).toEqual([]);
+      }),
+  );
+
+  it.effect.each(["write_pull_request_guides", "read_pull_request_guide"] as const)(
+    "%s bounds its caller thread lookup",
+    (tool) =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        const harness = yield* makeHarness({
+          getThreadShell: () =>
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        });
+        const target = { repository: "t3tools/t3code", number: 9 };
+        const pending = yield* (
+          tool === "write_pull_request_guides"
+            ? harness.call(tool, { pullRequests: [target] }).pipe(Effect.asVoid)
+            : harness.call(tool, target).pipe(Effect.asVoid)
+        ).pipe(Effect.flip, Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust(McpDeadline.OPERATION_TIMEOUT);
+        expect(yield* Fiber.join(pending)).toMatchObject({
+          _tag: "PullRequestToolTimeoutError",
+          tool,
+          saved: false,
+        });
+        expect(yield* Ref.get(harness.guideRequests)).toEqual([]);
+      }),
+  );
+
+  it.effect("guide reads bound the stored-guide service too", () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        getGuide: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      const pending = yield* harness
+        .call("read_pull_request_guide", {
+          repository: "t3tools/t3code",
+          number: 9,
+        })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(McpDeadline.OPERATION_TIMEOUT);
+      expect(yield* Fiber.join(pending)).toMatchObject({
+        _tag: "PullRequestToolTimeoutError",
+        tool: "read_pull_request_guide",
+        saved: false,
+      });
+    }),
+  );
+
+  it.effect.each(["link_pull_request", "unlink_pull_request"] as const)(
+    "%s keeps the remaining budget after a target permission read",
+    (tool) =>
+      Effect.gen(function* () {
+        const target = ThreadId.make("target-thread");
+        const permissionStarted = yield* Deferred.make<void>();
+        const finishPermission = yield* Deferred.make<void>();
+        const handlerStarted = yield* Deferred.make<void>();
+        const harness = yield* makeHarness({
+          callerLayer: Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
+            getThreadShell: () =>
+              Deferred.succeed(permissionStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(finishPermission)),
+                Effect.as(McpToolAccessTestkit.liveThreadShell(target)),
+              ),
+          }),
+          getThreadShell: () =>
+            Deferred.succeed(handlerStarted, undefined).pipe(Effect.andThen(Effect.never)),
+        });
+        const pending = yield* harness
+          .call(tool, {
+            threadId: target,
+            repository: "t3tools/t3code",
+            number: 9,
+          })
+          .pipe(Effect.flip, Effect.forkChild);
+        yield* Deferred.await(permissionStarted);
+        yield* TestClock.adjust("6 seconds");
+        yield* Deferred.succeed(finishPermission, undefined);
+        yield* Deferred.await(handlerStarted);
+        yield* TestClock.adjust("4 seconds");
+        expect(yield* Fiber.join(pending)).toMatchObject({
+          _tag: "PullRequestToolTimeoutError",
+          tool,
+          saved: false,
+        });
+        expect(yield* Ref.get(harness.commands)).toEqual([]);
+      }),
+  );
+
+  it.effect("guide generation timeout says runs may have started", () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        generate: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      const pending = yield* harness
+        .call("write_pull_request_guides", {
+          pullRequests: [{ repository: "t3tools/t3code", number: 9 }],
+        })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(McpDeadline.OPERATION_TIMEOUT);
+      const error = yield* Fiber.join(pending);
+      expect(error).toMatchObject({
+        _tag: "PullRequestToolTimeoutError",
+        tool: "write_pull_request_guides",
+        saved: "unknown",
+      });
+      expect(error.message).toContain(
+        "read_pull_request_guide for each pull request before retrying",
+      );
+    }),
+  );
+
+  it.effect("re-watching preserves the existing watch without dispatching or reading back", () =>
+    Effect.gen(function* () {
+      let reads = 0;
+      const shell = v2PullRequestThread(makeThread([makeLink(9, { watch })]));
+      const harness = yield* makeHarness({
+        getThreadShell: () => {
+          reads++;
+          return reads === 1 ? Effect.succeed(shell) : Effect.die("unexpected read-back");
+        },
+      });
+      expect(
+        yield* harness.call("watch_pull_request", {
+          url: "https://github.com/T3Tools/T3Code/pull/9/files",
+        }),
+      ).toMatchObject({ number: 9, watching: true, wasWatching: true, alreadyWatching: true });
+      expect(yield* Ref.get(harness.commands)).toEqual([]);
+      expect(reads).toBe(1);
+      expect(yield* Ref.get(harness.detailRequests)).toEqual([]);
+    }),
+  );
+
+  it.effect.each(["unlinked", "linked", "dismissed"] as const)(
+    "unwatching an unwatched $0 PR does not dispatch",
+    (state) =>
+      Effect.gen(function* () {
+        const links =
+          state === "unlinked"
+            ? []
+            : [
+                makeLink(
+                  9,
+                  state === "dismissed"
+                    ? {
+                        source: "stack-dismissed",
+                        watch,
+                      }
+                    : {},
+                ),
+              ];
+        const harness = yield* makeHarness({ thread: makeThread(links) });
+        expect(
+          yield* harness.call("unwatch_pull_request", {
+            repository: "t3tools/t3code",
+            number: 9,
+          }),
+        ).toMatchObject({ watching: false, wasWatching: false, alreadyUnwatched: true });
+        expect(yield* Ref.get(harness.commands)).toEqual([]);
+      }),
+  );
+
+  it.effect("watching a dismissed link still dispatches to make it visible", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        thread: makeThread([makeLink(9, { source: "stack-dismissed", watch })]),
+      });
+      yield* harness.call("watch_pull_request", { repository: "t3tools/t3code", number: 9 });
+      expect(yield* Ref.get(harness.commands)).toMatchObject([
+        { type: "thread.pull-request.watch", watching: true },
+      ]);
+    }),
+  );
+
+  for (const tool of ["watch_pull_request", "unwatch_pull_request"] as const) {
+    it.effect.each(["thread", "project", "dispatch", "masked dispatch", "result"] as const)(
+      `${tool} bounds a stalled $0 with one deadline`,
+      (stage) =>
+        Effect.gen(function* () {
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const exited = yield* Deferred.make<void>();
+          const blocked = Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.ensuring(Deferred.succeed(exited, undefined)),
+          );
+          const shell = v2PullRequestThread(
+            makeThread(tool === "unwatch_pull_request" ? [makeLink(9, { watch })] : []),
+          );
+          let reads = 0;
+          const harness = yield* makeHarness({
+            getThreadShell: () => {
+              reads++;
+              return stage === "thread" || (stage === "result" && reads === 2)
+                ? blocked.pipe(Effect.as(shell))
+                : Effect.succeed(shell);
+            },
+            getProjectShell: () =>
+              stage === "project"
+                ? blocked.pipe(Effect.as(Option.some(makeProject())))
+                : Effect.succeed(Option.some(makeProject())),
+            dispatch: () =>
+              (stage === "dispatch" || stage === "masked dispatch"
+                ? stage === "masked dispatch"
+                  ? Effect.uninterruptible(blocked)
+                  : blocked
+                : Effect.void
+              ).pipe(Effect.as({ sequence: 1, storedEvents: [] })),
+          });
+          const pending = yield* harness
+            .call(tool, {
+              repository: "t3tools/t3code",
+              number: 9,
+            })
+            .pipe(Effect.flip, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust(McpDeadline.OPERATION_TIMEOUT);
+          const error = yield* Fiber.join(pending);
+          const saved = stage === "result" ? true : stage.includes("dispatch") ? "unknown" : false;
+          expect(error).toMatchObject({ _tag: "PullRequestWatchTimeoutError", saved });
+          expect(error.message).toContain(
+            "list_thread_pull_requests to check watching before retrying",
+          );
+          expect(error.message).toContain("Do not call unwatch_pull_request");
+          expect(error.message).toContain(
+            saved === true
+              ? "was saved"
+              : saved === false
+                ? "Nothing was saved"
+                : "may have been saved",
+          );
+          // Release masked cleanup only after proving the timeout response did not wait for it.
+          yield* Deferred.succeed(release, undefined);
+          yield* Deferred.await(exited);
+        }),
+    );
+  }
+
+  for (const tool of ["watch_pull_request", "unwatch_pull_request"] as const) {
+    it.effect.each(["same thread", "other thread", "oauth"] as const)(
+      `${tool} bounds an explicit target for $0 credentials`,
+      (credential) =>
+        Effect.gen(function* () {
+          const entered = yield* Deferred.make<void>();
+          const target = credential === "same thread" ? THREAD_ID : ThreadId.make("target-thread");
+          let permissionReads = 0;
+          let handlerReads = 0;
+          const blocked = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+          const scope =
+            credential === "oauth"
+              ? {
+                  ...invocation(["pull-requests"]),
+                  requestNamespace: "client:session",
+                  thread: undefined,
+                  client: { sessionId: "session", label: "test", access: "full-access" as const },
+                }
+              : invocation(["pull-requests"]);
+          const harness = yield* makeHarness({
+            callerLayer: Layer.mock(ThreadManagement.ThreadManagementService)({
+              getCallerRow: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
+              getThreadShell: () => {
+                permissionReads++;
+                return blocked;
+              },
+            }),
+            getThreadShell: () => {
+              handlerReads++;
+              return blocked;
+            },
+          });
+          const pending = yield* harness
+            .call(
+              tool,
+              {
+                threadId: target,
+                repository: "t3tools/t3code",
+                number: 9,
+              },
+              ["pull-requests"],
+              scope,
+            )
+            .pipe(Effect.flip, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust(McpDeadline.OPERATION_TIMEOUT);
+          expect(yield* Fiber.join(pending)).toMatchObject({
+            _tag: "PullRequestWatchTimeoutError",
+            saved: false,
+          });
+          expect(permissionReads).toBe(credential === "same thread" ? 0 : 1);
+          expect(handlerReads).toBe(credential === "same thread" ? 1 : 0);
+          expect(yield* Ref.get(harness.commands)).toEqual([]);
+        }),
+    );
+  }
+
+  it.effect.each(["watch_pull_request", "unwatch_pull_request"] as const)(
+    "%s preserves the OAuth write permission check",
+    (tool) =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        const error = yield* harness
+          .call(
+            tool,
+            {
+              threadId: THREAD_ID,
+              repository: "t3tools/t3code",
+              number: 9,
+            },
+            ["pull-requests"],
+            {
+              ...invocation(["pull-requests"]),
+              thread: undefined,
+              client: { sessionId: "session", label: "test", access: "read-only" },
+            },
+          )
+          .pipe(Effect.flip);
+        expect(error).toMatchObject({ _tag: "OrchestratorMcpFailure", code: "capability_denied" });
+        expect(yield* Ref.get(harness.commands)).toEqual([]);
+      }),
+  );
+
+  it.effect.each(["thread", "oauth"] as const)(
+    "keeps the remaining budget after a $0 target permission read",
+    (credential) =>
+      Effect.gen(function* () {
+        const target = ThreadId.make("target-thread");
+        const permissionStarted = yield* Deferred.make<void>();
+        const finishPermission = yield* Deferred.make<void>();
+        const handlerStarted = yield* Deferred.make<void>();
+        const scope =
+          credential === "oauth"
+            ? {
+                ...invocation(["pull-requests"]),
+                thread: undefined,
+                client: { sessionId: "session", label: "test", access: "full-access" as const },
+              }
+            : invocation(["pull-requests"]);
+        const harness = yield* makeHarness({
+          callerLayer: Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
+            getThreadShell: () =>
+              Deferred.succeed(permissionStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(finishPermission)),
+                Effect.as(McpToolAccessTestkit.liveThreadShell(target)),
+              ),
+          }),
+          getThreadShell: () =>
+            Deferred.succeed(handlerStarted, undefined).pipe(Effect.andThen(Effect.never)),
+        });
+        const pending = yield* harness
+          .call(
+            "watch_pull_request",
+            {
+              threadId: target,
+              repository: "t3tools/t3code",
+              number: 9,
+            },
+            ["pull-requests"],
+            scope,
+          )
+          .pipe(Effect.flip, Effect.forkChild);
+        yield* Deferred.await(permissionStarted);
+        yield* TestClock.adjust("6 seconds");
+        yield* Deferred.succeed(finishPermission, undefined);
+        yield* Deferred.await(handlerStarted);
+        yield* TestClock.adjust("4 seconds");
+        expect(yield* Fiber.join(pending)).toMatchObject({
+          _tag: "PullRequestWatchTimeoutError",
+          saved: false,
+        });
+        expect(yield* Ref.get(harness.commands)).toEqual([]);
+      }),
+  );
+
+  it.effect("shares one timeout budget between lookup and a never-completing dispatch", () =>
+    Effect.gen(function* () {
+      const readStarted = yield* Deferred.make<void>();
+      const finishRead = yield* Deferred.make<void>();
+      const dispatchStarted = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        getThreadShell: () =>
+          Deferred.succeed(readStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(finishRead)),
+            Effect.as(v2PullRequestThread(makeThread([]))),
+          ),
+        dispatch: () =>
+          Deferred.succeed(dispatchStarted, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      const pending = yield* harness
+        .call("watch_pull_request", {
+          repository: "t3tools/t3code",
+          number: 9,
+        })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(readStarted);
+      yield* TestClock.adjust("6 seconds");
+      yield* Deferred.succeed(finishRead, undefined);
+      yield* Deferred.await(dispatchStarted);
+      yield* TestClock.adjust("4 seconds");
+      expect(yield* Fiber.join(pending)).toMatchObject({
+        _tag: "PullRequestWatchTimeoutError",
+        saved: "unknown",
+      });
+    }),
+  );
+
   it.effect("refuses to watch a merged pull request and stops an existing watch", () =>
     Effect.gen(function* () {
-      const watch = {
-        startedAt: "2026-08-20T00:00:00.000Z",
-        headSha: null,
-        failedChecks: [],
-        passed: false,
-        passedChecks: [],
-        passedPending: [],
-        remarksThrough: "2026-08-20T00:00:00.000Z",
-        remarkIds: [],
-        conflicting: false,
-        conflictHead: null,
-        conflictWokeFor: null,
-        wakes: 0,
-      };
       const merged = makeLink(1, { headBranch: "done" });
       const harness = yield* makeHarness({
         thread: makeThread([
-          { ...merged, snapshot: merged.snapshot && { ...merged.snapshot, state: "merged" } },
+          {
+            ...merged,
+            watch,
+            snapshot: merged.snapshot && { ...merged.snapshot, state: "merged" },
+          },
           makeLink(2, { headBranch: "idle" }),
           makeLink(3, { headBranch: "watched", watch }),
         ]),
@@ -422,7 +1333,7 @@ describe("pull request toolkit handlers", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness({
         thread: {
-          ...makeThread([makeLink(1, { headBranch: "feature" })]),
+          ...makeThread([makeLink(1, { headBranch: "feature", watch })]),
           lineage: {
             rootThreadId: ThreadId.make("parent"),
             parentThreadId: ThreadId.make("parent"),
@@ -579,6 +1490,7 @@ describe("pull request toolkit handlers", () => {
         url: "https://github.com/t3tools/t3code/pull/123",
       });
       expect(result.alreadyLinked).toBe(true);
+      expect(yield* Ref.get(harness.commands)).toEqual([]);
     }),
   );
 
@@ -729,7 +1641,7 @@ describe("pull request guide tools", () => {
               remoteName: "origin",
               remoteUrl: "git@github.com:acme/web.git",
             },
-            provider: "github",
+            provider: SourceControlProviderKind.make("github"),
             displayName: "acme/web",
             owner: "acme",
             name: "web",

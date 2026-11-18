@@ -1,5 +1,6 @@
 """Command-shape corpus for repair decisions and dependency advice."""
 import json
+import shlex
 from pathlib import Path
 import sys
 import tempfile
@@ -7,6 +8,28 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from offbox_lib import command_usage as usage
+
+REPORTER_ARGVS = (
+    ['bash', '-c', 'set -e; cd integrations/memory-system/tests; for module in '
+     'test_recall_storage test_recall_refresh test_recall test_tool_logging test_recall_budget '
+     'test_card_mask_capture test_search_budgets test_robob_readonly; do RECALL_RULE_PREFLIGHT=1 '
+     'uv run --no-project --python 3.14 --with mcp==2.2.0 --with httpx python -m unittest "$module"; done'],
+    ['''set -e
+if ! command -v zsh >/dev/null; then sudo apt-get update -qq && sudo apt-get install -y -qq zsh; fi
+suite_fixture=$(mktemp -d)
+rsync -a --exclude .git --exclude node_modules --exclude tmp ./ "$suite_fixture/baseline/"
+printf "%s" "$BASELINE_ARCHIVE_B64" | base64 -d | tar -xz -C "$suite_fixture/baseline"
+rm -f "$suite_fixture/baseline/integrations/harness-hooks/tests/test_install.py"
+uv venv "$suite_fixture/venv"
+uv pip install --python "$suite_fixture/venv/bin/python" pytest==8.4.2
+"$suite_fixture/venv/bin/python" -m pytest "$suite_fixture/baseline/integrations/harness-hooks/tests"'''],
+    ['bash', '-c', 'set -euo pipefail; rm -rf build app/build .gradle build/native; mkdir -p build/itf; '
+     'source scripts/env.sh; ./gradlew --dependency-verification strict :app:assembleDebug :app:assembleRelease'],
+    ['bash', '-c', 'set -o pipefail; cd integrations/memory-system/tests && RECALL_RULE_PREFLIGHT=1 '
+     'RECALL_TOOL_LOG_DIR=$(mktemp -d) uv run --no-project --python 3.14 --with mcp==2.2.0 --with httpx '
+     'python -m unittest discover -p "test_*.py" 2>&1 | tee /tmp/recall-106-suite.log | '
+     'rg "^(FAIL|ERROR):|^Ran |^FAILED|^OK"'],
+)
 
 
 class CommandUsageTests(unittest.TestCase):
@@ -18,6 +41,112 @@ class CommandUsageTests(unittest.TestCase):
 
     def inspect(self, cmd, **kw):
         return usage.inspect(self.root, '.', [cmd], **kw)
+
+    def test_reporter_commands_are_not_js(self):
+        for argv in REPORTER_ARGVS:
+            with self.subTest(argv=argv):
+                result = usage.inspect(self.root, '.', argv)
+                self.assertFalse(result.uses_js)
+                self.assertEqual(result.packages, ())
+
+    def test_unknown_executables_and_opaque_non_js_bodies(self):
+        for command in ('./gradlew test', "bash -c 'make test'", 'cargo test',
+                        "bash -c 'python3 -m unittest | rg OK'", "bash -c 'eval \"$X\"'",
+                        'source scripts/env.sh', '. scripts/env.sh',
+                        'python3 test.py "$file"', 'X=$(mktemp -d) uv run python3 test.py',
+                        'unknown-tool x >out', '"$venv/bin/python" -m pytest'):
+            with self.subTest(command=command):
+                self.assertFalse(self.inspect(command).uses_js)
+                self.assertEqual(self.inspect(command).packages, ())
+        for command in ('X=$(mktemp -d) uv run python3 test.py npm', 'X="$(mktemp -d)" python3 test.py npm'):
+            self.assertFalse(usage.segments(command, self.root)[1])
+            self.assertFalse(self.inspect(command).uses_js)
+        for command in ("X=$(mktemp -d); bash -c 'python3 test.py npm'",
+                        'for t in $(printf x) npm; do python3 "$t"; done', 'set -- $(printf x) npm'):
+            self.assertFalse(self.inspect(command).uses_js)
+
+    def test_js_commands_and_opaque_js_words(self):
+        for command in ('npm test', './node_modules/.bin/vitest run', 'vite build',
+                        './test.js', './test.mjs', './test.cjs', './test.ts',
+                        'for t in "$(node -p process.version)"; do python3 "$t"; done',
+                        'set -- "$(node -p process.version)"; python3 x',
+                        '''bash -c 'for f in a b; do pnpm vitest run "$f"; done' ''',
+                        'x=$(mktemp -d)\nnpx vitest run', '''bash -c 'eval "npm test"' '''):
+            with self.subTest(command=command):
+                self.assertTrue(self.inspect(command).uses_js)
+
+    def test_opaque_js_word_boundaries(self):
+        for word, js in (('node_modules', False), ('my-node-thing', False), ('node.js', False),
+                         ('node2', False), ('2node', False), ('node_', False), ('_node', False),
+                         ('node', True), ('/usr/bin/node', True), ('npx vitest', True)):
+            with self.subTest(word=word):
+                self.assertEqual(self.inspect(f'eval "{word}"').uses_js, js)
+
+    def test_substitution_comment_and_quote_corpus(self):
+        cases = (
+            ('$(printf x # ) node\n)', False),
+            ('$(printf x # npm\n)', False),
+            ('"$(printf x # ) node\n)"', False),
+            ('$(printf "%s" "$(printf x # ) npm\n)")', False),
+            ('''"$(python3 -c "print('node.js')")"''', False),
+            ('''"$(python3 -c 'print("node.js")')"''', False),
+            ('''"$(python3 -c "print('node_modules')")"''', False),
+            ('''"$(python3 -c "print('my-node-thing')")"''', False),
+            ('"$(printf \'%s\' "$(printf \'node.js\')")"', False),
+            ('''"`python3 -c "print('node.js')"`"''', False),
+            ('''`python3 -c "print('node.js')"`''', False),
+            ('''"`python3 -c 'print("node.js")'`"''', False),
+            ('`printf x # npm\n`', False),
+            ('"`printf x # npm\n`"', False),
+            ('''"$(case x in x) python3 -c "print('node.js')";; esac)"''', False),
+            ('"$(case\\\n x in x) python3 -c "print(\'node.js\')";; esac)"', False),
+            ('"$(ca\\\nse x in x) python3 -c "print(\'node.js\')";; esac)"', False),
+            ('"$(printf "%s" "$\\\n{missing:-)}"; python3 -c "print(\'node.js\')")"', False),
+            ('"$(ca\\\nse x in x) npm root;; esac)"', True),
+            ('''"$(printf '%s' "${missing:-)}"; python3 -c "print('node.js')")"''', False),
+            ('''$(bash -c 'printf x # npm')''', False),
+            ('''`bash -c 'printf x # npm'`''', False),
+            ('''"$(bash -c 'printf x # npm')"''', False),
+            ('''"`bash -c 'printf x # npm'`"''', False),
+            ('''$(bash -c 'npm root # comment')''', True),
+            ('''`bash -c 'npm root # comment'`''', True),
+            ('$(printf x; # ) node\n printf y)', False),
+            ('$(printf x#node_modules)', False),
+            ('$(printf x#suffix; npm root)', True),
+            ('$(printf x # comment\n npm root)', True),
+            ('$(printf x "$(npm root)")', True),
+            ('$(npm root)', True),
+            ('"$(npm root)"', True),
+            ('`npm root`', True),
+            ('"`npm root`"', True),
+        )
+        for value, js in cases:
+            for command in (f'X={value} python3 -m pytest',
+                            f'for t in {value}; do python3 "$t"; done', f'set -- {value}'):
+                for form in (command, 'bash -c ' + shlex.quote(command)):
+                    with self.subTest(command=form):
+                        self.assertEqual(self.inspect(form).uses_js, js)
+
+    def test_control_forms_keep_body_cwd_and_ignore_for_word_lists(self):
+        web = self.root / 'apps/web'
+        web.mkdir(parents=True)
+        (web / 'package.json').write_text('{"dependencies":{"vitest":"1"}}')
+        for body in ('for t in a; do npx vitest "$t"; done',
+                     'for t in a; do for f in b; do npx vitest "$t" "$f"; done; done',
+                     'while test -f flag; do npx vitest; done',
+                     'until false; do npx vitest; done',
+                     'if true; then npx vitest; elif false; then python3 x; else true; fi',
+                     'set -x\nnpx vitest'):
+            with self.subTest(body=body):
+                result = self.inspect("bash -c 'cd apps/web && " + body + "'")
+                self.assertEqual(result.packages, (web,))
+        for command in ('for t in node npm; do python3 "$t"; done',
+                        'while true; do python3 test.py; done',
+                        'if true; then python3 test.py; else pytest x; fi'):
+            parsed, uncertain, _ = usage.segments(command, self.root)
+            self.assertFalse(uncertain)
+            self.assertFalse(self.inspect(command).uses_js)
+            self.assertNotIn('for', [s.words[0] for s in parsed if s.words])
 
     def test_first_words_and_wrappers(self):
         cases = [
@@ -31,16 +160,16 @@ class CommandUsageTests(unittest.TestCase):
             ('uv run --with x --python 3 go test x.go', True, False, ''),
             ('uv run --no-group python go version', True, False, ''),
             ('uv run --only-group python go version', True, False, ''),
-            ('uv run --unknown-option python go version', True, True, ''),
+            ('uv run --unknown-option python go version', True, False, ''),
             ('uvx go test x.go', True, False, ''),
             ('uv --project sub run go test x.go', True, False, ''),
             ('npx go test x.go', True, True, ''),
             ('npm exec go test x.go', True, True, ''),
-            ('uv run unknown-script', True, True, ''),
+            ('uv run unknown-script', True, False, ''),
             ('node -v\ngo test x.go', True, True, ''),
-            ('test "$(go env GOOS)" = linux', True, True, ''),
-            ('VALUE=$(go version) python3 x.py', True, True, ''),
-            ('VALUE=`go version` python3 x.py', True, True, ''),
+            ('test "$(go env GOOS)" = linux', True, False, ''),
+            ('VALUE=$(go version) python3 x.py', True, False, ''),
+            ('VALUE=`go version` python3 x.py', True, False, ''),
             ('uv run --with pytest python -m pytest x', False, False, ''),
             ('bash scripts/x.sh', True, False, ''),
             ('./scripts/x.sh', True, False, ''),
@@ -48,8 +177,8 @@ class CommandUsageTests(unittest.TestCase):
             ('bash -lc "go test ./pkg"', True, False, ''),
             ('node_modules/.bin/vitest run', False, True, ''),
             ('./node_modules/.bin/custom-tool', False, True, ''),
-            ('something-unknown test', True, True, ''),
-            ('"unterminated', True, True, ''),
+            ('something-unknown test', True, False, ''),
+            ('"unterminated', True, False, ''),
             ('cd "$PACKAGE" && vp test run', True, True, ''),
         ]
         for cmd, go, js, install in cases:
@@ -160,7 +289,7 @@ class CommandUsageTests(unittest.TestCase):
                     self.assertEqual(result.packages, ())
                     if command.startswith(('go', 'bash')) or '>' in suffix or '<' in suffix:
                         self.assertTrue(result.needs_go)
-        for command in ('node x', 'vp test run x', 'unknown-tool x'):
+        for command in ('node x', 'vp test run x'):
             for suffix in suffixes:
                 self.assertTrue(self.inspect(command + suffix).uses_js, command + suffix)
         self.assertTrue(self.inspect('python3 x # comment\nnode x').uses_js)
@@ -225,7 +354,7 @@ class CommandUsageTests(unittest.TestCase):
             with self.subTest(command=command):
                 result = self.inspect(command)
                 self.assertTrue(result.needs_go)
-                self.assertTrue(result.uses_js)
+                self.assertEqual(result.uses_js, "node -p" in command)
 
     def test_comment_uncertainty_keeps_nearest_zero_dependency_package(self):
         sub = self.root / 'sub'

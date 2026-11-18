@@ -256,6 +256,95 @@ it.effect("uses independent archive rowids when SQLite reuses a live rowid", () 
 
 // Jumping TestClock after the file layer starts replays its checkpoint schedule.
 // Real time also lets sleeps registered after worker replies complete normally.
+it.live("requires the matching archive snapshot to restore an install backup's point in time", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "archive-restore-" });
+    const current = path.join(dir, "current");
+    const backup = path.join(dir, "backup");
+    yield* fs.makeDirectory(current);
+    const open = (directory: string) =>
+      Layer.fresh(Sqlite.layerFromPath(path.join(directory, "statev2.sqlite")));
+    yield* Effect.scoped(seedRows.pipe(Effect.provide(open(current))));
+    // Only synthetic, closed files are copied. This is the install backup's point in time.
+    yield* fs.copy(current, backup);
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        for (const index of [5, 6]) {
+          yield* sql`INSERT INTO orchestration_events
+          (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+           actor_kind, payload_json, metadata_json, application_event_version)
+          VALUES (${`event:${index}`}, 'thread', 'old', ${index}, 'thread.metadata-updated',
+            '2020-01-01', 'server', '{}', '{}', 2)`;
+        }
+        yield* sql`INSERT INTO orchestration_v2_projection_turn_items
+          (turn_item_id, thread_id, ordinal, type, status, updated_at, payload_json)
+          VALUES ('future-item', 'old', 2, 'assistant_message', 'completed', '2020-01-01', '{"text":"future"}')`;
+        for (let pass = 0; pass < 12; pass++) yield* archiveHistoryPass();
+        assert.deepEqual(
+          yield* sql`SELECT sequence FROM ardud_archive.ardud_events ORDER BY sequence`,
+          [2, 3, 4, 5].map((sequence) => ({ sequence })),
+        );
+      }).pipe(Effect.provide(open(current))),
+    );
+    for (const matchingArchive of [false, true]) {
+      const restored = path.join(dir, matchingArchive ? "paired" : "main-only");
+      yield* fs.copy(backup, restored);
+      if (!matchingArchive) {
+        for (const name of yield* fs.readDirectory(current)) {
+          if (/^archive\.sqlite(?:-wal)?$/.test(name))
+            yield* fs.copyFile(path.join(current, name), path.join(restored, name));
+        }
+      }
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          assert.deepEqual(
+            yield* sql`SELECT identity FROM ardud_history_archive_identity`,
+            yield* sql`SELECT identity FROM ardud_archive.ardud_identity`,
+          );
+          const history = () =>
+            sql`SELECT sequence, event_id FROM ardud_history_events ORDER BY sequence`;
+          const items = () =>
+            sql`SELECT turn_item_id FROM ardud_history_turn_items ORDER BY turn_item_id`;
+          const expected = [1, 2, 3, 4, ...(matchingArchive ? [] : [5])].map((sequence) => ({
+            sequence,
+            event_id: `event:${sequence}`,
+          }));
+          // Overlaps are hidden, but the newer archive leaks post-backup data despite a valid binding.
+          assert.deepEqual(yield* history().pipe(NodeSqliteClient.readOnly), expected);
+          assert.deepEqual(
+            yield* items(),
+            matchingArchive
+              ? [{ turn_item_id: "item" }]
+              : [{ turn_item_id: "future-item" }, { turn_item_id: "item" }],
+          );
+          for (let pass = 0; pass < 12; pass++) yield* archiveHistoryPass();
+          assert.deepEqual(yield* history(), expected);
+          assert.deepEqual(
+            yield* sql`SELECT turn_item_id, COUNT(*) AS copies
+            FROM ardud_archive.ardud_turn_items GROUP BY turn_item_id ORDER BY turn_item_id`,
+            (matchingArchive ? ["item"] : ["future-item", "item"]).map((turn_item_id) => ({
+              turn_item_id,
+              copies: 1,
+            })),
+          );
+          if (matchingArchive) {
+            yield* sql`INSERT INTO orchestration_events
+              (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+               actor_kind, payload_json, metadata_json, application_event_version)
+              VALUES ('after-restore', 'thread', 'old', 5, 'thread.metadata-updated',
+                '2020-01-01', 'server', '{}', '{}', 2)`;
+            assert.deepEqual((yield* history()).at(-1), { sequence: 5, event_id: "after-restore" });
+          }
+        }).pipe(Effect.provide(open(restored))),
+      );
+    }
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live("attaches history on the file reader and preserves it across reopen", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -372,7 +461,7 @@ it.live("pins cold and hot snapshots before allowing a live shadow to be rearchi
 it("reads archive pacing from the environment with safe fallbacks", () => {
   assert.deepEqual(historyArchivePacing({}), {
     paused: false,
-    minIntervalMs: 250,
+    minIntervalMs: 5000,
     contentionMs: 1_000,
     backoffMs: 10_000,
     maxBackoffMs: 300_000,
@@ -398,7 +487,7 @@ it("reads archive pacing from the environment with safe fallbacks", () => {
     }),
     {
       paused: false,
-      minIntervalMs: 250,
+      minIntervalMs: 5000,
       contentionMs: 1_000,
       backoffMs: 20_000,
       maxBackoffMs: 20_000,
@@ -408,19 +497,38 @@ it("reads archive pacing from the environment with safe fallbacks", () => {
 
 it("never schedules passes back to back and doubles the backoff under contention", () => {
   const pacing = historyArchivePacing({});
-  // A quick pass waits the minimum gap; a long one waits at least its own duration.
-  assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 3, contendedStreak: 0 }), 250);
-  assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 4_000, contendedStreak: 0 }), 4_000);
+  // A quick pass waits the minimum gap; a long pass keeps a 10% duty cycle.
+  assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 3, contendedStreak: 0 }), 5000);
+  assert.equal(
+    nextHistoryArchiveDelayMs(pacing, { durationMs: 4_000, contendedStreak: 0 }),
+    36_000,
+  );
   assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 10, contendedStreak: 1 }), 10_000);
   assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 10, contendedStreak: 2 }), 20_000);
   assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 10, contendedStreak: 6 }), 300_000);
   assert.equal(nextHistoryArchiveDelayMs(pacing, { durationMs: 10, contendedStreak: 99 }), 300_000);
-  // The 140 s pass of 11 Nov 2026 would now be followed by at least 140 s of quiet.
+  // The 140 s pass of 11 Nov 2026 would now be followed by at least 1262 s of quiet.
   assert.equal(
     nextHistoryArchiveDelayMs(pacing, { durationMs: 140_237, contendedStreak: 1 }),
-    140_237,
+    1_262_133,
   );
 });
+
+it.effect("bounds each pass to four rows even when the row-work clock is fast", () =>
+  Effect.gen(function* () {
+    yield* seed;
+    const sql = yield* SqlClient.SqlClient;
+    for (let index = 5; index <= 30; index++) {
+      yield* sql`INSERT INTO orchestration_events
+        (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json, application_event_version)
+        VALUES (${`event:${index}`}, 'thread', 'old', ${index}, 'thread.metadata-updated', '2020-01-01', 'server', '{}', '{}', 2)`;
+    }
+    const pass = yield* runPass;
+    assert.equal(pass.moved, 4);
+    assert.deepEqual(yield* sql`SELECT COUNT(*) AS n FROM ardud_archive.ardud_events`, [{ n: 4 }]);
+    assert.deepEqual(yield* sql`SELECT COUNT(*) AS n FROM orchestration_events`, [{ n: 26 }]);
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
 
 const delayQuery =
   (pattern: RegExp, delay: Parameters<typeof Effect.sleep>[0]): Statement.Transformer =>
@@ -527,6 +635,9 @@ it.live("keeps hot rows until the worker reports the archive copy durable", () =
         // The live writer never runs F_FULLFSYNC for the archive (or main) itself.
         assert.deepEqual(yield* sql`PRAGMA fullfsync`, [{ fullfsync: 0 }]);
         assert.deepEqual(yield* sql`PRAGMA ardud_archive.synchronous`, [{ synchronous: 1 }]);
+        assert.deepEqual(yield* sql`PRAGMA ardud_archive.journal_size_limit`, [
+          { journal_size_limit: 33554432 },
+        ]);
         const real = yield* HistoryArchiveDurability;
         let barriers = 0;
         const refusing = HistoryArchiveDurability.of({

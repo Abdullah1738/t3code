@@ -1,3 +1,5 @@
+import { captureReplyCoverage, deliveredReplyCoverage, markAnswered, type AnsweredInput } from "./unanswered.ts";
+import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
@@ -33,6 +35,7 @@ export type OutboxOperation = {
   generation?: number;
   replyTo?: string;
   attachment?: FileAttachment;
+  healthReceipt?: HealthSidecar;
   /** SDK effect name, such as "confetti"; applies to the first text chunk only. */
   effect?: string;
   subject?: string;
@@ -138,6 +141,26 @@ export class Store {
       .get(...wanted) !== null;
   }
 
+  groupAudience(): string[] {
+    const rosters = this.db.query<{ rowid: number; participants: string }, []>(`SELECT rowid, json_extract(payload, '$.participants') AS participants
+      FROM inbound WHERE json_type(payload, '$.participants') = 'array'
+      AND json_array_length(payload, '$.participants') > 0 ORDER BY rowid DESC`);
+    let members: string[] = [];
+    let since = 0;
+    // Select and normalize in JS: SQLite TRIM does not recognize all JS whitespace.
+    // Exhaust the cached query before selecting a roster; Bun 1.4.1 leaves a broken-out iterator active.
+    for (const roster of rosters.all()) {
+      members = (JSON.parse(roster.participants) as unknown[])
+        .filter((address): address is string => typeof address === "string").map(address => address.trim()).filter(Boolean);
+      if (members.length) { since = roster.rowid; break; }
+    }
+    // Rosterless messages can reveal members added since the last reported roster.
+    const observed = this.db.query<{ sender: string }, [number]>(`SELECT DISTINCT json_extract(payload, '$.sender') AS sender
+      FROM inbound WHERE rowid >= ? AND json_type(payload, '$.sender') = 'text'
+      ORDER BY sender`).all(since).map(row => row.sender.trim()).filter(Boolean);
+    return [...new Set([...members, ...observed])];
+  }
+
   pendingInbound(): InboundRecord[] {
     return this.db.query<Omit<InboundRecord, "payload"> & { payload: string }, []>(
       "SELECT id, payload, state FROM inbound WHERE state IN ('pending', 'processing') ORDER BY rowid",
@@ -145,6 +168,13 @@ export class Store {
   }
 
   updateInbound(id: string, state: string, payload?: unknown, failure?: InboundFailure): void {
+    if (payload !== undefined) {
+      const previous = this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+      const saved = previous ? JSON.parse(previous.payload) as AnsweredInput : undefined;
+      if (saved?.answeredAt !== undefined || saved?.unanswered !== undefined) payload = { ...payload as object,
+        ...(saved.answeredAt !== undefined ? { answeredAt: saved.answeredAt } : {}),
+        ...(saved.unanswered ? { unanswered: { ...saved.unanswered, ...(payload as AnsweredInput).unanswered } } : {}) };
+    }
     const detail = failure ?? (state === "failed" ? { stage: "state-transition", message: "No failure detail supplied", threadId: null, at: Date.now() } : undefined);
     const result = this.db.query(`UPDATE inbound SET state = ?, payload = COALESCE(?, payload), failure = COALESCE(?, failure)
       WHERE id = ?`).run(state, payload === undefined ? null : json(payload), detail ? json(detail) : null, id);
@@ -173,6 +203,7 @@ export class Store {
       generation: op.generation, replyTo: op.replyTo,
       attachment: op.attachment ? { sha256: op.attachment.sha256, name: op.attachment.name,
         mimeType: op.attachment.mimeType, size: op.attachment.size } : undefined,
+      ...(op.healthReceipt ? { healthReceipt: op.healthReceipt } : {}),
       effect: op.effect, subject: op.subject,
       poll: op.poll ? { title: op.poll.title, options: [...op.poll.options] } : undefined,
       app: op.app ? { url: op.app.url, caption: op.app.caption, subcaption: op.app.subcaption,
@@ -183,6 +214,7 @@ export class Store {
       const result = this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
         ON CONFLICT(id) DO NOTHING`).run(op.id, payload);
       if (result.changes) {
+        captureReplyCoverage(this, op);
         if (op.app?.updateOf) this.set(`app-latest:${op.app.updateOf}`, op.id);
         toolLog.capture(() => {
           this.set(`log-queued:${op.id}`, Date.now());
@@ -265,6 +297,8 @@ export class Store {
         state = ?, providerId = COALESCE(?, providerId) WHERE id = ?`
       ).run(state, state, providerId ?? null, id);
       if (!result.changes) throw new Error(`Unknown outbox operation: ${id}`);
+      if (state === "sent") markAnswered(this, deliveredReplyCoverage(this, this.getOperation(id)!));
+      rememberHealthReceipt(this, id, state);
     }).immediate();
   }
 

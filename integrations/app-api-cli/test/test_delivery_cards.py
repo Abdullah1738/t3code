@@ -17,6 +17,49 @@ import order_tracker as t
 
 
 class CardTests(unittest.TestCase):
+    def test_items_preserve_separate_identifiers_and_aliases(self):
+        for aliases in ({'item_code': 'code', 'sku_config': 'config'},
+                        {'itemCode': 'code', 'skuConfig': 'config'}):
+            with self.subTest(aliases=aliases):
+                row = c.items([{'name': 'Wrap', 'sku': 'sku', 'item_id': 'id', **aliases}])[0]
+                self.assertEqual({key: row[key] for key in ('item_code', 'sku', 'sku_config', 'item_id')},
+                                 {'item_code': 'code', 'sku': 'sku', 'sku_config': 'config', 'item_id': 'id'})
+        plain = c.items([{'name': 'Wrap'}])[0]
+        self.assertFalse({'item_code', 'sku', 'sku_config', 'item_id'} & plain.keys())
+        for key in ('item_code', 'sku', 'sku_config', 'item_id'):
+            with self.subTest(key=key):
+                self.assertEqual(c.items([{'name': 'Wrap', key: ' x' * 100}])[0][key], c.text(' x' * 100, 80))
+        self.assertEqual(c.items([{'itemCode': 'code'}])[0]['name'], 'Item code')
+
+    def test_adding_item_ids_keeps_preview_hash_and_send_update_keys(self):
+        def preview(path, view):
+            path.write_bytes(b'fixture-preview')
+            return True
+
+        with patch.object(c, 'preview', side_effect=preview) as render, patch.object(c, 'log_render'):
+            path = self.owner_placement()
+            before = c.read(path)
+            folder = c.APPS / before['slug']
+            fingerprint = c.read(folder / 'preview-state.json')['hash']
+            send_args = before['send_args']
+            self.cfg['card_meta']['items'] = c.items([
+                {**self.cfg['card_meta']['items'][0], 'item_code': 'code', 'sku': 'sku',
+                 'sku_config': 'config', 'item_id': 'id'}])
+            calls = len(self.calls)
+            c.sync(self.cfg, self.data, send=True, update=True)
+            after = c.read(path)
+            self.assertEqual(c.read(folder / 'preview-state.json')['hash'], fingerprint)
+            self.assertEqual(render.call_count, 1)
+            self.assertEqual(after['send_args'], send_args)
+            self.assertEqual(after['bridge_id'], before['bridge_id'])
+            self.assertEqual(len(self.calls), calls)
+            self.data['status'] = 'preparing'
+            c.sync(self.cfg, self.data, update=True)
+            update = [args for args in self.calls if '--update-id' in args][-1]
+            key = send_args[send_args.index('--key') + 1]
+            self.assertEqual(update[update.index('--key') + 1],
+                             key + ':stage:' + hashlib.sha256(b'Preparing').hexdigest()[:24])
+
     def owner_placement(self, app='noon', vertical='food'):
         self.cfg.update(app=app, order='FTESTSTAGE1404', vertical=vertical, **{'for':'owner'})
         self.cfg['delivery_card']['chat'] = 'owner'
@@ -161,6 +204,11 @@ class CardTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.real_preview = c.preview
+        def preview(path, view):
+            path.write_bytes(b'fixture-preview')
+            return True
+        p = patch.object(c, 'preview', side_effect=preview); p.start(); self.addCleanup(p.stop)
         for obj, name, value in ((c, 'APPS', self.root/'apps'), (c, 'ROOT', self.root/'state'),
                                  (t, 'ROOT', self.root/'state'), (t, 'WATCHERS', self.root/'watchers'),
                                  (c, 'WATCHERS', self.root/'watchers')):
@@ -472,7 +520,7 @@ class CardTests(unittest.TestCase):
 
     def test_missing_pillow_and_renderer_still_publishes_and_sends(self):
         self.metadata_warnings = ['missing og:image']
-        with patch.dict(sys.modules, {'PIL': None}), patch.object(c, 'preview_chrome', return_value=False):
+        with patch.object(c, 'preview', side_effect=self.real_preview), patch.dict(sys.modules, {'PIL': None}), patch.object(c, 'preview_chrome', return_value=False):
             result = c.sync(self.cfg, self.data, send=True)
         self.assertEqual(result['status'], 'sent')
         folder = c.APPS / result['slug']
@@ -503,6 +551,7 @@ class CardTests(unittest.TestCase):
                     self.calls.clear()
                     with contextlib.ExitStack() as stack:
                         if not has_preview:
+                            stack.enter_context(patch.object(c, 'preview', side_effect=self.real_preview))
                             stack.enter_context(patch.dict(sys.modules, {'PIL': None}))
                             stack.enter_context(patch.object(c, 'preview_chrome', return_value=False))
                         result = c.sync(cfg, self.data, send=True)
@@ -983,12 +1032,18 @@ class RenderLoggingTests(unittest.TestCase):
         with patch.object(c, '_build', return_value={'has_preview': False}), patch.object(c, 'log_render') as log:
             self.assertFalse(c.build({}, {})['has_preview'])
             self.assertFalse(log.call_args.args[1])
+            self.assertEqual(log.call_args.kwargs['outcome'], 'fallback')
+            self.assertEqual(log.call_args.kwargs['failure_code'], 'preview_missing')
         with patch.object(c, '_build', side_effect=ValueError('PRIVATE_CARD')), patch.object(c, 'log_render') as log:
             with self.assertRaises(ValueError):
                 c.build({}, {})
             self.assertFalse(log.call_args.args[1])
+            self.assertEqual(log.call_args.kwargs['outcome'], 'failed')
+            self.assertEqual(log.call_args.kwargs['failure_code'], 'render_exception')
         with patch.object(c.subprocess, 'Popen') as child, patch.object(c.threading, 'Thread'):
-            c.log_render(time.monotonic(), False)
+            c.log_render(time.monotonic(), False, chat='+971501234567 /private/PRIVATE https://private/?token=PRIVATE', failure_code='PRIVATE')
             self.assertEqual(child.call_args.args[0][2:5], ['log-card-render', '--kind', 'delivery'])
+            self.assertNotIn('PRIVATE', str(child.call_args))
+            self.assertIn('renderer_failed', child.call_args.args[0])
         with patch.object(c.subprocess, 'Popen', side_effect=OSError('unavailable')):
             c.log_render(time.monotonic(), True)

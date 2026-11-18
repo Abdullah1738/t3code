@@ -208,3 +208,37 @@ it.effect("keeps a committed acknowledgement when the timer runs after the deadl
     }),
   ).pipe(Effect.provide(NodeCrypto.layer)),
 );
+
+it.effect(
+  "notifies internal commit observers without an MCP deadline lease before later reads fail",
+  () =>
+    Effect.gen(function* () {
+      let accepted = false;
+      const saved: OrchestratorMcpThreadSendResult = {
+        threadId: ThreadId.make("thread:internal-commit"),
+        messageId: MessageId.make("message:internal-commit"),
+        runId: RunId.make("run:internal-commit"),
+        status: "preparing",
+        delivery: "started",
+      };
+      const result = yield* ThreadSendAcknowledgement.observe(
+        Effect.gen(function* () {
+          const observer = yield* ThreadSendAcknowledgement.command;
+          assert.isDefined(observer);
+          assert.isTrue(observer!.check());
+          observer!.accept(saved);
+          return yield* Effect.fail("projection and receipt reads unavailable");
+        }),
+        {
+          commandId: CommandId.make("command:internal-commit"),
+          messageId: saved.messageId,
+          mode: "auto",
+          onAccepted: () => {
+            accepted = true;
+          },
+        },
+      ).pipe(Effect.result);
+      assert.isTrue(accepted);
+      assert.equal(result._tag, "Failure");
+    }),
+);

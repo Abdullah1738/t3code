@@ -353,11 +353,24 @@ for (const [name, url, runtime, startedAt, expected] of [
         url,
         request: async (_method, route) =>
           route === "/health"
-            ? { ok: true, status: "healthy", serverStartedAt: boot }
+            ? {
+                ok: true,
+                status: "healthy",
+                serverStartedAt: boot,
+                bootId:
+                  startedAt === now
+                    ? "8d0efaf9-5dd4-400f-9db1-8308e5a591b0"
+                    : "f2493692-950c-4f64-9025-73e929d67f42",
+              }
             : { threads: [] },
       },
       readRuntime: () =>
-        runtime && { ...runtime, startedAt: new Date(now).toISOString(), pid: process.pid },
+        runtime && {
+          ...runtime,
+          startedAt: new Date(now).toISOString(),
+          pid: process.pid,
+          bootId: "8d0efaf9-5dd4-400f-9db1-8308e5a591b0",
+        },
       readTail: () => tail,
     });
     NodeAssert.equal(report.verdict, expected);
@@ -425,20 +438,80 @@ for (const target of [
 const localRuntime = {
   origin: "http://127.0.0.1:3773",
   pid: process.pid,
+  bootId: "8d0efaf9-5dd4-400f-9db1-8308e5a591b0",
   startedAt: new Date(now).toISOString(),
 };
 const localClient = {
   url: localRuntime.origin,
   request: async (_method, route) =>
     route === "/health"
-      ? { ok: true, status: "healthy", serverStartedAt: localRuntime.startedAt }
+      ? {
+          ok: true,
+          status: "healthy",
+          serverStartedAt: localRuntime.startedAt,
+          bootId: localRuntime.bootId,
+        }
       : { threads: [] },
 };
+for (const [name, runtimeBoot, responseBoot, readyDelayMs, listener, expected] of [
+  ["long boot, same UUID", localRuntime.bootId, localRuntime.bootId, 534_000, false, true],
+  [
+    "same timestamps, different UUID",
+    localRuntime.bootId,
+    "f2493692-950c-4f64-9025-73e929d67f42",
+    0,
+    true,
+    false,
+  ],
+  ["legacy long boot, listener owned", undefined, undefined, 534_000, true, true],
+  ["legacy short boot, listener unverified", undefined, undefined, 0, false, false],
+  ["new CLI, old runtime file", undefined, localRuntime.bootId, 115_000, true, true],
+  ["new runtime file, old response", localRuntime.bootId, undefined, 115_000, true, true],
+  ["invalid UUIDs cannot match", "fixture-secret", "fixture-secret", 0, false, false],
+]) {
+  NodeTest.test(`stable runtime identity: ${name}`, async () => {
+    const current = Date.now();
+    const rows = Array.from({ length: 21 }, (_, i) =>
+      JSON.stringify({
+        time: new Date(current - (20 - i) * 30_000 - 15_000).toISOString(),
+        kind: "sample",
+      }),
+    );
+    const report = await deepHealth({
+      client: {
+        ...localClient,
+        request: async (_method, route) =>
+          route === "/health"
+            ? {
+                ok: true,
+                status: "healthy",
+                bootId: responseBoot,
+                serverStartedAt: localRuntime.startedAt,
+              }
+            : { threads: [] },
+      },
+      readRuntime: () => ({
+        ...localRuntime,
+        bootId: runtimeBoot,
+        startedAt: new Date(now + readyDelayMs).toISOString(),
+      }),
+      checkListener: () => listener,
+      readTail: () => ({ text: rows.join("\n") + "\n", bytesRead: 2000 }),
+    });
+    NodeAssert.equal(report.lag.status, expected ? "complete" : "unknown");
+    NodeAssert.equal(report.lag.sampleCount, expected ? 20 : 0);
+    NodeAssert.equal(report.verdict, expected ? "healthy" : "unknown");
+    NodeAssert.doesNotMatch(JSON.stringify(report), /fixture-secret/);
+    if (runtimeBoot === localRuntime.bootId && responseBoot !== undefined)
+      NodeAssert.equal(report.stages.listener.status, "skipped");
+  });
+}
 NodeTest.test("both probes ignore abort: one shared budget still returns a report", async () => {
   const start = performance.now();
   const report = await deepHealth({
     timeoutMs: 25,
     client: { ...localClient, request: () => new Promise(() => {}) },
+    readRuntime: () => null,
   });
   NodeAssert.ok(performance.now() - start < 250);
   NodeAssert.equal(report.connection.status, "timeout");
@@ -448,32 +521,35 @@ NodeTest.test("both probes ignore abort: one shared budget still returns a repor
   NodeAssert.ok(["ok", "error", "skipped"].includes(report.stages.runtime.status));
   NodeAssert.match(report.summary, /timeout/);
 });
-NodeTest.test(
-  "listener ignoring abort cannot authorize local evidence or outlast the budget",
-  { timeout: 500 },
-  async () => {
-    const report = await deepHealth({
-      timeoutMs: 25,
-      client: {
-        ...localClient,
-        request: (_method, route) =>
-          route === "/health"
-            ? Promise.reject(new Error("unavailable"))
-            : Promise.resolve({ threads: [] }),
-      },
-      readRuntime: () => localRuntime,
-      checkListener: () => new Promise(() => {}),
-      readTail: () => {
-        throw new Error("must not read unverified lag");
-      },
-    });
-    NodeAssert.equal(report.stages.listener.status, "timeout");
-    NodeAssert.equal(report.lag.bytesRead, 0);
-    NodeAssert.match(report.summary, /unverified/);
-    NodeAssert.equal(report.status, "timeout");
-    NodeAssert.equal(report.stage, "listener");
-  },
-);
+for (const connected of [false, true])
+  NodeTest.test(
+    `listener ignoring abort stays bounded (HTTP connected: ${connected})`,
+    { timeout: 500 },
+    async () => {
+      const report = await deepHealth({
+        timeoutMs: 25,
+        client: {
+          ...localClient,
+          request: (_method, route) =>
+            route === "/health"
+              ? connected
+                ? Promise.resolve({ ok: true, status: "healthy" })
+                : Promise.reject(new Error("unavailable"))
+              : Promise.resolve({ threads: [] }),
+        },
+        readRuntime: () => localRuntime,
+        checkListener: () => new Promise(() => {}),
+        readTail: () => {
+          throw new Error("must not read unverified lag");
+        },
+      });
+      NodeAssert.equal(report.stages.listener.status, "timeout");
+      NodeAssert.equal(report.lag.bytesRead, 0);
+      NodeAssert.match(report.summary, /unverified/);
+      NodeAssert.equal(report.status, "timeout");
+      NodeAssert.equal(report.stage, "listener");
+    },
+  );
 for (const stage of ["runtime", "lagTail"]) {
   for (const failure of ["throw", "reject", "hang"]) {
     NodeTest.test(
@@ -540,6 +616,7 @@ NodeTest.test(
             : { threads: [] },
       },
       readRuntime: () => localRuntime,
+      checkListener: () => false,
     });
     NodeAssert.equal(report.verdict, "unknown");
     NodeAssert.doesNotMatch(JSON.stringify(report), /fixture-secret/);

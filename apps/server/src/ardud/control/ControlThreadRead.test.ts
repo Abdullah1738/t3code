@@ -7,6 +7,7 @@ import {
   OrchestrationV2RunJson,
   ProviderInstanceId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
   type OrchestrationV2Run,
 } from "@t3tools/contracts";
@@ -213,6 +214,7 @@ describe("native thread owner reads", () => {
       const expected = {
         ...shellSummary(shell!, { origin: null, nativeSessionId: null }),
         native: null,
+        changeMarker: 0,
         state: "idle",
         status: "completed",
         run: runSummary(h.runs.at(-1)!),
@@ -229,6 +231,146 @@ describe("native thread owner reads", () => {
         [5, 5],
       );
     }).pipe(Effect.provide(Sqlite.layerMemory.pipe(Layer.provide(NodeServices.layer)))),
+  );
+
+  it.effect(
+    "status ignores settled request history and preserves pending input and old active runs",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness;
+        const sql = h.sql;
+        const at = DateTime.formatIso(date);
+        // Invalid historical bodies make any accidental history decoding fail deterministically.
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            for (let ordinal = 1; ordinal <= 2000; ordinal++) {
+              yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests ${sql.insert({
+                runtime_request_id: `settled-${ordinal}`,
+                thread_id: threadId,
+                node_id: `settled-node-${ordinal}`,
+                provider_turn_id: null,
+                kind: "user_input",
+                status: "resolved",
+                created_at: at,
+                resolved_at: at,
+                payload_json: "{}",
+              })}`;
+              yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert({
+                turn_item_id: `settled-item-${ordinal}`,
+                thread_id: threadId,
+                node_id: `settled-node-${ordinal}`,
+                ordinal,
+                type: "user_input_request",
+                status: "completed",
+                updated_at: at,
+                payload_json: "{}",
+              })}`;
+            }
+          }),
+        );
+        const active = { ...h.runs[0]!, status: "running" as const, completedAt: null };
+        yield* sql`UPDATE orchestration_v2_projection_runs SET status = 'running', completed_at = NULL,
+        payload_json = ${yield* encodeRun(active)} WHERE run_id = ${active.id}`;
+        for (const [id, kind, type] of [
+          ["approval", "command", "approval_request"],
+          ["question", "user_input", "user_input_request"],
+          ["missing-item", "user_input", null],
+        ] as const) {
+          yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests ${sql.insert({
+            runtime_request_id: id,
+            thread_id: threadId,
+            node_id: `node:${id}`,
+            provider_turn_id: null,
+            kind,
+            status: "pending",
+            created_at: at,
+            resolved_at: null,
+            payload_json: JSON.stringify({
+              id,
+              nodeId: `node:${id}`,
+              providerTurnId: null,
+              nativeRequestRef: null,
+              kind,
+              status: "pending",
+              createdAt: at,
+              resolvedAt: null,
+              responseCapability: { type: "message" },
+            }),
+          })}`;
+          if (type === null) continue;
+          yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert({
+            turn_item_id: `item:${id}`,
+            thread_id: threadId,
+            node_id: `node:${id}`,
+            ordinal: 2001,
+            type,
+            status: "pending",
+            updated_at: at,
+            payload_json: JSON.stringify({
+              id: `item:${id}`,
+              threadId,
+              nodeId: `node:${id}`,
+              runId: null,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 2001,
+              type,
+              status: "pending",
+              title: id,
+              startedAt: null,
+              completedAt: null,
+              updatedAt: at,
+              requestId: id,
+              ...(type === "approval_request"
+                ? { requestKind: "command", prompt: "pwd" }
+                : { questions: [] }),
+            }),
+          })}`;
+        }
+        const detail = yield* h.reader.detail(threadId);
+        const native = yield* h.reader.byNative("ses_fixture");
+        assert.deepStrictEqual(native, detail);
+        assert.strictEqual(detail.state, "needs-input");
+        assert.deepStrictEqual(detail.run, runSummary(active));
+        assert.deepStrictEqual(detail.recentRuns, h.runs.slice(-5).toReversed().map(runSummary));
+        assert.deepStrictEqual(detail.pendingRequests, [
+          {
+            requestId: RuntimeRequestId.make("approval"),
+            kind: "approval",
+            requestKind: "command",
+            status: "pending",
+            createdAt: at,
+            canRespond: true,
+            prompt: "pwd",
+            title: "approval",
+            options: null,
+          },
+          {
+            requestId: RuntimeRequestId.make("missing-item"),
+            kind: "question",
+            requestKind: "user_input",
+            status: "pending",
+            createdAt: at,
+            canRespond: true,
+          },
+          {
+            requestId: RuntimeRequestId.make("question"),
+            kind: "question",
+            requestKind: "user_input",
+            status: "pending",
+            createdAt: at,
+            canRespond: true,
+            title: "question",
+            questions: [],
+          },
+        ]);
+        assert.deepStrictEqual(
+          h.recordReads.map(({ count }) => count),
+          [6, 6],
+        );
+      }).pipe(Effect.provide(Sqlite.layerMemory.pipe(Layer.provide(NodeServices.layer)))),
   );
 
   it.effect("refuses unknown and ambiguous owners", () =>

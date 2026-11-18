@@ -1,0 +1,727 @@
+"""Exercise the vendored validator through the QA lifecycle boundary."""
+import json
+import os
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+from harness.ephemeral import admission, lifecycle, producer_latch, workspace as wsm
+
+
+@pytest.fixture
+def qa(tmp_path, monkeypatch, qa_capacity):
+    ws = wsm.prepare("qa12", zone_id="ZQA", runner_cidrs=[], root=tmp_path / "envs")
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    state = tmp_path / "ssm.json"
+    state.write_text("{}")
+    monkeypatch.setenv("QA_LATCH_STATE", str(state))
+    monkeypatch.setenv("PATH", f"{binary}:{os.environ['PATH']}")
+    aws = binary / "aws"
+    aws.write_text('''#!/usr/bin/env node
+const fs = require('node:fs'), a = process.argv.slice(2);
+const path = process.env.QA_LATCH_STATE, state = JSON.parse(fs.readFileSync(path));
+const arg = k => a[a.indexOf(k)+1];
+let result = {};
+if(a[0] === 'sts') result = {Account: '434793037400'};
+else if(a[0] === 'ssm') {
+ const name = arg('--name');
+ if(!name.startsWith('/crpko/qa12/')) throw Error('foreign path');
+ if(state.denied) { process.stderr.write('(AccessDeniedException)'); process.exit(1); }
+ if(a[1] === 'get-parameter') {
+  if(!state[name]) { process.stderr.write('(ParameterNotFound)'); process.exit(1); }
+  result = {Parameter: {Name: name, Type: 'String', Value: JSON.stringify(state[name])}};
+ } else if(a[1] === 'put-parameter') {
+  if(!a.includes('--no-overwrite')) throw Error('overwrite');
+  if(state[name]) { process.stderr.write('(ParameterAlreadyExists)'); process.exit(1); }
+  state[name] = JSON.parse(arg('--value')); state.puts = (state.puts || 0)+1;
+ } else if(a[1] === 'delete-parameter') { delete state[name]; state.deletes = (state.deletes || 0)+1; }
+ else throw Error('unexpected operation');
+ fs.writeFileSync(path, JSON.stringify(state));
+} else throw Error('unexpected service');
+console.log(JSON.stringify(result));
+''')
+    aws.chmod(0o700)
+    return ws, state
+
+
+def held_plan():
+    return {"variables": {k: {"value": v} for k, v in {
+        "rebuild_producer_hold": True, "dev_backoffice_bootstrap_hold": True,
+        "registry_publisher_stream_enabled": False,
+        "environment_config_path": "../../../config/environments/qa12.json"}.items()}, "resource_changes": []}
+
+
+def test_create_retry_conflict_and_unknown_identity(qa, monkeypatch):
+    ws, state = qa
+    first = producer_latch.invoke(ws, "create")
+    assert first["env"] == ws.env and first["region"] == "ap-south-2"
+    assert producer_latch.invoke(ws, "create") == first
+    assert json.loads(state.read_text())["puts"] == 1
+    monkeypatch.setattr(admission, "native_input", lambda *a: {"installation_id": "01a1eeee-1234-7123-8123-123456789abd"})
+    with pytest.raises(RuntimeError, match="HOLD_LATCH_CONFLICT"):
+        producer_latch.invoke(ws, "create")
+    assert json.loads(state.read_text())[f"/crpko/{ws.env}/rebuild/producer-hold"] == first
+
+
+@pytest.mark.parametrize("branch", ["saved", "direct", "no-plan"])
+@pytest.mark.parametrize("bad", ["missing", "dev", "qa34", "account", "region", "unreadable", "unsafe"])
+def test_apply_refuses_before_any_mutation(qa, monkeypatch, branch, bad):
+    ws, state = qa
+    producer_latch.invoke(ws, "create")
+    doc = json.loads(state.read_text())
+    latch = doc[f"/crpko/{ws.env}/rebuild/producer-hold"]
+    if bad == "missing": del doc[f"/crpko/{ws.env}/rebuild/producer-hold"]
+    elif bad in ("dev", "qa34"): latch["env"] = bad
+    elif bad == "account": latch["account_id"] = "111111111111"
+    elif bad == "region": latch["region"] = "ap-south-1"
+    elif bad == "unreadable": doc["denied"] = True
+    state.write_text(json.dumps(doc))
+    value = held_plan()
+    if bad == "unsafe":
+        value["resource_changes"] = [{"mode": "managed", "type": "aws_appautoscaling_target", "address": 'module.ecs_runtime.aws_appautoscaling_target.service["backoffice-core-worker"]',
+            "change": {"after": {"resource_id": "service/crpko-qa12/crpko-qa12-backoffice-core-worker", "min_capacity": 1, "max_capacity": 1}}}]
+    plan = ws.root / "tfplan"
+    if branch != "no-plan": plan.write_text("saved plan")
+    calls = []
+    def tf(w, *args, **kwargs):
+        calls.append(args)
+        if args[0] == "plan": plan.write_text("new exact plan")
+        return subprocess.CompletedProcess(args, 0, json.dumps(value), "")
+    monkeypatch.setattr(lifecycle, "_tf", tf)
+    with pytest.raises(RuntimeError, match="HOLD_"):
+        lifecycle.apply(ws, *(["-target=module.ecs_runtime"] if branch == "direct" else []))
+    assert not any(a[0] == "apply" for a in calls)
+    assert not json.loads(state.read_text()).get("deletes")
+
+
+def test_both_apply_routes_use_the_validated_plan_and_keep_latch(qa, monkeypatch):
+    ws, state = qa
+    latch = producer_latch.invoke(ws, "create")
+    calls = []
+    def tf(w, *args, **kwargs):
+        calls.append(args)
+        if args[0] == "plan":
+            variables = Path(next(a.split("=", 1)[1] for a in args if a.startswith("-var-file=") and "hold-" in a))
+            assert json.loads(variables.read_text()) == {k: v["value"] for k, v in held_plan()["variables"].items() if k != "environment_config_path"}
+            (ws.root / "tfplan").write_text("exact")
+        return subprocess.CompletedProcess(args, 0, json.dumps(held_plan()), "")
+    monkeypatch.setattr(lifecycle, "_tf", tf)
+    lifecycle.plan(ws)
+    lifecycle.apply(ws)
+    lifecycle.apply(ws, "-target=module.ecs_runtime")
+    assert [a[0] for a in calls] == ["plan", "show", "apply", "plan", "show", "apply"]
+    assert all(a[-1] == str(ws.root / "tfplan") for a in calls if a[0] == "apply")
+    assert json.loads(state.read_text())[f"/crpko/{ws.env}/rebuild/producer-hold"] == latch
+
+
+def test_teardown_keeps_latch_on_partial_failure_then_deletes_last(qa, monkeypatch):
+    ws, state = qa
+    producer_latch.invoke(ws, "create")
+    monkeypatch.setattr(lifecycle, "workspace", lambda env: ws)
+    monkeypatch.setattr(lifecycle, "_session", lambda *a: type("Session", (), {"client": lambda *a: None})())
+    monkeypatch.setattr(lifecycle, "_tf", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle.zone_mod, "destroy", lambda *a: None)
+    monkeypatch.setattr(lifecycle.teardown, "prune_appconfig", lambda *a, **k: [])
+    monkeypatch.setattr(lifecycle.teardown, "sweep", lambda *a, **k: {})
+    left = ["ecs task draining"]
+    def residue(*a, **k):
+        assert k["ignore_producer_latch"]
+        assert not json.loads(state.read_text()).get("deletes")
+        return list(left)
+    monkeypatch.setattr(lifecycle.teardown, "residue", residue)
+    with pytest.raises(RuntimeError, match="residue"):
+        lifecycle.destroy(ws.env)
+    assert producer_latch.invoke(ws, "variables")
+    left.clear()
+    lifecycle.destroy(ws.env, keep_workspace=True)
+    assert json.loads(state.read_text())["deletes"] == 1
+
+
+@pytest.mark.parametrize("start", ["ecs.run_task(cluster='crpko-qa12')", "aas.register_scalable_target(MinCapacity=1)", "subprocess.run(['terraform', 'apply'])",
+    "ecs.create_service(desiredCount=1)", "ecs.create_task_set(scale=100)",
+    "events.put_targets(Targets=[{}])", "scheduler.create_schedule(State='ENABLED')",
+    "subprocess.run(['aws', 'ecs', 'create-service'])",
+    "lifecycle._tf(ws, 'apply')",
+    "command = ['aws', 'ecs', 'run-task']; subprocess.run(command)",
+    "command = ['terraform', 'apply']; subprocess.Popen(command)",
+    "asyncio.create_subprocess_exec('aws', 'ecs', 'run-task')",
+    "asyncio.create_subprocess_shell(command)",
+    "from subprocess import run as launch; launch(command)",
+    "import subprocess as sp; launch = sp.run; launch(command)",
+    "from asyncio import create_subprocess_exec as launch; launch(*command)",
+    "from harness.ephemeral.lifecycle import _tf as terraform; terraform(ws, operation)",
+    "start = getattr(ecs, 'run_task'); start(cluster='crpko-qa12')",
+    "method = 'create_service'; getattr(ecs, method)(desiredCount=1)",
+    "method = {'start': 'run_task'}; getattr(ecs, method['start'])(cluster='crpko-qa12')",
+    "method = ['create_task_set']; getattr(ecs, method[0])(scale=100)",
+    "os.system(command)", "os.execvp('aws', command)", "os.execvpe('terraform', command, env)",
+    "os.spawnlp(os.P_WAIT, 'aws', *command)",
+    "from subprocess import *; run(command)",
+    "getattr(subprocess, method)(command)", "getattr(os, method)(*command)",
+    "getattr(asyncio, method)(*command)"])
+def test_inventory_refuses_a_planted_unclassified_start(tmp_path, start):
+    import shutil
+    from harness.ephemeral import start_paths
+    assert start_paths.check() == []
+    shutil.copytree(start_paths.ROOT / "src/harness", tmp_path / "src/harness")
+    shutil.copytree(start_paths.ROOT / "scripts", tmp_path / "scripts")
+    (tmp_path / "src/harness/unclassified.py").write_text(f"def start():\n    {start}\n")
+    assert any("unclassified.py" in error for error in start_paths.check(tmp_path))
+
+
+@pytest.mark.parametrize("binding,call", [("import subprocess as launch", "launch.run(command)"),
+    ("from subprocess import run as launch", "launch(command)"),
+    ("import asyncio as launch", "launch.create_subprocess_exec(*command)")])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_inventory_aliases_in_sibling_functions_cannot_hide_launches(tmp_path, binding, call, reverse):
+    from harness.ephemeral import start_paths
+    directory = tmp_path / "src/harness"
+    directory.mkdir(parents=True)
+    functions = [f"def start():\n    {binding}\n    {call}\n",
+                 "def copy():\n    import shutil as launch\n    launch.copyfile(a, b)\n"]
+    (directory / "unclassified.py").write_text("\n".join(functions[::-1] if reverse else functions))
+    assert any("unclassified.py:start:process-launch" in error for error in start_paths.check(tmp_path))
+
+
+@pytest.mark.parametrize("suffix,source", [
+    ("mjs", "new RunTaskCommand(input)"),
+    ("js", "import {RunTaskCommand as Start} from '@aws-sdk/client-ecs'; client.send(new Start(input))"),
+    ("cjs", "const command = commands[name]; client.send(command)"),
+    ("mjs", "const command = ['aws', 'ecs', 'run-task']; spawn(command[0], command.slice(1))"),
+    ("sh", 'command="aws ecs run-task"; $command'),
+])
+def test_inventory_refuses_unresolved_launch_sources(tmp_path, suffix, source):
+    import shutil
+    from harness.ephemeral import start_paths
+    shutil.copytree(start_paths.ROOT / "src/harness", tmp_path / "src/harness")
+    shutil.copytree(start_paths.ROOT / "scripts", tmp_path / "scripts")
+    directory = tmp_path / ("scripts" if suffix == "sh" else "src/harness")
+    (directory / f"unclassified.{suffix}").write_text(source)
+    assert any(f"unclassified.{suffix}" in error for error in start_paths.check(tmp_path))
+
+
+def test_inventory_binds_assigned_commands_outside_launch_expression(tmp_path):
+    from harness.ephemeral import start_paths
+    directory = tmp_path / "src/harness"
+    directory.mkdir(parents=True)
+    path = directory / "launcher.py"
+    path.write_text("import subprocess\ncommand = ['aws', 'ecs', 'describe-services']\nsubprocess.run(command)\n")
+    inventory = tmp_path / "paths.json"
+    rows = [{**hit, "class": "cannot-raise", "admission": "read only", "proof": "describe-services"}
+            for hit in start_paths.discover(tmp_path)]
+    inventory.write_text(json.dumps({"paths": rows}))
+    assert start_paths.check(tmp_path, inventory) == []
+    path.write_text(path.read_text().replace("describe-services", "run-task"))
+    assert any("unclassified" in error for error in start_paths.check(tmp_path, inventory))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cluster", ["crpko-qa12", "qa12", "arn:aws:ecs:ap-south-2:434793037400:cluster/crpko-qa12",
+                                   "arn:aws:ecs:ap-south-2:434793037400:cluster/qa12"])
+async def test_fault_restoration_refuses_under_latch_before_sdk_write(qa, monkeypatch, cluster):
+    from harness.faults import EcsInjector
+    ws, state = qa
+    producer_latch.invoke(ws, "create")
+    monkeypatch.setattr(wsm, "workspace", lambda env: ws)
+    calls = []
+    injector = EcsInjector(None, None, cluster, f"crpko-{ws.env}")
+    with pytest.raises(RuntimeError, match="REBUILD_PRODUCER_HELD"):
+        await injector._mutate(lambda **kwargs: calls.append(kwargs), desiredCount=1)
+    assert calls == []
+    producer_latch.invoke(ws, "delete")
+    await injector._mutate(lambda **kwargs: calls.append(kwargs), desiredCount=1)
+    assert calls == [{"desiredCount": 1}]
+
+
+@pytest.mark.parametrize("cluster", [
+    "arn:aws:ecs:ap-south-1:434793037400:cluster/crpko-qa12",
+    "arn:aws:ecs:ap-south-2:111111111111:cluster/crpko-qa12",
+    "arn:aws:ecs:ap-south-1:434793037400:cluster/qa12",
+    "arn:aws:ecs:ap-south-2:111111111111:cluster/qa12",
+    "arn:aws-cn:ecs:ap-south-2:434793037400:cluster/crpko-qa12",
+    "arn:aws:ecs:ap-south-2:434793037400:service/crpko-qa12",
+    "arn:aws:ecs:ap-south-2:434793037400:cluster/crpko-qa12/extra",
+    "crpko-qa12-invalid", "", None,
+])
+def test_fault_cluster_identity_refuses_before_latch_or_sdk(cluster, monkeypatch):
+    monkeypatch.setattr(producer_latch, "invoke", lambda *a: pytest.fail("foreign identity read latch"))
+    with pytest.raises(ValueError):
+        producer_latch.refuse_start(cluster)
+
+
+@pytest.mark.parametrize("cluster", ["crpko-dev", "arn:aws:ecs:ap-south-1:111111111111:cluster/crpko-dev"])
+def test_non_qa_fault_target_does_not_use_qa_latch(cluster, monkeypatch):
+    monkeypatch.setattr(producer_latch, "invoke", lambda *a: pytest.fail("non-QA target read QA latch"))
+    producer_latch.refuse_start(cluster)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["stop", "restore"])
+@pytest.mark.parametrize("arn", [False, True])
+async def test_fault_stop_and_restore_share_latch_admission(qa, monkeypatch, route, arn):
+    from harness.faults import EcsInjector
+    ws, state = qa
+    producer_latch.invoke(ws, "create")
+    monkeypatch.setattr(wsm, "workspace", lambda env: ws)
+    writes = []
+    class ECS:
+        def describe_services(self, **kwargs):
+            return {"services": [{"status": "ACTIVE", "desiredCount": 2}]}
+        def update_service(self, **kwargs):
+            writes.append(kwargs)
+            pytest.fail("held fault reached ECS write")
+    class AAS:
+        def describe_scalable_targets(self, **kwargs):
+            return {"ScalableTargets": [{"MinCapacity": 2, "MaxCapacity": 2}]}
+        def register_scalable_target(self, **kwargs):
+            writes.append(kwargs)
+            pytest.fail("held fault reached autoscaling write")
+    cluster = f"crpko-{ws.env}"
+    if arn: cluster = f"arn:aws:ecs:ap-south-2:434793037400:cluster/{cluster}"
+    injector = EcsInjector(ECS(), AAS(), cluster, f"crpko-{ws.env}")
+    if route == "restore":
+        injector._saved["worker"] = {"desired": 2, "target": {"MinCapacity": 2, "MaxCapacity": 2}}
+    with pytest.raises(RuntimeError, match="REBUILD_PRODUCER_HELD"):
+        await getattr(injector, route)(("worker",))
+    assert not writes
+
+
+def test_fresh_lifecycle_keeps_own_latch_through_activation_gate_and_retry(qa, monkeypatch):
+    from harness.ephemeral import bootstrap, images
+    from test_ephemeral_bootstrap import FakeRunner
+    ws, state = qa
+    monkeypatch.setattr(lifecycle, "workspace", lambda env: ws)
+    monkeypatch.setattr(lifecycle, "prepare", lambda *a, **k: ws)
+    monkeypatch.setattr(lifecycle, "_session", lambda *a: type("Session", (), {"client": lambda *a: None})())
+    monkeypatch.setattr(lifecycle.zone_mod, "ensure", lambda *a, **k: "ZQA")
+    monkeypatch.setattr(lifecycle.kafka_tarball, "ensure_cached", lambda *a: None)
+    assert lifecycle.up_prepare(ws.env, runner_cidrs=[]) == ws
+    latch = producer_latch.invoke(ws, "create")
+    def tf(w, *args, **kwargs):
+        if args[0] == "plan":
+            assert producer_latch.invoke(ws, "variables")
+            (ws.root / "tfplan").write_text("exact plan")
+        return subprocess.CompletedProcess(args, 0, json.dumps(held_plan()), "")
+    monkeypatch.setattr(lifecycle, "_tf", tf)
+    lifecycle.plan(ws)
+    lifecycle.apply(ws)
+    pointers = []
+    class SSM:
+        def put_parameter(self, **kw): pointers.append(kw)
+    images.write_pointers(SSM(), ws.env, [images.Release("edge-api", "sha256:" + "a" * 64, "b" * 40)])
+    assert pointers and all(p["Name"].startswith("/crpko/qa12/release-") for p in pointers)
+    lifecycle.plan(ws)
+    lifecycle.apply(ws)
+    # AWS/runbook boundaries are offline; bootstrap sequencing and its gate are real.
+    monkeypatch.setattr(bootstrap, "_prerequisite_problem", lambda ws: None)
+    monkeypatch.setattr(bootstrap, "_secret_step", lambda *a: "secret prerequisite admitted")
+    monkeypatch.setattr(bootstrap, "service_migrations", lambda *a, **k: "service baselines admitted")
+    monkeypatch.setattr(bootstrap, "native_configuration_readback", lambda *a, **k: "native config admitted")
+    release = ws.root / "release.json"
+    release.write_text("{}")
+    monkeypatch.setenv("HARNESS_QA_REGISTRY_RELEASE_EVIDENCE", str(release))
+    monkeypatch.setenv("HARNESS_QA_REGISTRY_RECORD_AUDIT_URI", "s3://offline/record-audit")
+    session = type("Session", (), {"client": lambda *a: None})()
+    for _ in range(2):
+        report = bootstrap.run(ws, session=session, runner=FakeRunner(), services=True)
+        by = {step.name: step for step in report.steps}
+        assert not report.failed
+        assert by["canonical-activation"].status == "blocked"
+        assert by["canonical-activation"].detail == bootstrap.CANONICAL_GATE
+        assert producer_latch.invoke(ws, "create") == latch
+    assert json.loads(state.read_text())["puts"] == 1
+
+
+def test_replaced_plan_refuses_after_admission(qa, monkeypatch):
+    ws, state = qa
+    producer_latch.invoke(ws, "create")
+    plan = ws.root / "tfplan"
+    plan.write_text("safe plan")
+    calls = []
+    def tf(w, *args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args, 0, json.dumps(held_plan()), "")
+    monkeypatch.setattr(lifecycle, "_tf", tf)
+    invoke = producer_latch.invoke
+    def validate(w, action, **kwargs):
+        result = invoke(w, action, **kwargs)
+        if action == "validate": plan.write_text("different unsafe plan")
+        return result
+    monkeypatch.setattr(producer_latch, "invoke", validate)
+    with pytest.raises(RuntimeError, match="HOLD_PLAN_CHANGED"):
+        lifecycle.apply(ws)
+    assert calls == ["show"]
+
+
+@pytest.mark.parametrize("script,selector", [("run-registry-resync-release.mjs", "--env"),
+    ("run-registry-effective-control-backfill-release.mjs", "--env"),
+    ("run-backoffice-registry-catalog.mjs", "--environment")])
+def test_direct_writer_wrapper_refuses_qa_latch(qa, script, selector):
+    ws, state = qa
+    producer_latch.invoke(ws, "create")
+    result = subprocess.run(["node", str(ws.devops / "scripts" / script), selector, ws.env],
+                            text=True, capture_output=True, timeout=30)
+    assert result.returncode != 0
+    assert "REBUILD_PRODUCER_HELD" in result.stderr
+
+
+def test_default_qa_producer_proof_refuses_new_source(qa):
+    ws, state = qa
+    producer_latch.invoke(ws, "create")
+    (ws.devops / "scripts/unclassified.mjs").write_text('const args = ["run-task"];\n')
+    module = (ws.devops / "scripts/lib/rebuild-admission.mjs").as_uri()
+    result = subprocess.run(["node", "--input-type=module", "-e",
+        f'import {{producerHold}} from {json.dumps(module)}; producerHold({{env:"qa12",account_id:"434793037400",region:"ap-south-2"}});'],
+        text=True, capture_output=True, timeout=30)
+    assert result.returncode != 0 and "HOLD_PATH_UNCLASSIFIED" in result.stderr
+
+
+def _offline_destroy(ws, monkeypatch):
+    monkeypatch.setattr(lifecycle, "workspace", lambda env: ws)
+    monkeypatch.setattr(lifecycle, "_session", lambda *a: type("Session", (), {"client": lambda *a: None})())
+    monkeypatch.setattr(lifecycle.zone_mod, "destroy", lambda *a: None)
+    monkeypatch.setattr(lifecycle.teardown, "prune_appconfig", lambda *a, **k: [])
+    monkeypatch.setattr(lifecycle.teardown, "sweep", lambda *a, **k: {})
+
+
+@pytest.mark.parametrize("operation", ["plan", "apply", "up_prepare", "prepare"])
+def test_teardown_serializes_waiting_lifecycle_operations_across_workspace_removal(qa, monkeypatch, operation):
+    ws, state = qa
+    producer_latch.invoke(ws, "create")
+    _offline_destroy(ws, monkeypatch)
+    paused, release, attempted, entered = (threading.Event() for _ in range(4))
+    calls = []
+    def residue(*a, **k):
+        paused.set()
+        assert release.wait(10)
+        return []
+    def tf(w, *args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args, 0, "{}", "")
+    monkeypatch.setattr(lifecycle.teardown, "residue", residue)
+    monkeypatch.setattr(lifecycle, "_tf", tf)
+    if operation == "up_prepare":
+        original = lifecycle._up_prepare
+        def preparing(*args, **kwargs):
+            entered.set()
+            assert not ws.root.exists()
+            return original(*args, **kwargs)
+        monkeypatch.setattr(lifecycle, "_up_prepare", preparing)
+        monkeypatch.setattr(lifecycle, "prepare", lambda *a, **k: wsm.prepare(*a, root=ws.root.parent, **k))
+        monkeypatch.setattr(lifecycle.zone_mod, "ensure", lambda *a, **k: "ZQA")
+        monkeypatch.setattr(lifecycle.kafka_tarball, "ensure_cached", lambda *a: None)
+    if operation == "prepare":
+        original = wsm._prepare
+        def preparing(*args, **kwargs):
+            entered.set()
+            assert not ws.root.exists()
+            return original(*args, **kwargs)
+        monkeypatch.setattr(wsm, "_prepare", preparing)
+    def waiting_operation():
+        attempted.set()
+        if operation == "up_prepare":
+            return lifecycle.up_prepare(ws.env, runner_cidrs=[])
+        if operation == "prepare":
+            return wsm.prepare(ws.env, root=ws.root.parent, zone_id="ZQA", runner_cidrs=[])
+        with pytest.raises((RuntimeError, FileNotFoundError)):
+            getattr(lifecycle, operation)(ws)
+    with ThreadPoolExecutor(2) as pool:
+        destroying = pool.submit(lifecycle.destroy, ws.env)
+        try:
+            assert paused.wait(10)
+            waiting = pool.submit(waiting_operation)
+            assert attempted.wait(10)
+            assert not entered.wait(0.2)
+            assert calls == ["destroy"] and not waiting.done()
+            assert ws.root.exists()
+        finally:
+            release.set()
+        destroying.result(timeout=10)
+        waiting.result(timeout=30)
+    assert calls == ["destroy"]
+    # Waiters and the next caller must use the same inode after rmtree.
+    from harness.ephemeral.lifecycle_lock import lock_path
+    lock = lock_path(ws)
+    inode = lock.stat().st_ino
+    from harness.ephemeral.lifecycle_lock import lifecycle_lock
+    with lifecycle_lock(ws):
+        assert lock.stat().st_ino == inode
+    assert json.loads(state.read_text())["deletes"] == 1
+    if operation == "up_prepare":
+        assert entered.is_set() and json.loads(state.read_text())["puts"] == 2
+    elif operation == "prepare":
+        assert entered.is_set()
+    else:
+        assert not ws.root.exists()
+
+
+def test_teardown_waits_for_admitted_apply_completion(qa, monkeypatch):
+    ws, state = qa
+    producer_latch.invoke(ws, "create")
+    _offline_destroy(ws, monkeypatch)
+    (ws.root / "tfplan").write_text("safe plan")
+    admitted, release, attempted, destroying = (threading.Event() for _ in range(4))
+    order = []
+    invoke = producer_latch.invoke
+    def admission(w, action, **kwargs):
+        result = invoke(w, action, **kwargs)
+        if action == "validate":
+            admitted.set()
+            assert release.wait(10)
+        elif action == "delete":
+            order.append("delete")
+        return result
+    def tf(w, *args, **kwargs):
+        if args[0] == "destroy": destroying.set()
+        if args[0] != "show": order.append(args[0])
+        return subprocess.CompletedProcess(args, 0, json.dumps(held_plan()), "")
+    monkeypatch.setattr(producer_latch, "invoke", admission)
+    monkeypatch.setattr(lifecycle, "_tf", tf)
+    monkeypatch.setattr(lifecycle.teardown, "residue", lambda *a, **k: [])
+    def destroy():
+        attempted.set()
+        lifecycle.destroy(ws.env)
+    with ThreadPoolExecutor(2) as pool:
+        applying = pool.submit(lifecycle.apply, ws)
+        try:
+            assert admitted.wait(10)
+            teardown = pool.submit(destroy)
+            assert attempted.wait(10)
+            assert not destroying.wait(0.2)
+            assert not teardown.done()
+        finally:
+            release.set()
+        applying.result(timeout=10)
+        teardown.result(timeout=10)
+    assert order == ["apply", "destroy", "delete"]
+
+
+def test_lifecycle_lock_serializes_processes_and_does_not_reenter_after_fork(tmp_path):
+    import multiprocessing
+    from types import SimpleNamespace
+    from harness.ephemeral.lifecycle_lock import lifecycle_lock
+    ws = SimpleNamespace(root=tmp_path / "qa12", env="qa12")
+    ws.root.mkdir()
+    context = multiprocessing.get_context("fork")
+    attempted, acquired = context.Event(), context.Event()
+    def waiter():
+        attempted.set()
+        other = SimpleNamespace(root=tmp_path / "other-checkout/envs/qa12", env="qa12")
+        with lifecycle_lock(other):
+            acquired.set()
+    try:
+        with lifecycle_lock(ws):
+            with lifecycle_lock(ws):  # Same-process nested prepare remains reentrant.
+                process = context.Process(target=waiter)
+                process.start()
+            assert attempted.wait(5)
+            ws.root.rmdir()
+            assert not acquired.wait(0.2)
+    finally:
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill(); process.join()
+            pytest.fail("lifecycle waiter did not acquire after owner released")
+    assert process.exitcode == 0 and acquired.is_set()
+
+
+@pytest.mark.parametrize("module,function", [
+    ("asyncio", "create_subprocess_exec"), ("asyncio", "create_subprocess_shell"),
+    ("asyncio.subprocess", "create_subprocess_exec"), ("asyncio.subprocess", "create_subprocess_shell"),
+])
+@pytest.mark.parametrize("form", ["qualified", "module-import", "from-import", "from-alias", "wildcard"])
+def test_inventory_async_process_namespaces(tmp_path, module, function, form):
+    if form == "qualified": source = f"{module}.{function}(command)"
+    elif form == "module-import": source = f"import {module} as launcher; launcher.{function}(command)"
+    elif form == "from-import": source = f"from {module} import {function}; {function}(command)"
+    elif form == "from-alias": source = f"from {module} import {function} as launch; launch(command)"
+    else: source = f"from {module} import *; {function}(command)"
+    _assert_unclassified_python(tmp_path, source)
+
+
+@pytest.mark.parametrize("module,function", [
+    ("subprocess", "run"), ("asyncio", "create_subprocess_exec"),
+    ("asyncio.subprocess", "create_subprocess_shell"), ("os", "execvp"),
+])
+@pytest.mark.parametrize("form", ["assignment", "getattr", "container", "default", "annotation"])
+def test_inventory_process_module_handoffs(tmp_path, module, function, form):
+    if form == "assignment": source = f"launcher = {module}; launcher.{function}(command)"
+    elif form == "getattr": source = f"launcher = {module}; getattr(launcher, method)(command)"
+    elif form == "container": source = f"launchers = [{module}]; getattr(launchers[0], method)(command)"
+    elif form == "default": source = f"def launch(launcher={module}):\n    getattr(launcher, method)(command)"
+    else: source = f"launcher: object = {module}; launcher.{function}(command)"
+    _assert_unclassified_python(tmp_path, f"import {module}\n{source}")
+
+
+def _assert_unclassified_python(tmp_path, source):
+    from harness.ephemeral import start_paths
+    directory = tmp_path / "src/harness"
+    directory.mkdir(parents=True)
+    (directory / "unclassified.py").write_text(source)
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text('{"paths": []}')
+    assert any("unclassified.py" in error for error in start_paths.check(tmp_path, inventory))
+
+
+@pytest.mark.parametrize("function", ["subprocess_exec", "subprocess_shell"])
+def test_inventory_low_level_async_process_launch(tmp_path, function):
+    _assert_unclassified_python(tmp_path, f"loop.{function}(protocol, command)")
+
+
+def test_two_checkouts_cannot_apply_during_teardown_residue(qa, monkeypatch):
+    import shutil
+    ws, state = qa
+    other = wsm.Workspace(ws.env, ws.root.parent.parent / "other-checkout/envs" / ws.env)
+    shutil.copytree(ws.root, other.root)
+    producer_latch.invoke(ws, "create")
+    _offline_destroy(ws, monkeypatch)
+    paused, release, attempted = (threading.Event() for _ in range(3))
+    calls = []
+    def residue(*a, **k):
+        paused.set()
+        assert release.wait(10)
+        return []
+    def tf(w, *args, **kwargs):
+        calls.append((w.root, args[0]))
+        if args[0] == "plan": (w.root / "tfplan").write_text("safe plan")
+        return subprocess.CompletedProcess(args, 0, json.dumps(held_plan()), "")
+    def apply():
+        attempted.set()
+        with pytest.raises(RuntimeError, match="HOLD_LATCH_REQUIRED"):
+            lifecycle.apply(other)
+    monkeypatch.setattr(lifecycle.teardown, "residue", residue)
+    monkeypatch.setattr(lifecycle, "_tf", tf)
+    with ThreadPoolExecutor(2) as pool:
+        destroying = pool.submit(lifecycle.destroy, ws.env)
+        try:
+            assert paused.wait(10)
+            applying = pool.submit(apply)
+            assert attempted.wait(10)
+            with pytest.raises(TimeoutError):
+                applying.result(timeout=0.2)
+            assert calls == [(ws.root, "destroy")]
+        finally:
+            release.set()
+        destroying.result(timeout=10)
+        applying.result(timeout=10)
+    assert not ws.root.exists() and other.root.exists()
+    assert calls == [(ws.root, "destroy")]
+    assert json.loads(state.read_text())["deletes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_latch_creation_in_another_checkout_waits_for_fault_completion(qa, monkeypatch):
+    import asyncio
+    import shutil
+    from harness.faults import EcsInjector
+    ws, state = qa
+    other = wsm.Workspace(ws.env, ws.root.parent.parent / "other-checkout/envs" / ws.env)
+    shutil.copytree(ws.root, other.root)
+    monkeypatch.setattr(wsm, "workspace", lambda env: ws)
+    entered, release, attempted, creating = (threading.Event() for _ in range(4))
+    order = []
+    run = producer_latch.subprocess.run
+    def observe_create(command, *args, **kwargs):
+        if command[-1] == "create": creating.set()
+        return run(command, *args, **kwargs)
+    monkeypatch.setattr(producer_latch.subprocess, "run", observe_create)
+    def sdk(**kwargs):
+        entered.set()
+        assert release.wait(10)
+        assert f"/crpko/{ws.env}/rebuild/producer-hold" not in json.loads(state.read_text())
+        order.append("fault-complete")
+    def create():
+        attempted.set()
+        producer_latch.invoke(other, "create")
+        order.append("create")
+    injector = EcsInjector(None, None, f"crpko-{ws.env}", f"crpko-{ws.env}")
+    mutation = asyncio.create_task(injector._mutate(sdk, desiredCount=1))
+    creation = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        creation = asyncio.create_task(asyncio.to_thread(create))
+        assert await asyncio.to_thread(attempted.wait, 10)
+        assert not await asyncio.to_thread(creating.wait, 0.2)
+        assert not creation.done()
+    finally:
+        release.set()
+        results = await asyncio.gather(mutation, *([creation] if creation else []), return_exceptions=True)
+    assert not any(isinstance(result, BaseException) for result in results)
+    assert order == ["fault-complete", "create"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("service,method", [("ecs", "update_service"), ("application-autoscaling", "register_scalable_target")])
+@pytest.mark.parametrize("phase", ["stage_unknown", "restore_unknown"])
+@pytest.mark.parametrize("recovery", [False, True])
+@pytest.mark.parametrize("activation", ["before-send", "retry"])
+async def test_fault_transport_attempt_rechecks_hold(qa, monkeypatch, service, method, phase, recovery, activation):
+    import boto3
+    from botocore.config import Config
+    from botocore.awsrequest import AWSResponse
+    from harness.faults import EcsInjector
+    from harness.completion import fault_restore
+    ws, state = qa
+    latch = producer_latch.invoke(ws, "create")
+    producer_latch.invoke(ws, "delete")
+    monkeypatch.setattr(wsm, "workspace", lambda env: ws)
+    checks, sends = [], []
+    def validate_attempt(record, state, admission):
+        checks.append(state)
+        admission()
+    monkeypatch.setattr(fault_restore, "validate_sdk_attempt", validate_attempt)
+    client = boto3.client(service, region_name=wsm.REGION, endpoint_url="http://127.0.0.1:1",
+        aws_access_key_id="offline", aws_secret_access_key="offline",
+        config=Config(retries={"total_max_attempts": 3, "mode": "standard"}))
+    def activate(*a, **k):
+        doc = json.loads(state.read_text())
+        doc[f"/crpko/{ws.env}/rebuild/producer-hold"] = latch
+        state.write_text(json.dumps(doc))
+    class Body:
+        def stream(self, **kwargs): yield b'{}'
+    def transport(request):
+        sends.append(request.body)
+        if activation == "retry" and len(sends) == 1:
+            activate()
+            return AWSResponse(request.url, 500, {}, Body())
+        return AWSResponse(request.url, 200, {}, Body())
+    client._endpoint.http_session.send = transport
+    if activation == "before-send": client.meta.events.register_last("before-send", activate)
+    desired = 0 if phase == "stage_unknown" else 1
+    args = ({"cluster": f"crpko-{ws.env}", "service": "worker", "desiredCount": desired} if service == "ecs" else
+        {"ServiceNamespace": "ecs", "ResourceId": f"service/crpko-{ws.env}/worker",
+         "ScalableDimension": "ecs:service:DesiredCount", "MinCapacity": desired, "MaxCapacity": 1})
+    injector = EcsInjector(client, client, f"crpko-{ws.env}", f"crpko-{ws.env}")
+    monkeypatch.setattr(injector, "_check_identity", lambda mode: None)
+    try:
+        with pytest.raises(fault_restore.TransportFenceError, match="REBUILD_PRODUCER_HELD") as error:
+            await injector._mutate(getattr(client, method), _recovery=object() if recovery else None,
+                                   _mode="worker", _phase=phase, **args)
+        assert error.value.may_have_sent == (activation == "retry")
+        assert len(sends) == (1 if activation == "retry" else 0)
+        assert bool(checks) == recovery
+    finally:
+        client.close()
+
+
+def test_distinct_qa_targets_do_not_block_each_other(tmp_path):
+    from harness.ephemeral.lifecycle_lock import lifecycle_lock
+    first = wsm.Workspace("qa12", tmp_path / "a/qa12")
+    second = wsm.Workspace("qa34", tmp_path / "b/qa34")
+    def acquire():
+        with lifecycle_lock(second): return True
+    with ThreadPoolExecutor(1) as pool:
+        with lifecycle_lock(first):
+            assert pool.submit(acquire).result(timeout=2)
+
+
+def test_relative_target_state_directory_refuses(tmp_path, monkeypatch):
+    from harness.ephemeral.lifecycle_lock import lifecycle_lock
+    monkeypatch.setenv("XDG_STATE_HOME", ".checkout-state")
+    with pytest.raises(ValueError, match="must be absolute"):
+        with lifecycle_lock(wsm.Workspace("qa12", tmp_path / "qa12")):
+            pytest.fail("relative coordination root accepted")

@@ -373,6 +373,7 @@ def food_orders(timeout=10, *, page=None):
     deadline = _deadline(timeout)
     headers = _headers('food', deadline)
     data = _food_data(_read('food_orders', headers, deadline, page=page))
+    toollog.order_page(data.get('orders'))
     if not isinstance(data.get('orders'), list):
         raise NoonError('SCHEMA_CHANGED')
     rows, seen = [], set()
@@ -401,6 +402,7 @@ def nownow_orders(timeout=10, *, page=None):
     deadline = _deadline(timeout)
     headers = _headers('nownow', deadline)
     data = _nownow_data(_read('nownow_orders', headers, deadline, page=page))
+    toollog.order_page(data.get('orders'))
     if not isinstance(data.get('orders'), list):
         raise NoonError('SCHEMA_CHANGED')
     rows, seen = [], set()

@@ -16,10 +16,38 @@ import time
 from jobs import (read_state, save_state, state_path, directory_inventory,
                   SourceFailure, source_error, stderr_line, permission_denied, deadline_call)
 from rollup import rollup
-from toollog import emit, private_dir, safe_fields, finite_number
+from status import CADENCES
+from toollog import directory, emit, private_dir, safe_fields, finite_number
 
 REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/DiagnosticReports/Retired'),
                Path.home() / 'Library/Logs/DiagnosticReports']
+
+
+def missing_day(now=None):
+    try:
+        utc = dt.datetime.now(dt.timezone.utc) if now is None else now.astimezone(dt.timezone.utc)
+        day = utc.date()
+        state = read_state('missing-day')
+        if state.get('reportedDay') == day.isoformat():
+            return
+        since = min(dt.date.fromisoformat(row['since']) for row in CADENCES.values())
+        missing = [date.isoformat() for date in (day - dt.timedelta(days=1), day)
+                   if date >= since and not (directory() / (date.isoformat() + '.ndjson')).exists()]
+        if state.get('pendingDay') == day.isoformat():
+            missing = sorted(set(missing + state.get('missingDates', [])))
+        if missing:
+            # emit can create an empty file before a busy lock drops the append.
+            # Retain what was missing so the next check still retries it.
+            state.update(pendingDay=day.isoformat(), missingDates=missing)
+            save_state('missing-day', state)
+            if emit('collector', 'error', 'log.missing_day', now=utc, ok=False,
+                    props={'source': ' and '.join(missing), 'count': len(missing)}, error_tag='log.missing_day'):
+                state['reportedDay'] = day.isoformat()
+                state.pop('pendingDay', None)
+                state.pop('missingDates', None)
+                save_state('missing-day', state)
+    except Exception:
+        pass
 
 
 # launchd's hourly interval also accrues runtime, sleep and coalescing drift.
@@ -142,6 +170,7 @@ def unified_command(command, capture_output=True, text=True, timeout=60, env=Non
 
 def next_unified_chunk(size, elapsed, model=None):
     model = dict(model or {})
+    spent = model.get('spent', 0)+elapsed
     previous = model.get('previous')
     limit = model.get('limit', UNIFIED_CHUNK_S)
     if previous and abs(size-previous[0]) > .000001:
@@ -165,15 +194,17 @@ def next_unified_chunk(size, elapsed, model=None):
         # Startup can hide curvature in two tiny probes. Sample the nominal
         # window before a large jump when the model leaves room for four calls.
         # Expensive startup may only afford three calls to clear the ceiling.
-        if (max(size, previous[0]) < UNIFIED_CHUNK_S and rate*UNIFIED_WINDOW_S > 1 and
-                4*overhead+rate*UNIFIED_WINDOW_S <= UNIFIED_BUDGET_S):
+        # Flat or decreasing tiny-query timings can be startup noise too;
+        # they do not establish that a full-window query is cheap.
+        if (max(size, previous[0]) < UNIFIED_CHUNK_S and
+                spent+2*overhead+rate*UNIFIED_WINDOW_S <= UNIFIED_BUDGET_S):
             size_next = min(size_next, UNIFIED_CHUNK_S)
     elif previous:
         size_next = max(UNIFIED_FIRST_CHUNK_S, min(limit,
                         size*max(UNIFIED_TARGET_S, previous[1])/max(.001, elapsed)))
     else:
         size_next = min(limit, max(UNIFIED_FIRST_CHUNK_S, size*2))
-    model.update(previous=(size, elapsed), limit=limit)
+    model.update(previous=(size, elapsed), limit=limit, spent=spent)
     return size_next, model
 
 
@@ -1017,6 +1048,8 @@ def disk_tooling_probe(run=subprocess.run, popen=subprocess.Popen, is_alive=aliv
 
 
 def main():
+    # Check before any job can create today's file and hide its absence.
+    missing_day()
     deadline = time.monotonic()+290
     try:
         collect(deadline=deadline)
@@ -1031,4 +1064,10 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    if sys.argv[1:] == ['--tailnet']:
+        from tailnet import check
+        missing_day()
+        check()
+    else:
+        main()

@@ -20,14 +20,94 @@ test("test default stays outside the home log tree when the override is absent",
 });
 const dirs: string[] = [];
 const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
+
+test("auth log-only metadata is allowlisted identically in Python and TypeScript", () => {
+  const dir = fixture();
+  const entries = [
+    { name: "triage.decision", props: { class: "otp", routed: "logged" } },
+    { name: "fastpath.auth_logged", props: { source: "mail", senderLabel: "Claude", authKind: "signin_link" } },
+    { name: "fastpath.auth_logged", props: { source: "sms", senderLabel: "an inbox sender", authKind: "otp" } },
+    { name: "fastpath.auth_logged", props: { senderLabel: "private@example.test", authKind: "123456", body: "private", link: "https://example.test/private" } },
+  ].map(entry => ({ ...entry, component: "triage", kind: "event" as const }));
+  for (const entry of entries) toolLog(entry);
+  const script = `import json, sys\nsys.path.insert(0, "helpers")\nfrom toollog import tool_log\nfor entry in json.loads(sys.argv[1]): tool_log(entry)\n`;
+  const result = Bun.spawnSync(["python3", "-I", "-B", "-c", script, JSON.stringify(entries)], { env: { ...process.env, TOOLLOG_DIR: dir } });
+  expect(result.exitCode).toBe(0);
+  const all = rows(dir);
+  for (const offset of [0, entries.length]) {
+    for (let i = 0; i < 3; i++) expect(all[offset + i].props).toEqual(entries[i]!.props);
+    expect(all[offset + 3].props).toBeUndefined();
+  }
+});
+
+test.each(["data_read.retried", "data_read.failed", "data_write.retried", "data_write.failed", "runs_log.write_failed"])("%s retains only file fault metadata", name => {
+  const dir = fixture();
+  const props = { path: "/home/fixture/settings.json", errnoCode: "EDEADLK", attempts: 4, ms: 1750, dataless: true };
+  toolLog({ component: "triage", kind: "error", name, props: { ...props, body: "private" } });
+  expect(rows(dir)[0].props).toEqual(props);
+  for (const path of ["private body", "/file\nprivate", "/" + "x".repeat(1024)]) {
+    toolLog({ component: "triage", kind: "error", name, props: { path } });
+  }
+  expect(rows(dir).slice(1).every(row => row.props === undefined)).toBe(true);
+});
 const emptyBreakdown = {
-  byWatcher: {}, watcherTotals: { watchers: 0, runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0 }, fires: 0 },
-  byHelper: {}, helperTotals: { helpers: 0, runs: 0, failures: 0, exitCodes: {} }, errorsByTagAndSource: [],
+  byDependency: {}, dependencyTotals: { dependencies: 0, busyRuns: 0 },
+  slots: { allSlotsBusyMinutes: 0, topHolders: [] },
+  byWatcher: {}, watcherTotals: { watchers: 0, runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0, busy: 0 }, fires: 0 },
+  byHelper: {}, helperTotals: { helpers: 0, runs: 0, failures: 0, exitCodes: {} }, errorsByTagAndSource: [], hourly: [], markers: [],
   wake: { attempts: 0, sent: 0, failed: 0, replyGuard: { total: 0, blocked: 0, accepted: 0 } },
 };
 const day = () => new Date().toISOString().slice(0, 10);
 const rows = (dir: string) => readFileSync(join(dir, `${day()}.ndjson`), "utf8").trim().split("\n").map(line => JSON.parse(line));
 afterEach(() => { if (before === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = before; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test.each([
+  ["msgs", true], ["9router", true], ["mail.archive-v2", true], ["a".repeat(64), true],
+  ["a".repeat(65), false], ["", false], ["private text", false], ["/private/path", false],
+  ["private12345", false], [12345, false], [null, false], [{ name: "msgs" }, false],
+] as const)("dependency labels are validated by the writer and rollup: %s", async (dependency, valid) => {
+  const dir = fixture();
+  toolLog({ component: "runner", kind: "error", name: "watch.run", ids: { watcher: "fixture" },
+    props: { outcome: "busy", stderrClass: "dependency_busy", dependency } });
+  expect(rows(dir)[0].props.dependency).toBe(valid ? dependency : undefined);
+  // An imported or older writer's row must pass the same validation at read time.
+  writeFileSync(join(dir, `${day()}.ndjson`), JSON.stringify({ ts: new Date().toISOString(), tool: "watchers",
+    component: "runner", kind: "error", name: "watch.run", ids: { watcher: "fixture" }, props: { outcome: "busy", dependency } }) + "\n");
+  const result = await rollup(day(), dir);
+  expect(result?.byWatcher.fixture?.outcomes.busy).toBe(1);
+  expect(Object.keys(result!.byDependency)).toEqual(valid ? [dependency as string] : []);
+});
+
+test("slot snapshots retain only sanitized holder ids and valid elapsed times", () => {
+  const dir = fixture();
+  toolLog({ component: "runner", kind: "perf", name: "slot.backlog", props: { depth: 2, active: 2, cap: 2, oldestWaitMs: 60_000,
+    holders: [{ watcher: "flighty-bookings", elapsedMs: 60_000, secret: "private" }, { watcher: null, elapsedMs: 1 },
+      { watcher: {}, elapsedMs: 1 }, { watcher: "valid", elapsedMs: -1 }, { watcher: "valid", elapsedMs: Infinity }, null], request: { secret: "private" } } });
+  expect(rows(dir)[0].props).toEqual({ depth: 2, active: 2, cap: 2, oldestWaitMs: 60_000, holders: [{ watcher: "flighty-bookings", elapsedMs: 60_000 }] });
+});
+
+test.each([
+  ["named", "flighty-bookings", true],
+  ["hexadecimal", "abcdefabcdefabcdefabcdef", true],
+  ["24 digits", "123456789012345678901234", false],
+  ["embedded digits", "watcher-12345", false],
+  ["phone", "+971500000000", false],
+  ["spaces", "private text", false],
+  ["path", "/Users/private", false],
+  ["empty", "", false],
+  ["long", "a".repeat(81), false],
+  ["unicode", "watcher-é", false],
+  ["number", 1234567890, false],
+] as const)("slot holder ids use the writer's watcher sanitizer: %s", (_shape, watcher, readable) => {
+  const dir = fixture();
+  for (const name of ["slot.wait", "slot.backlog"]) toolLog({ component: "runner", kind: "perf", name,
+    ids: { watcher }, props: { holders: [{ watcher, elapsedMs: 30_000 }] } });
+  const expected = readable ? String(watcher) : new Bun.CryptoHasher("sha256").update(String(watcher)).digest("hex").slice(0, 24);
+  for (const row of rows(dir)) {
+    expect(row.ids.watcher).toBe(expected);
+    expect(row.props.holders).toEqual([{ watcher: expected, elapsedMs: 30_000 }]);
+  }
+});
 
 test("watcher and Telegram loggers share the same private, allowlisted format", async () => {
   const dir = fixture();
@@ -56,15 +136,15 @@ test("watcher and Telegram loggers share the same private, allowlisted format", 
   expect(statSync(join(dir, `${day()}.ndjson`)).mode & 0o777).toBe(0o600);
 });
 
-test("creator fallbacks retain stable lookup fields and discard arbitrary reasons", () => {
+test.each(["native", "status", "send"])("creator fallbacks retain stable %s fields and discard arbitrary reasons", step => {
   const dir = fixture();
-  for (const reason of ["timeout", "exit:1", "exit:127", "invalid", "archived", "private payload", "exit:1 secret"]) {
+  for (const reason of ["timeout", "exit:1", "exit:127", "invalid", "archived", "error", "private payload", "exit:1 secret"]) {
     toolLog({ component: "wakes", kind: "error", name: "wake.creator_fallback", ok: false,
-      ids: { watcher: "fixture" }, props: { step: "native", reason, durationMs: 12 } });
+      ids: { watcher: "fixture" }, props: { step, reason, durationMs: 12 } });
   }
   const all = rows(dir);
-  expect(all.map(row => row.props.reason)).toEqual(["timeout", "exit:1", "exit:127", "invalid", "archived", undefined, undefined]);
-  expect(all.every(row => row.props.step === "native" && row.props.durationMs === 12)).toBe(true);
+  expect(all.map(row => row.props.reason)).toEqual(["timeout", "exit:1", "exit:127", "invalid", "archived", "error", undefined, undefined]);
+  expect(all.every(row => row.props.step === step && row.props.durationMs === 12)).toBe(true);
 });
 
 test("logging drops IO and serialization failures without raising", () => {
@@ -100,7 +180,7 @@ test("rollup counts fixture names/kinds, rates, percentiles and top error tags, 
   for (const ms of [1, 2, 3, 4, 100]) toolLog({ component: "runner", kind: "perf", name: "watch.run", durationMs: ms, ok: true });
   toolLog({ component: "runner", kind: "error", name: "watch.run", durationMs: 8, ok: false, ids: { watcher: "fixture" }, error: { tag: "watch.timeout" } });
   const result = await rollup(day());
-  expect(result).toMatchObject({ total: 6, counts: { "watch.run": 6 }, kinds: { perf: 5, error: 1 }, ok: 5, failed: 1, okRate: 5 / 6, errorRate: 1 / 6, durations: { "watch.run": { count: 6, p50: 3, p95: 100, max: 100 } }, errors: [{ tag: "watch.timeout", count: 1, sampleId: "fixture" }] });
+  expect(result).toMatchObject({ total: 6, counts: { "watch.run": 6 }, kinds: { perf: 5, error: 1 }, ok: 5, failed: 1, okRate: 5 / 6, errorRate: 1 / 6, durations: { "watch.run": { count: 6, p50: 3, p95: 100, max: 100 } }, errors: [{ tag: "watch.timeout", count: 1, topSources: [{ source: "watcher", id: "fixture", count: 1 }] }] });
   expect(statSync(join(dir, `rollup-${day()}.json`)).mode & 0o777).toBe(0o600);
   expect(await rollup("../../secret")).toBeUndefined();
   expect(await rollup("2026-02-30")).toBeUndefined();
@@ -241,4 +321,20 @@ test("relay metadata keeps bounded values and rejects text in every new field", 
   expect(rows(dir)[1].props).toEqual({ reason: "resume", relays: 1 });
   expect(rows(dir)[2].props).toBeUndefined();
   expect(JSON.stringify(rows(dir))).not.toContain(secret);
+});
+
+test('queued wakes retain route and confirmation metadata and count as sent only after confirmation', async () => {
+  const dir = fixture();
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: false,
+    props: { via: 'thread:abcd1234', confirmed: 'pending', accepted: true } });
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: false,
+    props: { via: 'wake:owner-fallback', meant_for: 'abcd1234', confirmed: 'pending', accepted: true } });
+  expect(rows(dir).map(row => row.props)).toEqual([
+    { via: 'thread:abcd1234', confirmed: 'pending', accepted: true },
+    { via: 'wake:owner-fallback', meant_for: 'abcd1234', confirmed: 'pending', accepted: true },
+  ]);
+  expect((await rollup(day(), dir))?.wake).toMatchObject({ attempts: 2, sent: 0, failed: 0 });
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.confirmed', ok: true, durationMs: 1_000 });
+  toolLog({ component: 'wakes', kind: 'error', name: 'wake.unconfirmed', ok: false, durationMs: 600_000 });
+  expect((await rollup(day(), dir))?.wake).toMatchObject({ attempts: 2, sent: 1, failed: 1 });
 });

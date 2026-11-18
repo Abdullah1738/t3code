@@ -1,6 +1,37 @@
 import { expect, test } from "bun:test";
 import { cardPreviewImage, ogImageOf } from "../src/card-preview.ts";
 import type { LineFile } from "../src/line.ts";
+import { captureLogs } from "./log-fixture.ts";
+
+test("card preview attempt increases per failing card and resets after success", async () => {
+  let ready = false;
+  const fetchFn = Object.assign(async () => {
+    if (!ready) throw new Error("PRIVATE +971501234567 /Users/private https://private.test/");
+    return new Response("<title>Done</title>", { headers: { "content-type": "text/html" } });
+  }, { preconnect: fetch.preconnect });
+  const preview = cardPreviewImage(async () => "", fetchFn, "owner");
+  const url = "https://private.test/q-PRIVATE/";
+  const rows = await captureLogs(async () => {
+    await expect(preview(url)).rejects.toThrow();
+    await expect(preview("https://private.test/other-PRIVATE/")).rejects.toThrow();
+    await expect(preview(url)).rejects.toThrow();
+    ready = true;
+    expect(await preview(url)).toBeUndefined();
+    ready = false;
+    await expect(preview(url)).rejects.toThrow();
+  });
+  expect(rows.filter(row => row.name === "card.render").map(row => row.props?.attempt)).toEqual([1, 1, 2, 1]);
+  expect(JSON.stringify(rows)).not.toMatch(/PRIVATE|971501234567|\/Users\/private|https:\/\//);
+});
+
+test("long-running card retries still log attempts above 100", async () => {
+  const fetchFn = Object.assign(async () => { throw new Error("page fetch failed"); }, { preconnect: fetch.preconnect });
+  const preview = cardPreviewImage(async () => "", fetchFn);
+  const rows = await captureLogs(async () => {
+    for (let i = 0; i < 101; i++) await expect(preview("https://private.test/q-fixture/")).rejects.toThrow();
+  });
+  expect(rows.filter(row => row.name === "card.render").at(-1)?.props?.attempt).toBe(101);
+});
 
 test("ogImageOf resolves relative og:image values and ignores non-https ones", () => {
   expect(ogImageOf(`<meta property="og:image" content="/preview.png?v=2&amp;x=1">`, "https://a.example/ride/"))
@@ -70,7 +101,7 @@ test("card preparation logs render success/failure without page or caption text"
     }))("https://a.example/q-fixture/");
     await expect(cardPreviewImage(async () => "", fakeFetch({}))("https://a.example/delivery-fixture/")).rejects.toThrow();
   });
-  expect(logs.filter(l => l.name === "card.render").map(l => [l.ok, l.props?.cardKind])).toEqual([[true, "quick"], [false, "delivery"]]);
+  expect(logs.filter(l => l.name === "card.render" || l.name === "card.renders").map(l => [l.ok, l.props?.cardKind]).sort((a, b) => Number(b[0]) - Number(a[0]))).toEqual([[true, "quick"], [false, "delivery"]]);
   expect(logs.some(l => l.name === "bridge.catch")).toBe(true);
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_CARD_TEXT");
 });

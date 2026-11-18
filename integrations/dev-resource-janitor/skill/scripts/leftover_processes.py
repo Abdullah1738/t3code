@@ -1,13 +1,18 @@
-"""Read-only process evidence. Unknown ownership or incomplete observations always keep."""
+"""Process evidence and opt-in session cleanup. Unknown or incomplete always keeps."""
 import ctypes
 import datetime
+import json
+import math
 import os
 import re
 import shlex
+import socket
 import struct
 import subprocess
+import sys
 import time
 import urllib.parse
+from pathlib import Path
 
 import active_sessions
 
@@ -15,6 +20,10 @@ IDLE_GRACE = 2 * 60 * 60
 NATIVE_KEYS = {"CLAUDE_CODE_SESSION_ID": "claudeAgent", "CODEX_THREAD_ID": "codex"}
 THREAD_KEYS = {"T3_THREAD_ID", "T3CODE_THREAD_ID", "ROBOB_THREAD_ID"}
 TERMINAL = {"completed", "cancelled", "failed", "interrupted"}
+OWNER_CALL_TIMEOUT = 20
+OBSERVATION_BUDGET = 10 * 60
+BROWSER_EXIT_GRACE = 5
+OWNER_ENDPOINTS = ("by_native", "detail", "recovery")
 
 
 def redact_opaque_token(match):
@@ -71,9 +80,9 @@ def parse_ps(raw):
     return rows
 
 
-def processes(pid=None):
+def processes(pid=None, *, timeout=15):
     select = ["-p", str(pid)] if pid else ["-ax"]
-    return parse_ps(run(["/bin/ps", *select, "-o", "pid=,ppid=,lstart=,tty=,args="]))
+    return parse_ps(run(["/bin/ps", *select, "-o", "pid=,ppid=,lstart=,tty=,args="], timeout=timeout))
 
 
 def parse_top(raw):
@@ -100,13 +109,25 @@ def launch_services():
 
 def native_binding(pid):
     """Only allowlisted session identifiers leave KERN_PROCARGS2; never dump environments."""
+    try:
+        ids = environment_values(pid, THREAD_KEYS | set(NATIVE_KEYS))
+    except (OSError, ValueError):
+        return None
+    return {key: value for key, value in ids.items()
+            if re.fullmatch(r"[A-Za-z0-9:_/%.-]{1,600}", value)} or None
+
+
+def environment_values(pid, keys):
+    """An empty readable environment differs from an unavailable observation."""
     lib = ctypes.CDLL(None, use_errno=True)
     mib = (ctypes.c_int * 3)(1, 49, pid)
     size = ctypes.c_size_t(1024 * 1024)
     buf = ctypes.create_string_buffer(size.value)
     if lib.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
-        return None
+        raise OSError(ctypes.get_errno(), "process metadata unavailable")
     data = buf.raw[:size.value]
+    if len(data) < 4:
+        raise ValueError("process metadata incomplete")
     argc = struct.unpack("i", data[:4])[0]
     pos = data.find(b"\0", 4) + 1
     while pos < len(data) and data[pos] == 0:
@@ -115,9 +136,9 @@ def native_binding(pid):
     for item in data[pos:].split(b"\0")[argc:]:
         key, sep, value = item.partition(b"=")
         name = key.decode(errors="replace")
-        if sep and name in THREAD_KEYS | set(NATIVE_KEYS) and re.fullmatch(rb"[A-Za-z0-9:_/%.-]{1,600}", value):
+        if sep and name in keys:
             ids[name] = value.decode()
-    return ids or None
+    return ids
 
 
 def parent_chain(row, rows):
@@ -143,6 +164,8 @@ def family(row):
         return program
     if program in {"node", "cua-driver", "claude", "codex", "opencode", "npx", "bun"}:
         return program
+    if program == "agent-browser-darwin-arm64":
+        return "agent-browser"
     return None
 
 
@@ -176,35 +199,71 @@ def probe(row):
             "binding": native_binding(row["pid"])}
 
 
-def control(path):
-    status, body = active_sessions._control_get(path, timeout=20)
-    if status != 200 or not isinstance(body, dict) or body.get("ok") is not True:
-        raise RuntimeError(f"owner api: status {status}")
-    return body
+def owner_call_summary(calls):
+    summary = {}
+    for kind in OWNER_ENDPOINTS:
+        samples = calls.get(kind, [])
+        durations = sorted(ms for ms, _ in samples)
+        failures = {}
+        for _, status in samples:
+            if status is not None:
+                failures[status] = failures.get(status, 0) + 1
+        summary[kind] = {
+            "count": len(samples),
+            "p50_ms": round(durations[math.ceil(len(durations) * .50) - 1], 3) if durations else None,
+            "p95_ms": round(durations[math.ceil(len(durations) * .95) - 1], 3) if durations else None,
+            "max_ms": round(durations[-1], 3) if durations else None,
+            "failures": failures,
+        }
+    return summary
 
 
-def owner(binding):
+def control(path, calls=None):
+    kind = ("by_native" if path.startswith("/threads/by-native/") else
+            "recovery" if path.startswith("/recovery/") else "detail")
+    started, status, failed = time.perf_counter(), 0, True
+    try:
+        status, body = active_sessions._control_get(path, timeout=OWNER_CALL_TIMEOUT)
+        if status != 200 or not isinstance(body, dict) or body.get("ok") is not True:
+            raise RuntimeError(f"owner api: status {status}")
+        failed = False
+        return body
+    finally:
+        if calls is not None:
+            calls.setdefault(kind, []).append(((time.perf_counter() - started) * 1000,
+                                              str(status) if failed else None))
+
+
+def owner(binding, calls=None):
     if not binding:
         return None
     tids = {value for key, value in binding.items() if key in THREAD_KEYS}
+    views = []
     for key, driver in NATIVE_KEYS.items():
         if key in binding:
-            body = control("/threads/by-native/" + urllib.parse.quote(binding[key], safe="") + "?driver=" + driver)
+            body = control("/threads/by-native/" + urllib.parse.quote(binding[key], safe="") +
+                           "?driver=" + driver + "&view=owner", calls=calls)
             thread = body.get("thread")
             if not isinstance(thread, dict) or not thread.get("threadId"):
                 return None
             tids.add(thread["threadId"])
+            views.append(thread)
     if len(tids) != 1:
         return None
     tid = tids.pop()
-    body = control("/threads/" + urllib.parse.quote(tid, safe=""))
+    # Resolve every binding before a keep marker, so conflicting ids stay unknown.
+    if any(view.get("deleted") is True for view in views):
+        return {"thread": {"threadId": tid}, "keep_reason": "owner_deleted"}
+    if any(view.get("state") != "idle" or view.get("status") not in TERMINAL for view in views):
+        return {"thread": {"threadId": tid}, "keep_reason": "owner_has_work_or_not_ended"}
+    body = control("/threads/" + urllib.parse.quote(tid, safe=""), calls=calls)
     detail = body.get("thread")
     if not isinstance(detail, dict) or detail.get("threadId") != tid:
         return None
     # Recovery pages are ordered by thread id. The strict prefix cursor starts
     # before this exact owner; never infer the owner's absence from a page.
     recovery = control("/recovery/snapshot?" + urllib.parse.urlencode({
-        "active": "false", "cursor": tid[:-1], "limit": 500}))
+        "active": "false", "cursor": tid[:-1], "limit": 500}), calls=calls)
     entries = recovery.get("threads")
     if not isinstance(entries, list):
         return None
@@ -331,6 +390,9 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
            refresh=processes, refresh_roster=active_sessions.checked_snapshot, now=None, deadline=None, cursor=0, cwd_hints=None):
     report = {"report_only": True, "inventory": [], "candidates": [], "problems": [],
               "checked": 0, "skipped": 0, "budget_skipped": 0, "next_cursor": cursor}
+    calls = {}
+    if resolve is owner:
+        resolve = lambda binding: owner(binding, calls=calls)
     if not roster["complete"]:
         report["problems"] = ["liveness_unavailable: " + "; ".join(roster["problems"])]
     now = time.time() if now is None else now
@@ -373,6 +435,8 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
                 item["owner"] = own["thread"]["threadId"] if own else None
                 if not own:
                     reason = "unknown_owner"
+                elif own.get("keep_reason"):
+                    reason = own["keep_reason"]
                 elif not owner_clear(own, roster):
                     reason = "owner_has_work_or_not_ended"
                 elif any(k == details["cwd"] for k in keep):
@@ -416,7 +480,261 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
             if item.get("candidate"):
                 item.update(candidate=False, keep_reason="liveness_unavailable")
     report["skipped"] = len(report["inventory"]) - report["checked"]
+    report["owner_calls"] = owner_call_summary(calls)
     return report
+
+
+def browser_metadata(pid):
+    values = environment_values(pid, {"AGENT_BROWSER_SESSION", "AGENT_BROWSER_NAMESPACE",
+                                      "AGENT_BROWSER_SOCKET_DIR"})
+    session = values.get("AGENT_BROWSER_SESSION")
+    if not session or session in {".", ".."} or not re.fullmatch(r"[\w.-]{1,128}", session):
+        raise ValueError("session unavailable")
+    # lsof binds the session to this daemon, including custom socket directories
+    # and namespaces; guessing a path can close a different session.
+    raw = run(["/usr/sbin/lsof", "-b", "-w", "-nP", "-a", "-p", str(pid), "-U", "-Fn"])
+    paths = {line[1:] for line in raw.splitlines() if line.startswith("n/") and line.endswith(".sock")}
+    matches = [Path(path) for path in paths if Path(path).name == session + ".sock"]
+    if len(matches) != 1:
+        raise ValueError("session socket ambiguous or unavailable")
+    sock = matches[0]
+    if sock.with_suffix(".pid").read_text().strip() != str(pid):
+        raise ValueError("session pid sidecar mismatch")
+    return {"session": session, "socket": str(sock), "namespace": values.get("AGENT_BROWSER_NAMESPACE"),
+            "socket_dir": values.get("AGENT_BROWSER_SOCKET_DIR"), "binding": native_binding(pid)}
+
+
+def cpu_processes():
+    raw = run(["/bin/ps", "-ax", "-o", "pid=,ppid=,lstart=,tty=,time=,rss=,args="])
+    result = {}
+    for line in raw.splitlines():
+        fields = line.split(None, 10)
+        if len(fields) != 11:
+            raise ValueError("CPU observation incomplete")
+        times = fields[8].split(":")
+        if len(times) not in {2, 3}:
+            raise ValueError("CPU time unavailable")
+        seconds = sum(float(value) * 60 ** i for i, value in enumerate(reversed(times)))
+        row = parse_ps(" ".join(fields[:8] + [fields[10]]))[int(fields[0])]
+        result[row["pid"]] = {**row, "cpu_seconds": seconds, "rss_kib": int(fields[9])}
+    if not result:
+        raise ValueError("CPU observation empty")
+    return result
+
+
+def descendants(pid, rows):
+    found = {pid}
+    while True:
+        more = {p for p, row in rows.items() if row["ppid"] in found}
+        if more <= found:
+            return found - {pid}
+        found |= more
+
+
+def detect_agent_browsers(rows, before, after, roster, labels, keep=(), *, metadata=browser_metadata,
+                          resolve=owner, now=None, window_s=0, deadline=None):
+    report = {"inventory": [], "candidates": [], "problems": [], "actions": [],
+              "reap_enabled": os.environ.get("DEV_JANITOR_REAP_AGENT_BROWSER") == "1"}
+    now = time.time() if now is None else now
+    calls, owners = {}, {}
+    if resolve is owner:
+        resolve = lambda binding: owner(binding, calls=calls)
+    for row in rows.values():
+        if family(row) != "agent-browser":
+            continue
+        item = {**row, "args": redact(row["args"]), "session": None, "socket": None,
+                "owner_state": "unknown", "owner": None, "children": [], "candidate": False}
+        report["inventory"].append(item)
+        try:
+            item["age_s"] = now - time.mktime(time.strptime(row["start"], "%a %b %d %H:%M:%S %Y"))
+            details = metadata(row["pid"])
+            item.update(session=details["session"], socket=details["socket"], namespace=details.get("namespace"),
+                        socket_dir=details.get("socket_dir"), binding=details["binding"])
+            reason = keep_reason(row, parent_chain(row, rows), labels, keep)
+            if any(value in keep for value in (details["session"], details["socket"], str(Path(details["socket"]).parent))):
+                reason = reason or "keep_file"
+            if deadline is not None and time.monotonic() >= deadline:
+                reason = reason or "observation_budget_exhausted"
+            if not reason and (row["ppid"] != 1 or item["age_s"] < IDLE_GRACE):
+                reason = "not_orphaned_or_young"
+            if not reason and (not roster["complete"] or window_s < 1):
+                reason = "observation_incomplete"
+            tree = descendants(row["pid"], before)
+            if not reason and tree != descendants(row["pid"], after):
+                reason = "child_tree_changed"
+            for pid in tree | {row["pid"]}:
+                first, last = before.get(pid), after.get(pid)
+                identity = lambda value: {k: value.get(k) for k in ("pid", "ppid", "start", "args", "tty")} if value else None
+                if (not first or not last or identity(first) != identity(last)
+                        or (pid == row["pid"] and identity(first) != identity(row))):
+                    reason = reason or "process_identity_changed"
+                    continue
+                delta = last["cpu_seconds"] - first["cpu_seconds"]
+                if delta < 0:
+                    reason = reason or "observation_incomplete"
+                if pid != row["pid"]:
+                    item["children"].append({"pid": pid, "ppid": first["ppid"], "start": first["start"], "tty": first["tty"],
+                                             "command": redact(first["args"]), "cpu_delta_s": delta,
+                                             "cpu_seconds": last["cpu_seconds"],
+                                             "rss_kib": last["rss_kib"]})
+                    if delta > 0:
+                        reason = reason or "child_busy"
+            if not reason:
+                binding = details["binding"]
+                if not binding:
+                    # Readable-but-unbound is still unknown ownership. In particular,
+                    # OpenCode cloud-browser sessions do not inherit native ids.
+                    reason = "unknown_owner"
+                else:
+                    key = tuple(sorted(binding.items()))
+                    if key not in owners:
+                        owners[key] = resolve(binding)
+                    own = owners[key]
+                    if own:
+                        item["owner"] = own["thread"]["threadId"]
+                    if own and own.get("keep_reason") == "owner_has_work_or_not_ended":
+                        item["owner_state"] = "live-owner"
+                    elif (own and not own.get("keep_reason")
+                          and own["thread"].get("state") is not None and own["thread"].get("status") is not None
+                          and (own["thread"]["state"] != "idle" or own["thread"]["status"] not in TERMINAL)):
+                        item["owner_state"] = "live-owner"
+                    if own and not own.get("keep_reason") and owner_clear(own, roster) and expired(own["thread"], now):
+                        item["owner_state"] = "ended-owner"
+                    else:
+                        reason = "unknown_owner" if not own else own.get("keep_reason", "owner_not_clear_or_recent")
+            if reason:
+                item["keep_reason"] = reason
+            else:
+                item["candidate"] = True
+                report["candidates"].append(dict(item))
+        except Exception as exc:
+            item["keep_reason"] = "observation_unavailable: " + type(exc).__name__
+    report["owner_calls"] = owner_call_summary(calls)
+    return report
+
+
+def scan_agent_browsers(roster, keep=()):
+    try:
+        rows = processes()
+        if not any(family(row) == "agent-browser" for row in rows.values()):
+            return detect_agent_browsers(rows, {}, {}, roster, {}, keep)
+        labels = launch_services()
+        before = cpu_processes()
+        started = time.monotonic()
+        # Two top samples provide a bounded observation window without a polling
+        # loop. CPU progress is measured with cumulative ps times on either side.
+        run(["/usr/bin/top", "-l", "2", "-s", "1", "-stats", "pid,cpu"], timeout=15)
+        after = cpu_processes()
+        return detect_agent_browsers(rows, before, after, roster, labels, keep,
+                                     window_s=time.monotonic() - started, deadline=started + OBSERVATION_BUDGET)
+    except Exception as exc:
+        return {"inventory": [], "candidates": [], "actions": [],
+                "reap_enabled": os.environ.get("DEV_JANITOR_REAP_AGENT_BROWSER") == "1",
+                "problems": ["browser_observation_unavailable: " + type(exc).__name__]}
+
+
+def browser_tree_matches(item, rows):
+    current = rows.get(item["pid"])
+    if not current or any(current.get(k) != item.get(k) for k in ("pid", "ppid", "start", "args", "tty")):
+        return False
+    if descendants(item["pid"], rows) != {child["pid"] for child in item["children"]}:
+        return False
+    return all(all(rows[child["pid"]].get(k) == child[k] for k in ("ppid", "start", "tty", "cpu_seconds"))
+               and redact(rows[child["pid"]]["args"]) == child["command"] for child in item["children"])
+
+
+def revalidate_agent_browser(item, *, metadata=browser_metadata, resolve=owner,
+                             snapshot=active_sessions.checked_snapshot, observe=cpu_processes, now=None):
+    details = metadata(item["pid"])
+    if any(details.get(k) != item.get(k) for k in ("session", "socket", "namespace", "socket_dir", "binding")):
+        return False
+    roster = snapshot()
+    # Provider and workspace reads can outlast the roster's active-thread read.
+    # Resolve this exact owner after all of them, before the final tree checks.
+    own = resolve(details["binding"]) if details["binding"] else None
+    return bool(roster["complete"] and own and not own.get("keep_reason")
+                and own["thread"]["threadId"] == item["owner"] and owner_clear(own, roster)
+                and expired(own["thread"], time.time() if now is None else now)
+                and browser_tree_matches(item, observe()))
+
+
+def close_agent_browser(item):
+    # agent-browser 0.38.2 connection.rs uses newline-delimited JSON. Sending
+    # close on this existing socket avoids the CLI's ensure_daemon/respawn path
+    # and its HOME/XDG/namespace routing, while retaining graceful state cleanup.
+    meta = browser_metadata(item["pid"])
+    if any(meta.get(key) != item.get(key) for key in ("session", "socket", "namespace", "socket_dir")):
+        raise ValueError("session identity changed")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(30)
+        stream.connect(item["socket"])
+        if sys.platform == "darwin":
+            # sys/un.h: SOL_LOCAL=0, LOCAL_PEERPID=2. The kernel binds the
+            # connection to the PID; a replaced socket must never receive close.
+            peer = struct.unpack("i", stream.getsockopt(0, 2, struct.calcsize("i")))[0]
+        else:
+            peer = struct.unpack("3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                        struct.calcsize("3i")))[0]
+        if peer != item["pid"] or not browser_tree_matches(item, cpu_processes()):
+            raise ValueError("daemon or child tree changed")
+        stream.sendall(json.dumps({"id": "janitor-" + str(time.time_ns()), "action": "close"}).encode() + b"\n")
+        with stream.makefile("rb") as reply:
+            response = reply.readline(65537)
+        if len(response) > 65536 or json.loads(response).get("success") is not True:
+            raise RuntimeError("session close failed")
+
+
+def reap_agent_browsers(report, *, rescan=None, close=close_agent_browser, refresh=None, validate=None):
+    if os.environ.get("DEV_JANITOR_REAP_AGENT_BROWSER") != "1":
+        return []
+    if rescan is None:
+        rescan = lambda: scan_agent_browsers(active_sessions.checked_snapshot())
+    if validate is None:
+        validate = revalidate_agent_browser
+    actions = []
+    for original in report.get("candidates", []):
+        entry = {"pid": original["pid"], "session": original["session"], "ok": False, "action": "kept"}
+        try:
+            fresh = rescan()
+            def identity(item):
+                return ({key: item.get(key) for key in ("pid", "ppid", "start", "args", "tty", "session", "socket", "namespace", "socket_dir", "owner", "binding")},
+                        sorted((child["pid"], child["start"]) for child in item["children"]))
+            candidate = next((item for item in fresh["candidates"] if identity(item) == identity(original)), None)
+            if fresh.get("problems") or not candidate:
+                entry["reason"] = "changed_before_close"
+            else:
+                if not validate(candidate):
+                    entry["reason"] = "owner_or_child_tree_changed"
+                else:
+                    entry["action"] = "close"
+                    close(candidate)
+                    identities = [(candidate["pid"], candidate["start"])] + [(c["pid"], c["start"]) for c in candidate["children"]]
+                    # v0.38.2 acknowledges close before its 100 ms shutdown delay.
+                    # Bound both the grace period and each process read by one deadline.
+                    deadline = time.monotonic() + BROWSER_EXIT_GRACE
+                    pause = .1
+                    while (budget := deadline - time.monotonic()) > 0:
+                        remaining = processes(timeout=budget) if refresh is None else refresh()
+                        if not any(remaining.get(pid, {}).get("start") == start for pid, start in identities):
+                            entry["ok"] = True
+                            break
+                        delay = min(pause, deadline - time.monotonic())
+                        if delay > 0:
+                            time.sleep(delay)
+                        pause = min(pause * 2, .5)
+                    if not entry["ok"]:
+                        entry["reason"] = "close_incomplete"
+        except Exception as exc:
+            entry["reason"] = type(exc).__name__
+        actions.append(entry)
+    return actions
+
+
+def report_summary(report):
+    result = {key: report[key] for key in ("candidates", "problems", "checked", "skipped", "budget_skipped", "owner_calls")}
+    if "agent_browser" in report:
+        result["agent_browser"] = report["agent_browser"]
+    return result
 
 
 def scan(roster, keep=(), cursor=0):
@@ -428,9 +746,12 @@ def scan(roster, keep=(), cursor=0):
             hints = cwd_inventory(rows)
         except Exception:
             hints = {}
-        return detect(rows, memory, labels, roster, keep, deadline=time.monotonic() + 120,
-                      cursor=cursor, cwd_hints=hints)
+        report = detect(rows, memory, labels, roster, keep, deadline=time.monotonic() + OBSERVATION_BUDGET,
+                        cursor=cursor, cwd_hints=hints)
+        report["agent_browser"] = scan_agent_browsers(roster, keep)
+        return report
     except Exception as exc:
         return {"report_only": True, "inventory": [], "candidates": [],
                 "problems": ["process_inventory_unavailable: " + type(exc).__name__],
-                "checked": 0, "skipped": 0, "budget_skipped": 0, "next_cursor": cursor}
+                "checked": 0, "skipped": 0, "budget_skipped": 0, "next_cursor": cursor,
+                "owner_calls": owner_call_summary({})}

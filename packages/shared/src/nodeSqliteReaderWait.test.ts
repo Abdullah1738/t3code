@@ -27,6 +27,16 @@ it.live(
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         const waits: number[] = [];
+        const granted: string[] = [];
+        let pending = 0;
+        const started = () => {
+          pending++;
+          return (lane: string, acquired: boolean) => {
+            if (!acquired) return;
+            pending--;
+            granted.push(lane);
+          };
+        };
         yield* sql`SELECT 1`.pipe(SqliteClient.readOnly);
         yield* sql
           .withTransaction(
@@ -39,6 +49,7 @@ it.live(
         assert.equal(waits.length, 0);
         yield* sql`SELECT 1`.pipe(
           SqliteClient.readOnly,
+          Effect.provideService(SqliteClient.ReaderWaitStartedObserver, started),
           Effect.provideService(SqliteClient.ReaderWaitObserver, (ms) => waits.push(ms)),
         );
         yield* sql
@@ -51,13 +62,19 @@ it.live(
           .pipe(
             SqliteClient.readOnly,
             SqliteClient.foregroundReads,
+            Effect.provideService(SqliteClient.ReaderWaitStartedObserver, started),
             Effect.provideService(SqliteClient.ReaderWaitObserver, (ms) => waits.push(ms)),
           );
         assert.equal(waits.length, 2);
+        assert.equal(pending, 0);
+        assert.deepEqual(granted, ["background", "foreground"]);
         assert.isTrue(waits.every((ms) => Number.isFinite(ms) && ms >= 0));
         assert.deepEqual(
           yield* sql`SELECT 3 AS n`.pipe(
             SqliteClient.readOnly,
+            Effect.provideService(SqliteClient.ReaderWaitStartedObserver, () => {
+              throw new Error("observer");
+            }),
             Effect.provideService(SqliteClient.ReaderWaitObserver, () => {
               throw new Error("observer");
             }),

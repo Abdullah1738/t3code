@@ -4,6 +4,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import phone_hold
+
 KNOWN = {'com.deliveroo.orderapp': 'Deliveroo', 'com.instashop': 'InstaShop',
          'com.instashop.app': 'InstaShop', 'com.maf.carrefour': 'Carrefour',
          'com.lulu.luluonline': 'Lulu', 'com.unioncoop.ucs': 'Union Coop',
@@ -18,7 +20,7 @@ def detect(packages, seen):
 
 
 def main():
-    if (Path.home()/'.local/share/phone-lock/priority-hold').exists():
+    if phone_hold.held():
         return
     state = Path(os.environ['WATCH_DIR'])/'delivery-packages.json'
     p = subprocess.run(['/opt/homebrew/bin/adb', '-s', '002473611000997', 'shell', 'pm', 'list', 'packages', '-3'],

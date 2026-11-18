@@ -171,7 +171,17 @@ export const store = (source: KanbanStoreShape): KanbanStoreShape =>
   new Proxy(source, {
     get(target, key, receiver) {
       if (!Object.hasOwn(target, key)) return Reflect.get(target, key, receiver);
-      const member = target[key as keyof KanbanStoreShape];
+      // Metadata lookups are synchronous; the transaction observer only carries
+      // context. Neither is a database operation to time or turn into an Effect.
+      if (["callerAnalytics", "registerCallerParent", "observeCallerWrites"].includes(String(key)))
+        return Reflect.get(target, key, receiver);
+      const member =
+        target[
+          key as keyof Omit<
+            KanbanStoreShape,
+            "callerAnalytics" | "registerCallerParent" | "observeCallerWrites"
+          >
+        ];
       const wrap = (
         operation: Effect.Effect<unknown, KanbanStoreError, Scope.Scope>,
         args: unknown[] = [],

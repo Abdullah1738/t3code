@@ -7,7 +7,7 @@ import { toolError, toolLog } from "./toollog.ts";
 import { CARD_TEXT_FIELDS, cardLayout, cardSafeText, type CardText } from "./card-text.ts";
 import type { SendblueOptions } from "./chats.ts";
 import { SPECTRUM_CARD_APP, type CardApp } from "./config.ts";
-import { chatKey, LineError, sendblueFailureCode, type ChatKey, type Line, type LineAppCard, type LineEvent, type LineFile, type LineInbound, type LineLocation, type LineNoFix, type LineOutbound, type SendOptions, type TypingOptions } from "./line.ts";
+import { chatKey, LineError, sendblueErrorKey, sendblueFailureCode, type ChatKey, type Line, type LineAppCard, type LineEvent, type LineFile, type LineInbound, type LineLocation, type LineNoFix, type LineOutbound, type SendOptions, type TypingOptions } from "./line.ts";
 
 const BASE = "https://api.sendblue.com";
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -105,9 +105,9 @@ function handleOf(response: unknown): string {
 
 function errorCodeOf(message: Json): string | undefined {
   const key = str(message.error_key);
-  if (key) return key;
+  if (key) return sendblueErrorKey(key);
   const code = num(message.error_code);
-  return code === undefined ? undefined : String(code);
+  return sendblueErrorKey(code === undefined ? undefined : String(code));
 }
 
 type Frame = { id?: string; event?: string; data: string };
@@ -235,10 +235,9 @@ export class Sendblue implements Line {
     if (response.ok) return parsed;
 
     const status = response.status;
-    const detail = isObject(parsed) ? (str(parsed.message) ?? str(parsed.error_reason) ?? str(parsed.error)) : undefined;
-    const errorKey = isObject(parsed) ? (str(parsed.error_key) ?? str(parsed.error) ?? (num(parsed.error_code) === undefined ? undefined : String(parsed.error_code))) : undefined;
-    const code = sendblueFailureCode(status, errorKey);
-    const message = `Sendblue ${method} ${path} returned ${status}${detail ? `: ${detail.slice(0, 200)}` : ""}`;
+    const rawKey = isObject(parsed) ? (str(parsed.error_key) ?? str(parsed.error) ?? (num(parsed.error_code) === undefined ? undefined : String(parsed.error_code))) : undefined;
+    const code = sendblueFailureCode(status, rawKey);
+    const message = `Sendblue ${method} ${path} returned ${status}`;
     if (status === 429) throw new LineError(message, code, true, false);
     if (status >= 500) throw new LineError(message, code, true, send);
     throw new LineError(message, code, false, false);
@@ -493,6 +492,10 @@ export class Sendblue implements Line {
     // A placeholder 0,0 fix arrives without coordinates; that is still "no fix yet".
     const fix = isObject(response.location) ? toLocation(response.location) : undefined;
     return fix ?? { state: "shared_no_fix_yet" };
+  }
+
+  async setOptOut(address: string, optedOut: boolean): Promise<void> {
+    await this.#call("POST", "/api/v2/contacts/opt-out", { json: { number: address, opted_out: optedOut }, send: false });
   }
 
   async download(url: string, maxBytes: number, timeoutMs: number): Promise<LineFile> {

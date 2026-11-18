@@ -25,6 +25,7 @@ import toollog
 
 from . import api, capacity, common, git_snapshot
 from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
+from .home import StartWaitFailed
 
 RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() else "rsync"
 STALL_S = capacity.setting("OFFBOX_SYNC_STALL_S", 180)
@@ -92,6 +93,8 @@ def setup(box_id: str) -> Path:
                     or e.status in (409, 502, 503) or api.gateway_timeout(e)):
                 raise
             last = e
+        except StartWaitFailed:
+            raise
         except api.BudgetExpired as error:
             if last is not None and last.outage:
                 raise last from error
@@ -201,7 +204,16 @@ def ssh_base(box_id: str, *, probe: bool = True) -> list[str]:
 
 
 def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 120, check: bool = False):
-    p = subprocess.run(ssh_base(box_id) + [box_id, command], input=input, capture_output=True, timeout=timeout)
+    until = time.time() + timeout
+    with api.budget(timeout):
+        argv = ssh_base(box_id) + [box_id, command]
+        remaining = until - time.time()
+        left = api.left()
+        if left is not None:
+            remaining = min(remaining, left)
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        p = subprocess.run(argv, input=input, capture_output=True, timeout=remaining)
     if p.returncode == 255:
         check_host_key(box_id, p.stderr)
     if p.returncode == 255:
@@ -914,7 +926,7 @@ def _verify_content(box_id: str, root: Path, remote_dir: str, expected: dict, ti
                 raise OffboxError(f"tracked content differs after checksum repair: {remaining[:20]!r}; nothing ran")
             repaired = True
             result["repaired"] = len(bad)
-        except common.SshHostKeyMismatch:
+        except (common.SshHostKeyMismatch, StartWaitFailed):
             raise
         except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
             raise OffboxError(f"tracked content repair failed for {bad[:20]!r}: {e}; nothing ran") from e
@@ -1128,7 +1140,7 @@ def _remote_stall(box_id: str, timeout: float) -> tuple[str, str | None]:
         if p.returncode:
             check_host_key(box_id, p.stderr)
             return "remote_probe=failed", None
-    except common.SshHostKeyMismatch:
+    except (common.SshHostKeyMismatch, StartWaitFailed):
         raise
     except (OffboxError, OSError, subprocess.TimeoutExpired):
         return "remote_probe=unavailable", None
@@ -1187,6 +1199,8 @@ def _refresh_master(box_id, *, close=True, refresh=True):
     for action in ([close_master] if close else []) + ([setup] if refresh else []):
         try:
             action(box_id)
+        except StartWaitFailed:
+            raise
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             pass
 
@@ -1255,6 +1269,8 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
         try:
             with api.budget(max(0, deadline - time.monotonic())):
                 state = (api.get(box_id) or {}).get("state")
+        except StartWaitFailed:
+            raise
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             state = None
         if state and state not in api.LIVE_STATES:
@@ -1290,7 +1306,7 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float, *, run
     finally:
         try:
             ssh(box_id, f"rm -rf -- {qstage}", check=True, timeout=5)
-        except common.SshHostKeyMismatch:
+        except (common.SshHostKeyMismatch, StartWaitFailed):
             raise
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             log(f"push_git cleanup failed {box_id} {staging}")
@@ -1401,16 +1417,19 @@ def _missing_pull(code: int, error: str) -> bool:
     return missing
 
 
-def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800) -> dict:
+def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800,
+         *, relative: bool = False) -> dict:
     with toollog.span("sync", "run.pull", ids={"box": box_id}, tag="pull_failed") as data:
-        result = _pull(box_id, remote_dir, rel_cwd, path, local_cwd, timeout)
+        options = {'relative': True} if relative else {}
+        result = _pull(box_id, remote_dir, rel_cwd, path, local_cwd, timeout, **options)
         data["ok"] = bool(result.get("ok"))
         data["props"].update(bytes=result.get("received", 0), files=result.get("files", 0),
                              failed=not data["ok"], stale=not data["ok"])
         return result
 
 
-def _pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800) -> dict:
+def _pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800,
+          *, relative: bool = False) -> dict:
     """Copy <remote cwd>/<path> back to <local cwd>/<path> (file or dir; remote globs allowed)."""
     path = path.rstrip("/") or "."
     if path.startswith("/") or ".." in Path(path).parts:
@@ -1418,10 +1437,11 @@ def _pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path
     rbase = f"{remote_dir}/{rel_cwd}".rstrip("/").replace("/./", "/").rstrip(".")
     rbase = rbase.rstrip("/")
     parent = os.path.dirname(path)
-    dest = (local_cwd / parent) if parent else local_cwd
+    dest = local_cwd if relative else (local_cwd / parent) if parent else local_cwd
     dest.mkdir(parents=True, exist_ok=True)
-    cmd = [RSYNC, "-az", "--no-o", "--no-g", "--stats", "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
-           f"{box_id}:{rbase}/{path}", f"{dest}/"]
+    cmd = [RSYNC, "-az", "--no-o", "--no-g", "--stats", *(['--relative'] if relative else []),
+           "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
+           f"{box_id}:{rbase}/{'./' if relative else ''}{path}", f"{dest}/"]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if p.returncode:
         check_host_key(box_id, p.stderr.encode(errors="replace"))

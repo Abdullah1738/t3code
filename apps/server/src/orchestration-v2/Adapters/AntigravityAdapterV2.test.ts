@@ -204,6 +204,7 @@ describe("AntigravityAdapterV2 client file system", () => {
         modelSelection,
         runtimePolicy,
       });
+      assert.isTrue(session.backgroundTasksEndWithProcess);
       yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
       if (readTextFile === undefined || writeTextFile === undefined) {
         return yield* Effect.die("Antigravity sessions must serve client file requests");

@@ -39,6 +39,11 @@ export const kanbanBoardLockHoldDuration = Metric.timer("kanban_board_lock_hold_
   description: "Time holding board state permits by operation.",
 });
 
+export const kanbanBoardGateHoldMs = Metric.histogram("kanban_board_gate_hold_ms", {
+  description: "Time holding the board gate by operation, in milliseconds.",
+  boundaries: [1, 10, 100, 1_000, 5_000, 10_000, 30_000, 60_000, 120_000],
+});
+
 export const providerSessionsTotal = Metric.counter("t3_provider_sessions_total", {
   description: "Total provider session lifecycle operations.",
 });

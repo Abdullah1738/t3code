@@ -712,7 +712,12 @@ describe("V2 environment commands", () => {
             queuedRunId: "run-3",
             targetRunId: "run-active",
           },
-          { type: "queued-run.cancel", runId: "run-3" },
+          {
+            type: "queued-run.cancel",
+            runId: "run-3",
+            reason: "queued_cancel",
+            detail: "Queued message cancelled from the client.",
+          },
           { type: "queued-run.edit", runId: "run-3", text: "updated queued text" },
           {
             type: "queued-run.edit",

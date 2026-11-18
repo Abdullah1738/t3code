@@ -71,6 +71,10 @@ SMS/email evidence. An absent bank alert does not authorize another payment.
   retained 30 days, source health, reconciliation records. Mode 0600.
 - `delivery-source-health`: 60s robob-watch check, expires 7 Oct 2027. Existing
   failure escalation wakes repair and alerts rather than remaining silent.
+  Collectors ask `ph hold status --json`; a present hold defers collection
+  silently. ph frees holds whose holder exited or that went 30 minutes without
+  a refresh. There are no stale or missing-lease alerts. If ph status cannot be
+  read, collection stays deferred.
 - Existing per-order watchers keep their cursors. Context migration changes
   routing to arrival-only and asks Abdullah for actual arrival once per order.
 - ID-less delivery-window pushes wake verification, never certify arrival.

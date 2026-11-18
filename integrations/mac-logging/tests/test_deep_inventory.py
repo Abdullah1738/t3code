@@ -174,7 +174,8 @@ class DeepInventoryTests(unittest.TestCase):
 
     def test_hourly_skips_inventory_while_deep_holds_lock_but_collects_crashes(self):
         root=self.roots([('lock',1)])[0]
-        jobs.save_state('disk-inventory',dict(duMode='links',sizes={str(root):1024},partials={}))
+        jobs.save_state('disk-inventory',dict(duMode='links',sizes={str(root):1024},partials={},
+            childState={str(root): {str(root/'0000'): dict(bytes=1024, at=self.now, partial=False)}}))
         with jobs.inventory_lock() as acquired:
             self.assertIsNot(acquired,False)
             with patch.object(collector,'collect') as crash, patch.object(collector,'disk_wait'), \
@@ -199,8 +200,10 @@ class DeepInventoryTests(unittest.TestCase):
             result=normal(command,**kwargs)
             killed[0]=True
             return result
+        jobs.save_state('disk-inventory', dict(duMode='links', childState={str(root): {
+            str(p): dict(partial=True, elapsedMs=10) for p in root.iterdir()}}))
         deep.run_pass([root],run,stopped=lambda:killed[0])
-        self.assertEqual(len(jobs.read_state('disk-inventory')['childState'][str(root)]),128)
+        self.assertEqual(sum('bytes' in v for v in jobs.read_state('disk-inventory')['childState'][str(root)].values()),128)
         end=self.rows('disk.deep.end')[-1]['props']
         self.assertEqual(end['stopReason'],'killed')
         self.assertEqual(end['childrenRemaining'],2)
@@ -253,7 +256,7 @@ class DeepInventoryTests(unittest.TestCase):
                (0,'du: child: Permission denied\ndu: child: Input/output error',True,True)]
         for code,stderr,partial,failed in cases:
             with self.subTest(code=code,stderr=stderr):
-                cache={str(child):dict(bytes=4096,at=self.now-86400,attemptedAt=0,partial=False)
+                cache={str(child):dict(bytes=4096,at=self.now-86400,attemptedAt=0,partial=False,elapsedMs=10)
                        for child in root.iterdir()}
                 original=copy.deepcopy(cache)
                 def run(command,**kwargs):
@@ -363,7 +366,7 @@ class DeepInventoryTests(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired) as error:
                 runner(['/usr/bin/du','-skl','/fixture/child'],timeout=600,text=True)
             self.assertEqual(error.exception.stdout,'1\t/fixture/child\n')
-            self.assertEqual(popen.call_args.args[0][:6],['/usr/bin/nice','-n','10','/usr/sbin/taskpolicy','-c','utility'])
+            self.assertEqual(popen.call_args.args[0][:8],['/usr/bin/nice','-n','10','/usr/sbin/taskpolicy','-c','utility','-d','throttle'])
             self.assertEqual(popen.call_args.kwargs['pass_fds'],(42,))
             kill.assert_called_once_with(12345,signal.SIGKILL)
 
@@ -373,7 +376,7 @@ class BackgroundProcessTests(unittest.TestCase):
         popen=subprocess.Popen
         processes=[]
         def spawn(command,**kwargs):
-            process=popen(command[6:],**kwargs)
+            process=popen(command[8:],**kwargs)
             processes.append(process)
             return process
         with tempfile.TemporaryDirectory() as directory:
