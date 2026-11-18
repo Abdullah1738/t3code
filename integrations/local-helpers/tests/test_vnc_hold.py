@@ -41,7 +41,8 @@ class Clock:
 
 
 class RFB:
-    def __init__(self, reject=None):
+    def __init__(self, reject=None, rejection_suffix=None):
+        self.rejection_suffix = rejection_suffix
         self.reject, self.events, self.updates = reject, [], []
         self.credentials = None
         self.shared = None
@@ -87,9 +88,11 @@ class RFB:
                                         "-K", key.hex()], input=encrypted, capture_output=True,
                                        check=True, timeout=5).stdout
                 self.credentials = (clear[:64].split(b"\0")[0], clear[64:].split(b"\0")[0])
-                if self.reject:
-                    reason = self.reject.encode()
-                    s.sendall(struct.pack(">II", 1, len(reason)) + reason)
+                if self.reject is not None or self.rejection_suffix is not None:
+                    reason = (self.reject or "").encode()
+                    suffix = (self.rejection_suffix if self.rejection_suffix is not None
+                              else struct.pack(">I", len(reason)) + reason)
+                    s.sendall(struct.pack(">I", 1) + suffix)
                     return
                 s.sendall(struct.pack(">I", 0))
                 self.shared = vnc.recvn(s, 1)
@@ -228,6 +231,80 @@ class HoldTest(unittest.TestCase):
         self.assertFalse(self.state.data["connected"])
         self.assertNotIn(TEST_PASSWORD.decode(), self.log.getvalue())
         self.assertNotIn(TEST_PASSWORD.decode(), self.state.path.read_text())
+
+    def test_rejection_reason_eof_matrix_preserves_auth_backoff(self):
+        cases = {
+            "missing_length": b"",
+            "length_1_byte": b"\x00",
+            "length_2_bytes": b"\x00\x00",
+            "length_3_bytes": b"\x00\x00\x00",
+            "missing_body": struct.pack(">I", 6),
+            "truncated_body": struct.pack(">I", 6) + b"den",
+            "oversized_truncated_body": struct.pack(">I", 8192) + b"den",
+        }
+        for name, suffix in cases.items():
+            with self.subTest(reason=name):
+                self.state = vnc.State(self.directory / name, self.clock)
+                delays = []
+                for count in range(1, 6):
+                    with RFB(rejection_suffix=suffix) as server:
+                        hold = self.hold(connector=server.connect)
+                        delays.append(hold.run_connection())
+                    self.assertEqual(server.events, [])
+                    self.assertIsNone(server.shared)
+                    self.assertEqual(self.state.data["auth_failures_in_row"], count)
+                    self.assertEqual(self.state.data["last_error"],
+                                     "auth_failed: rejection reason unavailable")
+                    self.assertFalse(self.state.data["connected"])
+                    self.state = vnc.State(self.state.directory, self.clock)
+                self.assertEqual(delays, [15, 60, 300, 900, 900])
+                self.assertNotIn(TEST_PASSWORD.decode(), self.state.path.read_text())
+        self.assertNotIn(TEST_PASSWORD.decode(), self.log.getvalue())
+
+    def test_rejection_reason_network_error_matrix_preserves_auth_backoff(self):
+        real_recvn = vnc.recvn
+        # Server payload has been authenticated when SecurityResult (offset55) arrives.
+        # Inject transport faults only after that result, at length/body read boundaries.
+        for stage, boundary in (("length", 55), ("body", 59)):
+            for error_type in (socket.timeout, ConnectionResetError):
+                with self.subTest(stage=stage, error=error_type.__name__):
+                    self.state = vnc.State(self.directory / (stage + error_type.__name__), self.clock)
+                    delays = []
+                    for _ in range(5):
+                        received = 0
+                        client_thread = threading.current_thread()
+                        def interrupted_reason(s, n):
+                            nonlocal received
+                            if threading.current_thread() is not client_thread:
+                                return real_recvn(s, n)
+                            if received >= boundary:
+                                raise error_type(TEST_PASSWORD.decode())
+                            data = real_recvn(s, n)
+                            received += len(data)
+                            return data
+                        with RFB(reject="denied") as server:
+                            hold = self.hold(connector=server.connect)
+                            with patch.object(vnc, "recvn", side_effect=interrupted_reason):
+                                delays.append(hold.run_connection())
+                        self.assertEqual(server.events, [])
+                        self.assertEqual(self.state.data["last_error"],
+                                         "auth_failed: rejection reason unavailable")
+                    self.assertEqual(delays, [15, 60, 300, 900, 900])
+                    self.assertEqual(self.state.data["auth_failures_in_row"], 5)
+        self.assertNotIn(TEST_PASSWORD.decode(), self.log.getvalue())
+        self.assertNotIn(TEST_PASSWORD.decode(), self.state.path.read_text())
+
+    def test_empty_and_oversized_complete_reasons_remain_auth_failures(self):
+        for name, suffix in (("empty", struct.pack(">I", 0)),
+                             ("oversized", struct.pack(">I", 8192) + b"x" * 8192)):
+            with self.subTest(reason=name):
+                self.state = vnc.State(self.directory / name, self.clock)
+                with RFB(rejection_suffix=suffix) as server:
+                    hold = self.hold(connector=server.connect)
+                    self.assertEqual(hold.run_connection(), 15)
+                self.assertEqual(self.state.data["auth_failures_in_row"], 1)
+                self.assertTrue(self.state.data["last_error"].startswith("auth_failed:"))
+                self.assertEqual(server.events, [])
 
     def test_retry_heartbeats_preserve_auth_deadline_without_connections_or_password_reads(self):
         self.state.update(connected=False, auth_failures_in_row=4,

@@ -116,8 +116,14 @@ def connect(secret, host="127.0.0.1", port=5900):
         finally:
             wipe(creds)
         if struct.unpack(">I", recvn(s, 4))[0]:
-            size = struct.unpack(">I", recvn(s, 4))[0]
-            reason = recvn(s, min(size, 4096)).decode(errors="replace")
+            # SecurityResult is authoritative even if the optional explanation is
+            # cut short. Losing that classification would bypass auth backoff.
+            reason = "rejection reason unavailable"
+            try:
+                size = struct.unpack(">I", recvn(s, 4))[0]
+                reason = recvn(s, min(size, 4096)).decode(errors="replace")
+            except (EOFError, OSError):
+                pass
             reason = reason.replace(secret.decode(errors="replace"), "[redacted]")
             raise AuthError(reason[:200])
         s.sendall(b"\x01")  # shared: never kick other viewers
