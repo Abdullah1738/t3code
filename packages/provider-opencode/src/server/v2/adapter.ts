@@ -4148,6 +4148,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     });
 
     const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+      runtimeInventory: Effect.sync(() => ({
+        roots: connection.runtimeProcess === undefined ? [] : [connection.runtimeProcess],
+        loads: [],
+        nativeThreadIds: [...threads.keys()],
+      })),
       sessionUpdateFanout: "interested_threads",
       instanceId,
       driver,

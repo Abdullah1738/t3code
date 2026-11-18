@@ -6713,6 +6713,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       threadId?: ThreadId,
       {
         summaryOnly = false,
+        callerRunOnly = false,
         location,
         projectId,
         unsettledOnly = false,
@@ -6723,7 +6724,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         recentFirst = false,
         limit,
         threadIds,
-      }: ShellSnapshotOptions = {},
+      }: ShellSnapshotOptions & { readonly callerRunOnly?: boolean } = {},
       listCandidatesOnly: ThreadListPageOptions | undefined = undefined,
       olderThanCursor = false,
     ) {
@@ -6738,6 +6739,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       const executedRuns = lookupIndexesReady
         ? sql`orchestration_v2_projection_runs candidate INDEXED BY ardud_shell_executed_run_idx`
         : sql`orchestration_v2_projection_runs candidate`;
+      // Retain one extra byte so the caller detects overflow before decoding JSON.
+      const selectionPayload = (payload: Statement.Fragment) =>
+        callerRunOnly
+          ? sql`CAST(substr(CAST(${payload} AS BLOB), 1, ${CALLER_WORK_PAYLOAD_BYTES + 1}) AS TEXT)`
+          : payload;
       return yield* sql<ShellThreadRow>`
             -- Correlated lookups retain the thread/run indexes even for full GET snapshots.
             WITH${omitIdleSubagents ? sql` RECURSIVE` : sql``} shell_runs AS NOT MATERIALIZED (
@@ -6814,7 +6820,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 LIMIT 1
               )`
               } AS activity_run_started_at,
-              (
+              ${selectionPayload(sql`(
                 SELECT json_extract(session.payload_json, '$.lastError')
                 -- Keep bindings outermost: one provider instance can hold every session.
                 FROM orchestration_v2_projection_provider_session_bindings binding
@@ -6824,34 +6830,45 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   AND session.provider_instance_id = t.provider_instance_id
                 ORDER BY session.updated_at DESC, session.provider_session_id DESC
                 LIMIT 1
-              ) AS last_error,
-              (
+              )`)} AS last_error,
+              ${
+                callerRunOnly
+                  ? sql`NULL`
+                  : sql`(
                 SELECT (${latestFailurePayload(
                   sql`t.thread_id`,
                   sql`presented.run_id`,
                   sql`json_extract(presented.payload_json, '$.rootNodeId')`,
                 )}) WHERE presented.status = 'failed'
-              ) AS terminal_failure_payload_json,
+              )`
+              } AS terminal_failure_payload_json,
               blocked.run_id AS blocking_run_id,
               blocked.requested_at AS blocking_run_requested_at,
               json_extract(blocked.payload_json, '$.startedAt') AS blocking_run_started_at,
               blocked.completed_at AS blocking_run_completed_at,
-              (
+              ${selectionPayload(sql`(
                 ${latestFailurePayload(
                   sql`t.thread_id`,
                   sql`blocked.run_id`,
                   sql`json_extract(blocked.payload_json, '$.rootNodeId')`,
                 )}
-              ) AS blocking_failure_payload_json,
-              (
+              )`)} AS blocking_failure_payload_json,
+              ${
+                callerRunOnly
+                  ? sql`NULL`
+                  : sql`(
                 SELECT request.payload_json
                 FROM orchestration_v2_projection_runtime_requests request
                 WHERE request.thread_id = t.thread_id
                   AND request.status = 'pending'
                 ORDER BY request.created_at DESC, request.runtime_request_id DESC
                 LIMIT 1
-              ) AS pending_request_payload_json,
-              (
+              )`
+              } AS pending_request_payload_json,
+              ${
+                callerRunOnly
+                  ? sql`NULL`
+                  : sql`(
                 SELECT secret.payload_json
                 -- Keep runs outermost so completed history is never scanned for a pending secret.
                 FROM ${activityRuns}
@@ -6863,7 +6880,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   AND secret.type = 'secret_request' AND secret.status = 'waiting'
                 ORDER BY secret.updated_at DESC, secret.turn_item_id DESC
                 LIMIT 1
-              ) AS pending_secret_request_payload_json,
+              )`
+              } AS pending_secret_request_payload_json,
               ${
                 summaryOnly
                   ? sql`NULL`
@@ -7667,12 +7685,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ...thread,
               activeRunId: active[0] === undefined ? null : RunId.make(active[0].run_id),
             };
-            if (thread.forkedFrom?.type === "run") return row;
             if (row.activeRunId !== null || thread.archivedAt !== null)
               return { ...row, pendingBackgroundTasks: [] };
+            if (thread.forkedFrom?.type === "run") return row;
 
             // Caller liveness needs pending work, never shell counts or inherited history.
-            // Cap both row count and payload size before decoding on the foreground lane.
+            // Cap both row count and payload size before decoding on the identity lane.
             const latest = yield* sql<{
               readonly run_id: string;
               readonly ordinal: number;
@@ -7683,13 +7701,47 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               WHERE thread_id = ${threadId} ORDER BY ordinal DESC, run_id DESC LIMIT 1
             `;
             if (latest[0] === undefined) return { ...row, pendingBackgroundTasks: [] };
-            const latestRun = {
+            let latestRun = {
               id: RunId.make(latest[0].run_id),
               ordinal: latest[0].ordinal,
               status: latest[0].status,
             };
-            // Held queues and rollback can change the shell's presented latest run.
-            if (latestRun.status === "queued" || latestRun.status === "rolled_back") return row;
+            if (latestRun.status === "queued" || latestRun.status === "rolled_back") {
+              // Held queues and usage-limit failures can change the presented run.
+              // Read that selection without shell counts, rosters or fork history.
+              const shellRow = (yield* selectShellThreadRows(threadId, {
+                summaryOnly: true,
+                callerRunOnly: true,
+              }))[0];
+              if (shellRow === undefined) return null;
+              if (
+                [shellRow.last_error, shellRow.blocking_failure_payload_json].some(
+                  (payload) =>
+                    payload !== null &&
+                    Buffer.byteLength(payload, "utf8") > CALLER_WORK_PAYLOAD_BYTES,
+                )
+              )
+                return row;
+              const state = yield* shellThreadStateFromRow({
+                row: shellRow,
+                runOrdinalsByThreadId: new Map(),
+                itemCountsByThreadId: new Map(),
+                providerThreadsByThreadId: new Map(),
+                pendingTurnItemsByThreadId: new Map(),
+              });
+              if (
+                state.latestRunId === null ||
+                state.latestRunStatus === "idle" ||
+                state.latestRunStatus === "queued" ||
+                state.latestRunStatus === "rolled_back"
+              )
+                return { ...row, pendingBackgroundTasks: [] };
+              latestRun = {
+                id: state.latestRunId,
+                ordinal: 0,
+                status: state.latestRunStatus,
+              };
+            }
             const providers = yield* sql<CallerWorkPayloadRow>`
               SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= ${CALLER_WORK_PAYLOAD_BYTES}
                 THEN payload_json ELSE NULL END AS payload_json

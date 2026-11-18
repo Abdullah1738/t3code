@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { OpenChamber, type MessageRecord, type SessionRecord } from "../src/openchamber.ts";
+import { assertPromptUnexpired, OpenChamber, type ChatBackend, type MessageRecord, type SessionRecord } from "../src/openchamber.ts";
 import { Router } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 import type { ChatContext } from "../src/chats.ts";
@@ -18,6 +18,7 @@ import { BoundedTimeout } from "../src/bounded.ts";
 import { PromptProbeTracker } from "../src/prompt-probe.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { FAILED_INBOUND_REPLAY_MAX_AGE_MS } from "../src/inbound-failure.ts";
+import { markAnswered } from "../src/unanswered.ts";
 
 const hash = (id: string) => `msg_${createHash("sha256").update(id).digest("hex")}`;
 const now = Date.parse("2026-11-13T10:00:00Z");
@@ -39,9 +40,10 @@ class Backend extends OpenChamber {
   override async getSession(id: string, directory: string) { return { id, directory, title: "Chat", time: { created: now, updated: now } } as SessionRecord; }
   override async messages() { return this.records; }
   override async promptAccepted(_id: string, _dir: string, id: string) { return this.records.some(r => r.id === id && r.type === "user"); }
-  override async prompt(...args: Parameters<OpenChamber["prompt"]>) {
-    const [_id, _dir, id, text, , , , , beforeSend] = args;
+  override async prompt(...args: Parameters<ChatBackend["prompt"]>) {
+    const [_id, _dir, id, text, , , , , beforeSend, expiresAt] = args;
     beforeSend?.();
+    assertPromptUnexpired(expiresAt);
     this.prompts.push(id);
     this.targets.push(_id);
     if (this.unavailable) throw new Error("unavailable");
@@ -60,7 +62,8 @@ function setup(slug = "owner", overrides: Partial<ConstructorParameters<typeof R
     roleOf: () => ({ role: "admin", name: slug }), typing: () => false, react: async () => {},
   };
   if (slug === "owner") ctx.chat.kind = "owner";
-  const makeRouter = () => new Router(store, backend, { read: async () => {}, typing: async () => {}, downloadAttachment: async () => { throw new Error("unexpected file"); } }, {
+  const transport = { read: async () => {}, typing: async () => {}, downloadAttachment: async () => { throw new Error("unexpected file"); } };
+  const makeRouter = () => new Router(store, backend, transport, {
     owner: "+15555550123", chatGuid: ctx.chat.key, timezone: "Asia/Dubai", skillPath: "/test/imessage/SKILL.md",
     alertSkillPath: "/test/telegram/SKILL.md", alertSocketPath: "/test/telegram.sock", openCodeConfigRoot: "/nonexistent/config", quietMs: 0,
     context: ctx, log: (event, code) => logs.push(`${event} ${code ?? ""}`), notifyFailure: async (_text, key) => { alerts.push(key); return true; }, ...overrides,
@@ -73,7 +76,7 @@ function setup(slug = "owner", overrides: Partial<ConstructorParameters<typeof R
   };
   const input = (id: string, age = 120_000) => store.acceptInbound(id, { id, text: id, source: "typed", attachments: [], isAudioMessage: false, receivedAt: now - age } satisfies NormalizedInbound);
   const states = () => store.db.query<{ state: string }, []>("SELECT state FROM inbound ORDER BY rowid").all().map(r => r.state);
-  return { get store() { return store; }, backend, router, input, states, logs, alerts, ctx, restart, makeRouter };
+  return { get store() { return store; }, backend, router, input, states, logs, alerts, ctx, restart, makeRouter, transport };
 }
 
 test.each([
@@ -1059,7 +1062,7 @@ test.each(["owner", "moni"].flatMap(slug => [true, false].map(bus => ({ slug, bu
     h.store.set(`stuck-wake-attempt:${id}`, now - 5 * 60_000);
     await h.router.checkInboundLatency();
     expect(h.alerts).toEqual(bus ? [] : [`imessage-stuck-wake:${id}`]);
-    expect(h.backend.prompts).toEqual([]);
+    expect(h.backend.prompts).toEqual(bus ? [hash(id)] : []);
   },
 );
 
@@ -1536,4 +1539,152 @@ test.each(guardedWakePaths.flatMap(([engine, path]) => (["cooldown", "cap"] as c
   expect(h.store.get(`stuck-wake-attempt:${h.member}`)).toBeUndefined();
   expect(h.store.get<Record<string, unknown>>(h.promptKey)).toEqual(cooldown);
   expect(h.store.get<string>(`batch-phase:${h.member}`)).toBe("deferred-wake");
+});
+
+
+test("bus wake survives a refused human steer and takes the next turn despite continuous human traffic", async () => {
+  const h = setup(); let steers = 0;
+  h.backend.steer = async () => { steers++; return "refused"; };
+  h.input("human-first", 0); await h.router.tick();
+  h.input("wake:agent-bus:queued", 0); h.input("human-followup", 0);
+  await h.router.tick();
+  expect(steers).toBeGreaterThan(0);
+  expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id='wake:agent-bus:queued'").get()?.state).toBe("pending");
+  setSystemTime(now + 61_000);
+  h.input("human-continuous", 0);
+  h.backend.records.push(
+    { id: "answer-first", type: "assistant", content: [{ type: "text", text: "First answer" }], finish: "stop", time: { created: now, completed: now + 60_000 } },
+    { id: "idle-first", type: "idle", outcome: "succeeded", completedAt: now + 60_000, time: { created: now + 60_000 } });
+  await h.router.tick();
+  expect(h.backend.prompts).toEqual([hash("human-first"), hash("wake:agent-bus:queued")]);
+  expect(h.store.get<number>("inbound-delivered:wake:agent-bus:queued")).toBe(now + 61_000);
+  h.input("wake:agent-bus:also-due", 120_000);
+  h.backend.records.push(
+    { id: "bus-answer", type: "assistant", content: [{ type: "text", text: "NO_REPLY" }], finish: "stop", time: { created: now + 61_000, completed: now + 61_001 } },
+    { id: "bus-idle", type: "idle", outcome: "succeeded", completedAt: now + 61_001, time: { created: now + 61_001 } });
+  setSystemTime(now + 62_000); await h.router.tick();
+  expect(h.backend.prompts[2]).toBe(hash("human-followup"));
+  expect(h.store.db.query<{state:string},[]>("SELECT state FROM inbound WHERE id='human-followup'").get()?.state).toBe("admitted");
+  expect(h.store.get<boolean>("bus-yield-human")).toBe(false);
+  expect(h.store.db.query<{state:string},[]>("SELECT state FROM inbound WHERE id='human-continuous'").get()?.state).toBe("pending");
+});
+
+test("a legacy mixed bus batch is not permanently barred by its first stuck-wake attempt", async () => {
+  const h = setup(); const leader = "wake:watcher-leading-bus", member = "wake:agent-bus:legacy-member";
+  h.input(leader, 31 * 60_000); h.input(member, 30 * 60_000);
+  h.store.updateInbound(member, "batched");
+  h.store.set(`batch:${leader}`, { id: member, text: "PRIVATE request", attachments: [], isAudioMessage: false, receivedAt: now - 30 * 60_000, batchIds: [leader, member] });
+  h.store.set(`batch-phase:${leader}`, "deferred-wake");
+  for (const id of [leader, member]) { h.store.set(`stuck-wake-retry:${id}`, now - 15 * 60_000); h.store.set(`stuck-wake-attempt:${id}`, now - 10 * 60_000); }
+  await h.router.tick();
+  expect(h.backend.prompts).toEqual([hash(leader)]);
+  expect(h.states()).toEqual(["done", "done"]);
+  expect(h.store.get<number>(`inbound-delivered:${member}`)).toBe(now);
+});
+
+
+test("an expired bus ask with an uncertain earlier POST is reconciled without a new POST", async () => {
+  const h = setup(); const id = "wake:agent-bus:expired";
+  h.store.acceptInbound(id, { id, text: "PRIVATE", attachments: [], isAudioMessage: false, receivedAt: now - 700_000, agentExpiresAt: now - 1 });
+  h.store.set(`synthetic-retry:${id}`, { attempts: 1, nextAt: 0, prompts: [{ sessionId: "ses_1", directory: "/Chats/ses_1", messageId: "earlier", startedAt: now - 700_000 }] });
+  await h.router.tick();
+  expect(h.backend.prompts).toEqual([]);
+  expect(h.states()).toEqual(["failed"]);
+});
+
+
+test("expiring a deferred bus leader releases younger members", async () => {
+  const h = setup(); const leader = "wake:agent-bus:expired-leader", next = "wake:agent-bus:younger";
+  for (const [id, expiresAt] of [[leader, now - 1], [next, now + 300_000]] as const) h.store.acceptInbound(id,
+    { id, text: id, attachments: [], isAudioMessage: false, receivedAt: now - 120_000, agentExpiresAt: expiresAt });
+  h.store.updateInbound(next, "batched");
+  h.store.set(`batch:${leader}`, { id: next, text: "PRIVATE", attachments: [], isAudioMessage: false, receivedAt: now - 120_000, batchIds: [leader,next] });
+  h.store.set(`batch-phase:${leader}`, "deferred-wake"); await h.router.tick();
+  setSystemTime(now + 31_000); await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.records.filter(row=>row.type==="user" && row.text===next)).toHaveLength(1);
+  expect(h.states()).toEqual(["failed","done"]);
+});
+
+test("tool-mode humans held for an overdue bus get their own next turn", async () => {
+  const h = setup("owner", { replyMode: "tool" }); let steers = 0;
+  h.backend.steer = async () => { steers++; return "steered"; };
+  h.input("wake:agent-bus:overdue", 120_000); await h.router.tick();
+  h.input("human-held", 0); h.input("wake:agent-bus:another", 120_000); await h.router.tick(); expect(steers).toBe(0);
+  h.input("human-historic-failure", 300_000); h.store.updateInbound("human-historic-failure", "failed");
+  h.store.set("batch-phase:human-historic-failure", "accepted"); h.store.set("inbound-delivered:human-historic-failure", now - 200_000);
+  await h.router.checkInboundLatency(); expect(h.store.get<boolean>("bus-yield-human")).toBe(true);
+  expect(h.store.db.query<{state:string},[]>("SELECT state FROM inbound WHERE id='human-held'").get()?.state).toBe("pending");
+  h.backend.records.push(
+    { id:"bus-quiet",type:"assistant",content:[{type:"text",text:"NO_REPLY"}],finish:"stop",time:{created:now,completed:now+1}},
+    { id: "bus-end", type: "idle", outcome: "succeeded", completedAt: now + 1, time: { created: now + 1 } });
+  setSystemTime(now + 1); await h.router.tick();
+  expect(h.backend.prompts).toEqual([hash("wake:agent-bus:overdue"),hash("human-held")]);
+  expect(h.store.get<boolean>("bus-yield-human")).toBe(false);
+  expect(h.store.db.query<{state:string},[]>("SELECT state FROM inbound WHERE id='human-held'").get()?.state).toBe("admitted");
+  // Tool replies settle coverage before the provider's idle event reaches the router.
+  markAnswered(h.store, ["human-held"]);
+  h.input("human-continuing", 0);
+  h.backend.records.push(
+    { id:"human-quiet",type:"assistant",content:[{type:"text",text:"NO_REPLY"}],finish:"stop",time:{created:now+1,completed:now+2}},
+    { id:"human-end",type:"idle",outcome:"succeeded",completedAt:now+2,time:{created:now+2}});
+  setSystemTime(now + 2); await h.router.tick();
+  expect(h.backend.prompts[2]).toBe(hash("wake:agent-bus:another"));
+  expect(h.store.db.query<{state:string},[]>("SELECT state FROM inbound WHERE id='human-continuing'").get()?.state).toBe("pending");
+});
+
+test("fresh bus siblings cannot let human traffic unseal overdue preparation", async () => {
+  const h = setup(); h.input("wake:agent-bus:old", 120_000); h.input("wake:agent-bus:fresh", 0); let checked = false;
+  h.backend.createChat = async () => { if (!checked) { checked=true; h.input("human-during-prepare",0); } return { id: "ses_1", directory: "/Chats/ses_1" } as SessionRecord; };
+  await h.router.tick(); expect(h.backend.prompts).toEqual([hash("wake:agent-bus:old")]);
+  expect(h.store.db.query<{state:string},[]>("SELECT state FROM inbound WHERE id='human-during-prepare'").get()?.state).toBe("pending");
+});
+
+
+test.each([false,true])("human priority survives quiet and typing grace after a bus turn, typing=%s", async typing => {
+  const h=setup("owner",{quietMs:1_500}); let composing=typing; h.ctx.typing=()=>composing;
+  h.input("wake:agent-bus:first",120_000); await h.router.tick();
+  h.input("human-next",0); h.input("wake:agent-bus:second",120_000);
+  h.backend.records.push(
+    {id:"bus-quiet",type:"assistant",content:[{type:"text",text:"NO_REPLY"}],finish:"stop",time:{created:now,completed:now+1}},
+    {id:"bus-end",type:"idle",outcome:"succeeded",completedAt:now+1,time:{created:now+1}});
+  for(const delta of [1,2,1501,1502]) {
+    setSystemTime(now+delta); await h.router.tick();
+    if(delta<1500 || composing) expect(h.backend.prompts).toEqual([hash("wake:agent-bus:first")]);
+  }
+  composing=false; setSystemTime(now+2000); await h.router.tick();
+  expect(h.backend.prompts[1]).toBe(hash("human-next"));
+});
+
+test.each(["human-late","/new"])("an arrival during markRead cannot starve a due bus; controls stay fenced: %s", async late => {
+  const h=setup(); h.input("wake:agent-bus:due",120_000); h.input("human-before-read",0);
+  h.transport.read=async()=>{h.input(late,0);}; await h.router.tick();
+  expect(h.backend.prompts).toEqual(late==="/new"?[]:[hash("wake:agent-bus:due")]);
+});
+
+test("a busy backend defers an overdue bus without giving away its next free turn", async () => {
+  const h = setup(); const id = "wake:agent-bus:deferred-admission";
+  h.store.set("route", { id: "ses_1", directory: "/Chats/ses_1", generation: 1 });
+  let busy = true; h.backend.sessionBusy = async () => busy;
+  h.input(id, 120_000); h.input("human-waiting", 0); await h.router.tick();
+  expect(h.backend.prompts).toEqual([]); expect(h.store.get<boolean>("bus-yield-human")).not.toBe(true);
+  busy = false; await h.router.tick();
+  expect(h.backend.prompts).toEqual([hash(id)]); expect(h.store.get<boolean>("bus-yield-human")).toBe(true);
+});
+
+test.each([false, true])("the actual prompt receives the bus deadline on submit and resend, retry=%s", async retry => {
+  const h = setup(); const id = "wake:agent-bus:deadline-guard"; const expiresAt = now + 120_000;
+  h.store.acceptInbound(id, { id, text: "PRIVATE_REQUEST", attachments: [], isAudioMessage: false, receivedAt: now - 120_000, agentExpiresAt: expiresAt });
+  let calls = 0; const deadlines: (number | undefined)[] = [];
+  h.backend.prompt = async (_id, _dir, _message, _text, _system, _files, _model, _owner, _beforeSend, expiry) => {
+    deadlines.push(expiry);
+    if (++calls === 1 && retry) throw new Error("transport unavailable");
+    setSystemTime(expiresAt);
+    assertPromptUnexpired(expiry);
+  };
+  await h.router.tick();
+  if (retry) { setSystemTime(now + 61_000); await h.router.tick(); }
+  expect(deadlines).toEqual(Array(retry ? 2 : 1).fill(expiresAt));
+  expect(h.store.get<number>(`inbound-delivered:${id}`)).toBeUndefined();
+  setSystemTime(expiresAt + 1); await h.router.tick(); expect(h.states()).toEqual(["failed"]);
 });

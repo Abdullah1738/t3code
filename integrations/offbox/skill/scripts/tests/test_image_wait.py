@@ -469,6 +469,8 @@ class RunnerImageSelectionTests(Isolated):
         # The first and last draws share their low 16 bits: a two-byte suffix collides in this second.
         draws = iter((0x1111c75c, 0x22221111, 0x33332222, 0x44443333, 0x55554444, 0x6666c75c))
         def random_bytes(width):
+            if width == 8:
+                return bytes.fromhex('0123456789abcdef')
             return (next(draws) & ((1 << (8 * width)) - 1)).to_bytes(width, 'big')
         fixed = dt.datetime(2026, 11, 16, 10, 55, 55, tzinfo=common.TZ)
         with contextlib.redirect_stderr(io.StringIO()), \

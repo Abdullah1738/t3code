@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
-  checkWakeRoute, trackConfirmation, watcherInstance, retiredWatcher, pollingWatcher, heldByMaintenance, loadMaintenance, MAINTENANCE_FILE, validDepends, type Dependency, addStop, editContext, editWatcher, removeWatcher, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
+  clearFailureProbe, clearFailureState, dubaiClock, checkWakeRoute, trackConfirmation, watcherInstance, retiredWatcher, pollingWatcher, heldByMaintenance, loadMaintenance, MAINTENANCE_FILE, validDepends, type Dependency, addStop, editContext, editWatcher, removeWatcher, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
   saveState, sendNotes, type State, type Stop, stopFor, unscopedSender, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
 } from "./lib.ts";
 
@@ -19,7 +19,7 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
                   [--depends ssd,phone] [--inflight-check CMD]
                   [--chat SLUG]  (wake that bridge chat, e.g. moni, instead of the owner's; her own data)
   robob-watch add --json FILE|-          same fields as watcher.json (id, title, check, interval_s, mode, context,
-                                         expires_at, max_fires, inflight_check, timeout_s, max_consecutive_failures, failure_notice_after, owner_imessage_alerts, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
+                                         expires_at, max_fires, inflight_check, timeout_s, max_consecutive_failures, failure_notice_after, failure_pause_probe, owner_imessage_alerts, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
   robob-watch context ID [--json FILE|- | --context TEXT | --context-file PATH] [--replace]
@@ -46,6 +46,7 @@ Check contract: a zsh command run in the watcher dir with WATCH_DIR set. Print n
 print the event text on stdout (exit 0) when it fires. Non-zero exit = failure (backoff; failure notice from the 2nd in a row).
 watcher.json failure_notice_after overrides 2 (1 = every failure); pause and alert after 5 in a row.
 watcher.json max_consecutive_failures overrides 5 (0 = backoff only); resume clears the failure pause and count.
+Failure pauses retry after 15 min, 30 min, then hourly; failure_pause_probe: false opts out.
 Keep your own state in $WATCH_DIR. Helpers on PATH: whatsapp-new-message, output-changed, email-new-message.
 Default interval 15s (min 5s). --trigger FILE runs the check within ~1s of FILE changing (push instead of poll),
 e.g. --trigger ~/Library/Messages/chat.db-wal for iMessage; the interval stays as the fallback.
@@ -84,8 +85,9 @@ const ago = (value?: string) => {
 
 function statusLabel(watcher: Watcher, state: State): string {
   watcher = pollingWatcher(watcher, state) ?? watcher;
-  return state.failure_paused_at ? `paused (failing since ${state.failing_since ?? state.failure_paused_at})`
-    : watcher.paused ? "paused" : state.status;
+  if (watcher.paused) return "paused";
+  return state.failure_paused_at ? `paused (failing since ${state.failing_since ?? state.failure_paused_at})${watcher.failure_pause_probe !== false ? ` next probe ${dubaiClock(state.failure_probe_next_at ?? iso(Date.parse(state.failure_paused_at) + 15 * 60_000))} Dubai` : ""}`
+    : state.status;
 }
 
 function dependencies(value: string): Dependency[] {
@@ -176,6 +178,7 @@ async function main(argv: string[]): Promise<void> {
         if (values.json === undefined && previous?.depends) candidate.depends = previous.depends;
         if (values.json === undefined && previous?.max_consecutive_failures !== undefined) candidate.max_consecutive_failures = previous.max_consecutive_failures;
         if (values.json === undefined && previous?.failure_notice_after !== undefined) candidate.failure_notice_after = previous.failure_notice_after;
+        if (values.json === undefined && previous?.failure_pause_probe !== undefined) candidate.failure_pause_probe = previous.failure_pause_probe;
         if (values.json === undefined && previous?.owner_imessage_alerts) candidate.owner_imessage_alerts = true;
         if (values.json === undefined && previous?.trip) candidate.trip = previous.trip;
         if (values.json === undefined && previous?.chat && values.chat === undefined) candidate.chat = previous.chat;
@@ -351,19 +354,9 @@ async function main(argv: string[]): Promise<void> {
         }
         if (command === "resume") {
           queueOwnerRecovery(w, s);
-          delete s.failure_paused_at;
-          delete s.trigger_error;
-          delete s.load_timeouts;
-          delete s.load_timeout_since;
-          s.consecutive_failures = 0;
-          s.failure_alerted = false;
-          delete s.failure_escalated;
-          delete s.failing_since;
-          delete s.dependency_busy;
-          delete s.failure_episode;
-          delete s.last_error;
-          delete s.last_error_sources;
+          clearFailureState(s);
         }
+        if (command === "pause") clearFailureProbe(s);
         s.next_at = 0;
         saveState(w.id, s);
         if (endedGrace !== undefined) toolLog({ component: "cli", kind: "event", name: "watch.grace_ended", ids: { watcher: w.id }, props: { reason: "resume", relays: endedGrace } });

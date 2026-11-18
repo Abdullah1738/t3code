@@ -1,3 +1,4 @@
+import { RobobLinkDown } from "./robob-link-gate.ts";
 import { probeDeferred } from "./probe-policy.ts";
 import { safeLineFailureCode, sendblueErrorKey } from "./line.ts";
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync } from "node:fs";
@@ -36,7 +37,7 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "outboxId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId", "requestId", "serverRequestId", "outageId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "generation", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews", "linkFailureCount", "boundMs", "elapsedMs", "msUntilAccepted"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "generation", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews", "linkFailureCount", "boundMs", "elapsedMs", "msUntilAccepted", "downMs", "skippedCalls", "failedProbes"]);
 const ENUMS: Record<string, readonly string[]> = {
   causeKind: ["timeout", "http", "transport"],
   probeOutcome: ["accepted", "notAcceptedYet", "timeout", "http", "transport"],
@@ -55,7 +56,7 @@ const ENUMS: Record<string, readonly string[]> = {
   failureCode: ["none", "renderer_failed", "preview_missing", "render_exception", "page_fetch", "page_http", "page_type", "page_body", "image_fetch", "image_http", "image_type", "image_body", "upload", "upload_url", "invalid_url", "file_prepare"],
   completionCheck: ["before", "after", "unchecked"],
   failureFormat: ["single"],
-  linkCause: ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"],
+  linkCause: ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "FETCH_FAILED", "HTTP_503"],
   backend: ["robob", "openchamber", "remote-box", "unknown"],
 };
 
@@ -90,6 +91,10 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
       props[key] = value; continue;
     }
+    if (entry.component === "remote-box" && entry.name === "moni-callback-ready"
+      && (key === "handlerMs" || key === "loopDelayMs") && typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      props[key] = value; continue;
+    }
     if (entry.component === "remote-box" && entry.name === "moni-runner-error") {
       if (key === "path" && typeof value === "string" && ["/send", "/files", "/react", "/agent-ask", "/agent-answer", "/agent-requests", "/share", "/unshare", "/shares", "/metrics", "/ready"].includes(value)
         || key === "errorClass" && typeof value === "string" && ["LineError", "RemoteSendError", "Error", "UnknownError"].includes(value)
@@ -107,7 +112,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     if (entry.name === "robob.link_state" && key === "resumedByRun" && typeof value === "string" && /^[a-f0-9-]{36}$/.test(value)) { props[key] = value; continue; }
     if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1)) continue;
     if ((NUMBERS.has(key) || key === "replies" && entry.name === "notice.reply") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
-    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders", "linkRecovery", "retrySafe", "answersInbound"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
+    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders", "linkRecovery", "retrySafe", "answersInbound", "linkGated", "linkProbe", "linkGateDown"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
     else if (key === "holderRunId" && typeof value === "string" && value.length <= 250 && /^[a-zA-Z0-9_:%.@-]+$/.test(value)) props[key] = value;
     else if (typeof value === "string" && ENUMS[key]?.includes(value)) props[key] = value;
     // A route template is code-owned; no query strings, ids, or URLs enter the log.
@@ -115,7 +120,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   }
   if (Object.keys(props).length) line.props = props;
   if (entry.name === "router.prompt_probes" && entry.component === "router" && entry.kind === "perf") line.promptProbe = cleanPromptProbe(entry.promptProbe);
-  if (entry.component === "robob" && ["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply"].includes(entry.name)) line.link = cleanRobobLink(entry.link);
+  if (entry.component === "robob" && ["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply"].includes(entry.name)) line.link = cleanRobobLink(entry.link);
   if (entry.name === "card.renders" && entry.kind === "perf") line.renders = cleanRenders(entry.renders);
   if (entry.name === "turn.robob_calls" && entry.component === "robob" && entry.kind === "perf") line.calls = cleanCalls(entry.calls);
   if (entry.kind === "error" || entry.name === "turn.robob_call" && entry.ok === false) {
@@ -218,7 +223,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && line.level !== "warn" && !["msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && line.level !== "warn" && !["msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }
@@ -242,8 +247,12 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   function enqueue(line: LogLine): void {
     if (!options.defer) { append(line, line.ts); return; }
     pending.push(line);
+    scheduleFlush();
+  }
+  function scheduleFlush(): void {
     if (!scheduled) { scheduled = true; queueMicrotask(flush); }
   }
+  function saveLink(): void { if (options.defer) scheduleFlush(); else robobLink.save(); }
   function write(entry: Entry): void {
     try {
       if (entry.kind === "error" || entry.name === "form.fail" || entry.name === "turn.robob_call" && entry.ok === false) entry = { ...entry, site: entry.site ?? logSite() };
@@ -255,8 +264,12 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       }
       const link = robobLink.accept(line);
       for (const event of link.events) enqueue(event);
+      if (entry.props?.linkGated === true && entry.ok === false && !link.keepDetail) {
+        saveLink();
+        return;
+      }
       for (const probe of promptProbes.accept(line)) for (const messageRead of messageReads.accept(probe)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
-      if (!options.defer) robobLink.save();
+      saveLink();
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
       if (["turn.start", "reply.sent", "inbound.answered"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
         refreshChains(`${line.ids.chat}\0${line.ids.inboundId}`);
@@ -469,7 +482,9 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (line) for (const record of calls.accept(line, false)) if (record.name !== "turn.start") enqueue(record);
     });
   }
-  return { write, rollup, tick, capture, flush: flushAll, settled, runIds: calls.ids, beginRun };
+  const skipRobob = (site: string) => { for (const event of robobLink.skip(site)) enqueue(event); saveLink(); };
+  const robobSite = (site: string) => { const first = robobLink.firstAtSite(site); saveLink(); return first; };
+  return { robobLinkDown: robobLink.down, robobSite, skipRobob, write, rollup, tick, capture, flush: flushAll, settled, runIds: calls.ids, beginRun };
 }
 
 export const toolLog = createToolLog({ defer: true });
@@ -477,8 +492,9 @@ export const toolLog = createToolLog({ defer: true });
 export const completionReady = Symbol("completionReady");
 // Keep correlation on the error identity without mutating or serializing caller-owned errors.
 const loggedFailures = new WeakMap<object, string>();
-export function markLoggedFailure(error: unknown, requestId: string): void {
-  if (error !== null && typeof error === "object") loggedFailures.set(error, requestId);
+const gatedFailures = new WeakSet<object>();
+export function markLoggedFailure(error: unknown, requestId: string, gated = false): void {
+  if (error !== null && typeof error === "object") { loggedFailures.set(error, requestId); if (gated) gatedFailures.add(error); }
 }
 function loggedRequestId(error: unknown): string | undefined {
   const seen = new Set<object>();
@@ -491,9 +507,12 @@ function loggedRequestId(error: unknown): string | undefined {
 }
 export function toolError(component: string, tag: string, cause: unknown, ids?: LogLine["ids"], props?: LogLine["props"]): void {
   if (cause === completionReady || cause === probeDeferred) return;
+  if (cause instanceof RobobLinkDown) {
+    if (!cause.firstAtSite(tag)) return;
+  } else if (toolLog.robobLinkDown() && cause !== null && typeof cause === "object" && gatedFailures.has(cause) && !toolLog.robobSite(tag)) return;
   const requestId = loggedRequestId(cause);
   toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids: { ...ids, ...(requestId ? { requestId } : {}) }, props: { ...controlFailureProps(cause), ...props },
-    ...(requestId ? { alreadyLogged: true } : {}), error: { tag, cause } });
+    ...(requestId || cause instanceof RobobLinkDown ? { alreadyLogged: true } : {}), error: { tag, cause } });
 }
 export function cardKind(value: string): string {
   // Generator names only; captions, query values and health data never enter the log.

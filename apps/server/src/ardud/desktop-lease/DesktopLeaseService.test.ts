@@ -20,7 +20,7 @@ import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import {
   DesktopLease,
   QUIET_MS,
-  QUARANTINE_MAX_MS,
+  QUARANTINE_EXPIRE_MS,
   STALE_MS,
   type DesktopLeaseOptions,
 } from "./DesktopLease.ts";
@@ -323,7 +323,6 @@ describe("desktop lease service liveness", () => {
           assert.equal((yield* service.status()).lease?.state, "quarantined");
           setThreadLookup(rootThreadId, rootLookup);
           setThreadLookup(childThreadId, childLookup);
-          addTime(QUIET_MS);
           const next = yield* service.acquire(nextCaller, { ...request, taskId: "next" });
           const canRecover = rootLookup === "idle" && childLookup === "idle";
           assert.equal(next.state, canRecover ? "held" : "queued");
@@ -343,6 +342,77 @@ describe("desktop lease service liveness", () => {
           }
         }),
       ),
+  );
+
+  it.effect.each(["idle", "failed"] as const)(
+    "frees a stopping holder only when known terminal (%s)",
+    (lookup) =>
+      run(({ service, addTime, setLookup }) =>
+        Effect.gen(function* () {
+          const held = yield* service.acquire(caller, request);
+          yield* service.callStart(caller, "stopping-hung");
+          assert.equal((yield* service.release(caller, held.ticket)).lease?.state, "stopping");
+          setLookup(lookup);
+          const next = yield* service.acquire(nextCaller, { ...request, taskId: "next-stopping" });
+          assert.equal(next.state, lookup === "idle" ? "held" : "queued");
+          if (lookup === "failed") {
+            addTime(QUIET_MS);
+            assert.equal((yield* service.status()).lease?.state, "quarantined");
+            assert.equal(
+              (yield* service.acquire(nextCaller, { ...request, taskId: "next-stopping" })).state,
+              "cancelled",
+            );
+          }
+        }),
+      ),
+  );
+
+  it.effect.each(["silent", "terminal"] as const)(
+    "warns about quarantine and %s recovery without analytics",
+    (recovery) => {
+      const warnings: unknown[] = [];
+      const logger = Logger.make(({ message }) => {
+        for (const value of Array.isArray(message) ? message : [message]) {
+          if (typeof value === "object" && value !== null && "reason" in value)
+            warnings.push(value);
+        }
+      });
+      return run(({ service, addTime, setLookup }) =>
+        Effect.gen(function* () {
+          const held = yield* service.acquire(caller, request);
+          yield* service.callStart(caller, "warning-hung");
+          addTime(QUIET_MS);
+          assert.equal((yield* service.status()).lease?.state, "quarantined");
+          setLookup(recovery === "terminal" ? "idle" : "failed");
+          if (recovery === "silent") addTime(QUARANTINE_EXPIRE_MS);
+          assert.isNull((yield* service.status()).lease);
+          assert.deepEqual(warnings, [
+            {
+              ticket: held.ticket,
+              taskId: "task",
+              mode: "native",
+              rootThreadId,
+              childThreadId,
+              from: "held",
+              to: "quarantined",
+              reason: "open_call_timeout",
+              age_ms: QUIET_MS,
+            },
+            {
+              ticket: held.ticket,
+              taskId: "task",
+              mode: "native",
+              rootThreadId,
+              childThreadId,
+              from: "quarantined",
+              to: "finished",
+              reason: recovery === "terminal" ? "auto_reconciled" : "quarantine_max_age",
+              age_ms: QUIET_MS + (recovery === "silent" ? QUARANTINE_EXPIRE_MS : 0),
+            },
+          ]);
+        }),
+      ).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+    },
   );
 
   it.effect.each([
@@ -377,14 +447,14 @@ describe("desktop lease service liveness", () => {
   );
 
   it.effect.each([
-    ["running", "failed", false],
-    ["failed", "running", false],
-    ["idle", "running", false],
+    ["running", "failed", true],
+    ["failed", "running", true],
+    ["idle", "running", true],
     ["failed", "failed", true],
     ["failed", "idle", true],
     ["idle", "failed", true],
   ] as const)(
-    "requires neither thread known active for age recovery (root %s, child %s)",
+    "expires silent quarantine regardless of projection liveness (root %s, child %s)",
     ([rootLookup, childLookup, clears]) =>
       run(({ service, addTime, setThreadLookup }) =>
         Effect.gen(function* () {
@@ -394,7 +464,7 @@ describe("desktop lease service liveness", () => {
           assert.equal((yield* service.status()).lease?.state, "quarantined");
           setThreadLookup(rootThreadId, rootLookup);
           setThreadLookup(childThreadId, childLookup);
-          addTime(QUARANTINE_MAX_MS);
+          addTime(QUARANTINE_EXPIRE_MS);
           const next = yield* service.acquire(nextCaller, { ...request, taskId: "after-age" });
           assert.equal(next.state, clears ? "held" : "queued");
         }),

@@ -176,7 +176,7 @@ test("a running history backfill blocks the live check; nothing is stopped", () 
 const holdLock = () => {
   const lockFile = join(store, ".wa-check.lock");
   writeFileSync(lockFile, "");
-  const p = Bun.spawn(["/bin/zsh", "-c", `zmodload zsh/system; zsystem flock "${lockFile}" && { print held; sleep 20 }`], { stdout: "pipe" });
+  const p = Bun.spawn(["/bin/zsh", "-c", `zmodload zsh/system; zsystem flock -e "${lockFile}" && { print held; exec sleep 20 }`], { stdout: "pipe" });
   return p;
 };
 const waitHeld = async (p: ReturnType<typeof Bun.spawn>) => {
@@ -195,7 +195,7 @@ test("a live check waits for the shared lock and reports busy (exit 3) without p
     expect(r.err).toContain("another live check or history backfill is running");
     expect(callLog()).toHaveLength(0);
     expect(existsSync(mark)).toBe(false);
-  } finally { p.kill(); }
+  } finally { p.kill(); await p.exited; }
 });
 
 test("wa read --more takes the same lock, so it never pauses the daemon during a live check", async () => {
@@ -207,7 +207,7 @@ test("wa read --more takes the same lock, so it never pauses the daemon during a
     expect(r.err).toContain("a live wa check is running");
     expect(callLog()).toHaveLength(0);
     expect(existsSync(mark)).toBe(false);
-  } finally { p.kill(); }
+  } finally { p.kill(); await p.exited; }
 });
 
 test("a bootstrap that fails right after bootout is retried, then kickstarted", () => {

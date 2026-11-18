@@ -1,10 +1,10 @@
 """Wrapper evidence is diagnostic only; it never decides whether a run passed or stopped."""
 from pathlib import Path
-import re
+import offbox_protocol as protocol
 import shlex
 import subprocess
 
-PREFIX = 'offbox evidence '
+PREFIX = protocol.PREFIX
 
 # This runs inside runs.BOUNDED_PROCESS: a wedged receipt filesystem cannot hold up a step or signal handler.
 WRITER = r'''
@@ -26,6 +26,9 @@ if line.startswith('signal=') and 'step=' not in line:
     except OSError:
         pass
     line += ' step=' + step
+nonce = os.environ.get('OFFBOX_PROTOCOL_NONCE', '')
+if nonce:
+    line += ' [n=' + nonce + ']'
 print('offbox evidence ' + line, file=sys.stderr, flush=True)
 if os.environ.get('OFFBOX_RUN_ID'):
     try:
@@ -43,37 +46,23 @@ def shell(supervisor):
             + 'OFFBOX_EVIDENCE\n}\n')
 
 
-def describe(text, planned=0):
-    from .runs import COMMAND_STARTED_MARKER, STEP_RETRY
+def describe(text, planned=0, identity=None, *, trace=False):
+    identity = identity or protocol.Protocol()
     completed, started, signal, instrumented = {}, 0, '', False
-    for line in text.splitlines():
-        if line.startswith(COMMAND_STARTED_MARKER) or STEP_RETRY.fullmatch(line):
+    for marker in identity.scan(text, trace=trace):
+        kind, fields = marker.kind, marker.fields
+        if kind in ('command_started', 'retry', 'wrapper', 'begin'):
             completed, started, signal, instrumented = {}, 0, '', False
-        if line.startswith(PREFIX):
-            line = line[len(PREFIX):]
-        elif not re.match(r'(begin |start |end |signal=|wrapper )', line):
-            match = re.search(r'offbox step (\d+) rc=(-?\d+): ', line)
-            if match:
-                completed[int(match[1])] = int(match[2])
-            continue
-        fields = dict(re.findall(r'(\w+)=([^ ]+)', line))
-        if any(key in fields and not re.fullmatch(r'-?\d+', fields[key]) for key in ('step', 'rc', 'planned')):
-            continue
-        required = ('planned',) if line.startswith('begin ') else ('step', 'rc') if line.startswith('end ') else ('step',) if line.startswith('start ') else ()
-        if any(key not in fields for key in required):
-            continue
-        if line.startswith('wrapper '):
-            completed, started, signal, instrumented = {}, 0, '', False
-        if line.startswith('begin '):
-            completed, started, signal, instrumented = {}, 0, '', True
-            planned = int(fields.get('planned', '0'))
-        if line.startswith('start '):
-            started = int(fields.get('step', '0'))
-        if line.startswith('end '):
-            completed[int(fields['step'])] = int(fields['rc'])
-        if 'signal' in fields:
+        if kind == 'begin':
+            instrumented = True
+            planned = fields['planned']
+        elif kind == 'start':
+            started = fields['step']
+        elif kind in ('end', 'step'):
+            completed[fields['step']] = fields['rc']
+        elif kind == 'signal':
             signal = fields['signal']
-            started = int(fields.get('step', started))
+            started = fields.get('step', started)
     results = ', '.join(f'step {n} rc={rc}' for n, rc in sorted(completed.items()))
     last = max(completed, default=0)
     gaps = [n for n in range(1, last) if n not in completed]
@@ -97,17 +86,14 @@ def describe(text, planned=0):
     return (results + '; ' if results else '') + where
 
 
-def current_begin(text):
-    from .runs import COMMAND_STARTED_MARKER, STEP_RETRY
+def current_begin(text, identity=None, *, trace=False):
+    identity = identity or protocol.Protocol()
     begin = ""
-    for line in text.splitlines():
-        if line.startswith(COMMAND_STARTED_MARKER) or STEP_RETRY.fullmatch(line):
+    for marker in identity.scan(text, trace=trace):
+        if marker.kind in ('command_started', 'retry', 'wrapper'):
             begin = ""
-        line = line.removeprefix(PREFIX)
-        if line.startswith("wrapper "):
-            begin = ""
-        if line.startswith("begin "):
-            begin = line
+        if marker.kind == 'begin':
+            begin = marker.line
     return begin
 
 
@@ -122,8 +108,9 @@ def report(row, log_path=None, *, until=None, receipt_code=None):
         text = path.read_text(errors='replace') if path else ''
     except OSError:
         text = ''
+    identity = protocol.for_run(row, path)
     budget = 3 if until is None else min(3, max(0, until - now()))
-    if budget and row.get('box_id') and PREFIX in text:
+    if budget and row.get('box_id') and any(m.kind == 'begin' for m in identity.scan(text)):
         # Legacy runs have no trace; do not add a futile network read to their waits.
         remote = shlex.quote(row['run_id'] + '.trace')
         try:
@@ -131,18 +118,17 @@ def report(row, log_path=None, *, until=None, receipt_code=None):
             if result.returncode == 0 and result.stdout:
                 remote_text = result.stdout.decode(errors='replace')
                 # A retry may be queued but not yet have reached its wrapper. Do not resurrect its predecessor.
-                if current_begin(text) and current_begin(text) == current_begin(remote_text):
-                    local_notes = [line.removeprefix(PREFIX) for line in text.splitlines() if line.startswith(PREFIX)]
+                if current_begin(text, identity) and current_begin(text, identity) == current_begin(remote_text, identity, trace=True):
+                    local_notes = [m.line for m in identity.scan(text) if m.kind not in ('command_started', 'retry', 'step')]
                     remote_notes = iter(remote_text.splitlines())
                     # The streamed note precedes its file write. A failed write can leave disk behind the log.
                     if all(any(note == remote for remote in remote_notes) for note in local_notes):
-                        from .runs import STEP_RESULT
-                        local_tail = text.rsplit(PREFIX + current_begin(text), 1)[-1]
+                        local_tail = text.rsplit(PREFIX + current_begin(text, identity), 1)[-1]
                         # A failed evidence writer can still be followed by the ordinary step result line.
-                        results = [line for line in local_tail.splitlines() if STEP_RESULT.search(line)]
-                        text = remote_text + '\n' + '\n'.join(results)
+                        results = [m.line for m in identity.scan(local_tail) if m.kind == 'step']
+                        text = '\n'.join(PREFIX + line for line in remote_text.split('\n')) + '\n' + '\n'.join(results)
         except (OSError, subprocess.TimeoutExpired, OffboxError):
             pass
-    detail = describe(text, int(row.get('step_count') or 0))
+    detail = describe(text, int(row.get('step_count') or 0), identity)
     if detail:
         say('exit unknown: ' + detail + '; no exit receipt')

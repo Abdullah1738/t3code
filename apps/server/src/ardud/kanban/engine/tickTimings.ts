@@ -28,6 +28,8 @@ export const make = (now: () => number) => {
   const counts = phases.map(() => 0);
   let dbActive = 0;
   let dbMs = 0;
+  const byRead: Record<string, { count: number; ms: number }> = {};
+  const byStep: Record<string, { count: number; ms: number }> = {};
   const scanned = new Set<string>();
   const changed = new Set<string>();
   const account = () => {
@@ -56,6 +58,22 @@ export const make = (now: () => number) => {
         if (db) dbActive--;
       };
     },
+    read(read: string, step: string) {
+      if (finished) return () => {};
+      const at = now();
+      const entries = [
+        (byRead[read] ??= { count: 0, ms: 0 }),
+        (byStep[step] ??= { count: 0, ms: 0 }),
+      ];
+      for (const entry of entries) entry.count++;
+      let left = false;
+      return () => {
+        if (finished || left) return;
+        left = true;
+        const ms = Math.max(0, now() - at);
+        for (const entry of entries) entry.ms += ms;
+      };
+    },
     cards(value: unknown, write = false) {
       if (finished) return;
       for (const row of Array.isArray(value) ? value : [value]) {
@@ -71,6 +89,9 @@ export const make = (now: () => number) => {
       return {
         durationMs: Math.max(0, last - started),
         dbMs,
+        // Inclusive read latency, unlike the partitioned phase wall time.
+        byRead,
+        byStep,
         queueWaitMs: durations[phases.indexOf("queue_wait")]!,
         cardsScanned: scanned.size,
         cardsChanged: changed.size,
@@ -87,6 +108,23 @@ export const make = (now: () => number) => {
 export const current = Context.Reference<ReturnType<typeof make> | undefined>("KanbanTickTimings", {
   defaultValue: () => undefined,
 });
+
+export const step = Context.Reference<string>("KanbanTickStep", {
+  defaultValue: () => "planning",
+});
+
+export const threadRead = <A, E, R>(read: string, effect: Effect.Effect<A, E, R>) =>
+  Effect.flatMap(current, (timing) =>
+    timing === undefined
+      ? effect
+      : Effect.flatMap(step, (name) =>
+          Effect.acquireUseRelease(
+            Effect.sync(() => timing.read(read, name)),
+            () => measure("thread_status", effect),
+            (leave) => Effect.sync(leave),
+          ),
+        ),
+  );
 
 // No span per call outside a measured tick: these store paths are also used by
 // foreground board operations and detached work which outlives the tick.
@@ -118,7 +156,10 @@ export const admission = <A, E, R>(
   });
 
 const storePhase = (key: string): Phase => {
-  if (/^(board|boards|cards|openCards|dispatchCards|summaryCards)$/.test(key)) return "board_load";
+  if (
+    /^(board|boards|cards|openCards|tickCards|goalStoryCards|dispatchCards|summaryCards)$/.test(key)
+  )
+    return "board_load";
   if (/Pool|^pools$/.test(key)) return "pool_accounting";
   if (/Event/.test(key)) return "event_persistence";
   if (/Discussion|discussion|Message|message|ownerWait/.test(key)) return "discussion_updates";

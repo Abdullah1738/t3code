@@ -19,7 +19,7 @@ Use the defaults. Every option has one; don't stop to ask which to pick.
         that hasn't downloaded can't be marked: build again to retry the download.
     convo-card send --slug SLUG --session S [--to CHAT] [--days N] [--dry-run]
         Rebuilds, refuses while any translation is pending or stale, runs `card-check page`, then shares
-        the page and sends ONE live app card (`app --to CHAT`), keyed per last message + page URL, so
+        the page and sends ONE live app card (a link via agent-ask for remote chats), keyed per last message + page URL, so
         a repeat is a no-op. CHAT defaults to owner (Abdullah); S = the CURRENT session id of the chat
         you are in. Caption '<title> chat' and subcaption ('Lydia replied', 'Moni sent a photo') are
         fixed phrases: the card's text never updates, so it never carries message text, times or dates.
@@ -70,6 +70,25 @@ WORDS_FILE = "/usr/share/dict/words"
 CHAT_WORDS = {"ok", "okay", "thx", "pls", "plz", "lol", "yeah", "yep", "nope", "hi", "hey", "bye", "omg", "btw"}
 STEMS = (("ies", "y"), ("ied", "y"), ("es", ""), ("s", ""), ("ed", ""), ("ed", "e"), ("ing", ""), ("ing", "e"),
          ("ly", ""), ("er", ""), ("er", "e"), ("est", ""), ("est", "e"))
+
+try:
+    sys.path.insert(0, str(HERE.parent))
+    from toollog import helper_main, tool_log, stderr_cause
+except ImportError:
+    def helper_main(_name, fn, *args):
+        return fn(*args)
+    def tool_log(_entry):
+        pass
+    def stderr_cause(_text, **_kwargs):
+        return {}
+
+
+def log_event(name, *, who=None, key=None, ack=None, command=None, error=None, exit_code=None):
+    tool_log({"component": "convo-card", "name": name, "kind": "error" if error else "event",
+              "ok": not bool(error), "ids": {"helper": "convo-card." + command if command else "convo-card",
+              "chat": who, "key": key, "item": ack, "operation": command},
+              "props": {"exitCode": exit_code, **stderr_cause(error or "")},
+              **({"error": {"tag": "bridge.request_failed"}} if error else {})})
 
 
 def die(msg, code=2):
@@ -194,8 +213,10 @@ _words = None
 def english_words():
     global _words
     if _words is None:
+        # Fixtures must not depend on a host dictionary (Linux often has none).
+        path = os.environ.get("CONVO_CARD_WORDS_FILE", WORDS_FILE) if under_test() else WORDS_FILE
         try:
-            with open(WORDS_FILE, errors="replace") as f:
+            with open(path, errors="replace") as f:
                 _words = {w.strip().lower() for w in f}
         except OSError:
             _words = set()    # no word list: every message with letters gets reviewed
@@ -710,21 +731,63 @@ def cmd_translate(a):
     print(json.dumps({"stored": a.id, "pending": pending}, ensure_ascii=False))
 
 
+def remote_chat(who):
+    config = read_json(bridge_state() / "config.json", {}) or {}
+    return who not in ("owner", "abdullah") and (config.get("chatBackends", {}).get(who) or {}).get("kind") == "remote-box"
+
+
+def remote_refusal(error):
+    return bool(re.search(r"\(HTTP 403\)", error or "")
+                and "Use agent-ask to reach this chat on its box" in error)
+
+
+class BridgeError(RuntimeError):
+    def __init__(self, command, error, exit_code):
+        super().__init__(f"bridge {command} failed ({exit_code}): {error.strip()[:300]}")
+        self.remote_chat = remote_refusal(error)
+        # Generic 409s can wrap enqueue failures; only the missing-session 409
+        # proves the runtime rejected the request before touching the outbox.
+        self.refused = bool(re.search(r"\(HTTP (400|401|403|404|413|422|503)\)|"
+                                     r"\(HTTP 409\): No chat for this session\b|Invalid command arguments", error or ""))
+
+
+def relay_id(key):
+    return "areq_" + hashlib.sha256(json.dumps(["owner", key], separators=(",", ":")).encode()).hexdigest()
+
+
+def relay_outbox(who, key):
+    try:
+        db = bridge_state() / "state.sqlite"
+        with sqlite3.connect(f"{db.absolute().as_uri()}?mode=ro", uri=True, timeout=5) as con:
+            row = con.execute("select to_slug, status from agent_requests where id = ?", (relay_id(key),)).fetchone()
+        if row and row[0] != who:
+            return None
+        return row[1] if row else "missing"
+    except (OSError, sqlite3.Error):
+        return None
+
+
 def bridge(*args, timeout=60):
     # Under a test, only an injected stub bridge may run: the real one would send iMessage.
     if under_test() and not os.environ.get("CONVO_CARD_BRIDGE"):
         sys.exit(f"refused: test run; convo-card would send via the real bridge ({args[0] if args else '?'}); "
                  "set CONVO_CARD_BRIDGE to a stub")
     env = {k: v for k, v in os.environ.items() if k != "BUN_INSPECT"}
-    p = subprocess.run([*bridge_cmd(), *args], capture_output=True, text=True, timeout=timeout, env=env,
-                       stdin=subprocess.DEVNULL)
+    try:
+        p = subprocess.run([*bridge_cmd(), *args], capture_output=True, text=True, timeout=timeout, env=env,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        log_event("bridge.error", command=args[0], error=str(ex))
+        raise
     out = p.stdout.strip()
     try:
         data = json.loads(out.splitlines()[-1]) if out else {}
     except Exception:
         data = {"raw": out[:300]}
     if p.returncode != 0:
-        raise RuntimeError(f"bridge {args[0]} failed ({p.returncode}): {(p.stderr or out).strip()[:300]}")
+        error = p.stderr or out
+        log_event("bridge.error", command=args[0], error=error, exit_code=p.returncode)
+        raise BridgeError(args[0], error, p.returncode)
     return data
 
 
@@ -757,8 +820,13 @@ def cmd_send(a):
             die(f"card-check failed ({p.returncode}), not sending:\n" + (p.stdout + p.stderr).strip()[-1500:], 3)
         caption = clean(f"{cfg['title']} chat", 200)
         sub = subcaption(data)
+        sent = read_json(d / ".sent.json", {})
+        previous = sent.get(a.to) or {}
+        relay = a.to not in ("owner", "abdullah") and (remote_chat(a.to) or previous.get("route") == "agent-ask"
+                                                       or previous.get("status") == "remote-refused")
         if a.dry_run:
             print(json.dumps({"dry_run": True, "to": a.to, "caption": caption, "subcaption": sub,
+                              "route": "agent-ask" if relay else "app",
                               "publish": ["publish", "--app", a.slug] if a.to == "owner"
                               else ["share", "--app", a.slug, "--days", str(a.days)]}, ensure_ascii=False, indent=1))
             return
@@ -769,19 +837,67 @@ def cmd_send(a):
         if not url.startswith("https://"):
             die(f"bridge returned no https URL: {pub}", 3)
         key = f"convo-{a.slug}-{a.to}-{data['last_id']}-{sha(url)[:8]}"[:200]
-        sent = read_json(d / ".sent.json", {})
-        if (sent.get(a.to) or {}).get("key") == key:
+        if previous.get("key") == key and previous.get("status") in (None, "sent", "relayed"):
             print(json.dumps({"sent": False, "reason": "already sent for this message and link", "key": key}))
             return
         card_url = url.rstrip("/") + "/?v=" + data["v"]
-        to = [] if own_chat(a.to, a.session) else ["--to", a.to]
-        res = bridge("app", "--url", card_url, f"--caption={caption}", f"--subcaption={sub}",
-                     "--summary", "Live WhatsApp chat", "--session", a.session, "--key", key, *to)
-        sent[a.to] = {"key": key, "url": url, "card_url": card_url, "last_id": data["last_id"],
-                      "at": datetime.now(DXB).isoformat(timespec="seconds"), "op": res.get("id"),
-                      "created": res.get("created")}
-        write_json(d / ".sent.json", sent)
-    print(json.dumps({"sent": True, "to": a.to, "url": card_url, "key": key, "created": res.get("created")}))
+        res = None
+        if previous.get("status") not in (None, "sent", "relayed", "remote-refused", "refused"):
+            # A direct send with no reply can still land. Only an explicit remote
+            # refusal proves it is safe to change transports.
+            if previous.get("route") != "agent-ask" or not previous.get("key") or not previous.get("request"):
+                die("an earlier attempt may have sent; check the chat before sending again", 3)
+            # Finish the frozen relay first, even if a new message or share URL
+            # has changed this build's key. A later send can carry the update.
+            key = previous["key"]
+            state = relay_outbox(a.to, key)
+            if state in ("pending", "done", "done_late"):
+                res = {"id": relay_id(key), "created": False}
+            elif state not in ("open", "missing"):
+                die("an earlier relay may have sent; check the chat before sending again", 3)
+        entry = previous if previous.get("key") == key and previous.get("route") == "agent-ask" else {
+            "key": key, "url": url, "card_url": card_url, "last_id": data["last_id"]}
+        sent[a.to] = entry
+
+        def save(status):
+            entry.update(status=status, at=datetime.now(DXB).isoformat(timespec="seconds"))
+            write_json(d / ".sent.json", sent)
+
+        if not relay:
+            entry["route"] = "app"
+            save("attempting")
+            to = [] if own_chat(a.to, a.session) else ["--to", a.to]
+            try:
+                res = bridge("app", "--url", card_url, f"--caption={caption}", f"--subcaption={sub}",
+                             "--summary", "Live WhatsApp chat", "--session", a.session, "--key", key, *to)
+            except BridgeError as ex:
+                if not ex.remote_chat or a.to in ("owner", "abdullah"):
+                    if ex.refused:
+                        save("refused")
+                    raise
+                save("remote-refused")
+                relay = True
+        if relay:
+            entry["route"] = "agent-ask"
+            if res is None:
+                # Freeze the request across retries: a rebuild can change the page
+                # version while the message/link key remains the same.
+                entry.setdefault("request", "Send this conversation card link once in your own chat, using bridge send with dedupe key "
+                                 + json.dumps(key) + ". Keep that same key on any retry; reconcile an ambiguous send. "
+                                 "The exact message is the JSON string below. Answer done only after bridge acceptance; "
+                                 "otherwise answer declined with the send error.\n" + json.dumps(f"{caption}: {card_url}"))
+                save("attempting")
+                res = bridge("agent-ask", "--to", a.to, "--text=" + entry["request"],
+                             "--session", a.session, "--key", key)
+                if not isinstance(res, dict) or res.get("id") != relay_id(key) or type(res.get("created")) is not bool:
+                    die("bridge agent-ask returned a bad ack", 3)
+                if res["created"] is False and relay_outbox(a.to, key) not in ("open", "pending", "done", "done_late"):
+                    die("an earlier relay may have sent; check the chat before sending again", 3)
+            log_event("relay", who=a.to, key=key, ack=res["id"])
+        entry.update(op=res.get("id"), created=res.get("created"))
+        save("relayed" if relay else "sent")
+    print(json.dumps({"sent": True, "to": a.to, "url": entry["card_url"], "key": key,
+                      "created": res.get("created"), **({"relayed": True} if relay else {})}))
 
 
 def cmd_show(a):
@@ -1076,12 +1192,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    try:
-        from pathlib import Path as _LogPath
-        sys.path.insert(0, str(_LogPath(__file__).resolve().parents[1]))
-        from toollog import helper_main
-    except Exception:
-        # Standalone copies of helpers can run before the optional logger is installed.
-        def helper_main(_name, fn, *args):
-            return fn(*args)
     helper_main("convo-card", main)

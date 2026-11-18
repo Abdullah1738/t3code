@@ -1,3 +1,4 @@
+import './log-dir.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -63,7 +64,7 @@ test('migration preserves all four keys through scan-first and stale-scan saves,
   assert.deepEqual(realIo.loadStallState(), legacy);
   assert.equal(existsSync(join(f.dir, 'stall-state.json')), false);
   // Even a failed first API pass must retain migrated records and retries.
-  await assert.rejects(stall({}, { ...f.io, harnessCutoverStatus: async () => { throw new Error('API unavailable'); } }), /API unavailable/);
+  await assert.rejects(stall({}, { ...f.io, harnessCutoverStatus: async () => { throw Object.assign(new Error('API unavailable'), { code: 'TEST_CUTOVER_UNAVAILABLE' }); } }), /API unavailable/);
   assert.deepEqual(f.read('stall-state.json'), legacy);
   const fresh = structuredClone(legacy);
   fresh.stalls.pending.telegramTries = 2;
@@ -202,7 +203,7 @@ test('failure to publish interrupt intent prevents the interrupt', async t => {
     activeSessions: async () => new Set(['ses_a']), ocTail: async () => tail,
     ocSession: async () => ({}), ocForms: async () => [], ocPermissions: async () => [],
     threadByNative: async () => null,
-    saveStallState: () => { throw new Error('ledger unavailable'); },
+    saveStallState: () => { throw Object.assign(new Error('ledger unavailable'), { code: 'TEST_LEDGER_UNAVAILABLE' }); },
     ocInterrupt: async () => { interrupted = true; },
   });
   await assert.rejects(stall({}, f.io), /ledger unavailable/);

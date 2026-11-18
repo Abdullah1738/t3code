@@ -6,7 +6,7 @@ Wake events go to the creating Robob thread (`created_by_session`) in queue mode
 
 A queued wake remains `confirmed=pending` until the thread reports a new run, or the owner-chat router consumes its inbound row. A send timeout also stays pending: it may have queued on the server. After ten minutes without confirmation, the runner alerts once and tries the owner fallback with the same event key. `robob-watch show ID` includes `last_delivery` and pending confirmations. Owner fallbacks use spectrum-bridge `wake`, then bridge `send`, then Telegram `notify`. Explicit chat watchers and opt-in 120s heads-ups keep their existing behavior.
 
-Failed checks back off, with a failure notice from the 2nd failure in a row (`failure_notice_after`), pause and alert after 5 (`max_consecutive_failures`). Set `failure_notice_after` to 1 to notify on every failure, or `max_consecutive_failures` to 0 to keep retrying without pausing. Timed-out checks need 10 minutes of failures before either notice or pause; host-load timeout grace still applies. Wake watchers escalate at pause or after 15 minutes of failures. A successful check resets the streak.
+Failed checks back off, with a failure notice from the 2nd failure in a row (`failure_notice_after`), pause and alert after 5 (`max_consecutive_failures`). Set `failure_notice_after` to 1 to notify on every failure, or `max_consecutive_failures` to 0 to keep retrying without pausing. Timed-out checks need 10 minutes of failures before either notice or pause; host-load timeout grace still applies. Wake watchers escalate at pause or after 15 minutes of failures. Failure-paused watchers probe after 15 minutes, then 30 minutes later, then hourly, and resume automatically on a passing check with one recovery notice. The schedule survives runner restarts. Set `failure_pause_probe: false` for manual-only recovery; `pause` always stops probes and `resume` clears the failure state. `list` and `show` display the next probe in Dubai time. A successful check resets the streak.
 
 Layout (runtime lives at `~/.local/share/robob-watch`; this directory is the canonical source):
 - `src/runner.ts` runner loop (1s tick), `src/cli.ts` CLI (add/list/show/remove/pause/resume/test/fire-test/relay-ok/relays-off), `src/lib.ts` shared logic
@@ -47,6 +47,16 @@ Reports include hourly error sources, run failures/timeouts and p95 durations. E
 For manual release/restart scripts, call `robob-watch log-marker --service robob-watch --sha <git-sha> --step restart.complete || true` after success. Service/step are short identifiers; SHA is hex. Markers retain no IDs or free text and failures never interrupt the script.
 
 ## Tests
+
+`ride-card send` relays public link text through `agent-ask` for chats configured with
+`chatBackends.<slug>.kind = remote-box`, with a fallback for the bridge's explicit remote-chat
+403 refusal. The journal records `relayed` after bus acceptance, not final delivery. The same
+trip/recipient key is used by the bus and the recipient's send; unresolved direct attempts
+block a transport switch. `--dry-run` reports the route without sending or publishing.
+`bridge.error` and `relay` tool events retain command/error classifications and hashed
+recipient, key and acknowledgement identifiers. Abdullah's card still uses `app`.
+
+`convo-card send` uses the same remote-chat relay and exact-403 fallback: link text via `agent-ask`, journal status `relayed` after bus acceptance, stable-key reconciliation on retry, and `--dry-run` route `agent-ask` or `app`.
 
 Run from `integrations/robob-watch`. Bun: `bun test test/`. Python uses unittest; pytest is not installed on the Mac.
 

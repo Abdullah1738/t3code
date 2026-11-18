@@ -1,3 +1,4 @@
+import { RobobLinkDown, RobobLinkGate } from "./robob-link-gate.ts";
 import { markLoggedFailure, toolError, toolLog } from "./toollog.ts";
 import { controlFailureProps, type ControlFailure } from "./control-errors.ts";
 import { errorDetail } from "./log-error.ts";
@@ -134,7 +135,10 @@ export interface ControlConfigOptions {
   tokenFile?: string;
   env?: Record<string, string | undefined>;
   home?: string;
+  linkGate?: boolean | RobobLinkGate;
 }
+
+type RequestOptions = { timeoutMs?: number; signal?: AbortSignal; directResponse?: boolean };
 
 /**
  * Explicit options, then T3_CONTROL_URL / T3_CONTROL_TOKEN, then a token file:
@@ -159,7 +163,10 @@ export function discoverControlConfig(options: ControlConfigOptions = {}): { url
   return { url: new URL(url).origin, token };
 }
 
+const linkGates = new Map<string, RobobLinkGate>();
+
 export class ControlClient {
+  readonly linkGate?: RobobLinkGate;
   readonly url: string;
   private readonly token: string;
 
@@ -167,9 +174,26 @@ export class ControlClient {
     const { url, token } = discoverControlConfig(options);
     this.url = url;
     this.token = token;
+    if (options.linkGate) {
+      if (options.linkGate instanceof RobobLinkGate) this.linkGate = options.linkGate;
+      else {
+        let gate = linkGates.get(url);
+        if (!gate) {
+          gate = new RobobLinkGate({ skip: site => toolLog.skipRobob(site),
+            firstAtSite: site => toolLog.robobSite(site), persistedDown: () => toolLog.robobLinkDown() });
+          linkGates.set(url, gate);
+        }
+        this.linkGate = gate;
+      }
+    }
   }
 
-  async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
+  async request<T>(method: string, path: string, body?: unknown, options: RequestOptions = {}): Promise<T> {
+    return this.performRequest(method, path, body, options);
+  }
+
+  private async performRequest<T>(method: string, path: string, body: unknown, options: RequestOptions, probe = false): Promise<T> {
+    if (!probe) this.linkGate?.guard(`control.${method}.${path.split("?")[0]!.replace(/\/threads\/[^/]+/, "/threads/:id").replace(/[^a-zA-Z]/g, ".")}`);
     const requestId = randomUUID();
     let serverRequestId: string | undefined;
     const loggingAt = performance.now();
@@ -215,15 +239,21 @@ export class ControlClient {
       const echoed = response.headers?.get(CONTROL_REQUEST_ID_HEADER);
       if (echoed && echoed !== requestId) serverRequestId = echoed;
     });
-    let data: { ok?: unknown; error?: ControlFailure & { code?: unknown } } | undefined;
+    let data: { ok?: unknown; code?: unknown; error?: ControlFailure & { code?: unknown } } | undefined;
     try {
       data = await response.json() as typeof data;
     } catch (caughtError) {
       loggingError = caughtError;
       if (caughtError instanceof SyntaxError) loggingTag = "control.invalid_json";
+      throw new ControlError(response.status || 0);
     }
-    if (!response.ok || data?.ok !== true) {
-      throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "", data?.error);
+    if (!response.ok || !options.directResponse && data?.ok !== true) {
+      throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code
+        : options.directResponse && typeof data?.code === "string" ? data.code : "", data?.error);
+    }
+    if (probe && (data as { status?: string })?.status !== "healthy") {
+      responseStatus = 503;
+      throw new ControlError(503);
     }
     loggingOk = true;
     return data as T;
@@ -232,19 +262,24 @@ export class ControlClient {
       thrownError = error;
       throw error;
     } finally {
+      const detail = errorDetail(loggingError);
+      // Boot-time 503s are outages; other HTTP rejections and caller cancellation are application outcomes.
+      const transport = !loggingOk && !options.signal?.aborted
+        ? responseStatus === 503 && this.linkGate ? "HTTP_503"
+          : !(responseStatus && responseStatus >= 400)
+            ? requestTimeout?.aborted || detail.name === "TimeoutError" || ["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(String(detail.code))
+              ? "ETIMEDOUT" : detail.code === "ECONNREFUSED" || detail.code === "ECONNRESET" ? detail.code : this.linkGate && responseStatus === undefined ? "FETCH_FAILED" : undefined
+            : undefined
+        : undefined;
+      const linkCause = transport ?? (probe && !loggingOk ? "FETCH_FAILED" : undefined);
       toolLog.capture(() => {
       finishRead?.();
-      const detail = errorDetail(loggingError);
-      // HTTP rejections and caller cancellation are application outcomes, never link outages.
-      const transport = !loggingOk && !options.signal?.aborted && !(responseStatus && responseStatus >= 400)
-        ? requestTimeout?.aborted || detail.name === "TimeoutError" || ["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(String(detail.code))
-          ? "ETIMEDOUT" : detail.code === "ECONNREFUSED" || detail.code === "ECONNRESET" ? detail.code : undefined
-        : undefined;
       toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: performance.now() - loggingAt,
-        ok: loggingOk, ids: { ...loggingIds, ...(serverRequestId ? { serverRequestId } : {}) }, props: { method, route, ...controlFailureProps(thrownError), ...(transport ? { linkCause: transport } : {}), ...(!loggingOk ? { failureFormat: "single" } : {}) },
+        ok: loggingOk, ids: { ...loggingIds, ...(serverRequestId ? { serverRequestId } : {}) }, props: { method, route, ...controlFailureProps(thrownError), ...(this.linkGate ? { linkGated: true, linkProbe: probe, linkGateDown: !this.linkGate.available } : {}), ...(linkCause ? { linkCause } : {}), ...(!loggingOk ? { failureFormat: "single" } : {}) },
         ...(!loggingOk ? { error: { tag: loggingTag, cause: loggingError } } : {}) }));
-      if (!loggingOk) markLoggedFailure(thrownError, requestId);
+      if (!loggingOk) markLoggedFailure(thrownError, requestId, !!this.linkGate);
       });
+      this.linkGate?.outcome(loggingOk, !!transport, () => this.performRequest("GET", "/health", undefined, { timeoutMs: 5_000 }, true), probe);
     }
   }
 
@@ -285,6 +320,17 @@ export class ControlClient {
     return this.request("POST", `/threads/${encodeURIComponent(threadId)}/requests/${encodeURIComponent(requestId)}/respond`, body);
   }
 
+  private auxiliaryOutcome(ok: boolean, status: number | undefined, error: unknown, route: string, signal?: AbortSignal): void {
+    if (!this.linkGate) return;
+    const detail = errorDetail(error);
+    const cause = !ok && !signal?.aborted ? status === 503 ? "HTTP_503"
+      : status === undefined ? detail.code === "ECONNREFUSED" || detail.code === "ECONNRESET" ? detail.code : detail.name === "TimeoutError" ? "ETIMEDOUT" : "FETCH_FAILED" : undefined : undefined;
+    toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok,
+      props: { route, linkGated: true, linkGateDown: !this.linkGate.available, ...(cause ? { linkCause: cause } : {}) },
+      ...(!ok ? { error: { tag: "control.request_failed", cause: error } } : {}) });
+    this.linkGate.outcome(ok, !!cause, () => this.performRequest("GET", "/health", undefined, { timeoutMs: 5_000 }, true), false);
+  }
+
   /** Uploads one file through a signed URL and returns the attachment reference for send. */
   async upload(file: { name: string; mimeType: string; bytes: Uint8Array }, signal?: AbortSignal) {
     const type = file.mimeType.startsWith("image/") ? "image" as const : "file" as const;
@@ -296,6 +342,7 @@ export class ControlClient {
     }
     let response: Response;
     try {
+      this.linkGate?.guard("control.upload");
       response = await fetch(`${this.url}${issued.relativeUrl}`, {
         method: "POST",
         headers: { "content-length": String(file.bytes.byteLength) },
@@ -305,10 +352,14 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch (caughtError) { toolError("control", "control.catch3", caughtError);
+    } catch (caughtError) {
+      if (caughtError instanceof RobobLinkDown) throw caughtError;
+      this.auxiliaryOutcome(false, undefined, caughtError, "/attachments", signal);
+      toolError("control", "control.catch3", caughtError);
       throw new ControlError(0, "upload_failed");
     }
     await response.body?.cancel().catch((caughtError) => { toolError("control", "control.catch4", caughtError);});
+    this.auxiliaryOutcome(response.ok, response.status, undefined, "/attachments", signal);
     if (!response.ok) throw new ControlError(response.status, "upload_failed");
     return { attachmentId: issued.attachmentId, type, name: file.name, mimeType: file.mimeType, sizeBytes: file.bytes.byteLength };
   }
@@ -322,6 +373,7 @@ export class ControlClient {
     if (options.types?.length) query.set("types", options.types.join(","));
     let response: Response;
     try {
+      this.linkGate?.guard("control.events");
       response = await fetch(`${this.url}${PREFIX}/events${query.size ? `?${query}` : ""}`, {
         headers: {
           authorization: `Bearer ${this.token}`,
@@ -333,9 +385,13 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch (caughtError) { toolError("control", "control.catch5", caughtError);
+    } catch (caughtError) {
+      if (caughtError instanceof RobobLinkDown) throw caughtError;
+      this.auxiliaryOutcome(false, undefined, caughtError, "/events", options.signal);
+      toolError("control", "control.catch5", caughtError);
       throw new ControlError(0);
     }
+    this.auxiliaryOutcome(response.ok, response.status, undefined, "/events", options.signal);
     if (!response.ok || !response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
       await response.body?.cancel().catch((caughtError) => { toolError("control", "control.catch6", caughtError);});
       throw new ControlError(response.status);

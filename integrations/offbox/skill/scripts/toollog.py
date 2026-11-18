@@ -22,6 +22,7 @@ NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt', 'clien
 NUMBERS.update({"since", "expires_at"})
 NUMBERS.add("waited_s")
 NUMBERS.add("sample")
+NUMBERS.add('age')
 NUMBERS.update({"tracked_total", "tracked_heavy", "tracked_heavy_sent",
                 "tracked_node_modules_sent", "tracked_secret_sent"})
 NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
@@ -48,7 +49,7 @@ ENUMS = {
     "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
     "jdk_trigger": {"command", "repo-marker", "harness"},
     "class": {"good", "hard", "slow", "starting"},
-    "outcome": {"boat_box", "good", "bad", "indeterminate", "slow", "starting", "ready", "failover"},
+    "outcome": {"reattached", "exited-while-down", "gone", "queued", "boat_box", "good", "bad", "indeterminate", "slow", "starting", "ready", "failover"},
     "peer_path": {"direct", "relay", "unknown"},
     "refresh_stage": {"idle", "zpool", "incus", "mullvad", "sqlite"},
     "checkpoint": {"probe", "person", "post", "auto-stop", "request", "box-read"},

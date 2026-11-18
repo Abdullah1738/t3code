@@ -137,8 +137,16 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
   });
   const recordTransitions = Effect.fn("DesktopLease.recordTransitions")(function* () {
     const committed = transitions.splice(0);
-    if (Option.isNone(analytics)) return;
     for (const event of committed) {
+      if (
+        event.to === "quarantined" ||
+        event.reason === "quarantine_max_age" ||
+        event.reason === "auto_reconciled"
+      ) {
+        yield* Effect.logWarning("Desktop lease recovery transition", event);
+      }
+      if (Option.isNone(analytics)) continue;
+      const { rootThreadId: _root, childThreadId: _child, ...analyticsEvent } = event;
       // Lease task IDs allow text; encode it and hash long IDs to fit the analytics row limit.
       const encodedTaskId = encodeURIComponent(event.taskId.toWellFormed());
       const taskId =
@@ -150,7 +158,7 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
         surface: "server",
         route: "desktop-lease",
         kind: "desktop_lease.transition",
-        ...event,
+        ...analyticsEvent,
         taskId,
       });
     }
@@ -196,7 +204,7 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
           )
         : false;
     const activity =
-      lease?.state === "quarantined"
+      lease?.state === "quarantined" || lease?.state === "stopping"
         ? yield* Effect.gen(function* () {
             const rootActivity = yield* holderActivity(lease.rootThreadId);
             // Async children can execute desktop calls after their root's turn has ended.

@@ -96,7 +96,10 @@ def configure_fixture(root, backend):
 
     def attach(box, pid, out, err, **kwargs):
         output = 'background output\n'
-        marker = f'{runs.COMMAND_STARTED_MARKER} {os.environ[runs.BACKGROUND_RUN_ENV]}\n'
+        rid = os.environ[runs.BACKGROUND_RUN_ENV]
+        with contextlib.closing(common.db()) as con:
+            row = con.execute('SELECT protocol_nonce FROM runs WHERE run_id=?', (rid,)).fetchone()
+        marker = f'{runs.COMMAND_STARTED_MARKER} {rid} [n={row[0]}]\n'
         if err < len(marker):
             yield dict(type='stderr', data=marker[err:], nextOffset=len(marker))
         if out < len(output):
@@ -254,7 +257,7 @@ class BackgroundQueueTests(Isolated):
                 self.until(lambda: (root / 'following').exists())
                 self.assertEqual(int((root / 'following').read_text()), row['client_pid'])
                 path = root / 'LOGS_DIR' / f"{row['run_id']}.log"
-                marker = f"{runs.COMMAND_STARTED_MARKER} {row['run_id']}\n"
+                marker = f"{runs.COMMAND_STARTED_MARKER} {row['run_id']} [n={row['protocol_nonce']}]\n"
                 self.assertEqual(path.read_text(), marker + 'background output\n')
                 self.assertEqual(common.checkpoint(path), dict(stdoutOffset=18, stderrOffset=len(marker), logBytes=18 + len(marker)))
                 self.assertTrue(misc._client_alive(row['client_pid'], row['start_at']))
@@ -306,7 +309,7 @@ class BackgroundQueueTests(Isolated):
                                     return
                                 if '/command-history/' in parsed.path:
                                     stream, offset = query['stream'][0], int(query['offset'][0])
-                                    marker = f"{runs.COMMAND_STARTED_MARKER} {row['run_id']}\n" if produced.is_set() else ''
+                                    marker = f"{runs.COMMAND_STARTED_MARKER} {row['run_id']} [n={row['protocol_nonce']}]\n" if produced.is_set() else ''
                                     data = ((live + resume if resumed.is_set() else live) if produced.is_set() else '') if stream == 'stdout' else queue + marker
                                     page = dict(data=data[offset:], nextOffset=len(data), size=len(data), done=False)
                                 else:
@@ -328,7 +331,7 @@ class BackgroundQueueTests(Isolated):
                         began = time.monotonic()
                         produced.set()
                         path = root / 'LOGS_DIR' / f"{row['run_id']}.log"
-                        marker = f"{runs.COMMAND_STARTED_MARKER} {row['run_id']}\n"
+                        marker = f"{runs.COMMAND_STARTED_MARKER} {row['run_id']} [n={row['protocol_nonce']}]\n"
                         prefix = (queue + (live if first == 'stdout' else marker)).encode()
                         self.until(lambda: path.exists() and path.read_bytes().startswith(prefix))
                         release_history.set()

@@ -14,6 +14,44 @@ else:
 
 
 class AdmissionQueue(Base):
+    def test_reaper_holds_dispatch_until_the_replacement_runner_exists(self):
+        b, h, p = self.setup_queue()
+        self.con.execute('UPDATE commands SET created_at=? WHERE box_id=? AND pid=?', (boatd.now(), b, p))
+        original = boatd.settle_cmd
+        def inspect():
+            with boatd.runner_dispatch(blocking=False) as acquired:
+                self.assertFalse(acquired)
+            with patch.object(boatd, '_sh', return_value=(3, 'inactive')) as probe:
+                self.assertEqual(boatd.queue_head(self.con, b, p)['pid'], h)
+            probe.assert_not_called()
+        def settle(con, row):
+            inspect()
+            return original(con, row)
+        def spawn(box, pid, attempt):
+            inspect()
+            return self.f.spawn_runner(box, pid, attempt)
+        with patch.object(boatd, 'settle_cmd', side_effect=settle), patch.object(boatd, 'spawn_runner', side_effect=spawn):
+            boatd.reap_once(self.con)
+        self.assertEqual(self.status(b, h)['status'], 'queued')
+        self.assertIn(boatd.unit_name(b, h, 1), self.f.active_units)
+        self.assertEqual(self.events('run.queue.dead_head'), [])
+
+    def test_dead_queued_head_with_guest_claim_is_followed_without_reexecution(self):
+        for state in ('alive', 'exited'):
+            with self.subTest(state=state):
+                box, head, waiter = self.setup_queue(box_id='bx_guest_' + state)
+                self.f.guests[box, head] = {'state':state, 'exit_code':7}
+                with patch.object(boatd, '_sh', return_value=(3, 'inactive')), \
+                        patch.object(boatd, 'command_probe', return_value={'marker':{'pid':42}}):
+                    boatd.queue_head(self.con, box, waiter)
+                row = self.status(box, head)
+                self.assertEqual((row['status'], row['attempt']),
+                                 ('running' if state == 'alive' else 'exited', 1))
+                self.assertEqual(row['exit_code'], None if state == 'alive' else 7)
+                self.assertEqual(self.events('run.queue.dead_head'), [])
+                self.assertFalse([call for call in self.f.calls if call[0] == 'exec' and 'nohup' in call[-1]])
+                self.con.execute('DELETE FROM commands WHERE box_id=?', (box,))
+
     def setup_queue(self, *, attempt=1, box_id="bx_test"):
         b = self.box(box_id)
         h = self.cmd(b, pid=1001, status='queued', age=200, attempt=attempt)
@@ -28,7 +66,7 @@ class AdmissionQueue(Base):
     def test_dead_heads_are_settled_once_before_the_next_waiter_starts(self):
         for cause in ('killed', 'kill_file', 'inactive', 'failed', 'unknown'):
             with self.subTest(cause=cause):
-                b, h, p = self.setup_queue(attempt=2, box_id='bx_dead_' + cause)
+                b, h, p = self.setup_queue(box_id='bx_dead_' + cause)
                 if cause == 'killed':
                     self.con.execute('UPDATE commands SET killed=1 WHERE pid=?', (h,))
                 if cause == 'kill_file':
@@ -38,10 +76,10 @@ class AdmissionQueue(Base):
                     boatd.admit(self.con, b, p, 'k', io.BytesIO())
                     self.assertIsNone(boatd.queue_head(self.con, b, p))
                 if cause not in ('killed', 'kill_file'):
-                    self.assertEqual(probe.call_args.args[0][-1], boatd.unit_name(b, h, 2))
+                    self.assertEqual(probe.call_args.args[0][-1], boatd.unit_name(b, h, 1))
                 self.assertEqual(self.status(b, h)['status'], 'lost')
                 self.assertEqual(self.status(b, p)['status'], 'running')
-                result = boatd.read_result(b, h, 2)
+                result = boatd.read_result(b, h, 1)
                 self.assertEqual(result['status'], 'lost')
                 events = self.events('run.queue.dead_head')
                 self.assertEqual(len(events), 1)
@@ -226,7 +264,7 @@ class AdmissionQueue(Base):
                                started_at=100, ended_at=110)
                 if outcome in ('interrupted', 'retry', 'unknown_cleanup'):
                     info = dict(cause='boatd_restart', phase='running', cleanup='clean', retry=outcome == 'retry')
-                    receipt.update(status='interrupted', exit_code=None, interruption=info)
+                    receipt.update(status='interrupted', exit_code=None if outcome == 'retry' else 94, interruption=info)
                     if outcome == 'retry':
                         self.con.execute('UPDATE commands SET retry_interrupted=1 WHERE box_id=?', (b,))
                 if outcome == 'unknown_cleanup':
@@ -248,8 +286,8 @@ class AdmissionQueue(Base):
                 if outcome == 'stale_attempt':
                     self.assertEqual(row['status'], 'lost')
                 elif outcome == 'retry':
-                    self.assertEqual((row['status'], row['attempt']), ('queued', 2))
-                    self.assertIn((b, h, 2), self.f.spawned)
+                    self.assertEqual((row['status'], row['exit_code'], row['attempt']), ('interrupted', 94, 1))
+                    self.assertNotIn((b, h, 2), self.f.spawned)
                 elif outcome == 'unknown_cleanup':
                     self.assertEqual(row['status'], 'running')
                     self.assertEqual(boatd.read_result(b, h, 1)['interruption']['cleanup'], 'unknown')
@@ -269,7 +307,7 @@ class AdmissionQueue(Base):
                 saved = dict(attempt=1, status='exited', exit_code=0 if outcome == 'success' else 7,
                              started_at=100, ended_at=110)
                 if outcome == 'interrupted':
-                    saved.update(status='interrupted', exit_code=None,
+                    saved.update(status='interrupted', exit_code=94,
                                  interruption=dict(cleanup='clean', phase='running', retry=False))
                 if outcome == 'lost':
                     saved.update(status='lost', exit_code=None)
