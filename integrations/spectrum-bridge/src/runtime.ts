@@ -1,4 +1,4 @@
-import { markReactionAnswered } from "./unanswered.ts";
+import { markAnswered } from "./unanswered.ts";
 import type { RemoteBox } from "./remote-box.ts";
 import { RemoteRequestError } from "./remote-box.ts";
 import { validId } from "./remote-protocol.ts";
@@ -494,8 +494,9 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           const inbound = registry.all().find(chat =>
             chat.store.db.query<{ id: string }, [string]>("SELECT id FROM inbound WHERE id = ?").get(target));
           if (!inbound) throw new HttpError(403, "Forbidden");
+          const covered = [target];
           await options.line.react(target, kind);
-          markReactionAnswered(inbound.store, target);
+          markAnswered(inbound.store, covered);
           return reply(200, { id: `reaction:${hash(target + kind)}` });
         }
         case "/location-request": {

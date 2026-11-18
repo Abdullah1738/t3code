@@ -177,13 +177,6 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
   }).immediate();
 }
 
-export function markReactionAnswered(store: Store, target: string): void {
-  const turn = store.get<ReplyTurn | null>("activeTurn");
-  // A reaction to old history must not acknowledge an unrelated current turn.
-  const members = turn ? turnMembers(store, turn) : [];
-  markAnswered(store, members.includes(target) ? members : [target]);
-}
-
 export type Running = { members: readonly string[]; leaderKind: "human" | "wake" | "reset" | "background" };
 export function findOverdue(rows: readonly InboundRecord[], running: Running | undefined, now: number,
   opts: { startedAt: number; chat: string }) {

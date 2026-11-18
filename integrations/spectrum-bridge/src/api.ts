@@ -1,4 +1,4 @@
-import { markReactionAnswered } from "./unanswered.ts";
+import { markAnswered } from "./unanswered.ts";
 import { parseHealthSidecar } from "./health-receipts.ts";
 import { messageLengthError } from "./message-length.ts";
 import { toolError } from "./toollog.ts";
@@ -466,8 +466,10 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const inbound = store.db.query<{ id: string }, [string]>("SELECT id FROM inbound WHERE id = ?").get(target);
         if (!inbound && !store.byProviderId(target)) throw new ApiError(403);
         const id = `reaction:${hash(target + kind)}`;
+        // A tapback answers its target, including when another steer arrives during delivery.
+        const covered = [target];
         await photon.react(chat, target, kind as ReactionKind, id);
-        markReactionAnswered(store, target);
+        markAnswered(store, covered);
         return json({ id });
       }
 

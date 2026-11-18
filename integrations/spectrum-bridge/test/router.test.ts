@@ -11615,6 +11615,50 @@ test.each((["final", "tool"] as const).flatMap(replyMode => ["photon", "sendblue
   expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe(failed ? "admitted" : "done");
 });
 
+test.each((["final", "tool"] as const).flatMap(replyMode => ["photon", "sendblue"].flatMap(apiKind => [false, true].map(restart => ({ replyMode, apiKind, restart })))))("an in-flight $apiKind reaction cannot answer a later admitted steer ($replyMode, restart=$restart)", async ({ replyMode, apiKind, restart }) => {
+  const start = Date.parse("2026-11-17T17:00:00Z"); setSystemTime(start);
+  const h = setup(":memory:", { replyMode }); steering(h.backend);
+  const logs = await captureLogs(async () => {
+    h.input("react-root", "Thanks", { source: "typed" }); await h.router.tick();
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const react = async () => { entered.resolve(); await release.promise; };
+    let api = createApi({ store: h.store, photon: { react }, router: () => h.router, chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+    if (apiKind === "sendblue") {
+      const stateRoot = mkdtempSync(join(tmpdir(), "reaction-race-")); directories.push(stateRoot);
+      const registry = new ChatRegistry({ owner: options.owner, ownerStore: h.store, stateRoot, line: { react },
+        access: () => ({ people: [], groups: [] }), build: () => ({ api }) });
+      registry.restore();
+      api = createSbApi({ registry, line: { react } as unknown as Parameters<typeof createSbApi>[0]["line"], accessPath: join(stateRoot, "access.json"), enabled: () => true, health: () => ({}) });
+    }
+    const reacting = api(new Request("http://bridge/react", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target: "react-root", kind: "love" }) }));
+    await entered.promise;
+    try {
+      h.input("react-later", "Please run my next task", { source: "typed" });
+      h.input("react-member", "And this detail", { source: "typed" }); await h.router.tick();
+      expect(h.store.get<{ covered: string[] }>("activeTurn")!.covered).toContain("react-later");
+      expect(inbounds(h.store).filter(row => row.id !== "react-root").map(row => row.state)).toEqual(["admitted", "admitted"]);
+    } finally { release.resolve(); }
+    expect((await reacting).status).toBe(200);
+    const answeredAt = (id: string) => (inbounds(h.store).find(row => row.id === id)!.payload as { answeredAt?: number }).answeredAt;
+    expect(answeredAt("react-root")).toBeNumber();
+    for (const id of ["react-later", "react-member"]) expect(answeredAt(id)).toBeUndefined();
+    const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+    h.backend.final("NO_REPLY"); await router.tick(); await router.tick();
+    expect(h.backend.prompts.map(call => call.text)).toEqual(["Thanks", "Please run my next task\nAnd this detail"]);
+    expect(h.store.get<number>("human-retries:react-later")).toBe(1);
+    setSystemTime(start + 11 * 60_000); await router.checkUnanswered(); await router.tick();
+    expect(h.backend.prompts).toHaveLength(2);
+    for (const id of ["react-later", "react-member"]) expect(answeredAt(id)).toBeUndefined();
+    if (replyMode === "tool") agentSends(h, "react-own", "Next task handled");
+    h.backend.final("Next task handled"); await router.tick();
+    for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+    expect(inbounds(h.store).filter(row => row.id !== "react-root").map(row => row.state)).toEqual(["done", "done"]);
+  });
+  expect(logs.filter(line => line.name === "inbound.requeued" && line.ids?.inboundId === "react-later")).toHaveLength(1);
+  expect(logs.filter(line => line.name === "inbound.unanswered")).toEqual([]);
+});
+
 test.each(["failed", "interrupted"].flatMap(outcome => [false, true].map(restart => ({ outcome, restart }))))("a reaction to the latest partial cannot discard earlier answers after $outcome (restart=$restart)", async ({ outcome, restart }) => {
   const h = setup(); h.input("root", "Ask me"); await h.router.tick();
   const multiple = question();
