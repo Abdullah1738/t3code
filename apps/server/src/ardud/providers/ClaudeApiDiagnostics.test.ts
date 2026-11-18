@@ -58,6 +58,45 @@ describe("Claude API diagnostics", () => {
       assert.include(notice.message, value);
   });
 
+  it.each(
+    [
+      { name: "plain", secret: "private-opaque-value" },
+      { name: "quote", secret: 'private-quote-"value' },
+      { name: "backslash", secret: "private-backslash-\\value" },
+      { name: "quote and backslash", secret: 'private-both-"\\value' },
+      { name: "control characters", secret: "private-control-\n\tvalue" },
+    ].flatMap((credential) =>
+      ["object", "formatted JSON", "nested JSON"].map((form) => ({ ...credential, form })),
+    ),
+  )("scrubs decoded $name credentials in $form bodies", ({ secret, form }) => {
+    const body = {
+      error: {
+        code: "model_not_found",
+        message: form === "nested JSON" ? JSON.stringify({ echo: secret }) : `echo ${secret}`,
+      },
+    };
+    const error = Diagnostics.details({
+      environment: { ANTHROPIC_AUTH_TOKEN: secret },
+      model: "claude-opus-5-5",
+      status: 404,
+      body: form === "formatted JSON" ? `API Error: 404 ${JSON.stringify(body, null, 2)}` : body,
+      attempt: 1,
+      resume: false,
+    });
+    assert.equal(error.errorCode, "model_not_found");
+    assert.include(error.errorText, "echo");
+    assert.include(error.errorText, "[REDACTED]");
+    const failure = makeProviderFailure({
+      message: `API Error: 404 ${JSON.stringify(body)}`,
+    });
+    assert.include(failure.message, "private-");
+    const notice = Diagnostics.describe(failure, error);
+    for (const output of [error.errorText, JSON.stringify(error), notice.message]) {
+      assert.notInclude(output, secret);
+      assert.notInclude(output, "private-");
+    }
+  });
+
   it.each([
     {
       body: 'API Error: 404 {"error":{"code":"model_not_found","type":"not_found_error"}} (retry)',

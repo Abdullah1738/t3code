@@ -14,12 +14,30 @@ function property(value: unknown, key: string): unknown {
   return value !== null && typeof value === "object" ? Reflect.get(value, key) : undefined;
 }
 
-// Use the same redactor as persisted provider failures, before truncating any value.
-function safeText(value: string, environment: NodeJS.ProcessEnv): string {
+function scrubEnvironmentSecrets(value: string, environment: NodeJS.ProcessEnv, depth = 0): string {
   for (const [key, secret] of Object.entries(environment)) {
     if (/key|token|secret|password|authorization|cookie/i.test(key) && secret && secret.length >= 4)
       value = value.replaceAll(secret, "[REDACTED]");
   }
+  // JSON escaping can hide an environment credential from literal matching.
+  // Scrub decoded strings, including nested JSON bodies, before re-encoding them.
+  return value.replace(/"(?:[^"\\]|\\.)*"/g, (encoded) => {
+    try {
+      const decoded: unknown = JSON.parse(encoded);
+      return typeof decoded === "string"
+        ? JSON.stringify(
+            depth >= 8 ? "[REDACTED]" : scrubEnvironmentSecrets(decoded, environment, depth + 1),
+          )
+        : encoded;
+    } catch {
+      return encoded;
+    }
+  });
+}
+
+// Use the same redactor as persisted provider failures, before truncating any value.
+function safeText(value: string, environment: NodeJS.ProcessEnv): string {
+  value = scrubEnvironmentSecrets(value, environment);
   return makeProviderFailure({ message: value }).message.replace(
     /(\/[^\s"'<>?]*)\?[^\s"'<>]*/g,
     "$1",
@@ -104,8 +122,10 @@ export function describe(
     .join(" · ");
   return {
     ...failure,
+    // The operational message remains a routing input and can echo opaque credentials.
+    // Notices use only the environment-scrubbed diagnostics.
     message: makeProviderFailure({
-      message: `${summary}${error.errorText ? `: ${error.errorText}` : ""} — ${failure.message}`,
+      message: `${summary}${error.errorText ? `: ${error.errorText}` : ""}`,
     }).message,
   };
 }

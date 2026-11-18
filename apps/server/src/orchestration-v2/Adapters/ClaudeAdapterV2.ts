@@ -9784,11 +9784,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 retryFailure !== undefined)
             ) {
               context.apiAttempt = (context.apiAttempt ?? 0) + 1;
+              const syntheticCause = currentStatus === 404 ? cause : undefined;
+              const diagnosticStatus =
+                syntheticCause !== undefined
+                  ? syntheticCause === transcriptFailure
+                    ? transcriptStatus
+                    : context.latestApiFailureStatus
+                  : (currentStatus ?? transcriptError?.status ?? context.latestApiFailureStatus);
               context.apiDiagnostics = ClaudeApiDiagnostics.details({
                 environment: adapterOptions.environment,
                 model: context.input.modelSelection.model,
-                status: currentStatus ?? transcriptError?.status ?? context.latestApiFailureStatus,
+                status: diagnosticStatus,
                 body:
+                  (diagnosticStatus !== currentStatus
+                    ? syntheticCause === transcriptFailure
+                      ? transcriptError?.formatted
+                      : syntheticCause?.message
+                    : undefined) ??
                   (currentStatus == null ||
                   transcriptError?.status == null ||
                   transcriptError.status === currentStatus

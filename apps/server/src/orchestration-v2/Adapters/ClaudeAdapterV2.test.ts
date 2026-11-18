@@ -5,6 +5,7 @@ import { assertLiveCallerShell } from "../../mcp/OrchestratorMcpService.ts";
 import { liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
 import * as ProviderProcessRegistry from "../../ardud/providers/ProviderProcessRegistry.ts";
 import * as ClaudeTurnStartup from "../../ardud/providers/ClaudeTurnStartup.ts";
+import * as ClaudeApiDiagnostics from "../../ardud/providers/ClaudeApiDiagnostics.ts";
 import type { OrchestrationV2Run } from "@t3tools/contracts";
 import { continuedLaunchRecovery, nextLaunchRecovery } from "../launchRecovery.ts";
 // @effect-diagnostics nodeBuiltinImport:off -- workflow fixtures use files and the fake Claude CLI uses Node streams
@@ -8915,20 +8916,38 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       { status: 418, text: "API Error: 418 unclassified request failure", category: "unknown" },
       { status: 404, text: "There's an issue with the selected model", category: "transient" },
       { status: null, text: "Claude could not complete the request", category: "unknown" },
-    ].flatMap((scenario) => [
-      { ...scenario, recovered: false },
-      { ...scenario, recovered: true },
-    ]),
+    ].flatMap((scenario) =>
+      (scenario.status === null || scenario.status === 404 ? [0, 4095, 4096, 8192] : [0]).flatMap(
+        (padding) => [
+          { ...scenario, padding, recovered: false },
+          { ...scenario, padding, recovered: true },
+        ],
+      ),
+    ),
   )(
-    "keeps current terminal $status after a transcript retry (recovered=$recovered, $category)",
+    "keeps current terminal $status after a transcript retry (recovered=$recovered, $category, padding=$padding)",
     (scenario) =>
       Effect.gen(function* () {
+        const rows: AnalyticsEvent[] = [];
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const configDir = yield* fs.makeTempDirectoryScoped();
         const harness = yield* makeWakeHarnessWithOptions({
           environment: { CLAUDE_CONFIG_DIR: configDir },
-        });
+        }).pipe(
+          Effect.provideService(
+            Analytics.Analytics,
+            Analytics.Analytics.of({
+              record: (row) =>
+                Effect.sync(() => {
+                  rows.push(row);
+                }),
+              flush: Effect.void,
+              ingest: () => Effect.void,
+              read: () => Effect.die("unused read"),
+            }),
+          ),
+        );
         const now = yield* DateTime.now;
         yield* harness.runtime.startTurn(
           makeClaudeTestTurnInput({
@@ -8961,7 +8980,16 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               type: "system",
               subtype: "api_error",
               timestamp: DateTime.formatIso(now),
-              error: { status: 502, formatted: "502 fetch connect timeout" },
+              error: {
+                status: 502,
+                formatted: `502 fetch connect timeout ${JSON.stringify({
+                  error: {
+                    message: "x".repeat(scenario.padding),
+                    code: "upstream_timeout",
+                    type: "timeout_error",
+                  },
+                })}`,
+              },
             },
             ...(scenario.recovered ? [nativeResponse] : []),
           ]
@@ -9002,6 +9030,30 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         if (scenario.recovered) assert.notInclude(terminal.failure.message, "502");
         else if (usesTranscript)
           assert.include(terminal.failure.message, "502 fetch connect timeout");
+        const observed = rows.filter((row) => row.kind === "provider.claude_api_error");
+        assert.deepEqual(
+          observed.map((row) => row.phase),
+          ["attempt", "give_up"],
+        );
+        const expectedStatus = usesTranscript ? 502 : scenario.status;
+        for (const row of observed) {
+          assert.equal(row.claudeApiError?.status, expectedStatus);
+          if (usesTranscript) {
+            assert.equal(row.claudeApiError?.errorCode, "upstream_timeout");
+            assert.equal(row.claudeApiError?.errorType, "timeout_error");
+            assert.include(row.claudeApiError!.errorText, "502 fetch connect timeout");
+          } else assert.notInclude(row.claudeApiError!.errorText, "502");
+        }
+        assert.deepEqual(terminal.failure.claudeApiError, observed.at(-1)?.claudeApiError);
+        const notice = ClaudeApiDiagnostics.describe(
+          terminal.failure,
+          terminal.failure.claudeApiError!,
+        );
+        if (expectedStatus !== null) assert.include(notice.message, `HTTP ${expectedStatus}`);
+        if (usesTranscript) {
+          assert.include(notice.message, "upstream_timeout");
+          assert.notInclude(notice.message, "HTTP 404");
+        }
       }).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
