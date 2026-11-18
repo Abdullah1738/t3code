@@ -10,14 +10,15 @@ usage:
 
 common options:
   --name NAME          slug part (default from title)      --out DIR   write somewhere else (no publish)
-  --send owner|moni|CHAT   publish (owner: tailnet) or share (others: public link) and, with --session, send the app card
-  --session ID --key K     bridge session (the chat the card goes to) + dedupe key
+  --send owner|moni|CHAT   publish/share and, with --session, send to CHAT (remote chats get a link relay)
+  --session ID --key K     caller's bridge session + dedupe key (default qcard:SLUG:CHAT)
   --caption/--subcaption/--summary   override card text (no times/dates/day words; the bridge strips them)
   --no-og              skip the preview image (faster, for local checks)
 Prints JSON: {dir, page, og, slug, url?, caption, subcaption, title, description, ms}.
 """
 import threading
-import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, glob, json, os, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time
+from pathlib import Path
 
 LIB = os.path.expanduser("~/.local/libexec/qcard")
 sys.path.insert(0, LIB)
@@ -27,8 +28,26 @@ APPS = os.path.expanduser("~/.local/share/imessage-apps")
 CHROME = os.environ.get("CHROME_PATH")
 BUN = "/Users/ardud/.bun/bin/bun"
 BRIDGE = os.path.expanduser("~/.local/share/spectrum-bridge/src/cli.ts")
+try:
+    source = Path(__file__).resolve().parents[1] / "libexec/toollog"
+    sys.path.insert(0, str(source if source.is_dir() else Path.home() / ".local/libexec/toollog"))
+    from toollog import emit
+except ImportError:
+    def emit(*_args, **_kwargs):
+        pass
 TEMPLATES = ["price", "stat", "compare", "list", "timeline", "breakdown"]
 TIMEWORDS = re.compile(r"\b(today|tonight|tomorrow|yesterday|now|mon|tue|wed|thu|fri|sat|sun)[a-z]*\b|\d{1,2}:\d{2}|\b\d{1,2}\s?(am|pm)\b", re.I)
+
+
+def bridge_cmd():
+    return shlex.split(os.environ["QCARD_BRIDGE"]) if os.environ.get("QCARD_BRIDGE") else [BUN, BRIDGE]
+
+
+def log_event(name, *, command, who=None, ack=None, exit_code=None):
+    emit("qcard", "error" if name == "bridge.error" else "event", name, board="imessage",
+         ok=name != "bridge.error", ids={"sampleId": ack},
+         props={"command": command, "route": who, "exitCode": exit_code},
+         error_tag="bridge.request_failed" if name == "bridge.error" else None)
 
 
 def log_render(started, ok, *, chat=None, outcome=None, failure_code=None):
@@ -37,7 +56,7 @@ def log_render(started, ok, *, chat=None, outcome=None, failure_code=None):
         outcome = outcome if outcome in ('ok', 'fallback', 'failed') else 'ok' if ok else 'failed'
         failure_code = failure_code if failure_code in ('none', 'preview_missing', 'render_exception') else 'none' if ok else 'renderer_failed'
         env = {k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'}
-        child = subprocess.Popen([BUN, BRIDGE, 'log-card-render', '--kind', 'quick',
+        child = subprocess.Popen([*bridge_cmd(), 'log-card-render', '--kind', 'quick',
                                   '--ms', str(max(0, (time.monotonic() - started) * 1000)), '--chat', chat, '--outcome', outcome, '--failure-code', failure_code, '--attempt', '1', '--ok', str(ok).lower()],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         # Reap without holding the renderer or its per-order lock for logging.
@@ -83,13 +102,79 @@ def shot(html_path, png, w, h, budget=250):
                         f"--screenshot={png}", "file://" + html_path], check=True, capture_output=True, timeout=30)
 
 
+class BridgeError(SystemExit):
+    def __init__(self, command, error):
+        super().__init__(f"qcard: bridge {command} failed: {error}")
+        self.remote_chat = bool(re.search(r"\(HTTP 403\)", error)
+                                and "Use agent-ask to reach this chat on its box" in error)
+
+
 def bridge(*args):
     env = {k: v for k, v in os.environ.items() if k != "BUN_INSPECT"}
-    r = subprocess.run([BUN, BRIDGE, *args], capture_output=True, text=True, env=env, timeout=60)
     try:
-        return json.loads(r.stdout.strip().splitlines()[-1])
-    except Exception:
-        raise SystemExit(f"qcard: bridge {args[0]} failed: {r.stdout.strip()} {r.stderr.strip()}")
+        r = subprocess.run([*bridge_cmd(), *args], capture_output=True, text=True, env=env,
+                           stdin=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        log_event("bridge.error", command=args[0])
+        raise BridgeError(args[0], str(ex)) from ex
+    if r.returncode:
+        log_event("bridge.error", command=args[0], exit_code=r.returncode)
+        raise BridgeError(args[0], r.stderr.strip() or r.stdout.strip())
+    try:
+        data = json.loads(r.stdout.strip().splitlines()[-1])
+        if not isinstance(data, dict):
+            raise ValueError("expected an object")
+        return data
+    except (ValueError, IndexError) as ex:
+        log_event("bridge.error", command=args[0], exit_code=r.returncode)
+        raise BridgeError(args[0], f"invalid JSON response: {r.stdout.strip()} {r.stderr.strip()}") from ex
+
+
+def bridge_state():
+    return Path(os.environ.get("QCARD_BRIDGE_STATE") or Path.home() / ".config/spectrum-bridge")
+
+
+def own_chat(to, session):
+    # Cross-chat --to is owner-only; a chat's own live session must reply without it.
+    db = bridge_state() / ("state.sqlite" if to in ("owner", "abdullah") else f"chats/{to}/state.sqlite")
+    if not db.is_file():
+        return False
+    try:
+        con = sqlite3.connect(f"{db.absolute().as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("select value from kv where key = 'route'").fetchone()
+        finally:
+            con.close()
+        route = json.loads(row[0]) if row and row[0] else None
+    except (OSError, ValueError, sqlite3.Error):
+        return False
+    if not isinstance(route, dict) or not isinstance(route.get("id"), str):
+        return False
+    g = route.get("generation")
+    if type(g) is not int or g < 0:
+        return False
+    return session in (route["id"], f"{route['id']}@{g}")
+
+
+def remote_chat(who):
+    try:
+        config = json.loads((bridge_state() / "config.json").read_text())
+        return who not in ("owner", "abdullah") and config["chatBackends"][who]["kind"] == "remote-box"
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def relay(who, session, key, text):
+    request = ("Send this quick card link once in your own chat, using bridge send with dedupe key "
+               + json.dumps(key) + ". Keep that same key on any retry; reconcile an ambiguous send. "
+               "The exact message is the JSON string below. Answer done only after bridge acceptance; "
+               "otherwise answer declined with the send error.\n" + json.dumps(text))
+    ack = bridge("agent-ask", "--to", who, "--text=" + request, "--session", session, "--key", key)
+    if not isinstance(ack.get("id"), str) or not ack["id"] or type(ack.get("created")) is not bool:
+        log_event("bridge.error", command="agent-ask", who=who)
+        raise BridgeError("agent-ask", "bad ack")
+    log_event("relay", command="agent-ask", who=who, ack=ack["id"])
+    return {"relayed": True, "status": "relayed", "ack": ack["id"], "created": ack["created"], "to": who, "key": key}
 
 
 def clean(days=14):
@@ -158,6 +243,8 @@ def main():
         print(__doc__)
         return
     a = ap.parse_args()
+    if a.send and not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", a.send):
+        raise SystemExit("qcard: --send must be a bridge chat slug")
     t0 = time.time()
 
     if a.cmd == "templates":
@@ -231,12 +318,25 @@ def main():
         url = url + ("" if url.endswith("/") else "/") + f"?v={int(built)}"
         res["url"] = url
         if a.session:
-            args = ["app", "--url", url, "--caption", caption, "--session", a.session, "--key", a.key or f"qcard:{slug}"]
+            key = a.key or f"qcard:{slug}:{a.send}"
+            own = own_chat(a.send, a.session)
+            use_relay = not own and remote_chat(a.send)
+            args = ["app", "--url", url, "--caption", caption, "--session", a.session, "--key", key]
+            if not own:
+                args += ["--to", a.send]
             if sub:
                 args += ["--subcaption", sub]
             if a.summary:
                 args += ["--summary", card_text(a.summary)]
-            res["sent"] = bridge(*args)
+            if not use_relay:
+                try:
+                    res["sent"] = bridge(*args)
+                except BridgeError as ex:
+                    if own or not ex.remote_chat or a.send in ("owner", "abdullah"):
+                        raise
+                    use_relay = True
+            if use_relay:
+                res["sent"] = relay(a.send, a.session, key, f"{caption}: {url}")
     res["ms"] = {"data": int((t_data - t0) * 1000), "total": int((time.time() - t0) * 1000)}
     print(json.dumps(res, indent=1))
     if not a.out and a.cmd != "clean":
