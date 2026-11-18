@@ -3,6 +3,7 @@ import { ClaudeApiErrorDetails } from "./claudeApiError.ts";
 import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
+import * as Struct from "effect/Struct";
 import { OrchestrationV2CancelReason } from "../orchestrationV2.ts";
 
 const Timestamp = Schema.String.check(
@@ -288,6 +289,11 @@ const GeneralEvent = Schema.Struct({
   denyReason: Schema.optionalKey(McpDenyReason),
   reasonClass: Schema.optionalKey(McpReasonClass),
   invalidField: Schema.optionalKey(McpInvalidField),
+  errorFields: Schema.optionalKey(
+    Schema.Array(
+      Schema.String.check(Schema.isMaxLength(64), Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_.]*$/)),
+    ).check(Schema.isMaxLength(5)),
+  ),
   refusedAt: Schema.optionalKey(McpRefusedAt),
   replyStage: Schema.optionalKey(Label),
   replyPhases: Schema.optionalKey(McpReplyPhases),
@@ -663,7 +669,7 @@ export type AnalyticsEvent = typeof AnalyticsEvent.Type;
 export const AnalyticsIngestInput = Schema.Struct({
   events: Schema.Array(
     Schema.Struct({
-      ...GeneralEvent.fields,
+      ...Struct.omit(GeneralEvent.fields, ["errorFields"]),
       claudeApiError: Schema.optionalKey(Schema.Never),
       surface: Schema.Literals(["web", "desktop", "mobile"]),
     }),
@@ -1033,6 +1039,7 @@ export const AnalyticsRollup = Schema.Struct({
       notFoundReasons: Schema.optionalKey(Schema.Record(Label, Measurement)),
       foundByCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),
       idShapeCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),
+      errorFields: Schema.optionalKey(Schema.Record(Label, Measurement)),
       errors: Schema.Array(
         Schema.Struct({ errorTag: Label, errorPhase: McpPhase, count: Measurement }),
       ),

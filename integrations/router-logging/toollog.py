@@ -21,6 +21,8 @@ PROPS.update({'target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'las
 CONNECTION_ERRNOS = {'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN'}
 SYSCALLS = {'connect', 'read', 'write', 'getaddrinfo', 'send', 'recv', 'shutdown'}
 IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session', 'writer'}
+PROPS.update({'downSince', 'downMs', 'pid', 'ppid', 'initiator', 'stopReason', 'script', 'releaseDir',
+              'startedAtMs', 'finishedAtMs', 'lastErrorCode', 'outcome', 'ownerPid', 'lockAgeMs'})
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
             'The operation was aborted due to timeout', 'The operation was aborted'}
@@ -158,7 +160,7 @@ def _write(root, day, now, row, state):
                 except FileExistsError:
                     pass
                 # Drop counters must remain visible after the daily cap.
-                if row['kind'] != 'error' and not is_volume:
+                if row['kind'] != 'error' and row['component'] not in ('guard', 'supervisor') and not is_volume:
                     volume.dropped(state, 'daily_cap')
                     return False
             os.write(fd, (json.dumps(row, separators=(',', ':')) + '\n').encode())

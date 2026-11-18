@@ -245,17 +245,32 @@ def inventory_deep_owned(value, now):
 
 
 @contextmanager
-def inventory_lock():
+def inventory_lock(wait_s=0, stopped=lambda: False, on_wait=lambda: None):
     # Never unlink a flock file: another process may already have it open.
     path = state_path('disk-inventory').with_suffix('.lock')
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-        else:
-            yield fd
+        deadline = time.monotonic()+max(0, wait_s)
+        waiting = acquired = False
+        while True:
+            if wait_s > 0 and stopped():
+                break
+            if waiting and time.monotonic() >= deadline:
+                break
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    break
+                if not waiting:
+                    # Let callers measure contention without counting an uncontended open.
+                    on_wait()
+                    waiting = True
+                time.sleep(min(2, remaining))
+        yield fd if acquired else False
     finally:
         os.close(fd)
 

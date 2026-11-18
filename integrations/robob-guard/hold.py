@@ -98,9 +98,8 @@ class Holds:
         # Other holders may still be doing build preflight, so they opt in later.
         if by == "overload-restart":
             target = desktop_pid()
-            if target is None:
-                raise ValueError("expected one Robob desktop before watchdog quit")
-            write_reason(self.home, "watchdog", by, pid, target)
+            if target is not None:
+                write_reason(self.home, "watchdog", by, pid, target)
 
     def beater_is_ours(self, meta):
         if not isinstance(meta, dict) or not pid_alive(meta.get("beaterPid")) or not meta.get("token"):

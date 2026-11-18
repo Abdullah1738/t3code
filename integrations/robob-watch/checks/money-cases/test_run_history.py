@@ -1,10 +1,13 @@
 """History uses disposable watcher dirs, never live case books."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 from contextlib import redirect_stdout
 import datetime as dt
 import fcntl
 import io
 import json
-import os
 from pathlib import Path
 import signal
 import subprocess
