@@ -256,7 +256,7 @@ def wait_ssh(box_id: str, timeout: float = 90) -> None:
                 setup(box_id)
         except subprocess.TimeoutExpired:
             err = "timeout"
-        except common.SshHostKeyMismatch:
+        except (common.SshHostKeyMismatch, ssh_outage.SshUnreachable):
             raise
         except OffboxError as error:
             if error.outage or not client_limited or time.time() < deadline:

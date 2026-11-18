@@ -6,6 +6,7 @@ import { toolLog, toolError, logDirectory } from "./toollog.ts";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  clearFailureState, ensureFailureProbe, failureProbeDue, failureProbeDelay, pausedDuration, pauseRetryText, escalationText, escalationFallbackText,
   CheckShutdownError, withRelayLock, withRelayLockAsync, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   trackConfirmation, confirmWakes, inboundState, inQuiet, iso, installCheckShutdown, killRunningChecks, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
@@ -192,7 +193,13 @@ export async function pauseNotice(watcher: Watcher, state: State): Promise<void>
     const fresh = loadState(watcher.id);
     if (!definition || watcherInstance(watcher.id) !== instance || !fresh.failure_paused_at
       || fresh.failure_paused_at !== pausedAt) return;
-    if (queueOwnerFailure(definition, fresh, "pause")) saveState(watcher.id, fresh);
+    const changed = !fresh.failure_pause_notice || !fresh.failure_pause_escalation || !fresh.failure_pause_escalation_fallback;
+    const mins = Math.round((Date.parse(pausedAt!) - Date.parse(fresh.failing_since!)) / 60_000);
+    // A retry reuses the bridge key and its exact payload even after a manual pause or failed probe.
+    fresh.failure_pause_notice ??= `Watcher "${definition.title}" paused after ${fresh.consecutive_failures} failures in a row (${mins} min). Last error: ${(fresh.last_error ?? "").slice(0, 300)}. ${pauseRetryText(definition, fresh)} Log: ${join(watcherDir(watcher.id), "log")}`;
+    fresh.failure_pause_escalation ??= escalationText(definition, fresh, mins);
+    fresh.failure_pause_escalation_fallback ??= escalationFallbackText(definition, fresh, mins);
+    if (queueOwnerFailure(definition, fresh, "pause") || changed) saveState(watcher.id, fresh);
     return { watcher: definition, state: fresh };
   });
   if (!current) return;
@@ -207,8 +214,7 @@ export async function pauseNotice(watcher: Watcher, state: State): Promise<void>
     return fresh;
   });
   if (!state.failure_alerted) {
-    const mins = Math.round((Date.parse(state.failure_paused_at!) - Date.parse(state.failing_since!)) / 60_000);
-    const sent = await alert(watcher, `Watcher "${watcher.title}" paused after ${state.consecutive_failures} failures in a row (${mins} min). Last error: ${(state.last_error ?? "").slice(0, 300)}. Fix it, then robob-watch resume ${watcher.id}. Log: ${join(watcherDir(watcher.id), "log")}`,
+    const sent = await alert(watcher, state.failure_pause_notice!,
       `robob-watch:${watcher.id}:paused:${hash(state.failure_episode ?? state.failing_since ?? "")}`, "error", !ownerFailureAlerts(watcher, state));
     log(watcher.id, `pause notice ok=${sent.ok} via=${sent.via}`);
     const fresh = await update(fresh => { fresh.failure_alerted = sent.ok; });
@@ -251,6 +257,7 @@ async function failWatcher(watcher: Watcher, fresh: State, instance: string | un
     toolLog({ component: "runner", kind: "event", name: "watch.disabled", ids: { watcher: id }, props: { action: "pause", count: fresh.consecutive_failures } });
     fresh.failure_paused_at = iso();
     fresh.failure_alerted = false;
+    ensureFailureProbe(watcher, fresh);
     // Commit the pause before sending: a crash or failed send must retry the notice, never the check.
     saveState(id, fresh);
     await pauseNotice(watcher, fresh);
@@ -409,9 +416,61 @@ export async function tickOne(id: string): Promise<void> {
       if (!shuttingDown) {
         await applyOwnerAlertResults(id);
         if (!shuttingDown) dispatchOwnerAlerts(id);
+        if (!shuttingDown) await recoveryNotice(id);
       }
     }
   } catch (error) { if (!(error instanceof CheckShutdownError)) throw error; }
+}
+
+async function recoveryNotice(id: string): Promise<void> {
+  if (shuttingDown) return;
+  const instance = watcherInstance(id);
+  const pending = await withRelayLockAsync(() => {
+    if (shuttingDown || watcherInstance(id) !== instance) return;
+    const watcher = loadWatcher(id), state = loadState(id);
+    const notice = state.failure_recovery_notices?.[0];
+    if (!watcher || !notice || (notice.retry_at ?? 0) > now()) return;
+    notice.retry_at = now() + 60_000;
+    saveState(id, state);
+    return { watcher, ...notice };
+  });
+  if (!pending || shuttingDown) return;
+  const sent = await alert(pending.watcher, pending.text, pending.key, "info");
+  log(id, `auto-resume notice ok=${sent.ok} via=${sent.via}`);
+  if (sent.ok && !shuttingDown) await withRelayLockAsync(() => {
+    if (!loadWatcher(id) || watcherInstance(id) !== instance) return;
+    const fresh = loadState(id);
+    fresh.failure_recovery_notices = fresh.failure_recovery_notices?.filter(notice => notice.key !== pending.key);
+    if (!fresh.failure_recovery_notices?.length) delete fresh.failure_recovery_notices;
+    saveState(id, fresh);
+  });
+}
+
+async function failedProbe(id: string, state: State, instance: string | undefined, attempt: number, previousNextAt: string, message: string, duration: number): Promise<void> {
+  await withRelayLockAsync(() => {
+    const current = loadWatcher(id), fresh = loadState(id);
+    if (shuttingDown || !current || current.paused || watcherInstance(id) !== instance
+      || fresh.failure_paused_at !== state.failure_paused_at || fresh.failure_probe_attempts !== state.failure_probe_attempts) return;
+    fresh.last_run_ms = duration;
+    // Acquiring the mutex yields, so a hold may start after the check completes.
+    if (held(current)) {
+      fresh.failure_probe_attempts = attempt - 1;
+      fresh.failure_probe_next_at = previousNextAt;
+      fresh.next_at = 0;
+      saveState(id, fresh);
+      log(id, `probe ${attempt} failure ignored while held; retry deadline restored`);
+      log(id, heldByMaintenance(current, maintenance) ? "check failure ignored during maintenance" : "check failure ignored while SSD is unmounted");
+      return;
+    }
+    fresh.last_error = message;
+    fresh.failure_probe_attempts = attempt;
+    fresh.failure_probe_next_at = iso(now() + failureProbeDelay(attempt));
+    saveState(id, fresh);
+    const firstLine = message.split(/\r?\n/, 1)[0]!.slice(0, 500);
+    log(id, `probe ${attempt} failed: ${firstLine}; next probe ${fresh.failure_probe_next_at}`);
+    toolLog({ component: "runner", kind: "event", name: "watch.pause_probe", ok: false, durationMs: duration,
+      ids: { watcher: id }, props: { attempt, ok: false, duration_ms: duration, next_at: fresh.failure_probe_next_at, error_first_line: firstLine } });
+  });
 }
 
 async function tickWatcher(id: string): Promise<void> {
@@ -439,6 +498,12 @@ async function tickWatcher(id: string): Promise<void> {
   state = loadState(id);
   await headsUps(initialPoller, state);
   if (!sameInstance()) return;
+  if (state.failure_paused_at && !state.failure_probe_next_at && !initialPoller.paused && initialPoller.failure_pause_probe !== false) await withRelayLockAsync(() => {
+    const definition = loadWatcher(id);
+    state = loadState(id);
+    const current = definition && pollingWatcher(definition, state);
+    if (sameInstance() && current && ensureFailureProbe(current, state)) saveState(id, state);
+  });
   if (state.failure_paused_at) await pauseNotice(initialPoller, state);
   if (!sameInstance()) return;
   const definition = loadWatcher(id);
@@ -488,7 +553,8 @@ async function tickWatcher(id: string): Promise<void> {
   }
   if (state.status === "closing" && state.closing_final_check) return;
   const finalCheck = state.status === "closing" && t >= state.closing_until!;
-  if (state.failure_paused_at && !finalCheck) return;
+  const probing = !finalCheck && failureProbeDue(watcher, state, t);
+  if (state.failure_paused_at && !finalCheck && !probing) return;
   if (state.batch?.watcher && !sameDestination(state.batch.watcher, watcher)) return;
   if (state.status !== "closing" && !state.reply_handoff && !state.admitted_run && watcher.max_fires !== 0 && state.fires + (state.batch?.events.length ?? 0) >= watcher.max_fires) return;
   // Trigger files (e.g. chat.db-wal) run the check as soon as they change; interval_s stays the fallback.
@@ -498,12 +564,18 @@ async function tickWatcher(id: string): Promise<void> {
   try { sig = triggerSig(watcher, trigger => missing.push(trigger)); }
   catch (error) {
     if (!(error instanceof TriggerError)) throw error;
-    if ((state.next_at ?? 0) > t && !(finalCheck && !state.closing_final_started)) return;
+    if ((state.next_at ?? 0) > t && !probing && !(finalCheck && !state.closing_final_started)) return;
     state.last_run_at = iso(t);
     if (finalCheck) state.closing_final_started = true;
     delete state.load_timeouts;
     delete state.load_timeout_since;
     logTriggerError(watcher, state, error, t);
+    if (probing) {
+      const attempt = (state.failure_probe_attempts ?? 0) + 1;
+      log(id, `probe ${attempt}`);
+      await failedProbe(id, state, instance, attempt, state.failure_probe_next_at!, error.message, 0);
+      return;
+    }
     await failWatcher(watcher, state, instance, t, false, error.message);
     return;
   }
@@ -515,7 +587,7 @@ async function tickWatcher(id: string): Promise<void> {
   const initialMissing = state.trigger_sig === undefined && sig?.split("|").every(part => part === "missing");
   const triggered = !initialMissing && sig !== undefined && sig !== state.trigger_sig && !state.consecutive_failures && !state.load_timeouts && !state.pending
     && t - Date.parse(state.last_run_at ?? "1970-01-01") >= (watcher.trigger_gap_s ? watcher.trigger_gap_s * 1_000 : TRIGGER_MIN_GAP_MS);
-  if ((state.next_at ?? 0) > t && !triggered && !(finalCheck && !state.closing_final_started)) return;
+  if ((state.next_at ?? 0) > t && !probing && !triggered && !(finalCheck && !state.closing_final_started)) return;
   const schedule = () => {
     state.last_run_at = iso();
     state.next_at = now() + watcher.interval_s * 1_000;
@@ -535,7 +607,8 @@ async function tickWatcher(id: string): Promise<void> {
   let recoveredRun: string | undefined;
   let finalDeadline: number | undefined;
   let slotTiming: SlotTiming | undefined;
-  const dueAt = triggered || finalCheck || !state.next_at || state.next_at < 0 ? t : state.next_at;
+  let probe: { pausedAt: string; attempt: number; previousNextAt: string } | undefined;
+  const dueAt = probing ? Date.parse(state.failure_probe_next_at!) : triggered || finalCheck || !state.next_at || state.next_at < 0 ? t : state.next_at;
   const lane = checkLane(state.last_run_ms);
   const trigger = finalCheck ? "final" : state.consecutive_failures || state.load_timeouts ? "retry" : triggered ? "trigger" : "schedule";
   let lateMs = 0, loadModeAtAdmission = false;
@@ -559,7 +632,15 @@ async function tickWatcher(id: string): Promise<void> {
     const current = definition && pollingWatcher(definition, state);
     // A slot may open several ticks later, after maintenance or an owner pause began.
     const final = state.status === "closing" && now() >= state.closing_until!;
-    if (!current || !checking(state) || current.paused || (state.failure_paused_at && !final) || held(current)) return undefined;
+    if (!current || !checking(state) || current.paused || held(current)) return undefined;
+    if (state.failure_paused_at && !final) {
+      if (!probing || !failureProbeDue(current, state)) return undefined;
+      const attempt = state.failure_probe_attempts = (state.failure_probe_attempts ?? 0) + 1;
+      probe = { pausedAt: state.failure_paused_at, attempt, previousNextAt: state.failure_probe_next_at! };
+      // A crash during the check consumes one attempt, rather than replaying overdue checks in a burst.
+      state.failure_probe_next_at = iso(now() + failureProbeDelay(attempt));
+      log(id, `probe ${attempt}`);
+    } else if (probing) return undefined;
     if (state.batch?.watcher && !sameDestination(state.batch.watcher, current)) return undefined;
     handoffRun = state.reply_handoff?.run;
     recoveredRun = state.admitted_run?.run;
@@ -587,6 +668,10 @@ async function tickWatcher(id: string): Promise<void> {
   const currentDefinition = loadWatcher(id);
   const current = currentDefinition && pollingWatcher(currentDefinition, fresh);
   if (!current || !checking(fresh)) return;
+  if (probe && (current.paused || fresh.failure_paused_at !== probe.pausedAt || fresh.failure_probe_attempts !== probe.attempt)) {
+    log(id, `probe ${probe.attempt} completed after pause/resume/remove; state kept`);
+    return;
+  }
   const ackRun = async () => {
     try { await withRelayLockAsync(() => acknowledgeRun(id, instance, runId)); }
     catch (error) { if (error instanceof CheckShutdownError) throw error; toolError("runner", "watch.ack_failed", { watcher: id }); }
@@ -610,6 +695,11 @@ async function tickWatcher(id: string): Promise<void> {
   // A shell can exit nonzero while a descendant holds its pipes until the deadline.
   const timedOut = result.timedOut && (result.code === null || result.code === 0);
   if (timedOut || result.code !== 0) {
+    if (probe) {
+      await failedProbe(id, fresh, instance, probe.attempt, probe.previousNextAt,
+        result.busy ? `busy: ${result.busy.dependency}: ${result.busy.detail}` : timedOut ? `timed out after ${timeoutMs / 1000}s` : `exit ${result.code}: ${result.stderr.trim().slice(-500)}`, result.ms);
+      return;
+    }
     // Maintenance can remove a resource after admission; this failure must not pause an otherwise healthy check.
     if (held(current)) {
       fresh.next_at = 0;
@@ -653,15 +743,21 @@ async function tickWatcher(id: string): Promise<void> {
     toolLog({ component: "runner", kind: "event", name: "watch.recovered", ids: { watcher: id }, props: { count: failures, failures, notified } });
     log(id, `check recovered after ${failures} failures (${notified ? "notified" : "not notified"})`);
   }
-  queueOwnerRecovery(watcher, fresh);
-  fresh.consecutive_failures = 0;
-  fresh.failure_alerted = false;
-  delete fresh.failure_escalated;
-  delete fresh.last_error;
-  delete fresh.last_error_sources;
-  delete fresh.failing_since;
-  delete fresh.dependency_busy;
-  delete fresh.failure_episode;
+  if (probe) {
+    const pausedMs = Math.max(0, now() - Date.parse(probe.pausedAt));
+    const duration = pausedDuration(pausedMs);
+    const text = `Watcher "${watcher.title}" is running again on its own after ${duration} paused (retry ${probe.attempt} passed).`;
+    if (fresh.owner_imessage_episodes?.some(episode => !episode.recovery) && ownerFailureAlerts(current, fresh)) queueOwnerRecovery(current, fresh, text);
+    else (fresh.failure_recovery_notices ??= []).push({
+      key: `robob-watch:${id}:auto-resumed:${hash(fresh.failure_episode ?? fresh.failing_since ?? probe.pausedAt)}`, text,
+    });
+    log(id, `auto-resumed after ${duration} (probe ${probe.attempt})`);
+    toolLog({ component: "runner", kind: "event", name: "watch.pause_probe", ok: true, durationMs: result.ms,
+      ids: { watcher: id }, props: { attempt: probe.attempt, ok: true, duration_ms: result.ms } });
+    toolLog({ component: "runner", kind: "event", name: "watch.auto_resumed", ids: { watcher: id },
+      props: { paused_ms: pausedMs, attempts: probe.attempt } });
+  } else queueOwnerRecovery(watcher, fresh);
+  clearFailureState(fresh);
   if (handoffRun && fresh.reply_handoff?.run === handoffRun) {
     fresh.reply_handoff.accepted_run = runId;
     fresh.next_at = 0;

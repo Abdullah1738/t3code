@@ -1,3 +1,4 @@
+import * as ProviderRuntimeInventory from "../providers/ProviderRuntimeInventory.ts";
 import * as DatabaseDiagnostics from "../../persistence/DatabaseDiagnostics.ts";
 import { bootId, continuationReport } from "../fast-install/report.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
@@ -480,6 +481,9 @@ const makeRoutes = Effect.gen(function* () {
   const identities = yield* ExecutionIdentity.ExecutionIdentity;
   const observeControl = yield* ControlRequestAnalytics.make;
   const recovery = yield* RecoverySnapshot.RecoverySnapshot;
+  const providerInventory = yield* Effect.serviceOption(
+    ProviderRuntimeInventory.ProviderRuntimeInventory,
+  );
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -893,6 +897,13 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   // Read-only recovery view for stream-recovery; see ardud/recovery/RecoverySnapshot.ts.
+  const runtimeInventory = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    if (Option.isNone(providerInventory))
+      return yield* fail("internal", "Provider runtime inventory unavailable.");
+    return json({ ok: true, ...(yield* providerInventory.value.snapshot) });
+  });
+
   const recoverySnapshot = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const params = yield* searchParams;
@@ -2002,6 +2013,7 @@ const makeRoutes = Effect.gen(function* () {
     route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
     route("GET", `${p}/identity/resolve`, handle(identityResolve), "control.identity.resolve"),
     route("GET", `${p}/recovery/snapshot`, handle(recoverySnapshot)),
+    route("GET", `${p}/provider-runtimes/inventory`, handle(runtimeInventory)),
     route("GET", `${p}/threads/:threadId`, handle(getThread), "control.thread"),
     route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
     route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),

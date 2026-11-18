@@ -418,9 +418,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly driver?: ProviderDriverKind;
     readonly sessionUpdateFanout?: "interested_threads";
     readonly liveSessions?: Map<ProviderSessionId, OrchestrationV2ProviderSession>;
-    readonly pendingWorkForThread?: (
-      thread: OrchestrationV2ProviderThread,
-    ) => Effect.Effect<boolean>;
+    readonly pendingWorkForThread?: ProviderAdapter.ProviderAdapterV2SessionRuntime["hasPendingBackgroundWorkForThread"];
   } = {},
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
@@ -605,7 +603,7 @@ function layerTest(input: {
   readonly driver?: ProviderDriverKind;
   readonly sessionUpdateFanout?: "interested_threads";
   readonly liveSessions?: Map<ProviderSessionId, OrchestrationV2ProviderSession>;
-  readonly pendingWorkForThread?: (thread: OrchestrationV2ProviderThread) => Effect.Effect<boolean>;
+  readonly pendingWorkForThread?: ProviderAdapter.ProviderAdapterV2SessionRuntime["hasPendingBackgroundWorkForThread"];
 }) {
   const layerConfiguredEventSink =
     input.sessionWriteHook !== undefined
@@ -9288,6 +9286,9 @@ it.effect.each([
       const dependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          recordDelegationTimeout: () => Effect.succeed(true),
+          clearDelegationTimeout: () => Effect.void,
+          settleDelegationTimeout: () => Effect.succeed(undefined),
           getCallerRow: () =>
             Effect.succeed({
               ...liveThreadShell(threadId),
@@ -9639,4 +9640,65 @@ it.effect.each([
       ),
     );
   }).pipe(Effect.provide(layerTestMcpRegistry)),
+);
+
+it.effect("inventory observes each retention state without loading or unloading a thread", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const pending = yield* Ref.make(false);
+    const failUnload = yield* Ref.make(false);
+    yield* Effect.gen(function* () {
+      const fixture = yield* orphanSweepFixture(2);
+      const snapshot = fixture.manager.inventorySnapshot!;
+      const reasons = Effect.gen(function* () {
+        const result = yield* snapshot();
+        return new Map(
+          result.runtimes
+            .flatMap((runtime) => runtime.threads)
+            .map((thread) => [thread.nativeThreadId, thread.retention]),
+        );
+      });
+      assert.strictEqual((yield* reasons).get("orphan-native-0")?.reason, "not_tracked");
+      assert.strictEqual((yield* reasons).get("orphan-native-1")?.reason, "active_turn");
+      const providerThread = fixture.threads[0]!.providerThread;
+      yield* fixture.runtime.resumeThread({
+        providerThread,
+        threadId: providerThread.appThreadId!,
+        modelSelection,
+        runtimePolicy,
+      });
+      const idle = (yield* reasons).get("orphan-native-0")!;
+      assert.strictEqual(idle.reason, "idle_grace");
+      assert.strictEqual(idle.unloadAt! - idle.idleSince!, 3000);
+      yield* Ref.set(pending, true);
+      assert.strictEqual((yield* reasons).get("orphan-native-0")?.reason, "pending_work");
+      yield* Ref.set(pending, false);
+      yield* Ref.set(failUnload, true);
+      yield* fixture.runtime.unloadThread!({ providerThread }).pipe(Effect.exit);
+      const failed = (yield* reasons).get("orphan-native-0")!;
+      assert.strictEqual(failed.reason, "teardown_failed");
+      assert.notInclude(JSON.stringify(failed), "secret-error");
+      yield* Ref.set(failUnload, false);
+      yield* fixture.runtime.unloadThread!({ providerThread });
+      assert.strictEqual((yield* reasons).get("orphan-native-0")?.reason, "teardown_sent");
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 3000,
+          pendingWorkForThread: (_thread, options) =>
+            Ref.get(pending).pipe(
+              Effect.map(
+                (pending) =>
+                  pending && options?.includeSubagents === true && options.readOnly === true,
+              ),
+            ),
+          beforeUnload: Ref.get(failUnload).pipe(
+            Effect.flatMap((fail) => (fail ? Effect.die("secret-error") : Effect.void)),
+          ),
+          listLoadedNativeThreads: () => Effect.succeed(["orphan-native-0", "orphan-native-1"]),
+        }),
+      ),
+    );
+  }),
 );

@@ -1,3 +1,4 @@
+import * as ProviderRuntimeInventory from "./ardud/providers/ProviderRuntimeInventory.ts";
 import * as RunStartDeadline from "./orchestration-v2/RunStartDeadline.ts";
 import * as McpCallLedger from "./ardud/analytics/McpCallLedger.ts";
 import * as McpAvailability from "./ardud/analytics/McpAvailability.ts";
@@ -332,7 +333,6 @@ const layerResourceDiagnostics = Layer.mergeAll(
   layerResourceTelemetry,
   ProcessDiagnostics.layer.pipe(Layer.provide(layerResourceTelemetry)),
   ProcessResourceMonitor.layer.pipe(Layer.provide(layerResourceTelemetry)),
-  ProcessGroupMetrics.layer.pipe(Layer.provide(layerResourceTelemetry)),
 ).pipe(StartupPhaseLog.withStartupLayer("server.diagnostics"));
 
 const layerRelayClient = Layer.unwrap(
@@ -755,7 +755,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
   StartupPhaseLog.withStartupLayer("server.runtime-core"),
 );
 
-const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
+const layerRuntimeDependenciesBase = layerRuntimeCoreDependencies.pipe(
   Layer.provideMerge(layerUsage),
   Layer.provideMerge(layerBackground),
   Layer.provideMerge(layerResourceDiagnostics),
@@ -767,6 +767,11 @@ const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
   Layer.provideMerge(ServerLifecycleEvents.layer),
   Layer.provide(NetService.layer),
   StartupPhaseLog.withStartupLayer("server.dependencies"),
+);
+
+const layerRuntimeDependencies = ProviderRuntimeInventory.layer.pipe(
+  Layer.provide(ProviderRuntimeInventory.layerProcessTags),
+  Layer.provideMerge(layerRuntimeDependenciesBase),
 );
 
 const layerCommandReadiness = HttpRouter.middleware(
@@ -782,6 +787,7 @@ const layerCommandReadiness = HttpRouter.middleware(
 );
 
 const layerMakeRoutes = Layer.mergeAll(
+  ProcessGroupMetrics.layer,
   Layer.mergeAll(
     HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
       Layer.provide(AuthHttp.layer),

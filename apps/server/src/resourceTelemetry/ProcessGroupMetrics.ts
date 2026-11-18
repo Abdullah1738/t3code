@@ -1,3 +1,4 @@
+import * as ProviderRuntimeInventory from "../ardud/providers/ProviderRuntimeInventory.ts";
 import type { ResourceTelemetryProcess } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -166,21 +167,25 @@ export function assignRuntimeSlots(
   return { active, samples: [...active, ...exited] };
 }
 
-/**
- * Exports process totals by group while OTLP metrics export is on. Sampling walks the process
- * table, which an idle server otherwise never does, so only a server exporting metrics pays for
- * it, once a minute.
- */
+// Inventory and exported gauges consume the same process capture, once a minute.
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
-    if (config.otlpMetricsUrl === undefined) return;
     const telemetry = yield* ResourceTelemetry.ResourceTelemetry;
+    const inventory = yield* ProviderRuntimeInventory.ProviderRuntimeInventory;
     // A group that empties reads zero rather than holding its last value.
     const seen = new Set<string>();
     let previousRuntimes: ReadonlyArray<RuntimeSample> = [];
     const sample = Effect.fn("ProcessGroupMetrics.sample")(function* () {
-      const processes = (yield* telemetry.refresh).processes;
+      const snapshot = yield* telemetry.refresh;
+      const processes = snapshot.processes;
+      const runtimes = assignRuntimeSlots(providerRuntimeChildren(processes), previousRuntimes);
+      previousRuntimes = runtimes.active;
+      yield* inventory.refresh(snapshot, runtimes.active).pipe(
+        Effect.timeout("45 seconds"),
+        Effect.catchCause(() => Effect.logWarning("provider runtime inventory sample unavailable")),
+      );
+      if (config.otlpMetricsUrl === undefined) return;
       const totals = groupProcesses(processes);
       for (const group of totals.keys()) seen.add(group);
       for (const group of seen) {
@@ -190,7 +195,6 @@ export const layer = Layer.effectDiscard(
         yield* Metric.update(Metric.withAttributes(cpuPercent, attributes), total.cpuPercent);
         yield* Metric.update(Metric.withAttributes(processCount, attributes), total.count);
       }
-      const runtimes = assignRuntimeSlots(providerRuntimeChildren(processes), previousRuntimes);
       for (const runtime of runtimes.samples) {
         const attributes = metricAttributes({
           provider: runtime.provider,
@@ -212,7 +216,6 @@ export const layer = Layer.effectDiscard(
           childResidentBytes: runtime.residentBytes,
         });
       }
-      previousRuntimes = runtimes.active;
     });
     yield* sample().pipe(
       Effect.catch((error) =>

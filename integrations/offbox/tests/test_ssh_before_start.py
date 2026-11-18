@@ -342,6 +342,55 @@ class SshBeforeStartTests(Isolated):
                 self.assertFalse(self.con.execute("SELECT 1 FROM events WHERE kind='resume_stuck'").fetchone())
                 self.assertEqual(self.con.execute("SELECT state FROM leases WHERE box_id='same'").fetchone()[0], 'running')
 
+    def test_real_readiness_around_client_deadline_retains_box_and_watchdog(self):
+        self.clock.time.time = lambda: self.clock.t
+        for elapsed in (4, 5, 6):
+            for recover in (True, False):
+                with self.subTest(elapsed=elapsed, recover=recover), contextlib.ExitStack() as stack:
+                    self.con.execute("UPDATE leases SET state='running', note=NULL WHERE box_id='same'")
+                    self.con.execute("DELETE FROM events WHERE kind='resume_stuck'")
+                    self.con.commit()
+                    for module in (api, lease, prepare, ssh_sync):
+                        stack.enter_context(patch.object(module, 'time', self.clock.time))
+                    stack.enter_context(patch.object(home, 'active', return_value=True))
+                    stack.enter_context(patch.object(lease.offbox_protection, 'caller', return_value={'holder': self.me['owner']}))
+                    stack.enter_context(patch.object(ssh_sync, 'cfg_path', return_value=Path(self.tmp.name) / 'missing'))
+                    stack.enter_context(patch.object(ssh_sync, 'setup'))
+                    stack.enter_context(patch.object(ssh_sync, 'ssh_base', return_value=['ssh']))
+                    stack.enter_context(patch.object(lease, '_readiness_get', return_value={'state': 'resuming'}))
+                    stack.enter_context(patch.object(api, 'wait_state', return_value={'state': 'running'}))
+                    bring_up = stack.enter_context(patch.object(lease, '_bring_up_resumed', wraps=lease._bring_up_resumed))
+                    attempts = []
+                    def connect(argv, **kwargs):
+                        self.assertEqual(argv, ['ssh', 'same', 'true'])
+                        with self.assertRaises(common.OffboxError):
+                            with common.file_lock('box-same', timeout=0):
+                                pass
+                        attempts.append(argv[1])
+                        if len(attempts) == 1:
+                            self.clock.sleep(elapsed)
+                            return subprocess.CompletedProcess(argv, 255, b'', CONNECT.encode())
+                        return subprocess.CompletedProcess(argv, 0, b'', b'')
+                    stack.enter_context(patch.object(ssh_sync.subprocess, 'run', side_effect=connect))
+                    self.probe.reset_mock()
+                    self.probe.return_value = recover, 'box_ssh_unreachable'
+                    row = dict(self.con.execute("SELECT * FROM leases WHERE box_id='same'").fetchone())
+                    with common.file_lock('box-same', timeout=0), prepare.guard('same', seconds=5), ssh_outage.recovery(enabled=True):
+                        if recover:
+                            self.assertEqual(lease._reuse(self.con, row, None)['box_id'], 'same')
+                        else:
+                            with self.assertRaises(ssh_outage.SshUnreachable) as raised:
+                                lease._reuse(self.con, row, None)
+                            self.assertEqual(raised.exception.box, 'same')
+                            self.assertEqual(raised.exception.reason, 'box_ssh_unreachable')
+                            self.assertEqual(raised.exception.waited_s, 20)
+                        self.assertEqual(bring_up.call_args.kwargs['watch'].remaining(), 90)
+                    self.assertEqual(attempts, ['same', 'same'] if recover else ['same'])
+                    self.assertGreater(self.probe.call_count, 0)
+                    self.assertFalse(self.con.execute("SELECT 1 FROM events WHERE kind='resume_stuck'").fetchone())
+                    self.assertEqual(self.con.execute("SELECT state FROM leases WHERE box_id='same'").fetchone()[0], 'running')
+                    self.acquire.assert_not_called()
+
     def test_acquisition_cached_ssh_still_resumes_a_confirmed_stopped_box(self):
         attempts = self.acquisition_fixture(recover=False)
         with patch.object(api, 'get', return_value={'state': 'archived'}), \
