@@ -10,6 +10,7 @@ import { Store } from "../src/store.ts";
 import { FAILED_INBOUND_REPLAY_MAX_AGE_MS as HORIZON } from "../src/inbound-failure.ts";
 import { createToolLog, type LogLine } from "../src/toollog.ts";
 import { captureLogs } from "./log-fixture.ts";
+import { ProbeBackoff } from "../src/probe-policy.ts";
 
 const start = Date.parse("2026-11-17T12:00:00Z");
 const hash = (id: string) => `msg_${createHash("sha256").update(id).digest("hex")}`;
@@ -176,6 +177,31 @@ test.each([{ cooling: false }, { cooling: true }])("splitting stranded members r
   expect(h.missed().map(m => m.id)).toEqual(ids);
   expect(reads).toEqual([["ses_old", hash(ids[0]!)]]);
   expect(h.backend.prompts).toEqual([]);
+});
+
+test.each([false, true])("a split younger member retains failed-read cooldown and retry step after carrying its leader (restart=%s)", async restart => {
+  const h = setup(), ids = retiredBatch(h, [20, 14.5]);
+  const leader = ids[0]!, member = ids[1]!;
+  h.store.set(`stuck-wake-retry:${member}`, start);
+  const reads: string[] = [];
+  h.backend.promptAccepted = async (_session, _directory, id) => { reads.push(id); throw Object.assign(new Error("offline"), { status: 503 }); };
+  await h.router.checkInboundLatency();
+  expect(h.missed().map(m => m.id)).toEqual([leader]);
+  expect(reads).toEqual([hash(leader)]);
+  if (restart) h.router = h.restart();
+  // A later receipt for the carried leader must not clear its younger sibling's uncertainty.
+  await submit(h);
+  const policy = new ProbeBackoff(h.store);
+  setSystemTime(start + 59_999);
+  await h.router.checkInboundLatency();
+  expect(reads).toEqual([hash(leader)]);
+  expect(policy.cooling(member)).toBe(true);
+  expect(policy.retry(member)).toBe(true);
+  setSystemTime(start + 61_000);
+  await h.router.checkInboundLatency();
+  expect(reads).toEqual([hash(leader), hash(leader)]);
+  expect(policy.get(member)?.delay).toBe(120_000);
+  expect(h.store.get(`inbound-delivered:${member}`)).toBeUndefined();
 });
 
 test.each(["pending", "sent"])("expiry gets its own durable notice after a %s exhaustion notice", async state => {

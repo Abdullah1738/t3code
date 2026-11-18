@@ -413,12 +413,15 @@ export function withPreviousFailure(
 ): OrchestrationV2ProviderFailure {
   if (previous === undefined || failure.message.startsWith("Automatic resume failed."))
     return failure;
-  return makeProviderFailure({
-    ...failure,
-    category: failure.category ?? "unknown",
-    resetAt: failure.resetAt ?? null,
-    message: `Automatic resume failed. First error: ${previous.message.slice(0, 1500)} Resume error: ${failure.message.slice(0, 1500)} Files may be partly written.`,
-  });
+  return {
+    ...makeProviderFailure({
+      ...failure,
+      category: failure.category ?? "unknown",
+      resetAt: failure.resetAt ?? null,
+      message: `Automatic resume failed. First error: ${previous.message.slice(0, 1500)} Resume error: ${failure.message.slice(0, 1500)} Files may be partly written.`,
+    }),
+    ...(failure.claudeApiError === undefined ? {} : { claudeApiError: failure.claudeApiError }),
+  };
 }
 
 export function makeProviderFailureTurnItem(input: {

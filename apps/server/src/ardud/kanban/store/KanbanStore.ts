@@ -1224,8 +1224,9 @@ const make = Effect.gen(function* () {
         decoders.card,
       ),
     );
+  // Keep allocation on the writer, with the SELECT budget outside run's write marker.
   const nextCardNumber = (boardId: KanbanBoardId) =>
-    runRead(
+    run(
       "next card number",
       Effect.map(
         sql<{ readonly next: number }>`
@@ -1233,7 +1234,7 @@ const make = Effect.gen(function* () {
         `,
         (rows) => Number(rows[0]?.next ?? 1),
       ),
-    );
+    ).pipe(SavedWrite.read);
   const saveCard = (value: KanbanCard, before?: KanbanCard) =>
     run(
       "write card",
