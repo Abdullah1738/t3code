@@ -138,7 +138,8 @@ class CollectorBudgetTests(unittest.TestCase):
         jobs.directory_inventory([root], partial)
         props = self.rows('disk.inventory')[-1]['props']
         self.assertEqual((props['rootsOk'], props['rootsPartial'], props['rootsTimeout'], props['rootsDenied']),
-                         (0, 1, 0, 1))
+                         (0, 0, 0, 1))
+        self.assertEqual((props['rootsComplete'], props['rootsCompleteWithDenied']), (1, 1))
         for child in children:
             child.rmdir()
         jobs.directory_inventory([root], self.good)
@@ -232,10 +233,12 @@ class CollectorBudgetTests(unittest.TestCase):
             deep.run_pass([root], denied, budget=10)
             cache = jobs.read_state('disk-inventory')['childState'][str(root)][str(child)]
             self.assertEqual(cache['parts'][str(part)]['deniedCount'], 1)
-            self.assertTrue(cache['parts'][str(part)]['partial'])
+            self.assertFalse(cache['parts'][str(part)]['partial'])
+            self.assertTrue(cache['parts'][str(part)]['estimate'])
             jobs.directory_inventory([root], lambda *a, **k: self.fail('parts belong to deep pass'))
         row = self.rows('disk.inventory')[-1]
         self.assertEqual(row['props']['rootsDenied'], 1)
+        self.assertEqual((row['props']['rootsComplete'], row['props']['rootsCompleteWithDenied']), (1, 1))
         self.assertEqual(rollup(row['ts'][:10])['diskInventory']['rootsDenied'], 1)
 
 

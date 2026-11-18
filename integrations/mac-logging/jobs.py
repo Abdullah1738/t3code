@@ -751,7 +751,8 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
                 if child_denied:
                     failure = source_error('disk', 'disk.inventory.source', key, started,
                         SourceFailure('permission' if child_denied else 'partial', 'du returned an incomplete total', code),
-                        props=dict(bytes=size, deniedCount=child_denied, estimate=bool(child_denied), **measurement))
+                        props=dict(bytes=size, deniedCount=child_denied, estimate=bool(child_denied),
+                                   **(measurement if len(batch) == 1 else {})))
                     if source_failures is not None:
                         source_failures.add(failure)
                     inventory_log.timing(key, elapsed_ms)

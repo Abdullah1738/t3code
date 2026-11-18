@@ -445,10 +445,13 @@ class DeepInventoryTests(unittest.TestCase):
             lock_path = jobs.state_path('disk-inventory').with_suffix('.lock')
             inode = lock_path.stat().st_ino
             sleeps = []
+            real_sleep = jobs.time.sleep
             def release(seconds):
                 sleeps.append(seconds)
                 self.clock[0] += seconds
-                holder.communicate('release', timeout=10)
+                # subprocess.wait may sleep while reaping; that is not a lock retry.
+                with patch.object(jobs.time, 'sleep', real_sleep):
+                    holder.communicate('release', timeout=10)
             # A virtual retry interval longer than the entire pass budget proves
             # both deadlines begin after acquisition, without scheduler margins.
             with patch.object(jobs.time, 'sleep', side_effect=release), \
