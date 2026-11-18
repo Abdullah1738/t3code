@@ -10,6 +10,13 @@ const event = (type: string, payload: object = {}) =>
   ({ type, threadId: "thread-1", payload }) as unknown as OrchestrationV2DomainEvent;
 
 describe("boardEventRoute", () => {
+  it.each(["thread.pull-request-link-updated", "thread.pull-request-synced"])(
+    "refreshes card PR chips on %s without a work turn",
+    (type) => {
+      assert.strictEqual(boardEventRoute(event(type)), "pullRequestsChanged");
+      assert.strictEqual(threadEventOf(event(type)), "thread-1");
+    },
+  );
   it.each([
     {
       type: "run_interrupt_request",

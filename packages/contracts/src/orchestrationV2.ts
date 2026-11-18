@@ -1,4 +1,5 @@
 import { ThreadItemRedacted } from "./ardud/threadRedaction.ts";
+import { ClaudeApiErrorDetails } from "./ardud/claudeApiError.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -560,6 +561,7 @@ const OrchestrationV2DelegatedTaskStall = Schema.Struct({
   lastProgressKind: Schema.String,
   phase: Schema.optional(Schema.Literals(["post_tool", "first_event", "mid_turn"])),
   lastProgressTool: Schema.optional(Schema.String),
+  lastProgressExitCode: Schema.optional(Schema.Int),
   silentSeconds: Schema.optional(Schema.Finite),
 });
 
@@ -1437,6 +1439,7 @@ export type OrchestrationV2RestartAdmissionFailure =
  * Producers must redact credentials before constructing this value.
  */
 export const OrchestrationV2ProviderFailure = Schema.Struct({
+  claudeApiError: Schema.optional(ClaudeApiErrorDetails),
   class: OrchestrationV2ProviderFailureClass,
   message: OrchestrationV2ProviderFailureMessage,
   code: Schema.NullOr(OrchestrationV2ProviderFailureCode),
@@ -1625,6 +1628,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
     /** No tool result was received; this item may represent cleanup or a synthetic notice. */
     toolResultIncomplete: Schema.optional(Schema.Boolean),
     input: Schema.String,
+    /** Foreground tool limit in milliseconds; zero explicitly allows background work. */
+    timeoutMs: Schema.optional(NonNegativeInt),
     output: Schema.optional(Schema.String),
     /** Set on the wire when output was withheld; fetch it with getTurnItem. */
     outputOmitted: Schema.optional(Schema.Boolean),
@@ -2421,6 +2426,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     /** No tool result was received; this item may represent cleanup or a synthetic notice. */
     toolResultIncomplete: Schema.optional(Schema.Boolean),
     input: Schema.String,
+    timeoutMs: Schema.optional(NonNegativeInt),
     output: Schema.optional(Schema.String),
     /** Set on the wire when output was withheld; fetch it with getTurnItem. */
     outputOmitted: Schema.optional(Schema.Boolean),

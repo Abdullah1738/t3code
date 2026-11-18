@@ -1,3 +1,4 @@
+import { probeDeferred } from "./probe-policy.ts";
 import { safeLineFailureCode, sendblueErrorKey } from "./line.ts";
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -6,6 +7,7 @@ import { writeFile, readFile, rename, unlink } from "node:fs/promises";
 import { logDirectory } from "./log-directory.ts";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { createMessageReadAggregation } from "./log-message-reads.ts";
 import { cleanCalls, createCallAggregation, SLOW_CALL_MS, type CallSummary } from "./log-calls.ts";
 import { cleanRobobLink, createRobobLinkState, createRobobLinkAggregation, type RobobLink } from "./log-robob-link.ts";
 import { summarizeLog } from "./log-rollup.ts";
@@ -30,8 +32,11 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId", "requestId", "serverRequestId", "outageId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews", "linkFailureCount"]);
 const ENUMS: Record<string, readonly string[]> = {
+  readMode: ["full", "incremental", "cached-skip", "shared"],
+  fullReason: ["first-read", "route-change", "missing-until", "resync", "merge-conflict", "clock-skew"],
+  kind: ["control", "conversation", "notification", "outage", "dropped", "failed", "nudge", "request", "other"],
   state: ["pending", "admitted", "processing", "batched", "done", "failed", "unknown", "cancelled", "observed"],
   action: ["requeued", "in_turn"], leaderKind: ["human", "wake", "reset", "background", "none"],
   telegram: ["sent", "failed"], severity: ["warn"],
@@ -64,6 +69,16 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (entry.name === "synthetic.carry_evicted" && key === "reason" && (value === "expired" || value === "overflow")
+      || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
+      props[key] = value; continue;
+    }
+    if (entry.component === "remote-box" && entry.name === "moni-runner-error") {
+      if (key === "path" && typeof value === "string" && ["/send", "/files", "/react", "/agent-ask", "/agent-answer", "/agent-requests", "/share", "/unshare", "/shares", "/metrics", "/ready"].includes(value)
+        || key === "errorClass" && typeof value === "string" && ["LineError", "RemoteSendError", "Error", "UnknownError"].includes(value)
+        || key === "retryable" && typeof value === "boolean") { props[key] = value; continue; }
+      if (key === "code" && typeof value === "string") { props.code = safeLineFailureCode(value); continue; }
+    }
     if (["moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "moni-box-backend-state"].includes(entry.name)) {
       if (key === "event" && typeof value === "string" && /^[a-f0-9]{12}$/.test(value)
         || key === "kind" && (value === "inbound" || value === "wake")
@@ -72,9 +87,10 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
         props[key] = value; continue;
       }
     }
+    if (entry.name === "robob.link_state" && key === "resumedByRun" && typeof value === "string" && /^[a-f0-9-]{36}$/.test(value)) { props[key] = value; continue; }
     if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1)) continue;
     if ((NUMBERS.has(key) || key === "replies" && entry.name === "notice.reply") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
-    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders", "linkRecovery"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
+    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders", "linkRecovery", "answersInbound"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && ENUMS[key]?.includes(value)) props[key] = value;
     // A route template is code-owned; no query strings, ids, or URLs enter the log.
     else if (key === "route" && typeof value === "string" && /^(?:\/(?:[a-z-]+|:id))*$/.test(value)) props[key] = value;
@@ -137,7 +153,12 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   let rolledYesterday = "";
   let recovery: Promise<void> | undefined;
   const calls = createCallAggregation(processRunId);
-  const robobLink = createRobobLinkState();
+  const messageReads = createMessageReadAggregation();
+  const robobLink = createRobobLinkState({ root, now, checkpoint: () => {
+    const day = new Date(now()).toISOString().slice(0, 10);
+    const path = join(root(), `${day}.ndjson`);
+    return { day, offset: existsSync(path) ? statSync(path).size : 0 };
+  } });
   const renders = createRenderAggregation();
   let writeFailed = false;
   function append(entry: Entry, stamp?: string): void {
@@ -171,7 +192,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && !["msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }
@@ -190,6 +211,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   function flush(): void {
     scheduled = false;
     for (const line of pending.splice(0)) append(line, line.ts);
+    robobLink.save();
   }
   function enqueue(line: LogLine): void {
     if (!options.defer) { append(line, line.ts); return; }
@@ -207,7 +229,8 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       }
       const link = robobLink.accept(line);
       for (const event of link.events) enqueue(event);
-      for (const render of renders.accept(line)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
+      for (const messageRead of messageReads.accept(line)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
+      if (!options.defer) robobLink.save();
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
       if (["turn.start", "reply.sent", "inbound.answered"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
         refreshChains(`${line.ids.chat}\0${line.ids.inboundId}`);
@@ -307,6 +330,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   }
   function flushAll(): boolean {
     capture(() => { for (const line of robobLink.flush(now)) enqueue(line); });
+    for (const line of messageReads.flush()) enqueue(line);
     for (const line of renders.flush()) enqueue(line);
     for (const line of calls.flush()) enqueue(line);
     flush();
@@ -393,6 +417,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   async function tick(): Promise<void> {
     try {
       const at = now();
+      for (const line of messageReads.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       if (rolling) { await settled(); return; }
       const hour = Math.floor(at / 3_600_000);
       const hourly = hour !== rolledHour;
@@ -437,7 +462,7 @@ function loggedRequestId(error: unknown): string | undefined {
   }
 }
 export function toolError(component: string, tag: string, cause: unknown, ids?: LogLine["ids"], props?: LogLine["props"]): void {
-  if (cause === completionReady) return;
+  if (cause === completionReady || cause === probeDeferred) return;
   const requestId = loggedRequestId(cause);
   toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids: { ...ids, ...(requestId ? { requestId } : {}) }, props,
     ...(requestId ? { alreadyLogged: true } : {}), error: { tag, cause } });

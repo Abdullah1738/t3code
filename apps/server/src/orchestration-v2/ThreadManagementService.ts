@@ -1563,7 +1563,8 @@ const make = Effect.gen(function* () {
     const preflightError =
       target.thread.archivedAt !== null
         ? new ThreadManagementThreadArchivedError({ threadId: input.threadId })
-        : (input.mode === "steer" || input.mode === "restart") && steerableRun === undefined
+        : (input.mode === "restart" || (input.mode === "steer" && input.activeTurnOnly)) &&
+            steerableRun === undefined
           ? new ThreadManagementNoSteerableRunError({
               threadId: input.threadId,
               mode: input.mode,
@@ -1610,6 +1611,8 @@ const make = Effect.gen(function* () {
       dispatchMode = { type: "start_immediately" };
     } else if (interruptedForRestart) {
       // A retry can arrive after interrupt committed but before the message did.
+      dispatchMode = { type: "queue_after_active" };
+    } else if (input.mode === "steer" && steerableRun === undefined && !input.activeTurnOnly) {
       dispatchMode = { type: "queue_after_active" };
     } else if (input.mode === "steer" || input.mode === "restart") {
       if (steerableRun === undefined) {

@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CheckSlots, type SlotEvent, type SlotTiming } from "../src/host.ts";
@@ -87,7 +87,10 @@ async function busyProbe(script: string) {
     ROBOB_WATCH_SPECTRUM_CLI: bridge, ROBOB_WATCH_TELEGRAM_CLI: bridge }, stdout: "pipe", stderr: "pipe" });
   const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
   expect(error).toBe(""); expect(code).toBe(0);
-  const rows = readFileSync(join(root,"logs/2026-11-16.ndjson"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+  const logDir = join(root, "logs");
+  const logFiles = readdirSync(logDir).filter(name => name.endsWith(".ndjson")).sort();
+  expect(logFiles.length).toBeGreaterThan(0);
+  const rows = logFiles.flatMap(name => readFileSync(join(logDir, name), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)));
   return { root, result: JSON.parse(output.trim().split("\n").at(-1)!), rows,
     calls: existsSync(callLog) ? readFileSync(callLog,"utf8").trim().split("\n").map(line=>JSON.parse(line) as string[]) : [] };
 }
@@ -641,7 +644,7 @@ test("runner logs holder snapshots and one backlog summary, then adds slot wait 
   const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
   expect(error).toBe(""); expect(code).toBe(0);
   expect(output.match(/slot backlog:/g)).toHaveLength(1);
-  expect(output).toContain("slot backlog: depth 2, oldest 60.0s, active 2/2, holders [one:60.0s,two:60.0s]");
+  expect(output).toContain("slot backlog: depth 2, oldest 60.0s, active 2/4, holders [one:60.0s,two:60.0s]");
   for (const id of ["three", "four"]) {
     const log = readFileSync(join(root, "root/watchers", id, "log"), "utf8");
     expect(log).toContain("slot wait passed 30s: slot_wait 30.0s, holders [one:30.0s,two:30.0s]");

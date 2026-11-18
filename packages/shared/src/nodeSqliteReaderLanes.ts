@@ -91,6 +91,13 @@ export interface ReaderPoolSlot {
   readonly lock: ReaderSlotLock;
   readonly lane: "foreground" | "background";
   readonly slot: number;
+  readonly snapshot: () => ReaderPoolSnapshot;
+}
+
+export interface ReaderPoolSnapshot {
+  readonly queueDepth: number;
+  readonly oldestInFlightAgeMs: number | null;
+  readonly holder: string | null;
 }
 
 export interface ReaderPool {
@@ -113,6 +120,7 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
   readonly slots: ReadonlyArray<Effect.Effect<Connection | undefined>>;
   readonly queueLimit: number;
 }) {
+  const clock = yield* Clock.Clock;
   let inFlight = 0;
   // Reads between slot choice and permit request (awaiting their worker). Counted
   // for admission and slot choice so concurrent reads spread across slots and a
@@ -159,6 +167,21 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
     return span?._tag === "Span" && /^[a-zA-Z0-9_.:/#@%+-]{1,160}$/.test(span.name)
       ? span.name
       : "database";
+  };
+  const snapshot = (entry: Entry): ReaderPoolSnapshot => {
+    const holders = entries.flatMap((slot) => (slot.holder ? [slot.holder] : []));
+    const oldest = holders.reduce<bigint | undefined>(
+      (oldest, held) => (oldest === undefined || held.started < oldest ? held.started : oldest),
+      undefined,
+    );
+    return {
+      queueDepth: Math.max(0, inFlight + acquiring - holders.length),
+      oldestInFlightAgeMs:
+        oldest === undefined
+          ? null
+          : Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - oldest) / 1e6),
+      holder: entry.holder ? holderName(entry.holder) : null,
+    };
   };
   const notify = (
     entry: Entry,
@@ -304,7 +327,13 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
       Effect.map((connection) =>
         connection === undefined
           ? undefined
-          : { connection, lock: locks[entry.slot]!, lane: options.lane, slot: entry.slot },
+          : {
+              connection,
+              lock: locks[entry.slot]!,
+              lane: options.lane,
+              slot: entry.slot,
+              snapshot: () => snapshot(entry),
+            },
       ),
     );
   });
