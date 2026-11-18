@@ -372,7 +372,7 @@ it.effect.each(["ended", "fork"] as const)(
       const base = liveThreadShell(callerId);
       const shell = {
         ...base,
-        activeRunId: state === "ended" ? null : base.activeRunId,
+        activeRunId: null,
         forkedFrom:
           state === "fork"
             ? { type: "run" as const, threadId: callerId, runId: base.activeRunId! }
