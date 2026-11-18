@@ -1,4 +1,4 @@
-import { captureReplyCoverage, deliveredReplyCoverage, markAnswered, type AnsweredInput } from "./unanswered.ts";
+import { captureReplyCoverage, deliveredReplyCoverage, markControlAcked, markAnswered, type AnsweredInput } from "./unanswered.ts";
 import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
@@ -30,6 +30,8 @@ export type OutboxOperation = {
   id: string;
   // "notification" survives only for reference lookup of historical rows.
   kind: "notification" | "conversation" | "control";
+  /** A direct command response, such as /status, can complete its own inbound row. */
+  answersInbound?: true;
   text: string;
   sessionId?: string;
   generation?: number;
@@ -199,7 +201,7 @@ export class Store {
   enqueue(op: OutboxOperation, attribution?: { inboundId?: string }): boolean {
     // Normalize property order and omit unrelated caller fields before comparing content.
     const payload = json({
-      id: op.id, kind: op.kind, text: op.text, sessionId: op.sessionId,
+      id: op.id, kind: op.kind, ...(op.answersInbound ? { answersInbound: true } : {}), text: op.text, sessionId: op.sessionId,
       generation: op.generation, replyTo: op.replyTo,
       attachment: op.attachment ? { sha256: op.attachment.sha256, name: op.attachment.name,
         mimeType: op.attachment.mimeType, size: op.attachment.size } : undefined,
@@ -297,7 +299,11 @@ export class Store {
         state = ?, providerId = COALESCE(?, providerId) WHERE id = ?`
       ).run(state, state, providerId ?? null, id);
       if (!result.changes) throw new Error(`Unknown outbox operation: ${id}`);
-      if (state === "sent") markAnswered(this, deliveredReplyCoverage(this, this.getOperation(id)!));
+      if (state === "sent") {
+        const op = this.getOperation(id)!;
+        if (op.kind === "control" && !op.answersInbound) markControlAcked(this, op);
+        else markAnswered(this, deliveredReplyCoverage(this, op));
+      }
       rememberHealthReceipt(this, id, state);
     }).immediate();
   }

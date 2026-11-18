@@ -854,6 +854,7 @@ export class Router {
     if (!Number.isSafeInteger(quiet) || quiet < 0) throw new Error("Invalid quiet period");
     new Intl.DateTimeFormat("en-US", { timeZone: options.timezone });
     const chat = options.context?.chat;
+    this.store.set("log-chat", chat?.slug ?? "owner");
     this.store.set("unanswered-chat", !chat || chat.kind === "owner" ? "owner" : chat.kind === "dm" && chat.slug === "moni" ? "moni" : "other");
     const restored = this.store.get<Turn | null>("activeTurn");
     if (restored && restored.covered === undefined && restored.steered?.length) {
@@ -911,11 +912,6 @@ export class Router {
       const due = findOverdue([{ ...fresh, payload: JSON.parse(fresh.payload) }], liveRunning, now, { startedAt: this.unansweredStartedAt, chat })[0];
       if (!due) continue;
       const { row, input, ageMs, action, leaderKind: kind } = due;
-      // #37's queued technical-problem notice already owns these rows.
-      const notice = this.store.db.query(`SELECT 1 FROM outbox o WHERE (json_extract(o.payload, '$.replyTo') = ?
-        OR EXISTS (SELECT 1 FROM kv coverage, json_each(coverage.value) member WHERE coverage.key = 'reply-covered:' || o.id AND member.value = ?))
-        AND (o.id LIKE 'outage:%' OR o.id LIKE 'turn:%:failed') AND o.state IN ('pending', 'sending', 'sent', 'uncertain') LIMIT 1`).get(row.id, row.id);
-      if (notice) continue;
       const state = { ...input.unanswered };
       if (state.overdueAt !== undefined && !due.requeue && !due.alert) continue;
       if (due.requeue) {
@@ -1001,6 +997,8 @@ export class Router {
       if (succeeded || row.state !== "failed") this.store.updateInbound(id, "done");
       if (this.store.get<number>(`inbound-delivered:${id}`) !== undefined) continue;
       this.store.set(`inbound-delivered:${id}`, deliveredAt);
+      toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "inbound.delivered",
+        ids: { chat: this.options.context?.chat.slug ?? this.store.get<string>("unanswered-chat") ?? "other", inboundId: id } }));
       const receivedAt = (JSON.parse(row.payload) as NormalizedInbound).receivedAt;
       if (receivedAt !== undefined && Number.isSafeInteger(receivedAt) && receivedAt >= 0) {
         this.options.log?.("inbound-latency", `id=${id} receivedAt=${new Date(receivedAt).toISOString()} deliveredAt=${new Date(deliveredAt).toISOString()} ms=${deliveredAt - receivedAt}`);
@@ -1491,7 +1489,7 @@ export class Router {
       && ["sent", "uncertain"].includes(this.store.getOperation(p.prompt)?.state ?? ""));
   }
 
-  private acknowledge(id: string, text: string, state = "done"): void {
+  private acknowledge(id: string, text: string, state = "done", answersInbound = false): void {
     this.store.db.transaction(() => {
       // The owner never typed a synthetic row, so no notice may ask them to resend it.
       if (this.syntheticBatch(id)) {
@@ -1506,7 +1504,7 @@ export class Router {
         });
         this.store.set("preparingDelivery", null);
       }
-      this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", text, ...this.replyTarget(id) });
+      this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", ...(answersInbound ? { answersInbound: true } : {}), text, ...this.replyTarget(id) });
       if (state === "failed") this.failInbound(id, "prepare", text);
       else this.store.updateInbound(id, state);
     }).immediate();
@@ -2359,7 +2357,7 @@ export class Router {
       return;
     }
     if (text.toLowerCase() === "/status") {
-      this.acknowledge(row.id, this.describe(row.id));
+      this.acknowledge(row.id, this.describe(row.id), "done", true);
       return;
     }
     if (command === "approve" || command === "answer") {
@@ -2699,7 +2697,7 @@ export class Router {
         this.store.set("newDeferred", null);
         this.store.set("newQueued", null);
         this.store.set("newNudge", this.nudgeReset(route, newChatNudge(this.options.replyMode)));
-        this.acknowledge(inboundId, "Fresh start. What's up?");
+        this.acknowledge(inboundId, "Fresh start. What's up?", "done", true);
       }).immediate();
       this.options.log?.("context-reset-nudged", "new");
       return;
@@ -2708,7 +2706,7 @@ export class Router {
       const created = await this.reading(this.backend.createChat(), false);
       this.store.db.transaction(() => {
         this.store.set("route", { ...created, generation, createdAt: Date.now(), threadAt: Date.now() });
-        this.acknowledge(inboundId, "Fresh start. What's up?");
+        this.acknowledge(inboundId, "Fresh start. What's up?", "done", true);
       }).immediate();
       this.retireOthers();
     } catch (caughtError) { toolError("router", "router.catch20", caughtError);
