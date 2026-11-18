@@ -1,3 +1,4 @@
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { createPublicKey, createHmac } from "node:crypto";
 import { toolLog } from "./toollog.ts";
 import { readFileSync } from "node:fs";
@@ -52,6 +53,7 @@ export class RemoteBox {
   private nextStateLog = 0;
   private readonly callbackErrors = new Map<string, { at: number; count: number; props: Record<string, string | number | boolean> }>();
   private readonly unanswered: RemoteUnanswered;
+  private readonly callbackLoopDelay = monitorEventLoopDelay({ resolution: 100 });
   constructor(readonly config: RemoteBoxConfig, readonly store: Store, private readonly io: {
     fetch?: Fetch; now?: () => number; log: (event: string, code?: string) => void;
     notice: (id: string, text: string) => Promise<void>; active: () => boolean;
@@ -90,6 +92,7 @@ export class RemoteBox {
     this.backendState();
     const columns = store.db.query<{ name: string }, []>("PRAGMA table_info(remote_inbox)").all();
     for (const column of ["expires_at", "picked_up_at", "delivery_checked_at", "delivery_final"]) if (!columns.some(c => c.name === column)) store.db.exec(`ALTER TABLE remote_inbox ADD COLUMN ${column} INTEGER`);
+    this.callbackLoopDelay.enable();
   }
   private backendState() {
     this.nextStateLog = this.now() + 300_000;
@@ -117,7 +120,7 @@ export class RemoteBox {
       if (all || this.now() - window.at >= 60_000) this.emitCallbackError(key);
     }
   }
-  stop() { this.flushCallbackErrors(true); }
+  stop() { this.callbackLoopDelay.disable(); this.flushCallbackErrors(true); }
   private callbackError(path: string, status: number, error: unknown) {
     // Emit the completed window so count includes every suppressed repeat, even if the failure stops.
     this.flushCallbackErrors();
@@ -441,11 +444,25 @@ export class RemoteBox {
     }
   }
   async callback(request: Request, io: { line: Line; chat: ChatKey; bus: (path: string, body: Record<string, unknown>, id: string, fingerprint: string) => Promise<Response> }): Promise<Response> {
-    const reply = (status: number, body: unknown) => Response.json(body, { status });
-    // This entry is used by a dedicated loopback listener, never by the trusted Unix socket.
-    if (!tokenMatches(request.headers.get("authorization"), this.callbackToken)) return reply(403, { error: "Forbidden" });
-    if (!this.io.active()) return reply(503, { error: "Backend paused" });
+    const started = performance.now();
     const path = new URL(request.url).pathname;
+    const authorized = tokenMatches(request.headers.get("authorization"), this.callbackToken);
+    const reply = (status: number, body: unknown) => {
+      const response = Response.json(body, { status });
+      if (authorized && path === "/ready") {
+        toolLog.capture(() => {
+          const handlerMs = Math.max(0, performance.now() - started);
+          // Max sampled loop delay since the preceding /ready, including stalls outside this handler.
+          const loopDelayMs = this.callbackLoopDelay.max / 1_000_000;
+          this.callbackLoopDelay.reset();
+          this.emit("moni-callback-ready", undefined, handlerMs, { status, handlerMs, loopDelayMs });
+        });
+      }
+      return response;
+    };
+    // This entry is used by a dedicated loopback listener, never by the trusted Unix socket.
+    if (!authorized) return reply(403, { error: "Forbidden" });
+    if (!this.io.active()) return reply(503, { error: "Backend paused" });
     if (request.method !== "POST" || !["/send", "/files", "/react", "/agent-ask", "/agent-answer", "/agent-requests", "/share", "/unshare", "/shares", "/ready", "/metrics"].includes(path)) return reply(403, { error: "Forbidden" });
     try {
       const body = await jsonBody(request);
