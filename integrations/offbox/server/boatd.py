@@ -1397,6 +1397,19 @@ def tail(path: Path, n: int, start: int = 0) -> str:
         return ""
 
 
+def node_setup(row):
+    """The host-owned invocation journal locates setup independently of command output."""
+    attempt = row['attempt'] or 1
+    try:
+        history = json.loads((cmd_dir(row['box_id']) / f"{row['pid']}.{attempt}.invocations.json").read_text())
+        offset = history[-1]['stderr_offset']
+        if type(offset) is int and offset >= 0:
+            return {'stderrOffset': offset}
+    except (OSError, ValueError, TypeError, IndexError, KeyError):
+        pass
+    return {'stderrOffset': 0 if attempt == 1 else None}
+
+
 def cmd_status_json(con, box_id: str, pid: int, tail_bytes: int = 4096) -> dict:
     r = cmd_row(con, box_id, pid)
     d = cmd_dir(box_id)
@@ -1408,7 +1421,7 @@ def cmd_status_json(con, box_id: str, pid: int, tail_bytes: int = 4096) -> dict:
             "queuedMs": 0 if r["sync"] else max(0, r["queued_s"] if r["queued_s"] is not None else
                 (r["started_at"] or r["ended_at"] or now()) - r["created_at"]) * 1000,
             "runMs": max(0, (r["ended_at"] or now()) - r["started_at"]) * 1000 if r["started_at"] else 0,
-            "attempt": r["attempt"] or 1, "retryInterrupted": bool(r["retry_interrupted"]),
+            "nodeSetup": node_setup(r), "attempt": r["attempt"] or 1, "retryInterrupted": bool(r["retry_interrupted"]),
             "interruptedAt": iso(r["interrupted_at"]), "bootId": boot_id(), "serverStartedAt": iso(STARTED),
             "stdout": tail(d / f"{pid}.out", tail_bytes), "stderr": tail(d / f"{pid}.err", tail_bytes),
             "metrics": json.loads(r["metrics"]) if r["metrics"] else None,
@@ -3284,7 +3297,7 @@ class Handler(BaseHTTPRequestHandler):
                 return {"ok": True, "data": data, "nextOffset": nxt, "size": size,
                         "done": r["status"] not in ("queued", "running") and nxt >= size,
                         "commandId": r['command_id'], "status": r['status'],
-                        "attempt": r['attempt'] or 1,
+                        "attempt": r['attempt'] or 1, "nodeSetup": node_setup(r),
                         "metrics": host_box_metrics(r['metrics']),
                         "interruption": json.loads(r['metrics'] or '{}').get('interruption')}
             return {"ok": True, "command": cmd_status_json(con, bid, r["pid"], 0)}
@@ -3393,8 +3406,11 @@ class Handler(BaseHTTPRequestHandler):
         d = cmd_dir(bid)
         offs = {"out": out_off, "err": err_off}
         started = last_beat = now()
-        attempt = cmd_row(con, bid, pid)["attempt"] or 1
-        emit({"type": "hello", "status": cmd_row(con, bid, pid)["status"], "attempt": attempt, "bootId": boot_id(), "serverStartedAt": iso(STARTED)})
+        initial = cmd_row(con, bid, pid)
+        attempt = initial["attempt"] or 1
+        emit({"type": "hello", "status": initial["status"], "attempt": attempt,
+              "commandId": initial["command_id"], "nodeSetup": node_setup(initial),
+              "bootId": boot_id(), "serverStartedAt": iso(STARTED)})
         try:
             while True:
                 sent = False
@@ -3406,13 +3422,17 @@ class Handler(BaseHTTPRequestHandler):
                         text, nxt = _utf8_cut(data, offs[which])
                         if nxt > offs[which]:
                             offs[which] = nxt
-                            emit({"type": typ, "data": text, "nextOffset": nxt})
+                            current = cmd_row(con, bid, pid)
+                            emit({"type": typ, "data": text, "nextOffset": nxt,
+                                  "attempt": current["attempt"] or 1, "commandId": current["command_id"],
+                                  "nodeSetup": node_setup(current)})
                             sent = True
                 r = con.execute("SELECT status, exit_code, signal, attempt, command_id, started_at, ended_at, metrics FROM commands WHERE box_id=? AND pid=?",
                                 (bid, pid)).fetchone()
                 if (r["attempt"] or 1) != attempt:
                     attempt = r["attempt"] or 1
-                    emit({"type": "attempt", "status": r["status"], "attempt": attempt})
+                    emit({"type": "attempt", "status": r["status"], "attempt": attempt,
+                          "commandId": r["command_id"], "nodeSetup": node_setup(cmd_row(con, bid, pid))})
                 if r["status"] not in ("queued", "running"):
                     if sent:
                         continue  # Drain bounded chunks before handling a final incomplete UTF-8 tail.
@@ -3423,7 +3443,10 @@ class Handler(BaseHTTPRequestHandler):
                                 f.seek(offs[which])
                                 rest = f.read()
                             offs[which] += len(rest)
-                            emit({"type": typ, "data": rest.decode(errors="replace"), "nextOffset": offs[which]})
+                            current = cmd_row(con, bid, pid)
+                            emit({"type": typ, "data": rest.decode(errors="replace"), "nextOffset": offs[which],
+                                  "attempt": current["attempt"] or 1, "commandId": current["command_id"],
+                                  "nodeSetup": node_setup(current)})
                     if all(offs[w] >= sizes[w] for w in sizes):
                         emit({"type": "exit", "exitCode": r["exit_code"], "signal": r["signal"],
                               "status": r["status"], "attempt": attempt, "commandId": r["command_id"],

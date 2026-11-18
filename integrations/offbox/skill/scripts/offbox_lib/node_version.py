@@ -286,7 +286,7 @@ facts = dict(version=version, path=path, pin=pin, choice=choice, candidates=cand
 print('offbox: node ' + version + ' (' + label + ')', file=sys.stderr, flush=True)
 if version == 'none':
     sys.exit(0)
-print('offbox-node: ' + json.dumps(dict(facts, label=label)), file=sys.stderr, flush=True)
+print('offbox-node: ' + json.dumps(dict(facts, label=label, run_id=os.environ.get('OFFBOX_RUN_ID'))), file=sys.stderr, flush=True)
 try:
     if os.environ.get('OFFBOX_RUN_ID'):
         receipt = Path.home() / '.offbox/exit' / (os.environ['OFFBOX_RUN_ID'] + '.node.json')
@@ -332,54 +332,99 @@ def validate_override(extra):
 def stderr_offset(path):
     from .common import read_json
     try:
-        offset = read_json(path.with_suffix('.node-stream.json'), {}).get('offset', 0)
+        saved = read_json(path.with_suffix('.node-stream.json'), {})
+        context = read_json(path.with_suffix('.node-attempt.json'), dict(attempt=1, stderrOffset=0))
+        if saved.get('context') != context:
+            return 0
+        offset = saved.get('offset', 0)
         return offset if type(offset) is int and offset >= 0 and path.with_suffix('.node-stderr.log').is_file() else 0
     except Exception:
         return 0
 
 
-def capture_stderr(path, data, offset):
-    """Keep setup lines from the authenticated stderr stream, never the merged display log."""
+def observe_attempt(path, metadata, *, until=None):
+    """Only the command API may move setup to a new stderr byte range."""
     from .common import atomic_write_json, read_json
-    from .runs import COMMAND_STARTED_MARKER, STEP_RETRY
+    try:
+        attempt = metadata.get('attempt')
+        if type(attempt) is not int or attempt < 1:
+            return
+        setup = metadata.get('nodeSetup')
+        boundary = setup.get('stderrOffset') if isinstance(setup, dict) else None
+        if type(boundary) is not int or boundary < 0:
+            boundary = 0 if attempt == 1 else None
+        state = read_json(path.with_suffix('.state.json'), {})
+        command_id = state.get('command_id', metadata.get('commandId'))
+        if 'command_id' in state and (not command_id or metadata.get('commandId') not in (None, command_id)):
+            return False
+        context = dict(attempt=attempt, stderrOffset=boundary)
+        if command_id:
+            context['command_id'] = command_id
+        target = path.with_suffix('.node-attempt.json')
+        prior = read_json(target, {})
+        same_command = prior.get('command_id') == context.get('command_id')
+        if same_command and prior.get('attempt', 0) > attempt:
+            return False
+        if same_command and prior.get('attempt') == attempt and type(prior.get('stderrOffset')) is int:
+            if boundary is None or boundary < prior['stderrOffset']:
+                return False
+        if prior != context:
+            atomic_write_json(target, context)
+            if state.get('node') is not None:
+                from .runs import save_run_state
+                save_run_state(path.stem, node=None, until=until)
+            return True
+        return False
+    except Exception:
+        pass
+
+
+def capture_stderr(path, data, offset):
+    """Keep only the current invocation's setup; workload text never reopens it."""
+    from .common import atomic_write_json, read_json
+    from .runs import COMMAND_STARTED_MARKER
     try:
         progress = path.with_suffix('.node-stream.json')
         saved = read_json(progress, {}) if offset else {}
         if offset != saved.get('offset', 0):
             return
+        context = read_json(path.with_suffix('.node-attempt.json'), dict(attempt=1, stderrOffset=0))
+        boundary = context.get('stderrOffset')
+        changed = saved.get('context') != context
         target = path.with_suffix('.node-stderr.log')
-        tail, skipping, setup = saved.get('tail', ''), saved.get('skipping', False), saved.get('setup', True)
+        if changed or not offset:
+            target.write_text('')
+        tail, skipping, setup = ('', False, True) if changed else (
+            saved.get('tail', ''), saved.get('skipping', False), saved.get('setup', True))
         selected = []
-        with io.BytesIO(data) as stream:
+        payload = data[max(0, boundary - offset):] if type(boundary) is int else b''
+        with io.BytesIO(payload) as stream:
             while part := stream.readline(65536):
                 line = tail + part.decode(errors='replace')
                 complete = part.endswith(b'\n')
                 if len(line) > 65536:
                     skipping = True
                 if complete:
-                    if not skipping:
-                        if STEP_RETRY.fullmatch(line.rstrip('\n')):
-                            setup = True
+                    if not skipping and setup:
+                        if line.startswith(('offbox-node: ', COMMAND_STARTED_MARKER)):
                             selected.append(line)
-                        elif setup and line.startswith(('offbox-node: ', COMMAND_STARTED_MARKER,
-                                                        'offbox evidence wrapper ')):
-                            selected.append(line)
-                            if line.startswith(COMMAND_STARTED_MARKER):
-                                setup = False
+                        if line.startswith(COMMAND_STARTED_MARKER):
+                            setup = False
                     tail, skipping = '', False
                 else:
                     tail = '' if skipping else line
-        if not offset or selected:
-            with target.open('w' if not offset else 'a') as stream:
+        if selected:
+            with target.open('a') as stream:
                 stream.writelines(selected)
-        atomic_write_json(progress, dict(offset=offset + len(data), tail=tail, skipping=skipping, setup=setup))
+        atomic_write_json(progress, dict(offset=offset + len(data), tail=tail, skipping=skipping,
+                                         setup=setup, context=context))
     except Exception:
         pass
 
 
-def record(run, path, *, source=None, start=0, length=None, digest=None):
+def record(run, path, *, source=None, start=0, length=None, digest=None, projected=False):
     """Collect a receipt from a stderr source; missing diagnostics are null."""
-    from .runs import COMMAND_STARTED_MARKER, STEP_RETRY, save_run_state
+    from .runs import COMMAND_STARTED_MARKER, now, save_run_state
     from .common import atomic_write_json, read_json
     try:
         source = source or path
@@ -387,7 +432,9 @@ def record(run, path, *, source=None, start=0, length=None, digest=None):
         end = info.st_size if length is None else start + length
         cache_path = path.with_suffix('.node-remote-cache.json' if source != path else '.node-cache.json')
         cache = read_json(cache_path, {})
-        identity = [str(source), info.st_dev, info.st_ino, start, length, digest]
+        context = read_json(path.with_suffix('.node-attempt.json'), dict(attempt=1, stderrOffset=0))
+        boundary = context.get('stderrOffset')
+        identity = [2, run['run_id'], str(source), info.st_dev, info.st_ino, start, length, digest, context, projected]
         same = cache.get('identity') == identity
         unchanged = same and cache.get('end') == end and cache.get('mtime_ns') == info.st_mtime_ns
         offset = cache.get('offset', start)
@@ -407,7 +454,11 @@ def record(run, path, *, source=None, start=0, length=None, digest=None):
                     if checksum.hexdigest() != digest:
                         return False
                 # Size growth does not prove an append: recovery can rewrite an earlier receipt in place.
-                offset, facts, label, setup, reset = start, None, None, True, bool(cache)
+                setup = (type(boundary) is int and (not projected or
+                         read_json(path.with_suffix('.node-stream.json'), {}).get('context') == context))
+                offset, facts, label, reset = start, None, None, True
+                if not projected and type(boundary) is int:
+                    offset = min(end, start + boundary)
                 stream.seek(offset)
                 while stream.tell() < end:
                     position = stream.tell()
@@ -418,12 +469,9 @@ def record(run, path, *, source=None, start=0, length=None, digest=None):
                                 raw = stream.readline(min(end - stream.tell(), 65536))
                             offset = stream.tell()
                             continue
-                        break  # A later committed chunk can complete this receipt or retry boundary.
+                        break  # A later committed chunk can complete this receipt.
                     offset = stream.tell()
                     line = raw.decode(errors='replace')
-                    if (STEP_RETRY.fullmatch(line.rstrip('\n')) or
-                            (setup and line.startswith('offbox evidence wrapper '))):
-                        facts, label, setup, reset = None, None, True, True
                     if line.startswith(COMMAND_STARTED_MARKER):
                         setup = False
                     if setup and line.startswith('offbox-node: '):
@@ -431,7 +479,7 @@ def record(run, path, *, source=None, start=0, length=None, digest=None):
                             data = json.loads(line[len('offbox-node: '):])
                         except ValueError:
                             continue
-                        if (isinstance(data, dict) and
+                        if (isinstance(data, dict) and data.get('run_id') == run['run_id'] and
                                 all(isinstance(data.get(k), str) for k in ('version', 'path', 'pin', 'choice', 'label')) and
                                 isinstance(data.get('candidates'), list) and
                                 all(isinstance(v, str) for v in data['candidates'])):
@@ -439,12 +487,13 @@ def record(run, path, *, source=None, start=0, length=None, digest=None):
                             label = f"offbox: node {data['version']} ({data['label']})"
             atomic_write_json(cache_path, dict(identity=identity, end=end, offset=offset, mtime_ns=info.st_mtime_ns,
                                               facts=facts, label=label, setup=setup, reset=reset))
+        # Optional receipt persistence must not extend a wait/logs deadline on a busy state writer.
         if facts is None:
             if reset and read_json(path.with_suffix('.state.json'), {}).get('node') is not None:
-                save_run_state(run['run_id'], node=None)
+                save_run_state(run['run_id'], node=None, until=now())
             return reset
         if read_json(path.with_suffix('.state.json'), {}).get('node') != facts:
-            save_run_state(run['run_id'], node=facts)
+            save_run_state(run['run_id'], node=facts, until=now())
         if label:
             client = path.with_suffix('.client.log')
             if not client.exists() or label not in client.read_text(errors='replace').splitlines():

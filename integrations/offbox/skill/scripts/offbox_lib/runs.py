@@ -2421,6 +2421,9 @@ def interruption_info(status):
 
 
 def remember_interruption(run_id, status, *, until=None):
+    if run_id and isinstance(status, dict):
+        metadata = status.get('command') if isinstance(status.get('command'), dict) else status
+        node_version.observe_attempt(LOGS_DIR / f'{run_id}.log', metadata, until=until)
     info = interruption_info(status)
     if (run_id and info is not None and
             read_json(LOGS_DIR / f'{run_id}.state.json', {}).get('interruption') != info):
@@ -3569,13 +3572,14 @@ def reset_disk_retry(error):
                         ('start_claim:' + error.run_id, new_id('claim')))
     save_run_state(error.run_id, status='starting', box_id=None, process_id=None, exit_code=None,
                    command_id=None, wrapper_pid=None, known_exit_code=None, end_at=None,
-                   infra_failure=None, infra_reason=None, setup_native_crash=False, disk_space={}, wrapper_exit_code=None)
+                   infra_failure=None, infra_reason=None, setup_native_crash=False, disk_space={}, wrapper_exit_code=None,
+                   node=None)
     # The public id survives, but stream offsets and disk markers belong to the old attempt.
     # Retain its output for inspection without letting it classify the replacement's exit.
     with log_lock(error.run_id):
         path = LOGS_DIR / f'{error.run_id}.log'
         archive = '.disk-full-' + new_id('attempt')
-        for old in (path, *path.parent.glob(path.name + '.*')):
+        for old in (path, *path.parent.glob(path.name + '.*'), *path.parent.glob(path.stem + '.node-*')):
             if old.is_file() and '.disk-full-' not in old.name:
                 old.rename(old.with_name(old.name + archive))
     error.disk_reset = True

@@ -864,10 +864,10 @@ class RecipeTests(unittest.TestCase):
         self.assertIn('mv "$NVM_DIR/versions/node/', script)
 
 
-def node_receipt(version):
+def node_receipt(version, run_id='run-test'):
     facts = dict(version=version, path=f'/home/user/.nvm/versions/node/{version}/bin/node',
                  pin='package.json engines ^24.13.1', choice='newest nvm', candidates=[version])
-    return facts, 'offbox-node: ' + json.dumps(dict(facts, label=facts['pin'])) + '\n'
+    return facts, 'offbox-node: ' + json.dumps(dict(facts, label=facts['pin'], run_id=run_id)) + '\n'
 
 
 class NodeCollectionTests(Isolated):
@@ -913,9 +913,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
             node_version.record(dict(run_id='run-test'), path)
             self.assertEqual(len(reads), 10002)
             final, receipt = node_receipt('v24.22.3')
-            with path.open('a') as stream:
-                stream.write('offbox-server: the server restarted while this run was going (attempt 1 is lost); '
-                             'it is queued again as attempt 2\n' + receipt + 'offbox-command-started: run-test\n')
+            path.write_text(receipt + 'offbox-command-started: run-test\n')
             node_version.record(dict(run_id='run-test'), path)
             self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], final)
             # Rewrites/truncation and a trailing partial line must not reuse the old attempt.
@@ -949,7 +947,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.box('bx', member=True)
         a = cli.build_parser().parse_args(['run', '--bg', '--', 'echo hello'])
         runner = runs.Runner(a, self.me)
-        first, receipt = node_receipt('v24.22.1')
+        first, receipt = node_receipt('v24.22.1', runner.run_id)
         marker = f'{runs.COMMAND_STARTED_MARKER} {runner.run_id}\n'
         initial = 'offbox evidence wrapper pid=1\n' + receipt + marker
         with patch.object(pool, 'acquire', return_value=dict(box_id='bx', remote_dir='w/r', size='large')), \
@@ -964,12 +962,13 @@ runpy.run_path(sys.argv[0], run_name='__main__')
             self.assertEqual(json.loads(state.read_text())['node'], first)
             self.assertIn('offbox: node v24.22.1', runner.log_path.with_suffix('.client.log').read_text())
             self.assertNotIn('box pressure', runner.log_path.read_text())
-            final, receipt = node_receipt('v24.22.3')
+            final, receipt = node_receipt('v24.22.3', runner.run_id)
             retained = (initial + 'offbox-server: the server restarted while this run was going (attempt 1 is lost); '
                         'it is queued again as attempt 2\noffbox evidence wrapper pid=2\n' + receipt + marker)
             def history(box, cmd, which, offset, **kw):
                 data = retained if which == 'stderr' else ''
-                return dict(data=data[offset:], nextOffset=len(data), size=len(data), done=False)
+                return dict(data=data[offset:], nextOffset=len(data), size=len(data), done=False,
+                            attempt=2, nodeSetup=dict(stderrOffset=len(initial.encode())))
             with patch.object(api, 'history_logs', side_effect=history):
                 self.assertEqual(misc.logs(runner.run_id, False), 0)
             self.assertEqual(json.loads(state.read_text())['node'], final)
@@ -991,10 +990,84 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                     node_version.record(dict(run_id='run-test'), path)
                     with path.open('a') as stream:
                         stream.write(boundary + tail)
+                    node_version.observe_attempt(path, dict(attempt=2, nodeSetup=dict(
+                        stderrOffset=len(('offbox evidence wrapper pid=1\n' + first + marker).encode()))))
                     node_version.capture_stderr(path, path.read_bytes(), 0)
                     for _ in range(2):
                         resources.finalize(dict(run_id='run-test', mode='bg'), node_only=True)
                     self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], expected)
+
+    def test_attach_uses_attempt_envelope_not_workload_retry_lines(self):
+        _, receipt = node_receipt('v24.22.1')
+        final, latest = node_receipt('v24.22.3')
+        initial = receipt + 'offbox-command-started: run-test\n'
+        current = latest + 'offbox-command-started: run-test\n'
+        path = runs.LOGS_DIR / 'run-test.log'
+        frames = [dict(type='hello', attempt=1), dict(type='stderr', data=initial),
+                  dict(type='attempt', attempt=2),
+                  dict(type='stderr', data=current, attempt=2,
+                       nodeSetup=dict(stderrOffset=len(initial.encode()))), dict(type='exit', exitCode=0)]
+        with patch.object(api, 'BACKEND', 'server'), patch.object(api, 'cmd_attach', return_value=iter(frames)), \
+                patch.object(runs, '_ttl_keeper'):
+            self.assertEqual(runs.follow('bx', 7, path, echo=False, run_id='run-test'), 0)
+        resources.finalize(dict(run_id='run-test', mode='bg'), node_only=True)
+        self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], final)
+
+    def test_receipt_must_name_this_run_before_command_start(self):
+        path = runs.LOGS_DIR / 'run-test.log'
+        runs.save_run_state('run-test', node=None)
+        for run_id in ('another-run', None, 'run-test'):
+            with self.subTest(run_id=run_id):
+                facts, receipt = node_receipt('v24.22.3', run_id)
+                path.write_text(receipt + 'offbox-command-started: run-test\n')
+                node_version.record(dict(run_id='run-test'), path)
+                self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'],
+                                 facts if run_id == 'run-test' else None)
+
+    def test_status_retains_retry_provenance_for_recovered_stderr(self):
+        _, first = node_receipt('v24.22.1')
+        facts, latest = node_receipt('v24.22.3')
+        prefix = first + 'offbox-command-started: run-test\n'
+        path = runs.LOGS_DIR / 'run-test.log'
+        path.write_text(prefix + latest + 'offbox-command-started: run-test\n')
+        metadata = dict(status='exited', running=False, exitCode=0, attempt=2,
+                        nodeSetup=dict(stderrOffset=len(prefix.encode())))
+        with patch.object(api, 'cmd_status', return_value=metadata):
+            self.assertEqual(runs._ended('bx', 7, None, 'run-test'), metadata)
+        node_version.record(dict(run_id='run-test'), path)
+        self.assertEqual(common.read_json(path.with_suffix('.state.json'), {})['node'], facts)
+
+    def test_old_server_retried_setup_clears_previous_node_without_history(self):
+        facts, receipt = node_receipt('v24.22.1')
+        path = runs.LOGS_DIR / 'run-test.log'
+        path.write_text(receipt + 'offbox-command-started: run-test\n')
+        node_version.capture_stderr(path, path.read_bytes(), 0)
+        row = dict(run_id='run-test', mode='bg')
+        resources.finalize(row, node_only=True)
+        self.assertEqual(common.read_json(path.with_suffix('.state.json'), {})['node'], facts)
+        runs.remember_interruption('run-test', dict(attempt=2))
+        for _ in range(2):
+            resources.finalize(row, node_only=True)
+        self.assertIsNone(common.read_json(path.with_suffix('.state.json'), {})['node'])
+
+    def test_remote_command_identity_scopes_attempt_order(self):
+        path = runs.LOGS_DIR / 'run-test.log'
+        old = dict(commandId='cmd_old', attempt=2, nodeSetup=dict(stderrOffset=375))
+        for reported_id in ('cmd_new', None):
+            with self.subTest(reported_id=reported_id):
+                runs.save_run_state('run-test', command_id='cmd_old')
+                node_version.observe_attempt(path, old)
+                runs.save_run_state('run-test', command_id='cmd_new')
+                node_version.observe_attempt(path, old)
+                self.assertEqual(common.read_json(path.with_suffix('.node-attempt.json'), {})['command_id'], 'cmd_old')
+                current = dict(attempt=1, nodeSetup=dict(stderrOffset=0))
+                if reported_id:
+                    current['commandId'] = reported_id
+                node_version.observe_attempt(path, current)
+                expected = dict(command_id='cmd_new', attempt=1, stderrOffset=0)
+                self.assertEqual(common.read_json(path.with_suffix('.node-attempt.json'), {}), expected)
+                node_version.observe_attempt(path, old)
+                self.assertEqual(common.read_json(path.with_suffix('.node-attempt.json'), {}), expected)
 
     def test_nested_wrapper_and_receipt_are_user_output(self):
         facts, receipt = node_receipt('v24.22.1')
@@ -1013,14 +1086,226 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         path.write_text(first + 'offbox-command-started: run-test\n' + 'x' * 131072 + '\n' +
                         'offbox-server: the server restarted while this run was going (attempt 1 is lost); '
                         'it is queued again as attempt 2\n' + receipt + 'offbox-command-started: run-test\n')
-        node_version.record(dict(run_id='run-test'), path)
+        node_version.observe_attempt(path, dict(attempt=2, nodeSetup=dict(stderrOffset=
+            len((first + 'offbox-command-started: run-test\n' + 'x' * 131072 + '\n').encode()))))
+        source = Path(str(path) + '.remote')
+        source.write_bytes(path.read_bytes())
+        node_version.record(dict(run_id='run-test'), path, source=source)
         self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], final)
 
 
 class NodeHistoryTests(unittest.TestCase):
+    def test_metadata_replay_does_not_repeat_display_or_recovery_hash_bytes(self):
+        from test_log_catchup import LogCatchupTests
+        _, old = node_receipt('v24.22.1', 'run-x')
+        facts, current = node_receipt('v24.22.3', 'run-x')
+        first = (old + 'offbox-command-started: run-x\n').encode()
+        raw = first + (current + 'offbox-command-started: run-x\n').encode()
+        final = dict(attempt=2, nodeSetup=dict(stderrOffset=len(first)))
+        for live in (False, True):
+            for initial in (dict(attempt=1), dict(attempt=2)):
+                for recovered in (False, True):
+                    if live and recovered:
+                        continue  # Recovered-copy verification runs to terminal history, not a live snapshot.
+                    with self.subTest(live=live, initial=initial, recovered=recovered):
+                        case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+                        case.setUp()
+                        try:
+                            case.prefix(b'')
+                            case.state('running' if live else 'done', None if live else 0)
+                            if recovered:
+                                Path(str(case.path) + '.remote').write_bytes(raw)
+                                common.atomic_write_json(Path(str(case.path) + '.remote.json'), dict(
+                                    merged=True, lengths=[0, len(raw)], hashes=[hashlib.sha256(b'').hexdigest(),
+                                                                             hashlib.sha256(raw).hexdigest()]))
+                            calls = []
+                            def changing_history(box, command, stream, offset, **kw):
+                                if stream == 'stdout':
+                                    return dict(data='', nextOffset=0, size=0, done=True, **initial)
+                                calls.append(offset)
+                                before = len(calls) == 1
+                                source = first if before else raw
+                                data = source[offset:offset + 37]
+                                return dict(data=data.decode(), nextOffset=offset + len(data), size=len(source),
+                                            done=offset + len(data) == len(source), **(initial if before else final))
+                            case.history.side_effect = changing_history
+                            with patch.object(api, 'BACKEND', 'server'):
+                                self.assertIn(misc._catch_up_log(case.row(), live=live), ('complete', 'caught_up'))
+                                case.state('done', 0)
+                                case.streams(b'', raw, page=37)
+                                ordinary = case.history.side_effect
+                                case.history.side_effect = lambda *a, **kw: dict(ordinary(*a, **kw), **final)
+                                for _ in range(2):
+                                    self.assertIn(misc._catch_up_log(case.row()), ('complete', 'caught_up'))
+                            self.assertEqual(case.path.read_bytes(), raw)
+                            self.assertEqual(common.checkpoint(case.path),
+                                             dict(stdoutOffset=0, stderrOffset=len(raw), logBytes=len(raw)))
+                            self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'], facts)
+                        finally:
+                            case.doCleanups()
+
+    def test_replacement_remote_command_resets_node_provenance(self):
+        from test_log_catchup import LogCatchupTests
+        case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+        case.setUp()
+        try:
+            old_facts, old = node_receipt('v24.22.1', 'run-x')
+            facts, current = node_receipt('v24.22.3', 'run-x')
+            prefix = b'previous invocation\n' * 15
+            runs.save_run_state('run-x', command_id='cmd_old')
+            metadata = dict(commandId='cmd_old', attempt=2, nodeSetup=dict(stderrOffset=len(prefix)))
+            runs.remember_interruption('run-x', metadata)
+            node_version.capture_stderr(case.path, prefix + old.encode(), 0)
+            resources.finalize(case.row(), node_only=True)
+            self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'], old_facts)
+            case.con.execute("UPDATE runs SET status='running',client_pid=?,command_id='cmd_old' WHERE run_id='run-x'",
+                             (os.getpid(),))
+            case.con.commit()
+            runs.reset_disk_retry(SimpleNamespace(started=False, run_id='run-x'))
+            self.assertFalse(case.path.with_suffix('.node-attempt.json').exists())
+            self.assertIsNone(common.read_json(case.path.with_suffix('.state.json'), {})['node'])
+            runs.remember_interruption('run-x', metadata)  # A late reply during replacement cannot restore it.
+            self.assertFalse(case.path.with_suffix('.node-attempt.json').exists())
+            case.con.execute("UPDATE runs SET status='done',exit_code=0,box_id='bx_a',process_id=7,"
+                             "command_id='cmd_a' WHERE run_id='run-x'")
+            case.con.commit()
+            runs.save_run_state('run-x', status='done', box_id='bx_a', process_id=7, command_id='cmd_a', exit_code=0)
+            case.prefix(b'')
+            raw = (current + 'offbox-command-started: run-x\n').encode()
+            case.streams(b'', raw, page=37)
+            ordinary = case.history.side_effect
+            case.history.side_effect = lambda *a, **kw: dict(ordinary(*a, **kw), commandId='cmd_a',
+                                                           attempt=1, nodeSetup=dict(stderrOffset=0))
+            with patch.object(api, 'BACKEND', 'server'):
+                self.assertEqual(case.invoke(wait=True)[0], 0)
+            context = common.read_json(case.path.with_suffix('.node-attempt.json'), {})
+            runs.remember_interruption('run-x', metadata)
+            self.assertEqual(common.read_json(case.path.with_suffix('.node-attempt.json'), {}), context)
+            self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'], facts)
+            self.assertEqual(case.path.read_bytes(), raw)
+        finally:
+            case.doCleanups()
+
+    def test_stale_node_clear_respects_caller_deadline(self):
+        from test_log_catchup import LogCatchupTests
+        for budget in (0, 1):
+            with self.subTest(budget=budget):
+                case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+                case.setUp()
+                try:
+                    facts, _ = node_receipt('v24.22.1', 'run-x')
+                    runs.save_run_state('run-x', node=facts)
+                    clock, calls = [1000.0], []
+                    @contextlib.contextmanager
+                    def busy_lock(name, timeout=600):
+                        calls.append(timeout)
+                        clock[0] += timeout
+                        raise common.OffboxError('isolated state lock contention')
+                        yield
+                    def advance(seconds):
+                        clock[0] += seconds
+                    with patch.object(runs, 'file_lock', busy_lock), \
+                            patch.object(runs, 'now', side_effect=lambda: clock[0]), \
+                            patch.object(runs.time, 'sleep', side_effect=advance):
+                        runs.remember_interruption('run-x', dict(attempt=2, nodeSetup=dict(stderrOffset=300)),
+                                                   until=1000 + budget)
+                    self.assertTrue(calls)
+                    self.assertEqual(set(calls), {0})
+                    self.assertLessEqual(clock[0], 1000 + budget)
+                finally:
+                    case.doCleanups()
+
+    def test_final_node_collection_cannot_extend_history_deadline(self):
+        from test_log_catchup import LogCatchupTests
+        for update in ('clear stale facts', 'save fresh facts'):
+            with self.subTest(update=update):
+                case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+                case.setUp()
+                try:
+                    facts, receipt = node_receipt('v24.22.1', 'run-x')
+                    initial = (receipt + 'offbox-command-started: run-x\n').encode()
+                    runs.save_run_state('run-x', command_id='cmd_a', node=None)
+                    runs.remember_interruption('run-x', dict(commandId='cmd_a', attempt=1,
+                                                            nodeSetup=dict(stderrOffset=0)))
+                    case.prefix(initial, out=0, err=len(initial))
+                    node_version.capture_stderr(case.path, initial, 0)
+                    if update == 'clear stale facts':
+                        resources.finalize(case.row(), node_only=True)
+                    case.state('running', None)
+                    clock, calls = [1000.0], []
+                    actual_lock = runs.file_lock
+                    @contextlib.contextmanager
+                    def contention(name, timeout=600):
+                        if name != 'run-state-run-x':
+                            with actual_lock(name, timeout=timeout) as acquired:
+                                yield acquired
+                            return
+                        calls.append(timeout)
+                        clock[0] += timeout
+                        raise common.OffboxError('modeled isolated state lock contention')
+                        yield
+                    def page(box, command, stream, offset, **kw):
+                        source = b'' if stream == 'stdout' else initial
+                        return dict(data=source[offset:].decode(), nextOffset=len(source), size=len(source),
+                                    done=False, commandId='cmd_a', attempt=2 if update == 'clear stale facts' else 1,
+                                    nodeSetup=dict(stderrOffset=len(initial) if update == 'clear stale facts' else 0))
+                    case.history.side_effect = page
+                    def advance(seconds):
+                        clock[0] += seconds
+                    checkpoint = common.checkpoint(case.path)
+                    with patch.object(api, 'BACKEND', 'server'), patch.object(runs, 'file_lock', contention), \
+                            patch.object(misc.time, 'time', side_effect=lambda: clock[0]), \
+                            patch.object(runs, 'now', side_effect=lambda: clock[0]), \
+                            patch.object(runs.time, 'sleep', side_effect=advance):
+                        result = misc._catch_up_log(case.row(), budget=1, live=True)
+                    self.assertEqual(result, 'incomplete:timeout' if update == 'clear stale facts' else 'complete')
+                    self.assertTrue(calls)
+                    self.assertEqual(set(calls), {0})
+                    self.assertLessEqual(clock[0], 1001)
+                    self.assertEqual(case.path.read_bytes(), initial)
+                    self.assertEqual(common.checkpoint(case.path), checkpoint)
+                    resources.finalize(case.row(), node_only=True)
+                    self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'],
+                                     None if update == 'clear stale facts' else facts)
+                finally:
+                    case.doCleanups()
+
+    def test_recovered_node_collection_never_waits_for_state_writer(self):
+        from test_log_catchup import LogCatchupTests
+        for update in ('clear stale facts', 'save fresh facts'):
+            with self.subTest(update=update):
+                case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+                case.setUp()
+                try:
+                    facts, receipt = node_receipt('v24.22.3', 'run-x')
+                    raw = receipt.encode() if update == 'save fresh facts' else b'no receipt\n'
+                    runs.save_run_state('run-x', node=None if update == 'save fresh facts' else facts)
+                    Path(str(case.path) + '.remote').write_bytes(raw)
+                    common.atomic_write_json(Path(str(case.path) + '.remote.json'), dict(
+                        merged=True, lengths=[0, len(raw)], hashes=[hashlib.sha256(b'').hexdigest(),
+                                                                  hashlib.sha256(raw).hexdigest()]))
+                    actual_lock, calls = runs.file_lock, []
+                    @contextlib.contextmanager
+                    def contention(name, timeout=600):
+                        if name != 'run-state-run-x':
+                            with actual_lock(name, timeout=timeout) as acquired:
+                                yield acquired
+                            return
+                        calls.append(timeout)
+                        raise common.OffboxError('modeled isolated state lock contention')
+                        yield
+                    with patch.object(runs, 'file_lock', contention):
+                        resources.finalize(case.row(), node_only=True)
+                    self.assertEqual(calls, [0])
+                    resources.finalize(case.row(), node_only=True)
+                    self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'],
+                                     facts if update == 'save fresh facts' else None)
+                finally:
+                    case.doCleanups()
+
     def test_metadata_repair_never_rewinds_committed_display_offsets(self):
         from test_log_catchup import LogCatchupTests
-        facts, receipt = node_receipt('v24.22.3')
+        facts, receipt = node_receipt('v24.22.3', 'run-x')
         stdout = b'workload stdout\n'
         stderr = ('offbox evidence wrapper pid=1\n' + receipt + 'offbox-command-started: run-x\nresult\n').encode()
         for live in (False, True):
@@ -1049,8 +1334,8 @@ class NodeHistoryTests(unittest.TestCase):
 
     def test_stdout_cannot_supply_or_suppress_setup_facts_on_logs_then_wait(self):
         from test_log_catchup import LogCatchupTests
-        facts, receipt = node_receipt('v24.22.1')
-        _, other = node_receipt('v24.22.3')
+        facts, receipt = node_receipt('v24.22.1', 'run-x')
+        _, other = node_receipt('v24.22.3', 'run-x')
         forms = {
             'older log': 'offbox evidence wrapper pid=99\n' + other + 'offbox-command-started: older-run\n',
             'older marker': 'offbox-command-started: older-run\n',
@@ -1085,10 +1370,108 @@ class NodeHistoryTests(unittest.TestCase):
                 finally:
                     case.doCleanups()
 
+    def test_stderr_replayed_logs_cannot_reopen_setup(self):
+        from test_log_catchup import LogCatchupTests
+        facts, receipt = node_receipt('v24.22.1', 'run-x')
+        retry = ('offbox-server: the server restarted while this run was going (attempt 1 is lost); '
+                 'it is queued again as attempt 2\n')
+        for mode in ('history', 'recovered'):
+            for identity in ('older-run', 'run-x', None):
+                for body in ('receipt', 'missing', 'malformed'):
+                    with self.subTest(mode=mode, identity=identity, body=body):
+                        _, nested = node_receipt('v24.22.3', identity)
+                        if body == 'missing':
+                            nested = ''
+                        elif body == 'malformed':
+                            nested = 'offbox-node: {}\n'
+                        stderr = ('offbox evidence wrapper pid=1\n' + receipt +
+                                  'offbox-command-started: run-x\n' + retry +
+                                  'offbox evidence wrapper pid=99\n' + nested +
+                                  'offbox-command-started: older-run\n').encode()
+                        case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+                        case.setUp()
+                        try:
+                            case.prefix(b'')
+                            case.state('running', None)
+                            if mode == 'history':
+                                case.streams(b'', stderr, page=37)
+                                with patch.object(misc, '_refresh_running_ttl'), patch.object(api, 'BACKEND', 'server'):
+                                    self.assertEqual(case.invoke()[0], 0)
+                                    case.state('done', 0)
+                                    self.assertEqual(case.invoke(wait=True)[0], 0)
+                            else:
+                                remote = Path(str(case.path) + '.remote')
+                                remote.write_bytes(stderr)
+                                Path(str(case.path) + '.remote.json').write_text(json.dumps(dict(
+                                    merged=True, lengths=[0, len(stderr)], hashes=[
+                                        hashlib.sha256(b'').hexdigest(), hashlib.sha256(stderr).hexdigest()])))
+                                for _ in range(2):
+                                    resources.finalize(dict(case.row()), node_only=True)
+                            self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'], facts)
+                            client = case.path.with_suffix('.client.log').read_text()
+                            self.assertEqual(client.count('offbox: node v24.22.1'), 1)
+                            self.assertNotIn('v24.22.3', client)
+                        finally:
+                            case.doCleanups()
+
+    def test_retry_provenance_selects_setup_without_trusting_retry_text(self):
+        from test_log_catchup import LogCatchupTests
+        _, old = node_receipt('v24.22.1', 'run-x')
+        final, receipt = node_receipt('v24.22.3', 'run-x')
+        first = (old + 'offbox-command-started: run-x\n').encode()
+        current = (receipt + 'offbox-command-started: run-x\n').encode()
+        for mode in ('history', 'recovered'):
+            for boundary in (len(first), None):
+                with self.subTest(mode=mode, boundary=boundary):
+                    case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+                    case.setUp()
+                    try:
+                        case.prefix(b'')
+                        raw = first + current
+                        metadata = (dict(attempt=2) if boundary is None else
+                                    dict(attempt=2, nodeSetup=dict(stderrOffset=boundary)))
+                        if mode == 'history':
+                            def history(box, command, stream, offset, **kw):
+                                data = raw if stream == 'stderr' else b''
+                                return dict(data=data[offset:].decode(), nextOffset=len(data), size=len(data),
+                                            done=True, **metadata)
+                            with patch.object(api, 'history_logs', side_effect=history):
+                                self.assertEqual(case.invoke(wait=True)[0], 0)
+                        else:
+                            node_version.observe_attempt(case.path, metadata)
+                            remote = Path(str(case.path) + '.remote')
+                            remote.write_bytes(raw)
+                            Path(str(case.path) + '.remote.json').write_text(json.dumps(dict(
+                                merged=True, lengths=[0, len(raw)], hashes=[
+                                    hashlib.sha256(b'').hexdigest(), hashlib.sha256(raw).hexdigest()])))
+                            resources.finalize(dict(case.row()), node_only=True)
+                        state = common.read_json(case.path.with_suffix('.state.json'), {})
+                        self.assertEqual(state.get('node'), final if boundary is not None else None)
+                    finally:
+                        case.doCleanups()
+
+    def test_old_server_without_setup_retry_still_records_node(self):
+        from test_log_catchup import LogCatchupTests
+        facts, receipt = node_receipt('v24.22.1', 'run-x')
+        stderr = (receipt + 'offbox-command-started: run-x\n').encode()
+        case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+        case.setUp()
+        try:
+            case.prefix(b'')
+            def history(box, command, stream, offset, **kw):
+                data = stderr if stream == 'stderr' else b''
+                return dict(data=data[offset:].decode(), nextOffset=len(data), size=len(data),
+                            done=True, attempt=1)
+            with patch.object(api, 'history_logs', side_effect=history):
+                self.assertEqual(case.invoke(wait=True)[0], 0)
+            self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'], facts)
+        finally:
+            case.doCleanups()
+
     def test_old_waiter_display_log_is_repaired_only_from_stderr_history(self):
         from test_log_catchup import LogCatchupTests
-        facts, receipt = node_receipt('v24.22.1')
-        _, other = node_receipt('v24.22.3')
+        facts, receipt = node_receipt('v24.22.1', 'run-x')
+        _, other = node_receipt('v24.22.3', 'run-x')
         case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
         case.setUp()
         try:
@@ -1110,8 +1493,8 @@ class NodeHistoryTests(unittest.TestCase):
 
 class RecoveredNodeTests(_BackgroundOutputFixture):
     def test_verified_recovered_stderr_collects_for_logs_and_wait(self):
-        facts, receipt = node_receipt('v24.22.3')
-        _, forged = node_receipt('v24.99.0')
+        facts, receipt = node_receipt('v24.22.3', 'run-x')
+        _, forged = node_receipt('v24.99.0', 'older-run')
         stdout, stderr = forged.encode(), receipt.encode()
         self.box_get.return_value = dict(state='running')
         self.history.side_effect = runs.OffboxError('history unavailable')
@@ -1128,7 +1511,7 @@ class RecoveredNodeTests(_BackgroundOutputFixture):
         self.assertNotIn('v24.99.0', label)
 
     def test_unverified_or_changed_recovered_copy_cannot_supply_facts(self):
-        _, receipt = node_receipt('v24.22.3')
+        _, receipt = node_receipt('v24.22.3', 'run-x')
         raw = receipt.encode()
         remote = Path(str(self.path) + '.remote')
         self.path.write_text('')

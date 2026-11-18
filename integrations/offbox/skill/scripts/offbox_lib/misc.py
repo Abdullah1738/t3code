@@ -1128,6 +1128,9 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                     if time.time() >= deadline:
                         return 'incomplete:timeout'
                     remember_interruption(r['run_id'], page, until=deadline)
+                    if i == 1 and read_offset > node_version.stderr_offset(path):
+                        read_offset = 0
+                        continue
                     if live and api.BACKEND == 'server' and page.get('status'):
                         from .home_run_observation import observe
                         observe(r['run_id'], page['status'], status=page['status'], attempt=page.get('attempt'))
@@ -1152,8 +1155,9 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                         return 'incomplete:invalid history offset'
                     if remote.get('lengths'):
                         # stdout matches its prefix; stderr also has the outer wrapper's PID diagnostic first.
+                        # Metadata replay may rewind reads; hashes retain their already consumed progress.
                         expected = remote['lengths'][i]
-                        payload = data
+                        payload = data[max(0, offsets[i] - read_offset):]
                         if trimming:
                             header.extend(payload)
                             if b'\n' not in header and len(header) <= 256:
@@ -1169,7 +1173,7 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                         copied[i] += len(chunk)
                     if i == 1:
                         node_version.capture_stderr(path, data, read_offset)
-                    skip = max(0, ck[which + 'Offset'] - read_offset)
+                    skip = max(0, max(ck[which + 'Offset'], offsets[i]) - read_offset)
                     dst.write(data[skip:])
                     empty_pages = 0
                     read_offset = nxt
