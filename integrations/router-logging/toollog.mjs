@@ -8,9 +8,10 @@ const CAP = 200 * 1024 * 1024;
 const seen = new Set();
 const failurePhases = new WeakMap();
 const props = new Set(['model','size','count','status','enabled','locked','limited','reloginNeeded','state','action','tag','dryRun','complete','cost','hour','exitCode','attempt','source','failed','total','fourxx','fivexx','phase','durationMaxMs','omitted']);
-for (const prop of ['target', 'ok', 'loopBlockMaxMs', 'longestSyncOp', 'longestSyncMs']) props.add(prop);
+for (const prop of ['target', 'ok', 'loopBlockMaxMs', 'longestSyncOp', 'longestSyncMs', 'httpStatus']) props.add(prop);
 const numericScanProps = new Set(['loopBlockMaxMs', 'longestSyncMs']);
 const safeProp = (key, value) => {
+  if (key === 'httpStatus') return Number.isFinite(value);
   if (numericScanProps.has(key)) return Number.isFinite(value) && value >= 0;
   if (key === 'longestSyncOp') return Boolean(token(value));
   if (key === 'target') return ['control', 'opencode'].includes(value);
@@ -32,6 +33,7 @@ const errorMessage = (value, tag) => messages.has(value) ? value.slice(0, 300) :
 const replicaProps = value => Object.fromEntries(['replicaGeneration', 'replicaAgeMs', 'threadAheadMs', 'deferredThreads', 'maxThreadAheadMs']
   .filter(key => value?.[key] !== undefined)
   .map(key => [key, Number.isFinite(value[key]) ? value[key] : 'unknown']));
+const httpProps = value => Number.isFinite(value?.httpStatus) ? { httpStatus: value.httpStatus } : {};
 export function failure(value, result = false) {
   try {
     const fetchFailed = !result && value?.name === 'TypeError' && value?.message === 'fetch failed';
@@ -130,7 +132,7 @@ export async function observed(component, name, work, fields = {}) {
   try {
     result = await work();
   } catch (error) {
-    try { emit(component, name, { ...fields, props:{...fields.props, ...replicaProps(error), ...(failurePhases.has(error) ? {phase:failurePhases.get(error)} : {})}, kind:'error', ok:false, durationMs:performance.now()-start, error:failure(error) }); } catch {}
+    try { emit(component, name, { ...fields, props:{...fields.props, ...replicaProps(error), ...httpProps(error), ...(failurePhases.has(error) ? {phase:failurePhases.get(error)} : {})}, kind:'error', ok:false, durationMs:performance.now()-start, error:failure(error) }); } catch {}
     throw error;
   }
   try {

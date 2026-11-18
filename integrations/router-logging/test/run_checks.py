@@ -25,5 +25,19 @@ with tempfile.TemporaryDirectory(prefix='9router-fixtures-') as scratch:
                     samples.setdefault(row['name'], row)
             except (ValueError, KeyError):
                 pass
+    fixture_codes = {'TEST_CUTOVER_UNAVAILABLE', 'TEST_SEND_FAILED', 'TEST_DISPATCH_FAILED', 'TEST_LEDGER_UNAVAILABLE'}
+    emitted_codes = set()
+    for path in [capture, *(root / 'logs').glob('*.ndjson')]:
+        if path.exists():
+            for line in path.read_text().splitlines():
+                try:
+                    row = json.loads(line)
+                    code = row.get('error', {}).get('tag')
+                    if code in fixture_codes:
+                        assert row['error']['message'] == code, row
+                        emitted_codes.add(code)
+                except (ValueError, KeyError):
+                    pass
+    assert emitted_codes >= fixture_codes, fixture_codes - emitted_codes
     for name in sorted(samples):
         print('SAMPLE ' + json.dumps(samples[name], separators=(',', ':')))

@@ -30,7 +30,7 @@ export async function check(opts, io = realIo) {
 async function checkImpl(opts, io) {
   const start = performance.now();
   const decision = (action, ok = true) => emit('catalog-guard', 'catalog.decision', { kind: ok ? 'perf' : 'error', ok, durationMs: performance.now() - start, props: { action, tag: action, dryRun: opts.dryRun }, ...(ok ? {} : { error: { tag: action } }) });
-  if (io.INSTANCE_ID !== 'opencode') throw new Error('catalog-guard only compares the OpenCode instance');
+  if (io.INSTANCE_ID !== 'opencode') throw Object.assign(new Error('catalog-guard only compares the OpenCode instance'), { code: 'CATALOG_INSTANCE_INVALID' });
   const now = Date.now();
   const state = opts.dryRun ? {} : io.readState();
   const cache = io.readJson(opts.cache);
