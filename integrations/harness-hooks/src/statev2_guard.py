@@ -4529,14 +4529,15 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 invocation = _fixture_invocation(shlex.join(run))
                 # The walker resolved this cd; the proof must run where it
                 # landed. select.py walks $PWD, which keeps a symlinked
-                # target's logical path, and the caller's shell started in cwd.
+                # target's logical path (the fixture's HERE cd included, so
+                # pass the script), and the caller's shell started in cwd.
                 logical = os.path.normpath(os.path.join(str(cwd), target)) if cwd is not None and target is not None else None
                 if target is not None and (
                         caller_command is not None or 'offbox' in map(os.path.basename, run) or
                         cwd is None or directory is None or
                         os.path.realpath(logical) != os.path.realpath(directory) or
                         any(os.environ.get(name) and not (inherited_startup_safe(name, str(cwd)) and
-                                                          inherited_startup_safe(name, logical))
+                                                          inherited_startup_safe(name, logical, value))
                             for name in ('BASH_ENV', 'ENV'))):
                     invocation = []
         except ValueError:

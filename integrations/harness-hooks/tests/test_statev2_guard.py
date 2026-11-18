@@ -5969,6 +5969,28 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             self.assertEqual(guard.classify(f'cd ./bad/alias && bash {fixture} | tail -3', start), SCRIPT)
             self.assertIsNone(guard.classify(f'cd {self.root}/physical/deep && bash {fixture} | tail -3', start))
 
+    def test_fixture_wrapper_cd_logical_script_here(self):
+        # A relative script's HERE cd ($0/..) also runs against the logical
+        # $PWD: from start/parent/alias it reaches start/parent/other, not
+        # physical/other.
+        self.write_plain_subpath_fixture()
+        source = (self.root / 'tmp/fixture.sh').read_text()
+        _, _, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        self.write('physical/other/tests/fixture.sh', source)
+        (self.root / 'physical/deep').mkdir(parents=True)
+        (self.root / 'start/parent/other').mkdir(parents=True)
+        (self.root / 'start/parent/alias').symlink_to(self.root / 'physical/deep')
+        start = str(self.root / 'start')
+        command = 'cd ./parent/alias && bash ../other/tests/fixture.sh | tail -3'
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(guard.classify(command, start))
+            (self.root / 'start/parent/other/.nvmrc').symlink_to(marker)
+            self.assertEqual(guard.classify(command, start), SCRIPT)
+            self.assertEqual(guard.classify(command.replace(' | tail -3', ''), start), SCRIPT)
+        # Without BASH_ENV no selector runs, so the fixture proof stands.
+        self.assertIsNone(guard.classify(command, start))
+
     def test_repo_node_pin_hashes_cover_fork_helpers(self):
         # Editing local-helpers' repo-node-pin turns the fixture proof off
         # until the guard reviews and pins the new bytes.
