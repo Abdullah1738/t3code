@@ -1,5 +1,6 @@
 """Replay the existing transport fixtures and verify observable diagnostic coverage."""
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -7,6 +8,14 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+
+
+if importlib.util.find_spec('cryptography') is None:
+    raise ImportError(
+        "app-api-cli tests need `cryptography`; run them with the commerce CLI's interpreter "
+        f"({Path.home() / '.local/share/uv/tools/mitmproxy/bin/python'}) "
+        "or install test/requirements.txt in the test environment"
+    )
 
 
 class LaneLogs(unittest.TestCase):
