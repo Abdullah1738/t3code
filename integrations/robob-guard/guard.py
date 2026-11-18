@@ -71,6 +71,24 @@ def record_check_error(state, now, backend_up):
             state["pending_alerts"].setdefault(key, dict(kind="check-error", at=now))
 
 
+def record_orphan_block(state, now, orphan, conflict):
+    fresh_conflict = (conflict is not None and (state["ownership_conflict_at"] is None
+                      or conflict["at"] > state["ownership_conflict_at"]))
+    if orphan is None and not fresh_conflict:
+        return None
+    if state["orphan_episode"] is None:
+        state["orphan_episode"] = int(now)
+    state["orphan_blocked"] = True
+    if orphan is not None:
+        state["orphan_owner"] = orphan
+    if fresh_conflict:
+        state["ownership_conflict_at"] = conflict["at"]
+    key = "robob-guard:%s:orphan-backend" % state["orphan_episode"]
+    if key not in state["alerts_sent"]:
+        state["pending_alerts"].setdefault(key, dict(kind="orphan-backend", at=now, backend=orphan))
+    return "replace-blocked:orphan-backend pid=%s" % (orphan["pid"] if orphan else "unknown")
+
+
 def decide(previous, *, now, up, boot_time, hold=None, hold_pid_alive=False, desktop=None,
            orphan=None, orphan_known=True, conflict=None):
     state = copy.deepcopy(previous)
@@ -110,22 +128,9 @@ def decide(previous, *, now, up, boot_time, hold=None, hold_pid_alive=False, des
     else:
         state["down_count"] += 1
         statuses.append("down " + str(state["down_count"]))
-        fresh_conflict = (conflict is not None and (state["ownership_conflict_at"] is None
-                          or conflict["at"] > state["ownership_conflict_at"]))
-        if orphan is not None or fresh_conflict:
-            if state["orphan_episode"] is None:
-                state["orphan_episode"] = int(now)
-            state["orphan_blocked"] = True
-            if orphan is not None:
-                state["orphan_owner"] = orphan
-            if fresh_conflict:
-                state["ownership_conflict_at"] = conflict["at"]
-            key = "robob-guard:%s:orphan-backend" % state["orphan_episode"]
-            if key not in state["alerts_sent"]:
-                state["pending_alerts"].setdefault(key, dict(kind="orphan-backend", at=now,
-                                                           backend=orphan))
-            pid = orphan["pid"] if orphan else "unknown"
-            return state, statuses + ["replace-blocked:orphan-backend pid=%s" % pid], "backoff"
+        blocked = record_orphan_block(state, now, orphan, conflict)
+        if blocked is not None:
+            return state, statuses + [blocked], "backoff"
         if not orphan_known:
             return state, statuses + ["orphan-backend-unverified"], "backoff"
         retry_after_orphan = state["orphan_blocked"]
@@ -730,6 +735,13 @@ def check(home):
             detail = "step=%s errors=%s %s" % (step, state["check_error_count"], error)
         if not ownership_checked and up is not True:
             orphan, conflict, ownership_errors = backend_ownership(home, state)
+        if check_failed and up is not True:
+            # Confirmed ownership still matters when another observation failed.
+            # Retain the owner before diagnostics-only reads can disappear next tick.
+            blocked = record_orphan_block(state, now, orphan, conflict)
+            if blocked is not None:
+                statuses.append(blocked)
+                action = "backoff"
         if ownership_errors and up is not True and not check_failed:
             reset_unready(state)
             record_check_error(state, now, up)

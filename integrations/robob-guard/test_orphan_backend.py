@@ -342,6 +342,57 @@ class OrphanTests(unittest.TestCase):
         self.assertIn("check-error:ValueError", self.log())
         self.assertIn('orphan_backend={"pid":43', self.log())
 
+    def test_check_error_persists_confirmed_ownership_and_alert_before_runtime_disappears(self):
+        rows = [(step, signal, delivered) for step in ["backend_ready", "desktop_snapshot"]
+                for signal in ["orphan", "conflict", "older-conflict"] for delivered in [False, True]]
+        for step, observation, delivered in rows:
+            with self.subTest(step=step, observation=observation, delivered=delivered):
+                self.desktop, self.registration, self.parent = None, set(), 1
+                self.alive = observation == "orphan"
+                guard.atomic_json(self.runtime_path, self.runtime)
+                state = guard.initial_state()
+                state.update(last_replace=10000, last_reopen=10000, awaiting_reopen=True)
+                guard.atomic_json(self.state_path, state)
+                self.child_log.parent.mkdir(parents=True, exist_ok=True)
+                self.child_log.write_text(self.conflict_line(9999 if observation == "older-conflict" else 10001)
+                                          if observation != "orphan" else "")
+                self.notify_mock.reset_mock()
+                self.notify_mock.return_value = delivered
+                self.reopen_mock.reset_mock()
+                with patch("guard." + step, side_effect=subprocess.TimeoutExpired(step, 10)):
+                    state = self.tick(10030)
+                self.assertEqual(state["check_error_count"], 1)
+                self.assertEqual(state["orphan_blocked"], observation != "older-conflict")
+                key = "robob-guard:10030:orphan-backend"
+                if observation == "older-conflict":
+                    self.notify_mock.assert_not_called()
+                    self.assertIsNone(state["orphan_owner"])
+                    continue
+                self.notify_mock.assert_called_once()
+                if delivered:
+                    self.assertIn(key, state["alerts_sent"])
+                else:
+                    self.assertEqual(state["pending_alerts"][key]["kind"], "orphan-backend")
+                self.assertIn("check-error:TimeoutExpired replace-blocked:orphan-backend", self.log())
+                self.reopen_mock.assert_not_called()
+                self.stop_unready_desktop_mock.assert_not_called()
+                if observation == "orphan":
+                    self.assertEqual(state["orphan_owner"], dict(self.runtime, ppid=1, listening=True))
+                    self.runtime_path.unlink()
+                    state = self.tick(10060)
+                    self.assertTrue(state["orphan_blocked"])
+                    self.reopen_mock.assert_not_called()
+                    self.assertEqual(self.notify_mock.call_count, 1 if delivered else 2)
+                    self.alive = False
+                    state = self.tick(10090)
+                else:
+                    self.assertIsNone(state["orphan_owner"])
+                    self.assertEqual(state["ownership_conflict_at"], 10001)
+                    state = self.tick(10060)
+                self.reopen_mock.assert_called_once()
+                self.assertFalse(state["orphan_blocked"])
+                self.kill_mock.assert_not_called()
+
     def test_notify_orphan_text_and_key(self):
         alert = dict(kind="orphan-backend", at=10000, backend=dict(self.runtime, ppid=1, listening=True))
         with patch("guard.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
