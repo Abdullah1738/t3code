@@ -18,7 +18,7 @@ const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
   alertKind: ["pause", "failing", "recovered"],
-  severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy"],
+  severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy", "stuck_previous"],
   source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored", "logged"],
   authKind: ["otp", "signin_link"],
   senderLabel: ["Emirates NBD", "Emirates Islamic", "Mashreq", "ADCB", "Wio", "Apple", "Google", "WHOOP", "Claude", "Virgin", "e&", "du", "your bank", "an inbox sender"],
@@ -66,10 +66,13 @@ function fields(entry: LogEntry, at: Date) {
   }
   const props: Record<string, unknown> = {};
   const fileEvent = ["data_read.retried", "data_read.failed", "data_write.retried", "data_write.failed", "runs_log.write_failed"].includes(entry.name);
+  const stuckEvent = entry.component === "runner" && ["watch.skip", "watch.stuck_group", "watch.stuck_exited"].includes(entry.name);
   for (const [key, value] of Object.entries(entry.props ?? {})) {
     // Only triage supplies a bounded, credential-redacted classifier diagnostic.
     if (entry.component === "triage" && entry.name === "triage.classify" && key === "classifier_error"
       && typeof value === "string" && value.length <= 400 && !/[\x00-\x1f]/.test(value)) props[key] = value;
+    else if (stuckEvent && key === "diagnostic" && typeof value === "string" && value.length <= 4_000 && !/[\x00-\x1f]/.test(value)) props[key] = value;
+    else if (stuckEvent && ["pgid", "pid", "killedAt", "ageMs"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (fileEvent && key === "path" && typeof value === "string" && value.length <= 1024 && value.startsWith("/") && !/[\x00-\x1f]/.test(value)) props[key] = value;
     else if (fileEvent && (key === "attempts" || key === "ms") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (fileEvent && key === "dataless" && typeof value === "boolean") props[key] = value;
