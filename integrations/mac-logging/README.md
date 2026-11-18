@@ -499,11 +499,24 @@ redacted. No du stdout, unified log messages, report contents or arbitrary
 exception text is logged. Parse failures use fixed messages. Commands use the
 C locale so permission diagnostics can be identified consistently.
 
-A completed du that exits 1 solely because of unreadable entries still supplies
-a usable root total. That source emits a successful event with `partial=true`
-and `deniedCount` plus the readable `bytes`; the cached inventory retains those flags in `partials`.
-Other exits and timeouts do not supply usable du totals. A partial total measures
-only readable entries; permission grants remain an owner action.
+Denied children retain readable bytes (zero when du can read nothing), with
+`denied=true`, `estimate=true`, and `partial=false` on the child. They are
+refreshed only by the deep pass. Roots whose only gaps are denied children
+report `completeWithDenied`; `disk.inventory.rootsComplete` includes these
+roots and `rootsCompleteWithDenied` names their count. Their cached root stays
+in `partials` so disk-growth attribution does not treat estimates as exact.
+Vanished children count as zero only after lstat confirms absence on available
+storage. Attributable batch errors affect only their child; unknown diagnostics
+retain conservative batch handling.
+
+Child source events retain deep probe cost metrics, errors and notable successes
+(new ≥1 GiB, change ≥1 GiB or ≥20%, or ≥10 seconds). Root summaries and the hourly inventory
+carry denial, timeout, backoff and estimate counts and the top three child costs.
+Batch costs are equal shares of command time, not individual timings.
+`disk.deep.end.secondsByRoot` accounts for root turns without double-counting
+batched child rows. Failed 600-second leaf scans retry only in deep passes,
+with delays of 1, 2, 4 then 8 days. Budget-truncated probes do not acquire this
+backoff. Parent probes still descend immediately into checkpointed parts.
 
 Big roots emit child source events with `bytes`, `exitCode`, `elapsedMs`,
 `partial`, and `deniedCount`, plus a root aggregate with `completedCount` and
