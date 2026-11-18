@@ -59,6 +59,7 @@ import { KanbanToolkit, type ModelInput } from "./tools.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
 import * as McpBoardReplies from "../engine/mcpBoardReplies.ts";
 import * as Activity from "../engine/activity.ts";
+import * as ActivityRead from "./activityRead.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
 
 const askGateNote = (
@@ -670,8 +671,7 @@ const handlers = {
             "bad_time",
             window.startsWith("until") ? "until" : "since",
           );
-        const read = yield* service.activity(board.id, window);
-        return { activity: { boardId: board.id, ...Activity.rollup({ window, ...read }) } };
+        return yield* ActivityRead.read(service, board.id, window);
       }),
     ),
   ),
