@@ -45,6 +45,7 @@ BACKEND_STATE = _HOME_STATE / "backend-state.json"
 HOME_FAILURES = _HOME_STATE / "home-failures.jsonl"
 PERSON_PREFIX = "person:"          # OFFBOX_THREAD=person:<name>, set by offbox-person for someone's own box
 DEFAULT_OWNER = "ardud"
+OFFBOX_BUN_DEFAULT = "1.4.1"
 _BACKEND_REASON: str | None = None
 _BACKEND: str | None = None        # set by select_backend(); None = decide from the files and the environment
 
@@ -318,7 +319,7 @@ EXIT_HOME_DOWN = 93            # person-box work while the home server is down: 
 EXIT_INTERRUPTED = 94          # the home command was interrupted and was not run again
 EXIT_DETACHED = 95             # the Robob client went away; the remote run is still running
 EXIT_LOCAL = 96                # local state failure; never automatic local fallback
-EXIT_TOOLCHAIN = 99            # repo Node/pnpm could not be provisioned; user command never started
+EXIT_TOOLCHAIN = 99            # pinned Node/pnpm/Quint could not be provisioned; user command never started
 EXIT_NOT_STARTED = 100         # queued client died before acquiring a box; nothing ran, safe to rerun
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
@@ -752,11 +753,23 @@ def _owner_columns(con) -> None:
 
 
 def event(con, box_id: str | None, kind: str, detail: str = "", *, limit: int | None = 2000) -> None:
+    if box_id and (kind in ('stop', 'delete', 'lease_resume', 'resume_state', 'lease_gone', 'prune_hold_released')
+                   or 'health_fail' in kind):
+        import offbox_protection
+        try:
+            structured = json.loads(detail)
+        except (ValueError, TypeError):
+            structured = None
+        if not isinstance(structured, dict) or structured.get('version') != 1:
+            from . import lease
+            detail = json.dumps({**(structured if isinstance(structured, dict) else {}),
+                                 **offbox_protection.envelope(kind, detail, lease.protection(con, box_id))})
+        limit = None
     # Fetch summaries are bounded JSON; truncating them makes analytics unreadable.
     payload = detail if kind == 'logs_fetch' or limit is None else detail[:limit]
     con.execute("INSERT INTO events VALUES (?,?,?,?)", (now(), box_id, kind, payload))
     con.commit()
-    log(f"{kind} {box_id or '-'} {detail if kind == 'logs_fetch' else detail[:300]}")
+    log(f"{kind} {box_id or '-'} {detail if kind == 'logs_fetch' or limit is None else detail[:300]}")
 
 
 def kv_get(con, k: str, max_age: float | None = None):
@@ -774,6 +787,21 @@ def kv_get(con, k: str, max_age: float | None = None):
 def kv_set(con, k: str, v) -> None:
     con.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)", (k, json.dumps(v), now()))
     con.commit()
+
+
+def event_once(con, box_id, kind, detail, key):
+    con.execute('SAVEPOINT box_event')
+    try:
+        inserted = con.execute('INSERT OR IGNORE INTO kv VALUES (?,?,?)', (key, 'true', now())).rowcount
+        if inserted:
+            con.execute('INSERT INTO events VALUES (?,?,?,?)', (now(), box_id, kind, detail))
+        con.execute('RELEASE box_event')
+    except BaseException:
+        con.execute('ROLLBACK TO box_event')
+        con.execute('RELEASE box_event')
+        raise
+    if inserted:
+        log(f'{kind} {box_id} {detail}')
 
 
 @contextlib.contextmanager

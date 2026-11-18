@@ -2253,13 +2253,13 @@ describe("CodexAdapterV2 session initialize", () => {
         );
         for (const [index, request] of requests.entries()) {
           const config = Reflect.get(request.params as object, "config");
-          assert.equal(config['mcp_servers."fixture".env.ROBOB_THREAD_ID'], "same-robob-id");
+          assert.equal(config["mcp_servers.fixture.env.ROBOB_THREAD_ID"], "same-robob-id");
           assert.equal(
-            config['mcp_servers."fixture".env.ROBOB_NATIVE_THREAD_ID'],
+            config["mcp_servers.fixture.env.ROBOB_NATIVE_THREAD_ID"],
             index === 1 ? "inventory-start" : "",
           );
-          assert.isString(config['mcp_servers."fixture".env.ROBOB_THREAD_LOAD_ID']);
-          assert.isUndefined(config['mcp_servers."http".env.ROBOB_THREAD_ID']);
+          assert.isString(config["mcp_servers.fixture.env.ROBOB_THREAD_LOAD_ID"]);
+          assert.isUndefined(config["mcp_servers.http.env.ROBOB_THREAD_ID"]);
         }
       }).pipe(
         Effect.scoped,
@@ -15414,31 +15414,45 @@ it.each([
   },
 );
 
-it("tags dotted MCP env overrides without replacing command, args or sibling servers", () => {
+it.each([
+  ["probe", true],
+  ["launch-probe", true],
+  ["under_score", true],
+  ["123", true],
+  ['"quoted"', true],
+  ["dot.name", false],
+  [".leading", false],
+  ["trailing.", false],
+  ["two..dots", false],
+] as const)("tags only an unambiguous Codex override segment: %s", (name, tagged) => {
   const params = CodexAdapterV2.codexThreadRuntimeParams({
     mcpSession: undefined,
     attribution: {
       threadId: "robob-one",
       loadId: "load-one",
       nativeThreadId: "native-one",
-      servers: ["launch-probe", "dot.name"],
+      servers: [name],
     },
   });
-  assert.deepEqual(params.config['mcp_servers."launch-probe".env.ROBOB_THREAD_ID'], "robob-one");
-  assert.deepEqual(
-    params.config['mcp_servers."launch-probe".env.ROBOB_THREAD_LOAD_ID'],
-    "load-one",
-  );
-  assert.deepEqual(
-    params.config['mcp_servers."dot.name".env.ROBOB_NATIVE_THREAD_ID'],
-    "native-one",
-  );
-  assert.isUndefined(params.config['mcp_servers."launch-probe"']);
-  assert.isUndefined(params.config['mcp_servers."launch-probe".command']);
-  assert.strictEqual(params.config.service_tier, "default");
+  assert.deepEqual(params.config, {
+    ...CodexAdapterV2.CODEX_THREAD_CONFIG,
+    ...(tagged
+      ? {
+          [`mcp_servers.${name}.env.ROBOB_THREAD_ID`]: "robob-one",
+          [`mcp_servers.${name}.env.ROBOB_THREAD_LOAD_ID`]: "load-one",
+          [`mcp_servers.${name}.env.ROBOB_NATIVE_THREAD_ID`]: "native-one",
+        }
+      : {}),
+  });
+});
+
+it("leaves command, args and sibling servers intact when tagging a fresh load", () => {
   const fresh = CodexAdapterV2.codexThreadRuntimeParams({
     mcpSession: undefined,
     attribution: { threadId: "same-robob", loadId: "fresh-fork", servers: ["probe"] },
   });
-  assert.strictEqual(fresh.config['mcp_servers."probe".env.ROBOB_NATIVE_THREAD_ID'], "");
+  assert.strictEqual(fresh.config["mcp_servers.probe.env.ROBOB_NATIVE_THREAD_ID"], "");
+  assert.isUndefined(fresh.config["mcp_servers.probe"]);
+  assert.isUndefined(fresh.config["mcp_servers.probe.command"]);
+  assert.strictEqual(fresh.config.service_tier, "default");
 });

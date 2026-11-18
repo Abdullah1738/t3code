@@ -84,6 +84,7 @@ import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as CredentialStore from "./ardud/mcp/CredentialStore.ts";
 import * as BoardsDatabase from "./ardud/persistence/BoardsDatabase.ts";
+import * as KanbanStore from "./ardud/kanban/store/KanbanStore.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DeviceHubProxy from "./device/DeviceHubProxy.ts";
@@ -694,6 +695,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
   Layer.provideMerge(
     ProviderInstanceRegistryHydration.layer.pipe(
+      Layer.provide(KanbanStore.layer),
       StartupPhaseLog.withStartupLayer("server.provider-hydration"),
     ),
   ),

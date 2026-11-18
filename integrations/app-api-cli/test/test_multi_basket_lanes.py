@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 import order_card
+from owner_go_support import approve_test_flows
 from pathlib import Path
 from unittest.mock import patch
 
@@ -46,6 +47,7 @@ class MinutesMultiBasketTests(unittest.TestCase):
     quiet codes, merchant qtyMax enforcement and consumed-skip re-prepare."""
 
     def setUp(self):
+        approve_test_flows(self)
         p=patch.object(cmin.options,'read_options',return_value={'groups':[]})
         p.start();self.addCleanup(p.stop)
 
@@ -211,6 +213,15 @@ class MinutesMultiBasketTests(unittest.TestCase):
 
 
 class NowNowMultiBasketTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+        captured = patch('commerce_food_capture.find_bank_capture',
+                         return_value={'source_id': 123, 'source': 'msgs'})
+        captured.start(); self.addCleanup(captured.stop)
+        for field, value in (('LAST4', '2342'), ('NETWORK', 'mastercard')):
+            card = patch.object(order_card, field, value)
+            card.start(); self.addCleanup(card.stop)
+
     """items= form, pre-auth validation, two-product single-session lane with
     one edit per extra line, and multi prepare_only without a place send."""
 
@@ -295,6 +306,7 @@ class NowNowMultiBasketTests(unittest.TestCase):
             flow.quiet_delivery()
             flow.pre_place_read()
             review = flow.review_final()
+            j.record_nownow_prepared(flow.flow_id, flow.review['digest'])
             placed = flow.place()
             tracking = flow.poll_tracking(sleep=lambda _: None)
             paid = flow.confirm_paid(tracking)
@@ -430,6 +442,8 @@ MAIN_ITEMS = [{'sku_config': MAIN_SKU, 'quantity': 2},
 
 
 class MainMultiBasketTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
 
     def make_flow(self, responses):
         harness = MainHarness(responses)
@@ -594,6 +608,8 @@ SUPER_ITEMS = [{'sku_config': SUPER_SKU, 'quantity': 1},
 
 
 class SupermallMultiBasketTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
 
     def make_flow(self, responses):
         harness = SuperHarness(responses)

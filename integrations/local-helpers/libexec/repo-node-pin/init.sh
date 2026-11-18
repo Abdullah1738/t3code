@@ -94,7 +94,8 @@ if [ "${_repo_node_hooked:-}" != 1 ]; then
     if [ -n "${ZSH_VERSION:-}" ]; then
         # chpwd covers `cd repo && pnpm ...`; preexec covers interactive PATH changes.
         eval 'chpwd_functions+=(_repo_node_hook); preexec_functions+=(_repo_node_hook); precmd_functions+=(_repo_node_hook)'
-        if [ ! -o interactive ]; then
+        # zsh's `[` does not implement the -o shell-option test; `[[` does.
+        if [[ ! -o interactive ]]; then
             # Claude restores its snapshot PATH after .zshenv. Refresh before its next command.
             if typeset -f TRAPDEBUG >/dev/null; then
                 functions -c TRAPDEBUG _repo_node_previous_debug

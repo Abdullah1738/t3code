@@ -45,6 +45,7 @@ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryService.ts";
+import { forkParked } from "../serverActivation.ts";
 import * as ProviderSwitchService from "./ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
@@ -240,6 +241,7 @@ const layerOrchestratorProvided = Orchestrator.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerCheckpointServiceProvided,
+      layerCommandOutputHubProvided,
       CommandPolicy.layer,
       layerStores,
       layerEventSinkProvided,
@@ -455,7 +457,13 @@ export const layer = Layer.mergeAll(
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,
   DelegatedTaskProgressGuard.layer.pipe(
-    Layer.provide(Layer.mergeAll(layerOrchestratorProvided, layerThreadManagementProvided)),
+    Layer.provide(
+      Layer.mergeAll(
+        layerOrchestratorProvided,
+        layerThreadManagementProvided,
+        layerCommandOutputHubProvided,
+      ),
+    ),
   ),
   RunStartDeadline.layer.pipe(
     Layer.provide(Layer.merge(layerOrchestratorProvided, layerEventSinkProvided)),
@@ -470,6 +478,14 @@ export const layer = Layer.mergeAll(
 ).pipe(Layer.provideMerge(layerStartProgress));
 
 export const layerProduction = Layer.mergeAll(
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      // Snapshot before activation so a new timeout cannot be mistaken for a previous process's work.
+      const pending = yield* threads.snapshotDelegationTimeouts();
+      yield* forkParked(threads.sweepDelegationTimeouts(pending));
+    }),
+  ).pipe(Layer.provide(layerThreadManagementProvided)),
   layer.pipe(Layer.provide(layerProjectService)),
   layerProjectService,
   layerManagedProjectFoldersProvided,

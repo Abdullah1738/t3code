@@ -491,6 +491,7 @@ for (const [name, clientLayer] of [
         Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           let commits = 0;
+          const committed = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
           yield* sql`CREATE TABLE observed_commits(value TEXT)`;
           const observe = () => {
             commits += 1;
@@ -501,10 +502,16 @@ for (const [name, clientLayer] of [
                 yield* sql`INSERT INTO observed_commits VALUES ('outer')`;
                 yield* sql.withTransaction(sql`INSERT INTO observed_commits VALUES ('nested')`);
                 assert.equal(commits, 0);
+                assert.equal(Atomics.load(committed, 0), 0);
               }),
             )
-            .pipe(Effect.provideService(SqliteClient.TransactionCommitObserver, observe));
+            .pipe(
+              Effect.provideService(SqliteClient.TransactionCommitObserver, observe),
+              Effect.provideService(SqliteClient.TransactionCommitSignal, committed),
+            );
           assert.equal(commits, 1);
+          assert.equal(Atomics.load(committed, 0), 2);
+          Atomics.store(committed, 0, 0);
           yield* sql
             .withTransaction(
               sql`INSERT INTO observed_commits VALUES ('rolled back')`.pipe(
@@ -513,9 +520,11 @@ for (const [name, clientLayer] of [
             )
             .pipe(
               Effect.provideService(SqliteClient.TransactionCommitObserver, observe),
+              Effect.provideService(SqliteClient.TransactionCommitSignal, committed),
               Effect.result,
             );
           assert.equal(commits, 1);
+          assert.equal(Atomics.load(committed, 0), 0);
           yield* sql
             .withTransaction(sql`INSERT INTO observed_commits VALUES ('observer throws')`)
             .pipe(
@@ -1830,6 +1839,7 @@ const blockCheckpointBehindReader = (
   sql: SqlClient.SqlClient,
   filename: string,
   worker: NodeWorkerThreads.Worker,
+  pages = 11000,
 ) =>
   Effect.gen(function* () {
     yield* sql.unsafe("PRAGMA journal_size_limit = 1").unprepared;
@@ -1845,7 +1855,7 @@ const blockCheckpointBehindReader = (
     const checkpointRequests = pauseCheckpointRequests(worker);
     yield* Effect.addFinalizer(() => Effect.sync(checkpointRequests.release));
     yield* sql.unsafe(`
-      WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
+      WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${pages})
       INSERT INTO pages(payload) SELECT randomblob(4000) FROM n
     `).unprepared;
     yield* writerBridgeBarrier();
@@ -1855,9 +1865,9 @@ const blockCheckpointBehindReader = (
     const blocked = waitForCheckpointMessage(worker, (request as { readonly id: unknown }).id);
     checkpointRequests.sendNext();
     const state = yield* Effect.promise(() => blocked);
-    assert.isTrue(state.blocked as boolean);
-    assert.isAbove(state.log as number, 0);
-    return { reader, checkpointRequests };
+    if (pages >= 10000) assert.isTrue(state.blocked as boolean);
+    assert.isAbove(state.log as number, pages);
+    return { reader, checkpointRequests, state };
   });
 
 const readCheckpointState = (db: NodeSqlite.DatabaseSync) => {
@@ -1867,6 +1877,36 @@ const readCheckpointState = (db: NodeSqlite.DatabaseSync) => {
   }
   return { log: state.log, checkpointed: state.checkpointed };
 };
+
+it.effect.skipIf(!supportsNoopCheckpoint)(
+  "admits concurrent writers while a reader pins an oversized WAL below the frame ceiling",
+  () =>
+    withCheckpointClient((sql, filename) =>
+      Effect.gen(function* () {
+        const worker = startedWorkers.at(-1)!;
+        const { reader, checkpointRequests, state } = yield* blockCheckpointBehindReader(
+          sql,
+          filename,
+          worker,
+          1200,
+        );
+        assert.isBelow(state.log as number, 10000);
+        assert.isBelow(state.checkpointed as number, state.log as number);
+        const finished = yield* Deferred.make<void>();
+        const writers = yield* Effect.all(
+          [1, 2].map((value) => sql.withTransaction(sql`INSERT INTO entries VALUES (${value})`)),
+          { concurrency: 2 },
+        ).pipe(Effect.andThen(Deferred.succeed(finished, undefined)), Effect.forkChild);
+        yield* Deferred.await(finished).pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+        yield* Fiber.join(writers);
+        assert.equal(reader.prepare("SELECT COUNT(*) AS count FROM entries").get()?.count, 0);
+        assert.deepEqual(yield* sql`SELECT value FROM entries ORDER BY value`.values, [[1], [2]]);
+        reader.exec("ROLLBACK");
+        checkpointRequests.release();
+        yield* checkpointWorkerReply(worker);
+      }),
+    ),
+);
 
 it.effect.each([false, true])(
   "names the acquired writer checkpoint wait and closes its spans (interrupted=%s)",
@@ -2489,8 +2529,8 @@ it.effect.each([false, true])(
           assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pages`, [{ count: 1202 }]);
           assert.equal(reader.prepare("SELECT COUNT(*) AS count FROM pages").get()?.count, 1201);
         } else {
-          yield* eventLoopTurn;
-          assert.isUndefined(write.pollUnsafe(), "the physical size limit must still gate writes");
+          yield* Fiber.join(write).pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+          assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pages`, [{ count: 1201 }]);
           assert.equal(reader.prepare("SELECT COUNT(*) AS count FROM pages").get()?.count, 1200);
         }
         reader.exec("ROLLBACK");
@@ -2501,7 +2541,7 @@ it.effect.each([false, true])(
           { count: resetDuringHandoff ? 1203 : 1202 },
         ]);
         assert.isAtMost(Number((yield* fs.stat(`${filename}-wal`)).size), limit);
-        assert.equal(reply.blocked, !resetDuringHandoff);
+        assert.isFalse(reply.blocked as boolean);
         // Both implementations eventually reply; only a bound distinguishes SQLite's 5s busy wait.
         assert.isBelow(elapsed, 1000, "TRUNCATE must return promptly while the reader stays open");
       }),
@@ -2728,7 +2768,7 @@ it.effect.each(["PRAGMA incremental_vacuum(1)", "PRAGMA user_version = 42"])(
         yield* sql`PRAGMA auto_vacuum = INCREMENTAL`;
         yield* sql`VACUUM`;
         yield* sql`CREATE TABLE reclaim(payload BLOB)`;
-        yield* sql`INSERT INTO reclaim VALUES (zeroblob(8000000))`;
+        yield* sql`INSERT INTO reclaim VALUES (zeroblob(64000000))`;
         yield* sql`DELETE FROM reclaim`;
         yield* checkpointWorkerReply(worker);
         const { reader, checkpointRequests } = yield* blockCheckpointBehindReader(
@@ -3490,7 +3530,14 @@ it.effect("retains transaction control timings on the caller span with a worker 
         "ROLLBACK",
       ])
         yield* sql.unsafe(statement).unprepared;
-      const failed = yield* sql.unsafe("COMMIT").unprepared.pipe(Effect.result);
+      const committed = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+      const failed = yield* sql
+        .unsafe("COMMIT")
+        .unprepared.pipe(
+          Effect.provideService(SqliteClient.TransactionCommitSignal, committed),
+          Effect.result,
+        );
+      assert.equal(Atomics.load(committed, 0), 4);
       assert.equal(failed._tag, "Failure");
       const span = yield* Effect.currentSpan;
       for (const [operation, count] of [
@@ -3510,6 +3557,121 @@ it.effect("retains transaction control timings on the caller span with a worker 
     ),
   );
 });
+
+it.effect("cancels an unstarted native commit and rolls its writes back", () =>
+  withFileClient((sql, filename) =>
+    Effect.gen(function* () {
+      yield* sql`CREATE TABLE cancelled_commit(value INTEGER)`;
+      const committed = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+      const inserted = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const transaction = yield* sql
+        .withTransaction(
+          sql`INSERT INTO cancelled_commit VALUES (1)`.pipe(
+            Effect.andThen(Deferred.succeed(inserted, undefined)),
+            Effect.andThen(Deferred.await(finish)),
+          ),
+        )
+        .pipe(
+          Effect.provideService(SqliteClient.TransactionCommitSignal, committed),
+          Effect.result,
+          Effect.forkChild,
+        );
+      yield* Deferred.await(inserted);
+      assert.isFalse(yield* SqliteClient.cancelTransactionCommit(committed));
+      assert.equal(Atomics.load(committed, 0), 3);
+      yield* Deferred.succeed(finish, undefined);
+      assert.equal((yield* Fiber.join(transaction))._tag, "Failure");
+      const native = yield* openDatabase(filename);
+      assert.deepEqual(native.prepare("SELECT value FROM cancelled_commit").all(), []);
+      yield* sql.withTransaction(sql`INSERT INTO cancelled_commit VALUES (2)`);
+      assert.deepEqual(native.prepare("SELECT value FROM cancelled_commit").all(), [{ value: 2 }]);
+    }),
+  ),
+);
+
+it.effect("settles expiry from an executing native commit before its acknowledgement", () =>
+  withFileClient((sql, filename) =>
+    Effect.gen(function* () {
+      yield* sql`PRAGMA journal_mode=DELETE`;
+      yield* sql`PRAGMA busy_timeout=5000`;
+      yield* sql`CREATE TABLE executing_commit(value INTEGER)`;
+      const reader = yield* openDatabase(filename);
+      reader.exec("BEGIN");
+      reader.prepare("SELECT * FROM executing_commit").all();
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (reader.isTransaction) reader.exec("ROLLBACK");
+        }),
+      );
+      const committed = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+      const held = holdWriterReply(writerWorkers.at(-1)!, /^COMMIT$/i);
+      yield* Effect.addFinalizer(() => Effect.sync(held.deliver));
+      let acknowledgements = 0;
+      const transaction = yield* sql
+        .withTransaction(sql`INSERT INTO executing_commit VALUES (1)`)
+        .pipe(
+          Effect.provideService(SqliteClient.TransactionCommitSignal, committed),
+          Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+            acknowledgements++;
+          }),
+          Effect.forkChild,
+        );
+      yield* Effect.promise(async () => {
+        while (Atomics.load(committed, 0) === 0) {
+          const wait = Atomics.waitAsync(committed, 0, 0);
+          if (wait.async) await wait.value;
+        }
+      });
+      assert.equal(Atomics.load(committed, 0), 1);
+      const expiry = yield* SqliteClient.cancelTransactionCommit(committed).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      assert.isUndefined(expiry.pollUnsafe());
+      reader.exec("COMMIT");
+      assert.isTrue(yield* Fiber.join(expiry));
+      yield* Effect.promise(() => held.ready);
+      assert.equal(Atomics.load(committed, 0), 2);
+      assert.equal(acknowledgements, 0);
+      assert.isUndefined(transaction.pollUnsafe());
+      assert.deepEqual(reader.prepare("SELECT value FROM executing_commit").all(), [{ value: 1 }]);
+      held.deliver();
+      yield* Fiber.join(transaction);
+      assert.equal(acknowledgements, 1);
+    }),
+  ),
+);
+
+it.effect("retains a failed native commit result before its acknowledgement", () =>
+  withFileClient((sql, filename) =>
+    Effect.gen(function* () {
+      yield* sql`PRAGMA foreign_keys=ON`;
+      yield* sql`CREATE TABLE commit_parent(id INTEGER PRIMARY KEY)`;
+      yield* sql`CREATE TABLE failed_commit(parent_id INTEGER REFERENCES commit_parent(id)
+        DEFERRABLE INITIALLY DEFERRED)`;
+      const committed = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+      const held = holdWriterReply(writerWorkers.at(-1)!, /^COMMIT$/i);
+      yield* Effect.addFinalizer(() => Effect.sync(held.deliver));
+      const transaction = yield* sql
+        .withTransaction(sql`INSERT INTO failed_commit VALUES (1)`)
+        .pipe(
+          Effect.provideService(SqliteClient.TransactionCommitSignal, committed),
+          Effect.result,
+          Effect.forkChild,
+        );
+      yield* Effect.promise(() => held.ready);
+      assert.equal(Atomics.load(committed, 0), 4);
+      assert.isFalse(yield* SqliteClient.cancelTransactionCommit(committed));
+      assert.isUndefined(transaction.pollUnsafe());
+      const native = yield* openDatabase(filename);
+      assert.deepEqual(native.prepare("SELECT parent_id FROM failed_commit").all(), []);
+      held.deliver();
+      assert.equal((yield* Fiber.join(transaction))._tag, "Failure");
+      yield* sql.withTransaction(sql`INSERT INTO commit_parent VALUES (1)`);
+      assert.deepEqual(native.prepare("SELECT id FROM commit_parent").all(), [{ id: 1 }]);
+    }),
+  ),
+);
 
 it.effect.each([
   "COMMIT",
@@ -3545,15 +3707,18 @@ it.effect.each([
           const held = holdWriterReply(writerWorkers.at(-1)!, /.*/);
           yield* Effect.addFinalizer(() => Effect.sync(held.deliver));
           let commits = 0;
+          const committed = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
           const commit = yield* connection.executeUnprepared(statement, [], undefined).pipe(
             Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
               commits++;
             }),
+            Effect.provideService(SqliteClient.TransactionCommitSignal, committed),
             Effect.forkChild,
           );
           yield* Effect.promise(() => held.ready);
           assert.deepEqual(native.prepare("SELECT value FROM syntax_ack").all(), [{ value: 1 }]);
           assert.equal(commits, 0);
+          assert.equal(Atomics.load(committed, 0), expected * 2);
           assert.isUndefined(commit.pollUnsafe());
           held.deliver();
           yield* Fiber.join(commit);
@@ -3699,16 +3864,19 @@ it.effect(
         const held = holdWriterReply(writer, /^COMMIT$/i);
         yield* Effect.addFinalizer(() => Effect.sync(held.discard));
         let commits = 0;
+        const committed = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
         const transaction = yield* sql.withTransaction(sql`INSERT INTO lost_ack VALUES (1)`).pipe(
           Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
             commits++;
           }),
+          Effect.provideService(SqliteClient.TransactionCommitSignal, committed),
           Effect.flip,
           Effect.forkChild,
         );
         yield* Effect.promise(() => held.ready);
         const observer = yield* openDatabase(filename);
         assert.equal(observer.prepare("SELECT COUNT(*) AS count FROM lost_ack").get()?.count, 1);
+        assert.equal(Atomics.load(committed, 0), 2);
         held.discard();
         yield* Effect.promise(() => writer.terminate());
         const failure = yield* Fiber.join(transaction);
@@ -4785,6 +4953,7 @@ it.effect.each([
   { name: "WeakSet", make: () => new WeakSet() },
   { name: "RegExp", make: () => /fixture/ },
   { name: "boxed number", make: () => Object(1) as object },
+  // oxlint-disable-next-line typescript/no-extraneous-class -- Native SQLite binding compatibility requires a class instance.
   { name: "class instance", make: () => new (class Binding {})() },
   { name: "callable", make: () => () => undefined },
 ])("preserves native named bindings on $name", ({ make }) =>

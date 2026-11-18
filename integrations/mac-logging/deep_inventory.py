@@ -12,6 +12,9 @@ import jobs
 from toollog import emit
 
 BUDGET_S = 90*60
+# Hourly inventory holds the lock for minutes and drifts onto 03:30; skipping
+# the daily deep pass then loses the whole day.
+DEEP_LOCK_WAIT_S = 15*60
 SLOW_ROOTS = ('wt', 't3code-wt', 'board-wt', 'coord-wt')
 
 
@@ -81,8 +84,6 @@ class BackgroundDu:
 
 
 def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
-    started, wall_started = time.monotonic(), time.time()
-    deadline, wall_deadline = started+budget, wall_started+budget
     measured = partial = bytes_measured = 0
     metrics = dict(timeouts=0, secondsInTimeouts=0, probeTimeouts=0, secondsInProbeTimeouts=0, probeAllowances=[], childrenDescended=set(), partsMeasured=0)
     metrics.update(cpuSecondsDu=0, wallSecondsDu=0, firstAttempts=0, firstAttemptTimeouts=0, secondsWasted=0)
@@ -101,14 +102,30 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
     roots = list(jobs.DIRECTORY_ROOTS if paths is None else paths)
     priorities = {str(Path('/Volumes/ExternalSSD')/name): i for i, name in enumerate(SLOW_ROOTS)}
     roots.sort(key=lambda p: (priorities.get(str(p), len(priorities)), str(p)))
-    with jobs.inventory_lock() as lock_fd:
-        if lock_fd is False:
-            jobs.inventory_skipped_logs(roots, jobs.read_state('disk-inventory'), 'lock_held')
-            emit('disk', 'event', 'disk.deep.end', props=dict(duMode='links', skipReason='lock_held',
+    lock_wait_started = None
+
+    def waiting():
+        nonlocal lock_wait_started
+        lock_wait_started = time.monotonic()
+
+    with jobs.inventory_lock(wait_s=DEEP_LOCK_WAIT_S, stopped=stopped, on_wait=waiting) as lock_fd:
+        lock_wait_ms = (max(0, (time.monotonic()-lock_wait_started)*1000)
+                        if lock_wait_started is not None else 0)
+        if lock_wait_ms > 0:
+            emit('disk', 'event', 'disk.deep.lock_wait', props=dict(
+                waitedMs=lock_wait_ms, acquired=lock_fd is not False))
+        killed = stopped()
+        if lock_fd is False or killed:
+            reason = dict(stopReason='killed') if killed else dict(skipReason='lock_held')
+            if not killed:
+                jobs.inventory_skipped_logs(roots, jobs.read_state('disk-inventory'), 'lock_held')
+            emit('disk', 'event', 'disk.deep.end', props=dict(duMode='links', lockWaitMs=lock_wait_ms, **reason,
                  timeouts=0, secondsInTimeouts=0, probeTimeouts=0, secondsInProbeTimeouts=0,
                  probeAllowanceMedianS=0, childrenDescended=0, partsMeasured=0,
                  spawnPolicy='nice-10-utility-io-throttle', **contention_props()))
             return
+        started, wall_started = time.monotonic(), time.time()
+        deadline, wall_deadline = started+budget, wall_started+budget
         state = jobs.read_state('disk-inventory')
         cursor = state.get('deepNextRoot')
         if cursor in [str(path) for path in roots]:
@@ -167,7 +184,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
         initial = copy.deepcopy(child_state)
 
         def props():
-            return dict(duMode='links', durationMs=max(0, (time.time()-wall_started)*1000),
+            return dict(duMode='links', durationMs=max(0, (time.time()-wall_started)*1000), lockWaitMs=lock_wait_ms,
                         childrenMeasured=measured, childrenPartial=partial,
                         childrenRemaining=remaining(), bytesMeasured=bytes_measured, stopReason=stop_reason,
                         rootsPartial=sum(not listed for entries, listed in listings.values()),

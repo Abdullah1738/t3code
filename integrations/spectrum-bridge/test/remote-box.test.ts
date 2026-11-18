@@ -8,17 +8,18 @@ import { opaqueId } from "../src/remote-protocol.ts";
 import { Store } from "../src/store.ts";
 import { BoxRunner } from "../../moni-box-runner/src/runner.ts";
 import { ChatRegistry, createAgentBus, createSbApi } from "../src/runtime.ts";
-import { chatKey, type Line } from "../src/line.ts";
+import { chatKey, LineError, type Line } from "../src/line.ts";
 import { parseCommand } from "../src/cli.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { fenceOwnerAlert, notificationAccepted } from "../src/telegram-fallback.ts";
 import { createApi as createTelegramApi } from "../../telegram-bridge/src/api.ts";
 import { Store as TelegramStore } from "../../telegram-bridge/src/store.ts";
-import { toolLog } from "../src/toollog.ts";
+import { createToolLog, toolLog } from "../src/toollog.ts";
 import { summarizeLog } from "../src/log-rollup.ts";
+import { ChatMirror, type MirrorSink, type MirrorItem } from "../src/mirror.ts";
 const roots: string[] = [], closes: (() => void)[] = [];
 afterEach(() => { closes.splice(0).forEach(f => f()); roots.splice(0).forEach(p => rmSync(p, { recursive: true, force: true })); });
-function setup() {
+function setup(mirrorSink?: MirrorSink) {
   const root = mkdtempSync(join(tmpdir(), "remote-box-test-")); roots.push(root);
   const mac = join(root, "mac"), box = join(root, "box"); mkdirSync(mac); mkdirSync(box);
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
@@ -27,13 +28,14 @@ function setup() {
   const config: RemoteBoxConfig = { kind: "remote-box", url: "http://127.0.0.1:12345", tokenFile: join(mac, "token"), callbackTokenFile: join(mac, "callbackToken"), publicKeyFile: join(mac, "publicKey"), callbackPort: 12346, epoch: "test", boxId: "bx_test" };
   const logs: string[] = [], notices: string[] = [], texts: string[] = [];
   const alerts: { text: string; key: string }[] = [], requests: { path: string; body: Record<string, unknown> }[] = [];
-  let eventsFail = false;
+  let eventsFail = false, routerReady = true, callbackReady = true;
   let requestHook: ((path: string) => Promise<void>) | undefined;
   let now = 1000, online = true, dropAck = false, active = true;
   const store = new Store(join(mac, "state.sqlite")); closes.push(() => store.close());
-  const runner = new BoxRunner({ root: box, boxId: config.boxId, epoch: config.epoch, token, callbackToken, privateKey: keys.privateKey, callbackUrl: "http://127.0.0.1:12346", system: "system" }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, { now: () => now, fetch: (async () => Response.json({ epoch: "test", accepted: true })) });
+  const runner = new BoxRunner({ root: box, boxId: config.boxId, epoch: config.epoch, token, callbackToken, privateKey: keys.privateKey, callbackUrl: "http://127.0.0.1:12346", system: "system" }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, { now: () => now, modelReady: async () => routerReady, callbackReady: async () => callbackReady, fetch: (async () => Response.json({ epoch: "test", accepted: true })) });
   closes.push(() => runner.db.close());
   const io = { now: () => now, active: () => active,
+    mirror: mirrorSink ? new ChatMirror(store, mirrorSink, { now: () => now, timeoutMs: 20 }) : undefined,
     ownerAlert: async (_severity: "attention", text: string, key: string): Promise<boolean> => { alerts.push({ text, key }); return true; },
     log: (name: string, code?: string) => logs.push(`${name} ${code ?? ""}`), notice: async (id: string) => { notices.push(id); },
     fetch: (async (url, init) => { if (!online) throw new Error("private error should never be logged");
@@ -44,21 +46,187 @@ function setup() {
       if (String(url).endsWith("/deliver") && dropAck) { dropAck = false; throw new Error("lost ack"); } return response; }),
   } satisfies ConstructorParameters<typeof RemoteBox>[2];
   let remote = new RemoteBox(config, store, io);
+  closes.push(() => remote.stop());
   const line: Line = { number: "+15550000000", events: async function* () {}, backfill: async () => [], outbound: async () => [],
     sendText: async () => ({ handle: "sent" }), upload: async () => "https://media.example/file", getMessage: async () => undefined,
     sendApp: async () => ({ handle: "sent" }), react: async () => {}, typing: async () => {}, read: async () => {},
     requestLocation: async () => {}, location: async () => undefined, setOptOut: async () => {}, download: async () => ({ data: new Uint8Array(), name: "", mimeType: "" }) };
-  return { root, mac, box, get remote() { return remote; }, runner, store, config, logs, notices, texts, alerts, requests, line,
+  return { root, mac, box, get remote() { return remote; }, mirror: io.mirror, runner, store, config, logs, notices, texts, alerts, requests, line,
     failEvents: () => { eventsFail = true; },
+    readiness: (router: boolean, callback: boolean) => { routerReady = router; callbackReady = callback; },
     ownerAlert: (alert: typeof io.ownerAlert) => { io.ownerAlert = alert; },
     requestHook: (hook: typeof requestHook) => { requestHook = hook; },
-    restart: () => { const reopened = new Store(join(mac, "state.sqlite")); closes.push(() => reopened.close()); remote = new RemoteBox(config, reopened, io); },
+    restart: () => { remote.stop(); const reopened = new Store(join(mac, "state.sqlite")); closes.push(() => reopened.close()); remote = new RemoteBox(config, reopened, io); },
     failNotice: () => { io.notice = async id => { notices.push(id); throw new Error("ambiguous notice"); }; },
     advance: (ms = 65_000) => { now += ms; }, offline: () => { online = false; }, online: () => { online = true; }, drop: () => { dropAck = true; }, rollback: () => { active = false; },
     request: (path: string, body: unknown = {}, auth = callbackToken) => new Request(`http://bridge${path}`, { method: "POST", headers: { authorization: `Bearer ${auth}` }, body: JSON.stringify({ epoch: "test", ...body as object }) }),
   };
 }
 function files(root: string): string { return readdirSync(root, { withFileTypes: true }).map(e => e.isDirectory() ? files(join(root, e.name)) : readFileSync(join(root, e.name)).toString()).join(""); }
+
+test("delivered human backlog behind a fence gets one notice and one refreshed owner alert across flaps and restart", async () => {
+  const s = setup(), head = opaqueId("held-message");
+  s.runner.enqueue(head, { kind: "inbound", text: "PRIVATE_HEAD" });
+  s.runner.db.query("UPDATE inbox SET state='interrupted',interrupted_at=1000 WHERE id=?").run(head);
+  await s.remote.tick(); expect(s.alerts).toHaveLength(1);
+  s.remote.accept("waiting-dm", { text: "PRIVATE_WAITING" });
+  for (let n = 0; n < 10; n++) {
+    s.advance(30_000); if (n % 2) s.offline(); else s.online();
+    await s.remote.tick(); if (n === 4) s.restart();
+  }
+  expect(s.store.db.query<{ sealed: string | null; delivered_at: number }, [string]>("SELECT sealed,delivered_at FROM remote_inbox WHERE id=?").get(opaqueId("waiting-dm")))
+    .toMatchObject({ sealed: null, delivered_at: 31_000 });
+  expect(s.notices).toHaveLength(1);
+  expect(s.alerts).toHaveLength(2);
+  expect(s.alerts[1]!.key).toBe(`moni-box-fenced:${head.slice(0, 12)}:inbound:${opaqueId("waiting-dm")}`);
+  expect(JSON.stringify(s.alerts)).not.toContain("PRIVATE_");
+  s.online(); s.advance(65_000); await s.remote.tick();
+  s.remote.accept("second-waiting-dm", { text: "PRIVATE_SECOND" });
+  s.advance(65_000); await s.remote.tick(); expect(s.alerts).toHaveLength(2); expect(s.notices).toHaveLength(1);
+});
+
+test("box terminal acknowledgements retire delivered backlog without marking a NO_REPLY turn answered", async () => {
+  const s = setup(); s.remote.accept("terminal", { text: "PRIVATE_TERMINAL" });
+  await s.remote.tick(); await s.runner.tick();
+  s.advance(5_000); await s.remote.tick();
+  expect(s.store.db.query<{ finished_at: number }, []>("SELECT finished_at FROM remote_inbox").get()!.finished_at).toBe(6_000);
+  expect(s.store.db.query<{ answered_at: null }, []>("SELECT answered_at FROM remote_unanswered").get()!.answered_at).toBeNull();
+  s.offline(); s.advance(600_000); await s.remote.tick(); expect(s.notices).toHaveLength(0);
+  await s.remote.checkUnanswered(); expect(s.alerts).toHaveLength(1);
+  expect(s.alerts[0]!.key).toBe(`imessage-unanswered:${opaqueId("terminal")}`);
+});
+
+test("wake-only fences never qualify for a waiting notice", async () => {
+  const s = setup(), head = opaqueId("only-wake");
+  s.runner.enqueue(head, { kind: "wake", text: "PRIVATE_WAKE" });
+  s.runner.db.query("UPDATE inbox SET state='interrupted',interrupted_at=1000 WHERE id=?").run(head);
+  for (let n = 0; n < 8; n++) { s.advance(65_000); await s.remote.tick(); }
+  expect(s.notices).toHaveLength(0);
+});
+
+test.each([
+  { kind: "wake", hasSend: false, age: 600_000, behind: "inbound", failed: true },
+  { kind: "wake", hasSend: false, age: 599_999, behind: "inbound", failed: false },
+  { kind: "inbound", hasSend: false, age: 600_000, behind: "inbound", failed: false },
+  { kind: "wake", hasSend: true, age: 600_000, behind: "inbound", failed: false },
+  { kind: "wake", hasSend: false, age: 600_000, behind: "wake", failed: false },
+  { kind: "wake", hasSend: false, age: 600_000, behind: undefined, failed: false },
+] as const)("wake autofail matrix %j", async ({ kind, hasSend, age, behind, failed }) => {
+  const s = setup(), id = opaqueId("head");
+  s.runner.enqueue(id, { kind, watcher: "homevisit", text: "PRIVATE_WAKE" });
+  s.runner.db.query("UPDATE inbox SET state='interrupted',interrupted_at=1000 WHERE id=?").run(id);
+  if (hasSend) s.runner.db.query("INSERT INTO actions(id,path,payload,state,inbox_id) VALUES (?,'/send','{}','pending',?)").run(opaqueId("sent"), id);
+  if (behind) s.remote.accept("behind", { text: "PRIVATE_DM" }, undefined, behind);
+  s.advance(age);
+  const logs = await captureLogs(async () => {
+    await s.remote.tick();
+    if (failed) { await s.runner.tick(); s.restart(); s.advance(5_000); await s.remote.tick(); }
+  });
+  const state = s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)!.state;
+  expect(state).toBe(failed ? "done" : "interrupted");
+  expect(logs.filter(l => l.name === "moni-box-wake-autofailed")).toHaveLength(failed ? 1 : 0);
+  expect(s.alerts.filter(a => a.key === `moni-box-wake-autofailed:${id.slice(0, 12)}`)).toHaveLength(failed ? 1 : 0);
+  if (failed) { expect(s.alerts.at(-1)!.text).toContain("homevisit"); expect(s.texts).toEqual(["PRIVATE_DM"]); }
+  expect(s.requests.filter(r => r.path === "/resolve")).toHaveLength(failed ? 1 : 0);
+  expect(s.notices).toHaveLength(!failed && behind === "inbound" ? 1 : 0);
+  expect(JSON.stringify([s.alerts, s.logs, logs])).not.toContain("PRIVATE_");
+});
+
+test("a custom wake age keeps a younger wake fenced and autofails at its boundary", async () => {
+  const s = setup(), id = opaqueId("head"); s.config.wakeFenceAutoFailMs = 900_000;
+  s.remote.accept("head", { text: "wake" }, undefined, "wake"); await s.remote.tick();
+  s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  s.remote.accept("dm", { text: "dm" }); s.advance(899_999); await s.remote.tick();
+  expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)!.state).toBe("interrupted");
+  s.advance(5_000); await s.remote.tick();
+  expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)!.state).toBe("done");
+});
+
+test("autofail finds a DM past a page of wakes and retries a lost alert acknowledgement unchanged after restart", async () => {
+  const s = setup(), id = opaqueId("head");
+  s.runner.enqueue(id, { kind: "wake", text: "private" });
+  s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  for (let i = 0; i < 101; i++) s.runner.enqueue(opaqueId(`wake:${i}`), { kind: "wake", text: "private" });
+  s.runner.enqueue(opaqueId("dm"), { kind: "inbound", text: "private" });
+  let accepted = false;
+  s.ownerAlert(async (_severity, text, key) => { s.alerts.push({ text, key }); return accepted; });
+  s.advance(600_000); await s.remote.tick(); const alert = s.alerts[0];
+  s.restart(); s.advance(65_000); accepted = true; await s.remote.tick();
+  s.restart(); s.advance(65_000); await s.remote.tick();
+  expect(s.alerts).toEqual([alert, alert]);
+  expect(s.requests.filter(r => r.path === "/resolve")).toHaveLength(1);
+  expect(s.notices).toHaveLength(0);
+});
+
+test("remote fenced DM alerts once at ten minutes across restart, without requeue or plaintext", async () => {
+  const s = setup(); s.remote.accept("head", { text: "PRIVATE_HEAD" }); await s.remote.tick();
+  s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  s.remote.accept("dm", { text: "PRIVATE_DM", attachments: [{ name: "PRIVATE_FILE" }] });
+  s.advance(300_000); await s.remote.checkUnanswered();
+  expect(s.alerts).toHaveLength(0);
+  const before = s.requests.length;
+  const logs = await captureLogs(async () => {
+    s.advance(300_000); await s.remote.checkUnanswered();
+    s.restart(); s.advance(3_600_000); await s.remote.checkUnanswered(); await s.remote.checkUnanswered();
+  });
+  expect(s.alerts.filter(a => a.key === `imessage-unanswered:${opaqueId("dm")}`)).toHaveLength(1);
+  expect(s.requests).toHaveLength(before);
+  expect(logs.filter(l => l.name === "inbound.overdue_notice")).toHaveLength(2);
+  expect(logs.find(l => l.name === "inbound.overdue_notice")?.props?.backend).toBe("remote-box");
+  expect(logs.some(l => l.name === "inbound.unanswered" || l.error?.tag === "inbound.unanswered")).toBe(false);
+  expect((await summarizeLog((async function* () { yield* logs; })())).unanswered_alerts).toBe(2);
+  expect(s.store.db.query("SELECT 1 FROM inbound").get()).toBeNull();
+  expect(files(s.mac)).not.toContain("PRIVATE_");
+});
+
+test("a wake that acquires send evidence during resolution keeps the fence", async () => {
+  const s = setup(), id = opaqueId("wake"); s.remote.accept("wake", { text: "private" }, undefined, "wake");
+  await s.remote.tick(); s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  s.remote.accept("dm", { text: "private" });
+  s.requestHook(async path => {
+    if (path === "/resolve") s.runner.db.query("INSERT OR IGNORE INTO actions(id,path,payload,state,inbox_id) VALUES (?,'/send','{}','pending',?)").run(opaqueId("late-send"), id);
+  });
+  s.advance(600_000); await s.remote.tick(); s.advance(5_000); await s.remote.tick();
+  expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)!.state).toBe("interrupted");
+  expect(s.alerts.map(a => a.key)).toEqual([`moni-box-fenced:${id.slice(0, 12)}`]);
+  expect(s.requests.filter(r => r.path === "/resolve")).toHaveLength(1);
+  expect(s.logs.some(l => l.startsWith("moni-box-wake-autofailed "))).toBe(false);
+});
+
+test("unanswered retries freeze Telegram text after a lost acknowledgement and concurrent checks across restart", async () => {
+  const s = setup(); let accepted = false;
+  s.ownerAlert(async (_severity, text, key) => { s.alerts.push({ text, key }); return accepted; });
+  s.remote.accept("dm", { text: "PRIVATE" }); s.advance(600_000);
+  await Promise.all([s.remote.checkUnanswered(), s.remote.checkUnanswered()]);
+  const original = s.alerts[0]; expect(s.alerts).toHaveLength(1);
+  s.restart(); s.advance(600_000); accepted = true; await s.remote.checkUnanswered();
+  s.restart(); s.advance(600_000); await s.remote.checkUnanswered();
+  expect(s.alerts).toEqual([original, original]);
+});
+
+test("successful attributed sends and reactions answer only their own DM; uncertain sends and notices do not", async () => {
+  const s = setup(), chat = chatKey.dm("+15555550199");
+  for (const id of ["replied", "later", "reacted", "uncertain"]) s.remote.accept(id, { text: "PRIVATE" });
+  const io = { line: s.line, chat, bus: async () => Response.json({}) };
+  const body = { id: opaqueId("reply"), inboxId: opaqueId("replied"), text: "reply" };
+  expect((await s.remote.callback(s.request("/send", body), io)).status).toBe(200);
+  expect((await s.remote.callback(s.request("/send", body), io)).status).toBe(200);
+  expect((await s.remote.callback(s.request("/react", { target: "reacted", kind: "like" }), io)).status).toBe(200);
+  const broken = { ...io, line: { ...s.line, sendText: async () => { throw new Error("uncertain"); } } };
+  expect((await s.remote.callback(s.request("/send", { id: opaqueId("broken"), inboxId: opaqueId("uncertain"), text: "reply" }), broken)).status).toBe(502);
+  await s.remote.send(opaqueId("notice"), "offline", undefined, s.line, chat);
+  s.restart(); s.advance(600_000); await s.remote.checkUnanswered();
+  expect(s.alerts.map(a => a.key).sort()).toEqual(["later", "uncertain"].map(id => `imessage-unanswered:${opaqueId(id)}`).sort());
+});
+
+test("remote backend state is logged at construction and every five minutes even while inactive", async () => {
+  const logs = await captureLogs(async () => {
+    const s = setup(); s.rollback(); await s.remote.tick(); s.advance(299_999); await s.remote.tick();
+    s.advance(1); await s.remote.tick(); s.restart();
+  });
+  const states = logs.filter(l => l.name === "moni-box-backend-state");
+  expect(states).toHaveLength(3); expect(states.map(l => l.props?.active)).toEqual([true, false, false]);
+});
 
 test.each(["inbound", "wake"] as const)("%s fence logs and alerts once across ticks and restart; growth logs again and resolve clears once", async kind => {
   const s = setup(), id = opaqueId("fenced"), canary = "PRIVATE_FENCE_CANARY";
@@ -76,12 +244,13 @@ test.each(["inbound", "wake"] as const)("%s fence logs and alerts once across ti
     expect(s.alerts[0]!.text).toContain(`--id ${id} --state done|pending`);
     s.remote.accept("behind", { text: canary }); s.advance(5_000); await s.remote.tick();
     expect(s.logs.filter(l => l.startsWith("moni-box-fenced "))).toHaveLength(2);
-    expect(s.alerts).toHaveLength(1);
+    expect(s.alerts).toHaveLength(2);
+    expect(s.alerts[1]!.key).toBe(`moni-box-fenced:${id.slice(0, 12)}:inbound:${opaqueId("behind")}`);
     await s.remote.resolve(id, "done"); s.advance(5_000); await s.remote.tick(); s.advance(5_000); await s.remote.tick();
     expect(s.logs.filter(l => l.startsWith("moni-box-unfenced "))).toHaveLength(1);
     // Re-fencing the same id after explicit pending resolution must not re-alert.
     s.runner.db.query("UPDATE inbox SET state='interrupted' WHERE id=?").run(id);
-    s.advance(5_000); await s.remote.tick(); expect(s.alerts).toHaveLength(1);
+    s.advance(5_000); await s.remote.tick(); expect(s.alerts).toHaveLength(2);
   });
   expect(lines.find(l => l.name === "moni-box-fenced")?.props).toEqual({ event: id.slice(0, 12), kind, ageMs: 5000, hasSend: false, queuedBehind: 0 });
   expect(lines.find(l => l.name === "moni-box-unfenced")?.props).toEqual({ event: id.slice(0, 12), fencedMs: 30000 });
@@ -134,7 +303,9 @@ test.each([
   expect(operations).toHaveLength(1);
   expect(operations[0]!.state).toBe(failure.startsWith("queued") ? "sent" : "pending");
   s.restart(); s.advance(5_000); await s.remote.tick(); s.advance(5_000); await s.remote.tick();
-  expect(s.alerts).toHaveLength(3); expect(s.notices).toHaveLength(0); expect(s.texts).toHaveLength(0);
+  expect(s.alerts.filter(a => a.key === original.key)).toEqual([original, original, original]);
+  expect(s.alerts.filter(a => a.key === `moni-box-fenced:${id.slice(0, 12)}:inbound:${opaqueId("behind")}`)).toHaveLength(1);
+  expect(s.alerts).toHaveLength(4); expect(s.notices).toHaveLength(1); expect(s.texts).toHaveLength(0);
   expect(JSON.stringify([s.logs, s.alerts, operations])).not.toContain(canary);
   expect(s.logs.join()).not.toContain("PRIVATE_ALERT_ERROR"); expect(s.store.get("remoteOutage")).toBeUndefined();
 });
@@ -193,7 +364,7 @@ test("slow events and alerts permit concurrent lease renewals and owner resoluti
     expect(s.runner.active()).toBe(true);
     s.advance(250); lease.release(); await renewing;
     s.advance(750); alert.release(); await probing;
-    expect(s.requests.filter(r => r.path === "/events")).toHaveLength(i + 2);
+    expect(s.requests.filter(r => r.path === "/events" && r.body.headOnly === true)).toHaveLength(i + 2);
     expect(s.runner.active()).toBe(true);
     expect(await s.remote.resolve(id, i === 2 ? "done" : "pending")).toEqual({ accepted: true });
     expect(s.store.get<unknown>(`remoteFenceAlert:${id}`)).toEqual(s.alerts[0]);
@@ -257,7 +428,149 @@ test("remote commands require an owner session; resolve is reconciled and cannot
     const nextPage = await cli("remote-events", "--chat", "moni", "--session", "owner-thread", "--after", metadata.nextCursor);
     expect(nextPage.code).toBe(0); expect(JSON.parse(nextPage.stdout).events[0].id).toBe(opaqueId("cli-page:100"));
     expect(() => parseCommand(["remote-events", "--chat", "moni", "--session", "owner-thread", "--after", "short"])).toThrow("--after");
+    const actionId = opaqueId("cli-backing-off");
+    s.runner.db.query("INSERT INTO actions(id,path,payload,state,inbox_id,attempts,last_status,next_at) VALUES (?,'/react',?,'pending',?,2,502,99999)")
+      .run(actionId, JSON.stringify({ target: "PRIVATE_ACTION_TARGET", text: "PRIVATE_ACTION_TEXT", token: "PRIVATE_ACTION_TOKEN" }), id);
+    s.runner.db.query("INSERT INTO actions(id,path,payload,state) VALUES (?,'/metrics','{}','pending')").run(opaqueId("hidden-metric"));
+    const actionsPage = await cli("remote-events", "--chat", "moni", "--session", "owner-thread");
+    expect(actionsPage.code).toBe(0);
+    expect(JSON.parse(actionsPage.stdout).actions).toEqual([{ id: actionId.slice(0, 12), path: "/react", attempts: 2, lastStatus: 502, nextAt: 99999, inboxId: id.slice(0, 12) }]);
+    expect(actionsPage.stdout).not.toContain("PRIVATE_"); expect(actionsPage.stdout).not.toContain("payload");
   } finally { await server.stop(true); }
+});
+
+test.each([
+  { retryable: false, uncertain: false, status: 422 }, { retryable: true, uncertain: false, status: 502 },
+  { retryable: false, uncertain: true, status: 502 }, { retryable: true, uncertain: true, status: 502 },
+])("reaction LineError classification retryable=$retryable uncertain=$uncertain is private and cap-safe", async ({ retryable, uncertain, status }) => {
+  const s = setup(), target = "PRIVATE_REACTION_TARGET";
+  s.remote.accept(target, { text: "PRIVATE_MESSAGE_TEXT" });
+  const io = { line: { ...s.line, react: async () => { throw new LineError("PRIVATE_ERROR_BODY", "http_400:invalid_number", retryable, uncertain); } },
+    chat: chatKey.dm("+15555550199"), bus: async () => Response.json({}) };
+  const lines = await captureLogs(async () => {
+    expect((await s.remote.callback(s.request("/react", { target, kind: "like" }), io)).status).toBe(status);
+    s.advance(60_000); await s.remote.tick();
+  });
+  const failure = lines.find(l => l.name === "moni-runner-error")!;
+  expect(failure.kind).toBe("error");
+  expect(failure.props).toEqual({ path: "/react", status, errorClass: "LineError", code: "http_400:invalid_number", retryable, count: 0 });
+  expect(JSON.stringify(lines)).not.toContain("PRIVATE_"); expect(s.logs.join("\n")).not.toContain("PRIVATE_");
+  const root = join(s.root, "capped"), log = createToolLog({ root, now: () => 0, capBytes: 1 });
+  log.write({ component: "fixture", kind: "event", name: "fill" }); log.write(failure);
+  const raw = readFileSync(join(root, "1970-01-01.ndjson"), "utf8");
+  expect(raw).toContain('"name":"moni-runner-error"'); expect(raw).toContain('"path":"/react"'); expect(raw).not.toContain("PRIVATE_");
+});
+
+test("100 callback failures aggregate to one summary with 99 suppressed repeats and flush without another failure", async () => {
+  const s = setup(), target = "PRIVATE_TARGET"; s.remote.accept(target, {});
+  const io = { line: { ...s.line, react: async () => { throw new LineError("PRIVATE_ERROR", "network", true, false); } },
+    chat: chatKey.dm("+15555550199"), bus: async () => Response.json({}) };
+  const lines = await captureLogs(async () => {
+    for (let n = 0; n < 100; n++) {
+      expect((await s.remote.callback(s.request("/react", { target, kind: "like" }), io)).status).toBe(502);
+      s.advance(599);
+    }
+    expect(s.logs.filter(l => l.startsWith("moni-runner-error"))).toHaveLength(0);
+    s.advance(100); await s.remote.tick();
+    expect(s.logs.filter(l => l.startsWith("moni-runner-error"))).toHaveLength(1);
+    await s.remote.callback(s.request("/react", { target, kind: "like" }), io);
+    s.advance(60_000); await s.remote.tick();
+  });
+  expect(lines.filter(l => l.name === "moni-runner-error").map(l => l.props?.count)).toEqual([99, 0]);
+  expect(JSON.stringify(lines)).not.toContain("PRIVATE_");
+});
+
+test("callback aggregation separates route and status, sanitizes unknown code/name, and catches async bus failures", async () => {
+  const s = setup(); s.remote.accept("PRIVATE_TARGET", {});
+  let error: unknown = new LineError("PRIVATE_ERROR", "PRIVATE_CODE", false, false);
+  const io = { line: { ...s.line, react: async () => { throw error; } }, chat: chatKey.dm("+15555550199"), bus: async (): Promise<Response> => { throw error; } };
+  const lines = await captureLogs(async () => {
+    await s.remote.callback(s.request("/react", { target: "PRIVATE_TARGET", kind: "like" }), io);
+    error = Object.assign(new Error("PRIVATE_BODY"), { name: "PRIVATE_NAME" });
+    await s.remote.callback(s.request("/react", { target: "PRIVATE_TARGET", kind: "like" }), io);
+    expect((await s.remote.callback(s.request("/agent-ask", { operationId: opaqueId("bus") }), io)).status).toBe(502);
+    s.advance(60_000); await s.remote.tick();
+  });
+  const failures = lines.filter(l => l.name === "moni-runner-error"); expect(failures).toHaveLength(3);
+  expect(failures.map(l => [l.props?.path, l.props?.status, l.props?.errorClass, l.props?.code])).toEqual([
+    ["/react", 422, "LineError", "lineFailure"], ["/react", 502, "Error", undefined], ["/agent-ask", 502, "Error", undefined],
+  ]);
+  expect(JSON.stringify(lines)).not.toContain("PRIVATE_"); expect(s.logs.join("\n")).not.toContain("PRIVATE_");
+});
+
+test("stop flushes an open aggregation window once before 60 seconds and deletes its key", async () => {
+  const s = setup(); s.remote.accept("PRIVATE_TARGET", {});
+  const io = { line: { ...s.line, react: async () => { throw new LineError("PRIVATE_ERROR", "network", true, false); } },
+    chat: chatKey.dm("+15555550199"), bus: async () => Response.json({}) };
+  const lines = await captureLogs(async () => {
+    for (let n = 0; n < 100; n++) await s.remote.callback(s.request("/react", { target: "PRIVATE_TARGET", kind: "like" }), io);
+    expect(s.logs.filter(l => l.startsWith("moni-runner-error"))).toHaveLength(0);
+    s.remote.stop(); s.remote.stop();
+    s.advance(60_000); await s.remote.tick(); s.remote.stop();
+  });
+  expect(lines.filter(l => l.name === "moni-runner-error").map(l => l.props?.count)).toEqual([99]);
+  expect(JSON.stringify(lines)).not.toContain("PRIVATE_");
+});
+
+test.each([
+  { retryable: false, uncertain: false }, { retryable: true, uncertain: false },
+  { retryable: false, uncertain: true }, { retryable: true, uncertain: true }, { retryable: null, uncertain: null },
+])("uncertain send history failure retryable=$retryable uncertain=$uncertain keeps the runner blocked without resending", async ({ retryable, uncertain }) => {
+  const s = setup(); let sends = 0, turns = 0; const paths: string[] = [];
+  const id = opaqueId("uncertain-history"), inbox = opaqueId("later-inbox");
+  s.store.db.query("INSERT INTO remote_sends VALUES (?,1000,'uncertain',NULL)").run(id);
+  const io = { line: { ...s.line, outbound: async (): Promise<never> => {
+    throw retryable === null ? new Error("PRIVATE_HISTORY_ERROR") : new LineError("PRIVATE_HISTORY_ERROR", "http_401", retryable, uncertain!);
+  }, sendText: async () => { sends++; return { handle: "unexpected" }; } }, chat: chatKey.dm("+15555550199"), bus: async () => Response.json({}) };
+  const runner = new BoxRunner({ ...s.runner.config, root: join(s.root, "history-runner") }, { run: async () => { turns++; return "NO_REPLY"; } }, {
+    callbackReady: async () => true, fetch: async (url, init) => { paths.push(new URL(String(url)).pathname); return s.remote.callback(new Request(url, init), io); },
+  }); closes.push(() => runner.db.close());
+  await runner.handle(new Request("http://box/lease", { method: "POST", headers: { authorization: `Bearer ${runner.config.token}` }, body: JSON.stringify({ boxId: runner.config.boxId, epoch: runner.config.epoch }) }));
+  runner.db.query("INSERT INTO actions(id,path,payload,state) VALUES (?,'/send',?,'pending')").run(id, JSON.stringify({ text: "PRIVATE_SEND_TEXT" }));
+  runner.db.query("INSERT INTO actions(id,path,payload,state) VALUES (?,'/react','{}','pending')").run(opaqueId("later-reaction"));
+  runner.enqueue(inbox, {}); await runner.tick(); await runner.tick();
+  expect(paths).toEqual(["/send", "/send", "/send", "/send"]);
+  expect(sends).toBe(0); expect(turns).toBe(0);
+  expect(runner.db.query("SELECT state,attempts FROM actions WHERE id=?").get(id)).toEqual({ state: "pending", attempts: 0 });
+  expect(runner.db.query("SELECT state FROM inbox WHERE id=?").get(inbox)).toEqual({ state: "pending" });
+  expect(s.store.db.query("SELECT state FROM remote_sends WHERE id=?").get(id)).toEqual({ state: "uncertain" });
+});
+
+test("actual remote outage, fence, recovery and diagnostic rows survive the cap while queue depth is dropped", async () => {
+  const s = setup(); const id = opaqueId("fenced-cap"); s.runner.enqueue(id, {});
+  s.runner.db.query("UPDATE inbox SET state='interrupted',interrupted_at=1000 WHERE id=?").run(id);
+  const lines = await captureLogs(async () => {
+    await s.remote.tick(); s.offline(); s.advance(5_000); await s.remote.tick();
+    s.online(); s.advance(65_000); await s.remote.tick();
+    s.runner.db.exec("UPDATE inbox SET state='done'"); s.advance(300_000); await s.remote.tick();
+    s.failEvents(); s.advance(5_000); await s.remote.tick();
+  });
+  const root = join(s.root, "capped-lifecycle"), log = createToolLog({ root, now: () => 0, capBytes: 1 });
+  log.write({ component: "fixture", kind: "event", name: "fill" }); for (const line of lines) log.write(line);
+  const saved = readFileSync(join(root, "1970-01-01.ndjson"), "utf8").trim().split("\n").map(raw => JSON.parse(raw));
+  for (const name of ["moni-box-fenced", "moni-box-down", "moni-runner-error", "moni-box-up", "moni-box-unfenced", "moni-box-backend-state", "moni-box-events-error"]) {
+    expect(saved.some(l => l.name === name)).toBe(true);
+  }
+  expect(saved.some(l => l.name === "moni-queue-depth")).toBe(false);
+});
+
+test("pending action metadata is projected explicitly and rejects private or malformed input shapes", async () => {
+  const s = setup();
+  const action = { id: "a".repeat(12), path: "/react", attempts: 2, lastStatus: 502, nextAt: 9000, inboxId: "b".repeat(12) };
+  let rows: unknown = [{ ...action, payload: "PRIVATE_PAYLOAD", target: "PRIVATE_TARGET", token: "PRIVATE_TOKEN" }];
+  const remote = new RemoteBox(s.config, s.store, { active: () => true, log: () => {}, notice: async () => {},
+    fetch: async () => Response.json({ events: [], actions: rows }) });
+  expect(await remote.events()).toEqual({ events: [], actions: [action] });
+  for (const patch of [
+    { id: "PRIVATE_ID" }, { id: "a".repeat(64) }, { path: "/react?PRIVATE_TARGET" }, { path: "/metrics" },
+    { attempts: -1 }, { attempts: 1.5 }, { lastStatus: 99 }, { lastStatus: 600 },
+    { nextAt: -1 }, { nextAt: "PRIVATE_NEXT_AT" }, { inboxId: "PRIVATE_ID" }, { inboxId: undefined },
+  ]) {
+    rows = [{ ...action, ...patch }]; await expect(remote.events()).rejects.toThrow("Invalid box action");
+  }
+  rows = "PRIVATE_PAYLOAD"; await expect(remote.events()).rejects.toThrow("Invalid box actions");
+  rows = [{ ...action, lastStatus: null, nextAt: null, inboxId: null }];
+  expect((await remote.events()).actions).toEqual([{ ...action, lastStatus: null, nextAt: null, inboxId: null }]);
 });
 
 test("a large fenced backlog logs its full depth even after a page of skipped attachment failures", async () => {
@@ -303,7 +616,7 @@ test.each(["empty", "bus", "watcher"])("ten flaps and a long outage stay silent 
   expect(s.notices).toHaveLength(0); expect(s.logs.join()).toContain("moni-notice-suppressed not-waiting");
 });
 
-test("waiting inbound needs continuous grace, retains one outage through ten flaps", async () => {
+test("waiting inbound keeps its grace and one notice through ten flaps", async () => {
   const s = setup(); s.remote.accept("real-inbound", { text: "private" });
   s.offline(); await s.remote.tick();
   const outage = s.store.get<{ id: string }>("remoteOutage")!.id;
@@ -327,7 +640,8 @@ test("notice cap persists across restart and a distinct outage, then expires at 
   s.restart(); s.advance(); await s.remote.tick(); expect(s.notices).toHaveLength(1);
   s.advance(120_000); await s.remote.tick(); expect(s.notices).toHaveLength(1);
   expect(s.logs.join()).toContain("moni-notice-suppressed already-sent");
-  s.online(); s.advance(); await s.remote.tick(); s.advance(300_000); await s.remote.tick();
+  s.online(); s.advance(); await s.remote.tick(); await s.runner.tick();
+  s.advance(5_000); await s.remote.tick(); s.advance(300_000); await s.remote.tick();
   expect(s.store.get("remoteOutage")).toBeNull();
   s.remote.accept("second", { text: "private" }); s.offline(); s.advance(); await s.remote.tick();
   s.advance(120_000); s.restart(); await s.remote.tick(); expect(s.notices).toHaveLength(1);
@@ -339,16 +653,17 @@ test("notice cap persists across restart and a distinct outage, then expires at 
 });
 
 test.each([60_000, 120_001, 21_600_001].flatMap(stoppedMs => [false, true].map(waiting => ({ stoppedMs, waiting }))))(
-  "restart after $stoppedMs ms restarts continuous grace with waiting=$waiting", async ({ stoppedMs, waiting }) => {
+  "restart after $stoppedMs ms preserves message age with waiting=$waiting", async ({ stoppedMs, waiting }) => {
     const s = setup();
     if (waiting) s.remote.accept("waiting", { text: "private" });
     s.offline(); await s.remote.tick();
     const id = s.store.get<{ id: string }>("remoteOutage")!.id;
     s.advance(stoppedMs); s.restart(); await s.remote.tick();
-    expect(s.notices).toHaveLength(0);
+    expect(s.notices).toHaveLength(waiting && stoppedMs >= 120_000 ? 1 : 0);
     expect(s.store.get<{ id: string }>("remoteOutage")!.id).toBe(id);
-    expect(s.logs.at(-2)).toBe("moni-notice-suppressed grace");
-    s.advance(119_999); await s.remote.tick(); expect(s.notices).toHaveLength(0);
+    if (!waiting) expect(s.logs).toContain("moni-notice-suppressed not-waiting");
+    else if (stoppedMs < 120_000) expect(s.logs).toContain("moni-notice-suppressed grace");
+    s.advance(119_999); await s.remote.tick(); expect(s.notices).toHaveLength(waiting ? 1 : 0);
     s.advance(65_000); await s.remote.tick(); expect(s.notices).toHaveLength(waiting ? 1 : 0);
     expect(s.store.get<{ id: string }>("remoteOutage")!.id).toBe(id);
   });
@@ -366,7 +681,8 @@ test("an uncertain notice reserves both caps before sending and survives restart
   s.offline(); await s.remote.tick(); s.advance(120_000); await s.remote.tick();
   expect(s.notices).toHaveLength(1); expect(s.logs.join()).toContain("moni-notice-error");
   s.restart(); s.advance(); await s.remote.tick(); expect(s.notices).toHaveLength(1);
-  s.online(); s.advance(); await s.remote.tick(); s.advance(300_000); await s.remote.tick();
+  s.online(); s.advance(); await s.remote.tick(); await s.runner.tick();
+  s.advance(5_000); await s.remote.tick(); s.advance(300_000); await s.remote.tick();
   s.remote.accept("waiting-again", { text: "private" }); s.offline(); s.advance(); await s.remote.tick();
   s.advance(120_000); await s.remote.tick(); expect(s.notices).toHaveLength(1);
   expect(s.logs.join()).toContain("moni-notice-suppressed rate-limited");
@@ -379,11 +695,11 @@ test("legacy sends seed the cap and unclassified ciphertext cannot trigger a not
   s.restart(); expect(s.store.get<number>("remoteNoticeAt")).toBe(1000);
   s.offline(); await s.remote.tick(); s.advance(130_000); await s.remote.tick();
   expect(s.notices).toHaveLength(0); expect(s.logs.join()).toContain("moni-notice-suppressed not-waiting");
-  s.remote.accept("new-inbound", { text: "private" }); s.advance(); await s.remote.tick();
+  s.remote.accept("new-inbound", { text: "private" }); s.advance(130_000); await s.remote.tick();
   expect(s.logs.join()).toContain("moni-notice-suppressed rate-limited"); expect(s.notices).toHaveLength(0);
 });
 
-test.each(["noticeAfterMs", "outageClearMs", "noticeMinGapMs"])("%s validates duration shapes", field => {
+test.each(["noticeAfterMs", "outageClearMs", "noticeMinGapMs", "wakeFenceAutoFailMs"])("%s validates duration shapes", field => {
   const s = setup();
   for (const value of [null, true, "120000", -1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
     expect(() => remoteBoxConfig({ chatBackends: { moni: { ...s.config, [field]: value } } }, "moni")).toThrow();
@@ -427,8 +743,9 @@ test("Moni remote-box receipt and delivered reply never wait on a local Robob ou
   const moni = registry.open(key); closes.push(() => moni.store.close());
   const call = (ok: boolean) => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok, durationMs: 10,
     props: { method: "GET", route: "/threads/:id/messages", ...(ok ? {} : { linkCause: "ECONNREFUSED" }), failureFormat: "single" } });
+  // A prior test can leave the process-wide logger inside an outage. Recover it outside this fixture.
+  call(true); toolLog.flush(); await toolLog.settled();
   const rows = await captureLogs(async () => {
-    call(true);
     for (let i = 0; i < 3; i++) call(false);
     try {
       const sink = registry.sink(async () => {}).acceptInto(key, undefined, "+15555550199");
@@ -469,6 +786,74 @@ test("box watcher canary stays out of Mac state, archives and logs; lease expiry
   await s.remote.tick(); await watches.tick(); await s.runner.tick();
   expect(checks).toBe(1); expect(files(s.box)).toContain(canary); expect(files(s.mac)).not.toContain(canary); expect(s.logs.join()).not.toContain(canary);
   s.rollback(); s.advance(); await watches.tick(); expect(checks).toBe(1);
+});
+
+test("delivery card owner relay to a remote Moni chat reports the exact refusal without sending", async () => {
+  const s = setup(), ownerStore = new Store(join(s.mac, "delivery-owner.sqlite")); closes.push(() => ownerStore.close());
+  let sends = 0;
+  s.line.sendText = async () => { sends++; throw new Error("No real sends allowed"); };
+  const registry = new ChatRegistry({ owner: "+15555550123", ownerStore, stateRoot: s.mac, line: s.line,
+    access: () => ({ people: [{ name: "Moni", role: "admin", addresses: ["+15555550199"] }], groups: [] }),
+    build: chat => { if (chat.info.slug === "moni") chat.remote = s.remote; return { api: async () => Response.json({}) }; } });
+  registry.restore(); const moni = registry.open(chatKey.dm("+15555550199")); closes.push(() => moni.store.close());
+  const session = "ardud-control:thread:fake-owner";
+  ownerStore.set("route", { id: session, generation: 1 });
+  const api = createSbApi({ registry, line: s.line, accessPath: join(s.mac, "access.json"), enabled: () => true, health: () => ({}) });
+  const command = parseCommand(["send", "--to", "moni", "--text=https://cards.example.com/s/fake/", "--session", session,
+    "--key", "delivery-card:order-amazon-fake"]);
+  const response = await api(new Request(`http://bridge${command.path}`, { method: command.method, body: JSON.stringify(command.body) }));
+  expect(response.status).toBe(403);
+  expect(await response.json()).toEqual({ error: "Use agent-ask to reach this chat on its box" });
+  expect(sends).toBe(0);
+  expect(moni.store.pendingOutbox()).toEqual([]);
+  expect(s.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox").get()!.n).toBe(0);
+  const relay = parseCommand(["agent-ask", "--to", "moni", "--text=Send the fake delivery card once", "--session", session,
+    "--key", "delivery-card:order-amazon-fake"]);
+  const ask = () => api(new Request(`http://bridge${relay.path}`, { method: relay.method, body: JSON.stringify(relay.body) }));
+  const accepted = await ask();
+  expect(accepted.status).toBe(202);
+  const ack = await accepted.json() as { id: string; created: boolean };
+  expect(ack).toEqual({ id: expect.stringMatching(/^areq_[a-f0-9]{64}$/), created: true });
+  expect(await (await ask()).json()).toEqual({ id: ack.id, created: false });
+  expect(s.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox").get()!.n).toBe(1);
+  expect(sends).toBe(0);
+  expect(moni.store.pendingOutbox()).toEqual([]);
+});
+
+test.each(["before", "after"])("delivery card bus retry recovers a failure %s the durable wake without duplicating it", async failure => {
+  const s = setup(), ownerStore = new Store(join(s.mac, "delivery-retry-owner.sqlite")); closes.push(() => ownerStore.close());
+  let sends = 0;
+  s.line.sendText = async () => { sends++; throw new Error("No real sends allowed"); };
+  const registry = new ChatRegistry({ owner: "+15555550123", ownerStore, stateRoot: s.mac, line: s.line,
+    access: () => ({ people: [{ name: "Moni", role: "admin", addresses: ["+15555550199"] }], groups: [] }),
+    build: chat => { if (chat.info.slug === "moni") chat.remote = s.remote; return { api: async () => Response.json({}) }; } });
+  registry.restore(); const moni = registry.open(chatKey.dm("+15555550199")); closes.push(() => moni.store.close());
+  const session = "ardud-control:thread:fake-owner";
+  ownerStore.set("route", { id: session, generation: 1 });
+  const api = createSbApi({ registry, line: s.line, accessPath: join(s.mac, "access.json"), enabled: () => true, health: () => ({}) });
+  const command = parseCommand(["agent-ask", "--to", "moni", "--text=Send the fake delivery card once", "--session", session,
+    "--key", "delivery-card:order-amazon-failed-wake"]);
+  const ask = () => api(new Request(`http://bridge${command.path}`, { method: command.method, body: JSON.stringify(command.body) }));
+  const accept = s.remote.accept.bind(s.remote);
+  let fail = true;
+  s.remote.accept = (...args) => {
+    if (fail && failure === "before") throw new Error("fixture wake unavailable");
+    const created = accept(...args);
+    if (fail) throw new Error("fixture acknowledgement lost");
+    return created;
+  };
+  expect((await ask()).status).toBe(500);
+  expect(ownerStore.db.query<{ status: string }, []>("SELECT status FROM agent_requests").all()).toEqual([{ status: "open" }]);
+  expect(s.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox").get()!.n).toBe(failure === "before" ? 0 : 1);
+  fail = false;
+  const recovered = await ask();
+  expect(recovered.status).toBe(200);
+  const ack = await recovered.json() as { id: string; created: boolean };
+  expect(ack).toEqual({ id: expect.stringMatching(/^areq_[a-f0-9]{64}$/), created: false });
+  expect(await (await ask()).json()).toEqual(ack);
+  expect(s.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox").get()!.n).toBe(1);
+  expect(sends).toBe(0);
+  expect(moni.store.pendingOutbox()).toEqual([]);
 });
 
 test("bus answer acknowledgement is idempotent; owner relays refuse before writing a local outbox", async () => {
@@ -535,4 +920,194 @@ test("bridge readiness gates remote lease checks and sends before side effects",
   enabled = true; expect((await api(s.request("/ready"))).status).toBe(200);
   expect((await api(s.request("/send", body))).status).toBe(200); expect(sends).toBe(1);
   s.rollback(); expect((await api(s.request("/ready"))).status).toBe(503);
+});
+
+test("delivered status lookup rotates bounded pages and retires only reported terminal or replied ids", async () => {
+  const s = setup(), ids = Array.from({ length: 205 }, (_, n) => opaqueId(`status:${n}`));
+  for (const [n, id] of ids.entries()) {
+    s.remote.accept(`status:${n}`, { text: "PRIVATE_STATUS" });
+    s.runner.enqueue(id, { kind: "inbound", text: "PRIVATE_STATUS" });
+  }
+  s.store.db.exec("UPDATE remote_inbox SET sealed=NULL,delivered_at=1000");
+  s.runner.db.query("UPDATE inbox SET state='done' WHERE id=?").run(ids[204]!);
+  s.runner.db.query("INSERT INTO actions(id,path,payload,state,inbox_id) VALUES (?,'/send','{}','done',?)").run(opaqueId("committed"), ids[150]!);
+  // A missing row is not proof of completion, including on a replaced runner.
+  s.runner.db.query("DELETE FROM inbox WHERE id=?").run(ids[10]!);
+  for (let n = 0; n < 4; n++) { await s.remote.tick(); s.advance(5_000); }
+  const pages = s.requests.filter(r => r.path === "/events" && r.body.ids).map(r => r.body.ids as string[]);
+  expect(pages.map(p => p.length)).toEqual([100, 100, 5, 100]);
+  const finished = s.store.db.query<{ id: string }, []>("SELECT id FROM remote_inbox WHERE finished_at IS NOT NULL ORDER BY seq").all();
+  expect(finished.map(r => r.id)).toEqual([ids[150]!, ids[204]!]);
+  expect(JSON.stringify(pages)).not.toContain("PRIVATE_STATUS");
+});
+
+test("a refreshed fence alert retries its frozen first-DM identity after lost acknowledgement and restart", async () => {
+  const s = setup(), head = opaqueId("refresh-head");
+  s.runner.enqueue(head, { kind: "inbound", text: "PRIVATE_REFRESH" });
+  s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  await s.remote.tick();
+  let accepted = false;
+  s.ownerAlert(async (_severity, text, key) => { s.alerts.push({ text, key }); return accepted; });
+  s.remote.accept("refresh-first", { text: "PRIVATE_REFRESH" }); s.advance(5_000); await s.remote.tick();
+  const refresh = s.alerts[1]!;
+  s.remote.accept("refresh-second", { text: "PRIVATE_REFRESH" });
+  s.restart(); s.advance(5_000); accepted = true; await s.remote.tick();
+  s.restart(); s.advance(5_000); await s.remote.tick();
+  expect(s.alerts.slice(1)).toEqual([refresh, refresh]);
+  expect(refresh.key).toBe(`moni-box-fenced:${head.slice(0, 12)}:inbound:${opaqueId("refresh-first")}`);
+  expect(JSON.stringify(s.alerts)).not.toContain("PRIVATE_REFRESH");
+});
+
+test("a committed callback reply retires delivered waiting metadata before the runner completes", async () => {
+  const s = setup(); s.remote.accept("reply-before-done", { text: "PRIVATE_REPLY" }); await s.remote.tick();
+  await s.remote.callback(s.request("/send", { id: opaqueId("early-send"), inboxId: opaqueId("reply-before-done"), text: "reply" }),
+    { line: s.line, chat: chatKey.dm("+15555550199"), bus: async () => Response.json({}) });
+  expect(s.store.db.query<{ finished_at: number }, []>("SELECT finished_at FROM remote_inbox").get()!.finished_at).toBe(1000);
+  s.offline(); s.advance(600_000); await s.remote.tick(); await s.remote.checkUnanswered();
+  expect(s.notices).toHaveLength(0); expect(s.alerts).toHaveLength(0);
+});
+
+test("one transport outage cannot send a second notice after its waiting episode clears and six hours pass", async () => {
+  const s = setup(); s.remote.accept("first-episode", { text: "private" }); s.offline(); await s.remote.tick();
+  s.advance(120_000); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  s.store.db.exec("UPDATE remote_inbox SET finished_at=121000");
+  s.advance(65_000); await s.remote.tick();
+  s.remote.accept("second-episode", { text: "private" }); s.advance(21_600_000); s.restart(); await s.remote.tick();
+  expect(s.notices).toHaveLength(1); expect(s.logs).toContain("moni-notice-suppressed already-sent");
+});
+
+test.each(["fence", "router", "callback", "both", "pending", "running"].flatMap(stall =>
+  ["sent", "uncertain", "not-attempted"].map(notice => ({ stall, notice }))))(
+  "$stall stall with $notice notice preserves the reservation when transport fails", async ({ stall, notice }) => {
+    const s = setup(), head = opaqueId("transition-head");
+    if (["fence", "pending", "running"].includes(stall)) {
+      s.runner.enqueue(head, { kind: "inbound", text: "PRIVATE_TRANSITION_HEAD" });
+      s.runner.db.query("UPDATE inbox SET state=?,interrupted_at=1000 WHERE id=?").run(stall === "fence" ? "interrupted" : stall, head);
+    } else s.readiness(stall !== "router" && stall !== "both", stall !== "callback" && stall !== "both");
+    if (notice === "uncertain") s.failNotice();
+    s.remote.accept("transition-first", { text: "PRIVATE_TRANSITION" }); await s.remote.tick();
+    s.advance(notice === "not-attempted" ? 60_000 : 120_000); await s.remote.tick();
+    expect(s.notices).toHaveLength(notice === "not-attempted" ? 0 : 1);
+    expect(s.store.get("remoteOutage")).toBeUndefined();
+
+    s.offline(); s.advance(5_000); await s.remote.tick();
+    const outage = s.store.get<{ id: string }>("remoteOutage")!.id;
+    s.restart(); s.online(); s.readiness(true, true);
+    s.runner.db.query("UPDATE inbox SET state='done' WHERE id=?").run(head);
+    s.advance(65_000); await s.remote.tick(); await s.runner.tick();
+    s.advance(5_000); await s.remote.tick();
+    expect(s.store.get("remoteWaitingNotice")).toBeNull();
+    expect(s.store.get<{ id: string }>("remoteOutage")!.id).toBe(outage);
+
+    s.remote.accept("transition-second", { text: "PRIVATE_TRANSITION" });
+    s.offline(); s.advance(21_600_000); await s.remote.tick();
+    expect(s.store.get<{ id: string }>("remoteOutage")!.id).toBe(outage);
+    expect(s.notices).toHaveLength(1);
+    s.restart(); s.advance(65_000); await s.remote.tick();
+    expect(s.notices).toHaveLength(1);
+    expect(JSON.stringify([s.logs, s.alerts])).not.toContain("PRIVATE_TRANSITION");
+  });
+
+
+// Readiness class: either dependency (or both) can block new work, with or without human backlog.
+test.each([
+  { router: false, callback: true }, { router: true, callback: false }, { router: false, callback: false },
+].flatMap(readiness => ["inbound", "wake"].map(kind => ({ ...readiness, kind }))))(
+  "readiness router=$router callback=$callback retains authority and notices only waiting $kind", async ({ router, callback, kind }) => {
+    const s = setup(); s.readiness(router, callback);
+    s.remote.accept("blocked-admission", { text: "PRIVATE_READINESS" }, undefined, kind as "inbound" | "wake");
+    await s.remote.tick(); await s.runner.tick(); expect(s.texts).toHaveLength(0);
+    s.advance(119_999); await s.remote.tick(); expect(s.notices).toHaveLength(0);
+    s.restart(); s.advance(5_000); await s.remote.tick(); await s.runner.tick();
+    expect(s.runner.active()).toBe(true); expect(s.texts).toHaveLength(0);
+    expect(s.notices).toHaveLength(kind === "inbound" ? 1 : 0);
+    s.advance(65_000); await s.remote.tick(); expect(s.notices).toHaveLength(kind === "inbound" ? 1 : 0);
+    expect(s.store.get("remoteOutage")).toBeUndefined(); expect(s.store.get("remoteFence")).toBeUndefined();
+    s.readiness(true, true); s.advance(5_000); await s.remote.tick(); await s.runner.tick();
+    expect(s.texts).toHaveLength(1); expect(s.runner.db.query("SELECT 1 FROM interruptions").get()).toBeNull();
+    expect(JSON.stringify([s.logs, s.alerts])).not.toContain("PRIVATE_READINESS");
+  });
+
+// Retirement class: committed sends, explicit reactions, and terminal box acknowledgements all end an episode.
+test.each(["send", "reaction", "terminal"])("%s retirement clears the last DM's notice reservation before the next arrival", async retirement => {
+  const s = setup(), head = opaqueId("episode-head");
+  s.runner.enqueue(head, { kind: "inbound", text: "PRIVATE_EPISODE" });
+  s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  s.remote.accept("episode-first", { text: "PRIVATE_EPISODE" }); await s.remote.tick();
+  s.advance(120_000); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  const io = { line: s.line, chat: chatKey.dm("+15555550199"), bus: async () => Response.json({}) };
+  if (retirement === "terminal") {
+    s.runner.db.query("UPDATE inbox SET state='done' WHERE id=?").run(opaqueId("episode-first"));
+    s.advance(5_000); await s.remote.tick();
+  } else {
+    const response = await s.remote.callback(s.request(retirement === "send" ? "/send" : "/react", retirement === "send"
+      ? { id: opaqueId("episode-reply"), inboxId: opaqueId("episode-first"), text: "reply" } : { target: "episode-first", kind: "like" }), io);
+    expect(response.status).toBe(200);
+  }
+  expect(s.store.get("remoteWaitingNotice")).toBeNull();
+  // No empty-queue tick occurs between this retirement and the next DM.
+  s.remote.accept("episode-second", { text: "PRIVATE_EPISODE" });
+  s.advance(120_000); await s.remote.tick(); expect(s.notices).toHaveLength(1);
+  expect(s.logs).toContain("moni-notice-suppressed rate-limited");
+  s.restart(); s.advance(21_600_000); await s.remote.tick();
+  expect(s.notices).toHaveLength(2); expect(s.notices[0]).not.toBe(s.notices[1]);
+});
+
+
+// Held-queue class: pending and running heads, both machine and human, with either tail kind.
+test.each(["pending", "running"].flatMap(state => ["inbound", "wake"].flatMap(headKind =>
+  ["inbound", "wake"].map(tailKind => ({ state, headKind, tailKind })))))(
+  "$state $headKind head notices held $tailKind once without needing an interrupted fence", async ({ state, headKind, tailKind }) => {
+    const s = setup(), head = opaqueId("busy-head");
+    s.runner.enqueue(head, { kind: headKind, text: "PRIVATE_BUSY_HEAD" });
+    s.runner.db.query("UPDATE inbox SET state=? WHERE id=?").run(state, head);
+    s.remote.accept("held-tail", { text: "PRIVATE_HELD_TAIL" }, undefined, tailKind as "inbound" | "wake");
+    await s.remote.tick(); s.advance(119_999); await s.remote.tick(); expect(s.notices).toHaveLength(0);
+    s.restart(); s.advance(5_000); await s.remote.tick();
+    expect(s.notices).toHaveLength(tailKind === "inbound" ? 1 : 0);
+    s.advance(65_000); await s.remote.tick(); s.restart(); s.advance(65_000); await s.remote.tick();
+    expect(s.notices).toHaveLength(tailKind === "inbound" ? 1 : 0);
+    expect(s.runner.active()).toBe(true); expect(s.alerts).toHaveLength(0);
+    expect(s.store.get("remoteOutage")).toBeUndefined(); expect(s.store.get("remoteFence")).toBeUndefined();
+    expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(head)?.state).toBe(state);
+    expect(JSON.stringify([s.logs, s.alerts])).not.toContain("PRIVATE_");
+  });
+
+test("mirror hooks copy accepted DMs and successful replies once, excluding wakes and failed sends", async () => {
+  const items: MirrorItem[] = [];
+  const s = setup({ ensure: async () => ({ threadId: "mirror" }), upload: async () => ({ attachmentId: "a" }),
+    append: async (_id, next) => { items.push(...next); } });
+  s.remote.accept("dm", { text: "question", sentAt: 1000 });
+  s.remote.accept("dm", { text: "question", sentAt: 1000 }); s.remote.accept("wake", { text: "private wake" }, undefined, "wake");
+  await s.remote.send("reply", "answer", undefined, s.line, chatKey.dm("moni"));
+  await s.remote.send("reply", "answer", undefined, s.line, chatKey.dm("moni"));
+  await s.remote.send("notice", "temporarily offline", undefined, s.line, chatKey.dm("moni"));
+  const failing = { ...s.line, sendText: async () => { throw new LineError("failed", "http_400", false, false); } };
+  await expect(s.remote.send("failed", "never sent", undefined, failing, chatKey.dm("moni"))).rejects.toThrow();
+  for (let i = 0; i < 4; i++) await s.mirror!.tick();
+  expect(items.map(item => item.id)).toEqual(["dm", "send:reply", "send:notice"]);
+  expect(items.map(item => item.role)).toEqual(["user", "assistant", "assistant"]);
+});
+
+test("an uncertain send is mirrored only after outbound reconciliation proves success", async () => {
+  const items: MirrorItem[] = [];
+  const s = setup({ ensure: async () => ({ threadId: "mirror" }), upload: async () => ({ attachmentId: "a" }),
+    append: async (_id, next) => { items.push(...next); } });
+  const uncertain = { ...s.line, sendText: async () => { throw new LineError("lost ack", "network", true, true); } };
+  await expect(s.remote.send("reconcile", "answer", undefined, uncertain, chatKey.dm("moni"))).rejects.toThrow();
+  await s.mirror!.tick(); expect(items).toHaveLength(0);
+  s.line.outbound = async () => [{ handle: "confirmed", chat: chatKey.dm("moni"), text: "answer", sentAt: 1000, status: "sent" }];
+  await s.remote.send("reconcile", "answer", undefined, s.line, chatKey.dm("moni"));
+  await s.mirror!.tick(); expect(items.map(item => item.id)).toEqual(["send:reconcile"]);
+});
+
+test("a hung mirror never holds Moni's reply or prevents the next successful send", async () => {
+  let appends = 0, sends = 0;
+  const s = setup({ ensure: async () => ({ threadId: "mirror" }), upload: async () => ({ attachmentId: "a" }),
+    append: async () => { appends++; return new Promise<never>(() => {}); } });
+  s.line.sendText = async () => ({ handle: `sent-${++sends}` });
+  s.remote.accept("dm", { text: "question", sentAt: 1000 }); const running = s.mirror!.tick();
+  await s.remote.send("one", "answer", undefined, s.line, chatKey.dm("moni"));
+  await s.remote.send("two", "second answer", undefined, s.line, chatKey.dm("moni"));
+  expect(sends).toBe(2); expect(appends).toBe(1); await running;
 });

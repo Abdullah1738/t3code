@@ -17,7 +17,7 @@ class LoggingReview(Isolated):
     def setUp(self):
         super().setUp()
         self.logdir = Path(self.tmp.name)/'shared-logs'
-        self.stack.enter_context(patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.logdir)))
+        self.stack.enter_context(patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.logdir)))
         self.stack.enter_context(patch.object(api, '_COMMAND_DURATIONS', {}))
         self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))

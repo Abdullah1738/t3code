@@ -20,6 +20,10 @@ ACCOUNT = FakeAuth().revalidate('nownow').account_ref
 class ActiveOrderTests(unittest.TestCase):
     def setUp(self):
         approve_test_flows(self)
+        import order_card
+        for field, value in (('LAST4', '2342'), ('NETWORK', 'mastercard')):
+            card = patch.object(order_card, field, value)
+            card.start(); self.addCleanup(card.stop)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name).resolve() / 'commerce'

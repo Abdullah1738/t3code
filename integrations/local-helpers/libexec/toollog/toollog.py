@@ -17,7 +17,7 @@ import tempfile
 from functools import lru_cache
 
 # Keep iMessage class names in sync with spectrum-bridge/src/log-error.ts.
-_IMESSAGE_ERROR_NAMES = frozenset('Error TypeError RangeError ReferenceError SyntaxError URIError EvalError AggregateError IMessageError APIError FetchError HTTPError NetworkError ZodError AbortError TimeoutError SystemError SQLiteError SqliteError DOMException JudgeError TransportError PublishError CliError SttError SecretError ShareError HttpError ApiError ControlError LineError SendblueError ValidationError UnknownError'.split())
+_IMESSAGE_ERROR_NAMES = frozenset('Error TypeError RangeError ReferenceError SyntaxError URIError EvalError AggregateError IMessageError APIError FetchError HTTPError NetworkError ZodError AbortError TimeoutError BoundedTimeout SystemError SQLiteError SqliteError DOMException JudgeError TransportError PublishError CliError SttError SecretError ShareError HttpError ApiError ControlError LineError SendblueError ValidationError UnknownError'.split())
 
 CAP_BYTES = 50 * 1024 * 1024
 HOOKS_CAP_BYTES = 35 * 1024 * 1024
@@ -571,7 +571,9 @@ def _imessage_replayed_cause(row):
                      else 'HttpError' if tag_status else 'UnknownError') if isinstance(tag, str) else 'UnknownError'
     name = source.get('name') if source.get('name') is not None else error.get('name', fallback_name)
     name = name if isinstance(name, str) and name in _IMESSAGE_ERROR_NAMES else 'UnknownError'
-    if name not in {'Error', 'UnknownError', 'TimeoutError'}:
+    if tag == 'router.catch1' and props.get('causeKind') in ('timeout', 'http', 'transport'):
+        return (tag, 'prompt_acceptance_probe')
+    if name not in {'Error', 'UnknownError', 'TimeoutError', 'BoundedTimeout'}:
         return None
     tag = tag if re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_.:-]{0,99}', tag) else 'operation.failed'
     fallback_code = error.get('code') if error.get('code') is not None else 'http_' + tag_status[1] if tag_status else None
@@ -678,10 +680,47 @@ def _imessage_rollup_records(board, day):
         yield 0, row
 
 
+def _imessage_probe_stats(row):
+    if row.get('component') != 'router' or row.get('name') != 'router.prompt_probes' or row.get('kind') != 'perf':
+        return None
+    value = row.get('promptProbe')
+    if not isinstance(value, dict):
+        return None
+    outcomes = ('accepted', 'notAcceptedYet', 'timeout', 'http', 'transport')
+    valid = lambda n: type(n) is int and 0 <= n <= 10_000_000
+    if not all(valid(value.get(k)) for k in ('calls',) + outcomes):
+        return None
+    if value['calls'] != sum(value[k] for k in outcomes):
+        return None
+    statuses = value.get('httpByStatus')
+    if not isinstance(statuses, dict) or any(not isinstance(k, str) or not re.fullmatch(r'[1-5]\d{2}', k) or not valid(v) for k, v in statuses.items()):
+        return None
+    if sum(statuses.values()) != value['http']:
+        return None
+    result = {k: value[k] for k in ('calls',) + outcomes}
+    result['httpByStatus'] = dict(statuses)
+    for field in ('elapsedMs', 'attempts', 'msUntilAccepted'):
+        bins = value.get(field)
+        if not isinstance(bins, list) or len(bins) > 100_000:
+            return None
+        if any(not isinstance(pair, list) or len(pair) != 2 or type(pair[0]) is not int or not 0 <= pair[0] <= 2**53 - 1 or not valid(pair[1]) or pair[1] < 1 for pair in bins):
+            return None
+        result[field] = [tuple(pair) for pair in bins]
+    samples = lambda field: sum(n for _, n in result[field])
+    if samples('elapsedMs') != result['calls'] or samples('attempts') > result['accepted'] or samples('attempts') != samples('msUntilAccepted'):
+        return None
+    return result
+
+
 def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
     causes, render_failures = Counter(), Counter()
+    cause_kinds = defaultdict(Counter)
+    probe_totals, probe_statuses = Counter(), Counter()
+    probe_bins = defaultdict(list)
+    probe_hours = {}
+    probe_rows = defaultdict(Counter)
     samples, references, durations = {}, {}, defaultdict(list)
     order_errors, order_polls = {}, defaultdict(list)
     component_totals, component_errors = Counter(), defaultdict(Counter)
@@ -703,9 +742,23 @@ def rollup(board, day, top_n=20):
     total = oks = failed = errors = observed = 0
     single_failures = 0
     deduped_failures = 0
+    probe_failure_kinds = {}
     def observe_error(row, line_number, weight=1):
         nonlocal single_failures
+        probe_id = (row.get('ids') or {}).get('inboundId', '')
+        if board == 'imessage' and isinstance(probe_id, str) and re.fullmatch(r'row_[a-f0-9]{16}', probe_id):
+            probe_tag = ('router.probe_backoff' if row.get('name') == 'router.probe_backoff'
+                         else 'router.catch1' if (row.get('error') or {}).get('tag') == 'router.catch1' else None)
+            if probe_tag:
+                key = (probe_tag, 'admission_read_failed')
+                causes[key] += weight
+                probe_rows[key][probe_id] += weight
         if board == 'imessage' and row.get('alreadyLogged') is True:
+            request_id = (row.get('ids') or {}).get('requestId')
+            cause_kind = (row.get('props') or {}).get('causeKind')
+            if ((row.get('error') or {}).get('tag') == 'router.catch1'
+                    and isinstance(request_id, str) and request_id and cause_kind in ('timeout', 'http', 'transport')):
+                probe_failure_kinds[request_id] = cause_kind
             return
         request_failure = (board == 'imessage' and row.get('component') == 'robob' and row.get('name') == 'turn.robob_call'
                            and row.get('kind') == 'perf' and row.get('ok') is False)
@@ -727,6 +780,14 @@ def rollup(board, day, top_n=20):
             if not isinstance(error_name, str) or error_name not in _IMESSAGE_ERROR_NAMES:
                 error_name = 'UnknownError'
             key = (tag, error_name)
+            cause_kind = (row.get('props') or {}).get('causeKind')
+            # Request details follow catches, including when their count is owned by a summary.
+            if cause_kind is None and request_failure:
+                request_id = (row.get('ids') or {}).get('requestId')
+                if isinstance(request_id, str):
+                    cause_kind = probe_failure_kinds.get(request_id)
+            if cause_kind in ('timeout', 'http', 'transport'):
+                cause_kinds[key][cause_kind] += weight
         tags[key] += weight
         references.setdefault(key, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
         identity = row.get('ids')
@@ -792,6 +853,18 @@ def rollup(board, day, top_n=20):
         if values:
             durations[name].extend(values)
         if board == 'imessage':
+            probe = _imessage_probe_stats(row)
+            if probe:
+                hour = str(row.get('ts', ''))[11:13]
+                hourly = probe_hours.setdefault(hour, {'counts': Counter(), 'statuses': Counter(), 'bins': defaultdict(list)})
+                for field in ('calls', 'accepted', 'notAcceptedYet', 'timeout', 'http', 'transport'):
+                    probe_totals[field] += probe[field]
+                    hourly['counts'][field] += probe[field]
+                probe_statuses.update(probe['httpByStatus'])
+                hourly['statuses'].update(probe['httpByStatus'])
+                for field in ('elapsedMs', 'attempts', 'msUntilAccepted'):
+                    probe_bins[field].extend(probe[field])
+                    hourly['bins'][field].extend(probe[field])
             component = row.get('component', 'unknown')
             call = row.get('_rollup_call') if aggregate else _imessage_call_name(row)
             for label in [name] + ([call] if name == 'turn.robob_call' and call else []):
@@ -901,7 +974,8 @@ def rollup(board, day, top_n=20):
                                  for rule, threads in sorted(threads_by_rule.items())},
             'repeatLoops': loops,
             'topErrorTags': [{**({'tag': key[0], 'name': key[1]} if board == 'imessage' else {'tag': key}),
-                              'count': count, 'sampleId': samples.get(key, references[key])}
+                              'count': count, 'sampleId': samples.get(key, references[key]),
+                              **({'causeKinds': dict(cause_kinds[key])} if board == 'imessage' and cause_kinds[key] else {})}
                              for key, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
     if board == 'agent-tools':
         result['unattributedByRule'] = {rule: [
@@ -946,8 +1020,21 @@ def rollup(board, day, top_n=20):
             merchant: {**poll, 'failureShare': poll['failed'] / poll['count']}
             for merchant, poll in sorted(poll_counts.items())}
     if board == 'imessage':
+        def probe_summary(counts, statuses, bins):
+            summary = {field: counts[field] for field in ('calls', 'accepted', 'notAcceptedYet', 'timeout', 'http', 'transport')}
+            summary['httpByStatus'] = dict(statuses)
+            for field in ('elapsedMs', 'attempts', 'msUntilAccepted'):
+                values = bins[field]
+                summary[field] = {'count': sum(n for _, n in values), **(percentiles(values) if values else {'p50': 0, 'p95': 0, 'max': 0})}
+            return summary
+        result['promptProbe'] = {**probe_summary(probe_totals, probe_statuses, probe_bins),
+            'byHour': {hour: probe_summary(value['counts'], value['statuses'], value['bins']) for hour, value in sorted(probe_hours.items())}}
         result['dedupedFailures'] = deduped_failures
-        result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count}
+        result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count,
+                                **({'distinctInboundIds': len(probe_rows[(tag, cause)]),
+                                    'topInboundIds': [{'inboundId': row, 'count': attempts} for row, attempts in
+                                                      sorted(probe_rows[(tag, cause)].items(), key=lambda x: (-x[1], x[0]))[:14]]}
+                                   if (tag, cause) in probe_rows else {})}
                                for (tag, cause), count in sorted(causes.items(), key=lambda x: (-x[1], x[0]))[:20]]
         result['cardRenderFailures'] = dict(sorted(render_failures.items()))
         result['byComponent'] = {}

@@ -48,7 +48,7 @@ export class BoxWatchers {
           }
           if (!this.runner.active() || existsSync(join(dir, "disabled"))) continue;
           if (state.output.trim()) {
-            this.runner.enqueue(opaqueId(`watch:${id}:${state.run}`), { text: `[Watcher ${id}, not typed by Moni.]\n${state.output}\nContext: ${watch.context}` });
+            this.runner.enqueue(opaqueId(`watch:${id}:${state.run}`), { kind: "wake", watcher: id, text: `[Watcher ${id}, not typed by Moni.]\n${state.output}\nContext: ${watch.context}` });
             state.fires++;
           }
           writeFileSync(join(dir, ".run-ok"), state.run, { mode: 0o600 });

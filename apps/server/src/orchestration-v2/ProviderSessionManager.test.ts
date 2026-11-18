@@ -9286,6 +9286,9 @@ it.effect.each([
       const dependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          recordDelegationTimeout: () => Effect.succeed(true),
+          clearDelegationTimeout: () => Effect.void,
+          settleDelegationTimeout: () => Effect.succeed(undefined),
           getCallerRow: () =>
             Effect.succeed({
               ...liveThreadShell(threadId),

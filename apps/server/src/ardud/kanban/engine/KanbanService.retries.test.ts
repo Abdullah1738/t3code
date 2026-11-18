@@ -5,16 +5,20 @@
  * queue and holds no slot. The pure decision is tested in retries.test.ts.
  */
 import { assert, it } from "@effect/vitest";
+import { withTestSchedulerBudget } from "./testSchedulerBudget.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Exit from "effect/Exit";
+import * as Queue from "effect/Queue";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
 
 import {
   KanbanError,
@@ -2303,6 +2307,40 @@ const gateFlaggedCard = Effect.gen(function* () {
 const gateRequeues = (events: ReadonlyArray<KanbanCardEvent>) =>
   events.filter((event) => event.body === Retries.REVIEW_GATE_REQUEUED_EVENT);
 
+// Register short board-lock retries explicitly: advancing TestClock before a
+// post-commit drain requests its backoff would leave that drain asleep forever.
+const advanceBoardRetries = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const clock = yield* Clock.Clock;
+    const scheduled = yield* Queue.unbounded<{
+      readonly until: number;
+      readonly resume: Deferred.Deferred<void>;
+    }>();
+    const retryClock: Clock.Clock = {
+      ...clock,
+      sleep: (duration) => {
+        const ms = Duration.toMillis(duration);
+        if (ms < 10 || ms > 80) return clock.sleep(duration);
+        return Effect.gen(function* () {
+          const resume = yield* Deferred.make<void>();
+          yield* Queue.offer(scheduled, { until: clock.currentTimeMillisUnsafe() + ms, resume });
+          yield* Deferred.await(resume);
+        });
+      },
+    };
+    const advance = Effect.forever(
+      Effect.gen(function* () {
+        const retry = yield* Queue.take(scheduled);
+        yield* TestClock.adjust(Math.max(0, retry.until - clock.currentTimeMillisUnsafe()));
+        yield* Deferred.succeed(retry.resume, undefined);
+      }),
+    );
+    return yield* Effect.raceFirst(
+      effect.pipe(Effect.provideService(Clock.Clock, retryClock)),
+      advance,
+    );
+  });
+
 it.effect(
   "a subtask edit requeues a gate-refused review, retaining queue age, wait and retries",
   () =>
@@ -2447,7 +2485,23 @@ it.effect.each(["approved", "picked"] as const)(
           owner,
           "owner",
         );
-        yield* kanban.tick;
+        const noticeDrained = yield* Deferred.make<void>();
+        const tracer = Tracer.make({
+          span(options) {
+            const span = new Tracer.NativeSpan(options);
+            if (options.name === "KanbanService.drainOwnerRoutes") {
+              const end = span.end.bind(span);
+              span.end = (time, exit) => {
+                end(time, exit);
+                Deferred.doneUnsafe(noticeDrained, Effect.void);
+              };
+            }
+            return span;
+          },
+        });
+        // The tick's notice must settle before the answer invalidates its snapshot.
+        yield* kanban.tick.pipe(Effect.withTracer(tracer));
+        yield* Deferred.await(noticeDrained);
         assert.isNotNull((yield* now).card.stalled);
         const ask = (yield* now).card.asks.at(-1)!;
         yield* kanban.answerAsk(
@@ -2463,7 +2517,7 @@ it.effect.each(["approved", "picked"] as const)(
         assert.deepStrictEqual((yield* now).card.retries, card.retries);
         assert.lengthOf(gateRequeues((yield* now).events), 1);
       }).pipe(Effect.provide(testLayer(fake.layer)));
-    }),
+    }).pipe(advanceBoardRetries, withTestSchedulerBudget),
 );
 
 it.effect("changing guessedGates rechecks refused reviews on that board", () =>
@@ -2799,6 +2853,7 @@ it.effect(
       const fake = makeFake();
       let fail = false;
       let depth = 0;
+      let failedCommits = 0;
       const sqlLayer = Layer.effect(
         SqlClient.SqlClient,
         Effect.map(SqlClient.SqlClient, (sql) => {
@@ -2807,13 +2862,25 @@ it.effect(
               const outer = depth++ === 0;
               return sql
                 .withTransaction(
-                  effect.pipe(
-                    Effect.tap(() =>
+                  Effect.gen(function* () {
+                    // Snapshot reads also use transactions; inject only after a write.
+                    const before =
                       outer && fail
-                        ? Effect.die(new Error("commit failed after card write"))
-                        : Effect.void,
-                    ),
-                  ),
+                        ? (yield* sql<{ changes: number }>`SELECT total_changes() AS changes`)[0]
+                            ?.changes
+                        : undefined;
+                    const result = yield* effect;
+                    if (before !== undefined) {
+                      const after = yield* sql<{ changes: number }>`
+                        SELECT total_changes() AS changes
+                      `;
+                      if (Number(after[0]?.changes) > before) {
+                        failedCommits++;
+                        return yield* Effect.die(new Error("commit failed after card write"));
+                      }
+                    }
+                    return result;
+                  }),
                 )
                 .pipe(
                   Effect.ensuring(
@@ -2842,6 +2909,7 @@ it.effect(
           ),
         );
         assert.isTrue(Exit.isFailure(result));
+        assert.strictEqual(failedCommits, 1);
         const detail = yield* now;
         assert.deepStrictEqual(detail.card.stalled, card.stalled);
         assert.deepStrictEqual(detail.card.subtasks, card.subtasks);

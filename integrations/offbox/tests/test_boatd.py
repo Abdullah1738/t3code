@@ -89,7 +89,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="boatd-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        log_env = patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.tmp / "shared-logs"))
+        log_env = patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.tmp / "shared-logs"))
         log_env.start()
         self.addCleanup(log_env.stop)
         self.saved = {k: getattr(boatd, k) for k in (
@@ -307,7 +307,7 @@ class ReconcileRuns(Base):
         out = boatd.reconcile(self.con)
         self.assertEqual(out["boxes_failed"], 1)
         self.assertEqual(self.status(b, p)["status"], "interrupted")
-        self.assertEqual(self.state(b)["state"], "archived")
+        self.assertEqual(self.state(b)["state"], "error")
         self.assertEqual(self.f.spawned, [])
 
     def test_runner_that_cannot_be_spawned_ends_the_run_instead_of_blocking_the_queue(self):
@@ -936,6 +936,23 @@ class Http(Base):
                         self.assertEqual(data, content[offset:offset + (1 << 20)])
                         self.assertEqual(page["nextOffset"], offset + len(data))
                         self.assertEqual(page["done"], status == "exited" and page["nextOffset"] >= page["size"])
+
+    def test_running_history_page_limit_preserves_utf8_and_advances_by_offset(self):
+        bid = self.box()
+        self.cmd(bid, pid=1001, status='running')
+        content = 'abc€tail'.encode()
+        (boatd.cmd_dir(bid) / '1001.out').write_bytes(content)
+        offset, received = 0, b''
+        while offset < len(content):
+            st, page = self.call('ardud', 'GET',
+                f'/sandboxes/{bid}/command-history/cmd_1001/logs?stream=stdout&offset={offset}&limitBytes=4')
+            self.assertEqual(st, 200)
+            self.assertGreater(page['nextOffset'], offset)
+            self.assertLessEqual(len(page['data'].encode()), 4)
+            self.assertFalse(page['done'])
+            received += page['data'].encode()
+            offset = page['nextOffset']
+        self.assertEqual(received, content)
 
     def test_saved_states_are_per_owner_even_with_the_same_name(self):
         hers, his = self.make_box("moni"), self.make_box("ardud")

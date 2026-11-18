@@ -41,6 +41,7 @@ export class GitRepositoryDiscovery extends Context.Service<
 >()("t3/git/GitRepositoryDiscovery") {}
 
 const CAPACITY = 2_048;
+const REFS_CACHE_BYTES = 32 * 1024 * 1024;
 // Like listRefs, this scans the whole repository; seven fields exceed the
 // default command budget even at 12,000 ordinary remote-tracking refs.
 const REFS_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
@@ -48,6 +49,40 @@ const encodeSignature = Schema.encodeSync(
   Schema.fromJsonString(Schema.Array(Schema.Array(Schema.String))),
 );
 const isGitCommandError = Schema.is(GitCommandError);
+
+const makeRefCache = <A extends { readonly bytes: number }>() => {
+  const values = new Map<string, A>();
+  let bytes = 0;
+  const remove = (key: string) => {
+    const value = values.get(key);
+    if (value === undefined) return;
+    bytes -= value.bytes;
+    values.delete(key);
+  };
+  return {
+    get: (key: string) => {
+      const value = values.get(key);
+      if (value !== undefined) {
+        values.delete(key);
+        values.set(key, value);
+      }
+      return value;
+    },
+    set: (key: string, value: A) => {
+      remove(key);
+      if (value.bytes > REFS_CACHE_BYTES) return;
+      while (bytes + value.bytes > REFS_CACHE_BYTES || values.size >= CAPACITY) {
+        const oldest = values.keys().next().value;
+        if (oldest === undefined) break;
+        remove(oldest);
+      }
+      values.set(key, value);
+      bytes += value.bytes;
+    },
+    delete: remove,
+    keys: () => values.keys(),
+  };
+};
 
 export const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
@@ -69,11 +104,12 @@ export const make = Effect.gen(function* () {
       readonly values: ReadonlyMap<string, string>;
     }
   >();
-  const snapshots = new Map<string, RepositoryDiscovery>();
-  const rawRefs = new Map<
-    string,
-    { readonly signature: string; readonly refs: RepositoryDiscovery["refs"] }
-  >();
+  const snapshots = makeRefCache<{ readonly bytes: number; readonly value: RepositoryDiscovery }>();
+  const rawRefs = makeRefCache<{
+    readonly bytes: number;
+    readonly signature: string;
+    readonly refs: RepositoryDiscovery["refs"];
+  }>();
   const generations = new Map<string, number>();
   let sequence = 0;
 
@@ -343,7 +379,7 @@ export const make = Effect.gen(function* () {
         ),
       ].sort();
       const key = `${commonDir}\u0000${gitDir}\u0000${branch}`;
-      const completed = snapshots.get(key);
+      const completed = snapshots.get(key)?.value;
       if (!fresh && completed !== undefined) {
         const current = yield* branchSignature(
           commonDir,
@@ -356,7 +392,7 @@ export const make = Effect.gen(function* () {
         if (completed.signature === (yield* digest(config.signature + current))) return completed;
       }
       const load = Effect.gen(function* () {
-        const remembered = snapshots.get(key);
+        const remembered = snapshots.get(key)?.value;
         const before = yield* branchSignature(
           commonDir,
           gitDir,
@@ -374,7 +410,7 @@ export const make = Effect.gen(function* () {
           const beforeRefs = yield* refSignature(commonDir);
           const cached = rawRefs.get(rawKey);
           if (!fresh && cached?.signature === beforeRefs)
-            return { refs: cached.refs, stable: true };
+            return { refs: cached.refs, bytes: cached.bytes, stable: true };
           const rawGeneration = ++sequence;
           boundedSet(generations, rawKey, rawGeneration);
           const output = yield* git.execute({
@@ -412,9 +448,13 @@ export const make = Effect.gen(function* () {
             if (name) refs.set(name, { oid, upstream, remoteName, remoteRef, symref, upstreamRef });
           }
           const stable = beforeRefs === (yield* refSignature(commonDir));
+          // Sliced fields may retain the complete UTF-16 stdout backing string.
+          // Include it and an estimate for each parsed object/map entry; the two
+          // caches each budget 32 MiB, counting shared maps conservatively twice.
+          const bytes = output.stdout.length * 2 + refs.size * 320;
           if (stable && generations.get(rawKey) === rawGeneration)
-            boundedSet(rawRefs, rawKey, { signature: beforeRefs, refs });
-          return { refs, stable };
+            rawRefs.set(rawKey, { signature: beforeRefs, refs, bytes });
+          return { refs, bytes, stable };
         });
         // Different branches share raw remote refs, retaining #1584's cold sharing.
         const raw = yield* fresh ? readRefs : locks.withLock(rawKey, readRefs);
@@ -437,7 +477,7 @@ export const make = Effect.gen(function* () {
           generations.get(key) === generation &&
           config.signature === (yield* signature(config.files))
         )
-          boundedSet(snapshots, key, result);
+          snapshots.set(key, { value: result, bytes: raw.bytes });
         return result;
       });
       return yield* fresh ? load : locks.withLock(key, load);

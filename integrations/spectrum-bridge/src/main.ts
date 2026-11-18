@@ -1,3 +1,4 @@
+import { ProbeBudget } from "./probe-policy.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { acknowledgePhoton, notifyFailedInbound } from "./inbound-failure.ts";
 import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
@@ -122,6 +123,7 @@ async function main(): Promise<void> {
   });
   await chmod(socketPath, 0o600);
   const store = new Store(join(stateRoot, "state.sqlite"));
+  const probeBudget = new ProbeBudget(store);
   if (backend instanceof RobobBackend) backend.trackFirstTurns(store);
   // Retire only unsent legacy observer output. Agent-authored notify:* operations are untouched.
   store.db.query("UPDATE outbox SET state = 'cancelled' WHERE id LIKE 'juno:%' AND state IN ('pending', 'uncertain', 'failed')").run();
@@ -147,7 +149,7 @@ async function main(): Promise<void> {
   });
   const makeRouter = () => chatGuid ? new Router(store, backend, photon, {
     ...config, chatGuid, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
-    medsFold: {},
+    medsFold: {}, probeBudget,
     transcribe: input => transcribe(input), notifyUnanswered: (severity, text, key) => outlet.notify(severity, text, key), notifyFailure: notifyFailedInbound, log, recoverAttachment,
   }) : undefined;
   router = makeRouter();
@@ -318,6 +320,7 @@ async function main(): Promise<void> {
     if (chatGuid) await photon.typing(chatGuid, false).catch((caughtError) => { toolError("main", "main.catch18", caughtError);});
     await photon.close();
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.
+    toolLog.flush();
     process.exit(0);
   };
   process.once("SIGTERM", () => { void stop(); });

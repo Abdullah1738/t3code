@@ -210,21 +210,16 @@ export function applyReviewResult(
       continueReview: true,
     };
   }
-  if (prsLanded(card)) {
-    return {
-      stage: "completed",
-      reviewStep: next,
-      reviewRound: card.reviewRound,
-      continueReview: false,
-    };
-  }
-  return {
-    stage: "in_review",
-    reviewStep: next,
-    reviewRound: card.reviewRound,
-    continueReview: false,
-  };
+  return finishedReview({ ...card, reviewStep: next });
 }
+
+/** Finish passed review without crediting an additional verdict. */
+export const finishedReview = (card: KanbanCard): ReviewOutcome => ({
+  stage: prsLanded(card) ? "completed" : "in_review",
+  reviewStep: card.reviewStep,
+  reviewRound: card.reviewRound,
+  continueReview: false,
+});
 
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);

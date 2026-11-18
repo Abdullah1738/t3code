@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from urllib.parse import parse_qs, urlsplit
 from janitor_test_safety import JanitorTestCase
 from unittest.mock import patch
 
@@ -324,14 +325,47 @@ class ProcessTests(JanitorTestCase):
 
     def test_owner_binding_and_recovery_api_shapes(self):
         responses = [{'thread': OWNER['thread']}, {'thread': OWNER['thread']},
-                     {'threads': [{'threadId': 'owner', **OWNER['recovery']}], 'nextCursor': None}]
-        with patch.object(lp, 'control', side_effect=responses) as api:
+                     {'threads': [{'threadId': 'owne0'}, {'threadId': 'owne1'},
+                                  {'threadId': 'owner', **OWNER['recovery']}], 'nextCursor': 'owner'}]
+        with patch.object(lp, 'control', side_effect=responses) as api, \
+                patch.object(lp, 'RECOVERY_PAGE_LIMIT', 3):
             result = lp.owner({'CLAUDE_CODE_SESSION_ID': 'native'})
             self.assertEqual(result['thread'], OWNER['thread'])
             self.assertEqual(result['recovery']['heldWork'], False)
+            self.assertTrue(lp.owner_clear(result, ROSTER))
+            self.assertEqual(parse_qs(urlsplit(api.call_args_list[2].args[0]).query),
+                             {'active': ['false'], 'cursor': ['owne'], 'limit': [str(lp.RECOVERY_PAGE_LIMIT)]})
         self.assertIn('driver=claudeAgent', api.call_args_list[0].args[0])
         self.assertIn('&view=owner', api.call_args_list[0].args[0])
-        self.assertIn('active=false', api.call_args_list[2].args[0])
+
+    def test_owner_absent_from_recovery_page_stays_unknown_and_keeps_process(self):
+        pages = [[], [{'threadId': f'other-{i}'} for i in range(lp.RECOVERY_PAGE_LIMIT)]]
+        for entries in pages:
+            responses = [(200, {'ok': True, **body}) for body in (
+                {'thread': OWNER['thread']}, {'thread': OWNER['thread']},
+                {'threads': entries, 'nextCursor': 'more-threads'})]
+            with self.subTest(rows=len(entries)), patch.object(lp.active_sessions, '_control_get',
+                    side_effect=responses * 2) as api:
+                self.assertIsNone(lp.owner(DETAILS['binding']))
+                report = lp.detect(lp.parse_ps(PS), lp.parse_top(TOP), {}, ROSTER,
+                                   inspect=lambda row: DETAILS)
+                self.assertEqual(report['candidates'], [])
+                self.assertEqual(report['inventory'][0]['keep_reason'], 'unknown_owner')
+                self.assertEqual(api.call_count, 6)
+                self.assertEqual(parse_qs(urlsplit(api.call_args.args[0]).query),
+                                 {'active': ['false'], 'cursor': ['owne'],
+                                  'limit': [str(lp.RECOVERY_PAGE_LIMIT)]})
+
+    def test_recovery_timeout_or_failure_keeps_process(self):
+        for status, body in ((0, 'timed out'), (503, None)):
+            responses = [(200, {'ok': True, 'thread': OWNER['thread']})] * 2 + [(status, body)]
+            with self.subTest(status=status), patch.object(lp.active_sessions, '_control_get',
+                    side_effect=responses):
+                report = lp.detect(lp.parse_ps(PS), lp.parse_top(TOP), {}, ROSTER,
+                                   inspect=lambda row: DETAILS)
+                self.assertEqual(report['candidates'], [])
+                self.assertTrue(report['inventory'][0]['keep_reason'].startswith('observation_unavailable:'))
+                self.assertEqual(report['owner_calls']['recovery']['failures'], {str(status): 1})
 
     def test_owner_view_keep_matrix_never_reads_detail_or_recovery(self):
         forms = [
@@ -535,12 +569,17 @@ class ProcessTests(JanitorTestCase):
             cursor = report['next_cursor']
         self.assertEqual(runs, [[20, 40], [50, 30], [20, 40], [50, 30]])
 
-    def test_process_module_has_no_signal_or_delete_primitives(self):
+    def test_signal_primitive_is_only_in_opt_in_stop_and_deletion_stays_forbidden(self):
         import ast
         tree = ast.parse(Path(lp.__file__).read_text())
         forbidden = {'kill', 'killpg', 'unlink', 'remove', 'rmdir', 'rmtree'}
+        stop = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'stop_xcode_builds')
+        send_default = stop.args.kw_defaults[stop.args.kwonlyargs.index(
+            next(arg for arg in stop.args.kwonlyargs if arg.arg == 'send'))]
+        self.assertIsInstance(send_default, ast.Attribute)
+        self.assertEqual(ast.unparse(send_default), 'os.kill')
         for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute):
+            if isinstance(node, ast.Attribute) and node is not send_default:
                 self.assertNotIn(node.attr, forbidden)
 
 

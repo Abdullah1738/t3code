@@ -135,6 +135,8 @@ def snapshot(args):
     started = time.monotonic()
     state = Path.home() / ".local/state/harness-hooks"
     row = {"card": args.card, "ask": args.ask, "db": args.db, "check": "refused", "bytes": 0}
+    directory = None
+    copy_started = False
     try:
         if not Path(args.db).is_absolute():
             raise Refused("database path must be absolute")
@@ -150,7 +152,6 @@ def snapshot(args):
             raise Refused("control card identity invalid")
         approval(card, args.ask, datetime.now(timezone.utc))
         row["card"] = card["id"]
-        claim(state, card["id"], args.ask, db)
         parent = Path(args.out_parent or os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve()
         if args.out_parent:
             parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -159,6 +160,8 @@ def snapshot(args):
         directory = Path(tempfile.mkdtemp(prefix="live-db-snapshot-", dir=parent))
         directory.chmod(0o700)
         destination = directory / db.name
+        claim(state, card["id"], args.ask, db)
+        copy_started = True
         row["method"] = copy_database(db, destination)
         row["bytes"] = sum(p.stat().st_size for p in directory.iterdir())
         row["check"] = "allowed"
@@ -170,6 +173,11 @@ def snapshot(args):
         row["check"] = "snapshot failed"
         raise Refused("snapshot failed") from None
     finally:
+        if directory is not None and not copy_started:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
         row["ms"] = round((time.monotonic() - started) * 1000, 3)
         audit(state, row)
 

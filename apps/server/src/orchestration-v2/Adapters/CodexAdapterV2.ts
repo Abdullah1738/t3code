@@ -1493,8 +1493,11 @@ export function codexThreadRuntimeParams(input: {
       ...CODEX_THREAD_CONFIG,
       ...Object.fromEntries(
         (input.attribution?.servers ?? []).flatMap((name) => {
+          // Codex splits override paths on literal dots; quoting a segment creates another server.
+          // A name with dots cannot be tagged safely, so its children stay unattributed.
+          if (name.includes(".")) return [];
           const tag = input.attribution!;
-          const prefix = `mcp_servers.${JSON.stringify(name)}.env`;
+          const prefix = `mcp_servers.${name}.env`;
           return [
             [`${prefix}.ROBOB_THREAD_ID`, tag.threadId],
             [`${prefix}.ROBOB_THREAD_LOAD_ID`, tag.loadId],

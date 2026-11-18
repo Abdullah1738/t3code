@@ -195,7 +195,11 @@ def _fields(entry, at):
                 continue
             file_event = entry['name'] in ('data_read.retried', 'data_read.failed', 'data_write.retried',
                                            'data_write.failed', 'runs_log.write_failed')
-            if file_event and key == 'path' and type(value) is str and len(value) <= 1024 and value.startswith('/') and not any(ord(c) < 32 for c in value):
+            # Only triage supplies a bounded, credential-redacted classifier diagnostic.
+            if (entry['component'] == 'triage' and entry['name'] == 'triage.classify' and key == 'classifier_error'
+                    and type(value) is str and len(value) <= 400 and not any(ord(c) < 32 for c in value)):
+                props[key] = value
+            elif file_event and key == 'path' and type(value) is str and len(value) <= 1024 and value.startswith('/') and not any(ord(c) < 32 for c in value):
                 props[key] = value
             elif file_event and key in ('attempts', 'ms') and _finite(value) and value >= 0:
                 props[key] = value

@@ -1,3 +1,6 @@
+import * as HttpRequestLifecycle from "./ardud/http/HttpRequestLifecycle.ts";
+import * as ControlRequestAnalytics from "./ardud/control/ControlRequestAnalytics.ts";
+import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as ControlHttpTelemetry from "./observability/ControlHttpTelemetry.ts";
 import * as Mime from "effect/http/Mime";
 import { interruptionProps } from "./observability/analyticsInterruption.ts";
@@ -282,49 +285,107 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
           Option.isSome(requestUrl) && requestUrl.value.pathname.startsWith("/api/ardud/control/")
             ? yield* ControlHttpTelemetry.make(requestUrl.value.href, request.headers["user-agent"])
             : undefined;
+        const lifecycle = control ? HttpRequestLifecycle.forRequest(request.source) : undefined;
+        const runFork = Effect.runForkWith(yield* Effect.context<never>());
+        let controlProps: NonNullable<AnalyticsEvent["props"]> = {};
+        const observer = {
+          start: (
+            route: { readonly path: string; readonly method: string } | undefined,
+            requestId: string,
+          ) => {
+            controlProps = {
+              ...controlProps,
+              requestId,
+              ...(route === undefined ? {} : { httpRoute: route.path, httpMethod: route.method }),
+              ...(lifecycle === undefined ? {} : { receiveToHandlerMs: lifecycle.elapsedMs() }),
+            };
+          },
+          complete: (props: NonNullable<AnalyticsEvent["props"]>) => {
+            controlProps = { ...controlProps, ...props };
+          },
+        };
         let interruption: ReturnType<typeof interruptionProps> = {};
         let errorTag: string | undefined;
         let recorded = false;
+        let matchedPath = "unmatched";
+        let status = 499;
+        let responseBytes: number | undefined;
+        let responseReadyMs: number | undefined;
+        const record = (delivery?: {
+          responseDelivery: "finished" | "closed";
+          responseElapsedMs: number;
+        }) =>
+          Effect.suspend(() => {
+            if (recorded) return Effect.void;
+            const path = controlProps.httpRoute ?? matchedPath;
+            if (path === OTLP_TRACES_PROXY_PATH || path.startsWith("/api/ardud/analytics"))
+              return Effect.void;
+            recorded = true;
+            const route = safeAnalyticsLabel(path.replaceAll("*", ":rest"), "unmatched");
+            const remote = Option.getOrElse(request.remoteAddress, () => "");
+            const failureTag = errorTag ?? controlProps.errorTag;
+            return Effect.flatMap(DateTime.now, (now) =>
+              recordServerAnalytics(analytics.value, {
+                ts: DateTime.formatIso(now),
+                ...(lifecycle === undefined ? {} : { startedAt: lifecycle.receivedAt }),
+                kind: "server.http",
+                surface: "server",
+                route,
+                durationMs:
+                  delivery?.responseElapsedMs ??
+                  Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6),
+                ...delivery,
+                props: {
+                  ...interruption,
+                  ...control?.props(),
+                  ...controlProps,
+                  ...(path === "unmatched"
+                    ? {
+                        ...ControlHttpTelemetry.pathHint(request.url),
+                        userAgent: ControlHttpTelemetry.userAgent(request.headers["user-agent"]),
+                        remoteKind:
+                          remote === ""
+                            ? "unknown"
+                            : /^(127\.|::1$|::ffff:127\.)/.test(remote)
+                              ? "loopback"
+                              : "remote",
+                      }
+                    : {}),
+                  ...(responseReadyMs === undefined ? {} : { responseReadyMs }),
+                  ...(delivery === undefined || responseReadyMs === undefined
+                    ? {}
+                    : {
+                        writeOutMs: Math.max(0, delivery.responseElapsedMs - responseReadyMs),
+                      }),
+                  method: request.method,
+                  status,
+                  originKind,
+                  span: safeAnalyticsLabel(`http.${request.method}.${route}`, "http.request"),
+                  ...(failureTag !== undefined
+                    ? { errorTag: failureTag }
+                    : status >= 400
+                      ? { errorTag: status >= 500 ? "Http5xx" : "Http4xx" }
+                      : {}),
+                  ...(responseBytes === undefined ? {} : { bytes: responseBytes }),
+                },
+              }),
+            );
+          });
+        // Register before routing so a disconnect is recorded even if no response is built.
+        lifecycle?.onSettled((delivery) => {
+          runFork(record(delivery));
+        });
         yield* HttpEffect.appendPreResponseHandler((_request, response) =>
           Effect.gen(function* () {
             const matched = yield* Effect.serviceOption(HttpRouter.RouteContext);
-            const path = Option.isSome(matched) ? matched.value.route.path : "unmatched";
-            if (path === OTLP_TRACES_PROXY_PATH || path.startsWith("/api/ardud/analytics"))
-              return response;
-            const route = safeAnalyticsLabel(path.replaceAll("*", ":rest"), "unmatched");
-            // The stream finalizer owns streamed responses; known bodies are already encoded.
-            const record = (bytes: number | undefined, failure?: string) =>
-              Effect.suspend(() => {
-                if (recorded) return Effect.void;
-                recorded = true;
-                const responseErrorTag = failure ?? errorTag;
-                return Effect.flatMap(DateTime.now, (now) =>
-                  recordServerAnalytics(analytics.value, {
-                    ts: DateTime.formatIso(now),
-                    kind: "server.http",
-                    surface: "server",
-                    route,
-                    durationMs: Math.max(
-                      0,
-                      Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6,
-                    ),
-                    props: {
-                      ...interruption,
-                      ...control?.props(),
-                      method: request.method,
-                      status: response.status,
-                      originKind,
-                      span: safeAnalyticsLabel(`http.${request.method}.${route}`, "http.request"),
-                      ...(responseErrorTag !== undefined
-                        ? { errorTag: responseErrorTag }
-                        : response.status >= 400
-                          ? { errorTag: response.status >= 500 ? "Http5xx" : "Http4xx" }
-                          : {}),
-                      ...(bytes === undefined ? {} : { bytes }),
-                    },
-                  }),
-                );
-              });
+            matchedPath = Option.isSome(matched) ? matched.value.route.path : "unmatched";
+            status = response.status;
+            responseReadyMs = lifecycle?.elapsedMs();
+            const recordBody = (bytes: number | undefined, failure?: string) => {
+              responseBytes = bytes;
+              errorTag = failure ?? errorTag;
+              return lifecycle === undefined ? record() : Effect.void;
+            };
             const body = response.body;
             if (body._tag === "Stream" && request.method !== "HEAD") {
               let bytes = 0;
@@ -339,7 +400,7 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
                     ),
                     Stream.onExit((exit) => {
                       if (Exit.isFailure(exit)) interruption = interruptionProps(exit.cause);
-                      return record(
+                      return recordBody(
                         bytes,
                         Exit.isFailure(exit) ? analyticsErrorTag(exit.cause) : undefined,
                       );
@@ -350,13 +411,19 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
                 ),
               );
             }
-            yield* record(
+            yield* recordBody(
               request.method === "HEAD" || body._tag === "Empty" ? 0 : body.contentLength,
             );
             return response;
           }),
         );
-        return yield* (control ? control.observe(app) : app).pipe(
+        return yield* (
+          control
+            ? control
+                .observe(app)
+                .pipe(Effect.provideService(ControlRequestAnalytics.HttpObserver, observer))
+            : app
+        ).pipe(
           Effect.onExit((exit) =>
             Effect.sync(() => {
               if (Exit.isFailure(exit)) {

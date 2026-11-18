@@ -222,7 +222,7 @@ redirects/proxies/arbitrary endpoints and never log credentials or raw bodies.
 
 ## Minimal next parent work (no purchase needed yet)
 
-1. Check phone priority-hold, then use the **normal logged-in app only**. Do not
+1. Check `ph hold status --json` (present true = wait), then use the **normal logged-in app only**. Do not
    clone, root, log out, change proxy/VPN/TLS settings or intercept credentials.
 2. Inspect existing baskets first. Record a sanitized per-service manifest and
    selected subset, cart/store identity visible to the user and current selected

@@ -322,6 +322,8 @@ export class ProviderAdapterSteerRunError extends Schema.TaggedError<ProviderAda
     driver: ProviderDriverKind,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
+    // Only a rejection before handing input to the provider permits a follow-up.
+    delivery: Schema.optional(Schema.Literal("not_sent")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {

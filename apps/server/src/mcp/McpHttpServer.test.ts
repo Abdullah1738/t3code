@@ -48,6 +48,8 @@ import * as CredentialStore from "../ardud/mcp/CredentialStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
+import * as DeviceService from "../device/DeviceService.ts";
+import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
 import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import * as ReplyBuilders from "../ardud/http/ReplyBuilders.ts";
@@ -93,6 +95,19 @@ const layerTest = McpHttpServer.layerPreviewToolkit.pipe(
   Layer.provideMerge(PreviewAutomationBroker.layer),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-http-server-test-" })),
   Layer.provideMerge(NodeServices.layer),
+);
+const layerImageInputTest = Layer.mergeAll(
+  McpHttpServer.layerPreviewToolkit,
+  McpHttpServer.layerDeviceToolkit,
+  McpHttpServer.layerHtmlToolkit,
+).pipe(
+  Layer.provideMerge(McpServer.McpServer.layer),
+  Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+  Layer.provide(PreviewAutomationBroker.layer),
+  Layer.provide(Layer.mock(DeviceService.DeviceService)({})),
+  Layer.provide(Layer.mock(PreviewBrowser.PreviewBrowser)({})),
+  Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-image-input-test-" })),
+  Layer.provide(NodeServices.layer),
 );
 const layerPullRequestsTest = McpHttpServer.layerPullRequestsToolkit.pipe(
   Layer.provideMerge(McpServer.McpServer.layer),
@@ -1435,6 +1450,65 @@ it.effect("refuses preview tools to a client outside a thread before they run", 
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect.each([
+  {
+    name: "html_preview",
+    input: { html: "", width: false, appearance: "bogus" },
+    fields: ["html", "width", "appearance"],
+    constraints: ["length of at least 1", "integer", '"dark"', '"light"'],
+  },
+  {
+    name: "preview_snapshot",
+    input: { includeImage: "private-image", save: "private-save" },
+    fields: ["includeImage", "save"],
+    constraints: ["boolean"],
+  },
+  {
+    name: "device_screenshot",
+    input: { deviceId: false, hostId: 42 },
+    fields: ["deviceId", "hostId"],
+    constraints: ["string"],
+  },
+])("$name reports every invalid image input field and records only paths", (scenario) =>
+  Effect.gen(function* () {
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const registration = layerImageInputTest.pipe(
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const result = yield* callTool(scenario.name, scenario.input);
+      const part = result.content[0];
+      if (part?.type !== "text") throw new Error("missing input rejection text");
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toEqual({
+        code: "invalid_request",
+        message: part.text,
+        invalidFields: scenario.fields,
+      });
+      for (const field of scenario.fields) expect(part.text).toContain(`${field} must be`);
+      for (const constraint of scenario.constraints) expect(part.text).toContain(constraint);
+      expect(part.text.length).toBeLessThanOrEqual(300);
+      expect(part.text).not.toMatch(/[\r\n]/);
+      expect(part.text).not.toMatch(/private|bogus/);
+      const row = yield* Deferred.await(recorded);
+      expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+        tool: scenario.name,
+        outcome: "error",
+        errorTag: "invalid_request",
+        errorFields: scenario.fields,
+      });
+      expect(JSON.stringify(row)).not.toMatch(/private|bogus|got|Invalid input/);
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
 it.effect("rejects non-boolean snapshot image options before selecting a browser host", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
@@ -1449,9 +1523,14 @@ it.effect("rejects non-boolean snapshot image options before selecting a browser
           Effect.provideService(McpSchema.McpServerClient, client),
         );
       expect(result.isError).toBe(true);
-      expect(result.content).toEqual([{ type: "text", text: "Preview snapshot failed: AiError." }]);
-      expect(result.structuredContent).toEqual({
-        error: { _tag: "AiError", operation: "snapshot", failureCount: 1 },
+      expect(result.structuredContent).toMatchObject({
+        code: "invalid_request",
+        invalidFields: ["includeImage"],
+      });
+      const part = result.content[0];
+      expect(part?.type === "text" ? part.text : "").toContain("includeImage must be a boolean");
+      expect(result.structuredContent).toMatchObject({
+        message: part?.type === "text" ? part.text : "",
       });
     }
   }).pipe(Effect.provide(layerTest)),
@@ -1540,8 +1619,9 @@ it.effect("accepts finite wait budgets and refuses non-finite ones", () => {
       ["t3_thread_wait", { threadId: "thread-wait", timeoutMs: "-Infinity" }],
       ["t3_thread_read", { threadId: "thread-wait", afterPosition: "2" }],
     ] as const) {
-      const refused = yield* callTool(name, args).pipe(Effect.flip);
-      expect(refused._tag, `${name} ${JSON.stringify(args)}`).toBe("InvalidParams");
+      const refused = yield* callTool(name, args);
+      expect(refused.isError, name).toBe(true);
+      expect(refused.structuredContent).toMatchObject({ code: "invalid_request" });
     }
     expect(calls).toHaveLength(2);
   }).pipe(Effect.provide(layerRecordingTools(calls)));
@@ -2099,9 +2179,12 @@ it.effect("registers annotated tools and preserves authenticated request context
         .pipe(
           Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
           Effect.provideService(McpSchema.McpServerClient, client),
-          Effect.flip,
         );
-      expect(malformed._tag).toBe("InvalidParams");
+      expect(malformed.isError).toBe(true);
+      expect(malformed.structuredContent).toMatchObject({
+        code: "invalid_request",
+        invalidFields: ["selector"],
+      });
 
       const snapshot = yield* server
         .callTool({
