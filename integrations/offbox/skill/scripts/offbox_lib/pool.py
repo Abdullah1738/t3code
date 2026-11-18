@@ -804,7 +804,7 @@ def _reconcile_pinned(con, row):
 
 
 def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=None):
-    from . import allocation, api, home, lease, outage
+    from . import allocation, api, home, lease, outage, ssh_outage
     from .identity import require_proven
     # A pooled box is mapped to the caller's owner string. An unproven caller's string is shared, so it can't take one.
     require_proven(me, "run")
@@ -1263,6 +1263,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                             "It stays stopped with its disk and no longer counts toward the pool. "
                             "Trying other pool boxes, then a fresh lease.")
                         continue
+                    except ssh_outage.SshUnreachable:
+                        raise
                     except OffboxError as e:
                         if isinstance(e, home.StartWaitFailed):
                             raise
@@ -1334,7 +1336,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         last_error = e
                         break
                     except OffboxError as e:
-                        if isinstance(e, (common.SourceGone, home.StartWaitFailed)):
+                        if isinstance(e, (common.SourceGone, home.StartWaitFailed, ssh_outage.SshUnreachable)):
                             raise
                         if resume_stall is not None:
                             refused = 400 <= (getattr(e, 'status', None) or 0) < 500

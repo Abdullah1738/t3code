@@ -23,7 +23,7 @@ from pathlib import Path
 
 import toollog
 
-from . import api, capacity, common, git_snapshot
+from . import api, capacity, common, git_snapshot, ssh_outage
 from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
 from .home import StartWaitFailed
 
@@ -185,6 +185,8 @@ def ssh_base(box_id: str, *, probe: bool = True) -> list[str]:
         return base + ["-p", str(cached[1])]
     if not probe:
         return base
+    last_connect = None
+    non_connect_failure = False
     for port in ports.groups():
         left = api.left()
         timeout = 5 if left is None else min(5, max(0, left))
@@ -194,11 +196,21 @@ def ssh_base(box_id: str, *, probe: bool = True) -> list[str]:
             p = subprocess.run(base + ["-p", port, "-o", "ConnectTimeout=3", "-o", "ControlPath=none",
                                       box_id, "true"], capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired:
+            non_connect_failure = True
             continue
         check_host_key(box_id, p.stderr)
         if p.returncode == 0:
             _HOME_PORTS[box_id] = (config, int(port))
             return base + ["-p", port]
+        if ssh_outage.checking_pre_start():
+            try:
+                ssh_outage.classify(box_id, p.returncode, p.stderr)
+            except ssh_outage.SshUnreachable as error:
+                last_connect = error
+            else:
+                non_connect_failure = True
+    if last_connect is not None and not non_connect_failure:
+        raise last_connect
     raise OffboxError(f"management SSH unreachable for {box_id} on management and legacy endpoints; "
                        "use the home control API (`offbox exec`, #95)")
 
@@ -218,6 +230,8 @@ def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 
         check_host_key(box_id, p.stderr)
     if p.returncode == 255:
         toollog.emit("ssh", "ssh.drop", kind="error", ok=False, ids={"box": box_id}, tag="ssh_drop", props={"exitCode": 255})
+    if check or ssh_outage.checking_pre_start():
+        ssh_outage.classify(box_id, p.returncode, p.stderr)
     if check and p.returncode != 0:
         raise OffboxError(f"ssh {box_id} failed ({p.returncode}): {p.stderr.decode(errors='replace')[-400:]}")
     return p
@@ -242,7 +256,7 @@ def wait_ssh(box_id: str, timeout: float = 90) -> None:
                 setup(box_id)
         except subprocess.TimeoutExpired:
             err = "timeout"
-        except common.SshHostKeyMismatch:
+        except (common.SshHostKeyMismatch, ssh_outage.SshUnreachable):
             raise
         except OffboxError as error:
             if error.outage or not client_limited or time.time() < deadline:
@@ -1037,7 +1051,7 @@ def _verify_content(box_id: str, root: Path, remote_dir: str, expected: dict, ti
                 raise OffboxError(f"tracked content differs after checksum repair: {remaining[:20]!r}; nothing ran")
             repaired = True
             result["repaired"] = len(bad)
-        except (common.SshHostKeyMismatch, StartWaitFailed):
+        except (common.SshHostKeyMismatch, StartWaitFailed, ssh_outage.SshUnreachable):
             raise
         except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
             raise OffboxError(f"tracked content repair failed for {bad[:20]!r}: {e}; nothing ran") from e
@@ -1342,6 +1356,11 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
                     cmd[cmd.index("-e") + 1] = shlex.join(ssh_base(box_id))
             p = _watch_rsync(cmd, left, input=input, on_stall=stalled, on_progress=progress,
                              cwd=str(source) if source is not None else None)
+        except ssh_outage.SshUnreachable as error:
+            state = ssh_outage.control_state(error)
+            if state and state not in api.LIVE_STATES:
+                raise BoxStoppedDuringPush(box_id) from error
+            raise
         except FileNotFoundError:
             if source is not None and not source.is_dir():
                 raise common.SourceGone(source) from None
@@ -1372,13 +1391,23 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
             check_host_key(box_id, p.stderr.encode(errors="replace"))
         if p.returncode not in (255, 12):
             return p
+        connect_failure = None
+        if ssh_outage.checking_pre_start():
+            try:
+                ssh_outage.classify(box_id, p.returncode, p.stderr, rsync=True)
+            except ssh_outage.SshUnreachable as error:
+                if error.reason == 'tailnet_down':
+                    raise
+                connect_failure = error
+        # A reachable control API can still identify a stopped box and refresh a stale endpoint.
+        control_end = min(deadline, time.monotonic() + 5) if connect_failure is not None else deadline
         old = _endpoint(box_id)
         if attempt < len(RETRY_PAUSES):
-            with api.budget(max(0, deadline - time.monotonic())):
+            with api.budget(max(0, control_end - time.monotonic())):
                 _refresh_master(box_id)
         # sshkey only returns connection details. Read state even when refreshing those details failed.
         try:
-            with api.budget(max(0, deadline - time.monotonic())):
+            with api.budget(max(0, control_end - time.monotonic())):
                 state = (api.get(box_id) or {}).get("state")
         except StartWaitFailed:
             raise
@@ -1387,7 +1416,10 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
         if state and state not in api.LIVE_STATES:
             log(f"push_retry_box_not_running {box_id}")
             raise BoxStoppedDuringPush(box_id)
+        if connect_failure is not None:
+            raise connect_failure
         if attempt == len(RETRY_PAUSES):
+            ssh_outage.classify(box_id, p.returncode, p.stderr, rsync=True)
             return p
         new = _endpoint(box_id)
         endpoint = f" endpoint={old} -> {new}" if old and new and old != new else ""
