@@ -8,8 +8,8 @@ Claude Code and Codex agents Robob runs do not use the personal `~/.claude` or
 - Codex home: `~/.robob/harness-homes/codex` (`CODEX_HOME`)
 - Codex Terra home: `~/.robob/harness-homes/codex-cu` (`CODEX_HOME`)
 
-The generator uses only Python's stdlib; shared servers reuse their installed
-MCP SDK venvs. Auth is never written here: credentials come from each
+The generator uses only Python's stdlib; shared servers use dedicated Python
+runtimes. Auth is never written here: credentials come from each
 instance's environment, and OAuth state stays in the home it was created in.
 
 ## Files
@@ -38,7 +38,10 @@ instance's environment, and OAuth state stays in the home it was created in.
 
 Flighty uses a private copy of its venv's base Python at
 `~/.local/share/shared-mcp-flighty/python`, with packages from the existing venv.
-InBody keeps its existing venv. They serve `127.0.0.1:18766/mcp` and
+InBody uses Homebrew Python 3.14 with a dedicated venv at
+`~/.local/share/shared-mcp-inbody/python`. Its package and locked dependencies
+are installed non-editably from an internal-disk staging copy; runtime imports
+never use the ExternalSSD source or venv. They serve `127.0.0.1:18766/mcp` and
 `127.0.0.1:18767/mcp`. Their LaunchAgents restart failed servers; `install.zsh
 --check` also calls Flighty's `search_airports` to catch database access errors.
 cua-driver retains a separate MCP connection per client because its transport
@@ -57,7 +60,7 @@ Run these steps in order from `integrations/harness-homes`:
 2. Add the printed binary in **System Settings > Privacy & Security > Full Disk
    Access**. Grant access to this copy only; the shared uv interpreter is used
    by other projects.
-3. `/bin/zsh -f install.zsh` syncs the copy before loading the services, then
+3. `/bin/zsh -f install.zsh` prepares both runtimes before loading the services, then
    checks them before switching config. A failed install restores the previous
    package/config/jobs and leaves the dedicated copy in place.
 4. `install.zsh --check` verifies the installed homes, plists, jobs and endpoints.
@@ -67,6 +70,12 @@ a new grant. InBody's check lists tools without calling its authenticated API.
 The temporary servers started by `shared/smoke.py` use the same interpreters as
 the LaunchAgents, but inherit the caller's access. Only the installed service's
 health check proves Flighty's database is readable under launchd.
+
+`install.zsh --inbody-python` prepares only InBody (no jobs or harness config).
+Normal install preflights both runtimes; `--dry-run` writes neither. Unchanged
+InBody build inputs leave its runtime untouched. `--check` rejects shared MCP
+startup paths/interpreters on `/Volumes/`; failed startup prints the jobs' last
+20 error-log lines without changing the logs.
 
 ## Source parity checks
 
@@ -143,6 +152,12 @@ thread-scoped headers by the provider adapter.
 ```sh
 cd integrations/harness-homes
 /opt/homebrew/bin/python3 tests/test_generate_homes.py
+```
+
+Run the package suite offbox from the repo root, including its MCP HTTP fixtures:
+
+```sh
+offbox run -- 'uv run --no-project --with pytest==9.0.2 --with mcp==1.27.2 --with httpx==0.28.1 python -m pytest integrations/harness-homes/tests -q'
 ```
 
 To verify the packaged draft without touching live homes, use a fresh temporary

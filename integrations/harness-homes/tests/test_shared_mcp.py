@@ -20,6 +20,7 @@ import generate_homes as gh
 import opencode
 import check
 import serve
+import runtime_paths
 
 
 @contextmanager
@@ -144,9 +145,9 @@ class SharedMcpTests(unittest.TestCase):
         with mock.patch.object(serve.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="ignored")):
             self.assertEqual(serve.keychain_value("fixture"), "")
 
-    def test_launch_agents_use_dedicated_flighty_python_and_existing_inbody_venv(self):
+    def test_launch_agents_use_dedicated_internal_python_runtimes(self):
         interpreters = {"flighty": "/Users/ardud/.local/share/shared-mcp-flighty/python/bin/python3.12",
-                        "inbody": "/Volumes/ExternalSSD/inbody-api-mcp/.venv/bin/python"}
+                        "inbody": "/Users/ardud/.local/share/shared-mcp-inbody/python/bin/python"}
         for name, port in (("flighty", 18766), ("inbody", 18767)):
             label = f"com.ardud.shared-mcp-{name}"
             data = plistlib.loads((PKG / "launchd" / f"{label}.plist").read_bytes())
@@ -193,6 +194,11 @@ class SharedMcpTests(unittest.TestCase):
                 shared.mkdir()
                 (root / "toollog.py").write_text((PKG / "toollog.py").read_text())
                 (shared / "check.py").write_text((PKG / "shared/check.py").read_text())
+                (shared / 'runtime_paths.py').write_text((PKG / 'shared/runtime_paths.py').read_text())
+                plists = root / 'Library/LaunchAgents'
+                plists.mkdir(parents=True)
+                (plists / 'com.ardud.shared-mcp-flighty.plist').write_bytes(plistlib.dumps(
+                    {'ProgramArguments': [sys.executable, str(shared / 'serve.py'), 'flighty']}))
                 (shared / "opencode.py").write_text("SHARED_IDS = ('flighty', 'inbody')\n")
                 (root / "generate_homes.py").write_text(
                     f"def load_manifest(): return {{'mcpServers': [{{'id': 'flighty', 'url': {url!r}}}]}}\n")
@@ -210,6 +216,48 @@ class SharedMcpTests(unittest.TestCase):
             self.assertEqual(check.probe(url, "inbody"), ["search_airports"])
             self.assertEqual([call["method"] for call in calls],
                              ["initialize", "notifications/initialized", "tools/list"])
+
+    def test_volume_guard_covers_arguments_symlinks_and_venv_base(self):
+        cases = ('interpreter', 'script', 'interpreter-link', 'script-link', 'config-link', 'home', 'executable')
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                python = root / 'python/bin/python'
+                python.parent.mkdir(parents=True)
+                python.touch()
+                script = root / 'serve.py'
+                script.touch()
+                args = [str(python), str(script), 'inbody']
+                external = '/Volumes/ExternalSSD/fixture'
+                if case in ('interpreter', 'script'):
+                    args[0 if case == 'interpreter' else 1] = external
+                elif case in ('interpreter-link', 'script-link', 'config-link'):
+                    path = {'interpreter-link': python, 'script-link': script,
+                            'config-link': python.parent.parent / 'pyvenv.cfg'}[case]
+                    path.unlink(missing_ok=True)
+                    path.symlink_to(external)
+                else:
+                    (python.parent.parent / 'pyvenv.cfg').write_text(f'{case} = {external}\n')
+                plist = root / 'job.plist'
+                plist.write_bytes(plistlib.dumps({'ProgramArguments': args}))
+                with self.assertRaisesRegex(ValueError, '/Volumes/'):
+                    runtime_paths.validate_plist(plist)
+                plist.write_bytes(plistlib.dumps({'ProgramArguments': [sys.executable, 'serve.py', 'inbody']}))
+                self.assertEqual(runtime_paths.validate_plist(plist, require_interpreter=True), Path(sys.executable))
+
+    def test_inbody_runtime_guard_rejects_external_package_or_search_path(self):
+        for path in ('/Volumes/ExternalSSD/pkg/server.py', '/Volumes/Elsewhere/lib/python3.14'):
+            with self.subTest(path=path), mock.patch.object(runtime_paths.subprocess, 'run',
+                    return_value=mock.Mock(stdout=json.dumps([sys.executable, path]))):
+                with self.assertRaisesRegex(ValueError, '/Volumes/'):
+                    runtime_paths.validate_inbody(sys.executable)
+
+    def test_check_fails_before_http_for_external_runtime(self):
+        with mock.patch.object(check.gh, 'load_manifest', return_value=self.manifest), \
+                mock.patch.object(check, 'validate_plist', side_effect=ValueError('/Volumes/ external runtime')), \
+                mock.patch.object(check, 'probe') as probe:
+            self.assertEqual(check.main(), 1)
+            probe.assert_not_called()
 
     def test_flighty_requires_exactly_one_site_packages_directory(self):
         for versions in ([], ["3.12", "3.13"]):
