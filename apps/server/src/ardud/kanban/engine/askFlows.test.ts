@@ -277,7 +277,7 @@ it.effect(
 );
 
 it.effect(
-  "answering a blocking ask sends the card back to its worker with the answer as the wake note",
+  "answering a blocking ask restores its worker and delivers the answer without dispatch",
   () =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -309,10 +309,11 @@ it.effect(
           { verdict: "picked", optionIds: ["lite"], revision: 0 },
           owner,
         );
-        assert.strictEqual(result.card.stage, "todo");
-        assert.strictEqual(
-          result.card.wakeNote,
-          'The owner PICKED an answer to q1 on card #1: "Which database?".\n\nPicked: SQLite',
+        assert.strictEqual(result.card.stage, "working");
+        assert.strictEqual(result.card.activeThreadId, threadId);
+        assert.strictEqual(result.card.wakeNote, null);
+        assert.isTrue(
+          (yield* fake.heard(threadId)).some((text) => text.includes("Picked: SQLite")),
         );
         const events = (yield* kanban.card(card.id)).events;
         assert.strictEqual(
@@ -513,9 +514,9 @@ it.effect("the owner hands one ask to the evaluator, which decides it for him", 
       assert.deepStrictEqual(closed.answer?.by, evaluatorActor);
       assert.isUndefined(closed.handedAt);
       // The card goes back to its worker with the decision, marked as the evaluator's.
-      assert.strictEqual(result.card.stage, "todo");
-      assert.strictEqual(
-        result.card.wakeNote,
+      assert.strictEqual(result.card.stage, "working");
+      assert.include(
+        (yield* fake.heard(threadId)).join("\n"),
         [
           'The evaluator, deciding for the owner (he handed it over), PICKED an answer to q1 on card #1: "Which queue?".',
           "Evaluator's note, read this before you act:\nWe already run SQS.",
@@ -671,9 +672,9 @@ it.effect(
               result.error?.code,
             ]),
             [
-              ["toy:1", true, "todo", undefined],
+              ["toy:1", true, "working", undefined],
               ["toy:3", false, undefined, "conflict"],
-              ["toy:2", true, "todo", undefined],
+              ["toy:2", true, "working", undefined],
             ],
           );
           assert.include(
@@ -688,8 +689,8 @@ it.effect(
             [1, "Deploy B"],
           ] as const) {
             const card = (yield* kanban.card(workers[index]!.id)).card;
-            assert.strictEqual(
-              card.wakeNote,
+            assert.include(
+              (yield* fake.heard(workers[index]!.threadId)).join("\n"),
               `The owner APPROVED q1 on card #${card.number}: "Deploy ${title}?".\n\n` +
                 `Owner's note, read this before you act:\n${note}`,
             );
