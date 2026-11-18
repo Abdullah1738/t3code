@@ -80,6 +80,7 @@ def rollup(day, root=None, now=None):
     supervisor = dict(unresponsive=0, crawling=0, memoryHigh=0, killed=0,
                       exitedBySignal=Counter(), exitedByCode=Counter(), killedByReason=Counter())
     heartbeat_observations = {}
+    health_hours, health_late = {}, defaultdict(list)
     day_start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc).timestamp() * 1000
     day_end = day_start + 86400000
     volume_writers = {}
@@ -104,6 +105,22 @@ def rollup(day, root=None, now=None):
                             raise ValueError('invalid lock dimensions')
                     total += 1
                     counts[row['name']] += 1
+                    if row['name'] in ('health.request.late', 'supervisor.health_probe'):
+                        props = row.get('props') if isinstance(row.get('props'), dict) else {}
+                        at = dt.datetime.fromisoformat(row.get('ts', '').replace('Z', '+00:00'))
+                        if at.tzinfo is None:
+                            raise ValueError('health timestamp needs timezone')
+                        at = at.astimezone(dt.timezone.utc)
+                        if at.date().isoformat() == day:
+                            hour = at.replace(minute=0, second=0, microsecond=0).isoformat().replace('+00:00', 'Z')
+                            group = health_hours.setdefault(hour, dict(late=[], probes=[]))
+                            if row['name'] == 'health.request.late' and metric(props.get('acceptToHandlerMs')):
+                                group['late'].append(props['acceptToHandlerMs'])
+                                probe = props.get('probe')
+                                if isinstance(probe, str) and re.fullmatch('[a-f0-9]{8}', probe):
+                                    health_late[probe].append((at, props))
+                            elif row['name'] == 'supervisor.health_probe' and metric(props.get('totalMs')) and props['totalMs'] > 5000:
+                                group['probes'].append((at, props))
                     if row.get('component') == 'supervisor':
                         name = row['name']
                         props = row.get('props') if isinstance(row.get('props'), dict) else {}
@@ -253,6 +270,57 @@ def rollup(day, root=None, now=None):
                 open_heartbeat.add((primary, worker))
     result['supervisor'] = {**supervisor, 'noHeartbeatMs': interval_total(heartbeat_intervals),
                             'openNoHeartbeatWorkers': len(open_heartbeat)}
+    adjacent_days, probe_ids = set(), set()
+    for group in health_hours.values():
+        for at, props in group['probes']:
+            if isinstance(props.get('probe'), str):
+                probe_ids.add(props['probe'])
+            for offset in (-300, 300):
+                neighbor = (at + dt.timedelta(seconds=offset)).date().isoformat()
+                if neighbor != day:
+                    adjacent_days.add(neighbor)
+    # Late handlers and completed probes can land on opposite sides of UTC
+    # midnight. Adjacent files contribute joins only, never this day's counts.
+    for neighbor in sorted(adjacent_days):
+        try:
+            with (root / (neighbor + '.ndjson')).open() as lines:
+                for line in lines:
+                    if 'health.request.late' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                        props = row.get('props', {})
+                        probe = props.get('probe')
+                        if (row.get('tool') != '9router' or row.get('name') != 'health.request.late'
+                                or row.get('kind') != 'perf' or not isinstance(probe, str) or probe not in probe_ids
+                                or not metric(props.get('acceptToHandlerMs'))):
+                            continue
+                        at = dt.datetime.fromisoformat(row.get('ts', '').replace('Z', '+00:00'))
+                        if at.tzinfo is not None:
+                            health_late[probe].append((at.astimezone(dt.timezone.utc), props))
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+        except FileNotFoundError:
+            pass
+    result['healthByHour'] = []
+    for hour, group in sorted(health_hours.items()):
+        probes = []
+        for at, props in group['probes']:
+            probe = props.get('probe')
+            candidates = health_late.get(probe, []) if isinstance(probe, str) else []
+            # Correlate by the probe's bounded ID, never by nearest traffic alone.
+            # A timed-out probe can reach the handler after its timeout row.
+            candidates = [(abs((late_at - at).total_seconds()), late) for late_at, late in candidates
+                          if abs((late_at - at).total_seconds()) <= 300]
+            late = min(candidates, key=lambda item: item[0])[1] if candidates else {}
+            probes.append(dict(ts=at.isoformat().replace('+00:00', 'Z'),
+                **{key: props.get(key) if metric(props.get(key)) else None for key in (
+                    'totalMs', 'maxLagMsSinceLast', 'lagMs', 'hbAgeMs', 'loopDelayP99Ms', 'loopDelayMaxMs', 'loopDelayWindowMs')},
+                **{key: late.get(key) if metric(late.get(key)) else None for key in (
+                    'acceptToHandlerMs', 'idleMs', 'loopLagAtAcceptMs')}))
+        result['healthByHour'].append(dict(hour=hour, lateRows=len(group['late']),
+            acceptToHandlerMs=percentiles(group['late']), probesOver5s=len(probes),
+            probesWithLateRow=sum(p['acceptToHandlerMs'] is not None for p in probes), probes=probes))
     drops = Counter()
     for writer in volume_writers.values():
         drops.update(writer)
