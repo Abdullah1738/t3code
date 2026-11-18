@@ -6857,6 +6857,9 @@ it.effect("logs only board lock holds of at least five seconds", () =>
         "board.acquired_at_ms": 4_999,
         "board.held_ms": 5_000,
         "board.waiters": 0,
+        subSteps: [{ subStep: "hold.5000", ms: 5_000 }],
+        // TestClock fixes the threshold snapshot timestamp along with the hold timestamps.
+        threshold: { awaited: "hold.5000", readers: [], observedAtMs: 9_999 },
       });
     }).pipe(
       Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),

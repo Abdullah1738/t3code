@@ -620,11 +620,11 @@ class ClassifierTests(unittest.TestCase):
 
     def test_retry_exhaustion_and_http_errors_log_specific_cause(self):
         for error, expected, attempts in (
-            (TimeoutError(), 'socket_timeout', 2),
-            (urllib.error.HTTPError(t.CLASSIFIER_ENDPOINT, 503, '', {}, None), 'http_status=503', 2),
-            (urllib.error.HTTPError(t.CLASSIFIER_ENDPOINT, 401, '', {}, None), 'http_status=401', 1),
-            (urllib.error.URLError(OSError()), 'url_error=OSError', 2),
-            (ValueError('private response body'), 'ValueError', 1),
+            (TimeoutError('private response body'), 'socket_timeout', 2),
+            (urllib.error.HTTPError(t.CLASSIFIER_ENDPOINT, 503, 'private response body', {}, None), 'http_status=503', 2),
+            (urllib.error.HTTPError(t.CLASSIFIER_ENDPOINT, 401, 'private response body', {}, None), 'http_status=401', 1),
+            (urllib.error.URLError(OSError('private response body')), 'url_error=OSError', 2),
+            (ValueError('fixture validation; password="private response body"'), 'ValueError: fixture validation;', 1),
         ):
             with self.subTest(cause=expected), patch.object(t, 'classify', side_effect=error):
                 hits, meta = t.classify_batch([{'id': 'a'}], {}, 20)
