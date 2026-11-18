@@ -26,6 +26,7 @@ DESKTOP_STARTUP_GRACE = 180
 UNREADY_WINDOW = 180
 UNREADY_MIN_TICKS = 3
 REPLACE_COOLDOWN = 15 * 60
+CHECK_ERROR_MIN_TICKS = 4
 
 
 def initial_state():
@@ -33,7 +34,8 @@ def initial_state():
                 failed_reopens=0, awaiting_reopen=False, next_retry=0,
                 failure_episode=None, crash_episode=None, alerts_sent=[], pending_alerts={},
                 unready_since=None, unready_last=None, unready_ticks=0,
-                unready_desktop=None, last_replace=None)
+                unready_desktop=None, last_replace=None,
+                check_error_count=0, check_error_since=None)
 
 
 def finite_number(value):
@@ -50,6 +52,20 @@ def valid_hold(hold, now, alive):
 
 def reset_unready(state):
     state.update(unready_since=None, unready_last=None, unready_ticks=0, unready_desktop=None)
+
+
+def reset_check_errors(state):
+    state.update(check_error_count=0, check_error_since=None)
+
+
+def record_check_error(state, now, backend_up):
+    state["check_error_count"] += 1
+    if state["check_error_since"] is None:
+        state["check_error_since"] = int(now)
+    if backend_up is not True and state["check_error_count"] >= CHECK_ERROR_MIN_TICKS:
+        key = "robob-guard:%s:check-error" % state["check_error_since"]
+        if key not in state["alerts_sent"]:
+            state["pending_alerts"].setdefault(key, dict(kind="check-error", at=now))
 
 
 def decide(previous, *, now, up, boot_time, hold=None, hold_pid_alive=False, desktop=None):
@@ -173,10 +189,10 @@ def read_state(path):
     if not isinstance(state, dict):
         return defaults
     state = dict(defaults, **state)
-    for key in ("down_count", "backoff_step", "failed_reopens", "unready_ticks"):
+    for key in ("down_count", "backoff_step", "failed_reopens", "unready_ticks", "check_error_count"):
         if type(state[key]) is not int or state[key] < 0:
             return defaults
-    for key in ("last_reopen", "failure_episode", "crash_episode", "last_replace", "unready_since", "unready_last"):
+    for key in ("last_reopen", "failure_episode", "crash_episode", "last_replace", "unready_since", "unready_last", "check_error_since"):
         if state[key] is not None and not finite_number(state[key]):
             return defaults
     if ((state["unready_desktop"] is not None and not isinstance(state["unready_desktop"], str))
@@ -189,7 +205,7 @@ def read_state(path):
         return defaults
     for key, alert in state["pending_alerts"].items():
         if (not isinstance(key, str) or not isinstance(alert, dict)
-                or alert.get("kind") not in ("failed-reopen", "crash-loop")
+                or alert.get("kind") not in ("failed-reopen", "crash-loop", "check-error")
                 or not finite_number(alert.get("at"))):
             return defaults
     return state
@@ -229,6 +245,35 @@ def robob_present(output):
 def process_up():
     return robob_present(subprocess.run(["/bin/ps", "-axo", "pid=,comm="],
                          check=True, capture_output=True, text=True, timeout=10).stdout)
+
+
+def process_diagnostics():
+    from quit_reason import registered_desktop_pids
+    detail = {}
+    try:
+        targets = sorted(registered_desktop_pids())
+        detail["lsappinfo_pid"] = targets[0] if len(targets) == 1 else targets[:5]
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+        targets = None
+        detail["lsappinfo_error"] = type(error).__name__
+    try:
+        output = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,comm=,args="],
+                                check=True, capture_output=True, text=True, timeout=5).stdout
+        alive, others = set(), []
+        for line in output.splitlines():
+            fields = line.split(None, 3)
+            if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
+                continue
+            pid, ppid = int(fields[0]), int(fields[1])
+            alive.add(pid)
+            if fields[2] == EXECUTABLE and pid not in (targets or []) and len(others) < 5:
+                others.append(dict(pid=pid, ppid=ppid, args=(fields[3] if len(fields) == 4 else "")[:160]))
+        detail["lsappinfo_alive"] = (targets[0] in alive if targets and len(targets) == 1
+                                    else [pid in alive for pid in targets] if targets is not None else "unknown")
+        detail["robob_processes"] = others
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+        detail.update(lsappinfo_alive="unknown", processes_error=type(error).__name__)
+    return "processes=" + json.dumps(detail, separators=(",", ":"))
 
 
 def backend_ready(home):
@@ -398,11 +443,14 @@ def reopen(home):
 def notify(home, key, alert):
     dubai = datetime.timezone(datetime.timedelta(hours=4), "Dubai")
     when = datetime.datetime.fromtimestamp(alert["at"], dubai).strftime("%d %b %H:%M:%S Dubai")
-    event = ("Three consecutive Robob reopens failed" if alert["kind"] == "failed-reopen"
-             else "Robob reopened more than four times within an hour")
+    event = {"failed-reopen": "Three consecutive Robob reopens failed",
+             "crash-loop": "Robob reopened more than four times within an hour",
+             "check-error": "Robob guard checks keep failing; backend readiness is not confirmed"}[alert["kind"]]
+    followup = (". Recovery is blocked; check guard.log." if alert["kind"] == "check-error"
+                else ". The guard will keep trying.")
     command = [str(home / ".bun/bin/bun"), str(home / ".local/share/telegram-bridge/src/cli.ts"),
                "notify", "--source", "Robob guard", "--severity", "attention",
-               "--text", event + " at " + when + ". The guard will keep trying.", "--key", key]
+               "--text", event + " at " + when + followup, "--key", key]
     try:
         subprocess.run(command, env=clean_environment(home), stdin=subprocess.DEVNULL,
                        capture_output=True, check=True, timeout=30)
@@ -424,9 +472,13 @@ def check(home):
         hold_path = home / ".robob/install-hold.json"
         previous = read_state(state_path)
         hold = read_json(hold_path, {"by": "invalid"}) if hold_path.exists() else None
+        up = None
+        step = "backend_ready"
         try:
             up = backend_ready(home)
+            step = "desktop_snapshot"
             desktop = None if up else desktop_snapshot()
+            step = "decide"
             state, statuses, action = decide(previous, now=now, up=up, boot_time=boot_epoch(),
                 hold=hold, hold_pid_alive=pid_alive(hold.get("pid")) if isinstance(hold, dict) else False,
                 desktop=desktop)
@@ -436,15 +488,21 @@ def check(home):
                 with (root / "hold.lock").open("a") as hold_lock:
                     fcntl.flock(hold_lock, fcntl.LOCK_EX)
                     latest = read_json(hold_path, None)
-                    latest_up = backend_ready(home)
-                    desktop = None if latest_up else desktop_snapshot()
+                    step = "backend_ready"
+                    up = backend_ready(home)
+                    step = "desktop_snapshot"
+                    desktop = None if up else desktop_snapshot()
                     now = time.time()
-                    state, statuses, action = decide(previous, now=now, up=latest_up, boot_time=boot_epoch(),
+                    step = "decide"
+                    state, statuses, action = decide(previous, now=now, up=up, boot_time=boot_epoch(),
                         hold=latest, hold_pid_alive=pid_alive(latest.get("pid")) if isinstance(latest, dict) else False,
                         desktop=desktop)
+                    detail = "backend-ready" if up else "backend-unready"
                     if action in ("reopen", "replace"):
                         # Failed recovery operations use the same retry budget as failed opens.
+                        step = "persist_attempt"
                         atomic_json(state_path, state)
+                        step = "stop_unready_desktop"
                         if action == "replace" and not stop_unready_desktop(home, desktop):
                             state = copy.deepcopy(previous)
                             reset_unready(state)
@@ -456,24 +514,29 @@ def check(home):
                             action = "backoff"
                             detail = "backend-recovered-after-stop"
                         else:
+                            step = "reopen"
                             try:
                                 reopen(home)
                             except (OSError, subprocess.SubprocessError) as error:
-                                detail = "open-failed:" + type(error).__name__
-            atomic_json(state_path, state)
-            for key, alert in list(state["pending_alerts"].items()):
-                state = notification_result(state, key, notify(home, key, alert))
-                atomic_json(state_path, state)
-                detail += " alert:" + key + (":retry" if key in state["pending_alerts"] else ":sent")
-                if action == "none":
-                    action = "alert"
-            append_log(root / "guard.log", now, statuses, action, detail)
+                                detail += " open-failed:" + type(error).__name__
+            reset_check_errors(state)
         except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
             # An unknown observation breaks the consecutive-unready window.
             state = read_state(state_path)
             reset_unready(state)
+            record_check_error(state, now, up)
+            statuses, action = ["check-error:" + type(error).__name__], "none"
+            detail = "step=%s errors=%s %s" % (step, state["check_error_count"], error)
+        if up is not True or statuses[0].startswith("check-error:"):
+            detail += " " + process_diagnostics()
+        atomic_json(state_path, state)
+        for key, alert in list(state["pending_alerts"].items()):
+            state = notification_result(state, key, notify(home, key, alert))
             atomic_json(state_path, state)
-            append_log(root / "guard.log", now, ["check-error:" + type(error).__name__], "none", str(error))
+            detail += " alert:" + key + (":retry" if key in state["pending_alerts"] else ":sent")
+            if action == "none":
+                action = "alert"
+        append_log(root / "guard.log", now, statuses, action, detail)
 
 
 if __name__ == "__main__":

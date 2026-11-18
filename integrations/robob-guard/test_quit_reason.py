@@ -1,4 +1,6 @@
 import json
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import subprocess
@@ -26,7 +28,7 @@ class QuitReasonTests(unittest.TestCase):
                 44: EXECUTABLE, 45: EXECUTABLE + " Helper"}, '"pid"=42', 42, False),
             ("no app", {}, "", None, False),
             ("orphaned backend only", {43: EXECUTABLE}, "", None, False),
-            ("stale registration", {}, "pid = 42", None, True),
+            ("stale registration", {}, "pid = 42", None, False),
             ("wrong executable", {42: "/bin/other"}, "pid = 42", None, True),
             ("multiple registrations", {42: EXECUTABLE, 43: EXECUTABLE},
                 "pid = 42\npid = 43", None, True),
@@ -36,7 +38,8 @@ class QuitReasonTests(unittest.TestCase):
                 if command[0] == "/usr/bin/lsappinfo":
                     return Mock(stdout=info)
                 self.assertEqual(command[:2], ["/bin/ps", "-p"])
-                return Mock(stdout=processes.get(int(command[2]), ""))
+                value = processes.get(int(command[2]), "")
+                return subprocess.CompletedProcess(command, 0 if value else 1, stdout=value)
             with self.subTest(name=name), patch("sys.argv", ["quit_reason", "--initiator", "installer", "--reason", "release .13"]), \
                     patch("quit_reason.subprocess.run", side_effect=run), patch("quit_reason.write_reason") as write:
                 if invalid:
@@ -55,6 +58,39 @@ class QuitReasonTests(unittest.TestCase):
                 patch("quit_reason.write_reason") as write:
             with self.assertRaises(subprocess.TimeoutExpired):
                 desktop_pid()
+            write.assert_not_called()
+
+    def test_ps_failure_corpus(self):
+        for code, output, expected in [(1, "", None), (0, EXECUTABLE, 42),
+                                       (0, "/bin/other", ValueError), (0, "", ValueError),
+                                       (2, "", subprocess.CalledProcessError),
+                                       (1, EXECUTABLE, subprocess.CalledProcessError)]:
+            with self.subTest(code=code, output=output), patch("quit_reason.registered_desktop_pids", return_value={42}), \
+                    patch("quit_reason.subprocess.run", return_value=subprocess.CompletedProcess("ps", code, stdout=output)):
+                if isinstance(expected, type):
+                    with self.assertRaises(expected):
+                        desktop_pid()
+                else:
+                    self.assertEqual(desktop_pid(), expected)
+
+    def test_stale_pid_cli_is_clean_and_reports_no_desktop(self):
+        output = io.StringIO()
+        with patch("sys.argv", ["quit_reason", "--initiator", "installer", "--reason", "test"]), \
+                patch("quit_reason.subprocess.run", side_effect=[
+                    subprocess.CompletedProcess("lsappinfo", 0, stdout="pid = 42"),
+                    subprocess.CompletedProcess("ps", 1, stdout="")]), \
+                patch("quit_reason.write_reason") as write, redirect_stdout(output):
+            self.assertIsNone(main())
+        self.assertEqual(output.getvalue(), "no desktop\n")
+        write.assert_not_called()
+
+    def test_watchdog_hold_without_desktop_keeps_hold_without_quit_reason(self):
+        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", side_effect=lambda pid: pid in (12, 12345)), \
+                patch("hold.subprocess.Popen", return_value=Mock(pid=12345)), \
+                patch("hold.desktop_pid", return_value=None), patch("hold.write_reason") as write:
+            holds = Holds(Path(directory))
+            self.assertEqual(holds.start("overload-restart", 12), 12345)
+            self.assertTrue(holds.path.exists())
             write.assert_not_called()
 
     def test_watchdog_hold_hands_off_before_returning(self):
