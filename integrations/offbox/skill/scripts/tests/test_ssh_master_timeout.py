@@ -69,11 +69,12 @@ class SSHMasterTimeoutTests(Isolated):
             ssh_sync.cfg_path(bid).write_text('Host bxA\n  HostName new.example\n  Port 2222\n')
 
         self.setup.side_effect = refresh
-        with patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 255)) as probe, \
+        with patch.object(lease, 'subprocess', wraps=subprocess) as process, \
                 patch.object(ssh_sync, 'close_master') as close, \
                 patch.object(api, 'get', return_value={'state': 'archived', 'type': 'large'}) as get, \
                 patch.object(api, 'resume', return_value={}) as resume, \
                 patch.object(api, 'wait_state', return_value=live):
+            process.run.return_value = subprocess.CompletedProcess([], 255)
             got = lease._reuse(self.con, row, None)
         self.assertEqual(got['state'], 'running')
         resume.assert_called_once_with('bxA', lease.RUN_TTL_S, None)
@@ -82,9 +83,9 @@ class SSHMasterTimeoutTests(Isolated):
         self.wait_ssh.assert_called_once_with('bxA')
         self.assertEqual(ssh_sync._endpoint('bxA'), 'new.example:2222')
         self.assertEqual(self.stale_events(), ['rc=255'])
-        self.assertEqual(probe.call_args.args[0], ssh_sync.ssh_base('bxA') +
+        self.assertEqual(process.run.call_args.args[0], ssh_sync.ssh_base('bxA') +
                          ['-o', 'ConnectTimeout=5', 'bxA', 'true'])
-        self.assertEqual(probe.call_args.kwargs['timeout'], 10)
+        self.assertEqual(process.run.call_args.kwargs['timeout'], 10)
         self.assertEqual(self.con.execute(
             "SELECT COUNT(*) FROM events WHERE box_id='bxA' AND kind='lease_resume'").fetchone()[0], 1)
 
