@@ -147,6 +147,7 @@ for (const owner of ["runner", "library"] as const) for (const release of [false
       expect(await until(() => !!recordedPid(join(held, "check.pid")) && !!recordedPid(join(held, "descendant.pid")), 3000)).toBe(true);
       pid = recordedPid(join(held, "check.pid")); descendant = recordedPid(join(held, "descendant.pid"));
       lock = new Database(join(root, "relay-lock.sqlite"));
+      lock.exec("PRAGMA busy_timeout = 2000");
       lock.exec(`BEGIN ${lockMode}`);
       child.stdin.write("attempt\n");
       expect(await until(() => existsSync(attempted), 1000)).toBe(true);
@@ -156,7 +157,7 @@ for (const owner of ["runner", "library"] as const) for (const release of [false
       expect(existsSync(join(blocked, "started"))).toBe(false);
       expect(JSON.parse(readFileSync(join(blocked, "state.json"), "utf8"))).toEqual({ status: "active", fires: 0, consecutive_failures: 0, next_at: 0 });
       if (release) {
-        lock.exec("COMMIT"); lock.close(); lock = undefined;
+        lock.exec("ROLLBACK"); lock.close(); lock = undefined;
         expect(await until(() => existsSync(completed), 2000)).toBe(true);
         expect(readFileSync(join(blocked, "started"), "utf8")).toBe("started\n");
         expect(JSON.parse(readFileSync(join(blocked, "state.json"), "utf8")).consecutive_failures).toBe(0);
@@ -166,7 +167,7 @@ for (const owner of ["runner", "library"] as const) for (const release of [false
       expect(await Promise.race([child.exited, Bun.sleep(2000).then(() => "did not exit")])).toBe(0);
       expect(await until(() => gone(pid!) && gone(descendant!), Math.max(0, 2000 - (Date.now() - stopped)))).toBe(true);
     } finally {
-      if (lock) { lock.exec("ROLLBACK"); lock.close(); }
+      if (lock) { if (lock.inTransaction) lock.exec("ROLLBACK"); lock.close(); }
       if (child.exitCode === null) { child.kill("SIGKILL"); await child.exited; }
       if (pid && !gone(pid)) { try { process.kill(-pid, "SIGKILL"); } catch {} }
       if (descendant && !gone(descendant)) { try { process.kill(descendant, "SIGKILL"); } catch {} }
