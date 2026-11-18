@@ -126,6 +126,6 @@ export const wrap = (
     putThreadLink: (row) =>
       locks.access(row.boardId, store.putThreadLink(row), true, `thread:${row.threadId}`),
     addThreadCard: (id, cardId, at) => card(cardId, store.addThreadCard(id, cardId, at), true),
-    threadCards: (id) => thread(id, store.threadCards(id)),
+    threadCards: (id, options) => thread(id, store.threadCards(id, options)),
   };
 };

@@ -1,5 +1,6 @@
 """install.zsh against a throwaway HOME and a fake launchctl. Run: /usr/bin/python3 -m unittest discover -s tests"""
 import os
+import shlex
 import plistlib
 import shutil
 import stat
@@ -167,6 +168,7 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         rc, out, err = self.run_install()
         self.assertEqual(rc, 0, err)
         for rel in (".local/libexec/mail/mail_oauth.py", ".local/libexec/mail/kc-read",
+                    ".local/bin/opencode", ".local/bin/opencode-web", ".local/libexec/opencode/service-bin.zsh",
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
                     ".local/bin/toollog", ".local/libexec/toollog/toollog.py",
                     ".local/bin/vp", ".local/libexec/vp/launcher.mjs",
@@ -176,6 +178,7 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
                     ".local/libexec/repo-node-pin/shared-deps.sh",
                     ".local/libexec/repo-node-pin/pnpm-bin/pnpm",
                     ".local/bin/qcard", ".local/bin/quint", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
+                    ".local/bin/timeout",
                     "Library/LaunchAgents/local.ardud.otp-idle.plist",
                     "Library/LaunchAgents/com.ardud.9router-log-poll.plist",
                     ".local/bin/robob-read-watchdog",
@@ -185,8 +188,11 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
                     "Library/LaunchAgents/com.ardud.mirage-beacon-keepalive.plist"):
             self.assertTrue(os.path.isfile(self.live(rel)), rel)
         self.assertTrue(os.access(self.live(".local/bin/qcard"), os.X_OK))
+        self.assertTrue(os.access(self.live(".local/bin/opencode"), os.X_OK))
+        self.assertEqual(stat.S_IMODE(os.stat(self.live(".local/libexec/opencode/service-bin.zsh")).st_mode), 0o644)
         self.assertTrue(os.access(self.live(".local/bin/quint"), os.X_OK))
         self.assertTrue(os.access(self.live(".local/libexec/vp/toolchain"), os.X_OK))
+        self.assertTrue(os.access(self.live(".local/bin/timeout"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
         self.assertEqual(len(loads), 14, self.calls_log())
         self.assertTrue(os.access(self.live(".local/bin/mirage-beacon-keepalive"), os.X_OK))
@@ -827,6 +833,143 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         self.assertEqual(rc, 1)
         self.assertIn("smoke failed", err)
         self.assertIn(self.live(".local/bin/uber"), err)
+
+
+class OpenCodeWebTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="opencode-web-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.home = self.temp.name
+        self.served = os.path.join(self.home, "served")
+        self.service = self.fake_bin("service binary", "opencode v2.0.22")
+        os.makedirs(os.path.join(self.home, "bin"))
+        config_dir = os.path.join(self.home, "libexec/opencode")
+        os.makedirs(config_dir)
+        self.launcher = os.path.join(self.home, "bin/opencode-web")
+        self.shim = os.path.join(self.home, "bin/opencode")
+        shutil.copy2(os.path.join(HERE, "bin/opencode-web"), self.launcher)
+        shutil.copy2(os.path.join(HERE, "bin/opencode"), self.shim)
+        self.config = os.path.join(config_dir, "service-bin.zsh")
+        with open(os.path.join(HERE, "libexec/opencode/service-bin.zsh")) as fh:
+            source = fh.read()
+        # Substitute the fixed reference in this copy only; neither launcher has a reference override.
+        self.assertEqual(source.count("/Volumes/ExternalSSD/opencode2/current/bin/opencode"), 1)
+        source = source.replace("/Volumes/ExternalSSD/opencode2/current/bin/opencode", self.service)
+        with open(self.config, "w") as fh:
+            fh.write(source)
+        self.lsof = os.path.join(self.home, "lsof")
+        with open(self.lsof, "w") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")
+        os.chmod(self.lsof, 0o755)
+        self.env = {"HOME": self.home, "PATH": "/usr/bin:/bin:/usr/sbin", "LANG": "en_US.UTF-8",
+                    "OPENCODE_WEB_LSOF": self.lsof, "BUN_INSPECT": "must-not-leak"}
+
+    def fake_bin(self, name, version, version_exit=0):
+        path = os.path.join(self.home, name)
+        with open(path, "w") as fh:
+            fh.write(f'''#!/bin/sh
+if [ "$1" = --version ]; then
+  printf '%s\\n' {shlex.quote(version)}
+  exit {version_exit}
+fi
+printf '%s\\n' "$0" "$@" "BUN_INSPECT=${{BUN_INSPECT-unset}}" >> {shlex.quote(self.served)}
+exit 42
+''')
+        os.chmod(path, 0o755)
+        return path
+
+    def run_web(self, binary=None):
+        env = dict(self.env)
+        if binary is not None:
+            env["OPENCODE_WEB_BIN"] = binary
+        return subprocess.run(["/bin/zsh", "-f", self.launcher], env=env,
+                              capture_output=True, text=True, timeout=10)
+
+    def assert_refused(self, result):
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(os.path.exists(self.served), result.stdout + result.stderr)
+        lines = (result.stdout + result.stderr).splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("refusing", lines[0])
+
+    def test_mismatched_override_never_serves(self):
+        binary = self.fake_bin("old binary", "1.19.5")
+        r = self.run_web(binary)
+        self.assert_refused(r)
+        self.assertIn("1.19.5", r.stderr)
+        self.assertIn("2.0.22", r.stderr)
+
+    def test_matching_versions_exec_with_arguments_and_status(self):
+        for version in ("2.0.22", "opencode v2.0.22", "v2.0.23", "2.0.99-beta.1+build.2"):
+            with self.subTest(version=version):
+                binary = self.fake_bin("override with spaces; dollar$", version)
+                r = self.run_web(binary)
+                self.assertEqual(r.returncode, 42, r.stdout + r.stderr)
+                with open(self.served) as fh:
+                    self.assertEqual(fh.read().splitlines(), [binary, "serve", "--hostname", "127.0.0.1",
+                                                           "--port", "4096", "BUN_INSPECT=unset"])
+                os.remove(self.served)
+
+    def test_default_uses_service_binary_without_a_running_service(self):
+        # Fail before running if the fixture did not replace the reference; never invoke a real binary.
+        with open(self.config) as fh:
+            self.assertIn(self.service, fh.read())
+        r = self.run_web()
+        self.assertEqual(r.returncode, 42, r.stdout + r.stderr)
+        with open(self.served) as fh:
+            self.assertEqual(fh.readline().strip(), self.service)
+
+    def test_invalid_or_unavailable_versions_refuse(self):
+        cases = [("", 0), ("garbage", 0), ("2.0", 0), ("2.0.22\n1.19.5", 0),
+                 ("warning: 2.0.22", 0), ("2.0.22", 1), ("2.1.0", 0), ("12.0.22", 0)]
+        for version, code in cases:
+            for reference in (False, True):
+                with self.subTest(version=version, code=code, reference=reference):
+                    self.fake_bin("service binary", version if reference else "opencode v2.0.22", code if reference else 0)
+                    binary = self.fake_bin("override", "2.0.22" if reference else version, 0 if reference else code)
+                    self.assert_refused(self.run_web(binary))
+        self.assert_refused(self.run_web(os.path.join(self.home, "missing")))
+        os.remove(self.service)
+        self.assert_refused(self.run_web(binary))
+
+    def test_login_environment_cannot_bypass_the_guard_or_leak_inspector(self):
+        binary = self.fake_bin("override", "2.0.22")
+        with open(os.path.join(self.home, ".zshrc"), "w") as fh:
+            fh.write("export BUN_INSPECT=from-login\n")
+        r = self.run_web(binary)
+        self.assertEqual(r.returncode, 42, r.stdout + r.stderr)
+        with open(self.served) as fh:
+            self.assertIn("BUN_INSPECT=unset", fh.read())
+        os.remove(self.served)
+        old = self.fake_bin("old binary", "1.19.5")
+        with open(os.path.join(self.home, ".zshrc"), "w") as fh:
+            fh.write(f"export OPENCODE_WEB_BIN={shlex.quote(old)}\n")
+        self.assert_refused(self.run_web(binary))
+
+    def test_waits_for_a_hand_started_server_to_exit(self):
+        held = os.path.join(self.home, "held")
+        with open(self.lsof, "w") as fh:
+            fh.write(f"#!/bin/sh\n[ -e {shlex.quote(held)} ] && exit 1\ntouch {shlex.quote(held)}\nexit 0\n")
+        r = self.run_web(self.service)
+        self.assertEqual(r.returncode, 42, r.stdout + r.stderr)
+        self.assertIn("waiting for it to exit", r.stdout)
+        self.assertTrue(os.path.exists(self.served))
+
+    def test_cli_shim_uses_shared_binary_and_forwards_arguments_and_status(self):
+        args = ["session", "arg with spaces; dollar$", "--port", "4096"]
+        r = subprocess.run([self.shim, *args], env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 42, r.stderr)
+        with open(self.served) as fh:
+            self.assertEqual(fh.read().splitlines(), [self.service, *args, "BUN_INSPECT=must-not-leak"])
+
+    def test_both_launchers_fail_when_shared_config_is_missing(self):
+        os.remove(self.config)
+        for launcher in (self.shim, self.launcher):
+            with self.subTest(launcher=launcher):
+                r = subprocess.run(["/bin/zsh", "-f", launcher], env=self.env,
+                                   capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertFalse(os.path.exists(self.served))
 
 
 if __name__ == "__main__":

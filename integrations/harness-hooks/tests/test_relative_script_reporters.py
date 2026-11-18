@@ -385,11 +385,19 @@ class RelativeScriptReporterTests(unittest.TestCase):
                         self.write('scripts/test.mjs', "console.log('ok')")
 
     def test_unresolved_script_names_the_word_and_fix(self):
-        event = self.event('python3 "$UNKNOWN_SCRIPT"')
-        self.check(event, 'live-database-script-unresolved')
-        result = engine.decide(event, 'codex')
-        for text in ('$UNKNOWN_SCRIPT', str(self.root), 'literal absolute script path'):
-            self.assertIn(text, result['reason'])
+        for isolated in (False, True):
+            with self.subTest(isolated=isolated):
+                event = self.event('python3 ' + ('-I ' if isolated else '') + '"$UNKNOWN_SCRIPT"')
+                self.check(event, 'live-database-script-unresolved')
+                result = engine.decide(event, 'codex')
+                for text in ('$UNKNOWN_SCRIPT', str(self.root)):
+                    self.assertIn(text, result['reason'])
+                if isolated:
+                    self.assertIn('literal absolute script path', result['reason'])
+                else:
+                    self.assertIn('non-isolated startup', result['reason'])
+                    self.assertIn('Resolve the named startup input', result['reason'])
+                    self.assertNotIn('literal absolute script path', result['reason'])
 
     def test_interpreter_stdin_data_and_executed_controls(self):
         body = "from pathlib import Path\nPath('tmp/REPORT.md').write_text('''node --test scripts/test-better-stack-alert-evaluator.mjs\npython3 -m unittest terraform/check.py\npython3 tmp/cards/169/verify-downloads.py''')\n"

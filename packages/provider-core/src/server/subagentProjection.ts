@@ -200,6 +200,30 @@ export function subagentResultForRun(
         DateTime.toEpochMillis(right.createdAt) - DateTime.toEpochMillis(left.createdAt),
     )[0] ??
     null;
+  // A cut run can contain useful findings, including text already marked as an
+  // answer. Preserve it for inspection without presenting it as a final report.
+  if (
+    (run.status === "cancelled" || run.status === "interrupted") &&
+    run.delegatedTaskStall === undefined &&
+    run.cancelReason !== "server_shutdown" &&
+    run.cancelReason !== "server_restart"
+  ) {
+    const detail = trimmed(run.cancelDetail);
+    const partial = message?.text ?? turnItem?.text;
+    return {
+      text: [
+        `Child task ${run.status}; no final report.`,
+        ...(run.cancelReason === undefined ? [] : [`Reason: ${run.cancelReason}`]),
+        ...(detail === undefined ? [] : [`Detail: ${detail}`]),
+        ...(partial === undefined
+          ? []
+          : [`\nPartial assistant findings (not a final report):\n${partial}`]),
+      ].join("\n"),
+      incomplete: `the child task was ${run.status} without a final report`,
+      messageId: message?.id ?? turnItem?.messageId ?? null,
+      turnItemId: turnItem?.id ?? null,
+    };
+  }
   const failure =
     run.status === "failed"
       ? projection.turnItems

@@ -1,4 +1,5 @@
 import { McpReasonClass, McpInvalidField, McpRefusedAt } from "./mcpReasonClass.ts";
+import { ClaudeApiErrorDetails } from "./claudeApiError.ts";
 import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -12,7 +13,7 @@ const Timestamp = Schema.String.check(
   }),
 );
 
-// Metadata only, apart from the bounded provider diagnostic below.
+// Labels stay metadata-only; the provider diagnostics below carry scrubbed, bounded excerpts.
 const Label = Schema.String.check(
   Schema.isMaxLength(160),
   Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+-]*$/),
@@ -224,6 +225,8 @@ const GeneralEvent = Schema.Struct({
     }),
   ),
   threadId: Schema.optionalKey(DerivedId),
+  // Claude API diagnostics are scrubbed at the adapter boundary, before truncation.
+  claudeApiError: Schema.optionalKey(ClaudeApiErrorDetails),
   durationMs: Schema.optionalKey(Measurement),
   phase: Schema.optionalKey(Label),
   waitedMs: Schema.optionalKey(Measurement),
@@ -432,6 +435,13 @@ const GeneralEvent = Schema.Struct({
       method: Schema.optionalKey(Label),
       httpMethod: Schema.optionalKey(Label),
       httpRoute: Schema.optionalKey(Label),
+      pathHint: Schema.optionalKey(Label),
+      pathHash: Schema.optionalKey(Label),
+      remoteKind: Schema.optionalKey(Schema.Literals(["loopback", "remote", "unknown"])),
+      receiveToHandlerMs: Schema.optionalKey(Measurement),
+      handlerMs: Schema.optionalKey(Measurement),
+      responseReadyMs: Schema.optionalKey(Measurement),
+      writeOutMs: Schema.optionalKey(Measurement),
       queryShape: Schema.optionalKey(Label),
       controlClient: Schema.optionalKey(Label),
       userAgent: Schema.optionalKey(Label),
@@ -660,6 +670,7 @@ export const AnalyticsIngestInput = Schema.Struct({
   events: Schema.Array(
     Schema.Struct({
       ...GeneralEvent.fields,
+      claudeApiError: Schema.optionalKey(Schema.Never),
       surface: Schema.Literals(["web", "desktop", "mobile"]),
     }),
   ).check(Schema.isMinLength(1), Schema.isMaxLength(100)),
@@ -740,6 +751,17 @@ export const AnalyticsRollup = Schema.Struct({
   total: Measurement,
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
+  claudeApiErrors: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        status: Schema.NullOr(Schema.Number),
+        model: ModelId,
+        host: Label,
+        attempts: Measurement,
+        giveUps: Measurement,
+      }),
+    ),
+  ),
   restartAdmission: Schema.optionalKey(
     Schema.Struct({
       scope: Schema.Literal("server-wide"),

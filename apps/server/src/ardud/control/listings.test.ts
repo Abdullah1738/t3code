@@ -1683,6 +1683,11 @@ describe("control listings", () => {
     "/threads/quiet/messages",
     "/threads/quiet/messages?since=0&role=user&all=true",
     "/messages?since=0&limit=1000",
+    "/threads?active=true&includeSubagents=true&limit=500",
+    "/threads?active=1&limit=500",
+    "/threads?state=running,queued&limit=500",
+    "/threads?ids=live-running&active=true&limit=1",
+    "/threads/quiet/runs/missing/evidence",
   ])("GET %s completes while the background reader is held", (endpoint) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -1692,7 +1697,7 @@ describe("control listings", () => {
         const sql = yield* SqlClient.SqlClient;
         const harness = yield* makeHarness();
         const expected = yield* harness.get(endpoint);
-        assert.equal(expected.status, 200);
+        assert.equal(expected.status, endpoint.endsWith("/evidence") ? 404 : 200);
         const entered = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const holder = yield* sql
@@ -1703,7 +1708,7 @@ describe("control listings", () => {
         yield* Deferred.await(entered);
         yield* Effect.gen(function* () {
           const response = yield* harness.get(endpoint);
-          assert.equal(response.status, 200);
+          assert.equal(response.status, expected.status);
           assert.deepEqual(response.body, expected.body);
           assert.isUndefined(holder.pollUnsafe());
         }).pipe(Effect.timeout("2 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
@@ -1712,7 +1717,7 @@ describe("control listings", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.live("a control message burst leaves a foreground reader for the UI", () =>
+  it.live("a mixed control list and message burst leaves a foreground reader for the UI", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -1726,7 +1731,13 @@ describe("control listings", () => {
           release,
         });
         const burst = yield* Effect.all(
-          Array.from({ length: 6 }, () => harness.get("/threads/quiet/messages?all=true")),
+          Array.from({ length: 6 }, (_, index) =>
+            harness.get(
+              index % 2 === 0
+                ? "/threads/quiet/messages?all=true"
+                : "/threads?active=true&limit=500",
+            ),
+          ),
           { concurrency: "unbounded" },
         ).pipe(Effect.forkChild);
         yield* Deferred.await(entered);
@@ -1764,7 +1775,7 @@ describe("control listings", () => {
         });
         // Initialize lazy route layers without entering the held shell read.
         assert.equal((yield* harness.get("/projects")).status, 200);
-        const list = yield* harness.get("/threads?active=true&limit=500").pipe(Effect.forkChild);
+        const list = yield* harness.get("/threads?limit=500").pipe(Effect.forkChild);
         yield* Deferred.await(entered);
         const first = yield* Deferred.make<void>();
         const second = yield* Deferred.make<void>();
@@ -1790,10 +1801,9 @@ describe("control listings", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  // Every listing form stays off the interactive reader slots, including enrichment.
+  // Historical listings stay off the interactive reader slots, including enrichment.
   it.live.each([
     "limit=1",
-    "limit=1&active=true",
     "limit=1&ids=quiet",
     "limit=1&ids=quiet&active=false",
     "limit=1&state=idle",

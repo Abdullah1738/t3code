@@ -4,9 +4,11 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 S="${DEV_JANITOR_SCRIPT_DIR:-${0:A:h}}"
 PY="${DEV_JANITOR_PYTHON:-/opt/homebrew/bin/python3}"
 LOG_DIR="${DEV_JANITOR_LOG_DIR:-$HOME/.local/share/dev-janitor}"
-# robob-watch passes no per-watcher env. The hourly run closes orphaned agent-browser daemons under the owner's
-# 16 Nov standing authority (#85, #91 q1); the module default stays off for manual and test runs.
+# robob-watch passes no per-watcher env. The hourly run closes orphaned agent-browser daemons and stops stalled
+# Xcode build trees under the owner's 16 Nov standing authority (#85, #87, #91 q1); the module defaults stay off
+# for manual and test runs.
 export DEV_JANITOR_REAP_AGENT_BROWSER="${DEV_JANITOR_REAP_AGENT_BROWSER:-1}"
+export DEV_JANITOR_STOP_XCODE_BUILDS="${DEV_JANITOR_STOP_XCODE_BUILDS:-1}"
 mkdir -p "$LOG_DIR"
 # robob-watch forwards stdout to iMessage. Keep all check output local, including subprocess diagnostics.
 exec >/dev/null 2>>"$LOG_DIR/watch.err"

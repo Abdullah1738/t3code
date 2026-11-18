@@ -394,7 +394,7 @@ chmod +x "$4/bin/quint"
         path.write_text(result.stderr + 'offbox-command-started: run-test\n' + result.stderr)
         with sqlite3.connect(':memory:') as con:
             con.executescript('CREATE TABLE events(ts REAL,box_id TEXT,kind TEXT,detail TEXT); CREATE TABLE kv(k TEXT PRIMARY KEY,v TEXT);')
-            with patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.root / 'events')):
+            with patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.root / 'events')):
                 for _ in range(2):
                     quint_tools.record(con, dict(run_id='run-test', box_id='bx_test'), path, 'server')
             rows = con.execute('SELECT kind,detail FROM events').fetchall()

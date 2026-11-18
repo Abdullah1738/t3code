@@ -18,6 +18,7 @@ export class ControlError extends Data.TaggedError("ControlError")<{
   readonly code: ControlErrorCode;
   readonly message: string;
   readonly rejection?: ControlRejection;
+  readonly failure?: { readonly errorTag: string; readonly reason: string };
 }> {}
 
 export const fail = (code: ControlErrorCode, message: string, rejection?: ControlRejection) =>

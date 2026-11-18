@@ -1057,7 +1057,117 @@ def _preamble_first(dst, stdout_bytes, run_id):
     dst.seek(end)
 
 
+def _recover_live_suffix(r, path, ck, length, deadline, stats):
+    from . import live_logs
+    from .runs import _commit
+    staged = path.with_name(path.name + '.recovery')
+    source = path.stat()
+    identity = dict(checkpoint=ck, box=r['box_id'], command=r['command_id'], inode=[source.st_dev, source.st_ino])
+    saved = read_json(offsets_path(staged), {})
+    prior = None
+    with contextlib.suppress(ValueError, TypeError):
+        prior = checkpoint(staged)
+    valid = (isinstance(saved, dict) and saved.get('base') == identity and prior is not None and staged.exists()
+             and prior['stdoutOffset'] >= ck['stdoutOffset'] and prior['stderrOffset'] >= ck['stderrOffset']
+             and 0 <= prior['logBytes'] <= staged.stat().st_size
+             and prior['logBytes'] == prior['stdoutOffset'] + prior['stderrOffset'] - ck['stdoutOffset'] - ck['stderrOffset'])
+    if not valid:
+        staged.write_bytes(b'')
+        prior = dict(stdoutOffset=ck['stdoutOffset'], stderrOffset=ck['stderrOffset'], logBytes=0)
+        atomic_write_json(offsets_path(staged), dict(prior, base=identity))
+    # Only checkpointed staging bytes can be reused after an interrupted page write. The original raw suffix
+    # stays intact until accumulated history covers it, including when several frames interleave past a failed commit.
+    with staged.open('r+b') as dst:
+        dst.truncate(prior['logBytes'])
+    result = _catch_up_live(r, staged, max(0, deadline - time.time()), stats, recovery_base=identity)
+    recovered = checkpoint(staged)
+    size = recovered['logBytes']
+    if size < length - ck['logBytes']:
+        live_logs.note(r['run_id'], 'recovery_staged', staged_bytes=size,
+                       remaining_uncommitted_bytes=length - ck['logBytes'] - size)
+        return 'incomplete:uncommitted suffix remains' if size else 'incomplete:history behind local log'
+    with staged.open('rb') as src, path.open('r+b') as dst:
+        dst.seek(ck['logBytes'])
+        left = size
+        while left:
+            chunk = src.read(min(left, 64 * 1024))
+            if not chunk:
+                raise OSError('short recovery file')
+            dst.write(chunk)
+            left -= len(chunk)
+        dst.truncate()
+        dst.flush()
+        published = dict(stdoutOffset=recovered['stdoutOffset'], stderrOffset=recovered['stderrOffset'], logBytes=dst.tell())
+        _commit(path, published['stdoutOffset'], published['stderrOffset'], published['logBytes'])
+    live_logs.note(r['run_id'], 'flush', bytes=size, **published)
+    if checkpoint(path) == published:
+        for temporary in (staged, offsets_path(staged)):
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+    return result if result.startswith('incomplete:') else 'caught_up'
+
+
+def _catch_up_live(r, path, budget, stats, *, recovery_base=None):
+    from . import live_logs
+    from .runs import _commit, remember_interruption
+    deadline = time.time() + (10 if budget is None else budget)
+    ck = checkpoint(path)
+    length = path.stat().st_size
+    if ck is None:
+        if length:
+            return 'incomplete:no checkpoint'
+        ck = dict(stdoutOffset=0, stderrOffset=0, logBytes=0)
+    if min(ck.values()) < 0 or length < ck['logBytes']:
+        return 'incomplete:invalid checkpoint'
+    if _remote_copy(path):
+        return 'incomplete:retained copy needs settled verification'
+    if length > ck['logBytes']:
+        return _recover_live_suffix(r, path, ck, length, deadline, stats)
+    offsets = [ck['stdoutOffset'], ck['stderrOffset']]
+    errors, behind, wrote, attempted = [], [0, 0], False, set()
+    with path.open('r+b') as dst:
+        dst.seek(ck['logBytes'])
+        def flush(i, data):
+            nonlocal wrote
+            dst.write(data)
+            dst.flush()
+            offsets[i] += len(data)
+            if recovery_base is None:
+                _commit(path, *offsets, dst.tell())
+            else:
+                atomic_write_json(offsets_path(path), dict(stdoutOffset=offsets[0], stderrOffset=offsets[1],
+                                                          logBytes=dst.tell(), base=recovery_base))
+            wrote = True
+            live_logs.note(r['run_id'], 'flush' if recovery_base is None else 'recovery_staged', bytes=len(data),
+                           stdoutOffset=offsets[0], stderrOffset=offsets[1],
+                           **{('logBytes' if recovery_base is None else 'staged_bytes'): dst.tell()})
+        with contextlib.closing(live_logs.pages(r['box_id'], r['command_id'], offsets, until=deadline, stats=stats)) as history:
+            for i, page, error in history:
+                attempted.add(i)
+                if error:
+                    errors.append(error)
+                    continue
+                remember_interruption(r['run_id'], page)
+                if api.BACKEND == 'server' and page.get('status'):
+                    from .home_run_observation import observe
+                    observe(r['run_id'], page['status'], status=page['status'], attempt=page.get('attempt'))
+                data = (page.get('data') or '').encode()
+                observed = int(page.get('nextOffset', offsets[i] + len(data)))
+                if data:
+                    flush(i, data)
+                behind[i] = max(0, int(page['size']) - observed) if page.get('size') is not None else 0
+        if len(attempted) < 2:
+            errors.append('timeout')
+    if errors or any(behind):
+        if any(behind):
+            live_logs.note(r['run_id'], 'backlog', remaining_bytes=sum(behind))
+        return 'incomplete:' + ('more output available' if any(behind) else ','.join(errors))
+    return 'caught_up' if wrote else 'complete'
+
+
 def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
+    if live:
+        return _catch_up_live(r, path, budget, stats)
     from .runs import remember_interruption
     started = time.time()
     deadline = started + (30 if budget is None else budget)
@@ -1434,6 +1544,18 @@ def logs(run_id: str, do_follow: bool) -> int:
         started = monotonic()
         result = _catch_up_log(r, budget=10, live=True) if r['status'] == 'running' else 'n/a'
         _tail(_shown_log(p), 0, True)
+        follower = read_json(LOGS_DIR / f"{r['run_id']}.follower.json", {})
+        if follower:
+            last = follower.get('last_write')
+            age = f"{max(0, int(now() - last))} s ago" if last is not None else 'never'
+            observed = follower.get('server_output_at')
+            detail = f'; server output observed {max(0, int(now() - observed))} s ago' if observed is not None else ''
+            if follower.get('remaining_bytes'):
+                age_at_fetch = max(0, int(now() - follower['backlog_at']))
+                detail += f"; at least {follower['remaining_bytes']} bytes behind at fetch {age_at_fetch} s ago"
+            if follower.get('event') == 'recovery_staged':
+                detail += f"; recovered {follower.get('staged_bytes', 0)} uncommitted bytes"
+            say(f"follower last wrote {age}; last event: {follower.get('event', 'unknown')}{detail}")
         notified = _incomplete_log(r, result, seconds=monotonic() - started)
         if r['mode'] != 'local' and not notified:
             if not r['box_id'] or not r['process_id']:
@@ -2081,6 +2203,8 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=
     A deadline, a lost stream (unknown exit) or any error removes the temp files and keeps the original."""
     from .runs import log_lock
     with log_lock(cur['run_id'], until=deadline):
+        from .live_logs import note
+        note(cur['run_id'], 'takeover')
         ck = checkpoint(log_path)
         if ck is not None:
             start, keep = (ck['stdoutOffset'], ck['stderrOffset']), ck['logBytes']
