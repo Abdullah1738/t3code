@@ -1,8 +1,10 @@
 import copy
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import signal
+import select
 import subprocess
 import sys
 import tempfile
@@ -14,6 +16,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import collector
 import deep_inventory as deep
 import jobs
+
+
+@contextmanager
+def held_inventory_lock():
+    path = jobs.state_path('disk-inventory').with_suffix('.lock')
+    process = subprocess.Popen([sys.executable, '-I', '-c', '''
+import fcntl, sys
+with open(sys.argv[1], 'a') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    print('ready', flush=True)
+    sys.stdin.read(1)
+''', str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        if not select.select([process.stdout], [], [], 10)[0]:
+            raise AssertionError('lock holder did not become ready')
+        if process.stdout.readline().strip() != 'ready':
+            raise AssertionError('lock holder failed to acquire flock')
+        yield process
+    finally:
+        if process.poll() is None:
+            process.communicate('release', timeout=10)
 
 
 class DeepInventoryTests(unittest.TestCase):
@@ -184,13 +207,136 @@ class DeepInventoryTests(unittest.TestCase):
                 collector.main()
                 crash.assert_called_once()
             before=jobs.read_state('disk-inventory')
-            deep.run_pass([root],lambda *a,**kw:self.fail('busy deep must exit'))
+            with patch.object(deep, 'DEEP_LOCK_WAIT_S', 0):
+                deep.run_pass([root],lambda *a,**kw:self.fail('busy deep must exit'))
             self.assertEqual(jobs.read_state('disk-inventory'),before)
         props=self.rows('disk.inventory')[-1]['props']
         self.assertEqual(props['skipReason'],'deep_pass_running')
         self.assertEqual(props['bytes'],1024)
         self.assertEqual(props['rootsComplete'],1)
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['skipReason'],'lock_held')
+
+    def test_wait_acquires_real_child_lock_and_budget_starts_after_acquisition(self):
+        root = self.roots([('wait', 1)])[0]
+        with held_inventory_lock() as holder:
+            lock_path = jobs.state_path('disk-inventory').with_suffix('.lock')
+            inode = lock_path.stat().st_ino
+            sleeps = []
+            def release(seconds):
+                sleeps.append(seconds)
+                self.clock[0] += seconds
+                holder.communicate('release', timeout=10)
+            # A virtual retry interval longer than the entire pass budget proves
+            # both deadlines begin after acquisition, without scheduler margins.
+            with patch.object(jobs.time, 'sleep', side_effect=release), \
+                 patch.object(deep, 'DEEP_LOCK_WAIT_S', 10):
+                calls = []
+                deep.run_pass([root], self.runner(lambda p: .25, calls), budget=1)
+            self.assertEqual(sleeps, [2])
+            self.assertEqual(lock_path.stat().st_ino, inode)
+        end = self.rows('disk.deep.end')[-1]['props']
+        self.assertEqual(end['lockWaitMs'], 2000)
+        self.assertEqual(end['durationMs'], 250)
+        self.assertEqual(end['childrenMeasured'], 1)
+        self.assertEqual(end['stopReason'], 'done')
+        self.assertNotIn('skipReason', end)
+        self.assertEqual(self.rows('disk.deep.lock_wait')[0]['props'], dict(waitedMs=2000, acquired=True))
+        self.assertEqual(len(self.rows('disk.deep.lock_wait')), 1)
+        self.assertTrue(calls)
+        self.assertFalse(any(r['props'].get('skipReason') == 'lock_held' for r in self.rows('disk.inventory.root')))
+
+    def test_wait_expiry_and_stop_leave_cache_unchanged(self):
+        root = self.roots([('wait-stop', 1)])[0]
+        for stop in (False, True):
+            log_dir = self.logs/str(stop)
+            with self.subTest(stop=stop), patch.object(self, 'logs', log_dir), \
+                 patch.dict(os.environ, TOOLLOG_DIR=str(log_dir)):
+                jobs.save_state('disk-inventory', dict(duMode='links', sizes={str(root): 1024}))
+                before = jobs.read_state('disk-inventory')
+                killed = [False]
+                sleeps = []
+                def wait(seconds):
+                    sleeps.append(seconds)
+                    self.clock[0] += seconds
+                    killed[0] = stop
+                with held_inventory_lock(), patch.object(jobs.time, 'sleep', side_effect=wait), \
+                     patch.object(deep, 'DEEP_LOCK_WAIT_S', 3):
+                    deep.run_pass([root], lambda *a, **k: self.fail('locked du'), stopped=lambda: killed[0])
+                    self.assertEqual(jobs.read_state('disk-inventory'), before)
+                end = self.rows('disk.deep.end')[-1]['props']
+                waited = 2000 if stop else 3000
+                self.assertEqual(end['lockWaitMs'], waited)
+                self.assertEqual(sleeps, [2] if stop else [2, 1])
+                self.assertEqual(self.rows('disk.deep.lock_wait')[0]['props'], dict(waitedMs=waited, acquired=False))
+                self.assertEqual(len(self.rows('disk.deep.lock_wait')), 1)
+                if stop:
+                    self.assertEqual(end['stopReason'], 'killed')
+                    self.assertNotIn('skipReason', end)
+                    self.assertFalse(self.rows('disk.inventory.root'))
+                else:
+                    self.assertEqual(end['skipReason'], 'lock_held')
+                    self.assertEqual(self.rows('disk.inventory.root')[-1]['props']['skipReason'], 'lock_held')
+
+    def test_free_lock_has_zero_wait_and_hourly_contention_never_sleeps(self):
+        root = self.roots([('free-lock', 1)])[0]
+        with patch.object(jobs.time, 'sleep', side_effect=AssertionError('unexpected lock wait')):
+            deep.run_pass([root], self.runner(lambda p: .25), budget=1)
+            with held_inventory_lock():
+                jobs.directory_inventory([root], lambda *a, **k: self.fail('locked hourly du'))
+        self.assertEqual(self.rows('disk.deep.end')[-1]['props']['lockWaitMs'], 0)
+        self.assertFalse(self.rows('disk.deep.lock_wait'))
+        hourly = self.rows('disk.inventory')[-1]['props']
+        self.assertEqual(hourly['skipReason'], 'deep_pass_running')
+        self.assertEqual(hourly['bytes'], 1024)
+
+    def test_already_stopped_does_not_measure_or_wait(self):
+        root = self.roots([('already-stopped', 1)])[0]
+        with patch.object(jobs.time, 'sleep', side_effect=AssertionError('stopped wait')):
+            deep.run_pass([root], lambda *a, **k: self.fail('stopped du'), stopped=lambda: True)
+        end = self.rows('disk.deep.end')[-1]['props']
+        self.assertEqual(end['stopReason'], 'killed')
+        self.assertEqual(end['lockWaitMs'], 0)
+        self.assertFalse(self.rows('disk.deep.lock_wait'))
+
+    def test_sigterm_during_real_lock_wait_exits_cleanly(self):
+        root = self.roots([('sigterm-wait', 1)])[0]
+        script = '''
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import jobs, deep_inventory
+jobs.DIRECTORY_ROOTS = [Path(sys.argv[2])]
+def no_measure(*args, **kwargs):
+    raise AssertionError('measured during lock wait')
+jobs.inventory_listing = no_measure
+sleep = jobs.time.sleep
+def wait(seconds):
+    print('waiting', flush=True)
+    sleep(seconds)
+jobs.time.sleep = wait
+deep_inventory.main()
+'''
+        with held_inventory_lock():
+            process = subprocess.Popen([sys.executable, '-I', '-c', script,
+                str(Path(jobs.__file__).parent), str(root)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertTrue(select.select([process.stdout], [], [], 10)[0], 'pass did not wait')
+                self.assertEqual(process.stdout.readline().strip(), 'waiting')
+                process.send_signal(signal.SIGTERM)
+                _, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(stderr, '')
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=10)
+        end = self.rows('disk.deep.end')[-1]['props']
+        self.assertEqual(end['stopReason'], 'killed')
+        self.assertGreater(end['lockWaitMs'], 0)
+        self.assertFalse(self.rows('disk.deep.lock_wait')[-1]['props']['acquired'])
+        self.assertFalse(self.rows('disk.inventory.source'))
+        self.assertFalse(jobs.state_path('disk-inventory').exists())
 
     def test_graceful_stop_checkpoints_current_batch(self):
         root=self.roots([('stop',130)])[0]
