@@ -466,6 +466,21 @@ def safe_fields(values, event=None):
         return u_episode_fields(values)
     if event in ('cpu.sample', 'cpu.spike'):
         return cpu_fields(values)
+    if event in ('disk.budget', 'disk.budget.over'):
+        result = {}
+        for key, value in (values or {}).items():
+            if key in ('sizeGb', 'budgetGb', 'overBy', 'sizeAgeS') and (
+                    value is None or finite_number(value) and value >= 0):
+                result[key] = value
+            elif key == 'path' and isinstance(value, str) and value.startswith('/') and not SECRET.search(value):
+                result[key] = ''.join(c for c in value[:1024] if c.isprintable())
+            elif key == 'owner' and isinstance(value, str) and re.fullmatch(r'[a-z][a-z0-9-]{0,63}', value):
+                result[key] = value
+            elif key == 'source' and value in ('inventory', 'deep', 'stale'):
+                result[key] = value
+            elif key == 'status' and value in ('ok', 'stale', 'unmeasured', 'missing', 'symlink', 'unavailable'):
+                result[key] = value
+        return result
     if event == 'disk.ssd_read_probe':
         result = {}
         for key, value in (values or {}).items():

@@ -545,6 +545,29 @@ absolute budget. The disk tooling probe follows, then inventory uses what remain
 No log command starts once its shared budget is exhausted. No live configuration
 or schedule change is needed for this order.
 
+## Folder budgets
+
+`disk-budgets.json`, installed beside the collector, assigns folder budgets in
+GiB to owner boards. The hourly collector emits `disk.budget` for every path,
+using complete inventory child/parts caches or root sums. `~/.robob/userdata`
+is excluded from its parent sum; symlinked targets are never measured. Missing
+paths report zero, while unavailable or incomplete measurements report a stale
+last complete size (or null). `sizeAgeS` is the measurement's age, rather than
+the last collector run's age.
+
+Targets outside those cached levels are measured only by the daily deep pass,
+using its existing lock, wall budget, per-folder cap and checkpointed scanner.
+`disk.budget.over` follows three consecutive UTC hourly over-budget samples,
+at most once per path per UTC day. Stale/missing observations and gaps reset
+the streak. These events do not send notifications.
+
+`mac-log-rollup` includes `diskBudgets.topOverBudget`, ordered by excess at each
+path's latest fresh daily observation. Growth uses the nearest fresh sample to
+24 hours earlier (within two hours), using measurement times from `sizeAgeS`;
+it is null when that baseline is missing. `sizeTs` and `growthWindowS` record
+the measurement time and actual comparison interval. Overlapping parent and
+child budgets are independent and must not be added together.
+
 ## diskutil hangs
 
 Each hourly collector run emits `disk.tooling_probe`: a 20 s `diskutil list
