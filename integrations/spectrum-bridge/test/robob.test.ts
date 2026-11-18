@@ -1568,7 +1568,7 @@ test.each([
   if (scope === "child") {
     control.threads.set(asking.threadId, asking);
     // The fake server has no SSE connection; deliver and drain its creation event.
-    backend.activeRoster.event({ data: { type: "thread.created", threadId: asking.threadId } });
+    rosterEvent(backend.activeRoster, { type: "thread.created", threadId: asking.threadId });
     await backend.statuses(true);
   }
   else {
@@ -2326,6 +2326,11 @@ test.each(["resolve", "upload"])("bus expiry during Robob %s preparation prevent
   } finally { upload.mockRestore(); resolve.mockRestore(); clock.mockRestore(); }
 });
 
+let rosterSequence = 0;
+function rosterEvent(roster: ActiveRoster, data: Record<string, unknown>) {
+  roster.event({ id: String(++rosterSequence), data });
+}
+
 function rosterFixture() {
   let time = 1_000_000;
   const client = new ControlClient({ url: "http://127.0.0.1:1", token: "test-token" });
@@ -2339,7 +2344,11 @@ function rosterFixture() {
   const roster = new ActiveRoster(client, () => time);
   const backend = new RobobBackend({ chatRoot: "/chats", client, activeRoster: roster, finishes: () => new Map() });
   const chats = [backend, ...["moni", "group-a", "group-b", "idle-a", "idle-b"].map(name => backend.forChat(`chats/${name}`, name))];
-  const event = (threadId: string, state: string, runId?: string) => roster.event({ data: { type: "thread.status", threadId, state, ...(runId ? { runId } : {}) } });
+  const event = (threadId: string, state: string, runId?: string) => {
+    const row = server.threads.find(row => row.threadId === threadId);
+    if (row && (!runId || runId === (row.activeRunId ?? row.latestRunId))) row.state = row.pendingRequest ? "needs-input" : state as typeof row.state;
+    rosterEvent(roster, { type: "thread.status", threadId, state, ...(runId ? { runId } : {}) });
+  };
   return { client, row, server, reads, roster, backend, chats, event, advance: (ms: number) => { time += ms; } };
 }
 
@@ -2352,7 +2361,7 @@ test("active roster shares six concurrent reads and the healthy 120-second budge
     expect(f.reads).toHaveBeenCalledTimes(1);
     for (let second = 1; second <= 120; second++) {
       f.advance(1_000);
-      if (scenario !== "idle" && second % 10 === 0) f.event("owner", second % 20 ? "running" : "waiting");
+      if (scenario !== "idle" && second % 10 === 0) f.event("owner", second % 20 ? "running" : "queued");
       await Promise.all(f.chats.map(chat => chat.statuses()));
       if (scenario === "steer" && second === 55) await f.backend.statuses(true);
     }
@@ -2372,14 +2381,89 @@ test("active roster stream-down TTL is one GET per ten seconds for the process",
   expect(f.roster.status()).toMatchObject({ startup: 1, stream_down: 12 });
 });
 
-test("active roster patches busy/idle immediately in all chat views without a GET", async () => {
+test.each(["idle", "running"] as const)("unchanged %s details during a refresh cannot start a reconciliation loop", async state => {
+  const f = rosterFixture(); f.server.threads[0]!.state = state;
+  f.roster.streamState(true); await f.backend.statuses();
+  f.advance(30_000);
+  const response = Promise.withResolvers<typeof f.server>(); f.reads.mockReturnValueOnce(response.promise);
+  const refresh = f.backend.statuses(true);
+  const reads = f.chats.map(() => f.roster.checkpoint("owner"));
+  for (const read of reads) f.roster.observe(structuredClone(f.server.threads[0]!), read);
+  response.resolve(structuredClone(f.server)); await refresh;
+  for (const read of reads) f.roster.observe(structuredClone(f.server.threads[0]!), read);
+  await f.backend.statuses(true);
+  expect(f.reads).toHaveBeenCalledTimes(2);
+  expect(f.roster.status().ambiguous).toBe(0);
+});
+
+test("ambiguities during and already covered by one fetch cannot start another generation", async () => {
+  const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
+  const old = f.chats.map(() => f.roster.checkpoint("owner"));
+  const response = Promise.withResolvers<typeof f.server>(); f.reads.mockReturnValueOnce(response.promise);
+  const idle = { ...f.server.threads[0]!, state: "idle" as const };
+  for (const read of old) f.roster.observe(idle, { ...read, revision: -1 });
+  expect(f.reads).toHaveBeenCalledTimes(2);
+  response.resolve(structuredClone(f.server));
+  await Promise.all(f.chats.map(chat => chat.statuses(true)));
+  for (const read of old) f.roster.observe(idle, read);
+  expect(await f.backend.statuses(true)).toHaveProperty("owner");
+  expect(f.reads).toHaveBeenCalledTimes(2);
+  expect(f.roster.status().ambiguous).toBe(1);
+});
+
+test.each(["thread.created", "thread.status", "request.opened", "request.resolved"])("family discovery during %s cannot publish a complete roster missing a new child", async type => {
+  const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
+  const stale = structuredClone(f.server);
+  const response = Promise.withResolvers<typeof f.server>(); f.reads.mockReturnValueOnce(response.promise);
+  f.advance(30_000); const admission = f.backend.statuses(true);
+  const request = { requestId: "pending", kind: "question" as const, requestKind: "user_input" };
+  f.server.threads.push({ ...f.row("child", "needs-input", "owner"), pendingRequest: request }); f.server.total++;
+  rosterEvent(f.roster, { type, threadId: "child", state: "needs-input", ...request });
+  response.resolve(stale);
+  expect(await admission).toHaveProperty("child", { type: "busy", root: "owner" });
+  expect(f.reads).toHaveBeenCalledTimes(3);
+  expect(f.roster.status().ambiguous).toBe(0);
+});
+
+test.each(["idle", "active", "steer", "stream-down"])("six Sendblue routers retain their 120-second list budget: %s", async scenario => {
+  const c = fakeControl(), backend = c.backend();
+  backend.activeRoster.streamState(scenario !== "stream-down");
+  const names = ["owner", "moni", "group-a", "group-b", "idle-a", "idle-b"];
+  const backends = names.map((name, i) => i ? backend.forChat(`chats/${name}`, name) : backend);
+  const stores = names.map(() => new Store(":memory:"));
+  const routes = await Promise.all(backends.map(b => b.createChat()));
+  if (scenario === "active" || scenario === "steer") c.threads.get(routes[0]!.id)!.runs.push({ runId: "budget-running", ordinal: 1, status: "running" });
+  const routers = backends.map((b, i) => new Router(stores[i]!, b, { typing: async () => {}, read: async () => {}, downloadAttachment: async () => { throw new Error("unused"); } }, {
+    context: { chat: { slug: names[i]!, key: `dm:+1555555012${i}`, title: names[i]!, kind: i === 0 ? "owner" : "dm" },
+      roleOf: () => ({ name: "Owner", role: "owner" }), typing: () => false, react: async () => {} }, chatGuid: `dm:+1555555012${i}`,
+    owner: "+15555550123", skillPath: "/skills", alertSkillPath: "/alert", alertSocketPath: "/alert.sock", timezone: "UTC",
+  }));
+  const start = Date.now();
+  try {
+    for (let second = 0; second <= 120; second++) {
+      setSystemTime(start + second * 1_000);
+      for (let i = 0; i < routers.length; i++) {
+        await (routers[i] as unknown as { statusesFor(route: typeof routes[number]): Promise<unknown> }).statusesFor(routes[i]!);
+      }
+      if (scenario === "steer" && second === 55) await backend.statuses(true);
+    }
+    await backend.statuses();
+    const lists = c.calls.filter(call => call.path.includes("active=true"));
+    if (scenario === "stream-down") expect(lists.length).toBe(13);
+    else expect(lists.length / 2).toBeLessThanOrEqual(4);
+    expect(backend.activeRoster.status().ambiguous).toBe(0);
+  } finally { setSystemTime(); for (const store of stores) store.db.close(); }
+});
+
+test("sequenced busy patches need no GET; a draining run reconciles before clearing idle", async () => {
   const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
   f.event("owner", "idle");
+  await f.backend.statuses(true);
   for (const chat of f.chats) expect(await chat.statuses()).toEqual({});
   f.event("owner", "running");
   for (const chat of f.chats) expect(await chat.statuses(true)).toEqual({ owner: { type: "busy", root: null } });
-  expect(f.reads).toHaveBeenCalledTimes(1);
-  expect(f.roster.status().patches).toBe(2);
+  expect(f.reads).toHaveBeenCalledTimes(2);
+  expect(f.roster.status()).toMatchObject({ ambiguous: 1, roster_event: 1 });
 });
 
 test("unknown threads, creation, archive, delete and resync refetch once", async () => {
@@ -2389,7 +2473,7 @@ test("unknown threads, creation, archive, delete and resync refetch once", async
     { type: "thread.updated", threadId: "owner", change: "thread.deleted" }, { type: "ready", resumed: false }, { type: "resync" },
   ]) {
     const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
-    f.roster.event({ data }); await Promise.all(f.chats.map(chat => chat.statuses(true)));
+    rosterEvent(f.roster, data); await Promise.all(f.chats.map(chat => chat.statuses(true)));
     expect(f.reads).toHaveBeenCalledTimes(2);
     expect(f.roster.status().roster_event).toBe(1); f.reads.mockRestore();
   }
@@ -2400,7 +2484,7 @@ test("healthy steer admission uses cache, a stream gap awaits one fetch, replies
   await f.backend.statuses(true); expect(f.reads).toHaveBeenCalledTimes(1);
   f.roster.streamState(false);
   let resolve!: (value: typeof f.server) => void;
-  f.reads.mockImplementation(() => new Promise(done => { resolve = done; }));
+  f.reads.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
   let admitted = false;
   const admission = f.backend.statuses(true).then(() => { admitted = true; });
   expect(admitted).toBe(false);
@@ -2434,10 +2518,12 @@ test("fetch failures retain busy families, fail admission closed and back off", 
 test("events during a slow refresh survive its older snapshot", async () => {
   const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
   let resolve!: (value: typeof f.server) => void;
-  f.advance(30_000); f.reads.mockImplementation(() => new Promise(done => { resolve = done; }));
+  f.advance(30_000); f.reads.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
   const admission = f.backend.statuses(true);
-  f.event("owner", "idle"); expect(await f.backend.statuses()).toEqual({});
+  f.event("owner", "idle"); expect(await f.backend.statuses()).toHaveProperty("owner");
   resolve(structuredClone(f.server)); await admission;
+  expect(await f.backend.statuses()).toHaveProperty("owner");
+  f.roster.observe(f.server.threads[0]!);
   expect(await f.backend.statuses()).toEqual({}); expect(f.reads).toHaveBeenCalledTimes(2);
 });
 
@@ -2445,7 +2531,7 @@ test("old-run status cannot clear a newer busy foreground", async () => {
   const f = rosterFixture(); f.server.threads[0]!.activeRunId = "new-run";
   f.roster.streamState(true); await f.backend.statuses();
   let resolve!: (value: typeof f.server) => void;
-  f.reads.mockImplementation(() => new Promise(done => { resolve = done; })); f.event("owner", "idle", "old-run");
+  f.reads.mockImplementationOnce(() => new Promise(done => { resolve = done; })); f.event("owner", "idle", "old-run");
   expect((await f.backend.statuses()).owner?.type).toBe("busy");
   const admission = f.backend.statuses(true); resolve(structuredClone(f.server)); await admission;
   expect((await f.backend.statuses()).owner?.type).toBe("busy");
@@ -2482,10 +2568,11 @@ test("canonical route detail clears busy state without waiting for the safety re
 test("a status patch during a fetch preserves the fetched parentage and native identity", async () => {
   const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
   let resolve!: (value: typeof f.server) => void;
-  f.advance(30_000); f.reads.mockImplementation(() => new Promise(done => { resolve = done; }));
+  f.advance(30_000); f.reads.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
   const refresh = f.backend.statuses(true);
   f.event("owner", "queued");
-  resolve({ total: 1, threads: [{ ...f.server.threads[0]!, parentThreadId: "new-root", rootThreadId: "new-root", nativeSessionId: "ses_new" }] });
+  f.server.threads[0] = { ...f.server.threads[0]!, parentThreadId: "new-root", rootThreadId: "new-root", nativeSessionId: "ses_new" };
+  resolve(structuredClone(f.server));
   expect(await refresh).toEqual({ owner: { type: "busy", root: "new-root" }, ses_new: { type: "busy", root: "new-root" } });
 });
 
@@ -2498,7 +2585,9 @@ test("one shared SSE subscription closes with the process and patches every chat
   const events = spyOn(f.client, "events").mockImplementation(async function* ({ signal }) {
     yield { id: "7", data: { type: "ready", sequence: 7, resumed: false } };
     await f.backend.statuses(true);
+    f.server.threads[0]!.state = "idle";
     yield { id: "9", data: { type: "thread.status", threadId: "owner", state: "idle" } };
+    await f.backend.statuses(true);
     opened();
     await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
     stopped();
@@ -2523,7 +2612,8 @@ test("SSE down: route detail clears its completed run without a list GET or chan
 
 test.each(["event-before-detail", "detail-before-event"])("older idle detail never overwrites a newer busy event: %s", async order => {
   const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
-  f.event("owner", "idle");
+  f.server.threads[0]!.state = "idle";
+  f.roster.observe(f.server.threads[0]!);
   const idle = { ...f.server.threads[0]!, state: "idle" as const, recentRuns: [], pendingRequests: [], run: null };
   let finish!: (value: { thread: typeof idle }) => void;
   spyOn(f.client, "thread").mockImplementation(() => new Promise(resolve => { finish = resolve; }));
@@ -2535,7 +2625,7 @@ test.each(["event-before-detail", "detail-before-event"])("older idle detail nev
   expect(await detail).toBe(order === "event-before-detail");
   if (order === "detail-before-event") f.event("owner", "running");
   expect(await f.backend.statuses()).toEqual({ owner: { type: "busy", root: null } });
-  expect(f.reads).toHaveBeenCalledTimes(1);
+  expect(f.reads).toHaveBeenCalledTimes(order === "event-before-detail" ? 2 : 1);
 });
 
 test("a repeated busy event also fences an older idle route detail", async () => {
@@ -2549,10 +2639,10 @@ test("a repeated busy event also fences an older idle route detail", async () =>
   response.resolve({ thread: idle });
   expect(await detail).toBe(true);
   expect(await f.backend.statuses()).toHaveProperty("owner");
-  expect(f.reads).toHaveBeenCalledTimes(1);
+  expect(f.reads).toHaveBeenCalledTimes(2);
 });
 
-test.each(["running", "idle"])("another thread's %s event cannot discard a fresh idle route detail", async state => {
+test.each(["running", "queued"])("another thread's %s event cannot discard a fresh idle route detail", async state => {
   const f = rosterFixture(); f.server.threads.push(f.row("other")); f.server.total = 2;
   f.roster.streamState(true); await f.backend.statuses();
   const idle = { ...f.server.threads[0]!, state: "idle" as const, recentRuns: [], pendingRequests: [], run: null };
@@ -2563,7 +2653,7 @@ test.each(["running", "idle"])("another thread's %s event cannot discard a fresh
   f.event("other", state);
   response.resolve({ thread: idle });
   expect(await detail).toBe(false);
-  expect(await f.backend.statuses()).toEqual(state === "running" ? { other: { type: "busy", root: null } } : {});
+  expect(await f.backend.statuses()).toEqual({ other: { type: "busy", root: null } });
   expect(f.reads).toHaveBeenCalledTimes(1);
 });
 
@@ -2579,20 +2669,20 @@ test.each(requestCases)("request events preserve aggregate needs-input across ru
   const request = { requestId: "pending", kind, requestKind };
   f.server.threads = [{ ...f.row("asking", state, parent), latestRunId: "run-1" }];
   f.roster.streamState(true); await f.backend.statuses();
-  f.roster.event({ data: { type: "request.opened", threadId: "asking", ...request, status: "pending" } });
+  rosterEvent(f.roster, { type: "request.opened", threadId: "asking", ...request, status: "pending" });
   const busy = { asking: { type: "busy" as const, root: parent } };
   expect(await f.backend.statuses(true)).toEqual(busy);
   for (const [status, next] of [["waiting", "waiting"], ["completed", "idle"], ["queued", "queued"], ["running", "running"]]) {
-    f.roster.event({ data: { type: "thread.status", threadId: "asking", runId: "run-1", status, state: next } });
+    rosterEvent(f.roster, { type: "thread.status", threadId: "asking", runId: "run-1", status, state: next });
     expect(await f.backend.statuses(true)).toEqual(busy);
   }
   expect(f.reads).toHaveBeenCalledTimes(1);
   // A summary exposes only one pending request. Resolving one cannot prove there are no others.
   f.server.threads[0] = { ...f.server.threads[0]!, state: "needs-input", pendingRequest: { ...request, requestId: "second" } };
-  f.roster.event({ data: { type: "request.resolved", threadId: "asking", ...request, status: "resolved" } });
+  rosterEvent(f.roster, { type: "request.resolved", threadId: "asking", ...request, status: "resolved" });
   expect(await f.backend.statuses(true)).toEqual(busy);
   f.server.threads[0] = { ...f.server.threads[0]!, state, pendingRequest: null };
-  f.roster.event({ data: { type: "request.resolved", threadId: "asking", ...request, requestId: "second", status: "cancelled" } });
+  rosterEvent(f.roster, { type: "request.resolved", threadId: "asking", ...request, requestId: "second", status: "cancelled" });
   expect(await f.backend.statuses(true)).toEqual(["running", "queued"].includes(state) ? busy : {});
   expect(f.reads).toHaveBeenCalledTimes(3);
 });
@@ -2604,7 +2694,7 @@ test.each([false, true])("an in-flight run-1 completion cannot erase a fetched b
   const response = Promise.withResolvers<typeof f.server>();
   f.advance(30_000); f.reads.mockReturnValue(response.promise);
   const admission = f.backend.statuses(true);
-  f.roster.event({ data: { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" } });
+  rosterEvent(f.roster, { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" });
   response.resolve({ total: 1, threads: [{ ...f.server.threads[0]!, latestRunId: "run-2", activeRunId: active ? "run-2" : null }] });
   expect(await admission).toEqual({ owner: { type: "busy", root: null } });
   expect(f.reads).toHaveBeenCalledTimes(2);
@@ -2620,16 +2710,96 @@ test.each(["opening", "fetched", "resolved"])("request state remains authoritati
   const stale = structuredClone(f.server);
   f.advance(30_000); f.reads.mockReturnValueOnce(response.promise);
   const admission = f.backend.statuses(true);
-  if (source === "opening") f.roster.event({ data: { type: "request.opened", threadId: "owner", ...request, status: "pending" } });
-  f.roster.event({ data: { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" } });
+  if (source === "opening") rosterEvent(f.roster, { type: "request.opened", threadId: "owner", ...request, status: "pending" });
+  rosterEvent(f.roster, { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" });
   if (source === "resolved") {
     f.server.threads[0] = { ...f.server.threads[0]!, state: "idle", pendingRequest: null };
-    f.roster.event({ data: { type: "request.resolved", threadId: "owner", ...request, status: "resolved" } });
+    rosterEvent(f.roster, { type: "request.resolved", threadId: "owner", ...request, status: "resolved" });
   }
   if (source === "fetched") Object.assign(stale.threads[0]!, { state: "needs-input", pendingRequest: request });
   response.resolve(stale);
-  expect(await admission).toEqual(source === "resolved" ? {} : { owner: { type: "busy", root: null } });
-  expect(f.reads).toHaveBeenCalledTimes(source === "resolved" ? 3 : 2);
+  expect(await admission).toEqual({ owner: { type: "busy", root: null } });
+  if (source === "resolved") {
+    f.roster.observe(f.server.threads[0]!);
+    expect(await f.backend.statuses()).toEqual({});
+  }
+  expect(f.reads).toHaveBeenCalledTimes(2);
+});
+
+const detailRequestRaces = (["question", "approval"] as const).flatMap(kind =>
+  (["waiting", "idle"] as const).flatMap(state => [false, true].map(fail => ({ kind, state, fail }))));
+
+test.each(detailRequestRaces)("a same-run detail cannot erase a fetched pending request (%j)", async ({ kind, state, fail }) => {
+  const f = rosterFixture();
+  f.server.threads = [{ ...f.row("child", "running", "owner"), activeRunId: null, latestRunId: "run-1" }];
+  f.roster.streamState(true); await f.backend.statuses();
+  const response = Promise.withResolvers<typeof f.server>();
+  f.advance(30_000); f.reads.mockReturnValueOnce(response.promise);
+  const admission = f.backend.statuses(true);
+  f.roster.observe({ ...f.server.threads[0]!, state, status: state, pendingRequest: null, updatedAt: "2026-11-19T00:00:01Z" });
+  f.server.threads[0] = { ...f.server.threads[0]!, state: "needs-input", updatedAt: "2026-11-19T00:00:02Z",
+    pendingRequest: { requestId: "pending", kind, requestKind: kind === "question" ? "user_input" : "command" } };
+  expect(f.roster.isBusy("child")).toBe(true);
+  if (fail) response.reject(new Error("reconciliation offline"));
+  else response.resolve(structuredClone(f.server));
+  if (fail) await expect(admission).rejects.toThrow("reconciliation offline");
+  else expect(await admission).toEqual({ child: { type: "busy", root: "owner" } });
+  expect(await f.backend.statuses()).toEqual({ child: { type: "busy", root: "owner" } });
+  expect(f.reads).toHaveBeenCalledTimes(2);
+});
+
+test.each(["fetched-busy", "detail-busy"])("conflicting same-run aggregate details preserve busy until reconciled: %s", async order => {
+  const f = rosterFixture(); f.server.threads[0]!.latestRunId = "run-1";
+  if (order === "detail-busy") f.server.threads[0]!.state = "waiting";
+  f.roster.streamState(true); await f.backend.statuses();
+  const response = Promise.withResolvers<typeof f.server>();
+  f.advance(30_000); f.reads.mockReturnValueOnce(response.promise);
+  const admission = f.backend.statuses(true);
+  f.roster.observe({ ...f.server.threads[0]!, state: order === "detail-busy" ? "running" : "waiting" });
+  expect(f.roster.isBusy("owner")).toBe(true);
+  response.resolve({ total: 1, threads: [{ ...f.server.threads[0]!, state: order === "fetched-busy" ? "running" : "waiting" }] });
+  expect(await admission).toEqual({ owner: { type: "busy", root: null } });
+  expect(f.reads).toHaveBeenCalledTimes(2);
+});
+
+const drainingRunEvents = [
+  { status: "waiting", state: "waiting" },
+  ...["completed", "failed", "cancelled", "interrupted", "rolled_back"].map(status => ({ status, state: "idle" })),
+];
+
+test.each(drainingRunEvents)("a run's %s event reconciles a child with older active work", async ({ status, state }) => {
+  const f = rosterFixture();
+  f.server.threads = [{ ...f.row("child", "running", "owner"), activeRunId: "run-2", latestRunId: "run-2" }];
+  f.roster.streamState(true); await f.backend.statuses();
+  f.server.threads[0]!.activeRunId = "run-1";
+  const response = Promise.withResolvers<typeof f.server>(); f.reads.mockReturnValueOnce(response.promise);
+  rosterEvent(f.roster, { type: "thread.status", threadId: "child", runId: "run-2", status, state });
+  // Replies use the retained view immediately, while complete family reads join one aggregate GET.
+  expect(await f.backend.statuses()).toEqual({ child: { type: "busy", root: "owner" } });
+  const admissions = Promise.all(f.chats.map(chat => chat.statuses(true)));
+  response.resolve(structuredClone(f.server));
+  for (const statuses of await admissions) expect(statuses).toEqual({ child: { type: "busy", root: "owner" } });
+  expect(f.reads).toHaveBeenCalledTimes(2);
+});
+
+test("a failed aggregate read after a terminal event retains the overlapping child's busy state", async () => {
+  const f = rosterFixture();
+  f.server.threads = [{ ...f.row("child", "running", "owner"), activeRunId: "run-2", latestRunId: "run-2" }];
+  f.roster.streamState(true); await f.backend.statuses();
+  f.reads.mockRejectedValue(new Error("offline"));
+  rosterEvent(f.roster, { type: "thread.status", threadId: "child", runId: "run-2", status: "completed", state: "idle" });
+  await expect(f.backend.statuses(true)).rejects.toThrow("offline");
+  expect(await f.backend.statuses()).toEqual({ child: { type: "busy", root: "owner" } });
+  expect(f.reads).toHaveBeenCalledTimes(2);
+});
+
+test("a final run completion removes its busy mark after one aggregate reconciliation", async () => {
+  const f = rosterFixture(); f.server.threads[0]!.latestRunId = "run-1";
+  f.roster.streamState(true); await f.backend.statuses();
+  f.server.threads = []; f.server.total = 0;
+  rosterEvent(f.roster, { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" });
+  expect(await f.backend.statuses(true)).toEqual({});
+  expect(f.reads).toHaveBeenCalledTimes(2);
 });
 
 test("a busy detail for a different run keeps admission blocked until the fetch ambiguity is reconciled", async () => {
@@ -2641,13 +2811,10 @@ test("a busy detail for a different run keeps admission blocked until the fetch 
   const admission = f.backend.statuses(true);
   const next = { ...f.server.threads[0]!, latestRunId: "run-2" };
   f.roster.observe(next);
-  f.reads.mockImplementationOnce(async () => {
-    expect(f.roster.isBusy("owner")).toBe(true);
-    return { total: 1, threads: [next] };
-  });
+  expect(f.roster.isBusy("owner")).toBe(true);
   response.resolve({ total: 1, threads: [{ ...f.server.threads[0]!, state: "idle" }] });
   expect(await admission).toEqual({ owner: { type: "busy", root: null } });
-  expect(f.reads).toHaveBeenCalledTimes(3);
+  expect(f.reads).toHaveBeenCalledTimes(2);
 });
 
 test("a failed request-resolution fetch retains needs-input and rejects admission", async () => {
@@ -2656,7 +2823,7 @@ test("a failed request-resolution fetch retains needs-input and rejects admissio
   f.server.threads[0] = { ...f.server.threads[0]!, state: "needs-input", pendingRequest: request };
   f.roster.streamState(true); await f.backend.statuses();
   f.reads.mockRejectedValue(new Error("offline"));
-  f.roster.event({ data: { type: "request.resolved", threadId: "owner", ...request, status: "resolved" } });
+  rosterEvent(f.roster, { type: "request.resolved", threadId: "owner", ...request, status: "resolved" });
   await expect(f.backend.statuses(true)).rejects.toThrow("offline");
   expect(await f.backend.statuses()).toEqual({ owner: { type: "busy", root: null } });
   expect(f.reads).toHaveBeenCalledTimes(2);
@@ -2668,9 +2835,9 @@ test.each(["resolved", "expired", "cancelled"])("a %s request cannot be revived 
   f.server.threads[0] = { ...f.server.threads[0]!, state: "needs-input", pendingRequest: request, latestRunId: "run-1" };
   f.roster.streamState(true); await f.backend.statuses();
   f.server.threads = []; f.server.total = 0;
-  f.roster.event({ data: { type: "request.resolved", threadId: "owner", ...request, status } });
+  rosterEvent(f.roster, { type: "request.resolved", threadId: "owner", ...request, status });
   expect(await f.backend.statuses(true)).toEqual({});
-  f.roster.event({ data: { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" } });
+  rosterEvent(f.roster, { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" });
   expect(await f.backend.statuses(true)).toEqual({});
   expect(f.reads).toHaveBeenCalledTimes(3);
 });
@@ -2681,7 +2848,7 @@ test.each([
   const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
   const request = { requestId: "question", kind: "question" as const, requestKind: "user_input" };
   f.server.threads.push({ ...f.row("unknown", "needs-input", "owner"), pendingRequest: request }); f.server.total = 2;
-  f.roster.event({ data: { type: "request.opened", threadId: "owner", ...request, ...fields, status: "pending" } });
+  rosterEvent(f.roster, { type: "request.opened", threadId: "owner", ...request, ...fields, status: "pending" });
   for (const statuses of await Promise.all(f.chats.map(chat => chat.statuses(true)))) {
     expect(statuses.unknown).toEqual({ type: "busy", root: "owner" });
   }
@@ -2689,7 +2856,7 @@ test.each([
   expect(f.roster.status()).toMatchObject({ misses: 1, roster_event: 1 });
 });
 
-test.each(["opened", "waiting", "completed"])("real backend steer admission finds a child's question after %s", async transition => {
+test.each(["opened", "waiting", "completed", "detail-fetch"])("real backend steer admission finds a child's question after %s", async transition => {
   const start = Date.now(); setSystemTime(start);
   const h = delegatedRouter({
     chat: { key: "dm:+15555550123", slug: "owner", kind: "owner", title: "Owner" },
@@ -2701,21 +2868,36 @@ test.each(["opened", "waiting", "completed"])("real backend steer admission find
   const request: PendingRequest = { requestId: "child-question", kind: "question", requestKind: "user_input", canRespond: true,
     questions: [{ id: "choice", header: "Pick", question: "Which?", options: [{ label: "A" }] }] };
   const child: Thread = { ...h.control.threads.get(route.id)!, threadId: "asking", parentThreadId: route.id,
-    runs: [{ runId: "child-run", ordinal: 1, status: "waiting" }], messages: [], pending: transition === "opened" ? [] : [request] };
+    runs: [{ runId: "child-run", ordinal: 1, status: "waiting" }], messages: [], pending: ["opened", "detail-fetch"].includes(transition) ? [] : [request] };
   h.control.threads.set(child.threadId, child);
   h.backend.activeRoster.streamState(true);
-  h.backend.activeRoster.event({ data: { type: "thread.created", threadId: child.threadId } });
+  rosterEvent(h.backend.activeRoster, { type: "thread.created", threadId: child.threadId });
   await h.backend.statuses(true);
   const initial = h.control.calls.filter(call => call.path.includes("active=true")).length;
   // Deliver at admission, after any earlier request scan, so the real guard must use the patched roster.
   const statuses = h.backend.statuses.bind(h.backend);
   const admission = spyOn(h.backend, "statuses").mockImplementation(async complete => {
     if (complete) {
-      child.pending = [request];
-      if (transition === "opened") h.backend.activeRoster.event({ data: { type: "request.opened", threadId: child.threadId, ...request, status: "pending" } });
+      if (transition === "detail-fetch") {
+        const read = h.backend.activeRoster.checkpoint(child.threadId);
+        const { thread: older } = await h.backend.client.thread(child.threadId);
+        const list = h.backend.client.listThreads.bind(h.backend.client);
+        spyOn(h.backend.client, "listThreads").mockImplementationOnce(async args => {
+          await Promise.resolve();
+          h.backend.activeRoster.observe(older, read);
+          child.pending = [request];
+          return list(args);
+        });
+        setSystemTime(start + 30_000);
+      }
+      else if (transition === "opened") {
+        child.pending = [request];
+        rosterEvent(h.backend.activeRoster, { type: "request.opened", threadId: child.threadId, ...request, status: "pending" });
+      }
       else {
+        child.pending = [request];
         child.runs[0]!.status = transition;
-        h.backend.activeRoster.event({ data: { type: "thread.status", threadId: child.threadId, runId: "child-run", status: transition, state: transition === "waiting" ? "waiting" : "idle" } });
+        rosterEvent(h.backend.activeRoster, { type: "thread.status", threadId: child.threadId, runId: "child-run", status: transition, state: transition === "waiting" ? "waiting" : "idle" });
       }
     }
     return statuses(complete);
@@ -2725,7 +2907,58 @@ test.each(["opened", "waiting", "completed"])("real backend steer admission find
   expect(admission.mock.calls.some(([complete]) => complete)).toBe(true);
   expect(h.control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
   expect(h.router.routerStatus().pending).toMatchObject([{ sessionId: child.threadId, kind: "question", state: "pending" }]);
-  expect(h.control.calls.filter(call => call.path.includes("active=true"))).toHaveLength(initial);
+  expect(h.control.calls.filter(call => call.path.includes("active=true"))).toHaveLength(initial + (transition === "detail-fetch" ? 1 : 0));
+});
+
+test.each([undefined, "9", "10", "bad", "9007199254740992"])("unordered event sequence %s retains busy and refetches once", async id => {
+  const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
+  f.roster.event({ id: "10", data: { type: "thread.status", threadId: "owner", state: "queued" } });
+  const response = Promise.withResolvers<typeof f.server>(); f.reads.mockReturnValueOnce(response.promise);
+  f.roster.event({ id, data: { type: "thread.status", threadId: "owner", state: "running" } });
+  expect(await f.backend.statuses()).toHaveProperty("owner");
+  const admission = Promise.all(f.chats.map(chat => chat.statuses(true)));
+  response.resolve(structuredClone(f.server)); await admission;
+  expect(f.reads).toHaveBeenCalledTimes(2);
+  expect(f.roster.status()).toMatchObject({ ambiguous: 1, roster_event: 1 });
+});
+
+test.each(["before", "during", "after"])("detail started %s the latest fetch clears only when ordered", async order => {
+  const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
+  let read = f.roster.checkpoint("owner");
+  const response = Promise.withResolvers<typeof f.server>();
+  f.advance(30_000); f.reads.mockReturnValueOnce(response.promise);
+  const refresh = f.backend.statuses(true);
+  if (order === "during") read = f.roster.checkpoint("owner");
+  response.resolve(structuredClone(f.server)); await refresh;
+  if (order === "after") read = f.roster.checkpoint("owner");
+  f.server.threads[0]!.state = "idle";
+  f.roster.observe(f.server.threads[0]!, read);
+  if (order === "after") expect(await f.backend.statuses()).toEqual({});
+  else {
+    expect(await f.backend.statuses(true)).toHaveProperty("owner");
+    f.roster.observe(f.server.threads[0]!);
+  }
+  expect(await f.backend.statuses(true)).toEqual({});
+  expect(f.reads).toHaveBeenCalledTimes(2);
+  expect(f.roster.status().ambiguous).toBe(0);
+});
+
+test("real backend familyBusy stays true when a newer child run ends but older work continues", async () => {
+  const h = delegatedRouter({
+    chat: { key: "dm:+15555550123", slug: "owner", kind: "owner", title: "Owner" },
+    roleOf: () => ({ name: "Owner", role: "owner" }), typing: () => false, react: async () => {},
+  });
+  const chat = await h.backend.createChat();
+  const child: Thread = { ...h.control.threads.get(chat.id)!, threadId: "child", parentThreadId: chat.id,
+    runs: [{ runId: "run-1", ordinal: 1, status: "running" }, { runId: "run-2", ordinal: 2, status: "running" }], messages: [], pending: [] };
+  h.control.threads.set(child.threadId, child);
+  h.backend.activeRoster.streamState(true); await h.backend.statuses(true);
+  child.runs[1]!.status = "completed";
+  rosterEvent(h.backend.activeRoster, { type: "thread.status", threadId: child.threadId, runId: "run-2", status: "completed", state: "idle" });
+  const family = h.router as unknown as { familyBusy(route: { id: string; directory: string; generation: number }): Promise<boolean> };
+  expect(await family.familyBusy({ ...chat, generation: 1 })).toBe(true);
+  expect((await h.backend.statuses(true)).child).toEqual({ type: "busy", root: chat.id });
+  expect(await family.familyBusy({ ...chat, generation: 1 })).toBe(true);
 });
 
 test("Sendblue finds a newly created child's question through the shared SSE-down fallback, without an event", async () => {
@@ -2756,6 +2989,8 @@ test("Sendblue finds a newly created child's question through the shared SSE-dow
   await listed.promise;
   await h.router.tick();
   expect(h.router.routerStatus().pending).toMatchObject([{ sessionId: "unannounced-child", kind: "question", state: "pending" }]);
-  expect(h.control.calls.filter(call => call.path.includes("active=true"))).toHaveLength(initial + 1);
-  expect(h.backend.activeRoster.status().roster_event).toBe(0);
+  const counters = h.backend.activeRoster.status();
+  expect(counters.stream_down).toBe(1);
+  expect(h.control.calls.filter(call => call.path.includes("active=true"))).toHaveLength(initial + 1 + counters.ambiguous);
+  expect(counters.roster_event).toBe(counters.ambiguous);
 });

@@ -306,7 +306,7 @@ test("failed control perf rows retain safe error detail and tick/completion meas
 test("active roster aggregates per minute with reasons, joins, patching, children and fetch latency", async () => {
   let time = at;
   const { log, lines } = setup({ now: () => time });
-  for (const rosterAction of ["fetches", "startup", "fetches", "safety", "joins", "hits", "patches", "misses", "streamUp", "streamDown", "children", "errors"]) {
+  for (const rosterAction of ["fetches", "startup", "fetches", "safety", "joins", "hits", "patches", "misses", "streamUp", "streamDown", "children", "errors", "ambiguous"]) {
     log.write({ component: "robob", kind: "perf", name: "robob.roster_action", props: { rosterAction, rows: 4, total: 4, text: "PRIVATE_ROSTER_EVENT" } });
   }
   for (const durationMs of [15, 31, 200]) log.write({ component: "robob", kind: "perf", name: "robob.roster_action", durationMs,
@@ -316,7 +316,7 @@ test("active roster aggregates per minute with reasons, joins, patching, childre
   const summaries = lines().filter(line => line.name === "robob.active_roster");
   expect(summaries).toHaveLength(1);
   expect(summaries[0]!.props).toMatchObject({ fetches: 2, startup: 1, safety: 1, joins: 1, hits: 1, patches: 1,
-    misses: 1, streamUp: 1, streamDown: 1, children: 1, errors: 1, rows: 4, total: 4, fetchMsP50: 31, fetchMsMax: 200 });
+    misses: 1, streamUp: 1, streamDown: 1, children: 1, errors: 1, ambiguous: 1, rows: 4, total: 4, fetchMsP50: 31, fetchMsMax: 200 });
   expect(JSON.stringify(lines())).not.toContain("PRIVATE_ROSTER_EVENT");
   expect(lines().some(line => line.name === "robob.roster_action")).toBe(false);
 });

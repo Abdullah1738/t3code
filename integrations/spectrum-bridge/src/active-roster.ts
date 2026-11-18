@@ -25,9 +25,15 @@ export function rosterStatuses(threads: Iterable<ThreadSummary>, native: Readonl
 }
 
 type Snapshot = { threads: ThreadSummary[]; total: number; fetchedAt: number; complete: boolean };
-type Patch = { row: ThreadSummary; state?: ThreadState; request?: ThreadSummary["pendingRequest"] };
+type DetailRead = { revision: number; fetch: number; fetching: boolean };
+function sameRow(a: ThreadSummary, b: ThreadSummary): boolean {
+  return a.state === b.state && a.status === b.status && a.parentThreadId === b.parentThreadId
+    && a.rootThreadId === b.rootThreadId && a.nativeSessionId === b.nativeSessionId
+    && a.pendingRequest?.requestId === b.pendingRequest?.requestId
+    && a.activeRunId === b.activeRunId && a.latestRunId === b.latestRunId;
+}
 const counters = () => ({ fetches: 0, startup: 0, roster_event: 0, safety: 0, stream_down: 0, incomplete: 0, error_retry: 0,
-  joins: 0, hits: 0, patches: 0, misses: 0, streamUp: 0, streamDown: 0, errors: 0, children: 0 });
+  joins: 0, hits: 0, patches: 0, misses: 0, streamUp: 0, streamDown: 0, errors: 0, children: 0, ambiguous: 0 });
 
 /** One active-family read and one event connection for all of the process's chats. */
 export class ActiveRoster {
@@ -35,7 +41,11 @@ export class ActiveRoster {
   private busy: Record<string, SessionStatus> = {};
   private known = new Map<string, ThreadSummary>();
   private fetching?: Promise<void>;
-  private pending = new Map<string, Patch>();
+  private pending = new Map<string, ThreadSummary>();
+  private sequences = new Map<string, number>();
+  private fetchVersion = 0;
+  private ambiguousRefresh = false;
+  private ambiguousGeneration = -1;
   private revisions = new Map<string, number>();
   private dirty = 0;
   private clean = 0;
@@ -100,31 +110,56 @@ export class ActiveRoster {
     this.background();
   }
 
+  checkpoint(threadId: string): DetailRead {
+    return { revision: this.revision(threadId), fetch: this.fetchVersion, fetching: !!this.fetching };
+  }
+
   /** Route detail reads also reconcile state while the event stream is reconnecting. */
-  observe(thread: ThreadSummary, revision = this.revision(thread.threadId)): void {
-    if (!this.cache || revision !== this.revision(thread.threadId)) return;
+  observe(thread: ThreadSummary, read = this.checkpoint(thread.threadId)): void {
+    if (!this.cache) return;
     const row: ThreadSummary = { threadId: thread.threadId, projectId: thread.projectId, title: thread.title,
       state: thread.state, status: thread.status, origin: thread.origin, nativeSessionId: thread.nativeSessionId,
       runtimeMode: thread.runtimeMode, parentThreadId: thread.parentThreadId, rootThreadId: thread.rootThreadId,
       worktreePath: thread.worktreePath, pendingRequest: thread.pendingRequest, createdAt: thread.createdAt, updatedAt: thread.updatedAt,
       activeRunId: thread.activeRunId, latestRunId: thread.latestRunId };
-    this.patch(row, { state: row.state, request: row.pendingRequest });
+    const previous = this.known.get(row.threadId);
+    // Repeated detail reads add no evidence and must not perpetuate a reconciliation fetch.
+    if (previous ? sameRow(previous, row) : !BUSY.has(row.state) && !row.pendingRequest) return;
+    // Only ordered facts may clear a thread: same-run identity is not a freshness token.
+    // Unordered reads/events retain busy evidence and share one aggregate reconciliation.
+    if (read.fetching || this.fetching || read.fetch !== this.fetchVersion || read.revision !== this.revision(row.threadId)) {
+      this.ambiguous(row, read); return;
+    }
+    this.patch(row);
   }
 
   revision(threadId: string): number { return this.revisions.get(threadId) ?? 0; }
 
   private touch(threadId: string): void { this.revisions.set(threadId, ++this.generation); }
 
-  private patch(row: ThreadSummary, change: Omit<Patch, "row">): void {
-    // An unchanged busy event still fences an older idle detail for this thread alone.
-    this.touch(row.threadId);
+  private ambiguous(row?: ThreadSummary, read?: DetailRead): void {
+    if (row) {
+      const current = this.known.get(row.threadId) ?? row;
+      const request = current.pendingRequest ?? row.pendingRequest;
+      this.patch({ ...current, pendingRequest: request,
+        state: request ? "needs-input" : BUSY.has(current.state) ? current.state : BUSY.has(row.state) ? row.state : "running" });
+    }
+    this.count("misses");
+    const generation = read?.fetch ?? this.fetchVersion;
+    // One aggregate read covers a generation's ambiguities, including arrivals during that read.
+    if (this.fetching || generation < this.fetchVersion || read?.fetching || this.ambiguousGeneration === generation) {
+      this.count("joins"); return;
+    }
+    this.ambiguousGeneration = generation;
+    this.ambiguousRefresh = true;
+    this.invalidate();
+  }
+
+  private patch(row: ThreadSummary): void {
     const previous = this.known.get(row.threadId);
     this.known.set(row.threadId, row);
-    if (this.fetching) this.pending.set(row.threadId, { ...this.pending.get(row.threadId), ...change, row });
-    if (previous && previous.state === row.state && previous.status === row.status && previous.parentThreadId === row.parentThreadId
-      && previous.rootThreadId === row.rootThreadId && previous.nativeSessionId === row.nativeSessionId
-      && previous.pendingRequest?.requestId === row.pendingRequest?.requestId
-      && previous.activeRunId === row.activeRunId && previous.latestRunId === row.latestRunId) return;
+    if (this.fetching) this.pending.set(row.threadId, row);
+    if (previous && sameRow(previous, row)) return;
     if (this.cache) {
       const index = this.cache.threads.findIndex(thread => thread.threadId === row.threadId);
       if (index < 0) this.cache.threads.push(row);
@@ -139,42 +174,47 @@ export class ActiveRoster {
     if (data.type === "error") { this.streamState(false); this.invalidate(); return; }
     if (data.type === "ready") { this.streamState(true); this.invalidate(); return; }
     const id = typeof data.threadId === "string" ? data.threadId : undefined;
+    const sequence = frame.id && /^\d+$/.test(frame.id) ? Number(frame.id) : NaN;
+    const ordered = Number.isSafeInteger(sequence) && sequence > (id ? this.sequences.get(id) ?? -1 : -1);
+    if (id) {
+      this.touch(id);
+      if (ordered) this.sequences.set(id, sequence);
+    }
     if (data.type === "request.resolved") {
       // A summary contains only one pending request; resolution needs the aggregate server view.
-      if (id) this.touch(id);
-      this.invalidate(); return;
+      const thread = id ? this.known.get(id) : undefined;
+      if (!thread) { this.count("misses"); this.invalidate(); return; }
+      this.ambiguous(thread); return;
     }
     if (data.type === "thread.created" || data.type === "resync"
       || data.type === "thread.updated" && CHANGES.has(String(data.change))) {
-      if (id) this.touch(id);
       this.invalidate(); return;
     }
     if (data.type !== "thread.status" && data.type !== "request.opened") return;
-    this.generation++;
     const thread = id ? this.known.get(id) : undefined;
     if (!thread || thread.parentThreadId !== null && !thread.rootThreadId) {
-      if (id) this.touch(id);
+      // Family discovery needs an identity/root, which a status event cannot supply.
       this.count("misses"); this.invalidate(); return;
     }
     if (data.type === "request.opened") {
       if (typeof data.requestId !== "string" || (data.kind !== "question" && data.kind !== "approval") || typeof data.requestKind !== "string") {
-        this.touch(thread.threadId); this.count("misses"); this.invalidate(); return;
+        this.ambiguous(thread); return;
       }
-      const request: NonNullable<ThreadSummary["pendingRequest"]> = { requestId: data.requestId, kind: data.kind, requestKind: data.requestKind };
-      this.patch({ ...thread, state: "needs-input", pendingRequest: request }, { request });
+      const pendingRequest: NonNullable<ThreadSummary["pendingRequest"]> = { requestId: data.requestId, kind: data.kind, requestKind: data.requestKind };
+      const row = { ...thread, state: "needs-input" as const, pendingRequest };
+      if (!ordered || this.fetching) this.ambiguous(row);
+      else this.patch(row);
       return;
     }
-    // A run event describes that run, not necessarily the thread's current run.
-    // Never let an old background completion clear a newer busy foreground.
     const runId = typeof data.runId === "string" ? data.runId : undefined;
     const current = thread.activeRunId ?? thread.latestRunId;
-    if (!STATES.has(data.state) || runId && current && runId !== current) {
-      this.touch(thread.threadId);
-      this.count("misses"); this.invalidate(); return;
+    if (!ordered || this.fetching || !STATES.has(data.state) || runId && current && runId !== current
+      || !BUSY.has(data.state as ThreadState) && !thread.pendingRequest) {
+      // A waiting/terminal run cannot prove no other run remains active.
+      this.ambiguous(thread); return;
     }
-    const state = data.state as ThreadState;
-    this.patch({ ...thread, state: thread.pendingRequest ? "needs-input" : state,
-      status: typeof data.status === "string" ? data.status : thread.status }, { state });
+    this.patch({ ...thread, state: thread.pendingRequest ? "needs-input" : data.state as ThreadState,
+      status: typeof data.status === "string" ? data.status : thread.status });
   }
 
   private async listen(signal: AbortSignal): Promise<void> {
@@ -238,6 +278,8 @@ export class ActiveRoster {
     const epoch = this.epoch;
     const healthy = this.stream;
     this.pending.clear();
+    this.fetchVersion++;
+    if (this.ambiguousRefresh) { this.count("ambiguous"); this.ambiguousRefresh = false; }
     this.lastReason = reason;
     this.lastFetchAt = this.now();
     this.count("fetches"); this.count(reason);
@@ -246,22 +288,14 @@ export class ActiveRoster {
       try {
         const { total, threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
         const rows = threads.map(thread => ({ ...thread }));
-        for (const [id, patched] of this.pending) {
+        // Unordered patches only hold busy/request evidence; the shared fetch covers their generation.
+        for (const [id, held] of this.pending) {
           const index = rows.findIndex(row => row.threadId === id);
-          if (index < 0) rows.push(patched.row);
+          if (index < 0) rows.push(held);
           else {
             const fetched = rows[index]!;
-            const sameRun = (fetched.activeRunId ?? fetched.latestRunId ?? null)
-              === (patched.row.activeRunId ?? patched.row.latestRunId ?? null);
-            // Request openings affect the thread across runs. Run patches apply only to their run.
-            const request = patched.request !== undefined && (patched.request !== null || sameRun) ? patched.request : fetched.pendingRequest;
-            let state = sameRun ? patched.state ?? fetched.state : fetched.state;
-            if (!sameRun && patched.state && BUSY.has(patched.state) && !BUSY.has(fetched.state)) {
-              // Neither read proves which run is current. Keep dispatch blocked until reconciliation.
-              state = patched.state; this.dirty++; this.count("misses");
-            }
-            rows[index] = { ...fetched, state: request ? "needs-input" : state, pendingRequest: request,
-              ...(sameRun && patched.state ? { status: patched.row.status } : {}) };
+            const pendingRequest = fetched.pendingRequest ?? held.pendingRequest;
+            rows[index] = { ...fetched, pendingRequest, state: pendingRequest ? "needs-input" : held.state };
           }
         }
         const isComplete = total <= threads.length;

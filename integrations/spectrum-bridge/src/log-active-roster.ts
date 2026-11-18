@@ -1,6 +1,6 @@
 import type { LogLine } from "./toollog.ts";
 
-export const ROSTER_ACTIONS = ["fetches", "startup", "roster_event", "safety", "stream_down", "incomplete", "error_retry", "joins", "hits", "patches", "misses", "streamUp", "streamDown", "errors", "children", "duration"] as const;
+export const ROSTER_ACTIONS = ["fetches", "startup", "roster_event", "safety", "stream_down", "incomplete", "error_retry", "joins", "hits", "patches", "misses", "streamUp", "streamDown", "errors", "children", "ambiguous", "duration"] as const;
 const COUNTS = [...ROSTER_ACTIONS.filter(key => key !== "duration"), "rows", "total", "fetchMsP50", "fetchMsMax", "generation", "lastFetchAt", "retryAt"];
 
 /** Health and log fields are code-owned scalars; no thread/event payload crosses this boundary. */
