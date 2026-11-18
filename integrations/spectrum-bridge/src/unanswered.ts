@@ -191,9 +191,9 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
       }
       store.updateInbound(id, nextState, { ...input, answeredAt: now });
       const ageMs = Math.max(0, now - (input.receivedAt ?? now));
-      const chat = store.get<string>("unanswered-chat") ?? "other";
+      const chat = store.get<string>("log-chat") ?? store.get<string>("unanswered-chat") ?? "other";
       toolLog.capture(() => {
-        if (opts.recordLatency !== false && (chat === "owner" || chat === "moni")) toolLog.write({ component: "router", kind: "perf", name: "inbound.answered",
+        if (opts.recordLatency !== false) toolLog.write({ component: "router", kind: "perf", name: "inbound.answered",
           ids: { inboundId: id, chat }, durationMs: ageMs });
         if (input.unanswered?.overdueAt !== undefined) toolLog.write({ component: "router", kind: "event", name: "inbound.answered_late",
           ids: { inboundId: id, chat }, props: { ageMs } });

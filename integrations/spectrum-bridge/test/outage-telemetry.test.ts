@@ -1,9 +1,9 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { copyFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRobobLinkAggregation, createRobobLinkState } from "../src/log-robob-link.ts";
-import { createToolLog, type LogLine } from "../src/toollog.ts";
+import { createToolLog, toolLog, type LogLine } from "../src/toollog.ts";
 import { Store } from "../src/store.ts";
 import { deliveredReplyCoverage, findOverdue, reconcileLegacyReplies, type AnsweredInput } from "../src/unanswered.ts";
 import { captureLogs } from "./log-fixture.ts";
@@ -15,7 +15,7 @@ const stores: Store[] = [];
 afterEach(() => { stores.splice(0).forEach(s => s.close()); roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); });
 const temp = () => { const root = mkdtempSync(join(tmpdir(), "outage-telemetry-")); roots.push(root); return root; };
 const input = (id: string): AnsweredInput => ({ id, text: "PRIVATE_MESSAGE", source: "typed", receivedAt: start, attachments: [], isAudioMessage: false });
-function store(chat: string) { const s = new Store(":memory:"); stores.push(s); s.set("unanswered-chat", chat === "group-trip" ? "other" : chat); s.set("log-chat", chat); return s; }
+function store(chat: string, path = ":memory:") { const s = new Store(path); stores.push(s); s.set("unanswered-chat", chat === "group-trip" ? "other" : chat); s.set("log-chat", chat); return s; }
 const saved = (s: Store, id: string): AnsweredInput => JSON.parse(s.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id=?").get(id)!.payload);
 
 test.each(["owner", "moni", "group-trip"])("outage telemetry: %s control ack preserves unanswered human batch and later conversation answers it", async chat => {
@@ -142,6 +142,62 @@ test("outage telemetry: delivery logs control kind and preserves group ack attri
   expect(rows.find(row => row.name === "reply.sent")?.props?.kind).toBe("control");
   expect(rows.find(row => row.name === "inbound.acked")?.ids?.chat).toBe("group-trip");
   expect(saved(s, "root").answeredAt).toBeUndefined();
+});
+
+const groupBatchReplies = [false, true].flatMap(defer => ["down", "recovered", "restarted"].map(phase => ({ defer, phase })));
+test.each(groupBatchReplies)("outage telemetry: group-batch reply while $phase with defer=$defer answers every covered row across restart", async ({ defer, phase }) => {
+  const root = temp(); let at = start;
+  let log = createToolLog({ root, defer, capBytes: 1, now: () => at });
+  const writer = spyOn(toolLog, "write").mockImplementation(entry => log.write(entry));
+  const path = join(root, "group.sqlite");
+  let s = store("group-trip", path);
+  let sends = 0;
+  const makeDelivery = () => new Delivery(s, { sendText: async () => ({ providerId: `delivery-${++sends}` }) }, {
+    projectScope: "test", chat: "group-trip", chatGuid: () => "iMessage;+;group-trip", enabled: () => true, sleep: async () => {},
+  });
+  let delivery = makeDelivery();
+  const call = (ok: boolean) => log.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok, durationMs: 10,
+    props: { route: "/threads/:id/messages", method: "GET", ...(ok ? {} : { linkCause: "ECONNREFUSED" }) } });
+  const stop = async () => { log.write({ component: "process", kind: "event", name: "bridge.stop" }); await log.settled(); };
+  const restart = async () => {
+    await stop(); at += 1_000;
+    stores.splice(stores.indexOf(s), 1); s.close();
+    s = store("group-trip", path); delivery = makeDelivery();
+    log = createToolLog({ root, defer, capBytes: 1, now: () => at }); call(true);
+  };
+  try {
+    for (let n = 0; n < 3; n++) call(false);
+    for (const id of ["root", "member"]) {
+      s.acceptInbound(id, input(id));
+      log.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "group-trip", messageId: id }, props: { backend: "robob" } });
+    }
+    s.set("batch:root", { ...input("root"), batchIds: ["root", "member"] });
+    s.enqueue({ id: "outage:batch-notice", kind: "control", text: "Technical problem", replyTo: "root" });
+    await delivery.tick(); await log.settled();
+    for (const id of ["root", "member"]) expect(saved(s, id).answeredAt).toBeUndefined();
+    expect((await log.rollup("2026-11-17"))?.robob_link).toMatchObject({ messagesWaiting: 2,
+      outages: [expect.objectContaining({ inboundAckedDuringOutage: 2, inboundAnsweredDuringOutage: 0, inboundAnsweredAfter: 0 })] });
+    at += 100;
+    if (phase !== "down") call(true);
+    if (phase === "restarted") await restart();
+    s.enqueue({ id: "batch-reply", kind: "conversation", text: "Actual answer", replyTo: "root" });
+    await delivery.tick(); await log.settled();
+    expect(sends).toBe(2);
+    for (const id of ["root", "member"]) expect(saved(s, id).answeredAt).toBeNumber();
+    if (phase === "down") { at += 100; call(true); }
+    await stop();
+    const expected = { inboundReceivedDuringOutage: 2, inboundAckedDuringOutage: 2,
+      inboundAnsweredDuringOutage: phase === "down" ? 2 : 0, inboundAnsweredAfter: phase === "down" ? 0 : 2, open: false };
+    expect((await log.rollup("2026-11-17"))?.robob_link).toMatchObject({ messagesWaiting: 0, outages: [expect.objectContaining(expected)] });
+    expect(JSON.parse(readFileSync(join(root, "robob-link-state.json"), "utf8"))).toMatchObject({ active: null, recovered: [] });
+    const rows: LogLine[] = readFileSync(join(root, "2026-11-17.ndjson"), "utf8").trim().split("\n").map(row => JSON.parse(row));
+    expect(rows.filter(row => row.name === "inbound.answered").map(row => row.ids?.inboundId).sort()).toEqual(["member", "root"]);
+    expect(rows.filter(row => row.name === "inbound.answered").every(row => row.ids?.chat === "group-trip")).toBe(true);
+    await restart(); await stop();
+    for (const id of ["root", "member"]) expect(saved(s, id).answeredAt).toBeNumber();
+    expect((await log.rollup("2026-11-17"))?.robob_link).toMatchObject({ messagesWaiting: 0, outages: [expect.objectContaining(expected)] });
+    expect(JSON.parse(readFileSync(join(root, "robob-link-state.json"), "utf8"))).toMatchObject({ active: null, recovered: [] });
+  } finally { try { await stop(); } finally { writer.mockRestore(); } }
 });
 
 test.each(["outage", "control", "synthetic-dropped", "turn", "nudge", "request"])("outage telemetry: %s notices ack a live turn without answering it", prefix => {
