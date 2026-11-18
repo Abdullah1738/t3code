@@ -90,6 +90,10 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
       props[key] = value; continue;
     }
+    if (entry.component === "remote-box" && entry.name === "moni-callback-ready"
+      && (key === "handlerMs" || key === "loopDelayMs") && typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      props[key] = value; continue;
+    }
     if (entry.component === "remote-box" && entry.name === "moni-runner-error") {
       if (key === "path" && typeof value === "string" && ["/send", "/files", "/react", "/agent-ask", "/agent-answer", "/agent-requests", "/share", "/unshare", "/shares", "/metrics", "/ready"].includes(value)
         || key === "errorClass" && typeof value === "string" && ["LineError", "RemoteSendError", "Error", "UnknownError"].includes(value)
