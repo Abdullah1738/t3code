@@ -10,9 +10,11 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HELPER = os.path.join(HERE, "..", "helpers", "send-approval")
+RUN_HELPER = os.path.join(HERE, "fixtures", "run-helper.py")
 FORMATTER = os.path.join(HERE, "..", "..", "spectrum-bridge", "src", "formatting.ts")
 BUN = os.environ.get("BUN") or os.path.expanduser("~/.bun/bin/bun")
 DRAFTED = (int(time.time() * 1000) - 3600_000) // 1000
@@ -143,12 +145,12 @@ class SendApprovalTest(unittest.TestCase):
             json.dump(answers, fh)
         env["SEND_APPROVAL_IDENTITY"] = seam
         env.update(native_env or {})
-        r = subprocess.run(["/usr/bin/python3", HELPER, "check", *args, "--drafted-at", str(drafted)],
+        r = subprocess.run(["/usr/bin/python3", RUN_HELPER, HELPER, "check", *args, "--drafted-at", str(drafted)],
                            capture_output=True, text=True, env=env)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
 
     def run_check_raw(self, *args):
-        r = subprocess.run(["/usr/bin/python3", HELPER, *args], capture_output=True, text=True, env=self.env())
+        r = subprocess.run(["/usr/bin/python3", RUN_HELPER, HELPER, *args], capture_output=True, text=True, env=self.env())
         return r.returncode, r.stdout.strip(), r.stderr.strip()
 
     def ok(self, iid, preview=PREVIEW, **kw):
@@ -735,7 +737,7 @@ class SendApprovalTest(unittest.TestCase):
         con = sqlite3.connect(self.state_db)
         con.execute('create table ardud_readonly_meta(key text primary key, value text not null)')
         con.executemany('insert into ardud_readonly_meta values (?,?)',
-                        [('ready', '1'), ('updated_at', iso(NOW)), ('schema_version', '1')])
+                        [('ready', '1'), ('updated_at', iso(int(time.time() * 1000))), ('schema_version', '1')])
         con.executescript(
             "create table orchestration_v2_projection_provider_threads(provider_thread_id text primary key, thread_id"
             " text, updated_at text, payload_json text);"
@@ -763,6 +765,20 @@ class SendApprovalTest(unittest.TestCase):
         code, out, err = self.app()
         self.assertEqual(code, 0, err)
         self.assertEqual(self.judged()["reply"], "go ahead")
+
+    def test_replica_freshness_does_not_depend_on_when_the_suite_was_imported(self):
+        # Full discovery can reach these tests after the replica's 120s freshness window.
+        with patch(__name__ + ".NOW", NOW - 180_000):
+            self.test_app_reply_after_the_finished_preview_is_approved()
+
+    def test_stale_replica_is_still_refused(self):
+        self.app_db([("assistant", NOW - 60_000, fenced(PREVIEW), "agent", "provider"),
+                     ("user", NOW - 30_000, "go ahead", "user", "mobile")])
+        with sqlite3.connect(self.state_db) as con:
+            con.execute("update ardud_readonly_meta set value=? where key='updated_at'", (iso(NOW - 180_000),))
+        code, _, err = self.app()
+        self.assertEqual(code, 2, err)
+        self.assertIn("Robob replica is stale", err)
 
     def test_app_preview_has_to_be_a_plain_code_block(self):
         # Astra r1 B2 / Sol r3 B1: the app renders markdown, so an HTML comment in a plain-text preview vanished.
@@ -947,7 +963,7 @@ class SendApprovalTest(unittest.TestCase):
         con = sqlite3.connect(self.state_db)
         con.execute('create table ardud_readonly_meta(key text primary key, value text not null)')
         con.executemany('insert into ardud_readonly_meta values (?,?)',
-                        [('ready', '1'), ('updated_at', iso(NOW)), ('schema_version', '1')])
+                        [('ready', '1'), ('updated_at', iso(int(time.time() * 1000))), ('schema_version', '1')])
         con.executescript(
             "create table orchestration_v2_projection_provider_threads(provider_thread_id text primary key, thread_id"
             " text, updated_at text, payload_json text);"
@@ -1121,7 +1137,7 @@ class SharedSessionRequestPathTest(unittest.TestCase):
                "SEND_APPROVAL_STATE_DB": os.path.join(self.tmp.name, "missing.sqlite"),
                "SEND_APPROVAL_BRIDGE_DIR": self.tmp.name, "SEND_APPROVAL_FORMATTER": FORMATTER,
                "SEND_APPROVAL_BUN": BUN, **env_extra}
-        r = subprocess.run(["/usr/bin/python3", HELPER, "check", "--app", "--preview", PREVIEW,
+        r = subprocess.run(["/usr/bin/python3", RUN_HELPER, HELPER, "check", "--app", "--preview", PREVIEW,
                             "--drafted-at", str(DRAFTED)],
                            capture_output=True, text=True, env=env)
         return r.returncode, r.stderr.strip()

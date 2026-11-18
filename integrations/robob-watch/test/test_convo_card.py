@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CARD = os.path.join(HERE, "..", "helpers", "convo-card", "convo_card.py")
+RUN_HELPER = os.path.join(HERE, "fixtures", "run-helper.py")
 DXB = timezone(timedelta(hours=4))
 SINCE = "2026-10-24T00:00+04:00"
 T0 = int(datetime(2026, 10, 24, 15, 28, tzinfo=DXB).timestamp())
@@ -138,6 +139,7 @@ class Base(unittest.TestCase):
             CONVO_CARD_BRIDGE_STATE=os.path.join(self.dir, "bridge-state"),
             CONVO_CARD_WACLI=self._exe("wacli", FAKE_WACLI), CONVO_CARD_BRIDGE=self._exe("bridge", FAKE_BRIDGE),
             CONVO_CARD_CHECK=self._exe("card-check", FAKE_CHECK), CONVO_CARD_LANGID=self._exe("langid", FAKE_LANGID),
+            CONVO_CARD_WORDS_FILE=os.path.join(HERE, "fixtures", "convo-words.txt"),
             FAKE_WACLI_LOG=self.logs["wacli"],
             FAKE_WACLI_PHOTOS=self.photos, FAKE_BRIDGE_LOG=self.logs["bridge"], FAKE_CHECK_LOG=self.logs["check"],
         )
@@ -171,7 +173,7 @@ class Base(unittest.TestCase):
         con.close()
 
     def run_card(self, *args, code=0, env=None):
-        p = subprocess.run(["/usr/bin/python3", CARD, *args], capture_output=True, text=True,
+        p = subprocess.run(["/usr/bin/python3", RUN_HELPER, CARD, *args], capture_output=True, text=True,
                            env=env or self.env, timeout=60)
         self.assertEqual(p.returncode, code, p.stdout + p.stderr)
         return p
@@ -270,7 +272,21 @@ class BuildTest(Base):
     def test_language_check_that_cannot_run_reviews_every_worded_message(self):
         self.msg(PHONE, "EN", T0, text="Lydia walked the dogs")
         self.msg(PHONE, "OK", T0 + 1, text="ok 👍")
-        env = dict(self.env, CONVO_CARD_LANGID="/usr/bin/false")
+        cases = {"missing executable": os.path.join(self.dir, "missing-langid"), "failed": "/usr/bin/false"}
+        for name, result in (("invalid JSON", "not JSON"), ("wrong length", "[]"),
+                             ("unknown language", '[{"top": null}]')):
+            cases[name] = self._exe(name.replace(" ", "-"), "#!/usr/bin/python3\nprint(" + repr(result) + ")\n")
+        for name, command in cases.items():
+            with self.subTest(failure=name):
+                env = dict(self.env, CONVO_CARD_LANGID=command)
+                out = json.loads(self.run_card("build", "--chat", "971500000001", "--slug", "lydia-chat", "--them", "Lydia",
+                                               "--me", "Moni", "--since", SINCE, env=env).stdout)
+                self.assertEqual([p["id"] for p in out["pending"]], ["EN"])
+
+    def test_missing_word_list_leaves_english_pending(self):
+        self.msg(PHONE, "EN", T0, text="hello")
+        self.msg(PHONE, "OK", T0 + 1, text="ok 👍")
+        env = dict(self.env, CONVO_CARD_WORDS_FILE=os.path.join(self.dir, "missing-words"))
         out = json.loads(self.run_card("build", "--chat", "971500000001", "--slug", "lydia-chat", "--them", "Lydia",
                                        "--me", "Moni", "--since", SINCE, env=env).stdout)
         self.assertEqual([p["id"] for p in out["pending"]], ["EN"])
@@ -283,6 +299,7 @@ class BuildTest(Base):
         self.msg(PHONE, "EN", T0 + 2, text="Booby is vomiting, should I call the vet?")
         self.msg(PHONE, "EN2", T0 + 3, text="on my way")
         env = dict(self.env, CONVO_CARD_LANGID=f"/usr/bin/osascript -l JavaScript {REAL_LANGID}")
+        env.pop("CONVO_CARD_WORDS_FILE")  # Keep the real macOS dictionary and recognizer together.
         out = json.loads(self.run_card("build", "--chat", "971500000001", "--slug", "lydia-chat", "--them", "Lydia",
                                        "--me", "Moni", "--since", SINCE, env=env).stdout)
         self.assertEqual([p["id"] for p in out["pending"]], ["ES", "DE"])
