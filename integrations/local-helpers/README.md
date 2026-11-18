@@ -5,6 +5,8 @@ mail OAuth heal and OTP watcher, the shared link-preview helper, the quick
 card builder, the MacBook power alerts and the Juno proxy. Edit them here,
 then install.
 
+`qcard --send CHAT --session ID` targets CHAT: own-chat app reply, `app --to` for another local chat, or an `agent-ask` link relay for a remote chat. Without `--session`, it only publishes/shares. The default key is `qcard:SLUG:CHAT`; retain `--key` across retries. Tests can set `QCARD_BRIDGE` (shell-split command) and `QCARD_BRIDGE_STATE` (bridge state directory).
+
 | Source | Installed as | Used by |
 | --- | --- | --- |
 | `bin/opencode`, `libexec/opencode/` | `~/.local/bin/opencode`, `~/.local/libexec/opencode/` | terminal CLI shim; shares the service binary path with `opencode-web` |
