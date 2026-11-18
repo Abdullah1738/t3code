@@ -27,9 +27,11 @@ class ToolLogTests(unittest.TestCase):
             if kind != 'timeout':
                 rows.append({'component': 'robob', 'name': 'turn.robob_call', 'kind': 'perf', 'ok': False,
                              'props': {'method': 'GET', 'route': '/threads/:id/messages', 'failureFormat': 'single'},
+                             'ids': {'requestId': kind},
                              'error': {'tag': 'control.request_failed', 'name': 'ControlError', 'status': 503 if kind == 'http' else 0}})
             rows.append({'component': 'router', 'name': 'bridge.catch', 'kind': 'error', 'ok': False,
                          'alreadyLogged': kind != 'timeout', 'props': {'causeKind': kind},
+                         'ids': {'requestId': kind},
                          'error': {'tag': 'router.catch1', 'name': 'BoundedTimeout' if kind == 'timeout' else 'ControlError',
                                    'causeKey': 'prompt_acceptance_probe'}})
         (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
@@ -42,8 +44,70 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(result['errorRate'], 3 / 6)
         tags = {row['tag']: row for row in result['topErrorTags']}
         self.assertEqual(tags['control.request_failed']['count'], 2)
+        self.assertEqual(tags['control.request_failed']['causeKinds'], {'http': 1, 'transport': 1})
         self.assertEqual(tags['router.catch1']['count'], 1)
         self.assertEqual(tags['router.catch1']['causeKinds'], {'timeout': 1})
+
+    def test_probe_owner_cause_kinds_survive_order_summaries_and_duplicate_catches(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        shapes = [('http_503', 'ControlError', 'control.request_failed', 'http'),
+                  ('refused', 'TypeError', 'control.request_failed', 'transport'),
+                  ('invalid_json', 'SyntaxError', 'control.invalid_json', 'http'),
+                  ('body_timeout', 'TimeoutError', 'control.request_failed', 'http')]
+        for shape, name, tag, kind in shapes:
+            for aggregate in (False, True):
+                for reverse in (False, True):
+                    with self.subTest(shape=shape, aggregate=aggregate, reverse=reverse):
+                        request = {'component': 'robob', 'name': 'turn.robob_call', 'kind': 'perf', 'ok': False,
+                                   'ids': {'requestId': shape, 'callBatchId': 'batch'},
+                                   'props': {'method': 'GET', 'route': '/threads/:id/messages', 'failureFormat': 'single'},
+                                   'error': {'tag': tag, 'name': name}}
+                        catch = {'component': 'router', 'name': 'bridge.catch', 'kind': 'error', 'ok': False,
+                                 'ids': {'requestId': shape}, 'alreadyLogged': True, 'props': {'causeKind': kind},
+                                 'error': {'tag': 'router.catch1', 'name': 'ControlError'}}
+                        rows = [request, catch, catch]
+                        if aggregate:
+                            rows.append({'component': 'robob', 'name': 'turn.robob_calls', 'kind': 'perf',
+                                         'ids': {'callBatchId': 'batch'}, 'calls': {'messages': {
+                                             'ok': 0, 'failed': 1, 'singleFailures': 1, 'histogram': [[10, 1]]}}})
+                        if reverse:
+                            rows.reverse()
+                        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                        result = toollog.rollup('imessage', self.day)
+                        self.assertEqual((result['failedCount'], result['dedupedFailures'], result['total']), (1, 2, 3))
+                        self.assertEqual(result['errorRate'], 1 / 3)
+                        self.assertEqual(len(result['topErrorTags']), 1)
+                        self.assertEqual(result['topErrorTags'][0]['tag'], tag)
+                        self.assertEqual(result['topErrorTags'][0]['count'], 1)
+                        self.assertEqual(result['topErrorTags'][0]['causeKinds'], {kind: 1})
+
+    def test_probe_owner_cause_kinds_require_a_correlated_deduplicated_catch(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        shapes = [('matching request', 'request', 'request', 'router.catch1', 'http', True, True),
+                  ('missing owner id', None, 'request', 'router.catch1', 'http', True, False),
+                  ('missing catch id', 'request', None, 'router.catch1', 'http', True, False),
+                  ('different request', 'request', 'other', 'router.catch1', 'http', True, False),
+                  ('other catch', 'request', 'request', 'router.catch49', 'http', True, False),
+                  ('invalid cause', 'request', 'request', 'router.catch1', 'PRIVATE_KIND', True, False),
+                  ('unmarked catch', 'request', 'request', 'router.catch1', 'http', False, False),
+                  ('invalid owner id', ['request'], 'request', 'router.catch1', 'http', True, False)]
+        for label, request_id, catch_id, tag, kind, marker, enriched in shapes:
+            with self.subTest(shape=label):
+                request = {'component': 'robob', 'name': 'turn.robob_call', 'kind': 'perf', 'ok': False,
+                           'ids': {'requestId': request_id}, 'props': {'failureFormat': 'single'},
+                           'error': {'tag': 'control.request_failed', 'name': 'ControlError'}}
+                catch = {'component': 'router', 'name': 'bridge.catch', 'kind': 'error', 'ok': False,
+                         'ids': {'requestId': catch_id}, 'alreadyLogged': marker, 'props': {'causeKind': kind},
+                         'error': {'tag': tag, 'name': 'ControlError'}}
+                (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in [request, catch]))
+                result = toollog.rollup('imessage', self.day)
+                owner = next(row for row in result['topErrorTags'] if row['tag'] == 'control.request_failed')
+                self.assertEqual(owner.get('causeKinds'), {'http': 1} if enriched else None)
+                failures = 1 if marker else 2
+                self.assertEqual(result['failedCount'], failures)
+                self.assertEqual(result['errorRate'], failures / result['total'])
 
     def test_prompt_probe_outcomes_keep_all_failures_in_error_rate(self):
         directory = toollog.board_dir('imessage')

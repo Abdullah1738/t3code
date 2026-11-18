@@ -742,6 +742,7 @@ def rollup(board, day, top_n=20):
     total = oks = failed = errors = observed = 0
     single_failures = 0
     deduped_failures = 0
+    probe_failure_kinds = {}
     def observe_error(row, line_number, weight=1):
         nonlocal single_failures
         probe_id = (row.get('ids') or {}).get('inboundId', '')
@@ -753,6 +754,11 @@ def rollup(board, day, top_n=20):
                 causes[key] += weight
                 probe_rows[key][probe_id] += weight
         if board == 'imessage' and row.get('alreadyLogged') is True:
+            request_id = (row.get('ids') or {}).get('requestId')
+            cause_kind = (row.get('props') or {}).get('causeKind')
+            if ((row.get('error') or {}).get('tag') == 'router.catch1'
+                    and isinstance(request_id, str) and request_id and cause_kind in ('timeout', 'http', 'transport')):
+                probe_failure_kinds[request_id] = cause_kind
             return
         request_failure = (board == 'imessage' and row.get('component') == 'robob' and row.get('name') == 'turn.robob_call'
                            and row.get('kind') == 'perf' and row.get('ok') is False)
@@ -775,6 +781,11 @@ def rollup(board, day, top_n=20):
                 error_name = 'UnknownError'
             key = (tag, error_name)
             cause_kind = (row.get('props') or {}).get('causeKind')
+            # Request details follow catches, including when their count is owned by a summary.
+            if cause_kind is None and request_failure:
+                request_id = (row.get('ids') or {}).get('requestId')
+                if isinstance(request_id, str):
+                    cause_kind = probe_failure_kinds.get(request_id)
             if cause_kind in ('timeout', 'http', 'transport'):
                 cause_kinds[key][cause_kind] += weight
         tags[key] += weight

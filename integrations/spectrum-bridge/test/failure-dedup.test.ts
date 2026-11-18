@@ -12,9 +12,16 @@ const echo = "91274f60-34f8-4298-bf6d-a96a95f36503";
 const fetchMock = (implementation: () => Promise<Response>): typeof fetch =>
   Object.assign(implementation, { preconnect: globalThis.fetch.preconnect });
 
-test.each(["http", "transport"] as const)("probe %s outcome survives request/catch deduplication", async kind => {
+test.each([
+  { shape: "http_503", kind: "http" }, { shape: "refused", kind: "transport" },
+  { shape: "invalid_json", kind: "http" }, { shape: "body_timeout", kind: "http" },
+] as const)("probe $shape outcome survives request/catch deduplication", async ({ shape, kind }) => {
   const fetcher = spyOn(globalThis, "fetch").mockImplementation(fetchMock(async () => {
-    if (kind === "transport") throw Object.assign(new TypeError("PRIVATE_BODY"), { code: "ECONNREFUSED" });
+    if (shape === "refused") throw Object.assign(new TypeError("PRIVATE_BODY"), { code: "ECONNREFUSED" });
+    if (shape === "invalid_json") return new Response("PRIVATE_BODY", { status: 200 });
+    if (shape === "body_timeout") return { ok: true, status: 200, headers: new Headers(), json: async () => {
+      throw new DOMException("PRIVATE_BODY", "TimeoutError");
+    } } as unknown as Response;
     return new Response(JSON.stringify({ ok: false }), { status: 503 });
   }));
   try {
@@ -29,14 +36,45 @@ test.each(["http", "transport"] as const)("probe %s outcome survives request/cat
       result = await toolLog.rollup(new Date().toISOString().slice(0, 10));
     });
     expect(result!.promptProbe).toMatchObject({ calls: 1, [kind]: 1,
-      httpByStatus: kind === "http" ? { "503": 1 } : {} });
+      httpByStatus: kind === "http" ? { [shape === "http_503" ? "503" : "200"]: 1 } : {} });
     expect(rows.find(row => row.name === "bridge.catch")).toMatchObject({ alreadyLogged: true,
       props: { causeKind: kind }, error: { causeKey: "prompt_acceptance_probe" } });
     expect(result!).toMatchObject({ failed: 1, dedupedFailures: 1 });
     expect(result!.errorRate).toBe(1 / result!.total);
-    expect(result!.topErrorTags).toEqual([expect.objectContaining({ tag: "control.request_failed", count: 1 })]);
+    const tag = shape === "invalid_json" ? "control.invalid_json" : "control.request_failed";
+    expect(result!.topErrorTags).toEqual([expect.objectContaining({ tag, count: 1, causeKinds: { [kind]: 1 } })]);
+    for (const aggregated of [false, true]) for (const reverse of [false, true]) {
+      const records = rows.filter(row => aggregated || row.name !== "turn.robob_calls");
+      records.push(rows.find(row => row.name === "bridge.catch")!);
+      if (reverse) records.reverse();
+      const replay = await summarizeLog((async function* () { yield* records; })());
+      expect(replay).toMatchObject({ failed: 1, dedupedFailures: 2 });
+      expect(replay.errorRate).toBe(1 / replay.total);
+      expect(replay.topErrorTags).toEqual([expect.objectContaining({ tag, count: 1, causeKinds: { [kind]: 1 } })]);
+    }
     expect(JSON.stringify(rows)).not.toContain("PRIVATE_");
   } finally { fetcher.mockRestore(); }
+});
+
+test.each([
+  { label: "matching request", requestId: "request", caughtId: "request", tag: "router.catch1", kind: "http", marker: true, enriched: true },
+  { label: "missing owner id", requestId: undefined, caughtId: "request", tag: "router.catch1", kind: "http", marker: true, enriched: false },
+  { label: "missing catch id", requestId: "request", caughtId: undefined, tag: "router.catch1", kind: "http", marker: true, enriched: false },
+  { label: "different request", requestId: "request", caughtId: "other", tag: "router.catch1", kind: "http", marker: true, enriched: false },
+  { label: "other catch", requestId: "request", caughtId: "request", tag: "router.catch49", kind: "http", marker: true, enriched: false },
+  { label: "invalid cause", requestId: "request", caughtId: "request", tag: "router.catch1", kind: "PRIVATE_KIND", marker: true, enriched: false },
+  { label: "unmarked catch", requestId: "request", caughtId: "request", tag: "router.catch1", kind: "http", marker: false, enriched: false },
+])("probe cause enrichment requires a correlated deduplicated catch: $label", async ({ requestId, caughtId, tag, kind, marker, enriched }) => {
+  const rows: LogLine[] = [{ ts: "2026-11-18T12:00:00Z", tool: "imessage", component: "robob", kind: "perf",
+    name: "turn.robob_call", ok: false, ids: { ...(requestId ? { requestId } : {}) },
+    props: { failureFormat: "single" }, error: { tag: "control.request_failed", name: "ControlError", message: "[redacted]" } },
+  { ts: "2026-11-18T12:00:00Z", tool: "imessage", component: "router", kind: "error", name: "bridge.catch", ok: false,
+    alreadyLogged: marker, ids: { ...(caughtId ? { requestId: caughtId } : {}) }, props: { causeKind: kind },
+    error: { tag, name: "ControlError", message: "[redacted]" } }];
+  const result = await summarizeLog((async function* () { yield* rows; })());
+  expect(result.topErrorTags.find(row => row.tag === "control.request_failed")?.causeKinds).toEqual(enriched ? { http: 1 } : undefined);
+  expect(result.failed).toBe(marker ? 1 : 2);
+  expect(result.errorRate).toBe((marker ? 1 : 2) / result.total);
 });
 
 test.each(["http", "invalid_json", "body_timeout", "fetch_timeout", "refused", "cancelled"])("%s request and its caller catches count once on disk and in the rollup", async shape => {
