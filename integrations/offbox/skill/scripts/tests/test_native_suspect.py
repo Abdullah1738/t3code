@@ -106,6 +106,56 @@ class SuspectTests(Isolated):
         self.assertEqual(start.call_count,2)
         self.assertEqual(len(self.events('box_suspect_set')),2)
 
+    def test_go_inventory_crash_output_marks_and_moves_the_run(self):
+        from test_go_repair import RepairFixture
+        for index, (failure, code) in enumerate((('kill -SEGV $$', 90), ('kill -ABRT $$', 90), ('exit 1', 97))):
+            with self.subTest(failure=failure):
+                for table in ('runs', 'leases', 'pool_members', 'kv', 'events'):
+                    self.con.execute('DELETE FROM ' + table)
+                acquire, start = self.run_fixture()
+                fixture = RepairFixture(Path(self.tmp.name) / f'go-{index}')
+                fixture.fault_inventory('sort', failure)
+                fixture.script = 'ulimit -c 0\n' + fixture.script
+                result = fixture.run()
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertNotIn('USER_COMMAND', result.stdout)
+                self.assertNotIn('replacing', result.stderr)
+                self.assertNotIn('mismatch', result.stderr)
+                self.assertFalse(fixture.calls.exists())
+
+                def stream(rn):
+                    if rn.box == 'bxA':
+                        rn.log_path.write_text(result.stderr)
+                        return result.returncode
+                    rn.log_path.write_text('offbox-command-started: run\n')
+                    return 0
+
+                with patch.object(api, 'BACKEND', 'server'), patch.object(runs.Runner, 'stream', stream):
+                    if code == 90:
+                        self.assertEqual(runs.run_remote(self.a, self.me), 0)
+                    else:
+                        with self.assertRaisesRegex(common.OffboxError, 'box setup failed \\(exit 97\\)'):
+                            runs.run_remote(self.a, self.me)
+                row = self.con.execute("SELECT * FROM runs WHERE box_id='bxA'").fetchone()
+                state = common.read_json(runs.LOGS_DIR / f"{row['run_id']}.state.json", {})
+                self.assertEqual(state.get('infra_failure'), 'native_crash' if code == 90 else None)
+                self.assertEqual(state.get('infra_reason'), 'go_inventory_crash' if code == 90 else None)
+                mark = unfit.get(self.con, 'bxA')
+                self.assertEqual(acquire.call_count, 2 if code == 90 else 1)
+                self.assertEqual(start.call_count, 2 if code == 90 else 1)
+                self.assertEqual(len(self.events('run_moved_off_suspect')), 1 if code == 90 else 0)
+                if code == 90:
+                    self.assertEqual(state['wrapper_exit_code'], 90)
+                    self.assertIsNone(state['command_exit_code'])
+                    self.assertEqual(mark['reason'], 'go_inventory_crash')
+                    self.assertEqual(mark['source'], 'auto')
+                    self.assertEqual(mark['expires_at'] - mark['since'], 86400)
+                    self.assertIn('bxA', acquire.call_args.kwargs['exclude'])
+                    self.assertFalse(unfit.available(self.con, 'bxA'))
+                else:
+                    self.assertIsNone(mark)
+                self.stop.assert_not_called()
+
     def test_after_started_native_marks_without_retry(self):
         acquire, _=self.run_fixture()
         with patch.object(api,'BACKEND','server'), patch.object(runs.Runner,'stream',self.crash_stream('setup_native_crash',started=True)):

@@ -162,6 +162,31 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(helper.Refused, "output parent must be private"):
             self.snapshot()
         self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+        state = self.root / ".local/state/harness-hooks"
+        self.assertFalse((state / "live-db-snapshots.jsonl").exists())
+        self.assertEqual(list(parent.iterdir()), [])
+        parent.chmod(0o700)
+        self.snapshot()
+        with self.assertRaisesRegex(helper.Refused, "approval already used for this database"):
+            self.snapshot()
+        self.assertEqual(len(list(parent.iterdir())), 1)
+
+    def test_preflight_failures_do_not_spend_or_leave_empty_temp_directory(self):
+        parent = Path(self.args.out_parent)
+        parent.mkdir(mode=0o700)
+        original = Path.chmod
+        def fail_temp_chmod(path, mode):
+            if path.name.startswith("live-db-snapshot-"):
+                raise OSError("fixture chmod failed")
+            return original(path, mode)
+        cases = [("mkdtemp", patch.object(helper.tempfile, "mkdtemp", side_effect=OSError)),
+                 ("chmod", patch.object(Path, "chmod", fail_temp_chmod)),
+                 ("claim", patch.object(helper, "claim", side_effect=helper.Refused("fixture claim refused")))]
+        for name, failure in cases:
+            with self.subTest(name=name), failure, self.assertRaises(helper.Refused):
+                self.snapshot()
+            self.assertEqual(list(parent.iterdir()), [])
+            self.assertFalse((self.root / ".local/state/harness-hooks/live-db-snapshots.jsonl").exists())
 
     def test_database_not_protected(self):
         self.args.db = str(self.root / "other.sqlite")
@@ -203,6 +228,7 @@ class SnapshotTests(unittest.TestCase):
                 self.snapshot()
         with self.assertRaisesRegex(helper.Refused, "already used"):
             self.snapshot()
+        self.assertEqual(len(list(Path(self.args.out_parent).iterdir())), 1)
 
     def test_clone_only_when_open_fails(self):
         destination = self.root / "clone.sqlite"

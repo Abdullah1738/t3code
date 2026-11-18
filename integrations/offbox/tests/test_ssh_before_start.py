@@ -189,15 +189,34 @@ class SshBeforeStartTests(Isolated):
                 self.probe.reset_mock()
 
     def test_no_sync_upload_recovers_on_the_same_box(self):
-        upload = self.stack.enter_context(patch.object(ssh_sync, 'put_file'))
-        upload.side_effect = [ssh_outage.SshUnreachable('same', CONNECT, reason='tailnet_down'), None]
-        self.probe.return_value = True, 'box_ssh_unreachable'
-        self.stack.enter_context(patch.object(runs, 'follow', return_value=runs._COMMAND_RUNNING))
-        self.assertEqual(self.run_case(flags=('--bg', '--no-sync')), 0)
-        self.assertEqual([c.args[0] for c in upload.call_args_list], ['same', 'same'])
-        self.push.assert_not_called()
-        self.assertEqual(self.acquire.call_count, 1)
-        self.command.assert_called_once()
+        for transport, failed_file in (('inline', 'env'), ('file', 'env'), ('file', 'command')):
+            with self.subTest(transport=transport, failed_file=failed_file):
+                script = 'true\n' * (1 if transport == 'inline' else runs.COMMAND_INLINE_MAX // 5 + 1)
+                uploaded, failed = [], False
+                def upload(box, path, *args, **kwargs):
+                    nonlocal failed
+                    kind = 'command' if '/.offbox/cmd/' in path else 'env'
+                    uploaded.append((box, kind))
+                    if kind == failed_file and not failed:
+                        failed = True
+                        raise ssh_outage.SshUnreachable(box, CONNECT, reason='tailnet_down')
+                self.probe.return_value = True, 'box_ssh_unreachable'
+                self.acquire.reset_mock()
+                self.command.reset_mock()
+                self.probe.reset_mock()
+                with patch.object(ssh_sync, 'put_file', side_effect=upload), \
+                        patch.object(runs, 'remote_script', return_value=script), \
+                        patch.object(runs, 'follow', return_value=runs._COMMAND_RUNNING):
+                    self.assertEqual(self.run_case(flags=('--bg', '--no-sync')), 0, self.err.getvalue())
+                expected = ['env', 'env']
+                if transport == 'file':
+                    expected = (['env', 'env', 'command'] if failed_file == 'env'
+                                else ['env', 'command', 'env', 'command'])
+                self.assertEqual(uploaded, [('same', kind) for kind in expected])
+                self.push.assert_not_called()
+                self.assertEqual(self.acquire.call_count, 1)
+                self.assertEqual(self.probe.call_count, 1)
+                self.command.assert_called_once()
 
     def test_ssh_handshake_retries_are_paced_and_hold_progress_is_throttled(self):
         self.push.side_effect = self.fail_push
