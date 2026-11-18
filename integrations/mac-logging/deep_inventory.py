@@ -195,6 +195,14 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                        for root, (entries, listed) in listings.items() for entry in entries)
         queue = list(roots)
         try:
+            if paths is None:
+                from disk_budgets import deep_refresh, load_budgets
+                # Extra targets share this pass's lock and wall/monotonic budget.
+                try:
+                    deep_refresh(load_budgets(), state, runner,
+                                 min(deadline, time.monotonic()+max(0, wall_deadline-time.time())), stopped)
+                except Exception:
+                    emit('disk', 'error', 'disk.budget.failed', ok=False, error_tag='disk.budget_failed')
             while queue:
                 path = queue.pop(0)
                 key = str(path)
