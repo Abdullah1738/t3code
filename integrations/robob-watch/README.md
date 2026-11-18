@@ -56,6 +56,8 @@ block a transport switch. `--dry-run` reports the route without sending or publi
 `bridge.error` and `relay` tool events retain command/error classifications and hashed
 recipient, key and acknowledgement identifiers. Abdullah's card still uses `app`.
 
+`convo-card send` uses the same remote-chat relay and exact-403 fallback: link text via `agent-ask`, journal status `relayed` after bus acceptance, stable-key reconciliation on retry, and `--dry-run` route `agent-ask` or `app`.
+
 Run from `integrations/robob-watch`. Bun: `bun test test/`. Python uses unittest; pytest is not installed on the Mac.
 
 ```sh

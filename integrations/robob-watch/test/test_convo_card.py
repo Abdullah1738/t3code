@@ -2,6 +2,7 @@ import os
 
 # Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
 os.environ.setdefault("ROBOB_TEST", "1")
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -47,6 +48,30 @@ if args[0] == "share":
                       "created": True, "metadataWarnings": json.loads(os.environ.get("FAKE_BRIDGE_WARN") or "[]")}))
 elif args[0] == "publish":
     print(json.dumps({"url": "https://host.ts.net:18401/" + args[2] + "/", "metadataWarnings": []}))
+elif args[0] in ("app", "send") and os.environ.get("FAKE_BRIDGE_REMOTE") and "--to" in args:
+    print(os.environ.get("FAKE_BRIDGE_ERROR") or
+          "Bridge request failed (HTTP 403): Use agent-ask to reach this chat on its box", file=sys.stderr)
+    sys.exit(1)
+elif args[0] == "agent-ask":
+    import hashlib, sqlite3
+    opt = lambda flag: args[args.index(flag) + 1]
+    key, who = opt("--key"), opt("--to")
+    oid = "areq_" + hashlib.sha256(json.dumps(["owner", key], separators=(",", ":")).encode()).hexdigest()
+    with sqlite3.connect(os.path.join(os.environ["CONVO_CARD_BRIDGE_STATE"], "state.sqlite")) as con:
+        created = not con.execute("select 1 from agent_requests where id=?", (oid,)).fetchone()
+        con.execute("insert or ignore into agent_requests values (?, ?, 'open')", (oid, who))
+        if not os.environ.get("FAKE_BUS_NO_WAKE"):
+            con.execute("insert or ignore into agent_wakes values (?)", (oid,))
+    if os.environ.get("FAKE_BUS_FAIL"):
+        print("agent bus unavailable", file=sys.stderr); sys.exit(1)
+    print(json.dumps({"id": "bad" if os.environ.get("FAKE_BUS_BAD_ACK") else oid, "created": created}))
+elif args[0] == "send":
+    import sqlite3
+    opt = lambda flag: args[args.index(flag) + 1]
+    with sqlite3.connect(os.environ["FAKE_MONI_BOX"]) as con:
+        created = not con.execute("select 1 from outbox where key=?", (opt("--key"),)).fetchone()
+        con.execute("insert or ignore into outbox values (?, ?)", (opt("--key"), opt("--text")))
+    print(json.dumps({"created": created}))
 elif args[0] == "app":
     print(json.dumps({"id": "app:1", "created": True}))
 else:
@@ -565,6 +590,278 @@ class SendTest(Base):
         self.run_card("send", "--slug", "lydia-chat", "--session", "x y", code=2)
         self.send("--to", "Moni Chat", code=2)
         self.assertEqual(self.log("bridge"), [])
+
+
+class RemoteConvoCardTest(Base):
+    SESSION = "ardud-control:thread:abc"
+
+    def setUp(self):
+        super().setUp()
+        self.bstate = self.env["CONVO_CARD_BRIDGE_STATE"]
+        os.makedirs(self.bstate)
+        self.busdb = os.path.join(self.bstate, "state.sqlite")
+        with sqlite3.connect(self.busdb) as con:
+            con.execute("create table agent_requests (id text primary key, to_slug text, status text)")
+            con.execute("create table agent_wakes (id text primary key)")
+        self.monidb = os.path.join(self.dir, "moni-box.sqlite")
+        with sqlite3.connect(self.monidb) as con:
+            con.execute("create table outbox (key text primary key, text text)")
+        self.env.update(FAKE_MONI_BOX=self.monidb, TOOLLOG_DIR=os.path.join(self.dir, "tool-logs"))
+        self.msg(PHONE, "T1", T0, text="hi")
+        self.build()
+
+    def remote(self, who="moni"):
+        with open(os.path.join(self.bstate, "config.json"), "w") as f:
+            json.dump({"chatBackends": {who: {"kind": "remote-box"}}}, f)
+
+    def send(self, *extra, code=0, **env):
+        return self.run_card("send", "--slug", "lydia-chat", "--session", self.SESSION, "--to", "moni",
+                             *extra, code=code, env=dict(self.env, **env))
+
+    def journal(self):
+        with open(os.path.join(self.card(), ".sent.json")) as f:
+            return json.load(f)["moni"]
+
+    def calls(self, command):
+        return [c for c in self.log("bridge") if c[0] == command]
+
+    def test_remote_gets_link_with_same_key_and_repeat_is_no_op(self):
+        self.remote()
+        out = json.loads(self.send().stdout)
+        self.assertTrue(out["sent"])
+        self.assertTrue(out["relayed"])
+        self.assertEqual(out["to"], "moni")
+        self.assertEqual([c[0] for c in self.log("bridge")], ["share", "agent-ask"])
+        ask, = self.calls("agent-ask")
+        opt = lambda n: ask[ask.index(n) + 1]
+        record = self.journal()
+        self.assertEqual(record["status"], "relayed")
+        self.assertEqual(opt("--key"), out["key"])
+        self.assertEqual(opt("--to"), "moni")
+        self.assertEqual(record["op"], "areq_" + hashlib.sha256(
+            json.dumps(["owner", out["key"]], separators=(",", ":")).encode()).hexdigest())
+        text = json.loads(opt("--text").split("\n")[-1])
+        self.assertEqual(text, "Lydia chat: " + record["card_url"])
+        for instruction in (json.dumps(out["key"]), "reconcile an ambiguous send", "Answer done only after bridge acceptance"):
+            self.assertIn(instruction, opt("--text"))
+        self.assertFalse(json.loads(self.send().stdout)["sent"])
+        self.assertEqual(len(self.calls("agent-ask")), 1)
+
+    def test_owner_stays_on_app_even_if_config_says_remote(self):
+        for who in ("owner", "abdullah"):
+            with self.subTest(who=who):
+                self.remote(who)
+                out = json.loads(self.run_card("send", "--slug", "lydia-chat", "--session", self.SESSION,
+                                              "--to", who).stdout)
+                self.assertTrue(out["sent"])
+                self.assertNotIn("relayed", out)
+                with open(os.path.join(self.card(), ".sent.json")) as f:
+                    self.assertEqual(json.load(f)[who]["status"], "sent")
+        self.assertEqual(len(self.calls("app")), 2)
+        self.assertEqual(self.calls("agent-ask"), [])
+
+    def test_exact_403_fallback_and_metadata_only_logs(self):
+        out = json.loads(self.send(FAKE_BRIDGE_REMOTE="moni").stdout)
+        self.assertTrue(out["relayed"])
+        app, = self.calls("app")
+        ask, = self.calls("agent-ask")
+        self.assertEqual(app[app.index("--key") + 1], ask[ask.index("--key") + 1])
+        events = []
+        for name in os.listdir(self.env["TOOLLOG_DIR"]):
+            if name.endswith(".ndjson"):
+                with open(os.path.join(self.env["TOOLLOG_DIR"], name)) as f:
+                    events.extend(json.loads(line) for line in f)
+        error = next(e for e in events if e["name"] == "bridge.error")
+        self.assertEqual(error["ids"]["helper"], "convo-card.app")
+        self.assertEqual(error["props"]["stderrClass"], "auth")
+        relay = next(e for e in events if e["name"] == "relay")
+        self.assertEqual(set(relay["ids"]), {"helper", "chat", "key", "item"})
+        self.assertNotIn("moni", relay["ids"].values())
+        self.assertNotIn(out["url"], json.dumps(events))
+
+    def test_ambiguous_direct_failure_blocks_later_relay(self):
+        self.send(code=1, FAKE_BRIDGE_REMOTE="moni", FAKE_BRIDGE_ERROR="connection reset after enqueue")
+        self.assertEqual(self.journal()["status"], "attempting")
+        self.remote()
+        out = self.send(code=3)
+        self.assertIn("may have sent", out.stderr)
+        self.assertEqual(len(self.calls("app")), 1)
+        self.assertEqual(self.calls("agent-ask"), [])
+
+    def test_definite_direct_refusals_allow_corrected_retry(self):
+        errors = ("Bridge request failed (HTTP 400): Invalid request",
+                  "Bridge request failed (HTTP 401): Unauthorized",
+                  "Bridge request failed (HTTP 403): Forbidden",
+                  "Bridge request failed (HTTP 404): Unknown chat",
+                  "Bridge request failed (HTTP 409): No chat for this session",
+                  "Bridge request failed (HTTP 413): Request body too large",
+                  "Bridge request failed (HTTP 422): Groups can't receive app cards",
+                  "Bridge request failed (HTTP 503): Bridge is not ready",
+                  "Invalid command arguments")
+        for error in errors:
+            with self.subTest(error=error):
+                self.reset_attempt()
+                self.send(code=1, FAKE_BRIDGE_REMOTE="moni", FAKE_BRIDGE_ERROR=error)
+                self.assertEqual(self.journal()["status"], "refused")
+                self.SESSION = "ardud-control:thread:corrected"
+                self.assertTrue(json.loads(self.send().stdout)["sent"])
+                self.assertEqual(self.calls("agent-ask"), [])
+
+    def test_ambiguous_direct_errors_stay_blocked_after_session_correction(self):
+        errors = ("Bridge request failed (HTTP 409): Operation could not be completed",
+                  "Bridge request failed (HTTP 408): Request timed out",
+                  "Bridge request failed (HTTP 500): Internal error",
+                  "Bridge request failed (HTTP 502): Bad gateway",
+                  "Bridge request failed (HTTP 504): Gateway timeout",
+                  "connection reset after enqueue")
+        for error in errors:
+            with self.subTest(error=error):
+                self.reset_attempt()
+                self.send(code=1, FAKE_BRIDGE_REMOTE="moni", FAKE_BRIDGE_ERROR=error)
+                self.SESSION = "ardud-control:thread:corrected"
+                count = len(self.calls("app"))
+                self.assertIn("may have sent", self.send(code=3).stderr)
+                self.assertEqual(len(self.calls("app")), count)
+                self.assertEqual(self.calls("agent-ask"), [])
+
+    def reset_attempt(self):
+        path = os.path.join(self.card(), ".sent.json")
+        if os.path.exists(path):
+            os.unlink(path)
+        with sqlite3.connect(self.busdb) as con:
+            con.execute("delete from agent_requests")
+            con.execute("delete from agent_wakes")
+
+    def test_old_relay_settles_before_changed_message_or_share_key(self):
+        self.remote()
+        for change in ("message", "share", "both"):
+            for state in ("open", "pending", "done", "done_late"):
+                with self.subTest(change=change, state=state):
+                    self.reset_attempt()
+                    self.send(code=1, FAKE_BUS_FAIL="1")
+                    first = self.calls("agent-ask")[-1]
+                    old = self.journal()
+                    if change in ("message", "both"):
+                        mid = "M-" + change + "-" + state
+                        self.msg(PHONE, mid, T0 + len(self.calls("agent-ask")), text="hi")
+                    env = {"FAKE_SHARE_URL": "https://new.example.test/" + change + "/" + state + "/"} if change in ("share", "both") else {}
+                    with sqlite3.connect(self.busdb) as con:
+                        con.execute("update agent_requests set status=?", (state,))
+                    before = len(self.calls("agent-ask"))
+                    out = json.loads(self.send(**env).stdout)
+                    self.assertTrue(out["relayed"])
+                    self.assertEqual((out["key"], out["url"]), (old["key"], old["card_url"]))
+                    self.assertEqual(self.journal()["status"], "relayed")
+                    if state == "open":
+                        self.assertEqual(self.calls("agent-ask")[-1], first)
+                        self.assertEqual(len(self.calls("agent-ask")), before + 1)
+                    else:
+                        self.assertEqual(len(self.calls("agent-ask")), before)
+                    self.assertTrue(json.loads(self.send(**env).stdout)["relayed"])
+                    self.assertNotEqual(self.journal()["key"], old["key"])
+
+    def test_only_exact_remote_403_falls_back(self):
+        errors = ("Bridge request failed (HTTP 403): Forbidden",
+                  "Bridge request failed (HTTP 500): Use agent-ask to reach this chat on its box",
+                  "Use agent-ask to reach this chat on its box")
+        for error in errors:
+            with self.subTest(error=error):
+                path = os.path.join(self.card(), ".sent.json")
+                if os.path.exists(path):
+                    os.unlink(path)
+                self.send(code=1, FAKE_BRIDGE_REMOTE="moni", FAKE_BRIDGE_ERROR=error)
+                self.assertEqual(self.calls("agent-ask"), [])
+
+    def test_failed_ask_replays_identical_request_and_key(self):
+        for no_wake in ("1", ""):
+            with self.subTest(no_wake=no_wake):
+                self.remote()
+                self.send(code=1, FAKE_BUS_FAIL="1", FAKE_BUS_NO_WAKE=no_wake)
+                self.assertEqual(self.journal()["status"], "attempting")
+                self.assertNotIn("op", self.journal())
+                first = self.calls("agent-ask")[-1]
+                self.assertIn("agent bus unavailable", self.send(code=1, FAKE_BUS_FAIL="1").stderr)
+                self.assertTrue(json.loads(self.send().stdout)["relayed"])
+                self.assertEqual(self.calls("agent-ask")[-3:], [first, first, first])
+                # New last message gives the second subcase a fresh key.
+                if no_wake:
+                    self.msg(PHONE, "T2", T0 + 1, text="hi")
+
+    def test_retry_freezes_link_text_but_uses_current_session(self):
+        self.remote()
+        self.send(code=1, FAKE_BUS_FAIL="1")
+        first, = self.calls("agent-ask")
+        config_path = os.path.join(self.card(), ".convo.json")
+        with open(config_path) as f:
+            cfg = json.load(f)
+        cfg["title"] = "Updated title"
+        with open(config_path, "w") as f:
+            json.dump(cfg, f)
+        self.SESSION = "ardud-control:thread:new"
+        self.send()
+        second = self.calls("agent-ask")[-1]
+        for flag in ("--text", "--key"):
+            self.assertEqual(first[first.index(flag) + 1], second[second.index(flag) + 1])
+        self.assertEqual(second[second.index("--session") + 1], self.SESSION)
+
+    def test_answered_bus_reconciles_without_another_ask(self):
+        self.remote()
+        self.send(code=1, FAKE_BUS_FAIL="1")
+        for state in ("pending", "done", "done_late"):
+            with self.subTest(state=state):
+                path = os.path.join(self.card(), ".sent.json")
+                with open(path) as f:
+                    journal = json.load(f)
+                journal["moni"]["status"] = "attempting"
+                with open(path, "w") as f:
+                    json.dump(journal, f)
+                with sqlite3.connect(self.busdb) as con:
+                    con.execute("update agent_requests set status=?", (state,))
+                self.assertTrue(json.loads(self.send().stdout)["relayed"])
+                self.assertEqual(len(self.calls("agent-ask")), 1)
+
+    def test_ambiguous_bus_or_unreadable_store_never_replays(self):
+        self.remote()
+        self.send(code=1, FAKE_BUS_FAIL="1")
+        for state in ("declined", "timed_out", "unknown", None):
+            with self.subTest(state=state):
+                with sqlite3.connect(self.busdb) as con:
+                    if state is None:
+                        con.execute("drop table agent_requests")
+                    else:
+                        con.execute("update agent_requests set status=?", (state,))
+                self.assertIn("may have sent", self.send(code=3).stderr)
+                self.assertEqual(len(self.calls("agent-ask")), 1)
+
+    def test_bad_ack_is_not_success(self):
+        self.remote()
+        self.assertIn("bad ack", self.send(code=3, FAKE_BUS_BAD_ACK="1").stderr)
+        self.assertEqual(self.journal()["status"], "attempting")
+
+    def test_remote_box_downstream_retry_has_one_message(self):
+        self.remote()
+        self.send(code=1, FAKE_BUS_FAIL="1")
+        first, = self.calls("agent-ask")
+        opt = lambda n: first[first.index(n) + 1]
+        text = json.loads(opt("--text").split("\n")[-1])
+        args = [self.env["CONVO_CARD_BRIDGE"], "send", "--text=" + text, "--session", "moni-session@1", "--key", opt("--key")]
+        for expected in (True, False):
+            result = subprocess.run(args, env=self.env, capture_output=True, text=True, check=True)
+            self.assertEqual(json.loads(result.stdout)["created"], expected)
+            self.send()
+        self.assertEqual(self.calls("agent-ask"), [first, first])
+        with sqlite3.connect(self.monidb) as con:
+            self.assertEqual(con.execute("select * from outbox").fetchall(), [(opt("--key"), text)])
+        with sqlite3.connect(self.busdb) as con:
+            self.assertEqual(con.execute("select count(*) from agent_requests").fetchone()[0], 1)
+            self.assertEqual(con.execute("select count(*) from agent_wakes").fetchone()[0], 1)
+
+    def test_dry_run_route_without_publish_or_send(self):
+        self.assertEqual(json.loads(self.send("--dry-run").stdout)["route"], "app")
+        self.remote()
+        self.assertEqual(json.loads(self.send("--dry-run").stdout)["route"], "agent-ask")
+        self.assertEqual(self.log("bridge"), [])
+        self.assertFalse(os.path.exists(os.path.join(self.card(), ".sent.json")))
 
 
 class WatchTest(Base):
