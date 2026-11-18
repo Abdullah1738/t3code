@@ -19,6 +19,7 @@ import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -33,6 +34,7 @@ import {
   PullRequestProviderError,
 } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -50,7 +52,7 @@ import {
  */
 const SWEEP_MINUTES = 2;
 const READ_FAILURE_LIMIT = 8;
-const MISSING_TOOL_READ_LIMIT = 3;
+const UNAVAILABLE_FAILURE_LIMIT = 3;
 /**
  * Without a host fingerprint, a pull request with nothing in flight is read again only when its
  * sync snapshot moves, or after this long, for news the snapshot cannot show, such as a bot
@@ -260,6 +262,7 @@ export const make = Effect.gen(function* () {
     Effect.suspend(() => reportEnd(lifeKey(target), lifeOf(target), reason));
 
   const readFailures = new Map<string, number>();
+  const unavailableReads = new Map<string, number>();
   const missingToolFailures = new Map<
     string,
     { attempts: number; nextAt: number; watches: string }
@@ -311,19 +314,34 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const giveUp = (
+  const giveUp = Effect.fn("PullRequestWatchReactor.giveUp")(function* (
     target: WatchTarget,
     failures: number,
     error: Option.Option<PullRequestService.PullRequestError>,
     reason?: string,
-  ) =>
-    record(target, null, {
+  ) {
+    const failure = Option.getOrUndefined(error);
+    const providerError =
+      failure !== undefined && "cause" in failure && isProviderError(failure.cause)
+        ? failure.cause
+        : undefined;
+    const fields = {
+      failures,
+      reason:
+        failure?._tag === "PullRequestUnavailableError"
+          ? failure.reason
+          : (reason ?? "read-failed"),
+      errorTag: failure?._tag ?? null,
+      providerReason: providerError?.reason ?? null,
+      providerDetail: providerError?.detail ?? null,
+    };
+    yield* record(target, null, {
       text: pullRequestWatchStopMessage(
         target.link,
         failures,
-        Option.getOrUndefined(error),
+        failure,
         reason,
-        Option.isSome(error) && isMissingTool(error.value) ? serverEnv.PATH : undefined,
+        failure !== undefined && isMissingTool(failure) ? serverEnv.PATH : undefined,
       ),
       notification: {
         source: { kind: "monitor" },
@@ -335,6 +353,33 @@ export const make = Effect.gen(function* () {
       Effect.catch(() => record(target, null)),
       Effect.tap(() => ended(target, "unreadable")),
     );
+    yield* Effect.logWarning("pull request watch gave up", {
+      threadId: target.thread.id,
+      pullRequest: target.link.url,
+      ...fields,
+    });
+    const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+    if (Option.isSome(analytics))
+      yield* analytics.value.record({
+        ts: DateTime.formatIso(yield* DateTime.now),
+        kind: "pull_request.watch.gave_up",
+        surface: "server",
+        route: "pull-request-watch",
+        threadId: target.thread.id,
+        props: {
+          number: failures,
+          reason: failure?._tag === "PullRequestUnavailableError" ? failure.reason : "read-failed",
+          ...(failure === undefined ? {} : { errorTag: failure._tag }),
+          ...(providerError === undefined
+            ? {}
+            : {
+                provider: providerError.provider,
+                reasonClass: providerError.reason,
+                operation: providerError.operation,
+              }),
+        },
+      });
+  });
 
   const readRemarks = Effect.fn("PullRequestWatchReactor.readRemarks")(
     function* (
@@ -474,23 +519,22 @@ export const make = Effect.gen(function* () {
     error: Option.Option<PullRequestService.PullRequestError>,
     reason?: string,
   ) {
-    let failures = (readFailures.get(group.key) ?? 0) + 1;
+    const failures = (readFailures.get(group.key) ?? 0) + 1;
     readFailures.set(group.key, failures);
     const missingTool = Option.isSome(error) && isMissingTool(error.value);
     if (missingTool) {
       const previous = missingToolFailures.get(group.key);
-      failures = (previous?.watches === watchSet(group) ? previous.attempts : 0) + 1;
+      const attempts = (previous?.watches === watchSet(group) ? previous.attempts : 0) + 1;
       missingToolFailures.set(group.key, {
-        attempts: failures,
-        nextAt: (yield* Clock.currentTimeMillis) + 60_000 * 2 ** (failures - 1),
+        attempts,
+        nextAt: (yield* Clock.currentTimeMillis) + 60_000 * 2 ** (attempts - 1),
         watches: watchSet(group),
       });
       yield* Effect.logWarning("pull request watch missing tool", {
         pullRequest: group.key,
-        attempts: failures,
+        attempts,
         path: serverEnv.PATH ?? "",
       });
-      if (failures < MISSING_TOOL_READ_LIMIT) return false;
     } else {
       missingToolFailures.delete(group.key);
     }
@@ -503,9 +547,18 @@ export const make = Effect.gen(function* () {
       });
     }
     const unavailable = Option.isSome(error) && error.value._tag === "PullRequestUnavailableError";
-    if (!missingTool && !unavailable && failures < READ_FAILURE_LIMIT) return false;
+    const consecutiveUnavailable = unavailable ? (unavailableReads.get(group.key) ?? 0) + 1 : 0;
+    unavailableReads.set(group.key, consecutiveUnavailable);
+    const missingToolAttempts = missingToolFailures.get(group.key)?.attempts ?? 0;
+    if (
+      failures < READ_FAILURE_LIMIT &&
+      consecutiveUnavailable < UNAVAILABLE_FAILURE_LIMIT &&
+      missingToolAttempts < UNAVAILABLE_FAILURE_LIMIT
+    )
+      return false;
     if (yield* eachTarget(group, (target) => giveUp(target, failures, error, reason))) {
       readFailures.delete(group.key);
+      unavailableReads.delete(group.key);
       missingToolFailures.delete(group.key);
     }
     return true;
@@ -580,6 +633,8 @@ export const make = Effect.gen(function* () {
     }
     if (detail.state !== "open") {
       readFailures.delete(group.key);
+      unavailableReads.delete(group.key);
+      missingToolFailures.delete(group.key);
       lastReads.delete(group.key);
       return yield* eachTarget(group, (target) =>
         detail.state === "closed"
@@ -589,6 +644,7 @@ export const make = Effect.gen(function* () {
     }
 
     readFailures.delete(group.key);
+    unavailableReads.delete(group.key);
     missingToolFailures.delete(group.key);
     const settling = pullRequestChecksSettling(detail);
     const observedHead = detail.headBranchSha ?? detail.checksHeadSha ?? headSha;
@@ -719,11 +775,16 @@ export const make = Effect.gen(function* () {
       }))
       .filter((group) => {
         const retry = missingToolFailures.get(group.key);
-        if (retry && retry.watches !== watchSet(group)) missingToolFailures.delete(group.key);
+        if (retry && retry.watches !== watchSet(group)) {
+          missingToolFailures.delete(group.key);
+          readFailures.delete(group.key);
+          unavailableReads.delete(group.key);
+        }
         return retry === undefined || retry.watches !== watchSet(group) || now >= retry.nextAt;
       });
     for (const cache of [
       readFailures,
+      unavailableReads,
       missingToolFailures,
       lastReads,
       threadTails,

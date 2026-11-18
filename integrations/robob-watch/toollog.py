@@ -1,5 +1,7 @@
 """Best-effort, allowlisted health tool logs. Python 3.9, stdlib only."""
 import contextlib
+import argparse
+import functools
 import hashlib
 import datetime as dt
 import fcntl
@@ -39,6 +41,11 @@ FOOD_EXIT_REASONS = {
     'order_bad_exclude', 'order_bad_portion', 'refused_duplicate',
     'bad_flag', 'bad_arguments', 'help',
 }
+ARGUMENT_REASONS = {'bad_arguments', 'unknown_subcommand', 'missing_required', 'bad_value'}
+WHOOP_EXIT_REASONS = {'completed', 'sync_failed', 'not_authorized', 'reauth_needed',
+                      'login_expired', 'backfill_failed', 'setup_failed', 'auth_failed',
+                      'serve_failed', 'report_failed'}
+CLI_EXIT_REASONS = FOOD_EXIT_REASONS | ARGUMENT_REASONS | WHOOP_EXIT_REASONS
 UNMARKED_MEANING = (
     'Distinct (run ID, kind) obligations from card.render (including failed renders), '
     'nag.sent, or food.warning with no matching delivery.result in this UTC day file; '
@@ -70,7 +77,8 @@ SCHEMAS = {
     'food.warning': {'warning': {'no_time', 'macro_drift', 'unverified', 'assumed', 'option_not_counted', 'partial'}, 'count': int},
     'cli.run': {'command': set(COMMANDS), 'subcommand': set(' '.join(COMMANDS.values()).split()) | {'unknown', 'none', 'help'},
                 'failCount': int, 'failedCheckIds': 'check_ids',
-                'reason': FOOD_EXIT_REASONS, 'candidateCount': int, 'queryLen': int},
+                'reason': CLI_EXIT_REASONS, 'candidateCount': int, 'queryLen': int,
+                'argc': int, 'rejected': 'rejected'},
     'watcher.run': {'trigger': 'trigger'}, 'sync.run': {'trigger': 'trigger', 'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
         'lastScoredSleep': 'iso', 'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool,
         **{k: ENDPOINT_SCHEMA for k in ('sleep', 'recovery', 'cycle', 'body')}},
@@ -161,6 +169,8 @@ def _fields(schema, props):
                 out[key] = value
         elif spec == 'exit_code' and type(value) is int and 0 <= value <= 255:
             out[key] = value
+        elif spec == 'rejected' and isinstance(value, (list, tuple)):
+            out[key] = rejected_names(value, props.get('reason'))
         elif spec == 'check_ids' and isinstance(value, (list, tuple)):
             out[key] = sorted({v for v in value if isinstance(v, str) and v in VALIDATE_CHECK_IDS})
         elif spec is bool and type(value) is bool:
@@ -170,6 +180,118 @@ def _fields(schema, props):
         elif isinstance(spec, set) and isinstance(value, str) and value in spec:
             out[key] = value
     return out
+
+
+
+def rejected_names(values, reason=None):
+    names = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        # Values attached with '=' are never part of a flag name.
+        flag = value.partition('=')[0]
+        if re.fullmatch(r'--[A-Za-z][A-Za-z0-9-]{0,63}', flag):
+            names.add(flag)
+        elif reason == 'unknown_subcommand' and re.fullmatch(r'[a-z][a-z0-9-]{0,30}', value):
+            names.add(value)
+        else:
+            names.add('<redacted>')
+    return sorted(names)[:32]
+
+
+def argument_failure(span, reason, rejected=(), argc=0):
+    if span is not None:
+        names = rejected_names(rejected, reason)
+        span.props.update(reason=reason, rejected=names, argc=getattr(span, 'argc', argc), stage='parse')
+        if span.component == 'food':
+            span.props.setdefault('queryLen', 0)
+        span.rejected = names
+
+
+class LoggedArgumentParser(argparse.ArgumentParser):
+    """Read argument structure; argparse keeps ownership of output and exit status."""
+    def __init__(self, *args, log_span=None, **kwargs):
+        self.log_span = log_span
+        self._failure = None
+        self._extras = []
+        self._option = None
+        self._input_args = []
+        self._argc = 0
+        super().__init__(*args, **kwargs)
+
+    def add_subparsers(self, **kwargs):
+        kwargs.setdefault('parser_class', functools.partial(type(self), log_span=self.log_span))
+        return super().add_subparsers(**kwargs)
+
+    def _check_value(self, action, value):
+        try:
+            return super()._check_value(action, value)
+        except argparse.ArgumentError:
+            self._failure = (('unknown_subcommand', [value]) if (isinstance(action, argparse._SubParsersAction) or action.dest in {'cmd', 'kind'})
+                             else ('bad_value', action.option_strings or ['<redacted>']))
+            raise
+
+    def _get_value(self, action, arg_string):
+        try:
+            return super()._get_value(action, arg_string)
+        except argparse.ArgumentError:
+            self._failure = ('bad_value', action.option_strings or ['<redacted>'])
+            raise
+
+    def _match_argument(self, action, pattern):
+        try:
+            return super()._match_argument(action, pattern)
+        except argparse.ArgumentError:
+            self._failure = ('missing_required', action.option_strings)
+            raise
+
+    def _parse_optional(self, arg_string):
+        self._option = arg_string
+        return super()._parse_optional(arg_string)
+
+    def parse_known_args(self, args=None, namespace=None):
+        self._input_args = list(sys.argv[1:] if args is None else args)
+        self._argc = len(self._input_args)
+        parsed, self._extras = super().parse_known_args(self._input_args, namespace)
+        if self.log_span is not None:
+            command = self.log_span.props.get('command')
+            if getattr(parsed, 'cmd', None) in COMMANDS.get(command, '').split():
+                self.log_span.props['subcommand'] = parsed.cmd
+        return parsed, self._extras
+
+    def error(self, message):
+        if self._failure is not None:
+            reason, names = self._failure
+        elif message.startswith(('the following arguments are required:', 'one of the arguments ')):
+            reason = 'missing_required'
+            required = message.partition(':')[2].replace(',', ' ').split() if ':' in message else message.split()
+            names = [flag for action in self._actions for flag in action.option_strings if flag in required]
+        elif message.startswith('ambiguous option:'):
+            reason, names = 'bad_arguments', [self._option]
+        else:
+            reason = 'bad_arguments'
+            # Only option-shaped extras before '--'; positional text is never inspected.
+            args = self._input_args
+            before = args[:args.index('--')] if '--' in args else args
+            names = [word.partition('=')[0] for word in self._extras
+                     if word in before and word.startswith('-')]
+            if not names and self._extras:
+                names = ['<redacted>']
+            if not names:
+                for action in self._actions:
+                    if message.startswith('argument ' + str(argparse._get_action_name(action)) + ':'):
+                        names = action.option_strings or ['<redacted>']
+                        break
+        argument_failure(self.log_span, reason, names, getattr(self, '_argc', 0))
+        super().error(message)
+
+    def exit(self, status=0, message=None):
+        if self.log_span is not None and 'reason' not in self.log_span.props:
+            if status == 0:
+                self.log_span.props['reason'] = 'help'
+            else:
+                argument_failure(self.log_span, 'bad_arguments', argc=getattr(self, '_argc', 0))
+        super().exit(status, message)
 
 
 def _line(component, name, kind, duration_ms, ok, props, tag, run_id, now, rejected=None):
@@ -188,7 +310,7 @@ def _line(component, name, kind, duration_ms, ok, props, tag, run_id, now, rejec
         # Exception text can contain foods, doses, API bodies or credentials.
         row['error'] = {'tag': tag, 'message': tag.replace('_', ' ')}
         if tag == 'invalid_arguments' and isinstance(rejected, (list, tuple)):
-            row['error']['rejected'] = sorted({v for v in rejected if isinstance(v, str) and re.fullmatch(r'--?[A-Za-z][A-Za-z0-9-]{0,63}', v)})[:32]
+            row['error']['rejected'] = rejected_names(rejected, clean.get('reason'))
     return (json.dumps(row, separators=(',', ':'), allow_nan=False) + '\n').encode()
 
 
@@ -321,7 +443,7 @@ class Span:
                 if tb is not None:
                     while tb.tb_next is not None:
                         tb = tb.tb_next
-                    self.props['stage'] = tb.tb_frame.f_code.co_name
+                    self.props.setdefault('stage', tb.tb_frame.f_code.co_name)
             emit(self.component, self.name, 'perf' if self.ok else 'error',
                  (time.monotonic() - self.start) * 1000, self.ok, self.props, self.tag, self.run_id, rejected=self.rejected, _now=self.render_at)
         except BaseException:
@@ -355,7 +477,9 @@ def run(component, argv=None, name='cli.run', trigger=None):
         props = {'command': component, 'subcommand': sub} if name == 'cli.run' else {}
         if component == 'validate' and name == 'cli.run':
             props.update(failCount=0, failedCheckIds=[])
-        return Span(component, name, props, trigger=trigger)
+        span = Span(component, name, props, trigger=trigger)
+        span.argc = len(args)
+        return span
     except BaseException:
         return contextlib.nullcontext()
 
@@ -604,6 +728,22 @@ def _run_summary(runs, start, end, interval=None):
     return result
 
 
+def _repeat_bursts(timestamps):
+    # Count disjoint qualifying windows, not every overlapping triple in a retry loop.
+    stamps = sorted(timestamps)
+    count, left, right = 0, 0, 0
+    while left < len(stamps):
+        right = max(right, left)
+        while right < len(stamps) and (stamps[right] - stamps[left]).total_seconds() <= 5:
+            right += 1
+        if right - left >= 3:
+            count += 1
+            left = right
+        else:
+            left += 1
+    return count
+
+
 def rollup(day=None):
     try:
         now = utcnow()
@@ -621,6 +761,7 @@ def rollup(day=None):
         source = root / (day.isoformat() + '.ndjson')
         names, kinds, outcomes, tags = Counter(), Counter(), Counter(), Counter()
         durations, samples = defaultdict(list), {}
+        rejected_top, diagnostics, burst_times = defaultdict(Counter), defaultdict(set), defaultdict(list)
         malformed = 0
         zero_sleep, last_scored = 0, None
         food_errors, delivered, expected = Counter(), {}, set()
@@ -686,7 +827,15 @@ def rollup(day=None):
                         durations[r['name']].append(value)
                     tag = r.get('error', {}).get('tag')
                     if tag in TAGS:
-                        cause = (tag, props.get('exceptionClass'), props.get('exitCode'), props.get('reason'))
+                        cause = (tag, props.get('reason'))
+                        diagnostics[cause].add((props.get('exceptionClass'), props.get('exitCode')))
+                        rejected_top[cause].update(props.get('rejected', rejected_names(
+                            r.get('error', {}).get('rejected', []), props.get('reason'))))
+                        stamp = iso_stamp(r.get('ts'))
+                        if r['name'] == 'cli.run' and r.get('ok') is False and stamp and props.get('command'):
+                            timestamp = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+                            if start <= timestamp < day_end:
+                                burst_times[(props['command'], props.get('subcommand'), props.get('reason'))].append(timestamp)
                         tags[cause] += 1
                         candidate = r.get('ids', {}).get('run')
                         if isinstance(candidate, str) and len(candidate) == 32 and all(c in '0123456789abcdef' for c in candidate):
@@ -719,9 +868,16 @@ def rollup(day=None):
         for name, values in durations.items():
             values.sort()
             result['durationMs'][name] = {'p50': _percentile(values, .5), 'p95': _percentile(values, .95), 'max': values[-1]}
-        result['topErrors'] = [{'tag': cause[0], 'count': count, 'sampleId': samples.get(cause),
-                                'exceptionClass': cause[1], 'exitCode': cause[2], 'reason': cause[3]}
-                               for cause, count in tags.most_common(20)]
+        result['repeatBurst'] = sum(_repeat_bursts(values) for values in burst_times.values())
+        result['topErrors'] = []
+        for cause, count in tags.most_common(20):
+            detail = diagnostics[cause]
+            result['topErrors'].append({'tag': cause[0], 'reason': cause[1], 'count': count,
+                'sampleId': samples.get(cause),
+                'exceptionClass': next(iter(detail))[0] if len(detail) == 1 else None,
+                'exitCode': next(iter(detail))[1] if len(detail) == 1 else None,
+                'rejected': [{'name': name, 'count': n} for name, n in
+                             sorted(rejected_top[cause].items(), key=lambda item: (-item[1], item[0]))[:3]]})
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)
         target = root / ('rollup-' + day.isoformat() + '.json')

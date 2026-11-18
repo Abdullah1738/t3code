@@ -1,5 +1,6 @@
 """install.zsh against a throwaway HOME and a fake launchctl. Run: /usr/bin/python3 -m unittest discover -s tests"""
 import os
+import plistlib
 import shutil
 import stat
 import subprocess
@@ -168,9 +169,12 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         for rel in (".local/libexec/mail/mail_oauth.py", ".local/libexec/mail/kc-read",
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
                     ".local/bin/toollog", ".local/libexec/toollog/toollog.py",
-                    ".local/bin/vp", ".local/libexec/vp/worktree.mjs",
+                    ".local/bin/vp", ".local/libexec/vp/launcher.mjs",
+                    ".local/libexec/vp/child.mjs", ".local/libexec/vp/events.mjs", ".local/libexec/vp/worktree.mjs",
                     ".local/libexec/vp/config-snapshot.mjs",
                     ".local/libexec/vp/toolchain-state.mjs", ".local/libexec/vp/toolchain",
+                    ".local/libexec/repo-node-pin/shared-deps.sh",
+                    ".local/libexec/repo-node-pin/pnpm-bin/pnpm",
                     ".local/bin/qcard", ".local/bin/quint", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
                     "Library/LaunchAgents/local.ardud.otp-idle.plist",
                     "Library/LaunchAgents/com.ardud.9router-log-poll.plist",
@@ -203,6 +207,18 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         self.assertIn("deploy that integration first", err)
         self.assertNotIn("differs", err)
         self.assertNotIn("not loaded", err)
+
+    def test_installed_read_watchdog_starts_with_granted_shell(self):
+        rc, _, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        with open(self.live("Library/LaunchAgents/com.ardud.robob-read-watchdog.plist"), "rb") as source:
+            plist = plistlib.load(source)
+        # TCC attributes launchd reads to the entrypoint, even for shell scripts.
+        self.assertEqual(plist["ProgramArguments"], [
+            "/bin/zsh", "-f", self.live(".local/bin/robob-read-watchdog"),
+        ])
+        self.assertEqual(plist["StartInterval"], 30)
+        self.assertTrue(plist["RunAtLoad"])
 
     def test_invalid_plist_fails_smoke(self):
         plist = os.path.join(self.pkg, "launchd/com.ardud.opencode-web.plist")
@@ -538,6 +554,21 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         self.assertIn("someone else's file", err)
         with open(uber) as fh:
             self.assertEqual(fh.read(), "#!/bin/sh\necho mine\n")
+
+    def test_pnpm_guard_payload_is_copied_and_checked_for_drift(self):
+        self.ready()
+        rc, _, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.run_install("--check")[0], 0)
+        for name in ("shared-deps.sh", "pnpm-bin/pnpm"):
+            with self.subTest(name=name):
+                target = self.live(".local/libexec/repo-node-pin/" + name)
+                with open(target, "a") as fh:
+                    fh.write("\n# drift\n")
+                rc, _, err = self.run_install("--check")
+                self.assertEqual(rc, 1)
+                self.assertIn(target + " differs", err)
+                self.assertEqual(self.run_install()[0], 0)
 
     def test_quint_guard_link_is_idempotent_and_check_reports_drift(self):
         self.ready()

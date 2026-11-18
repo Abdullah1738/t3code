@@ -58,7 +58,10 @@ PATH_BLOCK = r'''if [ -f "$HOME"/@ROOT@/package.json ]; then
     tail=$rest
     while [ -n "$tail" ]; do
       entry=${tail%%:*}
-      if [ -n "${__offbox_toolchain_bin:-}" ] && [ "$entry" = "$__offbox_toolchain_bin" ]; then
+      if [ -n "${__offbox_quint_bin:-}" ] && [ "$entry" = "$__offbox_quint_bin" ]; then
+        prefix="$prefix$entry"
+        if [[ $tail == *:* ]]; then prefix="$prefix:"; tail=${tail#*:}; else tail=; break; fi
+      elif [ -n "${__offbox_toolchain_bin:-}" ] && [ "$entry" = "$__offbox_toolchain_bin" ]; then
         prefix="$prefix$entry"
         if [[ $tail == *:* ]]; then prefix="$prefix:"; tail=${tail#*:}; else tail=; break; fi
       elif { [ -n "${__offbox_node_commands:-}" ] && [ "$entry" = "$__offbox_node_commands" ]; } ||

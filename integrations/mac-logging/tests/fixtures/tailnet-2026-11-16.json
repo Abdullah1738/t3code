@@ -1,0 +1,3197 @@
+{
+  "source": "~/.robob/logs/tools/mac/2026-11-16.ndjson; tailnet.sample CLI fields only. Peer reachability is a replay assumption from card #96, not historical probe measurements.",
+  "samples": [
+    {
+      "ts": "2026-11-16T08:25:40.775Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:27:13.872Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:28:14.649Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:29:16.117Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:30:17.122Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:31:18.084Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:32:18.983Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:33:46.039Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:34:57.138Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:35:58.694Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:36:59.578Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:38:04.525Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:39:08.375Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:40:09.208Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:41:10.092Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:42:10.842Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:43:17.078Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T08:44:18.792Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T09:07:11.786Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:08:38.880Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:09:48.298Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T09:10:53.219Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T09:13:13.060Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:20:10.293Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:25:41.263Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:27:29.638Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:30:58.839Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:37:03.637Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:41:05.847Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:44:26.549Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:46:47.574Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:50:23.323Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:56:09.578Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T09:59:45.274Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:01:19.555Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T10:18:18.038Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T10:23:26.041Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T10:29:01.912Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T10:30:05.838Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:31:08.693Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:32:11.621Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:33:13.715Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:34:14.663Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:35:15.647Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:36:30.328Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T10:37:34.109Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:38:36.530Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:39:40.417Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:40:42.402Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:41:43.144Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:42:46.026Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:43:54.034Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:45:04.100Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:46:07.488Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:47:14.477Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:48:37.350Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:49:38.450Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:50:45.504Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:52:01.223Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:53:10.436Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:54:16.143Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:55:27.109Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:56:30.522Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:57:35.636Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:58:39.145Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T10:59:39.662Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:00:40.310Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:01:42.249Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:02:45.216Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:03:54.518Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:04:59.155Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:06:01.117Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:07:03.687Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:08:15.401Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:09:26.159Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:10:28.234Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:11:30.228Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:12:36.789Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:13:42.219Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:14:57.116Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:16:03.062Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:17:09.066Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:18:18.118Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:19:22.206Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:20:26.238Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:21:34.271Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:22:37.243Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:23:38.857Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:24:46.000Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:26:12.018Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T11:27:23.309Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T11:28:34.051Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T11:29:36.384Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:31:00.593Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T11:32:31.700Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T11:34:02.452Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T11:35:27.516Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:36:39.923Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:37:53.750Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T11:38:57.452Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:39:58.054Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:41:18.567Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:42:29.493Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T11:54:24.990Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T11:55:33.957Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:00:03.872Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:02:08.153Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:03:09.080Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:04:21.835Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:05:28.373Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:06:29.420Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:07:34.777Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:08:53.682Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:09:58.977Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:11:59.186Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:13:18.244Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:14:19.683Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:16:05.982Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:17:08.130Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:18:09.115Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:19:09.792Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:20:10.543Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:21:12.605Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:30:57.736Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:36:42.471Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:38:48.403Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:40:27.541Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:43:34.648Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:45:46.061Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:48:02.569Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:49:23.197Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:50:30.281Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:51:35.666Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:52:54.882Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:54:47.061Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:56:11.072Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T12:57:41.186Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T12:58:49.726Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:00:01.550Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:01:10.964Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:02:16.581Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:03:22.057Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:04:30.865Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:05:36.191Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:06:41.895Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:07:46.019Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:08:49.066Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:09:51.598Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:10:55.305Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:11:57.706Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:13:00.727Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:14:09.857Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:15:21.541Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:16:23.832Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:17:26.925Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:18:33.744Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:19:37.681Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:20:59.965Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T13:22:11.351Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:23:18.845Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:24:34.044Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:25:39.515Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:27:06.899Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:28:21.651Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T13:29:30.093Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:30:39.854Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:32:06.045Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T13:33:14.471Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T13:34:21.778Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:35:27.035Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:37:06.758Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T13:40:21.477Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T13:41:24.132Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:42:42.898Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:44:04.311Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T13:45:08.068Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:46:15.167Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T13:47:54.910Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T13:57:26.832Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T14:03:26.992Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T14:10:23.037Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T14:12:30.256Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T14:13:37.390Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:17:46.504Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T14:26:53.514Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T14:27:57.686Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:28:58.841Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:29:59.488Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:30:59.987Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:32:00.916Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:33:01.870Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:34:04.977Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:35:05.609Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:36:06.140Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:37:07.521Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:38:08.689Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:39:09.587Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:40:11.552Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:41:14.248Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:42:17.089Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:43:18.490Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:44:20.352Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:45:21.133Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:46:22.012Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:47:23.794Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:48:24.894Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:49:27.092Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:50:30.457Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:51:31.457Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:52:32.266Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:53:33.108Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:54:36.198Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:55:39.789Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:56:40.436Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:57:41.128Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:58:41.715Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T14:59:46.476Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:00:47.058Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:01:49.313Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:02:52.431Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:04:00.308Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:05:06.635Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:06:07.350Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:07:07.982Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:08:08.651Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:09:10.197Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:10:11.680Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:11:25.674Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:12:33.067Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:13:33.830Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:14:37.175Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:15:38.170Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:16:38.988Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:17:42.972Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:18:44.454Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:19:45.983Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:20:46.637Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:21:47.237Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:22:47.892Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:23:49.121Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:24:49.909Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:25:50.847Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:26:51.782Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:27:53.640Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:28:56.115Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:29:56.883Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:30:57.595Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:31:58.403Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:32:59.636Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:34:26.015Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T15:35:27.050Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:36:28.210Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:37:29.042Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:38:30.048Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:39:30.841Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:40:36.224Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:41:38.064Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:42:38.637Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:43:39.888Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:44:40.699Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:45:41.724Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:46:42.447Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:47:43.532Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:48:44.374Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:49:45.784Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:50:46.717Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:51:47.495Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:52:52.595Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:53:53.427Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:54:54.233Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:55:55.049Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:56:57.398Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:57:58.264Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T15:58:59.198Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:00:00.155Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:01:01.541Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:02:05.077Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:03:06.753Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:04:15.684Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:05:21.218Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:06:22.865Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:07:23.663Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:08:27.136Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:09:29.151Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:10:29.985Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:11:30.841Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:12:31.932Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:13:33.151Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:14:34.182Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:15:35.774Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:16:38.032Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:17:42.359Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:18:43.144Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:19:45.204Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:20:46.172Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:21:54.167Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:22:58.471Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:24:05.919Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:25:08.518Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:26:13.691Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:27:14.322Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:28:15.527Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:30:54.801Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T16:32:05.467Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:33:32.829Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T16:34:47.354Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:35:50.442Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:36:54.214Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:37:58.148Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:39:15.254Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:40:28.017Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T16:41:37.834Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:42:38.822Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:44:34.150Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:45:36.022Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:46:43.721Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:47:44.818Z",
+      "backendState": "Running",
+      "selfOnline": false,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:49:03.226Z",
+      "backendState": "Running",
+      "selfOnline": false,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:50:04.470Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:51:05.160Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:52:08.568Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:53:13.743Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:54:21.414Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:55:22.184Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:56:34.426Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:57:43.423Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T16:59:02.728Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T17:00:03.774Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:01:06.740Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:02:07.797Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:03:09.192Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:05:10.580Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T17:06:13.247Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:07:16.941Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:08:36.002Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:09:36.972Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:10:37.941Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:11:38.943Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:12:39.960Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:13:40.770Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:14:42.609Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:15:54.926Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:17:02.010Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:18:04.451Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:19:05.622Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:20:10.881Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:21:14.680Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:22:15.744Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:23:16.918Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:24:52.418Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T17:26:00.851Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:27:02.207Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:28:05.994Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:29:10.669Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:30:11.794Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:31:13.459Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:32:14.670Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:33:50.852Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:34:56.682Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:35:58.248Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:37:01.456Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:38:02.961Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:39:22.871Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:40:24.003Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:41:24.818Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:42:25.643Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:43:27.499Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:44:29.008Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:45:32.683Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:46:39.162Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:47:49.973Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:48:58.206Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:50:03.904Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:51:04.928Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:52:09.908Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:53:17.187Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:54:59.410Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:56:05.161Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:57:14.448Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T17:58:18.092Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T17:59:18.957Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:00:24.585Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:01:28.938Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:02:29.747Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:03:31.105Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:04:31.978Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:05:32.761Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:06:36.427Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:08:14.737Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:09:26.055Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:10:29.664Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:11:39.287Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:12:42.657Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:14:10.839Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T18:15:14.927Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:16:19.062Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:17:23.244Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:18:25.015Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:19:26.065Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:20:26.778Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:21:31.017Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:22:33.079Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:23:34.764Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:24:35.537Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:25:36.509Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:26:41.231Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:28:08.798Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T18:29:13.355Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:30:18.922Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:31:20.058Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:32:22.245Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:33:29.172Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:35:36.226Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:36:40.486Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:38:48.632Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T18:39:53.778Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:40:57.805Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:42:02.841Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:43:11.496Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:44:12.311Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:46:17.915Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:47:46.096Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T18:50:18.593Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T18:51:20.279Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:54:51.257Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:56:33.788Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T18:57:56.378Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T18:59:47.428Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:01:13.353Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:02:43.974Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:04:42.612Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:05:59.585Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:07:02.457Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:09:31.030Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:11:14.860Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:12:59.365Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:14:03.999Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:15:13.981Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:16:16.206Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:17:36.599Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:18:39.020Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:20:27.063Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:21:48.818Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:25:10.024Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:27:51.959Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:30:32.797Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:35:18.827Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:36:41.436Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:37:53.640Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:39:58.752Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:41:48.841Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:43:14.934Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:48:02.842Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:50:29.293Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:51:50.722Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:53:01.805Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:55:13.832Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T19:56:29.271Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T19:58:46.679Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:01:42.286Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:05:35.275Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:08:06.523Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:10:02.684Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:12:07.127Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:18:36.859Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:21:11.017Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:23:48.628Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:28:08.564Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:29:35.579Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:31:08.457Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:32:10.707Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T20:33:29.664Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:35:14.383Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:36:54.385Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:38:51.092Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:42:15.739Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T20:44:24.130Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:46:10.822Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:49:40.612Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:51:30.852Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:53:04.495Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T20:57:30.544Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:01:58.444Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:03:21.427Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:04:28.413Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:05:39.421Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:06:41.626Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:07:58.099Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:11:09.683Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:12:42.622Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:13:54.321Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:15:40.991Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:18:44.274Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:20:08.933Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:21:20.007Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:22:34.067Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:27:19.983Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:30:12.703Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:31:38.900Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:33:07.578Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:34:36.764Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:35:38.702Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:36:43.379Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:37:58.465Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:39:04.139Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:40:16.216Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:42:29.218Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:43:34.956Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:44:51.756Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:46:44.574Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:47:51.062Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:49:13.366Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:50:23.928Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:51:50.466Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:53:07.774Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:54:08.510Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:55:13.492Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:56:31.346Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T21:57:56.105Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T21:58:56.932Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T22:00:08.183Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T22:02:04.590Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T22:03:15.919Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T22:04:24.896Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T22:05:31.184Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T22:07:23.642Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T22:09:10.605Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T22:10:17.947Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T22:11:46.489Z",
+      "backendState": "Unknown",
+      "selfOnline": null,
+      "statusError": "timeout"
+    },
+    {
+      "ts": "2026-11-16T22:13:01.998Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T22:14:20.629Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    },
+    {
+      "ts": "2026-11-16T22:15:24.655Z",
+      "backendState": "Running",
+      "selfOnline": true,
+      "statusError": null
+    }
+  ]
+}

@@ -47,6 +47,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Path from "effect/Path";
@@ -102,8 +103,18 @@ effectIt.effect("keeps an acknowledged compaction owned after expiry exhausts St
     const startCaptured = yield* Deferred.make<void>();
     const emitStart = yield* Deferred.make<void>();
     const emitEnd = yield* Deferred.make<void>();
-    const started = yield* Deferred.make<RunAttemptId | null>();
+    const stopped = yield* Deferred.make<void>();
+    const projectedAttempts: Array<RunAttemptId | null> = [];
     const ended = yield* Deferred.make<void>();
+    const logger = Logger.make(({ message }) => {
+      if (
+        (Array.isArray(message) ? message : [message]).includes(
+          "orchestration-v2.codex-abandoned-turn-interrupted",
+        )
+      )
+        Deferred.doneUnsafe(ended, Effect.void);
+    });
+    const loggerLayer = Logger.layer([logger], { mergeWithExisting: false });
     const transcript: CodexReplay.CodexAppServerReplayTranscript = {
       provider: "codex",
       protocol: "codex.app-server",
@@ -201,26 +212,41 @@ effectIt.effect("keeps an acknowledged compaction owned after expiry exhausts St
           },
         },
         { type: "emit_inbound", label: "compact", frame: { id: 3, result: {} } },
-        ...(["inProgress", "completed"] as const).map((status) => ({
-          type: "emit_inbound" as const,
-          label: status,
-          frame: {
-            method: status === "inProgress" ? "turn/started" : "turn/completed",
-            params: {
-              threadId: nativeThreadId,
-              turn: {
-                id: nativeTurnId,
-                items: [],
-                itemsView: "notLoaded",
-                status,
-                error: null,
-                startedAt: 1782622440,
-                completedAt: status === "completed" ? 1782622450 : null,
-                durationMs: null,
+        ...(["inProgress", "completed"] as const).flatMap((status) => [
+          ...(status === "completed"
+            ? [
+                {
+                  type: "expect_outbound" as const,
+                  frame: {
+                    id: 4,
+                    method: "turn/interrupt",
+                    params: { threadId: nativeThreadId, turnId: nativeTurnId },
+                  },
+                },
+                { type: "emit_inbound" as const, label: "stop-ack", frame: { id: 4, result: {} } },
+              ]
+            : []),
+          {
+            type: "emit_inbound" as const,
+            label: status,
+            frame: {
+              method: status === "inProgress" ? "turn/started" : "turn/completed",
+              params: {
+                threadId: nativeThreadId,
+                turn: {
+                  id: nativeTurnId,
+                  items: [],
+                  itemsView: "notLoaded",
+                  status,
+                  error: null,
+                  startedAt: 1782622440,
+                  completedAt: status === "completed" ? 1782622450 : null,
+                  durationMs: null,
+                },
               },
             },
           },
-        })),
+        ]),
       ],
     };
     const driver = yield* CodexReplay.makeReplayDriver(transcript, {
@@ -231,7 +257,9 @@ effectIt.effect("keeps an acknowledged compaction owned after expiry exhausts St
             )
           : entry.label === "completed"
             ? Deferred.await(emitEnd)
-            : Effect.void,
+            : entry.label === "stop-ack"
+              ? Deferred.succeed(stopped, undefined)
+              : Effect.void,
     });
     const context = yield* Layer.build(CodexTestkit.layer({ transcript, driver }));
     const registry = yield* Effect.service(ProviderAdapterRegistry.ProviderAdapterRegistryV2).pipe(
@@ -266,12 +294,14 @@ effectIt.effect("keeps an acknowledged compaction owned after expiry exhausts St
     });
     const projection = harness.projection();
     const successor = projection.runs[0]!;
-    runtime = yield* adapter.openSession({
-      threadId: successor.threadId,
-      providerSessionId: projection.providerThreads[0]!.providerSessionId!,
-      modelSelection,
-      runtimePolicy,
-    });
+    runtime = yield* adapter
+      .openSession({
+        threadId: successor.threadId,
+        providerSessionId: projection.providerThreads[0]!.providerSessionId!,
+        modelSelection,
+        runtimePolicy,
+      })
+      .pipe(Effect.provide(loggerLayer));
     owner = yield* runtime.ensureThread({
       threadId: successor.threadId,
       modelSelection,
@@ -288,16 +318,16 @@ effectIt.effect("keeps an acknowledged compaction owned after expiry exhausts St
         event.type === "provider_turn.updated" &&
         event.providerTurn.nativeTurnRef?.nativeId === nativeTurnId &&
         event.providerTurn.status === "running"
-          ? Deferred.succeed(started, event.providerTurn.runAttemptId)
-          : event.type === "turn.terminal"
-            ? Deferred.succeed(ended, undefined)
-            : Effect.void,
+          ? Effect.sync(() => {
+              projectedAttempts.push(event.providerTurn.runAttemptId);
+            })
+          : Effect.void,
       ),
       Effect.forkScoped,
     );
     const attemptId = RunAttemptId.make("expired-compaction-attempt");
     const runId = RunId.make("expired-compaction-run");
-    yield* runtime.compactThread!({
+    const compaction = yield* runtime.compactThread!({
       appThread: projection.thread,
       threadId: successor.threadId,
       runId,
@@ -315,7 +345,7 @@ effectIt.effect("keeps an acknowledged compaction owned after expiry exhausts St
       },
       modelSelection,
       runtimePolicy,
-    });
+    }).pipe(Effect.provide(loggerLayer), Effect.exit, Effect.forkScoped);
     yield* Deferred.await(startCaptured);
     yield* TestClock.adjust("10 minutes");
     yield* outbox.enqueue([
@@ -369,7 +399,9 @@ effectIt.effect("keeps an acknowledged compaction owned after expiry exhausts St
     yield* Effect.gen(function* () {
       const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
       for (let attempt = 0; attempt < 5; attempt++) {
-        expect(yield* worker.drain(1)).toBe(1);
+        const draining = yield* worker.drain(1).pipe(Effect.forkScoped({ startImmediately: true }));
+        yield* TestClock.adjust("10 seconds");
+        expect(yield* Fiber.join(draining)).toBe(1);
         if (attempt < 4) yield* TestClock.adjust(100 * 2 ** attempt);
       }
       const stop = Option.getOrThrow(yield* outbox.get("expired-compaction-stop"));
@@ -393,13 +425,29 @@ effectIt.effect("keeps an acknowledged compaction owned after expiry exhausts St
       const item = harness.projection().turnItems.find((item) => item.type === "error");
       expect(item?.type === "error" && item.failure.code).toBe("previous_turn_still_running");
       yield* Deferred.succeed(emitStart, undefined);
-      expect(yield* Deferred.await(started)).toBe(attemptId);
+      yield* Deferred.await(stopped);
+      expect(projectedAttempts).toEqual([]);
       expect(yield* runtime.holdsWorkForThread!(owner)).toBe(true);
       expect(harness.startRootRun).not.toHaveBeenCalled();
       yield* Deferred.succeed(emitEnd, undefined);
       yield* Deferred.await(ended);
+      yield* Fiber.join(compaction);
+      yield* runtime.interruptStartingRun!({
+        providerThread: owner,
+        runId,
+        attemptId,
+        stopBackgroundWork: false,
+      });
+      expect(projectedAttempts).toEqual([]);
+      expect(
+        yield* runtime.hasObservedTurnEnd!({
+          providerThreadId: owner.id,
+          providerTurnId: ProviderTurnId.make("start-expire:expired-compaction-attempt"),
+          attemptId,
+        }),
+      ).toBe(true);
       expect(yield* runtime.holdsWorkForThread!(owner)).toBe(false);
-    }).pipe(Effect.provide(workerLayer));
+    }).pipe(Effect.provide(Layer.mergeAll(workerLayer, loggerLayer)));
   }).pipe(
     Effect.scoped,
     Effect.provide(
@@ -1314,6 +1362,124 @@ const noRolloutFailure = (thread: OrchestrationV2ThreadProjection["providerThrea
       errorMessage: `no rollout found for thread id ${thread.nativeThreadRef?.nativeId}`,
     },
   });
+
+effectIt.effect.each(["interrupted", "failed", "completed", "cancelled", "rolled_back"] as const)(
+  "stops late output after external %s through the prepared production controls",
+  (status) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
+      yield* harness.start;
+      const controls = harness.startRootRun.mock.calls[0]![0];
+      const providerTurnId = ProviderTurnId.make("late-prepared-turn");
+      const nativeStarted = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      const presented: Array<string> = [];
+      harness.nativeStartTurn.mockImplementation(() =>
+        Effect.gen(function* () {
+          const current = harness.projection();
+          const completedAt = yield* DateTime.now;
+          harness.setProjection({
+            ...current,
+            runs: current.runs.map((run) =>
+              run.id === controls.run.id ? { ...run, status, completedAt } : run,
+            ),
+          });
+          yield* Deferred.succeed(nativeStarted, undefined);
+        }),
+      );
+      const events = Stream.fromEffect(Deferred.await(nativeStarted)).pipe(
+        Stream.flatMap(() =>
+          Stream.make(
+            {
+              type: "message.updated" as const,
+              driver: controls.providerThread.driver,
+              message: {
+                ...harness.projection().messages[0]!,
+                id: MessageId.make("late-prepared-message"),
+                threadId: controls.run.threadId,
+                runId: controls.run.id,
+                role: "assistant" as const,
+                text: "Still working",
+                streaming: false,
+              },
+            },
+            {
+              type: "turn.terminal" as const,
+              driver: controls.providerThread.driver,
+              providerThreadId: controls.providerThread.id,
+              providerTurnId,
+              runOrdinal: controls.run.ordinal,
+              status: "completed" as const,
+              threadDisposition: "reusable" as const,
+              failure: null,
+            },
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const execution = yield* RunExecutionService.RunExecutionServiceV2;
+        yield* execution.startRootRun({
+          ...controls,
+          rootNode: { ...controls.rootNode, providerTurnId },
+          attempt: { ...controls.attempt, providerTurnId },
+          session: {
+            ...controls.session,
+            subscribeEvents: Effect.succeed({
+              events,
+              close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid),
+            }),
+          },
+        });
+        yield* Deferred.await(closed);
+      }).pipe(
+        Effect.provide(
+          RunExecutionService.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                McpAppModelContext.layerEmpty,
+                PreviewAgentActivity.layer,
+                IdAllocator.layer,
+                ServerSettings.layerTest(),
+                Layer.mock(CheckpointService.CheckpointServiceV2)({
+                  captureBaseline: () => Effect.void,
+                }),
+                Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({
+                  allocate: () => Effect.succeed(1),
+                }),
+                Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+                  ingestNormalized: (input) =>
+                    Effect.sync(() => {
+                      const current = harness
+                        .projection()
+                        .runs.find((run) => run.id === controls.run.id)!;
+                      if (
+                        input.writeIfRunCurrent !== undefined &&
+                        current.status !== input.writeIfRunCurrent.expectedStatus
+                      )
+                        return [];
+                      if (input.event.type === "message.updated")
+                        presented.push(input.event.message.text);
+                      return [];
+                    }),
+                }),
+                Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent: harness.writeIfRunCurrent }),
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(presented).toEqual([]);
+      expect(harness.nativeInterruptTurn).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          providerTurnId,
+          stopBackgroundWork: true,
+        }),
+      );
+      expect(harness.projection().runs.find((run) => run.id === controls.run.id)?.status).toBe(
+        status,
+      );
+    }),
+);
 
 effectIt.effect.each(["early", "late", "late with history"] as const)(
   "recovers an ordinal-1 no-rollout resume at %s and persists its new native identity",

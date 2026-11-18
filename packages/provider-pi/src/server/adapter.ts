@@ -449,7 +449,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
     ) {
       const scope = yield* Effect.scope;
       const cwd = input.runtimePolicy.cwd ?? host.paths.cwd;
-      const mcpSession = yield* mcpSessions.read(input.threadId);
+      const mcpSession = yield* McpProviderSessions.readForRuntime(
+        mcpSessions,
+        input.threadId,
+        input.providerSessionId,
+        PI_PROVIDER,
+      );
       const provideCacheFs = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) =>
         effect.pipe(
           Effect.provideService(FileSystem.FileSystem, fileSystem),
@@ -1035,6 +1040,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               ...shared,
               title: toolName,
               type: "command_execution",
+              toolResultIncomplete: !completed,
               input: recordString(args, "command") ?? "",
               ...(outputText.length > 0 ? { output: outputText } : {}),
               ...(exitCode === undefined ? {} : { exitCode }),
@@ -1072,6 +1078,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             ...shared,
             title: toolName,
             type: "dynamic_tool",
+            toolResultIncomplete: !completed,
             ...mcpToolPresentation({ toolName }),
             toolName,
             input: args ?? {},

@@ -1,14 +1,24 @@
 #!/usr/bin/python3
-"""Read-only cadence report; failures are data, never a failing command."""
+"""Read-only cadence and launchd report; exit 1 when checks are not OK."""
 import argparse
 import datetime as dt
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 
 from toollog import directory
 
 UTC = dt.timezone.utc
+LAUNCHD_LABELS = (
+    'com.abdullah.mac-log-collector',
+    'com.abdullah.mac-deep-inventory',
+    'com.abdullah.mac-memory',
+    'com.abdullah.mac-cpu',
+    'com.abdullah.mac-ssd-read-probe',
+)
 # Logging shipped on 2026-11-13 UTC (#10); older days cannot prove silence.
 CADENCES = {
     # robob-watch/watchers/disk-space-guard/watcher.json: interval_s=1800;
@@ -30,6 +40,8 @@ CADENCES = {
     # cpu.spike is conditional evidence, never a scheduled job to mark silent.
     # launchd/com.abdullah.mac-cpu.plist: StartInterval=60; allow three minutes.
     'cpu.sample': dict(name='cpu.sample', target=None, gapHours=.05, since='2026-11-15'),
+    # launchd/com.abdullah.mac-ssd-read-probe.plist: independent StartInterval=60.
+    'disk.ssd_read_probe': dict(name='disk.ssd_read_probe', target=None, gapHours=.05, since='2026-11-17'),
     # launchd/com.abdullah.mac-tailnet.plist: StartInterval=60.
     'tailnet.sample': dict(name='tailnet.sample', target=None, gapHours=.05, since='2026-11-15'),
     # launchd/com.abdullah.mac-deep-inventory.plist: daily 03:30 local
@@ -127,6 +139,36 @@ def report(now=None, root=None, *, day=None):
         return dict(jobs={}, missingJobs=[], error='status.unavailable')
 
 
+def launchd_status(runner=None, uid=None):
+    runner = subprocess.run if runner is None else runner
+    uid = os.getuid() if uid is None else uid
+    states = {}
+    for label in LAUNCHD_LABELS:
+        state = 'unknown'
+        try:
+            result = runner(['/bin/launchctl', 'print', 'gui/%d/%s' % (uid, label)],
+                            capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                state = 'loaded'
+            elif 'Could not find service' in (result.stderr or ''):
+                state = 'not-loaded'
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        states[label] = state
+    return states
+
+
+def live_report(now=None, root=None, *, runner=None):
+    # Historical rollups use report() alone: current launchd state says nothing
+    # about whether a job was loaded on the day being rebuilt.
+    result = report(now, root)
+    result['launchd'] = launchd_status(runner)
+    result['ok'] = (not result.get('error') and not result['missingJobs']
+                    and not result.get('readErrors')
+                    and all(state == 'loaded' for state in result['launchd'].values()))
+    return result
+
+
 def main(argv=None):
     as_json = False
     try:
@@ -135,30 +177,34 @@ def main(argv=None):
         parser.add_argument('--json', action='store_true')
         args = parser.parse_args(argv)
         as_json = args.json
-        result = report(args.now)
+        result = live_report(args.now)
         if as_json:
             print(json.dumps(result, indent=2))
-        elif 'error' in result:
-            print(result['error'])
         else:
-            for key, row in result['jobs'].items():
+            for label, state in result['launchd'].items():
+                print('%-38s %s' % (label, state))
+            if 'error' in result:
+                print(result['error'])
+            for key, row in result.get('jobs', {}).items():
                 age = 'unknown' if row['ageMin'] is None else '%g min' % row['ageMin']
                 print('%-20s %-7s last=%s age=%s ok=%s' %
                       (key, row['status'], row['lastSeen'] or 'never', age, json.dumps(row['lastOk'])))
-            for filename in result['missingFiles']:
+            for filename in result.get('missingFiles', []):
                 print('missing day file: ' + filename)
-            for filename in result['readErrors']:
+            for filename in result.get('readErrors', []):
                 print('unreadable day file: ' + filename)
-            print('malformed lines: %d' % result['malformed'])
-    except SystemExit:
-        pass  # argparse help and invalid options both leave this command successful.
+            print('malformed lines: %d' % result.get('malformed', 0))
+            print('ok: %s' % json.dumps(result['ok']))
+        return 0 if result['ok'] else 1
+    except SystemExit as error:
+        return error.code
     except Exception:
         try:
-            print(json.dumps({'error': 'status.unavailable'}) if as_json else 'status.unavailable')
+            print(json.dumps({'ok': False, 'error': 'status.unavailable'}) if as_json else 'status.unavailable')
         except Exception:
             pass
-    return 0
+    return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

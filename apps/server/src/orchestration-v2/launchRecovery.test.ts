@@ -8,6 +8,7 @@ import {
 import {
   continuedLaunchRecovery,
   claudeRecoveryResult,
+  isAutomaticClaudeRecovery,
   nextLaunchRecovery,
 } from "./launchRecovery.ts";
 
@@ -125,6 +126,43 @@ describe("launch recovery exclusions", () => {
       launchRecovery: { ...first.recovery, since: "2026-11-13T00:00:00Z" },
     };
     expect(nextLaunchRecovery(input)).toBeUndefined();
+  });
+  it.each(["Work", "Please relay: ready", "[Watcher event from build] Ready"])(
+    "does not open another recovery budget after silent recovery: %s",
+    (text) => {
+      const input = base();
+      input.run = {
+        ...input.run,
+        delegatedTaskStallRecovery: {
+          phase: "first_event",
+          lastProgressAt: "2026-11-13T00:00:00Z",
+          attemptId: null,
+        },
+      };
+      input.automated = true;
+      input.text = text;
+      expect(isAutomaticClaudeRecovery("claudeAgent", input.run)).toBe(true);
+      expect(nextLaunchRecovery(input)).toBeUndefined();
+    },
+  );
+  it.each(
+    ["[Watcher event from build] Ready", "Please relay: ready"].flatMap((text) =>
+      [null, 401, 403, 404, 429].flatMap((status) =>
+        [false, true].map((retryable) => ({ text, status, retryable })),
+      ),
+    ),
+  )("honors the relay veto for $text/$status/$retryable", ({ text, status, retryable }) => {
+    const input = base();
+    input.automated = true;
+    input.text = text;
+    input.failure = {
+      ...input.failure,
+      category: "transient",
+      code: "claude_network_error",
+      retryable,
+      claudeAccess: { status, beforeResponse: true, refusalFree: true, refused: false },
+    };
+    expect(nextLaunchRecovery(input)?.recovery.kind).toBe(retryable ? "relay" : undefined);
   });
 });
 

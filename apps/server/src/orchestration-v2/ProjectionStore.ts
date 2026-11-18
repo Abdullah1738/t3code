@@ -1,4 +1,7 @@
-import { threadReadCount } from "../ardud/persistence/threadReadCount.ts";
+import {
+  threadReadCount,
+  readThreadIndexAvailability,
+} from "../ardud/persistence/threadReadCount.ts";
 import * as Deferred from "effect/Deferred";
 import { ShellRunLookupMigration } from "../ardud/persistence/shellRunLookupMigration.ts";
 import * as IdSetQueries from "./IdSetQueries.ts";
@@ -377,13 +380,17 @@ export interface ProjectionRecordFilter {
   readonly messageRunIds?: ReadonlyArray<RunId>;
   readonly turnItemRunIds?: ReadonlyArray<RunId | null>;
   readonly runIds?: ReadonlyArray<RunId>;
+  readonly restartCleanupSessionId?: ProviderSessionId;
   /** ardud: unfinished runs plus the newest N, instead of every run the thread ever had. */
   readonly recentRunLimit?: number;
   /** A single newest run, including when older runs are unfinished. */
   readonly latestRunOnly?: boolean;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
   readonly recentTurnItemLimit?: number;
+  readonly turnItemOrder?: "completion";
   readonly turnItemStatuses?: ReadonlyArray<OrchestrationV2TurnItem["status"]>;
+  /** Cleanup can retain partial output without ever receiving a tool result. */
+  readonly toolResultsOnly?: boolean;
   readonly omitSettledLeafNodes?: boolean;
 }
 
@@ -533,6 +540,12 @@ function threadListCandidate(shell: OrchestrationV2ThreadShell): ThreadListCandi
   };
 }
 
+export interface ThreadListPageOptions {
+  readonly limit: number;
+  readonly titleContains?: string;
+  readonly after?: { readonly updatedAtMs: number; readonly threadId: string };
+}
+
 export interface ShellSnapshotOptions {
   /** Control summaries omit history counts, fork ancestors and background/provider detail. */
   readonly summaryOnly?: boolean;
@@ -647,6 +660,7 @@ export interface ProjectionStoreV2Shape {
   >;
   readonly getThreadListCandidates: (
     projectId: ProjectId,
+    options?: ThreadListPageOptions,
   ) => Effect.Effect<ReadonlyArray<ThreadListCandidate>, ProjectionStoreV2Error>;
   readonly getCallerRow: (
     threadId: ThreadId,
@@ -992,6 +1006,13 @@ function preserveRunRecordedFields(
   if (current === undefined) return next;
   return {
     ...next,
+    ...(current.openTools === undefined
+      ? {}
+      : {
+          openTools: ["preparing", "queued", "starting", "running", "waiting"].includes(next.status)
+            ? current.openTools
+            : {},
+        }),
     ...((next.cancelReason === undefined ||
       next.cancelReason === "provider_cancelled" ||
       next.cancelReason === "provider_interrupted") &&
@@ -1009,6 +1030,9 @@ function preserveRunRecordedFields(
     ...(next.delegatedTaskStallRecovery === undefined &&
     current.delegatedTaskStallRecovery !== undefined
       ? { delegatedTaskStallRecovery: current.delegatedTaskStallRecovery }
+      : {}),
+    ...(next.transientRecovery === undefined && current.transientRecovery !== undefined
+      ? { transientRecovery: current.transientRecovery }
       : {}),
     ...(next.delegatedCompletion === undefined && current.delegatedCompletion !== undefined
       ? { delegatedCompletion: current.delegatedCompletion }
@@ -1251,6 +1275,24 @@ export function applyToProjection(
         runs: base.runs.map((run) => {
           if (run.id !== event.payload.runId) return run;
           const request = event.payload;
+          const openTools = { ...run.openTools };
+          if (request.type === "run_interrupt_request") {
+            for (const id of Object.keys(openTools)) delete openTools[id];
+          } else if (request.type === "command_execution" || request.type === "dynamic_tool") {
+            if (
+              request.status === "running" &&
+              ["starting", "running", "waiting"].includes(run.status)
+            ) {
+              openTools[encodeURIComponent(request.id)] ??= {
+                kind: request.type,
+                since: DateTime.formatIso(request.startedAt ?? request.updatedAt),
+              };
+            } else delete openTools[encodeURIComponent(request.id)];
+          }
+          const withTools =
+            run.openTools !== undefined || Object.keys(openTools).length > 0
+              ? { ...run, openTools }
+              : run;
           const recorded =
             request.type === "run_interrupt_request" &&
             request.cancelReason !== undefined &&
@@ -1259,14 +1301,14 @@ export function applyToProjection(
               run.cancelReason === "provider_cancelled" ||
               run.cancelReason === "provider_interrupted")
               ? {
-                  ...run,
+                  ...withTools,
                   cancelReason: request.cancelReason,
                   cancelDetail:
                     request.message === "Interrupt requested"
                       ? undefined
                       : request.message.slice(0, 500),
                 }
-              : run;
+              : withTools;
           return recorded.lastActivityAt === undefined ||
             DateTime.toEpochMillis(recorded.lastActivityAt) <
               DateTime.toEpochMillis(request.updatedAt)
@@ -1498,6 +1540,7 @@ const encodeTimelineSources = Schema.encodeEffect(
     Schema.Array(Schema.Struct({ threadId: Schema.String, id: Schema.String })),
   ),
 );
+const encodeJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.String));
 const encodeIdList = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
 
 // An empty list filter selects no rows, but SQLite still walks every row of
@@ -2313,6 +2356,28 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
   ProjectionStoreV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const threadReadIndexes = yield* Ref.make(
+      // Offline maintenance attaches the archive after constructing this layer.
+      yield* readThreadIndexAvailability(sql).pipe(
+        NodeSqliteClient.readOnly,
+        NodeSqliteClient.foregroundReads,
+        Effect.orElseSucceed(() => ({ main: false, ardud_archive: false })),
+      ),
+    );
+    const getThreadReadIndexes = Effect.fn("ProjectionStore.getThreadReadIndexes")(function* () {
+      const cached = yield* Ref.get(threadReadIndexes);
+      const inTransaction = yield* Effect.serviceOption(sql.transactionService);
+      if (cached.main && cached.ardud_archive && inTransaction._tag === "None") return cached;
+      const available = yield* readThreadIndexAvailability(sql);
+      // Maintenance only adds committed indexes. An older concurrent probe must
+      // not undo another page's observation that a schema finished building.
+      yield* Ref.update(threadReadIndexes, (current) => ({
+        main: current.main || available.main,
+        ardud_archive: current.ardud_archive || available.ardud_archive,
+      }));
+      // A caller's existing transaction may predate another reader's promotion.
+      return available;
+    });
     const speedups = yield* Switches;
     const lookupMigration = yield* ShellRunLookupMigration;
     // ardud: the writer connection is synchronous on the main thread, so a scan there
@@ -2334,6 +2399,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           json_extract(orchestration_v2_projection_runs.payload_json, ${path})
         )
         ELSE ${payload}
+      END
+    `;
+
+    // Tool membership comes from item events; merge-patching a snapshot would resurrect removed keys.
+    const replaceRecordedOpenTools = (payload: Statement.Fragment) => sql`
+      CASE
+        WHEN json_type(orchestration_v2_projection_runs.payload_json, '$.openTools') IS NULL
+        THEN ${payload}
+        ELSE json_set(${payload}, '$.openTools', CASE
+          WHEN excluded.status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
+            THEN json_extract(orchestration_v2_projection_runs.payload_json, '$.openTools')
+          ELSE json('{}')
+        END)
       END
     `;
 
@@ -2461,11 +2539,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 status = excluded.status,
                 requested_at = excluded.requested_at,
                 completed_at = excluded.completed_at,
-                payload_json = json_patch(${keepRecordedRunField(
+                payload_json = ${replaceRecordedOpenTools(sql`json_patch(${keepRecordedRunField(
                   keepRecordedRunField(
                     keepRecordedRunField(
                       keepRecordedRunField(
-                        keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                        keepRecordedRunField(
+                          keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                          "$.transientRecovery",
+                        ),
                         "$.delegatedTaskStallRecovery",
                       ),
                       "$.delegatedTaskStall",
@@ -2482,7 +2563,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     'cancelDetail', json_extract(orchestration_v2_projection_runs.payload_json, '$.cancelDetail')
                   )
                   ELSE '{}'
-                END)
+                END)`)}
             `;
               break;
             }
@@ -3068,6 +3149,29 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       OR json_extract(payload_json, '$.cancelReason') IS NULL
                       OR json_extract(payload_json, '$.cancelReason') IN ('provider_cancelled', 'provider_interrupted'))`;
               }
+              // Maintain only open tool identities on the run; board ticks never read item history.
+              const item = event.payload;
+              if (item.runId !== null && item.type === "run_interrupt_request") {
+                yield* sql`UPDATE orchestration_v2_projection_runs
+                  SET payload_json = json_set(payload_json, '$.openTools', json('{}'))
+                  WHERE run_id = ${item.runId}`;
+              } else if (
+                item.runId !== null &&
+                (item.type === "command_execution" || item.type === "dynamic_tool")
+              ) {
+                const path = `$.openTools.${encodeJsonString(encodeURIComponent(item.id))}`;
+                if (item.status === "running") {
+                  const since = DateTime.formatIso(item.startedAt ?? item.updatedAt);
+                  yield* sql`UPDATE orchestration_v2_projection_runs
+                    SET payload_json = json_set(payload_json, ${path}, json_object('kind', ${item.type}, 'since', ${since}))
+                    WHERE run_id = ${item.runId} AND status IN ('starting', 'running', 'waiting')
+                      AND json_type(payload_json, ${path}) IS NULL`;
+                } else {
+                  yield* sql`UPDATE orchestration_v2_projection_runs
+                    SET payload_json = json_remove(payload_json, ${path})
+                    WHERE run_id = ${item.runId}`;
+                }
+              }
               // One run-row update keeps the board sweep independent of transcript size.
               if (event.payload.runId !== null) {
                 yield* sql`UPDATE orchestration_v2_projection_runs
@@ -3583,12 +3687,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 WHERE thread_id = ${threadId}
                   ${filter?.turnItemTypes === undefined ? sql`` : sql`AND type IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemTypes)}))`}
                   ${filter?.turnItemStatuses === undefined ? sql`` : sql`AND status IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemStatuses)}))`}
+                  ${filter?.toolResultsOnly !== true ? sql`` : sql`AND type IN ('command_execution', 'dynamic_tool') AND COALESCE(json_extract(payload_json, '$.toolResultIncomplete'), 0) = 0 AND (status = 'completed' OR (status = 'failed' AND json_type(payload_json, '$.toolResultIncomplete') = 'false') OR json_type(payload_json, '$.output') IS NOT NULL OR json_type(payload_json, '$.exitCode') IS NOT NULL)`}
                   ${filter?.turnItemRunId === undefined ? sql`` : sql`AND run_id = ${filter.turnItemRunId}`}
                   ${filter?.turnItemRunIds === undefined ? sql`` : sql`AND (run_id IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemRunIds.filter((id): id is RunId => id !== null))})) OR (${filter.turnItemRunIds.includes(null) ? 1 : 0} = 1 AND run_id IS NULL))`}
                 ${
                   filter?.recentTurnItemLimit === undefined
                     ? sql`ORDER BY ordinal ASC, turn_item_id ASC`
-                    : sql`ORDER BY ordinal DESC, turn_item_id DESC LIMIT ${Math.max(1, Math.min(200, Math.floor(filter.recentTurnItemLimit)))}`
+                    : sql`ORDER BY ${filter.turnItemOrder === "completion" ? sql`COALESCE(json_extract(payload_json, '$.completedAt'), updated_at) DESC,` : sql``} ordinal DESC, turn_item_id DESC LIMIT ${Math.max(1, Math.min(200, Math.floor(filter.recentTurnItemLimit)))}`
                 }
               `
               : yield* sql<PayloadRow>`
@@ -3710,6 +3815,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             FROM orchestration_v2_projection_runs ${filter?.unfinishedRunsOnly ? sql`INDEXED BY orchestration_v2_projection_runs_recovery_idx` : sql``}
             WHERE thread_id = ${threadId}
               ${filter?.unfinishedRunsOnly ? sql`AND status IN ('queued','preparing','starting','running','waiting')` : sql``}
+              ${
+                filter?.restartCleanupSessionId === undefined
+                  ? sql``
+                  : sql`AND json_extract(payload_json, '$.providerRestartCleanup.providerSessionId') = ${filter.restartCleanupSessionId}`
+              }
               ${
                 filter?.runIds === undefined
                   ? sql``
@@ -6412,6 +6522,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const readLocalTimelinePage = Effect.fn("ProjectionStore.readLocalTimelinePage")(function* (
       threadId: ThreadId,
       options: ProjectionTimelinePageOptions,
+      readIndexes: { main: boolean; ardud_archive: boolean },
     ) {
       // Stream global positions before filtering messages, stopping at the lookahead.
       // Sorting this numbered stream or reusing it for totals would exhaust the history.
@@ -6445,7 +6556,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         }
         LIMIT ${options.limit + 1}
       )
-      SELECT ${threadReadCount(sql, threadId)} AS total_items, page.turn_item_id, page.position
+      SELECT ${threadReadCount(sql, threadId, readIndexes)} AS total_items, page.turn_item_id, page.position
       FROM (SELECT 1) LEFT JOIN page ON 1 ORDER BY page.position ASC`;
       const page = rows.filter((row) => row.turn_item_id !== null && row.position !== null);
       const items = yield* Effect.forEach(page.slice(0, options.limit), (row) =>
@@ -6471,13 +6582,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       return { items, totalItems: rows[0]?.total_items ?? 0, hasMore: page.length > options.limit };
     });
 
-    const getTimelinePage: ProjectionStoreV2Shape["getTimelinePage"] = (threadId, options) =>
-      sql
-        .withTransaction(
+    const getTimelinePage: ProjectionStoreV2Shape["getTimelinePage"] = Effect.fn(
+      "ProjectionStore.getTimelinePage",
+    )(
+      function* (threadId: ThreadId, options: ProjectionTimelinePageOptions) {
+        // Freeze index hints before opening this page's WAL snapshot. Maintenance
+        // may finish and another reader may promote the cache while it is open.
+        const readIndexes = yield* getThreadReadIndexes();
+        return yield* sql.withTransaction(
           Effect.gen(function* () {
             const records = yield* getThreadRecords(threadId, []);
             if (records.thread.forkedFrom?.type !== "run")
-              return yield* readLocalTimelinePage(threadId, options);
+              return yield* readLocalTimelinePage(threadId, options, readIndexes);
             const index = yield* readTimelineIndex(threadId, new Set());
             const matching = index.visible
               .map((row, position) => ({ ...row, position }))
@@ -6529,14 +6645,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               hasMore: matching.length > page.length,
             };
           }),
-        )
-        .pipe(
+        );
+      },
+      (effect, threadId) =>
+        effect.pipe(
           Effect.mapError((cause) =>
             isProjectionStoreThreadNotFoundError(cause) || isProjectionStoreReadError(cause)
               ? cause
               : new ProjectionStoreReadError({ threadId, cause }),
           ),
-        );
+        ),
+    );
 
     const getThreadSnapshotWindow: ProjectionStoreV2Shape["getThreadSnapshotWindow"] = (
       threadId,
@@ -6605,7 +6724,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         limit,
         threadIds,
       }: ShellSnapshotOptions = {},
-      listCandidatesOnly = false,
+      listCandidatesOnly: ThreadListPageOptions | undefined = undefined,
+      olderThanCursor = false,
     ) {
       const lookupIndexesReady =
         lookupMigration === undefined ||
@@ -6810,7 +6930,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             FROM orchestration_v2_projection_threads t${
               // Walk the recency index and stop at the limit; a sort would build every row.
               listCandidatesOnly && lookupIndexesReady
-                ? sql` INDEXED BY ardud_shell_project_threads_idx`
+                ? sql` INDEXED BY ardud_mcp_project_recency_idx`
                 : recentFirst && limit !== undefined
                   ? sql` INDEXED BY ardud_v2_threads_updated_idx`
                   : sql``
@@ -6880,13 +7000,31 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   })`
                 : sql``
             }
+            ${
+              listCandidatesOnly?.titleContains === undefined
+                ? sql``
+                : sql` AND (
+              instr(lower(t.title), ${listCandidatesOnly.titleContains.toLocaleLowerCase()}) > 0
+              OR t.title GLOB '*[^ -~]*'
+            )`
+            }
+            ${
+              listCandidatesOnly?.after === undefined
+                ? sql``
+                : olderThanCursor
+                  ? sql` AND CAST(ROUND(unixepoch(t.updated_at, 'subsec') * 1000) AS INTEGER) < ${listCandidatesOnly.after.updatedAtMs}`
+                  : sql` AND CAST(ROUND(unixepoch(t.updated_at, 'subsec') * 1000) AS INTEGER) = ${listCandidatesOnly.after.updatedAtMs}
+                    AND t.thread_id < ${listCandidatesOnly.after.threadId}`
+            }
             ${afterThreadId === undefined ? sql`` : sql` AND t.thread_id > ${afterThreadId}`}
             ${
-              limit === undefined
-                ? sql`ORDER BY t.updated_at ASC, t.thread_id ASC`
-                : recentFirst
-                  ? sql`ORDER BY t.updated_at DESC, t.thread_id ASC LIMIT ${limit}`
-                  : sql`ORDER BY t.thread_id ASC LIMIT ${limit}`
+              listCandidatesOnly !== undefined
+                ? sql`ORDER BY CAST(ROUND(unixepoch(t.updated_at, 'subsec') * 1000) AS INTEGER) DESC, t.thread_id DESC LIMIT ${listCandidatesOnly.limit}`
+                : limit === undefined
+                  ? sql`ORDER BY t.updated_at ASC, t.thread_id ASC`
+                  : recentFirst
+                    ? sql`ORDER BY t.updated_at DESC, t.thread_id ASC LIMIT ${limit}`
+                    : sql`ORDER BY t.thread_id ASC LIMIT ${limit}`
             }
           `;
     });
@@ -7469,36 +7607,41 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
 
     const getThreadListCandidates: ProjectionStoreV2Shape["getThreadListCandidates"] = Effect.fn(
       "ProjectionStore.getThreadListCandidates",
-    )(function* (projectId) {
-      const candidates: ThreadListCandidate[] = [];
-      let afterThreadId: string | undefined;
-      while (true) {
-        // Release the reader between batches; candidate filtering needs no history counts,
-        // fork sources, provider history or pending background items.
-        const rows = yield* sql.withTransaction(
-          selectShellThreadRows(
+    )(function* (projectId, options = { limit: 100 }) {
+      // SQLite lower() folds ASCII only. Non-ASCII titles remain candidates so the
+      // MCP's locale-aware predicate preserves existing Unicode matching.
+      const rows = yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const sameTime = yield* selectShellThreadRows(
             undefined,
+            { projectId, location: "active" },
+            options,
+          );
+          if (options.after === undefined || sameTime.length === options.limit) return sameTime;
+          // SQLite does not seek an expression-index tuple cursor. Equality plus id
+          // range and the older-time range each seek directly; both share one reader.
+          const older = yield* selectShellThreadRows(
+            undefined,
+            { projectId, location: "active" },
             {
-              projectId,
-              location: "active",
-              limit: 100,
-              ...(afterThreadId === undefined ? {} : { afterThreadId }),
+              ...options,
+              limit: options.limit - sameTime.length,
             },
             true,
-          ),
-        );
-        for (const row of rows) {
-          const state = yield* shellThreadStateFromRow({
-            row,
-            runOrdinalsByThreadId: new Map(),
-            itemCountsByThreadId: new Map(),
-            providerThreadsByThreadId: new Map(),
-            pendingTurnItemsByThreadId: new Map(),
-          });
-          candidates.push(threadListCandidate(shellFromState({ state, visibleItemCount: 0 })));
-        }
-        if (rows.length < 100) break;
-        afterThreadId = rows[rows.length - 1]!.thread_id;
+          );
+          return [...sameTime, ...older];
+        }),
+      );
+      const candidates: ThreadListCandidate[] = [];
+      for (const row of rows) {
+        const state = yield* shellThreadStateFromRow({
+          row,
+          runOrdinalsByThreadId: new Map(),
+          itemCountsByThreadId: new Map(),
+          providerThreadsByThreadId: new Map(),
+          pendingTurnItemsByThreadId: new Map(),
+        });
+        candidates.push(threadListCandidate(shellFromState({ state, visibleItemCount: 0 })));
       }
       return candidates;
     }, Effect.mapError(shellSnapshotReadError));
@@ -7880,13 +8023,38 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
       }),
       readShellSnapshot: (options) =>
         service.getShellSnapshot(options).pipe(Effect.map(Effect.succeed)),
-      getThreadListCandidates: (projectId) =>
+      getThreadListCandidates: (projectId, options = { limit: 100 }) =>
         service
           .getShellSnapshot({
             projectId,
             location: "active",
           })
-          .pipe(Effect.map((snapshot) => snapshot.threads.map(threadListCandidate))),
+          .pipe(
+            Effect.map((snapshot) =>
+              snapshot.threads
+                .filter(
+                  (thread) =>
+                    options.titleContains === undefined ||
+                    thread.title
+                      .toLocaleLowerCase()
+                      .includes(options.titleContains.toLocaleLowerCase()),
+                )
+                .filter(
+                  (thread) =>
+                    options.after === undefined ||
+                    DateTime.toEpochMillis(thread.updatedAt) < options.after.updatedAtMs ||
+                    (DateTime.toEpochMillis(thread.updatedAt) === options.after.updatedAtMs &&
+                      thread.id < options.after.threadId),
+                )
+                .toSorted(
+                  (a, b) =>
+                    DateTime.toEpochMillis(b.updatedAt) - DateTime.toEpochMillis(a.updatedAt) ||
+                    b.id.localeCompare(a.id),
+                )
+                .slice(0, options.limit)
+                .map(threadListCandidate),
+            ),
+          ),
       getCallerRow: Effect.fn("ProjectionStore.getCallerRow")(function* (threadId) {
         const projection = (yield* Ref.get(replayState)).projections.get(threadId);
         if (projection === undefined || projection.thread.deletedAt !== null) return null;
@@ -8255,6 +8423,9 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               (row) =>
                 (!filter?.latestRunOnly || row.id === newest?.id) &&
                 (!filter?.currentRunOnly || row.id === current?.id) &&
+                (filter?.restartCleanupSessionId === undefined ||
+                  row.providerRestartCleanup?.providerSessionId ===
+                    filter.restartCleanupSessionId) &&
                 (!filter?.unfinishedRunsOnly || UNFINISHED_RUN_STATUSES.has(row.status)),
             ),
             runtimeRequests: projection.runtimeRequests.filter(
@@ -8269,7 +8440,20 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                     filter.turnItemTypes.includes(row.type)) &&
                   (filter?.turnItemStatuses === undefined ||
                     filter.turnItemStatuses.includes(row.status)) &&
+                  (filter?.toolResultsOnly !== true ||
+                    ((row.type === "command_execution" || row.type === "dynamic_tool") &&
+                      row.toolResultIncomplete !== true &&
+                      (row.status === "completed" ||
+                        (row.status === "failed" && row.toolResultIncomplete === false) ||
+                        row.output !== undefined ||
+                        (row.type === "command_execution" && row.exitCode !== undefined)))) &&
                   (filter?.turnItemRunId === undefined || filter.turnItemRunId === row.runId),
+              )
+              .toSorted((a, b) =>
+                filter?.turnItemOrder === "completion"
+                  ? DateTime.toEpochMillis(a.completedAt ?? a.updatedAt) -
+                      DateTime.toEpochMillis(b.completedAt ?? b.updatedAt) || a.ordinal - b.ordinal
+                  : a.ordinal - b.ordinal,
               )
               .slice(
                 filter?.recentTurnItemLimit === undefined

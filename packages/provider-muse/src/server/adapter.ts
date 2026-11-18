@@ -776,7 +776,14 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
             summary: text || item.reason,
           };
         } else {
-          turnItem = { ...base, ...museToolPresentation(item, status) };
+          const presentation = museToolPresentation(item, status);
+          turnItem = {
+            ...base,
+            ...presentation,
+            ...(presentation.type === "command_execution" || presentation.type === "dynamic_tool"
+              ? { toolResultIncomplete: item.status === "inProgress" }
+              : {}),
+          };
         }
         yield* emit({
           type: "node.updated",
@@ -1705,7 +1712,12 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
       );
       const launchHost = Effect.fnUntraced(function* () {
         const epoch = ++hostEpoch;
-        const mcpSession = yield* mcpSessions.read(input.threadId);
+        const mcpSession = yield* McpProviderSessions.readForRuntime(
+          mcpSessions,
+          input.threadId,
+          input.providerSessionId,
+          MUSE_PROVIDER,
+        );
         const environment = McpProviderSession.withAgentDeviceEnvironment(
           options.environment,
           mcpSession,
@@ -1835,7 +1847,12 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         let missingNativeSession = false;
         return yield* Effect.gen(function* () {
           nativeSessionId = requestedId ?? host.connection.mintCommandId();
-          const mcpSession = yield* mcpSessions.read(args.threadId);
+          const mcpSession = yield* McpProviderSessions.readForRuntime(
+            mcpSessions,
+            args.threadId,
+            input.providerSessionId,
+            MUSE_PROVIDER,
+          );
           if (mcpSession && !host.initializeResult.grantedCapabilities.includes("sessionMcp"))
             return yield* protocolError(
               "Update Muse Code to a version that supports session MCP servers",

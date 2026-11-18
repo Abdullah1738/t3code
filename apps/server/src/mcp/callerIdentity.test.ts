@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { EnvironmentId, NodeId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
@@ -96,7 +97,12 @@ it.effect.each(["board", "send", "status", "delegate"] as const)(
             return yield* mcp.delegateTask(scope, { task: "test", clientRequestId: "same-key" });
           return yield* mcp.sendToThread(scope, { threadId: callerId, message: "test" });
         }).pipe(
-          Effect.provide(OrchestratorMcp.layer.pipe(Layer.provideMerge(deps))),
+          Effect.provide(
+            OrchestratorMcp.layer.pipe(
+              Layer.provide(McpProviderSessions.layer),
+              Layer.provideMerge(deps),
+            ),
+          ),
           Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
           Effect.flip,
         );
@@ -295,7 +301,12 @@ it.effect.each(
           assert.deepEqual(lanes, ["identity"]);
           assert.isFalse(yield* Deferred.isDone(release));
         }).pipe(
-          Effect.provide(OrchestratorMcp.layer.pipe(Layer.provideMerge(deps))),
+          Effect.provide(
+            OrchestratorMcp.layer.pipe(
+              Layer.provide(McpProviderSessions.layer),
+              Layer.provideMerge(deps),
+            ),
+          ),
           Effect.provideService(McpInvocationContext.McpInvocationContext, callerScope),
           Effect.ensuring(Deferred.succeed(release, undefined)),
         );

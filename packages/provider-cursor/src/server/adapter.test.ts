@@ -344,7 +344,8 @@ describe("CursorAdapterV2", () => {
         yield* mcpSessions.set({
           environmentId: EnvironmentId.make("cursor-lifecycle-environment"),
           threadId,
-          providerSessionId: "cursor-lifecycle-session",
+          providerSessionId: "mcp-cursor-lifecycle-session",
+          runtimeProviderSessionId: ProviderSessionId.make("cursor-lifecycle-session"),
           providerInstanceId: instanceId,
           endpoint: "http://127.0.0.1:43123/mcp",
           authorizationHeader: "Bearer synthetic-cursor-token",
@@ -430,6 +431,7 @@ describe("CursorAdapterV2", () => {
           modelSelection,
           runtimePolicy,
         });
+        assert.isTrue(runtime.backgroundTasksEndWithProcess);
         const providerThread = yield* runtime.ensureThread({
           threadId,
           modelSelection,
@@ -817,6 +819,15 @@ describe("CursorAdapterV2", () => {
         numFiles: 0,
       };
       const updates: ReadonlyArray<InteractionUpdate> = [
+        {
+          type: "tool-call-started",
+          modelCallId: "native-model-call",
+          callId: "mcp-unfinished",
+          toolCall: {
+            type: "mcp",
+            args: { providerIdentifier: "weather", toolName: "unfinished", args: {} },
+          },
+        },
         ...(["tool-call-started", "tool-call-completed"] as const).map((type) => ({
           type,
           modelCallId: "native-model-call",
@@ -1108,6 +1119,7 @@ describe("CursorAdapterV2", () => {
       );
       for (const item of mcpItems) {
         assert.equal(item.title, "get weather");
+        assert.isFalse(item.toolResultIncomplete);
         assert.deepEqual(item.toolSource, {
           key: "mcp:weather",
           name: "weather",
@@ -1115,6 +1127,17 @@ describe("CursorAdapterV2", () => {
         });
         assert.deepEqual(item.input, { city: "Berlin" });
       }
+      const cleanup = events.findLast(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "dynamic_tool" &&
+          event.turnItem.toolName === "mcp__weather__unfinished",
+      );
+      assert.isTrue(
+        cleanup?.type === "turn_item.updated" &&
+          cleanup.turnItem.type === "dynamic_tool" &&
+          cleanup.turnItem.toolResultIncomplete,
+      );
       const fileSearchItems = events.flatMap((event) =>
         event.type === "turn_item.updated" &&
         event.turnItem.type === "file_search" &&

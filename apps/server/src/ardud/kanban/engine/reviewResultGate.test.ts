@@ -12,13 +12,17 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as KanbanStore from "../store/KanbanStore.ts";
+import { McpCall } from "../../analytics/McpCall.ts";
 import { makeFake, owner, testLayer, workingCard } from "./askFlows.testkit.ts";
 import { KanbanThreads } from "./threads.ts";
+import { DeferWriteEffects, OwnerRouteMode } from "./KanbanService.ts";
+import * as SavedWrite from "./savedWrite.ts";
 
 type Boundary = {
   read:
@@ -631,4 +635,432 @@ it.effect.each(
         Effect.ensuring(Deferred.succeed(resume, undefined)),
       );
     }),
+);
+
+const refreshPr = Effect.fn("test.refreshPr")(function* (
+  phase: "landing" | "verdict",
+  boundary: "view" | "threadCards" | "board" | "write" | undefined,
+  change: "other" | "target" | "timeout" | "timeoutDiagnostic" | "failure" | "longHold" = "other",
+  linkShape: "pr" | "branchCommit" = "pr",
+) {
+  const fake = yield* makeFake;
+  const threads = yield* KanbanThreads.pipe(Effect.provide(fake.layer));
+  const entered = yield* Deferred.make<void>();
+  const resume = yield* Deferred.make<void>();
+  const applyEntered = yield* Deferred.make<void>();
+  const resumeApply = yield* Deferred.make<void>();
+  let work: ThreadId | undefined;
+  let merged = false;
+  let armed = false;
+  let fetched = false;
+  let holdApply = false;
+  const latch = <A, E, R>(name: string, read: Effect.Effect<A, E, R>) =>
+    Effect.gen(function* () {
+      const result = yield* read;
+      if (name === "write" && holdApply) {
+        holdApply = false;
+        yield* Deferred.succeed(applyEntered, undefined);
+        yield* Deferred.await(resumeApply);
+      }
+      if (name === "view" && armed && merged) fetched = true;
+      if (armed && boundary === name && (name !== "board" || fetched)) {
+        armed = false;
+        yield* Deferred.succeed(entered, undefined);
+        yield* Deferred.await(resume);
+        if (change === "failure") return yield* Effect.die("PR membership reader unavailable");
+      }
+      return result;
+    });
+  const slowThreads = Layer.succeed(KanbanThreads, {
+    ...threads,
+    view: (id) =>
+      latch(
+        "view",
+        threads.view(id).pipe(
+          Effect.map((view) =>
+            view && id === work
+              ? {
+                  ...view,
+                  prs:
+                    linkShape === "pr"
+                      ? [
+                          {
+                            url: "https://github.com/o/r/pull/1749",
+                            title: "Fix",
+                            state: merged ? ("merged" as const) : ("open" as const),
+                          },
+                        ]
+                      : [],
+                }
+              : view,
+          ),
+        ),
+      ),
+  });
+  const slowStore = Layer.effect(
+    KanbanStore.KanbanStore,
+    Effect.map(KanbanStore.KanbanStore, (store) => ({
+      ...store,
+      threadCards: (id) => latch("threadCards", store.threadCards(id)),
+      board: (id) => latch("board", store.board(id)),
+      updateCard: (...args: Parameters<typeof store.updateCard>) =>
+        latch("write", store.updateCard(...args)),
+      putCard: (...args: Parameters<typeof store.putCard>) =>
+        latch("write", store.putCard(...args)),
+    })),
+  ).pipe(Layer.provide(KanbanStore.layer));
+  return yield* Effect.gen(function* () {
+    const { kanban, card, board, worker, threadId } = yield* workingCard();
+    work = threadId;
+    if (linkShape === "branchCommit")
+      yield* kanban.editCard(
+        card.id,
+        {
+          links: [
+            { url: "https://github.com/o/r/tree/fix-1749", label: "Branch" },
+            {
+              url: "https://github.com/o/r/commit/abc1234abc1234abc1234abc1234abc1234abc1234",
+              label: "Commit",
+            },
+          ],
+        },
+        owner,
+      );
+    yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
+    yield* kanban.turnEnded(threadId);
+    yield* kanban.dispatchNow;
+    const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
+    if (phase === "landing") yield* kanban.reviewResult(reviewer, "clear", [], "abc1234");
+    const other = yield* kanban.createCard(board.id, { title: "Other", prompt: "Other" }, owner);
+    // A verdict timeout uses exactly the same stored PR facts as its fast case.
+    // Landing learns the merge during the outside read.
+    merged = phase === "landing";
+    armed = boundary !== undefined;
+    const call: McpCall["Service"] = {
+      boardWrite: true,
+      saved: false,
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "handler",
+    };
+    const pending = yield* Effect.forkChild(
+      (phase === "landing"
+        ? kanban.tick
+        : kanban.reviewResult(reviewer, "clear", [], "abc1234")
+      ).pipe(Effect.provideService(McpCall, call)),
+    );
+    if (boundary) {
+      yield* Deferred.await(entered);
+      if (change === "longHold") yield* TestClock.adjust(6_000);
+      else {
+        const id = change === "target" ? card.id : other.id;
+        const saved = yield* kanban.editCard(id, { description: "During refresh" }, owner);
+        assert.equal(saved.description, "During refresh");
+      }
+      assert.isUndefined(pending.pollUnsafe());
+      if (change === "timeout" || change === "timeoutDiagnostic") {
+        holdApply = change === "timeoutDiagnostic";
+        yield* TestClock.adjust(phase === "verdict" ? 100 : 2_000);
+        if (change === "timeoutDiagnostic") {
+          yield* Deferred.await(applyEntered);
+          yield* TestClock.adjust(6_000);
+          yield* Deferred.succeed(resumeApply, undefined);
+        }
+      } else {
+        yield* Deferred.succeed(resume, undefined);
+      }
+    }
+    yield* Fiber.join(pending);
+    if (phase === "verdict") assert.isTrue(call.saved);
+    const detail = yield* kanban.card(card.id);
+    return {
+      stage: detail.card.stage,
+      prs: detail.card.links.map(({ state }) => state),
+      reviews: detail.events
+        .filter((event) => event.kind === "review")
+        .map(({ fromStage, toStage, body, head }) => ({ fromStage, toStage, body, head })),
+      moves: detail.events
+        .filter((event) => event.kind === "moved")
+        .map(({ fromStage, toStage, body }) => ({ fromStage, toStage, body })),
+    };
+  }).pipe(
+    Effect.provide(testLayer(slowThreads, slowStore)),
+    Effect.ensuring(Deferred.succeed(resume, undefined)),
+    Effect.ensuring(Deferred.succeed(resumeApply, undefined)),
+  );
+});
+
+it.effect.each(["view", "threadCards"] as const)(
+  "landing releases its full PR fact read for a same-board card_update (%s)",
+  (boundary) =>
+    Effect.gen(function* () {
+      const baseline = yield* refreshPr("landing", undefined);
+      assert.equal(baseline.stage, "completed");
+      assert.deepEqual(yield* refreshPr("landing", boundary), baseline);
+    }),
+);
+
+it.effect("landing discards PR facts when the card changes during fetch", () =>
+  Effect.gen(function* () {
+    const result = yield* refreshPr("landing", "view", "target");
+    assert.equal(result.stage, "in_review");
+    assert.deepEqual(result.prs, ["open"]);
+  }),
+);
+
+it.effect("landing bounds a stalled fetch and keeps stored PR facts", () =>
+  Effect.gen(function* () {
+    const result = yield* refreshPr("landing", "view", "timeout");
+    assert.equal(result.stage, "in_review");
+    assert.deepEqual(result.prs, ["open"]);
+  }),
+);
+
+it.effect.each(["view", "threadCards"] as const)(
+  "a stalled PR fetch saves the same verdict and stage as a fast fetch within 100 ms (%s)",
+  (boundary) =>
+    Effect.gen(function* () {
+      assert.deepEqual(
+        yield* refreshPr("verdict", boundary, "timeout"),
+        yield* refreshPr("verdict", undefined),
+      );
+    }),
+);
+
+it.effect.each(["view", "threadCards"] as const)(
+  "a verdict with only branch and commit links saves during a stalled thread read (%s)",
+  (boundary) =>
+    Effect.gen(function* () {
+      const baseline = yield* refreshPr("verdict", undefined, "other", "branchCommit");
+      assert.equal(baseline.stage, "completed");
+      assert.deepEqual(baseline.prs, [null, null]);
+      assert.deepEqual(yield* refreshPr("verdict", boundary, "timeout", "branchCommit"), baseline);
+    }),
+);
+
+it.effect("a slow verdict collector attributes a timed-out PR fetch to syncPrs.fetch", () =>
+  Effect.gen(function* () {
+    const reports: Array<ReadonlyArray<SavedWrite.SubStep>> = [];
+    const result = yield* refreshPr("verdict", "view", "timeoutDiagnostic").pipe(
+      Effect.provideService(SavedWrite.callSubStepReporter, (steps) => reports.push(steps)),
+    );
+    assert.equal(result.stage, "in_review");
+    assert.deepInclude(reports.flat(), { subStep: "syncPrs.fetch", ms: 100 });
+  }),
+);
+
+it.effect("a failed PR membership read preserves the verdict and stage move", () =>
+  Effect.gen(function* () {
+    assert.deepEqual(
+      yield* refreshPr("verdict", "threadCards", "failure"),
+      yield* refreshPr("verdict", undefined),
+    );
+  }),
+);
+
+it.effect(
+  "landing releases its persistence snapshot for a same-card edit and discards stale facts",
+  () =>
+    Effect.gen(function* () {
+      const result = yield* refreshPr("landing", "board", "target");
+      assert.equal(result.stage, "in_review");
+      assert.deepEqual(result.prs, ["open"]);
+    }),
+);
+
+it.effect("landing reports syncPrs.write on a slow persistence hold", () =>
+  Effect.gen(function* () {
+    const holds: Array<{ subSteps?: ReadonlyArray<{ subStep: string }> }> = [];
+    const logger = Logger.make(({ message }) => {
+      const line = String(message);
+      if (line.startsWith('{"event":"kanban board lock long hold"')) holds.push(JSON.parse(line));
+    });
+    const result = yield* refreshPr("landing", "write", "longHold").pipe(
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+    );
+    assert.equal(result.stage, "completed");
+    assert.isTrue(
+      holds.some((hold) => hold.subSteps?.some((step) => step.subStep === "syncPrs.write")),
+    );
+  }),
+);
+
+it.effect.each([true, false])(
+  "card_move to needs_review saves while its two-PR refresh remains stalled (deferred=%s)",
+  (deferred) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const threads = yield* KanbanThreads.pipe(Effect.provide(fake.layer));
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      const finished = yield* Deferred.make<void>();
+      let work: ThreadId | undefined;
+      let armed = false;
+      const slow = Layer.succeed(KanbanThreads, {
+        ...threads,
+        view: (id) =>
+          Effect.gen(function* () {
+            const view = yield* threads.view(id);
+            if (id !== work || !armed) return view;
+            armed = false;
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(resume).pipe(
+              Effect.ensuring(Deferred.succeed(finished, undefined)),
+            );
+            return view;
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const { kanban, card, worker, threadId } = yield* workingCard();
+        work = threadId;
+        const links = [1, 2].map((number) => ({
+          url: `https://github.com/o/r/pull/${number}`,
+          label: `PR ${number}`,
+        }));
+        yield* kanban.editCard(card.id, { links }, owner);
+        const call: McpCall["Service"] = {
+          boardWrite: true,
+          saved: false,
+          callerResolved: true,
+          callerResolveMs: 0,
+          readerLane: "foreground",
+          phase: "handler",
+        };
+        armed = true;
+        const moving = yield* Effect.forkChild(
+          kanban
+            .moveCard(card.id, "needs_review", "cardThread", worker)
+            .pipe(Effect.provideService(McpCall, call)),
+        );
+        yield* Deferred.await(entered);
+        // The refresh is still blocked: completion cannot depend on its timeout.
+        const moved = yield* Fiber.join(moving);
+        assert.isTrue(call.saved);
+        assert.equal(moved.stage, "needs_review");
+        assert.deepEqual(
+          moved.links.map(({ url }) => url),
+          links.map(({ url }) => url),
+        );
+        const detail = yield* kanban.card(card.id);
+        assert.equal(detail.card.stage, "needs_review");
+        assert.lengthOf(
+          detail.events.filter(
+            (event) => event.kind === "moved" && event.toStage === "needs_review",
+          ),
+          1,
+        );
+        assert.isFalse(yield* Deferred.isDone(resume));
+        yield* Deferred.succeed(resume, undefined);
+        yield* Deferred.await(finished);
+      }).pipe(
+        Effect.provide(
+          testLayer(slow).pipe(
+            Layer.provide(Layer.succeed(OwnerRouteMode, "deferred")),
+            Layer.provide(Layer.succeed(DeferWriteEffects, deferred)),
+          ),
+        ),
+        Effect.ensuring(Deferred.succeed(resume, undefined)),
+      );
+    }),
+);
+
+it.effect("a saved syncPrs effect rechecks the review chain changed during its snapshot read", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const threads = yield* KanbanThreads.pipe(Effect.provide(fake.layer));
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let work: ThreadId | undefined;
+    let merged = false;
+    let armed = false;
+    let fetching = false;
+    const prThreads = Layer.succeed(KanbanThreads, {
+      ...threads,
+      view: (id) =>
+        Effect.gen(function* () {
+          const view = yield* threads.view(id);
+          if (id !== work || view === null) return view;
+          if (armed) fetching = true;
+          return {
+            ...view,
+            prs: [
+              {
+                url: "https://github.com/o/r/pull/1749",
+                title: "Fix",
+                state: merged ? ("merged" as const) : ("open" as const),
+              },
+            ],
+          };
+        }),
+    });
+    const slowStore = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (store) => ({
+        ...store,
+        board: (id) =>
+          Effect.gen(function* () {
+            const snapshot = yield* store.board(id);
+            if (armed && fetching) {
+              armed = false;
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(resume);
+            }
+            return snapshot;
+          }),
+      })),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, card, board, worker, threadId } = yield* workingCard();
+      work = threadId;
+      yield* kanban.updateBoard(board.id, {
+        reviewChains: [{ name: "Race", steps: [board.defaultCardModel] }],
+        defaultReviewChain: "Race",
+      });
+      yield* kanban.editCard(card.id, { reviewChain: "Race" }, owner);
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
+      yield* kanban.turnEnded(threadId);
+      yield* kanban.dispatchNow;
+      const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* kanban.reviewResult(reviewer, "clear", [], "abc1234");
+      assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      const sql = yield* SqlClient.SqlClient;
+      const routeKey = "sync-pr-board-race";
+      const payload = JSON.stringify({
+        kind: "effect",
+        effect: { kind: "syncPrs", cardId: card.id },
+        seq: -1,
+      });
+      yield* sql`INSERT INTO ardud_kanban_owner_routes (route_key, board_id, discussion_id, json, created_at)
+        VALUES (${routeKey}, ${board.id}, ${discussion.id}, ${payload}, ${board.createdAt})`;
+      merged = true;
+      armed = true;
+      // The post starts the existing lane's fresh BoardEffect drain.
+      const posting = yield* Effect.forkChild(
+        kanban.post(discussion.id, owner, [{ _tag: "md", text: "Refresh" }]),
+      );
+      yield* Deferred.await(entered);
+      yield* kanban.updateBoard(board.id, {
+        reviewChains: [{ name: "Race", steps: [board.defaultCardModel, board.defaultCardModel] }],
+      });
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(posting);
+      const detail = yield* kanban.card(card.id);
+      assert.equal(detail.card.stage, "in_review");
+      assert.equal(detail.card.reviewStep, 1);
+      assert.deepEqual(
+        detail.card.links.map(({ state }) => state),
+        ["merged"],
+      );
+      assert.isFalse(detail.events.some((event) => event.toStage === "completed"));
+      const rows = yield* sql<{
+        done_at: string | null;
+      }>`SELECT done_at FROM ardud_kanban_owner_routes WHERE route_key = ${routeKey}`;
+      assert.isNotNull(rows[0]?.done_at);
+    }).pipe(
+      Effect.provide(testLayer(prThreads, slowStore)),
+      Effect.ensuring(Deferred.succeed(resume, undefined)),
+    );
+  }),
 );

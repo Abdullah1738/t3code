@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.abdullah.mac-ssd-read-probe</string>
+<!-- Same granted identity as real jobs; thread count catches approval jams.
+     Dedicated cadence avoids CPU inventory blocked forever reaping lsof in U. -->
+<key>ProgramArguments</key><array><string>/bin/zsh</string><string>-fc</string><string>exec /usr/bin/python3 "$@"</string><string>--</string><string>__HOME__/.local/lib/mac-logging/ssd_probe.py</string><string>sample</string></array>
+<key>StartInterval</key><integer>60</integer>
+<key>RunAtLoad</key><true/>
+<!-- Leave timed-out children alive so persisted identities suppress new waiters. -->
+<key>AbandonProcessGroup</key><true/>
+<key>ProcessType</key><string>Standard</string>
+</dict></plist>

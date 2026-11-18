@@ -969,8 +969,15 @@ class SummaryAndHintTests(unittest.TestCase):
 
 class CliStepTests(Isolated):
 
-    def run_cli(self, argv, code, log_text='', recorded=None):
+    def run_cli(self, argv, code, log_text='', recorded=None, *, setup_history=False):
         a = cli.build_parser().parse_args(['run'] + argv)
+
+        def start(rn):
+            result = fake_start(rn)
+            if setup_history:
+                rn.register_pending()
+                rn.record(box_id=rn.box, process_id=rn.pid, command_id='setup-command', status='running')
+            return result
 
         def fake_follow(box, pid, log_path, echo=True, run_id=None, start_offsets=(0, 0)):
             if log_path:
@@ -978,7 +985,9 @@ class CliStepTests(Isolated):
             return code
 
         err = io.StringIO()
-        with patch.object(runs.Runner, 'start', fake_start), patch.object(runs, 'follow', fake_follow), \
+        with patch.object(runs.Runner, 'start', start), patch.object(runs, 'follow', fake_follow), \
+                patch.object(runs.api, 'history_logs', return_value=dict(data=log_text, done=True)), \
+                patch.object(runs.lease, 'idle_ttl'), \
                 patch.object(runs, 'recorded_exit', return_value=recorded), contextlib.redirect_stderr(err):
             rc = cli.cmd_run(a, self.me)
         return rc, err.getvalue().strip().splitlines()
@@ -1002,6 +1011,16 @@ class CliStepTests(Isolated):
         self.assertEqual(rc, 90)
         self.assertIn('offbox: steps incomplete: got 0 of 1 step results; remote exit unknown', lines)
         self.assertNotIn('offbox: remote exit 0', lines)
+
+    def test_quint_setup_failure_keeps_99_without_step_markers(self):
+        event = 'offbox-quint: {"attempt":"result","result":"failed","duration_s":1,"trigger":"command"}\n'
+        rc, lines = self.run_cli(['--step', 'quint --version'], 99, event)
+        self.assertEqual(rc, 99, lines)
+        self.assertFalse(any('steps incomplete' in line for line in lines), lines)
+        # A command cannot evade missing-step handling by printing setup text.
+        rc, _ = self.run_cli(['--step', 'quint --version'], 99,
+                             'offbox-command-started: run-test\n' + event)
+        self.assertEqual(rc, 90)
 
     def test_foreground_complete_steps_keep_zero(self):
         rc, lines = self.run_cli(['--step', 'true'], 0, 'offbox step 1 rc=0: true\n')
@@ -1116,7 +1135,7 @@ class CliStepTests(Isolated):
 
     def test_setup_97_maps_to_infra_90(self):
         rc, lines = self.run_cli(['--no-fallback', 'go', 'test', './...'], 97,
-                                 'offbox: Go repair: lock\noffbox-setup-failed\n')
+                                 'offbox: Go repair: lock\noffbox-setup-failed\n', setup_history=True)
         self.assertEqual(rc, 90)
         self.assertIn('offbox: box setup failed (exit 97), not your command', lines)
 
@@ -1127,7 +1146,7 @@ class CliStepTests(Isolated):
 
     def test_repo_setup_98_maps_to_infra_90(self):
         rc, lines = self.run_cli(['--no-fallback', '--step', 'java -version'], 98,
-                                 'offbox-repo-setup-failed\n')
+                                 'offbox-repo-setup-failed\n', setup_history=True)
         self.assertEqual(rc, 90)
         self.assertIn('offbox: repo toolchain setup failed (exit 98), not your command', lines)
 

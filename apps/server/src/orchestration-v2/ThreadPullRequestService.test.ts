@@ -366,7 +366,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
     ),
   );
 
-  it.effect("periodic sweeps read only unsettled threads once backfill is done", () =>
+  it.effect("periodic sweeps launch no git for 57 settled or archived worktrees", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const settled = {
@@ -374,7 +374,22 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           branch: "feature/settled",
           settledOverride: "settled" as const,
           settledAt: NOW,
+          branchPullRequest: {
+            projectId: ProjectId.make("project-1"),
+            repository: "acme/project",
+            number: 42,
+            url: "https://github.com/acme/project/pull/42",
+          },
         };
+        const idle = Array.from({ length: 57 }, (_, i) => ({
+          ...settled,
+          id: ThreadId.make(`idle-${i}`),
+          branch: `feature/idle-${i}`,
+          worktreePath: `/workspace/worktrees/idle-${i}`,
+          archivedAt: i % 2 ? NOW : null,
+        }));
+        let gitCalls = 0;
+        let identityCalls = 0;
         const activation = yield* Deferred.make<void>();
         const reads = yield* Queue.unbounded<{
           readonly location?: string;
@@ -388,16 +403,40 @@ describe("ThreadPullRequestServiceV2 reads", () => {
               Queue.offer(reads, options ?? {}).pipe(
                 Effect.as({
                   snapshotSequence: 1,
-                  threads: options?.unsettledOnly ? [] : [settled],
+                  threads: options?.unsettledOnly ? [] : idle,
                 }),
               ),
           }),
           Layer.mock(ProjectStore.ProjectStoreV2)({
-            listShells: () => Effect.succeed([]),
+            listShells: () =>
+              Effect.succeed([
+                {
+                  id: ProjectId.make("project-1"),
+                  title: "Project",
+                  workspaceRoot: "/workspace/project",
+                  defaultModelSelection: null,
+                  scripts: [],
+                  repositoryIdentity: null,
+                  createdAt: "2026-08-01T00:00:00.000Z",
+                  updatedAt: "2026-08-01T00:00:00.000Z",
+                },
+              ]),
           }),
-          Layer.mock(GitManager.GitManager)({}),
+          Layer.mock(GitManager.GitManager)({
+            branchPullRequest: () =>
+              Effect.sync(() => {
+                gitCalls++;
+                return null;
+              }),
+          }),
           Layer.mock(PullRequestService.PullRequestService)({}),
-          Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({}),
+          Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+            resolve: () =>
+              Effect.sync(() => {
+                identityCalls++;
+                return null;
+              }),
+          }),
           Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
           Layer.succeed(
             Crypto.Crypto,
@@ -417,11 +456,15 @@ describe("ThreadPullRequestServiceV2 reads", () => {
             unsettledOnly: false,
           });
           yield* service.drain;
+          expect(gitCalls).toBe(0);
+          expect(identityCalls).toBe(0);
           yield* TestClock.adjust("1 minute");
           expect(yield* Queue.take(reads)).toEqual({
             unsettledOnly: true,
           });
           yield* service.drain;
+          expect(gitCalls).toBe(0);
+          expect(identityCalls).toBe(0);
         }).pipe(Effect.provide(layerDependencies));
       }),
     ),

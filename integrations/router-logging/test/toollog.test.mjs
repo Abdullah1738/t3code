@@ -135,10 +135,29 @@ test('JS cap keeps errors, emits one cap marker, and expires only day files', t=
   fs.writeFileSync(join(root,'2000-01-01.ndjson'),'old'); fs.writeFileSync(join(root,'rollup-2000-01-01.json'),'old');fs.writeFileSync(join(root,'keep'),'keep');
   emit('test','fixture.first');
   assert.ok(!fs.existsSync(join(root,'2000-01-01.ndjson')));assert.ok(!fs.existsSync(join(root,'rollup-2000-01-01.json')));assert.ok(fs.existsSync(join(root,'keep')));
-  const path=join(root,new Date().toISOString().slice(0,10)+'.ndjson');fs.truncateSync(path,50*1024*1024);
+  const path=join(root,new Date().toISOString().slice(0,10)+'.ndjson');fs.truncateSync(path,200*1024*1024);
   emit('test','fixture.drop');emit('test','fixture.drop');emit('test','fixture.error',{kind:'error',error:{tag:'http_502'}});
-  const fd=fs.openSync(path,'r'),buf=Buffer.alloc(4096);const n=fs.readSync(fd,buf,0,4096,50*1024*1024);fs.closeSync(fd);const tail=buf.subarray(0,n).toString();
+  const fd=fs.openSync(path,'r'),buf=Buffer.alloc(4096);const n=fs.readSync(fd,buf,0,4096,200*1024*1024);fs.closeSync(fd);const tail=buf.subarray(0,n).toString();
   assert.equal(tail.split('log.cap').length-1,1);assert.ok(!tail.includes('fixture.drop'));assert.ok(tail.includes('fixture.error'));
+});
+test('JS 200 MiB cap accepts a line just below it and rejects lines above it', async t=>{
+  for (const offset of [-1, 1]) {
+    await t.test(`offset ${offset}`, t=>{
+    const {root}=fixture(t);
+    const day=new Date().toISOString().slice(0,10),path=join(root,day+'.ndjson');
+    fs.writeFileSync(path,'');fs.truncateSync(path,200*1024*1024+offset);
+    emit('test','fixture.first');
+    assert.equal(fs.existsSync(join(root,'.cap-'+day)),offset>=0);
+    emit('test','fixture.drop');emit('test','fixture.drop');
+    emit('test','fixture.error',{kind:'error',error:{tag:'http_502'}});
+    const fd=fs.openSync(path,'r'),buf=Buffer.alloc(4096);
+    const n=fs.readSync(fd,buf,0,buf.length,200*1024*1024+offset);fs.closeSync(fd);
+    const tail=buf.subarray(0,n).toString();
+    assert.equal(tail.split('log.cap').length-1,1);
+    assert.equal(tail.includes('fixture.first'),offset<0);
+    assert.ok(!tail.includes('fixture.drop'));assert.ok(tail.includes('fixture.error'));
+    });
+  }
 });
 
 test('provider availability analytics retain timings and counters but exclude private values', () => {

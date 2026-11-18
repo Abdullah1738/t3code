@@ -22,6 +22,7 @@ import {
 import { ChatFileAttachment, ChatImageAttachment } from "../chatAttachment.ts";
 import { ProviderInstanceId } from "../providerInstance.ts";
 import { ModelSelection } from "../modelSelection.ts";
+import { OrchestrationV2RestartAdmissionFailure } from "../orchestrationV2.ts";
 
 const kanbanId = <Brand extends string>(brand: Parameters<typeof Schema.brand<Brand>>[0]) =>
   TrimmedNonEmptyString.pipe(Schema.brand<Brand>(brand));
@@ -499,6 +500,7 @@ export const KANBAN_ASK_VERDICTS = [
   "acknowledged",
   "handed",
   "dropped",
+  "auto_closed",
 ] as const;
 export const KanbanAskVerdict = Schema.String;
 export type KanbanAskVerdict = string;
@@ -558,6 +560,7 @@ export const KanbanOwnerAsk = Schema.Struct({
         Schema.Literals(["approve", "pick", "draft", "action", "input", "notice"]),
       ),
       openAsksAtCreation: Schema.optional(NonNegativeInt),
+      openNoticesAtCreation: Schema.optional(NonNegativeInt),
       notified: Schema.optional(
         Schema.Struct({
           in_app: Schema.optional(IsoDateTime),
@@ -600,6 +603,8 @@ export const KanbanOwnerAsk = Schema.Struct({
   expiresAt: Schema.optional(IsoDateTime),
   /** Asks with the same key on a board are the same shape and can be answered together. */
   batchKey: Schema.optional(Schema.String),
+  /** The subtask a gate-cleared notice belongs to. Older notices use their title. */
+  subtaskId: Schema.optional(Schema.String),
   /** Bumped every time the agent edits the open ask. Absent means 0. */
   revision: Schema.optional(NonNegativeInt),
   revisedAt: Schema.optional(IsoDateTime),
@@ -1922,6 +1927,9 @@ export const KanbanCardEvent = Schema.Struct({
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
   body: Schema.NullOr(Schema.String),
+  runId: Schema.optionalKey(Schema.String),
+  admission: Schema.optionalKey(OrchestrationV2RestartAdmissionFailure),
+  failedThreadId: Schema.optionalKey(ThreadId),
   /** Caller of a system-authored evaluator admission sighting. */
   sourceThreadId: Schema.optionalKey(ThreadId),
   /** Original delivery to reconcile when assignment inputs have since changed. */
@@ -2090,6 +2098,7 @@ export type KanbanStandingApproval = typeof KanbanStandingApproval.Type;
 export const KanbanRelease = Schema.Struct({
   service: Schema.optional(Schema.String),
   postHoc: Schema.optional(Schema.Boolean),
+  buildCommit: Schema.optional(Schema.String),
   boardId: KanbanBoardId,
   cardId: KanbanCardId,
   cardNumber: Schema.Number,
@@ -2119,6 +2128,8 @@ export const KanbanBoard = Schema.Struct({
   releaseLedger: Schema.optional(Schema.Array(KanbanRelease)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  /** Evidence from unmarked history is reported without becoming gate input. */
+  historicalReleaseLedger: Schema.optional(Schema.Array(KanbanRelease)),
   standingApprovals: Schema.Array(KanbanStandingApproval).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
@@ -2253,6 +2264,8 @@ export const KanbanParticipant = Schema.Struct({
   typingUntil: Schema.NullOr(IsoDateTime),
   /** Agent was asked to reply here; "nudged" after one reminder at turn end. */
   owes: Schema.NullOr(Schema.Literals(["asked", "nudged"])),
+  /** The delivered ask stays fixed when reading later messages advances lastReadSeq. */
+  askedSeq: Schema.optional(NonNegativeInt),
   /** A turn-end reminder held by the board pause, to be retried after release. */
   deferred: Schema.optional(Schema.Boolean),
   /** Stable ID for retrying one deferred reminder after an ambiguous send. */
@@ -2516,6 +2529,8 @@ export type KanbanBoardSummary = typeof KanbanBoardSummary.Type;
  * resends neither board pictures nor every thread id.
  */
 export const KanbanBoardListEntry = Schema.Struct({
+  // A content-free entry keeps failed thread deletions hidden until cleanup commits.
+  purged: Schema.optional(Schema.Boolean),
   boardId: KanbanBoardId,
   board: Schema.NullOr(KanbanBoard),
   needsOwner: NonNegativeInt,
@@ -2528,6 +2543,11 @@ export type KanbanBoardListEntry = typeof KanbanBoardListEntry.Type;
 export const KanbanChange = Schema.Union([
   // `by`: who saved the card, when the save came from a move. Script listeners need it to skip a script's own moves.
   Schema.TaggedStruct("card", { card: KanbanCard, by: Schema.optional(KanbanActor) }),
+  Schema.TaggedStruct("purgeThreads", {
+    boardId: KanbanBoardId,
+    threadIds: Schema.Array(ThreadId),
+  }),
+  Schema.TaggedStruct("boardRemoved", { boardId: KanbanBoardId }),
   Schema.TaggedStruct("cardRemoved", { cardId: KanbanCardId }),
   Schema.TaggedStruct("goal", { goal: KanbanGoal }),
   Schema.TaggedStruct("pools", { pools: Schema.Array(KanbanPool) }),

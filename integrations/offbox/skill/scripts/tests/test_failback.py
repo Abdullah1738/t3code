@@ -171,15 +171,25 @@ class FailbackTests(Isolated):
                 self.assertEqual(self.output.getvalue().count('no time limit'), 1)
                 self.assertNotIn('600s', self.output.getvalue())
 
-    def test_missing_source_pinned_boat_still_refuses_without_probing(self):
+    def test_missing_source_pinned_boat_queues_explicit_sources_without_probing(self):
         self.full_pool()
         for label, options in SOURCE_REQUESTS:
             with self.subTest(source=label), patch.dict(os.environ, {home.FAILOVER_ENV: ''}), \
                     patch.object(home, 'probe') as probe, patch.object(lease, 'acquire_private') as create:
-                with self.assertRaisesRegex(common.OffboxError, "waiting can't help") as error:
+                self.clock.t = 1000
+                self.output.seek(0)
+                self.output.truncate()
+                with self.assertRaises(common.OffboxError) as error:
                     pool.acquire(self.me, run_id='mine', **options)
-                self.assertEqual(error.exception.code, 2)
-                self.assertEqual(self.clock.t, 1000)
+                if options.get('fresh'):
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertEqual(self.clock.t, 1000)
+                    self.assertIn('Run without --fresh', str(error.exception))
+                else:
+                    self.assertIsInstance(error.exception, pool.PoolBusyError)
+                    self.assertEqual(error.exception.code, 92)
+                    self.assertEqual(self.clock.t, 1600)
+                    self.assertIn('waiting for an idle box to recycle', self.output.getvalue())
                 probe.assert_not_called()
                 create.assert_not_called()
                 self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_waiters').fetchone()[0], 0)

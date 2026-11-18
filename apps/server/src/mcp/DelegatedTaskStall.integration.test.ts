@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as DelegatedTaskProgressGuard from "../orchestration-v2/DelegatedTaskProgressGuard.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -49,6 +50,7 @@ import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -57,11 +59,17 @@ it.effect.each([
   "silent",
   "post_tool_recovery",
   "first_event_recovery",
-  "first_event_recovery_claude",
+  "first_event_recovery_terminal_completed",
+  "first_event_recovery_terminal_cancelled",
+  "first_event_recovery_terminal_failed",
+  "first_event_adapter_owned_claude",
   "first_event_recovery_continuation_queued",
   "first_event_recovery_continuation_preparing",
   "first_event_recovery_continuation_starting",
-  "first_event_recovery_race_claude",
+  "first_event_recovery_network_continuation_queued",
+  "first_event_recovery_network_continuation_preparing",
+  "first_event_recovery_network_continuation_starting",
+  "post_tool_adapter_owned_claude",
   "post_tool_recovery_race",
   "first_event_recovery_race",
   "reasoning_no_recovery",
@@ -81,7 +89,15 @@ it.effect.each([
   "ended_run",
   "new_current_run",
 ] as const)("delegated stall commit: %s", (race) => {
-  const recovering = race.startsWith("post_tool") || race.startsWith("first_event");
+  const recovering =
+    (race.startsWith("post_tool") || race.startsWith("first_event")) && !race.endsWith("claude");
+  const interruptedStatus = race.endsWith("_completed")
+    ? "completed"
+    : race.endsWith("_cancelled")
+      ? "cancelled"
+      : race.endsWith("_failed")
+        ? "failed"
+        : "interrupted";
   const recoveryRace = race.includes("_race");
   const firstEvent = race.startsWith("first_event");
   const postTool = race.startsWith("post_tool");
@@ -183,7 +199,7 @@ it.effect.each([
                       runAttemptId: entry.turn.attemptId,
                       nativeTurnRef: null,
                       ordinal: entry.turn.providerTurnOrdinal,
-                      status: "interrupted",
+                      status: interruptedStatus,
                       startedAt: now,
                       completedAt: yield* DateTime.now,
                     },
@@ -194,9 +210,19 @@ it.effect.each([
                     providerThreadId: entry.turn.providerThread.id,
                     providerTurnId,
                     runOrdinal: entry.turn.runOrdinal,
-                    status: "interrupted",
-                    failure: null,
                     threadDisposition: "reusable",
+                    ...(interruptedStatus === "failed"
+                      ? {
+                          status: "failed" as const,
+                          failureItemOrdinal: 101,
+                          failure: {
+                            class: "provider_error" as const,
+                            message: "Old attempt failed during restart",
+                            code: null,
+                            retryable: false,
+                          },
+                        }
+                      : { status: interruptedStatus, failure: null }),
                   });
                 }),
               respondToRuntimeRequest: () => Effect.die("unused"),
@@ -413,6 +439,37 @@ it.effect.each([
         assert.equal(before.lastProgressAt, DateTime.formatIso(now));
         yield* TestClock.adjust("16 minutes");
         let stalledAt = now;
+        if (!codex && (firstEvent || postTool)) {
+          const threads = yield* ThreadManagementService.ThreadManagementService;
+          const rejected = yield* threads
+            .sendToThread({
+              threadId: task.childThreadId!,
+              projectId: ProjectId.make("project:task-cancel"),
+              commandId: CommandId.make("duplicate-claude-silent-recovery"),
+              messageId: MessageId.make("duplicate-claude-silent-recovery"),
+              mode: "restart",
+              createdBy: "system",
+              creationSource: "server",
+              modelSelection,
+              text: "Continue",
+              attachments: [],
+              delegatedTaskStallRecovery: {
+                phase: postTool ? "post_tool" : "first_event",
+                lastProgressAt: DateTime.formatIso(now),
+                attemptId: childRun.activeAttemptId,
+              },
+            })
+            .pipe(Effect.result);
+          assert.equal(rejected._tag, "Failure");
+          assert.equal(interrupts, 0);
+          yield* guard.check();
+          yield* worker.drain();
+          const current = yield* orchestrator.getThreadProjection(task.childThreadId!);
+          assert.lengthOf(current.attempts, 1);
+          assert.isUndefined(current.runs[0]!.delegatedTaskStallRecovery);
+          assert.equal(interrupts, 1);
+          return;
+        }
         if (recovering && recoveryRace) {
           const sink = yield* EventSink.EventSinkV2;
           const originalCommit = sink.commitCommand;
@@ -452,32 +509,68 @@ it.effect.each([
           return;
         }
         if (recovering) {
-          const running = yield* turnRunning();
-          yield* guard.check();
-          assert.isDefined(
-            (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs[0]!
-              .delegatedTaskStallRecovery,
-          );
-          yield* worker.drain();
-          yield* Fiber.join(running);
-          const recovered = (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs[0]!;
-          assert.equal(recovered.id, childRun.id);
-          assert.equal(recovered.providerThreadId, childRun.providerThreadId);
-          assert.notEqual(recovered.activeAttemptId, childRun.activeAttemptId);
-          assert.equal(
-            recovered.delegatedTaskStallRecovery?.phase,
-            postTool ? "post_tool" : "first_event",
-          );
-          const restarted = turns.findLast(
-            (entry) => entry.turn.threadId === task.childThreadId,
-          )!.turn;
-          assert.deepEqual(restarted.modelSelection, childRun.modelSelection);
-          assert.include(
-            restarted.message.text,
-            postTool ? "Write your final report now from what you have." : "Review the change",
-          );
+          const networkContinuation = race.includes("_network_continuation_");
+          let recovered = childRun;
+          if (!networkContinuation) {
+            const running = yield* turnRunning();
+            yield* guard.check();
+            assert.isDefined(
+              (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs[0]!
+                .delegatedTaskStallRecovery,
+            );
+            yield* worker.drain();
+            yield* Fiber.join(running);
+            const restartedProjection = yield* orchestrator.getThreadProjection(
+              task.childThreadId!,
+            );
+            recovered = restartedProjection.runs[0]!;
+            assert.equal(recovered.status, "running");
+            assert.lengthOf(restartedProjection.attempts, 2);
+            assert.equal(
+              restartedProjection.attempts.find(
+                (attempt) => attempt.id === childRun.activeAttemptId,
+              )?.status,
+              "superseded",
+            );
+            assert.equal(
+              restartedProjection.providerTurns.find(
+                (turn) => turn.runAttemptId === childRun.activeAttemptId,
+              )?.status,
+              interruptedStatus,
+            );
+            assert.equal(recovered.id, childRun.id);
+            assert.equal(recovered.providerThreadId, childRun.providerThreadId);
+            assert.notEqual(recovered.activeAttemptId, childRun.activeAttemptId);
+            assert.equal(
+              recovered.delegatedTaskStallRecovery?.phase,
+              postTool ? "post_tool" : "first_event",
+            );
+            const restarted = turns.findLast(
+              (entry) => entry.turn.threadId === task.childThreadId,
+            )!.turn;
+            assert.deepEqual(restarted.modelSelection, childRun.modelSelection);
+            assert.include(
+              restarted.message.text,
+              postTool ? "Write your final report now from what you have." : "Review the change",
+            );
+          }
           if (race.includes("_continuation_")) {
             const queued = race.endsWith("queued");
+            const continuationSource: typeof recovered = networkContinuation
+              ? {
+                  ...recovered,
+                  transientRecovery: {
+                    firstError: {
+                      class: "transport_error" as const,
+                      category: "transient" as const,
+                      code: "claude_network_error",
+                      retryable: true,
+                      message: "Connection dropped (ECONNRESET)",
+                    },
+                    since: DateTime.formatIso(yield* DateTime.now),
+                  },
+                }
+              : recovered;
             const sink = yield* EventSink.EventSinkV2;
             const bootCommandId = CommandId.make("command:runtime-reconcile:startup:boot");
             yield* sink.writeWithEffects({
@@ -490,7 +583,7 @@ it.effect.each([
                   runId: recovered.id,
                   occurredAt: yield* DateTime.now,
                   payload: {
-                    ...recovered,
+                    ...continuationSource,
                     status: queued ? "waiting" : "interrupted",
                     completedAt: yield* DateTime.now,
                     ...(queued
@@ -540,8 +633,9 @@ it.effect.each([
             assert.equal(continuation.delegatedTaskId, recovered.delegatedTaskId);
             assert.deepEqual(
               continuation.delegatedTaskStallRecovery,
-              recovered.delegatedTaskStallRecovery,
+              continuationSource.delegatedTaskStallRecovery,
             );
+            assert.deepEqual(continuation.transientRecovery, continuationSource.transientRecovery);
             return;
           }
           stalledAt = yield* DateTime.now;

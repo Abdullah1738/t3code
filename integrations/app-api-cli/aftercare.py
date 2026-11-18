@@ -184,7 +184,7 @@ def context(case):
             'A wake only means it is time to try again; it is not proof anything happened. '
             f'Do it in the {app} app as its skill says. If the app already shows a {case["kind"]} for this, close the case '
             'with that reference instead of submitting another. Never place, cancel or change an order. '
-            'Phone work waits while ~/.local/share/phone-lock/priority-hold exists; if it does, move --next-at an hour on. '
+            'Phone work waits while `ph hold status --json` shows present true; if it does, move --next-at an hour on. '
             f'Before the final submit check: {"; ".join(checks)}. '
             'If it still cannot be done that way, do not submit: run '
             f'`order-watch aftercare update --id {cid} --blocker "<what you saw>" --next-at <ISO next try>` and end the turn '

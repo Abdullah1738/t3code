@@ -7,6 +7,7 @@ DMG=${1:-$(ls -t $REL/Robob-*-arm64.dmg | head -1)}
 echo "installing $DMG"
 source "${0:A:h}/../../../integrations/robob-guard/scripts/install-hold.zsh"
 robob_hold_begin install-robob || exit $?
+robob_quit_reason install-robob || exit $?
 osascript -e 'tell application "Robob" to quit' 2>/dev/null || true
 for i in {1..30}; do pgrep -xq Robob || break; sleep 1; done
 pgrep -xq Robob && { echo "Robob still running; quit it and rerun"; exit 1; }

@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).with_name('fixtures')
 DAY = '2026-11-12'
 NEW_FIELDS = ('errorsByComponent', 'failureShare', 'topErrorSamplesByComponent',
-              'topOrderFailuresByComponent', 'pollsByMerchant')
+              'topOrderFailuresByComponent', 'pollsByMerchant', 'canReportByOutcome')
 
 
 def load(label, path):
@@ -104,6 +104,23 @@ class OrdersRollupTests(unittest.TestCase):
                 serialized = json.dumps(result)
                 for private in ('private-order', 'private-address', 'private-card', 'private-message'):
                     self.assertNotIn(private, serialized)
+
+    def test_can_report_counts_and_outcomes_in_every_reader(self):
+        self.write([{'ts': DAY + 'T12:00:00Z', 'tool': 'orders', 'component': 'order-watch',
+                     'name': 'order_watch.can_report', 'kind': 'event', 'ok': ok,
+                     'props': {'outcome': 'success' if ok else 'refused',
+                               'refusal': 'none' if ok else 'not_registered',
+                               'untrackable': False, 'eta_given': ok}}
+                    for ok in (True, False, False)])
+        for reader in READERS:
+            with self.subTest(reader=reader.__name__):
+                result = self.rollup(reader)
+                self.assertEqual(result['countsByName'], {'order_watch.can_report': 3})
+                self.assertEqual(result['canReportByOutcome'], {'success': 1, 'refused': 2})
+                self.assertEqual(result['total'], 3)
+                self.assertEqual(result['okRate'], 1 / 3)
+                if reader is not SHARED:
+                    self.assertEqual(result['invalidLines'], 0)
 
     def test_shared_sampling_weights_apply_to_component_denominators_and_timings(self):
         rows = self.fixture()
@@ -194,7 +211,7 @@ class OrdersRollupTests(unittest.TestCase):
         for reader in READERS:
             result = self.rollup(reader)
             for key in NEW_FIELDS:
-                self.assertEqual(result[key], {})
+                self.assertEqual(result[key], {'success': 0, 'refused': 0} if key == 'canReportByOutcome' else {})
 
     def test_per_order_failure_top_five_and_amazon_poll_share_do_not_duplicate_errors(self):
         def row(order, *, component='order-watch', name='track.poll', ok=False, **props):

@@ -331,6 +331,10 @@ export const layer: Layer.Layer<
             Effect.catchCause(() => Effect.succeed(input.inheritedBackgroundTurnItems)),
           ),
         shouldStartProviderTurn: () => isCurrentAttemptInStatus("running"),
+        loadRunSettlement: () =>
+          projectionStore
+            .getThreadRecords(input.threadId, ["runs"], { runIds: [input.runId] })
+            .pipe(Effect.map(({ runs }) => runs[0])),
         loadRunCancelMetadata: () => loadRunCancelMetadata(input.threadId, input.runId),
         loadRunInterruptReason: () =>
           projectionStore
@@ -2309,6 +2313,7 @@ export const layer: Layer.Layer<
             loadClaudeRefusal: runControls.loadClaudeRefusal,
             loadRecoveryAdmission: runControls.loadRecoveryAdmission,
             shouldFinalizeRun: runControls.shouldFinalizeRun,
+            loadRunSettlement: runControls.loadRunSettlement,
             hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
             loadRunInterruptReason: runControls.loadRunInterruptReason,
             loadRunCancelMetadata: runControls.loadRunCancelMetadata,

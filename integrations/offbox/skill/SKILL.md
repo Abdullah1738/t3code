@@ -80,7 +80,7 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 
 Every model request resends your whole context. Start long or queued runs with `offbox run --bg -- <cmd>`, note the run id, hand the wait off using your harness’s route below, and **end your turn**. The waiter covers pool queueing, first sync, execution and `--pull` artifacts. Its completion wakes you; `offbox wait` prints the run id, backend, exit code, log path and a short log tail. Keep foreground `offbox run -- <cmd>` for short runs.
 
-- **Codex:** delegate the watcher brief below with `delegate_task`, async, target `providerInstanceId: "claudeAgent"`, `model: "claude-sonnet-5-5"`, `options: {effort: "medium"}`, then end your turn. The child waits with blocking `offbox wait <run-id> --timeout 570` calls and a 600000 ms shell timeout; it replies once after the run ends. Medium is the owner’s choice for watchers: the delegation note "Standard mode only ... effort max" only rules out fast mode, it does not ask for max here. These ids are current, so skip `orchestrator_capabilities` unless the call is rejected. While it runs, do not check `task_status` or the run's logs. Until #1626 is fixed, a Claude child's parent notification can carry its first-turn launch text. On a completion notification, read `task_status` once. After a complete response confirms the task is terminal, `workState: result_available` and `hasPendingChildRuns: false`, consume `latestTerminalSummary ?? summary` (the latest field is null when it duplicates `summary`). First-turn launch text is not a run result even if marked terminal: require the run id, exit code and log path from the watcher. If work is pending, end your turn and await completion; do not loop status calls.
+- **Codex:** delegate the watcher brief below with `delegate_task`, async, target `providerInstanceId: "claudeAgent"`, `model: "claude-sonnet-5-5"`, `options: {effort: "medium"}`, then end your turn. The child waits with blocking `offbox wait <run-id> --timeout 570` calls and a 600000 ms shell timeout; it replies once after the run ends. Medium is the owner’s choice for watchers: the delegation note "Standard mode only ... effort max" only rules out fast mode, it does not ask for max here. These ids are current, so skip `orchestrator_capabilities` unless the call is rejected. While it runs, do not check `task_status` or the run's logs. Its completion notification carries the watcher's final reply (run id, exit code, pass or fail, log path): use it as the run's result without reading `task_status` (#1626 is fixed).
 - **Claude Code:** use Bash `run_in_background: true` for `offbox wait <run-id> --timeout 1500`, with the run id in `description`. End your turn. The `<task-notification>` has the description, exit code and `output-file`, but no output tail: Read that file once. Exit 124 means only that the wait expired; start another 1500-second background waiter and end your turn again. If a T3 call from the wake turn returns `parent_not_active`, retry that call once.
 - **One long local waiter in Claude Code** (not `offbox wait`, e.g. a FIFO or result-file watcher): start it once with Bash `run_in_background: true, timeout: 7200000`. A foreground command that gets moved to the background only gets the 30-minute default and is then killed. Don't start a second reader while it runs; wait for its completion notification.
 - **OpenCode:** native shell background launch was observed, but its completion wake has not been captured. Until verified, use `offbox wait <run-id> --timeout 540` in a shell call with a timeout of at least 550 seconds. On exit 124, the run continues: use another long bounded wait when you need its result. Do not shorten this to a 45-second loop.
@@ -179,7 +179,8 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   A missing node_modules bin (`command not found`, exit 127, or `not found` under npm/pnpm, exit 1/254) can mean
   that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
   separate runs can reuse deps while no box switch is reported.
-- Node version: offbox selects Node from the repo pin (`.nvmrc`/`.node-version`/`engines.node`), then the CI setup-node version, then the nvm default (or newest installed nvm Node, otherwise the box default), and prints its choice, provisioning a missing pinned version or stopping with exit 99.
+- Node version: offbox selects Node from the repo pin (`.nvmrc`/`.node-version`/`engines.node`), then the CI setup-node version, then the nvm default (or newest installed nvm Node, otherwise the box default), and prints its choice, provisioning a missing pinned version or stopping with exit 99; an open range pin (e.g. engines >=22) is narrowed to the CI setup-node version when that fits.
+- Bun-using runs match the Mac's installed Bun exactly, unless `.bun-version` or `packageManager: "bun@X.Y.Z"` pins it; `OFFBOX_BUN_VERSION=X.Y.Z` overrides once. Offbox installs a missing version and logs `offbox: bun X.Y.Z (from mac; box had …; box|cached|installed in Ns)`; without a working Mac Bun it uses 1.4.1.
 - In JS repos, runs put the current directory's and ancestor `node_modules/.bin` directories up to the repo root first on PATH, so repo-pinned `vp`/`tsc-rs` win over global copies, including after `cd apps/server`. On a fresh checkout or box, install with the repo's package manager first (see **Install with the repo's package manager**); `vp i` itself needs vite-plus installed.
 - pnpm: repos with `pnpm-lock.yaml` use `packageManager` (including explicit pnpm 11+) > CI `PNPM_VERSION` / `pnpm/action-setup` version > lockfile compatibility (9.0 → pnpm 10; fallback never 11+). A verified package in the box-local cache supplies a PATH shim, bypassing Corepack defaults. `offbox: pnpm vX (<source>)` records the selection; activation failure exits 99. Matching installed/cached toolchains make no network requests. Downloads retry all errors twice with 20 s connect, <30 KB/s for 60 s stall, and 600 s per attempt limits.
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has
@@ -226,11 +227,14 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`). Under a gitignored dir such as `tmp/`, only that path mirrors; the box's other files in that dir are kept |
 | `--no-sync` | run without syncing (box already has what you need) |
 | `--bg` | queue in a detached client and return a run id at once, even while the pool is full; then hand the wait off using your harness’s route and end your turn (see **Waiting for a run**). It collects `--pull` artifacts, prints a final summary and log tail, and exits with the run’s code. Client diagnostics: `logs/<id>.client.log` in the offbox state directory. |
-| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. `--fresh` doesn't always mean a new box: in the repository pool it can still reuse a pool box that was itself created fresh. In a full pool with no box of that kind, it stops at once (exit 2) instead of queueing. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
+| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates. A full pool queues `--template`/`--base` runs, then detaches and stops (never deletes) an idle box from another source to make room. `--fresh` can still reuse a pool box created fresh; it exits 2 when a full pool has no fresh-source member. It isn't a way off a bad box: offbox now stops broken boxes itself, and `offbox release <id>` stops one by hand. |
 | `--no-fallback` | return 90/91 instead of falling back to a local run |
 | `--remote` | same as `--no-fallback` (kept for old commands; every run uses a box now) |
 | `--step CMD` (repeatable) | run several checks with a real exit code each (see Fallback and exit codes) |
 | `--no-retry` | home server only: if the server restarts under this run, don't run it again (exit 94). For commands that are not safe to run twice (a deploy, a migration, anything that sends) |
+
+Pulls never overwrite a file changed locally after the push; the pulled copy goes to `<path>.offbox-pulled` instead.
+`offbox wait` returns only after pulls finish and prints their state.
 
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
 For long gates, use `offbox run --bg …` and the harness route in **Waiting for a run**; end your turn instead of polling. Do not rely on setsid or detached tmux to protect a foreground client from interruption.
@@ -399,7 +403,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   A run missing any planned step result exits 90 (`steps incomplete`), except a confirmed `offbox kill` returns 143 with the stopped step. Rerun the checks before treating them as passed.
   `--step` plus a trailing `-- cmd` is a usage error (2). Exit 1 whose last pipeline stage is grep gets a hint line:
   it may mean "no match" or an earlier stage failed.
-- **99** = the repo-pinned Node or pnpm could not be provided or activated. The command never started; fix the pin or retry after the download failure. Offbox does not run on the box default instead.
+- **99** = the selected Node, pnpm or Bun could not be provided or activated. The command never started; fix the pin or retry after the download failure. Offbox does not run on the box default instead.
 - **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.
@@ -445,7 +449,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 
 ## Disk space
 
-Offbox records /tmp, /var/tmp and workspace filesystem space before and after each run. Below 1 GiB free in /tmp it warns; below 256 MiB it refuses the command with **90**. On home boxes, an idle box first attempts safe cleanup of stale user-owned temp files. Critically full boxes with concurrent runs are refused without cleanup. The pool picker does not automatically move the run to another box.
+Offbox records /tmp, /var/tmp and workspace filesystem space before and after each run. Below 1 GiB free in /tmp it warns; below 256 MiB it refuses the command with **90**. A full box (workspace or /tmp) is cleaned once or kept out of the pool, and the run moves once to another box unless `--no-retry` is set; after manual cleanup, `offbox box release-disk-full <box>` returns it to the pool.
 
 After a nonzero exit, ENOSPC output or less than 64 MiB free on a measured filesystem marks the result `infra_failure: "enospc"` and returns **90** from run/wait/logs. The command's original exit and the start/end measurements stay in the state record and analytics. These test results are invalid; rerun after space is available. Successful commands retain exit 0.
 
@@ -455,7 +459,7 @@ The home reaper runs only below 50% temp space free. It preserves live-held file
 
 Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UTC). Run events are `run.request`, `run.queue`, `run.lease`, `run.sync`, `run.command`, `run.pull`, `run.end`, `run.invocation` and `run.error`. Other events include `backend.failover`, `home.probe`, `pool.snapshot`, `gate.decision`, `local.override`, `ssh.setup`, `ssh.readiness`, `ssh.drop`, `ssh.put_file`, `mullvad.check`, `reaper.action`, `reaper.pass` and `cli.<command>`. Logs contain ids, counts, sizes, durations and stable error tags; command output stays in the existing per-run logs.
 
-`offbox log-rollup --day YYYY-MM-DD` writes `rollup-YYYY-MM-DD.json` beside the day file; omit `--day` for today. Monitor/reaper ticks roll up yesterday after 00:05 UTC. Logs keep 30 days; after 50 MB in a day, only errors continue. Home-server services write their own local file at the same path.
+`offbox log-rollup --day YYYY-MM-DD` writes `rollup-YYYY-MM-DD.json` beside the day file; omit `--day` for today. Rollups include `generatedAt` (UTC) and `complete`. Monitor/reaper ticks finalize yesterday after 00:05 UTC and refresh today's partial at most hourly. For nightly review, read yesterday's complete rollup plus today's partial through `generatedAt`. Logs keep 30 days; after 50 MB in a day, only errors continue. Home-server services write their own local file at the same path.
 
 ## Troubleshooting
 
@@ -496,3 +500,5 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
   Edit there, run its tests (README), commit, `git push origin HEAD:main`, then `integrations/offbox/install.zsh`.
   Always push: install refuses unpushed changes, and `install.zsh --check` shows drift.
 - Raw boat access: `~/.local/bin/boat` (CLI, signed in). API key is in Keychain `boat-api`/`ardud`; never print it.
+
+A box that crashes native programs during setup is kept out of rotation for 24 h (manual `offbox box suspect BOX --reason "…"` marks last until `offbox box clear BOX`); a run that never started moves once to another home box, while a run that started after a recorded setup crash is flagged as infra to re-run.
