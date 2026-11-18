@@ -184,6 +184,8 @@ export function clean(event, now = new Date()) {
 export function emit(component, name, fields = {}) {
   let counts;
   try {
+    // Direct test runs and their children must opt into a log destination.
+    if (process.env.ROUTER_LOG_DIR === undefined && process.env.NODE_TEST_CONTEXT !== undefined) return;
     const now = new Date(), day = now.toISOString().slice(0,10);
     const root = process.env.ROUTER_LOG_DIR ?? join(homedir(), '.robob/logs/tools/9router');
     counts = volumeState(root, day);
