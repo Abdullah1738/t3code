@@ -1730,7 +1730,7 @@ test("steering files: incomplete family lists are unknown to admission", async (
 async function markerFixture(count = 1, running = false) {
   const control = fakeControl(); control.flags.markers = true;
   const backend = control.backend();
-  const chats = [];
+  const chats: Awaited<ReturnType<RobobBackend["createChat"]>>[] = [];
   for (let i = 0; i < count; i++) {
     const chat = await backend.createChat(); chats.push(chat);
     await backend.prompt(chat.id, chat.directory, `msg_${String(i).padStart(64, "0")}`, "hello");
@@ -1874,6 +1874,92 @@ test("marker polling: page-two failure retries the old watermark and marker with
   expect(new URL("http://test" + replay.path).searchParams.get("since")).toBe(oldSince);
   control.calls.length = 0; await tick();
   expect(pollingCalls(control.calls)).toHaveLength(1);
+});
+
+test.each([false, true])("marker polling: completion during the message drain cannot seal earlier text (model error=%s)", async modelError => {
+  const control = fakeControl(); control.flags.markers = true;
+  const alerts: string[] = [];
+  const backend = control.backend("/chats", { alert: async (_id, text) => { alerts.push(text); return true; } });
+  const store = new Store(":memory:"); stores.push(store); backend.trackFirstTurns(store);
+  const chat = await backend.createChat();
+  await backend.prompt(chat.id, chat.directory, `msg_${"a".repeat(64)}`, "hello");
+  const thread = control.threads.get(chat.id)!;
+  thread.driver = { instanceId: "codex", model: "test" };
+  control.reply(chat.id, "partial", "running");
+  const read = backend.client.crossThreadMessages.bind(backend.client);
+  const cross = spyOn(backend.client, "crossThreadMessages").mockImplementationOnce(async options => {
+    const response = await read(options);
+    control.reply(chat.id, modelError ? "There's an issue with the selected model (bad)." : "finished", "completed");
+    return response;
+  });
+  try {
+    await backend.beginMessageTick([chat.id]);
+    const during = await backend.messages(chat.id);
+    expect(during.some(record => record.type === "idle")).toBe(false);
+    expect(alerts).toHaveLength(0);
+    expect(store.get("firstTurns")).toMatchObject([{ id: chat.id, alert: null }]);
+    expect(control.calls.filter(call => call.method === "GET" && call.path === `/threads/${chat.id}`)).toHaveLength(1);
+    await backend.beginMessageTick([chat.id]);
+    const after = await backend.messages(chat.id);
+    expect(after.find(record => record.type === "idle")).toMatchObject({ outcome: modelError ? "failed" : "succeeded" });
+    expect(alerts).toHaveLength(modelError ? 1 : 0);
+    if (modelError) expect(alerts[0]).toContain("selected model");
+    else expect(JSON.stringify(after)).toContain("finished");
+  } finally { cross.mockRestore(); }
+});
+
+test("marker polling: archived omissions retry failed pages before stopping marker tracking", async () => {
+  const { control, backend, chats, tick } = await markerFixture();
+  const chat = chats[0]!;
+  control.flags.omit.add(chat.id); control.threads.get(chat.id)!.archived = true;
+  control.reply(chat.id, "final archive reply", "completed");
+  control.flags.pageSize = 1; control.flags.page2Status = 500;
+  await backend.beginMessageTick([chat.id]);
+  control.calls.length = 0; control.flags.page2Status = 0;
+  const repaired = await tick();
+  expect(JSON.stringify(repaired)).toContain("final archive reply");
+  expect(control.calls.filter(call => call.path.startsWith("/threads?ids="))).toHaveLength(1);
+  expect(control.calls.filter(call => call.path.startsWith("/messages?")).length).toBeGreaterThan(1);
+  control.calls.length = 0;
+  expect(await tick()).toEqual(repaired);
+  expect(pollingCalls(control.calls)).toHaveLength(0);
+});
+
+const malformedMessageRows: Array<{ name: string; patch: Record<string, unknown> | null }> = [
+  { name: "null row", patch: null },
+  ...["threadId", "messageId", "runId", "role", "text", "streaming", "createdAt", "updatedAt"].map(field => ({ name: `missing ${field}`, patch: { [field]: undefined } })),
+  ...["threadId", "messageId", "runId"].map(field => ({ name: `empty ${field}`, patch: { [field]: "" } })),
+  ...["threadId", "messageId", "runId", "text", "createdBy", "creationSource"].map(field => ({ name: `numeric ${field}`, patch: { [field]: 1 } })),
+  { name: "unknown thread", patch: { threadId: "unrequested-thread" } },
+  { name: "invalid role", patch: { role: "tool" } },
+  { name: "invalid phase", patch: { phase: "final" } },
+  { name: "string streaming", patch: { streaming: "false" } },
+  ...["createdAt", "updatedAt"].flatMap(field => [null, "invalid"].map(value => ({ name: `${field}=${value}`, patch: { [field]: value } }))),
+];
+
+test.each(malformedMessageRows)("marker polling: malformed $name falls back and retries the old checkpoint", async ({ patch }) => {
+  const { control, backend, chats, tick } = await markerFixture();
+  const chat = chats[0]!, thread = control.threads.get(chat.id)!;
+  thread.messages[1]!.text = "valid change";
+  const read = backend.client.crossThreadMessages.bind(backend.client);
+  let since: string | number | undefined;
+  const cross = spyOn(backend.client, "crossThreadMessages").mockImplementationOnce(async options => {
+    since = options.since;
+    const response = await read(options);
+    const row = patch === null ? null : { ...response.messages[0]!, ...patch };
+    return { ...response, messages: [row] } as typeof response;
+  });
+  try {
+    const fallback = await tick();
+    expect(fallback[0]).toEqual(await control.backend().messages(chat.id));
+    expect(control.calls.filter(call => call.path.includes(`/threads/${chat.id}/messages?`))).toHaveLength(2);
+    control.calls.length = 0;
+    expect(await tick()).toEqual(fallback);
+    const replay = control.calls.find(call => call.path.startsWith("/messages?"))!;
+    expect(new URL("http://test" + replay.path).searchParams.get("since")).toBe(String(since));
+    control.calls.length = 0; await tick();
+    expect(pollingCalls(control.calls)).toHaveLength(1);
+  } finally { cross.mockRestore(); }
 });
 
 test.each(["500", "old-server", "cross-400", "cross-404", "cross-500"])("marker polling: %s falls back without skipping threads", async fault => {

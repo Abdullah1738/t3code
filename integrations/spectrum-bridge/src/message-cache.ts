@@ -74,6 +74,7 @@ export class MessageCache {
     const writes = new Map(ids.map(id => [id, this.writes.get(id)]));
     let fallbackReason = "marker-error";
     const missing = new Set<string>();
+    const details = new Map<string, ThreadDetail>();
     try {
       for (let offset = 0; offset < ids.length; offset += 50) {
         const chunk = ids.slice(offset, offset + 50);
@@ -84,12 +85,10 @@ export class MessageCache {
           let summary = result.threads.find(thread => thread.threadId === id);
           if (!summary) {
             const { thread } = await this.client.thread(id);
-            this.details.set(id, thread);
             tick.details.set(id, Promise.resolve(thread));
             summary = thread;
             // An omitted summary is a repair boundary, never proof that the old transcript is empty.
             missing.add(id);
-            if (thread.archived) this.archived.set(id, thread);
           }
           if (!Number.isSafeInteger(summary.changeMarker) || summary.changeMarker! < 0) {
             fallbackReason = "missing-marker";
@@ -97,6 +96,25 @@ export class MessageCache {
           }
           tick.summaries.set(id, summary);
         }
+      }
+      // Like #50, capture exact run/error state before reading its messages. A terminal detail
+      // fetched afterwards could otherwise seal partial text or permanently clear a first-turn check.
+      for (const id of ids) {
+        const summary = tick.summaries.get(id)!;
+        const prior = this.details.get(id);
+        let read = tick.details.get(id);
+        if (!read) {
+          read = prior && this.canReuseDetail(prior, summary) ? Promise.resolve({ ...prior, ...summary })
+            : this.client.thread(id).then(({ thread }) => thread);
+          tick.details.set(id, read);
+        }
+        const detail = await read;
+        if (!Number.isSafeInteger(detail.changeMarker) || detail.changeMarker! < 0) {
+          fallbackReason = "missing-marker";
+          throw new Error("Missing change marker");
+        }
+        details.set(id, detail);
+        tick.summaries.set(id, detail);
       }
       fallbackReason = "cross-thread-error";
       const changed = ids.filter(id => {
@@ -139,7 +157,14 @@ export class MessageCache {
           tick.messages.delete(id);
           tick.failed.add(id);
           this.pollLog(tick, id, { fallbacks: 1, fallbackReason: "state-raced" });
-        } else { this.entries.set(id, snapshot); this.changedRoutes.delete(id); }
+        } else {
+          this.entries.set(id, snapshot);
+          this.changedRoutes.delete(id);
+          const detail = details.get(id)!;
+          this.details.set(id, detail);
+          // Final archive suppression belongs to the same successful checkpoint as the transcript.
+          if (detail.archived) this.archived.set(id, detail);
+        }
       }
     } catch (error) {
       const status = error instanceof ControlError ? error.status : 0;
@@ -164,7 +189,9 @@ export class MessageCache {
       if (!Array.isArray(response.messages) || !(response.nextCursor === null || typeof response.nextCursor === "string")) throw new Error("Invalid message page");
       this.pollLog(tick, ids[0]!, { bytesReturned: Buffer.byteLength(JSON.stringify(response)) });
       const counts = new Map<string, number>();
-      for (const { threadId, ...message } of response.messages) {
+      for (const row of response.messages) {
+        if (!this.validRow(row)) throw new Error("Invalid message row");
+        const { threadId, ...message } = row;
         const rows = messages.get(threadId);
         if (!rows) throw new Error("Unexpected message thread");
         counts.set(threadId, (counts.get(threadId) ?? 0) + 1);
@@ -183,6 +210,27 @@ export class MessageCache {
       const at = Date.parse(message.updatedAt ?? "");
       return Number.isFinite(at) ? Math.max(max, at) : max;
     }, BEGINNING);
+  }
+
+  private validRow(row: unknown): row is ControlMessage & { threadId: string } {
+    if (!row || typeof row !== "object") return false;
+    const value = row as Record<string, unknown>;
+    const time = (at: unknown) => typeof at === "string" && Number.isFinite(Date.parse(at));
+    return typeof value.threadId === "string" && value.threadId.length > 0
+      && typeof value.messageId === "string" && value.messageId.length > 0
+      && (value.runId === null || typeof value.runId === "string" && value.runId.length > 0)
+      && (value.role === "user" || value.role === "assistant" || value.role === "system")
+      && typeof value.text === "string" && typeof value.streaming === "boolean"
+      && time(value.createdAt) && time(value.updatedAt)
+      && (value.phase === undefined || value.phase === "answer" || value.phase === "narration" || value.phase === "unknown")
+      && (value.createdBy === undefined || typeof value.createdBy === "string")
+      && (value.creationSource === undefined || typeof value.creationSource === "string");
+  }
+
+  private canReuseDetail(prior: ThreadDetail, summary: ThreadSummary): boolean {
+    return prior.latestRunId === summary.latestRunId && prior.activeRunId === summary.activeRunId
+      && prior.status === summary.status && JSON.stringify(prior.pendingRequest) === JSON.stringify(summary.pendingRequest)
+      && (!summary.pendingRequest || prior.changeMarker === summary.changeMarker);
   }
 
   private merge(cached: Snapshot | undefined, incoming: ControlMessage[], full: boolean): ControlMessage[] | undefined {
@@ -210,9 +258,7 @@ export class MessageCache {
     if (!read) {
       const prior = this.details.get(threadId);
       // Summary-only stream changes retain the full run metadata. Transitions need exact completion/error/request details.
-      if (prior && prior.latestRunId === summary.latestRunId && prior.activeRunId === summary.activeRunId
-        && prior.status === summary.status && JSON.stringify(prior.pendingRequest) === JSON.stringify(summary.pendingRequest)
-        && (!summary.pendingRequest || prior.changeMarker === summary.changeMarker)) {
+      if (prior && this.canReuseDetail(prior, summary)) {
         read = Promise.resolve({ ...prior, ...summary });
       } else read = this.client.thread(threadId).then(({ thread }) => thread);
       shared?.set(threadId, read);
