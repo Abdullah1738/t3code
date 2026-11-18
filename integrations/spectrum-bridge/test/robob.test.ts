@@ -2196,14 +2196,18 @@ test("marker polling: sibling chat backends share the marker pass and native ali
   expect(new URL("http://test" + pollingCalls(control.calls)[0]!.path).searchParams.get("ids")).toBe(chats.map(chat => chat.id).join(","));
 });
 
-test.each(["waiting", "running"].flatMap(prior => ["completed", "failed", "cancelled", "interrupted", "rolled_back"].map(status => ({ prior, status }))))
+test.each([
+  ...["queued", "waiting", "running"].flatMap(prior => ["completed", "failed", "cancelled", "interrupted", "rolled_back"].map(status => ({ prior, status }))),
+  ...["completed", "failed", "cancelled", "interrupted"].map(prior => ({ prior, status: "rolled_back" })),
+])
   ("marker polling: retained $prior run becoming $status refreshes exact detail", async ({ prior, status }) => {
   const { control, backend, chats, tick } = await markerFixture(1, true);
   const chat = chats[0]!, thread = control.threads.get(chat.id)!;
   thread.runs[0]!.status = prior;
   await backend.prompt(chat.id, chat.directory, `msg_${"f".repeat(64)}`, "latest");
   control.reply(chat.id, "latest partial", "running");
-  await tick(); control.calls.length = 0;
+  const before = await tick(); control.calls.length = 0;
+  if (prior === "completed") expect(before[0]!.find(record => record.id === `idle:${thread.runs[0]!.runId}`)).toMatchObject({ outcome: "succeeded" });
   thread.runs[0]!.status = status;
   const result = await tick();
   expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(1);

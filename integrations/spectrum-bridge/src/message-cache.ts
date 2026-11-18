@@ -229,12 +229,11 @@ export class MessageCache {
 
   private canReuseDetail(prior: ThreadDetail, summary: ThreadSummary): boolean {
     if (summary.changeMarker! < prior.changeMarker!) return false;
-    // Older runs can stop draining or fail without changing the latest/active run identity.
-    const mutableHistory = prior.recentRuns.some(run => run.runId !== summary.latestRunId
-      && !["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(run.status));
+    // Provider rewinds can roll back even completed older runs without changing the latest run.
+    const retainedHistory = prior.recentRuns.some(run => run.runId !== summary.latestRunId);
     return prior.latestRunId === summary.latestRunId && prior.activeRunId === summary.activeRunId
       && prior.status === summary.status && JSON.stringify(prior.pendingRequest) === JSON.stringify(summary.pendingRequest)
-      && (!(summary.pendingRequest || mutableHistory) || prior.changeMarker === summary.changeMarker);
+      && (!(summary.pendingRequest || retainedHistory) || prior.changeMarker === summary.changeMarker);
   }
 
   private merge(cached: Snapshot | undefined, incoming: ControlMessage[], full: boolean): ControlMessage[] | undefined {
