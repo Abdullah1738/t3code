@@ -53,6 +53,8 @@ class Deps:
         if self.fail and reverse: raise RuntimeError('failed')
         return Child()
     def router_tunnel(self, box): self.events.append(('router-forward', box)); return Child()
+    def livez_tunnel(self, box): self.events.append(('livez-forward', box)); return Child()
+    def livez_refused(self): return True
     def both_ready(self):
         self.events.append(('both-ready', None))
         if self.readiness_error: raise self.readiness_error
@@ -66,7 +68,7 @@ class Tests(SupervisorTestCase):
     def test_stopped_box_recovery_never_allocates(self):
         deps = Deps(); supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
         self.assertTrue(supervisor.connect())
-        self.assertEqual(deps.events, [('ensure', 'bx_moni'), ('resume', 'bx_moni'), ('ssh-setup', 'bx_moni'), ('runner-ready', 'bx_moni'), ('forward', 'bx_moni'), ('reverse', 'bx_moni'), ('router-forward', 'bx_moni'), ('both-ready', None)])
+        self.assertEqual(deps.events, [('ensure', 'bx_moni'), ('resume', 'bx_moni'), ('ssh-setup', 'bx_moni'), ('runner-ready', 'bx_moni'), ('forward', 'bx_moni'), ('reverse', 'bx_moni'), ('router-forward', 'bx_moni'), ('livez-forward', 'bx_moni'), ('both-ready', None)])
         deps.stopped = True
         for child in supervisor.children: child.exit_code = 255
         self.assertTrue(supervisor.connect())
@@ -113,7 +115,7 @@ class RouterTunnelTests(SupervisorTestCase):
             deps.router_tunnel('bx_moni')
             self.assertEqual(calls, [('bx_moni', *ports, True)])
         for value in (None, True, 0, 1023, 65536, '20128', '20128:localhost:22'):
-            for key in ('boxRouterPort', 'macRouterPort'):
+            for key in ('boxRouterPort', 'macRouterPort', 'boxLivezPort', 'macLivezPort'):
                 with self.assertRaisesRegex(RuntimeError, 'invalid_router_port'): module.router_ports({key: value})
 
     def test_real_ssh_builder_binds_box_loopback_and_forwards_only_to_mac_router(self):
@@ -256,11 +258,11 @@ class RepairTests(SupervisorTestCase):
             self.assertTrue(all(not child.stopped for child in original))
 
     def test_sustained_failure_repairs_only_the_implicated_forward(self):
-        for target in module.TUNNELS:
+        for target in ('runner', 'callback', 'livez'):
             with self.subTest(target=target):
                 supervisor = self.supervisor(); original = supervisor.children
                 self.deps.readiness_error = (module.ReadinessError('runner', None, 'ConnectionRefusedError', 'ssh-transport') if target == 'runner'
-                                             else module.ReadinessError(target, 503))
+                                             else module.ReadinessError('router' if target == 'livez' else target, 503))
                 for _ in range(2):
                     self.assertFalse(supervisor.connect())
                     self.assertTrue(all(not child.stopped for child in original))
@@ -310,7 +312,7 @@ class RepairTests(SupervisorTestCase):
         router_tunnel = self.deps.router_tunnel
         self.deps.router_tunnel = lambda box: (_ for _ in ()).throw(OSError('private ssh details'))
         with self.assertRaises(OSError): supervisor.connect()
-        self.assertEqual(supervisor.children, original[:2])
+        self.assertEqual(supervisor.children, original[:2] + original[3:])
         self.assertTrue(all(not child.stopped for child in original[:2]))
         self.assertEqual(self.logs()[-1]['torn_down'], [])
         self.deps.router_tunnel = router_tunnel
@@ -337,7 +339,7 @@ class RepairTests(SupervisorTestCase):
         supervisor = self.supervisor(); original = supervisor.children
         self.deps.both_ready = lambda: setattr(original[2], 'exit_code', 255)
         self.assertFalse(supervisor.connect())
-        self.assertEqual(supervisor.children, original[:2])
+        self.assertEqual(supervisor.children, original[:2] + original[3:])
         self.assertEqual(self.logs()[-1]['exit_code'], 255)
         self.assertEqual(self.logs()[-1]['torn_down'], [])
 
@@ -599,6 +601,125 @@ class ReadinessContractTests(SupervisorTestCase):
         self.assertEqual(calls, [prefix + ['-L', '127.0.0.1:19463:127.0.0.1:19463', 'bx_moni'],
                                  prefix + ['-R', '127.0.0.1:19464:127.0.0.1:19464', 'bx_moni'],
                                  prefix + ['-R', '127.0.0.1:19465:127.0.0.1:20128', 'bx_moni']])
+
+
+class LivezTests(SupervisorTestCase):
+    def remote(self, config=None):
+        deps = module.OffboxDeps.__new__(module.OffboxDeps)
+        deps.config = config or {'boxId': 'bx_moni'}
+        return deps
+
+    def test_real_livez_ssh_arguments_defaults_and_overrides(self):
+        source = Path(__file__).resolve().parents[2] / 'offbox/skill/scripts/offbox_lib/ssh_sync.py'
+        node = next(node for node in ast.parse(source.read_text()).body if isinstance(node, ast.FunctionDef) and node.name == 'tunnel')
+        for config, mapping in (({}, '127.0.0.1:19466:127.0.0.1:20129'),
+                                ({'boxLivezPort': 19476, 'macLivezPort': 20139}, '127.0.0.1:19476:127.0.0.1:20139')):
+            calls = []
+            namespace = {'subprocess': SimpleNamespace(Popen=lambda args: calls.append(args) or Child()), 'ssh_base': lambda box: ['ssh', '-F', 'isolated-config']}
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), 'exec'), namespace)
+            deps = self.remote(config); deps.ssh_sync = SimpleNamespace(tunnel=namespace['tunnel'])
+            deps.livez_tunnel('bx_moni')
+            self.assertEqual(calls, [['ssh', '-F', 'isolated-config', '-N', '-o', 'ExitOnForwardFailure=yes', '-o',
+                                      'ControlMaster=no', '-o', 'ControlPath=none', '-R', mapping, 'bx_moni']])
+
+    def test_invalid_and_equal_ports_fail_before_forwarding(self):
+        for value in (None, True, 0, 1023, 65536, 19466.5, '19466', '19466:owner:22'):
+            for field in ('boxRouterPort', 'macRouterPort', 'boxLivezPort', 'macLivezPort'):
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(RuntimeError, 'invalid_router_port'):
+                    module.livez_ports({field: value})
+        for port in (1024, 19465, 65535):
+            with self.assertRaisesRegex(RuntimeError, 'invalid_router_port'):
+                module.router_ports({'boxRouterPort': port, 'boxLivezPort': port})
+
+    def test_blocked_api_health_is_never_probed_and_causes_no_teardown_or_slow_log(self):
+        deps = Deps(); remote = self.remote(); calls = []
+        remote.post = lambda *args: {'boxId': 'bx_moni', 'epoch': 'epoch', 'routerReady': remote.direct_ready('router'), 'callbackReady': True}
+        remote.config.update({'epoch': 'epoch', 'url': 'http://runner', 'tokenFile': 'unused'})
+        deps.both_ready = remote.both_ready; deps.direct_ready = remote.direct_ready
+        def urlopen(url, timeout):
+            calls.append((url, timeout))
+            if '/api/health' in url: raise AssertionError('worker loop must not be probed')
+            response = io.BytesIO(b'{"ready":true}'); response.status = 200
+            return response
+        clock = Clock(); supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps, clock=clock)
+        with patch.object(module.urllib.request, 'urlopen', urlopen):
+            self.assertTrue(supervisor.connect()); original = supervisor.children
+            for _ in range(12): clock.advance(5); self.assertTrue(supervisor.connect())
+        self.assertEqual(set(calls), {('http://127.0.0.1:20129/livez', 1.5)})
+        self.assertEqual(supervisor.children, original)
+        self.assertFalse(any(c.stopped for c in original))
+        self.assertEqual(self.logs(), [])
+
+    def test_mac_livez_503_never_rebuilds_and_logs_only_safe_reason(self):
+        for reason in ('no_worker', 'not_ready', 'heartbeat_stale', 'shutting_down', 'PRIVATE_KEY PRIVATE_TEXT', None, [], {}):
+            deps = Deps(); remote = self.remote(); deps.direct_router_reason = None
+            def direct(target):
+                result = remote.direct_ready(target); deps.direct_router_reason = remote.direct_router_reason
+                return result
+            deps.direct_ready = direct
+            deps.livez_refused = lambda: self.fail('no TCP repair probe when Mac is unready')
+            supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps, clock=Clock())
+            self.assertTrue(supervisor.connect()); original = supervisor.children
+            deps.readiness_error = module.ReadinessError('router', 200, 'DependencyUnavailable')
+            def urlopen(url, timeout):
+                self.assertEqual((url, timeout), ('http://127.0.0.1:20129/livez', 1.5))
+                raise module.urllib.error.HTTPError(url, 503, 'PRIVATE_TOKEN', {}, io.BytesIO(json.dumps({'reason': reason, 'key': 'PRIVATE_KEY'}).encode()))
+            with patch.object(module.urllib.request, 'urlopen', urlopen):
+                for _ in range(6): self.assertFalse(supervisor.connect())
+            self.assertEqual(supervisor.children, original); self.assertFalse(any(c.stopped for c in original))
+            slow = [e for e in self.logs() if e['event'] == 'moni-supervisor-router-slow'][-1]
+            self.assertEqual(slow['reason'], module.livez_reason(reason)); self.assertEqual(slow['torn_down'], [])
+        self.assertNotIn('PRIVATE_', self.output.getvalue())
+
+    def test_accepting_box_livez_port_never_rebuilds_on_readiness_alone(self):
+        deps = Deps(); deps.livez_refused = lambda: False
+        supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        self.assertTrue(supervisor.connect()); original = supervisor.children
+        deps.readiness_error = module.ReadinessError('router', 200, 'DependencyUnavailable')
+        for _ in range(6): self.assertFalse(supervisor.connect())
+        self.assertEqual(supervisor.children, original); self.assertFalse(any(c.stopped for c in original))
+        self.assertFalse(any(e['event'] in ('moni-supervisor-reconnect', 'moni-supervisor-router-slow') for e in self.logs()))
+
+    def test_direct_livez_requires_exact_200_and_boolean_ready(self):
+        for status, body, expected in ((200, b'{"ready":true}', True), (200, b'{"ready":false}', False),
+                                       (200, b'{"ready":1}', False), (200, b'{"ready":"true"}', False),
+                                       (200, b'null', False), (200, b'[]', False), (200, b'bad', False),
+                                       (201, b'{"ready":true}', False)):
+            deps = self.remote({'macLivezPort': 20139})
+            def urlopen(url, timeout):
+                self.assertEqual((url, timeout), ('http://127.0.0.1:20139/livez', 1.5))
+                response = io.BytesIO(body); response.status = status
+                return response
+            with patch.object(module.urllib.request, 'urlopen', urlopen): self.assertEqual(deps.direct_ready('router'), expected)
+        for body in (b'null', b'[]', b'bad'):
+            error = module.urllib.error.HTTPError('unused', 503, '', {}, io.BytesIO(body))
+            with patch.object(module.urllib.request, 'urlopen', side_effect=error):
+                self.assertFalse(deps.direct_ready('router')); self.assertEqual(deps.direct_router_reason, 'unknown')
+
+    def test_tcp_probe_is_exact_box_loopback_and_only_refusal_allows_repair(self):
+        deps = self.remote({'boxId': 'bx_moni', 'boxLivezPort': 19476})
+        deps.ssh_sync = SimpleNamespace(ssh_base=lambda box: ['ssh', '-F', 'isolated-config'])
+        for code, expected in ((42, True), (0, False), (1, False), (255, False)):
+            calls = []
+            def run(argv, **kwargs):
+                calls.append(argv)
+                self.assertEqual(argv[:4], ['ssh', '-F', 'isolated-config', 'bx_moni'])
+                self.assertEqual(kwargs, {'timeout': 5, 'stdout': module.subprocess.DEVNULL, 'stderr': module.subprocess.DEVNULL})
+                return SimpleNamespace(returncode=code)
+            with patch.object(module.subprocess, 'run', run): self.assertEqual(deps.livez_refused(), expected)
+            probe = module.shlex.split(calls[0][4])
+            self.assertEqual(probe[:2], ['python3', '-c'])
+            import errno
+            for result, exit_code in ((errno.ECONNREFUSED, 42), (0, 0), (errno.ETIMEDOUT, 0)):
+                connections = []
+                socket = SimpleNamespace(settimeout=lambda seconds: self.assertEqual(seconds, 1.5),
+                                         connect_ex=lambda address: connections.append(address) or result, close=lambda: None)
+                with patch('socket.socket', return_value=socket):
+                    with self.assertRaises(SystemExit) as error: exec(probe[2], {})
+                self.assertEqual(error.exception.code, exit_code); self.assertEqual(connections, [('127.0.0.1', 19476)])
+        for error in (OSError('PRIVATE_KEY'), module.subprocess.TimeoutExpired('PRIVATE_TEXT', 5)):
+            with patch.object(module.subprocess, 'run', side_effect=error): self.assertFalse(deps.livez_refused())
+        self.assertNotIn('PRIVATE_', self.output.getvalue())
 
 
 if __name__ == '__main__': unittest.main()

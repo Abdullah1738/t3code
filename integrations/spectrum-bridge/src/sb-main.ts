@@ -52,6 +52,14 @@ export type MainIo = {
 
 type Parts = { remote?: RemoteBox; router?: Router; delivery?: Delivery; replyGap?: ReplyGapMonitor; api: (request: Request) => Promise<Response>; backend?: ChatBackend; busy: boolean };
 
+export function acknowledgeSendblue(chat: Pick<ChatCore, "store" | "context" | "remote">, input: unknown, log: MainIo["log"]): void {
+  if (chat.remote && (input as { logSource?: string }).logSource === "backfill") return;
+  void acknowledgeReceived(chat.store, chat.context, input).catch(caughtError => {
+    toolError("sb-main", "sb-main.catch7", caughtError);
+    log("receipt-ack-failed");
+  });
+}
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -331,7 +339,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const ingress = runIngress({
     line: observed, owner: config.owner, ownerStore, access: async () => access,
     sink: chats.sink(note, () => config.enabled, message => guestDesk.unknown(message),
-      (chat, input) => { if (chat.remote) return; void acknowledgeReceived(chat.store, chat.context, input).catch((caughtError) => { toolError("sb-main", "sb-main.catch7", caughtError); return log("receipt-ack-failed"); }); }), log,
+      (chat, input) => acknowledgeSendblue(chat, input, log)), log,
     notify: (text, key) => outlet.notify("attention", text, key),
   }, abort.signal);
 

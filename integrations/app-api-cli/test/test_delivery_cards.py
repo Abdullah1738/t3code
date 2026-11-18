@@ -16,6 +16,14 @@ import delivery_cards as c
 import order_tracker as t
 
 
+def make_bridge_store(path, rid='fixture-session', generation=1):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as con:
+        con.execute('create table if not exists kv (key text primary key, value text not null)')
+        con.execute('create table if not exists outbox (id text primary key, payload text not null, state text not null, attempts integer not null default 0)')
+        con.execute("insert or replace into kv values ('route', ?)", (json.dumps({'id': rid, 'generation': generation}),))
+
+
 class CardTests(unittest.TestCase):
     def test_items_preserve_separate_identifiers_and_aliases(self):
         for aliases in ({'item_code': 'code', 'sku_config': 'config'},
@@ -252,11 +260,7 @@ class CardTests(unittest.TestCase):
         return self.bridge_dir / 'state.sqlite' if chat == 'owner' else self.bridge_dir / 'chats' / chat / 'state.sqlite'
 
     def store(self, chat, rid, generation):
-        self.db(chat).parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db(chat)) as con:
-            con.execute('create table if not exists kv (key text primary key, value text not null)')
-            con.execute('create table if not exists outbox (id text primary key, payload text not null, state text not null, attempts integer not null default 0)')
-            con.execute("insert or replace into kv values ('route', ?)", (json.dumps({'id': rid, 'generation': generation}),))
+        make_bridge_store(self.db(chat), rid, generation)
 
     def queue(self, args, state, attempts=0):
         # Like the bridge: --to ops sit in the target's store under hash(slug:key) with no session;
