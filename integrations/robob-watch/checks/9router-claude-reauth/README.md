@@ -25,6 +25,7 @@ The notification-only detector GETs `/api/providers`
 with local CLI auth every 60 seconds.
 The `boot` phase and private `supervisor.boot` event show shell-to-Node latency.
 Fetches share the remaining 45-second budget minus a 5-second journal reserve; exhausted budgets skip the tick through the same 15-minute outage bound. Deadlines after a valid fetch remain failures.
+Boot-exhausted ticks skip without fetching and persist the outage streak under an 80-second ceiling counted from shell startup; a hung load or save still fails at that ceiling.
 The first fetch has a 6-second timeout. Transient timeouts, refused/reset sockets
 and HTTP 502/503/504 get one retry after 1 second, bounded at 15 seconds.
 Two transient failures skip that tick without changing incidents or pending
@@ -101,7 +102,7 @@ before retry, it checks the outbox but does not send a stale alert; a missing
 row stays UNKNOWN. Service failures exit nonzero for robob-watch
 backoff, not healthy. robob-watch has its own failure alerts in addition to
 incident attention when a service stays down. Per-tick queueing is limited to
-three new incidents. The detector stops itself at 45 seconds, before the
+three new incidents. After a valid fetch the detector stops itself at 45 seconds, before the
 runner's 90-second limit; remaining incidents are persisted and processed on
 later ticks.
 
@@ -250,7 +251,7 @@ to the watcher log. Recovery remains a successful exit: reporting evidence must
 not spend another failure or pause the watcher at its failure limit. The `done`
 and `failed` markers prevent a stall warning on the next run.
 
-The 45-second timer includes shell-to-Node startup when invoked by `check.sh`.
+The 45-second timer includes shell-to-Node startup when invoked by `check.sh`; no-fetch boot skips use the 80-second ceiling instead.
 It does not unref; an unresolved fetch skips within its reserved budget, while
 other unresolved work fails with the phase name. Fetch aborts cover both headers and JSON body. Telegram
 commands retain an eight-second cap, kill their own spawned process group and

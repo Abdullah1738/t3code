@@ -31,6 +31,7 @@ export const SUPERVISOR_DEADLINE_MS = 45_000;
 // Skip persistence is one atomic journal write (file + directory fsync).
 export const SAVE_RESERVE_MS = 5_000;
 export const MIN_FETCH_BUDGET_MS = 3_000;
+export const BOOT_SKIP_HARD_CEILING_MS = 80_000;
 
 function newState() { return { version: 1, incidents: [], active: null }; }
 
@@ -346,8 +347,11 @@ async function tickImpl(ctx) {
       error.sustainedMinutes = Math.floor(elapsed / 60_000);
       throw error;
     }
-    emit('reauth', 'providers.fetch.skipped', { props: { consecutive: state.routerUnavailableCount, sinceMs: state.routerUnavailableSince } });
-    ctx.log?.(`9router Claude detector: router slow/unavailable (attempt ms ${error.attemptMs.join('/')}); skipped this tick (${state.routerUnavailableCount} consecutive, since ${new Date(state.routerUnavailableSince).toISOString()})`);
+    emit('reauth', 'providers.fetch.skipped', { props: { reason: error.reason, consecutive: state.routerUnavailableCount, sinceMs: state.routerUnavailableSince } });
+    const detail = error.attemptMs.length ? `attempt ms ${error.attemptMs.join('/')}`
+      : error.fetchAttempted ? `fetch interrupted: ${error.reason}`
+      : `no fetch: ${error.reason}${error.reason === 'boot_exhausted' ? `, boot ${Math.round(error.bootMs)}ms` : Number.isFinite(error.remainingMs) ? `, ${Math.floor(error.remainingMs)}ms left` : ''}`;
+    ctx.log?.(`9router Claude detector: router slow/unavailable (${detail}); skipped this tick (${state.routerUnavailableCount} consecutive, since ${new Date(state.routerUnavailableSince).toISOString()})`);
     // Unknown is not an empty snapshot: leave all incident/worker/delivery state
     // untouched, including queued notices whose markers might still be pending.
     return;
@@ -507,10 +511,13 @@ async function tickImpl(ctx) {
 }
 
 export class RouterUnavailableError extends Error {
-  constructor(attemptMs) {
+  constructor(attemptMs, { reason = 'unavailable', remainingMs, bootMs } = {}) {
     super('router slow/unavailable');
     this.code = 'ROUTER_UNAVAILABLE';
     this.attemptMs = attemptMs;
+    this.reason = reason;
+    this.remainingMs = remainingMs;
+    this.bootMs = bootMs;
   }
 }
 
@@ -537,7 +544,7 @@ export async function liveProviders({ data = join(homedir(), '.9router'), url = 
     emit('reauth', 'providers.fetch.budget', { durationMs: ms, props: { tag } });
     log(`9router Claude detector: providers fetch budget ${tag} (${Math.floor(ms)}ms remaining)`);
   };
-  const exhausted = tag => { budgetLog(tag, remaining()); return new RouterUnavailableError(attemptMs); };
+  const exhausted = tag => { const ms = remaining(); budgetLog(tag, ms); return new RouterUnavailableError(attemptMs, { reason: tag, remainingMs: ms }); };
   if (remaining() < MIN_FETCH_BUDGET_MS) throw exhausted('below_minimum');
   phase('providers:credentials');
   const raw = readFileSync(join(data, 'machine-id'), 'utf8').trim();
@@ -686,10 +693,20 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
 export async function runObserved(ctx, { watchDir, deadlineMs = SUPERVISOR_DEADLINE_MS, startedAt = Number(process.env.WATCH_STARTED_AT), previous, stderr, phase, onDeadline = () => {}, now = () => performance.now(), wallNow = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, exit = code => process.exit(code) } = {}) {
   const report = phase ?? phaseReporter(watchDir, { previous, stderr, startedAt, now, wallNow, log: ctx.log });
   const bootMs = Number.isFinite(startedAt) && startedAt > 0 ? Math.max(0, wallNow() - startedAt) : 0;
+  const nodeStartedAt = now();
   const remainingMs = Math.max(1, deadlineMs - bootMs);
-  const deadlineAt = now() + remainingMs;
-  let fetching, fetchSkipped = false, firstFetch = true, currentPhase = 'start', deadlineFailed = false;
-  const mark = next => { currentPhase = next; report.mark(next); };
+  const deadlineAt = nodeStartedAt + remainingMs;
+  const bootSkipped = bootMs > 0 && deadlineMs - bootMs < MIN_FETCH_BUDGET_MS + SAVE_RESERVE_MS;
+  // A fetch cannot fit, but the outage checkpoint and skip still need to commit.
+  // Use one fixed ceiling for this no-fetch path; a valid snapshot never gets
+  // extra time. An invalid shell timestamp uses boot 0 and the normal budget.
+  const hardDeadlineAt = bootSkipped ? nodeStartedAt + Math.max(0, BOOT_SKIP_HARD_CEILING_MS - bootMs) : deadlineAt;
+  let fetching, fetchSkipped = false, fetchAttempted = false, firstFetch = true, currentPhase = 'start', deadlineFailed = false;
+  const mark = next => {
+    currentPhase = next;
+    if (/^providers:(fetch|body|backoff)(:|$)/.test(next)) fetchAttempted = true;
+    report.mark(next);
+  };
   const hardDeadline = () => {
     deadlineFailed = true;
     report.failure('exceeded deadline');
@@ -703,16 +720,30 @@ export async function runObserved(ctx, { watchDir, deadlineMs = SUPERVISOR_DEADL
       timer = setTimer(hardDeadline, 0);
     } else hardDeadline();
   };
-  let timer = setTimer(deadline, remainingMs);
+  let timer = setTimer(bootSkipped ? hardDeadline : deadline, Math.max(0, hardDeadlineAt - now()));
   try {
     await tick({
       ...ctx,
-      load: () => { mark('load'); return ctx.load(); },
+      load: () => {
+        mark('load');
+        const state = ctx.load();
+        if (bootSkipped && now() >= hardDeadlineAt) hardDeadline();
+        return state;
+      },
       providers: async () => {
         mark('providers');
         // Only the initial snapshot can skip: later reads follow state changes.
         if (!firstFetch) return ctx.providers(mark);
         firstFetch = false;
+        if (bootSkipped) {
+          if (now() >= hardDeadlineAt) hardDeadline();
+          fetchSkipped = true;
+          const reason = bootMs + now() - nodeStartedAt >= deadlineMs ? 'boot_exhausted' : 'below_minimum';
+          const remainingMs = Math.max(0, deadlineAt - now() - SAVE_RESERVE_MS);
+          emit('reauth', 'providers.fetch.budget', { durationMs: remainingMs, props: { tag: reason } });
+          ctx.log?.(`9router Claude detector: providers fetch budget ${reason} (${Math.floor(remainingMs)}ms remaining)`);
+          throw new RouterUnavailableError([], { reason, remainingMs, bootMs });
+        }
         const controller = new AbortController();
         fetching = controller;
         const budgetMs = Math.max(0, deadlineAt - now() - SAVE_RESERVE_MS);
@@ -723,23 +754,25 @@ export async function runObserved(ctx, { watchDir, deadlineMs = SUPERVISOR_DEADL
           return await abortable(() => ctx.providers(mark, { deadlineAt: deadlineAt - SAVE_RESERVE_MS, signal: controller.signal, now, setTimer, clearTimer }), controller.signal);
         } catch (error) {
           fetchSkipped = error instanceof RouterUnavailableError;
+          if (fetchSkipped) error.fetchAttempted = fetchAttempted;
           throw error;
         } finally { fetching = undefined; clearTimer(budgetTimer); }
       },
       save: state => {
         mark('save');
         const before = now();
+        if (bootSkipped && before >= hardDeadlineAt) hardDeadline();
         const result = ctx.save(state);
-        if (now() >= deadlineAt && (!fetchSkipped || now() - before >= SAVE_RESERVE_MS)) hardDeadline();
+        if (bootSkipped ? now() >= hardDeadlineAt : now() >= deadlineAt && (!fetchSkipped || now() - before >= SAVE_RESERVE_MS)) hardDeadline();
         return result;
       },
     });
-    if (now() >= deadlineAt && !fetchSkipped) hardDeadline();
+    if (now() >= hardDeadlineAt && (bootSkipped || !fetchSkipped)) hardDeadline();
     mark('done');
   } catch (error) {
     // Marker/delivery code can catch IO errors internally. A late result after
     // a valid snapshot must still report the deadline, even on that error path.
-    if (!deadlineFailed && now() >= deadlineAt && !fetchSkipped) hardDeadline();
+    if (!deadlineFailed && now() >= hardDeadlineAt && (bootSkipped || !fetchSkipped)) hardDeadline();
     if (error instanceof RouterUnavailableError) report.mark('providers:fetch:retry');
     report.failure(`failed; router, notification delivery, journal or prior-worker state unavailable.${error.sustainedMinutes === undefined ? '' : ` for ${error.sustainedMinutes} min`}`);
     throw error;
