@@ -57,6 +57,7 @@ function setup(mirrorSink?: MirrorSink, harness?: (root: string) => Harness) {
     requestLocation: async () => {}, location: async () => undefined, setOptOut: async () => {}, download: async () => ({ data: new Uint8Array(), name: "", mimeType: "" }) };
   return { root, mac, box, get remote() { return remote; }, mirror: io.mirror, runner, store, config, logs, notices, texts, alerts, requests, line,
     failEvents: () => { eventsFail = true; },
+    failReadyLog: () => { const log = io.log; io.log = (name, code) => { if (name === "moni-callback-ready") throw new Error("PRIVATE_LOG_FAILURE"); return log(name, code); }; },
     readiness: (router: boolean, callback: boolean) => { routerReady = router; callbackReady = callback; },
     ownerAlert: (alert: typeof io.ownerAlert) => { io.ownerAlert = alert; },
     requestHook: (hook: typeof requestHook) => { requestHook = hook; },
@@ -68,6 +69,41 @@ function setup(mirrorSink?: MirrorSink, harness?: (root: string) => Harness) {
   };
 }
 function files(root: string): string { return readdirSync(root, { withFileTypes: true }).map(e => e.isDirectory() ? files(join(root, e.name)) : readFileSync(join(root, e.name)).toString()).join(""); }
+
+test.each(["ready", "invalid", "paused"])("a timing log failure preserves the %s readiness response", async state => {
+  const s = setup(); s.failReadyLog();
+  if (state === "paused") s.rollback();
+  const rows = await captureLogs(async () => {
+    const response = await s.remote.callback(s.request("/ready", state === "invalid" ? { epoch: "PRIVATE_EPOCH" } : {}),
+      { line: s.line, chat: chatKey.dm("+15555550199"), bus: async () => { throw new Error("not called"); } });
+    expect(response.status).toBe(state === "ready" ? 200 : state === "invalid" ? 403 : 503);
+    expect(await response.json()).toEqual(state === "ready" ? { epoch: "test" } : { error: state === "invalid" ? "Forbidden" : "Backend paused" });
+  });
+  expect(JSON.stringify([rows, s.logs])).not.toContain("PRIVATE_");
+});
+
+test("authenticated readiness logs handler and event-loop timing without callback payloads", async () => {
+  const s = setup();
+  const rows = await captureLogs(async () => {
+    for (const [body, expected] of [[{ marker: "PRIVATE_TEXT" }, 200], [{ epoch: "PRIVATE_EPOCH" }, 403]] as const) {
+      const response = await s.remote.callback(s.request("/ready", body), { line: s.line, chat: chatKey.dm("+15555550199"), bus: async () => { throw new Error("not called"); } });
+      expect(response.status).toBe(expected);
+    }
+    const denied = await s.remote.callback(s.request("/ready", {}, "PRIVATE_TOKEN"), { line: s.line, chat: chatKey.dm("+15555550199"), bus: async () => { throw new Error("not called"); } });
+    expect(denied.status).toBe(403);
+  });
+  const timings = rows.filter(row => row.name === "moni-callback-ready");
+  expect(timings).toHaveLength(2);
+  expect(timings.map(row => row.props?.status)).toEqual([200, 403]);
+  for (const row of timings) {
+    expect(row.durationMs).toBeGreaterThanOrEqual(0);
+    expect(row.props?.handlerMs).toBe(row.durationMs!);
+    expect(row.props?.loopDelayMs).toBeGreaterThanOrEqual(0);
+  }
+  expect(s.texts).toHaveLength(0);
+  const logged = JSON.stringify([rows, s.logs]);
+  for (const value of ["PRIVATE_", "a".repeat(40), "b".repeat(40), "authorization"]) expect(logged).not.toContain(value);
+});
 
 test("delivered human backlog behind a fence gets one notice and one refreshed owner alert across flaps and restart", async () => {
   const s = setup(), head = opaqueId("held-message");

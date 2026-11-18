@@ -931,8 +931,8 @@ class SummaryAndHintTests(unittest.TestCase):
             log = Path(d) / 'run.log'
             log.write_text('offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n'
                            + runs.COMMAND_STARTED_MARKER + ' run-retry\noffbox step 1 rc=0: a\n')
-            self.assertEqual(runs.step_results(log), [(1, 0)])
-            self.assertIsNone(runs.steps_exit(log, 2))
+            self.assertEqual(runs.step_results(log, "run-retry"), [(1, 0)])
+            self.assertIsNone(runs.steps_exit(log, 2, "run-retry"))
 
     def test_grep_hint_only_for_exit_1_from_trailing_grep(self):
         self.assertTrue(runs.last_stage_is_grep('go test ./... 2>&1 | tee /tmp/l | tail -40; grep -c FAIL /tmp/l'))
@@ -973,7 +973,10 @@ class CliStepTests(Isolated):
         a = cli.build_parser().parse_args(['run'] + argv)
 
         def start(rn):
+            nonlocal log_text
             result = fake_start(rn)
+            if callable(log_text):
+                log_text = log_text(rn)
             if setup_history:
                 rn.register_pending()
                 rn.record(box_id=rn.box, process_id=rn.pid, command_id='setup-command', status='running')
@@ -986,7 +989,7 @@ class CliStepTests(Isolated):
 
         err = io.StringIO()
         with patch.object(runs.Runner, 'start', start), patch.object(runs, 'follow', fake_follow), \
-                patch.object(runs.api, 'history_logs', return_value=dict(data=log_text, done=True)), \
+                patch.object(runs.api, 'history_logs', side_effect=lambda *args, **kwargs: dict(data=log_text, done=True)), \
                 patch.object(runs.lease, 'idle_ttl'), \
                 patch.object(runs, 'recorded_exit', return_value=recorded), contextlib.redirect_stderr(err):
             rc = cli.cmd_run(a, self.me)
@@ -1019,7 +1022,8 @@ class CliStepTests(Isolated):
         self.assertFalse(any('steps incomplete' in line for line in lines), lines)
         # A command cannot evade missing-step handling by printing setup text.
         rc, _ = self.run_cli(['--step', 'quint --version'], 99,
-                             'offbox-command-started: run-test\n' + event)
+                             lambda rn: f'offbox-command-started: {rn.run_id} [n={rn.protocol_nonce}]\n' + event,
+                             setup_history=True)
         self.assertEqual(rc, 90)
 
     def test_foreground_complete_steps_keep_zero(self):

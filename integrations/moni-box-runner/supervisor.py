@@ -232,11 +232,14 @@ class Supervisor:
                     direct_ready = self.deps.direct_ready(target)
                     self.log('moni-supervisor-direct-probe', 'direct-http', target, direct_started,
                              ready=direct_ready)
-                    repair = direct_ready
-                    if target == 'router':
-                        # Model unreadiness is not evidence of a broken forward. Only a refused box TCP port is.
-                        repair_target = 'livez'
-                        repair = direct_ready and self.deps.livez_refused()
+                    repair_target = 'livez' if target == 'router' else 'callback'
+                    port = livez_ports(self.config)[0] if target == 'router' else self.config['boxCallbackPort']
+                    # HTTP readiness cannot prove a broken forward; only explicit box-side TCP refusal can.
+                    refused = direct_ready and self.deps.port_refused(port)
+                    repair = refused
+                    if direct_ready and target == 'callback' and not refused:
+                        self.log('moni-supervisor-callback-slow', 'runner-lease', target, started, error,
+                                 latency_ms=latency_ms, box_tcp_refused=False)
                     if not direct_ready:
                         self.log('moni-supervisor-router-slow' if target == 'router' else 'moni-supervisor-callback-unready',
                                  'direct-http', target, started, error, latency_ms=latency_ms,
@@ -374,19 +377,22 @@ class OffboxDeps:
         box_port, mac_port = livez_ports(self.config)
         return capture_tunnel(lambda: self.ssh_sync.tunnel(box, box_port, mac_port, True))
 
-    def livez_refused(self):
-        port, _ = livez_ports(self.config)
+    def port_refused(self, port):
+        if type(port) is not int or not 1024 <= port <= 65535:
+            raise ValueError('invalid_probe_port')
         # A failed SSH command or a TCP timeout is inconclusive, not permission to tear down a healthy child.
         probe = ('import errno,socket,sys; s=socket.socket(); s.settimeout(1.5); '
-                 f'code=s.connect_ex(("127.0.0.1",{port})); s.close(); sys.exit(42 if code==errno.ECONNREFUSED else 0)')
+                 f'code=s.connect_ex(("127.0.0.1",{port})); s.close(); sys.exit(42 if code==errno.ECONNREFUSED else 0 if code==0 else 43)')
         try:
             with quiet_offbox():
                 result = subprocess.run(self.ssh_sync.ssh_base(self.config['boxId']) +
                                         [self.config['boxId'], 'python3 -c ' + shlex.quote(probe)],
                                         timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return result.returncode == 42
-        except (OSError, subprocess.TimeoutExpired):
-            return False
+            outcome = 'refused' if result.returncode == 42 else 'accepting' if result.returncode == 0 else 'unknown'
+        except (OSError, subprocess.TimeoutExpired, self.common.OffboxError):
+            outcome = 'unknown'
+        log_event('moni-supervisor-tcp-probe', target='box-loopback', port=port, outcome=outcome)
+        return outcome == 'refused'
 
     def post(self, base, token_file, path, body):
         token = Path(token_file).read_text().strip()

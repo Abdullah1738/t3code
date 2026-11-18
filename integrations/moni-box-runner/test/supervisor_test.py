@@ -27,6 +27,8 @@ class Clock:
     def __call__(self): return self.now
     def advance(self, seconds): self.now += seconds
 
+class OffboxError(Exception): pass
+
 class SupervisorTestCase(unittest.TestCase):
     def setUp(self):
         self.output = io.StringIO()
@@ -54,7 +56,7 @@ class Deps:
         return Child()
     def router_tunnel(self, box): self.events.append(('router-forward', box)); return Child()
     def livez_tunnel(self, box): self.events.append(('livez-forward', box)); return Child()
-    def livez_refused(self): return True
+    def port_refused(self, port): return True
     def both_ready(self):
         self.events.append(('both-ready', None))
         if self.readiness_error: raise self.readiness_error
@@ -66,7 +68,7 @@ class Deps:
 
 class Tests(SupervisorTestCase):
     def test_stopped_box_recovery_never_allocates(self):
-        deps = Deps(); supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        deps = Deps(); supervisor = module.Supervisor({'boxId': 'bx_moni', 'boxCallbackPort': 19464}, deps)
         self.assertTrue(supervisor.connect())
         self.assertEqual(deps.events, [('ensure', 'bx_moni'), ('resume', 'bx_moni'), ('ssh-setup', 'bx_moni'), ('runner-ready', 'bx_moni'), ('forward', 'bx_moni'), ('reverse', 'bx_moni'), ('router-forward', 'bx_moni'), ('livez-forward', 'bx_moni'), ('both-ready', None)])
         deps.stopped = True
@@ -76,12 +78,12 @@ class Tests(SupervisorTestCase):
         self.assertEqual(deps.events.count(('resume', 'bx_moni')), 2)
         self.assertFalse(any(name in ('create', 'fork', 'acquire') for name, _ in deps.events))
     def test_partial_connection_never_declares_ready(self):
-        deps = Deps(); deps.fail = True; supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        deps = Deps(); deps.fail = True; supervisor = module.Supervisor({'boxId': 'bx_moni', 'boxCallbackPort': 19464}, deps)
         with self.assertRaises(RuntimeError): supervisor.connect()
         self.assertNotIn(('both-ready', None), deps.events)
         self.assertEqual(supervisor.children, [])
     def test_pending_resume_is_confirmed_and_rollback_disables_connections(self):
-        deps = Deps(); deps.resume_pending = True; supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        deps = Deps(); deps.resume_pending = True; supervisor = module.Supervisor({'boxId': 'bx_moni', 'boxCallbackPort': 19464}, deps)
         self.assertTrue(supervisor.connect()); self.assertIn(('confirm', 'bx_moni'), deps.events)
         deps.enabled = False
         self.assertFalse(supervisor.connect()); self.assertEqual(supervisor.children, [])
@@ -129,7 +131,7 @@ class RouterTunnelTests(SupervisorTestCase):
         self.assertEqual(calls, [['ssh', '-F', 'isolated-config', '-N', '-o', 'ExitOnForwardFailure=yes', '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '-R', '127.0.0.1:19465:127.0.0.1:20128', 'bx_moni']])
 
     def test_lost_router_tunnel_reconnects_without_resuming_a_running_box(self):
-        deps = Deps(); supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        deps = Deps(); supervisor = module.Supervisor({'boxId': 'bx_moni', 'boxCallbackPort': 19464}, deps)
         self.assertTrue(supervisor.connect()); first = supervisor.children.copy()
         first[2].stopped = True
         self.assertTrue(supervisor.connect())
@@ -147,7 +149,7 @@ class RouterTunnelTests(SupervisorTestCase):
             child = original(box, reverse); children.append(child); return child
         deps.tunnel = tunnel
         deps.router_tunnel = lambda box: (_ for _ in ()).throw(RuntimeError('router'))
-        supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        supervisor = module.Supervisor({'boxId': 'bx_moni', 'boxCallbackPort': 19464}, deps)
         with self.assertRaisesRegex(RuntimeError, 'router'): supervisor.connect()
         self.assertTrue(all(child.stopped for child in children)); self.assertEqual(supervisor.children, [])
 
@@ -219,7 +221,7 @@ class RepairTests(SupervisorTestCase):
     def supervisor(self, deps=None, **kwargs):
         self.deps = deps or Deps()
         self.clock = Clock()
-        supervisor = module.Supervisor({'boxId': 'bx_moni'}, self.deps,
+        supervisor = module.Supervisor({'boxId': 'bx_moni', 'boxCallbackPort': 19464}, self.deps,
                                        clock=self.clock, sleep=self.clock.advance, **kwargs)
         self.assertTrue(supervisor.connect())
         return supervisor
@@ -325,7 +327,7 @@ class RepairTests(SupervisorTestCase):
             if not reverse: child.exit_code = 255
             return child
         deps.tunnel = tunnel
-        supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        supervisor = module.Supervisor({'boxId': 'bx_moni', 'boxCallbackPort': 19464}, deps)
         self.assertFalse(supervisor.connect())
         self.assertNotIn(('both-ready', None), deps.events)
         self.assertEqual(self.logs()[-1]['target'], 'runner')
@@ -533,7 +535,7 @@ class ReadinessContractTests(SupervisorTestCase):
 
     def test_http_status_and_fixed_target_reach_the_supervisor_log(self):
         deps = Deps(); remote = self.deps()
-        supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        supervisor = module.Supervisor({'boxId': 'bx_moni', 'boxCallbackPort': 19464}, deps)
         self.assertTrue(supervisor.connect())
         def post(*args):
             raise module.urllib.error.HTTPError('http://unused/control-token', 503, 'private text', {},
@@ -607,6 +609,7 @@ class LivezTests(SupervisorTestCase):
     def remote(self, config=None):
         deps = module.OffboxDeps.__new__(module.OffboxDeps)
         deps.config = config or {'boxId': 'bx_moni'}
+        deps.common = SimpleNamespace(OffboxError=OffboxError)
         return deps
 
     def test_real_livez_ssh_arguments_defaults_and_overrides(self):
@@ -657,7 +660,7 @@ class LivezTests(SupervisorTestCase):
                 result = remote.direct_ready(target); deps.direct_router_reason = remote.direct_router_reason
                 return result
             deps.direct_ready = direct
-            deps.livez_refused = lambda: self.fail('no TCP repair probe when Mac is unready')
+            deps.port_refused = lambda port: self.fail('no TCP repair probe when Mac is unready')
             supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps, clock=Clock())
             self.assertTrue(supervisor.connect()); original = supervisor.children
             deps.readiness_error = module.ReadinessError('router', 200, 'DependencyUnavailable')
@@ -672,8 +675,8 @@ class LivezTests(SupervisorTestCase):
         self.assertNotIn('PRIVATE_', self.output.getvalue())
 
     def test_accepting_box_livez_port_never_rebuilds_on_readiness_alone(self):
-        deps = Deps(); deps.livez_refused = lambda: False
-        supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
+        deps = Deps(); deps.port_refused = lambda port: False
+        supervisor = module.Supervisor({'boxId': 'bx_moni', 'boxCallbackPort': 19464}, deps)
         self.assertTrue(supervisor.connect()); original = supervisor.children
         deps.readiness_error = module.ReadinessError('router', 200, 'DependencyUnavailable')
         for _ in range(6): self.assertFalse(supervisor.connect())
@@ -706,11 +709,11 @@ class LivezTests(SupervisorTestCase):
                 self.assertEqual(argv[:4], ['ssh', '-F', 'isolated-config', 'bx_moni'])
                 self.assertEqual(kwargs, {'timeout': 5, 'stdout': module.subprocess.DEVNULL, 'stderr': module.subprocess.DEVNULL})
                 return SimpleNamespace(returncode=code)
-            with patch.object(module.subprocess, 'run', run): self.assertEqual(deps.livez_refused(), expected)
+            with patch.object(module.subprocess, 'run', run): self.assertEqual(deps.port_refused(19476), expected)
             probe = module.shlex.split(calls[0][4])
             self.assertEqual(probe[:2], ['python3', '-c'])
             import errno
-            for result, exit_code in ((errno.ECONNREFUSED, 42), (0, 0), (errno.ETIMEDOUT, 0)):
+            for result, exit_code in ((errno.ECONNREFUSED, 42), (0, 0), (errno.ETIMEDOUT, 43)):
                 connections = []
                 socket = SimpleNamespace(settimeout=lambda seconds: self.assertEqual(seconds, 1.5),
                                          connect_ex=lambda address: connections.append(address) or result, close=lambda: None)
@@ -718,8 +721,67 @@ class LivezTests(SupervisorTestCase):
                     with self.assertRaises(SystemExit) as error: exec(probe[2], {})
                 self.assertEqual(error.exception.code, exit_code); self.assertEqual(connections, [('127.0.0.1', 19476)])
         for error in (OSError('PRIVATE_KEY'), module.subprocess.TimeoutExpired('PRIVATE_TEXT', 5)):
-            with patch.object(module.subprocess, 'run', side_effect=error): self.assertFalse(deps.livez_refused())
+            with patch.object(module.subprocess, 'run', side_effect=error): self.assertFalse(deps.port_refused(19476))
         self.assertNotIn('PRIVATE_', self.output.getvalue())
+
+
+class CallbackRepairTests(SupervisorTestCase):
+    supervisor = RepairTests.supervisor
+    def test_routing_domain_errors_are_inconclusive_and_preserve_the_callback(self):
+        for error in (OffboxError('PRIVATE_ENDPOINT'), OSError('PRIVATE_KEY'),
+                      module.subprocess.TimeoutExpired('PRIVATE_TEXT', 5)):
+            with self.subTest(error=type(error).__name__):
+                supervisor = self.supervisor(); original = supervisor.children
+                remote = module.OffboxDeps.__new__(module.OffboxDeps)
+                remote.config = supervisor.config
+                remote.common = SimpleNamespace(OffboxError=OffboxError)
+                remote.ssh_sync = SimpleNamespace(ssh_base=lambda box: (_ for _ in ()).throw(error))
+                self.deps.port_refused = remote.port_refused
+                self.deps.readiness_error = module.ReadinessError('callback', 200, 'DependencyUnavailable')
+                for _ in range(3): self.assertFalse(supervisor.connect())
+                self.assertEqual(supervisor.children, original)
+                self.assertTrue(all(not child.stopped for child in original))
+                self.assertEqual(self.logs()[-2]['event'], 'moni-supervisor-tcp-probe')
+                self.assertEqual(self.logs()[-2]['outcome'], 'unknown')
+                self.assertEqual(self.logs()[-1]['event'], 'moni-supervisor-callback-slow')
+        self.assertNotIn('PRIVATE_', self.output.getvalue())
+
+    def test_box_timeout_with_accepting_port_preserves_callback_and_logs_slow(self):
+        supervisor = self.supervisor(); original = supervisor.children
+        probes = []
+        self.deps.port_refused = lambda port: probes.append(port) or False
+        def timeout():
+            self.clock.advance(5.2)
+            raise module.ReadinessError('callback', 200, 'DependencyUnavailable')
+        self.deps.both_ready = timeout
+        for _ in range(3): self.assertFalse(supervisor.connect())
+        self.assertEqual(supervisor.children, original)
+        self.assertTrue(all(not child.stopped for child in original))
+        slow = [r for r in self.logs() if r['event'] == 'moni-supervisor-callback-slow']
+        self.assertEqual(len(slow), 1)
+        self.assertEqual((slow[0]['latency_ms'], slow[0]['torn_down']), (5200, []))
+        self.assertEqual(probes, [19464])
+        self.assertFalse(any(r['event'] == 'moni-supervisor-reconnect' for r in self.logs()))
+
+    def test_dead_callback_child_rebuilds_only_callback(self):
+        supervisor = self.supervisor(); original = dict(supervisor._children)
+        original['callback'].exit_code = 255
+        self.assertTrue(supervisor.connect())
+        for name, child in original.items():
+            if name == 'callback': self.assertIsNot(supervisor._children[name], child)
+            else: self.assertIs(supervisor._children[name], child)
+        self.assertEqual(self.deps.events.count(('ensure', 'bx_moni')), 1)
+
+    def test_refused_callback_rebuilds_only_callback_and_logs_no_private_values(self):
+        supervisor = self.supervisor(); original = dict(supervisor._children)
+        probes = []; self.deps.port_refused = lambda port: probes.append(port) or True
+        self.deps.readiness_error = module.ReadinessError('callback', 200, 'DependencyUnavailable')
+        for _ in range(3): self.assertFalse(supervisor.connect())
+        self.assertEqual(probes, [19464])
+        for name, child in original.items():
+            self.assertEqual(child.stopped, name == 'callback')
+            if name != 'callback': self.assertIs(supervisor._children[name], child)
+        self.assertEqual(self.logs()[-1]['torn_down'], ['callback'])
 
 
 if __name__ == '__main__': unittest.main()

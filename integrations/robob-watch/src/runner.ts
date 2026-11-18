@@ -1,13 +1,14 @@
 import { applyOwnerAlertResults, dispatchOwnerAlerts, ownerFailureAlerts, queueOwnerFailure, queueOwnerRecovery } from "./owner-alerts.ts";
 import { randomUUID } from "node:crypto";
 import type { DependencyBusy } from "./cause.ts";
+import type { CheckGroup } from "./check-groups.ts";
 import { recordHealthDelivery, isHealthNag } from "./healthDelivery.ts";
 import { toolLog, toolError, logDirectory } from "./toollog.ts";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   clearFailureState, ensureFailureProbe, failureProbeDue, failureProbeDelay, pausedDuration, pauseRetryText, escalationText, escalationFallbackText,
-  CheckShutdownError, withRelayLock, withRelayLockAsync, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
+  CheckShutdownError, CheckStuckError, checkGroups, withRelayLock, withRelayLockAsync, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   trackConfirmation, confirmWakes, inboundState, inQuiet, iso, installCheckShutdown, killRunningChecks, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
@@ -76,12 +77,13 @@ function finish(watcher: Watcher, state: State, status: State["status"]): void {
 }
 
 async function runPendingCheck(watcher: Watcher, at: number, mainChecked = false): Promise<void> {
+  if (await skipStuckCheck(watcher.id)) return;
   const instance = watcherInstance(watcher.id);
   if (!watcher.pending_check || !instance) return;
   await slots.run(async timing => {
-    if (shuttingDown) return;
+    if (shuttingDown || checkGroups.previous(watcher.id)) return;
     const result = await withRelayLockAsync(() => {
-      if (shuttingDown) return;
+      if (shuttingDown || checkGroups.previous(watcher.id)) return;
       const current = loadWatcher(watcher.id);
       const state = loadState(watcher.id);
       if (!current || watcherInstance(watcher.id) !== instance || held(current) || current.paused || !current.pending_check
@@ -406,6 +408,44 @@ function recoverAdmission(id: string, instance: string | undefined): void {
   });
 }
 
+export async function skipStuckCheck(id: string): Promise<boolean> {
+  const t = now(), group = checkGroups.previous(id, t);
+  if (!group) return false;
+  const ageMs = t - group.killedAt!;
+  if (t >= group.nextLogAt) {
+    group.nextLogAt = t + Math.max(1_000, group.watcher.interval_s * 1_000);
+    // stdout reaches runner.log without opening the watcher's potentially stalled volume.
+    log(null, `skip: previous check group ${group.pgid} still alive ${Math.floor(ageMs / 1000)}s after SIGKILL (stuck in kernel) watcher=${id}: ${group.diagnostic}`);
+    toolLog({ component: "runner", kind: "event", name: "watch.skip", ids: { watcher: id },
+      props: { outcome: "stuck_previous", pgid: group.pgid, ageMs, diagnostic: group.diagnostic } });
+  }
+  return true;
+}
+
+async function alertStuckGroup(group: CheckGroup, t: number): Promise<void> {
+  const ageMs = t - group.killedAt!, id = group.watcher.id;
+  if (ageMs >= 30 * 60_000 && !group.alerted && !group.alerting) {
+    group.alerting = true;
+    try {
+      const sent = await alert(group.watcher, `Watcher "${group.watcher.title}" check group ${group.pgid} is still alive ${Math.floor(ageMs / 60_000)} min after SIGKILL: ${group.diagnostic}. New runs paused until it exits.`,
+        `stuck-group:${id}:${group.pgid}`);
+      group.alerted = sent.ok;
+      log(null, `stuck group ${group.pgid} alert ok=${sent.ok} via=${sent.via} watcher=${id}`);
+    } finally { group.alerting = false; }
+  }
+}
+
+export async function recordStuckGroups(): Promise<void> {
+  // Removed and paused watchers still own their surviving groups; notices cannot depend on listIds().
+  const groups = checkGroups.stuck(), t = now();
+  const count = checkGroups.globalWarning();
+  if (count !== undefined) {
+    log(null, `runner: ${count} check groups stuck in kernel — likely system-wide FS/TCC stall`);
+    toolLog({ component: "runner", kind: "event", name: "watch.stuck_global", props: { count } });
+  }
+  await Promise.all(groups.map(group => alertStuckGroup(group, t)));
+}
+
 export async function tickOne(id: string): Promise<void> {
   if (shuttingDown) return;
   try {
@@ -419,7 +459,10 @@ export async function tickOne(id: string): Promise<void> {
         if (!shuttingDown) await recoveryNotice(id);
       }
     }
-  } catch (error) { if (!(error instanceof CheckShutdownError)) throw error; }
+  } catch (error) {
+    if (error instanceof CheckStuckError) { await skipStuckCheck(id); return; }
+    if (!(error instanceof CheckShutdownError)) throw error;
+  }
 }
 
 async function recoveryNotice(id: string): Promise<void> {
@@ -557,6 +600,7 @@ async function tickWatcher(id: string): Promise<void> {
   if (state.failure_paused_at && !finalCheck && !probing) return;
   if (state.batch?.watcher && !sameDestination(state.batch.watcher, watcher)) return;
   if (state.status !== "closing" && !state.reply_handoff && !state.admitted_run && watcher.max_fires !== 0 && state.fires + (state.batch?.events.length ?? 0) >= watcher.max_fires) return;
+  if (await skipStuckCheck(id)) return;
   // Trigger files (e.g. chat.db-wal) run the check as soon as they change; interval_s stays the fallback.
   // A failing watcher keeps its backoff; the signature is recorded before the run so a change mid-run re-triggers.
   let sig: string | undefined;
@@ -618,7 +662,7 @@ async function tickWatcher(id: string): Promise<void> {
     lateMs = Math.max(0, now() - dueAt);
     loadModeAtAdmission = loadMode.high;
     return withRelayLockAsync(() => {
-    if (shuttingDown || !sameInstance()) return undefined;
+    if (shuttingDown || !sameInstance() || checkGroups.previous(id)) return undefined;
     recoverAdmission(id, instance);
     const recovery = loadState(id);
     const unacked = recovery.discarded_run ?? recovery.reply_handoff?.accepted_run
@@ -812,6 +856,7 @@ function recordCadence(watcher: Watcher): void {
 }
 export async function tick(): Promise<void> {
   if (shuttingDown) return;
+  void recordStuckGroups().catch(() => toolError("runner", "watch.stuck_notice_failed"));
   previousDayRollup();
   sampleLoad();
   const mounted = isMounted(SSD_PATH);

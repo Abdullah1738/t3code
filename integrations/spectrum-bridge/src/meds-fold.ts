@@ -67,6 +67,8 @@ export async function foldMedsLine(opts: FoldOptions = {}): Promise<FoldResult> 
     const done = await Promise.race([completed, timeout]);
     if (done === "timeout") {
       spawned.kill("SIGKILL");
+      // Callers rely on the child being reaped, not just signalled.
+      await Promise.race([spawned.exited, Bun.sleep(250)]).catch(() => {});
       return result("timeout");
     }
     const [exitCode, line] = done;

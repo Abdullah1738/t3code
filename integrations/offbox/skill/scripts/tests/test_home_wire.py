@@ -106,6 +106,25 @@ class Wire(Isolated):
         st = api.cmd_status(box, a["processId"])
         self.assertEqual((st["attempt"], st["retryInterrupted"], st["bootId"]), (1, True, "boot-2"))
 
+    def test_nonce_persists_over_http_and_fences_restart_start_detection(self):
+        nonce, run_id = '1234567890abcdef', 'run-nonced-recovery'
+        box = self.srv.make_box('ardud')
+        result = api.cmd_start(box, 'true', meta={'run_id': run_id, 'protocol_nonce': nonce})
+        row = dict(self.srv.con.execute('SELECT * FROM commands WHERE box_id=? AND pid=?',
+                                       (box, result['processId'])).fetchone())
+        self.assertEqual((row['run_id'], row['protocol_nonce']), (run_id, nonce))
+        row.update(status='queued', started_at=None)
+        start = f'offbox-command-started: {run_id} [n={nonce}]'
+        path = boatd.cmd_dir(box) / f"{row['pid']}.err"
+        for line, expected in ((start, True), (start + '\r', True),
+                               (start.replace(nonce, 'wrongnonce'), False),
+                               (f'offbox-command-started: {run_id}', False),
+                               (start.replace(run_id, 'run-other'), False),
+                               ('prefix ' + start, True), (start + ' suffix', True)):
+            with self.subTest(line=line):
+                path.write_text(line + '\n')
+                self.assertEqual(boatd.command_was_started(row), expected)
+
     def test_reattached_run_keeps_waiting_and_returns_real_exit(self):
         box = self.srv.box()
         pid = self.srv.cmd(box, retry=1)
@@ -205,7 +224,7 @@ class Wire(Isolated):
                     self.assertEqual(misc.wait(run_id, None), expected)
                     self.assertEqual(misc.logs(run_id, False), 90 if expected == 90 else 0)
                 self.assertEqual(runs.step_results(log), [(int(n), int(rc)) for n, rc in
-                                 runs.STEP_RESULT.findall(second)])
+                                 [(m.fields["step"], m.fields["rc"]) for m in runs.protocol.Protocol().scan(second) if m.kind == "step"]])
                 row = misc._run_row(run_id)
                 self.assertEqual(row['status'], 'infra' if expected == 90 else 'done' if expected == 0 else 'failed')
 
