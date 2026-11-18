@@ -14,6 +14,7 @@ import * as Effect from "effect/Effect";
 import {
   makeProviderFailure,
   makeProviderFailureTurnItem,
+  makeProviderRetryTurnItem,
   withPreviousFailure,
   MAX_PROVIDER_FAILURE_CODE_LENGTH,
   MAX_PROVIDER_FAILURE_MESSAGE_LENGTH,
@@ -430,3 +431,36 @@ it.each([
     "The provider could not start this turn. Retry the turn; if it keeps failing, check the provider setup and server logs.",
   );
 });
+
+it.each([
+  { category: "persistence", failureClass: "unknown", title: "Persistence error" },
+  { category: "unknown", failureClass: "usage_limit", title: "Usage limit reached" },
+  { category: "unknown", failureClass: "provider_error", title: "Provider error" },
+] as const)(
+  "names terminal and failed retry items for $category/$failureClass",
+  ({ category, failureClass, title }) => {
+    const occurredAt = DateTime.makeUnsafe("2026-11-18T04:44:05.319Z");
+    const input = {
+      driver: ProviderDriverKind.make("codex"),
+      threadId: ThreadId.make("thread:titles"),
+      runId: RunId.make("run:titles"),
+      nodeId: NodeId.make("node:titles"),
+      providerThreadId: ProviderThreadId.make("provider-thread:titles"),
+      providerTurnId: ProviderTurnId.make("provider-turn:titles"),
+      itemOrdinal: 1,
+      failure: makeProviderFailure({ category, class: failureClass, message: "Failure detail" }),
+      occurredAt,
+    };
+    assert.equal(makeProviderFailureTurnItem(input).title, title);
+    assert.equal(
+      makeProviderRetryTurnItem({
+        ...input,
+        retry: { attempt: 1, maxAttempts: 1, retryDelayMs: null },
+        status: "failed",
+        startedAt: occurredAt,
+        updatedAt: occurredAt,
+      }).title,
+      title,
+    );
+  },
+);

@@ -73,6 +73,7 @@ import {
   isTransientSqliteReadFailure,
   transientReadRetrySchedule,
 } from "../ardud/durability/transientSqliteRead.ts";
+import { runIngestionFailure } from "../ardud/durability/runPersistenceFailure.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import {
@@ -741,6 +742,7 @@ export const layer: Layer.Layer<
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
     const analyticsContext = yield* Effect.context<never>();
+    const analytics = yield* Effect.serviceOption(Analytics.Analytics);
     const startProgress = yield* Effect.serviceOption(ProviderStartProgress.ProviderStartProgress);
 
     const usageByRun = new Map<
@@ -895,11 +897,15 @@ export const layer: Layer.Layer<
         // Completion cohorts are advanced by Orchestrator while a provider
         // turn is in flight. Do not replay the run snapshot captured at start
         // over a newer acknowledgement, successor, or Stop barrier.
-        const { delegatedCompletion: _delegatedCompletion, ...runWithoutDelegatedCompletion } =
-          input.run;
+        const {
+          delegatedCompletion: _delegatedCompletion,
+          failure: _failure,
+          ...runWithoutDelegatedCompletion
+        } = input.run;
         const finalizedRun: OrchestrationV2Run = {
           ...runWithoutDelegatedCompletion,
           status: persistedStatus,
+          ...(input.terminal.status === "failed" ? { failure: input.terminal.failure } : {}),
           ...(persistedStatus === "cancelled" || persistedStatus === "interrupted"
             ? {
                 cancelReason:
@@ -2312,6 +2318,25 @@ export const layer: Layer.Layer<
                 });
                 if (finalized) return;
                 if (yield* Ref.get(startupFailurePending)) return;
+                const failure = runIngestionFailure(cause);
+                if (failure.category === "persistence") {
+                  if (Option.isSome(analytics)) {
+                    const now = yield* DateTime.now;
+                    yield* recordServerAnalytics(analytics.value, {
+                      ts: DateTime.formatIso(now),
+                      kind: "run.failed",
+                      surface: "server",
+                      route: "orchestrationV2",
+                      threadId: input.run.threadId,
+                      props: {
+                        runId: input.run.id,
+                        failureCategory: failure.category,
+                        failureCode: failure.code ?? "persistence_sql_error",
+                        errorMessage: failure.message.slice(0, 2000),
+                      },
+                    });
+                  }
+                }
                 const providerThread = yield* currentProviderThread;
                 const latestItemOrdinal = yield* Ref.get(latestTurnItemOrdinal);
                 const openSubagents = yield* Ref.get(openRunOwnedSubagents);
@@ -2338,10 +2363,7 @@ export const layer: Layer.Layer<
                     : { loadRunInterruptReason: input.loadRunInterruptReason }),
                   openRunOwnedSubagents: openSubagents,
                   terminal: makeFailedTerminalEvent(
-                    makeProviderFailure({
-                      cause: Cause.squash(cause),
-                      class: "unknown",
-                    }),
+                    failure,
                     latestItemOrdinal + 1,
                     input.session.backgroundTasksEndWithProcess !== true,
                   ),

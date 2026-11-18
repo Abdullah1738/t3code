@@ -2442,6 +2442,7 @@ const make = Effect.gen(function* () {
                 message: stalledSummary(stall, null).slice(0, 2_000),
                 retryable: null,
               };
+    yield* McpCallAnalytics.setTaskFailure(taskFailure);
     onProgress?.({ status, ...(taskFailure === undefined ? {} : { failure: taskFailure }) });
     const resultTransfer = taskResultTransfer(parentProjection, childControls, task) ?? null;
     const summaryRun =

@@ -68,6 +68,16 @@ const restarted: KanbanCardRetry = {
 };
 
 describe("noRetryReason", () => {
+  it("does not retry a server persistence failure as a provider crash", () => {
+    expect(
+      noRetryReason({ ...dropped, category: "persistence", code: "sqlite_14", retryable: false }),
+    ).toBe("Robob could not save the run");
+    expect(
+      decide({
+        failure: { ...dropped, category: "persistence", code: "sqlite_14", retryable: false },
+      }),
+    ).toEqual({ _tag: "flag", why: "Robob could not save the run" });
+  });
   it("retries a dropped stream, a crash and a run that failed without a message", () => {
     expect(noRetryReason(dropped)).toBeNull();
     expect(

@@ -151,6 +151,8 @@ const STOPPED_TEXT =
 export function noRetryReason(failure: RetryFailure): string | null {
   if (isOutage(failure)) return "the provider is out of usage or down";
   switch (failure.category) {
+    case "persistence":
+      return "Robob could not save the run";
     case "config":
       return "the provider refuses this account or setup";
     case "model_invalid":

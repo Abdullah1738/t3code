@@ -127,6 +127,10 @@ export class McpCall extends Context.Service<
     dispatchFenceRecovered?: boolean;
     retryPath?: "receipt_fast" | "attached_pending" | "dispatched";
     taskLookup?: TaskLookup;
+    taskFailure?: Pick<
+      NonNullable<AnalyticsEvent["props"]>,
+      "failureCategory" | "failureCode" | "errorMessage"
+    >;
     replyFailure?: "reply_timeout" | "reply_error";
     replyStage?: string;
     replySubSteps?: ReadonlyArray<{ readonly subStep: string; readonly ms: number }>;
@@ -324,6 +328,30 @@ export const setTaskLookup = Effect.fnUntraced(function* (
     call.value.saved = false;
 });
 
+// Task status can succeed as an RPC while reporting a failed child run.
+export const setTaskFailure = Effect.fnUntraced(function* (
+  failure:
+    | {
+        readonly category: NonNullable<NonNullable<AnalyticsEvent["props"]>["failureCategory"]>;
+        readonly code: string | null;
+        readonly message: string;
+      }
+    | undefined,
+) {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "None") return;
+  if (failure === undefined) {
+    delete call.value.taskFailure;
+    return;
+  }
+  const code = label(failure.code);
+  call.value.taskFailure = {
+    failureCategory: failure.category,
+    ...(code === undefined ? {} : { failureCode: code }),
+    errorMessage: failure.message.slice(0, 2000),
+  };
+});
+
 // Capture the receipt lookup before dispatch so interruption cannot hide a committed command.
 export const trackDelegation = Effect.fnUntraced(function* (
   taskId: string,
@@ -374,6 +402,7 @@ export function callOutcome(
       errorPhase: state.phase,
       props: {
         ...taskLookup,
+        ...state.taskFailure,
         ...(state.retryPath === undefined ? {} : { retryPath: state.retryPath }),
         ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
         code: "unknown",
@@ -513,6 +542,7 @@ export function callOutcome(
     ...(state.readOnly && state.taskLookup === undefined ? {} : { saved }),
     props: {
       ...taskLookup,
+      ...state.taskFailure,
       ...(state.retryPath === undefined ? {} : { retryPath: state.retryPath }),
       ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
       ...(notFoundReason === undefined ? {} : { notFoundReason }),
