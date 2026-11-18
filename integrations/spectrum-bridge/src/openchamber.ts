@@ -311,6 +311,7 @@ export type SteerGuard = { signal: AbortSignal; beforeSend: () => Promise<boolea
  * implements it here; Robob's control API implements it in robob.ts.
  */
 export interface ChatBackend {
+  readonly linkAvailable?: boolean;
   /** How owner-facing text names the app. Defaults to OpenChamber. */
   readonly brand?: { app: string };
   /** Share message reads within one router tick; later ticks always refresh. */
