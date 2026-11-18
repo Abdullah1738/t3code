@@ -6,8 +6,8 @@ import { toolLog, toolError, logDirectory } from "./toollog.ts";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  withRelayLock, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
-  trackConfirmation, confirmWakes, inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
+  CheckShutdownError, withRelayLock, withRelayLockAsync, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
+  trackConfirmation, confirmWakes, inboundState, inQuiet, iso, installCheckShutdown, killRunningChecks, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
@@ -18,6 +18,7 @@ const TICK_MS = 1_000;
 /** By default a trigger-file change never runs the same check more often than this (watcher.trigger_gap_s overrides). */
 const TRIGGER_MIN_GAP_MS = 2_000;
 const running = new Set<string>();
+let shuttingDown = false;
 let maintenance: Maintenance | undefined;
 let ssdMounted = true;
 const loadMode = new LoadMode();
@@ -77,7 +78,9 @@ async function runPendingCheck(watcher: Watcher, at: number, mainChecked = false
   const instance = watcherInstance(watcher.id);
   if (!watcher.pending_check || !instance) return;
   await slots.run(async timing => {
-    const result = await withRelayLock(() => {
+    if (shuttingDown) return;
+    const result = await withRelayLockAsync(() => {
+      if (shuttingDown) return;
       const current = loadWatcher(watcher.id);
       const state = loadState(watcher.id);
       if (!current || watcherInstance(watcher.id) !== instance || held(current) || current.paused || !current.pending_check
@@ -88,7 +91,7 @@ async function runPendingCheck(watcher: Watcher, at: number, mainChecked = false
         { WATCH_PENDING: "1", WATCH_RUN: `pending-${at.toString(36)}`, ...(mainChecked ? { WATCH_MAIN_CHECKED: "1" } : {}) },
         checkTimeout(current, sampleLoad()), instance);
     });
-    if (!result) return;
+    if (!result || shuttingDown) return;
     log(watcher.id, `pending check exit=${result.code} timeout=${result.timedOut}`);
   }, { watcher: watcher.id, operation: "pending", dueAt: at, intervalMs: watcher.interval_s * 1_000 });
 }
@@ -184,7 +187,7 @@ async function headsUps(watcher: Watcher, state: State): Promise<void> {
 export async function pauseNotice(watcher: Watcher, state: State): Promise<void> {
   const instance = watcherInstance(watcher.id);
   const pausedAt = state.failure_paused_at;
-  const current = withRelayLock(() => {
+  const current = await withRelayLockAsync(() => {
     const definition = loadWatcher(watcher.id);
     const fresh = loadState(watcher.id);
     if (!definition || watcherInstance(watcher.id) !== instance || !fresh.failure_paused_at
@@ -196,7 +199,7 @@ export async function pauseNotice(watcher: Watcher, state: State): Promise<void>
   watcher = current.watcher;
   state = current.state;
   // Resume owns this same lock. Bridge completion must never restore its old pause snapshot.
-  const update = (change: (fresh: State) => void) => withRelayLock(() => {
+  const update = (change: (fresh: State) => void) => withRelayLockAsync(() => {
     const fresh = loadState(watcher.id);
     if (!loadWatcher(watcher.id) || watcherInstance(watcher.id) !== instance || fresh.failure_paused_at !== pausedAt) return;
     change(fresh);
@@ -208,14 +211,14 @@ export async function pauseNotice(watcher: Watcher, state: State): Promise<void>
     const sent = await alert(watcher, `Watcher "${watcher.title}" paused after ${state.consecutive_failures} failures in a row (${mins} min). Last error: ${(state.last_error ?? "").slice(0, 300)}. Fix it, then robob-watch resume ${watcher.id}. Log: ${join(watcherDir(watcher.id), "log")}`,
       `robob-watch:${watcher.id}:paused:${hash(state.failure_episode ?? state.failing_since ?? "")}`, "error", !ownerFailureAlerts(watcher, state));
     log(watcher.id, `pause notice ok=${sent.ok} via=${sent.via}`);
-    const fresh = update(fresh => { fresh.failure_alerted = sent.ok; });
+    const fresh = await update(fresh => { fresh.failure_alerted = sent.ok; });
     if (!fresh) return;
     state = fresh;
   }
   if (shouldEscalate(watcher, state)) {
     const sent = await escalate(watcher, state, `robob-watch:${watcher.id}:escalate:${hash(state.failure_episode ?? state.failing_since ?? "").slice(0, 32)}`, !ownerFailureAlerts(watcher, state));
     log(watcher.id, `failure escalation ok=${sent.ok} via=${sent.via}${sent.ok ? "" : ` ${sent.detail}`}`);
-    update(fresh => { fresh.failure_escalated = sent.ok; });
+    await update(fresh => { fresh.failure_escalated = sent.ok; });
   }
 }
 
@@ -397,12 +400,18 @@ function recoverAdmission(id: string, instance: string | undefined): void {
 }
 
 export async function tickOne(id: string): Promise<void> {
-  applyOwnerAlertResults(id);
-  try { await tickWatcher(id); }
-  finally {
-    applyOwnerAlertResults(id);
-    dispatchOwnerAlerts(id);
-  }
+  if (shuttingDown) return;
+  try {
+    try {
+      await applyOwnerAlertResults(id);
+      await tickWatcher(id);
+    } finally {
+      if (!shuttingDown) {
+        await applyOwnerAlertResults(id);
+        if (!shuttingDown) dispatchOwnerAlerts(id);
+      }
+    }
+  } catch (error) { if (!(error instanceof CheckShutdownError)) throw error; }
 }
 
 async function tickWatcher(id: string): Promise<void> {
@@ -411,13 +420,14 @@ async function tickWatcher(id: string): Promise<void> {
   const initial = loadWatcher(id);
   if (!initial) return;
   finishRecoveredCap(id);
-  recoverAdmission(id, instance);
+  await withRelayLockAsync(() => recoverAdmission(id, instance));
   let state = loadState(id);
   const unacked = state.discarded_run ?? state.reply_handoff?.accepted_run
     ?? (state.admitted_run?.accepted ? state.admitted_run.run : undefined);
   if (unacked) {
     // State records acceptance before the separate helper ack; finish that ack after a crash/write failure.
-    try { acknowledgeRun(id, instance, unacked); } catch { toolError("runner", "watch.ack_failed", { watcher: id }); return; }
+    try { await withRelayLockAsync(() => acknowledgeRun(id, instance, unacked)); }
+    catch (error) { if (error instanceof CheckShutdownError) throw error; toolError("runner", "watch.ack_failed", { watcher: id }); return; }
     state = loadState(id);
     finishRecoveredCap(id);
     state = loadState(id);
@@ -437,7 +447,7 @@ async function tickWatcher(id: string): Promise<void> {
   const watcher = pollingWatcher(definition, state);
   if (!watcher) return;
   if (state.status === "closing" && now() >= state.closing_until! && (watcher.paused || (state.closing_final_check && !state.pending && !state.batch))) {
-    finalizeClosing(id);
+    await withRelayLockAsync(() => finalizeClosing(id));
     return;
   }
   if (!checking(state) || watcher.paused) return;
@@ -530,11 +540,12 @@ async function tickWatcher(id: string): Promise<void> {
   const trigger = finalCheck ? "final" : state.consecutive_failures || state.load_timeouts ? "retry" : triggered ? "trigger" : "schedule";
   let lateMs = 0, loadModeAtAdmission = false;
   const result = await slots.run(async timing => {
+    if (shuttingDown) return;
     slotTiming = timing;
     lateMs = Math.max(0, now() - dueAt);
     loadModeAtAdmission = loadMode.high;
-    return withRelayLock(() => {
-    if (!sameInstance()) return undefined;
+    return withRelayLockAsync(() => {
+    if (shuttingDown || !sameInstance()) return undefined;
     recoverAdmission(id, instance);
     const recovery = loadState(id);
     const unacked = recovery.discarded_run ?? recovery.reply_handoff?.accepted_run
@@ -566,7 +577,7 @@ async function tickWatcher(id: string): Promise<void> {
     });
   }, { watcher: id, run: attemptId, operation: "check", intervalMs: watcher.interval_s * 1_000,
     dueAt, lane });
-  if (!result) return;
+  if (!result || shuttingDown) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
   const failed = runTimedOut || result.code !== 0;
   toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: result.busy ? "busy" : runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", ...(result.busy ? { stderrClass: "dependency_busy", dependency: result.busy.dependency } : {}), exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs: Math.max(0, now() - t - result.ms), ...slotTiming, dueAt, lateMs, lane, loadMode: loadModeAtAdmission, intervalMs: watcher.interval_s * 1_000, trigger }, ...(failed ? { error: { tag: result.busy ? "watch.dependency_busy" : runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
@@ -576,7 +587,10 @@ async function tickWatcher(id: string): Promise<void> {
   const currentDefinition = loadWatcher(id);
   const current = currentDefinition && pollingWatcher(currentDefinition, fresh);
   if (!current || !checking(fresh)) return;
-  const ackRun = () => { try { acknowledgeRun(id, instance, runId); } catch { toolError("runner", "watch.ack_failed", { watcher: id }); } };
+  const ackRun = async () => {
+    try { await withRelayLockAsync(() => acknowledgeRun(id, instance, runId)); }
+    catch (error) { if (error instanceof CheckShutdownError) throw error; toolError("runner", "watch.ack_failed", { watcher: id }); }
+  };
   if (fresh.status === "closing" && checkedWatcher?.check !== current.check) {
     // Only the reply-only command may recover helper output. Keep its original delivery identity
     // until that poll succeeds, so an unacked outbox cannot cross recipients after a retarget.
@@ -586,7 +600,7 @@ async function tickWatcher(id: string): Promise<void> {
     delete fresh.admitted_run;
     fresh.next_at = 0;
     saveState(id, fresh);
-    if (!checkedWatcher?.inflight_check) ackRun();
+    if (!checkedWatcher?.inflight_check) await ackRun();
     log(id, "normal check completed after removal; only the configured in-flight check may emit during grace");
     return;
   }
@@ -655,10 +669,10 @@ async function tickWatcher(id: string): Promise<void> {
   const { event, urgent } = checkEvent(result.stdout);
   if (fresh.admitted_run?.run === runId) fresh.admitted_run.accepted = true;
   if (!event) {
-    saveState(id, fresh); ackRun();
+    saveState(id, fresh); await ackRun();
     fresh = loadState(id);
     finishRecoveredCap(id);
-    if (fresh.status === "closing" && fresh.closing_final_check && !fresh.batch) finalizeClosing(id);
+    if (fresh.status === "closing" && fresh.closing_final_check && !fresh.batch) await withRelayLockAsync(() => finalizeClosing(id));
     await runPendingCheck(watcher, t, true);
     return;
   }
@@ -668,7 +682,7 @@ async function tickWatcher(id: string): Promise<void> {
     else if (fresh.batch) (fresh.batch.healthRuns ??= []).push(healthRun);
   }
   saveState(id, fresh);
-  ackRun();
+  await ackRun();
   log(id, `event: ${event.slice(0, 500)}`);
   if (inQuiet(watcher.quiet)) log(id, "quiet hours: event held until they end");
   if (fresh.pending && !current.paused) await deliverPending(current, fresh);
@@ -701,6 +715,7 @@ function recordCadence(watcher: Watcher): void {
   toolLog({ component: "runner", kind: "event", name: "watch.cadence", ids: { watcher: watcher.id }, props: { intervalMs: watcher.interval_s * 1_000 } });
 }
 export async function tick(): Promise<void> {
+  if (shuttingDown) return;
   previousDayRollup();
   sampleLoad();
   const mounted = isMounted(SSD_PATH);
@@ -728,6 +743,12 @@ export async function tick(): Promise<void> {
   void Promise.all(jobs);
 }
 
+let tickTimer: ReturnType<typeof setInterval> | undefined;
+installCheckShutdown(() => {
+  shuttingDown = true;
+  if (tickTimer) clearInterval(tickTimer);
+});
+
 if (import.meta.main) {
   ensureDirs();
   // Only one runner at a time, even if launchd and a manual run overlap.
@@ -739,11 +760,12 @@ if (import.meta.main) {
     const command = alive ? Bun.spawnSync(["/bin/ps", "-o", "command=", "-p", String(other)]).stdout.toString() : "";
     if (alive && command.includes("robob-watch/src/runner.ts")) {
       log(null, `another runner is live (pid ${other}); exiting`);
+      await killRunningChecks();
       process.exit(0);
     }
   }
   writeFileSync(pidPath, `${process.pid}\n`);
   log(null, `robob-watch runner started pid=${process.pid} host load=${hostLoad().toFixed(1)}/core`);
   await tick().catch(() => toolError("runner", "watch.tick_failed"));
-  setInterval(() => void tick().catch(() => toolError("runner", "watch.tick_failed")), TICK_MS);
+  if (!shuttingDown) tickTimer = setInterval(() => void tick().catch(() => toolError("runner", "watch.tick_failed")), TICK_MS);
 }
