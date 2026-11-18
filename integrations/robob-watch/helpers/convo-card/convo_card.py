@@ -194,8 +194,10 @@ _words = None
 def english_words():
     global _words
     if _words is None:
+        # Fixtures must not depend on a host dictionary (Linux often has none).
+        path = os.environ.get("CONVO_CARD_WORDS_FILE", WORDS_FILE) if under_test() else WORDS_FILE
         try:
-            with open(WORDS_FILE, errors="replace") as f:
+            with open(path, errors="replace") as f:
                 _words = {w.strip().lower() for w in f}
         except OSError:
             _words = set()    # no word list: every message with letters gets reviewed
