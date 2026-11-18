@@ -80,10 +80,7 @@ it.effect("an enqueued continuation is found until it settles, then the next one
     yield* insertRaw("effect:raw", threadId);
     assert.isNull(yield* outbox.pendingRunContinuation(threadId));
     yield* outbox.enqueue([continuation("effect:second", threadId)]);
-    assert.include(
-      ["effect:raw", "effect:second"],
-      yield* outbox.pendingRunContinuation(threadId),
-    );
+    assert.include(["effect:raw", "effect:second"], yield* outbox.pendingRunContinuation(threadId));
   }).pipe(Effect.provide(layer)),
 );
 

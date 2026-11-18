@@ -14,6 +14,7 @@ import {
   RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -437,6 +438,7 @@ const rowToEffect = (row: EffectRow) =>
  */
 interface ContinuationMarks {
   seeded: boolean;
+  seedRetryAt: number;
   generation: number;
   readonly seedLock: Semaphore.Semaphore;
   readonly threads: Map<string, { generation: number; readonly unseen: Set<string> }>;
@@ -447,6 +449,7 @@ const continuationMarksFor = (sql: object): ContinuationMarks => {
   if (existing !== undefined) return existing;
   const created: ContinuationMarks = {
     seeded: false,
+    seedRetryAt: 0,
     generation: 0,
     seedLock: Semaphore.makeUnsafe(1),
     threads: new Map(),
@@ -564,11 +567,11 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         NodeSqliteClient.readOnly,
       );
 
-    // Rows left by an earlier process. Uses the status-led claim index; a failed
-    // seed leaves every probe on the database and is retried on the next probe.
+    // Rows left by an earlier process. Uses the status-led claim index; until a
+    // seed succeeds every probe reads the database, and a failed seed waits 5 s.
     const seedContinuationMarks = marks.seedLock.withPermits(1)(
       Effect.gen(function* () {
-        if (marks.seeded) return;
+        if (marks.seeded || (yield* Clock.currentTimeMillis) < marks.seedRetryAt) return;
         const rows = yield* sql<{ thread_id: string; effect_id: string }>`
           SELECT thread_id, effect_id FROM orchestration_v2_effect_outbox
           WHERE status IN ('pending', 'running')
@@ -582,7 +585,10 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         marks.seeded = true;
       }).pipe(
         Effect.catch((cause) =>
-          Effect.logWarning("effect_outbox.continuation_seed_failed", { cause }),
+          Effect.gen(function* () {
+            marks.seedRetryAt = (yield* Clock.currentTimeMillis) + 5_000;
+            yield* Effect.logWarning("effect_outbox.continuation_seed_failed", { cause });
+          }),
         ),
       ),
     );
@@ -614,7 +620,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           const nowIso = DateTime.formatIso(now);
           yield* Effect.forEach(
             effects,
-            (effect) => sql<{ readonly effect_id: string }>`
+            (effect) =>
+              sql<{ readonly effect_id: string }>`
               INSERT INTO orchestration_v2_effect_outbox (
                 effect_id,
                 command_id,
@@ -642,18 +649,18 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               ON CONFLICT(effect_id) DO NOTHING
               RETURNING effect_id
             `.pipe(
-              Effect.tap((inserted) =>
-                Effect.sync(() => {
-                  // Marked before commit: the probe must not miss it once it commits.
-                  if (
-                    inserted.length > 0 &&
-                    effect.request.type === "provider-runtime.continue" &&
-                    effect.request.queued !== true
-                  )
-                    markContinuation(marks, effect.threadId, effect.id);
-                }),
+                Effect.tap((inserted) =>
+                  Effect.sync(() => {
+                    // Marked before commit: the probe must not miss it once it commits.
+                    if (
+                      inserted.length > 0 &&
+                      effect.request.type === "provider-runtime.continue" &&
+                      effect.request.queued !== true
+                    )
+                      markContinuation(marks, effect.threadId, effect.id);
+                  }),
+                ),
               ),
-            ),
             { concurrency: 1, discard: true },
           );
           // EventSink owns the corresponding post-commit notification.
