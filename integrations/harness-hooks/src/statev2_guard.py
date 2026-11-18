@@ -51,6 +51,7 @@ MAX_SOURCE_BYTES = 2_000_000
 MAX_SCRIPTS = 32
 NODE_TEST_MAX_FILES = 200
 MAX_SHELL_DEPTH = 12
+ZSH_GLOBAL_ENV = '/etc/zshenv'
 STARTUP_ENV = re.compile(r'(?:BASH_ENV|ENV|BASHOPTS|SHELLOPTS|LD_[A-Za-z_]*|DYLD_[A-Za-z_]*|PYTHON[A-Z_]+)')
 SHELL_SPECIAL_BINDINGS = frozenset({'path', 'cdpath', 'fpath', 'FPATH', 'ARGV0', 'NULLCMD', 'READNULLCMD',
                                     'PS4', 'PROMPT4', 'BASH_XTRACEFD',
@@ -2320,9 +2321,18 @@ def _database_reference(source):
 
 def refusal_reason(rule, cause, cwd):
     if rule == "live-database-script-unresolved":
+        zsh_hint = None
+        if cause and 'zsh: implicit startup unproved' in cause:
+            zsh_hint = 'Use zsh -f -n to skip user startup files; check one file per call.'
+        elif cause and 'zsh: /etc/zshenv startup unproved' in cause:
+            zsh_hint = 'Resolve the named zsh startup input, then retry.'
+        elif cause and 'interpreter startup: zsh' in cause:
+            zsh_hint = "Check zsh's startup environment and executable, then retry."
         if cause and '\nAccepted: ' in cause:
             detail, hint = cause.split('\nAccepted: ', 1)
-            if 'startup' in detail or 'repo-node-pin' in detail:
+            if zsh_hint:
+                hint = zsh_hint
+            elif 'startup' in detail or 'repo-node-pin' in detail:
                 hint = 'Resolve the named startup input, then retry.'
             writer = re.fullmatch(r'no readable same-call heredoc writer for this script; invalidated by '
                                   r'(python3?) command at line (\d+); intervening command; '
@@ -2337,6 +2347,8 @@ def refusal_reason(rule, cause, cwd):
             fix = "Close the shell quote before running the command."
         elif cause and ('script source changed after its heredoc write' in cause or 'unchecked copy at script path' in cause):
             fix = "An intervening command may replace the checked source. Split source preparation and execution into separate calls."
+        elif zsh_hint:
+            fix = zsh_hint
         elif cause and ('startup' in cause or 'repo-node-pin' in cause):
             fix = "Resolve the named startup input, then retry."
         elif cause and ("MAX_SCRIPTS" in cause or "MAX_SHELL_DEPTH" in cause or "node --test lists" in cause):
@@ -2835,16 +2847,47 @@ def _node_test_glob_matches(value, directory):
     return files
 
 
+def _zsh_no_rcs(args):
+    no_rcs, index = False, 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {'--', '-'} or not arg.startswith(('-', '+')):
+            break
+        if arg in {'-o', '+o'}:
+            index += 1
+            if index == len(args) or (arg, args[index]) not in {('-o', 'norcs'), ('+o', 'rcs')}:
+                return False
+            no_rcs = True
+        elif arg in {'--no-rcs', '--norcs'}:
+            no_rcs = True
+        elif re.fullmatch(r'-[denucsvxf]+', arg):
+            no_rcs |= 'f' in arg
+            if 'c' in arg:
+                # Zsh keeps parsing options after -c; the shared shell scan
+                # expects the next word to be command text. Refuse ambiguous
+                # boundaries before granting startup or parse-only proof.
+                if index + 1 == len(args) or args[index + 1].startswith(('-', '+')):
+                    raise AmbiguousScript('zsh: options after -c unproved')
+                break
+        else:
+            return False
+        index += 1
+    return no_rcs
+
+
 def _interpreter_args(binary, args):
     operands = {"-X", "-W", "--check-hash-based-pycs"} if re.fullmatch(r"python[\d.]*", binary) else set()
-    if binary in {"bash", "sh", "zsh", "dash", "ksh"}:
+    shell = binary in {"bash", "sh", "zsh", "dash", "ksh"}
+    if shell:
         operands |= {"-o", "+o", "-O", "+O"}
     if binary in {"node", "bun", "deno"}:
         operands |= {"--test-name-pattern", "--test-skip-pattern", "--test-reporter", "--test-reporter-destination", "--test-concurrency"}
     result, index = [], 0
     while index < len(args):
         flag = args[index]
-        if flag in {"-c", "-e", "--eval", "-p", "--print", "-m", "--", "-"} or not flag.startswith(("-", "+")):
+        if (flag in {"-c", "--", "-"} or
+                not shell and flag in {"-e", "--eval", "-p", "--print", "-m"} or
+                not flag.startswith(("-", "+"))):
             return result + args[index:]
         index += 2 if flag in operands else 1
         if flag not in operands:
@@ -3542,8 +3585,24 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         nonlocal proof_failure
         binary = os.path.basename(words[0])
         if binary == 'zsh':
-            proof_failure = 'zsh: implicit startup unproved'
-            return False
+            if not _zsh_no_rcs(words[1:]):
+                proof_failure = 'zsh: implicit startup unproved'
+                return False
+            proof_failure = 'zsh: /etc/zshenv startup unproved'
+            try:
+                info = os.lstat(ZSH_GLOBAL_ENV)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+            else:
+                # -f still reads this system file. Trust only a regular file
+                # controlled by root; group/world writes or symlinks can hand
+                # startup back to an untrusted source.
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                    return False
+            if not unchanged_tool(ZSH_GLOBAL_ENV, directory):
+                return False
         if re.fullmatch(r'python[\d.]*', binary):
             startup_args = list(words[1:])
             isolated = False
@@ -3577,7 +3636,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 if arg not in {'--test', '--no-test', '--no-warnings', '--check', '-c'}:
                     proof_failure = 'node: runtime startup options unproved'
                     return False
-        if binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'}:
+        if binary in {'bash', 'sh', 'dash', 'ksh'}:
             for index, arg in enumerate(words[1:]):
                 if arg.startswith('+'):
                     raise AmbiguousScript(f'shell: plus options unproved at line {current_line}')
@@ -5171,14 +5230,19 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if binary in {'bun', 'deno'} and args[:1] == ['run']:
             args = _interpreter_args(binary, args[1:])
         program_args = list(args)
-        while program_args and program_args[0].startswith('-') and program_args[0] != '-':
+        while (program_args and program_args[0] != '-' and
+               (program_args[0].startswith('-') or binary == 'zsh' and program_args[0].startswith('+'))):
             flag = program_args.pop(0)
-            if flag in {'--', '-c', '-e', '--eval', '-p', '--print', '-m'}:
+            if flag in {'--', '-c'} or binary not in shells and flag in {'-e', '--eval', '-p', '--print', '-m'}:
                 break
         stdin_code = not args or program_args[:1] == ['-'] or all(arg.startswith('-') for arg in args)
         shell_options = args[:len(args) - len(program_args)] if binary in shells else []
         shell_stdin = any(re.fullmatch(r'-[a-z]*s[a-z]*', arg) for arg in shell_options)
         shell_command = any(re.fullmatch(r'-[a-z]*c[a-z]*', arg) for arg in shell_options)
+        # Zsh can use a lone dash to end options and execute the next word.
+        # Do not treat that word as an argument to the shared stdin marker.
+        if binary in shells and not shell_command and program_args[:1] == ['-'] and len(program_args) > 1:
+            raise AmbiguousScript(f'shell: bare dash input unproved at line {current_line}')
         stdin_code |= shell_stdin and not shell_command
         if binary in shells and changes_scripts:
             # Only command strings and literal stdin bodies are walked below.
@@ -5335,6 +5399,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             return finish_invocation()
         if binary in shells:
             if any(re.fullmatch(r"-[a-z]*n[a-z]*", arg) for arg in shell_options):
+                if binary == 'zsh' and program_args and program_args[0] != '-':
+                    path = script_path(program_args[0], directory, binary)
+                    if LIVE.search(str(path)):
+                        raise LiveRead('live-database-read')
                 if not wrapper_proved or not startup_proved or not preservation_tool(words, directory):
                     reason = invocation_startup_failure or (proof_failure if wrapper_proved else 'shell: command wrapper proof failed')
                     raise AmbiguousScript(f'{reason}; execution parse-only: shell at line {current_line}')
@@ -5367,7 +5435,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 if args[0] == '-':
                     return finish_invocation()
                 flag = args.pop(0)
-                if flag in {"-c", "-e", "--eval", "-p", "--print", "-m"}:
+                # Shell -e enables errexit; it does not consume the script as
+                # an eval string. Shell command strings were handled above.
+                if binary not in shells and flag in {"-c", "-e", "--eval", "-p", "--print", "-m"}:
                     if flag == "-m" and python and args:
                         if directory is not None:
                             for candidate in module_candidates(args, directory):

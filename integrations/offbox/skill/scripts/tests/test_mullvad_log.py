@@ -32,7 +32,7 @@ probe_exit() { echo 200; }
 cmd_check
 '''.replace('STATUS',status).replace('VPN','true' if good else 'false')
                 file=root/'check.sh';file.write_text(body)
-                result=subprocess.run(['bash',str(file),'check'],env={**os.environ,'OFFBOX_TOOL_LOG_DIR':str(root/'logs')},capture_output=True,text=True)
+                result=subprocess.run(['bash',str(file),'check'],env={**os.environ,'OFFBOX_LOG_DIR':str(root/'logs')},capture_output=True,text=True)
                 self.assertEqual(result.returncode,0 if good else 1,result.stderr+result.stdout)
                 rows=[json.loads(s) for p in (root/'logs').glob('*.ndjson') for s in p.read_text().splitlines()]
                 self.assertEqual(len(rows),1,result.stderr)

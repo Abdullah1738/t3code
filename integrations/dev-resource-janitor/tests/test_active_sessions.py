@@ -469,6 +469,10 @@ class RootWorkspaceTests(JanitorTestCase):
 class JanitorKeepsEverythingTests(JanitorTestCase):
     """An incomplete active set must keep every resource and every worktree, never reap."""
 
+    def setUp(self):
+        patch.object(active.time, 'sleep').start()
+        self.addCleanup(patch.stopall)
+
     def test_dev_janitor_scan_keeps_every_resource_when_the_snapshot_is_incomplete(self):
         import dev_janitor
         resources = [{"id": "sim:1", "kind": "simulator", "age_s": 99999, "tokens": ["x"]}]
@@ -540,7 +544,7 @@ class JanitorKeepsEverythingTests(JanitorTestCase):
             stack.enter_context(patch.object(wr, "LOG_DIR", tmp))
             stack.enter_context(patch.object(wr, "STATUS", os.path.join(tmp, "status.json")))
             stack.enter_context(patch.object(wr, "AUDIT", os.path.join(tmp, "audit.jsonl")))
-            stack.enter_context(patch.object(wr.active_sessions, "snapshot", side_effect=[healthy, failing]))
+            stack.enter_context(patch.object(wr.active_sessions, "snapshot", side_effect=[healthy, failing, failing]))
             stack.enter_context(patch.object(wr, "session_activity", return_value={}))
             stack.enter_context(patch.object(wr, "process_cwds", return_value=[]))
             stack.enter_context(patch.object(wr, "keep_list", return_value=[]))

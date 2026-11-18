@@ -281,7 +281,8 @@ class OrdersRollupTests(unittest.TestCase):
 
     def test_portable_logger_copies_remain_identical(self):
         self.assertEqual((ROOT / 'app-api-cli/toollog.py').read_bytes(),
-                         (ROOT / 'robob-watch/checks/money-cases/toollog.py').read_bytes())
+                         (ROOT / 'robob-watch/checks/money-cases/toollog.py').read_bytes(),
+                         msg='app-api-cli/toollog.py and robob-watch/checks/money-cases/toollog.py must stay identical: copy the changed one over the other')
 
     def test_card_fill_component_and_errors_survive_every_reader(self):
         rows = [dict(ts=DAY + 'T12:00:00Z', tool='orders', component='card-vault-fill',

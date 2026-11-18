@@ -16,9 +16,10 @@ import { createApi as createTelegramApi } from "../../telegram-bridge/src/api.ts
 import { Store as TelegramStore } from "../../telegram-bridge/src/store.ts";
 import { createToolLog, toolLog } from "../src/toollog.ts";
 import { summarizeLog } from "../src/log-rollup.ts";
+import { ChatMirror, type MirrorSink, type MirrorItem } from "../src/mirror.ts";
 const roots: string[] = [], closes: (() => void)[] = [];
 afterEach(() => { closes.splice(0).forEach(f => f()); roots.splice(0).forEach(p => rmSync(p, { recursive: true, force: true })); });
-function setup() {
+function setup(mirrorSink?: MirrorSink) {
   const root = mkdtempSync(join(tmpdir(), "remote-box-test-")); roots.push(root);
   const mac = join(root, "mac"), box = join(root, "box"); mkdirSync(mac); mkdirSync(box);
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
@@ -34,6 +35,7 @@ function setup() {
   const runner = new BoxRunner({ root: box, boxId: config.boxId, epoch: config.epoch, token, callbackToken, privateKey: keys.privateKey, callbackUrl: "http://127.0.0.1:12346", system: "system" }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, { now: () => now, modelReady: async () => routerReady, callbackReady: async () => callbackReady, fetch: (async () => Response.json({ epoch: "test", accepted: true })) });
   closes.push(() => runner.db.close());
   const io = { now: () => now, active: () => active,
+    mirror: mirrorSink ? new ChatMirror(store, mirrorSink, { now: () => now, timeoutMs: 20 }) : undefined,
     ownerAlert: async (_severity: "attention", text: string, key: string): Promise<boolean> => { alerts.push({ text, key }); return true; },
     log: (name: string, code?: string) => logs.push(`${name} ${code ?? ""}`), notice: async (id: string) => { notices.push(id); },
     fetch: (async (url, init) => { if (!online) throw new Error("private error should never be logged");
@@ -49,7 +51,7 @@ function setup() {
     sendText: async () => ({ handle: "sent" }), upload: async () => "https://media.example/file", getMessage: async () => undefined,
     sendApp: async () => ({ handle: "sent" }), react: async () => {}, typing: async () => {}, read: async () => {},
     requestLocation: async () => {}, location: async () => undefined, setOptOut: async () => {}, download: async () => ({ data: new Uint8Array(), name: "", mimeType: "" }) };
-  return { root, mac, box, get remote() { return remote; }, runner, store, config, logs, notices, texts, alerts, requests, line,
+  return { root, mac, box, get remote() { return remote; }, mirror: io.mirror, runner, store, config, logs, notices, texts, alerts, requests, line,
     failEvents: () => { eventsFail = true; },
     readiness: (router: boolean, callback: boolean) => { routerReady = router; callbackReady = callback; },
     ownerAlert: (alert: typeof io.ownerAlert) => { io.ownerAlert = alert; },
@@ -169,8 +171,9 @@ test("remote fenced DM alerts once at ten minutes across restart, without requeu
   });
   expect(s.alerts.filter(a => a.key === `imessage-unanswered:${opaqueId("dm")}`)).toHaveLength(1);
   expect(s.requests).toHaveLength(before);
-  expect(logs.filter(l => l.name === "unanswered.alert")).toHaveLength(2);
-  expect(logs.find(l => l.name === "unanswered.alert")?.props?.backend).toBe("remote-box");
+  expect(logs.filter(l => l.name === "inbound.overdue_notice")).toHaveLength(2);
+  expect(logs.find(l => l.name === "inbound.overdue_notice")?.props?.backend).toBe("remote-box");
+  expect(logs.some(l => l.name === "inbound.unanswered" || l.error?.tag === "inbound.unanswered")).toBe(false);
   expect((await summarizeLog((async function* () { yield* logs; })())).unanswered_alerts).toBe(2);
   expect(s.store.db.query("SELECT 1 FROM inbound").get()).toBeNull();
   expect(files(s.mac)).not.toContain("PRIVATE_");
@@ -743,7 +746,6 @@ test("Moni remote-box receipt and delivered reply never wait on a local Robob ou
   // A prior test can leave the process-wide logger inside an outage. Recover it outside this fixture.
   call(true); toolLog.flush(); await toolLog.settled();
   const rows = await captureLogs(async () => {
-    call(true);
     for (let i = 0; i < 3; i++) call(false);
     try {
       const sink = registry.sink(async () => {}).acceptInto(key, undefined, "+15555550199");
@@ -1070,3 +1072,42 @@ test.each(["pending", "running"].flatMap(state => ["inbound", "wake"].flatMap(he
     expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(head)?.state).toBe(state);
     expect(JSON.stringify([s.logs, s.alerts])).not.toContain("PRIVATE_");
   });
+
+test("mirror hooks copy accepted DMs and successful replies once, excluding wakes and failed sends", async () => {
+  const items: MirrorItem[] = [];
+  const s = setup({ ensure: async () => ({ threadId: "mirror" }), upload: async () => ({ attachmentId: "a" }),
+    append: async (_id, next) => { items.push(...next); } });
+  s.remote.accept("dm", { text: "question", sentAt: 1000 });
+  s.remote.accept("dm", { text: "question", sentAt: 1000 }); s.remote.accept("wake", { text: "private wake" }, undefined, "wake");
+  await s.remote.send("reply", "answer", undefined, s.line, chatKey.dm("moni"));
+  await s.remote.send("reply", "answer", undefined, s.line, chatKey.dm("moni"));
+  await s.remote.send("notice", "temporarily offline", undefined, s.line, chatKey.dm("moni"));
+  const failing = { ...s.line, sendText: async () => { throw new LineError("failed", "http_400", false, false); } };
+  await expect(s.remote.send("failed", "never sent", undefined, failing, chatKey.dm("moni"))).rejects.toThrow();
+  for (let i = 0; i < 4; i++) await s.mirror!.tick();
+  expect(items.map(item => item.id)).toEqual(["dm", "send:reply", "send:notice"]);
+  expect(items.map(item => item.role)).toEqual(["user", "assistant", "assistant"]);
+});
+
+test("an uncertain send is mirrored only after outbound reconciliation proves success", async () => {
+  const items: MirrorItem[] = [];
+  const s = setup({ ensure: async () => ({ threadId: "mirror" }), upload: async () => ({ attachmentId: "a" }),
+    append: async (_id, next) => { items.push(...next); } });
+  const uncertain = { ...s.line, sendText: async () => { throw new LineError("lost ack", "network", true, true); } };
+  await expect(s.remote.send("reconcile", "answer", undefined, uncertain, chatKey.dm("moni"))).rejects.toThrow();
+  await s.mirror!.tick(); expect(items).toHaveLength(0);
+  s.line.outbound = async () => [{ handle: "confirmed", chat: chatKey.dm("moni"), text: "answer", sentAt: 1000, status: "sent" }];
+  await s.remote.send("reconcile", "answer", undefined, s.line, chatKey.dm("moni"));
+  await s.mirror!.tick(); expect(items.map(item => item.id)).toEqual(["send:reconcile"]);
+});
+
+test("a hung mirror never holds Moni's reply or prevents the next successful send", async () => {
+  let appends = 0, sends = 0;
+  const s = setup({ ensure: async () => ({ threadId: "mirror" }), upload: async () => ({ attachmentId: "a" }),
+    append: async () => { appends++; return new Promise<never>(() => {}); } });
+  s.line.sendText = async () => ({ handle: `sent-${++sends}` });
+  s.remote.accept("dm", { text: "question", sentAt: 1000 }); const running = s.mirror!.tick();
+  await s.remote.send("one", "answer", undefined, s.line, chatKey.dm("moni"));
+  await s.remote.send("two", "second answer", undefined, s.line, chatKey.dm("moni"));
+  expect(sends).toBe(2); expect(appends).toBe(1); await running;
+});

@@ -30,7 +30,7 @@ class SuspectTests(Isolated):
         self.stack.enter_context(patch.object(lease, 'ensure_ttl', return_value=True))
         self.stack.enter_context(patch.object(api, 'get', return_value={'state':'running'}))
         self.stop = self.stack.enter_context(patch.object(lease, 'stop_box', side_effect=AssertionError('must not stop')))
-        self.stack.enter_context(patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(Path(self.tmp.name)/'tool-log')))
+        self.stack.enter_context(patch.dict(os.environ, OFFBOX_LOG_DIR=str(Path(self.tmp.name)/'tool-log')))
         self.me['repo_root'] = self.tmp.name
 
     def row(self, box):
