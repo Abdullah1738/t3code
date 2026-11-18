@@ -21,6 +21,26 @@ test("test default stays outside the home log tree when the override is absent",
 const dirs: string[] = [];
 const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
 
+test("cleaned classifier errors survive both sinks only in the triage classifier scope", () => {
+  const dir = fixture();
+  const error = "TypeError: fixture shape mismatch; at classify:1234; endpoint=https://openrouter.ai/api/v1/chat/completions; elapsed_ms=2; attempts=1";
+  const entries = [
+    { component: "triage", name: "triage.classify", props: { classifier_error: error } },
+    { component: "runner", name: "triage.classify", props: { classifier_error: error } },
+    { component: "triage", name: "triage.run", props: { classifier_error: error } },
+    ...[null, 1, {}, "x".repeat(401), "invalid\nmessage"].map(value => ({ component: "triage", name: "triage.classify", props: { classifier_error: value } })),
+  ].map(entry => ({ ...entry, kind: "perf" as const }));
+  for (const entry of entries) toolLog(entry);
+  const script = `import json, sys\nsys.path.insert(0, "helpers")\nfrom toollog import tool_log\nfor entry in json.loads(sys.argv[1]): tool_log(entry)\n`;
+  const result = Bun.spawnSync(["python3", "-I", "-B", "-c", script, JSON.stringify(entries)], { env: { ...process.env, TOOLLOG_DIR: dir } });
+  expect(result.exitCode).toBe(0);
+  const all = rows(dir);
+  for (const offset of [0, entries.length]) {
+    expect(all[offset].props).toEqual({ classifier_error: error });
+    expect(all.slice(offset + 1, offset + entries.length).every(row => row.props === undefined)).toBe(true);
+  }
+});
+
 test("auth log-only metadata is allowlisted identically in Python and TypeScript", () => {
   const dir = fixture();
   const entries = [
