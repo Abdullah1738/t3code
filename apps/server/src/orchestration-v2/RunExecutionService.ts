@@ -932,6 +932,7 @@ export const layer: Layer.Layer<
         // the next message. The capture is enqueued with these terminal events,
         // ahead of any later run's start on this thread's effect lane.
         const finalization = {
+          preserveProviderThreadBackgroundTasks: true,
           effects:
             input.terminal.status === "completed" ||
             input.terminal.status === "interrupted" ||
@@ -1050,6 +1051,7 @@ export const layer: Layer.Layer<
               expectedStatus: input.writeIfRunCurrent.expectedStatus,
               events: finalization.events,
               effects: finalization.effects,
+              preserveProviderThreadBackgroundTasks: true,
             });
             if (!result.committed) return false;
           } else {
@@ -1210,6 +1212,7 @@ export const layer: Layer.Layer<
         const makeFailedTerminalEvent = (
           failure: OrchestrationV2ProviderFailure,
           failureItemOrdinal: number,
+          childrenContinue = false,
         ): ProviderTerminalEvent => ({
           type: "turn.terminal",
           driver: input.providerThread.driver,
@@ -1224,6 +1227,7 @@ export const layer: Layer.Layer<
           failureItemOrdinal,
           status: "failed",
           failure,
+          ...(childrenContinue ? { childTurnsContinue: true } : {}),
           threadDisposition: "reusable",
         });
         const responseStreamingMode = yield* Effect.gen(function* () {
@@ -1326,10 +1330,12 @@ export const layer: Layer.Layer<
           attemptId: input.attempt.id,
           providerThreadId: input.providerThread.id,
         };
+        const subscribe =
+          input.session.subscribeEventsForIngestion ?? input.session.subscribeEvents;
         const eventSubscription =
-          input.session.subscribeEvents === undefined
+          subscribe === undefined
             ? { events: input.session.events, close: Effect.void }
-            : yield* input.session.subscribeEvents;
+            : yield* subscribe;
         // Admission can stop before the detached reader registers its finalizers.
         const closeSubscription = yield* Effect.cached(eventSubscription.close);
         const inheritedBackgroundTurnItems = yield* (
@@ -2268,6 +2274,7 @@ export const layer: Layer.Layer<
               Effect.flatMap((cause) => Effect.failCause(cause).pipe(Effect.delay("10 seconds"))),
             ),
           ),
+          Effect.ensuring(eventSubscription.ingestionEnded ?? Effect.void),
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>
             Effect.gen(function* () {
@@ -2336,6 +2343,7 @@ export const layer: Layer.Layer<
                       class: "unknown",
                     }),
                     latestItemOrdinal + 1,
+                    input.session.backgroundTasksEndWithProcess !== true,
                   ),
                   failureItemPersisted: false,
                   refreshAfterTurn,

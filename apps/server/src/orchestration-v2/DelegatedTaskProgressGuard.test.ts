@@ -356,6 +356,38 @@ describe("DelegatedTaskProgressGuard", () => {
     }),
   );
 
+  it.effect("a no-progress guard row includes active retry context", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      yield* h.start(60000);
+      const retryItem = {
+        id: TurnItemId.make("retry"),
+        runId,
+        type: "error",
+        status: "running",
+        ordinal: 2,
+        retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 1000 },
+        failure: {
+          class: "transport_error",
+          code: null,
+          message: "Request timed out.",
+          retryable: true,
+        },
+      } as OrchestrationV2TurnItem;
+      h.projectItems([retryItem]);
+      yield* TestClock.adjust("1 minute");
+      yield* h.guard.check();
+      assert.lengthOf(h.analytics, 1);
+      assert.equal(h.analytics[0]!.props?.attempt, 2);
+      assert.equal(h.analytics[0]!.props?.maxRetries, 10);
+      assert.equal(h.analytics[0]!.props?.errorMessage, "Request timed out.");
+      assert.equal(h.analytics[0]!.props?.waitSinceResponseMs, 60000);
+      assert.isTrue(h.analytics[0]!.props?.guardFiredDuringRetry);
+      yield* h.guard.check();
+      assert.lengthOf(h.analytics, 1);
+    }),
+  );
+
   it.effect("parallel tools are attributed in completion order", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness;
@@ -658,6 +690,7 @@ describe("DelegatedTaskProgressGuard", () => {
       assert.lengthOf(h.stops, 0);
       yield* TestClock.adjust("1 second");
       assert.lengthOf(h.stops, 1);
+      assert.equal(h.analytics[0]!.props?.waitSinceResponseMs, 60_000);
     }),
   );
   it.effect("time queued before the first provider start does not consume the idle budget", () =>

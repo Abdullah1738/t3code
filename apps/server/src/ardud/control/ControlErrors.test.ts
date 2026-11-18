@@ -1,13 +1,41 @@
 import { assert, it } from "@effect/vitest";
-import { CommandId, ControlErrorBody, OrchestratorMcpFailure, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  ControlErrorBody,
+  OrchestratorMcpFailure,
+  ProviderSessionId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
+import { ProviderSessionEndedError } from "../../orchestration-v2/ProviderSessionManager.ts";
 import { ControlError, operationFailure, rejectionDetails } from "./ControlErrors.ts";
 
 const threadId = ThreadId.make("thread");
 const commandId = CommandId.make("command");
 const decodeError = Schema.decodeUnknownSync(ControlErrorBody);
+
+it("classifies a lost provider session as a conflict requiring a queued follow-up", () => {
+  const error = operationFailure(
+    new Orchestrator.OrchestratorDispatchError({
+      commandId,
+      commandType: "message.dispatch",
+      cause: new ProviderSessionEndedError({
+        providerSessionId: ProviderSessionId.make("dead-session"),
+      }),
+    }),
+  );
+  assert.equal(error.code, "conflict");
+  assert.deepEqual(rejectionDetails(error), {
+    reason: "no_steerable_turn",
+    retrySafe: false,
+    holder: null,
+  });
+  assert.include(error.message, "mode=queue");
+  assert.include(error.message, "new clientRequestId");
+  decodeError({ code: error.code, message: error.message, ...rejectionDetails(error) });
+});
 
 it("preserves a send deadline's same-id retry guarantee as 503", () => {
   const error = operationFailure(

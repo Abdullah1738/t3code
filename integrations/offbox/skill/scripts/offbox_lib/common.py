@@ -45,6 +45,7 @@ BACKEND_STATE = _HOME_STATE / "backend-state.json"
 HOME_FAILURES = _HOME_STATE / "home-failures.jsonl"
 PERSON_PREFIX = "person:"          # OFFBOX_THREAD=person:<name>, set by offbox-person for someone's own box
 DEFAULT_OWNER = "ardud"
+OFFBOX_BUN_DEFAULT = "1.4.1"
 _BACKEND_REASON: str | None = None
 _BACKEND: str | None = None        # set by select_backend(); None = decide from the files and the environment
 
@@ -318,7 +319,7 @@ EXIT_HOME_DOWN = 93            # person-box work while the home server is down: 
 EXIT_INTERRUPTED = 94          # the home command was interrupted and was not run again
 EXIT_DETACHED = 95             # the Robob client went away; the remote run is still running
 EXIT_LOCAL = 96                # local state failure; never automatic local fallback
-EXIT_TOOLCHAIN = 99            # repo Node/pnpm could not be provisioned; user command never started
+EXIT_TOOLCHAIN = 99            # pinned Node/pnpm/Quint could not be provisioned; user command never started
 EXIT_NOT_STARTED = 100         # queued client died before acquiring a box; nothing ran, safe to rerun
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 

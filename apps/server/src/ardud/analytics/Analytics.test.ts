@@ -5,6 +5,7 @@ import {
   CommandId,
   LONG_TASK_HISTOGRAM_RATIO,
   AnalyticsEvent,
+  AnalyticsReadResult,
   type AnalyticsReadInput,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -26,6 +27,7 @@ import * as ServerConfig from "../../config.ts";
 import * as Analytics from "./Analytics.ts";
 import type { AnalyticsRollup } from "./rollup.ts";
 
+const decodeReadResult = Schema.decodeUnknownSync(AnalyticsReadResult);
 const day = "2026-11-13";
 const ts = `${day}T12:00:00.000Z`;
 const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
@@ -773,6 +775,36 @@ describe("Analytics", () => {
       assert.equal(persisted.askLatency.sentToSeen.p50Ms, 20 * 60_000);
       assert.isFalse(JSON.stringify(persisted).includes("private"));
     }).pipe(Effect.provide(Sqlite.layerMemory.pipe(Layer.provideMerge(NodeServices.layer)))),
+  );
+  it.effect("reads persisted deadline phases in MCP samples and rollup groups", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const phases = ["parent_records", "receipt", "dispatch", "handler"] as const;
+      for (const errorPhase of phases)
+        yield* analytics.record(
+          event({
+            kind: "mcp.call",
+            surface: "server",
+            tool: "delegate_task",
+            outcome: "timeout",
+            errorTag: "delegation_timeout",
+            errorPhase,
+          }),
+        );
+      yield* analytics.flush;
+      const cold = yield* open(setup);
+      const result = yield* cold.read({ day, kind: "mcp.call", tool: "delegate_task" });
+      assert.deepEqual(decodeReadResult(result), result);
+      assert.sameMembers(
+        result.samples.map((row) => row.errorPhase),
+        [...phases],
+      );
+      assert.sameDeepMembers(
+        [...result.rollup.mcpCalls[0]!.errors],
+        phases.map((errorPhase) => ({ errorTag: "delegation_timeout", errorPhase, count: 1 })),
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
   it.effect(
     "filters MCP samples and rollups by tool and outcome while persisting the full day",

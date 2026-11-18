@@ -37,6 +37,7 @@ type Progress = {
 };
 type Child = Progress & {
   run: OrchestrationV2Run;
+  lastResponseAt: DateTime.Utc;
   retryCheck?: Effect.Effect<boolean> | undefined;
   retrySessionId?: string | null;
   idleTimeoutMs: number;
@@ -109,6 +110,7 @@ const make = Effect.gen(function* () {
         const previous = child;
         child = {
           run,
+          lastResponseAt: now,
           idleTimeoutMs:
             limits.get(event.threadId) ?? previous?.idleTimeoutMs ?? normalizeIdleTimeout(),
           lastProgressAt: previous?.lastProgressAt ?? now,
@@ -130,6 +132,7 @@ const make = Effect.gen(function* () {
       }
       if (child.run.activeAttemptId !== run.activeAttemptId) {
         child.retryCheck = undefined;
+        child.lastResponseAt = event.occurredAt;
         child.stopping = false;
         child.lastProgressAt = event.occurredAt;
         child.lastProgressKind = run.status === "running" ? "run_started" : "not_started";
@@ -172,6 +175,12 @@ const make = Effect.gen(function* () {
       (event.type !== "runtime-request.updated" && event.runId !== child.run.id)
     )
       return;
+    if (
+      (event.type === "message.updated" && event.payload.role === "assistant") ||
+      (event.type === "turn-item.updated" &&
+        ["assistant_message", "reasoning"].includes(event.payload.type))
+    )
+      child.lastResponseAt = event.occurredAt;
     const progress = (kind: string) => {
       child.lastProgressAt = event.occurredAt;
       child.lastProgressKind = kind;
@@ -366,6 +375,14 @@ const make = Effect.gen(function* () {
                 const effort = run.modelSelection?.options?.find((o) =>
                   ["reasoningEffort", "effort", "variant"].includes(o.id),
                 )?.value;
+                const retryItem = snapshot.turnItems.findLast(
+                  (item) =>
+                    item.runId === run.id &&
+                    item.type === "error" &&
+                    item.status === "running" &&
+                    item.retry !== undefined,
+                );
+                const retry = retryItem?.type === "error" ? retryItem.retry : undefined;
                 yield* analytics.value.record({
                   ts: DateTime.formatIso(now),
                   kind: "delegated_task.stall",
@@ -391,6 +408,17 @@ const make = Effect.gen(function* () {
                             .slice(0, 160),
                         }),
                     silentSeconds: stall.silentSeconds,
+                    attempt: retry?.attempt ?? null,
+                    maxRetries: retry?.maxAttempts ?? null,
+                    errorMessage: (retryItem?.type === "error"
+                      ? retryItem.failure.message
+                      : stalledSummary(stall, null)
+                    ).slice(0, 2000),
+                    waitSinceResponseMs: Math.max(
+                      0,
+                      DateTime.toEpochMillis(now) - DateTime.toEpochMillis(child.lastResponseAt),
+                    ),
+                    guardFiredDuringRetry: retry !== undefined,
                     reasonClass:
                       phase === "mid_turn"
                         ? "mid_turn"
@@ -542,6 +570,7 @@ const make = Effect.gen(function* () {
           }
           children.set(shell.id, {
             run,
+            lastResponseAt: boot,
             idleTimeoutMs: limits.get(shell.id) ?? normalizeIdleTimeout(),
             lastProgressAt: boot,
             lastProgressKind: "server_restarted",

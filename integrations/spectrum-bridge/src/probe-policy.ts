@@ -28,6 +28,22 @@ export class ProbeBackoff {
   }
   cooling(leader: string) { return this.steps(leader).some(step => Date.now() < (step?.nextAt ?? 0)); }
   retry(leader: string) { return this.steps(leader).some(step => (step?.delay ?? 0) > 0); }
+  split(leader: string, members: readonly string[]) {
+    this.store.db.transaction(() => {
+      const backoff = this.get(leader);
+      if (!backoff) return;
+      for (const member of members) {
+        const prior = this.get(member);
+        // The split owns independent leases. Reads started under the old seal cannot settle them.
+        this.store.set(`replay-probe-backoff:${member}`, {
+          delay: Math.max(backoff.delay, prior?.delay ?? 0),
+          nextAt: Math.max(backoff.nextAt, prior?.nextAt ?? 0),
+          aliases: [...new Set([...backoff.aliases ?? [], ...prior?.aliases ?? []])],
+          token: randomUUID(),
+        } satisfies Backoff);
+      }
+    }).immediate();
+  }
   reserve(leader: string, alias?: string) {
     const prior = this.get(leader);
     // Batches can change leader. Retain shared prompt aliases so a later failed read fences every owner.

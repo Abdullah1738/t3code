@@ -1,3 +1,4 @@
+import * as ProviderRetryAnalytics from "../../ardud/analytics/ProviderRetry.ts";
 import * as CodexRetainedState from "../../ardud/orchestration/CodexRetainedState.ts";
 import {
   backgroundCommandWakeCommandId,
@@ -1246,6 +1247,7 @@ function codexUsageLimitError(
 }
 
 interface ActiveCodexTurnContext {
+  analyticsLastResponseAt?: DateTime.Utc;
   readonly promptAcceptedAt?: DateTime.Utc;
   closedCommandItemIds?: ReadonlySet<string>;
   completedCommandItemIds?: Set<string>;
@@ -1946,6 +1948,7 @@ export interface CodexAdapterV2Options {
 export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
   adapterOptions: CodexAdapterV2Options,
 ) {
+  const recordRetry = yield* ProviderRetryAnalytics.makeRecorder();
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const { clientFactory, crypto, fileSystem, idAllocator, serverConfig } = adapterOptions;
   const continuationRequests = adapterOptions.continuationRequests;
@@ -2278,6 +2281,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           context: ActiveCodexTurnContext,
           updatedAt: DateTime.Utc,
         ) {
+          context.analyticsLastResponseAt = updatedAt;
           const providerRetry = yield* Ref.modify(providerRetries, (current) => {
             const retry = current.get(context.providerTurnId);
             if (retry === undefined) {
@@ -2750,6 +2754,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               completedAt,
               updatedAt: completedAt,
               type: "command_execution",
+              toolResultIncomplete: true,
               input: tracked.command,
               ...(tracked.aggregatedOutput === undefined
                 ? {}
@@ -2890,6 +2895,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               driver: CODEX_PROVIDER,
               turnItem: {
                 ...artifacts.turnItem,
+                toolResultIncomplete: true,
                 status,
                 completedAt,
                 updatedAt: completedAt,
@@ -3393,6 +3399,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               appThread: childThread,
             });
             yield* emitProviderEvent({
+              type: "provider_thread.updated",
+              driver: CODEX_PROVIDER,
+              providerThread,
+            });
+            yield* emitProviderEvent({
               type: "node.updated",
               driver: CODEX_PROVIDER,
               node: {
@@ -3412,6 +3423,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 startedAt: now,
                 completedAt: null,
               },
+            });
+            // Recovery must discover and own the child before any running child work appears.
+            yield* emitSubagentTaskUpdate({
+              subagent,
+              status: "running",
             });
             yield* emitProviderEvent({
               type: "node.updated",
@@ -3433,11 +3449,6 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 startedAt: now,
                 completedAt: null,
               },
-            });
-            yield* emitProviderEvent({
-              type: "provider_thread.updated",
-              driver: CODEX_PROVIDER,
-              providerThread,
             });
             if (input.emitInitialPrompt && input.prompt.length > 0) {
               const promptNativeItemId = `${input.nativeItemId}:prompt`;
@@ -3472,10 +3483,6 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 turnItem: promptArtifacts.turnItem,
               });
             }
-            yield* emitSubagentTaskUpdate({
-              subagent,
-              status: "running",
-            });
 
             const pendingTurns = yield* Ref.modify(pendingSubagentTurns, (current) => {
               const pending = current.get(input.nativeThreadId) ?? [];
@@ -4056,6 +4063,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             completedAt,
             updatedAt,
             type: "command_execution",
+            toolResultIncomplete: false,
             input: item.command,
             ...(item.aggregatedOutput === null || item.aggregatedOutput === undefined
               ? {}
@@ -4239,6 +4247,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               completedAt,
               updatedAt,
               type: "dynamic_tool",
+              toolResultIncomplete: false,
               ...projection,
             };
             return { node, turnItem };
@@ -5108,6 +5117,21 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               category: codexFailureCategory(code, payload.error.codexErrorInfo),
               retryable: true,
             });
+            yield* recordRetry({
+              kind: "provider.retry",
+              threadId: context.projectionThreadId,
+              runId: context.projectionRunId ?? context.input.runId,
+              provider: adapterOptions.instanceId,
+              model:
+                context.subagent === null
+                  ? context.input.modelSelection.model
+                  : (context.subagent.task.modelSelection?.model ??
+                    context.subagent.task.model ??
+                    "unknown"),
+              retry,
+              errorMessage: failure.message,
+              lastResponseAt: context.analyticsLastResponseAt ?? context.startedAt,
+            });
             const itemOrdinal =
               previous?.itemOrdinal ??
               (yield* resolveItemOrdinal(context, `terminal-failure:${context.providerTurnId}`));
@@ -5252,6 +5276,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         );
         yield* client.handleServerNotification("thread/closed", (payload) =>
           Effect.gen(function* () {
+            yield* Effect.logInfo("codex.thread-closed", {
+              provider: CODEX_PROVIDER,
+              providerSessionId: input.providerSessionId,
+              nativeThreadId: payload.threadId,
+            });
             yield* reportRetainedStateLoss(payload.threadId);
             yield* handleNativeThreadShutdown(payload.threadId);
           }),
@@ -7644,6 +7673,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           providerSessionId: input.providerSessionId,
           providerSession: session,
           events: Stream.fromQueue(events),
+          backgroundTasksEndWithProcess: true,
           ...(sessionExitObserver === undefined
             ? {}
             : {
@@ -8138,13 +8168,24 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             function* (unloadInput) {
               const nativeThreadId = yield* getNativeThreadId(unloadInput.providerThread);
               sessionApprovals.delete(nativeThreadId);
-              yield* client.request("thread/unsubscribe", { threadId: nativeThreadId }).pipe(
-                // An exited app-server holds no subscriptions left to drop.
-                Effect.catchTags({
-                  CodexAppServerProcessExitedError: () => Effect.void,
-                  CodexAppServerInputStreamEndedError: () => Effect.void,
-                }),
-              );
+              const response = yield* client
+                .request("thread/unsubscribe", { threadId: nativeThreadId })
+                .pipe(
+                  // An exited app-server holds no subscriptions left to drop.
+                  Effect.catchTags({
+                    CodexAppServerProcessExitedError: () => Effect.succeed(null),
+                    CodexAppServerInputStreamEndedError: () => Effect.succeed(null),
+                  }),
+                );
+              // The acknowledgement precedes native shutdown and MCP termination;
+              // thread/closed is logged separately when that cleanup completes.
+              yield* Effect.logInfo("codex.thread-unsubscribe", {
+                provider: CODEX_PROVIDER,
+                providerSessionId: input.providerSessionId,
+                threadId: unloadInput.providerThread.appThreadId,
+                nativeThreadId,
+                status: response?.status ?? "runtimeExited",
+              });
               yield* reportRetainedStateLoss(nativeThreadId);
             },
             (effect, unloadInput) =>

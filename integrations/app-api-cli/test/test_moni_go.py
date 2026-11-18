@@ -6,6 +6,9 @@ import datetime as dt
 import io
 import json
 import sqlite3
+import tempfile
+import os
+from pathlib import Path
 import unittest
 import os as _os, tempfile as _tempfile
 # The live card-status record must never decide these tests.
@@ -32,23 +35,6 @@ from unittest.mock import Mock, patch
 
 import commerce_cli as c
 import moni_go
-
-
-# Talabat was retired by the owner on 2026-11-07 (talabat_retired.py). These tests use
-# the old Talabat lane to exercise shared guards (card, pause, Moni go, chat, --for), so
-# the retirement gate is switched off inside this test process only; the gate itself is
-# covered by test_talabat_retired.
-import talabat_retired as _talabat_retired
-from unittest.mock import patch as _retired_patch
-_retired_gate = _retired_patch.object(_talabat_retired, 'requested', return_value=False)
-
-
-def setUpModule():
-    _retired_gate.start()
-
-
-def tearDownModule():
-    _retired_gate.stop()
 
 
 NOW = dt.datetime(2026, 10, 15, 6, 40, tzinfo=dt.timezone.utc)
@@ -428,19 +414,19 @@ class CliGateTests(unittest.TestCase):
         return code, json.loads(out.getvalue())
 
     def test_moni_order_without_go_never_reaches_the_order_path(self):
-        with patch.object(c, 'purchase_talabat') as purchase, \
+        with patch.object(c, 'order_minutes') as purchase, \
                 patch.object(moni_go, 'read_history', return_value=[]):
-            code, out = self.run_cli(['order', 'talabat', '--branch', '1', '--item', '2', '--for', 'moni'])
+            code, out = self.run_cli(['order', 'minutes', '--sku', 'SKU1', '--for', 'moni'])
         self.assertEqual(code, 1)
         self.assertEqual(out['error'], 'MONI_GO_REQUIRED')
         purchase.assert_not_called()
 
     def test_moni_order_is_refused_when_her_robob_thread_is_unreadable(self):
         missing = _os.path.join(_BRIDGE_DIR, 'gone', 'state.sqlite')
-        with patch.object(c, 'purchase_talabat') as purchase, \
+        with patch.object(c, 'order_minutes') as purchase, \
                 patch.dict(_os.environ, {'MONI_BRIDGE_DB': missing}), \
                 patch.object(moni_go, 'read_history', return_value=[msg('yes order it', 3)]):
-            code, out = self.run_cli(['order', 'talabat', '--branch', '1', '--item', '2', '--for', 'moni',
+            code, out = self.run_cli(['order', 'minutes', '--sku', 'SKU1', '--for', 'moni',
                                       '--moni-go', 'yes order it'])
         self.assertEqual((code, out['error'], out['financial_retry']), (1, 'MONI_GO_UNVERIFIABLE', False))
         purchase.assert_not_called()
@@ -457,9 +443,9 @@ class CliGateTests(unittest.TestCase):
         # The real verify runs on a stubbed chat; its RuntimeError code surfaces through main()'s except block.
         runner = history(msg('JUST psl omg how long', 9, mid=10), msg('pls leave it', 5, mid=11))
         real_verify = moni_go.verify
-        with patch.object(c, 'purchase_talabat') as purchase, \
+        with patch.object(c, 'order_minutes') as purchase, \
                 patch.object(moni_go, 'verify', side_effect=lambda go: real_verify(go, now=NOW, runner=runner)):
-            code, out = self.run_cli(['order', 'talabat', '--vertical', 'restaurants', '--branch', '1', '--item', '2',
+            code, out = self.run_cli(['order', 'minutes', '--sku', 'SKU1',
                                       '--for', 'moni', '--moni-go', 'JUST psl omg how long',
                                       '--resume-flow', '25631dfb-3e6e-4aac-b9c6-761dc53f9b21'])
         self.assertEqual((code, out['ok'], out['error'], out['financial_retry']),
@@ -468,19 +454,19 @@ class CliGateTests(unittest.TestCase):
 
     def test_matched_go_passes_and_is_echoed(self):
         found = {'message_id': 9, 'at': 'x', 'text': 'yes order it'}
-        with patch.object(c, 'purchase_talabat', return_value={'ok': True}) as purchase, \
+        with patch.object(c, 'order_minutes', return_value={'ok': True}) as purchase, \
                 patch.object(moni_go, 'verify', return_value=found):
-            code, out = self.run_cli(['order', 'talabat', '--branch', '1', '--item', '2', '--for', 'moni',
+            code, out = self.run_cli(['order', 'minutes', '--sku', 'SKU1', '--for', 'moni',
                                       '--moni-go', 'yes order it'])
         self.assertEqual(code, 0)
         self.assertEqual(out['moni_go']['message_id'], 9)
         purchase.assert_called_once()
 
     def test_owner_orders_and_moni_prepare_only_skip_the_gate(self):
-        with patch.object(c, 'purchase_talabat', return_value={'ok': True}) as purchase, \
+        with patch.object(c, 'order_minutes', return_value={'ok': True}) as purchase, \
                 patch.object(moni_go, 'verify', side_effect=AssertionError('gate ran')):
-            self.assertEqual(self.run_cli(['order', 'talabat', '--branch', '1', '--item', '2'])[0], 0)
-            self.assertEqual(self.run_cli(['order', 'talabat', '--branch', '1', '--item', '2',
+            self.assertEqual(self.run_cli(['order', 'minutes', '--sku', 'SKU1'])[0], 0)
+            self.assertEqual(self.run_cli(['order', 'minutes', '--sku', 'SKU1',
                                            '--for', 'moni', '--prepare-only'])[0], 0)
         self.assertEqual(purchase.call_count, 2)
 
@@ -604,9 +590,14 @@ class GroupChatGoTests(unittest.TestCase):
         self.assertTrue(json.loads(out.getvalue())['ok'])
 
     def test_commerce_passes_moni_chat_to_verify(self):
-        with patch.object(c, 'purchase_talabat', return_value={'ok': True}), \
+        self.chat('group-sb_gro')
+        import delivery_cards
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {'CARD_STATUS_FILE': str(Path(temp) / 'cards.json')}), \
+                patch.object(delivery_cards, 'chat_store', return_value=Path(temp)), \
+                patch.object(c, 'order_minutes', return_value={'ok': True}), \
                 patch.object(moni_go, 'verify', return_value={'message_id': 1}) as verify:
-            code = c.main(['order', 'talabat', '--branch', '1', '--item', '2', '--for', 'moni',
+            code = c.main(['order', 'minutes', '--sku', 'SKU1', '--for', 'moni',
                            '--moni-go', 'Order pls', '--moni-chat', 'group-sb_gro'])
         self.assertEqual(code, 0)
         verify.assert_called_once_with('Order pls', chat='group-sb_gro')

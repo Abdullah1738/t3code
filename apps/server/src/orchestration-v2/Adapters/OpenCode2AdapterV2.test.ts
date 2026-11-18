@@ -74,11 +74,18 @@ const event = (
   type: string,
   data: Record<string, unknown>,
   label?: string,
+  version = 1,
 ): ProviderReplayEntry => ({
   type: "emit_inbound",
   frame: {
     type: "sdk.event",
-    event: { id: `evt_${type.replaceAll(".", "")}0000`, created: 1, type, data, ...durable },
+    event: {
+      id: `evt_${type.replaceAll(".", "")}0000`,
+      created: 1,
+      type,
+      data,
+      durable: { ...durable.durable, version },
+    },
   },
   ...(label === undefined ? {} : { label }),
 });
@@ -5596,6 +5603,82 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect.each(["completed", "failed"] as const)(
+    "distinguishes unfinished tools from the completed wait when the turn is %s",
+    (status) =>
+      Effect.gen(function* () {
+        const tool = { sessionID: SESSION, assistantMessageID: "msg_assistant" };
+        const { runtime, thread } = yield* resumed([
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          event("session.tool.input.started", { ...tool, id: "finished-wait", name: "bash" }),
+          event("session.tool.called", {
+            ...tool,
+            id: "finished-wait",
+            name: "bash",
+            input: { command: "offbox wait run-watch" },
+            executed: true,
+          }),
+          event(
+            "session.tool.success",
+            {
+              ...tool,
+              id: "finished-wait",
+              content: [{ type: "text", text: "exit 1 /logs/run-watch.log" }],
+              metadata: { exit: 1 },
+              executed: true,
+            },
+            undefined,
+            2,
+          ),
+          ...["bash", "mcp__test__unfinished"].flatMap((name, index) => [
+            event("session.tool.input.started", { ...tool, id: `unfinished-${index}`, name }),
+            event("session.tool.called", {
+              ...tool,
+              id: `unfinished-${index}`,
+              name,
+              input: { command: "unfinished command" },
+              executed: true,
+            }),
+          ]),
+          status === "completed"
+            ? event("session.execution.succeeded", { sessionID: SESSION })
+            : event("session.execution.failed", {
+                sessionID: SESSION,
+                error: { type: "unknown", message: "Provider failed after the wait" },
+              }),
+        ]);
+        const events = yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.startTurn(turnInput(thread));
+        const collected = yield* Fiber.join(events);
+        assert.deepInclude(collected.at(-1), { type: "turn.terminal", status });
+        const tools = collected.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          (event.turnItem.type === "command_execution" || event.turnItem.type === "dynamic_tool") &&
+          event.turnItem.status !== "running"
+            ? [event.turnItem]
+            : [],
+        );
+        assert.lengthOf(tools, 3);
+        assert.deepInclude(tools[0], {
+          type: "command_execution",
+          status: "completed",
+          input: "offbox wait run-watch",
+          output: "exit 1 /logs/run-watch.log",
+          exitCode: 1,
+          toolResultIncomplete: false,
+        });
+        for (const item of tools.slice(1)) {
+          assert.equal(item.toolResultIncomplete, true);
+          assert.equal(item.status, status === "completed" ? "completed" : "interrupted");
+        }
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("keeps thread-scoped T3 waits as dynamic tools through their lifecycle", () =>
     Effect.gen(function* () {
       const tool = { sessionID: SESSION, assistantMessageID: "msg_assistant", id: "call-wait" };
@@ -5606,12 +5689,17 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         promptAccepted,
         event("session.tool.input.started", { ...tool, name }),
         event("session.tool.called", { ...tool, name, input, executed: true }),
-        event("session.tool.success", {
-          ...tool,
-          content: [{ type: "text", text: "Reviewed" }],
-          metadata: {},
-          executed: true,
-        }),
+        event(
+          "session.tool.success",
+          {
+            ...tool,
+            content: [{ type: "text", text: "Reviewed" }],
+            metadata: {},
+            executed: true,
+          },
+          undefined,
+          2,
+        ),
         event("session.execution.succeeded", { sessionID: SESSION }),
       ]);
       const events = yield* runtime.events.pipe(
@@ -5637,6 +5725,7 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       const last = items.at(-1);
       assert.equal(last?.type === "dynamic_tool" ? last.toolName : null, name);
       assert.deepEqual(last?.type === "dynamic_tool" ? last.input : null, input);
+      assert.equal(last?.type === "dynamic_tool" ? last.toolResultIncomplete : null, false);
     }).pipe(Effect.scoped),
   );
 

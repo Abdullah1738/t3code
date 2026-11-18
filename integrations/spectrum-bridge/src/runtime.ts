@@ -419,11 +419,11 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           ownerOnly(false);
           live();
           if (body.chat !== "moni" || path === "/remote-events" && body.after !== undefined && !validId(body.after)
-            || path === "/remote-resolve" && (!validId(body.id) || !["done", "pending"].includes(String(body.state)))) throw new HttpError(400, "Invalid request");
+            || path === "/remote-resolve" && (!validId(body.id) || !["done", "pending", "failed"].includes(String(body.state)))) throw new HttpError(400, "Invalid request");
           const remote = registry.bySlugName("moni")?.remote;
           if (!remote) throw new HttpError(409, "Moni's chat is not on its box");
           try {
-            return reply(200, path === "/remote-events" ? await remote.events(body.after as string | undefined) : await remote.resolve(body.id as string, body.state as "done" | "pending"));
+            return reply(200, path === "/remote-events" ? await remote.events(body.after as string | undefined) : await remote.resolve(body.id as string, body.state as "done" | "pending" | "failed"));
           } catch (error) {
             if (error instanceof RemoteRequestError && error.status === 409) throw new HttpError(409, "Event is not interrupted/attachment-failed");
             throw new HttpError(502, "Box request failed");

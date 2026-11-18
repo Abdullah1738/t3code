@@ -8,7 +8,7 @@ import type { NormalizedInbound } from "../src/photon.ts";
 import { toolLog } from "../src/toollog.ts";
 import { captureReadTiming, completionChecked, includeReadTiming, startTickRead, tickRead, timeTick } from "../src/tick-timing.ts";
 import { RobobBackend } from "../src/robob.ts";
-import { ProbeBudget } from "../src/probe-policy.ts";
+import { ProbeBackoff, ProbeBudget } from "../src/probe-policy.ts";
 import * as preferences from "../src/preferred-model.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -84,6 +84,27 @@ function stalledProbe(id = "stalled", age = 120_000, earlier: string[] = []) {
   return h;
 }
 const probeTimeout = () => Object.assign(new Error("PRIVATE +971501234567 /Users/private/file https://private.test/?token=PRIVATE"), { name: "TimeoutError", code: "timeout" });
+
+test.each(["absent", "503"] as const)("a late %s leader read cannot settle split member history", async outcome => {
+  const h = stalledProbe("wake:leader", 20 * 60_000);
+  const policy = new ProbeBackoff(h.store);
+  policy.reserve("wake:leader"); policy.failed("wake:leader");
+  setSystemTime(now + 60_000);
+  const entered = Promise.withResolvers<void>(), read = Promise.withResolvers<boolean>();
+  h.backend.promptAccepted = async () => { entered.resolve(); return read.promise; };
+  const scan = h.router.checkInboundLatency();
+  await entered.promise;
+  policy.split("wake:leader", ["wake:leader", "wake:member"]);
+  const leader = policy.get("wake:leader"), member = policy.get("wake:member");
+  if (outcome === "absent") read.resolve(false);
+  else read.reject(new ControlError(503, "offline"));
+  await scan;
+  expect(policy.get("wake:leader")).toEqual(leader);
+  expect(policy.get("wake:member")).toEqual(member);
+  expect(policy.cooling("wake:member")).toBe(true);
+  expect(policy.retry("wake:member")).toBe(true);
+  expect(h.backend.prompts).toEqual([]);
+});
 
 test("timed-out replay probes back off 1m to 10m then accept the original row", async () => {
   const h = stalledProbe("stalled", 120_000, ["older-private-id"]);

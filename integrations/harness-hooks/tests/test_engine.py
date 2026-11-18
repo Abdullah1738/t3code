@@ -133,7 +133,7 @@ class EngineTests(unittest.TestCase):
         return event
 
     def run_adapter(self, harness, event, **env):
-        child_env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+        child_env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV") and not k.startswith("BASH_FUNC_")}
         child_env.update(env)
         run = subprocess.run([sys.executable, str(SRC / (harness + ".py"))], input=json.dumps(event),
                              text=True, capture_output=True, env=child_env, timeout=5, check=True)
@@ -239,7 +239,7 @@ class EngineTests(unittest.TestCase):
         command = result["context"].get("updatedInput", {}).get("command", "")
         # Read the token through the shell exactly as offbox does, including the
         # wrapper's per-command export and restoration of inherited context.
-        env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+        env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV") and not k.startswith("BASH_FUNC_")}
         env["CLAUDE_CODE_SESSION_ID"] = session
         run = subprocess.run(["/bin/bash", "-c", command], env=env, text=True, capture_output=True, check=True)
         return run.stdout.strip()

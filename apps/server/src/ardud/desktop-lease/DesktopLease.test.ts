@@ -10,6 +10,7 @@ import {
   DesktopLease,
   DesktopLeaseError,
   QUIET_MS,
+  QUARANTINE_MAX_MS,
   STALE_MS,
   type AcquireResult,
   type Caller,
@@ -24,7 +25,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) NodeFS.rmSync(dir, { recursive: true, force: true });
 });
 
-function setup(options: Pick<DesktopLeaseOptions, "holderTurnActive"> = {}) {
+function setup(options: Pick<DesktopLeaseOptions, "holderTurnActive" | "bootTimeMs"> = {}) {
   const transitions: LeaseTransition[] = [];
   const dir = NodeFS.mkdtempSync(NodePath.join(process.cwd(), ".desktop-lease-test-"));
   dirs.push(dir);
@@ -462,6 +463,196 @@ describe("desktop lease", () => {
       }
       store.status();
       expect(transitions).toHaveLength(2);
+    },
+  );
+
+  it.each([
+    ["quarantined", "unknown"],
+    ["quarantined", true],
+    ["stopping", "unknown"],
+    ["stopping", true],
+  ] as const)("recovers %s immediately after a reboot despite liveness %s", (state, active) => {
+    let boot: number | null = null;
+    const { open, addTime, filename, transitions } = setup({
+      bootTimeMs: () => boot,
+      holderTurnActive: () => active,
+    });
+    const store = open();
+    const held = store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "pre-boot-call");
+    if (state === "quarantined") {
+      addTime(QUIET_MS);
+      expect(store.status().lease?.state).toBe(state);
+    } else {
+      expect(store.release(caller("1"), held.ticket).lease?.state).toBe(state);
+    }
+    const queued = store.acquire(caller("2"), request("2"));
+    addTime(1000);
+    boot = 1_750_000_000_000 + (state === "quarantined" ? QUIET_MS : 0) + 1000;
+    // A host reboot kills every process; a stale running projection cannot keep its call alive.
+    expect(store.acquire(caller("2"), request("2"))).toMatchObject({
+      ticket: queued.ticket,
+      state: "held",
+      status: { lease: { ticket: queued.ticket } },
+    });
+    const db = new NodeSqlite.DatabaseSync(filename);
+    try {
+      expect(
+        db
+          .prepare("SELECT request_state, evidence FROM ardud_desktop_requests WHERE ticket = ?")
+          .get(held.ticket),
+      ).toEqual({
+        request_state: "finished",
+        evidence: `auto-reconciled: host rebooted at ${DateTime.formatIso(DateTime.makeUnsafe(boot))} after last heartbeat 2025-06-15T15:06:40.000Z; open call pre-boot-call started 2025-06-15T15:06:40.000Z`,
+      });
+      expect(db.prepare("SELECT state, ended_at FROM ardud_desktop_calls").all()).toEqual([
+        { state: "failed", ended_at: boot },
+      ]);
+    } finally {
+      db.close();
+    }
+    expect(transitions.at(-1)).toMatchObject({
+      ticket: held.ticket,
+      from: state,
+      to: "finished",
+      reason: "host_reboot",
+    });
+    expect(store.acquire(caller("1"), request("1")).state).toBe("finished");
+    conflict(() => store.callEnd("pre-boot-call", "completed"));
+    store.status();
+    expect(transitions.filter((event) => event.reason === "host_reboot")).toHaveLength(1);
+  });
+
+  it.each([null, 1_749_999_999_000, 1_750_000_000_000])(
+    "retains an unknown quarantine when boot time is %s",
+    (boot) => {
+      const { open, addTime } = setup({ bootTimeMs: () => boot });
+      const store = open();
+      store.acquire(caller("1"), request("1"));
+      store.callStart(caller("1"), "hung");
+      addTime(QUIET_MS);
+      store.status();
+      addTime(QUIET_MS);
+      expect(store.status().lease?.state).toBe("quarantined");
+    },
+  );
+
+  it("uses the heartbeat alone to recover a stopping lease without an open call", () => {
+    let boot: number | null = null;
+    const { open, addTime, transitions } = setup({ bootTimeMs: () => boot });
+    const store = open();
+    store.acquire(caller("1"), request("1"));
+    addTime(STALE_MS);
+    expect(store.status().lease?.state).toBe("stopping");
+    boot = 1_750_000_001_000;
+    expect(store.status().lease).toBeNull();
+    expect(transitions.at(-1)?.reason).toBe("host_reboot");
+  });
+
+  it("does not treat a call started at or after boot as a pre-reboot call", () => {
+    let boot: number | null = null;
+    const { open, addTime, filename } = setup({ bootTimeMs: () => boot });
+    const store = open();
+    const held = store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "oldest");
+    addTime(QUIET_MS);
+    store.status();
+    boot = 1_750_000_001_000;
+    const db = new NodeSqlite.DatabaseSync(filename);
+    try {
+      // Retained stores can have several open calls; all must predate the boot.
+      db.prepare("INSERT INTO ardud_desktop_calls VALUES (?, ?, 'started', ?, NULL)").run(
+        "newer",
+        held.ticket,
+        boot,
+      );
+    } finally {
+      db.close();
+    }
+    expect(store.status().lease?.state).toBe("quarantined");
+  });
+
+  it.each([
+    ["unknown", QUARANTINE_MAX_MS, true],
+    ["unknown", 5 * 60 * 60_000, false],
+    ["unknown", QUARANTINE_MAX_MS - 1, false],
+    [true, 7 * 60 * 60_000, false],
+  ] as const)("bounds quarantine age (liveness %s, age %s)", (active, age, clears) => {
+    const { open, addTime, filename, transitions } = setup({ holderTurnActive: () => active });
+    const store = open();
+    const held = store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "hung-age");
+    addTime(QUIET_MS);
+    store.status();
+    addTime(age);
+    expect(store.status().lease === null).toBe(clears);
+    if (clears) {
+      expect(transitions.at(-1)).toMatchObject({
+        from: "quarantined",
+        to: "finished",
+        reason: "quarantine_max_age",
+      });
+      const db = new NodeSqlite.DatabaseSync(filename);
+      try {
+        expect(
+          db
+            .prepare("SELECT evidence, request_state FROM ardud_desktop_requests WHERE ticket = ?")
+            .get(held.ticket),
+        ).toEqual({
+          evidence: `auto-reconciled: quarantined ${age}ms with no heartbeat and liveness unknown`,
+          request_state: "finished",
+        });
+        expect(db.prepare("SELECT state FROM ardud_desktop_calls").all()).toEqual([
+          { state: "failed" },
+        ]);
+      } finally {
+        db.close();
+      }
+    } else {
+      expect(transitions.map((event) => event.reason)).toEqual(["open_call_timeout"]);
+    }
+  });
+
+  it("keeps an unknown quarantine with a heartbeat after quarantine", () => {
+    const { open, addTime, filename } = setup();
+    const store = open();
+    const held = store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "hung-heartbeat");
+    addTime(QUIET_MS);
+    store.status();
+    const db = new NodeSqlite.DatabaseSync(filename);
+    try {
+      db.prepare(
+        "UPDATE ardud_desktop_requests SET heartbeat_at = quarantined_at + 1 WHERE ticket = ?",
+      ).run(held.ticket);
+    } finally {
+      db.close();
+    }
+    addTime(QUARANTINE_MAX_MS);
+    expect(store.status().lease?.state).toBe("quarantined");
+  });
+
+  it.each(["stopping", "quarantined"] as const)(
+    "explains a %s holder in refusals and queued snapshots",
+    (state) => {
+      const { open, addTime } = setup();
+      const store = open();
+      const held = store.acquire(caller("1"), request("1"));
+      store.callStart(caller("1"), "blocked");
+      if (state === "stopping") store.release(caller("1"), held.ticket);
+      else addTime(QUIET_MS);
+      const queued = store.acquire(caller("2"), request("2"));
+      const since = state === "stopping" ? "2025-06-15T15:06:40.000Z" : "2025-06-15T15:16:40.000Z";
+      const message = `Held by ${held.ticket} (task-1, ${state} since ${since}). It clears itself once its threads are idle, after a reboot, or after 6 h. To clear it now, the owner runs: t3ctl desktop-lease reconcile --ticket ${held.ticket} --evidence "<why>" (needs environment:maintain, an admin login).`;
+      expect(queued.status.message).toBe(message);
+      for (const who of [caller("1"), caller("2")]) {
+        expect(() => store.callStart(who, "refused")).toThrow(
+          `Only the current lease holder may start desktop work. ${message}`,
+        );
+      }
+      expect(() => store.heartbeat(caller("1"), held.ticket)).toThrow(
+        `Lease is not held; do not start desktop work. ${message}`,
+      );
     },
   );
 

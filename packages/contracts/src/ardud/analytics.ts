@@ -12,7 +12,7 @@ const Timestamp = Schema.String.check(
   }),
 );
 
-// Metadata only. Deliberately no arbitrary property bag or free-form text fields.
+// Metadata only, apart from the bounded provider diagnostic below.
 const Label = Schema.String.check(
   Schema.isMaxLength(160),
   Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+-]*$/),
@@ -68,11 +68,19 @@ const McpOutcome = Schema.Literals([
   "interrupted",
   "interrupted_by_shutdown",
 ]);
-const McpPhase = Schema.Literals([
+export const McpPhase = Schema.Literals([
   "caller",
   "dispatch",
   "result",
   "handler",
+  "parent_records",
+  "child_records",
+  "catalog",
+  "request_key",
+  "receipt",
+  "settings",
+  "selection",
+  "workspace",
   "lane_wait",
   "query",
   "render",
@@ -221,6 +229,14 @@ const GeneralEvent = Schema.Struct({
   waitedMs: Schema.optionalKey(Measurement),
   lateMs: Schema.optionalKey(Measurement),
   afterCap: Schema.optionalKey(Schema.Boolean),
+  detachedOutcomeWake: Schema.optionalKey(
+    Schema.Literals([
+      "sent",
+      "sent_after_restart",
+      "suppressed_retry_saved",
+      "suppressed_definite",
+    ]),
+  ),
   tool: Schema.optionalKey(Label),
   build: Schema.optionalKey(Label),
   bootId: Schema.optionalKey(Id),
@@ -379,6 +395,12 @@ const GeneralEvent = Schema.Struct({
       lastProgressKind: Schema.optionalKey(Label),
       lastProgressTool: Schema.optionalKey(Label),
       silentSeconds: Schema.optionalKey(Measurement),
+      attempt: Schema.optionalKey(Schema.NullOr(Measurement)),
+      maxRetries: Schema.optionalKey(Schema.NullOr(Measurement)),
+      // Provider diagnostics are required to explain retries; never include tool or prompt bodies.
+      errorMessage: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(2000))),
+      waitSinceResponseMs: Schema.optionalKey(Measurement),
+      guardFiredDuringRetry: Schema.optionalKey(Schema.Boolean),
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
       cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
@@ -482,6 +504,9 @@ const GeneralEvent = Schema.Struct({
       receiptState: Schema.optionalKey(Schema.Literal("accepted")),
       missingLookup: Schema.optionalKey(Schema.Literals(["subagents", "child_thread_id"])),
       dispatchFenceRecovered: Schema.optionalKey(Schema.Boolean),
+      retryPath: Schema.optionalKey(
+        Schema.Literals(["receipt_fast", "attached_pending", "dispatched"]),
+      ),
       idShape: Schema.optionalKey(
         Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),
       ),

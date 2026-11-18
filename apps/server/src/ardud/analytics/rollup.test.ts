@@ -402,6 +402,37 @@ describe("analytics rollups", () => {
     assert.deepEqual(rollup.mcpOverflow, { groups: 0, retryAttempts: 0, detachedOutcomes: 0 });
     assert.deepEqual(finishRollup(accumulator, "2026-11-13", ts), rollup);
   });
+  it("keeps deadline stages separate from dispatch and historical handler failures", () => {
+    const accumulator = makeAccumulator();
+    for (const errorPhase of [
+      "parent_records",
+      "parent_records",
+      "dispatch",
+      "handler",
+      undefined,
+    ] as const)
+      accumulate(
+        accumulator,
+        event({
+          kind: "mcp.call",
+          tool: "delegate_task",
+          outcome: "timeout",
+          errorTag: "delegation_timeout",
+          ...(errorPhase === undefined ? {} : { errorPhase }),
+        }),
+      );
+    const rollup = finishRollup(accumulator, "2026-11-13", ts);
+    assert.sameDeepMembers(
+      [...rollup.mcpCalls[0]!.errors],
+      [
+        { errorTag: "delegation_timeout", errorPhase: "parent_records", count: 2 },
+        { errorTag: "delegation_timeout", errorPhase: "handler", count: 2 },
+        { errorTag: "delegation_timeout", errorPhase: "dispatch", count: 1 },
+      ],
+    );
+    assert.equal(rollup.mcpFailureBreakdown![0]!.count, 5);
+    assert.equal(rollup.mcpFailureContexts![0]!.count, 5);
+  });
   it("keeps pre-handler percentiles separate and skips historical calls without timing", () => {
     const accumulator = makeAccumulator();
     for (const preHandlerMs of [undefined, undefined, 0, 20, 80]) {

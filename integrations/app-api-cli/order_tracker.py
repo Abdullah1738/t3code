@@ -38,8 +38,8 @@ if __name__ == '__main__':
 ROOT = Path.home() / '.local/state/order-tracker'
 WATCHERS = Path.home() / '.local/share/robob-watch/watchers'
 # Moni's texts go to her Robob thread on the assistant line, never Abdullah's own iMessage.
-BUN = '/Users/ardud/.bun/bin/bun'
-BRIDGE_CLI = '/Users/ardud/.local/share/spectrum-bridge/src/cli.ts'
+BUN = delivery_cards.BUN
+BRIDGE_CLI = delivery_cards.BRIDGE
 PROBLEM_CLI = '/Users/ardud/.local/share/telegram-bridge/src/cli.ts'
 BRIDGE_DB = Path.home() / '.config/spectrum-bridge/state.sqlite'
 ROUTE_ID = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_:.-]{0,199}')
@@ -184,7 +184,7 @@ def queue_problem_notices(cfg, result, state, events, now=None):
             identity.append(cfg['merchant_domain'])
         key = 'order-problem:' + hashlib.sha256(
             json.dumps(identity, separators=(',', ':')).encode()).hexdigest()
-        notices.setdefault(key, {'status': 'pending',
+        notices.setdefault(key, {'status': 'pending', 'open': [],
                                 'text': f"{cfg['app']} order {cfg['order']} (AED {total:,.2f}): {description.rstrip('.')}."})
     return [event for event in events if event['kind'] not in
             {'tracking_problem', 'problem', 'eta_elapsed', 'card_link_problem'}]
@@ -196,7 +196,7 @@ def send_problem_notices(cfg, state, path, folder):
             or os.environ.get('WATCH_RUN', '').startswith('prime-')):
         return
     for key, notice in state.get('problem_notices', {}).items():
-        if notice['status'] == 'sent':
+        if notice['status'] in ('sent', 'relayed'):
             continue
         try:
             # Telegram's alerts queue survives iMessage session rotation; ordinary
@@ -206,14 +206,25 @@ def send_problem_notices(cfg, state, path, folder):
                 route = bridge_route()
                 if not route:
                     break
-                args = [BUN, BRIDGE_CLI, 'send', '--to', notice['chat'], '--session', route, '--key', key]
-            p = subprocess.run([*args, '--text=' + notice['text']], capture_output=True, text=True,
-                               timeout=20, env=store.clean_env())
-            ack = json.loads(p.stdout) if p.returncode == 0 else None
-            if (isinstance(ack, dict) and isinstance(ack.get('id'), str)
-                    and isinstance(ack.get('created'), bool)):
-                notice.update(status='sent', bridge_id=ack['id'])
-        except (OSError, subprocess.TimeoutExpired, ValueError):
+                notice.setdefault('args', ['send', '--to', notice['chat'], '--session', route, '--key', key, '--text=' + notice['text']])
+                # Old pending notices recorded neither tried nor open. Their
+                # original send may have landed; retain that history on upgrade.
+                notice.setdefault('open', [{'args': list(notice['args'])}])
+                final, notice['args'] = delivery_cards.reconcile(notice['args'], notice, 'args')
+                if not final:
+                    notice['tried'] = True
+                    notice['args'][notice['args'].index('--session') + 1] = route
+                    final = delivery_cards.attempt(notice, 'args', lambda: write(path, state))
+                notice['status'] = final
+            else:
+                p = subprocess.run([*args, '--text=' + notice['text']], capture_output=True, text=True,
+                                   timeout=20, env=store.clean_env())
+                ack = json.loads(p.stdout) if p.returncode == 0 else None
+                if (isinstance(ack, dict) and isinstance(ack.get('id'), str)
+                        and isinstance(ack.get('created'), bool)):
+                    notice.update(status='sent', bridge_id=ack['id'])
+        except (OSError, subprocess.TimeoutExpired, ValueError, sqlite3.Error) as exc:
+            delivery_cards.remember_bridge_error(notice, exc)
             pass  # The retained text and key make an ambiguous retry safe.
         write(path, state)
         break  # Keep the poll's send budget bounded; the rest stay pending.
@@ -234,7 +245,7 @@ def queue_tracking_unavailable(cfg, result, state, events):
     key = 'order-unavailable:' + hashlib.sha256(
         json.dumps([cfg['app'], cfg['order']], separators=(',', ':')).encode()).hexdigest()
     state.setdefault('problem_notices', {}).setdefault(key, {
-        'status': 'pending', 'chat': chat,
+        'status': 'pending', 'chat': chat, 'open': [],
         'text': f"Amazon order {cfg['order']}: tracking is unavailable. I'll keep checking."})
     return events
 
@@ -381,7 +392,7 @@ def notify_placement(path, args, result):
         if cfg.get('for') != 'moni':
             return 'failed:registered_for_owner' if args.recipient == 'moni' else 'skipped'
         notice = cfg.get('placed_notice')
-        if not isinstance(notice, dict) or notice.get('status') in ('sent', 'skipped'):
+        if not isinstance(notice, dict) or notice.get('status') in ('sent', 'relayed', 'skipped'):
             # No notice: registered before placement notices existed; never text an old order.
             return 'skipped'
         if args.no_placed_text:
@@ -390,7 +401,7 @@ def notify_placement(path, args, result):
             write_order(path, cfg)
             return 'skipped'
         key = f'order-placed:{path.stem}'
-        retry = notice.get('status') in ('attempting', 'ambiguous')
+        retry = notice.get('status') in ('attempting', 'ambiguous') or bool(notice.get('args') or notice.get('open'))
         if retry and (notice.get('channel') != 'bridge' or notice.get('key') != key):
             # An earlier imsg-era send may have gone out and has no bridge key; never resend blind.
             return 'failed:ambiguous_check_imsg_history'
@@ -404,31 +415,33 @@ def notify_placement(path, args, result):
             args.placed_text or placement_text(cfg, result, args.store))
         cfg['placed_notice'] = {**(notice if retry else {}), 'status': 'attempting', 'at': stamp(),
                                 'text': text, 'channel': 'bridge', 'key': key}
+        holder = cfg['placed_notice']
+        holder.setdefault('args', ['send', '--to', 'moni', '--session', route, '--key', key, f'--text={text}'])
+        holder.setdefault('open', [{'args': list(holder['args'])}] if retry else [])
         write_order(path, cfg)
-        ack = {}
         try:
-            # --text=VALUE: the CLI's parser rejects a separate value that starts with "-".
-            p = subprocess.run([BUN, BRIDGE_CLI, 'send', '--to', 'moni', '--session', route, '--key', key, f'--text={text}'],
-                               capture_output=True, text=True, timeout=20, env=store.clean_env())
-            if p.returncode == 0:
-                try:
-                    ack = json.loads(p.stdout or '')
-                except json.JSONDecodeError:
-                    ack = None
-                if isinstance(ack, dict) and isinstance(ack.get('id'), str) and isinstance(ack.get('created'), bool):
-                    outcome, status = 'sent', 'sent'
-                else:
-                    ack, (outcome, status) = {}, ('ambiguous', 'failed:bridge_bad_ack')
+            if retry and notice.get('args'):
+                final, holder['args'] = delivery_cards.reconcile(holder['args'], holder, 'args')
             else:
-                # A failed request may still have been queued; the same key makes a retry safe.
-                outcome, status = 'ambiguous', f'failed:bridge_exit_{p.returncode}'
-        except subprocess.TimeoutExpired:
+                final = None
+            if not final:
+                holder['args'] = delivery_cards.live_session(holder['args'])
+                final = delivery_cards.attempt(holder, 'args', lambda: write_order(path, cfg))
+            outcome = final if final in ('sent', 'relayed') else 'ambiguous'
+            status = final
+        except delivery_cards.BridgeError as exc:
+            delivery_cards.remember_bridge_error(holder, exc)
+            outcome = 'failed' if exc.refused and not holder['open'] else 'ambiguous'
+            status = f'failed:bridge_exit_{exc.detail["exit_code"]}'
+        except subprocess.TimeoutExpired as exc:
+            delivery_cards.remember_bridge_error(holder, exc)
             outcome, status = 'ambiguous', 'failed:bridge_timeout'
-        except OSError:
+        except OSError as exc:
+            delivery_cards.remember_bridge_error(holder, exc)
             outcome, status = 'failed', 'failed:bridge_unavailable'
+        except (ValueError, sqlite3.Error):
+            outcome, status = 'ambiguous', 'failed:bridge_bad_ack'
         cfg['placed_notice'].update(status=outcome, finished_at=stamp())
-        if outcome == 'sent':
-            cfg['placed_notice'].update(bridge_id=ack['id'], created=ack['created'])
         write_order(path, cfg)
         return status
 
@@ -1613,7 +1626,7 @@ def _check(cfg, pending_only=False):
                 if events:
                     return {'ok': True}
             if (not state.get('pending_item_drops')
-                    and all(n['status'] == 'sent' for n in state.get('problem_notices', {}).values())):
+                    and all(n['status'] in ('sent', 'relayed') for n in state.get('problem_notices', {}).values())):
                 retire_terminal(cfg, folder, path, state)
             return {'ok': not bool(state.get('retire_error') or state.get('card_error')),
                     'logProps': {'merchant': cfg.get('app'), 'state': state['status'], 'changed': False}}
@@ -1991,7 +2004,7 @@ def main(argv=None, _locked=False):
             settings.update(held=held,
                             skip_send=bool(settings.get('skip_send') or args.no_card_send or args.no_placed_text or
                                            (not new and cfg.get('placed_notice', {}).get('channel') != 'delivery_card' and
-                                            cfg.get('placed_notice', {}).get('status') in ('sent', 'ambiguous', 'attempting'))))
+                                            cfg.get('placed_notice', {}).get('status') in ('sent', 'relayed', 'ambiguous', 'attempting'))))
             if chat_of(cfg) != default_chat(cfg['for']):
                 settings.setdefault('chat', chat_of(cfg))
             # New registrations publish after the prime, not during it.
@@ -2032,7 +2045,7 @@ def main(argv=None, _locked=False):
                        f'Run order-watch remove --app {app} --order {args.order} {shlex.join(merchant_args(cfg))} only to stop tracking early. Item/shipment-scoped evidence (Amazon or noon marketplace) proves only that part: say package/item, and verify all shipments before closing. whole_order_complete=false is never a whole-order completion. '
                        'Amazon aftercare is scoped return/refund/cancellation evidence, not a fresh arrival or whole-order cancellation: do not remove tracking or initiate any return/refund/cancellation from it. Historical package evidence is not a new arrival. '
                        'On candidate delivered, verify or ask Abdullah before removing. '
-                       'Use existing read-only evidence first; no phone UI while priority-hold is present.')
+                       'Use existing read-only evidence first; no phone UI while `ph hold status --json` shows present true.')
             command = shlex.join([sys.executable, str(Path(__file__).resolve()), 'check', '--app', app, '--order', args.order,
                                   *merchant_args(cfg)])
             # For native apps, add writes watcher.json, then primes one real check (robob-watch
@@ -2067,13 +2080,19 @@ def main(argv=None, _locked=False):
             # One placement card replaces Moni's old placement text.
             notified = card['status'] if cfg['for'] == 'moni' else 'failed:registered_for_owner' if args.recipient == 'moni' else 'skipped'
             if cfg['for'] == 'moni':
-                cfg['placed_notice'] = {'status': 'sent' if notified == 'sent' else 'skipped',
+                cfg['placed_notice'] = {'status': notified,
                                         'channel': 'delivery_card', 'at': stamp()}
+                if card.get('bridge_error'):
+                    cfg['placed_notice']['bridge_error'] = card['bridge_error']
                 write_order(path, cfg)
         else:
             notified = notify_placement(path, args, result) if registered else 'skipped'
-        print(json.dumps({'tracker_id': wid, 'watcher_registered': registered, 'moni_notified': notified,
-                          'delivery_card': card, 'chat': chat_of(cfg)}))
+        receipt = {'tracker_id': wid, 'watcher_registered': registered, 'moni_notified': notified,
+                   'delivery_card': card, 'chat': chat_of(cfg)}
+        failure = (card or {}).get('bridge_error') or read(path).get('placed_notice', {}).get('bridge_error')
+        if failure:
+            receipt['bridge_error'] = failure
+        print(json.dumps(receipt))
         if not registered:
             return 1
         return NOTICE_FAILED_EXIT if notified.startswith('failed') else 0

@@ -16,8 +16,10 @@ import type * as AcpSchema from "effect-acp/schema";
 import type * as AcpCompat from "effect-acp/compat";
 
 import { beginAcpMockPrompt } from "./acpMockCancellationState.ts";
+import { frameRequestLog } from "./acpMockRequestLog.ts";
 
 const requestLogPath = process.env.T3_ACP_REQUEST_LOG_PATH;
+let pendingRequestLog = "";
 const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
@@ -2444,11 +2446,10 @@ const program = Effect.gen(function* () {
               }
               const payload = event.payload;
               return Effect.sync(() => {
-                NodeFS.appendFileSync(
-                  requestLogPath,
-                  payload.endsWith("\n") ? payload : `${payload}\n`,
-                  "utf8",
-                );
+                // Raw events are transport chunks, which can end inside a JSON message.
+                const framed = frameRequestLog(pendingRequestLog, payload);
+                if (framed.write) NodeFS.appendFileSync(requestLogPath, framed.write, "utf8");
+                pendingRequestLog = framed.pending;
               });
             },
           }
