@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -20,6 +21,22 @@ from test_triage import t
 
 
 _sampled = set()
+
+# Shape table: newline separators must reach the redactor before layout changes.
+CLASSIFIER_CREDENTIAL_ERRORS = (
+    ('label LF', 'token\nFixtureSecret'),
+    ('label CRLF', 'token\r\nFixtureSecret'),
+    ('label colon LF', 'token:\nFixtureSecret'),
+    ('label indented LF', 'token\n\tFixtureSecret'),
+    ('credentials block', 'credentials:\nfixtureuser\nFixtureSecret'),
+    ('creds block CRLF', 'creds:\r\nfixtureuser\r\nFixtureSecret'),
+    ('login details block', 'login details:\nfixtureuser\nFixtureSecret'),
+    ('wrapped block', '**credentials:**\nfixtureuser\nFixtureSecret'),
+    ('labelled username block', 'credentials:\nusername: fixtureuser\nFixtureSecret'),
+    ('email pair', 'fixture@example.invalid\nFixtureSecret89'),
+    ('quoted multiline password', 'password: "FixtureSecret\nFixtureTail"'),
+    ('remaining control character', 'token\nFixtureSecret\x00'),
+)
 
 
 class TriageLoggingTests(unittest.TestCase):
@@ -104,14 +121,47 @@ class TriageLoggingTests(unittest.TestCase):
 
     def test_classifier_failure_logs_stable_tag_and_actual_fail_open_route(self):
         item = self.item(id='mail:private:1:1', preview='Private body should never appear')
-        state = self.run_batch([item], error=ValueError('private token and response body'))
+        state = self.run_batch([item], error=ValueError('fixture failure password=FixtureSecret89'))
         self.assertIn('outbox', state)
         row, = self.decisions(item['id'])
         self.assertEqual((row['props']['class'], row['props']['routed']), ('fail_open', 'chat'))
         self.assertEqual(self.rows('triage.classify')[-1]['ok'], False)
         errors = [row['error'] for row in self.rows() if 'error' in row]
         self.assertIn({'tag': 'classifier.failed', 'message': 'classifier.failed'}, errors)
-        self.assertNotIn('private token', json.dumps(self.rows()))
+        self.assertNotIn('FixtureSecret89', json.dumps(self.rows()))
+
+    def test_classifier_message_and_frame_survive_report_run_record_and_tool_log(self):
+        item = self.item()
+        state = self.run_batch([item], error=TypeError('fixture shape mismatch password=FixtureSecret89 OTP 123456'))
+        report = t.read_json(Path(state['outbox']['batch']))
+        error = report['usage']['classifier_error']
+        self.assertTrue(error.startswith('TypeError: fixture shape mismatch'))
+        self.assertRegex(error, r'; at classify_batch:\d+; endpoint=' + re.escape(t.CLASSIFIER_ENDPOINT) +
+                         r'; elapsed_ms=\d+; attempts=1$')
+        rows = [json.loads(line) for line in (Path(os.environ['WATCH_DIR']) / 'diagnostics/runs.jsonl').read_text().splitlines()]
+        self.assertEqual(rows[-1]['classifier_error'], error)
+        self.assertEqual(self.rows('triage.classify')[-1]['props']['classifier_error'], error)
+        for value in ('FixtureSecret89', '123456'):
+            self.assertNotIn(value, error)
+
+    def test_multiline_classifier_credentials_are_redacted_before_persistence(self):
+        for shape, message in CLASSIFIER_CREDENTIAL_ERRORS:
+            with self.subTest(shape=shape):
+                before = len(self.rows())
+                state = self.run_batch([self.item()], error=TypeError('fixture mismatch; ' + message))
+                report = t.read_json(Path(state['outbox']['batch']))
+                error = report['usage']['classifier_error']
+                self.assertTrue(error.startswith('TypeError: fixture mismatch;'))
+                self.assertRegex(error, r'; at classify_batch:\d+; endpoint=' + re.escape(t.CLASSIFIER_ENDPOINT) +
+                                 r'; elapsed_ms=\d+; attempts=1$')
+                self.assertIn('[redacted]', error)
+                self.assertFalse(any(ord(c) < 32 or ord(c) == 127 for c in error))
+                runs = [json.loads(line) for line in (Path(os.environ['WATCH_DIR']) / 'diagnostics/runs.jsonl').read_text().splitlines()]
+                self.assertEqual(runs[-1]['classifier_error'], error)
+                self.assertEqual(self.rows('triage.classify')[-1]['props']['classifier_error'], error)
+                persisted = json.dumps({'report': report, 'runs': runs[-1:], 'logs': self.rows()[before:]})
+                for secret in ('FixtureSecret', 'FixtureTail'):
+                    self.assertNotIn(secret, persisted)
 
     def test_failed_run_is_traced_and_keeps_the_original_failure(self):
         with patch.object(t, 'active_watchers', return_value=[]), \

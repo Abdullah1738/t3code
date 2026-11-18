@@ -19,6 +19,7 @@ import importlib.machinery
 import importlib.util
 import imaplib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -1498,19 +1499,56 @@ def classify(items, context):
                                  headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'X-OpenRouter-Title': 'inbox-triage'})
     with urllib.request.urlopen(req, timeout=18) as response:
         result = json.load(response)
+    if not isinstance(result, dict):
+        raise ValueError('classifier response not an object')
+    choices = result.get('choices')
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ValueError('classifier response missing choice object')
+    choice = choices[0]
+    finish = ''
+    if 'finish_reason' in choice:
+        reason = choice['finish_reason']
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError('classifier finish_reason not a string')
+        finish = ' (finish_reason=' + (clean(reason, 40) if reason is not None else 'null') + ')'
+    def invalid(message):
+        return ValueError('classifier ' + message + finish)
+    message = choice.get('message')
+    if not isinstance(message, dict):
+        raise invalid('message not an object')
+    content = message.get('content')
+    if not isinstance(content, str):
+        raise invalid('content not a string')
     usage = result.get('usage', {})
+    if not isinstance(usage, dict):
+        raise invalid('usage not an object')
+    def number(value):
+        return type(value) in (int, float) and 0 <= value <= sys.float_info.max and math.isfinite(value)
     meta = {'model': result.get('model', MODEL), 'input_tokens': usage.get('prompt_tokens', 0),
             'output_tokens': usage.get('completion_tokens', 0), 'cost_usd': usage.get('cost')}
+    for field, value in (('prompt_tokens', meta['input_tokens']), ('completion_tokens', meta['output_tokens'])):
+        if not number(value):
+            raise invalid('usage.' + field + ' not a nonnegative finite number')
     if meta['cost_usd'] is None:
         meta['cost_usd'] = meta['input_tokens'] * INPUT_USD + meta['output_tokens'] * OUTPUT_USD
-    content = result['choices'][0]['message']['content']
-    parsed = json.loads(content)
+    elif not number(meta['cost_usd']):
+        raise invalid('usage.cost not a nonnegative finite number')
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise invalid('content not valid JSON') from e
+    if not isinstance(parsed, dict):
+        raise invalid('parsed response not an object')
     ids, used, hits = {i['id'] for i in items}, set(), []
     if not isinstance(parsed.get('hits'), list):
-        raise ValueError('classifier response missing hits array')
+        raise invalid('response missing hits array')
     for hit in parsed['hits']:
+        if not isinstance(hit, dict):
+            raise invalid('hit not an object')
+        if not isinstance(hit.get('id'), str):
+            raise invalid('hit id not a string')
         if hit.get('id') not in ids or hit['id'] in used or hit.get('urgency') not in ('urgent', 'today', 'info') or not isinstance(hit.get('reason'), str):
-            raise ValueError('invalid classifier hit')
+            raise invalid('invalid hit')
         used.add(hit['id'])
         hits.append({'id': hit['id'], 'reason': clean(hit['reason'], 150), 'urgency': hit['urgency']})
     return hits, meta
@@ -1519,6 +1557,17 @@ def classify(items, context):
 class ClassifierDeadline(BaseException):
     """Not an OSError (as TimeoutError is), so socket connect fallback and urllib's
     error wrapping can't catch it and carry on past the budget."""
+
+
+def classifier_error(error):
+    detail = type(error).__name__ + ': ' + re.sub(r'[\x00-\x1f\x7f]', ' ', clean(str(error), 160))
+    frame = None
+    trace = error.__traceback__
+    while trace:
+        if trace.tb_frame.f_code.co_filename == __file__:
+            frame = trace.tb_frame.f_code.co_name + ':' + str(trace.tb_lineno)
+        trace = trace.tb_next
+    return detail + ('; at ' + frame if frame else '')
 
 
 def deferred_stats(items, now):
@@ -1574,7 +1623,7 @@ def classify_batch(items, context, seconds=20):
                          'socket_timeout' if isinstance(error, TimeoutError) else
                          f'http_status={error.code}' if isinstance(error, urllib.error.HTTPError) else
                          f'url_error={type(error.reason).__name__}' if isinstance(error, urllib.error.URLError) else
-                         type(error).__name__)
+                         classifier_error(error))
                 causes.append({'attempt': attempts, 'cause': cause,
                                'elapsed_ms': round((time.monotonic()-attempt_start)*1000)})
                 retry = isinstance(error, (ClassifierDeadline, TimeoutError, urllib.error.URLError))
@@ -1594,7 +1643,8 @@ def classify_batch(items, context, seconds=20):
     log_failure('classifier.failed')
     tool_log({'component': 'triage', 'kind': 'perf', 'name': 'triage.classify', 'ok': False,
               'durationMs': meta['classifier_elapsed_ms'], 'ids': log_ids(),
-              'props': {'class': 'fail_open', 'count': len(items)}})
+              'props': {'class': 'fail_open', 'count': len(items),
+                        'classifier_error': meta['classifier_error']}})
     return ([{'id': i['id'], 'reason': 'Classifier unavailable; manually review', 'urgency': 'info'} for i in items],
             {'model': MODEL, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': None, **meta})
 

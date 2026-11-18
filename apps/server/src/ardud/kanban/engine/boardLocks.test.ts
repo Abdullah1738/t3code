@@ -787,6 +787,126 @@ it.effect("a stale read-only operation reruns before any write or external side 
   }),
 );
 
+it.effect.each(["initial", "reacquire"] as const)(
+  "#1941 %s validation can read outside its gate without re-entering itself",
+  (stage) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      let depth = 0;
+      let validations = 0;
+      let reads = 0;
+      yield* locks.run(
+        Effect.gen(function* () {
+          yield* locks.scopeDispatch(
+            "a",
+            ["card:target"],
+            Effect.gen(function* () {
+              assert.strictEqual(++depth, 1, "validation re-entered before its read returned");
+              validations++;
+              if (stage === "initial" || validations > 1) {
+                yield* locks.outsideRead(
+                  "view:worker",
+                  () => 0,
+                  Effect.sync(() => {
+                    reads++;
+                  }),
+                );
+              }
+              return true;
+            }).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  depth--;
+                }),
+              ),
+            ),
+          );
+          yield* locks.outside(Effect.void, undefined, true);
+        }),
+        "target",
+      );
+      assert.strictEqual(validations, 2);
+      assert.strictEqual(reads, stage === "initial" ? 2 : 1);
+      assert.deepEqual(yield* locks.holders, []);
+    }),
+);
+
+it.effect.each(["none", "unrelated", "card", "slot", "migration"] as const)(
+  "#1941 validation retries its snapshot after an outside read overlaps %s changes",
+  (change) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let free = true;
+      let depth = 0;
+      let attempts = 0;
+      let reads = 0;
+      let sent = 0;
+      const dispatch = yield* locks
+        .run(
+          Effect.gen(function* () {
+            attempts++;
+            yield* locks.scopeDispatch(
+              "a",
+              ["card:target"],
+              Effect.gen(function* () {
+                assert.strictEqual(++depth, 1, "validation re-entered before its read returned");
+                const snapshot = free;
+                yield* locks.outsideRead(
+                  "view:worker",
+                  () => 0,
+                  Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Deferred.await(resume)),
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        reads++;
+                      }),
+                    ),
+                  ),
+                );
+                return snapshot;
+              }).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    depth--;
+                  }),
+                ),
+              ),
+            );
+            yield* locks.outside(
+              Effect.sync(() => {
+                sent++;
+              }),
+            );
+          }),
+          "target",
+        )
+        .pipe(Effect.exit, Effect.forkChild);
+      yield* Deferred.await(entered);
+      if (change === "migration") yield* locks.exclusive(Effect.void);
+      else if (change !== "none") {
+        yield* locks.run(
+          locks.access(
+            "a",
+            Effect.sync(() => {
+              if (change === "slot") free = false;
+            }),
+            true,
+            change === "card" ? "card:target" : change === "slot" ? "slots:worker" : "card:other",
+          ),
+        );
+      }
+      yield* Deferred.succeed(resume, undefined);
+      const result = yield* Fiber.join(dispatch);
+      assert.strictEqual(Exit.isSuccess(result), change !== "slot");
+      assert.strictEqual(sent, change === "slot" ? 0 : 1);
+      assert.strictEqual(attempts, change === "none" ? 1 : change === "slot" ? 9 : 2);
+      assert.strictEqual(reads, change === "slot" ? 1 : 2);
+      assert.deepEqual(yield* locks.holders, []);
+    }),
+);
+
 it.effect.each(["validation", "read"] as const)(
   "#1397 pending dispatch %s releases the gate within its read budget",
   (stage) =>

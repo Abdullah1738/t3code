@@ -113,6 +113,19 @@ Tests: `/usr/bin/python3 -m unittest discover -s tests` (each install test runs
 the installer from a throwaway git copy of this package, with a temp `HOME` and
 a fake `launchctl`; the power alert tests use a fake `pmset` and notifier).
 
+## timeout
+
+macOS has no `timeout(1)`, and agents write `timeout 40 cmd` out of Linux habit.
+`bin/timeout` is a GNU-compatible Perl shim installed as `~/.local/bin/timeout`:
+`timeout [-s SIG] [-k DUR] [--preserve-status] [--foreground] [-v] DURATION CMD...`,
+durations take `s`/`m`/`h`/`d`, and it exits 124 on timeout, 137 when KILL was
+needed, 125/126/127 for its own, can't-run and not-found errors. The command
+runs in its own process group so the signal also reaches its children; TERM,
+INT, HUP and QUIT sent to timeout are passed on. When timeout owns the terminal
+it hands it to that group (so the command can read it) and takes it back after;
+Ctrl-Z stops both. Tests:
+`/usr/bin/python3 -B -m unittest discover -s tests -p test_timeout.py`.
+
 ## Quint
 
 `bin/quint` installs as `~/.local/bin/quint`. The wrapper checks `java -version` for Java 21+
