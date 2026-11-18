@@ -1,0 +1,417 @@
+#!/usr/bin/python3 -I
+"""Hold a shared loopback Screen Sharing session; macOS relocks when its unlocking viewer leaves."""
+import argparse
+import fcntl
+import hashlib
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+from pathlib import Path
+import plistlib
+import re
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+
+VERSION = "1"
+USER = "ardud"
+LABEL = "com.ardud.vnc-hold"
+AUTH_BACKOFF = (15, 60, 300, 900)
+
+
+class KeychainError(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+class AuthError(Exception):
+    pass
+
+
+class LockReadError(Exception):
+    pass
+
+
+def password():
+    try:
+        result = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", "robob-mac-login",
+                                 "-a", USER, "-w"], capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        raise KeychainError("timeout") from None
+    if result.returncode:
+        raise KeychainError(result.returncode)
+    return bytearray(result.stdout.rstrip(b"\n"))
+
+
+def locked():
+    result = subprocess.run(["/usr/sbin/ioreg", "-n", "Root", "-d1", "-a"],
+                            capture_output=True, timeout=10)
+    try:
+        root = plistlib.loads(result.stdout)
+        # ioreg -a can return a root dict or an array, depending on the macOS version.
+        root = root[0] if isinstance(root, list) else root
+        users = root["IOConsoleUsers"]
+        if result.returncode or not users:
+            raise ValueError("no console users")
+        return any(bool(u.get("CGSSessionScreenIsLocked")) for u in users)
+    except (ValueError, KeyError, IndexError, TypeError, plistlib.InvalidFileException):
+        raise LockReadError() from None
+
+
+def wipe(value):
+    value[:] = b"\0" * len(value)
+
+
+def recvn(s, n):
+    data = b""
+    while len(data) < n:
+        chunk = s.recv(n - len(data))
+        if not chunk:
+            raise EOFError("closed")
+        data += chunk
+    return data
+
+
+def aes_ecb(key, data):
+    # enc -K takes literal hex, not an fd/stdin source. -pass stdin derives a
+    # different key and breaks type 30. Only the ephemeral DH key is in argv.
+    return subprocess.run(["/usr/bin/openssl", "enc", "-aes-128-ecb", "-nopad", "-K", key.hex()],
+                          input=data, capture_output=True, check=True, timeout=10).stdout
+
+
+def connect(secret, host="127.0.0.1", port=5900):
+    if not secret or len(secret) > 63 or 0 in secret:
+        raise ValueError("invalid credential length or NUL")
+    s = socket.create_connection((host, port), 10)
+    try:
+        recvn(s, 12)
+        s.sendall(b"RFB 003.008\n")
+        n = recvn(s, 1)[0]
+        if 30 not in recvn(s, n):
+            raise AuthError("Apple auth type 30 unavailable")
+        s.sendall(bytes([30]))
+        gen, klen = struct.unpack(">HH", recvn(s, 4))
+        if not 16 <= klen <= 512:
+            raise ValueError("invalid DH size")
+        p = int.from_bytes(recvn(s, klen), "big")
+        peer = int.from_bytes(recvn(s, klen), "big")
+        if not (1 < gen < p and 1 < peer < p):
+            raise ValueError("invalid DH parameters")
+        priv = int.from_bytes(os.urandom(klen), "big") % (p - 2) + 1
+        pub = pow(gen, priv, p).to_bytes(klen, "big")
+        key = hashlib.md5(pow(peer, priv, p).to_bytes(klen, "big")).digest()
+        creds = bytearray(os.urandom(128))
+        try:
+            u = USER.encode() + b"\0"
+            creds[:len(u)] = u
+            creds[64:64 + len(secret)] = secret
+            creds[64 + len(secret)] = 0
+            s.sendall(aes_ecb(key, creds) + pub)
+        finally:
+            wipe(creds)
+        if struct.unpack(">I", recvn(s, 4))[0]:
+            size = struct.unpack(">I", recvn(s, 4))[0]
+            reason = recvn(s, min(size, 4096)).decode(errors="replace")
+            reason = reason.replace(secret.decode(errors="replace"), "[redacted]")
+            raise AuthError(reason[:200])
+        s.sendall(b"\x01")  # shared: never kick other viewers
+        width, height = struct.unpack(">HH", recvn(s, 4))
+        recvn(s, 16)
+        size = struct.unpack(">I", recvn(s, 4))[0]
+        if size > 1048576:
+            raise ValueError("invalid desktop name size")
+        recvn(s, size)
+        return s, width, height
+    except BaseException:
+        s.close()
+        raise
+
+
+def atomic_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix=".state-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(data, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def state_dir():
+    return Path(os.environ.get("VNC_HOLD_STATE_DIR", Path.home() / ".local/state/vnc-hold"))
+
+
+class State:
+    def __init__(self, directory, clock=time):
+        self.directory, self.clock = Path(directory), clock
+        self.path = self.directory / "state.json"
+        # Corrupt existing state is fatal: an empty history could repeat a bad password.
+        previous = json.loads(self.path.read_text()) if self.path.exists() else {}
+        self.data = dict(pid=os.getpid(), connected=False, connected_since=None,
+                         last_keepalive_at=None, locked=None, last_unlock_attempt_at=None,
+                         last_unlock_result=None, typing_paused=False, typing_paused_reason=None,
+                         last_error=None, auth_failures_in_row=0, version=VERSION)
+        self.data.update(previous)
+        self.data.update(pid=os.getpid(), connected=False, connected_since=None, version=VERSION)
+        self.last_write = 0
+
+    def update(self, **fields):
+        changed = any(self.data.get(k) != v for k, v in fields.items())
+        updated = dict(self.data, **fields)
+        if changed or self.clock.monotonic() - self.last_write >= 60 or not self.path.exists():
+            atomic_json(self.path, updated)
+            self.last_write = self.clock.monotonic()
+        self.data = updated
+
+    def reset_if_requested(self):
+        path = self.directory / "reset.json"
+        token = json.loads(path.read_text())["token"] if path.exists() else None
+        if token is not None and token != self.data.get("reset_token"):
+            self.update(reset_token=token, attempt_failed=None, paused_password_sha256=None, typing_paused=False,
+                        typing_paused_reason=None)
+            return True
+        return False
+
+
+class Hold:
+    def __init__(self, state, password_source=password, lock_reader=locked, clock=time,
+                 connector=connect, log=None):
+        self.state, self.password_source, self.lock_reader = state, password_source, lock_reader
+        self.clock, self.connector = clock, connector
+        self.log = log or logging.getLogger("vnc-hold")
+        self.secret = bytearray()
+        self.next_refresh = 0
+
+    def read_lock(self):
+        value = self.lock_reader()
+        if not isinstance(value, bool):
+            raise LockReadError()
+        self.state.update(locked=value)
+        return value
+
+    def refresh_password(self):
+        fresh = self.password_source()
+        wipe(self.secret)
+        self.secret = bytearray(fresh)
+        wipe(fresh)
+        self.next_refresh = self.clock.monotonic() + 120
+        failed = self.state.data.get("attempt_failed")
+        paused_hash = self.state.data.get("paused_password_sha256") or (failed or {}).get("password_sha256")
+        if ((paused_hash and paused_hash != hashlib.sha256(self.secret).hexdigest())
+                or self.state.data["typing_paused_reason"] == "Keychain read failed after reset"):
+            self.state.update(attempt_failed=None, paused_password_sha256=None,
+                              typing_paused=False, typing_paused_reason=None)
+        if (self.state.data["last_error"] or "").startswith("keychain_read_failed"):
+            self.state.update(last_error=None)
+
+    def event(self, s, sym, down):
+        s.sendall(struct.pack(">BBxxI", 4, int(down), sym))
+        self.clock.sleep(0.03)
+
+    def key(self, s, sym):
+        self.event(s, sym, True)
+        self.event(s, sym, False)
+
+    def maybe_unlock(self, s):
+        if self.state.reset_if_requested():
+            try:
+                self.refresh_password()
+            except KeychainError as error:
+                # Reset authorizes a retry, never using a stale cached password after a correction.
+                self.state.update(typing_paused=True, typing_paused_reason="Keychain read failed after reset",
+                                  last_unlock_result="keychain_read_failed",
+                                  last_error=f"keychain_read_failed exit={error.code}")
+                self.next_refresh = self.clock.monotonic() + 120
+                return
+        if not self.read_lock():
+            return
+        if self.state.data["typing_paused"]:
+            if self.clock.monotonic() >= self.next_refresh:
+                try:
+                    self.refresh_password()
+                except KeychainError as error:
+                    self.next_refresh = self.clock.monotonic() + 120
+                    self.state.update(last_unlock_result="keychain_read_failed",
+                                      last_error=f"keychain_read_failed exit={error.code}")
+                    return
+            if self.state.data["typing_paused"]:
+                self.state.update(last_unlock_result="skipped_paused")
+                return
+        if not self.secret or any(c < 32 or c > 126 for c in self.secret):
+            self.state.update(last_unlock_result="non_ascii_password", typing_paused=True,
+                              typing_paused_reason="password must be printable ASCII",
+                              paused_password_sha256=hashlib.sha256(self.secret).hexdigest())
+            return
+        last = self.state.data["last_unlock_attempt_at"]
+        if last is not None and self.clock.time() - last < 120:
+            return
+        self.clock.sleep(1)
+        if not self.read_lock():
+            return
+        # Reserve BEFORE sending a key: EOF/crash mid-typing must not permit an automatic retry.
+        self.state.update(last_unlock_attempt_at=self.clock.time(), typing_paused=True,
+                          typing_paused_reason="unlock attempt pending",
+                          attempt_failed={"at": self.clock.time(),
+                                          "password_sha256": hashlib.sha256(self.secret).hexdigest()})
+        self.key(s, 0xffe1)  # shift wakes the display
+        self.clock.sleep(1.5)
+        # RFB carries X keysyms, not US keycodes: uppercase/punctuation select their
+        # own symbols. Preserve the live client's ord(ch), without extra Shift.
+        for char in self.secret:
+            self.key(s, char)
+        self.key(s, 0xff0d)
+        for _ in range(8):
+            self.clock.sleep(1)
+            if not self.read_lock():
+                self.state.update(last_unlock_result="unlocked", typing_paused=False,
+                                  typing_paused_reason=None, attempt_failed=None, last_error=None)
+                self.log.info("console unlocked")
+                return
+        self.state.update(last_unlock_result="still_locked", typing_paused=True,
+                          typing_paused_reason="password rejected or unlock unconfirmed")
+        self.log.error("UNLOCK_FAILED, typing paused until the Keychain password changes")
+
+    def session(self, s):
+        stopped = threading.Event()
+        def drain():
+            try:
+                while s.recv(65536):
+                    pass
+            except OSError:
+                pass
+            finally:
+                stopped.set()
+        s.settimeout(None)
+        threading.Thread(target=drain, daemon=True).start()
+        while not stopped.is_set():
+            s.sendall(struct.pack(">BBHHHH", 3, 1, 0, 0, 1, 1))
+            self.state.update(last_keepalive_at=self.clock.time())
+            self.maybe_unlock(s)
+            self.clock.sleep(5)
+        raise EOFError("closed")
+
+    def run_connection(self):
+        s = None
+        try:
+            self.refresh_password()
+            s, width, height = self.connector(self.secret)
+            self.state.update(connected=True, connected_since=self.clock.time(),
+                              auth_failures_in_row=0, last_error=None)
+            self.log.info("connected %sx%s", width, height)
+            self.session(s)
+        except AuthError as error:
+            count = self.state.data["auth_failures_in_row"] + 1
+            self.error(f"auth_failed: {error}", auth_failures_in_row=count)
+            return AUTH_BACKOFF[min(count - 1, len(AUTH_BACKOFF) - 1)]
+        except KeychainError as error:
+            self.error(f"keychain_read_failed exit={error.code}", last_unlock_result="keychain_read_failed")
+        except Exception as error:
+            # Exception text/tracebacks may contain captured subprocess output or arguments.
+            self.error(type(error).__name__)
+        finally:
+            if s is not None:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                s.close()
+            wipe(self.secret)
+            self.state.update(connected=False)
+        return 15
+
+    def wait_retry(self, delay):
+        deadline = self.clock.monotonic() + delay
+        while self.clock.monotonic() < deadline:
+            self.clock.sleep(min(60, deadline - self.clock.monotonic()))
+            # A disconnected daemon still needs a fresh state file; keepalive time
+            # must continue to describe the last actual network request.
+            self.state.update()
+
+    def error(self, message, **fields):
+        if self.state.data["last_error"] != message:
+            self.log.error("%s", message)
+        self.state.update(last_error=message, **fields)
+
+
+def status(directory, lock_reader=locked, launchctl=subprocess.run, now=time.time):
+    try:
+        data = json.loads((Path(directory) / "state.json").read_text())
+        live_lock = lock_reader()
+        proc = launchctl(["/bin/launchctl", "print", f"gui/{os.getuid()}/{LABEL}"],
+                         capture_output=True, text=True, timeout=10)
+        launch_state = re.search(r"^\s*state = (\S+)", proc.stdout, re.M)
+        launch_pid = re.search(r"^\s*pid = (\d+)", proc.stdout, re.M)
+        # Full launchctl output may include environment variables. Show only state/pid.
+        print(json.dumps(data, indent=2, sort_keys=True))
+        print(f"launchctl: state={launch_state[1] if launch_state else 'unavailable'} "
+              f"pid={launch_pid[1] if launch_pid else 'unavailable'}")
+        print(f"live locked={live_lock}")
+        age = now() - (data.get("last_keepalive_at") or 0)
+        healthy = (data["connected"] and not data["typing_paused"] and not data["auth_failures_in_row"]
+                   and not data["last_error"] and live_lock is False and 0 <= age <= 120
+                   and proc.returncode == 0 and launch_state and launch_state[1] == "running"
+                   and launch_pid and int(launch_pid[1]) == data["pid"])
+        return 0 if healthy else 1
+    except Exception as error:
+        print(f"unhealthy: {type(error).__name__}")
+        return 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("run", "status", "selftest", "reset-attempts"), nargs="?", default="run")
+    parser.add_argument("--once", action="store_true", help="alias for selftest")
+    args = parser.parse_args(argv)
+    command = "selftest" if args.once else args.command
+    directory = state_dir()
+    if command == "status":
+        return status(directory)
+    if command == "reset-attempts":
+        atomic_json(directory / "reset.json", {"token": uuid.uuid4().hex})
+        print("typing pause reset requested; daemon applies it on its next check")
+        return 0
+    if command == "selftest":
+        secret = password()
+        try:
+            s, width, height = connect(secret)
+            try:
+                print(f"ok {width}x{height} locked={locked()}")
+            finally:
+                s.close()
+        finally:
+            wipe(secret)
+        return 0
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (directory / "run.lock").open("w") as lease:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        log_path = Path.home() / "Library/Logs/vnc-hold.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(log_path, maxBytes=262144, backupCount=2)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        logger = logging.getLogger("vnc-hold")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        state = State(directory)
+        state.update()
+        hold = Hold(state, log=logger)
+        while True:
+            hold.wait_retry(hold.run_connection())
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print(f"vnc-hold failed: {type(error).__name__}", file=sys.stderr)
+        sys.exit(1)
