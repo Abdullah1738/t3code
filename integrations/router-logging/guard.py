@@ -290,6 +290,7 @@ def serve():
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         poll = None
+        pool_alerts = None
         next_poll = 0
         try:
             while not stopping:
@@ -300,6 +301,11 @@ def serve():
                     guard.step(time.time() * 1000, job, listener, read_json(runtime.marker), runtime.lock_age_ms())
                 except Exception:
                     emit('guard', 'guard.error', kind='error', error=dict(tag='tick_failed'))
+                if pool_alerts is None or pool_alerts.poll() is not None:
+                    # Delivery can block on several historical bridge retries.
+                    # Its own process keeps listener repair on the 15 s cadence.
+                    pool_alerts = subprocess.Popen([sys.executable, '-I', str(Path(__file__).with_name('run.py')), 'pool-alerts'],
+                                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if poll is not None and poll.poll() is not None:
                     poll = None
                 if start >= next_poll and poll is None:
@@ -310,10 +316,12 @@ def serve():
                 while not stopping and time.monotonic() - start < 15:
                     time.sleep(max(0, min(.5, 15 - (time.monotonic() - start))))
         finally:
-            if poll is not None and poll.poll() is None:
-                poll.terminate()
+            for child in (pool_alerts, poll):
+                if child is None or child.poll() is not None:
+                    continue
+                child.terminate()
                 try:
-                    poll.wait(timeout=5)
+                    child.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    poll.kill()
-                    poll.wait()
+                    child.kill()
+                    child.wait()

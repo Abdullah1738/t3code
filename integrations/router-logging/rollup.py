@@ -10,6 +10,7 @@ import tempfile
 from toollog import directory, safe_target, CONNECTION_ERRNOS
 from volume import REASONS, integer
 from listener_rollup import windows as listener_windows
+from pool_rollup import summarize as pool_summary
 
 
 def percentiles(values):
@@ -67,6 +68,7 @@ def rollup(day, root=None, now=None):
     next_day = dt.datetime.combine(dt.date.fromisoformat(day) + dt.timedelta(days=1), dt.time(), dt.timezone.utc)
     root = Path(root) if root is not None else directory()
     counts, kinds, tags = Counter(), Counter(), Counter()
+    pool_rows = []
     times, samples = defaultdict(list), {}
     targets = defaultdict(Counter)
     proxy = {}
@@ -110,6 +112,8 @@ def rollup(day, root=None, now=None):
                             raise ValueError('invalid lock dimensions')
                     total += 1
                     counts[row['name']] += 1
+                    if row['name'] in ('pool.exhausted', 'pool.recovered'):
+                        pool_rows.append(row)
                     if row['name'] in ('health.request.late', 'supervisor.health_probe'):
                         props = row.get('props') if isinstance(row.get('props'), dict) else {}
                         at = dt.datetime.fromisoformat(row.get('ts', '').replace('Z', '+00:00'))
@@ -258,6 +262,7 @@ def rollup(day, root=None, now=None):
     measured = ok + failed
     result = dict(day=day, total=total, malformed=malformed, countsByName=dict(counts), countsByKind=dict(kinds), okRate=ok / measured if measured else None, errorRate=kinds['error'] / total if total else None, failedRate=failed / measured if measured else None, durationMs=durations, topErrors=[dict(tag=tag, count=count, sampleIds=samples[tag]) for tag, count in tags.most_common(20)])
     result.update(generatedAt=generated.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), complete=generated >= next_day)
+    result['pools'] = pool_summary(day, root, generated, pool_rows)
     for error in result['topErrors']:
         if error['tag'] in CONNECTION_ERRNOS:
             error['byTarget'] = [dict(target=target, count=count) for target, count in targets[error['tag']].most_common()]
