@@ -72,6 +72,45 @@ class WebTrackerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             identity.order_id('noon', '#2606')
 
+    def test_amazon_marketplaces_require_the_amazon_tracker_before_any_writes(self):
+        from amazon_email_orders import DOMAINS
+        for domain in DOMAINS:
+            for merchant in (domain, 'www.' + domain, 'orders.' + domain):
+                with self.subTest(domain=merchant), \
+                        mock.patch.object(tracker, 'write_order', side_effect=AssertionError('no registration')), \
+                        mock.patch.object(tracker, 'run', side_effect=AssertionError('no watcher')), \
+                        redirect_stderr(io.StringIO()) as error, redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        tracker.main(['add', '--app', 'web', '--order', '123-1234567-1234567',
+                                      '--merchant-domain', merchant, '--merchant-name', 'Amazon'])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn('use --app amazon', error.getvalue())
+        self.assertFalse((tracker.ROOT / 'orders').exists())
+
+    def test_amazon_lookalike_domains_remain_generic_web_merchants(self):
+        def register(args, timeout=12):
+            wid = args[args.index('--id') + 1]
+            tracker.write(tracker.WATCHERS / wid / 'watcher.json', {'id': wid})
+            return '{}'
+        for domain in ('notamazon.ae', 'amazon.ae.evil.invalid', 'amazon-ae.invalid'):
+            with self.subTest(domain=domain), mock.patch.object(tracker, 'run', side_effect=register), \
+                    mock.patch.object(cards, 'safe_sync', return_value={'status': 'skipped'}), \
+                    mock.patch.object(store, 'reconcile'):
+                self.assertEqual(self.cli('add', '--app', 'web', '--order', '2606',
+                                          '--merchant-domain', domain, '--merchant-name', 'Other shop',
+                                          '--no-card-send'), 0)
+                cfg = tracker.read(tracker.ROOT / 'orders' / (identity.tracker_id('web', '2606', domain) + '.json'))
+                self.assertEqual(cfg['app'], 'web')
+
+    def test_legacy_amazon_web_trackers_can_still_be_removed(self):
+        cfg = {**self.cfg, 'merchant_domain': 'amazon.ae',
+               'watcher': identity.tracker_id('web', self.cfg['order'], 'amazon.ae')}
+        path = tracker.ROOT / 'orders' / (cfg['watcher'] + '.json')
+        tracker.write(path, cfg)
+        with mock.patch.object(tracker, 'retire') as retire:
+            self.cli('remove', '--app', 'web', '--order', cfg['order'], '--merchant-domain', 'amazon.ae')
+        retire.assert_called_once_with(cfg, path, cfg['watcher'])
+
     def test_registration_stores_domain_name_and_domain_bound_callbacks(self):
         calls = []
 
