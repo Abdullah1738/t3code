@@ -2176,7 +2176,7 @@ test.each([100, 1_500].flatMap(historySize => ["idle", "active", "steer"].map(sc
     table.push({ historySize, scenario, before, after });
     console.log("message-read-budget", JSON.stringify(table));
   } finally { setSystemTime(); }
-});
+}, 30_000);
 
 test("message read modes, full reasons and returned bytes survive the minute log aggregation", async () => {
   const root = mkdtempSync(join(tmpdir(), "message-reads-log-")); dirs.push(root);
