@@ -247,6 +247,13 @@ export interface KanbanStoreShape {
   readonly dispatchCards: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly tickCards: (
+    boardId: KanbanBoardId,
+    liveThreadIds?: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly goalStoryCards: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   readonly openCards: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
@@ -368,6 +375,9 @@ export interface KanbanStoreShape {
     groups: ReadonlyArray<KanbanGroup>,
   ) => Effect.Effect<void, KanbanStoreError>;
 
+  readonly settlingDiscussions: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<KanbanDiscussion>, KanbanStoreError>;
   readonly discussions: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanDiscussion>, KanbanStoreError>;
@@ -1070,6 +1080,44 @@ const make = Effect.gen(function* () {
       WHERE board_id = ${boardId} AND json_extract(json, '$.settledAt') IS NULL
       ORDER BY number
     `,
+        "ardud_kanban_cards",
+        decoders.card,
+      ),
+    );
+  const tickCards: KanbanStoreShape["tickCards"] = (boardId, liveThreadIds = []) =>
+    runRead(
+      "read tick cards",
+      readCollection(
+        sql<KeyedVersionRow>`
+        SELECT id, board_id, cache_version FROM ardud_kanban_cards c
+        WHERE board_id = ${boardId} AND (
+          (json_extract(c.json, '$.settledAt') IS NULL AND stage NOT IN ('completed', 'deployed', 'verified'))
+          OR active_thread_id IS NOT NULL
+          OR (json_extract(c.json, '$.settledAt') IS NULL AND json_extract(c.json, '$.stalled.by._tag') = 'system')
+          OR json_extract(c.json, '$.wait') IS NOT NULL
+          OR json_extract(c.json, '$.deciding') IS NOT NULL
+          OR EXISTS (SELECT 1 FROM json_each(c.json, '$.asks') WHERE json_extract(value, '$.closedAt') IS NULL)
+          OR (json_extract(c.json, '$.settledAt') IS NULL AND EXISTS
+            (SELECT 1 FROM json_each(c.json, '$.subtasks') WHERE json_extract(value, '$.state') = 'open'))
+          OR json_extract(c.json, '$.workThreadId') IN (SELECT value FROM json_each(${JSON.stringify(liveThreadIds)}))
+          OR json_extract(c.json, '$.reviewThreadId') IN (SELECT value FROM json_each(${JSON.stringify(liveThreadIds)}))
+        ) ORDER BY number
+      `,
+        "ardud_kanban_cards",
+        decoders.card,
+      ),
+    );
+  const goalStoryCards: KanbanStoreShape["goalStoryCards"] = (boardId) =>
+    runRead(
+      "read goal story cards",
+      readCollection(
+        sql<KeyedVersionRow>`
+        SELECT id, board_id, cache_version FROM ardud_kanban_cards
+        WHERE board_id = ${boardId} AND (
+          json_extract(json, '$.goalId') IN (SELECT id FROM ardud_kanban_goals WHERE board_id = ${boardId} AND json_extract(json, '$.status') = 'active')
+          OR (json_extract(json, '$.goalId') IS NULL AND json_extract(json, '$.settledAt') IS NULL AND stage NOT IN ('completed', 'deployed', 'verified'))
+        ) ORDER BY number
+      `,
         "ardud_kanban_cards",
         decoders.card,
       ),
@@ -1801,6 +1849,23 @@ const make = Effect.gen(function* () {
         (rows) => decoders.discussion.reconcile(boardId, new Set(rows.map(rowKey))),
       ),
     );
+  const settlingDiscussions: KanbanStoreShape["settlingDiscussions"] = (boardId) =>
+    runRead(
+      "read settling discussions",
+      readCollection(
+        sql<KeyedVersionRow>`
+        SELECT d.id, d.board_id, d.cache_version FROM ardud_kanban_discussions d
+        LEFT JOIN ardud_kanban_cards c ON c.id = d.card_id
+        WHERE d.board_id = ${boardId}
+          AND json_extract(d.json, '$.settledAt') IS NULL
+          AND json_extract(d.json, '$.archivedAt') IS NULL
+          AND (c.id IS NULL OR c.stage = 'verified')
+        ORDER BY d.rowid
+      `,
+        "ardud_kanban_discussions",
+        decoders.discussion,
+      ),
+    );
   const openDiscussions = (boardId: KanbanBoardId) =>
     runRead(
       "read open discussions",
@@ -2238,6 +2303,8 @@ const make = Effect.gen(function* () {
     finishBoardPurgeThread,
     putBoardWithPools,
     cards,
+    tickCards,
+    goalStoryCards,
     openCards,
     dispatchCards,
     watchCardWrites,
@@ -2290,6 +2357,7 @@ const make = Effect.gen(function* () {
     putGroups,
     discussions,
     openDiscussions,
+    settlingDiscussions,
     discussion,
     latestSystemDiscussion,
     discussionByEvaluator,

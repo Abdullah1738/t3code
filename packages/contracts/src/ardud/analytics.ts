@@ -570,6 +570,12 @@ const GeneralEvent = Schema.Struct({
       ),
       tickId: Schema.optionalKey(Id),
       activeTickId: Schema.optionalKey(Id),
+      byRead: Schema.optionalKey(
+        Schema.Record(Label, Schema.Struct({ count: Measurement, ms: Measurement })),
+      ),
+      byStep: Schema.optionalKey(
+        Schema.Record(Label, Schema.Struct({ count: Measurement, ms: Measurement })),
+      ),
       cardsScanned: Schema.optionalKey(Measurement),
       cardsChanged: Schema.optionalKey(Measurement),
       dbMs: Schema.optionalKey(Measurement),
