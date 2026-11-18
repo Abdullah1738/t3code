@@ -899,8 +899,9 @@ def missing_step_count(results: list[tuple[int, int]], planned: int) -> int:
     return len(set(range(1, planned + 1)) - {n for n, _ in results})
 
 
-def checked_steps_code(log_path: Path | None, planned: int, code: int | None, *, report: bool = True) -> int | None:
-    if code == common.EXIT_TOOLCHAIN and quint_tools.failed_setup(log_path):
+def checked_steps_code(log_path: Path | None, planned: int, code: int | None, *, report: bool = True,
+                       run_id: str | None = None) -> int | None:
+    if code == common.EXIT_TOOLCHAIN and (quint_tools.failed_setup(log_path) or nvm_failed_setup(run_id, log_path)):
         return code
     missing = missing_step_count(step_results(log_path), planned)
     if missing:
@@ -1016,7 +1017,7 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
         return code
     if not planned:
         return code
-    checked = checked_steps_code(path, planned, code, report=report)
+    checked = checked_steps_code(path, planned, code, report=report, run_id=run['run_id'])
     if history_incomplete:
         if report and checked is not None:
             say('steps incomplete: final attempt output unavailable; remote exit unknown')
@@ -1039,6 +1040,11 @@ def setup_failed(log_path: Path | None) -> bool:
 
 NO_NODE_MODULES_MARKER = "OFFBOX_NO_NODE_MODULES"
 DEPS_CONTEXT_MARKER = "offbox-missing-deps-context: "
+DEPS_INSTALL_MARKER = "offbox-deps-install: "
+NVM_HINT_PREFIX = "your command sourced ~/.nvm/nvm.sh, which home boxes don't have. "
+NVM_WARNING = ('your command sources ~/.nvm/nvm.sh, but home boxes keep Node at /usr/local/bin/node '
+               'and have no ~/.nvm. offbox picks Node from the repo pin itself (see "offbox: node"). '
+               'It will install nvm.sh before your command so this still works.')
 
 
 def missing_deps_hint(root: Path, *, cwd: Path | None = None, repo_root: Path | None = None) -> str:
@@ -1061,14 +1067,30 @@ def missing_deps_hint(root: Path, *, cwd: Path | None = None, repo_root: Path | 
 
 
 def box_deps_hint(root: Path, log_path: Path | None) -> str:
+    from .misc import _raw_log
     # Only the remote marker proves absence: the Mac's node_modules is never synced.
     try:
-        lines = log_path.read_text(errors="replace").splitlines() if log_path else []
+        lines = _raw_log(log_path).read_text(errors="replace").splitlines() if log_path else []
         marked = NO_NODE_MODULES_MARKER in lines
     except OSError:
-        marked = False
+        lines, marked = [], False
+    if any('.nvm/nvm.sh: No such file or directory' in line for line in lines):
+        versions = [match[1] for line in lines
+                    if (match := re.match(r'offbox: node (v\d+\.\d+\.\d+)\b', line))]
+        version = versions[-1] if versions else '(see "offbox: node" above)'
+        return (NVM_HINT_PREFIX +
+                f"offbox already put Node {version} on PATH; drop the source line or see the "
+                "remote-compute skill's Node section.")
     if not marked:
         return ""
+    for line in reversed(lines):
+        if line.startswith(DEPS_INSTALL_MARKER):
+            try:
+                code, install = json.loads(line[len(DEPS_INSTALL_MARKER):])
+                return (f"command exited {code} and node_modules is still missing; its own install step "
+                        f"({install}) didn't run or didn't finish. The failing line is above.")
+            except (ValueError, TypeError):
+                pass
     package, cwd = root, root
     for line in lines:
         if not line.startswith(DEPS_CONTEXT_MARKER):
@@ -1620,8 +1642,48 @@ def log_probe_error(run_id, reason):
         pass
 
 
+def nvm_receipt(run_id: str, path: Path) -> str | None:
+    from .misc import _raw_log
+    try:
+        result, started = None, False
+        for line in _raw_log(path).read_text(errors='replace').splitlines():
+            if STEP_RETRY.fullmatch(line):
+                result, started = None, False
+            if line == f'{COMMAND_STARTED_MARKER} {run_id}':
+                started = True
+            prefix = f'offbox-nvm-sh: {run_id} '
+            if not started and line.startswith(prefix) and line[len(prefix):] in ('present', 'installed', 'failed'):
+                result = line[len(prefix):]
+        return None if started and result == 'failed' else result
+    except OSError:
+        pass
+    return None
+
+
+def nvm_failed_setup(run_id: str | None, path: Path | None) -> bool:
+    return bool(run_id and path is not None and nvm_receipt(run_id, path) == 'failed')
+
+
+def nvm_result(run_id: str, path: Path) -> None:
+    """Read setup receipts only before this run's user command, never from its output."""
+    try:
+        previous = read_json(LOGS_DIR / f'{run_id}.state.json', {}) or {}
+        if not previous.get('nvm_ref'):
+            return
+        result = nvm_receipt(run_id, path)
+        if result is None or previous.get('nvm_sh') == result:
+            return
+        save_run_state(run_id, nvm_sh=result)
+        if result in ('installed', 'failed'):
+            with contextlib.closing(db()) as con:
+                event(con, previous.get('box_id'), f'nvm_sh_{result}', json.dumps(dict(run_id=run_id)))
+    except OSError:
+        pass
+
+
 def space_result(run_id, code, path=None, *, report=False):
     from .misc import _raw_log
+    nvm_result(run_id, path or LOGS_DIR / f'{run_id}.log')
     raw = _raw_log(path or LOGS_DIR / f'{run_id}.log')
     record = offbox_disk_space.result(raw, code)
     bun = bun_version.result(raw.read_text(errors='replace')) if raw and raw.exists() else None
@@ -1667,6 +1729,16 @@ def space_result(run_id, code, path=None, *, report=False):
     return code
 
 
+def report_box_hint(code: int | None, step_res: list[tuple[int, int]], hint: str) -> None:
+    failed_code = next((rc for _, rc in step_res if rc), code)
+    if not hint or not (code not in (0, None) or any(rc != 0 for _, rc in step_res)):
+        return
+    # A hidden source failure can be followed by `nvm: command not found`.
+    if (code == 127 or failed_code == 127) and not hint.startswith(NVM_HINT_PREFIX):
+        return
+    say(hint)
+
+
 def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | None = None, planned: int = 0,
                 where: str = "remote", deps_hint: str = "", box_id: str | None = None) -> None:
     """Always the last offbox line, so a caller's own `| tail` / `; echo` can't be mistaken for it."""
@@ -1676,10 +1748,8 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
         say("exit 1 may be from the trailing grep (no match) or an earlier stage. Use --step for each command.")
     if code == 137 or any(rc == 137 for _, rc in (step_res or [])):
         say("exit 137 = the box killed the command for memory. Rerun with --size xlarge.")
-    failed_code = next((rc for _, rc in (step_res or []) if rc), code)
-    if (where == "remote" and code != 127 and failed_code != 127 and deps_hint
-            and (code not in (0, None) or any(rc != 0 for _, rc in (step_res or [])))):
-        say(deps_hint)
+    if where == "remote":
+        report_box_hint(code, step_res or [], deps_hint)
     if code is None:
         hint = f"; inspect with offbox ssh {box_id}" if box_id else ""
         say("remote exit unknown (process lost); offbox exits 90" + hint)
@@ -1732,9 +1802,11 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
         for index, package in enumerate(packages))
     missing = missing + ' fi' if packages else ':'
     if usage.install:
-        advice = ('printf "\\n%s\\n" "offbox: command exited $__offbox_exit and node_modules is still missing; "'
-                  + shlex.quote(f"its own install step ({usage.install}) didn't run or didn't finish. The failing line is above.")
-                  + ' >&2')
+        # Choose advice after receiving stderr, so an nvm source failure takes precedence.
+        advice = (f'printf "\\n%s%s\\n%s\\n%s%s%s\\n" {shlex.quote(DEPS_CONTEXT_MARKER)} '
+                  f'"$__offbox_deps_context" {NO_NODE_MODULES_MARKER} '
+                  f'{shlex.quote(DEPS_INSTALL_MARKER + "[")} "$__offbox_exit" '
+                  f'{shlex.quote(", " + json.dumps(usage.install) + "]")} >&2')
     else:
         advice = (f'printf "\\n%s%s\\n%s\\n" {shlex.quote(DEPS_CONTEXT_MARKER)} '
                   f'"$__offbox_deps_context" {NO_NODE_MODULES_MARKER} >&2')
@@ -1781,6 +1853,8 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
                                                        repo_key=repo_key, template=template)),
               node,
+              *([node_version.command_nvm_block(run_id)] if node_version.command_uses_nvm(
+                  ' ; '.join(steps) if steps else (argv[0] if len(argv) == 1 else shlex.join(argv))) else []),
               bun,
               quint_tools.block(quint_tools.trigger(repo_root or Path.cwd(), rel, argv, steps)),
               node_tools.block(rdir, repo_root),
@@ -1970,9 +2044,14 @@ class Runner:
             try:
                 save_run_state(self.run_id, resources=resources.unavailable(
                     'not_started' if api.BACKEND == 'server' else 'boat'),
+                    nvm_ref=node_version.command_uses_nvm(cmd_text), nvm_sh=None,
                     **offbox_disk_space.client_metadata())
             except Exception:
                 pass
+            if node_version.command_uses_nvm(cmd_text):
+                event(con, None, 'nvm_ref_detected', json.dumps(dict(run_id=self.run_id)))
+                if api.BACKEND == 'server' and a.template != 'crpko-node':
+                    say(NVM_WARNING)
             if a.bg:
                 with log_lock(self.run_id):
                     self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3144,7 +3223,7 @@ def save_run_state(run_id, *, until=None, **values):
             time.sleep(min(.01, left))
             guard = file_lock('run-state-' + run_id, timeout=0)
     try:
-        previous = read_json(path, {})
+        previous = read_json(path, {}) or {}
         atomic_write_json(path, {**previous, **values})
     finally:
         guard.__exit__(None, None, None)
@@ -4339,7 +4418,8 @@ def _run_remote(a, rn) -> int:
     deps_hint = box_deps_hint(rn.root, rn.log_path)
     effective = space_result(rn.run_id, code, rn.log_path, report=True)
     if steps:
-        res = step_results(rn.log_path)
+        from .misc import _raw_log
+        res = step_results(_raw_log(rn.log_path))
         failed = next((n for n, rc in res if rc != 0), None)
         report_exit(steps[failed - 1] if failed else "", code, res, len(steps), deps_hint=deps_hint, box_id=rn.box)
     else:

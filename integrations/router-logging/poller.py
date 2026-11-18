@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from rollup import rollup
+from listener_rollup import windows as listener_windows
 from toollog import directory, emit
 
 BASE = 'http://127.0.0.1:20128'
@@ -152,6 +153,22 @@ def rollup_complete(path):
         return False
 
 
+def refresh_listener_rollups(root, now):
+    # Daily counters are final, but a recovery can close an older listener window.
+    for report in root.glob('rollup-????-??-??.json'):
+        day = report.stem.removeprefix('rollup-')
+        if day >= now.date().isoformat():
+            continue
+        try:
+            dt.date.fromisoformat(day)
+            previous = json.loads(report.read_text()).get('listener', {})
+            pending = any(row.get('end') is None for row in previous.get('windows', []))
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+        if pending and listener_windows(day, root, now) != previous:
+            rollup(day, root, now=now)
+
+
 def poll(get=None, root=None, now=None):
     start = time.monotonic()
     root = Path(root) if root is not None else directory()
@@ -176,6 +193,7 @@ def poll(get=None, root=None, now=None):
             state['rollupHour'] = hour
             save_state(state_path, state)
             emit('poller', 'log.rollup', kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000)
+        refresh_listener_rollups(root, now)
         get = get or Router().get
         providers = get('/api/providers')
         logs = get('/api/usage/logs')

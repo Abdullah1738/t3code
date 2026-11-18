@@ -1637,6 +1637,14 @@ def _check(cfg, pending_only=False):
             return {'ok': True}
         try:
             result = fetch(cfg, deepcopy(state) if pending_only else state, now)
+            if cfg.get('app') == 'amazon' and not pending_only:
+                from amazon_checkout import discover, summary
+                discover(sys.modules[__name__], cfg, state.get('amazon_cache', {}))
+                if cfg.get('checkout'):
+                    _, checkout_result = summary(sys.modules[__name__], cfg, result)
+                    state.update(checkout=cfg['checkout'], siblings=cfg['siblings'],
+                                 checkout_terminal=checkout_result['checkout_terminal'])
+                    result.update(checkout_result={**checkout_result})
         except Exception:
             record_poll(state, False, time.time(), base_interval, cfg)
             if cfg.get('app') == 'amazon':
@@ -1818,7 +1826,7 @@ def retire(cfg, path, watcher=None):
 
 @toollog.registration
 @toollog.entrypoint('order-watch', 'status', cli=True)
-def main(argv=None, _locked=False):
+def main(argv=None, _locked=False, _checkout=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ['can-report']:
         from order_receipts import can_report
@@ -1828,7 +1836,9 @@ def main(argv=None, _locked=False):
                        'order not registered or id ambiguous': 'not_registered',
                        'invalid tracker registration': 'invalid_registration',
                        'tracker not running or payment still held': 'not_running_or_held',
-                       'usage: order-watch can-report ORDER_ID': 'usage'}[proof.get('error')]
+                       'usage: order-watch can-report ORDER_ID': 'usage',
+                       'amazon checkout confirmation unavailable': 'checkout_unavailable',
+                       'amazon checkout has untracked siblings': 'checkout_untracked'}[proof.get('error')]
             toollog.emit('order-watch', 'order_watch.can_report', ok=bool(proof['ok']),
                          ids={'watcher': proof.get('tracker')},
                          props={'outcome': 'success' if proof['ok'] else 'refused', 'refusal': refusal,
@@ -1853,7 +1863,7 @@ def main(argv=None, _locked=False):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['status', 'add', 'check', 'check-pending', 'remove', 'reconcile'])
     parser.add_argument('--app', required=True, choices=list(PACKAGES) + list(ALIASES) + ['web'])
-    parser.add_argument('--order', '--order-id', required=True)
+    parser.add_argument('--order', '--order-id', required=True, action='append')
     parser.add_argument('--merchant-domain', help='web: trusted sender hostname')
     parser.add_argument('--merchant-name', help='web add: merchant name on the delivery card')
     parser.add_argument('--for', '--requester', dest='recipient', choices=['owner', 'moni'], default='owner')
@@ -1884,6 +1894,10 @@ def main(argv=None, _locked=False):
     parser.add_argument('--amount', help='order amount in AED for charge confirmation')
     args = parser.parse_args(argv)
     app = ALIASES.get(args.app, args.app)
+    order_ids = list(dict.fromkeys(order_identity.order_id(app, oid) for oid in args.order))
+    args.order = order_ids[0]
+    if len(order_ids) > 1 and (app != 'amazon' or args.command != 'add'):
+        parser.error('Several --order values require add --app amazon')
     try:
         args.order = order_identity.order_id(app, args.order)
         if app == 'web':
@@ -1906,14 +1920,20 @@ def main(argv=None, _locked=False):
     # Same rule as the bridge's chat slugs; group slugs carry "_" (group-sb_gro).
     if args.chat and not CHAT_RE.fullmatch(args.chat):
         parser.error('Invalid --chat')
+    if app == 'amazon' and args.command == 'add' and _checkout is None and not _locked:
+        from amazon_checkout import add
+        code = add(sys.modules[__name__], args, argv, order_ids)
+        if code is not None:
+            return code
     wid = order_identity.tracker_id(app, args.order, args.merchant_domain)
     path = ROOT / 'orders' / (wid + '.json')
     if args.command == 'add' and not args.dry_run_text and not _locked:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with path.with_suffix('.registration.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            return main(argv, _locked=True)
+            return main(argv, _locked=True, _checkout=_checkout)
     cfg = read(path)
+    previous_checkout = cfg.get('checkout')
     new = not cfg
     if app == 'web' and new and args.command == 'add' and not args.merchant_name:
         parser.error('--merchant-name is required for a new web tracker')
@@ -1942,6 +1962,9 @@ def main(argv=None, _locked=False):
         from order_receipts import payment
         cfg.update(payment(args.amount or (cfg.get('total') or args.total or '').removeprefix('AED '),
                            args.card if isinstance(args.card, str) else cfg.get('card_last4')))
+    if _checkout:
+        from amazon_checkout import apply
+        apply(cfg, _checkout)
     if args.total and (new or not cfg.get('total')):
         cfg['total'] = args.total.strip()
     for field in ('placed_at', 'eta'):
@@ -2010,6 +2033,14 @@ def main(argv=None, _locked=False):
             # New registrations publish after the prime, not during it.
             settings['ready'] = False
             write_order(path, cfg)
+        if _checkout:
+            from amazon_checkout import apply, log
+            if cfg.get('amount') != next(row['amount'] for row in _checkout['orders'] if row['order'] == args.order):
+                log('checkout_mismatch', args.order, _checkout['id'])
+            apply(cfg, _checkout)
+            write_order(path, cfg)
+            if previous_checkout != cfg['checkout']:
+                log('checkout_link', args.order, cfg['checkout'], count=len(cfg['siblings']))
         if watchpath.exists():
             print(json.dumps({'watcher': wid, 'already_exists': True}))
         else:

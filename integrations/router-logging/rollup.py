@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 from toollog import directory, safe_target, CONNECTION_ERRNOS
 from volume import REASONS, integer
+from listener_rollup import windows as listener_windows
 
 
 def percentiles(values):
@@ -79,6 +80,9 @@ def rollup(day, root=None, now=None):
     distinct, account_distinct = set(), defaultdict(set)
     unlocks = 0
     supervisor = dict(unresponsive=0, crawling=0, memoryHigh=0, killed=0,
+                      starts=0, stopping=0, exits=0, reloads=0, workerForks=0, restartScheduled=0,
+                      deploy=Counter(), stopsBySignal=Counter(), stopsByInitiator=Counter(), exitCodes=Counter(),
+                      pendingWorkerOutcomes=0,
                       exitedBySignal=Counter(), exitedByCode=Counter(), killedByReason=Counter())
     heartbeat_observations = {}
     health_hours, health_late = {}, defaultdict(list)
@@ -126,9 +130,24 @@ def rollup(day, root=None, now=None):
                         name = row['name']
                         props = row.get('props') if isinstance(row.get('props'), dict) else {}
                         counter = {'worker.unresponsive': 'unresponsive', 'worker.crawling': 'crawling',
-                                   'worker.memory_high': 'memoryHigh', 'worker.killed': 'killed'}.get(name)
+                                   'worker.memory_high': 'memoryHigh', 'worker.killed': 'killed',
+                                   'supervisor.start': 'starts', 'supervisor.stopping': 'stopping',
+                                   'supervisor.exit': 'exits', 'supervisor.reload': 'reloads',
+                                   'worker.forked': 'workerForks', 'supervisor.restart_scheduled': 'restartScheduled'}.get(name)
                         if counter:
                             supervisor[counter] += 1
+                        if name in ('deploy.bootout', 'deploy.bootstrap', 'deploy.reload', 'deploy.result'):
+                            supervisor['deploy'][name] += 1
+                        if name == 'supervisor.stopping':
+                            for field, key in (('signal', 'stopsBySignal'), ('initiator', 'stopsByInitiator')):
+                                value = props.get(field)
+                                supervisor[key][value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', value) else 'unknown'] += 1
+                        if name == 'supervisor.exit':
+                            code = props.get('code')
+                            supervisor['exitCodes'][str(code) if type(code) is int else 'unknown'] += 1
+                            pending = props.get('pendingWorkers')
+                            if isinstance(pending, list):
+                                supervisor['pendingWorkerOutcomes'] += len(pending)
                         if name == 'worker.exited':
                             signal = props.get('signal')
                             signals = {'SIGKILL', 'SIGTERM', 'SIGINT', 'SIGHUP', 'SIGABRT', 'SIGSEGV', 'SIGBUS', 'SIGQUIT', 'SIGILL', 'SIGTRAP'}
@@ -330,6 +349,7 @@ def rollup(day, root=None, now=None):
         result['healthByHour'].append(dict(hour=hour, lateRows=len(group['late']),
             acceptToHandlerMs=percentiles(group['late']), probesOver5s=len(probes),
             probesWithLateRow=sum(p['acceptToHandlerMs'] is not None for p in probes), probes=probes))
+    result['listener'] = listener_windows(day, root, generated)
     drops = Counter()
     for writer in volume_writers.values():
         drops.update(writer)

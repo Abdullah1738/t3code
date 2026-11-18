@@ -83,6 +83,65 @@ class LogCatchupTests(Isolated):
         self.assertIn('failed exit=7', out)
         self.assertEqual(err, '')
 
+    def test_logs_and_stuck_wait_replay_failure_advice(self):
+        for content, expected in (
+                ('offbox: node v24.22.3 (box default)\n'
+                 '/home/user/.nvm/nvm.sh: No such file or directory\n',
+                 'your command sourced ~/.nvm/nvm.sh'),
+                (runs.NO_NODE_MODULES_MARKER + '\n' + runs.DEPS_INSTALL_MARKER + '[1, "npm ci"]\n',
+                 'its own install step (npm ci)')):
+            for code, steps in ((1, []), (127, []), (127, [(1, 127), (2, 0)])):
+                for entry in ('logs', 'wait', 'stuck'):
+                    with self.subTest(entry=entry, expected=expected, code=code, steps=steps):
+                        self.state('failed', code)
+                        self.con.execute("UPDATE runs SET step_count=? WHERE run_id='run-x'", (len(steps),))
+                        self.con.commit()
+                        data = (content + ''.join(f'offbox step {n} rc={rc}: check\n' for n, rc in steps)).encode()
+                        self.prefix(data)
+                        self.streams(data, b'')
+                        if entry != 'stuck':
+                            _, _, err = self.invoke(wait=entry == 'wait')
+                        else:
+                            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as output:
+                                self.assertEqual(misc._holder_stuck(
+                                    self.row(), {'status': 'exited', 'exitCode': code}, self.path, 0, False), code)
+                            err = output.getvalue()
+                        wanted = code != 127 or 'your command sourced' in expected
+                        self.assertEqual(err.count(expected), int(wanted), err)
+                        if 'your command sourced' in expected:
+                            self.assertNotIn('node_modules', err)
+
+    def test_partial_step_failure_hint_uses_received_or_recovered_output(self):
+        self.con.execute("UPDATE runs SET step_count=2 WHERE run_id='run-x'")
+        self.con.commit()
+        for recovered in (False, True):
+            for complete in (False, True):
+                for entry in ('logs', 'wait', 'stuck'):
+                    with self.subTest(recovered=recovered, complete=complete, entry=entry):
+                        self.state('failed', 127)
+                        content = ('offbox: node v24.22.1 (box default)\n'
+                                   '/home/user/.nvm/nvm.sh: No such file or directory\n'
+                                   + runs.NO_NODE_MODULES_MARKER + '\n'
+                                   'offbox step 1 rc=127: hidden script\n'
+                                   + ('offbox step 2 rc=0: later\n' if complete else ''))
+                        self.prefix(b'prefix\n' if recovered else content.encode())
+                        if recovered:
+                            Path(str(self.path) + '.remote').write_text(content)
+                            common.atomic_write_json(Path(str(self.path) + '.remote.json'),
+                                                     dict(source='process log', merged=True))
+                        with patch.object(misc, '_catch_up_log', return_value='complete'):
+                            if entry != 'stuck':
+                                code, _, err = self.invoke(wait=entry == 'wait')
+                            else:
+                                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as output:
+                                    code = misc._holder_stuck(self.row(), {'status': 'exited', 'exitCode': 127},
+                                                              self.path, 0, False)
+                                err = output.getvalue()
+                        self.assertEqual(code, (0 if entry == 'logs' else 127) if complete else 90)
+                        self.assertEqual(err.count('your command sourced ~/.nvm/nvm.sh'), 1, err)
+                        self.assertEqual('steps incomplete:' in err, not complete)
+                        self.assertNotIn('node_modules', err)
+
     def test_detached_recovery_places_setup_before_command_output(self):
         preamble = b'offbox: node v24.22.1\noffbox: pnpm v11.10.0\noffbox-command-started: run-x\n'
         stdout = b'pytest failure details\n20 failed, 3 passed\n'
