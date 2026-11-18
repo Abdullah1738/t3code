@@ -638,6 +638,9 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
     url = API + path
     h = {"Authorization": "Bearer " + _key(), "Content-Type": "application/json", "Accept": "application/json"}
     h.update(headers or {})
+    if BACKEND == 'server':
+        import offbox_protection
+        h.update(offbox_protection.header())
     data = json.dumps(body).encode() if body is not None else None
     is_start = method == "POST" and (path == "/sandboxes" or path.endswith(("/fork", "/resume")))
     attempt = 0
@@ -933,6 +936,10 @@ def stream(path: str, timeout: float = 120, deadline: float | None = None):
 
 # ---------------------------------------------------------------- sandboxes
 
+def box_protection(box_id: str) -> dict:
+    return call('GET', f'/sandboxes/{box_id}/protection', timeout=5, retries=0)
+
+
 def get(box_id: str, *, deadline: float | None = None) -> dict | None:
     if deadline is None:
         d = call("GET", f"/sandboxes/{box_id}", ok404=True)
@@ -1045,12 +1052,22 @@ def resume(box_id: str, ttl: int, size: str | None = None) -> dict:
         raise _refused(e, box_id) or e from e
 
 
-def stop(box_id: str) -> dict:
-    return call("POST", f"/sandboxes/{box_id}/stop", {}, retries=1)
+def stop(box_id: str, *, override=False) -> dict:
+    import offbox_protection
+    token = offbox_protection.CALLER.set(offbox_protection.caller(override=override))
+    try:
+        return call("POST", f"/sandboxes/{box_id}/stop", {}, retries=1)
+    finally:
+        offbox_protection.CALLER.reset(token)
 
 
-def delete(box_id: str) -> dict:
-    return call("DELETE", f"/sandboxes/{box_id}", headers={"X-Ascii-Confirm-Delete": box_id}, ok404=True) or {}
+def delete(box_id: str, *, override=False) -> dict:
+    import offbox_protection
+    token = offbox_protection.CALLER.set(offbox_protection.caller(override=override))
+    try:
+        return call("DELETE", f"/sandboxes/{box_id}", headers={"X-Ascii-Confirm-Delete": box_id}, ok404=True) or {}
+    finally:
+        offbox_protection.CALLER.reset(token)
 
 
 def rename(box_id: str, name: str) -> None:

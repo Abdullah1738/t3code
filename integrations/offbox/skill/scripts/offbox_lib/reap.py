@@ -10,7 +10,7 @@ import re
 import contextlib
 
 from . import api, bases, capacity, lease, prune
-from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
+from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
                      iso_ts, kv_set, log, mine, now, owner_of_root, owner_scoped, PERSON_PREFIX, require_mine, say, token_owner, write)
 from .identity import thread_get
@@ -211,6 +211,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if not dry:
             try:
                 with file_lock('box-'+box_id, timeout=0):
+                    if what in ('stop', 'delete', 'refresh'):
+                        lease.check_protection(con, box_id)
                     if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
                         actions[-1] += ' (unanswered resume; skipped)'
                         return
@@ -240,7 +242,6 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 event(con, box_id, f"reap_{what}_failed", f"{why}: {e}")
                 actions[-1] += f" (FAILED: {e})"
 
-    refreshes = 0  # resume+stop of pinned leases near boat's 14-day limit; a few per pass (120 s budget)
     # A lease with an open prune hold stays on the list even if it is marked deleted: its hold is released only
     # after fresh confirmation, and a failed or busy release must be retried on a later pass.
     # `live` is what this process's token can see. On the home server that is one owner's boxes, while the database
@@ -304,6 +305,15 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 actions.append(f"forget {bid}: {api.NAME} deleted its data")
             continue
         state = b.get("state")
+        if (r['pinned_until'] or 0) > now():
+            if not dry and api.BACKEND != 'server':
+                try:
+                    with file_lock('box-' + bid, timeout=0):
+                        bases.retain_pin(con, bid, state)
+                except OffboxError as error:
+                    actions.append(f'{bid}: pinned disk retention at risk: {error}')
+                    event(con, bid, 'pin_retention_failed', str(error))
+            continue
         running_runs = lease.active_runs(con, bid)
         if running_runs:
             _check_stale_runs(con, bid, state, dry, actions, start_budget)
@@ -313,13 +323,6 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 continue
         # A failed stop is retried without asking Docker; never refresh or automatically delete a wedged box.
         note = con.execute('SELECT note FROM leases WHERE box_id=?', (bid,)).fetchone()[0] or ''
-        if note.startswith('disk-full:'):
-            stopped = iso_ts(b.get('stoppedAt'))
-            if ((r['pinned_until'] or 0) > now() and state in api.STOPPED_STATES and stopped and
-                    now() - stopped > KEEPALIVE_S and refreshes < 2):
-                refreshes += 1
-                act(bid, 'refresh', 'disk_full pinned disk retention',
-                    lambda bid=bid: lease.refresh_box(con, bid), expected=r)
         if note.startswith((BOX_WEDGED_NOTE, 'disk-full:')):
             if not running_runs and state in api.LIVE_STATES:
                 act(bid, 'stop', 'set aside: box-wedged',
@@ -367,11 +370,6 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if state in api.LIVE_STATES and idle > idle_limit:
             act(bid, "stop", f"idle {int(idle // 60)}m",
                 lambda bid=bid: lease.stop_box(con, bid, "reap: idle", locked=True), expected=r)  # act() holds box-<id>
-        stopped = iso_ts(b.get("stoppedAt"))
-        if pinned and state in api.STOPPED_STATES and stopped and now() - stopped > KEEPALIVE_S and refreshes < 2:
-            refreshes += 1
-            act(bid, "refresh", f"pinned, stopped {round((now() - stopped) / 86400, 1)}d",
-                lambda bid=bid: lease.refresh_box(con, bid), expected=r)
     # Boxes whose recipe was cancelled (lease._retire_recipe_box) and whose delete failed then: delete them now.
     # 'bringing_up' rows are left behind by a bring-up that never finished (Ctrl-C, SIGTERM, a tool timeout): the
     # recipe cannot be trusted, so the box is retired like a quarantined one.
@@ -403,7 +401,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             busy = con.execute("SELECT COUNT(*) FROM events WHERE box_id=? AND kind LIKE 'template_build%' AND ts>?",
                                (bid, now() - 3 * 3600)).fetchone()[0]
             if not busy:
-                act(bid, "stop", "template/base left running", lambda bid=bid: api.stop(bid))
+                act(bid, "stop", "template/base left running", lambda bid=bid: lease.request_stop(con, bid, 'reap: template/base left running'))
     bases.upkeep(con, live, dry, actions, act)
     # Orphans: offbox-named live boxes we have no record of (e.g. a crashed create).
     known = {r[0] for r in con.execute("SELECT box_id FROM leases")} | protected
@@ -412,7 +410,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             continue
         created = iso_ts(b.get("createdAt")) or now()
         if b.get("state") in api.LIVE_STATES and now() - created > IDLE_STOP_S:
-            act(bid, "stop", "unregistered offbox box", lambda bid=bid: api.stop(bid))
+            act(bid, "stop", "unregistered offbox box", lambda bid=bid: lease.request_stop(con, bid, 'reap: unregistered box'))
     return actions
 
 
@@ -500,7 +498,6 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
         lease._release_locked(con, bid)
     if not dry:
         reconcile_lost(con, bid, state=state, foreign=True, role='reap')
-    from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND (status IN ('starting','running') OR "
                            "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)) OR "
                            "(exit_code IS NOT NULL AND pulls IS NOT NULL AND pulls!='[]' AND "
