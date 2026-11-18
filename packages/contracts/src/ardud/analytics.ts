@@ -366,6 +366,18 @@ const GeneralEvent = Schema.Struct({
   props: Schema.optionalKey(
     Schema.Struct({
       ...RuntimeSampleProps,
+      tools: Schema.optionalKey(Schema.Array(Label).check(Schema.isMaxLength(16))),
+      boardIds: Schema.optionalKey(Schema.Array(Id).check(Schema.isMaxLength(16))),
+      frames: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            functionName: Schema.String.check(Schema.isMaxLength(160)),
+            url: Schema.String.check(Schema.isMaxLength(160)),
+            lineNumber: Measurement,
+            columnNumber: Measurement,
+          }),
+        ).check(Schema.isMaxLength(3)),
+      ),
       total: Schema.optionalKey(Measurement),
       distinctCwds: Schema.optionalKey(Measurement),
       maxPerSecond: Schema.optionalKey(Measurement),
