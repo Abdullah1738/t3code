@@ -1,3 +1,9 @@
+import {
+  nativeThreadOwners,
+  retentionFor,
+  type Retention,
+  type InventoryRuntimeSource,
+} from "../ardud/providers/runtimeInventoryModel.ts";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -194,6 +200,12 @@ export const ProviderSessionManagerV2Error = Schema.Union([
 export type ProviderSessionManagerV2Error = typeof ProviderSessionManagerV2Error.Type;
 
 export interface ProviderSessionManagerV2Shape {
+  readonly inventorySnapshot?: (
+    processes?: ReadonlyArray<{ readonly pid: number; readonly startTimeMs: number }>,
+  ) => Effect.Effect<{
+    readonly runtimes: ReadonlyArray<InventoryRuntimeSource>;
+    readonly truncated: number;
+  }>;
   /** Reads only the live session map; does not refresh, probe, or count as activity. */
   readonly runtimeSnapshot?: () => Effect.Effect<{
     readonly turns: ReadonlyArray<{
@@ -491,6 +503,16 @@ export const layerWithOptions = (
           }),
       );
       const sessions = yield* Ref.make(new Map<string, LiveSessionEntry>());
+      const teardownByRuntime = new WeakMap<
+        ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        Map<string, Retention>
+      >();
+      const retiredRuntimes = new Map<
+        ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        { entry: LiveSessionEntry; retention: Retention }
+      >();
+      let retiredTruncated = 0;
+
       const sessionUpdateObservers = yield* Ref.make<ReadonlyMap<ThreadId, number>>(new Map());
       // Register before audience selection, or wait for that session's in-flight
       // fan-out before reading a snapshot. Refreshes share this per-session ordering.
@@ -1426,12 +1448,34 @@ export const layerWithOptions = (
                     input.detail ?? `Provider session released: ${input.reason}.`,
                   );
           // Teardown proceeds even while storage retries hold replacement opens.
+          const retired = {
+            entry: entry.value,
+            retention: {
+              reason: "teardown_sent",
+              since: DateTime.toEpochMillis(releasedAt),
+              sentAt: DateTime.toEpochMillis(releasedAt),
+              detail: "stop_sent",
+            } satisfies Retention as Retention,
+          };
+          retiredRuntimes.set(entry.value.runtime, retired);
+          if (retiredRuntimes.size > 256) {
+            const oldest = retiredRuntimes.keys().next().value;
+            if (oldest !== undefined) retiredRuntimes.delete(oldest);
+            retiredTruncated++;
+          }
           const closing = yield* Effect.gen(function* () {
             if (input.cancelIdleFiber !== false) yield* cancelIdleFiber(entry.value.idleFiber);
-            return yield* closeScopeWithin(entry.value.scope, {
+            const result = yield* closeScopeWithin(entry.value.scope, {
               providerSessionId: input.providerSessionId,
               reason: input.reason,
             });
+            if (Option.isNone(result) || Exit.isFailure(result.value))
+              retired.retention = {
+                reason: "teardown_failed",
+                since: yield* Clock.currentTimeMillis,
+                detail: Option.isNone(result) ? "stop_timeout" : "stop_failed",
+              };
+            return result;
           }).pipe(Effect.forkDetach({ startImmediately: true }));
           // Consumers acknowledge after their admitted writes finish, before finalization
           // can detach or reopen this session. Replacement opens stay serialized until then.
@@ -1828,6 +1872,8 @@ export const layerWithOptions = (
           if (entry === undefined) {
             return current;
           }
+          const nativeId = input.providerThread.nativeThreadRef?.nativeId;
+          if (nativeId != null) teardownByRuntime.get(entry.runtime)?.delete(nativeId);
           const providerThreadLoadsByThread = new Map(entry.providerThreadLoadsByThread);
           providerThreadLoadsByThread.set(input.threadId, {
             key: input.providerThreadKey,
@@ -2149,6 +2195,31 @@ export const layerWithOptions = (
                 reason: string,
               ) {
                 const now = yield* Clock.currentTimeMillis;
+                const runtime = entry?.runtime ?? input.orphan?.runtime;
+                const nativeId = (pending?.providerThread ?? input.orphan?.providerThread)
+                  ?.nativeThreadRef?.nativeId;
+                if (
+                  runtime !== undefined &&
+                  nativeId != null &&
+                  ["deferred", "failed", "unloaded"].includes(outcome)
+                ) {
+                  const observations =
+                    teardownByRuntime.get(runtime) ?? new Map<string, Retention>();
+                  teardownByRuntime.set(runtime, observations);
+                  observations.set(
+                    nativeId,
+                    outcome === "deferred"
+                      ? { reason: "pending_work", since: idleSinceMs ?? now, detail: reason }
+                      : outcome === "failed"
+                        ? { reason: "teardown_failed", since: now, detail: "unsubscribe_failed" }
+                        : {
+                            reason: "teardown_sent",
+                            since: now,
+                            sentAt: now,
+                            detail: "unsubscribe_sent",
+                          },
+                  );
+                }
                 yield* Effect.logInfo("orchestration-v2.driver-session.idle-unload", {
                   provider: entry?.runtime.driver ?? input.orphan?.runtime.driver ?? "unknown",
                   providerSessionId: input.providerSessionId,
@@ -2364,15 +2435,6 @@ export const layerWithOptions = (
           }
           const loaded = new Set(result.value);
           counts.loaded = loaded.size;
-          const owners = new Map<
-            string,
-            Array<{
-              threadId: ThreadId;
-              providerThread: OrchestrationV2ProviderThread;
-            }>
-          >();
-          // Native IDs are the bounded runtime roster. Resolve them once for the
-          // session, then accept only directly attached owners; never walk history.
           const records = yield* projectionStore
             .getProviderThreadsByNativeIds(providerSessionId, [...loaded])
             .pipe(Effect.exit);
@@ -2385,27 +2447,16 @@ export const layerWithOptions = (
             });
             return;
           }
-          for (const providerThread of records.value) {
-            const threadId = providerThread.appThreadId;
-            const ref = providerThread.nativeThreadRef;
-            if (
-              threadId === null ||
-              !entry.attachedThreadIds.has(threadId) ||
-              providerThread.providerInstanceId !== entry.runtime.instanceId ||
-              providerThread.providerSessionId !== providerSessionId ||
-              ref?.driver !== entry.runtime.driver ||
-              ref.nativeId === null ||
-              !loaded.has(ref.nativeId)
-            )
-              continue;
-            const candidates = owners.get(ref.nativeId) ?? [];
-            candidates.push({ threadId, providerThread });
-            owners.set(ref.nativeId, candidates);
-          }
+          const owners = nativeThreadOwners({
+            runtime: entry.runtime,
+            attachedThreadIds: entry.attachedThreadIds,
+            loaded,
+            records: records.value,
+          });
           let attempts = 0;
           for (const nativeId of loaded) {
-            const candidates = owners.get(nativeId);
-            if (candidates?.length !== 1) {
+            const providerThread = owners.get(nativeId);
+            if (providerThread === undefined) {
               counts.skippedUnknown++;
               continue;
             }
@@ -2413,7 +2464,7 @@ export const layerWithOptions = (
               counts.capped++;
               continue;
             }
-            const owner = candidates[0]!;
+            const owner = { threadId: providerThread.appThreadId!, providerThread };
             const pending = entry.idleThreadUnloads.get(
               providerThreadRuntimeKey(owner.providerThread),
             );
@@ -2603,6 +2654,38 @@ export const layerWithOptions = (
           );
         return {
           ...runtime,
+          ...(runtime.unloadThread === undefined
+            ? {}
+            : {
+                unloadThread: Effect.fn("ProviderSessionManager.observeUnload")(function* (input: {
+                  readonly providerThread: OrchestrationV2ProviderThread;
+                }) {
+                  const nativeId = input.providerThread.nativeThreadRef?.nativeId;
+                  const observations =
+                    teardownByRuntime.get(runtime) ?? new Map<string, Retention>();
+                  teardownByRuntime.set(runtime, observations);
+                  const now = yield* Clock.currentTimeMillis;
+                  if (nativeId != null)
+                    observations.set(nativeId, {
+                      reason: "teardown_sent",
+                      since: now,
+                      sentAt: now,
+                      detail: "unsubscribe_sent",
+                    });
+                  yield* runtime.unloadThread!(input).pipe(
+                    Effect.onExit((exit) =>
+                      Effect.gen(function* () {
+                        if (Exit.isFailure(exit) && nativeId != null)
+                          observations.set(nativeId, {
+                            reason: "teardown_failed",
+                            since: yield* Clock.currentTimeMillis,
+                            detail: "unsubscribe_failed",
+                          });
+                      }),
+                    ),
+                  );
+                }),
+              }),
           get providerSession() {
             return runtime.providerSession;
           },
@@ -3145,7 +3228,185 @@ export const layerWithOptions = (
         return { turns, providerSessions: Object.fromEntries(counts) };
       });
 
+      const inventorySnapshot = Effect.fn("ProviderSessionManager.inventorySnapshot")(function* (
+        processes?: ReadonlyArray<{ readonly pid: number; readonly startTimeMs: number }>,
+      ) {
+        const current = yield* Ref.get(sessions);
+        const liveRuntimes = new Set([...current.values()].map((entry) => entry.runtime));
+        const entries = [
+          ...current.values(),
+          ...[...retiredRuntimes.values()]
+            .filter(({ entry }) => !liveRuntimes.has(entry.runtime))
+            .map(({ entry }) => entry),
+        ];
+        const runtimes = yield* Effect.forEach(
+          entries,
+          Effect.fn("ProviderSessionManager.inventoryRuntime")(function* (entry: LiveSessionEntry) {
+            const runtime = entry.runtime;
+            const retired = liveRuntimes.has(runtime) ? undefined : retiredRuntimes.get(runtime);
+            const diagnostics =
+              runtime.runtimeInventory === undefined
+                ? { roots: [], loads: [] }
+                : yield* runtime.runtimeInventory;
+            if (
+              retired !== undefined &&
+              processes !== undefined &&
+              !diagnostics.roots.some((root) =>
+                processes.some(
+                  (process) =>
+                    process.pid === root.pid &&
+                    Math.abs(process.startTimeMs - root.spawnedAtMs) < 5000,
+                ),
+              )
+            ) {
+              retiredRuntimes.delete(runtime);
+              return undefined;
+            }
+            const roster =
+              retired === undefined && runtime.listLoadedNativeThreads !== undefined
+                ? yield* runtime
+                    .listLoadedNativeThreads()
+                    .pipe(Effect.timeout("10 seconds"), Effect.option)
+                : Option.none<ReadonlyArray<string>>();
+            const loaded = new Set(
+              Option.isSome(roster)
+                ? roster.value
+                : [
+                    ...(diagnostics.nativeThreadIds ?? []),
+                    ...diagnostics.loads.map((load) => load.nativeThreadId),
+                    ...diagnostics.roots.flatMap((root) =>
+                      root.nativeThreadId === undefined ? [] : [root.nativeThreadId],
+                    ),
+                    ...[...entry.idleThreadUnloads.values()].flatMap((pending) =>
+                      pending.providerThread.nativeThreadRef?.nativeId == null
+                        ? []
+                        : [pending.providerThread.nativeThreadRef.nativeId],
+                    ),
+                  ],
+            );
+            const records = yield* projectionStore
+              .getProviderThreadsByNativeIds(runtime.providerSessionId, [...loaded])
+              .pipe(Effect.catch(() => Effect.succeed([])));
+            const owners = nativeThreadOwners({
+              runtime,
+              attachedThreadIds: entry.attachedThreadIds,
+              loaded,
+              records,
+            });
+            const threads = yield* Effect.forEach(
+              [...loaded],
+              Effect.fn("ProviderSessionManager.inventoryThread")(function* (
+                nativeThreadId: string,
+              ) {
+                const owner = owners.get(nativeThreadId);
+                const pending =
+                  owner === undefined
+                    ? undefined
+                    : entry.idleThreadUnloads.get(providerThreadRuntimeKey(owner));
+                const shell =
+                  owner?.appThreadId == null
+                    ? null
+                    : yield* projectionStore
+                        .getThreadShell(owner.appThreadId)
+                        .pipe(Effect.catch(() => Effect.succeed(null)));
+                const busy = [...entry.busyTurns.values()].some(
+                  (turn) =>
+                    owner !== undefined && turn.nativeThreadKey === providerThreadRuntimeKey(owner),
+                );
+                let pendingReason: string | undefined;
+                if (retired === undefined && !busy && owner !== undefined) {
+                  const loadedKey = entry.providerThreadLoadsByThread.get(
+                    owner.appThreadId!,
+                  )?.nativeThreadKey;
+                  if (loadedKey === undefined || loadedKey === providerThreadRuntimeKey(owner)) {
+                    const records = yield* projectionStore
+                      .getThreadRecords(owner.appThreadId!, ["runs"], { unfinishedRunsOnly: true })
+                      .pipe(Effect.option);
+                    if (Option.isNone(records)) pendingReason = "state_unavailable";
+                    else if (
+                      records.value.runs.some(
+                        (run) =>
+                          ["preparing", "queued", "starting", "running", "waiting"].includes(
+                            run.status,
+                          ) &&
+                          (run.providerThreadId === null || run.providerThreadId === owner.id),
+                      )
+                    )
+                      pendingReason = "unfinished_run";
+                  }
+                  for (const probe of [
+                    runtime.holdsWorkForThread?.(owner),
+                    runtime.hasPendingBackgroundWorkForThread?.(owner, {
+                      includeSubagents: true,
+                      readOnly: true,
+                    }),
+                  ]) {
+                    if (probe === undefined) continue;
+                    const result = yield* probe.pipe(Effect.timeout("2 seconds"), Effect.option);
+                    if (Option.isNone(result)) {
+                      pendingReason ??= "background_probe_unavailable";
+                      break;
+                    }
+                    if (result.value) {
+                      pendingReason ??= "background_work";
+                      break;
+                    }
+                  }
+                  if (entry.pinnedSinceMs !== null) pendingReason ??= "deferred_unload";
+                }
+                return {
+                  threadId: owner?.appThreadId ?? null,
+                  nativeThreadId,
+                  retention: retentionFor({
+                    tracked:
+                      owner !== undefined &&
+                      (!entry.supportsMultipleProviderThreads ||
+                        pending !== undefined ||
+                        busy ||
+                        entry.providerThreadLoadsByThread.get(owner.appThreadId!)?.loaded === true),
+                    busy,
+                    since: pending?.lastActivityAtMs ?? entry.lastActivityAtMs,
+                    idleTimeoutMs,
+                    ...(pendingReason === undefined ? {} : { pending: pendingReason }),
+                    held: pending?.held,
+                    teardown:
+                      retired?.retention ?? teardownByRuntime.get(runtime)?.get(nativeThreadId),
+                  }),
+                  settled:
+                    shell === null
+                      ? null
+                      : shell.settledAt !== null || shell.settledOverride === "settled",
+                  archived: shell === null ? null : shell.archivedAt !== null,
+                  lastTurnEndedAt:
+                    shell?.latestRunCompletedAt == null
+                      ? null
+                      : DateTime.toEpochMillis(shell.latestRunCompletedAt),
+                } satisfies InventoryRuntimeSource["threads"][number];
+              }),
+              { concurrency: 8 },
+            );
+            return {
+              provider: runtime.driver,
+              instanceId: runtime.instanceId,
+              providerSessionId: runtime.providerSessionId,
+              diagnostics,
+              rosterAvailable:
+                diagnostics.nativeThreadIds !== undefined ||
+                runtime.driver === "claudeAgent" ||
+                Option.isSome(roster),
+              threads,
+            } satisfies InventoryRuntimeSource;
+          }),
+          { concurrency: 4 },
+        );
+        return {
+          runtimes: runtimes.filter((runtime) => runtime !== undefined),
+          truncated: retiredTruncated,
+        };
+      });
+
       return ProviderSessionManagerV2.of({
+        inventorySnapshot,
         runtimeSnapshot,
         sweepOrphanedThreads,
         observeThreadSessionUpdates,

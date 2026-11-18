@@ -619,10 +619,11 @@ export interface ProviderAdapterV2SessionRuntime {
    * session-wide hasPendingBackgroundWork) so sibling native threads cannot pin
    * an unrelated root subscription open. Replacement checks opt in to subagents
    * owned by the live process.
+   * Read-only observers use cached state without refreshing retained rollout data.
    */
   readonly hasPendingBackgroundWorkForThread?: (
     providerThread: OrchestrationV2ProviderThread,
-    options?: { readonly includeSubagents?: boolean },
+    options?: { readonly includeSubagents?: boolean; readonly readOnly?: boolean },
   ) => Effect.Effect<boolean>;
   /**
    * ardud: all work the session holds for this provider thread, including what
@@ -642,6 +643,27 @@ export interface ProviderAdapterV2SessionRuntime {
    * thread keeps showing Waiting.
    */
   readonly backgroundTasksEndWithProcess?: true;
+  /** Cached spawn identities and successful load bindings; never opens a native thread. */
+  readonly runtimeInventory?: Effect.Effect<{
+    readonly nativeThreadIds?: ReadonlyArray<string>;
+    readonly ambiguousLoadIds?: ReadonlyArray<string>;
+    readonly roots: ReadonlyArray<{
+      readonly pid: number;
+      readonly spawnedAtMs: number;
+      readonly nativeThreadId?: string;
+      readonly teardown?: {
+        readonly reason: "teardown_sent" | "teardown_failed";
+        readonly since: number;
+        readonly detail: string;
+        readonly sentAt?: number;
+      };
+    }>;
+    readonly loads: ReadonlyArray<{
+      readonly nativeThreadId: string;
+      readonly threadId: string | null;
+      readonly loadId: string;
+    }>;
+  }>;
   /** Observes process exit without stopping it; shared sessions may have unrelated live owners. */
   readonly awaitSessionExit?: Effect.Effect<void, ProviderAdapterV2Error>;
   readonly getModelContextWindow?: (
