@@ -7,7 +7,7 @@ import os
 import re
 from pathlib import Path
 import tempfile
-from toollog import directory
+from toollog import directory, safe_target, CONNECTION_ERRNOS
 from volume import REASONS, integer
 
 
@@ -67,6 +67,7 @@ def rollup(day, root=None, now=None):
     root = Path(root) if root is not None else directory()
     counts, kinds, tags = Counter(), Counter(), Counter()
     times, samples = defaultdict(list), {}
+    targets = defaultdict(Counter)
     proxy = {}
     models = defaultdict(lambda: dict(count=0, aborted=0))
     clients = defaultdict(lambda: dict(count=0, aborted=0))
@@ -143,7 +144,12 @@ def rollup(day, root=None, now=None):
                         times[row['name']].append(ms)
                     tag = row.get('error', {}).get('tag')
                     if tag:
-                        tags[tag] += 1
+                        props = row.get('props', {})
+                        count = props.get('count', 1) if tag in CONNECTION_ERRNOS else 1
+                        count = count if type(count) is int and 0 < count <= 9007199254740991 else 1
+                        tags[tag] += count
+                        if tag in CONNECTION_ERRNOS:
+                            targets[tag][safe_target(props.get('target')) or 'unknown'] += count
                         samples.setdefault(tag, row.get('ids', {}))
                     if row['name'] in ('account.lock', 'account.unlock'):
                         props = row.get('props', {})
@@ -216,6 +222,9 @@ def rollup(day, root=None, now=None):
     measured = ok + failed
     result = dict(day=day, total=total, malformed=malformed, countsByName=dict(counts), countsByKind=dict(kinds), okRate=ok / measured if measured else None, errorRate=kinds['error'] / total if total else None, failedRate=failed / measured if measured else None, durationMs=durations, topErrors=[dict(tag=tag, count=count, sampleIds=samples[tag]) for tag, count in tags.most_common(20)])
     result.update(generatedAt=generated.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), complete=generated >= next_day)
+    for error in result['topErrors']:
+        if error['tag'] in CONNECTION_ERRNOS:
+            error['byTarget'] = [dict(target=target, count=count) for target, count in targets[error['tag']].most_common()]
     result['proxy'] = []
     for (model, route, stream), group in sorted(proxy.items()):
         result['proxy'].append(dict(
