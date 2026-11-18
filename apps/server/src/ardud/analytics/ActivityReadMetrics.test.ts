@@ -19,6 +19,7 @@ it.effect.each(["success", "interrupt"] as const)(
         readerLane: "background",
         phase: "handler",
         saved: "unknown",
+        retryPath: "attached_pending",
       };
       const entered = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
@@ -41,6 +42,12 @@ it.effect.each(["success", "interrupt"] as const)(
         yield* Fiber.join(fiber);
       } else yield* Fiber.interrupt(fiber);
       assert.equal(snapshot()?.[0]?.completed, outcome === "success");
+      const finalOutcome = callOutcome(
+        outcome === "success" ? Exit.succeed({ content: [] }) : Exit.interrupt(1),
+        state,
+      );
+      assert.equal(finalOutcome.props?.retryPath, "attached_pending");
+      assert.deepEqual(finalOutcome.props?.activityStages, snapshot());
       assert.isTrue(
         isAnalyticsEvent({
           ts: "2026-11-17T00:00:00.000Z",

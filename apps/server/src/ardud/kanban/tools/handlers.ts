@@ -61,6 +61,7 @@ import * as BoardReplies from "../engine/boardReplies.ts";
 import * as McpBoardReplies from "../engine/mcpBoardReplies.ts";
 import * as Activity from "../engine/activity.ts";
 import * as ActivityReadMetrics from "../../analytics/ActivityReadMetrics.ts";
+import * as ActivityRead from "./activityRead.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
 
 const askGateNote = (
@@ -678,12 +679,11 @@ const handlers = {
             "bad_time",
             window.startsWith("until") ? "until" : "since",
           );
-        const read = yield* service.activity(board.id, window);
-        const activity = yield* ActivityReadMetrics.step(
-          "rollup",
-          Effect.sync(() => Activity.rollup({ window, ...read })),
-        );
-        return { activity: { boardId: board.id, ...activity } };
+        if (input.digest !== undefined) {
+          const page = yield* service.activityDigest(board.id, window, input.digest, input.after);
+          return { activity: { boardId: board.id, window, digest: input.digest, ...page } };
+        }
+        return yield* ActivityRead.read(service, board.id, window);
       }),
     ),
   ),

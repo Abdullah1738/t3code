@@ -1,0 +1,763 @@
+{
+  "mix": {
+    "source": "17 Nov live interval_s/last_run_ms snapshot; active unpaused checking watchers only; no history=10s. One-second synthetic tick, constant captured runtime, all initially due. Names anonymized except health/flighty. This models steady workload, not historical CPU stalls.",
+    "watchers": [
+      {
+        "watcher": "watcher-000",
+        "intervalMs": 60000,
+        "checkMs": 24692
+      },
+      {
+        "watcher": "watcher-001",
+        "intervalMs": 600000,
+        "checkMs": 1214
+      },
+      {
+        "watcher": "watcher-002",
+        "intervalMs": 180000,
+        "checkMs": 16264
+      },
+      {
+        "watcher": "watcher-004",
+        "intervalMs": 120000,
+        "checkMs": 13683
+      },
+      {
+        "watcher": "watcher-005",
+        "intervalMs": 60000,
+        "checkMs": 17381
+      },
+      {
+        "watcher": "watcher-006",
+        "intervalMs": 300000,
+        "checkMs": 22117
+      },
+      {
+        "watcher": "watcher-009",
+        "intervalMs": 30000,
+        "checkMs": 8848
+      },
+      {
+        "watcher": "watcher-010",
+        "intervalMs": 30000,
+        "checkMs": 9268
+      },
+      {
+        "watcher": "watcher-013",
+        "intervalMs": 600000,
+        "checkMs": 1491
+      },
+      {
+        "watcher": "watcher-015",
+        "intervalMs": 300000,
+        "checkMs": 3670
+      },
+      {
+        "watcher": "watcher-017",
+        "intervalMs": 60000,
+        "checkMs": 16253
+      },
+      {
+        "watcher": "watcher-018",
+        "intervalMs": 300000,
+        "checkMs": 387
+      },
+      {
+        "watcher": "watcher-019",
+        "intervalMs": 60000,
+        "checkMs": 2599
+      },
+      {
+        "watcher": "watcher-020",
+        "intervalMs": 3600000,
+        "checkMs": 1744
+      },
+      {
+        "watcher": "watcher-021",
+        "intervalMs": 900000,
+        "checkMs": 5730
+      },
+      {
+        "watcher": "watcher-022",
+        "intervalMs": 1800000,
+        "checkMs": 1464
+      },
+      {
+        "watcher": "watcher-023",
+        "intervalMs": 120000,
+        "checkMs": 2121
+      },
+      {
+        "watcher": "watcher-024",
+        "intervalMs": 120000,
+        "checkMs": 3713
+      },
+      {
+        "watcher": "flighty-bookings",
+        "intervalMs": 180000,
+        "checkMs": 3826
+      },
+      {
+        "watcher": "watcher-026",
+        "intervalMs": 60000,
+        "checkMs": 602
+      },
+      {
+        "watcher": "forge-workouts",
+        "intervalMs": 600000,
+        "checkMs": 9804
+      },
+      {
+        "watcher": "watcher-029",
+        "intervalMs": 30000,
+        "checkMs": 1666
+      },
+      {
+        "watcher": "watcher-030",
+        "intervalMs": 15000,
+        "checkMs": 284
+      },
+      {
+        "watcher": "gym-nudge",
+        "intervalMs": 300000,
+        "checkMs": 323
+      },
+      {
+        "watcher": "watcher-034",
+        "intervalMs": 600000,
+        "checkMs": 474
+      },
+      {
+        "watcher": "watcher-035",
+        "intervalMs": 300000,
+        "checkMs": 8996
+      },
+      {
+        "watcher": "watcher-036",
+        "intervalMs": 15000,
+        "checkMs": 22692
+      },
+      {
+        "watcher": "watcher-037",
+        "intervalMs": 60000,
+        "checkMs": 4844
+      },
+      {
+        "watcher": "watcher-038",
+        "intervalMs": 60000,
+        "checkMs": 17439
+      },
+      {
+        "watcher": "watcher-039",
+        "intervalMs": 450000,
+        "checkMs": 10988
+      },
+      {
+        "watcher": "watcher-040",
+        "intervalMs": 10800000,
+        "checkMs": 5141
+      },
+      {
+        "watcher": "meds-nag",
+        "intervalMs": 300000,
+        "checkMs": 692
+      },
+      {
+        "watcher": "watcher-043",
+        "intervalMs": 60000,
+        "checkMs": 565
+      },
+      {
+        "watcher": "watcher-044",
+        "intervalMs": 900000,
+        "checkMs": 42153
+      },
+      {
+        "watcher": "watcher-046",
+        "intervalMs": 900000,
+        "checkMs": 12972
+      },
+      {
+        "watcher": "watcher-053",
+        "intervalMs": 120000,
+        "checkMs": 5227
+      },
+      {
+        "watcher": "watcher-054",
+        "intervalMs": 60000,
+        "checkMs": 69321
+      },
+      {
+        "watcher": "nutrition-checkin",
+        "intervalMs": 300000,
+        "checkMs": 738
+      },
+      {
+        "watcher": "nutrition-nudge",
+        "intervalMs": 300000,
+        "checkMs": 755
+      },
+      {
+        "watcher": "watcher-059",
+        "intervalMs": 15000,
+        "checkMs": 360
+      },
+      {
+        "watcher": "watcher-060",
+        "intervalMs": 600000,
+        "checkMs": 2434
+      },
+      {
+        "watcher": "watcher-062",
+        "intervalMs": 60000,
+        "checkMs": 27130
+      },
+      {
+        "watcher": "watcher-063",
+        "intervalMs": 15000,
+        "checkMs": 71
+      },
+      {
+        "watcher": "watcher-064",
+        "intervalMs": 120000,
+        "checkMs": 491
+      },
+      {
+        "watcher": "watcher-068",
+        "intervalMs": 60000,
+        "checkMs": 4302
+      },
+      {
+        "watcher": "watcher-071",
+        "intervalMs": 30000,
+        "checkMs": 13194
+      },
+      {
+        "watcher": "watcher-072",
+        "intervalMs": 30000,
+        "checkMs": 66047
+      },
+      {
+        "watcher": "watcher-075",
+        "intervalMs": 300000,
+        "checkMs": 874
+      },
+      {
+        "watcher": "watcher-076",
+        "intervalMs": 60000,
+        "checkMs": 834
+      },
+      {
+        "watcher": "watcher-082",
+        "intervalMs": 300000,
+        "checkMs": 2401
+      },
+      {
+        "watcher": "watcher-083",
+        "intervalMs": 15000,
+        "checkMs": 1128
+      },
+      {
+        "watcher": "watcher-084",
+        "intervalMs": 600000,
+        "checkMs": 1302
+      },
+      {
+        "watcher": "watcher-085",
+        "intervalMs": 3600000,
+        "checkMs": 6786
+      },
+      {
+        "watcher": "watcher-086",
+        "intervalMs": 15000,
+        "checkMs": 204
+      }
+    ]
+  },
+  "loads": [
+    {
+      "at": 0,
+      "load": 1.6
+    },
+    {
+      "at": 5129424,
+      "load": 1.4
+    },
+    {
+      "at": 5208905,
+      "load": 1.6
+    },
+    {
+      "at": 10643723,
+      "load": 10.2
+    },
+    {
+      "at": 21007693,
+      "load": 1.499
+    },
+    {
+      "at": 21012698,
+      "load": 1.5
+    },
+    {
+      "at": 21033052,
+      "load": 1.499
+    },
+    {
+      "at": 21048239,
+      "load": 1.5
+    },
+    {
+      "at": 21053528,
+      "load": 1.499
+    },
+    {
+      "at": 21070025,
+      "load": 1.7
+    },
+    {
+      "at": 23643266,
+      "load": 1.499
+    },
+    {
+      "at": 23683479,
+      "load": 1.5
+    },
+    {
+      "at": 23703561,
+      "load": 1.499
+    },
+    {
+      "at": 23759022,
+      "load": 1.6
+    },
+    {
+      "at": 25053576,
+      "load": 1.499
+    },
+    {
+      "at": 25063710,
+      "load": 1.5
+    },
+    {
+      "at": 25108947,
+      "load": 1.499
+    },
+    {
+      "at": 25119035,
+      "load": 1.5
+    },
+    {
+      "at": 25328105,
+      "load": 1.8
+    },
+    {
+      "at": 25983802,
+      "load": 1.499
+    },
+    {
+      "at": 25998898,
+      "load": 1.5
+    },
+    {
+      "at": 26263957,
+      "load": 1.499
+    },
+    {
+      "at": 26278641,
+      "load": 1.6
+    },
+    {
+      "at": 26293736,
+      "load": 1.499
+    },
+    {
+      "at": 26300246,
+      "load": 1.6
+    },
+    {
+      "at": 26783624,
+      "load": 1.4
+    },
+    {
+      "at": 26793757,
+      "load": 1.6
+    },
+    {
+      "at": 26839323,
+      "load": 1.499
+    },
+    {
+      "at": 26843680,
+      "load": 1.7
+    },
+    {
+      "at": 27338744,
+      "load": 1.499
+    },
+    {
+      "at": 28024302,
+      "load": 1.5
+    },
+    {
+      "at": 28084614,
+      "load": 1.499
+    },
+    {
+      "at": 28138927,
+      "load": 1.5
+    },
+    {
+      "at": 28143786,
+      "load": 1.499
+    },
+    {
+      "at": 28164115,
+      "load": 1.6
+    },
+    {
+      "at": 28169579,
+      "load": 1.499
+    },
+    {
+      "at": 28189621,
+      "load": 1.6
+    },
+    {
+      "at": 28218844,
+      "load": 1.499
+    },
+    {
+      "at": 28233907,
+      "load": 1.7
+    },
+    {
+      "at": 30274247,
+      "load": 9.8
+    },
+    {
+      "at": 30497854,
+      "load": 1.4
+    },
+    {
+      "at": 30803517,
+      "load": 1.5
+    },
+    {
+      "at": 31337470,
+      "load": 1.4
+    },
+    {
+      "at": 31382792,
+      "load": 1.6
+    },
+    {
+      "at": 43505167,
+      "load": 1.499
+    },
+    {
+      "at": 43520302,
+      "load": 1.6
+    },
+    {
+      "at": 44350273,
+      "load": 1.4
+    },
+    {
+      "at": 44518377,
+      "load": 1.8
+    },
+    {
+      "at": 44896573,
+      "load": 10.3
+    },
+    {
+      "at": 52156619,
+      "load": 1.499
+    },
+    {
+      "at": 53226816,
+      "load": 1.7
+    },
+    {
+      "at": 53356874,
+      "load": 1.499
+    },
+    {
+      "at": 53647668,
+      "load": 1.5
+    },
+    {
+      "at": 53676979,
+      "load": 1.4
+    },
+    {
+      "at": 53682010,
+      "load": 1.6
+    },
+    {
+      "at": 53907315,
+      "load": 1.4
+    },
+    {
+      "at": 53927365,
+      "load": 1.6
+    },
+    {
+      "at": 53936961,
+      "load": 1.499
+    },
+    {
+      "at": 54087257,
+      "load": 1.6
+    },
+    {
+      "at": 54127558,
+      "load": 1.499
+    },
+    {
+      "at": 54257460,
+      "load": 1.5
+    },
+    {
+      "at": 54352125,
+      "load": 1.499
+    },
+    {
+      "at": 54534115,
+      "load": 1.7
+    },
+    {
+      "at": 54616970,
+      "load": 1.4
+    },
+    {
+      "at": 54662380,
+      "load": 1.5
+    },
+    {
+      "at": 54857436,
+      "load": 1.499
+    },
+    {
+      "at": 54932980,
+      "load": 1.5
+    },
+    {
+      "at": 54936989,
+      "load": 1.499
+    },
+    {
+      "at": 54967094,
+      "load": 1.6
+    },
+    {
+      "at": 54972115,
+      "load": 1.499
+    },
+    {
+      "at": 55238836,
+      "load": 1.8
+    },
+    {
+      "at": 55252861,
+      "load": 1.499
+    },
+    {
+      "at": 56042750,
+      "load": 1.5
+    },
+    {
+      "at": 56108082,
+      "load": 1.4
+    },
+    {
+      "at": 56858124,
+      "load": 1.5
+    },
+    {
+      "at": 56868345,
+      "load": 1.4
+    },
+    {
+      "at": 56877750,
+      "load": 1.6
+    },
+    {
+      "at": 56997523,
+      "load": 1.499
+    },
+    {
+      "at": 57327950,
+      "load": 1.6
+    },
+    {
+      "at": 57363404,
+      "load": 1.499
+    },
+    {
+      "at": 57389872,
+      "load": 1.5
+    },
+    {
+      "at": 57602641,
+      "load": 1.499
+    },
+    {
+      "at": 57623325,
+      "load": 1.6
+    },
+    {
+      "at": 57702585,
+      "load": 1.4
+    },
+    {
+      "at": 57723295,
+      "load": 1.6
+    },
+    {
+      "at": 57762825,
+      "load": 1.499
+    },
+    {
+      "at": 57847726,
+      "load": 1.5
+    },
+    {
+      "at": 58242842,
+      "load": 1.499
+    },
+    {
+      "at": 58528151,
+      "load": 1.5
+    },
+    {
+      "at": 58542983,
+      "load": 1.4
+    },
+    {
+      "at": 58587957,
+      "load": 1.8
+    },
+    {
+      "at": 58622825,
+      "load": 1.499
+    },
+    {
+      "at": 58627904,
+      "load": 1.5
+    },
+    {
+      "at": 58632917,
+      "load": 1.499
+    },
+    {
+      "at": 58658043,
+      "load": 1.5
+    },
+    {
+      "at": 59238503,
+      "load": 1.499
+    },
+    {
+      "at": 59288147,
+      "load": 1.6
+    },
+    {
+      "at": 59303295,
+      "load": 1.499
+    },
+    {
+      "at": 59313555,
+      "load": 1.6
+    },
+    {
+      "at": 61948365,
+      "load": 1.499
+    },
+    {
+      "at": 62099252,
+      "load": 1.8
+    },
+    {
+      "at": 64944565,
+      "load": 1.499
+    },
+    {
+      "at": 64978907,
+      "load": 1.6
+    },
+    {
+      "at": 66043947,
+      "load": 1.499
+    },
+    {
+      "at": 66064210,
+      "load": 1.8
+    },
+    {
+      "at": 66224088,
+      "load": 1.4
+    },
+    {
+      "at": 66239145,
+      "load": 1.5
+    },
+    {
+      "at": 66244155,
+      "load": 1.4
+    },
+    {
+      "at": 66269436,
+      "load": 1.6
+    },
+    {
+      "at": 85517772,
+      "load": 1.499
+    },
+    {
+      "at": 85522535,
+      "load": 1.6
+    },
+    {
+      "at": 85638390,
+      "load": 1.499
+    },
+    {
+      "at": 85648417,
+      "load": 1.6
+    },
+    {
+      "at": 85653424,
+      "load": 1.499
+    },
+    {
+      "at": 85669038,
+      "load": 1.8
+    },
+    {
+      "at": 85778085,
+      "load": 1.499
+    },
+    {
+      "at": 85783115,
+      "load": 1.6
+    },
+    {
+      "at": 85802789,
+      "load": 1.499
+    },
+    {
+      "at": 85807641,
+      "load": 1.6
+    },
+    {
+      "at": 86342684,
+      "load": 1.499
+    },
+    {
+      "at": 86352880,
+      "load": 1.6
+    }
+  ]
+}

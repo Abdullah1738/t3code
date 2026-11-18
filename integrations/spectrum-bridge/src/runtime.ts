@@ -1,4 +1,4 @@
-import { markReactionAnswered } from "./unanswered.ts";
+import { markAnswered } from "./unanswered.ts";
 import type { RemoteBox } from "./remote-box.ts";
 import { RemoteRequestError } from "./remote-box.ts";
 import { validId } from "./remote-protocol.ts";
@@ -143,7 +143,7 @@ export class ChatRegistry<P> {
             const created = chat.remote ? chat.remote.accept(id, payload) : chat.store.acceptInbound(id, payload);
             if (created) {
               const message = input as { attachments?: { totalBytes?: number }[]; sentAt?: number; logSource?: string };
-              toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: chat.info.slug, messageId: id },
+              toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: chat.info.slug, messageId: id, inboundId: id },
                 props: { bytesKnown: !message.attachments?.length || message.attachments.every(a => (a.totalBytes ?? 0) > 0), attachmentCount: message.attachments?.length ?? 0, attachmentBytes: (message.attachments ?? []).reduce((n, a) => n + (a.totalBytes ?? 0), 0),
                   receiveLagMs: Math.max(0, this.now() - (message.sentAt ?? this.now())), source: message.logSource === "backfill" ? "backfill" : "live",
                   backend: chat.remote ? "remote-box" : this.options.backend ?? "unknown" } }));
@@ -494,8 +494,9 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           const inbound = registry.all().find(chat =>
             chat.store.db.query<{ id: string }, [string]>("SELECT id FROM inbound WHERE id = ?").get(target));
           if (!inbound) throw new HttpError(403, "Forbidden");
+          const covered = [target];
           await options.line.react(target, kind);
-          markReactionAnswered(inbound.store, target);
+          markAnswered(inbound.store, covered);
           return reply(200, { id: `reaction:${hash(target + kind)}` });
         }
         case "/location-request": {

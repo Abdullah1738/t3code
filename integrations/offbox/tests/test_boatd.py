@@ -89,7 +89,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="boatd-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        log_env = patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.tmp / "shared-logs"))
+        log_env = patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.tmp / "shared-logs"))
         log_env.start()
         self.addCleanup(log_env.stop)
         self.saved = {k: getattr(boatd, k) for k in (

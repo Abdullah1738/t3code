@@ -11,7 +11,6 @@ import {
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Logger from "effect/Logger";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
@@ -283,7 +282,7 @@ it.effect(
       const rendered = performance.now();
       assert.deepStrictEqual(result, legacyResult);
       assert.deepStrictEqual(rows, legacyRows);
-      yield* Effect.logInfo(
+      yield* Console.log(
         JSON.stringify({
           fixture: "Crpko",
           migrationMs: Math.round(migrationMs),
@@ -300,17 +299,14 @@ it.effect(
           legacyCompactMs: Math.round(legacyRendered - legacyRolled),
           legacyBoundaryRows: legacy.readinessBefore.length + legacy.after.length,
         }),
-      ).pipe(
-        Effect.provide(Logger.layer([Logger.defaultLogger])),
-        Effect.provideService(Console.Console, globalThis.console),
-      );
+      ).pipe(Effect.provideService(Console.Console, globalThis.console));
       assert.lengthOf(read.cards, 4700);
       assert.lengthOf(read.events, 150);
       assert.lengthOf(read.threads, 10000);
       assert.isAbove(result.stages.hours.todo?.hours ?? 0, 0);
-      assert.isTrue(
-        (result.pools.queueWait["codex/gpt-6.1-sol"] ?? []).some((value) => (value ?? 0) > 0),
-      );
+      const queueWait = result.pools.queueWait["codex/gpt-6.1-sol"];
+      assert.isTrue(Array.isArray(queueWait));
+      assert.isTrue(Array.isArray(queueWait) && queueWait.some((value) => (value ?? 0) > 0));
       assert.isAtMost(read.readinessBefore.length + read.after.length, 300 * 4);
       assert.isBelow(rendered - started, 5000);
       // Settled cards whose only activity is a closed ask must survive board_get since.

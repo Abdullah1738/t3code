@@ -14,12 +14,15 @@ import {
   kanbanWithoutWait,
   kanbanWithoutDeciding,
   kanbanRetryNotBefore,
+  kanbanAwaitsMerge,
+  kanbanWaitsOnEvaluator,
   kanbanAskKind,
   kanbanStepSubtasks,
   KANBAN_DECIDE_MS,
   type KanbanBoard,
   type KanbanCard,
   type KanbanCardEvent,
+  type KanbanDiscussion,
   type KanbanOwnerAsk,
   type KanbanPool,
   type KanbanPoolChange,
@@ -77,6 +80,185 @@ const minutesBetween = (from: string, to: string) =>
 const hours = (ms: number) => Math.round((ms / HOUR) * 100) / 100;
 const inWindow = (iso: string | null | undefined, window: ActivityWindow): iso is string =>
   iso !== null && iso !== undefined && iso >= window.since && iso < window.until;
+
+/** Shared with the nightly launch's supplied discussion IDs. Messages decide inclusion in the exact window. */
+export const discussionSources = (
+  discussions: ReadonlyArray<KanbanDiscussion>,
+  since: string,
+  exclude?: string,
+) =>
+  discussions.filter(
+    (source) =>
+      source.id !== exclude &&
+      Date.parse(source.lastMessageAt ?? source.createdAt) >= Date.parse(since),
+  );
+
+interface DiscussionDigestMessage {
+  readonly at: string;
+  readonly author: string;
+  readonly text: string;
+}
+
+export const discussionDigestRow = (
+  discussion: KanbanDiscussion,
+  card: KanbanCard | undefined,
+  messages: ReadonlyArray<DiscussionDigestMessage>,
+  window: ActivityWindow,
+) => {
+  const matching = messages.filter((message) => inWindow(message.at, window));
+  const last = matching.at(-1);
+  if (last === undefined) return null;
+  return {
+    discussionId: discussion.id,
+    ...(card === undefined ? {} : { card: card.number }),
+    title: oneLine(card?.title ?? discussion.title, 200),
+    messagesInWindow: matching.length,
+    ownerMessages: matching
+      .filter((message) => message.author === "owner")
+      .map((message) => ({ at: message.at, text: oneLine(message.text, 300) })),
+    // Pin priority to the cutoff so later ask closures cannot shift an index cursor.
+    openAsks: (card?.asks ?? [])
+      .filter(
+        (ask) => ask.at < window.until && (ask.closedAt === null || ask.closedAt >= window.until),
+      )
+      .map((ask) => ask.id),
+    last: { at: last.at, author: last.author, text: oneLine(last.text, 200) },
+  };
+};
+
+export const discussionDigestRows = (
+  rows: ReadonlyArray<NonNullable<ReturnType<typeof discussionDigestRow>>>,
+) =>
+  rows
+    .toSorted(
+      (left, right) =>
+        Number(right.ownerMessages.length > 0 || right.openAsks.length > 0) -
+          Number(left.ownerMessages.length > 0 || left.openAsks.length > 0) ||
+        right.last.at.localeCompare(left.last.at) ||
+        left.discussionId.localeCompare(right.discussionId),
+    )
+    .flatMap((row) => {
+      // Preserve every owner message even when one busy discussion exceeds a page.
+      // Continuations carry the same id and an offset; ordinary discussions stay one row.
+      const parts: Array<
+        typeof row & { ownerMessagesOffset?: number; ownerMessagesTotal?: number }
+      > = [];
+      let part = { ...row, ownerMessages: [] as typeof row.ownerMessages };
+      let offset = 0;
+      for (const message of row.ownerMessages) {
+        const next = { ...part, ownerMessages: [...part.ownerMessages, message] };
+        if (part.ownerMessages.length > 0 && JSON.stringify(next).length > 25_000) {
+          parts.push({
+            ...part,
+            ownerMessagesOffset: offset,
+            ownerMessagesTotal: row.ownerMessages.length,
+          });
+          offset += part.ownerMessages.length;
+          part = { ...row, ownerMessages: [message] };
+        } else part = next;
+      }
+      parts.push(
+        parts.length === 0
+          ? part
+          : { ...part, ownerMessagesOffset: offset, ownerMessagesTotal: row.ownerMessages.length },
+      );
+      return parts;
+    });
+
+type ThreadDigestFlag = "run_failed" | "restarted" | "stalled" | "refused_call";
+
+export const threadDigestRows = (
+  cards: ReadonlyArray<KanbanCard>,
+  threads: ReadonlyArray<KanbanThreadLink>,
+  events: ReadonlyArray<KanbanCardEvent>,
+  window: ActivityWindow,
+  threadCards: ReadonlyMap<string, ReadonlyArray<KanbanCard["id"]>> = new Map(),
+) => {
+  const byCard = new Map(cards.map((card) => [card.id, card]));
+  const associated = new Map(
+    threads.map((link) => [
+      link.threadId,
+      [
+        ...new Set([
+          ...(link.cardId === null ? [] : [link.cardId]),
+          ...(threadCards.get(link.threadId) ?? []),
+        ]),
+      ].flatMap((id) => {
+        const card = byCard.get(id);
+        return card === undefined ? [] : [card];
+      }),
+    ]),
+  );
+  return threads
+    .flatMap((link) => {
+      const carried = associated.get(link.threadId) ?? [];
+      const card = carried[0];
+      if (
+        card === undefined ||
+        link.startedAt >= window.until ||
+        (link.endedAt !== null && link.endedAt < window.since)
+      )
+        return [];
+      const flags = new Set<ThreadDigestFlag>();
+      for (const event of events) {
+        if (!carried.some((entry) => entry.id === event.cardId) || !inWindow(event.at, window))
+          continue;
+        if (isFailure(event)) flags.add("run_failed");
+        if (isStall(event)) flags.add("stalled");
+        if (
+          failureKind(event) === "verdict_refused" ||
+          event.body?.startsWith(Retries.REFUSED_VERDICT_PREFIX)
+        )
+          flags.add("refused_call");
+      }
+      if (
+        inWindow(link.startedAt, window) &&
+        threads.some(
+          (other) =>
+            link.cardId !== null &&
+            other.cardId === link.cardId &&
+            other.role === link.role &&
+            other.startedAt < link.startedAt,
+        )
+      )
+        flags.add("restarted");
+      return [
+        {
+          threadId: link.threadId,
+          card: card.number,
+          ...(carried.length > 1 ? { cards: carried.map((entry) => entry.number) } : {}),
+          role: link.role,
+          model: link.model,
+          startedAt: link.startedAt,
+          endedAt: link.endedAt,
+          flags: [...flags],
+        },
+      ];
+    })
+    .toSorted(
+      (left, right) =>
+        Number(right.flags.length > 0) - Number(left.flags.length > 0) ||
+        right.startedAt.localeCompare(left.startedAt) ||
+        left.threadId.localeCompare(right.threadId),
+    );
+};
+
+/** Index cursor, unlike board_get's card-number cursor: priority order isn't card order. */
+export const digestPage = <R>(rows: ReadonlyArray<R>, after = 0) => {
+  const items: Array<R> = [];
+  let chars = 0;
+  for (const row of rows.slice(after)) {
+    const size = JSON.stringify(row).length + 1;
+    if (items.length >= 40 || (items.length > 0 && chars + size > 29_000)) break;
+    items.push(row);
+    chars += size;
+  }
+  const hasMore = after + items.length < rows.length;
+  return {
+    rows: items,
+    page: { limit: 40, hasMore, nextAfter: hasMore ? after + items.length : null },
+  };
+};
 
 export const isPass = (event: KanbanCardEvent) =>
   event.kind === "review" && event.body?.trim() === "clear";
@@ -559,10 +741,13 @@ const ledgerUsage = (
     to: number,
     count = 1,
   ) => {
-    hourStarts.forEach((start, i) => {
+    const first = Math.max(0, hourIndex(Math.max(from, coverage)));
+    const last = Math.min(hourStarts.length - 1, hourIndex(to));
+    for (let i = first; i <= last; i++) {
+      const start = hourStarts[i]!;
       const overlap = Math.min(to, start + HOUR) - Math.max(from, start, coverage);
       if (overlap > 0) row(rows, pool)[i]! += (overlap * count) / HOUR;
-    });
+    }
   };
   const events = (history?.events ?? [])
     .filter((event) => event.at < window.until)
@@ -623,105 +808,274 @@ const ledgerUsage = (
         card.stage);
   const currentById = new Map(input.cards.map((card) => [card.id as string, card]));
   const readiness = groupEvents([...(input.readinessBefore ?? []), ...input.events]);
-  const flags = new Map([...readiness].map(([id, events]) => [id, events.filter(endsStall)]));
-  const stalledAt = (card: KanbanCard, at: number) => {
-    const last = flags.get(card.id)?.findLast((event) => time(event.at) <= at);
-    const snapshot = card.stalled;
-    if (
-      snapshot !== null &&
-      time(snapshot.at) <= at &&
-      (last === undefined || snapshot.at > last.at)
-    )
-      return snapshot;
-    return last !== undefined && isStall(last)
-      ? { at: last.at, by: last.actor, reason: last.body ?? "" }
-      : null;
+  // Queue reconstruction is synchronous: its own CPU budget must protect the event loop.
+  const queueStarted = performance.now();
+  let queueOmitted = false;
+  let visits = 0;
+  const withinBudget = () => {
+    if ((++visits & 63) === 0 && performance.now() - queueStarted >= 900) queueOmitted = true;
+    return !queueOmitted;
   };
-  const todoSpans = spans
-    .filter((span) => span.stage === "todo")
-    .map((span) => {
-      const card = span.card;
-      const ownEvents = readiness.get(card.id) ?? [];
-      const models =
-        card.workThreadId === null && card.models.length > 0
-          ? [...card.models].sort((a, b) => b.weight - a.weight).map((entry) => entry.model)
-          : [card.model];
-      const routes = [...new Set(models.map((model) => Rules.poolOf(pools, model)))];
-      const dependencies = new Set<string>();
-      const visit = (id: string) => {
-        if (dependencies.has(id)) return;
-        dependencies.add(id);
-        for (const next of currentById.get(id)?.blockedBy ?? []) visit(next);
-      };
-      for (const id of card.blockedBy) visit(id);
-      return {
-        span,
-        dependencies,
-        waits: waitIntervals(card, ownEvents, window.since, window.until),
-        routes,
-      };
-    });
-  const configured = new Map(pools.map((pool) => [pool.key, pool.slots]));
-  const queued = (from: number, to: number) => {
-    if (input.board?.archivedAt != null || input.board?.setup?.status === "running") return;
-    for (const { span, waits, routes, dependencies } of todoSpans) {
-      const card = span.card;
-      if (input.board?.pause && !input.board.pause.keep.includes(card.id)) continue;
-      if (
-        time(span.from) > from ||
-        time(span.to ?? window.until) <= from ||
-        time(card.createdAt) > from
-      )
-        continue;
-      if (
-        stalledAt(card, from) !== null ||
-        waits.some(([a, b]) => a <= from && b > from) ||
-        card.asks.some(
-          (ask) =>
-            ask.blocking &&
-            time(ask.at) <= from &&
-            (ask.closedAt === null || time(ask.closedAt) > from),
-        )
-      )
-        continue;
-      const candidate = {
-        ...kanbanWithoutWait(
-          card.deciding !== undefined && time(card.deciding.since) > from
-            ? kanbanWithoutDeciding(card)
-            : card,
-        ),
-        stage: "todo" as const,
-        activeThreadId: null,
-        activePool: null,
-        stalled: null,
-        settledAt: null,
-        asks: [],
-        retries: card.retries?.filter((retry) => time(retry.at) <= from),
-      };
-      const blockers = new Map<string, KanbanCard>();
-      for (const id of dependencies) {
-        const blocker = currentById.get(id);
-        if (blocker && time(blocker.createdAt) <= from)
-          blockers.set(id, {
-            ...blocker,
-            stage: atStage(blocker, from),
-            stalled: stalledAt(blocker, from),
-          });
+  const upperBound = (points: ReadonlyArray<number>, at: number) => {
+    let lo = 0,
+      hi = points.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (points[mid]! <= at) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  const changes = new Map<string, number[]>();
+  const change = (id: string, at: number) => {
+    if (!Number.isFinite(at)) return;
+    const points = changes.get(id) ?? [];
+    points.push(at);
+    changes.set(id, points);
+  };
+  for (const event of readiness.values())
+    for (const mark of event) change(mark.cardId, time(mark.at));
+  for (const span of spans) {
+    change(span.card.id, time(span.from));
+    change(span.card.id, time(span.to ?? window.until));
+  }
+  type Stall = KanbanCard["stalled"];
+  const stalls = new Map<string, { points: number[]; values: Stall[] }>();
+  const asks = new Map<string, Array<readonly [number, number]>>();
+  for (const card of input.cards) {
+    if (!withinBudget()) break;
+    for (const at of [
+      card.createdAt,
+      card.movedAt,
+      card.settledAt,
+      card.stalled?.at,
+      card.wait?.at,
+      card.wait?.expiredAt,
+      card.deciding?.since,
+    ])
+      if (at != null) change(card.id, time(at));
+    if (card.deciding !== undefined) change(card.id, time(card.deciding.since) + KANBAN_DECIDE_MS);
+    // Historical candidates contain only retries already recorded at that moment.
+    const retries = (card.retries ?? []).toSorted((a, b) => time(a.at) - time(b.at));
+    for (const retry of retries) {
+      change(card.id, time(retry.at));
+      const notBefore = kanbanRetryNotBefore({
+        ...card,
+        retries: card.retries?.filter((entry) => time(entry.at) <= time(retry.at)),
+      });
+      if (notBefore !== null) change(card.id, notBefore);
+    }
+    const intervals = card.asks
+      .filter((ask) => ask.blocking)
+      .map((ask) => [time(ask.at), time(ask.closedAt ?? window.until)] as const)
+      .filter(([from, to]) => to > from)
+      .sort((a, b) => a[0] - b[0]);
+    const merged: Array<[number, number]> = [];
+    for (const [from, to] of intervals) {
+      const last = merged.at(-1);
+      if (last && from <= last[1]) last[1] = Math.max(last[1], to);
+      else merged.push([from, to]);
+    }
+    asks.set(card.id, merged);
+    for (const ask of card.asks) {
+      change(card.id, time(ask.at));
+      if (ask.closedAt !== null) change(card.id, time(ask.closedAt));
+    }
+    // The legacy findLast uses event id order, even when timestamps are out of order.
+    const marks = (readiness.get(card.id) ?? [])
+      .filter(endsStall)
+      .map((event, rank) => ({ event, rank, at: time(event.at) }))
+      .sort((a, b) => a.at - b.at || a.rank - b.rank);
+    const points = [
+      ...new Set([
+        ...marks.map((mark) => mark.at),
+        ...(card.stalled === null ? [] : [time(card.stalled.at)]),
+      ]),
+    ].sort((a, b) => a - b);
+    let index = 0;
+    let latest: (typeof marks)[number] | undefined;
+    const values = points.map((at) => {
+      while (index < marks.length && marks[index]!.at <= at) {
+        const mark = marks[index++]!;
+        if (latest === undefined || mark.rank > latest.rank) latest = mark;
       }
-      if (!Rules.cardFlow(candidate, blockers, new Map(), from).ready) continue;
-      // A weighted alternative with room (or a reusable held thread) is not pool wait.
-      const candidates = routes.filter((key) => (configured.get(key) ?? 0) > 0);
-      if (candidates.length === 0) continue;
+      const snapshot = card.stalled;
       if (
-        candidates.some(
-          (key) =>
-            holding.get(key)?.has(card.workThreadId ?? "") ||
-            (holding.get(key)?.size ?? 0) < configured.get(key)!,
-        )
+        snapshot !== null &&
+        time(snapshot.at) <= at &&
+        (latest === undefined || snapshot.at > latest.event.at)
+      )
+        return snapshot;
+      return latest !== undefined && isStall(latest.event)
+        ? { at: latest.event.at, by: latest.event.actor, reason: latest.event.body ?? "" }
+        : null;
+    });
+    stalls.set(card.id, { points, values });
+  }
+  for (const points of changes.values()) points.sort((a, b) => a - b);
+  const stalledAt = (card: KanbanCard, at: number) => {
+    const timeline = stalls.get(card.id);
+    return timeline?.values[upperBound(timeline.points, at) - 1] ?? null;
+  };
+  const contains = (intervals: ReadonlyArray<readonly [number, number]>, at: number) => {
+    let lo = 0,
+      hi = intervals.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (intervals[mid]![0] <= at) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo > 0 && intervals[lo - 1]![1] > at;
+  };
+  const blockerCache = new Map<string, { at: number; card: KanbanCard }>();
+  const blocked = (card: KanbanCard, byId: ReadonlyMap<string, KanbanCard>) => {
+    // Clear subgraphs can converge exponentially; visit each edge once and keep the CPU guard live.
+    const states = new Map<string, "visiting" | "clear">([[card.id, "visiting"]]);
+    const stack = [{ card, next: 0 }];
+    while (stack.length > 0) {
+      if (!withinBudget()) return true;
+      const frame = stack.at(-1)!;
+      const id = frame.card.blockedBy[frame.next++];
+      if (id === undefined) {
+        states.set(frame.card.id, "clear");
+        stack.pop();
+        continue;
+      }
+      const blocker = byId.get(id);
+      if (blocker === undefined || (Rules.isDone(blocker.stage) && !kanbanAwaitsMerge(blocker)))
+        continue;
+      if (
+        card.workThreadId === null ||
+        blocker.workThreadId !== card.workThreadId ||
+        (blocker.stage !== "todo" && blocker.stage !== "working") ||
+        blocker.stalled !== null ||
+        blocker.priority === KANBAN_BACKLOG ||
+        kanbanWaitsOnEvaluator(blocker) ||
+        states.get(id) === "visiting"
+      )
+        return true;
+      if (states.get(id) === "clear") continue;
+      states.set(id, "visiting");
+      stack.push({ card: blocker, next: 0 });
+    }
+    return false;
+  };
+  const configured = new Map(pools.map((pool) => [pool.key, pool.slots]));
+  const todoSpans = [];
+  for (const span of spans) {
+    if (!withinBudget()) break;
+    if (span.stage !== "todo") continue;
+    const card = span.card;
+    const models =
+      card.workThreadId === null && card.models.length > 0
+        ? [...card.models].sort((a, b) => b.weight - a.weight).map((entry) => entry.model)
+        : [card.model];
+    const routes = [...new Set(models.map((model) => Rules.poolOf(pools, model)))].filter(
+      (key) => (configured.get(key) ?? 0) > 0,
+    );
+    const dependencies = new Set<string>();
+    const pending = [...card.blockedBy];
+    while (pending.length > 0 && withinBudget()) {
+      const id = pending.pop()!;
+      if (dependencies.has(id)) continue;
+      dependencies.add(id);
+      pending.push(...(currentById.get(id)?.blockedBy ?? []));
+    }
+    const waits = waitIntervals(card, readiness.get(card.id) ?? [], window.since, window.until);
+    for (const [a, b] of waits) {
+      change(card.id, a);
+      change(card.id, b);
+    }
+    // A sorted union means unrelated board events do not rebuild this card's readiness.
+    const invalidations = [
+      ...new Set([card.id, ...dependencies].flatMap((id) => changes.get(id) ?? [])),
+    ].sort((a, b) => a - b);
+    todoSpans.push({
+      span,
+      card,
+      routes,
+      dependencies,
+      waits,
+      invalidations,
+      from: Math.max(time(span.from), time(card.createdAt)),
+      to: time(span.to ?? window.until),
+      ready: false,
+      validUntil: -Infinity,
+    });
+  }
+  const starts = todoSpans.toSorted((a, b) => a.from - b.from);
+  const ends = todoSpans.toSorted((a, b) => a.to - b.to);
+  const active = new Set<(typeof todoSpans)[number]>();
+  let startIndex = 0,
+    endIndex = 0;
+  const queued = (from: number, to: number) => {
+    if (queueOmitted || input.board?.archivedAt != null || input.board?.setup?.status === "running")
+      return;
+    const full = new Set(
+      pools
+        .filter((pool) => pool.slots > 0 && (holding.get(pool.key)?.size ?? 0) >= pool.slots)
+        .map((pool) => pool.key),
+    );
+    if (full.size === 0) return;
+    while (startIndex < starts.length && starts[startIndex]!.from <= from)
+      active.add(starts[startIndex++]!);
+    while (endIndex < ends.length && ends[endIndex]!.to <= from) active.delete(ends[endIndex++]!);
+    for (const entry of active) {
+      if (!withinBudget()) return;
+      const { card, routes, waits, dependencies, invalidations } = entry;
+      if (
+        routes.length === 0 ||
+        routes.some((key) => !full.has(key) || holding.get(key)?.has(card.workThreadId ?? ""))
       )
         continue;
-      // Attribute a multi-model card once, to its highest-weight enabled route.
-      addHours(queueWait, candidates[0]!, from, to);
+      if (input.board?.pause && !input.board.pause.keep.includes(card.id)) continue;
+      if (from >= entry.validUntil) {
+        entry.validUntil = invalidations[upperBound(invalidations, from)] ?? Infinity;
+        entry.ready = false;
+        if (
+          stalledAt(card, from) !== null ||
+          contains(waits, from) ||
+          contains(asks.get(card.id) ?? [], from)
+        )
+          continue;
+        const candidate = {
+          ...kanbanWithoutWait(
+            card.deciding !== undefined && time(card.deciding.since) > from
+              ? kanbanWithoutDeciding(card)
+              : card,
+          ),
+          stage: "todo" as const,
+          activeThreadId: null,
+          activePool: null,
+          stalled: null,
+          settledAt: null,
+          asks: [],
+          retries: card.retries?.filter((retry) => time(retry.at) <= from),
+        };
+        if (!Rules.cardFlow({ ...candidate, blockedBy: [] }, new Map(), new Map(), from).ready)
+          continue;
+        const blockers = new Map<string, KanbanCard>();
+        for (const id of dependencies) {
+          if (!withinBudget()) break;
+          const blocker = currentById.get(id);
+          if (!blocker || time(blocker.createdAt) > from) continue;
+          let cached = blockerCache.get(id);
+          if (cached?.at !== from) {
+            cached = {
+              at: from,
+              card: {
+                ...blocker,
+                stage: atStage(blocker, from),
+                stalled: stalledAt(blocker, from),
+              },
+            };
+            blockerCache.set(id, cached);
+          }
+          blockers.set(id, cached.card);
+        }
+        entry.ready = !queueOmitted && !blocked(candidate, blockers);
+      }
+      if (entry.ready) addHours(queueWait, routes[0]!, from, to);
     }
   };
   let cursor = coverage;
@@ -770,13 +1124,16 @@ const ledgerUsage = (
         ),
       ]),
     );
+  const queueResult: Record<string, Array<number | null> | "budget"> = queueOmitted
+    ? { omitted: "budget" }
+    : values(queueWait);
   return {
     slots: Object.fromEntries(pools.map((pool) => [pool.key, pool.slots])),
     hours: hourStarts.map((at) => `${isoOf(at).slice(0, 13)}Z`),
     recordedSince,
     used: values(used),
     slotHours: values(slotHours),
-    queueWait: values(queueWait),
+    queueWait: queueResult,
     queueWaitBasis:
       "Ready todo card-hours while every routed pool was full; recorded stages/waits/flags, current board policy, routing, capacities, priority, subtasks and retry/evaluator holds. Multi-model cards count once on their highest-weight enabled route.",
   };

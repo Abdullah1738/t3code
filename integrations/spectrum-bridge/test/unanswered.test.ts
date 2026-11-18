@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store, type InboundRecord, type OutboxOperation } from "../src/store.ts";
-import { findOverdue, markAnswered, markReactionAnswered, reconcileLegacyReplies, turnMembers, UNANSWERED_REQUEUE_MS, type AnsweredInput } from "../src/unanswered.ts";
+import { findOverdue, markAnswered, reconcileLegacyReplies, turnMembers, UNANSWERED_REQUEUE_MS, type AnsweredInput } from "../src/unanswered.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { legacySteerStart, restoreLegacySteer } from "./fixtures/legacy-steer-upgrade.ts";
 import { summarizeLog } from "../src/log-rollup.ts";
@@ -54,7 +54,30 @@ for (const kind of ["text", "card", "file", "poll"] as const) test(`${kind} sent
   for (const id of ["later", "wake:x"]) expect(payload(id).answeredAt).toBeUndefined();
 });
 
-test("explicit reaction answers covered rows; arrival receipt does not", async () => {
+test("proven reply coverage settles legacy admitted rows while preserving cancellation", () => {
+  const s = store();
+  for (const id of ["legacy", "cancelled", "observed"]) {
+    const { source: _source, ...legacy } = input(id);
+    s.acceptInbound(id, legacy); s.updateInbound(id, id === "legacy" ? "admitted" : id);
+  }
+  s.enqueue({ id: "legacy-delivered", kind: "conversation", text: "Done" }, { covered: ["legacy", "cancelled", "observed"] });
+  s.outboxState("legacy-delivered", "sent");
+  const rows = s.db.query<{ id: string; state: string; payload: string }, []>("SELECT id, state, payload FROM inbound ORDER BY rowid").all();
+  expect(rows.map(row => row.state)).toEqual(["done", "cancelled", "observed"]);
+  expect(JSON.parse(rows[0]!.payload).answeredAt).toBeNumber();
+  for (const row of rows.slice(1)) expect(JSON.parse(row.payload).answeredAt).toBeUndefined();
+});
+
+test("a delivered control notice cannot settle an admitted human response", () => {
+  const s = store(); s.acceptInbound("answer", input("answer")); s.updateInbound("answer", "admitted");
+  s.set("activeTurn", { id: "ses_1", generation: 1, messageId: "msg", covered: ["answer"], phase: "running" });
+  s.enqueue({ id: "request-next", kind: "control", text: "Another question", sessionId: "ses_1", generation: 1 });
+  s.outboxState("request-next", "sent");
+  const saved = s.db.query<{ state: string; payload: string }, []>("SELECT state, payload FROM inbound").get()!;
+  expect(saved.state).toBe("admitted"); expect(JSON.parse(saved.payload).answeredAt).toBeUndefined();
+});
+
+test("explicit reaction answers only its target; arrival receipt does not", async () => {
   const s = store(); s.acceptInbound("root", input("root")); s.acceptInbound("followup", input("followup"));
   s.set("activeTurn", { id: "ses_1", generation: 1, messageId: "msg", inboundId: "root", covered: ["followup"], phase: "running" });
   await acknowledgePhoton(s, { react: async () => {} }, "iMessage;-;+15555550123", input("root"));
@@ -62,7 +85,9 @@ test("explicit reaction answers covered rows; arrival receipt does not", async (
   const api = createApi({ store: s, router: () => undefined, photon: { react: async () => {} }, chatGuid: () => "iMessage;-;+15555550123", enabled: () => true, health: () => ({}) });
   const res = await api(new Request("http://localhost/react", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ target: "root", kind: "like" }) }));
   expect(res.status).toBe(200);
-  for (const id of ["root", "followup"]) expect(JSON.parse(s.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id)!.payload).answeredAt).toBeNumber();
+  const payload = (id: string) => JSON.parse(s.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id)!.payload) as AnsweredInput;
+  expect(payload("root").answeredAt).toBeNumber();
+  expect(payload("followup").answeredAt).toBeUndefined();
 });
 
 test("answeredAt survives store reopen and stale payload updates, and late-answer logs feed rollup", async () => {

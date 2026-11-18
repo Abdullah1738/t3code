@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import type { NormalizedInbound } from "./photon.ts";
 import type { Store } from "./store.ts";
 import { toolLog } from "./toollog.ts";
+import { controlFailureProps } from "./control-errors.ts";
 
-export type RequeueReason = "watchdog_overdue" | "respond_failed" | "steer_failed" | "background_no_reply" | "turn_failed";
+export type RequeueReason = "respond_failed" | "steer_failed" | "background_no_reply" | "turn_failed" | "watchdog_overdue";
 
 export function leaderKind(id: string | undefined): "human" | "wake" | "reset" {
   if (id?.startsWith("reset:")) return "reset";
@@ -11,7 +12,7 @@ export function leaderKind(id: string | undefined): "human" | "wake" | "reset" {
 }
 
 /** Preserve sealed membership and uncertain POST identity; normal dispatch owns the retry. */
-export function requeueHuman(store: Store, id: string, reason: RequeueReason, options: { chat?: string; completed?: boolean } = {}): void {
+export function requeueHuman(store: Store, id: string, reason: RequeueReason, options: { chat?: string; completed?: boolean; failure?: unknown } = {}): void {
   if (leaderKind(id) !== "human") return;
   store.db.transaction(() => {
     const row = store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id);
@@ -24,14 +25,18 @@ export function requeueHuman(store: Store, id: string, reason: RequeueReason, op
       store.set(`human-retry-prompt:${id}`, `msg_${createHash("sha256").update(`${id}:unanswered:${count}`).digest("hex")}`);
       store.set(`steer-attempt:${id}`, null);
       store.set(`latency-route:${id}`, null);
+      store.set(`failed-delivery:${id}`, null);
+      store.set(`steer-reconciled:${id}`, false);
     }
     for (const member of members) {
       store.updateInbound(member, member === id ? "pending" : "batched");
       store.db.query("DELETE FROM kv WHERE key = ?").run(`inbound-delivered:${member}`);
     }
+    store.set(`human-response-prompt:${id}`, null);
+    store.set(`human-response-before:${id}`, null);
     store.set(`human-own-turn:${id}`, true);
     store.set(`batch-phase:${id}`, "queued-steer");
     toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "inbound.requeued",
-      ids: { inboundId: id, chat: options.chat ?? "owner" }, props: { reason } }));
+      ids: { inboundId: id, chat: options.chat ?? "owner" }, props: { reason, ...controlFailureProps(options.failure) } }));
   }).immediate();
 }

@@ -700,3 +700,45 @@ This event is attribution evidence, never authority to kill or throttle a PID.
 A process may exit between the argv read and lsof. Missing cwd
 prevents classification of relative operands. Crawls shorter than 30 seconds
 or wholly between minute samples are outside this detector's coverage.
+
+### Launchd SSD read probe
+
+The separate `com.abdullah.mac-ssd-read-probe` job runs every 60 seconds through
+`/bin/zsh -fc 'exec /usr/bin/python3 "$@"' -- <script> sample`, the same granted
+identity as guard and read-watchdog. It measures what the real jobs can read,
+without creating another ungranted TCC requester. CPU/U inventory cannot hold
+this schedule even if its lsof child is stuck forever.
+`mac-log-status` also checks for missing probe rows, allowing three minutes
+before reporting the detector late or silent.
+
+The reader stats and reads 4 KiB from `/Volumes/ExternalSSD/.mac-upkeep/probe.bin`
+(created by `install.zsh`). Both share a three-second Popen/poll deadline. A
+stalled child is abandoned without kill/wait and its PID plus exact `ps lstart`
+suppresses the next reader (`stuckPrior=true`). State and child output remain
+on the internal disk under `~/.local/state/mac-upkeep`.
+The job uses `AbandonProcessGroup=true` so launchd preserves these children when
+the minute parent exits; later runs use their saved identities to avoid pile-up.
+
+Every run also discovers sandboxd with `pgrep -x sandboxd` and counts `ps -M -p`
+rows minus the header. Both commands share a two-second deadline; an abandoned
+helper's PID plus kernel birth time suppresses new helpers until it clears.
+`sandboxdThreads` is null when unavailable. A read can pass during an approval
+jam, so a count of 20 or more also counts as a failed run. The event retains
+read outcome (`ok`, `slow` above 500 ms, `timeout`, `error`), separate `statMs` and
+`readMs`, symbolic errno, ProcessType, nice and loadavg1 alongside that count.
+
+Two consecutive failed runs atomically write
+`~/.local/state/mac-upkeep/ssd-launchd-read-blocked` with `since`, `lastOutcome`,
+`errno`, `sandboxdThreads` and nullable `promptingPath`; `lastOutcome=jam` when only the thread count tripped. The latch
+queues one deduplicated Telegram alert naming the cause through the collector's
+notification path. Only the first latch run captures tccd AUTHREQ_PROMPTING
+messages from the last five minutes, bounded at 15 seconds with Popen/abandon;
+its last responsible path, if found, is saved as `promptingPath` in the marker.
+It never runs that capture each minute. Restart tools must check the marker.
+
+An `ok` read with a known count below 20 removes the marker and queues one
+recovery line. Slow reads or an unavailable thread inventory cannot clear an
+existing interlock. Notification retries preserve exact keys/text and never
+write alerts to stdout. The evaluator loads only the new probe label after
+review; the CPU job retains its original launcher. Installer tests set
+`MAC_LOG_SSD_PROBE_FILE` for fixture init/check; live reads use the fixed target.

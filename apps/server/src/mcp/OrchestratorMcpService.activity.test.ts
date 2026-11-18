@@ -565,6 +565,10 @@ it.each([
   "continuation-interrupted-no-detail",
   "continuation-completed",
   "continuation-running",
+  "restart-interrupted",
+  "restart-interrupted-disposed",
+  "restart-cancelled",
+  "restart-cancelled-marker",
 ])("taskStatus exposes live child state: %s", async (state) => {
   const retryCause =
     state === "retrying-timeout"
@@ -572,6 +576,8 @@ it.each([
       : state === "retrying-refused"
         ? "Connection refused (ECONNREFUSED) — retry 2/10 (connection_retry), next in 1 s"
         : "Claude API no HTTP response: unknown.";
+  const restart = state.startsWith("restart-interrupted");
+  const unmirroredRestart = state.startsWith("restart-cancelled");
   const continuation = state === "fallback-resumed" || state.startsWith("continuation-");
   const mirrored = state.includes("-mirrored");
   const legacy = state.endsWith("-legacy");
@@ -669,6 +675,16 @@ it.each([
                     : "Task cancelled.",
             }
           : {}),
+        ...(restart
+          ? {
+              status: "interrupted",
+              result: "Interrupted by restart. Resume the same child thread.",
+              cancelReason: "server_shutdown",
+              completionDelivery: {
+                state: state.endsWith("-disposed") ? "disposed" : "acknowledged",
+              },
+            }
+          : {}),
         startedAt: now,
         completedAt: null,
         updatedAt: now,
@@ -715,13 +731,18 @@ it.each([
           ordinal: continuation ? 2 : 1,
           status: continuation
             ? continuationStatus
-            : ["fallback", "fallback-resumed"].includes(state)
-              ? "completed"
-              : state === "cancelled" || state === "interrupted"
-                ? state
-                : "running",
+            : unmirroredRestart
+              ? "cancelled"
+              : restart
+                ? "interrupted"
+                : ["fallback", "fallback-resumed"].includes(state)
+                  ? "completed"
+                  : state === "cancelled" || state === "interrupted"
+                    ? state
+                    : "running",
           instanceId: customCodexInstanceId,
         }),
+        ...(unmirroredRestart ? { cancelReason: "server_restart" } : {}),
         ...(continuation
           ? { delegatedTaskId: taskId, restartContinuationOfRunId: childRunId }
           : {}),
@@ -753,20 +774,33 @@ it.each([
           : {}),
       },
     ],
-    turnItems: state.startsWith("retrying")
-      ? [
-          {
-            type: "error",
-            status: "running",
-            runId: childRunId,
-            ordinal: 1,
-            failure: { message: retryCause },
-            retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
-            startedAt: now,
-            updatedAt: now,
-          },
-        ]
-      : [],
+    turnItems:
+      state === "restart-cancelled-marker"
+        ? [
+            {
+              type: "run_interrupt_request",
+              runId: childRunId,
+              cancelReason: "task_cancel",
+              message: "Parent cancelled this interrupted work.",
+              status: "completed",
+              ordinal: 1,
+              updatedAt: now,
+            },
+          ]
+        : state.startsWith("retrying")
+          ? [
+              {
+                type: "error",
+                status: "running",
+                runId: childRunId,
+                ordinal: 1,
+                failure: { message: retryCause },
+                retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
+                startedAt: now,
+                updatedAt: now,
+              },
+            ]
+          : [],
     visibleTurnItems: [],
     runtimeRequests: [],
     messages: [],
@@ -847,11 +881,15 @@ it.each([
     expect(result.status).toBe(
       continuation
         ? continuationStatus
-        : ["fallback", "fallback-resumed"].includes(state)
-          ? "completed"
-          : state === "cancelled" || state === "interrupted"
-            ? state
-            : "running",
+        : unmirroredRestart
+          ? "cancelled"
+          : restart
+            ? "interrupted"
+            : ["fallback", "fallback-resumed"].includes(state)
+              ? "completed"
+              : state === "cancelled" || state === "interrupted"
+                ? state
+                : "running",
     );
     if (continuation) {
       expect(result.cancelReason).toBe(
@@ -870,12 +908,17 @@ it.each([
       );
     }
     expect(result.taskId).toBe(taskId);
+    const resumable = (restart && !state.endsWith("-disposed")) || state === "restart-cancelled";
+    expect(result.resumable).toBe(resumable ? true : undefined);
+    expect(result.resumeThreadId).toBe(resumable ? childThreadId : undefined);
     expect(result.childThreadId).toBe(childThreadId);
     expect(result.finishedOn).toBe(
       ["fallback", "fallback-resumed"].includes(state) ? "claude-sonnet-5-5" : undefined,
     );
     if (
       continuation ||
+      restart ||
+      unmirroredRestart ||
       ["working", "cancelled", "interrupted", "fallback", "fallback-resumed"].includes(state)
     )
       expect(result.retry).toBeNull();

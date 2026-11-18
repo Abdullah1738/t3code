@@ -5,6 +5,7 @@ import {
   CommandId,
   LONG_TASK_HISTOGRAM_RATIO,
   AnalyticsEvent,
+  AnalyticsReadResult,
   type AnalyticsReadInput,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -26,6 +27,7 @@ import * as ServerConfig from "../../config.ts";
 import * as Analytics from "./Analytics.ts";
 import type { AnalyticsRollup } from "./rollup.ts";
 
+const decodeReadResult = Schema.decodeUnknownSync(AnalyticsReadResult);
 const day = "2026-11-13";
 const ts = `${day}T12:00:00.000Z`;
 const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
@@ -84,6 +86,79 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect(
+    "reads Claude API failures by status, requested model and host without counting give-ups as attempts",
+    () =>
+      Effect.gen(function* () {
+        const setup = yield* fixture;
+        const analytics = yield* open(setup);
+        const detail = {
+          model: "claude-opus-5-5[1m]",
+          host: "router.test",
+          path: "/v1",
+          status: 404,
+          errorCode: "model_not_found",
+          errorType: "not_found_error",
+          errorText: "model unavailable",
+          attempt: 1,
+          resume: true,
+        };
+        for (const row of [
+          event({
+            kind: "provider.claude_api_error",
+            surface: "server",
+            route: "provider",
+            phase: "attempt",
+            claudeApiError: detail,
+          }),
+          event({
+            kind: "provider.claude_api_error",
+            surface: "server",
+            route: "provider",
+            phase: "give_up",
+            claudeApiError: detail,
+          }),
+          event({
+            kind: "provider.claude_api_error",
+            surface: "server",
+            route: "provider",
+            phase: "attempt",
+            claudeApiError: {
+              ...detail,
+              status: 503,
+              model: "claude-sonnet-5-5",
+              host: "api.anthropic.com",
+            },
+          }),
+        ])
+          yield* analytics.record(row);
+        yield* analytics.flush;
+        const result = yield* analytics.read({ day, kind: "provider.claude_api_error" });
+        assert.deepEqual(result.rollup.claudeApiErrors, [
+          {
+            status: 404,
+            model: "claude-opus-5-5[1m]",
+            host: "router.test",
+            attempts: 1,
+            giveUps: 1,
+          },
+          {
+            status: 503,
+            model: "claude-sonnet-5-5",
+            host: "api.anthropic.com",
+            attempts: 1,
+            giveUps: 0,
+          },
+        ]);
+        assert.equal(
+          (yield* readSamples(analytics, { day, kind: "provider.claude_api_error" })).length,
+          3,
+        );
+        const section = yield* analytics.read({ day, section: "claudeApiErrors" });
+        assert.equal(section.rows?.length, 2);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("reads slot and claim decisions in defaults and by kind", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;
@@ -773,6 +848,36 @@ describe("Analytics", () => {
       assert.equal(persisted.askLatency.sentToSeen.p50Ms, 20 * 60_000);
       assert.isFalse(JSON.stringify(persisted).includes("private"));
     }).pipe(Effect.provide(Sqlite.layerMemory.pipe(Layer.provideMerge(NodeServices.layer)))),
+  );
+  it.effect("reads persisted deadline phases in MCP samples and rollup groups", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const phases = ["parent_records", "receipt", "dispatch", "handler"] as const;
+      for (const errorPhase of phases)
+        yield* analytics.record(
+          event({
+            kind: "mcp.call",
+            surface: "server",
+            tool: "delegate_task",
+            outcome: "timeout",
+            errorTag: "delegation_timeout",
+            errorPhase,
+          }),
+        );
+      yield* analytics.flush;
+      const cold = yield* open(setup);
+      const result = yield* cold.read({ day, kind: "mcp.call", tool: "delegate_task" });
+      assert.deepEqual(decodeReadResult(result), result);
+      assert.sameMembers(
+        result.samples.map((row) => row.errorPhase),
+        [...phases],
+      );
+      assert.sameDeepMembers(
+        [...result.rollup.mcpCalls[0]!.errors],
+        phases.map((errorPhase) => ({ errorTag: "delegation_timeout", errorPhase, count: 1 })),
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
   it.effect(
     "filters MCP samples and rollups by tool and outcome while persisting the full day",
