@@ -70,6 +70,17 @@ function fields(entry: LogEntry, at: Date) {
     // Only triage supplies a bounded, credential-redacted classifier diagnostic.
     if (entry.component === "triage" && entry.name === "triage.classify" && key === "classifier_error"
       && typeof value === "string" && value.length <= 400 && !/[\x00-\x1f]/.test(value)) props[key] = value;
+    else if (entry.name === "watch.pause_probe" && key === "error_first_line" && typeof value === "string") {
+      props[key] = value.split(/[\r\n]/, 1)[0]!.replace(/[\x00-\x1f]/g, " ")
+        .replace(/https?:\/\/\S+/gi, "[url]")
+        .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[credential]")
+        .replace(/((?:password|secret|token|api[_-]?key|authorization)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*(?:"|\\?$)|'(?:\\.|[^'\\])*(?:'|\\?$)|[^\s,;]+)/gi, "$1[redacted]")
+        .replace(/\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]+/g, "[redacted]").slice(0, 500);
+    }
+    else if ((entry.name === "watch.pause_probe" || entry.name === "watch.auto_resumed")
+      && ["attempts", "paused_ms", "duration_ms"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if (entry.name === "watch.pause_probe" && key === "ok" && typeof value === "boolean") props[key] = value;
+    else if (entry.name === "watch.pause_probe" && key === "next_at" && typeof value === "string" && Number.isFinite(Date.parse(value))) props[key] = new Date(value).toISOString();
     else if (fileEvent && key === "path" && typeof value === "string" && value.length <= 1024 && value.startsWith("/") && !/[\x00-\x1f]/.test(value)) props[key] = value;
     else if (fileEvent && (key === "attempts" || key === "ms") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (fileEvent && key === "dataless" && typeof value === "boolean") props[key] = value;
