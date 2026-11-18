@@ -29348,14 +29348,35 @@ it.effect.each(
   }),
 );
 
-it.effect.each(["work", "review"] as const)(
-  "#1891 an accepted %s wake survives unrelated pool occupancy",
-  (role) =>
+it.effect.each([
+  { role: "work", mixedStep: false, occupied: true },
+  { role: "review", mixedStep: false, occupied: true },
+  { role: "work", mixedStep: true, occupied: false },
+  { role: "work", mixedStep: true, occupied: true },
+] as const)(
+  "#1891 an accepted $role wake survives pool occupancy=$occupied (mixed step=$mixedStep)",
+  ({ role, mixedStep, occupied }) =>
     Effect.gen(function* () {
       const gate = yield* assignmentGate;
       const analytics: AnalyticsEvent[] = [];
       yield* Effect.gen(function* () {
         const { kanban, board, store, card, thread } = yield* reuseDeliveryFixture(role);
+        if (mixedStep) {
+          const current = (yield* kanban.card(card.id)).card;
+          const open = { state: "open" as const, note: null, doneBy: null, doneAt: null };
+          yield* store.putCard({
+            ...current,
+            subtasks: [
+              { ...open, id: "s1", step: 1, owner: "work", text: "Build", state: "done" },
+              { ...open, id: "s2", step: 2, owner: "review", text: "Review", state: "done" },
+              { ...open, id: "s8", step: 3, owner: "evaluator", text: "Handle release" },
+              { ...open, id: "s9", step: 3, owner: "work", text: "Resume main work" },
+              { ...open, id: "s10", step: 4, owner: "review", text: "Review main work" },
+            ],
+            subtaskSeq: 10,
+            wakeNote: "Card is in in_review; evaluator subtasks s8, s3, s4 are now.",
+          });
+        }
         yield* kanban.setPool(board.id, board.defaultCardModel, 1);
         const sibling = yield* kanban.createCard(
           board.id,
@@ -29368,15 +29389,107 @@ it.effect.each(["work", "review"] as const)(
         const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
         yield* Deferred.await(gate.entered);
         const claim = (yield* kanban.card(card.id)).card;
+        if (occupied)
+          yield* store.putCard({
+            ...sibling,
+            stage: "working",
+            activeThreadId: ThreadId.make("other-occupant"),
+            activeRole: "work",
+            activePool: claim.activePool,
+          });
+        yield* Deferred.succeed(gate.release, undefined);
+        yield* Fiber.join(dispatch);
+        const after = yield* kanban.card(card.id);
+        assert.equal(after.card.stage, role === "work" ? "working" : "in_review");
+        assert.equal(after.card.activeThreadId, thread);
+        if (mixedStep) {
+          assert.equal(kanbanOpenStep(after.card), 3);
+          assert.equal(after.card.subtasks.find((subtask) => subtask.id === "s8")?.state, "open");
+          assert.equal(after.card.subtasks.find((subtask) => subtask.id === "s9")?.state, "open");
+        }
+        assert.isFalse(after.events.some((event) => event.assignmentWake != null));
+        assert.lengthOf(gate.withdrawals, 0);
+        assert.isFalse(analytics.some((event) => event.kind === "kanban.assignment_wake.rollback"));
+        yield* kanban.dispatchNow;
+        assert.lengthOf(gate.fake.sends, before + 1);
+      }).pipe(
+        Effect.provide(
+          inlineTestLayer(gate.layer).pipe(Layer.provide(poolAnalyticsLayer(analytics))),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["work", "review"] as const)(
+  "#1891 an already accepted %s key keeps its claim when re-woken after review",
+  (role) =>
+    Effect.gen(function* () {
+      const gate = yield* assignmentGate;
+      const analytics: AnalyticsEvent[] = [];
+      yield* Effect.gen(function* () {
+        const {
+          kanban,
+          board,
+          store,
+          card,
+          thread: reviewer,
+        } = yield* reuseDeliveryFixture("review");
+        yield* kanban.dispatchNow;
+        yield* kanban.reviewResult(reviewer, "findings", ["Follow up on the review"], "abc1234");
+        const worker = (yield* kanban.card(card.id)).card.workThreadId!;
+        if (role === "review") {
+          yield* kanban.dispatchNow;
+          yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+            _tag: "thread",
+            threadId: worker,
+          });
+          yield* kanban.turnEnded(worker);
+        }
+        const thread = role === "work" ? worker : reviewer;
+        const before = gate.fake.sends.filter((send) => send.threadId === thread).length;
+        yield* kanban.setPool(
+          board.id,
+          role === "work" ? board.defaultCardModel : board.evaluatorModel,
+          1,
+        );
+        const parked = (yield* kanban.card(card.id)).card;
+        if (role === "review") {
+          assert.isAbove(parked.reviewRound, 0);
+          assert.equal(parked.reviewThreadId, reviewer);
+        }
+        yield* kanban.dispatchNow;
+        const first = gate.fake.sends.at(-1)!;
+        assert.equal(first.threadId, thread);
+        assert.isString(first.key);
+        const messages = [...(yield* Ref.get(gate.fake.threads)).get(thread)!.messages];
+        // Restore the unbound card left by the old rollback, retaining the accepted delivery receipt.
+        yield* store.putCard(parked);
+        const sibling = yield* kanban.createCard(
+          board.id,
+          { title: "Other review occupant", prompt: "Other review", priority: 99 },
+          owner,
+        );
+        gate.control.enabled = true;
+        const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+        yield* Deferred.await(gate.entered);
+        const claim = (yield* kanban.card(card.id)).card;
         yield* store.putCard({
           ...sibling,
-          stage: "working",
+          stage: role === "work" ? "working" : "in_review",
           activeThreadId: ThreadId.make("other-occupant"),
-          activeRole: "work",
+          activeRole: role,
           activePool: claim.activePool,
         });
         yield* Deferred.succeed(gate.release, undefined);
         yield* Fiber.join(dispatch);
+        assert.deepEqual(
+          gate.fake.sends
+            .filter((send) => send.threadId === thread)
+            .slice(before)
+            .map((send) => send.key),
+          [first.key, first.key],
+        );
+        assert.deepEqual((yield* Ref.get(gate.fake.threads)).get(thread)!.messages, messages);
         const after = yield* kanban.card(card.id);
         assert.equal(after.card.stage, role === "work" ? "working" : "in_review");
         assert.equal(after.card.activeThreadId, thread);
@@ -29384,7 +29497,21 @@ it.effect.each(["work", "review"] as const)(
         assert.lengthOf(gate.withdrawals, 0);
         assert.isFalse(analytics.some((event) => event.kind === "kanban.assignment_wake.rollback"));
         yield* kanban.dispatchNow;
-        assert.lengthOf(gate.fake.sends, before + 1);
+        assert.lengthOf(
+          gate.fake.sends.filter((send) => send.threadId === thread),
+          before + 2,
+        );
+        if (role === "review") {
+          yield* kanban.reviewResult(thread, "clear", [], "abc1234");
+          assert.isTrue(
+            (yield* kanban.card(card.id)).events.some(
+              (event) => event.kind === "review" && event.body === "clear",
+            ),
+          );
+        } else {
+          const read = yield* kanban.agentCall(thread, kanban.card(card.id));
+          assert.equal(read.card.activeThreadId, thread);
+        }
       }).pipe(
         Effect.provide(
           inlineTestLayer(gate.layer).pipe(Layer.provide(poolAnalyticsLayer(analytics))),
