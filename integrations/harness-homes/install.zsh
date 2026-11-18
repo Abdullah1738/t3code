@@ -4,6 +4,7 @@
 #   install.zsh            copy, generate, check
 #   install.zsh --check    check only (no copy, no write)
 #   install.zsh --flighty-python   prepare only the dedicated Flighty Python
+#   install.zsh --inbody-python    prepare only the dedicated InBody runtime
 #   install.zsh --with-agent   also (re)load com.ardud.harness-homes every 5 min
 set -eu
 
@@ -21,17 +22,17 @@ reload_helper="$pkg/../local-helpers/libexec/opencode-reload/opencode_reload.py"
 for arg in "$@"; do
   case "$arg" in
     --allow-reload) reload_flags+=(--allow-reload) ;;
-    --check|--dry-run|--flighty-python)
-      [[ $mode == install ]] || { print -u2 'choose --check, --dry-run or --flighty-python'; exit 2; }
+    --check|--dry-run|--flighty-python|--inbody-python)
+      [[ $mode == install ]] || { print -u2 'choose --check, --dry-run, --flighty-python or --inbody-python'; exit 2; }
       mode="${arg#--}"
       ;;
     --with-agent) with_agent=1 ;;
-    *) print -u2 "usage: install.zsh [--check | --dry-run | --flighty-python] [--with-agent] [--allow-reload]"; exit 2 ;;
+    *) print -u2 "usage: install.zsh [--check | --dry-run | --flighty-python | --inbody-python] [--with-agent] [--allow-reload]"; exit 2 ;;
   esac
 done
 
-if [[ "$mode" == flighty-python ]]; then
-  "$py" "$pkg/shared/flighty_python.py"
+if [[ "$mode" == flighty-python || "$mode" == inbody-python ]]; then
+  "$py" "$pkg/shared/${mode//-/_}.py"
   exit
 fi
 
@@ -91,11 +92,13 @@ opencode_config=$("$py" -c 'import sys; sys.path.insert(0, sys.argv[1]); import 
 "$py" "$reload_helper" --installer harness-homes --dry-run --pair "$preflight_dir/opencode.jsonc" \
   "$opencode_config" >"$preflight_dir/reload-preview"
 "$py" "$pkg/shared/flighty_python.py" --dry-run
+"$py" "$pkg/shared/inbody_python.py" --dry-run
 if [[ $mode == dry-run ]]; then
   cat "$preflight_dir/reload-preview"
   exit
 fi
 "$py" "$pkg/shared/flighty_python.py"
+"$py" "$pkg/shared/inbody_python.py"
 
 backup_dir=$(mktemp -d "${TMPDIR:-/tmp}/harness-homes-install.XXXXXX")
 agents=(com.ardud.shared-mcp-flighty com.ardud.shared-mcp-inbody)
@@ -193,6 +196,13 @@ done
 (( ready )) || {
   print -u2 -r -- "${last_check_output:-}"
   print -u2 "Shared MCP startup failed; configs were not switched"
+  for server in flighty inbody; do
+    err_log="$HOME/Library/Logs/com.ardud.shared-mcp-$server.err.log"
+    if [[ -r "$err_log" ]]; then
+      print -u2 -r -- "Last 20 lines of $err_log:"
+      tail -n 20 "$err_log" >&2
+    fi
+  done
   exit 1
 }
 if ! cmp -s "$pkg/manifest.json" "$dst/manifest.json"; then

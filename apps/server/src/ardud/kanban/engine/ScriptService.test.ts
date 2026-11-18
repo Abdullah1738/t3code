@@ -64,6 +64,7 @@ import type * as Waits from "./waits.ts";
 const threads = Layer.succeed(
   KanbanThreads,
   KanbanThreads.of({
+    liveThreadIds: () => Effect.succeed([]),
     remove: () => Effect.void,
     pendingUserInputs: () => Effect.succeed([]),
     claimContext: () => Effect.succeed(null),
@@ -1022,6 +1023,7 @@ it.effect(
     const recording = Layer.succeed(
       KanbanThreads,
       KanbanThreads.of({
+        liveThreadIds: () => Effect.succeed([]),
         remove: () => Effect.void,
         pendingUserInputs: () => Effect.succeed([]),
         claimContext: () => Effect.succeed(null),

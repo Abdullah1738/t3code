@@ -72,6 +72,9 @@ class ParserTests(unittest.TestCase):
 
     def test_sanitized_real_delivered_elapsed_subject(self):
         for subject in ['Delivered in 11 hrs 23 mins', 'Delivered in 2 hours',
+                        'Delivered in 10 hrs 31 mins', 'Delivered in 1 hr',
+                        'Delivered in 2 hours 5 minutes', 'Delivered in 1 hour 1 minute.',
+                        'Delivered in 2 hrs!', '  DELIVERED  in\t10 hrs 31 mins  ',
                         'Delivered: "Fixture"']:
             with self.subTest(subject=subject):
                 self.assertEqual(parse(shipment(subject))[0]['stage'], 'delivered')
@@ -105,6 +108,14 @@ class ParserTests(unittest.TestCase):
                         'How to cancel your order', 'Your order has not been delivered']:
             with self.subTest(subject=subject):
                 self.assertNotIn(a.classify_subject(subject), ('delivered', 'cancelled', 'shipped'))
+
+    def test_elapsed_delivery_rule_requires_the_whole_subject(self):
+        for subject in ['Delivery in 2 days', 'Arriving in 3 hrs', 'Will be delivered in 2 hrs',
+                        'Expected to be delivered in 4 hours', 'Not delivered in 10 hrs',
+                        'Delivered in 10 hrs if all goes well', 'Delivered in 45 mins',
+                        'Delivered in 10 hrs. Remaining items tomorrow']:
+            with self.subTest(subject=subject):
+                self.assertNotEqual(a.classify_subject(subject), 'delivered')
 
     def test_trusted_sender_not_display_name_or_suffix(self):
         for sender in ['Amazon <status@evil.invalid>', 'Amazon <x@amazon.ae.evil.invalid>',

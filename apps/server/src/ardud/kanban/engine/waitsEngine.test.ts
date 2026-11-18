@@ -265,6 +265,7 @@ const makeWorld = (
   const threadsLayer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      liveThreadIds: () => Effect.succeed([]),
       remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: () => Effect.succeed(null),
@@ -1946,9 +1947,11 @@ it.effect("an undelivered evaluator wake holds both pushed and tick waits until 
       yield* kanban.tick;
       assert.isUndefined((yield* cardOf(pushed.id)).wait);
       assert.strictEqual((yield* cardOf(pushed.id)).stage, "in_review");
+      assert.isNull((yield* cardOf(pushed.id)).deciding?.toldAt);
       yield* TestClock.adjust(Waits.WAIT_DECIDE_MS - MINUTE);
       yield* kanban.tick;
       assert.strictEqual((yield* cardOf(pushed.id)).stage, "in_review");
+      assert.isNull((yield* cardOf(pushed.id)).deciding?.toldAt);
       yield* TestClock.adjust(2 * MINUTE);
       yield* kanban.tick;
       assert.strictEqual((yield* cardOf(pushed.id)).stage, "completed");
@@ -2622,7 +2625,9 @@ const OldCardDetail = Schema.Struct({
 });
 const oldClientReads = Schema.decodeUnknownResult(OldCardDetail);
 const thisClientReads = Schema.decodeUnknownResult(KanbanCardDetail);
-const readAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent, { onExcessProperty: "error" });
+const readAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent, {
+  onExcessProperty: "error",
+});
 const encodeDetail = Schema.encodeUnknownSync(KanbanCardDetail);
 const onTheWire = (detail: KanbanCardDetail): unknown =>
   JSON.parse(JSON.stringify(encodeDetail(detail)));

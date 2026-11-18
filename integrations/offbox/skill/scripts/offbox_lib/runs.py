@@ -2746,17 +2746,16 @@ class Interrupted(OffboxError):
 
     def __init__(self, what: str, status=None):
         self.interruption = interruption_info(status) or {}
+        restarted = (status.get('interruptedAt') or status.get('serverStartedAt')) if isinstance(status, dict) else status
+        if restarted and not self.interruption:
+            self.interruption = {'cause':'boatd_restart', 'message':f'the offbox server restarted at {restarted}; nothing was re-run'}
         super().__init__(interruption_message(what, self.interruption) + f"\nexit {EXIT_INTERRUPTED}",
                          code=EXIT_INTERRUPTED, started=True)
 
 
 def retry_interrupted(a) -> bool:
-    """May the server run this command again by itself after a power cut? Yes for an ordinary `offbox run` (a
-    synced repo plus a test or build command: running it twice is harmless). No for person-box work (her
-    accounts, messages, logins: never twice without someone deciding), and no with --no-retry."""
-    if api.BACKEND != "server" or getattr(a, "no_retry", False):
-        return False
-    return person() is None
+    """Do not opt into replay on legacy servers. Started commands must be recovered in place."""
+    return False
 
 
 # A cold boot of the home server can take this long (it trains memory): after a dropped stream the client keeps

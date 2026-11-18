@@ -1226,6 +1226,28 @@ def drop_inventory(inventory, volume, now):
                 parentEntries=parent_entries, duMode=inventory.get('duMode'))
 
 
+def size_movers(sizes, old_sizes, uncertain=(), tracked=None):
+    """Comparable inventory deltas shared by swing and floor attribution."""
+    return sorted(((path, size-old_sizes[path]) for path, size in sizes.items()
+                   if number(size) and number(old_sizes.get(path)) and path not in uncertain
+                   and (tracked is None or path in tracked) and size != old_sizes[path]),
+                  key=lambda item: (-abs(item[1]), item[0]))
+
+
+def opencode_inventory_size(inventory, now):
+    parent = str(Path.home() / '.local/share')
+    path = str(Path.home() / '.local/share/opencode')
+    try:
+        size = inventory['children'][parent][path]
+        entry = inventory['childState'][parent][path]
+        if (number(size) and entry.get('partial') is False and number(entry.get('at'))
+                and 0 <= now-entry['at'] <= 7200 and entry.get('isDirectory') is True):
+            return size
+    except (KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
 def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/ExternalSSD'), paths=None):
     started = time.monotonic()
     sampled_at = dt.datetime.now(dt.timezone.utc)
@@ -1309,6 +1331,10 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
         cached = inventory.get('sizes', {})
         if isinstance(cached, dict):
             sizes.update({path: size for path, size in cached.items() if number(size)})
+        opencode = str(home / '.local/share/opencode')
+        child_size = opencode_inventory_size(inventory, time.time())
+        if number(child_size):
+            sizes[opencode] = child_size
     old_sizes = previous.get('sizes', {})
     if not isinstance(old_sizes, dict):
         old_sizes = {}
@@ -1324,8 +1350,7 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
         cached_sizes = inventory.get('sizes', {})
         if isinstance(cached_sizes, dict):
             uncertain.update(cached_sizes)
-    deltas = [(path, size-old_sizes[path]) for path, size in sizes.items()
-              if path in old_sizes and number(old_sizes[path]) and path not in uncertain]
+    deltas = size_movers(sizes, old_sizes, uncertain)
     growers = sorted(((path, delta) for path, delta in deltas if delta > 0), key=lambda x: x[1], reverse=True)[:5]
     for i, (path, delta) in enumerate(growers, 1):
         props['grower%dPath' % i] = path
@@ -1333,9 +1358,9 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
     movers = []
     if (not props['inventoryStale'] and number(previous.get('inventoryAt'))
             and 0 <= time.time()-previous['inventoryAt'] <= 7200):
-        tracked = {str(path) for path in paths} | {str(path) for path in DIRECTORY_ROOTS} | {str(temp_dir)}
-        movers = sorted(((path, delta) for path, delta in deltas if delta and path in tracked),
-                        key=lambda item: (-abs(item[1]), item[0]))[:3]
+        tracked = ({str(path) for path in paths} | {str(path) for path in DIRECTORY_ROOTS}
+                   | {str(temp_dir), str(home / '.local/share/opencode')})
+        movers = size_movers(sizes, old_sizes, uncertain, tracked)[:3]
         if movers:
             props.update(topMover1Path=movers[0][0], topMover1GbDelta=round(movers[0][1]/1024**3, 6))
     props.update(count=len(growers), baseline=int(not old_sizes), sourceErrors=errors)
