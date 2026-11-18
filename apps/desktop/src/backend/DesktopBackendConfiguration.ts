@@ -542,6 +542,7 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
 
     return {
       executablePath: process.execPath,
+      manageProcessShutdown: environment.isPackaged && !environment.isDevelopment,
       // Packaged builds only, so a dev instance never shares the cache with the
       // prod app it is often run from. `--require` rather than NODE_COMPILE_CACHE,
       // so the setting does not leak into the provider and terminal processes
@@ -550,6 +551,7 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
         // A process-wide old-space flag overrides the SQLite workers' resource limits.
         ...(environment.isPackaged ? ["--require", environment.compileCachePath] : []),
         environment.backendEntryPath,
+        ...(environment.isPackaged ? ["--base-dir", environment.baseDir] : []),
         "--bootstrap-fd",
         "3",
       ],

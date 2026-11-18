@@ -13,6 +13,7 @@ import * as ElectronTheme from "../electron/ElectronTheme.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopLifecycle from "./DesktopLifecycle.ts";
+import * as BackendProcess from "../backend/DesktopBackendProcess.ts";
 import * as DesktopShutdown from "./DesktopShutdown.ts";
 import * as DesktopState from "./DesktopState.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
@@ -155,7 +156,10 @@ describe("DesktopLifecycle", () => {
           const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
           yield* lifecycle.register;
 
+          const backstop = vi.spyOn(BackendProcess, "forceKillCapturedBackends");
           appListeners.get("before-quit-for-update")?.();
+          assert.equal(backstop.mock.calls.length, 1);
+          backstop.mockRestore();
           yield* Effect.yieldNow;
 
           let prevented = false;
