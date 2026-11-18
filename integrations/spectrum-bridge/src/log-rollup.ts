@@ -11,6 +11,12 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const components = new Map<string, Map<string, { count: number; ok: number; failed: number; histogram: Map<number, number> }>>();
   const errors = new Map<string, { tag: string; name: string; count: number; sampleId?: string; site?: string; causeKinds?: Record<string, number> }>();
   const causes = new Map<string, { tag: string; causeKey: string; count: number }>();
+  const probeRows = new Map<string, Map<string, number>>();
+  function probeCause(key: string, row: string) {
+    const rows = probeRows.get(key) ?? new Map<string, number>();
+    rows.set(row, (rows.get(row) ?? 0) + 1);
+    probeRows.set(key, rows);
+  }
   const renderFailures = new Map<string, number>();
   const represented = new Set<string>();
   const representedSingleFailures = new Set<string>();
@@ -94,11 +100,24 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   for await (const line of lines) {
     day ??= line.ts.slice(0, 10);
     recordedRows++;
+    const probeRow = line.ids?.inboundId;
+    if (probeRow && /^row_[a-f0-9]{16}$/.test(probeRow)) {
+      if (line.name === "router.probe_backoff") {
+        const key = "router.probe_backoff\0admission_read_failed";
+        const item = causes.get(key) ?? { tag: "router.probe_backoff", causeKey: "admission_read_failed", count: 0 };
+        item.count++; causes.set(key, item); probeCause(key, probeRow);
+      } else if (line.error?.tag === "router.catch1") {
+        // Keep row concentration visible even when the request layer owns the failure count.
+        const key = "router.catch1\0admission_read_failed";
+        const item = causes.get(key) ?? { tag: "router.catch1", causeKey: "admission_read_failed", count: 0 };
+        item.count++; causes.set(key, item); probeCause(key, probeRow);
+      }
+    }
     robobLink.accept(line);
     chainAggregation.accept(line);
     if (line.name === "inbound.overdue") overdue++;
     if (line.name === "inbound.watchdog_requeued") requeued_by_watchdog++;
-    if (["inbound.unanswered_alert", "unanswered.alert"].includes(line.name) && line.ids?.inboundId) alerts.add(`${line.ids.chat}:${line.ids.inboundId}`);
+    if (["inbound.overdue_notice", "inbound.unanswered_alert", "unanswered.alert"].includes(line.name) && line.ids?.inboundId) alerts.add(`${line.ids.chat}:${line.ids.inboundId}`);
     if (line.name === "inbound.answered_late") answered_late++;
     if (line.name === "inbound.answered" && line.durationMs !== undefined && ["owner", "moni"].includes(line.ids?.chat ?? "")) {
       const ms = Math.round(line.durationMs); firstReplies.set(ms, (firstReplies.get(ms) ?? 0) + 1);
@@ -143,6 +162,9 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     dedupedFailures, okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countedErrors + failedCalls) / total : 0,
     promptProbe: { ...summarizePromptProbe(promptProbe), byHour: Object.fromEntries([...probeHours].sort().map(([hour, stats]) => [hour, summarizePromptProbe(stats)])) },
     durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),
-    topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20), chains: chainAggregation.summary(),
+    topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20).map(item => {
+      const rows = probeRows.get(`${item.tag}\0${item.causeKey}`);
+      return rows ? { ...item, distinctInboundIds: rows.size, topInboundIds: [...rows].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 14).map(([inboundId, count]) => ({ inboundId, count })) } : item;
+    }), chains: chainAggregation.summary(),
     topErrorTags: [...errors.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.name.localeCompare(b.name)).slice(0, 20) };
 }

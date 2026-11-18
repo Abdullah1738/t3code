@@ -82,6 +82,25 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(result['errorRate'], 3 / 4)
         self.assertNotIn('PRIVATE_TOKEN', json.dumps(result))
 
+    def test_probe_causes_show_fourteen_hot_rows_without_recounting_errors(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        rows = []
+        for attempt in range(4):
+            for number in range(14):
+                identity = {'inboundId': f'row_{number:016x}'}
+                rows.append({'ts': self.day + 'T12:00:00Z', 'component': 'router', 'kind': 'error',
+                             'name': 'bridge.catch', 'alreadyLogged': True, 'ids': identity,
+                             'error': {'tag': 'router.catch1', 'name': 'ControlError', 'status': 503}})
+                rows.append({'ts': self.day + 'T12:00:00Z', 'component': 'router', 'kind': 'event',
+                             'name': 'router.probe_backoff', 'ids': identity})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual(result['errorRate'], 0)
+        for tag in ['router.catch1', 'router.probe_backoff']:
+            self.assertIn({'tag': tag, 'causeKey': 'admission_read_failed', 'count': 56, 'distinctInboundIds': 14,
+                           'topInboundIds': [{'inboundId': f'row_{number:016x}', 'count': 4} for number in range(14)]}, result['topCauses'])
+
     def test_shared_render_root_path_shapes_with_and_without_counters(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as temp:

@@ -46,6 +46,7 @@ def isolate_boat(stack):
 def isolate_home(stack, root, *, guard_failover=True):
     from offbox_lib import common, home
 
+    stack.enter_context(patch.dict(os.environ, OFFBOX_TEST="1", OFFBOX_LOG_DIR=str(Path(root) / "tool-logs")))
     root = Path(root) / "home-backend"
     for name, filename in (("SERVER_CFG", "server.json"), ("BACKEND_STATE", "backend-state.json"),
                            ("BACKEND_PATH", "backend"), ("HOME_FAILURES", "home-failures.jsonl")):

@@ -141,7 +141,7 @@ test("an empty day does not absorb later days' outages", async () => {
 test("link event cleaning accepts only counts, normalized causes, route templates and timestamps", () => {
   const safe = { outageId: "c5995564-4258-465d-b39c-670db4c76d6a", firstFailureAt: "2026-11-16T12:00:00.000Z", cause: "ECONNREFUSED" as const,
     route: "/threads/:id/send", failedCalls: 10, suppressedCalls: 5, causes: { ECONNREFUSED: 10 },
-    inboundReceivedDuringOutage: 2, inboundAnsweredAfter: 1, inboundAnsweredDuringOutage: 0 };
+    inboundReceivedDuringOutage: 2, inboundAckedDuringOutage: 0, inboundAnsweredAfter: 1, inboundAnsweredDuringOutage: 0 };
   const dirty = { ...safe, text: "PRIVATE_MESSAGE", recoveredAt: "PRIVATE_MESSAGE", firstReplyAt: "PRIVATE_MESSAGE", causes: { ...safe.causes, PRIVATE_MESSAGE: 200 }, downMs: Infinity };
   expect(cleanRobobLink(dirty)).toEqual(safe);
   expect(cleanRobobLink({ ...safe, route: "/threads/:id/send?prompt=PRIVATE_MESSAGE" })).toBeUndefined();
@@ -167,11 +167,12 @@ test("a collapsed failure cannot discard pending render counts at the minute bou
   expect((await f.log.rollup(day))?.countsByName["card.render"]).toBe(1);
 });
 
-test("an open outage cannot attribute later traffic beyond its last observation to downtime", async () => {
+test("a restored outage closed before new traffic cannot attribute that traffic to downtime", async () => {
   const f = setup();
   for (let i = 0; i < 3; i++) f.call("ECONNREFUSED");
   await f.log.rollup(day);
   const restarted = createToolLog({ root: f.root, now: () => Date.parse(`${day}T15:00:00Z`) }); logs.push(restarted);
+  restarted.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok: true });
   restarted.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "owner", messageId: "after-restart" }, props: { backend: "robob" } });
   expect((await restarted.rollup(day))?.robob_link.messagesWaiting).toBe(0);
 });

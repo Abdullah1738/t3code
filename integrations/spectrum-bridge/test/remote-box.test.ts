@@ -8,13 +8,13 @@ import { opaqueId } from "../src/remote-protocol.ts";
 import { Store } from "../src/store.ts";
 import { BoxRunner } from "../../moni-box-runner/src/runner.ts";
 import { ChatRegistry, createAgentBus, createSbApi } from "../src/runtime.ts";
-import { chatKey, type Line } from "../src/line.ts";
+import { chatKey, LineError, type Line } from "../src/line.ts";
 import { parseCommand } from "../src/cli.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { fenceOwnerAlert, notificationAccepted } from "../src/telegram-fallback.ts";
 import { createApi as createTelegramApi } from "../../telegram-bridge/src/api.ts";
 import { Store as TelegramStore } from "../../telegram-bridge/src/store.ts";
-import { toolLog } from "../src/toollog.ts";
+import { createToolLog, toolLog } from "../src/toollog.ts";
 import { summarizeLog } from "../src/log-rollup.ts";
 const roots: string[] = [], closes: (() => void)[] = [];
 afterEach(() => { closes.splice(0).forEach(f => f()); roots.splice(0).forEach(p => rmSync(p, { recursive: true, force: true })); });
@@ -44,6 +44,7 @@ function setup() {
       if (String(url).endsWith("/deliver") && dropAck) { dropAck = false; throw new Error("lost ack"); } return response; }),
   } satisfies ConstructorParameters<typeof RemoteBox>[2];
   let remote = new RemoteBox(config, store, io);
+  closes.push(() => remote.stop());
   const line: Line = { number: "+15550000000", events: async function* () {}, backfill: async () => [], outbound: async () => [],
     sendText: async () => ({ handle: "sent" }), upload: async () => "https://media.example/file", getMessage: async () => undefined,
     sendApp: async () => ({ handle: "sent" }), react: async () => {}, typing: async () => {}, read: async () => {},
@@ -53,7 +54,7 @@ function setup() {
     readiness: (router: boolean, callback: boolean) => { routerReady = router; callbackReady = callback; },
     ownerAlert: (alert: typeof io.ownerAlert) => { io.ownerAlert = alert; },
     requestHook: (hook: typeof requestHook) => { requestHook = hook; },
-    restart: () => { const reopened = new Store(join(mac, "state.sqlite")); closes.push(() => reopened.close()); remote = new RemoteBox(config, reopened, io); },
+    restart: () => { remote.stop(); const reopened = new Store(join(mac, "state.sqlite")); closes.push(() => reopened.close()); remote = new RemoteBox(config, reopened, io); },
     failNotice: () => { io.notice = async id => { notices.push(id); throw new Error("ambiguous notice"); }; },
     advance: (ms = 65_000) => { now += ms; }, offline: () => { online = false; }, online: () => { online = true; }, drop: () => { dropAck = true; }, rollback: () => { active = false; },
     request: (path: string, body: unknown = {}, auth = callbackToken) => new Request(`http://bridge${path}`, { method: "POST", headers: { authorization: `Bearer ${auth}` }, body: JSON.stringify({ epoch: "test", ...body as object }) }),
@@ -168,8 +169,9 @@ test("remote fenced DM alerts once at ten minutes across restart, without requeu
   });
   expect(s.alerts.filter(a => a.key === `imessage-unanswered:${opaqueId("dm")}`)).toHaveLength(1);
   expect(s.requests).toHaveLength(before);
-  expect(logs.filter(l => l.name === "unanswered.alert")).toHaveLength(2);
-  expect(logs.find(l => l.name === "unanswered.alert")?.props?.backend).toBe("remote-box");
+  expect(logs.filter(l => l.name === "inbound.overdue_notice")).toHaveLength(2);
+  expect(logs.find(l => l.name === "inbound.overdue_notice")?.props?.backend).toBe("remote-box");
+  expect(logs.some(l => l.name === "inbound.unanswered" || l.error?.tag === "inbound.unanswered")).toBe(false);
   expect((await summarizeLog((async function* () { yield* logs; })())).unanswered_alerts).toBe(2);
   expect(s.store.db.query("SELECT 1 FROM inbound").get()).toBeNull();
   expect(files(s.mac)).not.toContain("PRIVATE_");
@@ -424,7 +426,149 @@ test("remote commands require an owner session; resolve is reconciled and cannot
     const nextPage = await cli("remote-events", "--chat", "moni", "--session", "owner-thread", "--after", metadata.nextCursor);
     expect(nextPage.code).toBe(0); expect(JSON.parse(nextPage.stdout).events[0].id).toBe(opaqueId("cli-page:100"));
     expect(() => parseCommand(["remote-events", "--chat", "moni", "--session", "owner-thread", "--after", "short"])).toThrow("--after");
+    const actionId = opaqueId("cli-backing-off");
+    s.runner.db.query("INSERT INTO actions(id,path,payload,state,inbox_id,attempts,last_status,next_at) VALUES (?,'/react',?,'pending',?,2,502,99999)")
+      .run(actionId, JSON.stringify({ target: "PRIVATE_ACTION_TARGET", text: "PRIVATE_ACTION_TEXT", token: "PRIVATE_ACTION_TOKEN" }), id);
+    s.runner.db.query("INSERT INTO actions(id,path,payload,state) VALUES (?,'/metrics','{}','pending')").run(opaqueId("hidden-metric"));
+    const actionsPage = await cli("remote-events", "--chat", "moni", "--session", "owner-thread");
+    expect(actionsPage.code).toBe(0);
+    expect(JSON.parse(actionsPage.stdout).actions).toEqual([{ id: actionId.slice(0, 12), path: "/react", attempts: 2, lastStatus: 502, nextAt: 99999, inboxId: id.slice(0, 12) }]);
+    expect(actionsPage.stdout).not.toContain("PRIVATE_"); expect(actionsPage.stdout).not.toContain("payload");
   } finally { await server.stop(true); }
+});
+
+test.each([
+  { retryable: false, uncertain: false, status: 422 }, { retryable: true, uncertain: false, status: 502 },
+  { retryable: false, uncertain: true, status: 502 }, { retryable: true, uncertain: true, status: 502 },
+])("reaction LineError classification retryable=$retryable uncertain=$uncertain is private and cap-safe", async ({ retryable, uncertain, status }) => {
+  const s = setup(), target = "PRIVATE_REACTION_TARGET";
+  s.remote.accept(target, { text: "PRIVATE_MESSAGE_TEXT" });
+  const io = { line: { ...s.line, react: async () => { throw new LineError("PRIVATE_ERROR_BODY", "http_400:invalid_number", retryable, uncertain); } },
+    chat: chatKey.dm("+15555550199"), bus: async () => Response.json({}) };
+  const lines = await captureLogs(async () => {
+    expect((await s.remote.callback(s.request("/react", { target, kind: "like" }), io)).status).toBe(status);
+    s.advance(60_000); await s.remote.tick();
+  });
+  const failure = lines.find(l => l.name === "moni-runner-error")!;
+  expect(failure.kind).toBe("error");
+  expect(failure.props).toEqual({ path: "/react", status, errorClass: "LineError", code: "http_400:invalid_number", retryable, count: 0 });
+  expect(JSON.stringify(lines)).not.toContain("PRIVATE_"); expect(s.logs.join("\n")).not.toContain("PRIVATE_");
+  const root = join(s.root, "capped"), log = createToolLog({ root, now: () => 0, capBytes: 1 });
+  log.write({ component: "fixture", kind: "event", name: "fill" }); log.write(failure);
+  const raw = readFileSync(join(root, "1970-01-01.ndjson"), "utf8");
+  expect(raw).toContain('"name":"moni-runner-error"'); expect(raw).toContain('"path":"/react"'); expect(raw).not.toContain("PRIVATE_");
+});
+
+test("100 callback failures aggregate to one summary with 99 suppressed repeats and flush without another failure", async () => {
+  const s = setup(), target = "PRIVATE_TARGET"; s.remote.accept(target, {});
+  const io = { line: { ...s.line, react: async () => { throw new LineError("PRIVATE_ERROR", "network", true, false); } },
+    chat: chatKey.dm("+15555550199"), bus: async () => Response.json({}) };
+  const lines = await captureLogs(async () => {
+    for (let n = 0; n < 100; n++) {
+      expect((await s.remote.callback(s.request("/react", { target, kind: "like" }), io)).status).toBe(502);
+      s.advance(599);
+    }
+    expect(s.logs.filter(l => l.startsWith("moni-runner-error"))).toHaveLength(0);
+    s.advance(100); await s.remote.tick();
+    expect(s.logs.filter(l => l.startsWith("moni-runner-error"))).toHaveLength(1);
+    await s.remote.callback(s.request("/react", { target, kind: "like" }), io);
+    s.advance(60_000); await s.remote.tick();
+  });
+  expect(lines.filter(l => l.name === "moni-runner-error").map(l => l.props?.count)).toEqual([99, 0]);
+  expect(JSON.stringify(lines)).not.toContain("PRIVATE_");
+});
+
+test("callback aggregation separates route and status, sanitizes unknown code/name, and catches async bus failures", async () => {
+  const s = setup(); s.remote.accept("PRIVATE_TARGET", {});
+  let error: unknown = new LineError("PRIVATE_ERROR", "PRIVATE_CODE", false, false);
+  const io = { line: { ...s.line, react: async () => { throw error; } }, chat: chatKey.dm("+15555550199"), bus: async (): Promise<Response> => { throw error; } };
+  const lines = await captureLogs(async () => {
+    await s.remote.callback(s.request("/react", { target: "PRIVATE_TARGET", kind: "like" }), io);
+    error = Object.assign(new Error("PRIVATE_BODY"), { name: "PRIVATE_NAME" });
+    await s.remote.callback(s.request("/react", { target: "PRIVATE_TARGET", kind: "like" }), io);
+    expect((await s.remote.callback(s.request("/agent-ask", { operationId: opaqueId("bus") }), io)).status).toBe(502);
+    s.advance(60_000); await s.remote.tick();
+  });
+  const failures = lines.filter(l => l.name === "moni-runner-error"); expect(failures).toHaveLength(3);
+  expect(failures.map(l => [l.props?.path, l.props?.status, l.props?.errorClass, l.props?.code])).toEqual([
+    ["/react", 422, "LineError", "lineFailure"], ["/react", 502, "Error", undefined], ["/agent-ask", 502, "Error", undefined],
+  ]);
+  expect(JSON.stringify(lines)).not.toContain("PRIVATE_"); expect(s.logs.join("\n")).not.toContain("PRIVATE_");
+});
+
+test("stop flushes an open aggregation window once before 60 seconds and deletes its key", async () => {
+  const s = setup(); s.remote.accept("PRIVATE_TARGET", {});
+  const io = { line: { ...s.line, react: async () => { throw new LineError("PRIVATE_ERROR", "network", true, false); } },
+    chat: chatKey.dm("+15555550199"), bus: async () => Response.json({}) };
+  const lines = await captureLogs(async () => {
+    for (let n = 0; n < 100; n++) await s.remote.callback(s.request("/react", { target: "PRIVATE_TARGET", kind: "like" }), io);
+    expect(s.logs.filter(l => l.startsWith("moni-runner-error"))).toHaveLength(0);
+    s.remote.stop(); s.remote.stop();
+    s.advance(60_000); await s.remote.tick(); s.remote.stop();
+  });
+  expect(lines.filter(l => l.name === "moni-runner-error").map(l => l.props?.count)).toEqual([99]);
+  expect(JSON.stringify(lines)).not.toContain("PRIVATE_");
+});
+
+test.each([
+  { retryable: false, uncertain: false }, { retryable: true, uncertain: false },
+  { retryable: false, uncertain: true }, { retryable: true, uncertain: true }, { retryable: null, uncertain: null },
+])("uncertain send history failure retryable=$retryable uncertain=$uncertain keeps the runner blocked without resending", async ({ retryable, uncertain }) => {
+  const s = setup(); let sends = 0, turns = 0; const paths: string[] = [];
+  const id = opaqueId("uncertain-history"), inbox = opaqueId("later-inbox");
+  s.store.db.query("INSERT INTO remote_sends VALUES (?,1000,'uncertain',NULL)").run(id);
+  const io = { line: { ...s.line, outbound: async (): Promise<never> => {
+    throw retryable === null ? new Error("PRIVATE_HISTORY_ERROR") : new LineError("PRIVATE_HISTORY_ERROR", "http_401", retryable, uncertain!);
+  }, sendText: async () => { sends++; return { handle: "unexpected" }; } }, chat: chatKey.dm("+15555550199"), bus: async () => Response.json({}) };
+  const runner = new BoxRunner({ ...s.runner.config, root: join(s.root, "history-runner") }, { run: async () => { turns++; return "NO_REPLY"; } }, {
+    callbackReady: async () => true, fetch: async (url, init) => { paths.push(new URL(String(url)).pathname); return s.remote.callback(new Request(url, init), io); },
+  }); closes.push(() => runner.db.close());
+  await runner.handle(new Request("http://box/lease", { method: "POST", headers: { authorization: `Bearer ${runner.config.token}` }, body: JSON.stringify({ boxId: runner.config.boxId, epoch: runner.config.epoch }) }));
+  runner.db.query("INSERT INTO actions(id,path,payload,state) VALUES (?,'/send',?,'pending')").run(id, JSON.stringify({ text: "PRIVATE_SEND_TEXT" }));
+  runner.db.query("INSERT INTO actions(id,path,payload,state) VALUES (?,'/react','{}','pending')").run(opaqueId("later-reaction"));
+  runner.enqueue(inbox, {}); await runner.tick(); await runner.tick();
+  expect(paths).toEqual(["/send", "/send", "/send", "/send"]);
+  expect(sends).toBe(0); expect(turns).toBe(0);
+  expect(runner.db.query("SELECT state,attempts FROM actions WHERE id=?").get(id)).toEqual({ state: "pending", attempts: 0 });
+  expect(runner.db.query("SELECT state FROM inbox WHERE id=?").get(inbox)).toEqual({ state: "pending" });
+  expect(s.store.db.query("SELECT state FROM remote_sends WHERE id=?").get(id)).toEqual({ state: "uncertain" });
+});
+
+test("actual remote outage, fence, recovery and diagnostic rows survive the cap while queue depth is dropped", async () => {
+  const s = setup(); const id = opaqueId("fenced-cap"); s.runner.enqueue(id, {});
+  s.runner.db.query("UPDATE inbox SET state='interrupted',interrupted_at=1000 WHERE id=?").run(id);
+  const lines = await captureLogs(async () => {
+    await s.remote.tick(); s.offline(); s.advance(5_000); await s.remote.tick();
+    s.online(); s.advance(65_000); await s.remote.tick();
+    s.runner.db.exec("UPDATE inbox SET state='done'"); s.advance(300_000); await s.remote.tick();
+    s.failEvents(); s.advance(5_000); await s.remote.tick();
+  });
+  const root = join(s.root, "capped-lifecycle"), log = createToolLog({ root, now: () => 0, capBytes: 1 });
+  log.write({ component: "fixture", kind: "event", name: "fill" }); for (const line of lines) log.write(line);
+  const saved = readFileSync(join(root, "1970-01-01.ndjson"), "utf8").trim().split("\n").map(raw => JSON.parse(raw));
+  for (const name of ["moni-box-fenced", "moni-box-down", "moni-runner-error", "moni-box-up", "moni-box-unfenced", "moni-box-backend-state", "moni-box-events-error"]) {
+    expect(saved.some(l => l.name === name)).toBe(true);
+  }
+  expect(saved.some(l => l.name === "moni-queue-depth")).toBe(false);
+});
+
+test("pending action metadata is projected explicitly and rejects private or malformed input shapes", async () => {
+  const s = setup();
+  const action = { id: "a".repeat(12), path: "/react", attempts: 2, lastStatus: 502, nextAt: 9000, inboxId: "b".repeat(12) };
+  let rows: unknown = [{ ...action, payload: "PRIVATE_PAYLOAD", target: "PRIVATE_TARGET", token: "PRIVATE_TOKEN" }];
+  const remote = new RemoteBox(s.config, s.store, { active: () => true, log: () => {}, notice: async () => {},
+    fetch: async () => Response.json({ events: [], actions: rows }) });
+  expect(await remote.events()).toEqual({ events: [], actions: [action] });
+  for (const patch of [
+    { id: "PRIVATE_ID" }, { id: "a".repeat(64) }, { path: "/react?PRIVATE_TARGET" }, { path: "/metrics" },
+    { attempts: -1 }, { attempts: 1.5 }, { lastStatus: 99 }, { lastStatus: 600 },
+    { nextAt: -1 }, { nextAt: "PRIVATE_NEXT_AT" }, { inboxId: "PRIVATE_ID" }, { inboxId: undefined },
+  ]) {
+    rows = [{ ...action, ...patch }]; await expect(remote.events()).rejects.toThrow("Invalid box action");
+  }
+  rows = "PRIVATE_PAYLOAD"; await expect(remote.events()).rejects.toThrow("Invalid box actions");
+  rows = [{ ...action, lastStatus: null, nextAt: null, inboxId: null }];
+  expect((await remote.events()).actions).toEqual([{ ...action, lastStatus: null, nextAt: null, inboxId: null }]);
 });
 
 test("a large fenced backlog logs its full depth even after a page of skipped attachment failures", async () => {
@@ -600,7 +744,6 @@ test("Moni remote-box receipt and delivered reply never wait on a local Robob ou
   // A prior test can leave the process-wide logger inside an outage. Recover it outside this fixture.
   call(true); toolLog.flush(); await toolLog.settled();
   const rows = await captureLogs(async () => {
-    call(true);
     for (let i = 0; i < 3; i++) call(false);
     try {
       const sink = registry.sink(async () => {}).acceptInto(key, undefined, "+15555550199");

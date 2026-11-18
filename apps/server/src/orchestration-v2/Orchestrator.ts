@@ -28,6 +28,7 @@ import {
 } from "../ardud/observability/StartupPhaseLog.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
+import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as Crypto from "effect/Crypto";
 import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
@@ -1052,6 +1053,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const commandReceipts = yield* CommandReceiptStoreV2;
   const evaluatorAnalytics = yield* EvaluatorAnalytics.make;
   const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  const commandOutput = yield* Effect.serviceOption(CommandOutputHub.CommandOutputHub);
   const { skipped: queueDrainSkipped, terminal: neverStartedTerminalDrain } =
     yield* QueueDrainDiagnostics.make;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -11421,13 +11423,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       })
       .pipe(mapDispatchError(command));
     const run = current.runs.find((candidate) => candidate.id === plannedRun.id);
+    const outputActivity = Option.isSome(commandOutput)
+      ? yield* commandOutput.value.activity(command.threadId)
+      : undefined;
     if (
       run === undefined ||
       run.status !== "running" ||
       run.activeAttemptId !== plannedRun.activeAttemptId ||
       run.providerThreadId !== plannedRun.providerThreadId ||
       current.runs.findLast((candidate) => candidate.status !== "queued")?.id !== plannedRun.id ||
-      progressBlockers(current, plannedRun.id) ||
+      progressBlockers(
+        current,
+        plannedRun.id,
+        DateTime.toEpochMillis(yield* DateTime.now),
+        outputActivity,
+      ) ||
       latestQualifyingProgress(current, plannedRun.id) >
         DateTime.toEpochMillis(stall.lastProgressAt)
     ) {
@@ -11512,10 +11522,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
     if (command.delegatedTaskStall !== undefined) {
       const stall = command.delegatedTaskStall;
+      const outputActivity = Option.isSome(commandOutput)
+        ? yield* commandOutput.value.activity(command.threadId)
+        : undefined;
       if (
         run === undefined ||
         run.status !== "running" ||
-        progressBlockers(projection, run.id) ||
+        progressBlockers(
+          projection,
+          run.id,
+          DateTime.toEpochMillis(yield* DateTime.now),
+          outputActivity,
+        ) ||
         latestQualifyingProgress(projection, run.id) > DateTime.toEpochMillis(stall.lastProgressAt)
       )
         return;
