@@ -113,13 +113,16 @@ export class MessageCache {
           fallbackReason = "missing-marker";
           throw new Error("Missing change marker");
         }
-        details.set(id, detail);
-        tick.summaries.set(id, detail);
+        // Detail reads runs before its marker. Omitted summaries only have the previous poll's boundary.
+        const captured = { ...detail, changeMarker: missing.has(id) ? prior?.changeMarker : summary.changeMarker };
+        details.set(id, captured);
+        tick.details.set(id, Promise.resolve(captured));
+        tick.summaries.set(id, captured);
       }
       fallbackReason = "cross-thread-error";
       const changed = ids.filter(id => {
         const cached = this.entries.get(id);
-        if (missing.has(id) || this.reason(cached, Date.now(), id) || String(tick.summaries.get(id)!.changeMarker) !== cached?.marker) return true;
+        if (missing.has(id) || this.reason(cached, Date.now(), id) || tick.summaries.get(id)!.changeMarker?.toString() !== cached?.marker) return true;
         tick.messages.set(id, { ...cached!, full: false });
         this.pollLog(tick, id, { markerSkips: 1 });
         return false;
@@ -146,7 +149,7 @@ export class MessageCache {
           }
           const cached = this.entries.get(id);
           tick.messages.set(id, { messages, updatedAt: this.watermark(messages), fullAt: reason ? Date.now() : cached!.fullAt,
-            readAt: Math.min(now, Date.now()), full: !!reason, marker: String(tick.summaries.get(id)!.changeMarker) });
+            readAt: Math.min(now, Date.now()), full: !!reason, marker: tick.summaries.get(id)!.changeMarker?.toString() });
           if (reason) this.pollLog(tick, id, { fullReason: reason });
         }
       }
@@ -228,7 +231,7 @@ export class MessageCache {
   }
 
   private canReuseDetail(prior: ThreadDetail, summary: ThreadSummary): boolean {
-    if (summary.changeMarker! < prior.changeMarker!) return false;
+    if (!Number.isSafeInteger(prior.changeMarker) || summary.changeMarker! < prior.changeMarker!) return false;
     // Provider rewinds can roll back even completed older runs without changing the latest run.
     const retainedHistory = prior.recentRuns.some(run => run.runId !== summary.latestRunId);
     return prior.latestRunId === summary.latestRunId && prior.activeRunId === summary.activeRunId
@@ -363,7 +366,7 @@ export class MessageCache {
       const incoming = (await this.drain(tick, [threadId], BEGINNING)).get(threadId)!;
       const messages = this.merge(undefined, incoming, true)!;
       const snapshot: Snapshot = { messages, updatedAt: this.watermark(messages), fullAt: Date.now(), readAt: Date.now(), full: true,
-        marker: String(tick.summaries.get(threadId)!.changeMarker) };
+        marker: tick.summaries.get(threadId)!.changeMarker?.toString() };
       if (version === this.readVersions.get(threadId) && writes === this.writes.get(threadId)) {
         this.entries.set(threadId, snapshot);
         tick.messages.set(threadId, snapshot);

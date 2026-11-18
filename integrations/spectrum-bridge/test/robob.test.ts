@@ -49,7 +49,8 @@ function fakeControl() {
   const calls: Call[] = [];
   /** `ignoreSettled` mimics a server from before PATCH learned `settled`. */
   const flags = { ignoreSettled: false, recentRunsLimit: Infinity, historicalEvidence: "terminal" as "terminal" | "running" | "unknown" | "unavailable", sendFailure: undefined as string | undefined,
-    markers: false, missingMarker: false, markerStatus: 0, crossStatus: 0, page2Status: 0, pageSize: 1000, omit: new Set<string>(), override: new Map<string, number>() };
+    markers: false, missingMarker: false, markerStatus: 0, crossStatus: 0, page2Status: 0, pageSize: 1000, omit: new Set<string>(), override: new Map<string, number>(),
+    afterDetailRecords: undefined as ((thread: Thread) => void) | undefined };
   let sequence = 0;
   const events = new Map<string, { value: string; marker: number }>();
   const marker = (thread: Thread) => {
@@ -72,7 +73,13 @@ function fakeControl() {
     pendingRequest: thread.pending[0] ? { requestId: thread.pending[0].requestId, kind: thread.pending[0].kind, requestKind: thread.pending[0].requestKind } : null,
     lastError: thread.lastError, settled: thread.settled ?? false, ...(thread.archived ? { archived: true } : {}), createdAt: now(), updatedAt: now(),
   });
-  const detail = (thread: Thread) => ({ ...summary(thread), run: thread.runs.at(-1) ?? null, recentRuns: [...thread.runs].reverse().slice(0, flags.recentRunsLimit), pendingRequests: thread.pending });
+  const detail = (thread: Thread) => {
+    const records = { state: state(thread), status: thread.runs.at(-1)?.status ?? "idle", run: structuredClone(thread.runs.at(-1) ?? null),
+      recentRuns: structuredClone([...thread.runs].reverse().slice(0, flags.recentRunsLimit)), pendingRequests: structuredClone(thread.pending) };
+    const afterRecords = flags.afterDetailRecords; flags.afterDetailRecords = undefined;
+    afterRecords?.(thread);
+    return { ...summary(thread), ...records };
+  };
   const ok = (body: object, status = 200) => Response.json({ ok: true, ...body }, { status });
   const notFound = () => Response.json({ ok: false, error: { code: "not_found", message: "nope" } }, { status: 404 });
   const url = (() => {
@@ -2219,6 +2226,80 @@ test.each([
   });
   control.calls.length = 0; await tick();
   expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(0);
+});
+
+test.each(["retained rollback", "latest completion", "pending request"].flatMap(event => [false, true].map(omitted => ({ event, omitted }))))
+  ("marker polling: detail marker race repairs $event on the next tick (omitted=$omitted)", async ({ event, omitted }) => {
+  const { control, backend, chats, tick } = await markerFixture();
+  const chat = chats[0]!, thread = control.threads.get(chat.id)!;
+  await backend.prompt(chat.id, chat.directory, `msg_${"f".repeat(64)}`, "latest");
+  control.reply(chat.id, "latest partial", "running");
+  await tick();
+  thread.messages[1]!.text = "changed before detail";
+  if (omitted) control.flags.omit.add(chat.id);
+  control.flags.afterDetailRecords = current => {
+    if (event === "retained rollback") current.runs[0]!.status = "rolled_back";
+    else if (event === "latest completion") current.runs.at(-1)!.status = "completed";
+    else current.pending.push({ requestId: "raced-approval", kind: "approval", requestKind: "command", prompt: "Allow?" });
+  };
+  control.calls.length = 0;
+  const captured = await tick();
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(1);
+  if (event === "retained rollback") expect(captured[0]!.find(record => record.id === `idle:${thread.runs[0]!.runId}`)).toMatchObject({ outcome: "succeeded" });
+  control.calls.length = 0; control.flags.omit.clear();
+  const repaired = await tick();
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(1);
+  expect(pollingCalls(control.calls)).toHaveLength(2);
+  if (event === "pending request") expect(await backend.permissions(chat.id)).toHaveLength(1);
+  for (const options of [{ limit: 1 }, { limit: 100 }, { until: `msg_${"0".repeat(64)}`, limit: 20 }, { since: 0, limit: 100 }]) {
+    expect(await backend.messages(chat.id, chat.directory, options)).toEqual(await control.backend().messages(chat.id, chat.directory, options));
+  }
+  if (event === "retained rollback") expect(repaired[0]!.find(record => record.id === `idle:${thread.runs[0]!.runId}`)).toMatchObject({ outcome: "interrupted" });
+  control.calls.length = 0; await tick();
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(0);
+  expect(pollingCalls(control.calls)).toHaveLength(1);
+});
+
+test("marker polling: an omitted first summary cannot certify a raced detail marker", async () => {
+  const { control, backend, chats } = await markerFixture();
+  const chat = chats[0]!, thread = control.threads.get(chat.id)!;
+  await backend.prompt(chat.id, chat.directory, `msg_${"f".repeat(64)}`, "latest");
+  const reader = control.backend();
+  control.flags.omit.add(chat.id);
+  control.flags.afterDetailRecords = current => { current.runs[0]!.status = "rolled_back"; };
+  await reader.beginMessageTick([chat.id]);
+  expect((await reader.messages(chat.id)).find(record => record.id === `idle:${thread.runs[0]!.runId}`)).toMatchObject({ outcome: "succeeded" });
+  control.flags.omit.clear(); control.calls.length = 0;
+  await reader.beginMessageTick([chat.id]);
+  const repaired = await reader.messages(chat.id);
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(1);
+  expect(pollingCalls(control.calls)).toHaveLength(2);
+  expect(repaired).toEqual(await control.backend().messages(chat.id));
+  expect(repaired.find(record => record.id === `idle:${thread.runs[0]!.runId}`)).toMatchObject({ outcome: "interrupted" });
+  control.calls.length = 0; await reader.beginMessageTick([chat.id]); await reader.messages(chat.id);
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(0);
+  expect(pollingCalls(control.calls)).toHaveLength(1);
+});
+
+test.each(["marker", "page"])("marker polling: raced fallback detail after a %s failure cannot replace the committed boundary", async fault => {
+  const { control, backend, chats, tick } = await markerFixture();
+  const chat = chats[0]!, thread = control.threads.get(chat.id)!;
+  await backend.prompt(chat.id, chat.directory, `msg_${"f".repeat(64)}`, "latest");
+  await tick();
+  thread.messages[1]!.text = "trigger detail";
+  if (fault === "marker") control.flags.markerStatus = 500;
+  else { control.flags.pageSize = 1; control.flags.page2Status = 500; }
+  control.flags.afterDetailRecords = current => { current.runs[0]!.status = "rolled_back"; };
+  const fallback = await tick();
+  expect(fallback[0]!.find(record => record.id === `idle:${thread.runs[0]!.runId}`)).toMatchObject({ outcome: "succeeded" });
+  control.flags.markerStatus = 0; control.flags.page2Status = 0; control.flags.pageSize = 1000; control.calls.length = 0;
+  const repaired = await tick();
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(1);
+  expect(repaired[0]).toEqual(await control.backend().messages(chat.id));
+  expect(repaired[0]!.find(record => record.id === `idle:${thread.runs[0]!.runId}`)).toMatchObject({ outcome: "interrupted" });
+  control.calls.length = 0; await tick();
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(0);
+  expect(pollingCalls(control.calls)).toHaveLength(1);
 });
 
 test.each([false, true])("marker polling: Router tick deferral releases probe leases without backoff (landed=%s)", async landed => {
