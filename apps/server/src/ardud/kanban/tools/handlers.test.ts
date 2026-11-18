@@ -254,7 +254,8 @@ const fakeThreads = (
           ),
         ),
       view,
-      find: delivery?.findExisting ? view : () => Effect.succeed(null),
+      find: (id, options) =>
+        options?.lastAssistant || delivery?.findExisting ? view(id) : Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: (threadId) => Effect.sync(() => latestRuns.get(threadId) ?? null),
@@ -2313,6 +2314,38 @@ it.effect(
         (relativeRollup.structured.activity as { asks: unknown }).asks,
         activity.asks,
       );
+      const window = Activity.parseWindow(undefined, undefined, now);
+      assert.isNotString(window);
+      if (typeof window === "string") return;
+      const rawActivity = yield* kanban.activity(board.id, window);
+      assert.strictEqual(
+        JSON.stringify(rollup.structured),
+        JSON.stringify({
+          activity: { boardId: board.id, ...Activity.rollup({ window, ...rawActivity }) },
+        }),
+      );
+      const digest = yield* call(thread, "board_activity", { digest: "discussions", since });
+      assert.isFalse(digest.isError, digest.text);
+      assert.isBelow(digest.text.length, 30_000);
+      const discussionDigest = digest.structured.activity as {
+        rows: Array<{
+          discussionId: string;
+          ownerMessages: Array<{ text: string }>;
+          messagesInWindow: number;
+        }>;
+        page: { hasMore: boolean };
+      };
+      const busyDiscussion = (yield* kanban.card(busy.id)).card.discussionId!;
+      const row = discussionDigest.rows.find((row) => row.discussionId === busyDiscussion)!;
+      assert.isAbove(row.messagesInWindow, 60);
+      assert.isAtMost(row.ownerMessages[0]!.text.length, 300);
+      const threadDigest = yield* call(thread, "board_activity", { digest: "threads", since });
+      assert.isFalse(threadDigest.isError, threadDigest.text);
+      assert.include(JSON.stringify(threadDigest.structured), thread);
+      const invalidCursor = yield* Effect.result(
+        call(thread, "board_activity", { digest: "discussions", after: -1 }),
+      );
+      assert.isTrue(Result.isFailure(invalidCursor));
       const futureSince = DateTime.formatIso(DateTime.makeUnsafe(now + 60 * 60 * 1000));
       for (const name of ["board_get", "board_activity"]) {
         const future = yield* call(thread, name, { since: futureSince });
@@ -10602,6 +10635,189 @@ it.effect("a top-level board evaluator skips an explicit gate through subtask_do
     assert.isTrue(refused.isError);
     assert.include(refused.text, "needs Abdullah's approval");
   }).pipe(Effect.provide(layer));
+});
+
+it.effect("thread digests page at the service boundary without reading later pages", () => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "digests",
+      name: "Digests",
+      defaultProjectId: ProjectId.make("p1"),
+    });
+    const now = yield* Clock.currentTimeMillis;
+    const at = DateTime.formatIso(DateTime.makeUnsafe(now));
+    const window = {
+      since: DateTime.formatIso(DateTime.makeUnsafe(now - 86_400_000)),
+      until: DateTime.formatIso(DateTime.makeUnsafe(now + 1)),
+    };
+    for (let i = 0; i < 45; i++) {
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: `Card ${i}`, prompt: "Read" },
+        owner,
+      );
+      yield* store.putThreadLink({
+        threadId: ThreadId.make(`digest-${i}`),
+        boardId: board.id,
+        cardId: card.id,
+        role: i % 2 === 0 ? "work" : "review",
+        purpose: null,
+        discussionId: null,
+        model: board.defaultCardModel,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      });
+      if (i === 44) yield* kanban.flagCard(card.id, "Run failed: injected", owner);
+    }
+    const first = yield* kanban.activityDigest(board.id, window, "threads");
+    assert.lengthOf(first.rows, 40);
+    assert.strictEqual((first.rows[0] as { threadId: string }).threadId, "digest-44");
+    assert.isTrue(first.page.hasMore);
+    assert.lengthOf(fake.views, 40);
+    const second = yield* kanban.activityDigest(board.id, window, "threads", first.page.nextAfter!);
+    assert.lengthOf(second.rows, 5);
+    assert.isFalse(second.page.hasMore);
+    assert.lengthOf(fake.views, 45);
+  }).pipe(Effect.provide(fake.layer));
+});
+
+it.effect.each([
+  { name: "at the cutoff", elapsed: 1 },
+  { name: "after the cutoff", elapsed: 2 },
+])("thread digest pages stay stable when a failed card is claimed $name", ({ elapsed }) => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "pinned-thread-digest",
+      name: "Pinned threads",
+      defaultProjectId: ProjectId.make("p1"),
+    });
+    const now = yield* Clock.currentTimeMillis;
+    const startedAt = DateTime.formatIso(DateTime.makeUnsafe(now));
+    const window = {
+      since: DateTime.formatIso(DateTime.makeUnsafe(now - 86_400_000)),
+      until: DateTime.formatIso(DateTime.makeUnsafe(now + 1)),
+    };
+    const threadIds = Array.from({ length: 45 }, (_, index) =>
+      ThreadId.make(`pinned-digest-${String(index).padStart(2, "0")}`),
+    );
+    for (const threadId of threadIds) {
+      const card = yield* kanban.createCard(board.id, { title: threadId, prompt: "Work" }, owner);
+      yield* store.putThreadLink({
+        threadId,
+        boardId: board.id,
+        cardId: card.id,
+        role: "work",
+        purpose: null,
+        discussionId: null,
+        model: board.defaultCardModel,
+        startedAt,
+        endedAt: null,
+        paused: null,
+      });
+      yield* store.addThreadCard(threadId, card.id, startedAt);
+    }
+    const failed = yield* kanban.createCard(
+      board.id,
+      { title: "Failed before claim", prompt: "Work" },
+      owner,
+    );
+    yield* kanban.flagCard(failed.id, "Run failed: before claim", owner);
+    const first = yield* kanban.activityDigest(board.id, window, "threads");
+    assert.lengthOf(first.rows, 40);
+    assert.isTrue(first.page.hasMore);
+    yield* TestClock.adjust(Duration.millis(elapsed));
+    yield* store.addThreadCard(
+      threadIds[44]!,
+      failed.id,
+      DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis)),
+    );
+    assert.include(yield* store.threadCards(threadIds[44]!), failed.id);
+    const second = yield* kanban.activityDigest(board.id, window, "threads", first.page.nextAfter!);
+    assert.lengthOf(second.rows, 5);
+    assert.isFalse(second.page.hasMore);
+    const ids = [...first.rows, ...second.rows].map(
+      (row) => (row as { threadId: string }).threadId,
+    );
+    assert.deepStrictEqual(ids, threadIds);
+    assert.strictEqual(new Set(ids).size, 45);
+    assert.deepInclude(second.rows[4], { threadId: threadIds[44], flags: [] });
+  }).pipe(Effect.provide(fake.layer));
+});
+
+it.effect("thread digests include failures on persisted carried cards after release", () => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "shared-digest",
+      name: "Shared",
+      defaultProjectId: ProjectId.make("p1"),
+    });
+    const origin = yield* kanban.createCard(board.id, { title: "Original", prompt: "Work" }, owner);
+    const claimed = yield* kanban.createCard(
+      board.id,
+      { title: "Claimed later", prompt: "Next" },
+      owner,
+    );
+    const quiet = yield* kanban.createCard(board.id, { title: "Quiet", prompt: "Other" }, owner);
+    const shared = ThreadId.make("shared-worker");
+    const startedAt = DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis));
+    yield* store.putThreadLink({
+      threadId: shared,
+      boardId: board.id,
+      cardId: origin.id,
+      role: "work",
+      purpose: null,
+      discussionId: null,
+      model: board.defaultCardModel,
+      startedAt,
+      endedAt: null,
+      paused: null,
+    });
+    yield* store.addThreadCard(shared, origin.id, startedAt);
+    yield* store.addThreadCard(shared, claimed.id, startedAt);
+    yield* store.putCard({ ...origin, stage: "completed" });
+    yield* store.putCard({ ...claimed, stage: "completed" });
+    yield* TestClock.adjust(Duration.hours(48));
+    const now = yield* Clock.currentTimeMillis;
+    const at = DateTime.formatIso(DateTime.makeUnsafe(now));
+    const window = {
+      since: DateTime.formatIso(DateTime.makeUnsafe(now - 86_400_000)),
+      until: DateTime.formatIso(DateTime.makeUnsafe(now + 1)),
+    };
+    yield* kanban.flagCard(claimed.id, "Run failed: carried card failed", owner);
+    yield* kanban.flagCard(claimed.id, null, owner);
+    yield* store.putThreadLink({
+      threadId: ThreadId.make("quiet-worker"),
+      boardId: board.id,
+      cardId: quiet.id,
+      role: "work",
+      purpose: null,
+      discussionId: null,
+      model: board.defaultCardModel,
+      startedAt: at,
+      endedAt: null,
+      paused: null,
+    });
+    assert.lengthOf(yield* store.cardsByThread(shared), 0);
+    const page = yield* kanban.activityDigest(board.id, window, "threads");
+    assert.lengthOf(page.rows, 2);
+    assert.deepInclude(page.rows[0], {
+      threadId: shared,
+      card: origin.number,
+      cards: [origin.number, claimed.number],
+      flags: ["run_failed", "stalled"],
+    });
+    assert.isFalse(page.page.hasMore);
+  }).pipe(Effect.provide(fake.layer));
 });
 
 it.effect("a worker's later-step subtask refusal keeps its message and fixed reason", () => {

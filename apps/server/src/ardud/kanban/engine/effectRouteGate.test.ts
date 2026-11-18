@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as TestClock from "effect/testing/TestClock";
 import type * as Tracer from "effect/Tracer";
 
 import * as KanbanStore from "../store/KanbanStore.ts";
@@ -95,7 +96,8 @@ const answer = Effect.fn("test.effectRouteAnswer")(function* (
     );
     if (blocked) {
       yield* Deferred.await(entered);
-      // This commits while the route's reader is latched, without a timer or polling.
+      yield* TestClock.adjust(3_000);
+      assert.isUndefined(dropping.pollUnsafe());
       yield* edit;
       assert.isUndefined(dropping.pollUnsafe());
       yield* Deferred.succeed(resume, undefined);

@@ -177,6 +177,8 @@ describe("orchestration V2 contracts", () => {
       {},
       { outputIndicatesFailure: true },
       { outputIndicatesFailure: false },
+      { timeoutMs: 600_000, exitCode: 137, outputIndicatesFailure: true },
+      { timeoutMs: 0 },
     ]) {
       const runtime = decodeOrchestrationV2TurnItem({ ...base, ...metadata, updatedAt: now });
       const json = decodeOrchestrationV2TurnItemJson({

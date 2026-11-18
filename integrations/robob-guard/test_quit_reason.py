@@ -58,7 +58,7 @@ class QuitReasonTests(unittest.TestCase):
             write.assert_not_called()
 
     def test_watchdog_hold_hands_off_before_returning(self):
-        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", return_value=True), \
+        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", side_effect=lambda pid: pid in (12, 12345)), \
                 patch("hold.subprocess.Popen", return_value=Mock(pid=12345)), \
                 patch("hold.desktop_pid", return_value=42), \
                 patch("hold.write_reason") as write:
@@ -67,13 +67,13 @@ class QuitReasonTests(unittest.TestCase):
             write.assert_called_once_with(home, "watchdog", "overload-restart", 12, 42)
 
     def test_preflight_install_hold_is_not_quit_evidence(self):
-        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", return_value=True), \
+        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", side_effect=lambda pid: pid in (12, 12345)), \
                 patch("hold.subprocess.Popen", return_value=Mock(pid=12345)), patch("hold.write_reason") as write:
             Holds(Path(directory)).start("install-robob", 12)
             write.assert_not_called()
 
     def test_reused_watchdog_hold_refreshes_the_reason(self):
-        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", return_value=True), \
+        with tempfile.TemporaryDirectory() as directory, patch("hold.pid_alive", side_effect=lambda pid: pid in (12, 12345)), \
                 patch("hold.subprocess.Popen", return_value=Mock(pid=12345)), \
                 patch("hold.desktop_pid", return_value=42), patch("hold.write_reason") as write:
             holds = Holds(Path(directory))
@@ -81,6 +81,15 @@ class QuitReasonTests(unittest.TestCase):
             with patch.object(holds, "beater_is_ours", return_value=True):
                 holds.start("overload-restart", 12)
             self.assertEqual(write.call_count, 2)
+
+    def test_captured_target_is_not_replaced_by_a_new_registered_desktop(self):
+        with tempfile.TemporaryDirectory() as directory, patch("sys.argv", [
+                "quit_reason", "--initiator", "guard", "--reason", "backend-unready", "--target-pid", "42"]), \
+                patch("quit_reason.Path.home", return_value=Path(directory)), \
+                patch("quit_reason.desktop_pid") as lookup, patch("quit_reason.write_reason") as write:
+            main()
+            lookup.assert_not_called()
+            self.assertEqual(write.call_args.args[-1], 42)
 
     def test_shell_helper_locates_its_script_when_sourced(self):
         with tempfile.TemporaryDirectory() as directory:

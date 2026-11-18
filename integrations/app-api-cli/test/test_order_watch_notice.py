@@ -41,6 +41,7 @@ class AddNoticeTests(unittest.TestCase):
         self.send_code = 0
         self.send_error = None
         self.send_stdout = None
+        self.send_stderr = ''
         self.robob_calls = []
         self.route = 'ardud-control:thread:0b46eb22-1111-2222-3333-444455556666'
         self.bridge_db = self.root / 'bridge.sqlite'
@@ -49,6 +50,11 @@ class AddNoticeTests(unittest.TestCase):
         con.execute("insert into kv values ('route', ?)", (json.dumps({'id': self.route}),))
         con.commit()
         con.close()
+        target = self.root / 'chats/moni/state.sqlite'
+        target.parent.mkdir(parents=True)
+        with sqlite3.connect(target) as con:
+            con.execute('create table kv (key text primary key, value text not null)')
+            con.execute('create table outbox (id text primary key, payload text, state text, attempts integer)')
         patcher = mock.patch.dict(_os.environ, {'SPECTRUM_BRIDGE_DB': str(self.bridge_db)})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -85,7 +91,11 @@ class AddNoticeTests(unittest.TestCase):
         key = args[args.index('--key') + 1]
         out = self.send_stdout if self.send_stdout is not None else json.dumps(
             {'id': 'send:' + 'a' * 64, 'created': key not in [a[a.index('--key') + 1] for a in self.sends[:-1]]})
-        return subprocess.CompletedProcess(args, self.send_code, out if self.send_code == 0 else '', '')
+        if self.send_code == 0:
+            with sqlite3.connect(self.root / 'chats/moni/state.sqlite') as con:
+                con.execute('insert or ignore into outbox values (?, ?, ?, ?)',
+                            (t.delivery_cards.mine(args[2:]), '{}', 'sent', 1))
+        return subprocess.CompletedProcess(args, self.send_code, out if self.send_code == 0 else '', self.send_stderr)
 
     def notice(self, order):
         return t.read(self.root / 'state' / 'orders' / f'order-talabat-{order}.json')['placed_notice']
@@ -310,6 +320,61 @@ class AddNoticeTests(unittest.TestCase):
         # After checking chat history the caller closes it out.
         code, row = self.add('--no-placed-text', order='3999000778')
         self.assertEqual((code, row['moni_notified']), (0, 'skipped'))
+
+    def test_later_remote_refusal_preserves_legacy_unresolved_history(self):
+        for old_status in ('attempting', 'ambiguous', 'failed'):
+            for saved_args in (True, False):
+                with self.subTest(status=old_status, saved_args=saved_args):
+                    order = '399900' + str(len(self.sends) + 1000)
+                    self.send_error = subprocess.TimeoutExpired('bun', 20)
+                    self.add(order=order)
+                    path = self.root / 'state/orders' / f'order-talabat-{order}.json'
+                    cfg = t.read(path)
+                    first = cfg['placed_notice']['open'][0]
+                    cfg['placed_notice']['status'] = old_status
+                    if not saved_args:
+                        cfg['placed_notice'].pop('args')
+                    t.write(path, cfg)
+                    self.send_error = None
+                    self.send_code = 1
+                    self.send_stderr = 'Bridge request failed (HTTP 403): Use agent-ask to reach this chat on its box'
+                    for _ in range(2):
+                        code, row = self.add('--placed-text', 'replacement text', order=order)
+                        notice = self.notice(order)
+                        self.assertEqual(code, t.NOTICE_FAILED_EXIT)
+                        self.assertEqual(row['moni_notified'], 'failed:bridge_exit_1')
+                        self.assertEqual(notice['status'], 'ambiguous')
+                        self.assertEqual(notice['open'], [first])
+                        self.assertEqual(notice['args'], first['args'])
+                        self.assertEqual(notice['bridge_error']['http'], 403)
+
+    def test_failed_bun_launch_can_recover_via_bus_without_discarding_older_attempts(self):
+        for older in (False, True):
+            for error in (FileNotFoundError('missing bun'), PermissionError('bun is not executable')):
+                with self.subTest(older=older, error=type(error).__name__):
+                    order = '399800' + str(len(self.sends) + 1000)
+                    if older:
+                        self.send_error = subprocess.TimeoutExpired('bun', 20)
+                        self.add(order=order)
+                    self.send_error = error
+                    self.add(order=order)
+                    self.assertEqual(len(self.notice(order)['open']), int(older))
+                    self.send_error = None
+                    calls = []
+                    def remote(args):
+                        calls.append(args)
+                        if args[0] == 'send':
+                            raise t.delivery_cards.BridgeError('Bridge request failed (HTTP 403): Use agent-ask to reach this chat on its box', 1)
+                        return {'id': t.delivery_cards.mine(args), 'created': True}
+                    with mock.patch.object(t.delivery_cards, 'bridge', side_effect=remote):
+                        code, row = self.add(order=order)
+                        self.assertEqual(len(calls), 1 if older else 2)
+                        self.assertEqual(row['moni_notified'], 'failed:bridge_exit_1' if older else 'relayed')
+                        if not older:
+                            notice = self.notice(order)
+                            self.assertEqual(notice['agent_request_id'], t.delivery_cards.mine(calls[-1]))
+                            self.assertEqual(self.add(order=order)[1]['moni_notified'], 'skipped')
+                            self.assertEqual(len(calls), 2)
 
     def test_timeout_missing_bun_and_bad_ack(self):
         self.send_error = subprocess.TimeoutExpired('bun', 20)

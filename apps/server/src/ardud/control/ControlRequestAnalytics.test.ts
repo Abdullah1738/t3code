@@ -8,6 +8,7 @@ import * as Fiber from "effect/Fiber";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import * as HttpServerRequest from "effect/http/HttpServerRequest";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 import * as Stream from "effect/Stream";
@@ -524,4 +525,36 @@ it.effect("records a cancelled admission without pretending the read acquired a 
       204,
     );
   }).pipe(Effect.provide(ReplyBuilders.layer)),
+);
+
+it.effect("preserves a refusal response when its server logger defects", () =>
+  Effect.gen(function* () {
+    const samples: AnalyticsEvent[] = [];
+    const response = yield* observe(
+      "control.send",
+      Effect.succeed(HttpServerResponse.empty({ status: 409 })),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Logger.layer(
+            [
+              Logger.make(() => {
+                throw new Error("logger defect");
+              }),
+            ],
+            { mergeWithExisting: false },
+          ),
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => {
+                samples.push(event);
+              }),
+          }),
+        ),
+      ),
+    );
+    assert.equal(response.status, 409);
+    assert.lengthOf(samples, 1);
+    assert.equal(samples[0]!.props!.status, 409);
+  }),
 );

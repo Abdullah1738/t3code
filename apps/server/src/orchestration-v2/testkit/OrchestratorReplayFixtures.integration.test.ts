@@ -122,7 +122,20 @@ const runFixtureProvider = Effect.fn("runOrchestratorReplayFixture")(function* <
     name: `${input.fixtureName}/${input.driver.driver}`,
     transcript,
     commands: materialized.commands,
-    steps: materialized.steps,
+    steps: [
+      ...materialized.steps,
+      ...materialized.projectionThreadIds.flatMap((threadId) =>
+        input.driver.finalProviderSessionStatus === undefined
+          ? []
+          : [
+              {
+                type: "await_provider_session_status" as const,
+                threadId,
+                status: input.driver.finalProviderSessionStatus,
+              },
+            ],
+      ),
+    ],
     projectionThreadIds: materialized.projectionThreadIds,
     runtimePolicyOverride: {
       ...input.driver.runtimePolicyOverride,

@@ -51,6 +51,14 @@ export type MainIo = {
 
 type Parts = { remote?: RemoteBox; router?: Router; delivery?: Delivery; replyGap?: ReplyGapMonitor; api: (request: Request) => Promise<Response>; backend?: ChatBackend; busy: boolean };
 
+export function acknowledgeSendblue(chat: Pick<ChatCore, "store" | "context" | "remote">, input: unknown, log: MainIo["log"]): void {
+  if (chat.remote && (input as { logSource?: string }).logSource === "backfill") return;
+  void acknowledgeReceived(chat.store, chat.context, input).catch(caughtError => {
+    toolError("sb-main", "sb-main.catch7", caughtError);
+    log("receipt-ack-failed");
+  });
+}
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -319,7 +327,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     maxRequestBodySize: 28 * 1024 * 1024,
     fetch: createSbApi({ registry: chats, line, agentBus, accessPath: accessFile, enabled: ready, health: () => ({}) }, remoteCallback),
   }) : undefined;
-  process.once("exit", () => callbackServer?.stop(true));
+  process.once("exit", () => { callbackServer?.stop(true); remoteCallback?.stop(); toolLog.flush(); });
 
   // Unknown senders: one Telegram note per address, so the owner can allow them.
   const note = async (address: string, text: string) => {
@@ -329,7 +337,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const ingress = runIngress({
     line: observed, owner: config.owner, ownerStore, access: async () => access,
     sink: chats.sink(note, () => config.enabled, message => guestDesk.unknown(message),
-      (chat, input) => { if (chat.remote) return; void acknowledgeReceived(chat.store, chat.context, input).catch((caughtError) => { toolError("sb-main", "sb-main.catch7", caughtError); return log("receipt-ack-failed"); }); }), log,
+      (chat, input) => acknowledgeSendblue(chat, input, log)), log,
     notify: (text, key) => outlet.notify("attention", text, key),
   }, abort.signal);
 
@@ -405,8 +413,11 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     clearInterval(timer);
     clearInterval(unansweredTimer);
     await server.stop(true);
+    await callbackServer?.stop(true);
     await apps?.stop().catch((caughtError) => { toolError("sb-main", "sb-main.catch17", caughtError);});
     await shares.stopAll().catch((caughtError) => { toolError("sb-main", "sb-main.catch18", caughtError);});
+    for (const chat of chats.all()) chat.parts.remote?.stop();
+    toolLog.flush();
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.
     process.exit(0);
   };
