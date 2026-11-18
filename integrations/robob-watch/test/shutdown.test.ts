@@ -125,7 +125,7 @@ for (const owner of ["runner", "library"] as const) for (const release of [false
       writeFileSync(join(dir, "watcher.json"), JSON.stringify(normalize({ id, title: id, mode: "notify", interval_s: 300, max_fires: 0, check })));
       writeFileSync(join(dir, "state.json"), JSON.stringify({ status: "active", fires: 0, consecutive_failures: 0, next_at: 0 }));
     }
-    const attempted = join(sandbox, "attempted"), retried = join(sandbox, "retried");
+    const attempted = join(sandbox, "attempted"), completed = join(sandbox, "completed"), responsive = join(sandbox, "responsive");
     const child = Bun.spawn([process.execPath, "-e", `
       import {writeFileSync} from "node:fs";
       const lib=await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
@@ -133,12 +133,10 @@ for (const owner of ["runner", "library"] as const) for (const release of [false
         : 'const run=id=>lib.runCheck(lib.loadWatcher(id),lib.watcherDir(id));'}
       void run("held");
       process.stdin.on("data",async data=>{
-        if(data.toString().trim()==="retry") {
-          await run("blocked"); writeFileSync(${JSON.stringify(retried)},"1");
-        } else {
-          try {await run("blocked"); writeFileSync(${JSON.stringify(attempted)},"unexpected admission");}
+          writeFileSync(${JSON.stringify(attempted)},"waiting");
+          setTimeout(()=>writeFileSync(${JSON.stringify(responsive)},"1"),20);
+          try {await run("blocked"); writeFileSync(${JSON.stringify(completed)},"1");}
           catch(error) {writeFileSync(${JSON.stringify(attempted)},error.code??String(error));}
-        }
       });
     `], { env: {
       ...process.env, BUN_INSPECT: undefined, ROBOB_TEST: "1", ROBOB_WATCH_ROOT: root, TOOLLOG_DIR: join(sandbox, "logs"),
@@ -152,13 +150,14 @@ for (const owner of ["runner", "library"] as const) for (const release of [false
       lock.exec("BEGIN IMMEDIATE");
       child.stdin.write("attempt\n");
       expect(await until(() => existsSync(attempted), 1000)).toBe(true);
-      expect(readFileSync(attempted, "utf8")).toBe("SQLITE_BUSY");
+      expect(await until(() => existsSync(responsive), 1000)).toBe(true);
+      expect(readFileSync(attempted, "utf8")).toBe("waiting");
+      expect(existsSync(completed)).toBe(false);
       expect(existsSync(join(blocked, "started"))).toBe(false);
       expect(JSON.parse(readFileSync(join(blocked, "state.json"), "utf8"))).toEqual({ status: "active", fires: 0, consecutive_failures: 0, next_at: 0 });
       if (release) {
         lock.exec("COMMIT"); lock.close(); lock = undefined;
-        child.stdin.write("retry\n");
-        expect(await until(() => existsSync(retried), 2000)).toBe(true);
+        expect(await until(() => existsSync(completed), 2000)).toBe(true);
         expect(readFileSync(join(blocked, "started"), "utf8")).toBe("started\n");
         expect(JSON.parse(readFileSync(join(blocked, "state.json"), "utf8")).consecutive_failures).toBe(0);
       }

@@ -714,6 +714,11 @@ export async function killRunningChecks(signal: NodeJS.Signals = "SIGTERM"): Pro
 export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance = watcherInstance(watcher.id)): Promise<CheckResult> {
   if (stoppingChecks) return Promise.reject(new Error("Runner is shutting down"));
   installCheckShutdown();
+  const run = () => spawnCheck(watcher, dir, extraEnv, timeoutMs, instance);
+  return dir === watcherDir(watcher.id) ? withRelayLockAsync(run) : run();
+}
+
+function spawnCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string>, timeoutMs: number, instance: string | undefined): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
   assertMacWatcher(watcher.chat);
   const started = now();
@@ -1226,6 +1231,35 @@ export function relayCheck(given: Watcher, to: string, eta?: number, at = now())
  */
 // Runner admission calls the library's spawn guard while holding the same process's lock.
 let relayLockDepth = 0;
+export class CheckShutdownError extends Error {
+  constructor() { super("Runner is shutting down"); }
+}
+
+/** Yield only while acquiring: nested admission/spawn guards must finish before this transaction commits. */
+export function withRelayLockAsync<T>(fn: () => T): Promise<Awaited<T>> {
+  const attempt = (): Promise<Awaited<T>> => {
+    if (stoppingChecks || shutdownStarted) return Promise.reject(new CheckShutdownError());
+    if (relayLockDepth) {
+      try { return Promise.resolve(fn()); } catch (error) { return Promise.reject(error); }
+    }
+    mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+    const db = new Database(join(ROOT, "relay-lock.sqlite"));
+    try {
+      db.exec("PRAGMA busy_timeout = 0");
+      db.exec("BEGIN IMMEDIATE");
+    } catch (error) {
+      db.close();
+      if ((error as { code?: string }).code !== "SQLITE_BUSY") return Promise.reject(error);
+      return new Promise<void>(resolve => setTimeout(resolve, 20)).then(attempt);
+    }
+    relayLockDepth++;
+    try { return Promise.resolve(fn()); }
+    catch (error) { return Promise.reject(error); }
+    finally { relayLockDepth--; try { db.exec("COMMIT"); } finally { db.close(); } }
+  };
+  return attempt();
+}
+
 export function withRelayLock<T>(fn: () => T): T {
   if (relayLockDepth) return fn();
   mkdirSync(ROOT, { recursive: true, mode: 0o700 });
