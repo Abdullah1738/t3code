@@ -2740,6 +2740,30 @@ bash "$TASK_DIR/step5r.sh"
             self.assertIsNone(self.classify('bun exec' + separator + "'node read.js'"))
             self.assertEqual(self.classify('bun exec' + separator + "'node pkg/read.js'"), SCRIPT)
 
+    def test_bun_115_exec_options_select_shell_operand(self):
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for option in ('--silent', '--smol', '--no-clear-screen', '--silent --smol',
+                       '--filter "pkg*"', '--filter="pkg*"'):
+            for prefix in ('bun ' + option + ' exec', 'bun exec ' + option,
+                           'bun ' + option + ' exec ' + option):
+                for separator in (' ', ' -- '):
+                    for name, expected in (('safe', None), ('bad', SCRIPT)):
+                        command = prefix + separator + shlex.quote('node ' + name + '.js')
+                        with self.subTest(command=command):
+                            self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_exec_delimiter_preserves_leading_dash_body(self):
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for prefix in ('bun exec', 'bun --silent exec', 'bun exec --silent',
+                       'bun --silent exec --smol'):
+            for body_prefix in ('-missing || ', '--missing; ', '-e; ', '--preload=missing || '):
+                for name, expected in (('safe', None), ('bad', SCRIPT)):
+                    command = prefix + ' -- ' + shlex.quote(body_prefix + 'node ' + name + '.js')
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+
     def test_bun_115_absolute_test_files_after_unknown_cwd(self):
         good = self.write('test/ok.test.ts', 'console.log("ok")')
         bad = self.write('test/bad.test.ts', f'require("fs").readFileSync({LIVE!r})')

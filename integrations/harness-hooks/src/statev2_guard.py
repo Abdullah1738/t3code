@@ -2941,8 +2941,7 @@ def _bun_arguments(args):
                 index += 1
         elif options and arg == '--':
             options = False
-            if mode != 'exec':
-                result.append(arg)
+            result.append(arg)
         elif mode is None and not explicit_run and options and arg == 'run':
             explicit_run = True
         elif mode is None and not explicit_run and options and arg in BUN_SUBCOMMANDS:
@@ -5601,8 +5600,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if binary == "eval":
             return scan(" ".join(args), directory, depth + 1)
         if bun_mode == 'exec':
-            if args:
-                scan_child(args[0], directory, depth + 1)
+            if program_args:
+                scan_child(program_args[0], directory, depth + 1)
             return finish_invocation()
         if bun_mode == 'test':
             # Match vp test run after a non-literal cd; filters are not scripts.
