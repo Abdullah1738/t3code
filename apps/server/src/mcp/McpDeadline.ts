@@ -223,6 +223,7 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
             code: input.code,
             message:
               `${input.code === "caller_unresolved" ? "Caller resolution" : "delegate_task"} timed out during ${input.stage} for thread ${input.threadId ?? "unknown"}.` +
+              (input.code === "caller_unresolved" ? ` Waiting on "${pending.wait}".` : "") +
               ((input.code === "caller_unresolved" && input.stage === "caller") ||
               input.stage === "parent_records" ||
               (input.code === "delegation_timeout" &&
