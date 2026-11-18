@@ -47,6 +47,7 @@ const harnessHash = hash([
   controllerHash,
   await fileHash(resolve("apps/server/scripts/acp-mock-agent.ts")),
   await fileHash(resolve("apps/server/scripts/acpMockCancellationState.ts")),
+  await fileHash(resolve("apps/server/scripts/acpMockRequestLog.ts")),
   await fileHash(new URL("../budgets.json", import.meta.url).pathname),
 ]);
 const revisions = [

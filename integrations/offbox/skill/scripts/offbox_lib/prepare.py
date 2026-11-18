@@ -7,7 +7,7 @@ import signal
 import threading
 import time
 
-from . import api, capacity
+from . import api, capacity, ssh_outage
 from .common import OffboxError, SshHostKeyMismatch, log, say
 
 _ACTIVE = contextvars.ContextVar('prepare', default=None)
@@ -62,6 +62,7 @@ def can_move():
 class Budget:
     def __init__(self, box, end=None, seconds=None):
         seconds = seconds if seconds is not None else capacity.setting('OFFBOX_PREPARE_DEADLINE_SECONDS', 300, minimum=1, maximum=3600)
+        self.resume_watch = None
         self.start = time.monotonic()
         self.end = end if end is not None else self.start + seconds
         self.seconds = seconds
@@ -109,14 +110,17 @@ def guard(box, end=None, seconds=None):
             with phase('bring_up', box):
                 yield budget
             budget.check()
-    except SshHostKeyMismatch:
+    except (SshHostKeyMismatch, ssh_outage.SshUnreachable):
         raise
     except (Exception, _Expired) as error:
         if not isinstance(error, _Expired) and time.monotonic() < budget.end:
             raise
         if main:
             signal.setitimer(signal.ITIMER_REAL, 0)
-        log(f'resume_stuck {budget.box} {budget.phase} {time.monotonic()-budget.total_start:.1f}s')
+        if budget.resume_watch is not None:
+            budget.resume_watch.stuck(phase=budget.phase)
+        else:
+            log(f'resume_stuck {budget.box} {budget.phase} {time.monotonic()-budget.total_start:.1f}s')
         outage_cause = error if getattr(error, 'outage', False) else budget.outage_cause
         raise Stalled(budget.box, budget.phase, budget.seconds, outage_cause) from None
     finally:
@@ -170,6 +174,12 @@ def observe_outage(error=None):
     budget.outage_cause = error if error is not None and error.outage else None
 
 
+def track_resume(watch):
+    budget = _ACTIVE.get()
+    if budget is not None:
+        budget.resume_watch = watch
+
+
 @contextlib.contextmanager
 def pause_for_home_start(*, extra_seconds=0):
     """An answering home server's startup has its own bound, outside box preparation time."""
@@ -182,7 +192,8 @@ def pause_for_home_start(*, extra_seconds=0):
     timer = signal.setitimer(signal.ITIMER_REAL, 0) if main else None
     token = _ACTIVE.set(None)
     try:
-        yield
+        with budget.resume_watch.pause(extra_seconds=extra_seconds) if budget.resume_watch is not None else contextlib.nullcontext():
+            yield
     finally:
         elapsed = time.monotonic() - began + extra_seconds
         for field in ('start', 'end', 'total_start', 'phase_start', 'next_progress'):

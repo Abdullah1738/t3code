@@ -42,7 +42,7 @@ import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
 
 it.live.each(
   (["codex", "claudeAgent"] as const).flatMap((provider) =>
-    (["queue", "auto"] as const).map((mode) => ({ provider, mode })),
+    (["queue", "auto", "steer"] as const).map((mode) => ({ provider, mode })),
   ),
 )(
   "$provider $mode control send saves with background and queued startup work held",

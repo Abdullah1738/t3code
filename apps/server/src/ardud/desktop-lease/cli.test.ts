@@ -58,6 +58,10 @@ const run = (identity: Record<string, string | undefined>, ...args: string[]) =>
   });
 
 describe("t3ctl desktop-lease", () => {
+  it("documents that release withdraws queued tickets", async () => {
+    const result = await run({}, "--help");
+    expect(result.stdout + result.stderr).toContain("release also withdraws your queued ticket");
+  });
   it("uses the Codex native identity for acquire", async () => {
     received = [];
     const result = await run(

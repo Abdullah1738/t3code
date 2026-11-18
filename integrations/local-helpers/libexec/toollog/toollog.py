@@ -231,7 +231,7 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
          ids=None, props=None, error_tag=None):
     """Drop write failures. Error messages are fixed tags, never exception messages."""
     try:
-        if kind not in {'event', 'perf', 'error'} or not _LABEL.fullmatch(component) or not _LABEL.fullmatch(name):
+        if kind not in {'event', 'perf', 'error', 'opencode-reload'} or not _LABEL.fullmatch(component) or not _LABEL.fullmatch(name):
             return
         now = datetime.now(timezone.utc)
         day = now.strftime('%Y-%m-%d')
@@ -255,6 +255,30 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
         for key, value in [('ids', _metadata(ids, _IDS)), ('props', _metadata(props, _FIELDS))]:
             if value:
                 row[key] = value
+        if kind == 'opencode-reload':
+            # This event intentionally carries file paths and hashes, never bytes.
+            reload = props or {}
+            files = reload.get('files', [])
+            busy = reload.get('busy', {})
+            if (component != 'installers' or name != 'opencode-reload'
+                    or not _SLUG.fullmatch(reload.get('installer', ''))
+                    or not isinstance(files, list) or not files
+                    or not isinstance(busy, dict)
+                    or type(reload.get('waited_ms')) is not int or reload['waited_ms'] < 0
+                    or type(reload.get('allow_reload')) is not bool):
+                return
+            for item in files:
+                if (not isinstance(item, dict) or not isinstance(item.get('path'), str)
+                        or not os.path.isabs(item['path']) or any(
+                            item.get(key) is not None and not re.fullmatch(r'[a-f0-9]{64}', item[key])
+                            for key in ('sha256_before', 'sha256_after'))):
+                    return
+            if any(not _LABEL.fullmatch(key) or not (type(value) is int and value >= 0 or value == 'unknown')
+                   for key, value in busy.items()):
+                return
+            row['props'] = {key: reload[key] for key in ('installer', 'busy', 'waited_ms', 'allow_reload')}
+            row['props']['files'] = [{key: item[key] for key in ('path', 'sha256_before', 'sha256_after')}
+                                     for item in files]
         if error_tag:
             tag = error_tag if isinstance(error_tag, str) and _LABEL.fullmatch(error_tag) else 'other'
             row['error'] = {'tag': tag, 'message': tag}
@@ -658,6 +682,7 @@ def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
     causes, render_failures = Counter(), Counter()
+    probe_rows = defaultdict(Counter)
     samples, references, durations = {}, {}, defaultdict(list)
     order_errors, order_polls = {}, defaultdict(list)
     component_totals, component_errors = Counter(), defaultdict(Counter)
@@ -681,6 +706,14 @@ def rollup(board, day, top_n=20):
     deduped_failures = 0
     def observe_error(row, line_number, weight=1):
         nonlocal single_failures
+        probe_id = (row.get('ids') or {}).get('inboundId', '')
+        if board == 'imessage' and isinstance(probe_id, str) and re.fullmatch(r'row_[a-f0-9]{16}', probe_id):
+            probe_tag = ('router.probe_backoff' if row.get('name') == 'router.probe_backoff'
+                         else 'router.catch1' if (row.get('error') or {}).get('tag') == 'router.catch1' else None)
+            if probe_tag:
+                key = (probe_tag, 'admission_read_failed')
+                causes[key] += weight
+                probe_rows[key][probe_id] += weight
         if board == 'imessage' and row.get('alreadyLogged') is True:
             return
         request_failure = (board == 'imessage' and row.get('component') == 'robob' and row.get('name') == 'turn.robob_call'
@@ -923,7 +956,11 @@ def rollup(board, day, top_n=20):
             for merchant, poll in sorted(poll_counts.items())}
     if board == 'imessage':
         result['dedupedFailures'] = deduped_failures
-        result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count}
+        result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count,
+                                **({'distinctInboundIds': len(probe_rows[(tag, cause)]),
+                                    'topInboundIds': [{'inboundId': row, 'count': attempts} for row, attempts in
+                                                      sorted(probe_rows[(tag, cause)].items(), key=lambda x: (-x[1], x[0]))[:14]]}
+                                   if (tag, cause) in probe_rows else {})}
                                for (tag, cause), count in sorted(causes.items(), key=lambda x: (-x[1], x[0]))[:20]]
         result['cardRenderFailures'] = dict(sorted(render_failures.items()))
         result['byComponent'] = {}
@@ -945,7 +982,7 @@ def main(argv=None):
         p.add_argument('--board', required=True)
         p.add_argument('--day', default=datetime.now(timezone.utc).strftime('%Y-%m-%d'))
         if cmd == 'read':
-            p.add_argument('--kind', choices=['event', 'perf', 'error'])
+            p.add_argument('--kind', choices=['event', 'perf', 'error', 'opencode-reload'])
             p.add_argument('--name')
             p.add_argument('--limit', type=int, default=100)
         else:

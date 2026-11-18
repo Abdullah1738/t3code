@@ -8,28 +8,10 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import card_status as cs
 import commerce_cli as cli
-
-
-# Talabat was retired by the owner on 2026-11-07 (talabat_retired.py). These tests use
-# the old Talabat lane to exercise shared guards (card, pause, Moni go, chat, --for), so
-# the retirement gate is switched off inside this test process only; the gate itself is
-# covered by test_talabat_retired.
-import talabat_retired as _talabat_retired
-from unittest.mock import patch as _retired_patch
-_retired_gate = _retired_patch.object(_talabat_retired, 'requested', return_value=False)
-
-
-def setUpModule():
-    _retired_gate.start()
-
-
-def tearDownModule():
-    _retired_gate.stop()
 
 
 DECLINE = 'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY'
@@ -262,10 +244,6 @@ class CardStatusModuleTests(TempState):
 
 class CommerceCardRefusalTests(TempState):
     LANES = {
-        'talabat': (['order', 'talabat', '--vertical', 'restaurants', '--branch', '20515', '--item', '12345',
-                     '--apk-pool', 'unused'], 'purchase_talabat'),
-        'test-talabat-shops': (['test-talabat-shops', '--branch', '44444', '--item',
-                                '10000000-0000-4000-8000-000000000002', '--apk-pool', 'unused'], 'purchase_talabat'),
         'minutes': (['order', 'minutes', '--sku', 'SKU1', '--cvv-from-keychain'], 'order_minutes'),
         'nownow': (['order', 'nownow', '--product-code', 'P', '--store-code', 'S'], 'order_nownow'),
         'main': (['order', 'main', '--sku-config', 'C'], 'order_main'),
@@ -278,7 +256,7 @@ class CommerceCardRefusalTests(TempState):
         return code, json.loads(out.getvalue().strip().splitlines()[-1])
 
     def test_every_paying_lane_refuses_before_any_network_call(self):
-        cs.record_declined('2342', reason=DECLINE, source='commerce talabat 3965762974')
+        cs.record_declined('9546', reason=DECLINE, source='commerce talabat 3965762974')
         forbidden = AssertionError('no network, auth, keychain or Moni check before the card check')
         for name, (argv, lane) in self.LANES.items():
             with self.subTest(lane=name), \
@@ -291,37 +269,37 @@ class CommerceCardRefusalTests(TempState):
                 self.assertEqual(code, 3)
                 run.assert_not_called()
             self.assertEqual(result['error'], 'CARD_RECENTLY_DECLINED')
-            self.assertEqual(result['card_last4'], '2342')
+            self.assertEqual(result['card_last4'], '9546')
             self.assertFalse(result['ok'])
             self.assertFalse(result['financial_send'])
             self.assertFalse(result['financial_retry'])
-            self.assertIn('Ask Abdullah before trying it again; clear with: card-status ok 2342', result['message'])
+            self.assertIn('Ask Abdullah before trying it again; clear with: card-status ok 9546', result['message'])
 
     def test_lanes_check_the_order_card_not_the_cancelled_one(self):
-        # 5542 is cancelled; a cancelled record for it must not stop the lane. 2342 declined must.
+        # 5542 is cancelled; a cancelled record for it must not stop the lane. 9546 declined must.
         cs.record_cancelled('5542', reason='cancelled')
-        with patch.object(cli, 'purchase_talabat', return_value={'ok': True}) as purchase:
-            code, _ = self.run_cli(self.LANES['talabat'][0])
+        with patch.object(cli, 'order_minutes', return_value={'ok': True}) as purchase:
+            code, _ = self.run_cli(self.LANES['minutes'][0])
         self.assertEqual(code, 0)
         purchase.assert_called_once()
-        cs.record_declined('2342', reason=DECLINE)
-        code, result = self.run_cli(self.LANES['talabat'][0])
+        cs.record_declined('9546', reason=DECLINE)
+        code, result = self.run_cli(self.LANES['minutes'][0])
         self.assertEqual(code, 3)
-        self.assertEqual(result['card_last4'], '2342')
+        self.assertEqual(result['card_last4'], '9546')
 
     def test_prepare_only_is_not_refused_and_clear_reopens_ordering(self):
-        cs.record_declined('2342', reason=DECLINE)
-        with patch.object(cli, 'purchase_talabat', return_value={'ok': True, 'state': 'PREPARED_NOT_ORDERED'}):
-            code, result = self.run_cli([*self.LANES['talabat'][0], '--prepare-only'])
+        cs.record_declined('9546', reason=DECLINE)
+        with patch.object(cli, 'order_minutes', return_value={'ok': True, 'state': 'PREPARED_NOT_ORDERED'}):
+            code, result = self.run_cli([*self.LANES['minutes'][0], '--prepare-only'])
         self.assertEqual((code, result['state']), (0, 'PREPARED_NOT_ORDERED'))
-        cs.record_ok('2342', note='topped up')
-        with patch.object(cli, 'purchase_talabat', return_value={'ok': True}) as purchase:
-            code, _ = self.run_cli(self.LANES['talabat'][0])
+        cs.record_ok('9546', note='topped up')
+        with patch.object(cli, 'order_minutes', return_value={'ok': True}) as purchase:
+            code, _ = self.run_cli(self.LANES['minutes'][0])
         self.assertEqual(code, 0)
         purchase.assert_called_once()
 
     def test_supermall_paid_resume_only_finishes_tracking(self):
-        cs.record_declined('2342', reason=DECLINE)
+        cs.record_declined('9546', reason=DECLINE)
         argv = [*self.LANES['supermall'][0], '--resume-flow', FLOW]
         with patch.object(cli.journal, 'inspect', return_value={'order_id': 'NAEIA1'}), \
                 patch.object(cli, 'order_supermall', return_value={'ok': True}) as resume:
@@ -331,57 +309,32 @@ class CommerceCardRefusalTests(TempState):
                 patch.object(cli, 'order_supermall', side_effect=AssertionError('must not run')):
             self.assertEqual(self.run_cli(argv)[0], 3)
 
-    def test_talabat_decline_result_marks_card_and_blocks_next_order(self):
-        flow = Mock()
-        flow.flow_id = FLOW
-        flow.prepare.return_value = {'payable_minor': 4725}
-        flow.purchase.return_value = {'state': 'PAYMENT_ERROR_REPORTED', 'reason': DECLINE, 'flow_id': FLOW}
-        args = SimpleNamespace(vertical='restaurants', branch=20515, apk_pool='unused', resume_flow=None,
-                               prepare_only=False, label='Tim Hortons: muffin', recipient='moni')
-        with patch.object(cli, 'input_items', return_value=[{'item_id': 12345, 'quantity': 1}]), \
-                patch('talabat_basket.parse_items', return_value=[]), \
-                patch.object(cli.talabat.shared, 'verticals_key', return_value='0123456789abcdef'), \
-                patch('commerce_talabat.TalabatFlow', return_value=flow), \
-                patch.object(cli.journal, 'inspect', return_value={'order_id': '3965762974'}), \
-                patch.object(cli.journal, 'complete') as complete, \
-                patch.object(cli, 'register_tracking', return_value={'registered': True}) as register, \
-                contextlib.redirect_stdout(io.StringIO()):
-            result = cli.purchase_talabat(args)
-        # The payment outcome itself is unchanged.
-        self.assertFalse(result['ok'])
-        self.assertFalse(result['purchase_confirmed'])
-        self.assertFalse(result['financial_retry'])
-        self.assertEqual(result['error'], 'TALABAT_PAYMENT_NOT_CONFIRMED')
-        self.assertIn('Do not place another order', result['next_action'])
-        complete.assert_not_called()
-        self.assertFalse(register.call_args.kwargs['paid'])
-        flow.purchase.assert_called_once()
-        self.assertTrue(result['card_status']['recorded'])
-        self.assertTrue(result['card_status']['blocked'])
-        record = self.stored()['2342']
+    def test_live_decline_result_marks_the_current_card(self):
+        result = cli.note_card_decline({'reason': DECLINE, 'flow_id': FLOW,
+                                       'order': 'I123'}, app='noon minutes')
+        self.assertTrue(result['recorded'])
+        self.assertTrue(result['blocked'])
+        record = self.stored()['9546']
         self.assertEqual((record['state'], record['reason'], record['source']),
-                         ('declined', DECLINE, 'commerce talabat 3965762974'))
+                         ('declined', DECLINE, 'commerce noon minutes I123'))
         self.assertEqual(record['events'], [FLOW])
-        # A live decline happened just now: the 12h block starts at this write.
         self.assertEqual(record['at'], record['recorded_at'])
         self.assertLess(abs(record['at'] - time.time()), 60)
-        with patch.object(cli, 'purchase_talabat', side_effect=AssertionError('second order must not start')):
-            code, refused = self.run_cli(self.LANES['talabat'][0])
+        with patch.object(cli, 'order_minutes', side_effect=AssertionError('second order must not start')):
+            code, refused = self.run_cli(self.LANES['minutes'][0])
         self.assertEqual((code, refused['error']), (3, 'CARD_RECENTLY_DECLINED'))
-        self.assertIn('(PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY, commerce talabat 3965762974)',
-                      refused['message'])
 
     def test_other_payment_failures_do_not_mark_the_card(self):
         for reason in ('NO_ROLLBACK_OR_RETRY_ASSUMED', 'STATUS_READ_FAILED_NO_RETRY', None):
             self.assertIsNone(cli.note_card_decline({'state': 'PAYMENT_ERROR_REPORTED', 'reason': reason,
-                                                     'flow_id': FLOW}, app='talabat'))
+                                                     'flow_id': FLOW}, app='noon minutes'))
         self.assertFalse(self.path.exists())
 
     def test_recording_failure_never_changes_the_result(self):
         with patch.object(cs, 'record_declined', side_effect=OSError('disk full')):
-            noted = cli.note_card_decline({'reason': DECLINE, 'flow_id': FLOW}, app='talabat')
+            noted = cli.note_card_decline({'reason': DECLINE, 'flow_id': FLOW}, app='noon minutes')
         self.assertFalse(noted['recorded'])
-        self.assertIn('card-status declined 2342', noted['message'])
+        self.assertIn('card-status declined 9546', noted['message'])
 
     def test_recover_payment_decline_records_once_and_respects_a_later_clear(self):
         declined = {'ok': False, 'state': 'PAYMENT_ERROR_REPORTED', 'reason': DECLINE, 'flow_id': FLOW,
@@ -393,16 +346,16 @@ class CommerceCardRefusalTests(TempState):
         self.assertEqual(code, 1)
         self.assertEqual((result['state'], result['reason']), ('PAYMENT_ERROR_REPORTED', DECLINE))
         self.assertTrue(result['card_status']['recorded'])
-        self.assertEqual(self.stored()['2342']['source'], 'commerce talabat 3965762974')
+        self.assertEqual(self.stored()['9546']['source'], 'commerce talabat 3965762974')
         # Abdullah tops up; a later re-read of the same old flow keeps the card clear.
-        cs.record_ok('2342', note='topped up')
+        cs.record_ok('9546', note='topped up')
         with patch.object(cli, 'recover_payment', return_value={**declined, 'flow_id': 'other-old-flow'}), \
                 patch.object(cli.journal, 'flow_created_at', return_value=0), \
                 patch.object(cli.journal, 'decline_observed_at', return_value=None):
             code, result = self.run_cli(['recover-payment', 'other-old-flow'])
         self.assertEqual(code, 1)
         self.assertFalse(result['card_status']['recorded'])
-        self.assertFalse(cs.check('2342')['blocked'])
+        self.assertFalse(cs.check('9546')['blocked'])
 
     def test_cancelled_card_stays_blocked_after_12h(self):
         cs.record_cancelled('2342', reason='lost card', source='owner', now=AT)
@@ -461,7 +414,7 @@ class CommerceCardRefusalTests(TempState):
                 self.assertEqual(cs.check('5542', now=AT + 60)['blocked'], True)
 
     def test_cancelled_card_refuses_every_paying_lane(self):
-        cs.record_cancelled('2342', reason='lost card')
+        cs.record_cancelled('9546', reason='lost card')
         forbidden = AssertionError('no network, auth, keychain or Moni check before the card check')
         for name, (argv, lane) in CommerceCardRefusalTests.LANES.items():
             with self.subTest(lane=name), \
@@ -474,7 +427,7 @@ class CommerceCardRefusalTests(TempState):
                     code = cli.main([*argv, '--for', 'moni', '--moni-go', 'yes order it'])
                 result = json.loads(out.getvalue().strip().splitlines()[-1])
                 self.assertEqual(code, 3)
-                self.assertEqual((result['error'], result['card_last4']), ('CARD_CANCELLED', '2342'))
+                self.assertEqual((result['error'], result['card_last4']), ('CARD_CANCELLED', '9546'))
                 self.assertFalse(result['financial_send'])
                 run.assert_not_called()
 
@@ -483,10 +436,8 @@ class CommerceCardRefusalTests(TempState):
         pause.parent.mkdir(parents=True, exist_ok=True)
         pause.write_text('card cancelled by owner 29 Oct\n')
         forbidden = AssertionError('nothing may run while ordering is paused')
-        paused = ['order', 'test-talabat-shops', 'await-payment', 'marketplace-cart', 'cart', 'recover-payment']
-        argv_for = {'order': ['order', 'talabat', '--vertical', 'restaurants', '--branch', '20515',
-                              '--item', '12345', '--apk-pool', 'unused'],
-                    'test-talabat-shops': CommerceCardRefusalTests.LANES['test-talabat-shops'][0],
+        paused = ['order', 'await-payment', 'marketplace-cart', 'cart', 'recover-payment']
+        argv_for = {'order': self.LANES['minutes'][0],
                     'await-payment': ['await-payment', FLOW],
                     'marketplace-cart': ['marketplace-cart', 'main'],
                     'cart': ['cart', 'minutes', 'show'],
@@ -495,7 +446,6 @@ class CommerceCardRefusalTests(TempState):
                 patch.object(cli, 'CommerceAuth', side_effect=forbidden), \
                 patch.object(cli, 'cvv_from_keychain', side_effect=forbidden), \
                 patch.object(cli.subprocess, 'run', side_effect=forbidden), \
-                patch.object(cli, 'purchase_talabat', side_effect=forbidden), \
                 patch.object(cli, 'order_minutes', side_effect=forbidden), \
                 patch.object(cli, 'recover_payment', side_effect=forbidden), \
                 patch.object(cli, 'card_preflight', side_effect=forbidden):

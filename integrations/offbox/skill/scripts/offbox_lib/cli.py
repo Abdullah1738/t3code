@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     lr = sp.add_parser("log-rollup", help="roll up shared tool logs for a UTC day")
     lr.add_argument("--day", metavar="YYYY-MM-DD")
+    lr.add_argument("--live-only", action="store_true", help="exclude fixture run IDs; report excluded records")
 
     lg = sp.add_parser("logs")
     lg.add_argument("run_id")
@@ -475,10 +476,11 @@ def _main(argv: list[str] | None = None) -> int:
     from .redact import redact_argv, warn_env_values
     try:
         if a.sub == "log-rollup":
-            print(json.dumps(toollog.rollup(a.day), sort_keys=True))
+            print(json.dumps(toollog.rollup(a.day, live_only=a.live_only), sort_keys=True))
             return 0
         if a.sub == "reap":
             toollog.rollup_previous()
+            toollog.rollup_today()
         me = whoami()
         if a.sub == "exec":
             from . import execute

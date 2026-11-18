@@ -1,4 +1,4 @@
-import { markReactionAnswered } from "./unanswered.ts";
+import { markAnswered } from "./unanswered.ts";
 import type { RemoteBox } from "./remote-box.ts";
 import { RemoteRequestError } from "./remote-box.ts";
 import { validId } from "./remote-protocol.ts";
@@ -143,7 +143,7 @@ export class ChatRegistry<P> {
             const created = chat.remote ? chat.remote.accept(id, payload) : chat.store.acceptInbound(id, payload);
             if (created) {
               const message = input as { attachments?: { totalBytes?: number }[]; sentAt?: number; logSource?: string };
-              toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: chat.info.slug, messageId: id },
+              toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: chat.info.slug, messageId: id, inboundId: id },
                 props: { bytesKnown: !message.attachments?.length || message.attachments.every(a => (a.totalBytes ?? 0) > 0), attachmentCount: message.attachments?.length ?? 0, attachmentBytes: (message.attachments ?? []).reduce((n, a) => n + (a.totalBytes ?? 0), 0),
                   receiveLagMs: Math.max(0, this.now() - (message.sentAt ?? this.now())), source: message.logSource === "backfill" ? "backfill" : "live",
                   backend: chat.remote ? "remote-box" : this.options.backend ?? "unknown" } }));
@@ -419,11 +419,11 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           ownerOnly(false);
           live();
           if (body.chat !== "moni" || path === "/remote-events" && body.after !== undefined && !validId(body.after)
-            || path === "/remote-resolve" && (!validId(body.id) || !["done", "pending"].includes(String(body.state)))) throw new HttpError(400, "Invalid request");
+            || path === "/remote-resolve" && (!validId(body.id) || !["done", "pending", "failed"].includes(String(body.state)))) throw new HttpError(400, "Invalid request");
           const remote = registry.bySlugName("moni")?.remote;
           if (!remote) throw new HttpError(409, "Moni's chat is not on its box");
           try {
-            return reply(200, path === "/remote-events" ? await remote.events(body.after as string | undefined) : await remote.resolve(body.id as string, body.state as "done" | "pending"));
+            return reply(200, path === "/remote-events" ? await remote.events(body.after as string | undefined) : await remote.resolve(body.id as string, body.state as "done" | "pending" | "failed"));
           } catch (error) {
             if (error instanceof RemoteRequestError && error.status === 409) throw new HttpError(409, "Event is not interrupted/attachment-failed");
             throw new HttpError(502, "Box request failed");
@@ -494,8 +494,9 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           const inbound = registry.all().find(chat =>
             chat.store.db.query<{ id: string }, [string]>("SELECT id FROM inbound WHERE id = ?").get(target));
           if (!inbound) throw new HttpError(403, "Forbidden");
+          const covered = [target];
           await options.line.react(target, kind);
-          markReactionAnswered(inbound.store, target);
+          markAnswered(inbound.store, covered);
           return reply(200, { id: `reaction:${hash(target + kind)}` });
         }
         case "/location-request": {

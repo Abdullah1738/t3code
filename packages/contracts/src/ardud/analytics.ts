@@ -1,4 +1,5 @@
 import { McpReasonClass, McpInvalidField, McpRefusedAt } from "./mcpReasonClass.ts";
+import { ClaudeApiErrorDetails } from "./claudeApiError.ts";
 import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -12,7 +13,7 @@ const Timestamp = Schema.String.check(
   }),
 );
 
-// Metadata only. Deliberately no arbitrary property bag or free-form text fields.
+// Labels stay metadata-only; the provider diagnostics below carry scrubbed, bounded excerpts.
 const Label = Schema.String.check(
   Schema.isMaxLength(160),
   Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+-]*$/),
@@ -68,15 +69,39 @@ const McpOutcome = Schema.Literals([
   "interrupted",
   "interrupted_by_shutdown",
 ]);
-const McpPhase = Schema.Literals([
+export const McpPhase = Schema.Literals([
   "caller",
   "dispatch",
   "result",
   "handler",
+  "parent_records",
+  "child_records",
+  "catalog",
+  "request_key",
+  "receipt",
+  "settings",
+  "selection",
+  "workspace",
   "lane_wait",
   "query",
   "render",
 ]);
+// Pool identities include custom model slugs and provider suffixes such as [1m].
+const PoolKey = Schema.String.check(
+  Schema.isMaxLength(4608),
+  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+!~'()*[\],=-]*$/),
+);
+const PoolChangeFields = {
+  poolKey: PoolKey,
+  fromPoolKey: Schema.optionalKey(PoolKey),
+  fromSlots: Schema.NullOr(Measurement),
+  toSlots: Schema.NullOr(Measurement),
+  op: Schema.Literals(["set", "add", "remove", "replace", "auto_zero"]),
+  actorKind: Schema.Literals(["evaluator", "owner", "script", "system"]),
+  actorId: Schema.NullOr(DerivedId),
+};
+export const KanbanPoolChange = Schema.Struct({ at: Timestamp, ...PoolChangeFields });
+export type KanbanPoolChange = typeof KanbanPoolChange.Type;
 export const EvaluatorTrigger = Schema.Literals([
   "owner_answer",
   "card_ask",
@@ -140,6 +165,40 @@ export const EvaluatorPurposeKind = Schema.Literals([
   "request",
   "unknown",
 ]);
+// Provider instance/model ids may include punctuation excluded from routing labels.
+const RuntimeCounts = Schema.Record(Schema.String.check(Schema.isMaxLength(512)), Measurement);
+const RuntimeSampleProps = {
+  runningTurns: Schema.optionalKey(
+    Schema.Struct({
+      total: Measurement,
+      byProvider: RuntimeCounts,
+      byModel: RuntimeCounts,
+    }),
+  ),
+  runningByOrigin: Schema.optionalKey(
+    Schema.Struct({
+      boardWork: Measurement,
+      boardReview: Measurement,
+      boardEvaluator: Measurement,
+      delegatedChild: Measurement,
+      scheduledTask: Measurement,
+      other: Measurement,
+    }),
+  ),
+  queuedRuns: Schema.optionalKey(Measurement),
+  providerSessions: Schema.optionalKey(RuntimeCounts),
+  host: Schema.optionalKey(
+    Schema.Struct({
+      load1: Measurement,
+      load5: Measurement,
+      load15: Measurement,
+      rssMiB: Measurement,
+      heapUsedMiB: Measurement,
+      eventLoopLagP99Ms: Schema.optionalKey(Measurement),
+    }),
+  ),
+};
+
 const GeneralEvent = Schema.Struct({
   ts: Timestamp,
   kind: Label.check(Schema.makeFilter((kind) => kind !== "run.usage")),
@@ -166,17 +225,32 @@ const GeneralEvent = Schema.Struct({
     }),
   ),
   threadId: Schema.optionalKey(DerivedId),
+  // Claude API diagnostics are scrubbed at the adapter boundary, before truncation.
+  claudeApiError: Schema.optionalKey(ClaudeApiErrorDetails),
   durationMs: Schema.optionalKey(Measurement),
   phase: Schema.optionalKey(Label),
   waitedMs: Schema.optionalKey(Measurement),
   lateMs: Schema.optionalKey(Measurement),
   afterCap: Schema.optionalKey(Schema.Boolean),
+  detachedOutcomeWake: Schema.optionalKey(
+    Schema.Literals([
+      "sent",
+      "sent_after_restart",
+      "suppressed_retry_saved",
+      "suppressed_definite",
+    ]),
+  ),
   tool: Schema.optionalKey(Label),
   build: Schema.optionalKey(Label),
   bootId: Schema.optionalKey(Id),
   startedAt: Schema.optionalKey(Timestamp),
   committed: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
   taskId: Schema.optionalKey(DerivedId),
+  ticket: Schema.optionalKey(DerivedId),
+  mode: Schema.optionalKey(Schema.Literals(["native", "cua-driver"])),
+  from: Schema.optionalKey(Label),
+  to: Schema.optionalKey(Label),
+  age_ms: Schema.optionalKey(Measurement),
   parentThreadId: Schema.optionalKey(DerivedId),
   parentRunId: Schema.optionalKey(DerivedId),
   noticeMessageId: Schema.optionalKey(DerivedId),
@@ -285,6 +359,7 @@ const GeneralEvent = Schema.Struct({
   ),
   props: Schema.optionalKey(
     Schema.Struct({
+      ...RuntimeSampleProps,
       total: Schema.optionalKey(Measurement),
       distinctCwds: Schema.optionalKey(Measurement),
       maxPerSecond: Schema.optionalKey(Measurement),
@@ -323,6 +398,12 @@ const GeneralEvent = Schema.Struct({
       lastProgressKind: Schema.optionalKey(Label),
       lastProgressTool: Schema.optionalKey(Label),
       silentSeconds: Schema.optionalKey(Measurement),
+      attempt: Schema.optionalKey(Schema.NullOr(Measurement)),
+      maxRetries: Schema.optionalKey(Schema.NullOr(Measurement)),
+      // Provider diagnostics are required to explain retries; never include tool or prompt bodies.
+      errorMessage: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(2000))),
+      waitSinceResponseMs: Schema.optionalKey(Measurement),
+      guardFiredDuringRetry: Schema.optionalKey(Schema.Boolean),
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
       cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
@@ -421,7 +502,14 @@ const GeneralEvent = Schema.Struct({
         ]),
       ),
       idCanonical: Schema.optionalKey(Schema.Boolean),
+      commandId: Schema.optionalKey(DerivedId),
+      taskId: Schema.optionalKey(DerivedId),
+      receiptState: Schema.optionalKey(Schema.Literal("accepted")),
+      missingLookup: Schema.optionalKey(Schema.Literals(["subagents", "child_thread_id"])),
       dispatchFenceRecovered: Schema.optionalKey(Schema.Boolean),
+      retryPath: Schema.optionalKey(
+        Schema.Literals(["receipt_fast", "attached_pending", "dispatched"]),
+      ),
       idShape: Schema.optionalKey(
         Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),
       ),
@@ -430,7 +518,13 @@ const GeneralEvent = Schema.Struct({
       ),
       waitMs: Schema.optionalKey(Measurement),
       originKind: Schema.optionalKey(Label),
-      poolKey: Schema.optionalKey(Label),
+      poolKey: Schema.optionalKey(PoolKey),
+      fromPoolKey: Schema.optionalKey(PoolKey),
+      fromSlots: Schema.optionalKey(PoolChangeFields.fromSlots),
+      toSlots: Schema.optionalKey(PoolChangeFields.toSlots),
+      op: Schema.optionalKey(PoolChangeFields.op),
+      actorKind: Schema.optionalKey(PoolChangeFields.actorKind),
+      actorId: Schema.optionalKey(PoolChangeFields.actorId),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
       itemKind: Schema.optionalKey(Label),
@@ -563,6 +657,7 @@ export const AnalyticsIngestInput = Schema.Struct({
   events: Schema.Array(
     Schema.Struct({
       ...GeneralEvent.fields,
+      claudeApiError: Schema.optionalKey(Schema.Never),
       surface: Schema.Literals(["web", "desktop", "mobile"]),
     }),
   ).check(Schema.isMinLength(1), Schema.isMaxLength(100)),
@@ -643,6 +738,17 @@ export const AnalyticsRollup = Schema.Struct({
   total: Measurement,
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
+  claudeApiErrors: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        status: Schema.NullOr(Schema.Number),
+        model: ModelId,
+        host: Label,
+        attempts: Measurement,
+        giveUps: Measurement,
+      }),
+    ),
+  ),
   restartAdmission: Schema.optionalKey(
     Schema.Struct({
       scope: Schema.Literal("server-wide"),
@@ -685,6 +791,19 @@ export const AnalyticsRollup = Schema.Struct({
         ...LatencyFields,
       }),
     ),
+  ),
+  runtimeSamples: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        hour: Label,
+        samples: Measurement,
+        runningTurnsMax: Measurement,
+        runningTurnsAvg: Measurement,
+        queuedRunsMax: Schema.NullOr(Measurement),
+        load1Max: Measurement,
+        sampleMsMax: Measurement,
+      }),
+    ).check(Schema.isMaxLength(24)),
   ),
   errorCounts: Schema.Record(Label, Measurement),
   controlRoutes: Schema.optionalKey(
@@ -850,10 +969,11 @@ export const AnalyticsRollup = Schema.Struct({
       ),
       openAsksAsOf: Schema.NullOr(Timestamp),
       incompleteAskSnapshots: Measurement,
+      poolChanges: Schema.optionalKey(Schema.Array(KanbanPoolChange)),
       poolUtilisation: Schema.Array(
         Schema.Struct({
           hour: Label,
-          poolKey: Label,
+          poolKey: PoolKey,
           samples: Measurement,
           used: Measurement,
           slots: Measurement,

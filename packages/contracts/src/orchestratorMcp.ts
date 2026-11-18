@@ -244,6 +244,8 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   currentRunId: Schema.optional(Schema.NullOr(RunId)),
   currentRunStatus: Schema.optional(Schema.NullOr(OrchestrationV2RunStatus)),
   status: OrchestratorMcpDelegatedTaskStatus,
+  resumable: Schema.optional(Schema.Boolean),
+  resumeThreadId: Schema.optional(ThreadId),
   failure: Schema.optional(
     Schema.NullOr(
       Schema.Struct({
@@ -817,12 +819,14 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "run_starting",
       "caller_unresolved",
       "delegation_timeout",
+      "delegation_uncertain",
       "ambiguous_replay",
       "provider_unavailable",
       "model_unavailable",
       "runtime_mode_escalation_denied",
       "interaction_mode_escalation_denied",
       "task_not_found",
+      "task_record_missing",
       "task_creating",
       "task_not_cancellable",
       "thread_not_found",
@@ -841,6 +845,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     reason: Schema.optional(McpDenyReason),
     reasonClass: Schema.optionalKey(McpReasonClass),
     invalidField: Schema.optionalKey(McpInvalidField),
-    saved: Schema.optional(Schema.Boolean),
+    saved: Schema.optional(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+    taskId: Schema.optional(NodeId),
   },
 ) {}

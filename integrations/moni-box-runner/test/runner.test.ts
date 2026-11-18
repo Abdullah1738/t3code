@@ -34,6 +34,7 @@ test("fake harness replies are durably queued and callback payloads stay on the 
   const inputs: string[] = []; const s = setup({ run: async ({ text }) => { inputs.push(text); return "reply"; } });
   await s.lease(); s.runner.enqueue(opaqueId("event"), { text: "input" }); await s.runner.tick();
   expect(inputs).toEqual(["input"]); expect(s.calls.find(c => c.path.endsWith("/send"))?.body.text).toBe("reply");
+  expect(s.calls.find(c => c.path.endsWith("/send"))?.body.inboxId).toBe(opaqueId("event"));
   expect(s.runner.db.query<{ state: string }, []>("SELECT state FROM inbox").get()!.state).toBe("done");
 });
 test("Claude CLI uses the box home, router helper environment and explicit resume id", async () => {
@@ -126,6 +127,25 @@ test.each([false, true])("events expose only fence metadata with hasSend=%s; res
   expect(await (await s.runner.handle(s.request("/events", {}))).json()).toEqual({ events: [] });
 });
 
+test.each(["automatic", "manual-done", "resumed-no-reply", "resumed-replied"])("automatic retry distinguishes an automatic tombstone from %s completion", async completion => {
+  let attempts = 0;
+  const harness = { run: async () => { if (++attempts === 1) throw new Error("interrupted"); return completion === "resumed-replied" ? "reply" : "NO_REPLY"; } };
+  const s = setup(harness), id = opaqueId("wake"), dm = opaqueId("dm");
+  await s.lease(); s.runner.enqueue(id, { kind: "wake", text: "private" }); s.runner.enqueue(dm, { kind: "inbound", text: "dm" });
+  await s.runner.tick();
+  const automatic = { id, state: "done", reconciled: true, autoFailMs: 0 };
+  if (completion === "automatic") expect((await s.runner.handle(s.request("/resolve", automatic))).status).toBe(200);
+  else {
+    expect((await s.runner.handle(s.request("/resolve", { id, state: completion === "manual-done" ? "done" : "pending", reconciled: true }))).status).toBe(200);
+    if (completion !== "manual-done") await s.runner.tick();
+  }
+  if (completion === "resumed-replied") expect(s.calls.filter(c => c.path.endsWith("/send"))).toHaveLength(1);
+  const reopened = new BoxRunner(s.runner.config, harness, { callbackReady: async () => true }); clean.push(() => reopened.db.close());
+  await reopened.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  expect((await reopened.handle(s.request("/resolve", automatic))).status).toBe(completion === "automatic" ? 200 : 409);
+  expect(reopened.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)?.state).toBe("done");
+});
+
 test("legacy schema upgrades timestamp crash interruption and recognize old reply actions without exposing text", async () => {
   const s = setup({ run: async () => "NO_REPLY" }), root = join(s.root, "legacy"); mkdirSync(root);
   const db = new Database(join(root, "agent.sqlite")), id = opaqueId("legacy");
@@ -136,9 +156,11 @@ test("legacy schema upgrades timestamp crash interruption and recognize old repl
     const runner = new BoxRunner({ ...s.runner.config, root }, { run: async () => "NO_REPLY" }, { now: () => now, callbackReady: async () => true });
     clean.push(() => runner.db.close());
     await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
-    expect(await (await runner.handle(s.request("/events", {}))).json()).toEqual({ events: [
+    const metadata = await (await runner.handle(s.request("/events", {}))).text();
+    expect(metadata).not.toContain("PRIVATE_OLD");
+    expect(JSON.parse(metadata)).toEqual({ events: [
       { id, state: "interrupted", failure: null, kind: "wake", interruptedAt: 1234, hasSend: true },
-    ] });
+    ], actions: [{ id: opaqueId(`reply:${id}:0`).slice(0, 12), path: "/send", attempts: 0, lastStatus: null, nextAt: null, inboxId: null }] });
   }
 });
 
@@ -198,19 +220,25 @@ test("head-only probe skips more than a page of attachment failures and counts t
   for (const headOnly of ["true", 1, null]) expect((await s.runner.handle(s.request("/events", { headOnly }))).status).toBe(400);
 });
 
-test("permanent scope refusals fail one action while temporary unavailability retains it", async () => {
+test("permanent scope refusals fail reactions while temporary unavailability backs off without holding the inbox", async () => {
   for (const status of [400, 403, 404, 413, 422, 503]) {
-    const s = setup({ run: async () => "NO_REPLY" }); let available = false; const texts: string[] = [];
+    const s = setup({ run: async () => "NO_REPLY" }); let available = false, now = 1000; const texts: string[] = [];
     const r = new BoxRunner({ ...s.runner.config, root: join(s.root, `scope-${status}`) }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, {
+      now: () => now,
       callbackReady: async () => true,
       fetch: async url => String(url).endsWith("/react") && !available ? new Response("", { status }) : Response.json({ accepted: true }),
     }); clean.push(() => r.db.close());
     await r.action(opaqueId("refused-reaction"), "/react", { target: "unknown", kind: "love" });
     r.enqueue(opaqueId("following"), { text: "next" }); await r.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
     await r.tick();
-    expect(texts).toEqual(status === 503 ? [] : ["next"]);
+    expect(texts).toEqual(["next"]);
     expect(r.db.query<{ state: string }, []>("SELECT state FROM actions WHERE path='/react'").get()!.state).toBe(status === 503 ? "pending" : "failed");
     available = true; await r.tick(); expect(texts).toEqual(["next"]);
+    if (status === 503) {
+      expect(r.db.query("SELECT attempts,last_status,next_at,state FROM actions WHERE path='/react'").get()).toEqual({ attempts: 1, last_status: 503, next_at: 6000, state: "pending" });
+      now = 6000; await r.tick();
+      expect(r.db.query<{ state: string }, []>("SELECT state FROM actions WHERE path='/react'").get()!.state).toBe("done");
+    }
   }
 });
 

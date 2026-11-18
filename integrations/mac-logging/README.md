@@ -103,11 +103,13 @@ and checkpoints the next root to visit, so interrupted passes rotate fairly.
 Cheap batches can share a turn; known timeouts follow healthy discovery and
 refresh work after one early part attempt per root. Ordinary children that will expire
 during the pass are refreshed before more parts work can crowd them out.
-Individual probes use 1.5 times the child's last successful duration, or twice
-its root's median successful duration, bounded to 15–120 seconds. Roots with
-no timing data start at 15 seconds. A short probe timeout doubles the next
-probe and keeps the child in ordinary discovery; only a full probe of at least
-60 seconds establishes a timeout for descent. Legacy timeouts with no recorded
+Individual probes use 1.5 times the child's last successful duration, bounded
+to 15–120 seconds. Children without timing data start at 60 seconds; legacy
+short probes get at least 60 seconds or twice their last allowance, up to 120.
+A known-cost probe below 60 seconds gets one doubled retry per pass and stays
+in ordinary discovery. Only a full probe of at least 60 seconds establishes a
+timeout for descent. Deep batches first learn a cost, then reserve twice the
+estimated work within their deadline. Legacy timeouts with no recorded
 allowance or parts get one probe conversion. Batch deadlines fall back to
 individual probes. A confirmed timed-out child is split into immediate entries,
 with each completed part checkpointed and at most ten minutes per child per
@@ -123,7 +125,9 @@ partial with no total again. Its own directory allocation is included.
 Parts do not recurse. The hourly scanner leaves parts parents and recent
 timeouts to this pass.
 The daily budget is 90 minutes; du runs under nice 10
-and utility scheduling without inherited launchd background I/O policy.
+and utility scheduling with explicit `taskpolicy -d throttle` disk I/O policy.
+The hourly du children also use `-d throttle`; scan roots, accounting and cache
+semantics are unchanged.
 Termination keeps completed rows; unfinished children remain explicit partials.
 Both entry points acquire `state/disk-inventory.lock` non-blocking. A busy
 daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
@@ -650,3 +654,91 @@ offbox run -- 'PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integra
 Tests use private temporary roots and mock commands. Never use a real upkeep
 run to test instrumentation: those jobs can remove software, kill processes,
 prune snapshots and send alerts.
+
+## Volume crawl attribution
+
+The minute CPU snapshot selects candidates for `scan.volume_crawl` for `du`,
+`rg`, `find`, `fd`, `ncdu` and `dust` alive for at least 30 seconds. It matches
+filesystem operands resolving to `/`, a volume root, the home directory, or an
+immediate child of ExternalSSD. Implicit operands use cwd; explicit operands
+are resolved before classification. `rg -n foo src/` from a repo cwd is scoped;
+from `/Volumes/ExternalSSD` it names an immediate child and qualifies. A single
+`lsof -a -d cwd -p … -Fn` call has a two-second timeout for all candidates;
+missing cwd still permits attribution from absolute operands. `?` exiting
+processes are skipped. A separate two-second helper reads NUL-delimited
+Darwin `KERN_PROCARGS2` vectors for at most 32 candidates and four ancestors
+each. Candidate batches rotate if there are more. Reads have 256 KiB per-PID
+and 1 MiB total output limits. `proc_pidinfo` identity must match before/after
+the read and the original ps start-second, UID, PPID and executable name.
+Unreadable, changed or oversized vectors skip classification; flattened ps
+text is never reparsed as argv. No extra ps snapshot or environment dump runs.
+The metadata snapshot keeps full `comm` last so Darwin does not truncate the
+existing CPU family labels and interpreter hints. Native reads require LP64;
+the executable path's pointer-aligned boundary locates the first argument,
+preserving leading empty arguments without consuming environment entries.
+
+Records retain PID, PPID, up to four ancestor PID/name pairs, cwd, elapsed
+seconds and CPU percent from matching consecutive process identities (null on
+baseline). `argv` holds executable and resolved filesystem operands only;
+patterns, find expressions and option values are omitted. Paths are retained
+without the general logger's home/secret-word replacement. A parent-visible
+project/UUID thread identifier in a recognized `t3ctl` identity operand is
+retained; shell programs and query text never supply identity. It is null
+when no such operand is visible. The checked agent
+shell had no T3/ROBOB thread-id environment key. Raw argv stays out of CPU state.
+Lines are capped at 8 KiB by dropping trailing operands with `argvOmitted`.
+Oversized cwd/thread strings become null with `stringsOmitted`; parent names
+are bounded. Unknown option arity skips classification instead of guessing
+filesystem operands.
+The existing day cap and retention apply.
+Ncdu import mode is excluded because it reads an inventory rather than crawling.
+Fd execution clauses are excluded through their literal semicolon terminator
+or argv end; fd options and scan roots after a terminator are still parsed.
+
+Argument vectors retain spaces, quotes, backslashes and empty operands.
+This event is attribution evidence, never authority to kill or throttle a PID.
+A process may exit between the argv read and lsof. Missing cwd
+prevents classification of relative operands. Crawls shorter than 30 seconds
+or wholly between minute samples are outside this detector's coverage.
+
+### Launchd SSD read probe
+
+The separate `com.abdullah.mac-ssd-read-probe` job runs every 60 seconds through
+`/bin/zsh -fc 'exec /usr/bin/python3 "$@"' -- <script> sample`, the same granted
+identity as guard and read-watchdog. It measures what the real jobs can read,
+without creating another ungranted TCC requester. CPU/U inventory cannot hold
+this schedule even if its lsof child is stuck forever.
+`mac-log-status` also checks for missing probe rows, allowing three minutes
+before reporting the detector late or silent.
+
+The reader stats and reads 4 KiB from `/Volumes/ExternalSSD/.mac-upkeep/probe.bin`
+(created by `install.zsh`). Both share a three-second Popen/poll deadline. A
+stalled child is abandoned without kill/wait and its PID plus exact `ps lstart`
+suppresses the next reader (`stuckPrior=true`). State and child output remain
+on the internal disk under `~/.local/state/mac-upkeep`.
+The job uses `AbandonProcessGroup=true` so launchd preserves these children when
+the minute parent exits; later runs use their saved identities to avoid pile-up.
+
+Every run also discovers sandboxd with `pgrep -x sandboxd` and counts `ps -M -p`
+rows minus the header. Both commands share a two-second deadline; an abandoned
+helper's PID plus kernel birth time suppresses new helpers until it clears.
+`sandboxdThreads` is null when unavailable. A read can pass during an approval
+jam, so a count of 20 or more also counts as a failed run. The event retains
+read outcome (`ok`, `slow` above 500 ms, `timeout`, `error`), separate `statMs` and
+`readMs`, symbolic errno, ProcessType, nice and loadavg1 alongside that count.
+
+Two consecutive failed runs atomically write
+`~/.local/state/mac-upkeep/ssd-launchd-read-blocked` with `since`, `lastOutcome`,
+`errno`, `sandboxdThreads` and nullable `promptingPath`; `lastOutcome=jam` when only the thread count tripped. The latch
+queues one deduplicated Telegram alert naming the cause through the collector's
+notification path. Only the first latch run captures tccd AUTHREQ_PROMPTING
+messages from the last five minutes, bounded at 15 seconds with Popen/abandon;
+its last responsible path, if found, is saved as `promptingPath` in the marker.
+It never runs that capture each minute. Restart tools must check the marker.
+
+An `ok` read with a known count below 20 removes the marker and queues one
+recovery line. Slow reads or an unavailable thread inventory cannot clear an
+existing interlock. Notification retries preserve exact keys/text and never
+write alerts to stdout. The evaluator loads only the new probe label after
+review; the CPU job retains its original launcher. Installer tests set
+`MAC_LOG_SSD_PROBE_FILE` for fixture init/check; live reads use the fixed target.

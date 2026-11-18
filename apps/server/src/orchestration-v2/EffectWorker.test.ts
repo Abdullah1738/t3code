@@ -250,6 +250,7 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
+        Layer.mock(EffectOutbox.EffectOutboxV2)({ get: () => Effect.succeed(Option.none()) }),
         Layer.mock(EventSink.EventSinkV2)({
           writeIfRunCurrent: (input) =>
             Effect.sync(() => {
@@ -887,6 +888,178 @@ it.effect("keeps a max-attempt replay-safe failure terminal when fail settlement
     assert.equal(yield* Ref.get(failAttempts), 2);
     assert.equal(yield* Ref.get(retries), 0);
   }),
+);
+
+it.effect.each([
+  { defect: false, succeeds: false },
+  { defect: true, succeeds: false },
+  { defect: false, succeeds: true },
+  { defect: true, succeeds: true },
+])(
+  "bounds accepted notification bookkeeping (defect=$defect succeeds=$succeeds)",
+  ({ defect, succeeds }) =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const effectId = "effect:accepted-notification";
+      const maxAttempts = 2;
+      const maxAcceptedAttempts = 4;
+      let dispatches = 0;
+      const retryDecisions: boolean[] = [];
+      const dependencies = layerExecutorFor({
+        events: yield* Ref.make<ReadonlyArray<string>>([]),
+        threads: {
+          dispatch: () =>
+            Effect.suspend(() => {
+              dispatches++;
+              if (succeeds && dispatches === maxAcceptedAttempts)
+                return Effect.succeed({ sequence: 1, storedEvents: [] });
+              const error = new Orchestrator.OrchestratorProjectionError({
+                threadId,
+                cause: "accepted notification bookkeeping unavailable",
+              });
+              return defect ? Effect.die(error) : Effect.fail(error);
+            }),
+        },
+      });
+      yield* outbox.enqueue([
+        {
+          id: effectId,
+          commandId: CommandId.make("command:accepted-notification"),
+          threadId,
+          request: {
+            type: "notification.delivery.accept",
+            messageId: MessageId.make("message:accepted-notification"),
+          },
+        },
+      ]);
+      yield* Effect.gen(function* () {
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+          Effect.provide(
+            EffectWorker.layerWithOptions({
+              workerId: "accepted-notification-test",
+              maxAttempts,
+              maxAcceptedAttempts,
+            }).pipe(
+              Layer.provide(
+                Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+                  execute: (effect, options) => {
+                    retryDecisions.push(options!.willRetry);
+                    return executor.execute(effect, options);
+                  },
+                }),
+              ),
+            ),
+          ),
+        );
+        for (let attempt = 1; attempt <= maxAcceptedAttempts; attempt++) {
+          assert.isTrue(yield* worker.runOnce);
+          const persisted = Option.getOrThrow(yield* outbox.get(effectId));
+          assert.equal(persisted.attemptCount, attempt);
+          assert.equal(
+            persisted.status,
+            attempt < maxAcceptedAttempts ? "pending" : succeeds ? "succeeded" : "failed",
+          );
+          if (attempt < maxAcceptedAttempts) yield* TestClock.adjust("30 seconds");
+          else {
+            assert.isNotNull(persisted.completedAt);
+            if (!succeeds) assert.include(persisted.lastError!, "bookkeeping unavailable");
+          }
+        }
+        yield* TestClock.adjust("30 seconds");
+        assert.isFalse(yield* worker.runOnce);
+      }).pipe(Effect.provide(dependencies));
+      assert.equal(dispatches, maxAcceptedAttempts);
+      assert.deepEqual(retryDecisions, [true, true, true, false]);
+    }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
+);
+
+it.effect.each([
+  { stage: "settlement", defect: false, succeeds: false },
+  { stage: "settlement", defect: true, succeeds: false },
+  { stage: "settlement", defect: false, succeeds: true },
+  { stage: "settlement", defect: true, succeeds: true },
+  { stage: "cancellation read", defect: false, succeeds: false },
+  { stage: "cancellation read", defect: true, succeeds: false },
+  { stage: "cancellation read", defect: false, succeeds: true },
+  { stage: "cancellation read", defect: true, succeeds: true },
+])(
+  "bounds accepted notification recovery ($stage defect=$defect succeeds=$succeeds)",
+  ({ stage, defect, succeeds }) =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const effectId = "effect:accepted-notification-recovery";
+      const maxAcceptedAttempts = 4;
+      const retryDecisions: boolean[] = [];
+      let failures = 0;
+      const fail = Effect.suspend(() => {
+        failures++;
+        const error = new EffectOutbox.EffectOutboxError({
+          operation: stage === "settlement" ? "succeed" : "get",
+          effectId,
+          cause: "accepted notification recovery unavailable",
+        });
+        return defect ? Effect.die(error) : Effect.fail(error);
+      });
+      yield* outbox.enqueue([
+        {
+          id: effectId,
+          commandId: CommandId.make("command:accepted-notification-recovery"),
+          threadId,
+          request: {
+            type: "notification.delivery.accept",
+            messageId: MessageId.make("message:accepted-notification-recovery"),
+          },
+        },
+      ]);
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+        Effect.provide(
+          EffectWorker.layerWithOptions({
+            workerId: "accepted-notification-recovery-test",
+            maxAttempts: 2,
+            maxAcceptedAttempts,
+          }).pipe(
+            Layer.provide(
+              Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+                execute: (_effect, options) =>
+                  Effect.sync(() => {
+                    retryDecisions.push(options!.willRetry);
+                  }),
+              }),
+            ),
+          ),
+        ),
+        Effect.provideService(EffectOutbox.EffectOutboxV2, {
+          ...outbox,
+          get: (id) =>
+            stage === "cancellation read" && (!succeeds || failures < maxAcceptedAttempts - 1)
+              ? fail
+              : outbox.get(id),
+          succeed: (input) =>
+            stage === "settlement" && (!succeeds || failures < maxAcceptedAttempts - 1)
+              ? fail
+              : outbox.succeed(input),
+        }),
+      );
+      for (let attempt = 1; attempt <= maxAcceptedAttempts; attempt++) {
+        const exit = yield* Effect.exit(worker.runOnce);
+        assert.equal(Exit.isFailure(exit), !succeeds || attempt < maxAcceptedAttempts);
+        const persisted = Option.getOrThrow(yield* outbox.get(effectId));
+        assert.equal(persisted.attemptCount, attempt);
+        assert.equal(
+          persisted.status,
+          attempt < maxAcceptedAttempts ? "pending" : succeeds ? "succeeded" : "failed",
+        );
+        if (attempt === maxAcceptedAttempts) {
+          assert.isNotNull(persisted.completedAt);
+          if (!succeeds) assert.include(persisted.lastError!, "recovery unavailable");
+        }
+      }
+      assert.equal(failures, succeeds ? maxAcceptedAttempts - 1 : maxAcceptedAttempts);
+      if (stage === "settlement") assert.deepEqual(retryDecisions, [true, true, true, false]);
+      else assert.deepEqual(retryDecisions, succeeds ? [false] : []);
+      assert.isFalse(yield* worker.runOnce);
+    }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
 );
 
 it.effect("uses durable deadlines, notifications, and a slow liveness poll", () =>

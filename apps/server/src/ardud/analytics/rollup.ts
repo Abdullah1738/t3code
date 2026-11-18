@@ -1,4 +1,9 @@
-import type { AnalyticsEvent, AnalyticsRollup, RunUsageEvent } from "@t3tools/contracts";
+import type {
+  AnalyticsEvent,
+  AnalyticsRollup,
+  KanbanPoolChange,
+  RunUsageEvent,
+} from "@t3tools/contracts";
 import { LONG_TASK_HISTOGRAM_RATIO } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
@@ -231,6 +236,18 @@ function finishBreakdown(groups: Map<string, Breakdown>) {
 export const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
 
 export const makeAccumulator = () => ({
+  runtimeSamples: new Map<
+    string,
+    {
+      hour: string;
+      samples: number;
+      runningTurnsMax: number;
+      runningTurnsSum: number;
+      queuedRunsMax: number | null;
+      load1Max: number;
+      sampleMsMax: number;
+    }
+  >(),
   total: 0,
   invalidLines: 0,
   restartAdmissionOverflow: 0,
@@ -327,6 +344,10 @@ export const makeAccumulator = () => ({
     }
   >(),
   evaluatorStartsByTrigger: new Map<string, { boardId: string; trigger: string; count: number }>(),
+  claudeApiErrors: new Map<
+    string,
+    { status: number | null; model: string; host: string; attempts: number; giveUps: number }
+  >(),
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
@@ -391,6 +412,7 @@ interface BoardGroup {
   asks: Map<string, AskObservation>;
   snapshotRows: number;
   snapshots: Map<string, { expected: number | undefined; asks: Map<string, AskObservation> }>;
+  poolChanges: KanbanPoolChange[];
   pools: Map<
     string,
     { hour: string; poolKey: string; samples: number; used: number; slots: number; waiting: number }
@@ -416,6 +438,7 @@ function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: Anal
       asks: new Map(),
       snapshotRows: 0,
       snapshots: new Map(),
+      poolChanges: [],
       pools: new Map(),
       overflow: 0,
     };
@@ -520,6 +543,28 @@ function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: Anal
       });
   }
   if (
+    event.kind === "kanban.pool_change" &&
+    p.poolKey &&
+    p.op &&
+    p.actorKind &&
+    p.fromSlots !== undefined &&
+    p.toSlots !== undefined &&
+    p.actorId !== undefined
+  ) {
+    if (board.poolChanges.length >= BOARD_LIMIT) board.overflow++;
+    else
+      board.poolChanges.push({
+        at: event.ts,
+        poolKey: p.poolKey,
+        ...(p.fromPoolKey === undefined ? {} : { fromPoolKey: p.fromPoolKey }),
+        fromSlots: p.fromSlots,
+        toSlots: p.toSlots,
+        op: p.op,
+        actorKind: p.actorKind,
+        actorId: p.actorId,
+      });
+  }
+  if (
     event.kind === "kanban.pool_usage" &&
     p.poolKey &&
     p.used !== undefined &&
@@ -570,6 +615,44 @@ export function accumulate(
   }
   // Related follow-ups inform a filtered call view without becoming selected events or samples.
   if (correlationOnly) return;
+  if (event.kind === "provider.claude_api_error" && event.claudeApiError !== undefined) {
+    const { status, model, host } = event.claudeApiError;
+    const identity = JSON.stringify([status, model, host]);
+    const key = boundedKey(target.claudeApiErrors, identity);
+    const group = target.claudeApiErrors.get(key) ?? {
+      ...(key === OTHER ? { status: null, model: OTHER, host: OTHER } : { status, model, host }),
+      attempts: 0,
+      giveUps: 0,
+    };
+    if (event.phase === "attempt") group.attempts++;
+    if (event.phase === "give_up") group.giveUps++;
+    target.claudeApiErrors.set(key, group);
+  }
+  if (
+    event.kind === "server.runtime_sample" &&
+    event.props?.runningTurns &&
+    event.props.host &&
+    event.props.sampleMs !== undefined
+  ) {
+    const hour = event.ts.slice(11, 13);
+    const row = target.runtimeSamples.get(hour) ?? {
+      hour,
+      samples: 0,
+      runningTurnsMax: 0,
+      runningTurnsSum: 0,
+      queuedRunsMax: null,
+      load1Max: 0,
+      sampleMsMax: 0,
+    };
+    row.samples++;
+    row.runningTurnsMax = Math.max(row.runningTurnsMax, event.props.runningTurns.total);
+    row.runningTurnsSum += event.props.runningTurns.total;
+    if (event.props.queuedRuns !== undefined)
+      row.queuedRunsMax = Math.max(row.queuedRunsMax ?? 0, event.props.queuedRuns);
+    row.load1Max = Math.max(row.load1Max, event.props.host.load1);
+    row.sampleMsMax = Math.max(row.sampleMsMax, event.props.sampleMs);
+    target.runtimeSamples.set(hour, row);
+  }
   const admission = event.restartAdmission;
   if (
     admission &&
@@ -1112,6 +1195,13 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    claudeApiErrors: [...target.claudeApiErrors.values()],
+    runtimeSamples: [...target.runtimeSamples.values()]
+      .map(({ runningTurnsSum, ...row }) => ({
+        ...row,
+        runningTurnsAvg: runningTurnsSum / row.samples,
+      }))
+      .sort((a, b) => a.hour.localeCompare(b.hour)),
     restartAdmission: {
       scope: "server-wide",
       groupBy: "boot-hour",
@@ -1292,6 +1382,7 @@ export function finishRollup(
       failureCounts: Object.fromEntries(board.failures),
       restarts: board.restarts,
       ...finishBoardAsks(board, day, generatedAt),
+      poolChanges: board.poolChanges.toSorted((a, b) => a.at.localeCompare(b.at)),
       poolUtilisation: [...board.pools.values()].map((pool) => ({
         ...pool,
         used: pool.used / pool.samples,
