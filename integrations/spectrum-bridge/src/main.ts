@@ -292,6 +292,8 @@ async function main(): Promise<void> {
     if (ready()) void router?.checkUnanswered().catch(error => toolError("main", "unanswered.check", error));
   }, 60_000);
   const timer = setInterval(() => {
+    const route = store.get<{ id: string } | null>("route");
+    if (ready() && backend instanceof RobobBackend) backend.beginMessageTick(route ? [route.id] : []);
     void delivery.tick().catch((caughtError) => { toolError("main", "main.catch12", caughtError); return log("sender-failed"); });
     if (ready()) void router?.checkCompletion();
     if (ready()) void replyGap.tick().catch((caughtError) => { toolError("main", "reply-gap.check", caughtError); });

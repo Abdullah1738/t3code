@@ -25,8 +25,12 @@ export function createMessageReadAggregation() {
     const mode = { full: "fullReads", incremental: "incrementalReads", "cached-skip": "cachedSkipReads", shared: "sharedReads" }[String(line.props?.readMode)];
     if (mode) props[mode] = Number(props[mode] ?? 0) + 1;
     for (const field of ["rowsReturned", "bytesReturned"]) props[field] = Number(props[field] ?? 0) + Number(line.props?.[field] ?? 0);
+    for (const field of ["markerPolls", "crossThreadReads", "crossThreadPages", "markerSkips", "fallbacks", "detailReads", "evidenceReads", "discoveryReads", "markerChecks", "crossThreadChecks"]) {
+      if (line.props?.[field] !== undefined) props[field] = Number(props[field] ?? 0) + Number(line.props[field]);
+    }
     const reason = { "first-read": "firstReads", "route-change": "routeChanges", "missing-until": "missingUntils", resync: "resyncs", "merge-conflict": "mergeConflicts", "clock-skew": "clockSkews" }[String(line.props?.fullReason)];
     if (reason) props[reason] = Number(props[reason] ?? 0) + 1;
+    if (line.ids.tickId) output.push(line); // Preserve per-tick attribution as well as minute totals.
     return output;
   }
   return { accept, flush };

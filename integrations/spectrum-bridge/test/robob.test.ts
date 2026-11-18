@@ -6,7 +6,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backendKind } from "../src/backend.ts";
-import { ControlClient, discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
+import { ControlClient, ControlError, discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
 import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, SELECTED_MODEL_ISSUE, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
 import { opencodeRunEvidence } from "../src/opencode-steps.ts";
@@ -22,7 +22,7 @@ type Thread = {
   threadId: string; projectId: string; title: string; origin: string | null; runtimeMode: string;
   worktreePath: string | null; parentThreadId: string | null; nativeSessionId: string | null;
   runs: Array<{ runId: string; ordinal: number; status: string; requestedAt?: string }>;
-  messages: ControlMessage[]; pending: PendingRequest[]; lastError: string | null; settled?: boolean;
+  messages: ControlMessage[]; pending: PendingRequest[]; lastError: string | null; settled?: boolean; archived?: boolean;
   /** What the run-evidence route reports per run; absent means `unknown`. */
   evidence?: Record<string, "ran" | "none" | "unknown">;
   /** The thread's driver; absent means OpenCode, the driver the OpenCode fixtures represent. */
@@ -46,20 +46,29 @@ function fakeControl() {
   const natives = new Map<string, string>();
   const calls: Call[] = [];
   /** `ignoreSettled` mimics a server from before PATCH learned `settled`. */
-  const flags = { ignoreSettled: false, recentRunsLimit: Infinity, historicalEvidence: "terminal" as "terminal" | "running" | "unknown" | "unavailable" };
+  const flags = { ignoreSettled: false, recentRunsLimit: Infinity, historicalEvidence: "terminal" as "terminal" | "running" | "unknown" | "unavailable",
+    markers: false, missingMarker: false, markerStatus: 0, crossStatus: 0, page2Status: 0, pageSize: 1000, omit: new Set<string>(), override: new Map<string, number>() };
+  let sequence = 0;
+  const events = new Map<string, { value: string; marker: number }>();
+  const marker = (thread: Thread) => {
+    const value = JSON.stringify(thread);
+    if (events.get(thread.threadId)?.value !== value) events.set(thread.threadId, { value, marker: ++sequence });
+    return flags.override.get(thread.threadId) ?? events.get(thread.threadId)!.marker;
+  };
   const projects = [{ projectId: "chats", title: "iMessage", workspaceRoot: "/chats" }];
   let counter = 0;
   const now = () => new Date(Date.now() + counter++).toISOString();
   const state = (thread: Thread) => thread.pending.length ? "needs-input"
     : thread.runs.some(run => run.status === "running") ? "running" : thread.runs.some(run => run.status === "waiting") ? "waiting" : "idle";
   const summary = (thread: Thread) => ({
+    ...(flags.markers && !flags.missingMarker ? { changeMarker: marker(thread) } : {}),
     threadId: thread.threadId, projectId: thread.projectId, title: thread.title, state: state(thread), status: thread.runs.at(-1)?.status ?? "idle",
     // The driver decides the OpenCode fallback. Fixtures default to OpenCode, the driver their step rows come from.
     model: thread.driver ?? { instanceId: "opencode", model: "opencode-test" },
     origin: thread.origin, nativeSessionId: thread.nativeSessionId, runtimeMode: thread.runtimeMode, parentThreadId: thread.parentThreadId,
     rootThreadId: thread.parentThreadId ?? thread.threadId, worktreePath: thread.worktreePath, latestRunId: thread.runs.at(-1)?.runId ?? null,
     pendingRequest: thread.pending[0] ? { requestId: thread.pending[0].requestId, kind: thread.pending[0].kind, requestKind: thread.pending[0].requestKind } : null,
-    lastError: thread.lastError, settled: thread.settled ?? false, createdAt: now(), updatedAt: now(),
+    lastError: thread.lastError, settled: thread.settled ?? false, ...(thread.archived ? { archived: true } : {}), createdAt: now(), updatedAt: now(),
   });
   const detail = (thread: Thread) => ({ ...summary(thread), run: thread.runs.at(-1) ?? null, recentRuns: [...thread.runs].reverse().slice(0, flags.recentRunsLimit), pendingRequests: thread.pending });
   const ok = (body: object, status = 200) => Response.json({ ok: true, ...body }, { status });
@@ -81,7 +90,13 @@ function fakeControl() {
         return ok({ threadId, projectId: "chats", directory: body.directory, messageId: null, runId: null, status: "idle" }, 201);
       }
       if (path === "/threads" && request.method === "GET") {
+        if (searchParams.has("ids") && flags.markerStatus) return ok({}, flags.markerStatus);
         let list = [...threads.values()];
+        if (searchParams.has("ids")) {
+          const ids = searchParams.get("ids")!.split(",");
+          if (ids.length > 50 || ids.some(id => !id)) return ok({}, 400);
+          list = list.filter(thread => ids.includes(thread.threadId) && !flags.omit.has(thread.threadId));
+        }
         if (searchParams.get("parentThreadId")) list = list.filter(thread => thread.parentThreadId === searchParams.get("parentThreadId"));
         if (searchParams.get("active") === "true") list = list.filter(thread => state(thread) !== "idle");
         if (searchParams.get("origin")) list = list.filter(thread => thread.origin === searchParams.get("origin"));
@@ -90,6 +105,23 @@ function fakeControl() {
       if (parts[0] === "threads" && parts[1] === "by-native") {
         const thread = threads.get(natives.get(parts[2]!) ?? "");
         return thread ? ok({ nativeSessionId: parts[2], thread: detail(thread) }) : notFound();
+      }
+      if (path === "/messages") {
+        if (flags.crossStatus) return ok({}, flags.crossStatus);
+        if (searchParams.has("cursor") && flags.page2Status) return ok({}, flags.page2Status);
+        const ids = searchParams.get("threadIds")!.split(",");
+        if (ids.length > 50 || ids.some(id => !id)) return ok({}, 400);
+        const since = Number(searchParams.get("since"));
+        const rows = [...threads.values()].filter(thread => ids.includes(thread.threadId)).flatMap(thread =>
+          thread.messages.map(message => ({ ...message, threadId: thread.threadId })))
+          .filter(message => Date.parse(message.updatedAt ?? "") > since)
+          .sort((a, b) => Date.parse(a.updatedAt!) - Date.parse(b.updatedAt!) || Buffer.compare(Buffer.from(a.messageId), Buffer.from(b.messageId)));
+        const cursor = searchParams.get("cursor");
+        const after = cursor ? JSON.parse(Buffer.from(cursor, "base64url").toString()) as { u: number; id: string } : undefined;
+        const rest = after ? rows.filter(row => Date.parse(row.updatedAt!) > after.u || Date.parse(row.updatedAt!) === after.u && Buffer.compare(Buffer.from(row.messageId), Buffer.from(after.id)) > 0) : rows;
+        const page = rest.slice(0, Math.min(Number(searchParams.get("limit")), flags.pageSize));
+        const last = page.at(-1);
+        return ok({ messages: page, nextCursor: rest.length > page.length && last ? Buffer.from(JSON.stringify({ u: Date.parse(last.updatedAt!), id: last.messageId })).toString("base64url") : null });
       }
       const thread = parts[0] === "threads" ? threads.get(parts[1]!) : undefined;
       if (parts[0] === "threads" && !thread) return notFound();
@@ -1695,8 +1727,278 @@ test("steering files: incomplete family lists are unknown to admission", async (
   } finally { list.mockRestore(); }
 });
 
+async function markerFixture(count = 1, running = false) {
+  const control = fakeControl(); control.flags.markers = true;
+  const backend = control.backend();
+  const chats = [];
+  for (let i = 0; i < count; i++) {
+    const chat = await backend.createChat(); chats.push(chat);
+    await backend.prompt(chat.id, chat.directory, `msg_${String(i).padStart(64, "0")}`, "hello");
+    const thread = control.threads.get(chat.id)!;
+    thread.driver = { instanceId: "codex", model: "test" };
+    control.reply(chat.id, "original", running ? "running" : "completed");
+    thread.evidence = running ? {} : { [thread.runs[0]!.runId]: "none" };
+  }
+  const tick = async () => {
+    await backend.beginMessageTick(chats.map(chat => chat.id));
+    return Promise.all(chats.map(chat => backend.messages(chat.id)));
+  };
+  await tick(); control.calls.length = 0;
+  return { control, backend, chats, tick };
+}
+
+const pollingCalls = (calls: Call[]) => calls.filter(call => call.method === "GET" && (call.path.startsWith("/messages?") || call.path.startsWith("/threads?ids=") || call.path.includes("/messages?")));
+
+test.each(["idle", "active", "steer"])("marker polling: five-thread 60-second router budget (%s)", async scenario => {
+  const start = Date.parse("2026-11-15T09:30:00Z"); setSystemTime(start);
+  const control = fakeControl(); control.flags.markers = true;
+  const backend = control.backend();
+  const chats = [];
+  for (let i = 0; i < 5; i++) {
+    const chat = await backend.createChat(); chats.push(chat);
+    const thread = control.threads.get(chat.id)!;
+    thread.driver = { instanceId: "codex", model: "test" };
+    await backend.prompt(chat.id, chat.directory, `msg_${"0".repeat(64)}`, "history");
+    for (let row = 0; row < 100; row++) thread.messages.push({ messageId: `history-${row}`, role: "assistant", phase: "narration", text: "old text ".repeat(100),
+      runId: thread.runs[0]!.runId, streaming: false, createdAt: new Date(start - 200_000 + row * 1000).toISOString(), updatedAt: new Date(start - 200_000 + row * 1000).toISOString() });
+    thread.messages[0]!.createdAt = thread.messages[0]!.updatedAt = new Date(start - 120_000).toISOString();
+    thread.runs[0]!.status = "completed";
+  }
+  await backend.beginMessageTick(chats.map(chat => chat.id));
+  const lanes = chats.map(chat => {
+    const store = new Store(":memory:"); stores.push(store);
+    store.set("route", { ...chat, generation: 1 });
+    const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } }, {
+      owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alert",
+      alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 5_000,
+    });
+    return { chat, store, router, thread: control.threads.get(chat.id)! };
+  });
+  if (scenario !== "idle") for (const { chat, store, router, thread } of lanes) {
+    store.acceptInbound("budget", { id: "budget", text: "hello", attachments: [], isAudioMessage: false, source: "typed", receivedAt: start });
+    await router.tick();
+    thread.messages.push({ messageId: `stream-${chat.id}`, role: "assistant", phase: "narration", text: "working", streaming: true,
+      runId: thread.runs.at(-1)!.runId, createdAt: new Date(start + 500).toISOString(), updatedAt: new Date(start + 500).toISOString() });
+  }
+  control.calls.length = 0;
+  let completionSecond = 0;
+  for (let second = 1; second <= 60; second++) {
+    setSystemTime(start + second * 1000);
+    for (const { chat, store, thread } of lanes) {
+      const stream = thread.messages.find(message => message.messageId === `stream-${chat.id}`);
+      if (stream && second < 50) { stream.text += "."; stream.updatedAt = new Date().toISOString(); }
+      if (second === 30 && scenario === "steer") store.acceptInbound("budget-steer", { id: "budget-steer", text: "also this", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() });
+      if (second === 50 && scenario !== "idle") control.reply(chat.id, "done", "completed");
+    }
+    const from = control.calls.length;
+    await backend.beginMessageTick(chats.map(chat => chat.id));
+    for (const { router } of lanes) { await router.checkCompletion(); await router.tick(); }
+    const calls = pollingCalls(control.calls.slice(from));
+    expect(calls.length).toBeLessThanOrEqual(scenario === "idle" ? 1 : 2);
+    if (!completionSecond && scenario !== "idle" && lanes.every(({ store }) => store.pendingOutbox().some(op => op.kind === "conversation" && op.text === "done"))) completionSecond = second;
+  }
+  if (scenario !== "idle") expect(completionSecond).toBe(50);
+  const gets = control.calls.filter(call => call.method === "GET");
+  console.log("marker-five-thread-budget", JSON.stringify({ scenario, polling: pollingCalls(gets).length,
+    markers: gets.filter(call => call.path.startsWith("/threads?ids=")).length, messages: gets.filter(call => call.path.startsWith("/messages?")).length,
+    detail: gets.filter(call => /^\/threads\/[^/?]+$/.test(call.path)).length, evidence: gets.filter(call => call.path.endsWith("/evidence")).length,
+    discovery: gets.filter(call => call.path.startsWith("/threads?") && !call.path.startsWith("/threads?ids=")).length, completionSecond }));
+});
+
+test("marker polling: run completion without a message is visible on the next tick", async () => {
+  const start = Date.now(); setSystemTime(start);
+  const { control, backend, chats, tick } = await markerFixture(1, true);
+  const thread = control.threads.get(chats[0]!.id)!;
+  const before = await tick(); expect(before[0]!.some(record => record.type === "idle")).toBe(false);
+  thread.runs[0]!.status = "completed";
+  setSystemTime(start + 1000);
+  control.calls.length = 0;
+  const after = await tick(); expect(after[0]!.some(record => record.type === "idle")).toBe(true);
+  expect(after[0]).toEqual(await control.backend().messages(chats[0]!.id));
+  expect(pollingCalls(control.calls).filter(call => call.path.startsWith("/messages?"))).toHaveLength(1);
+  expect(control.calls.filter(call => call.path === `/threads/${chats[0]!.id}`)).toHaveLength(2); // One detail per backend, including the reference read.
+  expect(await backend.promptAccepted(chats[0]!.id, chats[0]!.directory, "absent")).toBe(false);
+});
+
+test("marker polling: five unchanged threads cost one polling GET including all router read forms", async () => {
+  const { control, backend, chats, tick } = await markerFixture(5);
+  for (let i = 0; i < 4; i++) {
+    control.calls.length = 0;
+    await tick();
+    for (const chat of chats) {
+      await backend.messageReadScope(async () => {
+        for (const options of [{ limit: 1 }, { limit: 20 }, { limit: 100 }, { until: "msg_" + String(chats.indexOf(chat)).padStart(64, "0") }]) await backend.messages(chat.id, chat.directory, options);
+      });
+      expect(await backend.promptAccepted(chat.id, chat.directory, "msg_" + String(chats.indexOf(chat)).padStart(64, "0"))).toBe(true);
+    }
+    expect(pollingCalls(control.calls)).toHaveLength(1);
+    expect(control.calls.filter(call => call.method === "GET")).toHaveLength(1);
+    expect(control.calls[0]!.path).not.toContain("updatedSince");
+    expect(control.calls[0]!.path).toContain("%2C");
+  }
+});
+
+test("marker polling: tied updates, system rows and paging remain deep-equal", async () => {
+  const { control, backend, chats, tick } = await markerFixture(5);
+  control.flags.pageSize = 2;
+  const chat = chats[0]!, thread = control.threads.get(chat.id)!;
+  const row = thread.messages[1]!;
+  for (const text of ["tie-one", "tie-two"]) {
+    row.text = text;
+    thread.messages.push({ ...row, messageId: text, role: "system", text: "never deliver" });
+    control.calls.length = 0;
+    const result = await tick();
+    expect(result[0]).toEqual(await control.backend().messages(chat.id));
+    expect(JSON.stringify(result[0])).toContain(text);
+    expect(JSON.stringify(result[0])).not.toContain("never deliver");
+    expect(control.calls.filter(call => call.path.startsWith("/threads?ids="))).toHaveLength(1);
+    expect(control.calls.filter(call => call.path.startsWith("/messages?")).length).toBeGreaterThanOrEqual(2);
+  }
+  expect(await backend.promptAccepted(chat.id, chat.directory, "absent")).toBe(false);
+});
+
+test("marker polling: page-two failure retries the old watermark and marker without partial cache commits", async () => {
+  const { control, chats, tick } = await markerFixture();
+  control.flags.pageSize = 1;
+  const thread = control.threads.get(chats[0]!.id)!;
+  thread.messages[1]!.text = "changed";
+  control.flags.page2Status = 500;
+  const fallback = await tick();
+  expect(fallback[0]).toEqual(await control.backend().messages(chats[0]!.id));
+  const first = control.calls.find(call => call.path.startsWith("/messages?"))!;
+  const oldSince = new URL("http://test" + first.path).searchParams.get("since");
+  control.flags.page2Status = 0; control.calls.length = 0;
+  const retry = await tick();
+  expect(retry[0]).toEqual(fallback[0]);
+  const replay = control.calls.find(call => call.path.startsWith("/messages?"))!;
+  expect(new URL("http://test" + replay.path).searchParams.get("since")).toBe(oldSince);
+  control.calls.length = 0; await tick();
+  expect(pollingCalls(control.calls)).toHaveLength(1);
+});
+
+test.each(["500", "old-server", "cross-400", "cross-404", "cross-500"])("marker polling: %s falls back without skipping threads", async fault => {
+  const { control, chats, tick } = await markerFixture(5);
+  if (fault === "500") control.flags.markerStatus = 500;
+  else if (fault === "old-server") control.flags.missingMarker = true;
+  else control.flags.crossStatus = Number(fault.slice(6));
+  for (const chat of chats) control.threads.get(chat.id)!.messages[1]!.text = "after-fault";
+  const result = await tick();
+  for (let i = 0; i < chats.length; i++) expect(result[i]).toEqual(await control.backend().messages(chats[i]!.id));
+  expect(control.calls.filter(call => call.path.includes("/messages?")).length).toBeGreaterThanOrEqual(5);
+});
+
+test("marker polling: decrease, omission, redaction resync, missing anchor and route change rebuild", async () => {
+  const start = Date.now(); setSystemTime(start);
+  const { control, backend, chats, tick } = await markerFixture();
+  const chat = chats[0]!, thread = control.threads.get(chat.id)!;
+  const full = () => control.calls.filter(call => call.path.startsWith("/messages?") && new URL("http://test" + call.path).searchParams.get("since") === "-8640000000000000");
+  control.flags.override.set(chat.id, 0); await tick(); expect(full()).toHaveLength(1);
+  control.calls.length = 0; await tick(); expect(full()).toHaveLength(0);
+  control.flags.omit.add(chat.id); await tick(); expect(full()).toHaveLength(1);
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(1);
+  control.flags.omit.clear(); control.calls.length = 0;
+  thread.messages[1]!.text = "redacted";
+  setSystemTime(start + 10 * 60_000); const rebuilt = await tick();
+  expect(JSON.stringify(rebuilt)).toContain("redacted"); expect(full()).toHaveLength(1);
+  control.calls.length = 0;
+  await tick(); await backend.messages(chat.id, chat.directory, { until: "missing" });
+  await backend.messages(chat.id, chat.directory, { until: "missing" });
+  expect(full()).toHaveLength(1);
+  control.calls.length = 0; await backend.retireOthers(chat.id); await tick(); expect(full()).toHaveLength(1);
+});
+
+test("marker polling: evidence is fresh each tick and shared once per run; promptAccepted adds no GET", async () => {
+  const { control, backend, chats, tick } = await markerFixture(1, true);
+  const chat = chats[0]!, thread = control.threads.get(chat.id)!;
+  thread.runs[0]!.status = "running"; thread.evidence = {};
+  await tick(); control.calls.length = 0;
+  await tick(); await backend.messages(chat.id); await backend.messages(chat.id);
+  expect(control.calls.filter(call => call.path.endsWith("/evidence"))).toHaveLength(1);
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(0);
+  const gets = control.calls.filter(call => call.method === "GET").length;
+  const prompt = `msg_${"f".repeat(64)}`;
+  await backend.steer(chat.id, chat.directory, prompt, "also this");
+  expect(await backend.promptAccepted(chat.id, chat.directory, prompt)).toBe(true);
+  expect(control.calls.filter(call => call.method === "GET")).toHaveLength(gets);
+  thread.evidence = { [thread.runs[0]!.runId]: "ran" };
+  const next = await tick(); expect(next[0]!.some(record => record.type === "assistant" && record.toolEvidence === "ran")).toBe(true);
+});
+
+test("marker polling: chunks at 50, including rebuilds, and uses the oldest observed watermark", async () => {
+  const { control, chats, tick } = await markerFixture(51);
+  await tick();
+  expect(control.calls.filter(call => call.path.startsWith("/threads?ids="))).toHaveLength(2);
+  expect(pollingCalls(control.calls)).toHaveLength(2);
+  control.calls.length = 0;
+  const watermark = Math.min(...chats.map(chat => Math.max(...control.threads.get(chat.id)!.messages.map(message => Date.parse(message.updatedAt!))))) - 30_000;
+  for (const chat of chats) control.threads.get(chat.id)!.messages[1]!.text += " changed";
+  await tick();
+  const pages = control.calls.filter(call => call.path.startsWith("/messages?"));
+  expect(pages).toHaveLength(2);
+  expect(new URL("http://test" + pages[0]!.path).searchParams.get("since")).toBe(String(watermark));
+  for (const call of control.calls.filter(call => call.path.startsWith("/threads?ids=") || call.path.startsWith("/messages?"))) {
+    const query = new URL("http://test" + call.path).searchParams;
+    const ids = (query.get("ids") ?? query.get("threadIds"))!.split(",");
+    expect(ids.length).toBeLessThanOrEqual(50); expect(ids.every(Boolean)).toBe(true);
+  }
+});
+
+test("marker polling: poll counters, per-tick attribution and fallback reasons survive logging", async () => {
+  const root = mkdtempSync(join(tmpdir(), "marker-reads-log-")); dirs.push(root);
+  const log = createToolLog({ root, now: () => Date.parse("2026-11-18T04:00:01Z") });
+  log.write({ component: "robob", kind: "perf", name: "robob.messages_read", ids: { threadId: "thread-one", tickId: "tick-one", callBatchId: "batch-one" },
+    props: { markerPolls: 1, crossThreadReads: 1, crossThreadPages: 2, markerSkips: 3, fallbacks: 1, fallbackReason: "cross-thread-error", evidenceReads: 4, detailReads: 1, discoveryReads: 2, rowsReturned: 9, bytesReturned: 321 } });
+  log.flush();
+  const rows = readFileSync(join(root, "2026-11-18.ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  const detail = rows.find(line => line.name === "robob.messages_read")!;
+  expect(detail.ids).toMatchObject({ threadId: "thread-one", tickId: "tick-one", callBatchId: "batch-one" });
+  expect(detail.props.fallbackReason).toBe("cross-thread-error");
+  expect(rows.find(line => line.name === "robob.message_reads")!.props).toMatchObject({ markerPolls: 1, crossThreadReads: 1, crossThreadPages: 2,
+    markerSkips: 3, fallbacks: 1, evidenceReads: 4, detailReads: 1, discoveryReads: 2, rowsReturned: 9, bytesReturned: 321 });
+});
+
+test("marker polling: archived omissions stop tracking without replacing history with an empty transcript", async () => {
+  const { control, chats, tick } = await markerFixture();
+  const chat = chats[0]!;
+  control.flags.omit.add(chat.id); control.threads.get(chat.id)!.archived = true;
+  const before = await tick();
+  control.calls.length = 0;
+  expect(await tick()).toEqual(before);
+  expect(pollingCalls(control.calls)).toHaveLength(0);
+});
+
+test("marker polling: needs-input reads one fresh detail and marker timeouts use the per-thread path", async () => {
+  const { control, backend, chats, tick } = await markerFixture();
+  const chat = chats[0]!;
+  control.threads.get(chat.id)!.pending.push({ requestId: "approval-one", kind: "approval", requestKind: "command", prompt: "Allow command?" });
+  await tick();
+  expect(await backend.sessionBusy(chat.id)).toBe(true);
+  expect(await backend.permissions(chat.id)).toHaveLength(1);
+  await backend.messages(chat.id);
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(1);
+  control.calls.length = 0;
+  const marker = spyOn(backend.client, "threadSummaries").mockRejectedValueOnce(new ControlError(0));
+  try {
+    const fallback = await tick();
+    expect(fallback[0]).toEqual(await control.backend().messages(chat.id));
+    expect(control.calls.some(call => call.path.startsWith(`/threads/${chat.id}/messages?`))).toBe(true);
+  } finally { marker.mockRestore(); }
+});
+
+test("marker polling: sibling chat backends share the marker pass and native aliases", async () => {
+  const { control, backend, chats } = await markerFixture(2);
+  const sibling = backend.forChat("chats/friend", "Friend");
+  control.natives.set("ses_friend", chats[1]!.id);
+  await sibling.resolve("ses_friend");
+  control.calls.length = 0;
+  await backend.beginMessageTick([chats[0]!.id, "ses_friend"]);
+  await backend.messages(chats[0]!.id); await sibling.messages("ses_friend");
+  expect(pollingCalls(control.calls)).toHaveLength(1);
+  expect(new URL("http://test" + pollingCalls(control.calls)[0]!.path).searchParams.get("ids")).toBe(chats.map(chat => chat.id).join(","));
+});
+
 // The reference creates a fresh backend for each read, retaining the pre-cache full-read path.
-test("incremental message records equal full reads through streaming, phases, runs and route rotation", async () => {
+test.each([false, true])("incremental message records equal full reads through streaming, phases, runs and route rotation (markers=%s)", async markers => {
   const control = fakeControl();
   const backend = control.backend();
   let chat = await backend.createChat();
@@ -1705,6 +2007,8 @@ test("incremental message records equal full reads through streaming, phases, ru
   let thread = control.threads.get(chat.id)!;
   thread.driver = { instanceId: "codex", model: "test" };
   const verify = async () => {
+    control.flags.markers = markers;
+    if (markers) backend.beginMessageTick([chat.id]);
     for (const options of [{ limit: 1 }, { limit: 20, until: prompt }, { until: prompt, since: Date.now() - 60_000 },
       { limit: 100 }, { until: `idle:${thread.runs[0]!.runId}`, limit: 20 }]) {
       expect(await backend.messages(chat.id, chat.directory, options)).toEqual(await control.backend().messages(chat.id, chat.directory, options));

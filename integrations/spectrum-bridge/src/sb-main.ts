@@ -389,6 +389,11 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     if (ready()) for (const chat of chats.all()) void (chat.parts.remote ?? chat.parts.router)?.checkUnanswered().catch(error => toolError("sb-main", "unanswered.check", error));
   }, 60_000);
   const timer = setInterval(() => {
+    if (ready() && backend instanceof RobobBackend) backend.beginMessageTick(chats.all().flatMap(chat => {
+      if (chat.parts.remote) return [];
+      const route = chat.store.get<{ id: string } | null>("route");
+      return route ? [route.id] : [];
+    }));
     for (const chat of chats.all()) {
       if (chat.parts.remote) { if (ready()) void chat.parts.remote.tick(); continue; }
       void chat.parts.delivery?.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
