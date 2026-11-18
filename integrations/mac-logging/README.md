@@ -218,6 +218,23 @@ Partial inventories and older snapshots without that evidence remain unknown.
 An unknown directory baseline also makes the event incomplete.
 These events never alert or launch extra scans.
 
+The minute CPU sampler also checks the severe free-space floors every two
+minutes: internal 15 GB, ExternalSSD 100 GB. `disk.floor_check` reads statvfs
+only; it neither runs du nor traverses the SSD. Each volume has an independent
+episode in `state/disk-low.json`, separate from the older 150 GB advisory's
+12-hour cooldown. Recovery emits `disk.low_cleared` with the episode duration.
+
+On a crossing, a separate child has six seconds to measure recent direct
+children of the user's `getconf DARWIN_USER_TEMP_DIR`, with at most 0.5 seconds
+per du. Symlinks are excluded. Budget failures emit `disk.movers_skipped`;
+completed sizes survive a later timeout. Other growers, including the opencode
+directory, reuse the swing inventory and delta calculation. First sightings
+report size without claiming a measured delta. The child emits `disk.low` with
+up to three movers, then sends through the existing Telegram notify command.
+Successful sends happen once per episode; failures log `disk.alert` and retry
+the frozen text/key on the next check. The inherited lock prevents overlapping
+workers. No new watcher or LaunchAgent is needed.
+
 ## Mac tailnet guard
 
 `com.abdullah.mac-tailnet` invokes `collector.py --tailnet` every 60 seconds,
