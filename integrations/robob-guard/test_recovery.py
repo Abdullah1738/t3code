@@ -16,6 +16,134 @@ import guard
 from hold import Holds
 
 
+class StaleRegistrationTests(unittest.TestCase):
+    def process_run(self, command, **kwargs):
+        if command[0] == "/usr/bin/lsappinfo":
+            return subprocess.CompletedProcess(command, 0, stdout=self.registration)
+        if command == ["/bin/ps", "-axo", "pid=,comm="]:
+            return subprocess.CompletedProcess(command, 0, stdout="43 " + guard.EXECUTABLE)
+        if command == ["/bin/ps", "-axo", "pid=,ppid=,comm=,args="]:
+            output = "43 1 %s %s --run-as-node server.mjs\n" % (guard.EXECUTABLE, guard.EXECUTABLE)
+            if self.executable:
+                output += "42 1 %s fixture\n" % self.executable
+            return subprocess.CompletedProcess(command, 0, stdout=output)
+        if command[:4] == ["/bin/ps", "-p", "42", "-o"]:
+            return subprocess.CompletedProcess(command, 0 if self.executable else 1, stdout=self.executable)
+        self.fail("unexpected command: %s" % command)
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.home = Path(temp.name)
+        self.path = self.home / ".local/state/robob-guard/state.json"
+        self.registration = "pid = 42"
+        self.executable = ""
+        for target, kwargs in [
+            ("guard.subprocess.run", dict(side_effect=self.process_run)),
+            ("guard.backend_ready", dict(return_value=False)),
+            ("guard.boot_epoch", dict(return_value=0)),
+            ("guard.pid_alive", dict(return_value=True)),
+            ("guard.reopen", {}), ("guard.stop_unready_desktop", {}),
+            ("guard.notify", dict(return_value=True)),
+        ]:
+            patcher = patch(target, **kwargs)
+            mocked = patcher.start()
+            self.addCleanup(patcher.stop)
+            setattr(self, target.rsplit(".", 1)[1], mocked)
+
+    def tick(self, now):
+        with patch("guard.time.time", return_value=now):
+            guard.check(self.home)
+        return guard.read_state(self.path)
+
+    def log(self):
+        return (self.path.parent / "guard.log").read_text()
+
+    def test_stale_desktop_with_leftover_backend_reopens_on_second_check(self):
+        self.tick(10000)
+        self.reopen.assert_not_called()
+        state = self.tick(10030)
+        self.reopen.assert_called_once_with(self.home)
+        self.stop_unready_desktop.assert_not_called()
+        self.assertTrue(state["awaiting_reopen"])
+        self.assertNotIn("check-error", self.log())
+        self.assertIn("down 2 action=reopen backend-unready", self.log())
+        self.assertIn('"lsappinfo_pid":42,"lsappinfo_alive":false', self.log())
+        self.assertIn('"pid":43,"ppid":1', self.log())
+        self.assertIn("--run-as-node server.mjs", self.log())
+
+    def test_install_hold_blocks_stale_desktop_reopen(self):
+        guard.atomic_json(self.home / ".robob/install-hold.json",
+                          dict(by="install", pid=99, startedAt=10000, beatAt=10000))
+        for now in [10000, 10030, 10060]:
+            self.tick(now)
+        self.reopen.assert_not_called()
+        self.stop_unready_desktop.assert_not_called()
+        self.assertEqual(self.log().count("hold:install action=none"), 3)
+        self.assertNotIn("check-error", self.log())
+
+    def test_silent_open_noop_still_counts_failed_reopens_and_alerts(self):
+        for now in range(10000, 11201, 30):
+            state = self.tick(now)
+        self.assertGreaterEqual(state["failed_reopens"], 3)
+        self.assertGreaterEqual(self.reopen.call_count, 3)
+        self.stop_unready_desktop.assert_not_called()
+        self.notify.assert_called_once()
+        self.assertEqual(self.notify.call_args.args[2]["kind"], "failed-reopen")
+        self.assertNotIn("check-error", self.log())
+
+    def test_ambiguous_desktop_errors_alert_once_and_clear_on_success(self):
+        for registration, executable in [("pid = 42", "/bin/other"), ("pid = 42\npid = 43", "")]:
+            for delivered in [False, True]:
+                with self.subTest(registration=registration, delivered=delivered):
+                    self.registration, self.executable = registration, executable
+                    self.notify.reset_mock()
+                    self.notify.return_value = delivered
+                    guard.atomic_json(self.path, guard.initial_state())
+                    for now in [10000, 10030, 10060]:
+                        self.tick(now)
+                    self.notify.assert_not_called()
+                    for now in [10090, 10120, 10150]:
+                        state = self.tick(now)
+                    self.assertEqual(state["check_error_count"], 6)
+                    self.assertEqual(state["check_error_since"], 10000)
+                    key = "robob-guard:10000:check-error"
+                    if delivered:
+                        self.notify.assert_called_once()
+                        self.assertEqual(state["alerts_sent"], [key])
+                    else:
+                        self.assertEqual(list(state["pending_alerts"]), [key])
+                        self.assertEqual({call.args[1] for call in self.notify.call_args_list}, {key})
+                    self.assertIn("step=desktop_snapshot", self.log())
+                    self.reopen.assert_not_called()
+                    self.stop_unready_desktop.assert_not_called()
+                    self.registration, self.executable = "pid = 42", ""
+                    state = self.tick(10180)
+                    self.assertEqual(state["check_error_count"], 0)
+                    self.assertIsNone(state["check_error_since"])
+                    self.registration, self.executable = registration, executable
+                    self.notify.return_value = True
+                    for now in [10210, 10240, 10270, 10300]:
+                        state = self.tick(now)
+                    self.assertIn("robob-guard:10210:check-error", state["alerts_sent"])
+
+    def test_error_steps_and_unknown_health_alert_without_reopening(self):
+        for step in ["backend_ready", "desktop_snapshot", "decide", "reopen"]:
+            with self.subTest(step=step), patch("guard." + step, side_effect=ValueError("fixture\nerror")):
+                guard.atomic_json(self.path, dict(guard.initial_state(), down_count=1))
+                ticks = [10000] if step == "reopen" else [10000, 10030, 10060, 10090]
+                for now in ticks:
+                    state = self.tick(now)
+                self.assertEqual(state["check_error_count"], len(ticks))
+                if len(ticks) == 4:
+                    self.assertIn("robob-guard:10000:check-error", state["alerts_sent"])
+                line = self.log().splitlines()[-1]
+                self.assertIn("step=" + step, line)
+                self.assertIn("fixture error", line)
+                self.assertIn("processes=", line)
+                self.assertIsNone(state["unready_since"])
+
+
 class RecoveryTests(unittest.TestCase):
     desktop = dict(pid=42, identity="fixture-birth", startedAt=9000)
 
@@ -535,7 +663,8 @@ class ProvenanceLockTests(unittest.TestCase):
                         raise OSError("provenance unavailable")
 
                     with patch("hold.time.time", return_value=10000), \
-                            patch("hold.desktop_pid", return_value=None if failure == "lookup" else 42), \
+                            patch("hold.desktop_pid", return_value=42,
+                                  side_effect=ValueError("ambiguous desktop") if failure == "lookup" else None), \
                             patch("hold.write_reason", side_effect=failed_write), \
                             patch("hold.subprocess.Popen", return_value=Mock(pid=99)), \
                             patch.object(holds, "beater_is_ours", return_value=acquisition == "reuse"):
@@ -547,6 +676,22 @@ class ProvenanceLockTests(unittest.TestCase):
                         self.assertEqual(json.loads(holds.path.read_text()), original)
                     else:
                         self.assertFalse(holds.path.exists())
+
+    def test_absent_desktop_preserves_each_hold_acquisition(self):
+        for acquisition in ["fresh", "reuse", "replace-beater"]:
+            with self.subTest(acquisition=acquisition), tempfile.TemporaryDirectory() as directory:
+                holds = Holds(Path(directory))
+                original = dict(by="overload-restart", pid=os.getpid(), startedAt=10000, beatAt=10000)
+                if acquisition != "fresh":
+                    guard.atomic_json(holds.path, original)
+                    guard.atomic_json(holds.meta, dict(token="existing", beaterPid=99))
+                with patch("hold.time.time", return_value=10000), patch("hold.desktop_pid", return_value=None), \
+                        patch("hold.write_reason") as write, patch("hold.subprocess.Popen", return_value=Mock(pid=99)) as spawned, \
+                        patch.object(holds, "beater_is_ours", return_value=acquisition == "reuse"):
+                    self.assertEqual(holds.start("overload-restart", os.getpid()), 99)
+                self.assertEqual(json.loads(holds.path.read_text()), original)
+                self.assertEqual(spawned.call_count, int(acquisition != "reuse"))
+                write.assert_not_called()
 
     def test_blocked_provenance_cannot_hold_recovery_past_creation_cap(self):
         for acquisition in ["fresh", "reuse", "replace-beater"]:
@@ -579,6 +724,7 @@ class ProvenanceLockTests(unittest.TestCase):
                             patch.object(holds, "beater_is_ours", return_value=acquisition == "reuse"), \
                             patch("hold.subprocess.Popen", return_value=Mock(pid=99)) as spawned, \
                             patch("guard.backend_ready", return_value=False), patch("guard.desktop_snapshot", return_value=desktop), \
+                            patch("guard.process_diagnostics", return_value="processes=fixture"), \
                             patch("guard.boot_epoch", return_value=0), patch("guard.stop_unready_desktop", return_value=True) as stopped, \
                             patch("guard.reopen", side_effect=lambda home: opens.append(clock[0])):
                         worker = threading.Thread(target=start, daemon=True)
