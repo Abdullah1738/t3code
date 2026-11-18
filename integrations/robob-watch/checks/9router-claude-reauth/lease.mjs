@@ -43,8 +43,8 @@ function releaseUnlocked(path, owner) {
 function guarded(path, operation, owner) {
   const script = 'guard=$1; shift; exec 9>>"$guard" || exit 70; /usr/bin/lockf -s -t 0 9 || exit 75; exec "$@"';
   const p = spawnSync('/bin/sh', ['-c', script, 'lease-guard', `${path}.guard`, process.execPath, SELF, '_guarded', path, operation, JSON.stringify(owner)], { encoding: 'utf8' });
-  if (p.error || p.status !== 0) throw new Error('lease serialization unavailable');
-  try { return JSON.parse(p.stdout); } catch { throw new Error('invalid lease result'); }
+  if (p.error || p.status !== 0) throw Object.assign(new Error('lease serialization unavailable'), { code: 'REAUTH_LEASE_SERIALIZATION' });
+  try { return JSON.parse(p.stdout); } catch { throw Object.assign(new Error('invalid lease result'), { code: 'REAUTH_LEASE_RESULT_INVALID' }); }
 }
 export function acquireLease(path, kind, id = randomUUID()) { return guarded(path, 'acquire', { kind, id }); }
 export function releaseLease(path, owner) { return guarded(path, 'release', owner); }

@@ -140,11 +140,18 @@ class InventoryLoggingTests(unittest.TestCase):
                     jobs.directory_inventory([self.root], denied)
                 rows = [r for p in (self.logs/str(deep)).glob('*.ndjson')
                         for r in map(json.loads, p.read_text().splitlines())]
-                partials = [r for r in rows if r['name'] == 'disk.inventory.source' and r['props']['source'] == str(child)]
-                self.assertTrue(partials)
-                self.assertTrue(all(r['props']['partial'] and r['props']['deniedCount'] == 1 for r in partials))
+                denials = [r for r in rows if r['name'] == 'disk.inventory.source' and r['props']['source'] == str(child)]
+                self.assertTrue(denials)
+                self.assertTrue(all(r['props']['failure'] == 'permission'
+                                    and r['props']['estimate'] and r['props']['deniedCount'] == 1
+                                    for r in denials))
+                cached = jobs.read_state('disk-inventory')['childState'][str(self.root)][str(child)]
+                self.assertFalse(cached['partial'])
+                self.assertEqual(cached['bytes'], 42*1024)
                 root_props = next(r['props'] for r in rows if r['name'] == 'disk.inventory.root')
                 self.assertEqual((root_props['deniedCount'], root_props['partialChildCount']), (1, 0))
+                self.assertTrue(root_props['completeWithDenied'])
+                self.assertTrue(root_props['partial'])
         cache = {str(child): dict(partial=True, limited=True, attemptedAt=1)}
         total, status, _ = jobs.inventory_status(cache, [SimpleNamespace(path=str(child))], True, 1000000)
         jobs.InventoryLog(self.root).root_event(cache, total, status)
@@ -238,7 +245,8 @@ class InventoryLoggingTests(unittest.TestCase):
                 before = jobs.read_state('disk-inventory')
                 with jobs.inventory_lock():
                     if deep:
-                        deep_inventory.run_pass([self.root], lambda *a, **k: self.fail('locked'))
+                        with patch.object(deep_inventory, 'DEEP_LOCK_WAIT_S', 0):
+                            deep_inventory.run_pass([self.root], lambda *a, **k: self.fail('locked'))
                     else:
                         jobs.directory_inventory([self.root], lambda *a, **k: self.fail('locked'))
                 self.assertEqual(jobs.read_state('disk-inventory'), before)

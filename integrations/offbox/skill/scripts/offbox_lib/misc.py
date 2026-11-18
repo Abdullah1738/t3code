@@ -24,7 +24,7 @@ import toollog
 
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_BUSY, EXIT_INFRA, EXIT_NOT_STARTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
-                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, kv_get, log, month_key, now,
+                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, kv_get, log, now,
                      delivered_bytes, offsets_path, out, read_json, record_delivery, require_mine, say, silence, size_summary)
 from .common import mine as token_mine  # release() has its own `mine` flag
 from .identity import require_proven
@@ -130,7 +130,7 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
               f"ago runs:{d['active_runs']}{pin}{note}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
 
 
-def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
+def release(me: dict, box_id: str | None, mine: bool, delete: bool, *, override=False) -> None:
     # An explicit box id still ends another caller's lease, so it is refused for an unproven caller too.
     require_proven(me, "release")
     con = db()
@@ -158,13 +158,13 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
         return
     for r in rows:
         lease.release_hold_if_worker_gone(con, r["box_id"])
-        if _report_prune_hold(con, r["box_id"]):
+        if not override and _report_prune_hold(con, r["box_id"]):
             continue
         # A foreground run holds box-<id> while it streams, so a hung run shows up as a lock timeout. Name the active
         # runs on that path too; the recheck under the lock still decides before any mutation.
         try:
-            with file_lock('box-'+r['box_id'], timeout=1):
-                _release_one(con, r, delete, me)
+            with contextlib.nullcontext() if override else file_lock('box-'+r['box_id'], timeout=1):
+                _release_one(con, r, delete, me, override=override)
         except OffboxError as e:
             if "timed out waiting for lock" not in str(e):
                 raise
@@ -186,28 +186,31 @@ def _report_prune_hold(con, box_id: str) -> bool:
 
 def _report_active_runs(con, box_id: str, lock_held: bool = False) -> bool:
     """Name the starting/running runs on a box and suggest kill. Returns False when there are none."""
-    ids = [x[0] for x in con.execute("SELECT run_id FROM runs WHERE box_id=? AND status IN ('starting','running') "
+    ids = [f"{x[0]} (holder {x[1] or 'unknown holder'})" for x in con.execute(
+                                     "SELECT run_id,owner FROM runs WHERE box_id=? AND (" + lease.reserved_run_sql() + ") "
                                      "ORDER BY start_at", (box_id,))]
     if not ids:
         return False
     where = " (the box lock is held by a live client)" if lock_held else ""
     say(f"{box_id}: run in progress, not released{where}: {', '.join(ids)}. If it is hung, stop it with "
-        "`offbox kill <run>` and release again.")
+        "`offbox kill <run>` and release again, or explicitly use --override-protection.")
     return True
 
 
-def _release_one(con, r, delete, me=None):
-        if _report_prune_hold(con, r["box_id"]):
+def _release_one(con, r, delete, me=None, *, override=False):
+        if not override and _report_prune_hold(con, r["box_id"]):
             return
-        if lease.active_runs(con, r["box_id"]):
+        if not override and lease.active_runs(con, r["box_id"]):
             _report_active_runs(con, r["box_id"])
             return
+        if delete or r['state'] in ('running', 'resume_stalled'):
+            lease.check_protection(con, r['box_id'], override=override)
         if delete:
-            lease.delete_box(con, r["box_id"], "release --delete")
+            lease.delete_box(con, r["box_id"], "release --delete", **({'override': True} if override else {}))
             print(f"deleted {r['box_id']}")
         else:
             if r["state"] in ("running", "resume_stalled"):
-                lease.stop_box(con, r["box_id"], "release")
+                lease.stop_box(con, r["box_id"], "release", **({'override': True} if override else {}))
             if r['state'] == 'resume_stalled':
                 print(f"stop requested for {r['box_id']} (disk kept; remains set aside)")
                 return
@@ -590,8 +593,21 @@ def status(me: dict, run_id: str | None = None) -> None:
         if line:
             print(line)
         return
-    from . import box_disk, unfit
+    from . import unfit
     with db() as disk_con:
+        for row in disk_con.execute("SELECT * FROM leases WHERE pinned_until>? AND pinned_until<=? "
+                                    "AND state!='deleted' ORDER BY pinned_until", (now(), now()+86400)):
+            holder = kv_get(disk_con, 'pin_owner:' + row['box_id']) or row['owner'] or 'unknown holder'
+            print(f"{row['box_id']}: pin expires {iso(row['pinned_until'])}; holder {holder}")
+            saved = kv_get(disk_con, 'pin_saved:' + row['box_id'])
+            if saved:
+                print(f"    retained disk snapshot: {saved}")
+        for row in disk_con.execute("SELECT * FROM events WHERE json_valid(detail) AND "
+                                    "json_extract(detail,'$.version')=1 ORDER BY ts DESC LIMIT 5"):
+            detail = json.loads(row['detail'])
+            who = detail['caller']
+            print(f"{iso(row['ts'])} {row['box_id'] or '-'} {detail['action']}: {detail['reason']} "
+                  f"actor={who['actor']} pid={who.get('pid')} thread={who.get('thread_id') or '-'}")
         for row in disk_con.execute("SELECT box_id FROM leases WHERE state != 'deleted'"):
             mark = unfit.get(disk_con, row['box_id'])
             if mark:
@@ -601,7 +617,7 @@ def status(me: dict, run_id: str | None = None) -> None:
             print(f"{row['box_id']}: disk_full " + ', '.join(
                 f"{name} {value.get('free_bytes', '?')} bytes free"
                 for name, value in info.get('space', {}).items()))
-    from . import common, home
+    from . import common
     con = db()
     cap = read_json(CAP_PATH, {})
     if common.home_config() is not None:
@@ -658,6 +674,14 @@ def status(me: dict, run_id: str | None = None) -> None:
             if retained and (retained['note'] or '').startswith(pool.RECYCLED_NOTE):
                 held += f" detached [{retained['note']}]"
             print(f"  {b['id']:<12} {b.get('state'):<9} {b.get('type'):<8} {(b.get('name') or '')[:60]}{held}")
+            pin = (b.get('protection') or {}).get('pin') or {}
+            expiry = common.iso_ts(pin.get('until'))
+            if pin.get('active') and expiry is not None and now() < expiry <= now()+86400:
+                print(f"    pin expires {pin['until']}; holder {pin.get('holder') or 'unknown holder'}")
+            if b.get('lastEvent'):
+                e = b['lastEvent']
+                print(f"    {e['action']}: {e['reason']} actor={e['caller']['actor']} "
+                      f"pid={e['caller'].get('pid')} run={e['caller'].get('run_id') or '-'}")
     except OffboxError as e:
         print(f"boxes: boat API unreachable ({e})")
     for row in con.execute("SELECT r.* FROM runs r JOIN kv k ON k.k='failover_queue:' || r.run_id "
@@ -1590,6 +1614,7 @@ def logs(run_id: str, do_follow: bool) -> int:
     if killed is not None and killed['process_id']:
         return report_killed(killed, p)
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
+    _report_deps_hint(r, code, p)
     _incomplete_log(_validated_step_row(r, code), result)
     if code is None:
         from .run_evidence import report
@@ -1597,7 +1622,7 @@ def logs(run_id: str, do_follow: bool) -> int:
     from . import native_crash
     native_crash.readback(r, code, _raw_log(p), report=True)
     from .runs import space_result
-    effective = space_result(r['run_id'], code, p, report=True)
+    space_result(r['run_id'], code, p, report=True)
     import offbox_disk_space
     if (offbox_disk_space.result(_raw_log(p), code).get('infra_failure') or
             read_json(LOGS_DIR / f"{r['run_id']}.state.json", {}).get('infra_failure')):
@@ -1992,6 +2017,7 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_
         _tail_selected(log_path, pos, echo)
         return complete_killed(killed, log_path, pulls=json.loads(r['pulls'] or '[]'), until=deadline)
     code = settled_steps_code(r, code, log_path=log_path, until=deadline)
+    _report_deps_hint(r, code, log_path)
     from . import resources
     resources.finalize(r)
     _tail_selected(log_path, pos, echo)
@@ -2293,13 +2319,11 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
 
 
 def _report_deps_hint(r, code, log_path) -> None:
-    from .runs import box_deps_hint, step_results
-    results = step_results(log_path)
-    failed_code = next((rc for _, rc in results if rc), code)
-    if code != 127 and failed_code != 127 and (code not in (0, None) or any(rc != 0 for _, rc in results)):
+    from .runs import box_deps_hint, report_box_hint, step_results
+    results = step_results(_raw_log(log_path))
+    if code not in (0, None) or any(rc != 0 for _, rc in results):
         hint = box_deps_hint(Path(r['repo_root'] or '.'), log_path)
-        if hint:
-            say(hint)
+        report_box_hint(code, results, hint)
 
 
 def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) -> int:
@@ -2327,7 +2351,7 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
     quarantine_pending = code == 97
     failure_tail_shown = False
     try:
-        from .runs import killed_result, report_killed, complete_killed
+        from .runs import killed_result, complete_killed
         killed = killed_result(r['run_id'], wait=True, until=until, row=r, known_code=code) if code in (None, 137, 143) else None
         if killed is not None and killed['process_id']:
             _tail_selected(log_path, delivered, echo)
@@ -2405,7 +2429,6 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
 
 def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None, *, show_failure=False):
     """Non-takeover wait (the lock was free, or this process holds it): follow, then record the end."""
-    from .runs import follow  # noqa: F401  (kept so the module-level patch points stay valid)
     if r['status'] not in ('starting','running'):
         return _settled(r, echo=echo, locked=True, until=until, show_failure=show_failure)
     log_path = LOGS_DIR / f"{r['run_id']}.log"
@@ -2450,7 +2473,8 @@ def run_events(run_id, as_json=False):
         rows = [dict(r) for r in con.execute("SELECT * FROM events WHERE "
                 "CASE WHEN json_valid(detail) THEN json_extract(detail,'$.run_id')=? "
                 "OR json_extract(detail,'$.old_run_id')=? OR json_extract(detail,'$.new_run_id')=? "
-                "ELSE detail LIKE ? END ORDER BY ts", (run_id, run_id, run_id, run_id + ' %'))]
+                "OR json_extract(detail,'$.caller.run_id')=? "
+                "ELSE detail LIKE ? END ORDER BY ts", (run_id, run_id, run_id, run_id, run_id + ' %'))]
     if as_json:
         print(json.dumps(rows))
     else:

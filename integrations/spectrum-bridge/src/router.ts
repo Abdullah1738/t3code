@@ -1,3 +1,5 @@
+import { bounded } from "./bounded.ts";
+import { PromptProbeTracker } from "./prompt-probe.ts";
 import { ProbeBackoff, ProbeBudget, probeDeferred } from "./probe-policy.ts";
 import { findOverdue, reconcileLegacyReplies, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
 import { toolLog as watcherLog } from "./watcherlog.ts";
@@ -12,7 +14,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming, savePreview } from "./inbound-files.ts";
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
-import { assistantText, isCompletionNoticeText, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { assistantText, isCompletionNoticeText, PromptExpiredError, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
 import { commandWord, controlCommand, isCommand } from "./commands.ts";
@@ -681,20 +683,10 @@ Bridge CLI: ${CLI} COMMAND ... --session CURRENT_SESSION_ID --key UNIQUE_KEY
 Secure forms and the other commands are in the imessage skill.`;
 }
 
-// Existing client methods do not accept cancellation signals. Bound the wait, but
-// treat timed-out mutations as ambiguous: their underlying request can finish later.
-export async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([operation, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(Object.assign(new Error("Router request timed out"), { name: "TimeoutError", code: "timeout" })), timeout);
-    })]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+export { bounded } from "./bounded.ts";
 
 export class Router {
+  private readonly promptProbes = new PromptProbeTracker(toolLog.write);
   private completionRead?: { key: string; result: Promise<MessageRecord[]>; timing: ReadTiming; records?: MessageRecord[]; at?: number };
   private completionTargetKey?: string;
   private completionWake = Promise.withResolvers<void>();
@@ -715,7 +707,8 @@ export class Router {
     }));
   }
 
-  private async probeAccepted(route: Route & { inboundId?: string }, prompt: string, leader = route.inboundId ?? prompt, timeout = this.readTimeout()): Promise<boolean> {
+  private async probeAccepted(route: Route & { inboundId?: string }, prompt: string, leader = route.inboundId ?? prompt, timeout = this.readTimeout(),
+    observe?: () => ReturnType<PromptProbeTracker["start"]>): Promise<boolean> {
     const promptKey = `prompt:${route.id}:${prompt}`;
     const retry = this.probeBackoff.retry(leader) || this.probeBackoff.retry(promptKey);
     if (this.probeBackoff.cooling(leader) || this.probeBackoff.cooling(promptKey)
@@ -724,14 +717,18 @@ export class Router {
     const promptLease = this.probeBackoff.reserve(promptKey);
     const ownsLease = () => this.probeBackoff.get(leader)?.token === leaderLease.token
       && this.probeBackoff.get(promptKey)?.token === promptLease.token;
+    const observation: { probe?: ReturnType<PromptProbeTracker["start"]> } = {};
+    if (observe) toolLog.capture(() => { observation.probe = observe(); });
     try {
       const accepted = await bounded(this.backend.promptAccepted(route.id, route.directory, prompt), timeout);
+      if (observation.probe) toolLog.capture(() => observation.probe?.complete(accepted));
       if (!ownsLease()) throw probeDeferred;
       if (accepted) this.probeBackoff.clear(leader);
       else this.probeBackoff.release(leader);
       this.probeBackoff.clear(promptKey);
       return accepted;
     } catch (error) {
+      if (observation.probe && error !== probeDeferred) toolLog.capture(() => observation.probe?.failure(error));
       // A receipt can settle this read while it is pending; late failures cannot restore its history.
       if (!ownsLease()) throw probeDeferred;
       const backoff = this.probeBackoff.failed(leader);
@@ -1052,6 +1049,8 @@ export class Router {
       if (row.state === "pending" && this.store.get(`human-own-turn:${id}`) || row.state === "admitted") continue;
       if (succeeded || row.state !== "failed") this.store.updateInbound(id, "done");
       if (this.store.get<number>(`inbound-delivered:${id}`) !== undefined) continue;
+      if (!synthetic(id)) this.store.set("bus-yield-human", false);
+      if (isAgentBusWake(id)) this.store.set("bus-yield-human", true);
       this.store.set(`inbound-delivered:${id}`, deliveredAt);
       toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "inbound.delivered",
         ids: { chat: this.options.context?.chat.slug ?? this.store.get<string>("unanswered-chat") ?? "other", inboundId: id } }));
@@ -1142,10 +1141,22 @@ export class Router {
       if (original) {
         if (this.probeBackoff.cooling(leader)) absent = false;
         else {
+          const steer = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
           const ids = [original.messageId, ...original.earlier ?? []];
           for (const [probeIndex, id] of ids.entries()) {
+            const steeredAt = id === original.messageId && id === `msg_${hash(leader)}`
+              && steer?.id === original.id && steer.directory === original.directory && steer.generation === original.generation
+              ? steer.startedAt : undefined;
+            const sentAt = id === original.messageId ? steeredAt ?? original.attemptAt ?? original.startedAt : original.startedAt;
+            const probeFailure: { value?: { error: unknown; props: Parameters<typeof toolError>[4] } } = {};
             try {
-              if (await this.probeAccepted(original, id, leader, 10_000)) {
+              if (await this.probeAccepted(original, id, leader, 10_000, () => {
+                const probe = this.promptProbes.start(original.id, id, sentAt);
+                return { ...probe, failure: (error: unknown) => {
+                  probeFailure.value = { error, props: undefined };
+                  return probeFailure.value.props = probe.failure(error);
+                } };
+              })) {
                 this.store.db.transaction(() => {
                   const retry = this.store.get<string>(`human-retry-prompt:${leader}`);
                   if (retry && retry !== original.messageId) return;
@@ -1170,7 +1181,8 @@ export class Router {
                 break;
               }
             } catch (caughtError) {
-              toolError("router", "router.catch1", caughtError, { inboundId: `row_${hash(leader).slice(0, 16)}` }, { probeIndex, probeCount: ids.length });
+              toolError("router", "router.catch1", probeFailure.value ? probeFailure.value.error : caughtError, { threadId: original.id, inboundId: `row_${hash(leader).slice(0, 16)}` },
+                { probeIndex, probeCount: ids.length, ...probeFailure.value?.props });
               absent = false;
               break;
             }
@@ -1230,7 +1242,7 @@ export class Router {
       if (!absent || age > FAILED_INBOUND_REPLAY_MAX_AGE_MS || parent?.state === "failed") continue;
       // Idempotency is scoped to the destination thread. Never replay across a rotation.
       if (original && (!this.current(original) || original.earlier?.length)) continue;
-      if (wake && this.store.get(`stuck-wake-attempt:${row.id}`) !== undefined) continue;
+      if (wake && !this.busBatch(leader) && this.store.get(`stuck-wake-attempt:${row.id}`) !== undefined) continue;
       // Batched rows retain the leader's original request id and sealed body. An orphan
       // without a known destination cannot be safely replayed, but still earns the wake alert.
       if ((row.state === "batched" || parent?.state === "processing") && !original) continue;
@@ -1253,13 +1265,33 @@ export class Router {
     if (due) await this.tick();
   }
 
+  private busBatch(id: string): boolean {
+    return (this.syntheticBatch(id) ?? [id]).some(isAgentBusWake);
+  }
+
+  private busExpiresAt(id: string): number | undefined {
+    const deadlines = (this.syntheticBatch(id) ?? [id]).flatMap(member => {
+      if (!isAgentBusWake(member)) return [];
+      const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id=?").get(member);
+      const expiresAt = row ? (JSON.parse(row.payload) as { agentExpiresAt?: number }).agentExpiresAt : undefined;
+      return expiresAt === undefined ? [] : [expiresAt];
+    });
+    return deadlines.length ? Math.min(...deadlines) : undefined;
+  }
+
+  private busExpired(id: string): boolean {
+    const expiresAt = this.busExpiresAt(id);
+    return expiresAt !== undefined && Date.now() >= expiresAt;
+  }
+
   private stuckWakeAttempted(id: string | undefined): boolean {
-    return id !== undefined && id.startsWith("wake:") && this.store.get(`inbound-delivered:${id}`) === undefined
+    return id !== undefined && !this.busBatch(id) && id.startsWith("wake:") && this.store.get(`inbound-delivered:${id}`) === undefined
       && this.store.get(`stuck-wake-attempt:${id}`) !== undefined;
   }
 
   private claimStuckWakeAttempt(id: string): boolean {
     const ids = this.syntheticBatch(id) ?? [id];
+    if (ids.some(isAgentBusWake)) return true;
     // Once admitted, the existing no-tool execution retry policy owns this row.
     if (ids.every(member => this.store.get(`inbound-delivered:${member}`) !== undefined)) return true;
     if (!ids.some(member => member.startsWith("wake:") && this.store.get(`stuck-wake-retry:${member}`) !== undefined)) return true;
@@ -1640,7 +1672,17 @@ export class Router {
         this.options.log?.("reply-nudge-dropped", reason);
         continue;
       }
-      const text = (JSON.parse(payload.get(id)?.payload ?? "{}") as Partial<NormalizedInbound>).text ?? "";
+      const saved = JSON.parse(payload.get(id)?.payload ?? "{}") as Partial<NormalizedInbound> & { agentExpiresAt?: number };
+      const text = saved.text ?? "";
+      if (isAgentBusWake(id) && reason === "undelivered" && saved.agentExpiresAt !== undefined && Date.now() >= saved.agentExpiresAt) {
+        this.failInbound(id, "synthetic", reason);
+        continue;
+      }
+      if (isAgentBusWake(id) && reason === "undelivered" && saved.agentExpiresAt !== undefined && Date.now() < saved.agentExpiresAt) {
+        this.store.set(key, { ...state, attempts, reason, nextAt: Date.now() + Math.min(30_000, SYNTHETIC_RETRY_MS * 2 ** Math.min(attempts - 1, 5)) } satisfies SyntheticRetry);
+        this.store.updateInbound(id, "pending");
+        continue;
+      }
       if (reason === "failed") {
         // The agent had it and started work: running it again could repeat side
         // effects, and the event is already in the session's history.
@@ -1884,7 +1926,12 @@ export class Router {
       const now = Date.now();
       let latestReceivedAt = 0;
       for (const row of rows) {
-        const input = row.payload as NormalizedInbound;
+        const input = row.payload as NormalizedInbound & { agentExpiresAt?: number };
+        if (row.state === "pending" && isAgentBusWake(row.id) && input.agentExpiresAt !== undefined && now >= input.agentExpiresAt
+          && !this.store.get<SyntheticRetry | null>(this.retryKey(row.id))?.prompts.length) {
+          this.retrySynthetic(row.id, "undelivered");
+          row.state = "failed";
+        }
         if (row.state !== "pending" || controlCommand(input.text)) continue;
         // Legacy rows get a durable receipt time once, including while another turn runs.
         if (input.receivedAt === undefined || !Number.isSafeInteger(input.receivedAt) || input.receivedAt < 0) {
@@ -1893,6 +1940,7 @@ export class Router {
         }
         latestReceivedAt = Math.max(latestReceivedAt, input.receivedAt);
       }
+      rows = this.store.pendingInbound();
       // A failed or retired turn never blocks the conversation.
       let currentTurn = this.store.get<Turn | null>("activeTurn");
       if (currentTurn?.origin === "request" && rows.some(row => row.state === "pending" && !synthetic(row.id)
@@ -1918,7 +1966,6 @@ export class Router {
         }
         return;
       }
-      if (rows.some(row => row.state === "pending" && !handled.has(row.id))) return;
       // Commands are never conversation, even if one was left queued. A synthetic
       // row waiting out a retry backoff does not hold up anything behind it.
       // A reset nudge goes first, so texts sent right after /new reach the fresh context.
@@ -1930,8 +1977,21 @@ export class Router {
         && (!this.store.get(`human-own-turn:${row.id}`) || !this.store.get(`steer-attempt:${row.id}`) || this.store.get(`steer-reconciled:${row.id}`) === true)
         && !(this.store.get(`batch-phase:${row.id}`) === "deferred-wake" && this.probeBackoff.cooling(row.id))
         && (!controlCommand((row.payload as NormalizedInbound).text) || !!this.store.get(`human-own-turn:${row.id}`));
+      const dueBus = rows.find(row => sendable(row) && this.busBatch(row.id)
+        && now - ((row.payload as NormalizedInbound).receivedAt ?? now) >= 60_000);
+      const humanNext = this.store.get<boolean>("bus-yield-human")
+        ? rows.find(row => sendable(row) && !synthetic(row.id)) : undefined;
+      if (rows.some(row => row.state === "pending" && !handled.has(row.id))
+        && (!dueBus || humanNext || this.controlArrived(handled) || this.isGroup())) return;
+      // One overdue bus turn is followed by the waiting human, even if more bus work is overdue.
+      if (steer && dueBus && !humanNext) {
+        for (const row of rows) if (row.state === "pending" && !synthetic(row.id)) this.store.set(`human-own-turn:${row.id}`, true);
+        return;
+      }
       const leader = steer ? rows.find(row => row.state === "pending" && !synthetic(row.id) && !this.store.get(`human-own-turn:${row.id}`))
         : rows.find(row => row.state === "pending" && resetRow(row.id))
+        ?? humanNext
+        ?? dueBus
         ?? rows.find(row => sendable(row) && !synthetic(row.id))
         ?? rows.find(row => sendable(row) && !row.id.startsWith("wake:"))
         ?? rows.find(sendable);
@@ -1980,6 +2040,7 @@ export class Router {
           if (["queued-steer", "deferred-wake"].includes(this.store.get<string>(`batch-phase:${row.id}`) ?? "")
             || row.state !== "pending" || isCommand(next.text) || next.replyTo !== input.replyTo
             || (this.options.swipes && next.replyTo && !sameAttachmentMessage(input, next))
+            || isAgentBusWake(row.id) !== isAgentBusWake(leader.id)
             || row.id.startsWith("wake:") !== leader.id.startsWith("wake:") || resetRow(row.id) || this.backingOff(row.id, now)
             || (steer && !steerText({ id: row.id, payload: next }))) break;
           members.push({ ...row, payload: next });
@@ -2069,7 +2130,7 @@ export class Router {
   private steerBlocked(turn: Turn): string | undefined {
     if (!this.backend.steer) return "backend";
     if (turn.phase !== "running") return `phase-${turn.phase}`;
-    if (turn.background) return "background";
+    if (turn.background || this.busBatch(turn.inboundId ?? "")) return "background";
     if (turn.origin !== undefined) return "request-turn";
     const id = turn.inboundId;
     if (id === undefined) return "missing-inbound";
@@ -3730,7 +3791,12 @@ export class Router {
     }
     const interrupted = () => {
       if (this.expireFailedReplay(row.id)) return true;
-      const held = latencyRoute !== undefined && latencyRoute !== null
+      const busReceivedAt = (this.syntheticBatch(row.id) ?? [row.id]).filter(isAgentBusWake).map(id => {
+        const member = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id=?").get(id);
+        return member ? (JSON.parse(member.payload) as NormalizedInbound).receivedAt ?? Date.now() : Date.now();
+      });
+      const busDue = busReceivedAt.some(at => Date.now() - at >= 60_000);
+      const held = busDue || latencyRoute !== undefined && latencyRoute !== null
         || steerAttempt !== undefined && steerAttempt !== null
         || preparing?.id === row.id && (preparing.attempt > 1 || preparing.held);
       const arrived = held ? this.controlArrived(handled)
@@ -3988,6 +4054,11 @@ export class Router {
         this.clearDeferredNew();
       }
       this.store.set(`batch-phase:${row.id}`, "submitting");
+      if (this.busExpired(row.id)) {
+        this.retrySynthetic(row.id, "undelivered");
+        this.store.set("preparingDelivery", null);
+        return false;
+      }
       this.store.set("preparingDelivery", null);
       if (this.options.swipes) this.freezeSwipe(row.id);
       // Anything the agent sends for this turn lands after this mark.
@@ -4016,13 +4087,15 @@ export class Router {
     if (!submitting) return;
     try {
       await this.sending(this.backend.prompt(turn.id, turn.directory, turn.messageId, body, system, parts, preferences.model, owner,
-        () => this.beforePromptPost(turn, row.id, handled)), handled, turn.messageId);
+        () => this.beforePromptPost(turn, row.id, handled), this.busExpiresAt(row.id)), handled, turn.messageId);
       if (this.current(turn)) this.store.db.transaction(() => {
         this.setTurn({ ...turn, phase: "running" });
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch (error) { toolError("router", "router.catch40", error);
+    } catch (error) {
+      if (error instanceof PromptExpiredError) { this.fail(turn, "", undefined, "undelivered"); return; }
+      toolError("router", "router.catch40", error);
       if (error === probeDeferred) { this.deferUnsentWake(turn); return; }
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
@@ -4424,17 +4497,20 @@ export class Router {
     if (this.probeBackoff.cooling(body.inboundId)) return;
     if (this.expireFailedReplay(body.inboundId)) return;
     if (this.controlArrived(handled)) return;
+    if (this.busExpired(body.inboundId)) { this.fail(turn, "", undefined, "undelivered"); return; }
     const input = this.store.get<NormalizedInbound | null>(`batch:${body.inboundId}`);
     const system = replay ? body.system + this.delayNote(input, turn.startedAt) : body.system;
     try {
       await this.sending(this.backend.prompt(turn.id, turn.directory, turn.messageId, body.text, system, body.parts, body.model, body.owner,
-        () => this.beforePromptPost(turn, body.inboundId, handled)), handled, turn.messageId);
+        () => this.beforePromptPost(turn, body.inboundId, handled), this.busExpiresAt(body.inboundId)), handled, turn.messageId);
       if (this.current(turn) && this.store.get<Turn | null>("activeTurn")?.messageId === turn.messageId) this.store.db.transaction(() => {
         this.setTurn({ ...turn, phase: "running" });
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch (error) { toolError("router", "router.catch44", error);
+    } catch (error) {
+      if (error instanceof PromptExpiredError) { this.fail(turn, "", undefined, "undelivered"); return; }
+      toolError("router", "router.catch44", error);
       if (error === probeDeferred) { this.deferUnsentWake(turn); return; }
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
@@ -5504,7 +5580,9 @@ export class Router {
     const live = this.store.get<Turn | null>("activeTurn");
     if (live?.messageId === turn.messageId) this.setTurn({ ...live, covered: [...new Set([...live.covered ?? [], ...members])] });
     this.store.set(`human-settled:${turn.messageId}`, false);
-    this.store.set(`turn-human:${turn.messageId}`, [...new Set([...this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? [], id])]);
+    const leaders = this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? [];
+    if (!leaders.includes(id)) this.store.set("bus-yield-human", false);
+    this.store.set(`turn-human:${turn.messageId}`, [...new Set([...leaders, id])]);
     for (const member of members) this.store.updateInbound(member, this.answered(member) ? "done" : "admitted");
   }
 

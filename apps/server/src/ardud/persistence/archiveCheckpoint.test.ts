@@ -16,11 +16,15 @@ import {
 import { ServerActivation } from "../../serverActivation.ts";
 import { archiveCheckpointLayer, HistoryArchiveDurability } from "./archiveCheckpoint.ts";
 
-vi.mock("node:worker_threads", () => ({ Worker: vi.fn() }));
+vi.mock("node:worker_threads", async (importOriginal) => ({
+  ...(await importOriginal<typeof NodeWorkerThreads>()),
+  Worker: vi.fn(),
+}));
 afterEach(() => vi.resetAllMocks());
 
 type Request = { id: number; operation: "checkpoint" | "flush-main" | "maintenance" };
 class CheckpointWorker extends NodeEvents.EventEmitter {
+  readonly threadId = 1;
   readonly requests: Request[] = [];
   readonly waiting: Array<(request: Request) => void> = [];
   readonly sent: Request[] = [];

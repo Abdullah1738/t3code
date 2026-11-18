@@ -19,14 +19,15 @@ admin token opens /admin/* only. Config: /etc/boatd/config.json (see DEFAULTS).
 
 Restarts are normal here (no UPS). Every start reconciles before the API answers anything but /health:
 a run whose unit is still active is followed, one that finished while boatd was down is finalized from its result
-file, one whose unit is gone with no result is `interrupted` (queued again once if it was submitted with
-retry_interrupted), queued runs start by themselves, containers are brought to the state the database expects, and
+file, one whose unit is gone follows the guest receipt or becomes `interrupted` when the process is gone.
+Started commands are never retried; queued runs start by themselves, containers return to the expected state, and
 half-created boxes and half-made saved states are cleaned up. Without its pool boatd serves /health only and says why.
 Stdlib only (Python 3.12, Ubuntu 24.04)."""
 
 from __future__ import annotations
 
 import datetime as dt
+import base64
 import fcntl
 import hashlib
 import hmac
@@ -62,9 +63,11 @@ import boatd_memory
 
 try:
     import offbox_disk_space
+    import offbox_protection
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skill/scripts"))
     import offbox_disk_space
+    import offbox_protection
 
 VAR = Path(os.environ.get("BOATD_VAR", "/var/lib/boatd"))
 ETC = Path(os.environ.get("BOATD_ETC", "/etc/boatd"))
@@ -79,14 +82,13 @@ if not _mgmt_config.is_file():
 # Use the image's actual configuration, including when installed separately on the host.
 MGMT_PORT = int(next(line.split()[1] for line in _mgmt_config.read_text().splitlines() if line.startswith("Port ")))
 VERSION = "2.0"
+EXEC_RECOVERY_SECONDS = 10
 STARTED = time.time()
 
 # Snapshot retention, the one place for these numbers. Every run ends with a snapshot (kind auto; stop on a stop):
 # the newest `run_keep` are kept plus the last one of each day for `run_daily_days` days. Boxes of the owners in
 # `person_owners` also get timer snapshots (boatd-snap-{hourly,daily,weekly}.timer), newest N kept per kind.
 RETENTION = {"run_keep": 20, "run_daily_days": 14, "person_hourly": 48, "person_daily": 30, "person_weekly": 12}
-MAX_ATTEMPTS = 2                      # an interrupted run is queued again at most once
-EXEC_RECOVERY_SECONDS = 10
 
 DEFAULTS = {
     "listen": "127.0.0.1", "port": 8443,
@@ -115,6 +117,7 @@ DEFAULTS = {
 CFG: dict = {}
 
 LIVE = ("ready", "running")
+BOX_LOCKS = threading.local()
 TS_FMT = "%Y-%m-%dT%H:%M:%S.%f"
 
 
@@ -194,6 +197,13 @@ def _cols(con, table: str) -> set:
 def migrate(con) -> None:
     """Idempotent: owner columns, per-owner saved states, run attempts, hashed tokens."""
     con.executescript(SCHEMA_V2)
+    con.execute("CREATE TABLE IF NOT EXISTS box_events (seq INTEGER PRIMARY KEY, ts REAL, box_id TEXT, action TEXT, detail TEXT)")
+    con.execute('CREATE INDEX IF NOT EXISTS box_events_box_seq ON box_events(box_id,seq)')
+    for column in ('pin_until REAL', 'pin_holder TEXT'):
+        if column.split()[0] not in _cols(con, 'boxes'):
+            con.execute('ALTER TABLE boxes ADD COLUMN ' + column)
+    if 'holder' not in _cols(con, 'commands'):
+        con.execute('ALTER TABLE commands ADD COLUMN holder TEXT')
     if "mgmt_ssh_port" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN mgmt_ssh_port INTEGER")
     if "provision_identity" not in _cols(con, "boxes"):
@@ -803,7 +813,14 @@ def delete_instance(box_id: str, owner: str, require_identity: bool = False) -> 
 
 
 def cleanup_provision(box_id: str, owner: str) -> None:
-    delete_instance(box_id, owner, require_identity=True)
+    con = db()
+    try:
+        with box_memory_lock(box_id):
+            snapshot = require_unprotected(con, box_id)
+            delete_instance(box_id, owner, require_identity=True)
+            box_event(con, box_id, 'delete', 'failed provision cleanup', snapshot)
+    finally:
+        con.close()
 
 
 # ---------------------------------------------------------------- boxes
@@ -848,9 +865,103 @@ def box_row(con, box_id: str, owner: str | None = None):
 
 
 def set_box(con, box_id: str, **kw) -> None:
+    with box_transaction(con):
+        _set_box(con, box_id, **kw)
+
+
+@contextmanager
+def box_transaction(con):
+    own = not con.in_transaction
+    if own:
+        con.execute('BEGIN IMMEDIATE')
+    try:
+        yield
+        if own:
+            con.execute('COMMIT')
+    except BaseException:
+        if own:
+            con.execute('ROLLBACK')
+        raise
+
+
+def _set_box(con, box_id, **kw):
+    before = con.execute('SELECT state FROM boxes WHERE id=?', (box_id,)).fetchone()
+    changed = 'state' in kw and before and before['state'] != kw['state']
+    snapshot = box_protection(con, box_id, probe=False) if changed else None
     kw["updated_at"] = now()
     cols = ", ".join(f"{k}=?" for k in kw)
     con.execute(f"UPDATE boxes SET {cols} WHERE id=?", (*kw.values(), box_id))
+    if changed:
+        action = {'archived': 'archive', 'deleted': 'delete', 'resuming': 'resume',
+                  'stopping': 'stop', 'error': 'health_fail'}.get(kw['state'], 'state_change')
+        box_event(con, box_id, action, kw.get('error') or offbox_protection.caller().get('reason') or
+                  f"{before['state']} -> {kw['state']}",
+                  snapshot, state_before=before['state'], state_after=kw['state'])
+
+
+def box_event(con, box_id, action, reason, snapshot=None, **fields):
+    data = offbox_protection.envelope(action, reason, snapshot or box_protection(con, box_id, probe=False), **fields)
+    detail = json.dumps(data, separators=(',', ':'))
+    con.execute('INSERT INTO box_events(ts,box_id,action,detail) VALUES (?,?,?,?)', (now(), box_id, action, detail))
+    log(detail)
+    toollog.emit('boatd', 'box.' + action, ok=True, ids={'box': box_id, 'run': data['caller'].get('run_id')}, props=data)
+
+
+def box_protection(con, box_id, *, probe=True, run_id=None):
+    row = box_row(con, box_id)
+    pin = bool(row['pinned']) and (row['pin_until'] is None or row['pin_until'] > now())
+    holds, gone, resolved = [], False, []
+    # An exited shell can leave children behind, including sync commands without run metadata.
+    # Only a positive process probe retires an invocation from lifecycle protection.
+    rows = con.execute('SELECT * FROM commands WHERE box_id=? ORDER BY pid DESC', (box_id,)).fetchall()
+    for c in rows:
+        if run_id and c['run_id'] != run_id:
+            continue
+        metrics = json.loads(c['metrics'] or '{}')
+        cache_key = f"holder_gone:{box_id}:{c['pid']}:{c['attempt'] or 1}"
+        unsettled = c['status'] in ('queued', 'running')
+        if not unsettled and con.execute('SELECT 1 FROM meta WHERE k=?', (cache_key,)).fetchone():
+            if run_id:
+                gone = True
+            continue
+        never_dispatched = (c['status'] not in ('queued', 'running') and c['started_at'] is None and
+                            (metrics.get('not_dispatched') is True or queue_loss_json(c)['notAdmitted']))
+        proof = ({'stopped': True, 'reason': 'not_dispatched'} if never_dispatched else
+                 command_probe(c) if probe and c['status'] != 'queued' else {})
+        confirmed = (proof.get('stopped') is True or (proof.get('readable') is True and
+                     proof.get('pids') == [] and (proof.get('join_verified') is True or proof.get('box_rc') is not None)))
+        if run_id:
+            gone = confirmed or gone
+        if confirmed and not unsettled:
+            resolved.append((cache_key, c, never_dispatched))
+            continue
+        holds.append(dict(run_id=c['run_id'], holder=c['holder'] or row['owner'],
+                          state=c['status'], process_id=c['pid'], probe=proof))
+    # The same protection endpoint fences late guest owners and settled rows with live cgroups.
+    if probe and not run_id and not holds and commands_busy(con, box_id):
+        holds.append(dict(run_id=None, holder=row['owner'], state='live command'))
+    snapshot = dict(pin=dict(active=pin, until=iso(row['pin_until']), holder=row['pin_holder']), holds=holds,
+                    confirmedGone=gone and not holds)
+    for cache_key, c, never_dispatched in resolved:
+        with box_transaction(con):
+            inserted = con.execute('INSERT OR IGNORE INTO meta(k,v) VALUES (?,?)', (cache_key, 'probe')).rowcount
+            if inserted:
+                reason = 'command confirmed never dispatched' if never_dispatched else 'receipt/process probe confirmed holder gone'
+                box_event(con, box_id, 'lease_free', reason, snapshot,
+                          run_id=c['run_id'], holder=c['holder'], process_id=c['pid'])
+    return snapshot
+
+
+def require_unprotected(con, box_id, *, reuse=False):
+    snapshot = box_protection(con, box_id)
+    caller = offbox_protection.caller()
+    override = caller.get('override') is True and caller.get('actor') == 'client:release'
+    reason = offbox_protection.blocked(snapshot, holder=caller.get('holder'),
+                                      automatic=not reuse and not override, reuse=reuse, override=override)
+    if reason:
+        box_event(con, box_id, 'protection_refused', reason, snapshot)
+        raise Fail(409, 'box_held', f'{box_id} is {reason}; explicit release --override-protection required')
+    return snapshot
 
 
 def latest_snap(con, box_id: str):
@@ -880,11 +991,14 @@ def box_json(con, r) -> dict:
     if state == "ready" and running:
         state = "running"
     snap = latest_snap(con, r["id"])
+    protection = box_protection(con, r['id'], probe=False)
+    last_event = con.execute('SELECT detail FROM box_events WHERE box_id=? ORDER BY seq DESC LIMIT 1', (r['id'],)).fetchone()
     archive_after = None
     if state in LIVE and r["ttl"]:
         archive_after = iso((r["last_active"] or r["updated_at"]) + r["ttl"])
     return {
         "snapshotBytes": (DISK.get('boxes') or {}).get(r['id'], {}).get('snapshot_bytes'),
+        'lastEvent': json.loads(last_event['detail']) if last_event else None,
         "id": r["id"], "name": r["name"], "state": state, "error": r["error"], "dataExpiredAt": None,
         'heldRuns': held_runs(con, r['id']),
         "stoppedAt": iso(r["stopped_at"]) if state == "archived" else None, "labels": json.loads(r["labels"] or "{}"),
@@ -895,7 +1009,9 @@ def box_json(con, r) -> dict:
         "createdAt": iso(r["created_at"]), "updatedAt": iso(r["updated_at"]), "archiveAfter": archive_after,
         "ttlSeconds": r["ttl"], "snapshots": True, "snapshotAvailable": snap is not None,
         "snapshotCompletedAt": iso(snap["created_at"]) if snap else None,
-        "lastSnapshotStatus": "completed" if snap else None, "source": r["source"], "pinned": bool(r["pinned"]),
+        "lastSnapshotStatus": "completed" if snap else None, "source": r["source"],
+        "pinned": protection['pin']['active'],
+        "protection": protection,
         "environment": "offbox-server",
     }
 
@@ -1031,7 +1147,7 @@ def create_box(con, body: dict, idem: str | None, owner: str, src_box: str | Non
     if idem:
         con.execute("INSERT INTO idem VALUES (?,?,?)", (idem, bid, t0))
     con.execute("COMMIT")
-    threading.Thread(target=provision, args=(bid, source, t), daemon=True).start()
+    threading.Thread(target=offbox_protection.bind(provision), args=(bid, source, t), daemon=True).start()
     return box_json(con, box_row(con, bid))
 
 
@@ -1103,12 +1219,27 @@ def prune_snaps(con, box_id: str) -> None:
 
 
 def stop_box(con, box_id: str, why: str) -> None:
+    token = offbox_protection.CALLER.set(offbox_protection.caller(reason=why))
+    try:
+        with lifecycle_lock(box_id):
+            with box_memory_lock(box_id):
+                require_unprotected(con, box_id)
+                if box_row(con, box_id)['state'] == 'archived':
+                    return
+                set_box(con, box_id, state='stopping')
+            settle_box_commands(con, box_id)
+            with box_memory_lock(box_id):
+                require_unprotected(con, box_id)
+                _stop_box(con, box_id, why)
+    finally:
+        offbox_protection.CALLER.reset(token)
+
+
+def _stop_box(con, box_id: str, why: str) -> None:
     r = box_row(con, box_id)
     if r["state"] == "archived":
         return
     set_box(con, box_id, state="stopping")
-    for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)):
-        kill_cmd(con, box_id, c["pid"], lost=True)
     if ct_running(box_id):
         incus("stop", ct(box_id), "--timeout", "60", timeout=120, check=False)
         if ct_running(box_id):
@@ -1128,6 +1259,15 @@ def stop_box(con, box_id: str, why: str) -> None:
 
 
 def resume_box(con, box_id: str, body: dict) -> None:
+    with lifecycle_lock(box_id), box_memory_lock(box_id):
+        check_delete_fence(con, box_id)
+        if box_row(con, box_id)['state'] == 'stopping':
+            raise Fail(409, 'sandbox_unavailable', f'{box_id} is stopping')
+        require_unprotected(con, box_id, reuse=True)
+        _resume_box(con, box_id, body)
+
+
+def _resume_box(con, box_id, body):
     disk_admit()
     r = box_row(con, box_id)
     if body.get("ttlSeconds"):
@@ -1140,35 +1280,61 @@ def resume_box(con, box_id: str, body: dict) -> None:
         return
     set_box(con, box_id, state="resuming", error=None, last_active=now())
 
+    context = offbox_protection.caller()
     def go():
+        offbox_protection.CALLER.set(context)
         c2 = db()
         try:
-            apply_size(box_id, box_row(c2, box_id)["type"])
-            _ensure_proxy(box_id, box_row(c2, box_id)["ssh_port"])
-            _ensure_mgmt_proxy(c2, box_id)
-            if not ct_running(box_id):
-                scratch().start(box_id)
-            _wait_boot(box_id)
-            scratch().verify(box_id)
-            set_box(c2, box_id, state="ready", last_active=now())
-            log(f"box {box_id} resumed")
+            with lifecycle_lock(box_id):
+                if box_row(c2, box_id)['state'] != 'resuming':
+                    return
+                check_delete_fence(c2, box_id)
+                apply_size(box_id, box_row(c2, box_id)["type"])
+                _ensure_proxy(box_id, box_row(c2, box_id)["ssh_port"])
+                _ensure_mgmt_proxy(c2, box_id)
+                if not ct_running(box_id):
+                    scratch().start(box_id)
+                _wait_boot(box_id)
+                scratch().verify(box_id)
+                with box_memory_lock(box_id):
+                    set_box(c2, box_id, state="ready", last_active=now())
+                log(f"box {box_id} resumed")
         except Exception as e:  # noqa: BLE001
-            set_box(c2, box_id, state="archived", error=str(e)[:500])
+            with lifecycle_lock(box_id), box_memory_lock(box_id):
+                if box_row(c2, box_id)['state'] != 'resuming':
+                    return
+                protected = offbox_protection.blocked(box_protection(c2, box_id, probe=False))
+                set_box(c2, box_id, state='error' if protected else 'archived', error=str(e)[:500])
             log(f"resume {box_id} failed: {e}")
         finally:
             c2.close()
     threading.Thread(target=go, daemon=True).start()
 
 
-def delete_box(con, box_id: str) -> None:
+def delete_box(con, box_id: str, why: str | None = None) -> None:
+    token = offbox_protection.CALLER.set(offbox_protection.caller(
+        reason=why or offbox_protection.caller().get('reason') or 'API delete'))
+    try:
+        with lifecycle_lock(box_id):
+            with box_memory_lock(box_id):
+                require_unprotected(con, box_id)
+                con.execute('INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)', ('delete_pending:' + box_id, '1'))
+                if box_row(con, box_id)['state'] in LIVE + ('provisioning', 'resuming'):
+                    set_box(con, box_id, state='stopping')
+            settle_box_commands(con, box_id)
+            with box_memory_lock(box_id):
+                require_unprotected(con, box_id)
+                _delete_box(con, box_id)
+                con.execute('DELETE FROM meta WHERE k=?', ('delete_pending:' + box_id,))
+    finally:
+        offbox_protection.CALLER.reset(token)
+
+
+def _delete_box(con, box_id: str) -> None:
     r = box_row(con, box_id)
-    if r["pinned"]:
-        raise Fail(409, "sandbox_pinned", f"{box_id} is pinned; unpin it first")
     with boatd_tmp.lock(box_id):
         if r['provision_identity']:
             check_instance_identity(box_id)
-        for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)):
-            kill_cmd(con, box_id, c["pid"], lost=True)
         delete_instance(box_id, r['owner'], require_identity=bool(r['provision_identity']))
     con.execute("DELETE FROM snaps WHERE box_id=?", (box_id,))
     set_box(con, box_id, state="deleted", deleted_at=now())
@@ -1176,6 +1342,25 @@ def delete_box(con, box_id: str) -> None:
 
 
 # ---------------------------------------------------------------- saved snapshots
+
+def settle_box_commands(con, box_id):
+    # Result writers acquire result -> box. Never wait for their result lock while holding the box lock.
+    for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)).fetchall():
+        kill_cmd(con, box_id, c['pid'], lost=True)
+
+
+@contextmanager
+def lifecycle_lock(box_id):
+    path = VAR / 'lifecycle-locks'
+    path.mkdir(exist_ok=True)
+    with open(path / box_id, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def check_delete_fence(con, box_id):
+    if con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:' + box_id,)).fetchone():
+        raise Fail(409, 'sandbox_deleting', f'{box_id} deletion is pending; pin, resume and reuse are refused')
 
 def saved_json(r) -> dict:
     return {"name": r["name"], "status": r["status"], "sourceSandboxId": r["source"], "snapshotId": r["snapshot_id"],
@@ -1322,11 +1507,19 @@ def dispatching(fn):
 
 @contextmanager
 def box_memory_lock(box_id):
+    held = getattr(BOX_LOCKS, 'held', frozenset())
+    if box_id in held:
+        yield
+        return
     path = VAR / 'memory-locks'
     path.mkdir(exist_ok=True)
     with open(path / box_id, 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+        BOX_LOCKS.held = held | {box_id}
+        try:
+            yield
+        finally:
+            BOX_LOCKS.held = held
 
 
 @dispatching
@@ -1339,42 +1532,55 @@ def start_cmd(con, box_id: str, body: dict, owner: str | None = None) -> dict:
         (d / f"{pid}.{ext}").touch()
     err = spawn_runner(box_id, pid, 1)
     if err:
-        con.execute("UPDATE commands SET status='exited', exit_code=127, ended_at=? WHERE box_id=? AND pid=?",
-                    (now(), box_id, pid))
+        rc, state = _sh(['systemctl', 'is-active', unit_name(box_id, pid, 1)], timeout=2)
+        current = cmd_row(con, box_id, pid)
+        metrics = {'not_dispatched': current['started_at'] is None and
+                   rc in (3, 4) and state in ('inactive', 'failed', 'unknown')}
+        con.execute("UPDATE commands SET status='exited', exit_code=127, ended_at=?, metrics=? WHERE box_id=? AND pid=?",
+                    (now(), json.dumps(metrics), box_id, pid))
         raise Fail(500, "spawn_failed", err)
     return {"ok": True, "processId": pid, "commandId": cid, "pid": pid, "attempt": 1, "retryInterrupted": bool(retry)}
 
 
 def queue_cmd(con, box_id, body, owner):
+    check_delete_fence(con, box_id)
     r = box_row(con, box_id, owner)
     if r["state"] not in LIVE:
         raise Fail(409, "machine_not_running", f"{box_id} is {r['state']}")
     command = body.get("command") or ""
     if not command:
         raise Fail(400, "invalid_command", "command is empty")
+    guard_snapshot = require_unprotected(con, box_id, reuse=True) if body.get('detached') else None
     disk_admit()
     previous = con.execute("SELECT * FROM commands WHERE box_id=? AND run_id IS NOT NULL "
                            "AND status IN ('exited','lost','interrupted') ORDER BY ended_at DESC LIMIT 1", (box_id,)).fetchone()
     if previous:
         free_idle_tmp(con, previous, dict(status='exited', ended_at=previous['ended_at']))
     meta = body.get("meta") or {}
+    if body.get('detached') and meta.get('run_id') and commands_busy(con, box_id):
+        raise Fail(409, 'commands_busy', f'{box_id} still has an unsettled or live command')
+    if body.get('detached') and held_runs(con, box_id):
+        raise Fail(409, 'box_held', f'{box_id} has an unconfirmed command; nothing ran')
     con.execute("BEGIN IMMEDIATE")
-    held = held_runs(con, box_id) if body.get('detached') else []
-    if held:
+    if body.get('detached') and held_runs(con, box_id):
         con.execute('ROLLBACK')
-        raise Fail(409, 'box_held', f"{box_id} is held while checking {', '.join(held)}; nothing ran")
+        raise Fail(409, 'box_held', f'{box_id} has an unconfirmed command; nothing ran')
+    if body.get('detached') and meta.get('run_id') and con.execute("SELECT 1 FROM commands WHERE box_id=? AND status IN ('queued','running') LIMIT 1", (box_id,)).fetchone():
+        con.execute('ROLLBACK')
+        raise Fail(409, 'commands_busy', f'{box_id} still has an unsettled command')
     pid = (con.execute("SELECT MAX(pid) FROM commands WHERE box_id=?", (box_id,)).fetchone()[0] or 1000) + 1
     cid = "cmd_" + secrets.token_hex(8)
-    # retry_interrupted: if the host dies under this run, queue it again once (same id, next attempt). Only the
-    # caller knows whether running it twice is safe, so the default is no.
+    # Retained for old clients; started commands are never retried, regardless of this preference.
     retry = 1 if body.get("retry_interrupted") is True else 0
     sync = not bool(body.get("detached"))
     timeout_s = int(body.get("timeoutSeconds") or 60) if sync else None
     con.execute("INSERT INTO commands (box_id, pid, command_id, command, cwd, status, created_at, kind, repo, run_id, "
-                "retry_interrupted, attempt, sync, timeout_s) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
+                "retry_interrupted, attempt, sync, timeout_s, holder) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
                 (box_id, pid, cid, command, body.get("cwd") or "/home/user", "queued", now(),
                  meta.get("kind") or guess_kind(command), meta.get("repo"), meta.get("run_id"), retry,
-                 int(sync), timeout_s))
+                 int(sync), timeout_s, offbox_protection.caller().get('holder')))
+    if body.get('detached'):
+        box_event(con, box_id, 'hand_out', 'command admitted', guard_snapshot, run_id=meta.get('run_id'))
     con.execute("COMMIT")
     return pid, cid, retry
 
@@ -1425,10 +1631,7 @@ def queue_loss_json(row):
 
 
 def _cg_pids(box_id: str, pid: int) -> list[int]:
-    try:
-        return [int(x) for x in (cg_path(box_id) / "boatd" / str(pid) / "cgroup.procs").read_text().split()]
-    except (OSError, ValueError):
-        return []
+    return run_processes(box_id, pid) or []
 
 
 def run_processes(box_id: str, pid: int) -> list[int] | None:
@@ -1480,28 +1683,40 @@ def command_probe(c) -> dict:
                 marker = {'invalid': True}
         except FileNotFoundError:
             pass
-        rc = None
-        receipts = [Path(str(base) + ".rc")]
+        rc, receipt_kind = None, None
+        receipts = [(root / "run/boatd" / f"{c['pid']}.receipt/exit", 'guest'), (Path(str(base) + ".rc"), 'legacy')]
         # Client receipts predate attempt-specific boatd receipts. Never reuse attempt 1's rc on retry.
         if c['run_id'] and (c['attempt'] or 1) == 1:
-            receipts.append(root / "home/user/.offbox/exit" / (c['run_id'] + '.rc'))
-        for f in receipts:
+            receipts.append((root / "home/user/.offbox/exit" / (c['run_id'] + '.rc'), 'legacy'))
+        for f, kind in receipts:
             try:
                 value = int(f.read_text().strip())
                 if not 0 <= value <= 255:
                     return {"reason": "invalid_receipt"}
                 rc = value
+                receipt_kind = kind
                 break
             except FileNotFoundError:
                 pass
         pids = run_processes(c['box_id'], c['pid'])
+        receipt = root / 'run/boatd' / f"{c['pid']}.receipt"
+        initializing = False
+        lock = receipt.with_suffix('.lock')
+        if lock.exists():
+            with lock.open('a') as owner:
+                try:
+                    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    initializing = True
+        if initializing and not pids:
+            return {'reason':'guest_initializing', 'box_rc':rc, 'receipt_kind':receipt_kind, 'marker':marker}
         joined = bool(marker and marker.get('cgroup_joined') is True and
                       type(marker.get('pid')) is int and marker['pid'] > 0 and marker.get('attempt') == (c['attempt'] or 1))
         # Legacy groups still identify members we can follow or stop. Without join evidence, an empty
         # group cannot prove there are no children outside it.
         if not joined and not pids:
             pids = None
-        return {"readable": True, "pids": pids, "box_rc": rc, "marker": marker,
+        return {"readable": True, "pids": pids, "box_rc": rc, 'receipt_kind':receipt_kind, "marker": marker,
                 'join_verified': joined, "reason": "cgroup_unverified" if not joined or pids is None else None}
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
         return {"reason": "box_unreadable"}
@@ -1527,6 +1742,7 @@ def cleanup_run(c, view=None, *, clock=None, pause=None) -> dict:
     def counted(result):
         if view.get('box_rc') is not None:
             result['box_rc'] = view['box_rc']
+            result['receipt_kind'] = view.get('receipt_kind')
             previous_receipt = metrics.get('interruption') or {}
             result['box_rc_at'] = previous_receipt.get('box_rc_at') if previous_receipt.get('box_rc') == view['box_rc'] else None
             result['box_rc_at'] = result['box_rc_at'] or now()
@@ -1589,6 +1805,19 @@ def result_lock(box_id, pid):
             held.remove(key)
 
 
+
+def write_stderr(box_id, pid, data, output=None) -> None:
+    # Pending guest bytes reserve host offsets; finish them before any other writer appends.
+    with result_lock(box_id, pid):
+        recover_guest_output(dict(box_id=box_id, pid=pid))
+        if output is None:
+            with open(cmd_dir(box_id) / f'{pid}.err', 'ab') as stream:
+                stream.write(data)
+        else:
+            output.write(data)
+            output.flush()
+
+
 def locked_command(fn):
     @wraps(fn)
     def locked(con, c, *args, **kwargs):
@@ -1629,12 +1858,10 @@ def save_interruption(con, c, info, *, result=None, view=None, repair_legacy=Fal
     if info.get('box_rc_at') is not None and info.get('box_rc') == cleanup.get('box_rc'):
         cleanup['box_rc_at'] = info['box_rc_at']
     info = {**info, **cleanup}
-    retry = (cleanup['cleanup'] != 'unknown' and bool(c['retry_interrupted'])
-             and (c['attempt'] or 1) < MAX_ATTEMPTS)
-    info['retry'] = retry
+    info['retry'] = False
     t = now()
     started = result.get('started_at') if result.get('started_at') is not None else c['started_at']
-    result.update(attempt=c['attempt'] or 1, status='interrupted', interruption=info,
+    result.update(attempt=c['attempt'] or 1, status='interrupted', exit_code=94, interruption=info,
                   started_at=started, ended_at=info.get('box_rc_at') or t, boot_id=c['boot_id'])
     m = json.loads(c['metrics'] or '{}')
     m['interruption'] = info
@@ -1644,10 +1871,6 @@ def save_interruption(con, c, info, *, result=None, view=None, repair_legacy=Fal
     if cleanup['cleanup'] == 'unknown':
         action = 'following'
         changes.update(status='running', exit_code=None, ended_at=None)
-    elif retry:
-        action = 'retry'
-        changes.update(status='queued', attempt=(c['attempt'] or 1)+1, started_at=None, queued_s=None,
-                       boot_id=None, exit_code=None, ended_at=None)
     else:
         action = 'interrupted'
     action = record_command_result(con, c, result, m, action, changes=changes,
@@ -1655,11 +1878,7 @@ def save_interruption(con, c, info, *, result=None, view=None, repair_legacy=Fal
     if action == 'finalized':
         return action
     emit_interruption(c, info, action == 'retry')
-    if action == 'retry':
-        # Clients use this exact line as an attempt boundary even when the next wrapper emits no bytes.
-        _note(c['box_id'], c['pid'], f"the server restarted while this run was going (attempt {c['attempt'] or 1} is lost); "
-                                  f"it is queued again as attempt {(c['attempt'] or 1)+1}")
-    elif action == 'interrupted':
+    if action == 'interrupted':
         _note(c['box_id'], c['pid'], f"{info['cause']}: the command ran partly; it is not run again; check what it did before running it again")
     return action
 
@@ -1736,6 +1955,23 @@ def _write_command_result(con, c, result, metrics, changes=None):
     # A terminal row is the pool's hand-back signal. Cleanup finishes before it becomes visible.
     with box_memory_lock(c['box_id']):
         if terminal_result(result):
+            if result.get('status') == 'interrupted':
+                result = dict(result, exit_code=94, interruption={**result['interruption'], 'retry':False})
+                metrics = dict(metrics, interruption=result['interruption'])
+            if result.get('reason') != 'before_spawn' and (result.get('guest_owned') or
+                    (cmd_dir(c['box_id']) / f"{c['pid']}.context.json").exists()):
+                drained = drain_guest_output(c)
+                if result.get('synthetic_kill') and drained.get('state') == 'exited' and not drained.get('legacy'):
+                    # Cleanup can observe an empty group just after its receipt lookup. The final drain
+                    # may be the first observer of the real exit; it wins over the synthetic kill fallback.
+                    result = dict(result, status='exited', exit_code=drained['exit_code'], signal=None,
+                                  ended_at=drained.get('ended_at') or now(), guest_owned=True)
+                    result.pop('synthetic_kill', None)
+                    metrics = dict(metrics, kill_synthetic=False, kill={**metrics.get('kill', {}),
+                                   'box_rc':result['exit_code'], 'receipt_kind':'guest', 'box_rc_at':result['ended_at']})
+                if drained.get('deleted') and not result.get('output_lost'):
+                    result = dict(result, output_lost=True)
+                    _note(c['box_id'], c['pid'], 'box deleted; only output copied before deletion is available')
             free_idle_tmp(con, c, result)
         return _commit_command_result(con, c, result, metrics, changes)
 
@@ -1771,11 +2007,12 @@ def completion_evidence(candidate, c, cleanup):
     rc = info.get('box_rc')
     if type(rc) is not int or not 0 <= rc <= 255:
         return None
-    result = dict(candidate, attempt=c['attempt'] or 1, status='interrupted' if signal_exit(rc) else 'exited',
-                  exit_code=None if signal_exit(rc) else rc, signal=None,
+    interrupted = signal_exit(rc) and not candidate.get('guest_owned')
+    result = dict(candidate, attempt=c['attempt'] or 1, status='interrupted' if interrupted else 'exited',
+                  exit_code=94 if interrupted else rc, signal=None,
                   started_at=candidate.get('started_at', c['started_at']), ended_at=info.get('box_rc_at') or now())
     result.pop('synthetic_kill', None)
-    if signal_exit(rc):
+    if interrupted:
         result['interruption'] = {**info, **cleanup, 'retry': False, 'box_rc_at': result['ended_at']}
     return result
 
@@ -1790,9 +2027,11 @@ def _kill_result_locked(con, c, observed, cleanup, *, lost=False, metrics=None):
     row_result['interruption'] = m.get('interruption')
     row_result['synthetic_kill'] = m.get('kill_synthetic', False)
     receipt = {}
-    if cleanup.get('box_rc') is not None and (m.get('interruption') or not signal_exit(cleanup['box_rc'])):
+    if cleanup.get('box_rc') is not None and (cleanup.get('receipt_kind') == 'guest' or
+            m.get('interruption') or not signal_exit(cleanup['box_rc'])):
         receipt = dict(started_at=c['started_at'], interruption={**(m.get('interruption') or {}),
-                       'box_rc': cleanup['box_rc'], 'box_rc_at': cleanup.get('box_rc_at') or now()})
+                       'box_rc': cleanup['box_rc'], 'box_rc_at': cleanup.get('box_rc_at') or now()},
+                       guest_owned=cleanup.get('receipt_kind') == 'guest')
     choices = (current.get('held_result'), request.get('held_result'), current, row_result,
                receipt, observed.get('held_result'), observed)
     saved, recognized_interruption = None, False
@@ -1843,6 +2082,8 @@ def restore_kill_result(con, c, res, cleanup=None, *, lost=False):
 
 def record_command_result(con, c, result, metrics, action, *, changes=None,
                           terminal_evidence=True, before_spawn=False, repair_legacy=False):
+    if before_spawn and terminal_result(result) and action not in ('retry', 'requeue', 'following'):
+        metrics = {**metrics, 'not_dispatched': True}
     with result_lock(c['box_id'], c['pid']):
         latest = dict(cmd_row(con, c['box_id'], c['pid']))
         if (latest['attempt'] or 1) != (result.get('attempt') or c['attempt'] or 1):
@@ -1857,11 +2098,6 @@ def record_command_result(con, c, result, metrics, action, *, changes=None,
             return _kill_result_locked(con, latest, result if terminal_evidence else {}, cleanup,
                                        lost=lost, metrics=metrics)
         if terminal_result(prior) and not repair_legacy:
-            # A retry receipt is durable before its queued/attempt+1 DB transition. Replay that transition
-            # once on recovery; the current-attempt guard prevents replay after the next attempt exists.
-            if prior.get('status') == 'interrupted' and (prior.get('interruption') or {}).get('retry') is True and action in ('retry', 'following'):
-                _write_command_result(con, latest, result, metrics, changes)
-                return action
             if not terminal_result(result):
                 metrics = json.loads(latest['metrics'] or '{}')
                 metrics['host_boxes'] = prior.get('host_boxes')
@@ -2048,7 +2284,10 @@ def queue_head(con, box_id, pid):
                     reason = 'unit_' + state if rc in (3, 4) and state in ('inactive', 'failed', 'unknown') else None
                 if not reason:
                     return head
-                if read_result(head['box_id'], head['pid'], head['attempt'] or 1):
+                receipt = read_result(head['box_id'], head['pid'], head['attempt'] or 1)
+                view = {} if receipt else command_probe(current)
+                if receipt or command_was_started(current) or view.get('marker') or view.get('pids') or \
+                        view.get('box_rc') is not None or view.get('reason') in ('incus_unavailable', 'guest_initializing'):
                     # Receipts survive a crash before the matching DB commit. Recover that outcome first.
                     action = settle_cmd(con, current)
                     recovered = cmd_row(con, head['box_id'], head['pid'])
@@ -2123,7 +2362,7 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                             "WHERE box_id=? AND pid=? AND status='queued'" + guard,
                             (now(), now() - t0, boot_id(), box_id, pid))
                 if updated.rowcount and alone and (free < need or not cpu_room):
-                    errf.write(f"offbox-server: admitted alone: needs {need / 2**30:.2f} GiB, {max(0, free) / 2**30:.2f} GiB free\n".encode())
+                    write_stderr(box_id, pid, f"offbox-server: admitted alone: needs {need / 2**30:.2f} GiB, {max(0, free) / 2**30:.2f} GiB free\n".encode(), errf)
                     errf.flush()
                     toollog.emit('boatd', 'run.queue', ids={'box': box_id, 'run': current['run_id']},
                                  props={'backend': 'home', 'reason': 'admitted_alone', 'position': 1,
@@ -2154,7 +2393,7 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             state = (reason, position, len(queue), head_id, head_need, cap, running if reason == 'cap' else None)
             waited = now() - t0
             if state != last_reason or last_said is None or now() - last_said >= 60:
-                errf.write(f"offbox-server: waiting; position {position} of {len(queue)}; {why}; waited {waited:.0f} s\n".encode())
+                write_stderr(box_id, pid, f"offbox-server: waiting; position {position} of {len(queue)}; {why}; waited {waited:.0f} s\n".encode(), errf)
                 errf.flush()
                 toollog.emit('boatd', 'run.queue', ids={'box': box_id, 'run': current['run_id']},
                              props={'backend': 'home', 'queued': True, 'waitMs': waited * 1000,
@@ -2263,7 +2502,7 @@ def disk_preflight(con, row, errf):
         probe = ct_exec(row['box_id'], command, timeout=120, check=False)
         for text in (probe.stdout, probe.stderr):
             if text:
-                errf.write(text)
+                write_stderr(row['box_id'], row['pid'], text, errf)
                 for line in text.decode(errors='replace').splitlines():
                     log(f"{row['box_id']} {row['run_id']}: {line}")
         return probe.returncode
@@ -2310,26 +2549,43 @@ def free_idle_tmp(con, finishing, result):
 
 
 def run_cmd(box_id: str, pid: int) -> int:
+    # systemd and startup reconciliation can race. Only one runner may own this command.
+    with open(cmd_dir(box_id) / f"{pid}.runner.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        return _run_cmd(box_id, pid)
+
+
+def _run_cmd(box_id: str, pid: int) -> int:
     load_cfg()
     con = db()
     r = cmd_row(con, box_id, pid)
     if r['status'] not in ('queued', 'running'):
+        con.close()
         return 0
+    if command_was_started(r):
+        try:
+            follow_guest(con, r)
+        finally:
+            con.close()
+        return 0
+    # A stale queued row is not proof of non-execution. Check the guest claim before touching its script.
+    guest = guest_command(r)
+    if guest['state'] != 'absent' or (r['attempt'] or 1) > 1:
+        try:
+            outcome = record_guest(con, r, guest)
+            if outcome == 'reattached':
+                follow_guest(con, cmd_row(con, box_id, pid))
+            return 0
+        finally:
+            con.close()
     attempt = r["attempt"] or 1
     d = cmd_dir(box_id)
     outf = open(d / f"{pid}.out", "ab", buffering=0)
     errf = open(d / f"{pid}.err", "ab", buffering=0)
     out_offset, err_offset = outf.tell(), errf.tell()
-    # needrestart can invoke the same transient unit again. Admission is not a new user run.
-    previous_start = r['started_at'] if r['status'] == 'running' else None
-    history_path = d / f'{pid}.{attempt}.invocations.json'
-    earlier = previous_start is not None or history_path.exists() or \
-              (attempt == 1 and (out_offset > 0 or err_offset > 0))
-    invocation_at = now()
-    errf.write((offbox_disk_space.MARKER + json.dumps(dict(phase='attempt', attempt=attempt)) + '\n').encode())
-    if previous_start is not None:
-        queued = r['queued_s'] or 0
-    elif r["sync"]:
+    write_json(d / f'{pid}.output-start.json', [out_offset, err_offset])
+    write_stderr(box_id, pid, (offbox_disk_space.MARKER + json.dumps(dict(phase='attempt', attempt=attempt)) + '\n').encode(), errf)
+    if r["sync"]:
         # Control commands must remain available while detached runs wait for host capacity.
         queued = 0
         con.execute("UPDATE commands SET status='running', started_at=?, queued_s=0, boot_id=? "
@@ -2337,169 +2593,398 @@ def run_cmd(box_id: str, pid: int) -> int:
     else:
         queued = admit(con, box_id, pid, r["kind"], errf)
     if cmd_row(con, box_id, pid)['status'] not in ('queued', 'running'):
-        outf.close()
-        errf.close()
+        outf.close(); errf.close(); con.close()
         return 0
     code, sig = None, None
     t0 = now()
-    t0 = previous_start if previous_start is not None else t0
-    try:
-        history = json.loads(history_path.read_text())
-    except (OSError, ValueError):
-        history = []
-    history.append(dict(invoked_at=invocation_at, previous_started_at=previous_start,
-                        previous_boot_id=r['boot_id'], boot_id=boot_id(), stdout_offset=out_offset, stderr_offset=err_offset))
-    write_json(history_path, history)
     host_boxes = {"start": running_box_count(con), "end": None}
-    if host_boxes['start'] is None:
-        host_boxes['start_reason'] = 'state_unavailable'
-    dispatched, failure = False, None
-    wrapper_path = f'/run/boatd/{pid}.{attempt}.boatd-wrap'
+    write_json(d / f'{pid}.context.json', {'host_boxes': host_boxes})
+    dispatched = False
     try:
         if (d / f"{pid}.kill").exists() or cmd_row(con, box_id, pid)['killed'] or json.loads(cmd_row(con, box_id, pid)['metrics'] or '{}').get('kill_request'):
             code, sig = 143, "SIGTERM"
         elif disk_preflight(con, r, errf):
             code = 90
-            if earlier:
-                failure = 'replacement runner preflight rejected before dispatch'
         else:
-            # Existing boxes and saved bases may still have an older installed wrapper. An immutable copy
-            # per attempt provides receipts without replacing code used by another live command.
-            wrapper = shlex.quote(SELF.with_name('boatd-wrap').read_text())
-            ct_exec(box_id, f"mkdir -p /run/boatd && cat > /run/boatd/{pid}.sh && chmod 600 /run/boatd/{pid}.sh "
-                    f"&& if ! test -e {wrapper_path}; then (set -C; printf %s {wrapper} > {wrapper_path}) "
-                    f"&& chmod 700 {wrapper_path}; fi",
+            ct_exec(box_id, f"mkdir -p /run/boatd && cat > /run/boatd/{pid}.sh && chmod 600 /run/boatd/{pid}.sh",
                     input=r["command"].encode(), timeout=60)
-            # Starting the host client is the dispatch boundary. Kill intent and dispatch share the lock;
-            # waiting for the command happens outside it so a live command can always be killed.
+            # Saved and already-running boxes retain old image files. Atomic replacement leaves live wrappers alone.
+            wrapper_tmp = f'/usr/local/sbin/.boatd-wrap-{pid}.tmp'
+            ct_exec(box_id, f'cat > {wrapper_tmp} && chmod 755 {wrapper_tmp} && mv -f {wrapper_tmp} /usr/local/sbin/boatd-wrap',
+                    input=SELF.with_name('boatd-wrap').read_bytes(), timeout=60)
+            # The guest owns output and the exit receipt; the Incus client is only a launcher.
+            launch = ('nohup /usr/local/sbin/boatd-wrap ' + str(pid) + ' ' +
+                      shlex.quote(r['cwd'] or '/home/user') + ' </dev/null >/dev/null 2>&1 &')
             with result_lock(box_id, pid):
                 current = cmd_row(con, box_id, pid)
-                if current['killed'] or current['status'] not in ('queued', 'running') or (d / f'{pid}.kill').exists():
-                    p = None
-                    code, sig = 143, 'SIGTERM'
-                else:
-                    p = subprocess.Popen(["incus", "exec", ct(box_id), "--", wrapper_path, str(pid),
-                                          r["cwd"] or "/home/user", str(attempt)],
-                                         stdin=subprocess.DEVNULL, stdout=outf, stderr=errf)
-                    dispatched = True
-            if p is not None:
-                code = p.wait()
-            if code is not None and code < 0:
-                sig, code = signal.Signals(-code).name, 128 - code
+                if current['killed'] or current['status'] not in ('queued', 'running'):
+                    return 0
+                dispatched = True
+                try:
+                    ct_exec(box_id, launch, timeout=60)
+                except Exception as e:
+                    _note(box_id, pid, f'launch response unavailable; checking the existing command: {e}')
+                    toollog.emit('boatd', 'run.exec_stream_lost', kind='error', ok=False,
+                                 ids={'box':box_id, 'run':r['run_id']},
+                                 props={'attempt':attempt, 'reason':'launch_response_unavailable'})
+            follow_guest(con, cmd_row(con, box_id, pid), launching=True)
+            con.close()
+            outf.close()
+            errf.close()
+            return 0
     except Exception as e:  # noqa: BLE001
-        failure = str(e)
+        if dispatched:
+            # Recovery/bookkeeping failures after the send cannot replace the guest's real exit.
+            raise
+        write_stderr(box_id, pid, f"\noffbox-server: never started; nothing ran, safe to retry (before_spawn): {e}\n".encode(), errf)
         code = 90
-    if failure and not dispatched and not earlier:
-        evidence = command_probe(r)
-        if evidence.get('marker') or evidence.get('box_rc') is not None or len(history) > 1:
-            earlier = True
-            t0 = (evidence.get('marker') or {}).get('time') or t0
-    stderr = tail(d / f'{pid}.err', 8192, err_offset)
-    if dispatched and code == 126 and 'boatd-wrap: start marker unavailable; command not dispatched' in stderr:
-        view = command_probe(r)
-        failure = 'wrapper start marker unavailable'
-        if not earlier and view.get('readable') and not view.get('marker') and view.get('box_rc') is None:
-            code, dispatched = 90, False
-        else:
-            earlier = True
-            t0 = (view.get('marker') or {}).get('time') or t0
-    if dispatched and code != 0 and not earlier:
-        view = command_probe(r)
-        if view.get('readable') and not view.get('pids') and view.get('marker') is None and view.get('box_rc') is None and \
-                outf.tell() == out_offset and 'offbox-command-started:' not in stderr and \
-                (wrapper_path in stderr or '/usr/local/sbin/boatd-wrap' in stderr) and any(s in stderr.lower() for s in (
-                    'no such file or directory', 'executable file not found', 'permission denied')):
-            # An explicit execve rejection plus no guest marker is positive proof of a pre-start failure.
-            failure, code, dispatched = 'Incus could not execute boatd-wrap', 90, False
-    requested = (d / f'{pid}.kill').exists() or cmd_row(con, box_id, pid)['killed'] or json.loads(cmd_row(con, box_id, pid)['metrics'] or '{}').get('kill_request')
-    transport = not requested and code != 0 and (failure is not None or stream_failure(stderr) or
-                              (dispatched and sig in ('SIGKILL', 'SIGTERM', 'SIGHUP')))
-    if transport and (earlier or dispatched):
-        c = dict(cmd_row(con, box_id, pid))
-        cause = 'incus_unavailable' if 'shutting down' in (failure or stderr).lower() else \
-                ('runner_restart' if sig else 'exec_stream_lost')
-        info = interruption(c, cause)
-        info['phase'] = 'running'
-        why = 'Incus on the home server shut down' if cause == 'incus_unavailable' else cause.replace('_', ' ')
-        info['message'] = f"{why} at {iso(now())}: the command ran partly; check what it did"
-        res = dict(attempt=attempt, status='interrupted', exit_code=None, started_at=t0,
-                   ended_at=now(), boot_id=r['boot_id'] or boot_id(), interruption=info,
-                   invocations=history, host_boxes=host_boxes)
-        view = recover_probe(c)
-        if not view.get('readable'):
-            host_boxes.update(end=None, end_reason=view.get('reason') or 'incus_unavailable')
-        else:
-            host_boxes['end'] = running_box_count(con)
-            if host_boxes['end'] is None:
-                host_boxes['end_reason'] = 'state_unavailable'
-        toollog.emit('boatd', 'run.exec_stream_lost', kind='error', ok=False,
-                     ids={'box': box_id, 'run': r['run_id']},
-                     props={'incusRc': code, 'stderrTail': (failure or stderr)[-1000:],
-                            'rcFilePresent': view.get('box_rc') is not None,
-                            'cgroupProcessCount': len(view['pids']) if view.get('pids') is not None else None})
-        # The earlier invocation might still be alive even though its replacement failed to dispatch.
-        # Both paths inspect that command before deciding; neither removes a possibly live cgroup.
-        with runner_dispatch():
-            act = settle_transport(con, c, res, view=view)
-            if act == 'retry':
-                cur = cmd_row(con, box_id, pid)
-                err = spawn_runner(box_id, pid, cur['attempt'])
-                if err:
-                    drop_cmd(con, box_id, pid, f'could not retry interrupted command: {err}')
-        outf.close()
-        errf.close()
-        return 0
-    if failure:
-        errf.write(f"\noffbox-server: never started; nothing ran, safe to retry (before_spawn): {failure}\n".encode())
-        toollog.emit('boatd', 'run.never_started', kind='error', ok=False,
-                     ids={'box': box_id, 'run': r['run_id']}, props={'phase': 'before_spawn', 'attempt': attempt})
     t1 = now()
     host_boxes['end'] = running_box_count(con)
-    if host_boxes['end'] is None:
-        host_boxes['end_reason'] = 'state_unavailable'
     toollog.emit("boatd", "run.command", kind="perf" if code == 0 else "error", duration_ms=max(0, t1-t0)*1000,
                  ok=code == 0, ids={"box": box_id, "run": r["run_id"]},
                  props={"exitCode": code, "timeoutHit": code == 124, "attempt": attempt, "backend": "home"},
                  tag="command_failed" if code != 0 else None)
-    observed = dispatched and failure is None and sig is None and not stream_failure(stderr)
-    status = "lost" if code == 255 and not ct_running(box_id) else "exited"
+    kill = (d / f"{pid}.kill").read_text() if (d / f"{pid}.kill").exists() else None
+    if kill and code in (137, 143, 255, None):
+        sig = sig or ("SIGKILL" if code == 137 else "SIGTERM")
+    status = "lost" if kill == "lost" or (code == 255 and not ct_running(box_id)) else "exited"
     disk = offbox_disk_space.command_result(d / f'{pid}.out', d / f'{pid}.err', code,
                                             stdout_offset=out_offset, stderr_offset=err_offset)
-    errf.write((offbox_disk_space.MARKER + json.dumps(
-        dict(phase='result', attempt=attempt, record=disk)) + '\n').encode())
+    write_stderr(box_id, pid, (offbox_disk_space.MARKER + json.dumps(
+        dict(phase='result', attempt=attempt, record=disk)) + '\n').encode(), errf)
+    # The result goes to disk first: if boatd or this runner is gone before the database has it, the next
+    # reconcile finalizes the run from this file instead of calling it interrupted.
     result = dict(attempt=attempt, status=status, exit_code=code, signal=sig,
-                  started_at=t0, ended_at=t1, boot_id=r['boot_id'] if earlier else boot_id(),
-                  host_boxes=host_boxes, invocations=history, reason="before_spawn" if failure else None)
+                  started_at=t0, ended_at=t1, boot_id=boot_id(), host_boxes=host_boxes,
+                  reason='before_spawn' if code == 90 else None)
     m = read_cg(cg_path(box_id) / "boatd" / str(pid))
+    try:
+        (cg_path(box_id) / "boatd" / str(pid)).rmdir()
+    except OSError:
+        pass
     m.update(box_window(con, box_id, t0, t1))
     m.update(disk)
     m["wall_s"] = round(t1 - t0, 2)
     m["queued_s"] = round(queued, 2)
     m["host_boxes"] = host_boxes
-    if failure:
+    if code == 90:
         m['start_failure'] = 'before_spawn'
-    action = record_command_result(con, cmd_row(con, box_id, pid), result, m, 'finalized',
-                                   terminal_evidence=observed, before_spawn=not earlier and not dispatched)
-    if action == 'following':
-        outf.close()
-        errf.close()
-        return 0
-    # Retain the empty group with its start marker: a later kill must still be able to verify cleanup.
+    record_command_result(con, cmd_row(con, box_id, pid), result, m, 'finalized', before_spawn=True)
     con.execute("UPDATE boxes SET last_active=?, updated_at=? WHERE id=?", (now(), now(), box_id))
     try:
-        ct_exec(box_id, f"rm -f /run/boatd/{pid}.sh {wrapper_path}", timeout=30, check=False)
+        ct_exec(box_id, f"rm -f /run/boatd/{pid}.sh", timeout=30, check=False)
     except (OSError, Fail, subprocess.SubprocessError):
         pass
     # Snapshot after every run, on the server. Instant on ZFS; retention trims old ones.
     if ct_running(box_id):
         snapshot(con, box_id, "auto")
         prune_snaps(con, box_id)
+    con.close()
     outf.close()
     errf.close()
     return 0
 
 
 # ---------------------------------------------------------------- reconcile (every start, and for orphans later)
+
+# This probe runs in the guest. PID start ticks prevent a reused PID from proving liveness.
+GUEST_PROBE = r'''
+import base64,fcntl,json,sys
+from pathlib import Path
+pid,oo,eo=sys.argv[1],int(sys.argv[2]),int(sys.argv[3])
+run=sys.argv[4]
+d=Path('/run/boatd')/(pid+'.receipt')
+r={'state':'absent','stdout':'','stderr':''}
+owner=None
+if d.exists() or d.with_suffix('.lock').exists() or sys.argv[5]=='fence':
+    d.parent.mkdir(parents=True,exist_ok=True)
+    owner=d.with_suffix('.lock').open('a')
+    try: fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError: owner.close(); owner=None; r['state']='unknown'
+    if owner and not d.exists():
+        d.mkdir(mode=0o700)
+        (d/'fenced').touch()
+if d.is_dir():
+    r['state']='gone' if owner else 'unknown'
+    try:
+        p,t=(d/'pid').read_text().split()
+        stat=Path('/proc')/p/'stat'
+        fields=stat.read_text().rsplit(')',1)[1].split()
+        if fields[0]!='Z' and fields[19]==t: r['state']='alive'
+    except (FileNotFoundError,ValueError,IndexError): pass
+    if (d/'exit').exists():
+        r.update(state='exited',exit_code=int((d/'exit').read_text()),ended_at=(d/'exit').stat().st_mtime)
+    elif r['state']=='gone':
+        # Fence a dead initializer before dropping its row; an unanswered launcher may still arrive later.
+        (d/'fenced').touch()
+    for name,off,key in [('out',oo,'stdout'),('err',eo,'stderr')]:
+        try:
+            with (d/name).open('rb') as f:
+                f.seek(off); r[key]=base64.b64encode(f.read(262144)).decode()
+        except FileNotFoundError: pass
+if run and (not d.is_dir() or (d/'fenced').exists()):
+    legacy=Path('/home/user/.offbox/exit')/run
+    marker=legacy.with_suffix('.pid')
+    if marker.exists():
+        p=marker.read_text().strip()
+        if Path('/proc',p).exists(): r.update(state='alive',legacy=True)
+    exit_file=legacy.with_suffix('.rc')
+    if exit_file.exists(): r.update(state='exited',exit_code=int(exit_file.read_text()),ended_at=exit_file.stat().st_mtime,legacy=True)
+print(json.dumps(r))
+'''
+
+
+def guest_command(c, fence=None) -> dict:
+    # Cancellation also drains output. Serialize the complete probe/cursor append with its result write.
+    with result_lock(c['box_id'], c['pid']):
+        return _guest_command(c, fence)
+
+
+def recover_guest_output(c) -> None:
+    d = cmd_dir(c['box_id'])
+    pending = d / f"{c['pid']}.output-pending.json"
+    if not pending.exists():
+        return
+    saved = json.loads(pending.read_text())
+    # Rewriting the same host range is safe even if a reader already consumed a partial append.
+    for name, offset, encoded in saved['writes']:
+        path = d / f"{c['pid']}.{name}"
+        with path.open('r+b' if path.exists() else 'w+b') as output:
+            output.seek(offset)
+            output.write(base64.b64decode(encoded, validate=True))
+    write_json(d / f"{c['pid']}.cursor.json", saved['offsets'])
+    pending.unlink()
+
+
+def _guest_command(c, fence=None) -> dict:
+    box_id, pid = c['box_id'], c['pid']
+    recover_guest_output(c)
+    state = incus('query', f'/1.0/instances/{ct(box_id)}/state', check=False, timeout=30)
+    if state.returncode:
+        if instance_missing(state):
+            return {'state':'gone', 'deleted':True}
+        raise Fail(503, 'command_probe_pending', f'{box_id}: Incus state unavailable')
+    status = json.loads(state.stdout)['status'].lower()
+    if status == 'stopped':
+        return {'state': 'absent' if c['status'] == 'queued' and c['started_at'] is None else 'gone'}
+    if status != 'running':
+        raise Fail(503, 'command_probe_pending', f'{box_id} is {status}')
+    cursor = cmd_dir(box_id) / f'{pid}.cursor.json'
+    offsets = json.loads(cursor.read_text()) if cursor.exists() else [0, 0]
+    run = c['run_id'] or ''
+    run = run if re.fullmatch(r'[A-Za-z0-9_-]{1,120}', run) else ''
+    if fence is None:
+        fence = command_was_started(c)
+    probe = ct_exec(box_id, 'python3 -I -c ' + shlex.quote(GUEST_PROBE) +
+                    f' {pid} {offsets[0]} {offsets[1]} ' + shlex.quote(run) + (' fence' if fence else 'check'), timeout=30)
+    result = json.loads(probe.stdout)
+    if result['state'] in ('absent', 'gone'):
+        legacy = command_probe(c)
+        if legacy.get('marker') or legacy.get('box_rc') is not None or legacy.get('pids'):
+            result['legacy'] = True
+            result['legacy_view'] = legacy
+            if legacy.get('box_rc') is not None:
+                result.update(state='exited', exit_code=legacy['box_rc'])
+            elif legacy.get('pids'):
+                result['state'] = 'alive'
+            elif legacy.get('pids') is None:
+                raise Fail(503, 'command_probe_pending', 'legacy command cleanup is unconfirmed')
+    if result['state'] == 'unknown':
+        if _cg_pids(box_id, pid):
+            result['state'] = 'alive'
+        else:
+            raise Fail(503, 'command_probe_pending', f'{box_id}/{pid} guest claim is still being initialized')
+    writes = []
+    for i, key in enumerate(('stdout', 'stderr')):
+        data = base64.b64decode(result.get(key, ''), validate=True)
+        if data:
+            name = 'out' if i == 0 else 'err'
+            path = cmd_dir(box_id) / f'{pid}.{name}'
+            writes.append((name, path.stat().st_size if path.exists() else 0, result[key]))
+            offsets[i] += len(data)
+    if writes:
+        # Persist source offsets and destination ranges before publishing bytes. A dead follower's
+        # replacement completes these exact writes instead of appending the same guest bytes again.
+        write_json(cmd_dir(box_id) / f'{pid}.output-pending.json', dict(writes=writes, offsets=offsets))
+        recover_guest_output(c)
+    # Legacy wrappers have no receipt, but their cgroup still identifies the live command.
+    if result['state'] in ('absent', 'gone') and _cg_pids(box_id, pid):
+        result['state'] = 'alive'
+        result['legacy'] = True
+    # Drain all saved output before publishing the exit.
+    result['_more'] = any(len(base64.b64decode(result.get(k, ''))) == 262144 for k in ('stdout', 'stderr'))
+    if result['state'] == 'exited' and (result['_more'] or (not result.get('legacy') and _cg_pids(box_id, pid))):
+        result['state'] = 'alive'
+    return result
+
+
+def drain_guest_output(c, result=None):
+    # Follower replacement resumes at the saved cursor, including cancellation and unknown exits.
+    while result is None or result.get('_more'):
+        result = guest_command(c)
+    return result
+
+
+def reconcile_event(c, outcome, code=None) -> None:
+    toollog.emit('boatd', 'reconcile.command', ids={'box': c['box_id'], 'run': c['run_id']},
+                 props={'pid': c['pid'], 'outcome': outcome, 'exitCode': code,
+                        'age': max(0, now()-c['created_at'])})
+
+
+def command_was_started(c) -> bool:
+    if c['status'] == 'running' or c['started_at'] is not None or (c['attempt'] or 1) > 1:
+        return True
+    if (cmd_dir(c['box_id']) / f"{c['pid']}.{c['attempt'] or 1}.invocations.json").exists():
+        return True
+    for ext in ('out', 'err'):
+        path = cmd_dir(c['box_id']) / f"{c['pid']}.{ext}"
+        if path.exists():
+            with path.open('rb') as f:
+                if any(b'offbox-command-started:' in line for line in f):
+                    return True
+    return False
+
+
+@locked_command
+def record_guest(con, c, result) -> str:
+    if result['state'] != 'alive':
+        result = drain_guest_output(c, result)
+    box_id, pid, t = c['box_id'], c['pid'], now()
+    alive = result['state'] == 'alive'
+    outcome = 'reattached' if alive else 'exited-while-down' if result['state'] == 'exited' else 'gone'
+    code = None if alive else result.get('exit_code', 94)
+    if result.get('legacy') and result.get('exit_code') is not None:
+        info = interruption(c, 'exec_stream_lost')
+        info.update(box_rc=result['exit_code'], box_rc_at=t)
+        res = dict(attempt=c['attempt'] or 1, started_at=c['started_at'], interruption=info)
+        action = settle_transport(con, c, res, view=result.get('legacy_view'))
+        outcome = {'following':'reattached', 'finalized':'exited-while-down'}.get(action, 'gone')
+        reconcile_event(c, outcome, cmd_row(con, box_id, pid)['exit_code'])
+        return outcome
+    if alive:
+        metrics = json.loads(c['metrics'] or '{}')
+        info = metrics.get('interruption') or interruption(c, 'boatd_restart')
+        first = info.get('stream_state') != 'reattached'
+        info.update(stream_state='reattached', message='following the existing command; nothing was re-run')
+        metrics['interruption'] = info
+        record_command_result(con, c, dict(attempt=c['attempt'] or 1, status='running',
+                              guest_owned=not result.get('legacy', False),
+                              started_at=c['started_at'] or c['created_at'], ended_at=None), metrics, 'following')
+        if first:
+            toollog.emit('boatd', 'run.reattached', ids={'box':box_id, 'run':c['run_id']},
+                         props={'attempt':c['attempt'] or 1})
+    else:
+        if outcome == 'gone':
+            _note(box_id, pid, f'interrupted by server restart at {iso(STARTED)}; process gone; exit unknown; nothing was re-run')
+        status = 'exited' if outcome != 'gone' else 'interrupted'
+        d = cmd_dir(box_id)
+        end = result.get('ended_at') or t
+        context = d / f'{pid}.context.json'
+        host_boxes = (json.loads(context.read_text()) if context.exists() else {}).get('host_boxes')
+        if host_boxes is not None:
+            host_boxes['end'] = running_box_count(con)
+        metrics = read_cg(cg_path(box_id) / 'boatd' / str(pid))
+        start = d / f'{pid}.output-start.json'
+        offsets = json.loads(start.read_text()) if start.exists() else [0, 0]
+        disk = offbox_disk_space.command_result(d / f'{pid}.out', d / f'{pid}.err', code,
+                                              stdout_offset=offsets[0], stderr_offset=offsets[1])
+        metrics.update(disk)
+        metrics.update(queued_s=c['queued_s'], recovered=True, host_boxes=host_boxes)
+        if status == 'exited':
+            metrics['wall_s'] = max(0, end-(c['started_at'] or end))
+            metrics.update(box_window(con, box_id, c['started_at'] or end, end))
+        write_stderr(box_id, pid, (offbox_disk_space.MARKER + json.dumps(
+            dict(phase='result', attempt=c['attempt'] or 1, record=disk)) + '\n').encode())
+        saved = dict(attempt=c['attempt'] or 1, status=status, exit_code=code,
+                     guest_owned=not result.get('legacy', False),
+                     started_at=c['started_at'], ended_at=end, host_boxes=host_boxes)
+        if status == 'interrupted':
+            info = interruption(c, 'boatd_restart')
+            info['message'] = f'interrupted by server restart at {iso(STARTED)}; process gone; exit unknown; nothing was re-run'
+            info.update(cleanup='clean', leftover_killed=0, retry=False)
+            saved['interruption'] = info
+            metrics['interruption'] = info
+            emit_interruption(c, info)
+        record_command_result(con, c, saved, metrics, 'finalized',
+                              changes={'interrupted_at':STARTED if status == 'interrupted' else c['interrupted_at']})
+        toollog.emit('boatd', 'run.command', ok=code == 0, ids={'box': box_id, 'run': c['run_id']},
+                     props={'exitCode': code, 'attempt': c['attempt'] or 1, 'backend': 'home'})
+        if status == 'exited':
+            try:
+                snapshot(con, box_id, 'auto')
+                prune_snaps(con, box_id)
+            except Exception as e:
+                log(f'snapshot after recovered command {box_id}/{pid}: {e}')
+    reconcile_event(c, outcome, code)
+    return outcome
+
+
+def commands_busy(con, box_id: str) -> bool:
+    if con.execute("SELECT 1 FROM commands WHERE box_id=? AND status IN ('queued','running') LIMIT 1", (box_id,)).fetchone():
+        return True
+    if any(_cg_pids(box_id, r['pid']) for r in con.execute('SELECT pid FROM commands WHERE box_id=?', (box_id,))):
+        return True
+    state = incus('query', f'/1.0/instances/{ct(box_id)}/state', timeout=30)
+    status = json.loads(state.stdout)['status'].lower()
+    if status == 'stopped':
+        return False
+    if status != 'running':
+        raise Fail(503, 'command_probe_pending', f'{box_id} is {status}')
+    runs = [r['run_id'] for r in con.execute('SELECT run_id FROM commands WHERE box_id=?', (box_id,))
+            if r['run_id'] and re.fullmatch(r'[A-Za-z0-9_-]{1,120}', r['run_id'])]
+    probe = ct_exec(box_id, 'python3 -I -c ' + shlex.quote(GUEST_BUSY), input=json.dumps(runs).encode(), timeout=30)
+    return json.loads(probe.stdout)['busy']
+
+
+GUEST_BUSY = r'''
+import fcntl,json,sys
+from pathlib import Path
+busy=False
+for marker in Path('/run/boatd').glob('*.receipt/pid'):
+    try:
+        p,t=marker.read_text().split()
+        fields=(Path('/proc')/p/'stat').read_text().rsplit(')',1)[1].split()
+        if fields[0]!='Z' and fields[19]==t: busy=True
+    except (FileNotFoundError,ValueError,IndexError): pass
+for lock in Path('/run/boatd').glob('*.lock'):
+    with lock.open('a') as owner:
+        try: fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: busy=True
+for run in json.load(sys.stdin):
+    marker=Path('/home/user/.offbox/exit')/(run+'.pid')
+    if marker.with_suffix('.rc').exists(): continue
+    try:
+        p=marker.read_text().strip()
+        if Path('/proc',p).exists(): busy=True
+    except FileNotFoundError: pass
+print(json.dumps({'busy':busy}))
+'''
+
+
+def follow_guest(con, c, launching=False) -> None:
+    # Only a fresh launch gets a grace period for the wrapper to create its receipt.
+    deadline = now() + 60 if launching else 0
+    while True:
+        with result_lock(c['box_id'], c['pid']):
+            c = cmd_row(con, c['box_id'], c['pid'])
+            if c['status'] not in ('queued', 'running'):
+                return
+            if c['killed'] or json.loads(c['metrics'] or '{}').get('kill_request'):
+                action, _ = restore_kill_result(con, c, read_result(c['box_id'], c['pid'], c['attempt'] or 1) or {})
+                if action != 'following':
+                    return
+            else:
+                try:
+                    result = guest_command(c, fence=not launching or now() >= deadline)
+                    if result['state'] != 'absent' or now() >= deadline:
+                        if result['state'] != 'alive' and record_guest(con, c, result) != 'reattached':
+                            return
+                        if result.get('_more'):
+                            continue
+                except Exception as e:
+                    # Incus shutdowns and read failures are uncertainty, never proof of process exit.
+                    log(f"following {c['box_id']}/{c['pid']}: probe pending: {e}")
+        time.sleep(1)
 
 def pending_kill_rows(con):
     # A killed run can still have a terminal row if the daemon died after saving its cleanup hold.
@@ -2509,21 +2994,34 @@ def pending_kill_rows(con):
 
 def _note(box_id: str, pid: int, text: str) -> None:
     try:
-        with open(cmd_dir(box_id) / f"{pid}.err", "ab") as f:
-            f.write(f"\noffbox-server: {text}\n".encode())
+        write_stderr(box_id, pid, f"\noffbox-server: {text}\n".encode())
     except OSError:
         pass
 
 
 @locked_command
 def settle_cmd(con, c) -> str:
+    with open(cmd_dir(c['box_id']) / f"{c['pid']}.runner.lock", 'w') as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            reconcile_event(c, 'reattached')
+            return 'following'
+        act = _settle_cmd(con, cmd_row(con, c['box_id'], c['pid']))
+        if act in ('following', 'finalized', 'killed', 'requeue'):
+            outcome = {'following':'reattached', 'finalized':'exited-while-down', 'killed':'gone', 'requeue':'queued'}[act]
+            reconcile_event(c, outcome, cmd_row(con, c['box_id'], c['pid'])['exit_code'])
+        return act
+
+
+def _settle_cmd(con, c) -> str:
     """One command the database calls queued or running. Returns what was done:
     following   its unit is alive (boatd alone restarted): nothing to do, its output keeps landing in the files
     finalized   the unit ended while nobody recorded it: exit code from its result file, snapshot taken
     killed      it was being killed when its unit went away
     requeue     it never started: still queued, needs a runner again
-    retry       it was running, the unit is gone with no result, and it may be retried: queued again, next attempt
-    interrupted same, but not to be retried (or already retried once): final"""
+    reattached  the guest is still running: follow its receipts without executing again
+    interrupted the guest is gone and its exit is unknown: final, never retried"""
     box_id, pid, attempt = c["box_id"], c["pid"], c["attempt"] or 1
     res = read_result(box_id, pid, attempt)
     kf = cmd_dir(box_id) / f'{pid}.kill'
@@ -2533,7 +3031,9 @@ def settle_cmd(con, c) -> str:
     if unit_active(unit_name(box_id, pid, attempt)):
         return "following"
     t = now()
-    if res:
+    c = cmd_row(con, box_id, pid)
+    res = read_result(box_id, pid, attempt)
+    if res and (res.get('status') != 'running' or (res.get('interruption') and not res.get('guest_owned'))):
         if res.get('status') == 'running' and res.get('interruption'):
             return settle_transport(con, c, res)
         if res.get('status') == 'interrupted':
@@ -2550,16 +3050,31 @@ def settle_cmd(con, c) -> str:
             snapshot(con, box_id, "auto")
             prune_snaps(con, box_id)
         return action
-    if c["status"] == "queued":
+    # A missing host unit says nothing about the guest. Even a queued row may have reached exec.
+    guest = guest_command(c)
+    if guest['state'] == 'alive':
+        if guest.get('legacy'):
+            _note(box_id, pid, 'following legacy command; its wrapper did not retain output after the disconnect; waiting for its existing exit receipt')
+        outcome = record_guest(con, c, guest)
+        if outcome != 'reattached':
+            return 'interrupted' if outcome == 'gone' else outcome
+        err = spawn_runner(box_id, pid, attempt)
+        if err:
+            raise Fail(503, 'follow_spawn_pending', err)
+        return 'reattached'
+    if guest['state'] == 'exited':
+        outcome = record_guest(con, c, guest)
+        return 'interrupted' if outcome == 'gone' else outcome
+    kf = cmd_dir(box_id) / f"{pid}.kill"
+    if kf.exists():
+        lost = kf.read_text().strip() == "lost"
+        con.execute("UPDATE commands SET status=?, signal=COALESCE(signal,'SIGTERM'), exit_code=COALESCE(exit_code,143), "
+                    "ended_at=? WHERE box_id=? AND pid=?", ("lost" if lost else "exited", t, box_id, pid))
+        return "killed"
+    if not command_was_started(c) and guest['state'] == 'absent':
         return "requeue"
-    cause = 'host_restart' if c['boot_id'] != boot_id() else 'runner_restart'
-    info = interruption(c, cause)
-    view = command_probe(c)
-    # A surviving exec is followed in place; no runner is dispatched for it.
-    if view.get('pids') or view.get('box_rc') is not None:
-        return settle_transport(con, c, {'attempt': attempt, 'started_at': c['started_at'],
-                                        'interruption': info}, view=view)
-    return save_interruption(con, c, info)
+    record_guest(con, c, guest)
+    return "interrupted"
 
 
 def drop_cmd(con, box_id: str, pid: int, why: str) -> None:
@@ -2589,7 +3104,9 @@ def start_container(box_id: str) -> str | None:
         set_box(c2, box_id, state="ready", last_active=now(), error=None)
         return None
     except Exception as e:  # noqa: BLE001
-        set_box(c2, box_id, state="archived", stopped_at=now(), error=f"did not start after a server restart: {e}"[:500])
+        protected = offbox_protection.blocked(box_protection(c2, box_id, probe=False))
+        set_box(c2, box_id, state='error' if protected else 'archived', stopped_at=now(),
+                error=f"did not start after a server restart: {e}"[:500])
         return str(e)
     finally:
         c2.close()
@@ -2622,11 +3139,12 @@ def sync_snaps(con, box_id: str) -> tuple[int, int]:
 
 
 @dispatching
+@offbox_protection.actor('restart')
 def reconcile(con) -> dict:
     """Run at every boatd start, before the API answers. Brings database, systemd units and containers back in
     line after a boatd restart or a host crash. Safe to run twice."""
     out = {"following": 0, "finalized": 0, "killed": 0, "requeue": 0, "retry": 0, "interrupted": 0,
-           "boxes_started": 0, "boxes_failed": 0, "cleaned": []}
+           "reattached": 0, "exited-while-down": 0, "gone": 0, "boxes_started": 0, "boxes_failed": 0, "cleaned": []}
     boxes = {r["id"]: r for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall()}
     # 1. A box whose creation was cut short: nothing useful is in it. Remove the half-made container; the row
     # stays as an error so the client that asked for it gets a clear answer.
@@ -2655,7 +3173,9 @@ def reconcile(con) -> dict:
                           "pid").fetchall(), *pending_kill_rows(con)]:
         act = settle_cmd(con, c)
         out[act] += 1
-        if act in ("requeue", "retry"):
+        if act == 'interrupted':
+            out['gone'] += 1
+        if act == "requeue":
             spawn.append((c["box_id"], c["pid"]))
     # Older boatd versions settled the Incus client's exit 1. Repair only that transport-error class.
     for c in con.execute("SELECT * FROM commands WHERE status='exited' AND killed=0 AND exit_code IN (1,125) AND ended_at > ?",
@@ -2695,7 +3215,7 @@ def reconcile(con) -> dict:
     errs: dict[str, str | None] = {}
     threads = []
     for bid in want:
-        th = threading.Thread(target=lambda b=bid: errs.__setitem__(b, start_container(b)), daemon=True)
+        th = threading.Thread(target=offbox_protection.bind(lambda b=bid: errs.__setitem__(b, start_container(b))), daemon=True)
         th.start()
         threads.append(th)
     end = now() + 420
@@ -2782,20 +3302,31 @@ def ssh_sessions(box_id: str) -> int:
 
 
 @toollog.observed("boatd", "reaper.pass", "reaper_failed")
+@offbox_protection.actor('reaper/idle timer')
 def reap_once(con) -> None:
     toollog.rollup_previous()
     toollog.rollup_today()
     t = now()
     for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall():
         bid = r["id"]
+        if r['pinned'] and r['pin_until'] is not None and r['pin_until'] <= t:
+            with box_memory_lock(bid):
+                current = box_row(con, bid)
+                if current['pinned'] and current['pin_until'] is not None and current['pin_until'] <= t:
+                    with box_transaction(con):
+                        set_box(con, bid, pinned=0)
+                        box_event(con, bid, 'pin_expired', 'pin reached its expiry')
         if r["state"] in LIVE:
             busy = con.execute("SELECT COUNT(*) FROM commands WHERE box_id=? AND status IN ('queued','running')",
                                (bid,)).fetchone()[0]
-            if busy or held_runs(con, bid) or ssh_sessions(bid):
+            if busy or box_protection(con, bid, probe=False)['pin']['active'] or held_runs(con, bid) or ssh_sessions(bid):
                 set_box(con, bid, last_active=t)
                 continue
             if r["ttl"] and t > (r["last_active"] or r["updated_at"]) + r["ttl"]:
                 try:
+                    if commands_busy(con, bid):
+                        set_box(con, bid, last_active=t)
+                        continue
                     stop_box(con, bid, "idle ttl")
                     toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "stop"})
                 except Exception as e:  # noqa: BLE001
@@ -2806,14 +3337,14 @@ def reap_once(con) -> None:
             used = con.execute("SELECT 1 FROM saved WHERE source=? AND status='ready'", (bid,)).fetchone()
             if not used and t - (r["stopped_at"] or t) > CFG["prune_unused_days"] * 86400:
                 try:
-                    delete_box(con, bid)
+                    delete_box(con, bid, 'archived box exceeded unused retention')
                     toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "delete"})
                 except Exception as e:  # noqa: BLE001
                     toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
                     log(f"prune {bid} failed: {e}")
         elif r["state"] == "error" and t - (r["updated_at"] or t) > 86400:
             try:
-                delete_box(con, bid)
+                delete_box(con, bid, 'failed box exceeded one-day retention')
                 toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "delete"})
             except Exception as e:  # noqa: BLE001
                 toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
@@ -2822,24 +3353,32 @@ def reap_once(con) -> None:
     for c in [*con.execute("SELECT * FROM commands WHERE status IN ('queued','running') AND created_at < ? AND "
                           "COALESCE(interrupted_at, 0) < ?", (t - 30, t - 30)).fetchall(), *pending_kill_rows(con)]:
         with runner_dispatch():
-            act = settle_cmd(con, c)
-            if act in ("requeue", "retry"):
-                b = con.execute("SELECT state FROM boxes WHERE id=? AND deleted_at IS NULL", (c["box_id"],)).fetchone()
-                cur = cmd_row(con, c["box_id"], c["pid"])
-                if not b or b["state"] not in LIVE:
-                    drop_cmd(con, c["box_id"], c["pid"], "its box is not running; the run was dropped")
-                    continue
-                if act == "requeue":
-                    # A queued run without a runner: mark the respawn so it is not repeated every 15 s.
-                    con.execute("UPDATE commands SET interrupted_at=? WHERE box_id=? AND pid=?", (t, c["box_id"], c["pid"]))
-                err = spawn_runner(c["box_id"], c["pid"], cur["attempt"] or 1)
-                if err:
-                    drop_cmd(con, c["box_id"], c["pid"], f"could not be started again: {err}")
-            if act != "following":
-                log(f"run {c['box_id']}/{c['pid']}: {act}")
+            reap_command(con, c, t)
     con.execute("DELETE FROM samples WHERE ts < ?", (t - CFG["keep_samples_days"] * 86400,))
     con.execute("DELETE FROM host_samples WHERE ts < ?", (t - CFG["keep_samples_days"] * 86400,))
     con.execute("DELETE FROM idem WHERE ts < ?", (t - 86400,))
+
+
+def reap_command(con, c, t):
+    try:
+        act = settle_cmd(con, c)
+    except Exception as e:
+        log(f"reconcile pending {c['box_id']}/{c['pid']}: {e}")
+        return
+    if act == "requeue":
+        b = con.execute("SELECT state FROM boxes WHERE id=? AND deleted_at IS NULL", (c["box_id"],)).fetchone()
+        cur = cmd_row(con, c["box_id"], c["pid"])
+        if not b or b["state"] not in LIVE:
+            drop_cmd(con, c["box_id"], c["pid"], "its box is not running; the run was dropped")
+            return
+        if act == "requeue":
+            # A queued run without a runner: mark the respawn so it is not repeated every 15 s.
+            con.execute("UPDATE commands SET interrupted_at=? WHERE box_id=? AND pid=?", (t, c["box_id"], c["pid"]))
+        err = spawn_runner(c["box_id"], c["pid"], cur["attempt"] or 1)
+        if err:
+            drop_cmd(con, c["box_id"], c["pid"], f"could not be started again: {err}")
+    if act != "following":
+        log(f"run {c['box_id']}/{c['pid']}: {act}")
 
 
 _prev_cpu = None
@@ -3136,6 +3675,13 @@ class Handler(BaseHTTPRequestHandler):
             if not who:
                 return self._err(401, "unauthorized", "bad token")
             owner, admin = who
+            try:
+                supplied = json.loads(self.headers.get('X-Offbox-Caller') or '{}')
+                if not isinstance(supplied, dict):
+                    raise ValueError('caller must be an object')
+            except ValueError:
+                raise Fail(400, 'invalid_caller', 'invalid X-Offbox-Caller') from None
+            offbox_protection.CALLER.set(offbox_protection.request_caller(supplied, owner, self.client_address[0]))
             if parts_of(path)[:1] == ["admin"]:
                 if not admin:
                     raise Fail(404, "not_found", path)
@@ -3225,10 +3771,40 @@ class Handler(BaseHTTPRequestHandler):
                     kw["last_active"] = now()
                 if "pinned" in b:
                     kw["pinned"] = 1 if b["pinned"] else 0
+                    kw['pin_until'] = b.get('pinUntil')
+                    kw['pin_holder'] = offbox_protection.caller().get('holder')
+                    if kw['pin_until'] is not None and (type(kw['pin_until']) not in (float, int) or
+                                                       not math.isfinite(kw['pin_until'])):
+                        raise Fail(400, 'invalid_pin', 'pinUntil must be a finite timestamp')
                 if "labels" in b:
                     kw["labels"] = json.dumps(b["labels"])
                 if kw:
-                    set_box(con, bid, **kw)
+                    with box_memory_lock(bid):
+                        if 'pinned' in kw:
+                            current = box_row(con, bid)
+                            check_delete_fence(con, bid)
+                            pin = box_protection(con, bid, probe=False)['pin']
+                            reconciliation = b.get('pinReconcile') or {}
+                            if not isinstance(reconciliation, dict):
+                                raise Fail(400, 'invalid_pin', 'pinReconcile must be an object')
+                            legacy_claim = (pin['active'] and pin['holder'] is None and pin['until'] is None
+                                            and kw['pin_holder'] and reconciliation.get('holder') == kw['pin_holder']
+                                            and type(reconciliation.get('until')) in (float, int)
+                                            and math.isfinite(reconciliation['until'])
+                                            and reconciliation['until'] > now())
+                            if pin['active'] and pin['holder'] != kw['pin_holder'] and not legacy_claim:
+                                raise Fail(409, 'sandbox_pinned', f"{bid} is pinned by {pin['holder'] or 'unknown holder'}")
+                            if kw['pinned'] and current['state'] in ('stopping', 'deleted', 'error'):
+                                raise Fail(409, 'sandbox_unavailable', f"{bid} is {current['state']}; cannot pin")
+                            foreign = [h for h in box_protection(con, bid)['holds'] if h['holder'] != kw['pin_holder']]
+                            if kw['pinned'] and foreign:
+                                raise Fail(409, 'box_held', f"{bid} is held by {foreign[0]['holder']} (run {foreign[0]['run_id']})")
+                            if legacy_claim:
+                                box_event(con, bid, 'pin_reconcile', 'client supplied its existing local pin ownership and expiry',
+                                          box_protection(con, bid, probe=False), local_pin=reconciliation)
+                        set_box(con, bid, **kw)
+                        if 'pinned' in kw:
+                            box_event(con, bid, 'pin' if kw['pinned'] else 'unpin', 'client keep')
                 return {"ok": True, "sandbox": box_json(con, box_row(con, bid))}
             if method == "DELETE":
                 if self.headers.get("X-Ascii-Confirm-Delete") != bid:
@@ -3237,6 +3813,13 @@ class Handler(BaseHTTPRequestHandler):
                 return {"ok": True, "deleted": bid}
             raise Fail(405, "method_not_allowed", method)
         op = rest[0]
+        if op == 'protection' and method == 'GET':
+            with box_memory_lock(bid):
+                snapshot = box_protection(con, bid, run_id=q.get('run_id'))
+            return {'ok': True, **snapshot}
+        if op == 'events' and method == 'GET':
+            rows = con.execute('SELECT * FROM box_events WHERE box_id=? ORDER BY seq DESC LIMIT 50', (bid,))
+            return {'ok': True, 'events': [{**dict(r), 'detail': json.loads(r['detail'])} for r in rows]}
         if op == "fork" and method == "POST":
             b = self._body()
             return {"ok": True, "sandbox": create_box(con, b, self.headers.get("Idempotency-Key"), owner, src_box=bid)}
@@ -3244,9 +3827,14 @@ class Handler(BaseHTTPRequestHandler):
             resume_box(con, bid, self._body())
             return {"ok": True, "sandbox": box_json(con, box_row(con, bid))}
         if op == "stop" and method == "POST":
-            box_row(con, bid)
-            threading.Thread(target=lambda: _bg(stop_box, bid, "api"), daemon=True).start()
-            set_box(con, bid, state="stopping")
+            with box_memory_lock(bid):
+                require_unprotected(con, bid)
+                set_box(con, bid, state='stopping')
+            context = offbox_protection.caller()
+            def stop():
+                offbox_protection.CALLER.set(context)
+                _bg(stop_box, bid, 'api')
+            threading.Thread(target=stop, daemon=True).start()
             return {"ok": True, "sandbox": box_json(con, box_row(con, bid))}
         if op == "sshkey" and method == "POST":
             return self._sshkey(con, bid, self._body())
@@ -3338,6 +3926,8 @@ class Handler(BaseHTTPRequestHandler):
                 "sshUser": "user", "managementSshEndpoint": f"{CFG['ssh_host']}:{mgmt_port}"}
 
     def _commands(self, con, method: str, bid: str, rest: list[str], q: dict):
+        if rest == ['busy'] and method == 'GET':
+            return {'ok': True, 'busy': commands_busy(con, bid)}
         if not rest and method == "POST":
             b = self._body()
             if b.get("detached"):

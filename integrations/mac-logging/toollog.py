@@ -21,6 +21,7 @@ NUMBERS.update('rootsOk rootsTimeout rootsDenied scanMs'.split())
 NUMBERS.update(('unreadableCount', 'turn', 'cachedCount', 'rootsComplete', 'rootsPartial',
                 'childrenCached', 'oldestChildAgeS', 'unmeasuredCount', 'limitedCount', 'lagS'))
 NUMBERS.update(('deltaGb', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
+NUMBERS.update(('freeGb', 'floorGb', 'lowForS'))
 NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
                 'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
 NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS',
@@ -36,6 +37,10 @@ BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'fil
 FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
                   'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
 NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
+NUMBERS.update(('timedOutCount', 'backedOffCount', 'estimatedCount', 'rootsCompleteWithDenied'))
+for i in range(1, 4):
+    NUMBERS.add('slowest%dMs' % i)
+NUMBERS.update(('lockWaitMs', 'waitedMs'))
 NUMBERS.update(('probeTimeouts', 'secondsInProbeTimeouts', 'probeAllowanceMedianS', 'allowanceS'))
 NUMBERS.update(('cpuS', 'loadAvg1Start', 'loadAvg1End', 'loadAvg1Max', 'cpuSecondsDu',
                 'wallSecondsDu', 'firstAttempts', 'firstAttemptTimeouts', 'secondsWasted'))
@@ -50,7 +55,8 @@ BACKUP_ARGS = {'memory_backup.sh', 'health_backup.sh', 'backup_control.py', 'red
                'backup', 'snapshots', 'forget', 'prune',
                '-c', '-f', '-l', '-lc', '-u', '-m', '[redacted]'}
 BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale', 'inventoryComplete'}
-BOOLEANS.add('cached')
+BOOLEANS.update(('completeWithDenied', 'estimate'))
+BOOLEANS.update(('cached', 'acquired'))
 NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',
             'diskarbitrationdPid', 'diskarbitrationdUptimeS', 'diskarbitrationdStat'}
 NULLABLE.add('inventoryAgeS')
@@ -68,12 +74,14 @@ for i in range(1, 6):
 for i in range(1, 4):
     TEXT.add('topMover%dPath' % i)
     NUMBERS.add('topMover%dGbDelta' % i)
+    NUMBERS.add('topMover%dGb' % i)
 PROBE_ERRORS = {prefix+field for prefix in ('internal', 'external')
                 for field in ('PurgeableError', 'SnapshotError')}
 TEXT.update('blockedIn samplePath skipped storagekitdStat diskarbitrationdStat'.split())
 TEXT.add('failure')
 TEXT.add('child')
 TEXT.add('spawnPolicy')
+TEXT.update('slowest%dPath' % i for i in range(1, 4))
 TEXT.update(('root', 'slowestChildPath'))
 NUMBERS.add('slowestChildMs')
 ATOM = re.compile(r'^[A-Za-z0-9_.:@/+ ()-]{1,180}$')
@@ -465,6 +473,21 @@ def safe_fields(values, event=None):
         return u_episode_fields(values)
     if event in ('cpu.sample', 'cpu.spike'):
         return cpu_fields(values)
+    if event in ('disk.budget', 'disk.budget.over'):
+        result = {}
+        for key, value in (values or {}).items():
+            if key in ('sizeGb', 'budgetGb', 'overBy', 'sizeAgeS') and (
+                    value is None or finite_number(value) and value >= 0):
+                result[key] = value
+            elif key == 'path' and isinstance(value, str) and value.startswith('/') and not SECRET.search(value):
+                result[key] = ''.join(c for c in value[:1024] if c.isprintable())
+            elif key == 'owner' and isinstance(value, str) and re.fullmatch(r'[a-z][a-z0-9-]{0,63}', value):
+                result[key] = value
+            elif key == 'source' and value in ('inventory', 'deep', 'stale'):
+                result[key] = value
+            elif key == 'status' and value in ('ok', 'stale', 'unmeasured', 'missing', 'symlink', 'unavailable'):
+                result[key] = value
+        return result
     if event == 'disk.ssd_read_probe':
         result = {}
         for key, value in (values or {}).items():
@@ -510,7 +533,18 @@ def safe_fields(values, event=None):
         return memory_fields(values, event)
     result = {}
     for key, value in (values or {}).items():
-        if key == 'lockHolderCmd' and backup_command(value):
+        if key in ('roots', 'secondsByRoot') and event in ('disk.inventory', 'disk.deep.end') and isinstance(value, dict):
+            result[key] = {}
+            for path, fields in list(value.items())[:13]:
+                if not isinstance(path, str) or not ATOM.fullmatch(path) or SECRET.search(path):
+                    continue
+                if key == 'secondsByRoot' and type(fields) in (int, float) and math.isfinite(fields) and fields >= 0:
+                    result[key][path] = fields
+                elif key == 'roots' and isinstance(fields, dict):
+                    allowed = {'deniedCount', 'timedOutCount', 'backedOffCount', 'estimatedCount', 'completeWithDenied'}
+                    allowed.update('slowest%d%s' % (i, suffix) for i in range(1,4) for suffix in ('Path', 'Ms'))
+                    result[key][path] = safe_fields({k:v for k,v in fields.items() if k in allowed})
+        elif key == 'lockHolderCmd' and backup_command(value):
             result[key] = value
         elif key in ('trigger', 'lockHolderTrigger') and value in ('launchd', 'manual', 'installer', 'unknown', 'agent'):
             if key != 'trigger' or value != 'agent':
@@ -543,6 +577,8 @@ def safe_fields(values, event=None):
                 'invalid_timestamp', 'current_unavailable'):
             result[key] = value
         elif key == 'volume' and value in ('internal', 'external'):
+            result[key] = value
+        elif event == 'disk.low_cleared' and key == 'reason' and value == 'emergency_recovery':
             result[key] = value
         elif key in ('previousTs', 'sampleTs', 'deltaFromTs', 'internalDeltaFromTs', 'externalDeltaFromTs') and isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', value):
             result[key] = value

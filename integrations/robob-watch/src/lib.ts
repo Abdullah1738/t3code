@@ -4,10 +4,10 @@ import { toolLog, toolError } from "./toollog.ts";
 import { StderrCause, stderrCause, type DependencyBusy } from "./cause.ts";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 export const HOME = homedir();
 export const ROOT = process.env.ROBOB_WATCH_ROOT ?? join(HOME, ".local/share/robob-watch");
@@ -109,6 +109,8 @@ export type Watcher = {
   max_consecutive_failures?: number;
   /** Failures in a row before the per-run failure notice; default 2, 1 = every failure. */
   failure_notice_after?: number;
+  /** False keeps a failure pause manual-only; otherwise probe after 15m, 30m, then hourly. */
+  failure_pause_probe?: boolean;
   depends?: Dependency[];
   /** Opt-in: text the owner a short heads-up when a wake sits queued behind a busy turn. Off by default. */
   headsup?: boolean;
@@ -156,6 +158,12 @@ export type State = {
   load_timeouts?: number;
   load_timeout_since?: string;
   failure_paused_at?: string;
+  failure_probe_attempts?: number;
+  failure_probe_next_at?: string;
+  failure_pause_notice?: string;
+  failure_pause_escalation?: string;
+  failure_pause_escalation_fallback?: string;
+  failure_recovery_notices?: { key: string; text: string; retry_at?: number }[];
   /** Separate from Telegram flags; retained through resume until bridge acceptance. */
   owner_imessage_episodes?: OwnerAlertEpisode[];
   last_error?: string;
@@ -304,6 +312,7 @@ export function removeWatcher(id: string, immediately = false): { archived?: str
     state.status = "closing";
     state.next_at = 0;
     delete state.failure_paused_at;
+    clearFailureProbe(state);
     saveState(id, state);
     if (started) toolLog({ component: "cli", kind: "event", name: "watch.grace_started", ids: { watcher: id }, props: { graceMs: REMOVAL_GRACE_MS } });
     log(id, `closing until ${iso(state.closing_until!)}`);
@@ -551,6 +560,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (maxFailures !== undefined && (!Number.isInteger(maxFailures) || maxFailures < 0)) errors.push("max_consecutive_failures must be an integer >= 0 (0 = never pause)");
   if (input.owner_imessage_alerts !== undefined && typeof input.owner_imessage_alerts !== "boolean") errors.push("owner_imessage_alerts must be boolean");
   if (input.owner_imessage_alerts === true && input.chat !== undefined) errors.push("owner_imessage_alerts requires an owner watcher");
+  if (input.failure_pause_probe !== undefined && typeof input.failure_pause_probe !== "boolean") errors.push("failure_pause_probe must be boolean");
   const noticeAfter = input.failure_notice_after;
   if (noticeAfter !== undefined && (!Number.isInteger(noticeAfter) || noticeAfter < 1)) errors.push("failure_notice_after must be an integer >= 1 (1 = every failure)");
   const depends = input.depends;
@@ -580,6 +590,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
     ...(noticeAfter !== undefined ? { failure_notice_after: noticeAfter } : {}),
+    ...(input.failure_pause_probe !== undefined ? { failure_pause_probe: input.failure_pause_probe } : {}),
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
     ...(input.headsup === true ? { headsup: true } : {}),
@@ -632,6 +643,79 @@ export function log(id: string | null, message: string): void {
 export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
 
 export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean; ms: number; busy?: DependencyBusy };
+const liveCheckGroups = new Map<number, Promise<void>>();
+let stoppingChecks = false;
+let shutdownInstalled = false;
+let shutdownStarted = false;
+let beforeCheckShutdown: (() => void) | undefined;
+
+export const checkGroupExit = (pgid: number): Promise<void> | undefined => liveCheckGroups.get(pgid);
+export const checkProcessTag = (id: string, run: string = randomUUID()): string => `${id}:${run}:${process.pid}`;
+
+export function installCheckShutdown(beforeShutdown?: () => void): void {
+  if (beforeShutdown) beforeCheckShutdown = beforeShutdown;
+  if (shutdownInstalled) return;
+  shutdownInstalled = true;
+  const stop = () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    beforeCheckShutdown?.();
+    void killRunningChecks().finally(() => process.exit(0));
+  };
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(signal, stop);
+  // Exit callbacks cannot await, including an imported runner's unexpected normal exit.
+  process.on("exit", () => { void killRunningChecks("SIGKILL"); });
+}
+
+function signalCheckGroup(pgid: number, signal: NodeJS.Signals): void {
+  try { process.kill(-pgid, signal); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") toolError("runner", "watch.kill_failed");
+  }
+}
+
+async function waitForChecks(closed: Promise<void>[], timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([Promise.all(closed), new Promise<void>(resolve => { timer = setTimeout(resolve, timeoutMs); })]);
+  } finally { clearTimeout(timer); }
+}
+
+function trackCheckGroup(pgid: number, child: ReturnType<typeof spawn>): void {
+  let release!: () => void;
+  liveCheckGroups.set(pgid, new Promise<void>(resolve => { release = resolve; }));
+  let watching = false;
+  const closed = () => {
+    if (watching) return;
+    watching = true;
+    // Closing the shell's pipes does not mean its redirected descendants have exited.
+    const reap = () => {
+      try { process.kill(-pgid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+          liveCheckGroups.delete(pgid);
+          release();
+          return;
+        }
+      }
+      setTimeout(reap, 25).unref();
+    };
+    reap();
+  };
+  child.once("close", closed);
+  child.once("error", closed);
+}
+
+export async function killRunningChecks(signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+  stoppingChecks = true;
+  const groups = [...liveCheckGroups];
+  for (const [pgid] of groups) signalCheckGroup(pgid, signal);
+  if (!groups.length || signal === "SIGKILL") return;
+  await waitForChecks(groups.map(([, closed]) => closed), 500);
+  for (const [pgid] of groups) if (liveCheckGroups.has(pgid)) signalCheckGroup(pgid, "SIGKILL");
+  // Let the runner reap direct children before it exits, including TERM-resistant checks.
+  await waitForChecks(groups.map(([, closed]) => closed), 250);
+}
 
 /**
  * Runs a check in its own process group so a timeout kills everything it started. The result never waits more
@@ -639,6 +723,13 @@ export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; 
  * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
  */
 export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance = watcherInstance(watcher.id)): Promise<CheckResult> {
+  if (stoppingChecks) return Promise.reject(new Error("Runner is shutting down"));
+  installCheckShutdown();
+  const run = () => spawnCheck(watcher, dir, extraEnv, timeoutMs, instance);
+  return dir === watcherDir(watcher.id) ? withRelayLockAsync(run) : run();
+}
+
+function spawnCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string>, timeoutMs: number, instance: string | undefined): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
   assertMacWatcher(watcher.chat);
   const started = now();
@@ -662,7 +753,8 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
     };
     const spawnChild = (closing = extraEnv.WATCH_CLOSING ?? (loadState(watcher.id).status === "closing" ? "1" : "0")) => spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), ...(process.env.HEALTH_TOOLLOG_DIR ? { HEALTH_TOOLLOG_DIR: process.env.HEALTH_TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv, WATCH_CLOSING: closing },
+      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), ...(process.env.HEALTH_TOOLLOG_DIR ? { HEALTH_TOOLLOG_DIR: process.env.HEALTH_TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv,
+        ROBOB_WATCH_CHECK: checkProcessTag(watcher.id, extraEnv.WATCH_RUN || undefined), WATCH_CLOSING: closing },
     });
     // Admission shares the removal lock; a stale callback must never start canceled outreach.
     const child = dir === watcherDir(watcher.id) ? withRelayLock(() => {
@@ -675,6 +767,7 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       if (!current || current.paused || (extraEnv.WATCH_PENDING === "1" ? !pending : !checking(state) || current.check !== watcher.check)) throw new Error("Watcher check changed before admission");
       return spawnChild(state.status === "closing" || state.reply_handoff ? "1" : "0");
     }) : spawnChild();
+    if (child.pid) trackCheckGroup(child.pid, child);
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", (chunk: string) => { cause.add(chunk); if (stderr.length < 20_000) stderr += chunk; });
@@ -1049,13 +1142,14 @@ export function telegram(source: string, text: string, key: string, severity = "
 
 /** Env a check child gets: its own inputs plus, under a test run, the test markers and every stub override,
  * so a check that runs a helper (wa, mailsend, the bridge CLIs) hits the same guard the test set up. */
-const TEST_ENV_KEYS = ["ROBOB_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
-  "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI",
+const TEST_ENV_KEYS = ["ROBOB_TEST", "ROBOB_WATCH_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
+  "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI", "SPECTRUM_BRIDGE_CONFIG",
   "ROBOB_WATCH_TELEGRAM_CLI", "ROBOB_WATCH_T3CTL", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB",
   "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "TOOLLOG_DIR", "HEALTH_TOOLLOG_DIR", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
 export function testEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const k of TEST_ENV_KEYS) if (process.env[k] !== undefined) out[k] = process.env[k]!;
+  if (resolve(ROOT) !== join(HOME, ".local/share/robob-watch")) out.ROBOB_WATCH_TEST = "1";
   return out;
 }
 
@@ -1148,12 +1242,46 @@ export function relayCheck(given: Watcher, to: string, eta?: number, at = now())
  */
 // Runner admission calls the library's spawn guard while holding the same process's lock.
 let relayLockDepth = 0;
+export class CheckShutdownError extends Error {
+  constructor() { super("Runner is shutting down"); }
+}
+
+/** Yield only while acquiring: nested admission/spawn guards must finish before releasing the mutex. */
+export function withRelayLockAsync<T>(fn: () => T): Promise<Awaited<T>> {
+  const attempt = (): Promise<Awaited<T>> => {
+    if (stoppingChecks || shutdownStarted) return Promise.reject(new CheckShutdownError());
+    if (relayLockDepth) {
+      try { return Promise.resolve(fn()); } catch (error) { return Promise.reject(error); }
+    }
+    mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+    const db = new Database(join(ROOT, "relay-lock.sqlite"));
+    try {
+      db.exec("PRAGMA busy_timeout = 0");
+      db.exec("BEGIN IMMEDIATE");
+    } catch (error) {
+      db.close();
+      if ((error as { code?: string }).code !== "SQLITE_BUSY") return Promise.reject(error);
+      return new Promise<void>(resolve => setTimeout(resolve, 20)).then(attempt);
+    }
+    relayLockDepth++;
+    try { return Promise.resolve(fn()); }
+    catch (error) { return Promise.reject(error); }
+    finally {
+      relayLockDepth--;
+      // This database is only a mutex; committing would needlessly upgrade past concurrent readers.
+      try { db.exec("ROLLBACK"); } finally { db.close(); }
+    }
+  };
+  return attempt();
+}
+
 export function withRelayLock<T>(fn: () => T): T {
   if (relayLockDepth) return fn();
   mkdirSync(ROOT, { recursive: true, mode: 0o700 });
   const db = new Database(join(ROOT, "relay-lock.sqlite"));
   try {
-    db.exec("PRAGMA busy_timeout = 15000");
+    // SQLite's synchronous wait prevents signal handlers from cleaning up owned check groups.
+    db.exec(`PRAGMA busy_timeout = ${shutdownInstalled ? 0 : 15000}`);
     db.exec("BEGIN IMMEDIATE");
     relayLockDepth++;
     try { return fn(); } finally { relayLockDepth--; db.exec("COMMIT"); }
@@ -1483,6 +1611,58 @@ export function shouldNotifyFailure(watcher: Watcher, state: State, timedOut: bo
     && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
 }
 
+export function clearFailureProbe(state: State): void {
+  delete state.failure_probe_attempts;
+  delete state.failure_probe_next_at;
+}
+
+/** Shared by manual resume and a passing check; queued recovery receipts survive this reset. */
+export function clearFailureState(state: State): void {
+  clearFailureProbe(state);
+  delete state.failure_paused_at;
+  delete state.failure_pause_notice;
+  delete state.failure_pause_escalation;
+  delete state.failure_pause_escalation_fallback;
+  delete state.trigger_error;
+  delete state.load_timeouts;
+  delete state.load_timeout_since;
+  state.consecutive_failures = 0;
+  state.failure_alerted = false;
+  delete state.failure_escalated;
+  delete state.failing_since;
+  delete state.dependency_busy;
+  delete state.failure_episode;
+  delete state.last_error;
+  delete state.last_error_sources;
+}
+
+export function ensureFailureProbe(watcher: Watcher, state: State): boolean {
+  if (!state.failure_paused_at || watcher.paused || watcher.failure_pause_probe === false || state.status !== "active"
+    || state.failure_probe_next_at) return false;
+  state.failure_probe_attempts = 0;
+  state.failure_probe_next_at = iso(Date.parse(state.failure_paused_at) + 15 * 60_000);
+  return true;
+}
+
+export function failureProbeDue(watcher: Watcher, state: State, t = now()): boolean {
+  return state.status === "active" && !!state.failure_paused_at && !watcher.paused && watcher.failure_pause_probe !== false
+    && !!state.failure_probe_next_at && Date.parse(state.failure_probe_next_at) <= t;
+}
+
+export const failureProbeDelay = (attempt: number) => (attempt < 1 ? 15 : attempt === 1 ? 30 : 60) * 60_000;
+export const dubaiClock = (at: string) => new Intl.DateTimeFormat("en-GB", {
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone: "Asia/Dubai",
+}).format(Date.parse(at));
+export function pausedDuration(ms: number): string {
+  const minutes = Math.max(0, Math.floor(ms / 60_000));
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : `${minutes}m`;
+}
+export function pauseRetryText(watcher: Watcher, state: State): string {
+  return watcher.failure_pause_probe === false || watcher.paused
+    ? `Fix it, then robob-watch resume ${watcher.id}.`
+    : `It retries on its own in 15 min, 30 min, then hourly; or robob-watch resume ${watcher.id}. Next retry: ${dubaiClock(state.failure_probe_next_at ?? iso(Date.parse(state.failure_paused_at!) + 15 * 60_000))} Dubai.`;
+}
+
 export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
   if (state.dependency_busy) return false;
   const threshold = watcher.max_consecutive_failures ?? FAILURE_ALERT_AFTER;
@@ -1514,7 +1694,9 @@ export function escalationText(watcher: Watcher, state: State, mins: number): st
   ].join("\n");
   return [
     `Watcher ${watcher.id} ("${watcher.title}") has been FAILING for ${mins} min (${state.consecutive_failures} runs); ${failureSummary(state)}.`,
-    ...(state.failure_paused_at ? ["It is paused and will not check again until resumed."] : []),
+    ...(state.failure_paused_at ? [watcher.failure_pause_probe === false || watcher.paused
+      ? "It is paused and will not check again until resumed."
+      : `It is paused and retries on its own next at ${dubaiClock(state.failure_probe_next_at ?? iso(Date.parse(state.failure_paused_at) + 15 * 60_000))} Dubai.`] : []),
     `Last error: ${(state.last_error ?? "").slice(0, 500)}`,
     "",
     "Diagnose and repair the cause now (e.g. \"wacli sync daemon is not running\" -> `wa start`, then `wa status`; see the robob-watchers skill's Troubleshooting).",
@@ -1547,18 +1729,22 @@ function failureSummary(state: State): string {
   return sources.length ? `failing sources: ${sources.join(", ")}` : "its check is failing";
 }
 
+export function escalationFallbackText(watcher: Watcher, state: State, mins: number): string {
+  return state.dependency_busy ? `Dependency ${state.dependency_busy.dependency} has been busy for ${mins} min; watcher "${watcher.title}" keeps retrying; nothing is lost.`
+    : `Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`;
+}
+
 export async function escalate(watcher: Watcher, state: State, key: string, imessageFallback = true): Promise<Delivery> {
   const started = now();
   let delivery: Delivery | undefined;
   try {
     const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.dependency_busy?.since ?? state.failing_since!)) / 60_000);
-    const text = escalationText(watcher, state, mins);
+    const text = (state.failure_paused_at && state.failure_pause_escalation) || escalationText(watcher, state, mins);
     const woke = await wake(`robob-watch ${watcher.id} ${state.dependency_busy ? "dependency busy" : "failing"}`, text, key);
     if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
     else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
     else {
-      const summary = state.dependency_busy ? `Dependency ${state.dependency_busy.dependency} has been busy for ${mins} min; watcher "${watcher.title}" keeps retrying; nothing is lost.`
-        : `Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`;
+      const summary = (state.failure_paused_at && state.failure_pause_escalation_fallback) || escalationFallbackText(watcher, state, mins);
       const sent = await imessage(summary, key);
       delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
     }

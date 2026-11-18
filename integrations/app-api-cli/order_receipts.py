@@ -178,7 +178,7 @@ def fetch(cfg, state, now):
     return result
 
 
-def can_report(order):
+def can_report(order, *, _sibling=False):
     import order_tracker as tracker
     if not ORDER_ID.fullmatch(order):
         return {'ok': False, 'error': 'invalid order id'}
@@ -201,6 +201,30 @@ def can_report(order):
         running = running and _epoch(expires) > time.time()
     held = (cfg.get('delivery_card') or {}).get('held')
     ok = cfg.get('active') is True and not held and (cfg.get('untrackable') is True or running)
+    if cfg.get('app') == 'amazon' and not _sibling:
+        from amazon_email_orders import track
+        from amazon_checkout import config_path, log, order_state
+        try:
+            mail = track(order, since=cfg['placed_at'][:10], timeout=35)
+        except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired):
+            mail = {}
+        checkout = mail.get('checkout')
+        if not checkout or mail.get('errors') or not checkout.get('complete'):
+            return {'ok': False, 'order': order, 'tracker': wid,
+                    'error': 'amazon checkout confirmation unavailable'}
+        missing = []
+        for oid in checkout['order_ids']:
+            member = tracker.read(config_path(tracker, oid))
+            state = order_state(tracker, member)
+            terminal = member and tracker.terminal_order(member, state.get('last_result', {}), state.get('status'))
+            if (not member or member.get('for') != cfg.get('for') or tracker.chat_of(member) != tracker.chat_of(cfg)
+                    or (oid != order and not terminal and not can_report(oid, _sibling=True)['ok'])):
+                missing.append(oid)
+        if missing:
+            log('checkout_mismatch', order, checkout['id'], count=len(missing))
+            return {'ok': False, 'order': order, 'tracker': wid, 'missing_orders': missing,
+                    'reason': 'Untracked checkout order(s): ' + ', '.join(missing),
+                    'error': 'amazon checkout has untracked siblings'}
     result = tracker.read(tracker.WATCHERS / wid / 'order-tracker-state.json').get('last_result', {})
     eta = result.get('eta_text') or result.get('eta') or cfg.get('eta')
     return {'ok': bool(ok), 'order': order, 'tracker': wid, 'untrackable': cfg.get('untrackable', False),

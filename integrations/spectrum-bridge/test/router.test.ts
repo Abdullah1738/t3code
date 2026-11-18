@@ -10538,6 +10538,18 @@ test("agent-bus failure runs the waiting human separately", async () => {
   expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Are you there?"]);
 });
 
+test("a human held behind a failed bus gets its own turn without private bus text", async () => {
+  const h = setup(":memory:", { failureNoticeMs:0, droppedBatchMs:0 });
+  const steers=steering(h.backend);
+  h.input("wake:agent-bus:steered", "[Agent request, not typed by anyone here.]\nPRIVATE_BUS_REQUEST"); await h.router.tick();
+  h.input("typed","Are you there?",{source:"typed"}); await h.router.tick(); expect(steers).toHaveLength(0);
+  h.backend.step("checking","tool-calls"); h.backend.failed();
+  for(let i=0;i<3;i++) await h.router.tick();
+  expect(h.backend.prompts.at(-1)?.text).toBe("Are you there?");
+  h.backend.final("Here I am"); await h.router.tick();
+  expect(h.conversations().map(op=>op.text)).toContain("Here I am");
+  expect(JSON.stringify(h.store.pendingOutbox())).not.toContain("PRIVATE_BUS_REQUEST");
+});
 
 test.each(["watcher", "bus"] as const)("mixed agent-bus/watcher failure preserves only watcher notice, leader=%s", async leader => {
   const logs: string[] = [];
@@ -10548,6 +10560,10 @@ test.each(["watcher", "bus"] as const)("mixed agent-bus/watcher failure preserve
   for (const id of leader === "watcher" ? [watcher, bus] : [bus, watcher]) {
     h.input(id, id === bus ? `[Agent request, not typed by anyone here.]\n${privateText}` : wakeBody());
   }
+  const ids = leader === "watcher" ? [watcher,bus] : [bus,watcher];
+  h.store.updateInbound(ids[1]!,"batched");
+  h.store.set(`batch:${ids[0]}`, {id:ids[1],text:`${wakeBody()}\n[Agent request]\n${privateText}`,attachments:[],isAudioMessage:false,receivedAt:Date.now(),batchIds:ids});
+  h.store.set(`batch-phase:${ids[0]}`,"deferred-wake");
   Object.assign(h.backend, { runToolEvidence: async () => "unknown" as const });
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(1);
@@ -10868,7 +10884,8 @@ test.each(["startup_unavailable", "send_timeout"].flatMap(reason => ["root", "ch
   expect(h.backend.prompts.some(prompt => prompt.text === text)).toBe(false);
 });
 
-test("control recovery: uncertain conflict waits for admission readback before requeue", async () => {
+test.each([0, 1])("control recovery: uncertain conflict waits for admission readback before requeue (prompt clock skew=%ims)", async skew => {
+  setSystemTime(1_800_000_000_000);
   const h = setup();
   const steers = steering(h.backend, async () => { throw new ControlError(409, "conflict", { reason: "command_id_conflict", retrySafe: false }); });
   h.input("root", "Original"); await h.router.tick();
@@ -10880,7 +10897,11 @@ test("control recovery: uncertain conflict waits for admission readback before r
   expect(h.backend.prompts).toHaveLength(1);
   expect(steers).toHaveLength(1);
   h.backend.promptAccepted = async (_id, _directory, prompt) => h.backend.records.some(record => record.id === prompt);
-  const nextAt = h.store.get<{ nextAt: number }>("replay-probe-backoff:human")!.nextAt;
+  const backoff = h.store.get<{ nextAt: number; aliases: string[] }>("replay-probe-backoff:human")!;
+  const promptKey = `replay-probe-backoff:${backoff.aliases[0]}`;
+  const promptBackoff = h.store.get<{ nextAt: number }>(promptKey)!;
+  h.store.set(promptKey, { ...promptBackoff, nextAt: promptBackoff.nextAt + skew });
+  const nextAt = Math.max(backoff.nextAt, promptBackoff.nextAt + skew);
   setSystemTime(nextAt - 1);
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(1);
@@ -12096,6 +12117,19 @@ test.each(["question", "permission", "legacy-question", "legacy-permission"].fla
     expect(calls.every(call => JSON.stringify(call) === JSON.stringify(calls[0]))).toBe(true);
     expect(slowReads).toBe(1);
   } finally { timer.mockRestore(); release.resolve([]); }
+});
+
+test.each([false,true])("a human held by a bus survives restart and receives its own answer, restart=%s", async restart => {
+  const h=setup(":memory:",{failureNoticeMs:0,droppedBatchMs:0}); const steers=steering(h.backend);
+  h.input("wake:agent-bus:late-steer","PRIVATE_BUS_REQUEST"); await h.router.tick();
+  h.input("late-human","Are you there?",{source:"typed"}); await h.router.tick(); expect(steers).toHaveLength(0);
+  const router=restart?new Router(h.store,h.backend,h.transport,h.routerOptions):h.router;
+  h.backend.step("checking","tool-calls"); h.backend.failed();
+  for(let i=0;i<3;i++) await router.tick();
+  expect(h.backend.prompts.at(-1)?.text).toBe("Are you there?");
+  h.backend.final("Yes, here I am"); await router.tick();
+  expect(h.conversations().map(op=>op.text)).toContain("Yes, here I am");
+  expect(JSON.stringify(h.store.pendingOutbox())).not.toContain("PRIVATE_BUS_REQUEST");
 });
 
 test("unanswered watchdog recovers the 16 Nov accepted human row after a wake ends NO_REPLY", async () => {

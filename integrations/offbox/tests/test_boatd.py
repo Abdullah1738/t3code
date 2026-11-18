@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,7 @@ class Fakes:
 
     def __init__(self):
         self.calls = []            # incus argv tuples
+        self.guests = {}
         self.running = set()       # containers that run
         self.active_units = set()
         self.spawned = []          # (box, pid, attempt)
@@ -45,7 +47,15 @@ class Fakes:
     def incus(self, *args, input=None, timeout=600, check=True):
         self.calls.append(args)
         rc, out = 0, b""
-        if args[:1] == ("start",):
+        if args[:1] == ('query',) and args[1].endswith('/state'):
+            bid = args[1].split('/')[3].replace('-', '_')
+            out = json.dumps({'status': 'Running' if bid in self.running else 'Stopped'}).encode()
+        elif args[:1] == ('exec',) and 'base64' in args[-1]:
+            pid = int(shlex.split(args[-1])[4])
+            out = json.dumps(self.guests.get((args[1].replace('-', '_'), pid), {'state':'absent'})).encode()
+        elif args[:1] == ('exec',) and 'busy=False' in args[-1]:
+            out = b'{"busy":false}'
+        elif args[:1] == ("start",):
             bid = args[1].replace("-", "_")
             if bid in self.start_fails:
                 rc = 1
@@ -246,23 +256,18 @@ class ReconcileRuns(Base):
         out = boatd.reconcile(self.con)
         r = self.status(b, p)
         self.assertEqual(out["interrupted"], 1)
-        self.assertEqual((r["status"], r["exit_code"], r["attempt"]), ("interrupted", None, 1))
+        self.assertEqual((r["status"], r["exit_code"], r["attempt"]), ("interrupted", 94, 1))
         self.assertIsNotNone(r["ended_at"])
         self.assertEqual(self.f.spawned, [])
-        self.assertIn("is not run again", (boatd.cmd_dir(b) / f"{p}.err").read_text())
+        self.assertIn("nothing was re-run", (boatd.cmd_dir(b) / f"{p}.err").read_text())
 
-    def test_retry_interrupted_queues_it_again_once_as_the_next_attempt_of_the_same_run(self):
-        b = self.box(running=False)          # the host restarted: the container is down too
+    def test_retry_flag_never_restarts_a_started_command(self):
+        b = self.box(running=False)
         p = self.cmd(b, retry=1)
-        (boatd.cmd_dir(b) / f"{p}.out").write_bytes(b"attempt one output\n")
         out = boatd.reconcile(self.con)
-        r = self.status(b, p)
-        self.assertEqual(out["retry"], 1)
-        self.assertEqual((r["status"], r["attempt"], r["started_at"], r["command_id"]), ("queued", 2, None, f"cmd_{p}"))
-        self.assertEqual(self.f.spawned, [(b, p, 2)])
-        self.assertIn(b, self.f.running, "its box was started before the runner")
-        self.assertEqual((boatd.cmd_dir(b) / f"{p}.out").read_bytes(), b"attempt one output\n", "output kept")
-        self.assertIn("queued again as attempt 2", (boatd.cmd_dir(b) / f"{p}.err").read_text())
+        self.assertEqual(out['interrupted'], 1)
+        self.assertEqual((self.status(b,p)['attempt'], self.status(b,p)['exit_code']), (1,94))
+        self.assertEqual(self.f.spawned, [])
 
     def test_a_run_already_retried_once_stays_interrupted(self):
         b = self.box()
@@ -286,9 +291,9 @@ class ReconcileRuns(Base):
         first = self.cmd(b, pid=1001, retry=1, age=300)
         second = self.cmd(b, pid=1002, status="queued", age=200)
         boatd.reconcile(self.con)
-        self.assertEqual(self.f.spawned, [(b, first, 2), (b, second, 1)])
+        self.assertEqual(self.f.spawned, [(b, second, 1)])
         head = self.con.execute("SELECT pid FROM commands WHERE status='queued' ORDER BY created_at, box_id, pid").fetchone()
-        self.assertEqual(head["pid"], first)
+        self.assertEqual(head["pid"], second)
 
     def test_a_run_that_was_being_killed_is_not_retried(self):
         b = self.box()
@@ -307,7 +312,7 @@ class ReconcileRuns(Base):
         out = boatd.reconcile(self.con)
         self.assertEqual(out["boxes_failed"], 1)
         self.assertEqual(self.status(b, p)["status"], "interrupted")
-        self.assertEqual(self.state(b)["state"], "archived")
+        self.assertEqual(self.state(b)["state"], "error")
         self.assertEqual(self.f.spawned, [])
 
     def test_runner_that_cannot_be_spawned_ends_the_run_instead_of_blocking_the_queue(self):
@@ -319,19 +324,19 @@ class ReconcileRuns(Base):
 
     def test_reconcile_twice_changes_nothing_more(self):
         b = self.box(running=False)
-        p = self.cmd(b, retry=1)
+        p = self.cmd(b, status="queued")
         boatd.reconcile(self.con)
         out = boatd.reconcile(self.con)
         self.assertEqual((out["retry"], out["following"]), (0, 1))
-        self.assertEqual(self.status(b, p)["attempt"], 2)
+        self.assertEqual(self.status(b, p)["attempt"], 1)
         self.assertEqual(len(self.f.spawned), 1)
 
     def test_reaper_applies_the_same_rules_while_boatd_runs(self):
         b = self.box()
-        p = self.cmd(b, retry=1)
+        p = self.cmd(b, status="queued")
         boatd.reap_once(self.con)
-        self.assertEqual((self.status(b, p)["status"], self.status(b, p)["attempt"]), ("queued", 2))
-        self.assertEqual(self.f.spawned, [(b, p, 2)])
+        self.assertEqual((self.status(b, p)["status"], self.status(b, p)["attempt"]), ("queued", 1))
+        self.assertEqual(self.f.spawned, [(b, p, 1)])
         boatd.reap_once(self.con)
         self.assertEqual(len(self.f.spawned), 1, "the new unit is followed, not spawned again")
 
@@ -796,7 +801,11 @@ class Http(Base):
                 stack.enter_context(patch.object(boatd.time, "sleep", side_effect=hold_admission))
                 stack.enter_context(patch.object(boatd, "spawn_runner", side_effect=spawn))
                 stack.enter_context(patch.object(boatd, "ct_exec"))
-                stack.enter_context(patch.object(boatd.subprocess, "Popen", side_effect=process))
+                stack.enter_context(patch.object(boatd, "guest_command", return_value={'state':'absent'}))
+                def finish_guest(con, c, **kw):
+                    (boatd.cmd_dir(c['box_id']) / f"{c['pid']}.out").write_bytes(b'ready\n')
+                    boatd.record_guest(con, c, {'state':'exited','exit_code':0})
+                stack.enter_context(patch.object(boatd, "follow_guest", side_effect=finish_guest))
                 stack.enter_context(patch.object(boatd, "snapshot"))
                 stack.enter_context(patch.object(boatd, "prune_snaps"))
                 th = threading.Thread(target=wait_for_memory)
@@ -1028,7 +1037,7 @@ class Http(Base):
         out = "".join(f["data"] for f in frames if f["type"] == "stdout")
         self.assertEqual(out, "the cut\n", "resumes from the byte offset it was given")
         self.assertEqual(frames[-1]['metrics']['host_boxes'], {'start': 9, 'end': 14})
-        self.assertEqual((frames[-1]["type"], frames[-1]["status"], frames[-1]["exitCode"]), ("exit", "interrupted", None))
+        self.assertEqual((frames[-1]["type"], frames[-1]["status"], frames[-1]["exitCode"]), ("exit", "interrupted", 94))
 
 
 class HealthAndDegraded(Base):
@@ -1235,8 +1244,8 @@ unused devices: <none>
         self.assertEqual(seen, ["import"], "asked for a plain import once while the pool was away")
         self.assertEqual(slept, [10])
         self.assertTrue(boatd.READY.is_set())
-        self.assertEqual(boatd.STATE["reconcile"]["retry"], 1)
-        self.assertEqual(self.status(b, p)["attempt"], 2)
+        self.assertEqual(boatd.STATE["reconcile"]["interrupted"], 1)
+        self.assertEqual(self.status(b, p)["attempt"], 1)
         self.assertEqual(started, ["reaper", "sampler"])
         boatd.READY.clear()
 

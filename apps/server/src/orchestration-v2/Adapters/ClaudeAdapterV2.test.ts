@@ -2533,6 +2533,7 @@ function makeFakeClaudeCli(
   let homeConnected = false;
   const stdins: Array<NodeStream.PassThrough> = [];
   const pendingRegistrations: Array<() => void> = [];
+  const exited = Promise.withResolvers<void>();
   const exits: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
   const spawn = (options: SpawnOptions): SpawnedProcess => {
     spawns.push(options);
@@ -2541,6 +2542,7 @@ function makeFakeClaudeCli(
     stdins.push(stdin);
     stdouts.push(stdout);
     const child = Object.assign(new NodeEvents.EventEmitter(), {
+      pid: 1800 + spawns.length,
       stdin,
       stdout,
       killed: false,
@@ -2558,6 +2560,7 @@ function makeFakeClaudeCli(
       child.exitCode = code;
       child.signalCode = signal;
       child.emit("exit", code, signal);
+      exited.resolve();
     };
     exits.push(exit);
     let pending = "";
@@ -2617,6 +2620,7 @@ function makeFakeClaudeCli(
     spawns,
     controlRequests,
     closed,
+    exited: Effect.promise(() => exited.promise),
     exitWithoutClosingOutput: (code: number | null, signal: NodeJS.Signals | null) =>
       exits[0]!(code, signal),
     releaseRegistration: () => pendingRegistrations.shift()?.(),
@@ -2680,6 +2684,17 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
       Effect.provide(NodeServices.layer),
     );
 
+  it.effect("inventory captures the CLI identity and drops it after exit", () =>
+    Effect.gen(function* () {
+      const cli = makeFakeClaudeCli();
+      const session = yield* openWith(cli);
+      assert.deepEqual(session.runtimeProcess?.(), { pid: 1801, spawnedAtMs: 0 });
+      yield* session.close;
+      yield* cli.exited;
+      assert.isUndefined(session.runtimeProcess?.());
+    }),
+  );
+
   it.effect("sends MCP servers over stdin, not argv or the environment", () =>
     Effect.gen(function* () {
       const cli = makeFakeClaudeCli();
@@ -2711,15 +2726,17 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
         Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
       );
       assert.isDefined(session.processExit);
+      assert.isDefined(session.runtimeProcess?.());
       const exited = yield* session.processExit!.pipe(Effect.forkChild);
       cli.exitWithoutClosingOutput(exit.code, exit.signal);
       assert.deepEqual(yield* Fiber.join(exited), exit);
+      assert.isUndefined(session.runtimeProcess?.());
       assert.deepEqual(yield* Deferred.await(exitLog), [
         "orchestration-v2.claude-process-exited",
         {
           threadId: "thread-claude-mcp-channel",
           providerSessionId: "provider-session-claude-mcp-channel",
-          pid: null,
+          pid: 1801,
           exitCode: exit.code,
           signal: exit.signal,
         },

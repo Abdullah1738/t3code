@@ -24,7 +24,7 @@ export function parseCutoverStatus(body) {
       || !value.claimedRunIds.every((id) => typeof id === 'string')))
     || (value.claimedRuns !== undefined && (!Array.isArray(value.claimedRuns)
       || !value.claimedRuns.every((claim) => typeof claim?.threadId === 'string' && typeof claim.runId === 'string')))) {
-    throw new Error('invalid harness-cutover status; recovery is held');
+    throw Object.assign(new Error('invalid harness-cutover status; recovery is held'), { code: 'CUTOVER_STATUS_INVALID' });
   }
   return value;
 }

@@ -16,6 +16,136 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_prompt_probe_outcomes_survive_request_catch_deduplication(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        rows = [{'component': 'router', 'name': 'router.prompt_probes', 'kind': 'perf',
+                 'ts': self.day + 'T12:00:00.000Z', 'promptProbe': {
+                     'calls': 3, 'accepted': 0, 'notAcceptedYet': 0, 'timeout': 1, 'http': 1, 'transport': 1,
+                     'httpByStatus': {'503': 1}, 'elapsedMs': [[10, 3]], 'attempts': [], 'msUntilAccepted': []}}]
+        for kind in ('timeout', 'http', 'transport'):
+            if kind != 'timeout':
+                rows.append({'component': 'robob', 'name': 'turn.robob_call', 'kind': 'perf', 'ok': False,
+                             'props': {'method': 'GET', 'route': '/threads/:id/messages', 'failureFormat': 'single'},
+                             'ids': {'requestId': kind},
+                             'error': {'tag': 'control.request_failed', 'name': 'ControlError', 'status': 503 if kind == 'http' else 0}})
+            rows.append({'component': 'router', 'name': 'bridge.catch', 'kind': 'error', 'ok': False,
+                         'alreadyLogged': kind != 'timeout', 'props': {'causeKind': kind},
+                         'ids': {'requestId': kind},
+                         'error': {'tag': 'router.catch1', 'name': 'BoundedTimeout' if kind == 'timeout' else 'ControlError',
+                                   'causeKey': 'prompt_acceptance_probe'}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual(result['promptProbe']['calls'], 3)
+        for kind in ('timeout', 'http', 'transport'):
+            self.assertEqual(result['promptProbe'][kind], 1)
+        self.assertEqual(result['failedCount'], 3)
+        self.assertEqual(result['dedupedFailures'], 2)
+        self.assertEqual(result['errorRate'], 3 / 6)
+        tags = {row['tag']: row for row in result['topErrorTags']}
+        self.assertEqual(tags['control.request_failed']['count'], 2)
+        self.assertEqual(tags['control.request_failed']['causeKinds'], {'http': 1, 'transport': 1})
+        self.assertEqual(tags['router.catch1']['count'], 1)
+        self.assertEqual(tags['router.catch1']['causeKinds'], {'timeout': 1})
+
+    def test_probe_owner_cause_kinds_survive_order_summaries_and_duplicate_catches(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        shapes = [('http_503', 'ControlError', 'control.request_failed', 'http'),
+                  ('refused', 'TypeError', 'control.request_failed', 'transport'),
+                  ('invalid_json', 'SyntaxError', 'control.invalid_json', 'http'),
+                  ('body_timeout', 'TimeoutError', 'control.request_failed', 'http')]
+        for shape, name, tag, kind in shapes:
+            for aggregate in (False, True):
+                for reverse in (False, True):
+                    with self.subTest(shape=shape, aggregate=aggregate, reverse=reverse):
+                        request = {'component': 'robob', 'name': 'turn.robob_call', 'kind': 'perf', 'ok': False,
+                                   'ids': {'requestId': shape, 'callBatchId': 'batch'},
+                                   'props': {'method': 'GET', 'route': '/threads/:id/messages', 'failureFormat': 'single'},
+                                   'error': {'tag': tag, 'name': name}}
+                        catch = {'component': 'router', 'name': 'bridge.catch', 'kind': 'error', 'ok': False,
+                                 'ids': {'requestId': shape}, 'alreadyLogged': True, 'props': {'causeKind': kind},
+                                 'error': {'tag': 'router.catch1', 'name': 'ControlError'}}
+                        rows = [request, catch, catch]
+                        if aggregate:
+                            rows.append({'component': 'robob', 'name': 'turn.robob_calls', 'kind': 'perf',
+                                         'ids': {'callBatchId': 'batch'}, 'calls': {'messages': {
+                                             'ok': 0, 'failed': 1, 'singleFailures': 1, 'histogram': [[10, 1]]}}})
+                        if reverse:
+                            rows.reverse()
+                        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                        result = toollog.rollup('imessage', self.day)
+                        self.assertEqual((result['failedCount'], result['dedupedFailures'], result['total']), (1, 2, 3))
+                        self.assertEqual(result['errorRate'], 1 / 3)
+                        self.assertEqual(len(result['topErrorTags']), 1)
+                        self.assertEqual(result['topErrorTags'][0]['tag'], tag)
+                        self.assertEqual(result['topErrorTags'][0]['count'], 1)
+                        self.assertEqual(result['topErrorTags'][0]['causeKinds'], {kind: 1})
+
+    def test_probe_owner_cause_kinds_require_a_correlated_deduplicated_catch(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        shapes = [('matching request', 'request', 'request', 'router.catch1', 'http', True, True),
+                  ('missing owner id', None, 'request', 'router.catch1', 'http', True, False),
+                  ('missing catch id', 'request', None, 'router.catch1', 'http', True, False),
+                  ('different request', 'request', 'other', 'router.catch1', 'http', True, False),
+                  ('other catch', 'request', 'request', 'router.catch49', 'http', True, False),
+                  ('invalid cause', 'request', 'request', 'router.catch1', 'PRIVATE_KIND', True, False),
+                  ('unmarked catch', 'request', 'request', 'router.catch1', 'http', False, False),
+                  ('invalid owner id', ['request'], 'request', 'router.catch1', 'http', True, False)]
+        for label, request_id, catch_id, tag, kind, marker, enriched in shapes:
+            with self.subTest(shape=label):
+                request = {'component': 'robob', 'name': 'turn.robob_call', 'kind': 'perf', 'ok': False,
+                           'ids': {'requestId': request_id}, 'props': {'failureFormat': 'single'},
+                           'error': {'tag': 'control.request_failed', 'name': 'ControlError'}}
+                catch = {'component': 'router', 'name': 'bridge.catch', 'kind': 'error', 'ok': False,
+                         'ids': {'requestId': catch_id}, 'alreadyLogged': marker, 'props': {'causeKind': kind},
+                         'error': {'tag': tag, 'name': 'ControlError'}}
+                (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in [request, catch]))
+                result = toollog.rollup('imessage', self.day)
+                owner = next(row for row in result['topErrorTags'] if row['tag'] == 'control.request_failed')
+                self.assertEqual(owner.get('causeKinds'), {'http': 1} if enriched else None)
+                failures = 1 if marker else 2
+                self.assertEqual(result['failedCount'], failures)
+                self.assertEqual(result['errorRate'], failures / result['total'])
+
+    def test_prompt_probe_outcomes_keep_all_failures_in_error_rate(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        aggregate = {'component': 'router', 'name': 'router.prompt_probes', 'kind': 'perf',
+                     'ts': self.day + 'T12:00:00.000Z', 'promptProbe': {
+                         'calls': 5, 'accepted': 1, 'notAcceptedYet': 1, 'timeout': 1, 'http': 1, 'transport': 1,
+                         'httpByStatus': {'503': 1}, 'elapsedMs': [[0, 2], [5, 1], [15, 1], [10000, 1]],
+                         'attempts': [[2, 1]], 'msUntilAccepted': [[172800000, 1]]}}
+        rows = [aggregate]
+        for name, kind in [('BoundedTimeout', 'timeout'), ('ControlError', 'http'), ('ControlError', 'transport')]:
+            rows.append({'component': 'router', 'name': 'bridge.catch', 'kind': 'error', 'ok': False,
+                         'error': {'tag': 'router.catch1', 'name': name, 'causeKey': 'prompt_acceptance_probe'},
+                         'props': {'causeKind': kind}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        result = toollog.rollup('imessage', self.day)
+        probe = result['promptProbe']
+        self.assertEqual({k: probe[k] for k in ('calls', 'accepted', 'notAcceptedYet', 'timeout', 'http', 'transport')},
+                         {'calls': 5, 'accepted': 1, 'notAcceptedYet': 1, 'timeout': 1, 'http': 1, 'transport': 1})
+        self.assertEqual(probe['httpByStatus'], {'503': 1})
+        self.assertEqual(probe['attempts'], {'count': 1, 'p50': 2, 'p95': 2, 'max': 2})
+        self.assertEqual(probe['msUntilAccepted'], {'count': 1, 'p50': 172800000, 'p95': 172800000, 'max': 172800000})
+        self.assertEqual(probe['byHour']['12']['calls'], 5)
+        self.assertEqual(result['countsByKind']['error'], 3)
+        self.assertEqual(result['errorRate'], 3 / 4)
+        tags = {r['name']: r for r in result['topErrorTags']}
+        self.assertEqual(tags['BoundedTimeout']['causeKinds'], {'timeout': 1})
+        self.assertEqual(tags['ControlError']['causeKinds'], {'http': 1, 'transport': 1})
+        self.assertEqual(tags['ControlError']['count'], 2)
+        # A malformed aggregate cannot erase an independent failure or leak its fields.
+        aggregate['promptProbe']['calls'] = 999
+        aggregate['promptProbe']['httpByStatus']['PRIVATE_TOKEN'] = 1
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual(result['promptProbe']['calls'], 0)
+        self.assertEqual(result['errorRate'], 3 / 4)
+        self.assertNotIn('PRIVATE_TOKEN', json.dumps(result))
+
     def test_probe_causes_show_fourteen_hot_rows_without_recounting_errors(self):
         directory = toollog.board_dir('imessage')
         directory.mkdir(parents=True)

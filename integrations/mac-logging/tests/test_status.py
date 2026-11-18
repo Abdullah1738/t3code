@@ -367,7 +367,8 @@ class StatusTests(unittest.TestCase):
                    diskInventory=dict(scans=0, rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0, scanMs=0),
                    diskWait=dict(runs=0, maxStuckForS=None, latestStuckUnmountMountPoint=None,
                                  busyRuns=0, topBusyComms=[]))
-        self.assertEqual({k: v for k, v in result.items() if k not in ('jobs', 'missingJobs', 'cpuSpikes')}, old)
+        self.assertEqual({k: v for k, v in result.items() if k not in ('jobs', 'missingJobs', 'cpuSpikes', 'diskBudgets')}, old)
+        self.assertEqual(result['diskBudgets'], dict(pathsMeasured=0, topOverBudget=[]))
         self.assertEqual(result['cpuSpikes'], dict(minutes=0, highestLoad=[]))
         health = result['jobs']['backup.run:health']
         self.assertEqual(health['lastSeen'], '2026-11-14T16:00:00.000Z')

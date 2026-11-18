@@ -1,4 +1,8 @@
 """Narrow offline checks for filtering and no-loss cursor/outbox behavior."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import copy
 import datetime as dt
 import importlib.util
@@ -7,7 +11,6 @@ import contextlib
 import hashlib
 import io
 import json
-import os
 from pathlib import Path
 import sqlite3
 import shutil
@@ -33,7 +36,8 @@ class ChargeDryRunReadOnly(unittest.TestCase):
                     item = {'id': 'imsg:dry-charge', 'source': 'imessage', 'sender': 'EmiratesNBD',
                             'subject': '', 'preview': text, 'ts': charged.timestamp()}
                     before = fixtures.data_snapshot(data)
-                    with patch.object(t, 'MONEY_CASES', Path(fixtures.mc.__file__)):
+                    with patch.object(t, 'MONEY_CASES', Path(fixtures.mc.__file__)), \
+                         patch.object(t, 'archive_reads', side_effect=lambda *_: contextlib.nullcontext()):
                         reasons, held, error = t.charge_checks([item], now.timestamp(), dry=True)
                     self.assertIsNone(error)
                     self.assertEqual(held, set())

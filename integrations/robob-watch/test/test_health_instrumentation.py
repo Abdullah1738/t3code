@@ -1,10 +1,13 @@
 """Run real entry points with isolated files and fake external services."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import ast
 import contextlib
 import datetime as dt
 import io
 import json
-import os
 from pathlib import Path
 import shutil
 import site

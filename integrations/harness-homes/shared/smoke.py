@@ -21,7 +21,7 @@ from serve import configure, offload_sync_tools
 HERE = Path(__file__).resolve().parent
 FLIGHTY = Path.home() / ".local/share/flighty-mcp"
 PYTHONS = {"flighty": Path.home() / ".local/share/shared-mcp-flighty/python/bin/python3.12",
-           "inbody": Path("/Volumes/ExternalSSD/inbody-api-mcp/.venv/bin/python")}
+           "inbody": Path.home() / ".local/share/shared-mcp-inbody/python/bin/python"}
 
 
 async def client_tools(url):

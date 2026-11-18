@@ -42,6 +42,7 @@ interface McpGroup {
   savedCounts: Map<string, number>;
   reasonClasses: Map<string, number>;
   invalidFields: Map<string, number>;
+  errorFields: Map<string, number>;
   notFoundReasons: Map<string, number>;
   foundByCounts: Map<string, number>;
   idShapeCounts: Map<string, number>;
@@ -1012,6 +1013,7 @@ export function accumulate(
         savedCounts: new Map(),
         reasonClasses: new Map(),
         invalidFields: new Map(),
+        errorFields: new Map(),
         notFoundReasons: new Map(),
         foundByCounts: new Map(),
         idShapeCounts: new Map(),
@@ -1027,6 +1029,7 @@ export function accumulate(
     increment(group.savedCounts, String(event.saved ?? "n/a"));
     if (event.reasonClass) increment(group.reasonClasses, event.reasonClass);
     if (event.invalidField) increment(group.invalidFields, event.invalidField);
+    for (const field of new Set(event.errorFields ?? [])) increment(group.errorFields, field);
     if (event.props?.notFoundReason !== undefined)
       increment(group.notFoundReasons, event.props.notFoundReason);
     if (event.props?.foundBy !== undefined) increment(group.foundByCounts, event.props.foundBy);
@@ -1427,6 +1430,7 @@ export function finishRollup(
         notFoundReasons: Object.fromEntries(group.notFoundReasons),
         foundByCounts: Object.fromEntries(group.foundByCounts),
         idShapeCounts: Object.fromEntries(group.idShapeCounts),
+        errorFields: Object.fromEntries(group.errorFields),
         errors: [...group.errors.values()],
         ...(retries.get(key) ?? { failedThenRetried: 0, retrySucceeded: 0 }),
       }))

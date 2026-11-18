@@ -63,9 +63,14 @@ class ProbeTests(unittest.TestCase):
 
     def test_finished_batch_with_missing_rows_logs_attempt_cost_once(self):
         root = self.roots([('missing-rows', 128)])[0]
-        for code, stderr, printed in ((0, '', 0), (0, '', 127),
-                                      (0, 'du: child: Permission denied', 127),
-                                      (1, 'du: child: Permission denied', 127)):
+        cases = [(0, '', 0, 'missing-total', 0), (0, '', 127, 'missing-total', 127)]
+        for code in (0, 1):
+            for error in ('Permission denied', 'Input/output error'):
+                cases.append((code, 'du: unknown: '+error, 127, 'exit', 0))
+                cases.append((code, 'du: {missing}: '+error, 127,
+                              None if error == 'Permission denied' else 'missing-total',
+                              128 if error == 'Permission denied' else 127))
+        for code, stderr, printed, failure, completed in cases:
             with self.subTest(code=code, stderr=stderr, printed=printed):
                 cache = {str(p): dict(partial=True, elapsedMs=1) for p in root.iterdir()}
                 metrics = dict(timeouts=0, secondsInTimeouts=0)
@@ -77,21 +82,23 @@ class ProbeTests(unittest.TestCase):
                 def run(command, **kwargs):
                     self.assertEqual(len(command)-2, 128)
                     self.clock[0] += 2
-                    return SimpleNamespace(returncode=code, stderr=stderr,
+                    return SimpleNamespace(returncode=code, stderr=stderr.format(missing=command[-1]),
                         stdout=''.join('1\t'+key+'\n' for key in command[2:2+printed]))
                 with patch.object(jobs.resource, 'getrusage', side_effect=usage):
                     _, status, _ = jobs.big_root_inventory(root, run, self.clock[0]+1000,
                         cache, deep=True, max_batches=1, metrics=metrics)
                 events = [r for r in self.rows('disk.inventory.source')[before:] if 'cpuS' in r['props']]
                 self.assertEqual(len(events), 1)
-                self.assertEqual(events[0]['props']['failure'], 'missing-total')
-                self.assertEqual(events[0]['props']['allowanceS'], 60)
+                self.assertEqual(events[0]['props'].get('failure'), failure)
+                if failure:
+                    self.assertEqual(events[0]['props']['allowanceS'], 60)
                 self.assertEqual(events[0]['props']['elapsedMs'], 2000)
                 self.assertEqual(events[0]['props']['cpuS'], .5)
                 self.assertEqual(metrics['cpuSecondsDu'], .5)
                 self.assertEqual(metrics['wallSecondsDu'], 2)
-                self.assertEqual(status['completedCount'], printed)
+                self.assertEqual(status['completedCount'], completed)
                 self.assertTrue(status['partial'])
+                self.assertEqual(status['completeWithDenied'], failure is None)
 
     def test_known_cost_short_attempt_gets_only_one_retry_per_pass(self):
         root = self.roots([('one-retry', 1)])[0]
@@ -212,13 +219,30 @@ class ProbeTests(unittest.TestCase):
         jobs.big_root_inventory(root, self.runner(lambda p: 20, calls), 200, cache)
         self.assertEqual(calls[-1][1], 60)
         self.assertEqual(cache[key]['elapsedMs'], 20000)
-        self.clock[0] += 90000
-        def denied(cmd, **kwargs):
-            self.clock[0] += 2
-            return SimpleNamespace(returncode=1, stdout='1\t'+key+'\n', stderr='du: Permission denied')
-        jobs.big_root_inventory(root, denied, self.clock[0]+200, cache)
-        self.assertEqual(cache[key]['elapsedMs'], 20000)
-        self.assertTrue(cache[key]['partial'])
+
+    def test_refresh_result_class_preserves_successful_cost_or_denied_estimate(self):
+        root = self.roots([('refresh-results', 1)])[0]
+        key = str(root/'0000')
+        cases = [('denied-total', 1, True, 'Permission denied', 2000, False, True, 1024),
+                 ('denied-empty', 1, False, 'Permission denied', None, False, True, 0),
+                 ('io-total', 1, True, 'Input/output error', 20000, True, False, 1024),
+                 ('io-empty', 1, False, 'Input/output error', 20000, True, False, 1024),
+                 ('other-exit', 2, True, '', 20000, True, False, 1024)]
+        for label, code, total, error, cost, partial, estimate, size in cases:
+            with self.subTest(label=label):
+                cache = {key: dict(bytes=1024, at=self.now+self.clock[0]-90000,
+                                   partial=False, elapsedMs=20000)}
+                def run(cmd, **kwargs):
+                    self.clock[0] += 2
+                    return SimpleNamespace(returncode=code, stdout='1\t'+key+'\n' if total else '',
+                                           stderr='du: '+key+': '+error if error else '')
+                _, status, _ = jobs.big_root_inventory(root, run, self.clock[0]+200, cache)
+                self.assertEqual(cache[key].get('elapsedMs'), cost)
+                self.assertEqual(cache[key]['lastAttemptMs'], 2000)
+                self.assertEqual(cache[key]['partial'], partial)
+                self.assertEqual(bool(cache[key].get('estimate')), estimate)
+                self.assertEqual(status['completeWithDenied'], estimate)
+                self.assertEqual(cache[key]['bytes'], size)
 
     def test_probe_logs_and_total_timeout_metrics_survive_allowlist(self):
         root = self.roots([('metrics', 1)])[0]
