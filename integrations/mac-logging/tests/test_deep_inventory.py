@@ -281,8 +281,10 @@ class DeepInventoryTests(unittest.TestCase):
         root = self.roots([('free-lock', 1)])[0]
         with patch.object(jobs.time, 'sleep', side_effect=AssertionError('unexpected lock wait')):
             deep.run_pass([root], self.runner(lambda p: .25), budget=1)
-            with held_inventory_lock():
-                jobs.directory_inventory([root], lambda *a, **k: self.fail('locked hourly du'))
+        # subprocess teardown may sleep while reaping the lock holder.
+        with held_inventory_lock(), \
+             patch.object(jobs.time, 'sleep', side_effect=AssertionError('unexpected lock wait')):
+            jobs.directory_inventory([root], lambda *a, **k: self.fail('locked hourly du'))
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['lockWaitMs'], 0)
         self.assertFalse(self.rows('disk.deep.lock_wait'))
         hourly = self.rows('disk.inventory')[-1]['props']
