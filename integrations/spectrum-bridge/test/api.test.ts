@@ -366,3 +366,15 @@ test("send and wake HTTP errors include the actual message length and limit", as
   }
   expect(h.store.pendingOutbox()).toEqual([]);
 });
+
+test("health exposes only scalar active roster counters", async () => {
+  const f = setup();
+  f.state.health.activeRoster = { fetches: 5, safety: 4, startup: 1, children: 2, rows: 9, total: 9,
+    streamHealthy: true, streamUp: 1, streamDown: 0, lastFetchAt: now, lastFetchReason: "safety", complete: true,
+    retryAt: 0, fetchMsP50: 15, fetchMsMax: 30, threads: ["PRIVATE_THREAD"], token: "PRIVATE_TOKEN" };
+  const result = await (await f.get("/health")).json();
+  expect(result.activeRoster).toEqual({ fetches: 5, safety: 4, startup: 1, children: 2, rows: 9, total: 9,
+    streamHealthy: true, streamUp: 1, streamDown: 0, lastFetchAt: now, lastFetchReason: "safety", complete: true,
+    retryAt: 0, fetchMsP50: 15, fetchMsMax: 30 });
+  expect(JSON.stringify(result)).not.toContain("PRIVATE_");
+});

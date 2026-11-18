@@ -2654,6 +2654,16 @@ export class Router {
    */
   private async statusesFor(route: Pick<Route, "id" | "directory">): Promise<Record<string, SessionStatus>> {
     const busy = this.backend.sessionBusy;
+    if (this.options.context && this.backend.activeStatuses && busy) {
+      const revision = this.statusRevision;
+      const own = await this.reading(busy.call(this.backend, route.id, route.directory));
+      const statuses = this.backend.activeStatuses();
+      if (revision === this.statusRevision) this.listed = { at: Date.now(), statuses };
+      const current = { ...statuses };
+      delete current[route.id];
+      if (own) current[route.id] = { type: "busy", root: null };
+      return current;
+    }
     if (!this.options.context || !busy) return this.reading(this.backend.statuses());
     if (!this.listing && (!this.listed || Date.now() - this.listed.at >= STATUS_LIST_MS)) {
       const revision = this.statusRevision;
