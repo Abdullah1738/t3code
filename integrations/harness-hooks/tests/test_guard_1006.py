@@ -291,8 +291,8 @@ class Reporter1006Tests(unittest.TestCase):
                 result = reporters.engine.decide(self.event(command), 'codex')
                 self.assertEqual(result['context']['rule'], SCRIPT)
                 self.assertEqual('vp test run' in result['reason'], test_mode)
-        for command, token in [('python3 "$UNKNOWN_SCRIPT"', '$UNKNOWN_SCRIPT'),
-                               ('cd "$UNKNOWN" && python3 relative.py', 'relative.py')]:
+        for command, token in [('python3 -I "$UNKNOWN_SCRIPT"', '$UNKNOWN_SCRIPT'),
+                               ('cd "$UNKNOWN" && python3 -I relative.py', 'relative.py')]:
             result = reporters.engine.decide(self.event(command), 'codex')
             reason = result['reason']
             self.assertIn(token, reason)

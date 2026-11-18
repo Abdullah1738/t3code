@@ -6,6 +6,7 @@ import { writeFile, readFile, rename, unlink } from "node:fs/promises";
 import { logDirectory } from "./log-directory.ts";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { createMessageReadAggregation } from "./log-message-reads.ts";
 import { cleanCalls, createCallAggregation, SLOW_CALL_MS, type CallSummary } from "./log-calls.ts";
 import { cleanRobobLink, createRobobLinkState, createRobobLinkAggregation, type RobobLink } from "./log-robob-link.ts";
 import { summarizeLog } from "./log-rollup.ts";
@@ -30,8 +31,10 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId", "requestId", "serverRequestId", "outageId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews"]);
 const ENUMS: Record<string, readonly string[]> = {
+  readMode: ["full", "incremental", "cached-skip", "shared"],
+  fullReason: ["first-read", "route-change", "missing-until", "resync", "merge-conflict", "clock-skew"],
   state: ["pending", "admitted", "processing", "batched", "done", "failed", "unknown", "cancelled", "observed"],
   action: ["requeued", "in_turn"], leaderKind: ["human", "wake", "reset", "background", "none"],
   telegram: ["sent", "failed"], severity: ["warn"],
@@ -141,6 +144,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   let rolledYesterday = "";
   let recovery: Promise<void> | undefined;
   const calls = createCallAggregation(processRunId);
+  const messageReads = createMessageReadAggregation();
   const robobLink = createRobobLinkState();
   const renders = createRenderAggregation();
   let writeFailed = false;
@@ -211,7 +215,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       }
       const link = robobLink.accept(line);
       for (const event of link.events) enqueue(event);
-      for (const render of renders.accept(line)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
+      for (const messageRead of messageReads.accept(line)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
       if (["turn.start", "reply.sent", "inbound.answered"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
         refreshChains(`${line.ids.chat}\0${line.ids.inboundId}`);
@@ -311,6 +315,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   }
   function flushAll(): boolean {
     capture(() => { for (const line of robobLink.flush(now)) enqueue(line); });
+    for (const line of messageReads.flush()) enqueue(line);
     for (const line of renders.flush()) enqueue(line);
     for (const line of calls.flush()) enqueue(line);
     flush();
@@ -397,6 +402,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   async function tick(): Promise<void> {
     try {
       const at = now();
+      for (const line of messageReads.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       if (rolling) { await settled(); return; }
       const hour = Math.floor(at / 3_600_000);
       const hourly = hour !== rolledHour;

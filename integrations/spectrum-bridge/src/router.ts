@@ -867,7 +867,7 @@ export class Router {
 
   tick(): Promise<void> {
     const turn = this.store.get<Turn | null>("activeTurn");
-    return this.ticking ??= timeTick({ chat: this.options.context?.chat.slug ?? "owner", ...(turn ? { threadId: turn.id } : {}) }, () => this.run())
+    return this.ticking ??= timeTick({ chat: this.options.context?.chat.slug ?? "owner", ...(turn ? { threadId: turn.id } : {}) }, () => this.backend.messageReadScope ? this.backend.messageReadScope(() => this.run()) : this.run())
       .finally(() => { this.ticking = undefined; });
   }
 

@@ -273,6 +273,16 @@ def close_browser_candidates(st):
         audit({"ts": int(time.time()), "event": "agent_browser_close", **entry})
 
 
+def stop_xcode_candidates(st):
+    report = st.get("processes", {}).get("xcode_builds")
+    if report is None:
+        return
+    report["actions"] = leftover_processes.stop_xcode_builds(
+        report, rescan=lambda: leftover_processes.scan_xcode_builds(active_sessions.checked_snapshot(), keep_list()))
+    for entry in report["actions"]:
+        audit({"ts": int(time.time()), "event": "xcode_build_stop", **entry})
+
+
 def audit(entry):
     os.makedirs(LOG_DIR, exist_ok=True)
     with open(AUDIT, "a") as f:
