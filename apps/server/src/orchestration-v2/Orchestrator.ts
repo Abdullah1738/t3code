@@ -5757,18 +5757,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (
         !dispatchMode.activeTurnOnly &&
         target !== undefined &&
-        (target.status === "completed" ||
-          ((target.status === "running" || target.status === "waiting") &&
-            turn !== undefined &&
-            turn.status === "completed"))
+        (target.status !== "running" ||
+          turn?.status !== "running" ||
+          (yield* stopReachedRun(command, command.threadId, target.id)))
       ) {
-        dispatchMode = { type: "start_immediately" };
+        dispatchMode = { type: "queue_after_active" };
       }
     }
     // Stop leaves the run reading as running until its provider stops. A plain
     // send in that window queues behind the stopped queue instead of steering
     // text the agent never receives, and like any user send it releases the
-    // hold; an explicit steer or restart still fails below.
+    // hold; an explicit restart still fails below.
     if (
       command.deliveryIntent === "auto" &&
       (dispatchMode.type === "restart_active" ||
@@ -6018,7 +6017,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       dispatchMode.type === "start_immediately" ||
       dispatchMode.type === "queue_after_active";
     const shouldQueue = queueBehindRun !== undefined && startsOrQueuesRun;
-    // A message the user sends from a client means they are back, so the
+    // A message from a person means they are back, so the
     // queue a stop or a restart held runs again, in its order, rather than
     // waiting for a Resume.
     // Continuations and scheduled tasks the server sends for them are not
@@ -6033,12 +6032,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           (run.status === "failed" || run.status === "interrupted") &&
           run.workspacePreparation?.type === "worktree",
       );
-    const sentByUserFromClient =
-      command.createdBy === "user" &&
-      (command.creationSource === "web" || command.creationSource === "mobile") &&
-      command.scheduledTaskId === undefined;
+    const sentByPerson = countsAsUserTurn(command) && command.scheduledTaskId === undefined;
     const heldRunsToRelease =
-      sentByUserFromClient && startsOrQueuesRun && !worktreeSetupUnresolved
+      sentByPerson && startsOrQueuesRun && !worktreeSetupUnresolved
         ? projection.runs.filter((run) => run.status === "queued" && run.queueHeld === true)
         : [];
     const releasedAt = yield* DateTime.now;
@@ -6160,10 +6156,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
       // Fresh work follows the active run, even when an unrelated older queue
       // is held. Its Stop receipt still owns late arrivals from every source.
-      // Client sends explicitly resume the queue above.
+      // A person's send explicitly resumes the queue above.
       const activeRunWork =
         activeRun !== undefined &&
-        ((!sentByUserFromClient && !worktreeSetupUnresolved) ||
+        ((!sentByPerson && !worktreeSetupUnresolved) ||
           (command.createdBy === "agent" && command.creationSource === "provider") ||
           command.contextReset === true);
       const stoppedBeforeWork =
