@@ -227,8 +227,9 @@ def _incremental(db, api, acct, since, names, stats, stop):
         token = page.get("nextPageToken")
         if not token:
             break
-    known = store.known_ext_ids(db, "email", acct)
-    new = [m for m in dict.fromkeys(added) if m not in known and m not in deleted]
+    candidates = dict.fromkeys(added)
+    known = store.existing_ext_ids(db, "email", acct, candidates)
+    new = [m for m in candidates if m not in known and m not in deleted]
     if not _fetch_many(db, api, acct, new, names, stats, stop):
         return None
     store.reconcile(db, "email", acct, back={m for m in added if m in known and m not in deleted})

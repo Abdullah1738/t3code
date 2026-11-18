@@ -114,12 +114,6 @@ const make = Effect.gen(function* () {
   const startup = yield* Effect.serviceOption(StartupPhaseLog.StartupPhaseLog);
   const bootId = Option.isSome(startup) ? startup.value.snapshot().bootId : undefined;
   const scope = yield* Effect.scope;
-  // Keep CPU intervals short even when durable retries back off to a minute.
-  yield* Effect.sleep("10 seconds").pipe(
-    Effect.andThen(Effect.sync(load)),
-    Effect.forever,
-    Effect.forkScoped,
-  );
   const mutex = yield* Semaphore.make(1);
   let changed = yield* Deferred.make<void>();
   const settingsMutex = yield* Semaphore.make(1);
@@ -186,6 +180,13 @@ const make = Effect.gen(function* () {
     | undefined;
   let activeCheckedAt: number | undefined;
   const runSources = new Map<string, RestartSource & { admitted?: boolean; hold?: LoadHold }>();
+  const updateLoadHolds = (now: number, loaded: boolean) => {
+    for (const entry of pending.values()) {
+      if (entry.wasLoaded) entry.loadHoldMs += Math.max(0, now - entry.checkedAt);
+      entry.checkedAt = now;
+      entry.wasLoaded = loaded;
+    }
+  };
   const key = (source: RestartSource) => `${source.threadId}:${source.sourceRunId}`;
   const recordAdmission = Effect.fn("RestartPacing.recordAdmission")(function* (
     source: RestartSource,
@@ -300,6 +301,32 @@ const make = Effect.gen(function* () {
     }
     yield* Deferred.succeed(changed, undefined);
   });
+  // Keep CPU intervals short and wake load-held heads independently of durable retries.
+  yield* Effect.sleep(PASS_MS).pipe(
+    Effect.andThen(
+      mutex.withPermits(1)(
+        Effect.gen(function* () {
+          const now = yield* Clock.currentTimeMillis;
+          const loadScore = load();
+          const loaded = loadScore > 1;
+          const loadSample = load.snapshot?.();
+          updateLoadHolds(now, loaded);
+          if (pass !== undefined) {
+            const loadChanged = pass.loaded !== loaded;
+            pass = {
+              ...pass,
+              loaded,
+              loadScore,
+              ...(loadSample === undefined ? {} : { loadSample }),
+            };
+            if (loadChanged) yield* queueChanged;
+          }
+        }),
+      ),
+    ),
+    Effect.forever,
+    Effect.forkScoped,
+  );
   // Called only under the pacing mutex; the enclosing operation owns tracing.
   const releaseReservation = (source: RestartSource, now: number, retrying = false) => {
     const reservation = active.get(key(source));
@@ -333,7 +360,16 @@ const make = Effect.gen(function* () {
       if (retrying) runSources.set(runKey, { ...source, admitted: false });
       else runSources.delete(runKey);
     },
-    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged))),
+    (effect, threadId, runId, effectId) =>
+      Effect.suspend(() => {
+        // Fresh starts own no reservation. Their finalizers must not queue
+        // behind recovery admission's projection reads and occupy start workers.
+        const source = runSources.get(`${threadId}:${runId}`);
+        if (source === undefined || source.effectId !== effectId || !source.admitted)
+          return Effect.void;
+        // Re-read ownership under the mutex before changing a reservation.
+        return mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged)));
+      }),
   );
   // Keep allocation/transfer and its finalizer metadata in the same mutex turn.
   const ownRunReservation = (source: RestartSource, runId: RunId) => {
@@ -507,11 +543,12 @@ const make = Effect.gen(function* () {
           ...(loadSample === undefined ? {} : { loadSample }),
         };
       }
+      const { config, loaded } = pass;
       if (activeCheckedAt === undefined || now - activeCheckedAt >= PASS_MS) {
-        if (active.size >= pass.config.maxActive && now - lastProgressAt >= STUCK_MS) {
+        if (active.size >= config.maxActive && now - lastProgressAt >= STUCK_MS) {
           yield* Effect.logWarning("restart-pacing.stuck", {
             idleMs: now - lastProgressAt,
-            maxActive: pass.config.maxActive,
+            maxActive: config.maxActive,
             holders: [...active.values()].map((holder) => ({
               ...holder.source,
               dispatching: holder.dispatching,
@@ -551,15 +588,10 @@ const make = Effect.gen(function* () {
         }
         activeCheckedAt = now;
       }
-      const { config, loaded } = pass;
       const queue = [...pending.values()];
       const spacing =
         lastStartAt === undefined ? 0 : Math.max(0, config.spacingMs - (now - lastStartAt));
-      for (const entry of queue) {
-        if (entry.wasLoaded) entry.loadHoldMs += Math.max(0, now - entry.checkedAt);
-        entry.checkedAt = now;
-        entry.wasLoaded = loaded;
-      }
+      updateLoadHolds(now, loaded);
       // A new load-held arrival must not starve waiters whose load budget is spent.
       queue.sort(
         (a, b) =>

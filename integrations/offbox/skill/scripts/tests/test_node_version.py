@@ -562,7 +562,7 @@ class BlockRunTests(unittest.TestCase):
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                     patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', '.', cmd_argv or ['node --version'], None, 'run-test',
-                                            steps=steps, node=blk)
+                                            steps=steps, node=blk, repo_root=repo)
             bindir = Path(home) / 'bin'
             bindir.mkdir()
             curl = bindir / 'curl'
@@ -1131,6 +1131,8 @@ class NodeHistoryTests(unittest.TestCase):
                             case.history.side_effect = changing_history
                             with patch.object(api, 'BACKEND', 'server'):
                                 self.assertIn(misc._catch_up_log(case.row(), live=live), ('complete', 'caught_up'))
+                                if live:
+                                    self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'], facts)
                                 case.state('done', 0)
                                 case.streams(b'', raw, page=37)
                                 ordinary = case.history.side_effect
@@ -1397,6 +1399,7 @@ class NodeHistoryTests(unittest.TestCase):
                                 case.streams(b'', stderr, page=37)
                                 with patch.object(misc, '_refresh_running_ttl'), patch.object(api, 'BACKEND', 'server'):
                                     self.assertEqual(case.invoke()[0], 0)
+                                    self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'], facts)
                                     case.state('done', 0)
                                     self.assertEqual(case.invoke(wait=True)[0], 0)
                             else:

@@ -9,7 +9,7 @@ export type ErrorDetail = {
 const NAMES = new Set([
   "Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError", "EvalError", "AggregateError",
   "IMessageError", "APIError", "FetchError", "HTTPError", "NetworkError", "ZodError",
-  "AbortError", "TimeoutError", "SystemError", "SQLiteError", "SqliteError", "DOMException",
+  "AbortError", "TimeoutError", "BoundedTimeout", "SystemError", "SQLiteError", "SqliteError", "DOMException",
   "JudgeError", "TransportError", "PublishError", "CliError", "SttError", "SecretError", "ShareError",
   "HttpError", "ApiError", "ControlError", "LineError", "SendblueError", "ValidationError", "UnknownError",
 ]);
@@ -33,7 +33,7 @@ const SYSTEM_CODES = new Set([
   "preconditionFailed", "operationNotSupported", "attachmentNotReady", "privateApiUnavailable",
   "serviceUnavailable", "timeout", "internalError", "databaseError", "networkError",
   "invalidServerUrl", "emptyAudio", "audioTooLarge", "keyUnavailable", "conversionFailed", "invalidResponse",
-  "jevFailed", "upload_url", "upload_failed",
+  "jevFailed", "upload_url", "upload_failed", "unavailable", "internal", "not_found", "conflict", "invalid_request", "forbidden",
   "SQLITE_ERROR", "SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_READONLY", "SQLITE_CANTOPEN", "SQLITE_CONSTRAINT",
 ]);
 // Bun exposes fixed HTTP error names as well as Node errno codes. Never accept arbitrary PascalCase strings.
@@ -53,7 +53,7 @@ RedirectURLTooLong RedirectURLInvalid InvalidRedirectURL UnexpectedRedirect Shor
 HTTP3ProtocolError HTTP3HeaderEncodingError DNSResolutionFailed HTTP3StreamReset HTTP3ContentLengthMismatch FailedToOpenSocket
 InvalidCRL UnsupportedProxyProtocol UnsupportedProtocol ProxyConnectFailed TLSHandshakeFailed`.split(/\s+/));
 // Stack strings can be provider-controlled. Only code-owned filenames/modules may survive.
-const SOURCE_FILES = new Set(`access.ts api.ts apps.ts backend.ts card-preview.ts card-text.ts chats.ts cli.ts commands.ts config.ts
+const SOURCE_FILES = new Set(`bounded.ts prompt-probe.ts log-prompt-probes.ts access.ts api.ts apps.ts backend.ts card-preview.ts card-text.ts chats.ts cli.ts commands.ts config.ts
 control.ts delivery.ts formatting.ts group-gate.ts group-judge.ts guest-calendar.ts guest-desk.ts guest-evidence.ts
 guest-flight.ts guest-providers.ts guest-responder.ts guests.ts inbound-failure.ts inbound-files.ts ingress.ts line.ts
 local-attachments.ts lock.ts log-calls.ts log-directory.ts log-error.ts log-rollup.ts main.ts meds-fold.ts openchamber.ts opencode-steps.ts

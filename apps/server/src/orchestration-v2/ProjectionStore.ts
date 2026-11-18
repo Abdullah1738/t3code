@@ -380,13 +380,17 @@ export interface ProjectionRecordFilter {
   readonly messageRunIds?: ReadonlyArray<RunId>;
   readonly turnItemRunIds?: ReadonlyArray<RunId | null>;
   readonly runIds?: ReadonlyArray<RunId>;
+  readonly restartCleanupSessionId?: ProviderSessionId;
   /** ardud: unfinished runs plus the newest N, instead of every run the thread ever had. */
   readonly recentRunLimit?: number;
   /** A single newest run, including when older runs are unfinished. */
   readonly latestRunOnly?: boolean;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
   readonly recentTurnItemLimit?: number;
+  readonly turnItemOrder?: "completion";
   readonly turnItemStatuses?: ReadonlyArray<OrchestrationV2TurnItem["status"]>;
+  /** Cleanup can retain partial output without ever receiving a tool result. */
+  readonly toolResultsOnly?: boolean;
   readonly omitSettledLeafNodes?: boolean;
 }
 
@@ -2352,6 +2356,28 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
   ProjectionStoreV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const threadReadIndexes = yield* Ref.make(
+      // Offline maintenance attaches the archive after constructing this layer.
+      yield* readThreadIndexAvailability(sql).pipe(
+        NodeSqliteClient.readOnly,
+        NodeSqliteClient.foregroundReads,
+        Effect.orElseSucceed(() => ({ main: false, ardud_archive: false })),
+      ),
+    );
+    const getThreadReadIndexes = Effect.fn("ProjectionStore.getThreadReadIndexes")(function* () {
+      const cached = yield* Ref.get(threadReadIndexes);
+      const inTransaction = yield* Effect.serviceOption(sql.transactionService);
+      if (cached.main && cached.ardud_archive && inTransaction._tag === "None") return cached;
+      const available = yield* readThreadIndexAvailability(sql);
+      // Maintenance only adds committed indexes. An older concurrent probe must
+      // not undo another page's observation that a schema finished building.
+      yield* Ref.update(threadReadIndexes, (current) => ({
+        main: current.main || available.main,
+        ardud_archive: current.ardud_archive || available.ardud_archive,
+      }));
+      // A caller's existing transaction may predate another reader's promotion.
+      return available;
+    });
     const speedups = yield* Switches;
     const lookupMigration = yield* ShellRunLookupMigration;
     // ardud: the writer connection is synchronous on the main thread, so a scan there
@@ -3661,12 +3687,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 WHERE thread_id = ${threadId}
                   ${filter?.turnItemTypes === undefined ? sql`` : sql`AND type IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemTypes)}))`}
                   ${filter?.turnItemStatuses === undefined ? sql`` : sql`AND status IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemStatuses)}))`}
+                  ${filter?.toolResultsOnly !== true ? sql`` : sql`AND type IN ('command_execution', 'dynamic_tool') AND COALESCE(json_extract(payload_json, '$.toolResultIncomplete'), 0) = 0 AND (status = 'completed' OR (status = 'failed' AND json_type(payload_json, '$.toolResultIncomplete') = 'false') OR json_type(payload_json, '$.output') IS NOT NULL OR json_type(payload_json, '$.exitCode') IS NOT NULL)`}
                   ${filter?.turnItemRunId === undefined ? sql`` : sql`AND run_id = ${filter.turnItemRunId}`}
                   ${filter?.turnItemRunIds === undefined ? sql`` : sql`AND (run_id IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemRunIds.filter((id): id is RunId => id !== null))})) OR (${filter.turnItemRunIds.includes(null) ? 1 : 0} = 1 AND run_id IS NULL))`}
                 ${
                   filter?.recentTurnItemLimit === undefined
                     ? sql`ORDER BY ordinal ASC, turn_item_id ASC`
-                    : sql`ORDER BY ordinal DESC, turn_item_id DESC LIMIT ${Math.max(1, Math.min(200, Math.floor(filter.recentTurnItemLimit)))}`
+                    : sql`ORDER BY ${filter.turnItemOrder === "completion" ? sql`COALESCE(json_extract(payload_json, '$.completedAt'), updated_at) DESC,` : sql``} ordinal DESC, turn_item_id DESC LIMIT ${Math.max(1, Math.min(200, Math.floor(filter.recentTurnItemLimit)))}`
                 }
               `
               : yield* sql<PayloadRow>`
@@ -3788,6 +3815,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             FROM orchestration_v2_projection_runs ${filter?.unfinishedRunsOnly ? sql`INDEXED BY orchestration_v2_projection_runs_recovery_idx` : sql``}
             WHERE thread_id = ${threadId}
               ${filter?.unfinishedRunsOnly ? sql`AND status IN ('queued','preparing','starting','running','waiting')` : sql``}
+              ${
+                filter?.restartCleanupSessionId === undefined
+                  ? sql``
+                  : sql`AND json_extract(payload_json, '$.providerRestartCleanup.providerSessionId') = ${filter.restartCleanupSessionId}`
+              }
               ${
                 filter?.runIds === undefined
                   ? sql``
@@ -6490,8 +6522,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const readLocalTimelinePage = Effect.fn("ProjectionStore.readLocalTimelinePage")(function* (
       threadId: ThreadId,
       options: ProjectionTimelinePageOptions,
+      readIndexes: { main: boolean; ardud_archive: boolean },
     ) {
-      const readIndexes = yield* readThreadIndexAvailability(sql);
       // Stream global positions before filtering messages, stopping at the lookahead.
       // Sorting this numbered stream or reusing it for totals would exhaust the history.
       const rows = yield* sql<{
@@ -6550,13 +6582,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       return { items, totalItems: rows[0]?.total_items ?? 0, hasMore: page.length > options.limit };
     });
 
-    const getTimelinePage: ProjectionStoreV2Shape["getTimelinePage"] = (threadId, options) =>
-      sql
-        .withTransaction(
+    const getTimelinePage: ProjectionStoreV2Shape["getTimelinePage"] = Effect.fn(
+      "ProjectionStore.getTimelinePage",
+    )(
+      function* (threadId: ThreadId, options: ProjectionTimelinePageOptions) {
+        // Freeze index hints before opening this page's WAL snapshot. Maintenance
+        // may finish and another reader may promote the cache while it is open.
+        const readIndexes = yield* getThreadReadIndexes();
+        return yield* sql.withTransaction(
           Effect.gen(function* () {
             const records = yield* getThreadRecords(threadId, []);
             if (records.thread.forkedFrom?.type !== "run")
-              return yield* readLocalTimelinePage(threadId, options);
+              return yield* readLocalTimelinePage(threadId, options, readIndexes);
             const index = yield* readTimelineIndex(threadId, new Set());
             const matching = index.visible
               .map((row, position) => ({ ...row, position }))
@@ -6608,14 +6645,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               hasMore: matching.length > page.length,
             };
           }),
-        )
-        .pipe(
+        );
+      },
+      (effect, threadId) =>
+        effect.pipe(
           Effect.mapError((cause) =>
             isProjectionStoreThreadNotFoundError(cause) || isProjectionStoreReadError(cause)
               ? cause
               : new ProjectionStoreReadError({ threadId, cause }),
           ),
-        );
+        ),
+    );
 
     const getThreadSnapshotWindow: ProjectionStoreV2Shape["getThreadSnapshotWindow"] = (
       threadId,
@@ -8383,6 +8423,9 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               (row) =>
                 (!filter?.latestRunOnly || row.id === newest?.id) &&
                 (!filter?.currentRunOnly || row.id === current?.id) &&
+                (filter?.restartCleanupSessionId === undefined ||
+                  row.providerRestartCleanup?.providerSessionId ===
+                    filter.restartCleanupSessionId) &&
                 (!filter?.unfinishedRunsOnly || UNFINISHED_RUN_STATUSES.has(row.status)),
             ),
             runtimeRequests: projection.runtimeRequests.filter(
@@ -8397,7 +8440,20 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                     filter.turnItemTypes.includes(row.type)) &&
                   (filter?.turnItemStatuses === undefined ||
                     filter.turnItemStatuses.includes(row.status)) &&
+                  (filter?.toolResultsOnly !== true ||
+                    ((row.type === "command_execution" || row.type === "dynamic_tool") &&
+                      row.toolResultIncomplete !== true &&
+                      (row.status === "completed" ||
+                        (row.status === "failed" && row.toolResultIncomplete === false) ||
+                        row.output !== undefined ||
+                        (row.type === "command_execution" && row.exitCode !== undefined)))) &&
                   (filter?.turnItemRunId === undefined || filter.turnItemRunId === row.runId),
+              )
+              .toSorted((a, b) =>
+                filter?.turnItemOrder === "completion"
+                  ? DateTime.toEpochMillis(a.completedAt ?? a.updatedAt) -
+                      DateTime.toEpochMillis(b.completedAt ?? b.updatedAt) || a.ordinal - b.ordinal
+                  : a.ordinal - b.ordinal,
               )
               .slice(
                 filter?.recentTurnItemLimit === undefined

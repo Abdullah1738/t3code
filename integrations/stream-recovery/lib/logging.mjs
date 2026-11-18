@@ -1,8 +1,11 @@
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const { emit, observed, failure = () => ({}), tagFailurePhase = error => error } = await import('../../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
-export { emit, observed, failure };
+const { emit, observed, failure = () => ({}), tagFailurePhase = error => error,
+  tagConnectionFailure = error => error, recordConnectionFailure = () => {}, errorScan = work => work(),
+  connectionWebSocket = (url, options) => new WebSocket(url, options),
+} = await import('../../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
+export { emit, observed, failure, tagConnectionFailure, recordConnectionFailure, connectionWebSocket };
 
 export function deferThread(io, threadId, error) {
   if (error?.code !== 'REPLICA_BEHIND_THREAD') return false;
@@ -22,6 +25,9 @@ const phases = new Set(['acquireLock', 'loadState', 'saveState', 'openDb', 'serv
   'ocSession', 'ocMessages', 'ocForms', 'ocPermissions', 'ocTail', 'ocChildren', 'ocInterrupt', 'telegram']);
 
 export async function timedScan(name, io, work) {
+  return errorScan(() => timedScanImpl(name, io, work));
+}
+async function timedScanImpl(name, io, work) {
   const totals = new Map(), timed = { ...io };
   const deferred = new Set();
   const props = { deferredThreads:0, maxThreadAheadMs:'unknown', longestSyncMs:0 };
@@ -50,13 +56,18 @@ export async function timedScan(name, io, work) {
           props.longestSyncMs = Math.round(ms);
         }
       };
+      const failed = error => {
+        tagFailurePhase(error, key);
+        recordConnectionFailure('stream-recovery', `${name}.scan`, error);
+        return error;
+      };
       try {
         const result = io[key](...args);
         if (result && typeof result.then === 'function') return result.then(
-          value => { finish(); return value; }, error => { finish(true); throw tagFailurePhase(error, key); });
+          value => { finish(); return value; }, error => { finish(true); throw failed(error); });
         finish(false, true);
         return result;
-      } catch (error) { finish(true, true); throw tagFailurePhase(error, key); }
+      } catch (error) { finish(true, true); throw failed(error); }
     };
   }
   try { return await observed('stream-recovery', `${name}.scan`, async () => {
@@ -98,7 +109,7 @@ export function recoveryIo(io) {
     const value = io[key];
     if (typeof value !== 'function' || wrapped.has(value)) continue;
     const work = (...args) => {
-      if (key !== 'telegram') return observed('stream-recovery', `recovery.${key}`, () => value.apply(io, args));
+      if (key !== 'telegram') return observed('stream-recovery', `recovery.${key}`, () => value.apply(io, args), {props:{step:key}});
       const start = performance.now();
       try {
         const reply = value.apply(io, args);

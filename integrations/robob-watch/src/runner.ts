@@ -11,7 +11,7 @@ import {
   heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
-import { CheckSlots, checkSlotCap, checkTimeout, hostLoad, isMounted, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH, type SlotTiming } from "./host.ts";
+import { CheckSlots, checkLane, checkSlotCap, checkTimeout, hostLoad, isMounted, LoadMode, LOAD_DWELL_MS, LOAD_LOW, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH, type SlotTiming } from "./host.ts";
 
 // A 1s tick costs a few stats and JSON reads per watcher; it lets trigger files and short intervals act fast.
 const TICK_MS = 1_000;
@@ -20,15 +20,25 @@ const TRIGGER_MIN_GAP_MS = 2_000;
 const running = new Set<string>();
 let maintenance: Maintenance | undefined;
 let ssdMounted = true;
-let highLoad = false;
+const loadMode = new LoadMode();
+let loadAccountedAt: number | undefined;
+const cadence = new Map<string, string>();
 function sampleLoad(): number {
-  const load = hostLoad();
-  const high = load >= LOAD_HIGH;
-  if (high !== highLoad) log(null, `host load mode ${high ? "started" : "ended"}: ${load.toFixed(1)}/core, slots=${checkSlotCap(load)}`);
-  highLoad = high;
+  const load = hostLoad(), at = now(), wasHigh = loadMode.high;
+  const high = loadMode.sample(load, at);
+  if (loadAccountedAt !== undefined && (!high || at - loadAccountedAt >= 60_000)) {
+    toolLog({ component: "runner", kind: "perf", name: "host.load_time", durationMs: Math.max(0, at - loadAccountedAt) });
+    loadAccountedAt = high ? at : undefined;
+  }
+  if (high !== wasHigh) {
+    log(null, `host load mode ${high ? "started" : "ended"}: ${load.toFixed(2)}/core, high=${LOAD_HIGH}, low=${LOAD_LOW}, dwell=${LOAD_DWELL_MS}ms, slots=${checkSlotCap(high)}+2 fast`);
+    toolLog({ component: "runner", kind: "event", name: "host.load_mode", props: { loadMode: high, load } });
+    if (high) loadAccountedAt = at;
+  }
   return load;
 }
-const slots = new CheckSlots(() => checkSlotCap(sampleLoad()), { emit: event => {
+const slots = new CheckSlots(() => checkSlotCap(loadMode.high), { emit: event => {
+  if (event.name === "slot.overrun") log(event.request.watcher, `fast lane overrun: ${(event.elapsedMs / 1000).toFixed(1)}s; next check uses slow pool`);
   if (event.name === "slot.wait" || event.name === "slot.backlog") {
     const holders = event.holders.map(holder => `${holder.watcher}:${(holder.elapsedMs / 1000).toFixed(1)}s`).join(",");
     if (event.name === "slot.wait") log(event.request.watcher, `slot wait passed 30s: slot_wait ${(event.waitMs / 1000).toFixed(1)}s, holders [${holders}]`);
@@ -38,8 +48,8 @@ const slots = new CheckSlots(() => checkSlotCap(sampleLoad()), { emit: event => 
   const request = "request" in data ? data.request : undefined;
   toolLog({ component: "runner", kind: "perf", name, ...("durationMs" in data ? { durationMs: data.durationMs } : {}),
     ids: request ? { watcher: request.watcher, ...(request.run ? { run: request.run } : {}) } : undefined,
-    props: { ...data, ...(request ? { operation: request.operation ?? "check" } : {}) } });
-} });
+    props: { ...data, ...(request ? { operation: request.operation ?? "check", lane: request.lane ?? "slow" } : {}) } });
+} }, 2);
 function slotStart(watcher: Watcher, timing: SlotTiming, operation: "check" | "pending", run: string): void {
   toolLog({ component: "runner", kind: "perf", name: "slot.start", ids: { watcher: watcher.id, run },
     props: { ...timing, operation, intervalMs: watcher.interval_s * 1_000 } });
@@ -433,6 +443,7 @@ async function tickWatcher(id: string): Promise<void> {
   if (!checking(state) || watcher.paused) return;
   if (held(watcher)) return;
   const t = now();
+  recordCadence(watcher);
   if (state.status !== "closing" && !state.reply_handoff && !state.admitted_run && watcher.expires_at && Date.parse(watcher.expires_at) <= t && !state.pending && !state.batch) {
     finish(watcher, state, "expired");
     const sent = await alert(watcher, `Watcher "${watcher.title}" expired without firing${state.fires ? " again" : ""} and is now off.`,
@@ -515,8 +526,13 @@ async function tickWatcher(id: string): Promise<void> {
   let finalDeadline: number | undefined;
   let slotTiming: SlotTiming | undefined;
   const dueAt = triggered || finalCheck || !state.next_at || state.next_at < 0 ? t : state.next_at;
+  const lane = checkLane(state.last_run_ms);
+  const trigger = finalCheck ? "final" : state.consecutive_failures || state.load_timeouts ? "retry" : triggered ? "trigger" : "schedule";
+  let lateMs = 0, loadModeAtAdmission = false;
   const result = await slots.run(async timing => {
     slotTiming = timing;
+    lateMs = Math.max(0, now() - dueAt);
+    loadModeAtAdmission = loadMode.high;
     return withRelayLock(() => {
     if (!sameInstance()) return undefined;
     recoverAdmission(id, instance);
@@ -549,11 +565,11 @@ async function tickWatcher(id: string): Promise<void> {
     return runCheck(current, watcherDir(id), { HEALTH_TOOLLOG_TRIGGER: state.consecutive_failures || state.load_timeouts ? "retry" : "schedule", WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
     });
   }, { watcher: id, run: attemptId, operation: "check", intervalMs: watcher.interval_s * 1_000,
-    dueAt });
+    dueAt, lane });
   if (!result) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
   const failed = runTimedOut || result.code !== 0;
-  toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: result.busy ? "busy" : runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", ...(result.busy ? { stderrClass: "dependency_busy", dependency: result.busy.dependency } : {}), exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs: Math.max(0, now() - t - result.ms), ...slotTiming }, ...(failed ? { error: { tag: result.busy ? "watch.dependency_busy" : runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
+  toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: result.busy ? "busy" : runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", ...(result.busy ? { stderrClass: "dependency_busy", dependency: result.busy.dependency } : {}), exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs: Math.max(0, now() - t - result.ms), ...slotTiming, dueAt, lateMs, lane, loadMode: loadModeAtAdmission, intervalMs: watcher.interval_s * 1_000, trigger }, ...(failed ? { error: { tag: result.busy ? "watch.dependency_busy" : runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
   if (!sameInstance()) return;
   const endLoad = sampleLoad();
   let fresh = loadState(id);
@@ -678,6 +694,12 @@ export function previousDayRollup(): void {
     void child.exited.then(code => { if (code) toolError("runner", "log.rollup_failed"); }).catch(() => toolError("runner", "log.rollup_failed"));
   } catch { toolError("runner", "log.rollup_spawn_failed"); }
 }
+function recordCadence(watcher: Watcher): void {
+  const key = `${iso().slice(0, 10)}:${watcher.interval_s}`;
+  if (cadence.get(watcher.id) === key) return;
+  cadence.set(watcher.id, key);
+  toolLog({ component: "runner", kind: "event", name: "watch.cadence", ids: { watcher: watcher.id }, props: { intervalMs: watcher.interval_s * 1_000 } });
+}
 export async function tick(): Promise<void> {
   previousDayRollup();
   sampleLoad();
@@ -691,7 +713,14 @@ export async function tick(): Promise<void> {
   previousMaintenance = maintenance;
   const jobs: Promise<void>[] = [];
   for (const id of listIds()) {
-    if (running.has(id)) continue;
+    if (running.has(id)) {
+      // A queued check can span midnight without entering tickWatcher again.
+      if (!cadence.get(id)?.startsWith(`${iso().slice(0, 10)}:`)) {
+        const watcher = loadWatcher(id), state = loadState(id);
+        if (watcher && checking(state) && !watcher.paused && !held(watcher)) recordCadence(watcher);
+      }
+      continue;
+    }
     running.add(id);
     jobs.push(tickOne(id).catch(error => { toolError("runner", "watch.runner_failed", { watcher: id }); log(id, `runner error: ${String(error).slice(0, 500)}`); }).finally(() => running.delete(id)));
   }

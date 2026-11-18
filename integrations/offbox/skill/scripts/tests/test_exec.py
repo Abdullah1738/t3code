@@ -34,7 +34,7 @@ class ExecTests(Isolated):
         self.con.commit()
         self.result = {"exitCode": 0, "stdout": "hello\n", "stderr": "warning\n", "processId": 123}
         self.call = self.stack.enter_context(patch.object(api, "call", return_value=self.result))
-        self.stack.enter_context(patch.dict(os.environ, {"OFFBOX_TOOL_LOG_DIR": str(Path(self.tmp.name) / "tools")}))
+        self.stack.enter_context(patch.dict(os.environ, {"OFFBOX_LOG_DIR": str(Path(self.tmp.name) / "tools")}))
         self.ssh = self.stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=AssertionError("no SSH")))
         self.setup = self.stack.enter_context(patch.object(ssh_sync, "setup", side_effect=AssertionError("no SSH setup")))
         self.base = self.stack.enter_context(patch.object(ssh_sync, "ssh_base", side_effect=AssertionError("no known_hosts")))
@@ -403,7 +403,9 @@ class ExecTests(Isolated):
         self.assertGreaterEqual(row["durationMs"], 0)
         self.assertNotIn(secret, json.dumps(rows))
         self.assertNotIn("private output", json.dumps(rows))
-        self.log.assert_not_called()
+        self.assertEqual(self.log.call_count, 1)
+        self.assertIn('client_command ', self.log.call_args.args[0])
+        self.assertNotIn(secret, self.log.call_args.args[0])
 
     def test_exception_body_never_enters_error_event_or_cli_log(self):
         secret = "private-command-value-123"
@@ -414,7 +416,9 @@ class ExecTests(Isolated):
         self.assertEqual(rows[0]["name"], "exec.error")
         self.assertEqual(rows[0]["props"]["exitCode"], 90)
         self.assertNotIn(secret, json.dumps(rows))
-        self.log.assert_not_called()
+        self.assertEqual(self.log.call_count, 1)
+        self.assertIn('client_command ', self.log.call_args.args[0])
+        self.assertNotIn(secret, self.log.call_args.args[0])
 
     def test_http_errors_that_echo_command_do_not_log_it(self):
         secret = "private-command-value-123"

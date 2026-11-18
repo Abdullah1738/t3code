@@ -19,6 +19,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -56,6 +57,70 @@ const workerLayer = (
       ),
     ),
   );
+
+it.effect.each(["general", "control", "start"] as const)(
+  "records the %s lane on a completed claim before execution settles",
+  (lane) =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const pending =
+        lane === "control"
+          ? {
+              ...start("trace-control"),
+              request: {
+                type: "checkpoint.capture" as const,
+                runId,
+                scopeId: CheckpointScopeId.make("scope:trace-control"),
+              },
+            }
+          : start(`trace-${lane}`);
+      const ended: Tracer.NativeSpan[] = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          const end = span.end.bind(span);
+          span.end = (...args) => {
+            ended.push(span);
+            end(...args);
+          };
+          return span;
+        },
+      });
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* outbox.enqueue([pending]);
+      yield* Effect.gen(function* () {
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const run =
+          lane === "start"
+            ? worker.runStartOnce
+            : lane === "control"
+              ? worker.runControlOnce
+              : worker.runOnce;
+        const fiber = yield* run.pipe(Effect.withTracer(tracer), Effect.forkScoped);
+        yield* Deferred.await(entered);
+        const claim = ended.find((span) => span.name === "EffectWorker.claim");
+        assert.isDefined(claim);
+        assert.equal(claim?.attributes.get("lane"), lane);
+        assert.equal(claim?.attributes.get("worker.id"), "start-lane-test");
+        assert.equal(claim?.attributes.get("effect.id"), pending.id);
+        assert.equal(claim?.attributes.get("effect.type"), pending.request.type);
+        assert.equal(claim?.attributes.get("thread.id"), pending.threadId);
+        assert.equal(claim?.attributes.get("result"), "claimed");
+        assert.equal(Option.getOrThrow(yield* outbox.get(pending.id)).status, "running");
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(fiber);
+        assert.equal(yield* worker.drain(), 0);
+      }).pipe(
+        Effect.provide(
+          workerLayer(outbox, () =>
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        ),
+        Effect.scoped,
+      );
+    }).pipe(Effect.provide(layerOutbox)),
+);
 
 it.effect("claims a committed start while all four general workers are occupied", () =>
   Effect.gen(function* () {

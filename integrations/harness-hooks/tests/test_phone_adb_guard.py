@@ -125,7 +125,9 @@ class PhoneAdbTests(unittest.TestCase):
         self.assertTrue(guard.classify(TAP)['reason'])
 
     def test_native_adapters_corpus(self):
-        with patch.object(engine, 'resolve_identity', return_value={}), patch.object(engine, '_classify_offbox', return_value={'heavy': False}):
+        # Keep this corpus about phone leases; shell-source proofs have their
+        # own adapter matrix and can conservatively reject these commands.
+        with patch.object(engine, 'resolve_identity', return_value={}), patch.object(engine, '_classify_offbox', return_value={'heavy': False}), patch.object(engine.statev2_guard, 'classify_detail', return_value=(None, None)):
             for harness, adapter, tool, field in [('claude', claude, 'Bash', 'command'),
                                                  ('codex', codex, 'exec_command', 'cmd'),
                                                  ('codex', codex, 'mcp__shell__exec_command', 'cmd')]:

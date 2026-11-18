@@ -272,7 +272,9 @@ thread needs input, so a caller can answer and wait again.
 
 `{ "text", "mode"?: "auto"|"queue"|"steer"|"restart", "providerInstanceId"?, "model"?, "variant"?, "options"?, "attachments"?, "clientRequestId"? }`.
 `auto` (default) starts an idle thread, steers a running turn, or queues behind a
-turn that cannot take steering yet. `queue` always waits for a separate turn.
+turn that cannot take steering yet. `steer` also starts or queues when the active
+turn is absent or has ended; a rejected native steer is delivered as the next turn
+when the provider confirms it was not sent. `queue` always waits for a separate turn.
 The model selection applies to this message's run. Use `PATCH` to change the
 thread's default. Response: `messageId`,
 `runId`, `status`, `delivery` (`started`, `queued`, `steered`, `restarted`).

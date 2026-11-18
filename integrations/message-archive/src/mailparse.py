@@ -9,8 +9,6 @@ from datetime import datetime, timezone
 from email.header import decode_header, make_header
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
-from compression import zstd
-
 import common
 
 # Tag patterns stop at the next "<" so a page full of unclosed "<" stays linear.
@@ -154,6 +152,17 @@ def raw_path(account, ts, key):
     return os.path.join(account, f"{d:%Y}", f"{d:%m}", f"{safe}.eml.zst")
 
 
+def _zstd():
+    try:
+        from compression import zstd
+    except ImportError as e:
+        raise RuntimeError(
+            "Raw message storage needs Python 3.14+ (compression.zstd); "
+            "use /opt/homebrew/opt/python@3.14/bin/python3.14"
+        ) from e
+    return zstd
+
+
 def save_raw(rel, raw):
     full = os.path.join(common.MAIL_DIR, rel)
     try:
@@ -164,7 +173,7 @@ def save_raw(rel, raw):
     os.makedirs(os.path.dirname(full), mode=0o700, exist_ok=True)
     tmp = full + ".part"
     with open(tmp, "wb") as f:
-        f.write(zstd.compress(raw, level=6))
+        f.write(_zstd().compress(raw, level=6))
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, full)
@@ -172,4 +181,4 @@ def save_raw(rel, raw):
 
 def load_raw(rel):
     with open(os.path.join(common.MAIL_DIR, rel), "rb") as f:
-        return zstd.decompress(f.read())
+        return _zstd().decompress(f.read())

@@ -294,6 +294,9 @@ it.effect(
               Layer.provide(
                 Layer.mergeAll(
                   Layer.mock(RunFinalizationService.RunFinalizationService)({}),
+                  Layer.mock(EffectOutbox.EffectOutboxV2)({
+                    get: () => Effect.succeed(Option.none()),
+                  }),
                   Layer.mock(CheckpointRollbackService.CheckpointRollbackServiceV2)({}),
                   Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
                   Layer.mock(ProviderTurnControlService.ProviderTurnControlServiceV2)({}),
@@ -1500,12 +1503,14 @@ it.effect.each([
 
 it.effect("a delayed first admission pass cannot reset the position progress window", () => {
   const h = harness({ maxActive: 4, spacingMs: 0 });
-  h.setLoad(2);
   return Effect.gen(function* () {
     const pacing = yield* RestartPacing.RestartPacing;
     const waiter = source(100);
     yield* pacing.register(waiter);
-    yield* TestClock.adjust("25 minutes");
+    // Keep the load hold below its cap while the first admission pass is delayed.
+    yield* TestClock.adjust("15 minutes");
+    h.setLoad(2);
+    yield* TestClock.adjust("10 minutes");
     assert.isAbove(yield* pacing.acquire(waiter), 0);
     yield* TestClock.adjust("4 minutes");
     const newcomer = source(1);
@@ -2291,6 +2296,9 @@ it.effect(
             Layer.provide(
               Layer.mergeAll(
                 Layer.mock(RunFinalizationService.RunFinalizationService)({}),
+                Layer.mock(EffectOutbox.EffectOutboxV2)({
+                  get: () => Effect.succeed(Option.none()),
+                }),
                 Layer.mock(CheckpointRollbackService.CheckpointRollbackServiceV2)({}),
                 Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
                 Layer.mock(ProviderTurnControlService.ProviderTurnControlServiceV2)({}),
@@ -2335,9 +2343,9 @@ it.effect(
   },
 );
 
-it.effect(
-  "ten durable waiters drain at twenty second spacing, including sleeping successors",
-  () => {
+it.effect.each(["held", "settles-after-5s"] as const)(
+  "twelve durable waiters respect spacing and capacity when startup is %s",
+  (settlement) => {
     const h = harness({ maxActive: 4, spacingMs: 20_000 });
     const starts: number[] = [];
     const executor = Layer.effect(
@@ -2360,7 +2368,7 @@ it.effect(
                   deferMs: delay,
                 });
               starts.push(yield* Clock.currentTimeMillis);
-              yield* pacing.releaseRun(effect.threadId, effect.request.runId, effect.id);
+              h.running.add(effect.request.runId);
             }).pipe(
               Effect.mapError((cause) =>
                 EffectWorker.isOrchestrationEffectExecutionError(cause)
@@ -2379,15 +2387,19 @@ it.effect(
       const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
       const outbox = yield* EffectOutbox.EffectOutboxV2;
       const pacing = yield* RestartPacing.RestartPacing;
+      const freedSlotWake = yield* Deferred.make<void>();
       h.wakeWith((input) =>
-        outbox
-          .wakeRestartEffect(input.effectId!)
-          .pipe(
-            Effect.mapError((cause) => new RestartPacingState.RestartPacingStateError({ cause })),
+        outbox.wakeRestartEffect(input.effectId!).pipe(
+          Effect.mapError((cause) => new RestartPacingState.RestartPacingStateError({ cause })),
+          Effect.tap((woken) =>
+            woken && input.sourceRunId === source(4).sourceRunId
+              ? Deferred.succeed(freedSlotWake, undefined)
+              : Effect.void,
           ),
+        ),
       );
       const began = yield* Clock.currentTimeMillis;
-      for (let id = 0; id < 10; id++) {
+      for (let id = 0; id < 12; id++) {
         const input = source(id);
         h.runSources.set(input.sourceRunId, input);
         yield* pacing.register({ ...input, effectId: `drain:${id}` });
@@ -2401,15 +2413,42 @@ it.effect(
         ]);
       }
       yield* worker.drain();
-      for (let count = 1; count < 10; count++) {
+      assert.deepEqual(starts, [began]);
+      if (settlement === "held") {
+        for (let count = 1; count < 4; count++) {
+          yield* TestClock.adjust(20_000);
+          yield* worker.drain();
+          assert.equal(starts.length, count + 1);
+        }
         yield* TestClock.adjust(20_000);
         yield* worker.drain();
-        assert.equal(starts.length, count + 1);
+        assert.deepEqual(
+          starts.map((at) => at - began),
+          [0, 20_000, 40_000, 60_000],
+        );
+        h.running.delete(source(0).sourceRunId);
+        yield* pacing.releaseRun(source(0).threadId, source(0).sourceRunId, "drain:0");
+        yield* Deferred.await(freedSlotWake);
+        yield* worker.drain();
+        assert.equal(starts.length, 5);
+        assert.equal(starts[4]! - began, 80_000);
+      } else {
+        for (let id = 0; id < 11; id++) {
+          yield* TestClock.adjust(5_000);
+          h.running.delete(source(id).sourceRunId);
+          yield* pacing.releaseRun(source(id).threadId, source(id).sourceRunId, `drain:${id}`);
+          yield* TestClock.adjust(14_999);
+          yield* worker.drain();
+          assert.equal(starts.length, id + 1);
+          yield* TestClock.adjust(1);
+          yield* worker.drain();
+          assert.equal(starts.length, id + 2);
+        }
+        assert.deepEqual(
+          starts.map((at) => at - began),
+          Array.from({ length: 12 }, (_, i) => i * 20_000),
+        );
       }
-      assert.deepEqual(
-        starts.map((at) => at - began),
-        Array.from({ length: 10 }, (_, i) => i * 20_000),
-      );
     }).pipe(
       Effect.provide(
         EffectWorker.layer.pipe(
@@ -2424,6 +2463,66 @@ it.effect(
     );
   },
 );
+
+it.effect("a load-held head wakes when load recovers before its durable retry", () => {
+  const h = harness();
+  h.setLoad(2);
+  const wakes: number[] = [];
+  h.wakeWith(() =>
+    Clock.currentTimeMillis.pipe(
+      Effect.tap((at) => Effect.sync(() => wakes.push(at))),
+      Effect.as(true),
+    ),
+  );
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const input = { ...source(1), effectId: "load:head" };
+    assert.equal(yield* pacing.acquire(input), 15_000);
+    yield* TestClock.adjust(15_000);
+    assert.equal(yield* pacing.acquire(input), 30_000);
+    yield* TestClock.adjust(30_000);
+    assert.equal(yield* pacing.acquire(input), 60_000);
+    assert.deepEqual(wakes, []);
+    h.setLoad(0);
+    yield* TestClock.adjust(15_000);
+    assert.lengthOf(wakes, 1);
+    assert.isAtMost(wakes[0]!, 60_000);
+    assert.equal(yield* pacing.acquire(input), 0);
+  }).pipe(Effect.provide(h.layer));
+});
+
+it.effect("admissions report each run's own load hold and exclude time under low load", () => {
+  const h = harness({ spacingMs: 0 });
+  h.setLoad(2);
+  const messages: string[] = [];
+  const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    yield* pacing.acquire(source(1));
+    yield* TestClock.adjust(29_999);
+    h.setLoad(0);
+    yield* TestClock.adjust(1);
+    yield* pacing.acquire(source(1));
+    yield* pacing.release(source(1));
+    yield* TestClock.adjust(29_999);
+    h.setLoad(2);
+    yield* TestClock.adjust(1);
+    yield* pacing.acquire(source(1));
+    yield* pacing.acquire(source(2));
+    yield* TestClock.adjust(29_999);
+    h.setLoad(0);
+    yield* TestClock.adjust(1);
+    assert.equal(yield* pacing.acquire(source(1)), 0);
+    assert.equal(yield* pacing.acquire(source(2)), 0);
+    const admissions = messages.filter((message) => message.includes("restart-pacing.admitted"));
+    assert.lengthOf(admissions, 3);
+    assert.include(admissions[0]!, '"loadHoldMs":30000');
+    assert.include(admissions[1]!, '"loadHoldMs":60000');
+    assert.include(admissions[2]!, '"loadHoldMs":30000');
+  }).pipe(
+    Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+  );
+});
 
 it.effect("a successor replaces its thread's source in place and retires old retries", () => {
   const h = harness({ spacingMs: 0 });

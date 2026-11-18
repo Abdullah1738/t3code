@@ -16,12 +16,12 @@ test("bounded timeout carries code.timeout through the log and rollup", async ()
   const rows = await captureLogs(async () => {
     try { await bounded(new Promise<never>(() => {}), 0); }
     catch (error) {
-      expect(error).toMatchObject({ name: "TimeoutError", code: "timeout" });
+      expect(error).toMatchObject({ name: "BoundedTimeout", code: "timeout" });
       toolError("router", "router.catch1", error);
     }
   });
   expect(rows.find(row => row.error?.tag === "router.catch1")?.error)
-    .toMatchObject({ name: "TimeoutError", code: "timeout", causeKey: "code.timeout" });
+    .toMatchObject({ name: "BoundedTimeout", code: "timeout", causeKey: "code.timeout" });
 });
 
 test.each([false, true])("generic causes survive every sanitization pass, defer=%s", async defer => {

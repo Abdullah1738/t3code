@@ -1012,6 +1012,16 @@ class CliStepTests(Isolated):
         self.assertIn('offbox: steps incomplete: got 0 of 1 step results; remote exit unknown', lines)
         self.assertNotIn('offbox: remote exit 0', lines)
 
+    def test_quint_setup_failure_keeps_99_without_step_markers(self):
+        event = 'offbox-quint: {"attempt":"result","result":"failed","duration_s":1,"trigger":"command"}\n'
+        rc, lines = self.run_cli(['--step', 'quint --version'], 99, event)
+        self.assertEqual(rc, 99, lines)
+        self.assertFalse(any('steps incomplete' in line for line in lines), lines)
+        # A command cannot evade missing-step handling by printing setup text.
+        rc, _ = self.run_cli(['--step', 'quint --version'], 99,
+                             'offbox-command-started: run-test\n' + event)
+        self.assertEqual(rc, 90)
+
     def test_foreground_complete_steps_keep_zero(self):
         rc, lines = self.run_cli(['--step', 'true'], 0, 'offbox step 1 rc=0: true\n')
         self.assertEqual(rc, 0)

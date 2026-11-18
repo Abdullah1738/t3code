@@ -22,6 +22,7 @@ import {
   type OrchestrationV2ProviderThread,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2ThreadProjection,
+  OrchestratorMcpFailure,
   OrchestratorMcpCreateThreadsResult,
   OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpTaskCancelResult,
@@ -57,7 +58,11 @@ import * as Schema from "effect/Schema";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
-import { McpSchema, McpServer } from "effect/ai";
+import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
+import * as McpToolAccess from "./McpToolAccess.ts";
+import * as McpToolAccessTestkit from "./McpToolAccess.testkit.ts";
+import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
+import { KanbanToolkit } from "../ardud/kanban/tools/tools.ts";
 
 import { ClaudeProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
@@ -1561,8 +1566,15 @@ describe("orchestrator MCP toolkit", () => {
             const unknownPagingParamError = yield* invoke("t3_thread_read", {
               threadId: parentThreadId,
               cursor: 90,
-            }).pipe(Effect.flip);
-            expect(unknownPagingParamError.message).toContain("Expected no excess property");
+            });
+            expect(unknownPagingParamError.isError).toBe(true);
+            expect(unknownPagingParamError.structuredContent).toMatchObject({
+              code: "invalid_request",
+            });
+            const rejectionText = unknownPagingParamError.content[0];
+            expect(rejectionText?.type === "text" ? rejectionText.text : "").toContain(
+              "cursor must be omitted",
+            );
             const threadUpdateTool = server.tools.find(
               ({ tool }) => tool.name === "t3_thread_update",
             );
@@ -4931,5 +4943,123 @@ describe("orchestrator MCP toolkit", () => {
         }).pipe(Effect.provide(layerTest));
       }),
     ),
+  );
+});
+
+describe("MCP input rejections", () => {
+  const decodeJsonNumber = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Number));
+  const definitions = [
+    OrchestratorToolkit.tools.t3_thread_read,
+    OrchestratorToolkit.tools.t3_thread_wait,
+    KanbanToolkit.tools.card_get,
+  ];
+  // Keep the shipped parameter schemas; no service should run for rejected input.
+  const toolkit = Toolkit.make(
+    ...definitions.map((definition) =>
+      Tool.make(definition.name, {
+        parameters: definition.parametersSchema,
+        success: Schema.Unknown,
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }).annotateMerge(definition.annotations),
+    ),
+  );
+  const registration = McpHttpServer.toolkitRegistration(
+    toolkit,
+    McpToolAccess.toLayer(toolkit, {
+      t3_thread_read: McpToolAccess.reads(() => Effect.die("rejected input reached handler")),
+      t3_thread_wait: McpToolAccess.reads(() => Effect.die("rejected input reached handler")),
+      card_get: McpToolAccess.reads(() => Effect.die("rejected input reached handler")),
+    }),
+  ).pipe(
+    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+  );
+
+  it.effect.each([
+    {
+      name: "t3_thread_read",
+      input: { limit: 200 },
+      field: "limit",
+      expected: ["integer", "1", "100", "200"],
+    },
+    {
+      name: "t3_thread_read",
+      input: { view: "bogus" },
+      field: "view",
+      expected: ["messages", "activity", "string"],
+    },
+    {
+      name: "t3_thread_wait",
+      input: { threadId: "overflow-thread", timeoutMs: decodeJsonNumber("1e400") },
+      field: "timeoutMs",
+      expected: ["finite number", "Infinity"],
+    },
+    {
+      name: "t3_thread_wait",
+      input: { threadId: "overflow-thread", timeoutMs: decodeJsonNumber("-1e400") },
+      field: "timeoutMs",
+      expected: ["finite number", "-Infinity"],
+    },
+    {
+      name: "card_get",
+      input: { card: "#1606", events: { limit: 0 } },
+      field: "events.limit",
+      expected: ["integer", "1", "0"],
+    },
+    {
+      name: "card_get",
+      input: { cardId: "#1606" },
+      field: "input",
+      expected: ["cardId", "omitted", "string", 'Did you mean "card"?'],
+    },
+  ])("$name rejects $field with a structured tool result", (scenario) =>
+    Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const exit = yield* server.callTool({ name: scenario.name, arguments: scenario.input }).pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, {
+          environmentId: EnvironmentId.make("input-rejection"),
+          requestNamespace: "input-rejection",
+          thread: undefined,
+          client: undefined,
+          capabilities: new Set<never>(),
+          issuedAt: 1,
+        }),
+        Effect.provideService(
+          McpSchema.McpServerClient,
+          McpSchema.McpServerClient.of({
+            clientId: 1,
+            clientCapabilities: {},
+            clientInfo: { name: "input-test", version: "1" },
+            protocolVersion: "2025-06-18",
+            initializePayload: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              clientInfo: { name: "input-test", version: "1" },
+            },
+            getClient: Effect.die("unused"),
+          }),
+        ),
+        Effect.exit,
+      );
+      expect(exit).toMatchObject({ _tag: "Success" });
+      if (exit._tag !== "Success") return;
+      const result = exit.value;
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        code: "invalid_request",
+        invalidFields: [scenario.field],
+      });
+      const part = result.content[0];
+      if (part?.type !== "text") throw new Error("missing input rejection text");
+      const message = part.text;
+      expect(result.structuredContent).toMatchObject({ message });
+      if (scenario.field !== "input") expect(message).toContain(scenario.field);
+      for (const expected of scenario.expected) expect(message).toContain(expected);
+      expect(message).not.toMatch(/[\r\n]/);
+      expect(message.length).toBeLessThanOrEqual(300);
+      expect(result.content).toEqual([{ type: "text", text: message }]);
+      expectJsonRoundTrip(result.structuredContent);
+    }).pipe(Effect.provide(registration)),
   );
 });

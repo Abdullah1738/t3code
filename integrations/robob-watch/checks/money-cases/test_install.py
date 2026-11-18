@@ -1,7 +1,10 @@
 """Deploy only source, keep case data, ping state and pause state, and link the CLI."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import importlib.util
 import json
-import os
 from pathlib import Path
 import tempfile
 import unittest

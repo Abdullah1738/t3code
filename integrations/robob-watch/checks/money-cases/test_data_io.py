@@ -1,10 +1,13 @@
 """iCloud hydration, skip bookkeeping and verified Keep Downloaded installation."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 from contextlib import redirect_stdout, redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
 import errno
 import io
 import json
-import os
 from pathlib import Path
 import signal
 from types import SimpleNamespace

@@ -1,3 +1,4 @@
+import * as ProviderRetry from "./ProviderRetry.ts";
 import type {
   KanbanThreadLink,
   OrchestrationV2ProviderTurn,
@@ -45,6 +46,8 @@ export const makeRunUsageObserver = Effect.fn("RunUsage.observeRun")(function* (
 ) {
   if (state.startedAt === undefined) state.startedAt = input.run.startedAt;
   const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  const recordRetry = yield* ProviderRetry.makeRecorder();
+  let lastResponseAt = input.run.startedAt ?? (yield* DateTime.now);
   const kanban = yield* Effect.serviceOption(KanbanStore.KanbanStore);
   if (Option.isSome(kanban) && input.appThread.lineage?.relationshipToParent === "subagent") {
     const parent = input.appThread.lineage.parentThreadId ?? input.appThread.lineage.rootThreadId;
@@ -82,6 +85,28 @@ export const makeRunUsageObserver = Effect.fn("RunUsage.observeRun")(function* (
   const observe = Effect.fnUntraced(function* (
     event: ProviderAdapter.ProviderAdapterV2Event,
   ): Effect.fn.Return<void> {
+    // Native Claude/Codex record at their response boundary; ACP/Pi expose retry items here.
+    if (
+      event.driver !== "claudeAgent" &&
+      event.driver !== "codex" &&
+      event.type === "turn_item.updated" &&
+      event.turnItem.runId === input.run.id
+    ) {
+      const item = event.turnItem;
+      if (item.type === "assistant_message" || item.type === "reasoning")
+        lastResponseAt = item.updatedAt;
+      if (item.type === "error" && item.status === "running" && item.retry !== undefined)
+        yield* recordRetry({
+          kind: "provider.retry",
+          threadId: input.run.threadId,
+          runId: input.run.id,
+          provider: input.run.providerInstanceId,
+          model: input.modelSelection.model,
+          retry: item.retry,
+          errorMessage: item.failure.message,
+          lastResponseAt,
+        });
+    }
     yield* Effect.sync(() => {
       if (
         event.type === "provider_turn.updated" &&

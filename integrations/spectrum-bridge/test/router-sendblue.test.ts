@@ -1696,8 +1696,11 @@ test.each(["dm", "group"].flatMap(kind => [false, true].map(modelError => ({ kin
   expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
     ["Original answer", "first"], ["Second successful answer", "second"],
   ]);
-  expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id IN ('second', 'second-member')").all().map(row => row.state)).toEqual(["done", "done"]);
-  expect(h.backend.prompts).toHaveLength(1);
+  const successfulMembers = () => h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id IN ('second', 'second-member')").all().map(row => row.state);
+  expect(successfulMembers()).toEqual(["admitted", "admitted"]);
+  for (const reply of h.store.pendingOutbox().filter(op => op.kind === "conversation")) h.store.outboxState(reply.id, "sent");
+  expect(successfulMembers()).toEqual(["done", "done"]);
+  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["Moni: robob original question", "Moni: robob third question"]);
   expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
 });
 
@@ -1812,8 +1815,11 @@ test.each(["dm", "group"].flatMap(kind => [false, true].flatMap(modelError => ["
   expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
     ["Original answer", "first"], ["Second successful answer", "second"],
   ]);
-  expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id IN ('second', 'second-member')").all().map(row => row.state)).toEqual(["done", "done"]);
-  expect(h.backend.prompts).toHaveLength(1);
+  const successfulMembers = () => h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id IN ('second', 'second-member')").all().map(row => row.state);
+  expect(successfulMembers()).toEqual(["admitted", "admitted"]);
+  for (const reply of h.store.pendingOutbox().filter(op => op.kind === "conversation")) h.store.outboxState(reply.id, "sent");
+  expect(successfulMembers()).toEqual(["done", "done"]);
+  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["Moni: robob original question", "Moni: robob third question"]);
   expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
 });
 

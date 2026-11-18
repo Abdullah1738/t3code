@@ -3,6 +3,17 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+const { tagConnectionFailure = error => error, connectionWebSocket = (url, options) => new WebSocket(url, options),
+} = await import('../../router-logging/toollog.mjs').catch(() => ({}));
+
+async function request(url, init) {
+  try { return await fetch(url, init); }
+  catch (error) { throw tagConnectionFailure(error, url); }
+}
+async function responseText(response, url) {
+  try { return await response.text(); }
+  catch (error) { throw tagConnectionFailure(error, url); }
+}
 
 const HOME = process.env.HOME || homedir();
 export const PATHS = {
@@ -57,9 +68,9 @@ export function writeState(state, path = PATHS.state) {
 export async function serviceSlugs({ directory = PROBE_DIRECTORY, timeoutMs = 20_000 } = {}) {
   const auth = 'Basic ' + Buffer.from(`opencode:${readFileSync(PATHS.ocPassword, 'utf8').trim()}`).toString('base64');
   const url = `${OC_URL}/api/model?${new URLSearchParams({ 'location[directory]': directory })}`;
-  const res = await fetch(url, { headers: { authorization: auth }, signal: AbortSignal.timeout(timeoutMs) });
+  const res = await request(url, { headers: { authorization: auth }, signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`opencode /api/model: HTTP ${res.status}`);
-  const body = parse(await res.text());
+  const body = parse(await responseText(res, url));
   const data = Array.isArray(body?.data) ? body.data : [];
   return data.map((m) => `${m.providerID}/${m.id}`);
 }
@@ -82,10 +93,10 @@ function control() {
 export async function harnessCutoverStatus({ timeoutMs = 15_000 } = {}) {
   const { url, token } = control();
   if (!token) throw new Error('no control token');
-  const response = await fetch(`${url}/api/ardud/control/harness-cutover/status`, {
+  const response = await request(`${url}/api/ardud/control/harness-cutover/status`, {
     headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(timeoutMs),
   });
-  const body = parse(await response.text());
+  const body = parse(await responseText(response, url));
   const cutover = body?.cutover;
   if (!response.ok || body?.ok !== true || typeof cutover?.active !== 'boolean' || typeof cutover.completed !== 'boolean'
     || (cutover.retainedOpenCodeModels !== undefined && (!Array.isArray(cutover.retainedOpenCodeModels)
@@ -106,7 +117,7 @@ export function refreshProviders({ instanceId = INSTANCE_ID, timeoutMs = 90_000 
   if (!token) return Promise.reject(new Error('no control token'));
   const wsUrl = `${url.replace(/^http/, 'ws')}/ws?orchestrationProtocol=2`;
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl, { headers: { authorization: `Bearer ${token}` } });
+    const ws = connectionWebSocket(wsUrl, { headers: { authorization: `Bearer ${token}` } });
     ws.binaryType = 'arraybuffer';
     let done = false;
     const finish = (fn, v) => {
@@ -143,7 +154,8 @@ export function refreshProviders({ instanceId = INSTANCE_ID, timeoutMs = 90_000 
         } else if (msg._tag === 'Defect') finish(reject, new Error('refreshProviders: defect'));
       }
     });
-    ws.addEventListener('error', () => finish(reject, new Error('refreshProviders: socket error')));
+    ws.addEventListener('error', ev => finish(reject, tagConnectionFailure(
+      new Error('refreshProviders: socket error', {cause:ev.error ?? ev}), wsUrl)));
     ws.addEventListener('close', () => finish(reject, new Error('refreshProviders: closed before reply')));
   });
 }

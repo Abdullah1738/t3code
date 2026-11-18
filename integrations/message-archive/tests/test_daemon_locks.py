@@ -242,10 +242,10 @@ class WriterTest(unittest.TestCase):
                 self.assertIsNone(store.get_state(self.db, "rollback"))
                 self.assertEqual(store.WRITE.snapshot()["source"], "unknown")
 
-    def test_writer_busy_timeout_changes_without_changing_reader(self):
+    def test_writer_and_reader_use_separate_busy_timeouts(self):
         self.assertEqual(self.db.execute("PRAGMA busy_timeout").fetchone()[0], 30000)
         with contextlib.closing(store.connect(readonly=True)) as reader:
-            self.assertEqual(reader.execute("PRAGMA busy_timeout").fetchone()[0], 60000)
+            self.assertEqual(reader.execute("PRAGMA busy_timeout").fetchone()[0], 250)
 
     def test_upsert_point_lookup_uses_unique_key_instead_of_scanning_items(self):
         queries = []

@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     lr = sp.add_parser("log-rollup", help="roll up shared tool logs for a UTC day")
     lr.add_argument("--day", metavar="YYYY-MM-DD")
+    lr.add_argument("--live-only", action="store_true", help="exclude fixture run IDs; report excluded records")
 
     lg = sp.add_parser("logs")
     lg.add_argument("run_id")
@@ -91,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("box_id", nargs="?")
     rl.add_argument("--mine", action="store_true")
     rl.add_argument("--delete", action="store_true", help="delete instead of stop (loses the warm disk)")
+    rl.add_argument("--override-protection", action="store_true", help="explicitly stop or delete a pinned or held box")
     sh = sp.add_parser("ssh")
     sh.add_argument("box_id", nargs="?")
     sh.add_argument("cmd", nargs=argparse.REMAINDER)
@@ -128,9 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     b = sp.add_parser("base")
     b.add_argument("action", choices=["rm"])
     b.add_argument("name")
-    k = sp.add_parser("keep", help="pin this lease so the reaper never deletes it")
+    k = sp.add_parser("keep", help="protect this lease from cleanup and reuse until its pin expires")
     k.add_argument("--days", type=float, default=30)
-    k.add_argument("--box", help="clear your pin on a previous box (with --days 0)")
+    k.add_argument("--box", help="pin a specific box, or clear your pin with --days 0")
 
     bx = sp.add_parser("box")
     bx.add_argument("action", choices=["release-disk-full", "suspect", "clear"])
@@ -213,7 +215,7 @@ def cmd_run(a, me) -> int:
 
 
 def _cmd_run(a, me) -> int:
-    from . import capacity, fallback, runs
+    from . import runs
     if a.cmd and a.cmd[0] == "--":
         a.cmd = a.cmd[1:]
     if a.step and a.cmd:
@@ -471,11 +473,17 @@ def _main(argv: list[str] | None = None) -> int:
             from .runs import validate_node_override
             validate_node_override(a)
         if a.sub == "log-rollup":
-            print(json.dumps(toollog.rollup(a.day), sort_keys=True))
+            print(json.dumps(toollog.rollup(a.day, live_only=a.live_only), sort_keys=True))
             return 0
         if a.sub == "reap":
             toollog.rollup_previous()
+            toollog.rollup_today()
         me = whoami()
+        import offbox_protection
+        offbox_protection.CALLER.set(offbox_protection.caller('client:' + a.sub, holder=me['owner'],
+                                                            thread_id=me.get('thread') or me.get('thread_id') or
+                                                            offbox_protection.caller().get('thread_id')))
+        log('client_command ' + json.dumps(offbox_protection.caller()))
         if a.sub == "exec":
             from . import execute
             return execute.command(a, me)
@@ -516,7 +524,7 @@ def _main(argv: list[str] | None = None) -> int:
                 from . import unfit
                 unfit.command(me, a.box_id, a.action, a.reason)
         elif a.sub == "release":
-            misc.release(me, a.box_id, a.mine, a.delete)
+            misc.release(me, a.box_id, a.mine, a.delete, override=a.override_protection)
         elif a.sub == "ssh":
             box, cmd = a.box_id, list(a.cmd)
             if box and not box.startswith("bx_"):

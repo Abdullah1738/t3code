@@ -56,10 +56,10 @@ class DependencyAdviceTests(unittest.TestCase):
 
     def assert_advice(self, result, hint, *, marker=False, install=''):
         self.assertNotEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(runs.NO_NODE_MODULES_MARKER in result.stderr, marker, result.stderr)
-        self.assertEqual(bool(hint), marker, hint)
+        self.assertEqual(runs.NO_NODE_MODULES_MARKER in result.stderr, marker or bool(install), result.stderr)
+        self.assertEqual(bool(hint), marker or bool(install), hint)
         if install:
-            self.assertIn(f"offbox: command exited {result.returncode} and node_modules is still missing; its own install step ({install}) didn't run or didn't finish. The failing line is above.", result.stderr)
+            self.assertEqual(hint, f"command exited {result.returncode} and node_modules is still missing; its own install step ({install}) didn't run or didn't finish. The failing line is above.")
         else:
             self.assertNotIn('its own install step', result.stderr)
 

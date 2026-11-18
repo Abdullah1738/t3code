@@ -17,6 +17,10 @@ GOOD = dict(complete=True, threads={}, opencode=set(), workspaces={'native': '/w
 
 
 class LivenessTests(JanitorTestCase):
+    def setUp(self):
+        self.sleep = patch.object(reaper.time, 'sleep').start()
+        self.addCleanup(patch.stopall)
+
     def test_both_scripts_use_same_api_workspaces_and_service_directories(self):
         with patch.object(active, 'snapshot', return_value={**GOOD, 'opencode': {'ses_test'}}), \
                 patch.object(active, 'opencode_directories', return_value=({'ses_test': '/work/service'}, None)):

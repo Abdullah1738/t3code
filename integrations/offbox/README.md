@@ -76,8 +76,13 @@ incomplete install is never selected.
 
 Toolchain exit code:
 
-- **99**: pinned Node/pnpm provisioning, checksum verification, or activation
+- **99**: pinned Node/pnpm/Quint provisioning, checksum verification, or activation
   failed. The user command never started. No box-default fallback.
+
+Quint runs use CLI 0.33.1 in a box-local cache behind the guarded wrapper. The
+first run installs it; warm runs check its version without npm. An explicit
+`QUINT_BIN` is preserved. Setup prints `offbox-quint:` events and a guarded CLI
+status line; runs without a Quint command or repo spec skip provisioning.
 
 ## Changing it
 
@@ -86,15 +91,28 @@ This tree is the source of truth. Every change is committed and pushed to
 
 ```bash
 cd integrations/offbox/skill/scripts
-# OFFBOX_STATE_DIR: the suite must not read this Mac's server.json / backend-state.json
-OFFBOX_STATE_DIR=$(mktemp -d) python3 -m unittest discover -s tests -p 'test_*.py'   # ~5 min
-python3 ../../tests/test_boatd.py                      # the server (boatd): reconcile, tokens, queue, retention
+python3 test-runner.py python3 -m unittest discover -s tests -p 'test_*.py'
+python3 test-runner.py python3 -m unittest discover -s ../../tests -p 'test_*.py'
 OFFBOX_RULES=../heavy-rules.json python3 classify.py --test
-(cd tests && unset BUN_INSPECT && bun test classify.test.ts gate-plugin.test.ts)
+(cd tests && unset BUN_INSPECT && python3 ../test-runner.py bun test classify.test.ts gate-plugin.test.ts toollog.test.ts)
 cd ../.. && git commit ... && git push origin HEAD:main
 ./install.zsh --dry-run && ./install.zsh               # or: integrations/deploy.zsh offbox
 ./install.zsh --check                                   # live copy == repo, HEAD on origin
 ```
+
+Use `skill/scripts/test-runner.py` around the server unittest suite and pytest
+entry points too. It gives the entire process tree a temporary tool-log directory;
+shared client fixtures and pytest use a fresh directory for each test. Direct
+unittest/pytest writers without an override drop events. `OFFBOX_LOG_DIR` selects
+the writer, retention and rollup directory; `OFFBOX_TOOL_LOG_DIR` remains a
+compatible fallback. Neither override isolates the CLI's database or run state.
+
+`offbox log-rollup --day YYYY-MM-DD --live-only` writes a separate
+`rollup-live-YYYY-MM-DD.json` with `records` and `excludedRecords` counts. It
+excludes explicit test events, fixture run IDs and run events without a run ID.
+Legacy events without run IDs outside `run.*` remain included, so old test noise
+without identifying metadata cannot be separated reliably. The day file and
+ordinary rollup stay intact.
 
 `install.zsh` restarts the monitor LaunchAgent and loads the home monitor (reloading it when its plist
 changed). A gate plugin change only takes effect after an OpenCode restart, which needs Abdullah's go.

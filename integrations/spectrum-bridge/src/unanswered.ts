@@ -5,6 +5,43 @@ import { toolLog } from "./toollog.ts";
 export const UNANSWERED_REQUEUE_MS = 5 * 60_000;
 export const UNANSWERED_ALERT_MS = 10 * 60_000;
 export const UNANSWERED_RESTART_WINDOW_MS = 30 * 60_000;
+
+/** Remote content stays encrypted; the relay needs only receipt times and reply attribution. */
+export class RemoteUnanswered {
+  private checking?: Promise<void>;
+  constructor(private readonly store: Store, private readonly notify?: (severity: "attention", text: string, key: string) => Promise<boolean>) {
+    store.db.exec(`CREATE TABLE IF NOT EXISTS remote_unanswered (
+      id TEXT PRIMARY KEY, received_at INTEGER NOT NULL, answered_at INTEGER, alert TEXT, alerted_at INTEGER)`);
+  }
+  accept(id: string, at: number) {
+    this.store.db.query("INSERT OR IGNORE INTO remote_unanswered(id,received_at) VALUES (?,?)").run(id, at);
+  }
+  answered(id: string, at: number) {
+    this.store.db.query("UPDATE remote_unanswered SET answered_at=COALESCE(answered_at,?) WHERE id=?").run(at, id);
+  }
+  check(now: number): Promise<void> {
+    return this.checking ??= this.sweep(now).finally(() => { this.checking = undefined; });
+  }
+  private async sweep(now: number) {
+    if (!this.notify) return;
+    const rows = this.store.db.query<{ id: string; received_at: number; alert: string | null }, [number]>(
+      "SELECT id,received_at,alert FROM remote_unanswered WHERE answered_at IS NULL AND alerted_at IS NULL AND received_at<=? ORDER BY received_at",
+    ).all(now - UNANSWERED_ALERT_MS);
+    for (const row of rows) {
+      const live = this.store.db.query("SELECT 1 FROM remote_unanswered WHERE id=? AND answered_at IS NULL AND alerted_at IS NULL").get(row.id);
+      if (!live) continue;
+      const ageMs = Math.max(0, now - row.received_at);
+      const time = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Dubai", hour: "2-digit", minute: "2-digit" }).format(row.received_at);
+      // Freeze the payload before sending: Telegram rejects changed text for the same key.
+      const text = row.alert ?? `Moni's iMessage from ${time} (Dubai) has had no reply for ${Math.floor(ageMs / 60_000)} min (backend: remote-box). Check her box queue.`;
+      if (!row.alert) this.store.db.query("UPDATE remote_unanswered SET alert=? WHERE id=?").run(text, row.id);
+      const sent = await this.notify("attention", text, `imessage-unanswered:${row.id}`).catch(() => false);
+      if (sent) this.store.db.query("UPDATE remote_unanswered SET alerted_at=? WHERE id=?").run(now, row.id);
+      toolLog.capture(() => toolLog.write({ component: "remote-box", kind: "event", name: "inbound.overdue_notice",
+        ids: { inboundId: row.id, chat: "moni" }, props: { backend: "remote-box", ageMs, telegram: sent ? "sent" : "failed" } }));
+    }
+  }
+}
 export const humanRow = (id: string) => !/^(?:wake|secret|reset):/.test(id);
 export type AnsweredInput = NormalizedInbound & { answeredAt?: number; unanswered?: {
   overdueAt?: number; requeuedAt?: number; alertAttempts?: number; alertedAt?: number;
@@ -45,13 +82,43 @@ export function captureReplyCoverage(store: Store, op: OutboxOperation): void {
   const turn = store.get<ReplyTurn | null>("activeTurn");
   const ids = op.sessionId && turn?.id === op.sessionId && turn.generation === op.generation ? turnMembers(store, turn) : [];
   if (op.replyTo) ids.push(...store.get<NormalizedInbound | null>(`batch:${op.replyTo}`)?.batchIds ?? [op.replyTo]);
-  store.set(`reply-covered:${op.id}`, [...new Set(ids.filter(humanRow))]);
+  saveReplyCoverage(store, op, ids);
+}
+
+function saveReplyCoverage(store: Store, op: OutboxOperation, ids: string[]): string[] {
+  const covered = [...new Set(ids.filter(humanRow))];
+  if (op.kind === "control" && !op.answersInbound) store.set(`reply-acked:${op.id}`, covered);
+  store.set(`reply-covered:${op.id}`, op.kind === "control" && !op.answersInbound ? [] : covered);
+  return op.kind === "control" && !op.answersInbound ? [] : covered;
+}
+
+export function markControlAcked(store: Store, op: OutboxOperation): void {
+  deliveredReplyCoverage(store, op);
+  if (store.get(`reply-ack-logged:${op.id}`)) return;
+  store.set(`reply-ack-logged:${op.id}`, true);
+  const prefix = op.id.split(":")[0];
+  const kind = prefix === "synthetic-dropped" ? "dropped" : prefix === "turn" ? "failed"
+    : ["outage", "control", "nudge", "request"].includes(prefix!) ? prefix! : "other";
+  for (const inboundId of store.get<string[]>(`reply-acked:${op.id}`) ?? []) {
+    const row = store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(inboundId);
+    if (!row || !humanInput(JSON.parse(row.payload) as NormalizedInbound)) continue;
+    toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "inbound.acked",
+      ids: { chat: store.get<string>("log-chat") ?? store.get<string>("unanswered-chat") ?? "other", inboundId, operationId: op.id }, props: { kind } }));
+  }
 }
 
 /** Older sends have delivery attribution, but predate the coverage snapshot. */
 export function deliveredReplyCoverage(store: Store, op: OutboxOperation): string[] {
   const saved = store.get<string[]>(`reply-covered:${op.id}`);
-  if (saved !== undefined) return saved;
+  if (saved !== undefined) {
+    // Upgrade snapshots may have incorrectly covered human rows with a control notice.
+    if (op.kind === "control" && !op.answersInbound) {
+      if (store.get(`reply-acked:${op.id}`) === undefined) store.set(`reply-acked:${op.id}`, saved);
+      store.set(`reply-covered:${op.id}`, []);
+      return [];
+    }
+    return saved;
+  }
   const sources = [store.get<string>(`log-inbound-id:${op.id}`), op.replyTo]
     .flatMap(id => id ? [sealedBatch(store, id)] : []);
   const ids = sources.flatMap(source => source.members);
@@ -74,15 +141,14 @@ export function deliveredReplyCoverage(store: Store, op: OutboxOperation): strin
       ids.push(...sealedBatch(store, member.inboundId).members);
     }
   }
-  const covered = [...new Set(ids.filter(humanRow))];
-  store.set(`reply-covered:${op.id}`, covered);
-  return covered;
+  return saveReplyCoverage(store, op, ids);
 }
 
 /** Reconcile upgrade history before overdue rows can be replayed. Session identity alone is not proof. */
 export function reconcileLegacyReplies(store: Store, since: number, now: number): void {
   const rows = store.db.query<{ id: string }, []>(`SELECT o.id FROM outbox o
-    WHERE o.state IN ('pending', 'sending', 'uncertain', 'failed', 'sent') AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)`).all()
+    WHERE json_extract(o.payload, '$.kind') = 'conversation' AND o.state IN ('pending', 'sending', 'uncertain', 'failed', 'sent')
+      AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)`).all()
     .map(({ id }) => {
       const sentAt = store.get<number>(`sent-at:${id}`);
       const known = Number.isSafeInteger(sentAt) && sentAt! >= 0 && sentAt! <= now;
@@ -117,7 +183,9 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
       && input.unanswered?.requeuedAt !== undefined && store.get(`human-own-turn:${id}`)
       && sealedBatch(store, id).members.every(member => covered.has(member))).map(row => row.id));
     for (const { id, state, input } of rows) {
-      if (!humanInput(input)) continue;
+      // Explicit reply coverage also settles older normalized rows without a source field.
+      if (state === "cancelled" || state === "observed"
+        || !humanInput(input) && !(input.source === undefined && input.id === id && Array.isArray(input.attachments))) continue;
       const retryAnswered = (state === "pending" || state === "batched") && queuedRetries.has(sealedBatch(store, id).leader);
       const nextState = state === "admitted" || retryAnswered ? "done" : state;
       if (input.answeredAt !== undefined) {
@@ -126,22 +194,15 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
       }
       store.updateInbound(id, nextState, { ...input, answeredAt: now });
       const ageMs = Math.max(0, now - (input.receivedAt ?? now));
-      const chat = store.get<string>("unanswered-chat") ?? "other";
+      const chat = store.get<string>("log-chat") ?? store.get<string>("unanswered-chat") ?? "other";
       toolLog.capture(() => {
-        if (opts.recordLatency !== false && (chat === "owner" || chat === "moni")) toolLog.write({ component: "router", kind: "perf", name: "inbound.answered",
+        if (opts.recordLatency !== false) toolLog.write({ component: "router", kind: "perf", name: "inbound.answered",
           ids: { inboundId: id, chat }, durationMs: ageMs });
         if (input.unanswered?.overdueAt !== undefined) toolLog.write({ component: "router", kind: "event", name: "inbound.answered_late",
           ids: { inboundId: id, chat }, props: { ageMs } });
       });
     }
   }).immediate();
-}
-
-export function markReactionAnswered(store: Store, target: string): void {
-  const turn = store.get<ReplyTurn | null>("activeTurn");
-  // A reaction to old history must not acknowledge an unrelated current turn.
-  const members = turn ? turnMembers(store, turn) : [];
-  markAnswered(store, members.includes(target) ? members : [target]);
 }
 
 export type Running = { members: readonly string[]; leaderKind: "human" | "wake" | "reset" | "background" };
