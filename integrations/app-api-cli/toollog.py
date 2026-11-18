@@ -26,8 +26,12 @@ DELEGATION_REASONS = {'NO_STANDING_DELEGATION', 'DUPLICATE_DELEGATED_RECORD',
     'BUS_REQUEST_MISSING', 'BUS_WRONG_SENDER', 'BUS_WRONG_TARGET', 'BUS_REQUEST_CLOSED',
     'BUS_REQUEST_STALE', 'BUS_UNREADABLE', 'INVALID_LIFETIME', 'UNSUPPORTED_DELEGATION',
     'DELEGATED_RECORD_INVALID'}
+STANDING_REASONS = {'STANDING_NOT_FOUND', 'NOT_STANDING', 'STANDING_REVOKED',
+    'STANDING_CURRENCY_MISMATCH', 'STANDING_CAP_EXCEEDED', 'INVALID_AMOUNT',
+    'INVALID_LIFETIME', 'STANDING_RECORD_INVALID'}
 _NAMES = {
     'record.refused',
+    'standing.created', 'standing_record.created', 'standing_record.refused',
     'delegate.created', 'delegate.revoked', 'delegated_record.created', 'delegated_record.refused',
     'moni_go.bus_checked', 'moni_go.bus_refused',
     'cmd.start', 'cmd.end', 'cmd.error', 'guard.refused', 'payment.may_have_sent',
@@ -47,7 +51,7 @@ _ENUMS = {
     'route': {'cdp', 'phone', 'unspecified'},
     'field': {'card_name', 'card_number', 'card_expiry', 'card_cvc'},
     'cardNickname': {'Marriott', 'MashreqNoon', 'Skywards', 'Mashreq'},
-    'reason': DELEGATION_REASONS | {'expired_at_write'},
+    'reason': DELEGATION_REASONS | STANDING_REASONS | {'expired_at_write'},
     'refusal': {'none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage',
                 'checkout_unavailable', 'checkout_untracked'},
     'busStatus': {'open', 'pending', 'timed_out'},
@@ -249,7 +253,7 @@ SUPERMALL_SILENT_DELIVERY_NOT_ACTIVE TALABAT_ADDRESS_CHECK_FAILED TALABAT_RETIRE
 UNSUPPORTED_NATIVE_MARKETPLACE_QUIET_DELIVERY UNSUPPORTED_QUIET_OPTION_SEMANTICS
 """.split())
 
-_KNOWN_TAGS = _GUARD_TAGS | DELEGATION_REASONS | frozenset("""
+_KNOWN_TAGS = _GUARD_TAGS | DELEGATION_REASONS | STANDING_REASONS | frozenset("""
 BRIDGE_REQUEST_FAILED
 OPERATION_FAILED LOG_CAP TRACK_REGISTRATION_FAILED TRACK_POLL_SOURCE_ERROR
 AUTH_EXPIRED AUTH_FORBIDDEN ACCOUNT_CAPTURE_REQUIRED INVALID_ORDER_ID INVALID_ARGUMENTS
@@ -678,7 +682,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher', 'vendorId', 'itemId', 'cardId'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'standingId', 'watcher', 'vendorId', 'itemId', 'cardId'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):

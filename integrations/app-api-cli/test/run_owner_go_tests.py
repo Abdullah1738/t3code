@@ -36,6 +36,7 @@ if __name__ == '__main__':
     names = [
         'test_owner_go',
         'test_owner_go_delegation',
+        'test_owner_go_standing',
         'test_owner_go_gates',
         'test_install_cli',
         'test_commerce_journal',
