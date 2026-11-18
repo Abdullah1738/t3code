@@ -61,7 +61,7 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
     row.pendingBackgroundTasks !== undefined ||
     row.archivedAt !== null ||
     row.providerInstanceId !== providerInstanceId ||
-    ((row.forkedFrom === null || row.forkedFrom.type === "node") && row.activeRunId !== null)
+    row.activeRunId !== null
   ) {
     if (call._tag === "Some") {
       call.value.callerResolved = true;
@@ -74,7 +74,7 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
       pendingBackgroundTasks: row.pendingBackgroundTasks ?? [],
     } satisfies CallerIdentity;
   }
-  // Only fork history or work exceeding the caller caps needs the exact shell.
+  // An inactive fork or work exceeding the caller caps still needs the exact shell.
   if (call._tag === "Some") {
     call.value.callerReaderLane = "background";
     call.value.readerLane = "background";
