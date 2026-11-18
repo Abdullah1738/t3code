@@ -11713,16 +11713,12 @@ const make = Effect.gen(function* () {
       | "provider_pause"
       | "recovery_pending"
       | "thread_unavailable",
-    observed?: KanbanThreadView | null,
+    view: KanbanThreadView | null,
   ) {
     const now = yield* nowMillis;
     for (const [id, at] of workerIdleSkipAt)
       if (now - at >= 10 * 60_000) workerIdleSkipAt.delete(id);
     if (!cards.some((card) => card.stage === "working" && !workerIdleSkipAt.has(card.id))) return;
-    const view =
-      observed === undefined
-        ? yield* freshThreads.find(threadId).pipe(Effect.catch(() => Effect.succeed(null)))
-        : observed;
     if (view !== null && view.state !== "idle" && view.state !== "queued") return;
     for (const card of cards) {
       if (card.stage !== "working" || workerIdleSkipAt.has(card.id)) continue;
@@ -11838,6 +11834,7 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     cards: ReadonlyArray<KanbanCard>,
     text: string,
+    view: KanbanThreadView | null,
   ) {
     if (
       (yield* threads.queuedRuns(threadId)).some(
@@ -11845,7 +11842,7 @@ const make = Effect.gen(function* () {
       )
     ) {
       yield* Effect.logDebug("kanban nudge skipped: unread message queued", { threadId });
-      yield* workerIdleSkip(threadId, cards, "queued_run");
+      yield* workerIdleSkip(threadId, cards, "queued_run", view);
       return;
     }
     // The send is accepted before the gate resumes. Acknowledge it on current rows,
@@ -11894,14 +11891,15 @@ const make = Effect.gen(function* () {
     cards: ReadonlyArray<KanbanCard>,
   ) {
     for (const card of cards) {
-      if (Rules.workerWaitDeferred(card)) yield* workerIdleSkip(threadId, [card], "self_wait");
       if (
         !Rules.workerWaitDeferred(card) ||
         card.workThreadId !== threadId ||
-        card.stalled !== null ||
-        (yield* activeWaitThreadRunning(card, threads))
+        card.stalled !== null
       )
         continue;
+      const activity = yield* activeWaitThreadState(card, threads);
+      yield* workerIdleSkip(threadId, [card], "self_wait", activity.view);
+      if (activity.running) continue;
       const next = releaseToQueue(card, yield* nowIso);
       // Cleanup can take turn admission itself; finish it before locking, then
       // confirm idleness under the same lock used by evaluator parking.
@@ -12064,10 +12062,11 @@ const make = Effect.gen(function* () {
   const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
     threadId: ThreadId,
     planned: ReadonlyArray<KanbanCard>,
+    observed: KanbanThreadView | null,
     runtimeFailureRunId: string | null = null,
   ) {
     if (waking(threadId)) {
-      yield* workerIdleSkip(threadId, planned, "recovery_pending");
+      yield* workerIdleSkip(threadId, planned, "recovery_pending", observed);
       return;
     }
     for (const card of planned) yield* advanceFinishedWorker(card);
@@ -12088,6 +12087,7 @@ const make = Effect.gen(function* () {
           threadId,
           [current ?? initial],
           current?.activeThreadId !== threadId ? "not_active_thread" : "state_changed",
+          observed,
         );
         continue;
       }
@@ -12099,7 +12099,7 @@ const make = Effect.gen(function* () {
     const carried = yield* store.cardsByThread(threadId);
     if (board?.pause && carried.some((card) => !board.pause!.keep.includes(card.id))) {
       yield* Ref.update(deferredNudges, (set) => new Set(set).add(threadId));
-      yield* workerIdleSkip(threadId, cards, "board_pause");
+      yield* workerIdleSkip(threadId, cards, "board_pause", observed);
       return;
     }
     // A parked sibling must not be woken by another card on the same thread.
@@ -12112,11 +12112,12 @@ const make = Effect.gen(function* () {
         threadId,
         cards,
         carried.some((card) => card.wait !== undefined) ? "self_wait" : "blocking_ask",
+        observed,
       );
       return;
     }
     for (const card of cards)
-      if (card.stalled !== null) yield* workerIdleSkip(threadId, [card], "stalled");
+      if (card.stalled !== null) yield* workerIdleSkip(threadId, [card], "stalled", observed);
     const nudge = (yield* upgradeFindings(cards)).filter(
       (card) =>
         card.stage === "working" &&
@@ -12340,7 +12341,7 @@ const make = Effect.gen(function* () {
           break;
         }
       }
-      yield* nudgeThread(threadId, first, recovery + Briefs.nudgeWorkText(first, boardStop));
+      yield* nudgeThread(threadId, first, recovery + Briefs.nudgeWorkText(first, boardStop), view);
     }
     for (const card of released)
       yield* noteDiscussion(card, `Card #${card.number}: Work thread idle; slot freed`).pipe(
@@ -12571,7 +12572,7 @@ const make = Effect.gen(function* () {
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
     const refused = Retries.refusedVerdict(card, yield* store.cardEvents(card.id), threadId);
     if (refused === null && card.nudgedAt === null) {
-      yield* nudgeThread(threadId, [card], Briefs.nudgeReviewText(card));
+      yield* nudgeThread(threadId, [card], Briefs.nudgeReviewText(card), null);
       return;
     }
     // A reviewer that still has no verdict after the nudge frees its slot. The first
@@ -12695,7 +12696,7 @@ const make = Effect.gen(function* () {
         continue;
       const review = carried.find((card) => card.activeRole === "review");
       if (review) yield* reviewerStopped(review, threadId);
-      else yield* nudgeWorker(threadId, carried);
+      else yield* nudgeWorker(threadId, carried, view);
     }
   });
 
@@ -13546,7 +13547,7 @@ const make = Effect.gen(function* () {
         if (failure.runId == null || latestFailure?.runId !== failure.runId) return;
         const now = yield* nowMillis;
         const due = carried.filter((entry) => Rules.failedTurnResumeDue(entry, fresh, now));
-        if (due.length > 0) yield* nudgeWorker(threadId, due, failure.runId);
+        if (due.length > 0) yield* nudgeWorker(threadId, due, fresh, failure.runId);
         return;
       }
       if (failure !== null) {
@@ -13788,7 +13789,7 @@ const make = Effect.gen(function* () {
       // A worker waiting on its own subagents hasn't stopped.
       if (Rules.waitingOnBackground(view, yield* nowMillis)) return;
       if (discussionAttempted) return;
-      yield* nudgeWorker(threadId, settled);
+      yield* nudgeWorker(threadId, settled, view);
       return;
     }
     if (!card) return;
@@ -14585,6 +14586,10 @@ const make = Effect.gen(function* () {
             // Repair stalled cards that held slots before flags released them.
             for (const initial of yield* cardsForPlan) {
               if (initial.stalled === null || initial.activeThreadId === null) continue;
+              const view =
+                initial.stage === "working" && initial.activeRole === "work"
+                  ? yield* readBackstopPlan(planView(initial.activeThreadId))
+                  : null;
               yield* step(
                 "releaseStalled",
                 Effect.gen(function* () {
@@ -14595,6 +14600,11 @@ const make = Effect.gen(function* () {
                     current.activeThreadId === null
                   )
                     return;
+                  if (
+                    current.activeRole === "work" &&
+                    current.activeThreadId === initial.activeThreadId
+                  )
+                    yield* workerIdleSkip(current.activeThreadId, [current], "stalled", view);
                   yield* letGo(current, false, "is stalled", {
                     until: "after the flag is cleared",
                     respectPause: true,
@@ -15335,7 +15345,7 @@ const make = Effect.gen(function* () {
                     updateCard(interrupted);
                     return;
                   }
-                  yield* nudgeWorker(threadId, [current]);
+                  yield* nudgeWorker(threadId, [current], fresh.value);
                   const saved = yield* store.card(current.id);
                   if (saved) updateCard(saved);
                   else invalidateCards();
@@ -20214,16 +20224,24 @@ const make = Effect.gen(function* () {
     ).pipe(Effect.andThen(write));
   };
 
-  const activeWaitThreadRunning = Effect.fn("KanbanService.activeWaitThreadRunning")(function* (
+  const activeWaitThreadState = Effect.fn("KanbanService.activeWaitThreadState")(function* (
     card: KanbanCard,
     io: typeof threadIo,
   ) {
-    if (card.activeThreadId === null) return false;
+    if (card.activeThreadId === null) return { running: false, view: null };
     const queued = yield* io.queuedRuns(card.activeThreadId);
     const view = yield* io.view(card.activeThreadId);
     // A missing/failed read cannot prove the owner is idle. PR watches alone may park.
-    return queued.length > 0 || view?.state !== "idle" || view.backgroundWork > 0;
+    return {
+      running: queued.length > 0 || view?.state !== "idle" || view.backgroundWork > 0,
+      view,
+    };
   });
+
+  const activeWaitThreadRunning = Effect.fn("KanbanService.activeWaitThreadRunning")(
+    (card: KanbanCard, io: typeof threadIo) =>
+      activeWaitThreadState(card, io).pipe(Effect.map((activity) => activity.running)),
+  );
 
   const waitCard: KanbanServiceShape["waitCard"] = (cardId, input, actor) =>
     guard(

@@ -12443,6 +12443,91 @@ const nudgesTo = (fake: Effect.Success<typeof makeFake>, threadId: string) =>
     ),
   );
 
+const queuedWorkerRun = (threadId: ThreadId) => ({
+  id: RunId.make("queued-successor"),
+  threadId,
+  ordinal: 2,
+  providerInstanceId: ProviderInstanceId.make("opencode"),
+  modelSelection: DEFAULT_CARD_MODEL,
+  providerThreadId: null,
+  userMessageId: MessageId.make("successor"),
+  rootNodeId: null,
+  activeAttemptId: null,
+  status: "queued" as const,
+  requestedAt: DateTime.makeUnsafe("2026-10-25T13:31:00.000Z"),
+  startedAt: null,
+  completedAt: null,
+  checkpointId: null,
+  contextHandoffId: null,
+});
+
+it.effect("#1757 a late queued run logs its hold without another thread read", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const events: AnalyticsEvent[] = [];
+    let workerThread: ThreadId | undefined;
+    let queueHolds = 0;
+    let readsAfterHold = 0;
+    const wrapped = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (io) =>
+        KanbanThreads.of({
+          ...io,
+          find: (threadId) =>
+            Effect.gen(function* () {
+              if (
+                threadId === workerThread &&
+                queueHolds > 0 &&
+                (yield* inBackstopRead("KanbanService.nudgeThread"))
+              )
+                readsAfterHold++;
+              return yield* io.find(threadId);
+            }),
+          queuedRuns: (threadId) =>
+            Effect.gen(function* () {
+              if (
+                threadId === workerThread &&
+                (yield* inBackstopRead("KanbanService.nudgeThread"))
+              ) {
+                queueHolds++;
+                return [queuedWorkerRun(threadId)];
+              }
+              return yield* io.queuedRuns(threadId);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Late queued run",
+          prompt: "Build",
+          subtasks: [{ owner: "work", step: 1, text: "Build" }],
+        },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      workerThread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(queueHolds, 1);
+      assert.strictEqual(readsAfterHold, 0);
+      const rows = events.filter(
+        (event) => event.kind === "kanban.worker_idle_skip" && event.cardId === card.id,
+      );
+      assert.lengthOf(rows, 1);
+      assert.strictEqual(rows[0]!.props?.reason, "queued_run");
+      const after = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(after.stage, "working");
+      assert.isNull(after.nudgedAt);
+      assert.strictEqual(yield* nudgesTo(fake, workerThread), 0);
+    }).pipe(Effect.provide(evaluatorAnalyticsLayer(wrapped, events)));
+  }),
+);
+
 it.effect.each([
   ["pr_watch", "idle"],
   ["quiet_not_due", "idle"],
@@ -12450,6 +12535,7 @@ it.effect.each([
   ["queued_run", "queued"],
   ["restart_hold", "idle"],
   ["self_wait", "idle"],
+  ["stalled", "idle"],
 ] as const)(
   "#1757 idle decisions explain %s with %s view and are limited to one row per ten minutes",
   ([reason, state]) =>
@@ -12471,29 +12557,7 @@ it.effect.each([
                   ),
                 ),
             queuedRuns: (threadId) =>
-              Effect.succeed(
-                threadId === queuedThread
-                  ? [
-                      {
-                        id: RunId.make("queued-successor"),
-                        threadId,
-                        ordinal: 2,
-                        providerInstanceId: ProviderInstanceId.make("opencode"),
-                        modelSelection: DEFAULT_CARD_MODEL,
-                        providerThreadId: null,
-                        userMessageId: MessageId.make("successor"),
-                        rootNodeId: null,
-                        activeAttemptId: null,
-                        status: "queued" as const,
-                        requestedAt: DateTime.makeUnsafe("2026-10-25T13:31:00.000Z"),
-                        startedAt: null,
-                        completedAt: null,
-                        checkpointId: null,
-                        contextHandoffId: null,
-                      },
-                    ]
-                  : [],
-              ),
+              Effect.succeed(threadId === queuedThread ? [queuedWorkerRun(threadId)] : []),
           }),
         ),
       ).pipe(Layer.provide(fake.layer));
@@ -12521,6 +12585,12 @@ it.effect.each([
         worker.prWatches = reason === "pr_watch" ? 1 : 0;
         if (reason === "queued_run") queuedThread = thread;
         if (reason === "restart_hold") worker.restartRecovery = { runId: "cut-run" };
+        if (reason === "stalled")
+          yield* store.putCard({
+            ...working,
+            nudgedAt: started,
+            stalled: { reason: "Needs recovery", by: owner, at: started },
+          });
         if (reason === "self_wait") {
           yield* store.putCard({
             ...working,
@@ -12549,10 +12619,15 @@ it.effect.each([
         assert.strictEqual(rows()[0]!.props?.nudgedAt, started);
         assert.strictEqual(rows()[0]!.props?.lastRunEndedAt, started);
         assert.strictEqual(rows()[0]!.props?.quietDueAt, "2026-10-25T13:30:00.000Z");
+        assert.strictEqual(
+          rows()[0]!.props?.holdUntil,
+          reason === "pr_watch" ? "2026-10-25T19:00:00.000Z" : null,
+        );
         assert.strictEqual(yield* nudgesTo(fake, thread), 0);
         const after = (yield* kanban.card(card.id)).card;
-        assert.strictEqual(after.stage, reason === "self_wait" ? "todo" : "working");
-        if (reason !== "self_wait") {
+        const parked = reason === "self_wait" || reason === "stalled";
+        assert.strictEqual(after.stage, parked ? "todo" : "working");
+        if (!parked) {
           yield* TestClock.adjust("9 minutes");
           yield* kanban.tick;
           assert.lengthOf(rows(), 1);
