@@ -1449,9 +1449,14 @@ it.effect("rejects non-boolean snapshot image options before selecting a browser
           Effect.provideService(McpSchema.McpServerClient, client),
         );
       expect(result.isError).toBe(true);
-      expect(result.content).toEqual([{ type: "text", text: "Preview snapshot failed: AiError." }]);
-      expect(result.structuredContent).toEqual({
-        error: { _tag: "AiError", operation: "snapshot", failureCount: 1 },
+      expect(result.structuredContent).toMatchObject({
+        code: "invalid_request",
+        invalidFields: ["includeImage"],
+      });
+      const part = result.content[0];
+      expect(part?.type === "text" ? part.text : "").toContain("includeImage must be a boolean");
+      expect(result.structuredContent).toMatchObject({
+        message: part?.type === "text" ? part.text : "",
       });
     }
   }).pipe(Effect.provide(layerTest)),
@@ -1540,8 +1545,9 @@ it.effect("accepts finite wait budgets and refuses non-finite ones", () => {
       ["t3_thread_wait", { threadId: "thread-wait", timeoutMs: "-Infinity" }],
       ["t3_thread_read", { threadId: "thread-wait", afterPosition: "2" }],
     ] as const) {
-      const refused = yield* callTool(name, args).pipe(Effect.flip);
-      expect(refused._tag, `${name} ${JSON.stringify(args)}`).toBe("InvalidParams");
+      const refused = yield* callTool(name, args);
+      expect(refused.isError, name).toBe(true);
+      expect(refused.structuredContent).toMatchObject({ code: "invalid_request" });
     }
     expect(calls).toHaveLength(2);
   }).pipe(Effect.provide(layerRecordingTools(calls)));
@@ -2099,9 +2105,12 @@ it.effect("registers annotated tools and preserves authenticated request context
         .pipe(
           Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
           Effect.provideService(McpSchema.McpServerClient, client),
-          Effect.flip,
         );
-      expect(malformed._tag).toBe("InvalidParams");
+      expect(malformed.isError).toBe(true);
+      expect(malformed.structuredContent).toMatchObject({
+        code: "invalid_request",
+        invalidFields: ["selector"],
+      });
 
       const snapshot = yield* server
         .callTool({
