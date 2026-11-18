@@ -2321,6 +2321,10 @@ def _database_reference(source):
 
 def refusal_reason(rule, cause, cwd):
     if rule == "live-database-script-unresolved":
+        python_hint = None
+        if cause and cause.startswith('python3: bare executable lookup unproved; '):
+            python_hint = ('retry this same call with /usr/bin/python3 -I … instead of bare python3; '
+                           'the executable, startup and mutation checks still apply.')
         zsh_hint = None
         if cause and 'zsh: implicit startup unproved' in cause:
             zsh_hint = 'Use zsh -f -n to skip user startup files; check one file per call.'
@@ -2330,7 +2334,9 @@ def refusal_reason(rule, cause, cwd):
             zsh_hint = "Check zsh's startup environment and executable, then retry."
         if cause and '\nAccepted: ' in cause:
             detail, hint = cause.split('\nAccepted: ', 1)
-            if zsh_hint:
+            if python_hint:
+                hint = python_hint
+            elif zsh_hint:
                 hint = zsh_hint
             elif 'startup' in detail or 'repo-node-pin' in detail:
                 hint = 'Resolve the named startup input, then retry.'
@@ -2343,7 +2349,9 @@ def refusal_reason(rule, cause, cwd):
             return ("statev2 guard: this command was NOT run.\n"
                     f"Could not check {detail}. Resolved workdir: {cwd}.\nAccepted: {hint}")
         fix = "Use a literal absolute script path."
-        if cause and "unbalanced quote" in cause:
+        if python_hint:
+            fix = 'Accepted: ' + python_hint
+        elif cause and "unbalanced quote" in cause:
             fix = "Close the shell quote before running the command."
         elif cause and ('script source changed after its heredoc write' in cause or 'unchecked copy at script path' in cause):
             fix = "An intervening command may replace the checked source. Split source preparation and execution into separate calls."
@@ -3204,6 +3212,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     copied_opaque = set()
     noclobber = False
     proof_failure = 'opaque binary'
+    python_lookup_unproved = False
     execution_site = 'script operand'
     execution_binary = 'script'
 
@@ -3556,7 +3565,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 name in SHELL_SPECIAL_BINDINGS or name.startswith(('LD_', 'DYLD_')))
 
     def preservation_tool(words, directory, *, builtin=False):
-        nonlocal proof_failure
+        nonlocal proof_failure, python_lookup_unproved
         label = binary_label(words)
         if not _preservation:
             proof_failure = label + ': command wrapper proof failed'
@@ -3575,10 +3584,15 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     return False
                 if os.environ.get(name) and not inherited_startup_safe(name, directory):
                     return False
-        if not builtin and (not _trusted_fixture_tool(words[0], os.path.basename(words[0]), directory) or
-                            not unchanged_tool(words[0], directory)):
-            proof_failure = label + ': executable provenance or mutation proof failed'
-            return False
+        if not builtin:
+            trusted = _trusted_fixture_tool(words[0], os.path.basename(words[0]), directory)
+            if not trusted or not unchanged_tool(words[0], directory):
+                proof_failure = label + ': executable provenance or mutation proof failed'
+                if not trusted and words[0] == 'python3' and unchanged_tool(words[0], directory):
+                    python_lookup_unproved = True
+                if None in tool_changes and unbounded_predecessors:
+                    proof_failure += '; preceding ' + unbounded_predecessors[0]
+                return False
         return True
 
     def interpreter_startup_proved(words, directory):
@@ -5795,7 +5809,14 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
 
         return walk(0, directory)[0]
 
-    scan(command, Path(cwd) if cwd is not None else None, _depth)
+    try:
+        scan(command, Path(cwd) if cwd is not None else None, _depth)
+    except AmbiguousScript as error:
+        if python_lookup_unproved:
+            # Hint selection must not infer provenance from caller-controlled
+            # operands that happen to contain a diagnostic phrase.
+            raise AmbiguousScript('python3: bare executable lookup unproved; ' + str(error)) from error
+        raise
     return paths
 
 
