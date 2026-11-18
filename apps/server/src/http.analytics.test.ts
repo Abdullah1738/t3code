@@ -1,15 +1,24 @@
+// @effect-diagnostics nodeBuiltinImport:off -- response events exercise the native lifecycle without opening a server.
+import * as NodeEvents from "node:events";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as ControlRequestAnalytics from "./ardud/control/ControlRequestAnalytics.ts";
+import * as HttpRequestLifecycle from "./ardud/http/HttpRequestLifecycle.ts";
 import { assert, it } from "@effect/vitest";
 import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
-import { HttpRouter, HttpServerResponse } from "effect/http";
+import { HttpEffect, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as Analytics from "./ardud/analytics/Analytics.ts";
 import { httpAnalyticsMiddleware } from "./http.ts";
 import * as ControlHttpTelemetry from "./observability/ControlHttpTelemetry.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { AnalyticsEvent as AnalyticsEventSchema } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+
+const decodeAnalyticsEvent = Schema.decodeUnknownSync(AnalyticsEventSchema, {
+  onExcessProperty: "error",
+});
 
 const layerHttpAnalytics = Layer.unwrap(
   Effect.map(httpAnalyticsMiddleware, (middleware) =>
@@ -69,7 +78,7 @@ it("attributes control HTTP rows with safe query modes, clients and separate rea
       readerQueryMs: 13,
       readerStatements: 1,
     });
-    Schema.decodeUnknownSync(AnalyticsEventSchema, { onExcessProperty: "error" })(events[0]);
+    decodeAnalyticsEvent(events[0]);
     assert.notInclude(JSON.stringify(events), "secret");
     assert.notInclude(JSON.stringify(events), "private");
   } finally {
@@ -175,6 +184,9 @@ it("records normalized HTTP routes, UTF-8/stream bytes and safe failures", async
       ],
     );
     assert.equal(events[2]?.props?.errorTag, "TestFailureError");
+    assert.equal(events[3]?.props?.pathHint, "/:value");
+    assert.match(events[3]?.props?.pathHash ?? "", /^sha256:[0-9a-f]{64}$/);
+    assert.equal(events[3]?.props?.remoteKind, "unknown");
     assert.isTrue(
       events.every((event) => event.durationMs !== undefined && event.props?.span !== undefined),
     );
@@ -204,3 +216,223 @@ it("preserves HTTP responses when analytics is absent or defective", async () =>
     }
   }
 });
+
+it.each(["buffered", "stream", "head", "closed"])(
+  "records one end-to-end control HTTP budget after %s delivery",
+  async (form) => {
+    const events: AnalyticsEvent[] = [];
+    const recorded = Promise.withResolvers<void>();
+    let tick = 0;
+    const source = new Request(
+      "http://test/api/ardud/control/threads/private/messages?token=secret",
+      {
+        method: form === "head" ? "HEAD" : "GET",
+        headers: { "x-request-id": "lifecycle-test", "user-agent": "Bun/1.4.1" },
+      },
+    );
+    const responseEvents = new NodeEvents.EventEmitter();
+    HttpRequestLifecycle.observe(source, responseEvents, () => tick);
+    const app = Layer.mergeAll(
+      HttpRouter.add(
+        "GET",
+        "/api/ardud/control/threads/:threadId/messages",
+        ControlRequestAnalytics.observe(
+          "control.messages",
+          Effect.gen(function* () {
+            (yield* NodeSqliteClient.ReaderWaitObserver)?.(27, "foreground");
+            (yield* NodeSqliteClient.StatementTimingObserver)?.({
+              connection: "reader",
+              lane: "foreground",
+              operation: "read",
+              durationMs: 13,
+              outcome: "success",
+            });
+            tick = 40;
+            return yield* ControlRequestAnalytics.encoding(
+              Effect.succeed(
+                form === "stream"
+                  ? HttpServerResponse.stream(Stream.make(new TextEncoder().encode("ok")))
+                  : HttpServerResponse.text("ok"),
+              ),
+            );
+          }),
+          { path: "/api/ardud/control/threads/:threadId/messages", method: "GET" },
+        ).pipe(Effect.provide(NodeCrypto.layer)),
+      ),
+      layerHttpAnalytics,
+    ).pipe(
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (event) =>
+            Effect.sync(() => {
+              events.push(event);
+              if (event.kind === "server.http") recorded.resolve();
+            }),
+        }),
+      ),
+    );
+    const { handler, dispose } = HttpRouter.toWebHandler(app, { disableLogger: true });
+    try {
+      tick = 10;
+      await (await handler(source)).text();
+      assert.lengthOf(
+        events.filter((event) => event.kind === "server.http"),
+        0,
+      );
+      tick = 55;
+      responseEvents.emit(form === "closed" ? "close" : "finish");
+      responseEvents.emit(form === "closed" ? "finish" : "close");
+      await recorded.promise;
+      const rows = events.filter((event) => event.kind === "server.http");
+      assert.lengthOf(rows, 1);
+      const event = rows[0]!;
+      assert.equal(event.route, "/api/ardud/control/threads/:threadId/messages");
+      assert.equal(event.durationMs, 55);
+      assert.equal(event.responseDelivery, form === "closed" ? "closed" : "finished");
+      assert.deepInclude(event.props!, {
+        requestId: "lifecycle-test",
+        receiveToHandlerMs: 10,
+        responseReadyMs: 40,
+        writeOutMs: 15,
+      });
+      assert.isNumber(event.props?.serializationMs);
+      assert.deepEqual(event.props?.readerTimings, [
+        { lane: "foreground", waitMs: 27, queryMs: 13, statements: 1 },
+      ]);
+      assert.isNumber(event.props?.handlerMs);
+      decodeAnalyticsEvent(event);
+      assert.notInclude(JSON.stringify(event), "private");
+      assert.notInclude(JSON.stringify(event), "secret");
+    } finally {
+      await dispose();
+    }
+  },
+);
+
+it("retains normalized unknown paths and a bounded caller hint", () => {
+  const a = ControlHttpTelemetry.pathHint("/api/secret-token/messages?token=query-secret");
+  const b = ControlHttpTelemetry.pathHint("/api/another-value/messages");
+  assert.equal(a.pathHint, "/api/:value/messages");
+  assert.equal(a.pathHint, b.pathHint);
+  assert.notEqual(a.pathHash, b.pathHash);
+  assert.equal(ControlHttpTelemetry.userAgent("Python-urllib/3.15"), "python-urllib/3.15");
+  assert.notInclude(JSON.stringify(a), "secret");
+});
+
+it("records a control disconnect before the handler builds a response", async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const recorded = Promise.withResolvers<AnalyticsEvent>();
+  const source = new Request("http://test/api/ardud/control/threads?active=true", {
+    headers: { "x-request-id": "early-close-test" },
+  });
+  let tick = 0;
+  const responseEvents = new NodeEvents.EventEmitter();
+  HttpRequestLifecycle.observe(source, responseEvents, () => tick);
+  const app = Layer.mergeAll(
+    HttpRouter.add(
+      "GET",
+      "/api/ardud/control/threads",
+      ControlRequestAnalytics.observe(
+        "control.threads",
+        Effect.promise(async () => {
+          entered.resolve();
+          await release.promise;
+          return HttpServerResponse.text("ok");
+        }),
+        { path: "/api/ardud/control/threads", method: "GET" },
+      ).pipe(Effect.provide(NodeCrypto.layer)),
+    ),
+    layerHttpAnalytics,
+  ).pipe(
+    Layer.provide(
+      Layer.mock(Analytics.Analytics)({
+        record: (event) =>
+          Effect.sync(() => {
+            if (event.kind === "server.http") recorded.resolve(event);
+          }),
+      }),
+    ),
+  );
+  const { handler, dispose } = HttpRouter.toWebHandler(app, { disableLogger: true });
+  try {
+    tick = 10;
+    const pending = handler(source);
+    await entered.promise;
+    tick = 25;
+    responseEvents.emit("close");
+    const event = await recorded.promise;
+    assert.equal(event.route, "/api/ardud/control/threads");
+    assert.equal(event.durationMs, 25);
+    assert.equal(event.responseDelivery, "closed");
+    assert.equal(event.props?.requestId, "early-close-test");
+    assert.equal(event.props?.receiveToHandlerMs, 10);
+    assert.notProperty(event.props, "handlerMs");
+    assert.notProperty(event.props, "writeOutMs");
+    decodeAnalyticsEvent(event);
+    release.resolve();
+    await pending;
+  } finally {
+    release.resolve();
+    await dispose();
+  }
+});
+
+const requestTargets = [
+  { target: "/api/secret/messages?token=secret", hint: "/api/:value/messages" },
+  { target: "//[?token=secret", hint: "//:value" },
+  { target: "//api/messages?token=secret", hint: "//api/messages" },
+  { target: "/\\[?token=secret", hint: "/:value" },
+  { target: "/api/%ZZ?token=secret", hint: "/api/:value" },
+  { target: "/api/%2F%3F?token=secret", hint: "/api/:value" },
+  { target: "https://example.invalid/api/secret?token=secret", hint: "/api/:value" },
+  { target: "http://[?token=secret", hint: ":value//:value" },
+  { target: "private/messages?token=secret", hint: ":value/messages" },
+  { target: "*?token=secret", hint: ":value" },
+  { target: "", hint: "/" },
+];
+
+it.effect.each(requestTargets)(
+  "logs raw request target $target without affecting its response",
+  ({ target, hint }) =>
+    Effect.gen(function* () {
+      const events: AnalyticsEvent[] = [];
+      const request = HttpServerRequest.fromWeb(new Request("http://test/")).modify({
+        url: target,
+      });
+      let responses = 0;
+      yield* Effect.gen(function* () {
+        const middleware = yield* httpAnalyticsMiddleware;
+        yield* HttpEffect.toHandled(
+          Effect.succeed(HttpServerResponse.empty({ status: 404 })),
+          (_request, response) =>
+            Effect.sync(() => {
+              responses += 1;
+              assert.equal(response.status, 404);
+            }),
+          middleware,
+        );
+      }).pipe(
+        Effect.provideService(HttpServerRequest.HttpServerRequest, request),
+        Effect.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => {
+                events.push(event);
+              }),
+          }),
+        ),
+      );
+      assert.equal(responses, 1);
+      assert.lengthOf(events, 1);
+      const event = events[0]!;
+      assert.equal(event.route, "unmatched");
+      assert.equal(event.props?.pathHint, hint);
+      assert.equal(
+        event.props?.pathHash,
+        ControlHttpTelemetry.pathHint(target.split("?", 1)[0]!).pathHash,
+      );
+      assert.notInclude(JSON.stringify(event), "secret");
+      decodeAnalyticsEvent(event);
+    }),
+);

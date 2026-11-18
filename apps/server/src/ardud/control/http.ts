@@ -1042,43 +1042,50 @@ const makeRoutes = Effect.gen(function* () {
         cursor,
       });
     }
-    const candidateIds =
-      ids ??
-      (yield* store
-        .liveThreadIds()
-        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))));
-    const candidates = yield* shellsFor(candidateIds, location);
-    let shells = candidates.filter(
-      (shell) =>
-        shell.deletedAt === null &&
-        (includeSubagents ||
-          parentThreadId !== null ||
-          shell.lineage.relationshipToParent !== "subagent") &&
-        (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
-        (projectId === null || shell.projectId === projectId) &&
-        (creationSources === undefined || creationSources.includes(shell.creationSource)) &&
-        (ids === undefined || ids.includes(shell.id)) &&
-        (since === undefined || DateTime.toEpochMillis(shell.updatedAt) > since),
-    );
-    if (active !== undefined) {
-      shells = shells.filter((shell) => (stateFromShell(shell) !== "idle") === active);
-    }
-    if (states !== undefined) {
-      shells = shells.filter((shell) => states.includes(stateFromShell(shell)));
-    }
-    if (origin !== null) shells = yield* filterByOrigin(shells, origin);
-    const total = shells.length;
-    const page = shells
-      .filter((shell) => afterThreadListCursor(shell, cursor))
-      .toSorted(compareThreadListShells)
-      .slice(0, limit + 1);
-    const summaries = yield* summarize(page.slice(0, limit));
-    return yield* encoded({
-      ok: true,
-      total,
-      threads: summaries,
-      nextCursor: nextThreadListCursor(page, limit),
+    const readPage = Effect.gen(function* () {
+      const candidateIds =
+        ids ??
+        (yield* store
+          .liveThreadIds()
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))));
+      const candidates = yield* shellsFor(candidateIds, location);
+      let shells = candidates.filter(
+        (shell) =>
+          shell.deletedAt === null &&
+          (includeSubagents ||
+            parentThreadId !== null ||
+            shell.lineage.relationshipToParent !== "subagent") &&
+          (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
+          (projectId === null || shell.projectId === projectId) &&
+          (creationSources === undefined || creationSources.includes(shell.creationSource)) &&
+          (ids === undefined || ids.includes(shell.id)) &&
+          (since === undefined || DateTime.toEpochMillis(shell.updatedAt) > since),
+      );
+      if (active !== undefined) {
+        shells = shells.filter((shell) => (stateFromShell(shell) !== "idle") === active);
+      }
+      if (states !== undefined) {
+        shells = shells.filter((shell) => states.includes(stateFromShell(shell)));
+      }
+      if (origin !== null) shells = yield* filterByOrigin(shells, origin);
+      const total = shells.length;
+      const page = shells
+        .filter((shell) => afterThreadListCursor(shell, cursor))
+        .toSorted(compareThreadListShells)
+        .slice(0, limit + 1);
+      const summaries = yield* summarize(page.slice(0, limit));
+      return yield* encoded({
+        ok: true,
+        total,
+        threads: summaries,
+        nextCursor: nextThreadListCursor(page, limit),
+      });
     });
+    // Live polling must not queue behind board sweeps. Share the single control
+    // permit with message reads so lists cannot consume both foreground slots.
+    return yield* liveOnly && !archived
+      ? ReplyBuilders.bounded(readPage.pipe(NodeSqliteClient.foregroundReads), "controlRead")
+      : readPage;
   }).pipe(NodeSqliteClient.backgroundReads);
 
   const getThread = Effect.gen(function* () {
@@ -1255,55 +1262,63 @@ const makeRoutes = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
     const runId = yield* param("runId");
-    yield* getShell(threadId);
-    const records = yield* threads
-      .getThreadRecords(
-        ThreadId.make(threadId),
-        ["runs", "messages", "turnItems", "attempts", "providerTurns"],
-        {
-          runIds: [RunId.make(runId)],
-          messageRunIds: [RunId.make(runId)],
-          turnItemRunIds: [RunId.make(runId)],
-        },
-      )
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    const run = records.runs.find((candidate) => candidate.id === runId);
-    if (run === undefined) {
-      return yield* fail("not_found", `Run ${runId} was not found on thread ${threadId}.`);
-    }
-    // A provider turn is this run's only when its attempt belongs to the run. Each native
-    // stream must have settled for the run's tool absence to be proven (see providerTurnsSettled).
-    const attemptIds = new Set(
-      records.attempts.filter((attempt) => attempt.runId === run.id).map((attempt) => attempt.id),
+    const evidence = yield* ReplyBuilders.bounded(
+      Effect.gen(function* () {
+        yield* getShell(threadId);
+        const records = yield* threads
+          .getThreadRecords(
+            ThreadId.make(threadId),
+            ["runs", "messages", "turnItems", "attempts", "providerTurns"],
+            {
+              runIds: [RunId.make(runId)],
+              messageRunIds: [RunId.make(runId)],
+              turnItemRunIds: [RunId.make(runId)],
+            },
+          )
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+        const run = records.runs.find((candidate) => candidate.id === runId);
+        if (run === undefined) {
+          return yield* fail("not_found", `Run ${runId} was not found on thread ${threadId}.`);
+        }
+        // A provider turn is this run's only when its attempt belongs to the run. Each native
+        // stream must have settled for the run's tool absence to be proven (see providerTurnsSettled).
+        const attemptIds = new Set(
+          records.attempts
+            .filter((attempt) => attempt.runId === run.id)
+            .map((attempt) => attempt.id),
+        );
+        const runTurns = records.providerTurns.filter(
+          (turn) => turn.runAttemptId !== null && attemptIds.has(turn.runAttemptId),
+        );
+        const messages = records.messages
+          .filter((message) => message.runId === run.id && message.role === "assistant")
+          .toSorted(
+            (left, right) =>
+              DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
+              left.id.localeCompare(right.id),
+          );
+        const evidence = runToolEvidence({
+          runStatus: run.status,
+          turnItems: records.turnItems.filter((item) => item.runId === run.id),
+          itemsComplete: providerTurnsSettled(runTurns),
+        });
+        return {
+          ok: true,
+          threadId,
+          runId: run.id,
+          status: run.status,
+          toolEvidence: evidence.toolEvidence,
+          complete: evidence.complete,
+          messages: messages.map((message) => ({
+            id: message.id,
+            phase: message.phase,
+            text: messagePreview(message),
+          })),
+        };
+      }).pipe(NodeSqliteClient.foregroundReads),
+      "controlRead",
     );
-    const runTurns = records.providerTurns.filter(
-      (turn) => turn.runAttemptId !== null && attemptIds.has(turn.runAttemptId),
-    );
-    const messages = records.messages
-      .filter((message) => message.runId === run.id && message.role === "assistant")
-      .toSorted(
-        (left, right) =>
-          DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
-          left.id.localeCompare(right.id),
-      );
-    const evidence = runToolEvidence({
-      runStatus: run.status,
-      turnItems: records.turnItems.filter((item) => item.runId === run.id),
-      itemsComplete: providerTurnsSettled(runTurns),
-    });
-    return json({
-      ok: true,
-      threadId,
-      runId: run.id,
-      status: run.status,
-      toolEvidence: evidence.toolEvidence,
-      complete: evidence.complete,
-      messages: messages.map((message) => ({
-        id: message.id,
-        phase: message.phase,
-        text: messagePreview(message),
-      })),
-    });
+    return yield* encoded(evidence);
   });
 
   const send = Effect.gen(function* () {

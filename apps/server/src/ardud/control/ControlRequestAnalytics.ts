@@ -1,3 +1,4 @@
+import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Cause from "effect/Cause";
@@ -18,6 +19,17 @@ import * as ReplyBuilders from "../http/ReplyBuilders.ts";
 
 export const CONTROL_REQUEST_ID_HEADER = "x-request-id";
 const validRequestId = /^[A-Za-z0-9._:-]{1,64}$/;
+
+export const HttpObserver = Context.Reference<
+  | {
+      readonly start: (
+        route: { readonly path: string; readonly method: string } | undefined,
+        requestId: string,
+      ) => void;
+      readonly complete: (props: NonNullable<AnalyticsEvent["props"]>) => void;
+    }
+  | undefined
+>("t3/ardud/control/HttpObserver", { defaultValue: () => undefined });
 
 interface RequestRecord {
   method: string;
@@ -116,6 +128,7 @@ export const observe = Effect.fnUntraced(function* <E, R>(
   const clock = yield* Clock.Clock;
   const started = clock.monotonicTimeNanosUnsafe();
   const startedAt = DateTime.formatIso(yield* DateTime.now);
+  const httpObserver = yield* HttpObserver;
   const httpRequest = yield* Effect.serviceOption(HttpServerRequest.HttpServerRequest);
   const incomingId =
     httpRequest._tag === "Some" ? httpRequest.value.headers[CONTROL_REQUEST_ID_HEADER] : undefined;
@@ -129,6 +142,7 @@ export const observe = Effect.fnUntraced(function* <E, R>(
           ),
     serializationMs: 0,
   };
+  httpObserver?.start(route, request.requestId);
   let waitMs = 0;
   const readerTimings = new Map<
     string,
@@ -193,6 +207,31 @@ export const observe = Effect.fnUntraced(function* <E, R>(
           : status !== undefined && status >= 400
             ? ("error" as const)
             : ("ok" as const);
+        const props: NonNullable<AnalyticsEvent["props"]> = {
+          method: request.method,
+          requestId: request.requestId,
+          ...(outcome === "interrupted" || request.responseBytes === undefined
+            ? {}
+            : {
+                responseBytes: request.responseBytes,
+                ...(request.itemCount === undefined ? {} : { itemCount: request.itemCount }),
+                ...(request.itemsTotal === undefined ? {} : { itemsTotal: request.itemsTotal }),
+              }),
+          ...(route === undefined ? {} : { httpMethod: route.method, httpRoute: route.path }),
+          phase: "unary",
+          waitMs,
+          readerTimings: [...readerTimings.values()],
+          replyAdmissions,
+          serializationMs: request.serializationMs,
+          readerHolders: [...readerHolders.values()]
+            .sort((a, b) => b.holdMs - a.holdMs)
+            .slice(0, 8),
+          ...(status === undefined ? {} : { status }),
+          ...(outcome === "ok"
+            ? {}
+            : { errorTag: outcome === "interrupted" ? "Interrupted" : "ControlRequestError" }),
+        };
+        httpObserver?.complete({ ...props, handlerMs: durationMs });
         if (analytics._tag === "None") return;
         yield* recordServerAnalytics(analytics.value, {
           ts: DateTime.formatIso(yield* DateTime.now),
@@ -203,30 +242,7 @@ export const observe = Effect.fnUntraced(function* <E, R>(
           ...(request.threadId === undefined ? {} : { threadId: request.threadId }),
           durationMs,
           outcome,
-          props: {
-            method: request.method,
-            requestId: request.requestId,
-            ...(outcome === "interrupted" || request.responseBytes === undefined
-              ? {}
-              : {
-                  responseBytes: request.responseBytes,
-                  ...(request.itemCount === undefined ? {} : { itemCount: request.itemCount }),
-                  ...(request.itemsTotal === undefined ? {} : { itemsTotal: request.itemsTotal }),
-                }),
-            ...(route === undefined ? {} : { httpMethod: route.method, httpRoute: route.path }),
-            phase: "unary",
-            waitMs,
-            readerTimings: [...readerTimings.values()],
-            replyAdmissions,
-            serializationMs: request.serializationMs,
-            readerHolders: [...readerHolders.values()]
-              .sort((a, b) => b.holdMs - a.holdMs)
-              .slice(0, 8),
-            ...(status === undefined ? {} : { status }),
-            ...(outcome === "ok"
-              ? {}
-              : { errorTag: outcome === "interrupted" ? "Interrupted" : "ControlRequestError" }),
-          },
+          props,
         });
       }),
     ),
