@@ -1,6 +1,16 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { AnalyticsEvent, KanbanBoardId, KanbanCardId, ThreadId } from "@t3tools/contracts";
+import {
+  AnalyticsEvent,
+  EnvironmentId,
+  KanbanBoardId,
+  KanbanCardId,
+  KanbanDiscussionId,
+  KanbanError,
+  KanbanScriptId,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
@@ -8,6 +18,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as References from "effect/References";
 import * as Path from "effect/Path";
@@ -16,12 +27,16 @@ import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Tracer from "effect/Tracer";
-import { McpSchema } from "effect/ai";
+import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
 import * as BoardLocks from "../engine/boardLocks.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
+import * as KanbanStore from "../store/KanbanStore.ts";
 import * as SavedReply from "./savedReply.ts";
 import { McpCall, callOutcome } from "../../analytics/McpCall.ts";
+import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
+import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
+import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 
 const reply = new McpSchema.CallToolResult({ content: [] });
 const callResult = Schema.decodeUnknownSync(McpSchema.CallToolResult);
@@ -31,6 +46,522 @@ const replyData = Schema.decodeUnknownSync(
     saved: Schema.NullOr(Schema.Boolean),
     message: Schema.String,
     threadId: Schema.optional(Schema.String),
+  }),
+);
+
+it.effect("#1747 a shared background reader cannot freeze gates or a foreground saved write", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped();
+    return yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const locks = yield* BoardLocks.make();
+      yield* sql`PRAGMA journal_mode = WAL`;
+      yield* sql`CREATE TABLE writes (board TEXT)`;
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const holder = yield* sql
+        .withTransaction(
+          sql`SELECT 1`.pipe(
+            Effect.andThen(Deferred.succeed(held, undefined)),
+            Effect.andThen(Deferred.await(release)),
+          ),
+        )
+        .pipe(
+          NodeSqliteClient.readOnly,
+          NodeSqliteClient.backgroundReads,
+          Effect.withSpan("KanbanAskFeed.read"),
+          Effect.forkChild,
+        );
+      yield* Deferred.await(held);
+      const entered = yield* Deferred.make<void>();
+      let snapshot: (() => NodeSqliteClient.ReaderSnapshot) | undefined;
+      let observing = false;
+      const stalled = yield* locks
+        .board(
+          "a",
+          locks.access(
+            "a",
+            sql`SELECT 1`.pipe(
+              NodeSqliteClient.readOnly,
+              NodeSqliteClient.backgroundReads,
+              SavedWrite.read,
+            ),
+          ),
+        )
+        .pipe(
+          Effect.provideService(NodeSqliteClient.ReaderSnapshotObserver, (read) => {
+            snapshot = read;
+            observing = true;
+            return () => {
+              observing = false;
+            };
+          }),
+          Effect.provideService(NodeSqliteClient.ReaderWaitStartedObserver, () => {
+            Deferred.doneUnsafe(entered, Effect.void);
+            return undefined;
+          }),
+          Effect.exit,
+          Effect.forkChild,
+        );
+      yield* Deferred.await(entered);
+      const sameBoard = yield* locks
+        .board("a", locks.access("a", sql`INSERT INTO writes VALUES ('a')`, true))
+        .pipe(Effect.forkChild);
+      const other = yield* SavedReply.protect(
+        locks.board(
+          "b",
+          Effect.gen(function* () {
+            yield* locks.access("b", sql`SELECT 1`.pipe(NodeSqliteClient.readOnly));
+            yield* locks.access(
+              "b",
+              sql.withTransaction(
+                Effect.gen(function* () {
+                  yield* sql`INSERT INTO writes VALUES ('b')`;
+                  assert.deepEqual(
+                    yield* sql`SELECT board FROM writes WHERE board = 'b'`.pipe(
+                      NodeSqliteClient.readOnly,
+                      SavedWrite.read,
+                    ),
+                    [{ board: "b" }],
+                  );
+                }),
+              ),
+              true,
+            );
+            return reply;
+          }),
+        ),
+        "card_update",
+      );
+      assert.isFalse(callResult(other).isError ?? false);
+      yield* TestClock.adjust(1_999);
+      assert.isUndefined(stalled.pollUnsafe());
+      assert.deepInclude(snapshot!(), {
+        db: "boards",
+        connection: "reader",
+        lane: "background",
+        slot: 0,
+        stage: "slot",
+        queueDepth: 1,
+        oldestInFlightAgeMs: 1_999,
+      });
+      yield* TestClock.adjust(1);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(stalled)));
+      yield* Fiber.join(sameBoard);
+      assert.isFalse(observing);
+      assert.isUndefined(holder.pollUnsafe());
+      assert.deepEqual(yield* sql`SELECT board FROM writes ORDER BY board`, [
+        { board: "a" },
+        { board: "b" },
+      ]);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(holder);
+      assert.deepEqual(yield* locks.holders, []);
+    }).pipe(
+      Effect.provide(
+        NodeSqliteClient.layer({
+          filename: path.join(directory, "boards.sqlite"),
+          readerWorker: true,
+          foregroundReaderSlots: 1,
+          spanAttributes: { "db.name": "boards" },
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+const mcpClient = McpSchema.McpServerClient.of({
+  clientId: 1,
+  clientCapabilities: {},
+  clientInfo: { name: "saved-reply-test", version: "1.0.0" },
+  protocolVersion: "2025-06-18",
+  initializePayload: {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "saved-reply-test", version: "1.0.0" },
+  },
+  getClient: Effect.die("unused"),
+});
+
+const cutoffStates = [
+  { saved: false, tool: "card_update", operation: "card.update", cardId: "card-1747" },
+  { saved: null, tool: "card_update", operation: "card.update", cardId: "card-1747" },
+  { saved: true, tool: "discussion_post", operation: "discussion.post", cardId: null },
+] as const;
+it.effect.each(
+  cutoffStates.flatMap((state) =>
+    (["effect", "return", "error"] as const).map((boundary) => ({ ...state, boundary })),
+  ),
+)(
+  "#1747 actual gate cutoff preserves pre-cancellation reader diagnostics (saved=$saved, boundary=$boundary)",
+  ({ saved, tool, operation, cardId, boundary }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped();
+      return yield* Effect.gen(function* () {
+        const raw = yield* KanbanStore.KanbanStore;
+        const sql = yield* SqlClient.SqlClient;
+        const locks = yield* BoardLocks.make();
+        yield* sql`PRAGMA journal_mode = WAL`;
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* sql
+          .withTransaction(
+            sql`SELECT 1`.pipe(
+              Effect.andThen(Deferred.succeed(held, undefined)),
+              Effect.andThen(Deferred.await(release)),
+            ),
+          )
+          .pipe(
+            NodeSqliteClient.readOnly,
+            NodeSqliteClient.backgroundReads,
+            Effect.withSpan("test.background"),
+            Effect.forkChild,
+          );
+        yield* Deferred.await(held);
+        const entered = yield* Deferred.make<void>();
+        const warnings: unknown[] = [];
+        let observing = false;
+        const handler = locks
+          .run(
+            Effect.gen(function* () {
+              yield* locks.access("robob", Effect.void);
+              if (saved !== false) yield* locks.access("robob", SavedWrite.committing, true);
+              if (saved === true)
+                yield* SavedWrite.record({
+                  kind: "message",
+                  message: {
+                    discussionId: KanbanDiscussionId.make("saved-discussion"),
+                    seq: 1,
+                    author: { _tag: "owner" },
+                    authorName: "Owner",
+                    blocks: [],
+                    answers: [],
+                    createdAt: "2026-11-16T18:58:30.000Z",
+                  },
+                });
+              yield* raw
+                .script(KanbanScriptId.make("missing"))
+                .pipe(NodeSqliteClient.backgroundReads);
+              return reply;
+            }),
+            cardId ?? undefined,
+          )
+          .pipe(Effect.provideService(BoardLocks.operationName, operation));
+        const toolkit = Toolkit.make(
+          Tool.make("budget_probe", {
+            success: Schema.Struct({}),
+            failure: KanbanError,
+            failureMode: boundary === "return" ? "return" : "error",
+          }),
+        );
+        const registration = McpHttpServer.toolkitRegistration(
+          toolkit,
+          McpToolAccess.toLayer(toolkit, {
+            budget_probe: McpToolAccess.reads(() =>
+              handler.pipe(
+                Effect.mapError(
+                  (error) => new KanbanError({ code: "conflict", detail: String(error) }),
+                ),
+                Effect.catchDefect((defect) =>
+                  defect instanceof BoardLocks.BoardStateChanged
+                    ? Effect.fail(
+                        new KanbanError({ code: "conflict", detail: "Board state changed" }),
+                      )
+                    : Effect.die(defect),
+                ),
+                Effect.as({}),
+              ),
+            ),
+          }),
+        ).pipe(Layer.provideMerge(McpServer.McpServer.layer));
+        const encoded = Effect.gen(function* () {
+          const server = yield* McpServer.McpServer;
+          return yield* server.callTool({ name: "budget_probe", arguments: {} });
+        }).pipe(
+          Effect.provide(registration),
+          Effect.provideService(McpInvocationContext.McpInvocationContext, {
+            environmentId: EnvironmentId.make("saved-reply-test"),
+            requestNamespace: "saved-reply-test",
+            thread: {
+              threadId: ThreadId.make("saved-reply-test"),
+              providerSessionId: "saved-reply-test",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+            },
+            client: undefined,
+            capabilities: new Set<McpInvocationContext.McpCapability>(),
+            issuedAt: 1,
+          }),
+          Effect.provideService(McpSchema.McpServerClient, mcpClient),
+        );
+        const pending = yield* SavedReply.protect(
+          boundary === "effect" ? handler.pipe(Effect.orDie) : encoded.pipe(Effect.orDie),
+          tool,
+        ).pipe(
+          Effect.provideService(McpCall, {
+            boardId: "robob",
+            ...(cardId === null ? {} : { cardId }),
+            targetResolved: true,
+            callerResolved: true,
+            callerResolveMs: 0,
+            readerLane: "foreground",
+            phase: "handler",
+            saved: false,
+          }),
+          Effect.provideService(NodeSqliteClient.ReaderWaitStartedObserver, () => {
+            Deferred.doneUnsafe(entered, Effect.void);
+            return undefined;
+          }),
+          Effect.provideService(NodeSqliteClient.ReaderSnapshotObserver, () => {
+            observing = true;
+            return () => {
+              observing = false;
+            };
+          }),
+          Effect.provide(
+            Logger.layer([Logger.make(({ message }) => warnings.push(message))], {
+              mergeWithExisting: false,
+            }),
+          ),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust(2_000);
+        assert.isDefined(pending.pollUnsafe());
+        const result = callResult(yield* Fiber.join(pending));
+        assert.deepInclude(result.structuredContent, { saved });
+        const message = result.content.find((item) => item.type === "text")?.text ?? "";
+        assert.match(message, /^Read timed out\. /);
+        if (saved === false) assert.include(message, "Safe to retry.");
+        else if (saved === null) {
+          assert.include(message, "before retrying");
+          assert.notInclude(message, "Safe to retry.");
+        } else assert.equal(message, "Read timed out. Saved; discussion_read for details.");
+        assert.strictEqual(result.isError, saved !== true);
+        const unavailable = warnings.find(
+          (row) => Array.isArray(row) && row[0] === "kanban saved write reply unavailable",
+        ) as [string, Record<string, unknown>];
+        assert.deepInclude(unavailable[1], {
+          boardId: "robob",
+          operation,
+          cardId,
+          saved,
+          "board.reply_phase": "read",
+          "kanban.reply.read_budget_ms": 2_000,
+          "kanban.reply.stage_at_timeout": "read",
+          "kanban.reply.timed_out": true,
+        });
+        const readers = unavailable[1].readers as ReadonlyArray<NodeSqliteClient.ReaderSnapshot>;
+        assert.lengthOf(readers, 1);
+        assert.deepInclude(readers[0], {
+          db: "boards",
+          connection: "reader",
+          lane: "background",
+          slot: 0,
+          stage: "slot",
+          queueDepth: 1,
+          oldestInFlightAgeMs: 2_000,
+        });
+        assert.isNotEmpty(unavailable[1].awaited);
+        const durable = warnings.flatMap((row) => {
+          const line = Array.isArray(row) ? row[0] : row;
+          return typeof line === "string" && line.includes('"saved":') ? [line] : [];
+        });
+        assert.lengthOf(durable, 1);
+        assert.deepInclude(JSON.parse(String(durable[0])), {
+          boardId: "robob",
+          operation,
+          cardId,
+          saved,
+          timedOut: true,
+          readers,
+        });
+        assert.isFalse(observing);
+        assert.isUndefined(holder.pollUnsafe());
+        yield* locks.board("robob", Effect.void);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(holder);
+      }).pipe(
+        Effect.provide(
+          KanbanStore.layer.pipe(
+            Layer.provideMerge(
+              Layer.effect(
+                SqlClient.SqlClient,
+                Effect.gen(function* () {
+                  const sql = yield* SqlClient.SqlClient;
+                  yield* sql`PRAGMA journal_mode = WAL`;
+                  return sql;
+                }),
+              ).pipe(
+                Layer.provide(
+                  NodeSqliteClient.layer({
+                    filename: path.join(directory, "boards.sqlite"),
+                    readerWorker: true,
+                    foregroundReaderSlots: 1,
+                    spanAttributes: { "db.name": "boards" },
+                  }),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([
+  new McpSchema.CallToolResult({ isError: true, content: [{ type: "text", text: "Conflict" }] }),
+  new McpSchema.CallToolResult({ structuredContent: { ok: true }, content: [] }),
+  new McpSchema.InputRequired({ requestState: "retry" }),
+])("#1747 an encoded result without a read deadline keeps its original contract %#", (result) =>
+  Effect.gen(function* () {
+    assert.strictEqual(yield* SavedReply.protect(Effect.succeed(result), "card_update"), result);
+  }),
+);
+
+it.effect.each([
+  { tool: "card_update", operation: "card.update", saved: false },
+  { tool: "card_update", operation: "card.update", saved: null },
+  { tool: "discussion_post", operation: "discussion.post", saved: null },
+  { tool: "evaluator_start", operation: "evaluator.submit", saved: true },
+] as const)(
+  "#1747 read deadline retains target and reader state with saved=$saved",
+  ({ tool, operation, saved }) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const warnings: unknown[] = [];
+      const clock = yield* Clock.Clock;
+      let active = true;
+      const logger = Logger.make(({ message }) => warnings.push(message));
+      const pending = yield* SavedReply.protect(
+        SavedWrite.subSteps(
+          operation,
+          locks
+            .run(
+              Effect.gen(function* () {
+                if (saved === null) yield* SavedWrite.committing;
+                if (saved === true)
+                  yield* SavedWrite.record({ kind: "evaluator", threadId: ThreadId.make("saved") });
+                const observe = yield* NodeSqliteClient.ReaderSnapshotObserver;
+                const stop = observe?.(() => {
+                  assert.isTrue(active);
+                  return {
+                    db: "boards",
+                    connection: "reader",
+                    lane: "background",
+                    slot: 0,
+                    stage: "slot",
+                    queueDepth: 2,
+                    oldestInFlightAgeMs: clock.currentTimeMillisUnsafe(),
+                    holder: "KanbanAskFeed.read",
+                  };
+                });
+                return yield* SavedWrite.stage(
+                  Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Effect.never),
+                    Effect.withSpan("KanbanStore.read", {
+                      attributes: { "kanban.operation": "read card" },
+                    }),
+                    Effect.ensuring(
+                      Effect.sync(() => {
+                        active = false;
+                        stop?.();
+                      }),
+                    ),
+                  ),
+                  "read",
+                );
+              }),
+            )
+            .pipe(Effect.provideService(BoardLocks.operationName, operation)),
+          true,
+        ),
+        tool,
+      ).pipe(
+        Effect.provideService(McpCall, {
+          boardId: "robob",
+          cardId: "card-1747",
+          targetResolved: true,
+          callerResolved: true,
+          callerResolveMs: 0,
+          readerLane: "foreground",
+          phase: "handler",
+          saved: false,
+        }),
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+      const result = callResult(yield* Fiber.join(pending));
+      const data = replyData(result.structuredContent);
+      assert.strictEqual(data.saved, saved);
+      assert.match(data.message, /^Read timed out\. /);
+      assert.notInclude(data.message, "board busy");
+      assert.deepEqual(result.content, [{ type: "text", text: data.message }]);
+      if (saved === false) assert.include(data.message, "Safe to retry.");
+      else if (saved === null) {
+        assert.include(data.message, "may have been saved");
+        assert.include(data.message, "before retrying");
+        assert.notInclude(data.message, "Safe to retry.");
+      } else assert.include(data.message, "Do not retry.");
+      assert.isFalse(active);
+      const details = {
+        boardId: "robob",
+        operation,
+        cardId: "card-1747",
+        "board.reply_phase": "read",
+        readers: [
+          {
+            db: "boards",
+            connection: "reader",
+            lane: "background",
+            slot: 0,
+            stage: "slot",
+            queueDepth: 2,
+            oldestInFlightAgeMs: 25_000,
+            holder: "KanbanAskFeed.read",
+          },
+        ],
+      };
+      const unavailable = warnings.find(
+        (message) =>
+          Array.isArray(message) && message[0] === "kanban saved write reply unavailable",
+      ) as [string, Record<string, unknown>];
+      assert.deepInclude(unavailable[1], { ...details, saved });
+      assert.include(unavailable[1].awaited as string[], "KanbanStore.read.card");
+      const rows = warnings.filter((message) => String(message).startsWith('{"event":'));
+      assert.lengthOf(rows, 1);
+      assert.deepInclude(JSON.parse(String(rows[0])), { ...details, saved });
+    }),
+);
+
+it.effect("#1747 a pre-resolution deadline logs the tool and explicit unresolved target", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const warnings: unknown[] = [];
+    const pending = yield* SavedReply.protect(
+      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      "subtask_done",
+    ).pipe(
+      Effect.provide(
+        Logger.layer([Logger.make(({ message }) => warnings.push(message))], {
+          mergeWithExisting: false,
+        }),
+      ),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+    yield* Fiber.join(pending);
+    const unavailable = warnings.find(
+      (message) => Array.isArray(message) && message[0] === "kanban saved write reply unavailable",
+    ) as [string, Record<string, unknown>];
+    assert.deepInclude(unavailable[1], { boardId: null, operation: "subtask_done", cardId: null });
   }),
 );
 
@@ -61,6 +592,16 @@ const refusalRow = Schema.decodeUnknownSync(
         Schema.Struct({ label: Schema.String, boardId: Schema.String, lock: Schema.String }),
       ),
       "board.blockers": Schema.Array(Schema.Struct({ label: Schema.String })),
+    }),
+  ),
+);
+
+const cardLockBlockers = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      "board.blockers": Schema.Array(
+        Schema.Struct({ label: Schema.String, cardId: Schema.String, heldForMs: Schema.Number }),
+      ),
     }),
   ),
 );
@@ -123,7 +664,19 @@ it.effect.each(["caller", "read", "mutate", "admission"] as const)(
       if (phase !== "admission") yield* Deferred.await(entered);
       yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
       const result = callResult(yield* Fiber.join(pending));
-      assert.strictEqual(replyData(result.structuredContent).saved, false);
+      const data = replyData(result.structuredContent);
+      assert.strictEqual(data.saved, false);
+      const message = String(data.message);
+      assert.include(message, "Safe to retry");
+      if (phase === "admission") {
+        assert.match(message, /^Board lock wait timed out\./);
+        assert.include(message, "held 25000ms by owner");
+        assert.include(message, "waited 25000ms");
+      } else {
+        assert.include(message, `stage: ${phase}`);
+        if (phase === "read") assert.match(message, /^Read timed out\./);
+        else assert.notInclude(message, "Board lock wait timed out");
+      }
       assert.lengthOf(rows, 1);
       const row = refusalRow(rows[0]);
       assert.strictEqual(row["board.observed_at_ms"], 25_000);
@@ -155,6 +708,83 @@ it.effect.each(["caller", "read", "mutate", "admission"] as const)(
       if (phase === "admission") yield* Fiber.interrupt(owner);
       assert.deepStrictEqual(yield* locks.holders, []);
     }),
+);
+
+it.effect("#1748 a card_update deadline logs its card-lock holder before cancellation", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const rows: string[] = [];
+    const logger = Logger.make(({ message, fiber }) => {
+      const line = Array.isArray(message) ? message[0] : message;
+      if (
+        fiber.getRef(References.CurrentLogAnnotations)["board.lock_log"] === true &&
+        typeof line === "string" &&
+        line.includes('"event":"kanban board write refused"')
+      )
+        rows.push(line);
+    });
+    const holder = yield* locks
+      .run(
+        locks.access(
+          "board-recall",
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        ),
+        "card-target",
+      )
+      .pipe(
+        Effect.provideService(BoardLocks.operationName, "KanbanService.tickStep:workerBackstop"),
+        Effect.forkChild,
+      );
+    yield* Deferred.await(entered);
+    const call = yield* SavedReply.protect(
+      locks
+        .run(
+          locks.access("board-recall", Effect.succeed(reply), true, "card:card-target"),
+          "card-target",
+        )
+        .pipe(
+          Effect.provideService(BoardLocks.operationName, "card.update"),
+          // The reply watchdog fires before the lock's own admission deadline.
+          Effect.provideService(BoardLocks.writeWaitMs, 60_000),
+        ),
+      "card_update",
+    ).pipe(
+      Effect.provideService(McpCall, {
+        boardId: "board-recall",
+        cardId: "card-target",
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        saved: false,
+      }),
+      Effect.provideService(References.MinimumLogLevel, "Error"),
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      Effect.forkChild,
+    );
+    yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+    assert.strictEqual(
+      replyData(callResult(yield* Fiber.join(call)).structuredContent).saved,
+      false,
+    );
+    assert.lengthOf(rows, 1);
+    const row = refusalRow(rows[0]);
+    assert.strictEqual(row["board.waiter"], "card.update");
+    assert.strictEqual(row["board.card_id"], "card-target");
+    assert.strictEqual(row["board.waiting_on"], "card");
+    assert.strictEqual(row["board.waited_ms"], 25_000);
+    const holderRow = cardLockBlockers(rows[0]);
+    assert.deepStrictEqual(holderRow["board.blockers"], [
+      {
+        label: "KanbanService.tickStep:workerBackstop",
+        cardId: "card-target",
+        heldForMs: 25_000,
+      },
+    ]);
+    yield* Fiber.interrupt(holder);
+    assert.deepStrictEqual(yield* locks.holders, []);
+  }),
 );
 
 it.effect("refusal observation time precedes delayed cancellation cleanup", () =>
@@ -389,20 +1019,20 @@ it.effect("a completed follow-up read does not replace a foreground admission st
     assert.strictEqual(callState.replyStage, "admission");
     assert.strictEqual(callState.replyPhases?.admission, 25_000);
     assert.strictEqual(callState.replyPhases?.mutate, 0);
-    assert.deepInclude(warnings, [
-      "kanban saved write reply unavailable",
-      {
-        timedOut: true,
-        saved: false,
-        commitStarted: false,
-        subSteps: [],
-        ...Object.fromEntries(
-          [...span.attributes].filter(
-            ([key]) => key.startsWith("kanban.reply.") && !key.startsWith("kanban.reply.stage_ms."),
-          ),
+    const unavailable = warnings.find(
+      (message) => Array.isArray(message) && message[0] === "kanban saved write reply unavailable",
+    ) as [string, Record<string, unknown>];
+    assert.deepInclude(unavailable[1], {
+      timedOut: true,
+      saved: false,
+      commitStarted: false,
+      subSteps: [],
+      ...Object.fromEntries(
+        [...span.attributes].filter(
+          ([key]) => key.startsWith("kanban.reply.") && !key.startsWith("kanban.reply.stage_ms."),
         ),
-      },
-    ]);
+      ),
+    });
   }).pipe(Effect.scoped),
 );
 

@@ -139,7 +139,7 @@ def remove_checked(parent, name, uid, cutoff, device, expected=None):
 
 
 def reap(root, uid, live, *, clock=time.time, proc=Path('/proc'), emit=print,
-         mountinfo=Path('/proc/self/mountinfo'), finished_before=None):
+         mountinfo=Path('/proc/self/mountinfo'), finished_before=None, keep_prefixes=()):
     root = Path(root)
     # A confirmed finished run needs no grace period; every live wrapper still fences its files.
     cutoff = min([finished_before if finished_before is not None else clock()-600] +
@@ -151,7 +151,7 @@ def reap(root, uid, live, *, clock=time.time, proc=Path('/proc'), emit=print,
     removed = 0
     for path in root.iterdir():
         # The parent is protected too: never recurse into any run's private scratch.
-        if path.name in ('offbox-run', '.X11-unix', 'snap-private-tmp') or path.name.startswith('systemd-private-'):
+        if path.name in ('offbox-run', '.X11-unix', 'snap-private-tmp') or path.name.startswith(('systemd-private-', *keep_prefixes)):
             continue
         if any(m == str(path) or m.startswith(str(path) + '/') for m in mounts):
             continue
@@ -228,12 +228,16 @@ def error_line(line):
     return not line.startswith((MARKER, 'offbox: warning:')) and bool(ENOSPC.search(line))
 
 
+NATIVE_CRASH_REASONS = {'toolchain_unpack_crash', 'go_inventory_crash'}
+
+
 def result(path, code, *, offset=0):
     phases, matches, seen_attempt, final = {}, False, 0, None
     probe_error, traceback_line, string_trace, command_started = None, None, 0, False
     probe_errors, started_attempts = {}, set()
     native_crash = False
-    native_attempts = set()
+    native_attempts = {}
+    native_reason = None
     try:
         with open(path, 'rb') as f:
             f.seek(offset)
@@ -259,24 +263,25 @@ def result(path, code, *, offset=0):
                                         (record.get('infra_failure') != 'disk_probe' or
                                          record.get('infra_reason') == 'probe_crashed') and
                                         (record.get('infra_failure') != 'native_crash' or
-                                         record.get('infra_reason') == 'toolchain_unpack_crash') and
+                                         isinstance(record.get('infra_reason'), str)) and
                                         (final is None or attempt >= final[0])):
                                     final = attempt, record
                             continue
-                        if phase == 'toolchain':
+                        if phase in ('toolchain', 'setup'):
                             if (item.get('infra_failure') == 'native_crash' and
-                                    item.get('infra_reason') == 'toolchain_unpack_crash'):
+                                    isinstance(item.get('infra_reason'), str)):
                                 native_crash = True
-                                native_attempts.add(seen_attempt)
+                                native_reason = item['infra_reason']
+                                native_attempts[seen_attempt] = native_reason
                             continue
                         space = item['space']
                         if phase not in ('server_start', 'start', 'end', 'gate') or not valid_space(space):
                             continue
                         if phase == 'server_start':
                             phases = {}
-                            native_crash = False
+                            native_reason = None
                         elif phase == 'start':
-                            native_crash = False
+                            native_reason = None
                             server_start = phases.get('server_start') if set(phases) == {'server_start'} else None
                             phases = {'server_start': server_start} if server_start is not None else {}
                         phases[phase] = space
@@ -310,7 +315,9 @@ def result(path, code, *, offset=0):
         # Older servers summarize disk failures only. Preserve the explicit stderr
         # toolchain marker for that same attempt so a client-only install is enough.
         native_crash = (final[1].get('infra_failure') == 'native_crash' or
-                        final[0] in native_attempts)
+                        final[1].get('setup_native_crash') is True or final[0] in native_attempts)
+        native_reason = (final[1].get('infra_reason') if final[1].get('infra_failure') == 'native_crash'
+                         else native_attempts.get(final[0]))
     if authoritative:
         probe_error = final[1].get('disk_probe_error') or probe_errors.get(final[0])
         command_started = final[0] in started_attempts
@@ -334,8 +341,12 @@ def result(path, code, *, offset=0):
             probe_crashed = final[1].get('infra_failure') == 'disk_probe'
         if probe_crashed:
             out.update(infra_failure='disk_probe', infra_reason='probe_crashed', command_exit_code=None)
-    if code == 90 and native_crash:
-        out.update(infra_failure='native_crash', infra_reason='toolchain_unpack_crash', command_exit_code=None)
+    if not authoritative:
+        native_crash = native_reason is not None
+    if native_crash:
+        out['setup_native_crash'] = True
+    if code == 90 and native_crash and native_reason:
+        out.update(infra_failure='native_crash', infra_reason=native_reason, command_exit_code=None)
     return out
 
 
@@ -353,8 +364,7 @@ def message(record):
     if record.get('infra_failure') == 'disk_probe':
         return 'infra: the offbox disk probe crashed before your command started; nothing ran. Rerun.'
     if record.get('infra_failure') == 'native_crash':
-        return ('infra: the box crashed unpacking a checksum-verified toolchain archive twice; '
-                'this is a box/host fault, not your repo. Nothing ran (exit 90).')
+        return 'infra: this box crashed native programs during setup (exit 90).'
     phases = record.get('disk_space', {})
     start = phases.get('start', phases.get('server_start', {}))
     end = phases.get('end', phases.get('gate', {}))

@@ -7,6 +7,7 @@ then install.
 
 | Source | Installed as | Used by |
 | --- | --- | --- |
+| `bin/opencode`, `libexec/opencode/` | `~/.local/bin/opencode`, `~/.local/libexec/opencode/` | terminal CLI shim; shares the service binary path with `opencode-web` |
 | `libexec/toollog/` | `~/.local/libexec/toollog/` | `toollog`, native harness hooks, homes, canaries and rcsim |
 | `libexec/mail/` | `~/.local/libexec/mail/` | `himalaya-heal`, `mailsearch`, otp watchers, message-archive (`MAIL_LIBEXEC`) |
 | `libexec/card-preview/` | `~/.local/libexec/card-preview/` | ride cards (`RIDE_CARD_PREVIEW_LIB`), coordinated-project daily cards |
@@ -15,7 +16,17 @@ then install.
 | `juno-proxy/` | `~/.local/share/juno-proxy/` | `com.abdullah.juno-proxy`: HTTP/CONNECT proxy and `/proxy.pac` on the Tailscale IP, port 8118, so tailnet devices reach Juno hosts through this Mac's VPN |
 | `lydia-ticks/` | `~/.local/share/lydia-ticks/` | `com.ardud.lydia-ticks-server` (Bun, 127.0.0.1:18820: saves each tick on Lydia's checklist and serves the per-day history page) and `com.ardud.lydia-ticks-tunnel` (Cloudflare tunnel for https://lydia.abdullah.fund). `tunnel.json` (tunnel credentials), `history-token` (the private history link) and `ticks.db*` (Lydia's data) stay live-only, never in the repo |
 | `bin/` | `~/.local/bin/` | agents and skills; `power-unplug-telegram.sh` and `battery-low-telegram.sh` for the power agents; `cards-tunnel`, `cards-health` and `cards-tunnel-setup` for the card links; `opencode-web` for the emergency OpenCode web UI; `rclaude` for an interactive Claude Code launched like Robob's claudeAgent threads (pinned harness binary, `~/.robob/harness-homes/claude`, 9router env and model/effort from `~/.robob/userdata/settings.json`; `rclaude --rclaude-print` shows the resolved command) |
-| `launchd/` | `~/Library/LaunchAgents/` | `local.ardud.otp-watch`, `local.ardud.otp-idle`, `local.ardud.mail-token-refresh`, `com.abdullah.juno-proxy`, `com.ardud.power-unplug-telegram` (Telegram when the MacBook is unplugged or plugged back in, every 20s), `com.ardud.battery-low-telegram` (Telegram every 5 min on battery at 20% or less), `com.ardud.cards-tunnel` (the named Cloudflare tunnel for cards.abdullah.fund), `com.ardud.cards-health` (every 5 min: restarts the tunnel when the public link stops answering, Telegram after two misses and when it's back), `com.ardud.lydia-ticks-server` and `com.ardud.lydia-ticks-tunnel` (see `lydia-ticks/` above; code changes restart them), `com.ardud.opencode-web` (always-on `opencode serve` on 127.0.0.1:4096, the emergency web UI at https://opencode.tail, independent of Robob and the OpenCode service; waits for a hand-started copy on the port to exit instead of killing it) |
+| `launchd/` | `~/Library/LaunchAgents/` | `local.ardud.otp-watch`, `local.ardud.otp-idle`, `local.ardud.mail-token-refresh`, `com.abdullah.juno-proxy`, `com.ardud.power-unplug-telegram` (Telegram when the MacBook is unplugged or plugged back in, every 20s), `com.ardud.battery-low-telegram` (Telegram every 5 min on battery at 20% or less), `com.ardud.cards-tunnel` (the named Cloudflare tunnel for cards.abdullah.fund), `com.ardud.cards-health` (every 5 min: restarts the tunnel when the public link stops answering, Telegram after two misses and when it's back), `com.ardud.lydia-ticks-server` and `com.ardud.lydia-ticks-tunnel` (see `lydia-ticks/` above; code changes restart them), `com.ardud.opencode-web` (always-on service-binary `opencode serve` with a major.minor version guard on 127.0.0.1:4096, the emergency web UI at https://opencode.tail, independent of Robob and the OpenCode service; waits for a hand-started copy on the port to exit instead of killing it) |
+
+`opencode` runs `/Volumes/ExternalSSD/opencode2/current/bin/opencode`, the binary
+used by `com.ardud.opencode-service`, forwarding arguments and exit status.
+`opencode-web` uses the same path from `libexec/opencode/service-bin.zsh`.
+Before serving it checks the selected binary against that fixed reference by
+running both with `--version`;
+an unreadable version or different major.minor version logs one refusal line
+and exits nonzero. `OPENCODE_WEB_BIN` can select another binary, subject to the
+same check. This only needs the installed service binary, so the emergency UI
+can still start when Robob and the OpenCode service are down.
 
 `install.zsh` also keeps two links in `~/.local/bin`: `wa` and `mailsend`
 point at the deployed robob-watch helpers (deploy robob-watch first). It
@@ -102,6 +113,19 @@ Tests: `/usr/bin/python3 -m unittest discover -s tests` (each install test runs
 the installer from a throwaway git copy of this package, with a temp `HOME` and
 a fake `launchctl`; the power alert tests use a fake `pmset` and notifier).
 
+## timeout
+
+macOS has no `timeout(1)`, and agents write `timeout 40 cmd` out of Linux habit.
+`bin/timeout` is a GNU-compatible Perl shim installed as `~/.local/bin/timeout`:
+`timeout [-s SIG] [-k DUR] [--preserve-status] [--foreground] [-v] DURATION CMD...`,
+durations take `s`/`m`/`h`/`d`, and it exits 124 on timeout, 137 when KILL was
+needed, 125/126/127 for its own, can't-run and not-found errors. The command
+runs in its own process group so the signal also reaches its children; TERM,
+INT, HUP and QUIT sent to timeout are passed on. When timeout owns the terminal
+it hands it to that group (so the command can read it) and takes it back after;
+Ctrl-Z stops both. Tests:
+`/usr/bin/python3 -B -m unittest discover -s tests -p test_timeout.py`.
+
 ## Quint
 
 `bin/quint` installs as `~/.local/bin/quint`. The wrapper checks `java -version` for Java 21+
@@ -165,7 +189,9 @@ picked abdullah.fund: `~/.local/bin/cards-tunnel-setup` creates the tunnel (cred
 `~/.cloudflared/cards-tunnel.json`, never in this repo), points the DNS name at it and starts it.
 
 `robob-read-watchdog` probes `t3ctl threads --active --limit 5` with a 10-second
-request deadline every 30 seconds. After three minutes of failed reads it sends
+request deadline every 30 seconds. A separate 20-second child deadline also
+covers a probe stuck before JavaScript starts (`ROBOB_WD_PROBE_DEADLINE` overrides it).
+After three minutes of failed reads it sends
 one Telegram alert, then one recovery when reads work again. It clears the
 incident quietly while Robob is closed or `tmux -L restart` has the
 `robob-restart` session. State and stderr live in
@@ -178,8 +204,15 @@ Unload with `launchctl bootout gui/$(id -u)/com.ardud.robob-read-watchdog`.
 
 Installers can call `robob-read-watchdog --sustain 300 --every 30 --give-up 1800`
 to require five minutes of consecutive healthy reads. Any failed probe resets
-the healthy window; timeout exits 1. This mode sends no notifications and uses
-no watchdog state. `ROBOB_WD_PROBE`, `ROBOB_WD_NOTIFY`, `ROBOB_WD_APP_RUNNING`,
+the healthy window; timeout exits 1. This mode sends no notifications. All modes
+share probe state: after the child deadline the watchdog sends one TERM, waits
+at most two seconds, then records a surviving child's PID and start time in
+`stuck_probe`. Further runs skip the probe until that identity is gone.
+An unreadable start time keeps suppression in place; an initially unreadable
+identity is recorded as `unknown` and retained until the PID is gone.
+Start-time identities and stuck-time diagnostics use UTC, so manual and launchd
+runs agree even when they have different `TZ` settings.
+`ROBOB_WD_PROBE`, `ROBOB_WD_NOTIFY`, `ROBOB_WD_APP_RUNNING`,
 `ROBOB_WD_RESTARTING` and `ROBOB_WD_SLEEP` accept replacement commands;
 `ROBOB_WD_STATE` overrides the state directory. `ROBOB_WD_NOW` accepts epoch
 seconds or a command returning epoch seconds for an advancing test clock.
@@ -259,3 +292,5 @@ and `oxlint-plugin-t3code` importers, whose runtime dependencies lint loads.
 To try an uninstalled branch, run its absolute `integrations/local-helpers/bin/vp`
 path from the target worktree. Config snapshots and Vite’s cache stay in a
 private temporary directory; the borrowed install is read-only.
+
+`vp` outcomes: `${XDG_STATE_HOME:-~/.local/state}/vp-shim/events.jsonl` (5 MB rotation).

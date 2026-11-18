@@ -10,14 +10,6 @@ else:
     from test_boatd import Base, boatd
 
 
-class InlineThread:
-    def __init__(self, target, args=(), kwargs=None, **unused):
-        self.target, self.args, self.kwargs = target, args, kwargs or {}
-
-    def start(self):
-        self.target(*self.args, **self.kwargs)
-
-
 class ScratchLifecycle(Base):
     def setUp(self):
         super().setUp()
@@ -29,8 +21,22 @@ class ScratchLifecycle(Base):
         self.stack.enter_context(patch.object(boatd, '_ensure_mgmt_proxy'))
         self.stack.enter_context(patch.object(boatd, '_fresh_identity'))
         self.stack.enter_context(patch.object(boatd, '_instance_bytes', return_value=0))
-        self.stack.enter_context(patch.object(boatd, 'threading', Mock(Thread=InlineThread)))
+        self.workers = []
+        workers = self.workers
+        class DeferredThread:
+            def __init__(self, target, args=(), kwargs=None, **unused):
+                self.target, self.args, self.kwargs = target, args, kwargs or {}
+
+            def start(self):
+                workers.append(self)
+        self.stack.enter_context(patch.object(boatd, 'threading', Mock(Thread=DeferredThread)))
         self.stack.enter_context(patch.object(boatd, 'disk_admit'))
+
+    def run_workers(self):
+        # Resume workers acquire the lifecycle lock after their caller returns.
+        while self.workers:
+            worker = self.workers.pop(0)
+            worker.target(*worker.args, **worker.kwargs)
 
     def test_every_new_source_allocates_before_start_and_checks_mount(self):
         for index, source in enumerate((('image', 'offbox-base'), ('saved', 'sv-base'), ('box', 'bx_zzzzzzzz'))):
@@ -47,10 +53,14 @@ class ScratchLifecycle(Base):
     def test_resume_and_recovery_start_but_live_resume_does_not_touch_scratch(self):
         bid = self.box(state='archived', running=False)
         boatd.resume_box(self.con, bid, {})
+        self.assertEqual(self.state(bid)['state'], 'resuming')
+        self.assertFalse(self.host.method_calls)
+        self.run_workers()
         self.host.start.assert_called_once_with(bid)
         self.host.verify.assert_called_once_with(bid)
         self.host.reset_mock()
         boatd.resume_box(self.con, bid, {})
+        self.assertFalse(self.workers)
         self.assertFalse(self.host.method_calls)
         self.host.reset_mock()
         boatd.start_container(bid)
@@ -82,6 +92,9 @@ class ScratchLifecycle(Base):
     def test_saved_copy_drops_reference_before_publishing_ready(self):
         bid = self.box()
         boatd.save_box(self.con, bid, 'base', 'ardud')
+        self.assertEqual(self.con.execute('SELECT status FROM saved WHERE name=?', ('base',)).fetchone()['status'],
+                         'pending')
+        self.run_workers()
         row = self.con.execute('SELECT * FROM saved WHERE name=?', ('base',)).fetchone()
         self.host.detach_copy.assert_called_once_with(row['instance'])
         self.assertEqual(row['status'], 'ready')

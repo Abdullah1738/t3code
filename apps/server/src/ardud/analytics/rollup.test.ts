@@ -365,7 +365,11 @@ describe("analytics rollups", () => {
     for (const row of [
       call({ ts: "2026-11-13T13:01:00.000Z", build: "new", outcome: "ok", durationMs: 40 }),
       call({ ts: "2026-11-13T12:02:00.000Z", outcome: "timeout", durationMs: 30 }),
-      call({ ts: "2026-11-13T12:01:00.000Z", durationMs: 20 }),
+      call({
+        ts: "2026-11-13T12:01:00.000Z",
+        durationMs: 20,
+        errorFields: ["limit", "events.limit", "limit"],
+      }),
       call({ callerThreadId: "other", outcome: "ok" }),
       call({ tool: "card_move", outcome: "ok" }),
       call({
@@ -373,6 +377,7 @@ describe("analytics rollups", () => {
         outcome: "refused",
         errorTag: "board_busy",
         errorPhase: "handler",
+        errorFields: ["limit"],
       }),
     ])
       accumulate(accumulator, row);
@@ -391,6 +396,7 @@ describe("analytics rollups", () => {
       retrySucceeded: 1,
     });
     assert.deepEqual(old.outcomes, { error: 1, timeout: 1, ok: 1, refused: 1 });
+    assert.deepEqual(old.errorFields, { limit: 2, "events.limit": 1 });
     assert.deepEqual(old.errors, [
       { errorTag: "caller_unresolved", errorPhase: "caller", count: 2 },
       { errorTag: "board_busy", errorPhase: "handler", count: 1 },
@@ -401,6 +407,37 @@ describe("analytics rollups", () => {
     );
     assert.deepEqual(rollup.mcpOverflow, { groups: 0, retryAttempts: 0, detachedOutcomes: 0 });
     assert.deepEqual(finishRollup(accumulator, "2026-11-13", ts), rollup);
+  });
+  it("keeps deadline stages separate from dispatch and historical handler failures", () => {
+    const accumulator = makeAccumulator();
+    for (const errorPhase of [
+      "parent_records",
+      "parent_records",
+      "dispatch",
+      "handler",
+      undefined,
+    ] as const)
+      accumulate(
+        accumulator,
+        event({
+          kind: "mcp.call",
+          tool: "delegate_task",
+          outcome: "timeout",
+          errorTag: "delegation_timeout",
+          ...(errorPhase === undefined ? {} : { errorPhase }),
+        }),
+      );
+    const rollup = finishRollup(accumulator, "2026-11-13", ts);
+    assert.sameDeepMembers(
+      [...rollup.mcpCalls[0]!.errors],
+      [
+        { errorTag: "delegation_timeout", errorPhase: "parent_records", count: 2 },
+        { errorTag: "delegation_timeout", errorPhase: "handler", count: 2 },
+        { errorTag: "delegation_timeout", errorPhase: "dispatch", count: 1 },
+      ],
+    );
+    assert.equal(rollup.mcpFailureBreakdown![0]!.count, 5);
+    assert.equal(rollup.mcpFailureContexts![0]!.count, 5);
   });
   it("keeps pre-handler percentiles separate and skips historical calls without timing", () => {
     const accumulator = makeAccumulator();
@@ -890,6 +927,54 @@ it("preserves all 25 groups until overflow requires an other row", () => {
   );
 });
 
+it("retains pool configuration changes per board alongside pool snapshots beyond sample limits", () => {
+  const target = makeAccumulator();
+  for (let index = 0; index < 501; index++)
+    accumulate(
+      target,
+      event({
+        kind: "kanban.pool_change",
+        boardId: "board-a",
+        props: {
+          poolKey: "codex/sol#xhigh",
+          fromSlots: index,
+          toSlots: index + 1,
+          op: "set",
+          actorKind: "owner",
+          actorId: null,
+        },
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "kanban.pool_change",
+      boardId: "board-b",
+      props: {
+        poolKey: "codex/sol#xhigh",
+        fromSlots: 2,
+        toSlots: 0,
+        op: "auto_zero",
+        actorKind: "system",
+        actorId: null,
+      },
+    }),
+  );
+  const boards = finishRollup(target, "2026-11-13", ts).boards;
+  assert.equal(boards.find((board) => board.boardId === "board-a")!.poolChanges!.length, 501);
+  assert.deepEqual(boards.find((board) => board.boardId === "board-b")!.poolChanges, [
+    {
+      at: ts,
+      poolKey: "codex/sol#xhigh",
+      fromSlots: 2,
+      toSlots: 0,
+      op: "auto_zero",
+      actorKind: "system",
+      actorId: null,
+    },
+  ]);
+});
+
 it("groups fixed denial reasons and roles and measures each timeout phase separately", () => {
   const target = makeAccumulator();
   for (const [callerRole, denyReason] of [
@@ -1227,3 +1312,168 @@ it.each(["failed", "noOutcome"] as const)(
     });
   },
 );
+
+it("keeps runtime, restart-admission and Git rate rollups within the combined day budget", () => {
+  const accumulator = makeAccumulator();
+  for (let minute = 0; minute < 1440; minute++) {
+    accumulate(accumulator, {
+      ts: `2026-11-13T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`,
+      kind: "server.runtime_sample",
+      surface: "server",
+      route: "server",
+      props: {
+        runningTurns: { total: minute % 60, byProvider: {}, byModel: {} },
+        ...(minute % 2 === 0 ? { queuedRuns: minute % 60 } : {}),
+        host: { load1: (minute % 60) * 2, load5: 1, load15: 1, rssMiB: 10, heapUsedMiB: 5 },
+        sampleMs: (minute % 60) / 100,
+      },
+    });
+  }
+  for (let minute = 0; minute < 1440; minute++) {
+    const at = `2026-11-13T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`;
+    accumulate(
+      accumulator,
+      event({
+        ts: at,
+        kind: "vcs.git_exec_rate",
+        props: {
+          total: 120,
+          distinctCwds: 20,
+          maxPerSecond: 10,
+          windowMs: 60_000,
+          overflow: 0,
+          top: Array.from({ length: 20 }, (_, index) => ({
+            operation: `GitManager.op${index}`,
+            subcommand: "status",
+            cwdHash: index.toString(16).padStart(16, "0"),
+            count: 6,
+          })),
+        },
+      }),
+    );
+    accumulate(
+      accumulator,
+      event({
+        ts: at,
+        kind: "restart.admission.admitted",
+        bootId: "boot-one",
+        restartAdmission: {
+          sourceRunId: `source-${minute}`,
+          classification: "continuation",
+          queuedAtMs: 0,
+          waitedMs: minute,
+          positionAtEntry: 12,
+          position: 1,
+          total: 7,
+          maxQueueDepth: 20,
+          active: 1,
+          maxActive: 4,
+          loaded: true,
+        },
+      }),
+    );
+  }
+  const rollup = finishRollup(accumulator, "2026-11-13", "2026-11-14T00:00:00.000Z");
+  assert.equal(rollup.runtimeSamples!.length, 24);
+  assert.deepEqual(rollup.runtimeSamples![0], {
+    hour: "00",
+    samples: 60,
+    runningTurnsMax: 59,
+    runningTurnsAvg: 29.5,
+    queuedRunsMax: 58,
+    load1Max: 118,
+    sampleMsMax: 0.59,
+  });
+  assert.equal(rollup.total, 4320);
+  assert.equal(rollup.kindCounts["vcs.git_exec_rate"], 1440);
+  assert.equal(rollup.kindCounts["restart.admission.admitted"], 1440);
+  assert.equal(rollup.restartAdmission!.groups.length, 24);
+  assert.equal(rollup.restartAdmission!.groups[0]!.admissions, 60);
+  assert.isBelow(JSON.stringify(rollup).length, 50_000);
+});
+
+it("does not turn an unavailable queue count into zero", () => {
+  const accumulator = makeAccumulator();
+  accumulate(accumulator, {
+    ts: "2026-11-13T12:00:00.000Z",
+    kind: "server.runtime_sample",
+    surface: "server",
+    route: "server",
+    props: {
+      runningTurns: { total: 0, byProvider: {}, byModel: {} },
+      host: { load1: 0, load5: 0, load15: 0, rssMiB: 1, heapUsedMiB: 1 },
+      sampleMs: 0.1,
+    },
+  });
+  assert.equal(
+    finishRollup(accumulator, "2026-11-13", "2026-11-14T00:00:00.000Z").runtimeSamples![0]!
+      .queuedRunsMax,
+    null,
+  );
+});
+
+describe("restart admission rollup", () => {
+  const admission = (waitedMs: number, input: Partial<AnalyticsEvent> = {}): AnalyticsEvent =>
+    event({
+      kind: "restart.admission.admitted",
+      bootId: "boot-one",
+      restartAdmission: {
+        sourceRunId: "source-" + waitedMs,
+        classification: "continuation",
+        queuedAtMs: 0,
+        waitedMs,
+        positionAtEntry: 12,
+        position: 1,
+        total: 7,
+        maxQueueDepth: 20,
+        active: 1,
+        maxActive: 4,
+        loaded: true,
+      },
+      ...input,
+    });
+  it("reports waits, depth, active reservations and each bound rule by boot/hour", () => {
+    const target = makeAccumulator();
+    for (const waitedMs of [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000])
+      accumulate(target, admission(waitedMs));
+    for (const rule of ["no_progress", "no_progress", "absolute_backstop", "wall_time"] as const)
+      accumulate(
+        target,
+        admission(1800000, {
+          kind: "restart.admission.failed",
+          restartAdmission: {
+            ...admission(0).restartAdmission!,
+            rule,
+            waitedMs: 1800000,
+            maxQueueDepth: 34,
+            active: 2,
+          },
+        }),
+      );
+    accumulate(target, admission(50, { bootId: "boot-two" }));
+    accumulate(target, admission(80, { ts: "2026-11-13T13:00:00.000Z" }));
+    const result = finishRollup(target, "2026-11-13", ts).restartAdmission!;
+    assert.strictEqual(result.scope, "server-wide");
+    assert.strictEqual(result.loadedTimeShare, null);
+    assert.strictEqual(result.groups.length, 3);
+    assert.deepEqual(result.groups[0], {
+      bootId: "boot-one",
+      hour: "2026-11-13T12Z",
+      admissions: 10,
+      maxQueueDepth: 34,
+      maxActiveObserved: 2,
+      maxActive: 4,
+      observations: 14,
+      loadedObservations: 14,
+      failuresByRule: { no_progress: 2, absolute_backstop: 1, wall_time: 1 },
+      wait: { count: 10, p50Ms: 500, p90Ms: 900, maxMs: 1000, approximate: false },
+    });
+  });
+  it("bounds boot/hour groups and exposes overflow", () => {
+    const target = makeAccumulator();
+    for (let i = 0; i < 140; i++) accumulate(target, admission(i, { bootId: "boot-" + i }));
+    const result = finishRollup(target, "2026-11-13", ts).restartAdmission!;
+    assert.strictEqual(result.groups.length, 128);
+    assert.strictEqual(result.overflow, 12);
+  });
+});

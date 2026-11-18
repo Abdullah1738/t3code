@@ -322,6 +322,8 @@ export class ProviderAdapterSteerRunError extends Schema.TaggedError<ProviderAda
     driver: ProviderDriverKind,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
+    // Only a rejection before handing input to the provider permits a follow-up.
+    delivery: Schema.optional(Schema.Literal("not_sent")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -538,6 +540,8 @@ export interface ProviderAdapterV2ForkThreadInput {
 export interface ProviderAdapterV2EventSubscription {
   readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
   readonly close: Effect.Effect<void>;
+  /** Acknowledge downstream writes before finalization can acquire session locks. */
+  readonly ingestionEnded?: Effect.Effect<void>;
 }
 
 export interface ProviderAdapterV2HistoricalContext {
@@ -607,6 +611,8 @@ export interface ProviderAdapterV2SessionRuntime {
    * Adapter runtimes may omit this and expose only their single-consumer event stream.
    */
   readonly subscribeEvents?: Effect.Effect<ProviderAdapterV2EventSubscription>;
+  /** Release waits for this consumer's close after admitted event writes have drained. */
+  readonly subscribeEventsForIngestion?: Effect.Effect<ProviderAdapterV2EventSubscription>;
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   /**
    * When present, RunExecutionService uses only this probe (never the
@@ -681,6 +687,13 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly taskId: string;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /** Checked by the delegated progress guard; adapters own native fencing and termination. */
+  readonly checkRetryHealth?: (input: {
+    readonly runId: RunId;
+    readonly attemptId: RunAttemptId | null;
+    readonly noResponseBudgetMs: number;
+    readonly flapLimit: number;
+  }) => Effect.Effect<boolean, ProviderAdapterV2Error>;
   readonly interruptStartingRun?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly runId: RunId;

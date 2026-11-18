@@ -653,7 +653,7 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
         _forward_background(queued)
     elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
     toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
-                 props={"from": "home", "to": "boat", "reason": "unreachable", "waitMs": elapsed})
+                 props={"from": "home", "to": "boat", "reason": reason, "waitMs": elapsed})
     if 'low on disk' in reason:
         detail = reason[reason.index('low on disk'):]
         routing_line(f"home offbox server is {detail}; this run is going to Boat", run_id)
@@ -662,7 +662,7 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
     else:
         monitor = common.home_state()
         classification = failure_class(reason)
-        routing_line(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead "
+        routing_line(f"home offbox could not prepare this run ({reason}); this run goes to Boat instead "
             f"class={classification} run={run_id or '-'} monitor_last_check={monitor.get('last_check')} "
             f"monitor_last_outcome={monitor.get('last_outcome')}", run_id)
     log(f"failover to boat: {reason[:300]}")

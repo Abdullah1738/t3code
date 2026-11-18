@@ -91,15 +91,17 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="boatd-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        log_env = patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.tmp / "shared-logs"))
+        log_env = patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.tmp / "shared-logs"))
         log_env.start()
         self.addCleanup(log_env.stop)
         self.saved = {k: getattr(boatd, k) for k in (
             "VAR", "ETC", "CMDS", "DB_PATH", "ADMIT_LOCK", "incus", "_sh", "spawn_runner", "unit_active",
-            "ct_running", "_wait_boot", "boot_id", "mem_available", "provision", "log")}
+            "ct_running", "_wait_boot", "boot_id", "mem_available", "provision", "log", "CG_ROOT")}
         self.addCleanup(lambda: [setattr(boatd, k, v) for k, v in self.saved.items()])
         boatd.VAR, boatd.ETC = self.tmp / "var", self.tmp / "etc"
         boatd.CMDS, boatd.DB_PATH, boatd.ADMIT_LOCK = boatd.VAR / "cmds", boatd.VAR / "boatd.db", boatd.VAR / "admit.lock"
+        boatd.CG_ROOT = self.tmp / 'cgroups'
+        boatd.CG_ROOT.mkdir()
         boatd.ETC.mkdir(parents=True)
         self.f = Fakes()
         boatd.incus, boatd._sh, boatd.spawn_runner = self.f.incus, self.f._sh, self.f.spawn_runner
@@ -117,6 +119,9 @@ class Base(unittest.TestCase):
         self.addCleanup(scratch_host.stop)
         # Resource inputs are explicit in admission tests, independent of the test runner's host.
         boatd.CFG["cpu_pressure_limit"] = 0
+        memory_input = patch.object(boatd.boatd_memory, 'meminfo', return_value={'MemTotal': 1000 * 2**30})
+        memory_input.start()
+        self.addCleanup(memory_input.stop)
         for target, values in ((boatd.STATE, {"loops": {}}), (boatd.LOOP_SPECS, {}), (boatd.LOOP_THREADS, {})):
             fixture = patch.dict(target, values, clear=target is not boatd.STATE)
             fixture.start()
@@ -304,7 +309,7 @@ class ReconcileRuns(Base):
         out = boatd.reconcile(self.con)
         self.assertEqual(out["boxes_failed"], 1)
         self.assertEqual(self.status(b, p)["status"], "interrupted")
-        self.assertEqual(self.state(b)["state"], "archived")
+        self.assertEqual(self.state(b)["state"], "error")
         self.assertEqual(self.f.spawned, [])
 
     def test_runner_that_cannot_be_spawned_ends_the_run_instead_of_blocking_the_queue(self):
@@ -939,6 +944,23 @@ class Http(Base):
                         self.assertEqual(data, content[offset:offset + (1 << 20)])
                         self.assertEqual(page["nextOffset"], offset + len(data))
                         self.assertEqual(page["done"], status == "exited" and page["nextOffset"] >= page["size"])
+
+    def test_running_history_page_limit_preserves_utf8_and_advances_by_offset(self):
+        bid = self.box()
+        self.cmd(bid, pid=1001, status='running')
+        content = 'abc€tail'.encode()
+        (boatd.cmd_dir(bid) / '1001.out').write_bytes(content)
+        offset, received = 0, b''
+        while offset < len(content):
+            st, page = self.call('ardud', 'GET',
+                f'/sandboxes/{bid}/command-history/cmd_1001/logs?stream=stdout&offset={offset}&limitBytes=4')
+            self.assertEqual(st, 200)
+            self.assertGreater(page['nextOffset'], offset)
+            self.assertLessEqual(len(page['data'].encode()), 4)
+            self.assertFalse(page['done'])
+            received += page['data'].encode()
+            offset = page['nextOffset']
+        self.assertEqual(received, content)
 
     def test_saved_states_are_per_owner_even_with_the_same_name(self):
         hers, his = self.make_box("moni"), self.make_box("ardud")

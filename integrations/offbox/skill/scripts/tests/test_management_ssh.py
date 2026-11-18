@@ -234,7 +234,7 @@ class HomeLease(Isolated):
         self.assertIs(caught.exception, error)
 
     def runner(self):
-        args = SimpleNamespace(no_sync=False, git=False, include=None)
+        args = SimpleNamespace(no_sync=False, git=False, include=None, pull=[])
         rn = runs.Runner(args, self.me)
         rn.box = "bx_fixture"
         rn.lease_row = {"box_id": rn.box, "size": "large"}

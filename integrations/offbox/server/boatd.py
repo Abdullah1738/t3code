@@ -26,6 +26,7 @@ Stdlib only (Python 3.12, Ubuntu 24.04)."""
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import fcntl
 import hashlib
@@ -59,12 +60,15 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boatd_disk as disk
 import boatd_tmp
+import boatd_memory
 
 try:
     import offbox_disk_space
+    import offbox_protection
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skill/scripts"))
     import offbox_disk_space
+    import offbox_protection
 
 VAR = Path(os.environ.get("BOATD_VAR", "/var/lib/boatd"))
 ETC = Path(os.environ.get("BOATD_ETC", "/etc/boatd"))
@@ -115,6 +119,7 @@ DEFAULTS = {
 CFG: dict = {}
 
 LIVE = ("ready", "running")
+BOX_LOCKS = threading.local()
 TS_FMT = "%Y-%m-%dT%H:%M:%S.%f"
 
 
@@ -200,6 +205,13 @@ def migrate(con) -> None:
         con.execute("ALTER TABLE snapshot_pending ADD COLUMN generation TEXT NOT NULL DEFAULT ''")
     if "start_error" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN start_error TEXT")
+    con.execute("CREATE TABLE IF NOT EXISTS box_events (seq INTEGER PRIMARY KEY, ts REAL, box_id TEXT, action TEXT, detail TEXT)")
+    con.execute('CREATE INDEX IF NOT EXISTS box_events_box_seq ON box_events(box_id,seq)')
+    for column in ('pin_until REAL', 'pin_holder TEXT'):
+        if column.split()[0] not in _cols(con, 'boxes'):
+            con.execute('ALTER TABLE boxes ADD COLUMN ' + column)
+    if 'holder' not in _cols(con, 'commands'):
+        con.execute('ALTER TABLE commands ADD COLUMN holder TEXT')
     if "mgmt_ssh_port" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN mgmt_ssh_port INTEGER")
     if "provision_identity" not in _cols(con, "boxes"):
@@ -875,7 +887,8 @@ def incus(*args, input: bytes | None = None, timeout: float = 600, check: bool =
         _INCUS_ACTIVE[token] = {'kind': kind, 'box': box, 'since': began}
     outcome, code = 'error', None
     try:
-        p = subprocess.run(["incus", *args], input=input, capture_output=True, timeout=timeout)
+        with boatd_memory.lifecycle_lock(VAR) if args[0] in ('start', 'init', 'copy') else contextlib.nullcontext():
+            p = subprocess.run(["incus", *args], input=input, capture_output=True, timeout=timeout)
         code, outcome = p.returncode, 'ok' if not p.returncode else 'error'
         if check and p.returncode != 0:
             raise Fail(500, "incus_failed", f"incus {' '.join(args[:3])}: {p.stderr.decode(errors='replace')[-500:]}")
@@ -933,7 +946,7 @@ def ct_running(box_id: str) -> bool:
 
 
 def cg_path(box_id: str) -> Path:
-    return CG_ROOT / f"lxc.payload.{ct(box_id)}"
+    return boatd_memory.payload_path(CG_ROOT, ct(box_id))
 
 
 def ct_exec(box_id: str, cmd: str, input: bytes | None = None, timeout: float = 120, user: int = 0,
@@ -967,7 +980,14 @@ def delete_instance(box_id: str, owner: str, require_identity: bool = False) -> 
 
 
 def cleanup_provision(box_id: str, owner: str) -> None:
-    delete_instance(box_id, owner, require_identity=True)
+    con = db()
+    try:
+        with box_memory_lock(box_id):
+            snapshot = require_unprotected(con, box_id)
+            delete_instance(box_id, owner, require_identity=True)
+            box_event(con, box_id, 'delete', 'failed provision cleanup', snapshot)
+    finally:
+        con.close()
 
 
 # ---------------------------------------------------------------- boxes
@@ -1012,18 +1032,110 @@ def box_row(con, box_id: str, owner: str | None = None):
 
 
 def set_box(con, box_id: str, **kw) -> None:
+    with box_transaction(con):
+        _set_box(con, box_id, **kw)
+
+
+@contextmanager
+def box_transaction(con):
+    own = not con.in_transaction
+    if own:
+        con.execute('BEGIN IMMEDIATE')
+    try:
+        yield
+        if own:
+            con.execute('COMMIT')
+    except BaseException:
+        if own:
+            con.execute('ROLLBACK')
+        raise
+
+
+def _set_box(con, box_id, **kw):
+    before = con.execute('SELECT state FROM boxes WHERE id=?', (box_id,)).fetchone()
+    changed = 'state' in kw and before and before['state'] != kw['state']
+    snapshot = box_protection(con, box_id, probe=False) if changed else None
     kw["updated_at"] = now()
     cols = ", ".join(f"{k}=?" for k in kw)
     con.execute(f"UPDATE boxes SET {cols} WHERE id=?", (*kw.values(), box_id))
+    if changed:
+        action = {'archived': 'archive', 'deleted': 'delete', 'resuming': 'resume',
+                  'stopping': 'stop', 'error': 'health_fail'}.get(kw['state'], 'state_change')
+        box_event(con, box_id, action, kw.get('error') or offbox_protection.caller().get('reason') or
+                  f"{before['state']} -> {kw['state']}",
+                  snapshot, state_before=before['state'], state_after=kw['state'])
+
+
+def box_event(con, box_id, action, reason, snapshot=None, **fields):
+    data = offbox_protection.envelope(action, reason, snapshot or box_protection(con, box_id, probe=False), **fields)
+    detail = json.dumps(data, separators=(',', ':'))
+    con.execute('INSERT INTO box_events(ts,box_id,action,detail) VALUES (?,?,?,?)', (now(), box_id, action, detail))
+    log(detail)
+    toollog.emit('boatd', 'box.' + action, ok=True, ids={'box': box_id, 'run': data['caller'].get('run_id')}, props=data)
+
+
+def box_protection(con, box_id, *, probe=True, run_id=None):
+    row = box_row(con, box_id)
+    pin = bool(row['pinned']) and (row['pin_until'] is None or row['pin_until'] > now())
+    holds, gone, resolved = [], False, []
+    # An exited shell can leave children behind, including sync commands without run metadata.
+    # Only a positive process probe retires an invocation from lifecycle protection.
+    rows = con.execute('SELECT * FROM commands WHERE box_id=? ORDER BY pid DESC', (box_id,)).fetchall()
+    for c in rows:
+        if run_id and c['run_id'] != run_id:
+            continue
+        metrics = json.loads(c['metrics'] or '{}')
+        cache_key = f"holder_gone:{box_id}:{c['pid']}:{c['attempt'] or 1}"
+        if con.execute('SELECT 1 FROM meta WHERE k=?', (cache_key,)).fetchone():
+            if run_id:
+                gone = True
+            continue
+        never_dispatched = (c['status'] not in ('queued', 'running') and c['started_at'] is None and
+                            (metrics.get('not_dispatched') is True or queue_loss_json(c)['notAdmitted']))
+        proof = ({'stopped': True, 'reason': 'not_dispatched'} if never_dispatched else
+                 command_probe(c) if probe and c['status'] != 'queued' else {})
+        confirmed = (proof.get('stopped') is True or (proof.get('readable') is True and
+                     proof.get('pids') == [] and (proof.get('join_verified') is True or proof.get('box_rc') is not None)))
+        if run_id:
+            gone = confirmed or gone
+        if confirmed:
+            resolved.append((cache_key, c, never_dispatched))
+            continue
+        holds.append(dict(run_id=c['run_id'], holder=c['holder'] or row['owner'],
+                          state=c['status'], process_id=c['pid'], probe=proof))
+    snapshot = dict(pin=dict(active=pin, until=iso(row['pin_until']), holder=row['pin_holder']), holds=holds,
+                    confirmedGone=gone and not holds)
+    for cache_key, c, never_dispatched in resolved:
+        with box_transaction(con):
+            inserted = con.execute('INSERT OR IGNORE INTO meta(k,v) VALUES (?,?)', (cache_key, 'probe')).rowcount
+            if inserted:
+                reason = 'command confirmed never dispatched' if never_dispatched else 'receipt/process probe confirmed holder gone'
+                box_event(con, box_id, 'lease_free', reason, snapshot,
+                          run_id=c['run_id'], holder=c['holder'], process_id=c['pid'])
+    return snapshot
+
+
+def require_unprotected(con, box_id, *, reuse=False):
+    snapshot = box_protection(con, box_id)
+    caller = offbox_protection.caller()
+    override = caller.get('override') is True and caller.get('actor') == 'client:release'
+    reason = offbox_protection.blocked(snapshot, holder=caller.get('holder'),
+                                      automatic=not reuse and not override, reuse=reuse, override=override)
+    if reason:
+        box_event(con, box_id, 'protection_refused', reason, snapshot)
+        raise Fail(409, 'box_held', f'{box_id} is {reason}; explicit release --override-protection required')
+    return snapshot
 
 
 def latest_snap(con, box_id: str):
     return con.execute("SELECT * FROM snaps WHERE box_id=? ORDER BY created_at DESC LIMIT 1", (box_id,)).fetchone()
 
 
-def held_runs(con, box_id: str) -> list[str]:
+def held_runs(con, box_id: str, *, exclude_pid=None) -> list[str]:
     held = []
     for c in con.execute("SELECT * FROM commands WHERE box_id=? AND (status='running' OR killed=1)", (box_id,)):
+        if c['pid'] == exclude_pid:
+            continue
         m = json.loads(c['metrics'] or '{}')
         info = m.get('interruption') or {}
         if (c['status'] == 'running' and (info.get('stream_state') in ('unknown', 'reattached') or info.get('cleanup') == 'unknown')) or \
@@ -1042,11 +1154,14 @@ def box_json(con, r) -> dict:
     if state == "ready" and running:
         state = "running"
     snap = latest_snap(con, r["id"])
+    protection = box_protection(con, r['id'], probe=False)
+    last_event = con.execute('SELECT detail FROM box_events WHERE box_id=? ORDER BY seq DESC LIMIT 1', (r['id'],)).fetchone()
     archive_after = None
     if state in LIVE and r["ttl"]:
         archive_after = iso((r["last_active"] or r["updated_at"]) + r["ttl"])
     return {
         "snapshotBytes": (DISK.get('boxes') or {}).get(r['id'], {}).get('snapshot_bytes'),
+        'lastEvent': json.loads(last_event['detail']) if last_event else None,
         "id": r["id"], "name": r["name"], "state": state, "error": r["error"], "dataExpiredAt": None,
         'heldRuns': held_runs(con, r['id']),
         "stoppedAt": iso(r["stopped_at"]) if state == "archived" else None, "labels": json.loads(r["labels"] or "{}"),
@@ -1058,7 +1173,9 @@ def box_json(con, r) -> dict:
         "createdAt": iso(r["created_at"]), "updatedAt": iso(r["updated_at"]), "archiveAfter": archive_after,
         "ttlSeconds": r["ttl"], "snapshots": True, "snapshotAvailable": snap is not None,
         "snapshotCompletedAt": iso(snap["created_at"]) if snap else None,
-        "lastSnapshotStatus": "completed" if snap else None, "source": r["source"], "pinned": bool(r["pinned"]),
+        "lastSnapshotStatus": "completed" if snap else None, "source": r["source"],
+        "pinned": protection['pin']['active'],
+        "protection": protection,
         "environment": "offbox-server",
     }
 
@@ -1250,49 +1367,48 @@ def _wait_boot(box_id: str, timeout: float = 120, ssh: bool = True) -> None:
 def provision(box_id: str, source: tuple[str, str | None], t: str) -> None:
     """source: ("image", alias) | ("saved", instance) | ("box", box_id). Runs in a thread."""
     con = db()
-    lock = boatd_tmp.lock(box_id)
-    lock.acquire()
     try:
-        # Keep the identity requirement after failed creation, later resumes and reaping.
-        set_box(con, box_id, provision_identity=1, identity_pending=1)
-        kind, ref = source
-        name = ct(box_id)
-        marker = ('-c', f'user.offbox.provision={box_id}')
-        if kind == "image":
-            incus("init", ref, name, "-p", "default", "-p", "offbox", *marker, timeout=900)
-        elif kind == "saved":
-            incus("copy", ref, name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
-        else:
-            incus("copy", ct(ref), name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
-        r = box_row(con, box_id)
-        scratch().create(box_id, r['owner'])
-        apply_size(box_id, t)
-        r = box_row(con, box_id)
-        _prepare_proxies(con, box_id)
-        if box_row(con, box_id)['state'] != 'provisioning':
-            return
-        scratch().start(box_id)
-        _wait_boot(box_id, ssh=False)
-        scratch().verify(box_id)
-        _fresh_identity(box_id)
-        set_box(con, box_id, identity_pending=0)
-        _wait_boot(box_id)
-        if con.execute("UPDATE boxes SET state='ready', last_active=?, updated_at=?, error=NULL, start_error=NULL "
-                       "WHERE id=? AND state='provisioning'", (now(), now(), box_id)).rowcount:
-            log(f"box {box_id} ready ({kind} {ref} {t})")
-    except Exception as e:  # noqa: BLE001
-        log(f"provision {box_id} failed: {e}")
-        if isinstance(e, Fail) and e.code == 'incus_slow':
-            failed_start(con, box_id, e, provision=True)
-            return
-        try:
-            cleanup_provision(box_id, box_row(con, box_id)['owner'])
-        except Exception as cleanup:
-            log(f'provision cleanup deferred for {box_id}: {cleanup}')
-            e = RuntimeError(f'{e}; cleanup deferred: {cleanup}')
-        set_box(con, box_id, state="error", error=str(e)[:500])
+        with lifecycle_lock(box_id), boatd_tmp.lock(box_id):
+            try:
+                # Keep the identity requirement after failed creation, later resumes and reaping.
+                set_box(con, box_id, provision_identity=1, identity_pending=1)
+                kind, ref = source
+                name = ct(box_id)
+                marker = ('-c', f'user.offbox.provision={box_id}')
+                if kind == "image":
+                    incus("init", ref, name, "-p", "default", "-p", "offbox", *marker, timeout=900)
+                elif kind == "saved":
+                    incus("copy", ref, name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
+                else:
+                    incus("copy", ct(ref), name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
+                r = box_row(con, box_id)
+                scratch().create(box_id, r['owner'])
+                apply_size(box_id, t)
+                r = box_row(con, box_id)
+                _prepare_proxies(con, box_id)
+                if box_row(con, box_id)['state'] != 'provisioning':
+                    return
+                scratch().start(box_id)
+                _wait_boot(box_id, ssh=False)
+                scratch().verify(box_id)
+                _fresh_identity(box_id)
+                set_box(con, box_id, identity_pending=0)
+                _wait_boot(box_id)
+                if con.execute("UPDATE boxes SET state='ready', last_active=?, updated_at=?, error=NULL, start_error=NULL "
+                               "WHERE id=? AND state='provisioning'", (now(), now(), box_id)).rowcount:
+                    log(f"box {box_id} ready ({kind} {ref} {t})")
+            except Exception as e:  # noqa: BLE001
+                log(f"provision {box_id} failed: {e}")
+                if isinstance(e, Fail) and e.code == 'incus_slow':
+                    failed_start(con, box_id, e, provision=True)
+                    return
+                try:
+                    cleanup_provision(box_id, box_row(con, box_id)['owner'])
+                except Exception as cleanup:
+                    log(f'provision cleanup deferred for {box_id}: {cleanup}')
+                    e = RuntimeError(f'{e}; cleanup deferred: {cleanup}')
+                set_box(con, box_id, state="error", error=str(e)[:500])
     finally:
-        lock.release()
         con.close()
 
 
@@ -1327,7 +1443,7 @@ def create_box(con, body: dict, idem: str | None, owner: str, src_box: str | Non
     if idem:
         con.execute("INSERT INTO idem VALUES (?,?,?)", (idem, bid, t0))
     con.execute("COMMIT")
-    threading.Thread(target=provision, args=(bid, source, t), daemon=True).start()
+    threading.Thread(target=offbox_protection.bind(provision), args=(bid, source, t), daemon=True).start()
     return box_json(con, box_row(con, bid))
 
 
@@ -1433,20 +1549,33 @@ def prune_snaps(con, box_id: str) -> None:
 
 
 def stop_box(con, box_id: str, why: str) -> None:
-    con.execute("UPDATE boxes SET state='stopping', stopped_at=NULL WHERE id=? AND state IN ('provisioning','resuming')",
-                (box_id,))
-    # Initial provisioning and recovery can still start the instance. Confirm
-    # stop only after their worker relinquishes the box.
-    with boatd_tmp.lock(box_id):
-        _stop_box(con, box_id, why)
+    token = offbox_protection.CALLER.set(offbox_protection.caller(reason=why))
+    try:
+        with box_memory_lock(box_id):
+            require_unprotected(con, box_id)
+            if box_row(con, box_id)['state'] == 'archived':
+                return
+            set_box(con, box_id, state='stopping', stopped_at=None)
+        continue_stop(con, box_id, why)
+    finally:
+        offbox_protection.CALLER.reset(token)
 
 
 def continue_stop(con, box_id: str, why: str) -> None:
-    # The request already published cancellation. A delayed worker must not
-    # publish it again after cleanup has completed and another resume started.
-    with boatd_tmp.lock(box_id):
-        if box_row(con, box_id)['state'] == 'stopping':
-            _stop_box(con, box_id, why)
+    # Cancellation was already published; an old worker must not cancel a new resume.
+    token = offbox_protection.CALLER.set(offbox_protection.caller(reason=why))
+    try:
+        with lifecycle_lock(box_id), boatd_tmp.lock(box_id):
+            if box_row(con, box_id)['state'] != 'stopping':
+                return
+            with box_memory_lock(box_id):
+                require_unprotected(con, box_id)
+            settle_box_commands(con, box_id)
+            with box_memory_lock(box_id):
+                require_unprotected(con, box_id)
+                _stop_box(con, box_id, why)
+    finally:
+        offbox_protection.CALLER.reset(token)
 
 
 def _stop_box(con, box_id: str, why: str) -> None:
@@ -1458,8 +1587,6 @@ def _stop_box(con, box_id: str, why: str) -> None:
     if r["state"] == "archived":
         return
     set_box(con, box_id, state="stopping")
-    for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)):
-        kill_cmd(con, box_id, c["pid"], lost=True)
     if ct_running(box_id):
         incus("stop", ct(box_id), "--timeout", "60", timeout=120, check=False)
         if ct_running(box_id):
@@ -1479,6 +1606,19 @@ def _stop_box(con, box_id: str, why: str) -> None:
 
 
 def resume_box(con, box_id: str, body: dict) -> None:
+    with lifecycle_lock(box_id), box_memory_lock(box_id):
+        check_delete_fence(con, box_id)
+        row = box_row(con, box_id)
+        if row['state'] == 'stopping':
+            if row['start_error']:
+                failure = json.loads(row['start_error'])
+                raise Fail(503, failure.get('class', 'incus_failed'), 'failed start cleanup is still pending', failure)
+            raise Fail(409, 'sandbox_unavailable', f'{box_id} is stopping')
+        require_unprotected(con, box_id, reuse=True)
+        _resume_box(con, box_id, body)
+
+
+def _resume_box(con, box_id, body):
     disk_admit()
     r = box_row(con, box_id)
     if r['start_error'] and r['state'] == 'stopping':
@@ -1498,59 +1638,79 @@ def resume_box(con, box_id: str, body: dict) -> None:
                        (now(), now(), box_id, r['state'])).rowcount:
         return
 
+    context = offbox_protection.caller()
     def go():
+        offbox_protection.CALLER.set(context)
         c2 = db()
         failure = {}
         identity_pending = False
-        lock = boatd_tmp.lock(box_id)
-        lock.acquire()
         try:
-            if box_row(c2, box_id)['state'] != 'resuming':
-                return
-            row = box_row(c2, box_id)
-            failure = json.loads(row['start_error'] or '{}')
-            identity_pending = bool(row['identity_pending'])
-            apply_size(box_id, box_row(c2, box_id)["type"])
-            _prepare_proxies(c2, box_id)
-            if box_row(c2, box_id)['state'] != 'resuming':
-                return
-            if not ct_running(box_id):
-                scratch().start(box_id)
-            if identity_pending or failure.get('provision'):
-                _wait_boot(box_id, ssh=False)
-                _fresh_identity(box_id)
-                set_box(c2, box_id, identity_pending=0)
-            _wait_boot(box_id)
-            scratch().verify(box_id)
-            if c2.execute("UPDATE boxes SET state='ready', last_active=?, updated_at=?, error=NULL, start_error=NULL "
-                          "WHERE id=? AND state='resuming'", (now(), now(), box_id)).rowcount:
-                log(f"box {box_id} resumed")
-        except Exception as e:  # noqa: BLE001
-            if isinstance(e, Fail) and e.code == 'incus_slow':
-                failed_start(c2, box_id, e)
-                return
-            if failure or identity_pending:
-                failure_error = e if isinstance(e, Fail) else Fail(500, 'incus_failed', str(e))
-                failed_start(c2, box_id, failure_error, provision=identity_pending, record=False)
-                return
-            c2.execute("UPDATE boxes SET state='archived', error=?, updated_at=? WHERE id=? AND state='resuming'",
-                       (str(e)[:500], now(), box_id))
-            log(f"resume {box_id} failed: {e}")
+            with lifecycle_lock(box_id), boatd_tmp.lock(box_id):
+                try:
+                    if box_row(c2, box_id)['state'] != 'resuming':
+                        return
+                    check_delete_fence(c2, box_id)
+                    row = box_row(c2, box_id)
+                    failure = json.loads(row['start_error'] or '{}')
+                    identity_pending = bool(row['identity_pending'])
+                    apply_size(box_id, box_row(c2, box_id)["type"])
+                    _prepare_proxies(c2, box_id)
+                    if box_row(c2, box_id)['state'] != 'resuming':
+                        return
+                    if not ct_running(box_id):
+                        scratch().start(box_id)
+                    if identity_pending or failure.get('provision'):
+                        _wait_boot(box_id, ssh=False)
+                        _fresh_identity(box_id)
+                        set_box(c2, box_id, identity_pending=0)
+                    _wait_boot(box_id)
+                    scratch().verify(box_id)
+                    if c2.execute("UPDATE boxes SET state='ready', last_active=?, updated_at=?, error=NULL, start_error=NULL "
+                                  "WHERE id=? AND state='resuming'", (now(), now(), box_id)).rowcount:
+                        log(f"box {box_id} resumed")
+                except Exception as e:  # noqa: BLE001
+                    if isinstance(e, Fail) and e.code == 'incus_slow':
+                        failed_start(c2, box_id, e)
+                        return
+                    if failure or identity_pending:
+                        failure_error = e if isinstance(e, Fail) else Fail(500, 'incus_failed', str(e))
+                        failed_start(c2, box_id, failure_error, provision=identity_pending, record=False)
+                        return
+                    with box_memory_lock(box_id):
+                        if box_row(c2, box_id)['state'] != 'resuming':
+                            return
+                        protected = offbox_protection.blocked(box_protection(c2, box_id, probe=False))
+                        set_box(c2, box_id, state='error' if protected else 'archived', error=str(e)[:500])
+                    log(f"resume {box_id} failed: {e}")
         finally:
-            lock.release()
             c2.close()
     threading.Thread(target=go, daemon=True).start()
 
 
-def delete_box(con, box_id: str) -> None:
+def delete_box(con, box_id: str, why: str | None = None) -> None:
+    token = offbox_protection.CALLER.set(offbox_protection.caller(
+        reason=why or offbox_protection.caller().get('reason') or 'API delete'))
+    try:
+        with lifecycle_lock(box_id):
+            with box_memory_lock(box_id):
+                require_unprotected(con, box_id)
+                con.execute('INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)', ('delete_pending:' + box_id, '1'))
+                if box_row(con, box_id)['state'] in LIVE + ('provisioning', 'resuming'):
+                    set_box(con, box_id, state='stopping')
+            settle_box_commands(con, box_id)
+            with box_memory_lock(box_id):
+                require_unprotected(con, box_id)
+                _delete_box(con, box_id)
+                con.execute('DELETE FROM meta WHERE k=?', ('delete_pending:' + box_id,))
+    finally:
+        offbox_protection.CALLER.reset(token)
+
+
+def _delete_box(con, box_id: str) -> None:
     r = box_row(con, box_id)
-    if r["pinned"]:
-        raise Fail(409, "sandbox_pinned", f"{box_id} is pinned; unpin it first")
     with boatd_tmp.lock(box_id):
         if r['provision_identity']:
             check_instance_identity(box_id)
-        for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)):
-            kill_cmd(con, box_id, c["pid"], lost=True)
         delete_instance(box_id, r['owner'], require_identity=bool(r['provision_identity']))
     con.execute("DELETE FROM snaps WHERE box_id=?", (box_id,))
     con.execute('DELETE FROM snapshot_pending WHERE box_id=?', (box_id,))
@@ -1559,6 +1719,25 @@ def delete_box(con, box_id: str) -> None:
 
 
 # ---------------------------------------------------------------- saved snapshots
+
+def settle_box_commands(con, box_id):
+    # Result writers acquire result -> box. Never wait for their result lock while holding the box lock.
+    for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)).fetchall():
+        kill_cmd(con, box_id, c['pid'], lost=True)
+
+
+@contextmanager
+def lifecycle_lock(box_id):
+    path = VAR / 'lifecycle-locks'
+    path.mkdir(exist_ok=True)
+    with open(path / box_id, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def check_delete_fence(con, box_id):
+    if con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:' + box_id,)).fetchone():
+        raise Fail(409, 'sandbox_deleting', f'{box_id} deletion is pending; pin, resume and reuse are refused')
 
 def saved_json(r) -> dict:
     return {"name": r["name"], "status": r["status"], "sourceSandboxId": r["source"], "snapshotId": r["snapshot_id"],
@@ -1741,15 +1920,57 @@ def dispatching(fn):
     return wrapped
 
 
+@contextmanager
+def box_memory_lock(box_id):
+    held = getattr(BOX_LOCKS, 'held', frozenset())
+    if box_id in held:
+        yield
+        return
+    path = VAR / 'memory-locks'
+    path.mkdir(exist_ok=True)
+    with open(path / box_id, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        BOX_LOCKS.held = held | {box_id}
+        try:
+            yield
+        finally:
+            BOX_LOCKS.held = held
+
+
 @dispatching
 def start_cmd(con, box_id: str, body: dict, owner: str | None = None) -> dict:
+    with box_memory_lock(box_id):
+        pid, cid, retry = queue_cmd(con, box_id, body, owner)
+    set_box(con, box_id, last_active=now())
+    d = cmd_dir(box_id)
+    for ext in ("out", "err"):
+        (d / f"{pid}.{ext}").touch()
+    err = spawn_runner(box_id, pid, 1)
+    if err:
+        rc, state = _sh(['systemctl', 'is-active', unit_name(box_id, pid, 1)], timeout=2)
+        current = cmd_row(con, box_id, pid)
+        metrics = {'not_dispatched': current['started_at'] is None and
+                   rc in (3, 4) and state in ('inactive', 'failed', 'unknown')}
+        con.execute("UPDATE commands SET status='exited', exit_code=127, ended_at=?, metrics=? WHERE box_id=? AND pid=?",
+                    (now(), json.dumps(metrics), box_id, pid))
+        raise Fail(500, "spawn_failed", err)
+    return {"ok": True, "processId": pid, "commandId": cid, "pid": pid, "attempt": 1, "retryInterrupted": bool(retry)}
+
+
+def queue_cmd(con, box_id, body, owner):
+    check_delete_fence(con, box_id)
     r = box_row(con, box_id, owner)
     if r["state"] not in LIVE:
         raise Fail(409, "machine_not_running", f"{box_id} is {r['state']}")
     command = body.get("command") or ""
     if not command:
         raise Fail(400, "invalid_command", "command is empty")
+    guard_snapshot = require_unprotected(con, box_id, reuse=True) if body.get('detached') else None
     disk_admit()
+    previous = con.execute("SELECT * FROM commands WHERE box_id=? AND run_id IS NOT NULL "
+                           "AND status IN ('exited','lost','interrupted') ORDER BY ended_at DESC LIMIT 1", (box_id,)).fetchone()
+    if previous:
+        free_idle_tmp(con, previous, dict(status='exited', ended_at=previous['ended_at']))
     meta = body.get("meta") or {}
     con.execute("BEGIN IMMEDIATE")
     held = held_runs(con, box_id) if body.get('detached') else []
@@ -1764,21 +1985,14 @@ def start_cmd(con, box_id: str, body: dict, owner: str | None = None) -> dict:
     sync = not bool(body.get("detached"))
     timeout_s = int(body.get("timeoutSeconds") or 60) if sync else None
     con.execute("INSERT INTO commands (box_id, pid, command_id, command, cwd, status, created_at, kind, repo, run_id, "
-                "retry_interrupted, attempt, sync, timeout_s) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
+                "retry_interrupted, attempt, sync, timeout_s, holder) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
                 (box_id, pid, cid, command, body.get("cwd") or "/home/user", "queued", now(),
                  meta.get("kind") or guess_kind(command), meta.get("repo"), meta.get("run_id"), retry,
-                 int(sync), timeout_s))
+                 int(sync), timeout_s, offbox_protection.caller().get('holder')))
+    if body.get('detached'):
+        box_event(con, box_id, 'hand_out', 'command admitted', guard_snapshot, run_id=meta.get('run_id'))
     con.execute("COMMIT")
-    set_box(con, box_id, last_active=now())
-    d = cmd_dir(box_id)
-    for ext in ("out", "err"):
-        (d / f"{pid}.{ext}").touch()
-    err = spawn_runner(box_id, pid, 1)
-    if err:
-        con.execute("UPDATE commands SET status='exited', exit_code=127, ended_at=? WHERE box_id=? AND pid=?",
-                    (now(), box_id, pid))
-        raise Fail(500, "spawn_failed", err)
-    return {"ok": True, "processId": pid, "commandId": cid, "pid": pid, "attempt": 1, "retryInterrupted": bool(retry)}
+    return pid, cid, retry
 
 
 def guess_kind(command: str) -> str:
@@ -2135,6 +2349,14 @@ def terminal_result(res) -> bool:
 
 
 def _write_command_result(con, c, result, metrics, changes=None):
+    # A terminal row is the pool's hand-back signal. Cleanup finishes before it becomes visible.
+    with box_memory_lock(c['box_id']):
+        if terminal_result(result):
+            free_idle_tmp(con, c, result)
+        return _commit_command_result(con, c, result, metrics, changes)
+
+
+def _commit_command_result(con, c, result, metrics, changes=None):
     updates = {k: result.get(k, c[k]) for k in ('status', 'started_at', 'ended_at', 'boot_id')}
     metrics = dict(metrics)
     metrics.pop('queue_lost_reason', None)
@@ -2237,6 +2459,8 @@ def restore_kill_result(con, c, res, cleanup=None, *, lost=False):
 
 def record_command_result(con, c, result, metrics, action, *, changes=None,
                           terminal_evidence=True, before_spawn=False, repair_legacy=False):
+    if before_spawn and terminal_result(result) and action not in ('retry', 'requeue', 'following'):
+        metrics = {**metrics, 'not_dispatched': True}
     with result_lock(c['box_id'], c['pid']):
         latest = dict(cmd_row(con, c['box_id'], c['pid']))
         if (latest['attempt'] or 1) != (result.get('attempt') or c['attempt'] or 1):
@@ -2373,10 +2597,14 @@ def predicted_peak(con, kind: str) -> int:
 
 
 def admitted_bytes(con) -> int:
-    """Memory promised to runs that started in the last 60 s and may not have grown yet."""
+    """Future anon growth for every running box; existing shmem remains charged to the host."""
+    needs = {}
+    for r in con.execute(f"SELECT box_id,kind FROM commands WHERE {async_filter(con)}status='running'"):
+        needs[r['box_id']] = max(needs.get(r['box_id'], 0), predicted_peak(con, r['kind']))
     total = 0
-    for r in con.execute(f"SELECT kind FROM commands WHERE {async_filter(con)}status='running' AND started_at > ?", (now() - 60,)):
-        total += predicted_peak(con, r["kind"])
+    for box, need in needs.items():
+        anon = boatd_memory.anon_bytes(cg_path(box))
+        total += max(0, need - (int(anon) if anon is not None else 0))
     return total
 
 
@@ -2466,6 +2694,7 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
     reserve = int(CFG["mem_reserve_gb"] * 2**30)
     t0 = now()
     last_reason, last_said = None, None
+    last_decision = None
     while True:
         current = dict(cmd_row(con, box_id, pid))
         if current.get('killed') or current['status'] != 'queued' or (CMDS / box_id / f"{pid}.kill").exists() or json.loads(current['metrics'] or '{}').get('kill_request'):
@@ -2477,7 +2706,15 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             current = dict(cmd_row(con, box_id, pid))
             if current.get('killed') or current['status'] != 'queued' or (CMDS / box_id / f"{pid}.kill").exists() or json.loads(current['metrics'] or '{}').get('kill_request'):
                 return now() - t0
-            free = mem_available() - reserve - admitted_bytes(con)
+            try:
+                info = boatd_memory.meminfo()
+                promised = admitted_bytes(con)
+                memory = boatd_memory.capacity(info, mem_available(), reserve, promised,
+                                               boatd_memory.payload_capacity(CG_ROOT, promised))
+            except (OSError, ValueError):
+                memory = dict(mem_available=None, shmem=None, committed_bytes=None, committed_as=None,
+                              admitted_bytes=None, reserve=reserve, free_bytes=0)
+            free = memory['free_bytes']
             mine = head is None or (head['box_id'], head['pid']) == (box_id, pid)
             head_need = need if mine else predicted_peak(con, head['kind'])
             cap = int(CFG.get("max_running") or 0)
@@ -2490,9 +2727,15 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             # PSI is a moving average: let a new run show up before admitting its neighbour.
             cpu_room = cpu_limit == 0 or (cpu_limit is not None and cpu_known and cpu < cpu_limit and
                                         (last_start is None or now() - last_start >= 10))
-            # The estimate can exceed this host's capacity. An empty host must still make FIFO progress.
             alone = running == 0
-            if mine and room and ((free >= need and cpu_room) or alone):
+            decision = mine and room and free >= need and (cpu_room or alone)
+            decision_state = (decision, mine, room, free >= need, cpu_room)
+            if decision or decision_state != last_decision:
+                toollog.emit('boatd', 'admit.decision', ids={'box': box_id, 'run': current['run_id']},
+                             props={**memory, 'need_bytes': need, 'decision': 'admit' if decision else 'queue',
+                                    'fifo': mine, 'room': room, 'cpu_room': cpu_room})
+                last_decision = decision_state
+            if decision:
                 guard = " AND killed=0" if 'killed' in current else ""
                 updated = con.execute("UPDATE commands SET status='running', started_at=?, queued_s=?, boot_id=? "
                             "WHERE box_id=? AND pid=? AND status='queued'" + guard,
@@ -2513,7 +2756,7 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                 reason, why = 'cap', f"max_running cap {running}/{cap}"
             elif free < head_need:
                 reason = 'memory'
-                why = f"head {head_id} needs {head_need / 2**30:.2f} GiB, {max(0, free) / 2**30:.2f} GiB free above reserve and recent admissions"
+                why = f"head {head_id} needs {head_need / 2**30:.2f} GiB, {max(0, free) / 2**30:.2f} GiB free above reserve and running headroom"
             elif cpu_limit is None:
                 reason, why = 'cpu_config', "a valid CPU admission setting"
             elif not cpu_known and cpu_limit > 0:
@@ -2642,6 +2885,46 @@ def disk_preflight(con, row, errf):
                 for line in text.decode(errors='replace').splitlines():
                     log(f"{row['box_id']} {row['run_id']}: {line}")
         return probe.returncode
+
+
+def free_idle_tmp(con, finishing, result):
+    box = finishing['box_id']
+    row = con.execute('SELECT * FROM boxes WHERE id=?', (box,)).fetchone()
+    if not row or row['pinned'] or row['owner'] in CFG.get('person_owners', []) or 'pool' not in row['name']:
+        return
+    if not finishing['run_id'] or not finishing['started_at'] or result.get('reason') == 'before_spawn':
+        return
+    if con.execute("SELECT 1 FROM commands WHERE box_id=? AND pid!=? AND status IN ('queued','running') LIMIT 1",
+                   (box, finishing['pid'])).fetchone() or held_runs(con, box, exclude_pid=finishing['pid']):
+        return
+    receipt = f"{finishing['pid']}/{finishing['attempt'] or 1}"
+    key = 'tmp_freed:' + box
+    prior = con.execute('SELECT v FROM meta WHERE k=?', (key,)).fetchone()
+    if prior and prior['v'] == receipt:
+        return
+    if run_processes(box, finishing['pid']) != []:
+        return
+    # #198's fd-anchored reaper preserves foreign owners, mounted trees, sockets and live-held files.
+    # Keep lock inodes as well as retained run scratch: a concurrent setup may be waiting on a lock.
+    source = Path(offbox_disk_space.__file__).read_text().split("\nif __name__ == '__main__':")[0]
+    source += "\nimport pwd\nroots=('/tmp','/dev/shm')\n"
+    source += "def used():\n return sum((s.f_blocks-s.f_bfree)*s.f_frsize for root in roots for s in [os.statvfs(root)])\n"
+    source += "before=used()\nremoved=0\n"
+    source += "\nfor root in ('/tmp','/dev/shm'):\n removed += reap(root,pwd.getpwnam('user').pw_uid,[],finished_before=" + repr(
+        result.get('ended_at') or now()) + ",keep_prefixes=('offbox-','.offbox'),emit=lambda item:None)\n"
+    source += "print(json.dumps(dict(bytes=max(0,before-used()))))\n"
+    try:
+        p = ct_exec(box, 'python3 -I -c ' + shlex.quote(source), timeout=30, check=False)
+        freed = json.loads(p.stdout) if p.returncode == 0 else None
+        if not isinstance(freed, dict) or type(freed.get('bytes')) is not int or freed['bytes'] < 0:
+            raise ValueError('tmp cleanup result unavailable')
+        con.execute('INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)', (key, receipt))
+        toollog.emit('boatd', 'box.tmp_freed', ids={'box': box, 'run': finishing['run_id']},
+                     props=freed)
+    except (OSError, ValueError, Fail, subprocess.SubprocessError):
+        # A failed cleanup leaves allocations visible to admission; never turn an unknown run into idle.
+        toollog.emit('boatd', 'box.tmp_free_failed', kind='error', ok=False, ids={'box': box},
+                     props={'reason': 'cleanup_unavailable'})
 
 
 def run_cmd(box_id: str, pid: int) -> int:
@@ -2950,7 +3233,9 @@ def start_container(box_id: str) -> str | None:
             failure_error = e if isinstance(e, Fail) else Fail(500, 'incus_failed', str(e))
             failed_start(c2, box_id, failure_error, provision=identity_pending, record=False)
         else:
-            set_box(c2, box_id, state="archived", stopped_at=now(), error=f"did not start after a server restart: {e}"[:500])
+            protected = offbox_protection.blocked(box_protection(c2, box_id, probe=False))
+            set_box(c2, box_id, state='error' if protected else 'archived', stopped_at=now(),
+                    error=f"did not start after a server restart: {e}"[:500])
         return str(e)
     finally:
         c2.close()
@@ -2983,6 +3268,7 @@ def sync_snaps(con, box_id: str) -> tuple[int, int]:
 
 
 @dispatching
+@offbox_protection.actor('restart')
 def reconcile(con) -> dict:
     """Run at every boatd start, before the API answers. Brings database, systemd units and containers back in
     line after a boatd restart or a host crash. Safe to run twice."""
@@ -3058,7 +3344,7 @@ def reconcile(con) -> dict:
     errs: dict[str, str | None] = {}
     threads = []
     for bid in want:
-        th = threading.Thread(target=lambda b=bid: errs.__setitem__(b, start_container(b)), daemon=True)
+        th = threading.Thread(target=offbox_protection.bind(lambda b=bid: errs.__setitem__(b, start_container(b))), daemon=True)
         th.start()
         threads.append(th)
     end = now() + 420
@@ -3149,18 +3435,27 @@ def ssh_sessions(box_id: str) -> int:
 
 
 @toollog.observed("boatd", "reaper.pass", "reaper_failed")
+@offbox_protection.actor('reaper/idle timer')
 def reap_once(con) -> None:
     toollog.rollup_previous()
+    toollog.rollup_today()
     t = now()
     for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall():
         bid = r["id"]
         if r['state'] == 'stopping' and r['start_error']:
             continue_failed_start(con, bid)
             continue
+        if r['pinned'] and r['pin_until'] is not None and r['pin_until'] <= t:
+            with box_memory_lock(bid):
+                current = box_row(con, bid)
+                if current['pinned'] and current['pin_until'] is not None and current['pin_until'] <= t:
+                    with box_transaction(con):
+                        set_box(con, bid, pinned=0)
+                        box_event(con, bid, 'pin_expired', 'pin reached its expiry')
         if r["state"] in LIVE:
             busy = con.execute("SELECT COUNT(*) FROM commands WHERE box_id=? AND status IN ('queued','running')",
                                (bid,)).fetchone()[0]
-            if busy or held_runs(con, bid) or ssh_sessions(bid):
+            if busy or box_protection(con, bid, probe=False)['pin']['active'] or held_runs(con, bid) or ssh_sessions(bid):
                 set_box(con, bid, last_active=t)
                 continue
             if r["ttl"] and t > (r["last_active"] or r["updated_at"]) + r["ttl"]:
@@ -3175,14 +3470,14 @@ def reap_once(con) -> None:
             used = con.execute("SELECT 1 FROM saved WHERE source=? AND status='ready'", (bid,)).fetchone()
             if not used and t - (r["stopped_at"] or t) > CFG["prune_unused_days"] * 86400:
                 try:
-                    delete_box(con, bid)
+                    delete_box(con, bid, 'archived box exceeded unused retention')
                     toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "delete"})
                 except Exception as e:  # noqa: BLE001
                     toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
                     log(f"prune {bid} failed: {e}")
         elif r["state"] == "error" and t - (r["updated_at"] or t) > 86400:
             try:
-                delete_box(con, bid)
+                delete_box(con, bid, 'failed box exceeded one-day retention')
                 toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "delete"})
             except Exception as e:  # noqa: BLE001
                 toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
@@ -3506,6 +3801,13 @@ class Handler(BaseHTTPRequestHandler):
             if not who:
                 return self._err(401, "unauthorized", "bad token")
             owner, admin = who
+            try:
+                supplied = json.loads(self.headers.get('X-Offbox-Caller') or '{}')
+                if not isinstance(supplied, dict):
+                    raise ValueError('caller must be an object')
+            except ValueError:
+                raise Fail(400, 'invalid_caller', 'invalid X-Offbox-Caller') from None
+            offbox_protection.CALLER.set(offbox_protection.request_caller(supplied, owner, self.client_address[0]))
             if parts_of(path)[:1] == ["admin"]:
                 if not admin:
                     raise Fail(404, "not_found", path)
@@ -3595,10 +3897,40 @@ class Handler(BaseHTTPRequestHandler):
                     kw["last_active"] = now()
                 if "pinned" in b:
                     kw["pinned"] = 1 if b["pinned"] else 0
+                    kw['pin_until'] = b.get('pinUntil')
+                    kw['pin_holder'] = offbox_protection.caller().get('holder')
+                    if kw['pin_until'] is not None and (type(kw['pin_until']) not in (float, int) or
+                                                       not math.isfinite(kw['pin_until'])):
+                        raise Fail(400, 'invalid_pin', 'pinUntil must be a finite timestamp')
                 if "labels" in b:
                     kw["labels"] = json.dumps(b["labels"])
                 if kw:
-                    set_box(con, bid, **kw)
+                    with box_memory_lock(bid):
+                        if 'pinned' in kw:
+                            current = box_row(con, bid)
+                            check_delete_fence(con, bid)
+                            pin = box_protection(con, bid, probe=False)['pin']
+                            reconciliation = b.get('pinReconcile') or {}
+                            if not isinstance(reconciliation, dict):
+                                raise Fail(400, 'invalid_pin', 'pinReconcile must be an object')
+                            legacy_claim = (pin['active'] and pin['holder'] is None and pin['until'] is None
+                                            and kw['pin_holder'] and reconciliation.get('holder') == kw['pin_holder']
+                                            and type(reconciliation.get('until')) in (float, int)
+                                            and math.isfinite(reconciliation['until'])
+                                            and reconciliation['until'] > now())
+                            if pin['active'] and pin['holder'] != kw['pin_holder'] and not legacy_claim:
+                                raise Fail(409, 'sandbox_pinned', f"{bid} is pinned by {pin['holder'] or 'unknown holder'}")
+                            if kw['pinned'] and current['state'] in ('stopping', 'deleted', 'error'):
+                                raise Fail(409, 'sandbox_unavailable', f"{bid} is {current['state']}; cannot pin")
+                            foreign = [h for h in box_protection(con, bid)['holds'] if h['holder'] != kw['pin_holder']]
+                            if kw['pinned'] and foreign:
+                                raise Fail(409, 'box_held', f"{bid} is held by {foreign[0]['holder']} (run {foreign[0]['run_id']})")
+                            if legacy_claim:
+                                box_event(con, bid, 'pin_reconcile', 'client supplied its existing local pin ownership and expiry',
+                                          box_protection(con, bid, probe=False), local_pin=reconciliation)
+                        set_box(con, bid, **kw)
+                        if 'pinned' in kw:
+                            box_event(con, bid, 'pin' if kw['pinned'] else 'unpin', 'client keep')
                 return {"ok": True, "sandbox": box_json(con, box_row(con, bid))}
             if method == "DELETE":
                 if self.headers.get("X-Ascii-Confirm-Delete") != bid:
@@ -3607,6 +3939,13 @@ class Handler(BaseHTTPRequestHandler):
                 return {"ok": True, "deleted": bid}
             raise Fail(405, "method_not_allowed", method)
         op = rest[0]
+        if op == 'protection' and method == 'GET':
+            with box_memory_lock(bid):
+                snapshot = box_protection(con, bid, run_id=q.get('run_id'))
+            return {'ok': True, **snapshot}
+        if op == 'events' and method == 'GET':
+            rows = con.execute('SELECT * FROM box_events WHERE box_id=? ORDER BY seq DESC LIMIT 50', (bid,))
+            return {'ok': True, 'events': [{**dict(r), 'detail': json.loads(r['detail'])} for r in rows]}
         if op == "fork" and method == "POST":
             b = self._body()
             return {"ok": True, "sandbox": create_box(con, b, self.headers.get("Idempotency-Key"), owner, src_box=bid)}
@@ -3614,11 +3953,17 @@ class Handler(BaseHTTPRequestHandler):
             resume_box(con, bid, self._body())
             return {"ok": True, "sandbox": box_json(con, box_row(con, bid))}
         if op == "stop" and method == "POST":
-            r = box_row(con, bid)
-            if r['start_error'] and r['state'] == 'archived':
-                return {"ok": True, "sandbox": box_json(con, r)}
-            set_box(con, bid, state="stopping")
-            threading.Thread(target=lambda: _bg(continue_stop, bid, "api"), daemon=True).start()
+            with box_memory_lock(bid):
+                require_unprotected(con, bid)
+                r = box_row(con, bid)
+                if r['start_error'] and r['state'] == 'archived':
+                    return {"ok": True, "sandbox": box_json(con, r)}
+                set_box(con, bid, state='stopping', stopped_at=None)
+            context = offbox_protection.caller()
+            def stop():
+                offbox_protection.CALLER.set(context)
+                _bg(continue_stop, bid, 'api')
+            threading.Thread(target=stop, daemon=True).start()
             return {"ok": True, "sandbox": box_json(con, box_row(con, bid))}
         if op == "sshkey" and method == "POST":
             return self._sshkey(con, bid, self._body())
@@ -3651,7 +3996,7 @@ class Handler(BaseHTTPRequestHandler):
                 p = cmd_dir(bid) / f"{r['pid']}.{which}"
                 with open(p, "rb") as f:
                     f.seek(off)
-                    data = f.read(1 << 20)
+                    data = f.read(max(4, min(1 << 20, int(q.get('limitBytes') or (1 << 20)))))
                     size = os.fstat(f.fileno()).st_size
                 data, nxt = _utf8_cut(data, off)
                 return {"ok": True, "data": data, "nextOffset": nxt, "size": size,

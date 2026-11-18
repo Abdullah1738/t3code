@@ -1,3 +1,5 @@
+import { inputRejection, excessArgumentRejection } from "./inputRejection.ts";
+import { boardInputErrorHint, withBoardInputHint } from "../ardud/kanban/tools/inputErrors.ts";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
@@ -25,6 +27,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -37,6 +40,8 @@ import { AiError, McpProtocol, McpSchema, McpServer, Tool, Toolkit } from "effec
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import {
   OrchestratorMcpFailure,
+  OrchestratorMcpDelegateTaskResult,
+  NodeId,
   PreviewAutomationError,
   type RunId,
   ThreadId,
@@ -109,7 +114,7 @@ import * as ControlStore from "../ardud/control/ControlStore.ts";
 // ardud schedules: retry a scheduled task's blocked runs.
 import * as ScheduledTaskBlockRetry from "../ardud/schedules/blockRetryTools.ts";
 import * as KanbanHandlers from "../ardud/kanban/tools/handlers.ts";
-import { KanbanToolkit, KanbanArgumentKeys, argumentFailure } from "../ardud/kanban/tools/tools.ts";
+import { KanbanToolkit, KanbanArgumentKeys } from "../ardud/kanban/tools/tools.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
@@ -594,7 +599,7 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
           fiber.context,
           McpInvocationContext.McpInvocationContext,
         );
-        return built.handle("preview_snapshot", payload).pipe(
+        return built.handle("preview_snapshot", payload, undefined, { errors: "all" }).pipe(
           Stream.unwrap,
           Stream.run(Sink.last()),
           Effect.flatMap(Effect.fromOption),
@@ -837,7 +842,7 @@ const registerDeviceScreenshot = Effect.fn("McpHttpServer.registerDeviceScreensh
     DeviceScreenshotTool,
     (payload) =>
       built
-        .handle("device_screenshot", payload)
+        .handle("device_screenshot", payload, undefined, { errors: "all" })
         .pipe(Stream.unwrap, Stream.run(Sink.last()), Effect.flatMap(Effect.fromOption)),
     (effect) =>
       effect.pipe(
@@ -859,7 +864,7 @@ const registerHtmlPreview = Effect.fn("McpHttpServer.registerHtmlPreview")(funct
     HtmlPreviewTool,
     (payload) =>
       built
-        .handle("html_preview", payload)
+        .handle("html_preview", payload, undefined, { errors: "all" })
         .pipe(Stream.unwrap, Stream.run(Sink.last()), Effect.flatMap(Effect.fromOption)),
     (effect) =>
       effect.pipe(
@@ -929,6 +934,7 @@ const handoffTargetIds = (
 
 export const withFailureStructuredContent = (
   result: McpSchema.CallToolResult | McpSchema.InputRequired,
+  maxTextLength = 8192,
 ) => {
   if (
     result instanceof McpSchema.InputRequired ||
@@ -937,7 +943,7 @@ export const withFailureStructuredContent = (
   )
     return result;
   const part = result.content.find((part) => part.type === "text");
-  if (part?.type !== "text" || part.text.length > 8192) return result;
+  if (part?.type !== "text" || part.text.length > maxTextLength) return result;
   try {
     const failure = JSON.parse(part.text) as Schema.Json;
     if (failure !== null && typeof failure === "object" && !Array.isArray(failure)) {
@@ -948,6 +954,55 @@ export const withFailureStructuredContent = (
     /* Plain-text failures stay unchanged. */
   }
   return result;
+};
+
+const encodeDelegationFailure = Schema.encodeSync(OrchestratorMcpFailure);
+const decodeDelegationFailure = Schema.decodeUnknownOption(OrchestratorMcpFailure);
+const isDelegationReceipt = Schema.is(
+  OrchestratorMcpDelegateTaskResult.mapFields(
+    ({ taskId, status, providerInstanceId, model, options }) => ({
+      taskId,
+      status,
+      providerInstanceId,
+      model,
+      options,
+    }),
+  ),
+);
+
+const withDelegationReceipt = (
+  result: McpSchema.CallToolResult | McpSchema.InputRequired,
+  state: McpCallAnalytics.McpCall["Service"],
+) => {
+  if (result instanceof McpSchema.InputRequired || state.parameterIssue !== undefined)
+    return result;
+  const content = result.structuredContent;
+  if (result.isError !== true && isDelegationReceipt(content)) return result;
+  const taskId = state.delegation === undefined ? undefined : NodeId.make(state.delegation.taskId);
+  const originalFailure =
+    result.isError === true ? decodeDelegationFailure(content) : Option.none();
+  const failure = Option.isSome(originalFailure)
+    ? {
+        ...encodeDelegationFailure(originalFailure.value),
+        saved:
+          originalFailure.value.saved ??
+          McpCallAnalytics.callOutcome(Exit.succeed(result), state).saved ??
+          "unknown",
+        ...(originalFailure.value.taskId === undefined && taskId !== undefined ? { taskId } : {}),
+      }
+    : encodeDelegationFailure(
+        new OrchestratorMcpFailure({
+          code: "delegation_uncertain",
+          saved: "unknown",
+          ...(taskId === undefined ? {} : { taskId }),
+          message: `Delegation returned no complete receipt.${taskId === undefined ? "" : ` Task ${taskId}: use task_status to recover it.`} Retry only with the same clientRequestId.`,
+        }),
+      );
+  return new McpSchema.CallToolResult({
+    isError: true,
+    content: [{ type: "text", text: JSON.stringify(failure) }],
+    structuredContent: failure,
+  });
 };
 
 const inputKeyCache = new WeakMap<object, ReadonlySet<string>>();
@@ -1325,6 +1380,9 @@ const withToolAnalytics =
                         ...(callState.reasonClass === undefined
                           ? {}
                           : { reasonClass: callState.reasonClass }),
+                        ...(callState.errorFields === undefined
+                          ? {}
+                          : { errorFields: callState.errorFields }),
                         ...(callState.invalidField === undefined ||
                         !callState.inputKeys?.has(callState.invalidField)
                           ? {}
@@ -1488,15 +1546,47 @@ const withToolAnalytics =
                           const failure =
                             allowed === undefined
                               ? undefined
-                              : argumentFailure(options.tool.name, allowed, payload);
+                              : excessArgumentRejection(allowed, payload);
+                          const rejectionResult = () => {
+                            const failure = inputRejection(
+                              callState.parameterIssue!,
+                              payload,
+                              boardInputErrorHint(options.tool.name, payload),
+                            );
+                            callState.errorFields = failure.invalidFields;
+                            return new McpSchema.CallToolResult({
+                              isError: true,
+                              structuredContent: failure,
+                              content: [{ type: "text", text: failure.message }],
+                            });
+                          };
+                          const handled = options.handle(payload).pipe(
+                            Effect.map((result) =>
+                              callState.parameterIssue === undefined ? result : rejectionResult(),
+                            ),
+                            Effect.catchCauseIf(
+                              (cause) =>
+                                callState.parameterIssue !== undefined &&
+                                !Cause.hasInterrupts(cause) &&
+                                !Cause.hasDies(cause),
+                              () => Effect.succeed(rejectionResult()),
+                            ),
+                            Effect.mapError(withBoardInputHint(options.tool.name, payload)),
+                          );
+                          if (failure !== undefined) callState.errorFields = failure.invalidFields;
                           return failure === undefined
                             ? options.tool.name === "wiki_read"
-                              ? WikiReadTiming.step("handler", options.handle(payload))
-                              : options.handle(payload)
+                              ? WikiReadTiming.step("handler", handled)
+                              : handled
                             : Effect.succeed(
                                 new McpSchema.CallToolResult({
                                   isError: true,
-                                  content: [{ type: "text", text: encodeJsonText(failure) }],
+                                  structuredContent: {
+                                    _tag: "OrchestratorMcpFailure",
+                                    reason: "invalid_args",
+                                    ...failure,
+                                  },
+                                  content: [{ type: "text", text: failure.message }],
                                 }),
                               );
                         }),
@@ -1508,7 +1598,15 @@ const withToolAnalytics =
                             : Effect.void,
                         ),
                       )
-                      .pipe(Effect.map(withFailureStructuredContent))
+                      .pipe(
+                        Effect.map((result) =>
+                          // Keep delegation failure metadata inside the shared reply-size check.
+                          withFailureStructuredContent(
+                            result,
+                            options.tool.name === "delegate_task" ? MAX_REPLY_BYTES : 8192,
+                          ),
+                        ),
+                      )
                       .pipe(Effect.provideService(ReplyRejection, rejection));
                     // Large reads run on their own "mcp" lane (whole call, so at most
                     // PERMITS.mcp large results are built at once). They queue only behind
@@ -1642,6 +1740,11 @@ const withToolAnalytics =
                         )
                       : protectedRead;
                     return yield* measuredRead.pipe(
+                      Effect.map((result) =>
+                        options.tool.name === "delegate_task"
+                          ? withDelegationReceipt(withFailureStructuredContent(result), callState)
+                          : result,
+                      ),
                       Effect.provideService(McpCallAnalytics.McpCall, callState),
                       Effect.provideService(SavedWrite.observer, (receipt) => {
                         if (!boardWrite) callState.saved = true;

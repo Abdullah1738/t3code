@@ -101,9 +101,11 @@ class IncusSlowTests(Base):
                         if recovery_failure == 'boot':
                             stack.enter_context(patch.object(boatd, '_wait_boot',
                                                 side_effect=boatd.Fail(500, 'boot_timeout', 'boot failed')))
-                        # Run the normal resume worker inline, keeping the test deterministic.
-                        with patch.object(boatd.threading, 'Thread', side_effect=lambda target, **kw: Mock(start=target)):
+                        workers = []
+                        with patch.object(boatd.threading, 'Thread',
+                                          side_effect=lambda target, **kw: Mock(start=lambda: workers.append(target))):
                             boatd.resume_box(self.con, bid, {})
+                        workers.pop(0)()
                         row = self.state(bid)
                         if recovery_failure:
                             self.assertEqual(row['state'], 'archived')
@@ -652,9 +654,12 @@ class IncusSlowTests(Base):
                     self.assertEqual(self.state(bid)['identity_pending'], 1)
                     identity.assert_not_called()
                     self.assertEqual(len([a for a, k in records if a[1] == 'box_start_failed']), int(exhausted))
+                    resumed = []
                     with patch.object(boatd, '_prepare_proxies'), \
-                            patch.object(boatd.threading, 'Thread', side_effect=lambda target, **kw: Mock(start=target)):
+                            patch.object(boatd.threading, 'Thread',
+                                         side_effect=lambda target, **kw: Mock(start=lambda: resumed.append(target))):
                         boatd.resume_box(self.con, bid, {})
+                        resumed.pop(0)()
                     self.assertEqual(self.state(bid)['state'], 'ready')
                     self.assertEqual(self.state(bid)['identity_pending'], 0)
                     identity.assert_called_once_with(bid)
@@ -669,14 +674,17 @@ class IncusSlowTests(Base):
                         value = {'status': 'Stopped', 'devices': {}, 'config': {'user.offbox.provision': bid}}
                         return subprocess.CompletedProcess(args, 0, json.dumps(value).encode(), b'')
                     return self.f.incus(*args, **kw)
+                workers = []
                 with patch.object(boatd, '_prepare_proxies'), patch.object(boatd, 'apply_size'), \
                         patch.object(boatd, 'incus', side_effect=incus), \
                         patch.object(boatd, '_wait_boot', side_effect=boatd.Fail(500, 'boot_timeout', 'not booted')), \
-                        patch.object(boatd.threading, 'Thread', side_effect=lambda target, **kw: Mock(start=target)):
+                        patch.object(boatd.threading, 'Thread',
+                                     side_effect=lambda target, **kw: Mock(start=lambda: workers.append(target))):
                     if startup:
                         boatd.start_container(bid)
                     else:
                         boatd.resume_box(self.con, bid, {})
+                        workers.pop(0)()
                 self.assertEqual(self.state(bid)['state'], 'archived')
                 self.assertNotIn(bid, self.f.running)
                 self.assertIsNone(self.state(bid)['ssh_port'])
@@ -695,9 +703,12 @@ class IncusSlowTests(Base):
                 stack.enter_context(patch.object(boatd, '_prepare_proxies'))
                 stack.enter_context(patch.object(boatd, 'apply_size'))
                 stack.enter_context(patch.object(boatd, '_wait_boot', side_effect=boatd.Fail(500, code, 'boot failed')))
-                stack.enter_context(patch.object(boatd.threading, 'Thread', side_effect=lambda target, **kw: Mock(start=target)))
+                workers = []
+                stack.enter_context(patch.object(boatd.threading, 'Thread',
+                    side_effect=lambda target, **kw: Mock(start=lambda: workers.append(target))))
                 emit = stack.enter_context(patch.object(boatd.toollog, 'emit'))
                 boatd.resume_box(self.con, bid, {})
+                workers.pop(0)()
                 row = self.state(bid)
                 self.assertEqual(row['state'], 'stopping')
                 self.assertEqual(json.loads(row['start_error'])['class'], code)

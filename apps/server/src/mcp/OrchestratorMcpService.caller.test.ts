@@ -655,7 +655,7 @@ it.effect.each(
       },
       {
         state: "accepted",
-        message: "This delegation was saved; its task projection is catching up.",
+        message: "This delegation was saved; its task record is missing.",
       },
       { state: "rejected", message: "This delegation was rejected: Parent run ended." },
     ] as const
@@ -678,8 +678,12 @@ it.effect.each(
   ),
 )(
   "recovers a missing task from its $state command $command for status and cancel",
-  ({ state, message, command }) =>
-    Effect.gen(function* () {
+  ({ state, message, command }) => {
+    const ownCommand = command.startsWith(
+      `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(callerId)}:`,
+    );
+    const cancelRequests: CommandId[] = [];
+    return Effect.gen(function* () {
       const commandId = CommandId.make(command);
       const taskId = IdAllocator.derive.delegatedTaskNode({ commandId });
       const service = yield* OrchestratorMcp.OrchestratorMcpService;
@@ -687,21 +691,37 @@ it.effect.each(
         ["status", service.taskStatus(scope, taskId).pipe(Effect.asVoid)],
         ["cancel", service.cancelTask(scope, { taskId }).pipe(Effect.asVoid)],
       ] as const) {
+        if (name === "cancel" && ownCommand && state === "pending") {
+          const cancelled = yield* service.cancelTask(scope, { taskId });
+          assert.equal(cancelled.status, "cancel_pending");
+          assert.include(cancelled.detail!, "as soon as");
+          continue;
+        }
         const error = yield* operation.pipe(Effect.flip);
         const creating =
-          name === "status" &&
-          (state === "pending" || state === "accepted") &&
-          !message.startsWith("No delegated");
-        assert.equal(error.code, creating ? "task_creating" : "task_not_found");
+          name === "status" && state === "pending" && !message.startsWith("No delegated");
+        const recordMissing = state === "accepted" && !message.startsWith("No delegated");
+        assert.equal(
+          error.code,
+          recordMissing ? "task_record_missing" : creating ? "task_creating" : "task_not_found",
+        );
         assert.include(error.message, message);
-        if (creating) assert.notInclude(error.message, "No delegated task has this id.");
+        if (creating || recordMissing)
+          assert.notInclude(error.message, "No delegated task has this id.");
         else assert.isTrue(error.message.startsWith("No delegated task has this id."));
       }
+      assert.deepEqual(cancelRequests, ownCommand && state === "pending" ? [commandId] : []);
     }).pipe(
       Effect.provide(
         layer({
           getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
           getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(callerId))),
+          requestCancelOnArrival: (commandId) =>
+            Effect.sync(() => {
+              cancelRequests.push(commandId);
+              // Accepted receipts need the committed-task lookup if no create is pending.
+              return state === "pending" ? "cancel_pending" : "not_pending";
+            }),
           getDelegationCommandState: (commandId) =>
             Effect.succeed(
               state === "accepted" || state === "rejected"
@@ -718,7 +738,52 @@ it.effect.each(
             ),
         }),
       ),
-    ),
+    );
+  },
+);
+
+it.effect.each(["provider_changed", "archived", "inactive"] as const)(
+  "does not register a pending cancel for a %s caller",
+  (state) =>
+    Effect.gen(function* () {
+      const shell = {
+        ...liveThreadShell(callerId),
+        ...(state === "provider_changed"
+          ? { providerInstanceId: ProviderInstanceId.make("claudeAgent") }
+          : state === "archived"
+            ? { archivedAt: DateTime.makeUnsafe(0) }
+            : { activeRunId: null, pendingBackgroundTasks: [] }),
+      };
+      let cancels = 0;
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcp.OrchestratorMcpService;
+        const commandId = CommandId.make(
+          `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(callerId)}:retry`,
+        );
+        const taskId = IdAllocator.derive.delegatedTaskNode({ commandId });
+        for (const operation of [
+          service.taskStatus(scope, taskId).pipe(Effect.asVoid),
+          service.cancelTask(scope, { taskId }).pipe(Effect.asVoid),
+        ]) {
+          const error = yield* operation.pipe(Effect.flip);
+          assert.equal(error.code, "parent_not_active");
+        }
+        assert.equal(cancels, 0);
+      }).pipe(
+        Effect.provide(
+          layer({
+            getCallerRow: () => Effect.succeed(shell),
+            getThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
+            getDelegationCommandState: () => Effect.succeed({ status: "pending" }),
+            requestCancelOnArrival: () =>
+              Effect.sync(() => {
+                cancels++;
+                return "cancel_pending";
+              }),
+          }),
+        ),
+      );
+    }),
 );
 
 it.effect.each([

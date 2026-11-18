@@ -1,4 +1,9 @@
-import type { AnalyticsEvent, AnalyticsRollup, RunUsageEvent } from "@t3tools/contracts";
+import type {
+  AnalyticsEvent,
+  AnalyticsRollup,
+  KanbanPoolChange,
+  RunUsageEvent,
+} from "@t3tools/contracts";
 import { LONG_TASK_HISTOGRAM_RATIO } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
@@ -37,6 +42,7 @@ interface McpGroup {
   savedCounts: Map<string, number>;
   reasonClasses: Map<string, number>;
   invalidFields: Map<string, number>;
+  errorFields: Map<string, number>;
   notFoundReasons: Map<string, number>;
   foundByCounts: Map<string, number>;
   idShapeCounts: Map<string, number>;
@@ -231,8 +237,36 @@ function finishBreakdown(groups: Map<string, Breakdown>) {
 export const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
 
 export const makeAccumulator = () => ({
+  runtimeSamples: new Map<
+    string,
+    {
+      hour: string;
+      samples: number;
+      runningTurnsMax: number;
+      runningTurnsSum: number;
+      queuedRunsMax: number | null;
+      load1Max: number;
+      sampleMsMax: number;
+    }
+  >(),
   total: 0,
   invalidLines: 0,
+  restartAdmissionOverflow: 0,
+  restartAdmission: new Map<
+    string,
+    {
+      bootId: string;
+      hour: string;
+      maxQueueDepth: number;
+      admissions: number;
+      failuresByRule: Record<string, number>;
+      maxActiveObserved: number;
+      maxActive: number;
+      loadedObservations: number;
+      observations: number;
+      waits: Durations;
+    }
+  >(),
   kinds: new Map<string, number>(),
   textGenerationOverflow: 0,
   textGeneration: new Map<
@@ -311,6 +345,10 @@ export const makeAccumulator = () => ({
     }
   >(),
   evaluatorStartsByTrigger: new Map<string, { boardId: string; trigger: string; count: number }>(),
+  claudeApiErrors: new Map<
+    string,
+    { status: number | null; model: string; host: string; attempts: number; giveUps: number }
+  >(),
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
@@ -375,6 +413,7 @@ interface BoardGroup {
   asks: Map<string, AskObservation>;
   snapshotRows: number;
   snapshots: Map<string, { expected: number | undefined; asks: Map<string, AskObservation> }>;
+  poolChanges: KanbanPoolChange[];
   pools: Map<
     string,
     { hour: string; poolKey: string; samples: number; used: number; slots: number; waiting: number }
@@ -400,6 +439,7 @@ function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: Anal
       asks: new Map(),
       snapshotRows: 0,
       snapshots: new Map(),
+      poolChanges: [],
       pools: new Map(),
       overflow: 0,
     };
@@ -504,6 +544,28 @@ function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: Anal
       });
   }
   if (
+    event.kind === "kanban.pool_change" &&
+    p.poolKey &&
+    p.op &&
+    p.actorKind &&
+    p.fromSlots !== undefined &&
+    p.toSlots !== undefined &&
+    p.actorId !== undefined
+  ) {
+    if (board.poolChanges.length >= BOARD_LIMIT) board.overflow++;
+    else
+      board.poolChanges.push({
+        at: event.ts,
+        poolKey: p.poolKey,
+        ...(p.fromPoolKey === undefined ? {} : { fromPoolKey: p.fromPoolKey }),
+        fromSlots: p.fromSlots,
+        toSlots: p.toSlots,
+        op: p.op,
+        actorKind: p.actorKind,
+        actorId: p.actorId,
+      });
+  }
+  if (
     event.kind === "kanban.pool_usage" &&
     p.poolKey &&
     p.used !== undefined &&
@@ -554,6 +616,84 @@ export function accumulate(
   }
   // Related follow-ups inform a filtered call view without becoming selected events or samples.
   if (correlationOnly) return;
+  if (event.kind === "provider.claude_api_error" && event.claudeApiError !== undefined) {
+    const { status, model, host } = event.claudeApiError;
+    const identity = JSON.stringify([status, model, host]);
+    const key = boundedKey(target.claudeApiErrors, identity);
+    const group = target.claudeApiErrors.get(key) ?? {
+      ...(key === OTHER ? { status: null, model: OTHER, host: OTHER } : { status, model, host }),
+      attempts: 0,
+      giveUps: 0,
+    };
+    if (event.phase === "attempt") group.attempts++;
+    if (event.phase === "give_up") group.giveUps++;
+    target.claudeApiErrors.set(key, group);
+  }
+  if (
+    event.kind === "server.runtime_sample" &&
+    event.props?.runningTurns &&
+    event.props.host &&
+    event.props.sampleMs !== undefined
+  ) {
+    const hour = event.ts.slice(11, 13);
+    const row = target.runtimeSamples.get(hour) ?? {
+      hour,
+      samples: 0,
+      runningTurnsMax: 0,
+      runningTurnsSum: 0,
+      queuedRunsMax: null,
+      load1Max: 0,
+      sampleMsMax: 0,
+    };
+    row.samples++;
+    row.runningTurnsMax = Math.max(row.runningTurnsMax, event.props.runningTurns.total);
+    row.runningTurnsSum += event.props.runningTurns.total;
+    if (event.props.queuedRuns !== undefined)
+      row.queuedRunsMax = Math.max(row.queuedRunsMax ?? 0, event.props.queuedRuns);
+    row.load1Max = Math.max(row.load1Max, event.props.host.load1);
+    row.sampleMsMax = Math.max(row.sampleMsMax, event.props.sampleMs);
+    target.runtimeSamples.set(hour, row);
+  }
+  const admission = event.restartAdmission;
+  if (
+    admission &&
+    (event.kind === "restart.admission.admitted" || event.kind === "restart.admission.failed")
+  ) {
+    const bootId = event.bootId ?? "unknown";
+    const hour = event.ts.slice(0, 13) + "Z";
+    const key = JSON.stringify([bootId, hour]);
+    let group = target.restartAdmission.get(key);
+    if (!group && target.restartAdmission.size >= MAX_GROUPS) target.restartAdmissionOverflow++;
+    else {
+      if (!group) {
+        group = {
+          bootId,
+          hour,
+          maxQueueDepth: 0,
+          admissions: 0,
+          failuresByRule: {},
+          maxActiveObserved: 0,
+          maxActive: 0,
+          loadedObservations: 0,
+          observations: 0,
+          waits: durations(),
+        };
+        target.restartAdmission.set(key, group);
+      }
+      group.observations++;
+      group.loadedObservations += Number(admission.loaded);
+      group.maxQueueDepth = Math.max(group.maxQueueDepth, admission.maxQueueDepth, admission.total);
+      group.maxActiveObserved = Math.max(group.maxActiveObserved, admission.active);
+      group.maxActive = Math.max(group.maxActive, admission.maxActive);
+      if (event.kind === "restart.admission.admitted") {
+        group.admissions++;
+        addDuration(group.waits, admission.waitedMs);
+      } else {
+        const rule = admission.rule ?? "unknown";
+        group.failuresByRule[rule] = (group.failuresByRule[rule] ?? 0) + 1;
+      }
+    }
+  }
   boardAccumulate(target, event);
   target.total++;
   if ("runId" in event) accumulateUsage(target.usage, event);
@@ -873,6 +1013,7 @@ export function accumulate(
         savedCounts: new Map(),
         reasonClasses: new Map(),
         invalidFields: new Map(),
+        errorFields: new Map(),
         notFoundReasons: new Map(),
         foundByCounts: new Map(),
         idShapeCounts: new Map(),
@@ -888,6 +1029,7 @@ export function accumulate(
     increment(group.savedCounts, String(event.saved ?? "n/a"));
     if (event.reasonClass) increment(group.reasonClasses, event.reasonClass);
     if (event.invalidField) increment(group.invalidFields, event.invalidField);
+    for (const field of new Set(event.errorFields ?? [])) increment(group.errorFields, field);
     if (event.props?.notFoundReason !== undefined)
       increment(group.notFoundReasons, event.props.notFoundReason);
     if (event.props?.foundBy !== undefined) increment(group.foundByCounts, event.props.foundBy);
@@ -929,11 +1071,12 @@ export function accumulate(
   }
 }
 
-export function summarize(values: Durations): AnalyticsLatency {
+function durationPercentile(values: Durations) {
   const sorted = values.histogram
     ? [...values.histogram].sort(([a], [b]) => a - b)
     : values.exact.toSorted((a, b) => a - b).map((value) => [value, 1] as const);
-  const percentile = (quantile: number): number | null => {
+
+  return (quantile: number): number | null => {
     const rank = Math.ceil(values.count * quantile);
     let seen = 0;
     for (const [key, count] of sorted) {
@@ -946,6 +1089,10 @@ export function summarize(values: Durations): AnalyticsLatency {
     }
     return null;
   };
+}
+
+export function summarize(values: Durations): AnalyticsLatency {
+  const percentile = durationPercentile(values);
   return {
     count: values.count,
     p50Ms: percentile(0.5),
@@ -1051,6 +1198,36 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    claudeApiErrors: [...target.claudeApiErrors.values()],
+    runtimeSamples: [...target.runtimeSamples.values()]
+      .map(({ runningTurnsSum, ...row }) => ({
+        ...row,
+        runningTurnsAvg: runningTurnsSum / row.samples,
+      }))
+      .sort((a, b) => a.hour.localeCompare(b.hour)),
+    restartAdmission: {
+      scope: "server-wide",
+      groupBy: "boot-hour",
+      loadedTimeShare: null,
+      basis:
+        "Terminal-hour cohorts; admission waits only. Depth: run lifetime maximum. Active/load: terminal samples. Read without board/card/kind filters.",
+      overflow: target.restartAdmissionOverflow,
+      groups: [...target.restartAdmission.values()]
+        .map(({ waits, ...group }) => {
+          const percentile = durationPercentile(waits);
+          return {
+            ...group,
+            wait: {
+              count: waits.count,
+              p50Ms: percentile(0.5),
+              p90Ms: percentile(0.9),
+              maxMs: waits.count ? waits.max : null,
+              approximate: waits.histogram !== undefined,
+            },
+          };
+        })
+        .sort((a, b) => a.hour.localeCompare(b.hour) || a.bootId.localeCompare(b.bootId)),
+    },
     evaluatorOutcomes: [...target.evaluatorOutcomes.values()].sort((a, b) =>
       JSON.stringify(a).localeCompare(JSON.stringify(b)),
     ),
@@ -1208,6 +1385,7 @@ export function finishRollup(
       failureCounts: Object.fromEntries(board.failures),
       restarts: board.restarts,
       ...finishBoardAsks(board, day, generatedAt),
+      poolChanges: board.poolChanges.toSorted((a, b) => a.at.localeCompare(b.at)),
       poolUtilisation: [...board.pools.values()].map((pool) => ({
         ...pool,
         used: pool.used / pool.samples,
@@ -1252,6 +1430,7 @@ export function finishRollup(
         notFoundReasons: Object.fromEntries(group.notFoundReasons),
         foundByCounts: Object.fromEntries(group.foundByCounts),
         idShapeCounts: Object.fromEntries(group.idShapeCounts),
+        errorFields: Object.fromEntries(group.errorFields),
         errors: [...group.errors.values()],
         ...(retries.get(key) ?? { failedThenRetried: 0, retrySucceeded: 0 }),
       }))

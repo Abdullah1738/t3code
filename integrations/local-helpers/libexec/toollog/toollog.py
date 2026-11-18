@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import errno
 import contextlib
 import json
 import math
@@ -18,7 +17,7 @@ import tempfile
 from functools import lru_cache
 
 # Keep iMessage class names in sync with spectrum-bridge/src/log-error.ts.
-_IMESSAGE_ERROR_NAMES = frozenset('Error TypeError RangeError ReferenceError SyntaxError URIError EvalError AggregateError IMessageError APIError FetchError HTTPError NetworkError ZodError AbortError TimeoutError SystemError SQLiteError SqliteError DOMException JudgeError TransportError PublishError CliError SttError SecretError ShareError HttpError ApiError ControlError LineError SendblueError ValidationError UnknownError'.split())
+_IMESSAGE_ERROR_NAMES = frozenset('Error TypeError RangeError ReferenceError SyntaxError URIError EvalError AggregateError IMessageError APIError FetchError HTTPError NetworkError ZodError AbortError TimeoutError BoundedTimeout SystemError SQLiteError SqliteError DOMException JudgeError TransportError PublishError CliError SttError SecretError ShareError HttpError ApiError ControlError LineError SendblueError ValidationError UnknownError'.split())
 
 CAP_BYTES = 50 * 1024 * 1024
 HOOKS_CAP_BYTES = 35 * 1024 * 1024
@@ -232,7 +231,7 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
          ids=None, props=None, error_tag=None):
     """Drop write failures. Error messages are fixed tags, never exception messages."""
     try:
-        if kind not in {'event', 'perf', 'error'} or not _LABEL.fullmatch(component) or not _LABEL.fullmatch(name):
+        if kind not in {'event', 'perf', 'error', 'opencode-reload'} or not _LABEL.fullmatch(component) or not _LABEL.fullmatch(name):
             return
         now = datetime.now(timezone.utc)
         day = now.strftime('%Y-%m-%d')
@@ -256,6 +255,30 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
         for key, value in [('ids', _metadata(ids, _IDS)), ('props', _metadata(props, _FIELDS))]:
             if value:
                 row[key] = value
+        if kind == 'opencode-reload':
+            # This event intentionally carries file paths and hashes, never bytes.
+            reload = props or {}
+            files = reload.get('files', [])
+            busy = reload.get('busy', {})
+            if (component != 'installers' or name != 'opencode-reload'
+                    or not _SLUG.fullmatch(reload.get('installer', ''))
+                    or not isinstance(files, list) or not files
+                    or not isinstance(busy, dict)
+                    or type(reload.get('waited_ms')) is not int or reload['waited_ms'] < 0
+                    or type(reload.get('allow_reload')) is not bool):
+                return
+            for item in files:
+                if (not isinstance(item, dict) or not isinstance(item.get('path'), str)
+                        or not os.path.isabs(item['path']) or any(
+                            item.get(key) is not None and not re.fullmatch(r'[a-f0-9]{64}', item[key])
+                            for key in ('sha256_before', 'sha256_after'))):
+                    return
+            if any(not _LABEL.fullmatch(key) or not (type(value) is int and value >= 0 or value == 'unknown')
+                   for key, value in busy.items()):
+                return
+            row['props'] = {key: reload[key] for key in ('installer', 'busy', 'waited_ms', 'allow_reload')}
+            row['props']['files'] = [{key: item[key] for key in ('path', 'sha256_before', 'sha256_after')}
+                                     for item in files]
         if error_tag:
             tag = error_tag if isinstance(error_tag, str) and _LABEL.fullmatch(error_tag) else 'other'
             row['error'] = {'tag': tag, 'message': tag}
@@ -413,7 +436,10 @@ def _imessage_call_stats(row):
                   and type(pair[0]) is int and 0 <= pair[0] <= 86_400_000
                   and type(pair[1]) is int and 1 <= pair[1] <= 10_000_000]
         if sum(count for _, count in values) == oks + failures:
-            result[name] = (oks, failures, values)
+            single = stats.get('singleFailures')
+            if type(single) is not int or not 0 <= single <= failures:
+                single = None
+            result[name] = (oks, failures, values, single)
     return result
 
 
@@ -449,7 +475,27 @@ serviceUnavailable sharedFriendLocationNotFound sharedPlanRequired timeout token
 tokenNetwork unauthenticated unauthorized unknownSendFailure uploadRateExceeded upload_failed
 upload_url
 """.split())
-_IMESSAGE_CAUSE_CODES.update(errno.errorcode.values())
+# Bun exposes a fixed node:os errno vocabulary; Python uses host-specific names and drops aliases.
+_IMESSAGE_CAUSE_CODES.update("""
+E2BIG EACCES EADDRINUSE EADDRNOTAVAIL EAFNOSUPPORT EAGAIN EALREADY EBADF
+EBADMSG EBUSY ECANCELED ECHILD ECONNABORTED ECONNREFUSED ECONNRESET EDEADLK
+EDESTADDRREQ EDOM EDQUOT EEXIST EFAULT EFBIG EHOSTUNREACH EIDRM
+EILSEQ EINPROGRESS EINTR EINVAL EIO EISCONN EISDIR ELOOP
+EMFILE EMLINK EMSGSIZE EMULTIHOP ENAMETOOLONG ENETDOWN ENETRESET ENETUNREACH
+ENFILE ENOBUFS ENODATA ENODEV ENOENT ENOEXEC ENOLCK ENOLINK
+ENOMEM ENOMSG ENOPROTOOPT ENOSPC ENOSR ENOSTR ENOSYS ENOTCONN
+ENOTDIR ENOTEMPTY ENOTSOCK ENOTSUP ENOTTY ENXIO EOPNOTSUPP EOVERFLOW
+EPERM EPIPE EPROTO EPROTONOSUPPORT EPROTOTYPE ERANGE EROFS ESPIPE
+ESRCH ESTALE ETIME ETIMEDOUT ETXTBSY EWOULDBLOCK EXDEV
+""".split())
+_IMESSAGE_CAUSE_CODES.update('network bad_response no_handle no_media_url unsupported invalid_app_card card_preview_unavailable too_large download_failed lineFailure sendUnconfirmed'.split())
+_IMESSAGE_CODE_ALIASES = {
+    'ConnectionRefused': 'ECONNREFUSED', 'Timeout': 'ETIMEDOUT',
+    'Malformed_HTTP_Response': 'HPE_INVALID_CONSTANT', 'InvalidHTTPResponse': 'HPE_INVALID_CHUNK_SIZE',
+    'ResponseHeadersTooLarge': 'UND_ERR_HEADERS_OVERFLOW', 'InvalidContentLength': 'UND_ERR_RES_CONTENT_LENGTH_MISMATCH',
+    'ZlibError': 'Z_DATA_ERROR',
+}
+_IMESSAGE_PROVIDER_CODES = {'invalid_number', 'worker_unavailable', 'stop_opt_out', 'opted_out', '5504', 'provider_error'}
 
 
 def _imessage_cause_key(value):
@@ -467,9 +513,91 @@ def _imessage_cause_key(value):
     if re.fullmatch(r'-?(?:0|[1-9]\d{0,4})', code) and abs(int(code)) <= 65535:
         return value
     # Provider detail after an HTTP status is intentionally never copied.
-    if re.fullmatch(r'http_[1-5]\d{2}:(?:provider_error|unknown)', code):
+    if re.fullmatch(r'http_[1-5][0-9]{2}(?::(?:invalid_number|worker_unavailable|stop_opt_out|opted_out|5504|provider_error))?', code):
         return value
     return None
+
+
+def _imessage_error_code(value):
+    if type(value) in (int, float) and abs(value) <= 65535 and math.isfinite(value) and value == int(value):
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    if value in _IMESSAGE_CODE_ALIASES:
+        return _IMESSAGE_CODE_ALIASES[value]
+    http = re.fullmatch(r'http_([1-5][0-9]{2})([\s\S]*)', value)
+    if http:
+        detail = http[2].removeprefix(':')
+        # Match safeLineFailureCode: provider text is reduced to a fixed vocabulary.
+        suffix = ':' + (_imessage_provider_code(detail) or 'provider_error') if detail else ''
+        return 'http_' + http[1] + suffix
+    if value in _IMESSAGE_CAUSE_CODES or re.fullmatch(r'(?:http|tokenHttp)[1-5][0-9]{2}', value):
+        return value
+    return None
+
+
+def _imessage_provider_code(value):
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    key = value.lower()
+    return 'stop_opt_out' if key == 'stop' else key if key in _IMESSAGE_PROVIDER_CODES else None
+
+
+def _imessage_replayed_cause(row):
+    # TS clean() rebuilds reduced error fields and ignores stored causeKey on replay.
+    kind = row.get('kind')
+    if kind not in ('error', 'perf', 'event') or not (kind == 'error' or row.get('name') == 'turn.robob_call' and row.get('ok') is False):
+        return None
+    for field in ('component', 'name'):
+        label = row.get(field, 'undefined')
+        label = 'null' if label is None else str(label).lower() if type(label) is bool else label
+        if not isinstance(label, str) or not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_.-]{0,99}', label):
+            return None
+    error = row.get('error') if isinstance(row.get('error'), dict) else {}
+    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+    source = error.get('cause') if isinstance(error.get('cause'), dict) else {}
+    nested = source.get('cause') if isinstance(source.get('cause'), dict) else {}
+    response = source.get('response') if isinstance(source.get('response'), dict) else {}
+    tag = error.get('tag')
+    tag = '' if tag is None else tag
+    if not isinstance(tag, str):
+        return None
+    if re.match(r'^http_[1-5][0-9]{2}', tag):
+        tag = _imessage_error_code(tag)
+    elif tag.startswith('sendblue.'):
+        tag = 'sendblue.' + (_imessage_provider_code(tag[9:]) or 'async_failure')
+    tag_status = re.match(r'^http_([1-5][0-9]{2})', tag)
+    fallback_name = ('ValidationError' if tag.startswith('form.') else 'SendblueError' if tag.startswith('sendblue.')
+                     else 'HttpError' if tag_status else 'UnknownError') if isinstance(tag, str) else 'UnknownError'
+    name = source.get('name') if source.get('name') is not None else error.get('name', fallback_name)
+    name = name if isinstance(name, str) and name in _IMESSAGE_ERROR_NAMES else 'UnknownError'
+    if tag == 'router.catch1' and props.get('causeKind') in ('timeout', 'http', 'transport'):
+        return (tag, 'prompt_acceptance_probe')
+    if name not in {'Error', 'UnknownError', 'TimeoutError', 'BoundedTimeout'}:
+        return None
+    tag = tag if re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_.:-]{0,99}', tag) else 'operation.failed'
+    fallback_code = error.get('code') if error.get('code') is not None else 'http_' + tag_status[1] if tag_status else None
+    code = next((safe for value in [source.get('code'), nested.get('code'), fallback_code]
+                 if (safe := _imessage_error_code(value)) is not None), None)
+    number = next((safe for value in [source.get('errno'), nested.get('errno'), error.get('errno')]
+                   if (safe := _imessage_error_code(value)) is not None), None)
+    if code is not None:
+        http = re.match(r'^(?:http_?|tokenHttp)([1-5])[0-9]{2}', code) if isinstance(code, str) else None
+        key = 'http.' + http[1] + 'xx' if http else f'code.{code}'
+    elif number is not None:
+        key = f'errno.{number}'
+    else:
+        fallback_status = error.get('status')
+        if fallback_status is None:
+            fallback_status = int(tag_status[1]) if tag_status else props.get('status')
+        status = next((value for value in [source.get('status'), source.get('statusCode'), response.get('status'), fallback_status]
+                       if value is not None), None)
+        if type(status) in (int, float) and 100 <= status <= 599 and math.isfinite(status) and status == int(status):
+            key = f'http.{int(status) // 100}xx'
+        else:
+            key = {'router.catch1': 'prompt_acceptance_probe', 'router.catch49': 'background_watch'}.get(tag, 'callsite_failure')
+    key = _imessage_cause_key(key)
+    return (tag, key) if key else None
 
 
 def _imessage_render_stats(row):
@@ -516,6 +644,7 @@ def _imessage_rollup_records(board, day):
         value = identity.get('callBatchId') if isinstance(identity, dict) else None
         return value if isinstance(value, str) else None
     represented = set()
+    represented_single_failures = set()
     pending = []
     for line, raw in _read_records(board, day):
         row = {key: value for key, value in raw.items() if not key.startswith('_rollup_')}
@@ -526,12 +655,15 @@ def _imessage_rollup_records(board, day):
             yield line, {**row, 'name': 'card.render', '_rollup_count': count, '_rollup_ok': count,
                          '_rollup_failed': 0, '_rollup_histogram': histogram}
         elif calls:
-            for name, (oks, failed, histogram) in calls.items():
+            for name, (oks, failed, histogram, single) in calls.items():
                 if batch(row) is not None:
                     represented.add((batch(row), name))
+                    if single is not None:
+                        represented_single_failures.add((batch(row), name))
                 yield line, {'ts': row.get('ts'), 'ids': row.get('ids'), 'component': 'robob', 'kind': 'perf',
                              'name': 'turn.robob_call', '_rollup_count': oks + failed,
-                             '_rollup_ok': oks, '_rollup_failed': failed, '_rollup_histogram': histogram, '_rollup_call': name}
+                             '_rollup_ok': oks, '_rollup_failed': failed, '_rollup_histogram': histogram, '_rollup_call': name,
+                             '_rollup_single_failures': single or 0}
         elif row.get('name') == 'turn.robob_call' and row.get('kind') == 'perf':
             pending.append((line, row))
             yield line, {'_rollup_skip': True}
@@ -542,15 +674,53 @@ def _imessage_rollup_records(board, day):
         if (batch(row), _imessage_call_name(row)) not in represented:
             yield line, {**row, '_rollup_deferred': True}
         elif row.get('error'):
-            yield line, {**row, '_rollup_deferred': True, '_rollup_diagnostic': True}
+            yield line, {**row, '_rollup_deferred': True, '_rollup_diagnostic': True,
+                         '_rollup_failure_counted': (batch(row), _imessage_call_name(row)) in represented_single_failures}
     for row in _imessage_shared_renders(board, day):
         yield 0, row
+
+
+def _imessage_probe_stats(row):
+    if row.get('component') != 'router' or row.get('name') != 'router.prompt_probes' or row.get('kind') != 'perf':
+        return None
+    value = row.get('promptProbe')
+    if not isinstance(value, dict):
+        return None
+    outcomes = ('accepted', 'notAcceptedYet', 'timeout', 'http', 'transport')
+    valid = lambda n: type(n) is int and 0 <= n <= 10_000_000
+    if not all(valid(value.get(k)) for k in ('calls',) + outcomes):
+        return None
+    if value['calls'] != sum(value[k] for k in outcomes):
+        return None
+    statuses = value.get('httpByStatus')
+    if not isinstance(statuses, dict) or any(not isinstance(k, str) or not re.fullmatch(r'[1-5]\d{2}', k) or not valid(v) for k, v in statuses.items()):
+        return None
+    if sum(statuses.values()) != value['http']:
+        return None
+    result = {k: value[k] for k in ('calls',) + outcomes}
+    result['httpByStatus'] = dict(statuses)
+    for field in ('elapsedMs', 'attempts', 'msUntilAccepted'):
+        bins = value.get(field)
+        if not isinstance(bins, list) or len(bins) > 100_000:
+            return None
+        if any(not isinstance(pair, list) or len(pair) != 2 or type(pair[0]) is not int or not 0 <= pair[0] <= 2**53 - 1 or not valid(pair[1]) or pair[1] < 1 for pair in bins):
+            return None
+        result[field] = [tuple(pair) for pair in bins]
+    samples = lambda field: sum(n for _, n in result[field])
+    if samples('elapsedMs') != result['calls'] or samples('attempts') > result['accepted'] or samples('attempts') != samples('msUntilAccepted'):
+        return None
+    return result
 
 
 def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
     causes, render_failures = Counter(), Counter()
+    cause_kinds = defaultdict(Counter)
+    probe_totals, probe_statuses = Counter(), Counter()
+    probe_bins = defaultdict(list)
+    probe_hours = {}
+    probe_rows = defaultdict(Counter)
     samples, references, durations = {}, {}, defaultdict(list)
     order_errors, order_polls = {}, defaultdict(list)
     component_totals, component_errors = Counter(), defaultdict(Counter)
@@ -571,15 +741,36 @@ def rollup(board, day, top_n=20):
     start = day_start.timestamp()
     total = oks = failed = errors = observed = 0
     single_failures = 0
+    deduped_failures = 0
+    probe_failure_kinds = {}
     def observe_error(row, line_number, weight=1):
         nonlocal single_failures
+        probe_id = (row.get('ids') or {}).get('inboundId', '')
+        if board == 'imessage' and isinstance(probe_id, str) and re.fullmatch(r'row_[a-f0-9]{16}', probe_id):
+            probe_tag = ('router.probe_backoff' if row.get('name') == 'router.probe_backoff'
+                         else 'router.catch1' if (row.get('error') or {}).get('tag') == 'router.catch1' else None)
+            if probe_tag:
+                key = (probe_tag, 'admission_read_failed')
+                causes[key] += weight
+                probe_rows[key][probe_id] += weight
+        if board == 'imessage' and row.get('alreadyLogged') is True:
+            request_id = (row.get('ids') or {}).get('requestId')
+            cause_kind = (row.get('props') or {}).get('causeKind')
+            if ((row.get('error') or {}).get('tag') == 'router.catch1'
+                    and isinstance(request_id, str) and request_id and cause_kind in ('timeout', 'http', 'transport')):
+                probe_failure_kinds[request_id] = cause_kind
+            return
         request_failure = (board == 'imessage' and row.get('component') == 'robob' and row.get('name') == 'turn.robob_call'
                            and row.get('kind') == 'perf' and row.get('ok') is False)
         single = (row.get('props') or {}).get('failureFormat') == 'single'
-        if request_failure and single:
+        if request_failure and single and not row.get('_rollup_failure_counted'):
             single_failures += weight
         if request_failure and not single and (row.get('error') or {}).get('tag') == 'control.request_failed':
             return
+        if board == 'imessage':
+            cause = _imessage_replayed_cause(row)
+            if cause:
+                causes[cause] += weight
         tag = (row.get('error') or {}).get('tag')
         if not isinstance(tag, str):
             return
@@ -589,9 +780,14 @@ def rollup(board, day, top_n=20):
             if not isinstance(error_name, str) or error_name not in _IMESSAGE_ERROR_NAMES:
                 error_name = 'UnknownError'
             key = (tag, error_name)
-            cause = _imessage_cause_key((row.get('error') or {}).get('causeKey'))
-            if cause:
-                causes[(tag, cause)] += weight
+            cause_kind = (row.get('props') or {}).get('causeKind')
+            # Request details follow catches, including when their count is owned by a summary.
+            if cause_kind is None and request_failure:
+                request_id = (row.get('ids') or {}).get('requestId')
+                if isinstance(request_id, str):
+                    cause_kind = probe_failure_kinds.get(request_id)
+            if cause_kind in ('timeout', 'http', 'transport'):
+                cause_kinds[key][cause_kind] += weight
         tags[key] += weight
         references.setdefault(key, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
         identity = row.get('ids')
@@ -607,6 +803,8 @@ def rollup(board, day, top_n=20):
         if board == 'imessage' and row.get('_rollup_diagnostic'):
             observe_error(row, line_number)
             continue
+        if board == 'imessage':
+            single_failures += row.get('_rollup_single_failures', 0)
         aggregate = board == 'imessage' and '_rollup_count' in row
         weight = row['_rollup_count'] if aggregate else _sample_rate(row)
         sampled |= weight > 1 and not aggregate
@@ -640,16 +838,33 @@ def rollup(board, day, top_n=20):
                 unrecognized_sampled |= refusal_weight > 1
         row_ok = row['_rollup_ok'] if aggregate else weight * (row.get('ok') is True)
         row_failed = row['_rollup_failed'] if aggregate else weight * (row.get('ok') is False)
+        already_logged = board == 'imessage' and row.get('alreadyLogged') is True
+        if already_logged:
+            if kind == 'error' or row_failed:
+                deduped_failures += weight
+            row_failed = 0
         observed += row_ok + row_failed
         oks += row_ok
         failed += row_failed
-        errors += weight * (kind == 'error')
+        errors += weight * (kind == 'error' and not already_logged)
         duration = row.get('durationMs')
         values = row['_rollup_histogram'] if aggregate else ([(duration, weight)]
             if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0 else [])
         if values:
             durations[name].extend(values)
         if board == 'imessage':
+            probe = _imessage_probe_stats(row)
+            if probe:
+                hour = str(row.get('ts', ''))[11:13]
+                hourly = probe_hours.setdefault(hour, {'counts': Counter(), 'statuses': Counter(), 'bins': defaultdict(list)})
+                for field in ('calls', 'accepted', 'notAcceptedYet', 'timeout', 'http', 'transport'):
+                    probe_totals[field] += probe[field]
+                    hourly['counts'][field] += probe[field]
+                probe_statuses.update(probe['httpByStatus'])
+                hourly['statuses'].update(probe['httpByStatus'])
+                for field in ('elapsedMs', 'attempts', 'msUntilAccepted'):
+                    probe_bins[field].extend(probe[field])
+                    hourly['bins'][field].extend(probe[field])
             component = row.get('component', 'unknown')
             call = row.get('_rollup_call') if aggregate else _imessage_call_name(row)
             for label in [name] + ([call] if name == 'turn.robob_call' and call else []):
@@ -759,7 +974,8 @@ def rollup(board, day, top_n=20):
                                  for rule, threads in sorted(threads_by_rule.items())},
             'repeatLoops': loops,
             'topErrorTags': [{**({'tag': key[0], 'name': key[1]} if board == 'imessage' else {'tag': key}),
-                              'count': count, 'sampleId': samples.get(key, references[key])}
+                              'count': count, 'sampleId': samples.get(key, references[key]),
+                              **({'causeKinds': dict(cause_kinds[key])} if board == 'imessage' and cause_kinds[key] else {})}
                              for key, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
     if board == 'agent-tools':
         result['unattributedByRule'] = {rule: [
@@ -804,7 +1020,21 @@ def rollup(board, day, top_n=20):
             merchant: {**poll, 'failureShare': poll['failed'] / poll['count']}
             for merchant, poll in sorted(poll_counts.items())}
     if board == 'imessage':
-        result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count}
+        def probe_summary(counts, statuses, bins):
+            summary = {field: counts[field] for field in ('calls', 'accepted', 'notAcceptedYet', 'timeout', 'http', 'transport')}
+            summary['httpByStatus'] = dict(statuses)
+            for field in ('elapsedMs', 'attempts', 'msUntilAccepted'):
+                values = bins[field]
+                summary[field] = {'count': sum(n for _, n in values), **(percentiles(values) if values else {'p50': 0, 'p95': 0, 'max': 0})}
+            return summary
+        result['promptProbe'] = {**probe_summary(probe_totals, probe_statuses, probe_bins),
+            'byHour': {hour: probe_summary(value['counts'], value['statuses'], value['bins']) for hour, value in sorted(probe_hours.items())}}
+        result['dedupedFailures'] = deduped_failures
+        result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count,
+                                **({'distinctInboundIds': len(probe_rows[(tag, cause)]),
+                                    'topInboundIds': [{'inboundId': row, 'count': attempts} for row, attempts in
+                                                      sorted(probe_rows[(tag, cause)].items(), key=lambda x: (-x[1], x[0]))[:14]]}
+                                   if (tag, cause) in probe_rows else {})}
                                for (tag, cause), count in sorted(causes.items(), key=lambda x: (-x[1], x[0]))[:20]]
         result['cardRenderFailures'] = dict(sorted(render_failures.items()))
         result['byComponent'] = {}
@@ -826,7 +1056,7 @@ def main(argv=None):
         p.add_argument('--board', required=True)
         p.add_argument('--day', default=datetime.now(timezone.utc).strftime('%Y-%m-%d'))
         if cmd == 'read':
-            p.add_argument('--kind', choices=['event', 'perf', 'error'])
+            p.add_argument('--kind', choices=['event', 'perf', 'error', 'opencode-reload'])
             p.add_argument('--name')
             p.add_argument('--limit', type=int, default=100)
         else:

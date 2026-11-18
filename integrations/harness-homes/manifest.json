@@ -89,6 +89,18 @@
         "installed": "~/.config/opencode/plugin/rootwide-search-guard.ts"
       }
     ],
+    "shared-dependencies": [
+      "../harness-hooks/src/shared_deps_guard.py",
+      "../harness-hooks/src/engine.py",
+      {
+        "source": "../local-helpers/libexec/repo-node-pin/shared-deps.sh",
+        "installed": "~/.local/libexec/repo-node-pin/shared-deps.sh"
+      },
+      {
+        "source": "../opencode-plugins/plugin/shared-deps-guard.ts",
+        "installed": "~/.config/opencode/plugin/shared-deps-guard.ts"
+      }
+    ],
     "quint-verify": [
       "../harness-hooks/src/quint_verify_guard.py",
       {
@@ -161,8 +173,8 @@
     ]
   },
   "codexModels": {
-    "catalogSource": "vendor/codex-models-0.166.0.json",
-    "extended": ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"],
+    "catalogSource": "vendor/codex-models-0.169.1.json",
+    "extended": ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"],
     "contextWindow": 872000,
     "autoCompactTokenLimit": 250000
   },

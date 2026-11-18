@@ -22,7 +22,10 @@ _VALUES = {
     'severity': ('info', 'attention', 'error'),
     'outcome': ('fire', 'no_change', 'fail', 'timeout'),
     'source': ('mail', 'sms', 'bank', 'charge'),
-    'routed': ('board', 'chat', 'ignored'),
+    'routed': ('board', 'chat', 'ignored', 'logged'),
+    'authKind': ('otp', 'signin_link'),
+    'senderLabel': ('Emirates NBD', 'Emirates Islamic', 'Mashreq', 'ADCB', 'Wio', 'Apple', 'Google',
+                    'WHOOP', 'Claude', 'Virgin', 'e&', 'du', 'your bank', 'an inbox sender'),
     'class': ('urgent', 'today', 'info', 'noise', 'candidate', 'charge', 'bank', 'security', 'otp', 'unknown', 'fail_open', 'deduped'),
     'action': ('create', 'queue', 'cancel', 'snooze', 'sent', 'retry', 'check', 'wake', 'notify', 'send', 'coalesce', 'conflict', 'expire', 'pause', 'remove', 'cap', 'resume'),
     'state': ('pending', 'sending', 'sent', 'uncertain', 'cancelled', 'failed', 'scheduled', 'queued', 'done', 'expired', 'paused', 'active'),
@@ -192,7 +195,11 @@ def _fields(entry, at):
                 continue
             file_event = entry['name'] in ('data_read.retried', 'data_read.failed', 'data_write.retried',
                                            'data_write.failed', 'runs_log.write_failed')
-            if file_event and key == 'path' and type(value) is str and len(value) <= 1024 and value.startswith('/') and not any(ord(c) < 32 for c in value):
+            # Only triage supplies a bounded, credential-redacted classifier diagnostic.
+            if (entry['component'] == 'triage' and entry['name'] == 'triage.classify' and key == 'classifier_error'
+                    and type(value) is str and len(value) <= 400 and not any(ord(c) < 32 for c in value)):
+                props[key] = value
+            elif file_event and key == 'path' and type(value) is str and len(value) <= 1024 and value.startswith('/') and not any(ord(c) < 32 for c in value):
                 props[key] = value
             elif file_event and key in ('attempts', 'ms') and _finite(value) and value >= 0:
                 props[key] = value

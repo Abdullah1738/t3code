@@ -1,7 +1,10 @@
 import {
   KanbanBoardId,
   KanbanCardId,
+  KanbanDiscussionId,
+  type KanbanDiscussion,
   ProviderInstanceId,
+  ProjectId,
   ThreadId,
   type KanbanBoard,
   type KanbanSubtask,
@@ -12,11 +15,18 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
+import { KanbanThreads, layer } from "./threads.ts";
 
 import type { SlotEvent } from "../store/KanbanStore.ts";
 
 import * as Activity from "./activity.ts";
 import * as Rules from "./rules.ts";
+import { boardReleaseSummary } from "./boardReplies.ts";
 
 const opus = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/claude-opus-5-5" };
 const sonnet = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/claude-sonnet-5-5" };
@@ -595,7 +605,7 @@ describe("rollup", () => {
   });
 
   it("puts run failures on the model of the thread that failed", () => {
-    expect(result.failures).toEqual({
+    expect(result.failures).toMatchObject({
       count: 1,
       byKind: { stalled: 1 },
       byPool: { [Rules.poolKey(opus)]: { count: 1, reasons: ["provider boom"] } },
@@ -1282,6 +1292,322 @@ it("reports a refused verdict separately from no verdict and ordinary flags", ()
   expect(Activity.compactRow(reviewing, events, window)).toMatchObject({
     failures: 1,
     lastFailure: reason,
+  });
+});
+
+const discussion = (id: string, lastMessageAt = t("12:00")): KanbanDiscussion => ({
+  id: KanbanDiscussionId.make(id),
+  boardId: KanbanBoardId.make("b1"),
+  cardId: null,
+  title: id,
+  evaluatorThreadId: null,
+  participants: [],
+  lastSeq: 1,
+  lastMessageAt,
+  createdBy: { _tag: "owner" },
+  createdAt: before,
+  archivedAt: null,
+  titleEditedAt: null,
+  settledAt: null,
+  snoozedUntil: null,
+  pinnedAt: null,
+  reopenedAt: null,
+});
+const digestRow = (id: string, at: string, author = "thread", asks: KanbanOwnerAsk[] = []) =>
+  Activity.discussionDigestRow(
+    discussion(id, at),
+    card(id, { asks }),
+    [{ at, author, text: "x".repeat(500) }],
+    window,
+  );
+
+it("discussion digest covers the window, prioritizes owner messages and open asks, and clips text", () => {
+  const rows = [
+    digestRow("quiet", t("23:00")),
+    digestRow("owner", t("21:00"), "owner"),
+    digestRow("ask", t("22:00"), "thread", [ask("q1", before)]),
+    digestRow("outside", before),
+    digestRow("exclusive-end", window.until),
+  ].filter((row) => row !== null);
+  const digest = Activity.digestPage(Activity.discussionDigestRows(rows));
+  expect(digest.rows.map((row) => row.discussionId)).toEqual(["ask", "owner", "quiet"]);
+  expect(digest.rows[0]!.openAsks).toEqual(["q1"]);
+  expect(digest.rows[1]!.ownerMessages[0]!.text.length).toBe(300);
+  expect(digest.rows[1]!.last.text.length).toBe(200);
+  expect(digest.rows[1]!.messagesInWindow).toBe(1);
+  expect(digest.page).toEqual({ limit: 40, hasMore: false, nextAfter: null });
+  expect(
+    Activity.discussionSources(
+      [discussion("outside", before), discussion("inside")],
+      window.since,
+    ).map((d) => d.id),
+  ).toEqual(["inside"]);
+});
+
+it("discussion digests page 45 discussions without skipping or repeating rows", () => {
+  const rows = Activity.discussionDigestRows(
+    Array.from({ length: 45 }, (_, i) => digestRow(`d${i}`, t("12:00"))!),
+  );
+  const first = Activity.digestPage(rows);
+  const second = Activity.digestPage(rows, first.page.nextAfter!);
+  expect(first.rows).toHaveLength(40);
+  expect(first.page.hasMore).toBe(true);
+  expect(second.rows).toHaveLength(5);
+  expect(second.page.hasMore).toBe(false);
+  expect(new Set([...first.rows, ...second.rows].map((r) => r.discussionId)).size).toBe(45);
+});
+
+it("digest pages stay below 30k even for a discussion with hundreds of owner messages", () => {
+  const row = Activity.discussionDigestRow(
+    discussion("busy"),
+    undefined,
+    Array.from({ length: 240 }, () => ({
+      at: t("12:00"),
+      author: "owner",
+      text: "\u0001".repeat(500),
+    })),
+    window,
+  )!;
+  const rows = Activity.discussionDigestRows([row]);
+  let after = 0;
+  let ownerMessages = 0;
+  do {
+    const page = Activity.digestPage(rows, after);
+    expect(
+      JSON.stringify({ activity: { boardId: "b1", window, digest: "discussions", ...page } })
+        .length,
+    ).toBeLessThan(30_000);
+    ownerMessages += page.rows.reduce((sum, r) => sum + r.ownerMessages.length, 0);
+    if (!page.page.hasMore) break;
+    expect(page.page.nextAfter).toBeGreaterThan(after);
+    after = page.page.nextAfter!;
+  } while (true);
+  expect(ownerMessages).toBe(240);
+});
+
+it("thread digest puts the run failure first and retains every card role", () => {
+  const cards = [card("quiet"), card("failed", { number: 2 })];
+  const links = [
+    thread("quiet", "quiet", "work", opus, t("15:00")),
+    thread("failed", "failed", "review", sonnet, t("10:00")),
+    thread("eval", "quiet", "evaluator", opus, t("14:00")),
+    thread("outside", "missing", "work", opus, before, before),
+  ];
+  const rows = Activity.threadDigestRows(
+    cards,
+    links,
+    [event("failed", t("11:00"), "flagged", "in_review", "todo", "Run failed: boom")],
+    window,
+  );
+  expect(rows.map((r) => r.threadId)).toEqual(["failed", "quiet", "eval"]);
+  expect(rows[0]!.flags).toEqual(["run_failed", "stalled"]);
+  expect(rows[0]!.model).toEqual(sonnet);
+});
+
+it.effect("digest reads only the newest assistant item and leaves ordinary views unchanged", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("digest-thread");
+    let reads = 0;
+    let runRecords: ReadonlyArray<unknown> = [];
+    let assistantAt = t("12:00");
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () =>
+        Effect.succeed({
+          status: "idle",
+          activityRunStatus: null,
+          pendingRuntimeRequest: null,
+          updatedAt: DateTime.makeUnsafe(t("12:00")),
+          latestRunCompletedAt: DateTime.makeUnsafe(t("12:00")),
+          pendingBackgroundTasks: [],
+          id: threadId,
+          projectId: ProjectId.make("p1"),
+          deletedAt: null,
+          activeRunId: null,
+          activityRunStartedAt: null,
+          archivedAt: null,
+          title: "Digest",
+          pullRequests: [],
+        } as never),
+      getThreadRecords: (_id, fields, filter, options) => {
+        expect(options).toEqual({ projectionOnly: true });
+        if (!fields.some((field) => field === "turnItems")) {
+          expect(fields).toEqual(["runs", "subagents"]);
+          expect(filter).toEqual({ latestRunOnly: true, pendingBackgroundTasksOnly: true });
+          return Effect.succeed({ runs: runRecords, subagents: [] } as never);
+        }
+        expect(fields).toEqual(["runs", "turnItems"]);
+        expect(filter).toEqual({ turnItemTypes: ["assistant_message"], recentTurnItemLimit: 1 });
+        reads++;
+        return Effect.succeed({
+          runs: runRecords,
+          turnItems: [
+            {
+              type: "assistant_message",
+              id: "assistant-last",
+              updatedAt: DateTime.makeUnsafe(assistantAt),
+              text: "a".repeat(500),
+            },
+          ],
+        } as never);
+      },
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      expect((yield* threads.find(threadId))?.lastAssistant).toBeUndefined();
+      expect(reads).toBe(0);
+      expect((yield* threads.find(threadId, { lastAssistant: true }))?.lastAssistant).toEqual({
+        at: t("12:00"),
+        text: "a".repeat(300),
+        itemId: "assistant-last",
+      });
+      expect(reads).toBe(1);
+      assistantAt = "2026-11-13T01:00:00.000Z";
+      for (const [start, end, status, expected] of [
+        [before, assistantAt, "completed", true],
+        [before, null, "waiting", true],
+        [before, "2026-11-11T23:59:59.999Z", "completed", false],
+        [window.until, assistantAt, "completed", false],
+      ] as const) {
+        runRecords = [
+          {
+            id: "run-1",
+            requestedAt: DateTime.makeUnsafe(start),
+            startedAt: DateTime.makeUnsafe(start),
+            completedAt: end === null ? null : DateTime.makeUnsafe(end),
+            lastActivityAt: DateTime.makeUnsafe(assistantAt),
+            status,
+          },
+        ];
+        const view = yield* threads.find(threadId, { lastAssistant: true, window });
+        expect(view?.activeInWindow).toBe(expected);
+        expect(view?.turnsInWindow).toBe(expected ? 1 : 0);
+      }
+      expect(reads).toBe(5);
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
+);
+
+it.each([
+  ["flagged", "Run failed: provider boom", ["run_failed", "stalled"]],
+  ["flagged", "Provider stopped moving", ["stalled"]],
+  ["flagged", "Review verdict refused: unrelated head", ["run_failed", "stalled", "refused_call"]],
+  ["moved", "Run failed, retrying once: transient", ["run_failed"]],
+  ["moved", "Thread too long; the next run starts on a fresh thread", ["run_failed"]],
+  ["comment", "Review verdict refused: clear at abc: missing checks", ["refused_call"]],
+  ["flagged", "Cleared", []],
+] as const)("thread digest flags %s: %s", (kind, body, expected) => {
+  for (const target of ["a", "carried"] as const) {
+    const cards = [card("a"), card("carried", { number: 2, stage: "completed" })];
+    const rows = Activity.threadDigestRows(
+      cards,
+      [thread("work", "a", "work", opus, t("10:00"))],
+      [event(target, t("11:00"), kind, "working", "todo", body)],
+      window,
+      new Map([["work", cards.map((card) => card.id)]]),
+    );
+    expect(rows[0]!.flags).toEqual(expected);
+  }
+});
+
+it("thread digest names restarts against earlier links, including before the window", () => {
+  const rows = Activity.threadDigestRows(
+    [card("a")],
+    [
+      thread("old", "a", "work", opus, before, t("01:00")),
+      thread("new", "a", "work", opus, t("02:00")),
+    ],
+    [],
+    window,
+  );
+  expect(rows[0]!.threadId).toBe("new");
+  expect(rows[0]!.flags).toEqual(["restarted"]);
+});
+
+it.each([
+  ["open before window", before, null, true],
+  ["opened in window", t("10:00"), null, true],
+  ["closed before window", before, "2026-11-11T23:59:59.999Z", false],
+  ["closed within window", before, t("23:00"), false],
+  ["closed just before cutoff", before, "2026-11-12T23:59:59.999Z", false],
+  ["closed at cutoff", before, window.until, true],
+  ["closed after cutoff", before, "2026-11-13T00:00:00.001Z", true],
+  ["opened at cutoff", window.until, null, false],
+  ["opened after cutoff", "2026-11-13T00:00:00.001Z", null, false],
+] as const)("discussion digest ask at pinned cutoff: %s", (_name, at, closedAt, open) => {
+  const row = digestRow("ask", t("12:00"), "thread", [ask("q1", at, { closedAt })])!;
+  expect(row.openAsks).toEqual(open ? ["q1"] : []);
+});
+
+it("pinned discussion pages retain all 45 IDs when an ask closes after the cutoff", () => {
+  let closedAt: string | null = null;
+  const rows = () =>
+    Activity.discussionDigestRows([
+      digestRow("old-ask", t("01:00"), "thread", [ask("q1", before, { closedAt })])!,
+      ...Array.from({ length: 44 }, (_, i) => digestRow(`quiet-${i}`, t("12:00"))!),
+    ]);
+  const first = Activity.digestPage(rows());
+  expect(first.rows[0]!.discussionId).toBe("old-ask");
+  expect(first.rows).toHaveLength(40);
+  closedAt = "2026-11-13T01:00:00.000Z";
+  const second = Activity.digestPage(rows(), first.page.nextAfter!);
+  const ids = [...first.rows, ...second.rows].map((row) => row.discussionId);
+  expect(second.rows).toHaveLength(5);
+  expect(second.page.hasMore).toBe(false);
+  expect(ids).toHaveLength(45);
+  expect(new Set(ids).size).toBe(45);
+});
+
+it("shared workers keep their origin and deduplicate persisted associations", () => {
+  const cards = [card("origin"), card("claimed", { number: 2 })];
+  const links = [thread("shared", "origin", "work", opus, t("02:00"))];
+  const rows = Activity.threadDigestRows(
+    cards,
+    links,
+    [],
+    window,
+    new Map([["shared", [cards[0]!.id, cards[0]!.id, cards[1]!.id, KanbanCardId.make("missing")]]]),
+  );
+  expect(rows[0]!).toMatchObject({ threadId: "shared", card: 1, cards: [1, 2], flags: [] });
+});
+
+it("a shared worker's persisted cards still supply flags when its origin is missing", () => {
+  const claimed = card("claimed", { number: 2, stage: "completed" });
+  const rows = Activity.threadDigestRows(
+    [claimed],
+    [thread("shared", "missing", "work", opus, before)],
+    [event("claimed", t("11:00"), "flagged", "working", "todo", "Run failed: claimed card")],
+    window,
+    new Map([["shared", [claimed.id]]]),
+  );
+  expect(rows[0]!).toMatchObject({ threadId: "shared", card: 2, flags: ["run_failed", "stalled"] });
+});
+
+describe("pool change activity", () => {
+  it("shows only changes in the window, with exact time, slots and actor", () => {
+    const change = {
+      at: t("12:00"),
+      poolKey: "codex/sol#xhigh",
+      fromSlots: 2,
+      toSlots: 1,
+      op: "set",
+      actorKind: "evaluator",
+      actorId: "thread-1",
+    } as const;
+    const read = { ...input, poolChanges: [change, { ...change, at: window.until }] };
+    expect(Activity.rollup(read).poolChanges.items).toEqual([change]);
+    expect(
+      Activity.rollup({ ...read, window: { since: t("13:00"), until: window.until } }).poolChanges
+        .items,
+    ).toEqual([]);
+    expect(Activity.rollup(input).poolChanges.items).toEqual([]);
   });
 });
 
@@ -2092,6 +2418,63 @@ const activityBoard: KanbanBoard = {
   nightlyReview: null,
   archivedAt: null,
 };
+
+it.each([false, true])(
+  "activity retains the latest five receipts and current window outside its event window (historical: %s)",
+  (historical) => {
+    const board: KanbanBoard = {
+      ...activityBoard,
+      standingApprovals: [
+        {
+          id: "sa",
+          gate: "deploy",
+          minIntervalHours: 4,
+          quote: "Release under the standing rule",
+          sourceThreadId: "owner",
+          saidAt: before,
+          approvedAsk: { cardId: "source", askId: "q1" },
+          recordedAt: before,
+          recordedBy: "evaluator",
+          revokedAt: null,
+          revokedBy: null,
+          revokeReason: null,
+        },
+      ],
+      releaseLedger: Array.from({ length: 7 }, (_, i) => ({
+        boardId: activityBoard.id,
+        cardId: KanbanCardId.make(`release-${i}`),
+        cardNumber: i + 1,
+        subtaskId: "s1",
+        service: "robob",
+        at: t(`0${i}:00`),
+        critical: null,
+        approvalId: "sa",
+      })),
+    };
+    const reporting = historical
+      ? {
+          ...board,
+          releaseLedger: board.releaseLedger!.slice(0, -1),
+          historicalReleaseLedger: board.releaseLedger!.slice(-1),
+        }
+      : board;
+    const release = boardReleaseSummary(reporting, t("08:00"));
+    const result = Activity.rollup({
+      window: { since: t("01:00"), until: t("02:00") },
+      currentAt: t("08:00"),
+      board: reporting,
+      release,
+      cards: [],
+      events: [],
+      pools: [],
+      threads: [],
+    });
+    expect(result.releaseLedger).toEqual(board.releaseLedger!.slice(-5));
+    expect(result.nextReleaseWindowAt).toBe(t("10:00"));
+    expect(result.nextReleaseWindowByService).toEqual({ robob: t("10:00") });
+    expect(boardReleaseSummary(reporting, t("10:00")).nextReleaseWindowAt).toBeNull();
+  },
+);
 const subtask = (
   owner: KanbanSubtask["owner"],
   patch: Partial<KanbanSubtask> = {},
@@ -2775,4 +3158,272 @@ describe("#1776 current pool holders", () => {
     const result = run({ currentAt, currentSlots: [slot(2, held.activeThreadId!, takeAt)] });
     expect(result.holders.items[0]!.holders[0]).toMatchObject({ heldSince: takeAt, heldForH: 2 });
   });
+});
+
+describe("failure detail rows", () => {
+  it.each([
+    { name: "primary before end", primary: true, endedAt: "2026-11-12T01:00:00.001Z" },
+    { name: "primary at end", primary: true, endedAt: t("01:00") },
+    { name: "primary after end", primary: true, endedAt: "2026-11-12T00:59:59.999Z" },
+    { name: "carried before end", primary: false, endedAt: "2026-11-12T01:00:00.001Z" },
+    { name: "carried at end", primary: false, endedAt: t("01:00") },
+    { name: "carried after end", primary: false, endedAt: "2026-11-12T00:59:59.999Z" },
+  ])("keeps the persisted failure source for $name", ({ primary, endedAt }) => {
+    const result = Activity.rollup({
+      window,
+      cards: [card("failed", { workThreadId: ThreadId.make("replacement") })],
+      threads: [
+        thread("failed-thread", primary ? "failed" : "primary", "work", sonnet, before, endedAt),
+        thread("replacement", "failed", "work", opus, before),
+      ],
+      events: [
+        {
+          ...event("failed", t("01:00"), "flagged", "working", "working", "Run failed: crash"),
+          failedThreadId: ThreadId.make("failed-thread"),
+        },
+      ],
+      pools: [],
+    });
+    expect(result.failures.rows[0]).toMatchObject({
+      threadId: "failed-thread",
+      role: "work",
+      pool: Rules.poolKey(sonnet),
+    });
+  });
+
+  it.each([
+    { name: "known reviewer after stage change", role: "review", stage: "needs_review" },
+    { name: "known worker despite review stage", role: "work", stage: "in_review" },
+  ] as const)("uses source role and model for $name", ({ role, stage }) => {
+    const result = Activity.rollup({
+      window,
+      cards: [card("failed")],
+      threads: [thread("source", "failed", role, sonnet, before, t("00:59"))],
+      events: [
+        {
+          ...event("failed", t("01:00"), "flagged", stage, stage, "Run failed: crash"),
+          failedThreadId: ThreadId.make("source"),
+        },
+      ],
+      pools: [],
+    });
+    expect(result.failures.rows[0]).toMatchObject({
+      threadId: "source",
+      role,
+      pool: Rules.poolKey(sonnet),
+    });
+  });
+
+  it.each([
+    {
+      name: "persisted id without a link",
+      persisted: true,
+      linked: false,
+      endedAt: null,
+      expected: "source",
+    },
+    { name: "legacy live link", persisted: false, linked: true, endedAt: null, expected: "source" },
+    {
+      name: "legacy ended link",
+      persisted: false,
+      linked: true,
+      endedAt: t("00:59"),
+      expected: null,
+    },
+    { name: "legacy missing link", persisted: false, linked: false, endedAt: null, expected: null },
+  ])("handles $name", ({ persisted, linked, endedAt, expected }) => {
+    const result = Activity.rollup({
+      window,
+      cards: [card("failed")],
+      threads: linked ? [thread("source", "failed", "work", sonnet, before, endedAt)] : [],
+      events: [
+        {
+          ...event("failed", t("01:00"), "flagged", "working", "working", "Run failed: crash"),
+          ...(persisted ? { failedThreadId: ThreadId.make("source") } : {}),
+        },
+      ],
+      pools: [],
+    });
+    expect(result.failures.rows[0]?.threadId).toBe(expected);
+  });
+
+  it("names each card and failed thread, repeats, role and pool without changing aggregates", () => {
+    const cards = [card("first", { number: 4476 }), card("second", { number: 1939 })];
+    const threads = [
+      thread("work-one", "first", "work", opus, before),
+      thread("review-two", "second", "review", sonnet, before),
+    ];
+    const events = [
+      event("first", t("01:00"), "moved", "working", "todo", "Run failed, retrying once: boom"),
+      event("second", t("02:00"), "flagged", "in_review", "in_review", "Run failed: crash"),
+      event("first", t("03:00"), "flagged", "working", "working", "Run failed: again"),
+    ];
+    const failures = Activity.rollup({ window, cards, threads, events, pools: [] }).failures;
+    expect(failures.byPool).toEqual({
+      [Rules.poolKey(opus)]: { count: 2, reasons: ["boom", "again"] },
+      [Rules.poolKey(sonnet)]: { count: 1, reasons: ["crash"] },
+    });
+    expect(
+      failures.rows.map(({ card, kind, role, pool, threadId, repeat }) => ({
+        card,
+        kind,
+        role,
+        pool,
+        threadId,
+        repeat,
+      })),
+    ).toEqual([
+      {
+        card: 4476,
+        kind: "stalled",
+        role: "work",
+        pool: Rules.poolKey(opus),
+        threadId: "work-one",
+        repeat: 2,
+      },
+      {
+        card: 1939,
+        kind: "stalled",
+        role: "review",
+        pool: Rules.poolKey(sonnet),
+        threadId: "review-two",
+        repeat: 1,
+      },
+      {
+        card: 4476,
+        kind: "retried",
+        role: "work",
+        pool: Rules.poolKey(opus),
+        threadId: "work-one",
+        repeat: 2,
+      },
+    ]);
+    expect(JSON.stringify(failures.rows)).not.toContain('"title"');
+  });
+  it("renders structured bound facts and leaves old events readable", () => {
+    const admission = {
+      queuedAtMs: Date.parse(t("00:00")),
+      waitedMs: 1800000,
+      positionAtFailure: 8,
+      totalAtFailure: 34,
+      rule: "no_progress" as const,
+    };
+    const old = event(
+      "first",
+      t("01:00"),
+      "flagged",
+      "working",
+      "working",
+      "Run failed: The restart admission queue never released this run (waited 30 min)",
+    );
+    const fresh = {
+      ...event("first", t("02:00"), "flagged", "working", "working", old.body),
+      admission,
+    };
+    const result = Activity.rollup({
+      window,
+      cards: [card("first")],
+      events: [old, fresh],
+      threads: [],
+      pools: [],
+    });
+    expect(result.failures.rows.map((row) => row.admission)).toEqual([admission, null]);
+    expect(result.failures.rows[0]?.threadId).toBeNull();
+    expect(result.restartAdmission).toMatchObject({
+      scope: "server-wide",
+      source: "analytics_read",
+      section: "restartAdmission",
+      days: ["2026-11-12"],
+      boardFailures: [1],
+    });
+  });
+  it("keeps the latest 50 of 60 failures and says how many remain", () => {
+    const events = Array.from({ length: 60 }, (_, i) =>
+      event(
+        "first",
+        DateTime.formatIso(DateTime.makeUnsafe(Date.parse(t("00:00")) + i * 1000)),
+        "flagged",
+        "working",
+        "working",
+        "Run failed: " + "x".repeat(200),
+      ),
+    );
+    const result = Activity.rollup({
+      window,
+      cards: [card("first")],
+      events,
+      threads: [],
+      pools: [],
+    });
+    expect(result.failures.rows).toHaveLength(50);
+    expect(result.failures.more).toBe(10);
+    expect(result.failures.rows[0]?.at).toBe(events.at(-1)?.at);
+    expect(result.failures.rows.every((row) => row.repeat === 60 && row.reason.length <= 120)).toBe(
+      true,
+    );
+    expect(JSON.stringify(result).length).toBeLessThanOrEqual(49000);
+  });
+});
+
+it("reports current idle evaluator stalls even with no events inside the window", () => {
+  const lastEventAt = "2026-11-08T00:00:00.000Z";
+  const idle = card("idle-evaluator", {
+    number: 1768,
+    stage: "completed",
+    updatedAt: window.until,
+    subtasks: [
+      {
+        id: "s7",
+        step: 3,
+        owner: "evaluator",
+        text: "Next",
+        state: "open",
+        createdAt: before,
+        doneAt: null,
+        doneBy: null,
+        note: null,
+      },
+    ],
+  });
+  const input: Activity.RollupInput = {
+    window,
+    cards: [idle],
+    events: [],
+    pools: [],
+    idleEvaluatorBoard: { id: idle.boardId, standingApprovals: [] },
+    lastEventAtByCard: new Map([[idle.id, lastEventAt]]),
+    threads: [thread("idle-thread", idle.id, "evaluator", opus, lastEventAt)],
+  };
+  const run = Activity.rollup(input);
+  expect(run.stalls.byKind).toEqual({ idle_evaluator: 1 });
+  expect(run.stalls.items).toEqual([
+    expect.objectContaining({
+      kind: "idle_evaluator",
+      card: 1768,
+      stage: "completed",
+      step: 3,
+      openEvaluatorSubtasks: ["s7"],
+      lastEventAt,
+      evaluatorThreadAlive: true,
+      idleHours:
+        Math.round(((Date.parse(window.until) - Date.parse(lastEventAt)) / 3_600_000) * 10) / 10,
+    }),
+  ]);
+  const closed = Activity.rollup({
+    ...input,
+    threads: input.threads.map((link) => ({ ...link, endedAt: window.until })),
+  });
+  expect(closed.stalls.items[0]!.evaluatorThreadAlive).toBe(false);
+  const big = Activity.rollup({
+    ...input,
+    cards: Array.from({ length: 500 }, (_, number) => ({
+      ...idle,
+      number,
+      id: KanbanCardId.make(`idle-${number}`),
+      updatedAt: lastEventAt,
+    })),
+  });
+  expect(big.stalls.byKind.idle_evaluator).toBe(500);
+  expect(big.stalls.more).toBeGreaterThan(0);
+  expect(JSON.stringify(big).length).toBeLessThan(50_000);
 });

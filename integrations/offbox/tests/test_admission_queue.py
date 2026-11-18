@@ -97,6 +97,7 @@ class AdmissionQueue(Base):
                 raise RuntimeError('stop after changed reason')
         with patch.object(boatd, 'predicted_peak', side_effect=lambda con, kind: (20 if kind == 'large' else 15) * 2**30), \
                 patch.object(boatd, 'mem_available', return_value=22 * 2**30), \
+                patch.object(boatd, 'admitted_bytes', return_value=0), \
                 patch.object(boatd, 'now', side_effect=lambda: clock[0]), patch.object(boatd.time, 'sleep', side_effect=tick):
             with self.assertRaises(RuntimeError):
                 boatd.admit(self.con, b, p, 'k', err)
@@ -165,28 +166,24 @@ class AdmissionQueue(Base):
         self.assertEqual(self.status(b, h)['status'], 'lost')
         self.assertEqual(self.status(b, p)['status'], 'running')
 
-    def test_oversized_live_head_is_admitted_alone_then_its_waiter_follows(self):
+    def test_oversized_head_waits_even_alone_and_after_one_hour(self):
         b, h, p = self.setup_queue()
-        self.con.execute("UPDATE commands SET kind='huge' WHERE pid=?", (h,))
         err = io.BytesIO()
-        with patch.object(boatd, 'predicted_peak', side_effect=lambda con, kind: (200 if kind == 'huge' else 4) * 2**30), \
+        clock = [10000.0]
+        def tick(_):
+            clock[0] += 4000
+            if clock[0] > 18000:
+                raise RuntimeError('still queued')
+        with patch.object(boatd, 'predicted_peak', return_value=200 * 2**30), \
                 patch.object(boatd, 'mem_available', return_value=20 * 2**30), \
                 patch.object(boatd, '_sh', return_value=(0, 'active')), \
-                patch.object(boatd.time, 'sleep', side_effect=RuntimeError('FIFO holds')):
-            with self.assertRaisesRegex(RuntimeError, 'FIFO holds'):
-                boatd.admit(self.con, b, p, 'k', io.BytesIO())
-            boatd.admit(self.con, b, h, 'huge', err)
-            self.assertEqual(self.status(b, h)['status'], 'running')
-            self.assertEqual(self.status(b, p)['status'], 'queued')
-            with self.assertRaisesRegex(RuntimeError, 'FIFO holds'):
-                boatd.admit(self.con, b, p, 'k', io.BytesIO())
-            self.con.execute("UPDATE commands SET status='exited' WHERE pid=?", (h,))
-            boatd.admit(self.con, b, p, 'k', io.BytesIO())
-        self.assertEqual(self.status(b, p)['status'], 'running')
-        self.assertIn(b'admitted alone: needs 200.00 GiB, 8.00 GiB free', err.getvalue())
-        alone = [r for r in self.events('run.queue') if r['props']['reason'] == 'admitted_alone']
-        self.assertEqual(len(alone), 1)
-        self.assertEqual(alone[0]['props']['position'], 1)
+                patch.object(boatd, 'now', side_effect=lambda: clock[0]), \
+                patch.object(boatd.time, 'sleep', side_effect=tick):
+            with self.assertRaisesRegex(RuntimeError, 'still queued'):
+                boatd.admit(self.con, b, h, 'huge', err)
+        self.assertEqual(self.status(b, h)['status'], 'queued')
+        self.assertEqual(self.status(b, p)['status'], 'queued')
+        self.assertIn(b'needs 200.00 GiB, 8.00 GiB free', err.getvalue())
 
     def test_empty_host_bypasses_cpu_checks_but_busy_host_keeps_them(self):
         b = self.box()

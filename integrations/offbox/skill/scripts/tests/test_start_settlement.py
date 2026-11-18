@@ -2,6 +2,7 @@
 import contextlib
 import io
 import os
+import signal
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -171,10 +172,11 @@ class StartPaths(Isolated):
         a = cli.build_parser().parse_args(['run', '--remote', '--bg', '--', 'go test ./...'])
         with patch.object(api, 'cmd_start', return_value={'processId': 1001, 'commandId': 'cmd-own'}), \
                 patch.object(api, 'get', return_value={'state': 'running'}), \
+                patch.object(runs.Runner, 'stream', side_effect=lambda **kw: signal.raise_signal(signal.SIGTERM)), \
                 patch.object(lease, 'ensure_ttl'), contextlib.redirect_stdout(io.StringIO()), \
                 patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(cli.cmd_run(a, self.me), 0)
+            self.assertEqual(cli.cmd_run(a, self.me), common.EXIT_DETACHED)
         row = self.con.execute('SELECT * FROM runs ORDER BY rowid DESC LIMIT 1').fetchone()
         self.assertEqual((row['process_id'], row['command_id'], row['wrapper_pid']), (1001, 'cmd-own', None))
 
@@ -434,7 +436,7 @@ class RecoveryPaths(ShellChecks):
         for route in ('wait','reap'):
             path = route + '.txt'
             self.con.execute("UPDATE runs SET status='starting',exit_code=NULL,end_at=NULL,remote_dir='w/r', "
-                             "rel_cwd='.',local_cwd=?,pulls=? WHERE run_id='run-dead'",
+                             "rel_cwd='.',local_cwd=?,pulls=?,pull_state=NULL,pull_owner=NULL,pull_summary=NULL WHERE run_id='run-dead'",
                              (self.tmp.name, '["' + path + '"]'))
             self.con.commit()
             def pull(box,remote,rel,path,dest,**opts):

@@ -12,7 +12,7 @@ import traceback
 from pathlib import Path
 import time
 
-from . import common, capacity, prepare, home
+from . import api, common, capacity, prepare, home, unfit
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_LOCAL, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      busy, db_retry, iso, kv_get, kv_set, local_error, log, now, say, write)
 from .common import backend, owner_scoped, token_owner
@@ -39,6 +39,17 @@ def _pin_available(con, box_id, me=None, *, record=True):
     from . import lease
     pin = lease.foreign_pin(con, box_id, me)
     if not pin:
+        lease.reconcile_holds(con, box_id)
+        if con.execute('SELECT 1 FROM runs WHERE box_id=? AND ' + lease.uncertain_holder_sql(), (box_id,)).fetchone():
+            return False
+        if api.BACKEND == 'server' and not con.in_transaction and not lease.active_runs(con, box_id):
+            import offbox_protection
+            try:
+                snapshot = lease.remote_protection(box_id)
+                return offbox_protection.blocked(snapshot, automatic=False, reuse=True,
+                                                 holder=(me or {}).get('owner')) is None
+            except OffboxError:
+                return False
         return True
     seen = _PIN_SKIPS.get()
     if record and seen is not None and box_id not in seen['boxes']:
@@ -133,11 +144,9 @@ def pool_cap(con, key, *, locked=False):
         for row in con.execute("SELECT * FROM pool_cap_callers WHERE pool_key=?", (key,)).fetchall():
             if row['granted'] and row['run_id']:
                 # Match lease.active_runs for this caller's run, rather than another run that reused its box.
-                active = con.execute("SELECT 1 FROM runs WHERE run_id=? AND box_id IS NOT NULL AND "
-                                     "(status IN ('starting','running') OR EXISTS "
-                                     "(SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id) OR "
-                                     "(status='lost' AND exit_code IS NULL AND NOT EXISTS "
-                                     "(SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)))",
+                from . import lease
+                active = con.execute("SELECT 1 FROM runs WHERE run_id=? AND box_id IS NOT NULL AND (" +
+                                     lease.reserved_run_sql() + ")",
                                      (row['run_id'],)).fetchone() is not None
             else:
                 active = _alive(row['pid'])
@@ -346,7 +355,7 @@ RECYCLED_LIKE = RECYCLED_NOTE + '%'
 def members(con, key):
     # token_mine(): on the home server a pool only holds this token owner's boxes, even when two owners' checkouts share
     # a repository key. Another owner's box answers 404 to our token, which reads as "gone".
-    return con.execute(f"""SELECT l.* FROM leases l JOIN pool_members p USING(box_id)
+    rows = con.execute(f"""SELECT l.* FROM leases l JOIN pool_members p USING(box_id)
         WHERE p.pool_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
@@ -354,6 +363,8 @@ def members(con, key):
         AND COALESCE(l.note,'') NOT LIKE 'disk-full:%'
         AND NOT EXISTS (SELECT 1 FROM kv WHERE k='boot_dead:' || l.box_id)
         ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key, TOO_BIG_LIKE, DEAD_LIKE, WEDGED_LIKE, RECYCLED_LIKE)).fetchall()
+    run = (_PIN_SKIPS.get() or {}).get('run')
+    return [r for r in rows if unfit.available(con, r['box_id'], run)]
 
 
 def _source_member(con, key, source) -> bool:
@@ -396,6 +407,8 @@ def candidates(con, key, size, source, me=None):
     full = not _room(con, key)
     out = []
     for r in rows:
+        if not unfit.available(con, r['box_id'], (_PIN_SKIPS.get() or {}).get('run')):
+            continue
         if not _pin_available(con, r['box_id'], me):
             continue
         if lease.boot_dead(con, r['box_id']):
@@ -436,6 +449,19 @@ def candidates(con, key, size, source, me=None):
         return (0, 0 if own else 1, have)
     out.sort(key=fit)
     return out, not full
+
+
+@contextlib.contextmanager
+def _pre_wait(reason):
+    from . import allocation
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        queue = allocation._QUEUE.get()
+        if queue is not None:
+            waits = queue.setdefault('pre_waits', {})
+            waits[reason] = waits.get(reason, 0) + time.monotonic() - started
 
 
 def _recycle_log(kind, detail):
@@ -536,6 +562,10 @@ class _QueuePoll:
         self.deadline = time.monotonic() + wait if deadline is None else deadline
 
     def call(self, operation):
+        with _pre_wait('selection_and_lock'):
+            return self._call(operation)
+
+    def _call(self, operation):
         # Only DB polling/selection uses this budget, never a machine start or a remote command.
         timeout = self.con.execute('PRAGMA busy_timeout').fetchone()[0]
         try:
@@ -628,6 +658,7 @@ def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id
             queue['check_source'] = check_source
             allocation.check_queue()
             queue["log_setup_ms"] = 0
+            queue["pre_wait_start"] = time.monotonic()
             poll = _QueuePoll(con, queue['wait'], run_id, deadline=queue['end'])
             poll.call(lambda: capacity.schema(con))
             def register():
@@ -729,10 +760,20 @@ def _lease_work(*, selected=True):
     finally:
         if queue is not None:
             queue["log_setup_ms"] = queue.get("log_setup_ms", 0) + (time.monotonic()-started)*1000
+            queue["pre_wait_start"] = time.monotonic()
 
 
 def _reuse_prepared(con, row, *args, **kwargs):
     from . import lease
+    from . import allocation
+    queue = allocation._QUEUE.get()
+    if queue is not None:
+        waits = queue.pop('pre_waits', {})
+        elapsed = max(0, time.monotonic() - queue.get('pre_wait_start', time.monotonic()))
+        detail = dict(duration_s=round(elapsed, 3),
+                      stages_s={key: round(value, 3) for key, value in waits.items()},
+                      queue_s=round(max(0, elapsed - sum(waits.values())), 3))
+        common.event(con, row['box_id'], 'pre_bring_up', json.dumps(detail, separators=(',', ':')))
     with _lease_work(), prepare.guard(row['box_id']) as budget:
         got = lease._reuse(con, row, *args, **kwargs)
         if got:
@@ -820,6 +861,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     unusable = set(exclude or ())
     pending_retries = set()
     pending_busy = {}
+    rejected_alternatives = set()
     stopping_reported = queue.setdefault('stopping_reported', set())
 
     def report_skip(bid, error, prefix=''):
@@ -861,21 +903,24 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     while True:
         allocation.check_queue()
         lease.cap_check()
-        pending = poll.call(lambda: con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
+        pending_rows = poll.call(lambda: con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                               f"WHERE l.repo_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') "
-                              "AND COALESCE(l.note,'') NOT LIKE ? AND COALESCE(l.note,'') NOT LIKE 'disk-full:%' "
-                              "LIMIT 1", (key, WEDGED_LIKE)).fetchone())
-        if create_first or (pending and (pending['box_id'] in unusable or
-                                            pending_busy.get(pending['box_id'], 0) > time.monotonic())):
-            pending = None
-        if pending and not _pin_available(con, pending['box_id'], me):
-            if not allocation.resume_inflight(con, pending['box_id']):
-                _reconcile_pinned(con, pending)
-            pending = None
-        if pending and lease.boot_dead(con, pending['box_id']):
-            pending = None
-        if pending and allocation.resume_inflight(con, pending['box_id']):
-            pending = None
+                              "AND COALESCE(l.note,'') NOT LIKE ? AND COALESCE(l.note,'') NOT LIKE 'disk-full:%'",
+                              (key, WEDGED_LIKE)).fetchall())
+        pending = None
+        for candidate in (() if create_first else pending_rows):
+            candidate_id = candidate['box_id']
+            if (candidate_id in unusable or pending_busy.get(candidate_id, 0) > time.monotonic()
+                    or not unfit.available(con, candidate_id, run_id)):
+                continue
+            if not _pin_available(con, candidate_id, me):
+                if not allocation.resume_inflight(con, candidate_id):
+                    _reconcile_pinned(con, candidate)
+                continue
+            if lease.boot_dead(con, candidate_id) or allocation.resume_inflight(con, candidate_id):
+                continue
+            pending = candidate
+            break
         bid = guard = None
         def select_pending():
             nonlocal pending, bid, guard
@@ -885,14 +930,16 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                 with _pool_lock(key, deadline, wait, **lock_options):
                     con.execute("UPDATE pool_waiters SET reserved=0 WHERE token=?", (waiter,))
                     con.commit()
-                    alternatives = candidates(con, key, size, source, me)[0] if not _matches(pending, source) else []
+                    alternatives = (candidates(con, key, size, source, me)[0]
+                                    if resume_stall is not None or not _matches(pending, source) else [])
                     can_use_other = False
                     for alternative in alternatives:
                         other = alternative['box_id']
                         # An unresolved resume fences new machine starts: only a ready running peer can avoid recovery.
-                        if (other == bid or other in unusable or alternative['state'] != 'running'
+                        if (other == bid or other in unusable or other in rejected_alternatives
+                                or alternative['state'] != 'running'
                                 or (size and SIZES.index(alternative['size'] or 'default') < SIZES.index(size))
-                                or allocation.resume_inflight(con, other)
+                                or con.execute('SELECT 1 FROM kv WHERE k=?', (f'resume_unanswered:{other}',)).fetchone()
                                 or lease.active_runs(con, other) or _older(con, key, waiter, alternative)):
                             continue
                         try:
@@ -910,7 +957,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         except OffboxError:
                             pending = None  # the sender/another reconciler owns this box; choose a peer or queue
                         else:
-                            if not _pin_available(con, bid, me):
+                            if not unfit.available(con, bid, run_id) or not _pin_available(con, bid, me):
                                 guard.__exit__(None, None, None)
                                 pending = None
                             else:
@@ -952,7 +999,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                     con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?", (str(e), bid))
                     con.commit()
                     prepare.move_once(e)
-                    resume_stall, create_first = e, True
+                    resume_stall, create_first = e, not isinstance(e, lease.ResumeNoProgress)
                     _unreserve_and_release(con, waiter, guard)
                     say(str(e))
                     continue
@@ -973,11 +1020,13 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         last_error = None
         if time.monotonic() >= next_refresh:
             # Outside the pool lock: it asks boat about every detached run.
-            _refresh_background(con, key)
+            with _pre_wait('background_refresh'):
+                _refresh_background(con, key)
             next_refresh = time.monotonic() + 10
         if not prune_checked:
             # Before reserving a create slot, and outside the pool lock: a held warm box may be ready now.
-            _recheck_prune_holds(con, key)
+            with _pre_wait('prune_recheck'):
+                _recheck_prune_holds(con, key)
             prune_checked = True
         tried = set(unusable)
         stopped_tries = 0
@@ -985,6 +1034,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         capacity_outage = None
         start_limit = None
         stopped_failed = False  # the last stopped box tried could not be used (error or gone)
+        retry_pending = False
         while True:
             # The pool lock covers only the choice: a box (its box lock taken without waiting) or a create slot.
             # The resume or create runs after it is released, so one slow boat call never holds up other callers
@@ -1036,6 +1086,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                                 f"({len(members(con, key))}/{cap} boxes, none from {source}). Nothing ran. "
                                 "Run without --fresh to use an existing pool box." + split_pool_notice(con, me), code=2)
                         for r in rows:
+                            if resume_stall is not None and any(p['box_id'] == r['box_id'] for p in pending_rows):
+                                continue
                             if (r["box_id"] in tried or _older(con, key, waiter, r)
                                     or allocation.resume_inflight(con, r['box_id'])):
                                 continue
@@ -1168,7 +1220,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         con.commit()
                         prepare.move_once(e)
                         resume_stall = e
-                        create_first = True
+                        create_first = not isinstance(e, lease.ResumeNoProgress)
+                        stopped_failed = True
                         say(str(e))
                         continue
                     except lease.BoxNotReady as e:
@@ -1176,6 +1229,10 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         stopped_error, stopped_failed = e, True
                         continue
                     except (allocation.Busy, allocation.Fenced) as error:
+                        # A free local lock did not prove this peer ready. Let pending resumes be observed next.
+                        if pending_rows and row['box_id'] not in rejected_alternatives:
+                            retry_pending = True
+                        rejected_alternatives.add(row['box_id'])
                         if getattr(error, 'resume_retry_box', None) == row['box_id']:
                             pending_retries.add(row['box_id'])
                         if row['state'] != 'running':
@@ -1335,6 +1392,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             if stopped_error is not None and not can_create:
                 raise stopped_error
             break
+        if retry_pending:
+            continue
         t = time.monotonic()
         if last_error and not isinstance(last_error, (api.SupplyOut, api.BoatAtCapacity)):
             raise last_error
@@ -1522,6 +1581,16 @@ def _recheck_prune_holds(con, key) -> bool:
 
 def _claim(con, me, row, run_id, *, pending_token=None):
     bid = row["box_id"]
+    from . import lease
+    import offbox_protection
+    snapshot = lease.protection(con, bid)
+    snapshot['holds'] = [h for h in snapshot['holds'] if h.get('run_id') != run_id or run_id is None]
+    refusal = offbox_protection.blocked(snapshot, automatic=False, reuse=True, holder=me['owner'])
+    if not refusal and api.BACKEND == 'server':
+        remote = lease.remote_protection(bid)
+        refusal = offbox_protection.blocked(remote, automatic=False, reuse=True, holder=me['owner'])
+    if refusal:
+        raise OffboxError(f'{bid} is {refusal}; repository pool hand-out refused', code=2)
     row["remote_dir"] = remote_dir_for(me["repo_root"])
     row["_new_checkout"] = con.execute(
         "SELECT 1 FROM pool_callers WHERE owner=? AND repo_root=? AND box_id=?",
@@ -1559,15 +1628,21 @@ def _claim(con, me, row, run_id, *, pending_token=None):
                         (bid, row["remote_dir"], row["size"], run_id))
         if pending_token is not None:
             con.execute("DELETE FROM pool_pending WHERE token=?", (pending_token,))
+    common.event(con, bid, 'hand_out', json.dumps(offbox_protection.envelope(
+        'hand_out', 'repository pool claim', snapshot, run_id=run_id, holder=me['owner'], pool_key=me['repo_key'])),
+        limit=None)
 
 
 def _refresh_background(con, key, pull_artifacts=True):
     """Detached runs have no lock holder; reclaim completed slots without waiting for the reaper."""
     from . import api, outage, runs, start_check
+    from .pulls import TERMINAL
     from .misc import _catch_up_finished
     rows = con.execute(f"""SELECT r.* FROM runs r JOIN leases l USING(box_id)
         WHERE l.repo_key=? AND {token_mine('l')} AND r.mode='bg' AND (r.status IN ('starting','running','lost') OR (r.status='infra' AND EXISTS
-        (SELECT 1 FROM kv WHERE k='start_unknown:' || r.run_id)))
+        (SELECT 1 FROM kv WHERE k='start_unknown:' || r.run_id)) OR
+        (r.exit_code IS NOT NULL AND r.pulls IS NOT NULL AND r.pulls!='[]' AND
+         (r.pull_state IS NULL OR r.pull_state IN ('pending','running'))))
         """, (key,)).fetchall()
     for row in rows:
         if api.left() is not None and api.left() <= 0:
@@ -1577,9 +1652,13 @@ def _refresh_background(con, key, pull_artifacts=True):
                 row = con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
                 row = runs.restore_run_state(row)
                 if runs.terminal_result(row):
+                    if not pull_artifacts and json.loads(row['pulls'] or '[]') and row['pull_state'] not in TERMINAL:
+                        continue
+                    if pull_artifacts and not runs.settle_pulls(row['run_id'], 'refresh', foreign=True):
+                        continue
                     runs.finish(row['run_id'], row['exit_code'], row['status'], run=row)
                     continue
-                runs.reconcile_lost(con, row['box_id'], foreign=True)
+                runs.reconcile_lost(con, row['box_id'], foreign=True, role='refresh', pull_artifacts=pull_artifacts)
                 row = runs.restore_run_state(con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone())
                 if row['status'] not in ('starting','running') and not (
                         row['status'] == 'infra' and start_check.recovery_marked(con, row)):
@@ -1599,7 +1678,7 @@ def _refresh_background(con, key, pull_artifacts=True):
                         if result.code is not None or result.verdict == 'fenced':
                             start_check.settle(con, row, result, 'pool checked an unattached start',
                                                until=None if api.left() is None else time.time() + api.left(),
-                                               foreign=True)
+                                               foreign=True, role='refresh')
                         else:
                             start_check.remember_wrapper(con, row, result.pid)
                             con.commit()
@@ -1607,7 +1686,9 @@ def _refresh_background(con, key, pull_artifacts=True):
                 left = api.left()
                 options = {} if left is None else {"deadline": time.time() + left, "retries": 0}
                 st = api.cmd_status(row['box_id'], pid, **options)
-                if st and not st.get('running') and st.get('status') in ('exited', 'lost'):
+                if st and not st.get('running') and st.get('status') in ('exited', 'lost', 'interrupted'):
+                    if st.get('status') == 'interrupted':
+                        runs.remember_interruption(row['run_id'], st)
                     if st.get('status') == 'lost':
                         confirmed = runs.confirmed_lost(row['box_id'], row['run_id'], timeout=min(20, api.left() or 20))
                         if confirmed is None:
@@ -1628,8 +1709,10 @@ def _refresh_background(con, key, pull_artifacts=True):
                     if pulls:
                         if not pull_artifacts:
                             continue  # pulls keep the slot reserved until the normal follower/reaper finishes
-                        runs.do_pulls(row['box_id'], dict(row), pulls, foreign=True)
-                    status, code = runs.completed_result(row, {**st, 'exitCode':code})
+                        if not runs.settle_pulls(row['run_id'], 'refresh', foreign=True):
+                            continue
+                    status, code = (('interrupted', runs.EXIT_INTERRUPTED) if st.get('status') == 'interrupted'
+                                    else runs.completed_result(row, {**st, 'exitCode':code}))
                     runs.finish(row['run_id'], code, status, run=row)
         except OffboxError as error:
             if isinstance(error, (api.ApiError, api.NetworkError, api.BudgetExpired)):

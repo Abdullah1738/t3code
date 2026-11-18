@@ -464,7 +464,7 @@ class BaseRouting(unittest.TestCase):
         self.add('server', 'warm', default=True)
         # Undo the fixture's emit mock: exercise the real event sanitizer and NDJSON sink.
         with patch.object(home.toollog, 'emit', self.real_emit), \
-                patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.root / 'tool-logs')):
+                patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.root / 'tool-logs')):
             self.assertEqual(self.run_outage('--base', 'warm')[0], 93)
             self.assertEqual(self.run_outage()[0], 'exec')
         events = [json.loads(line) for path in (self.root / 'tool-logs').glob('*.ndjson')

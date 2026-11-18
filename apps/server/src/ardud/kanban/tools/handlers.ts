@@ -56,6 +56,7 @@ import {
 } from "../engine/messagePages.ts";
 import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
+import * as InputValidation from "./inputValidation.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
 import * as McpBoardReplies from "../engine/mcpBoardReplies.ts";
 import * as Activity from "../engine/activity.ts";
@@ -123,6 +124,7 @@ const toolFailure = (error: KanbanError) =>
               ? "operation_failed"
               : "invalid_args"),
     reasonClass: error.reasonClass ?? kanbanReasonClass(error.code, error.reason),
+    ...(typeof error.saved === "boolean" ? { saved: error.saved } : {}),
     ...(error.invalidField === undefined ? {} : { invalidField: error.invalidField }),
     message: error.message,
   });
@@ -670,6 +672,10 @@ const handlers = {
             "bad_time",
             window.startsWith("until") ? "until" : "since",
           );
+        if (input.digest !== undefined) {
+          const page = yield* service.activityDigest(board.id, window, input.digest, input.after);
+          return { activity: { boardId: board.id, window, digest: input.digest, ...page } };
+        }
         const read = yield* service.activity(board.id, window);
         return { activity: { boardId: board.id, ...Activity.rollup({ window, ...read }) } };
       }),
@@ -730,126 +736,134 @@ const handlers = {
     ),
   ),
 
-  card_update: McpToolAccess.actsAsCaller((input) =>
-    withCaller((service, caller) =>
-      Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card, input.boardId);
-        yield* boundCard(caller, card);
-        const updated = yield* service.editCard(
-          card.id,
-          {
-            ...(input.description !== undefined ? { description: input.description } : {}),
-            ...(input.links !== undefined ? { links: input.links } : {}),
-            ...(input.comment !== undefined ? { comment: input.comment } : {}),
-          },
-          caller.actor,
-        );
-        return { card: updated };
-      }),
-    ),
+  card_update: McpToolAccess.actsAsCaller(
+    (input) =>
+      withCaller((service, caller) =>
+        Effect.gen(function* () {
+          const card = yield* cardFor(service, caller, input.card, input.boardId);
+          yield* boundCard(caller, card);
+          const updated = yield* service.editCard(
+            card.id,
+            {
+              ...(input.description !== undefined ? { description: input.description } : {}),
+              ...(input.links !== undefined ? { links: input.links } : {}),
+              ...(input.comment !== undefined ? { comment: input.comment } : {}),
+            },
+            caller.actor,
+          );
+          return { card: updated };
+        }),
+      ),
+    InputValidation.card_update,
   ),
 
-  card_move: McpToolAccess.actsAsCaller((input) =>
-    withCaller((service, caller) =>
-      Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card, input.boardId);
-        yield* boundCard(caller, card);
-        if (caller.link?.role === "review") {
-          return yield* refuse(
-            "Review threads record their verdict with card_review_result.",
-            "role_not_allowed",
+  card_move: McpToolAccess.actsAsCaller(
+    (input) =>
+      withCaller((service, caller) =>
+        Effect.gen(function* () {
+          const card = yield* cardFor(service, caller, input.card, input.boardId);
+          yield* boundCard(caller, card);
+          if (caller.link?.role === "review") {
+            return yield* refuse(
+              "Review threads record their verdict with card_review_result.",
+              "role_not_allowed",
+            );
+          }
+          const moved = yield* service.moveCard(
+            card.id,
+            input.to,
+            isCardThread(caller) ? "cardThread" : "evaluator",
+            caller.actor,
+            {
+              note: input.note ?? null,
+              question: input.question ?? null,
+              ...(input.keepWait === undefined ? {} : { keepWait: input.keepWait }),
+            },
           );
-        }
-        const moved = yield* service.moveCard(
-          card.id,
-          input.to,
-          isCardThread(caller) ? "cardThread" : "evaluator",
-          caller.actor,
-          {
-            note: input.note ?? null,
-            question: input.question ?? null,
-            ...(input.keepWait === undefined ? {} : { keepWait: input.keepWait }),
-          },
-        );
-        const dependency = card.wait?.card
-          ? yield* service.card(KanbanCardId.make(card.wait.card)).pipe(
-              Effect.map((detail) => detail.card),
-              Effect.catchTags({ KanbanError: () => Effect.succeed(null) }),
-            )
-          : null;
-        const dependencyBoard =
-          dependency !== null && dependency.boardId !== card.boardId
-            ? ((yield* service.boards).find((board) => board.id === dependency.boardId)?.name ??
-              dependency.boardId)
-            : undefined;
-        const waitTargets =
-          dependency === null
-            ? undefined
-            : new Map([
-                [
-                  dependency.id as string,
-                  {
-                    ...dependency,
-                    ...(dependencyBoard === undefined ? {} : { boardName: dependencyBoard }),
-                  },
-                ],
-              ]);
-        const waitMessage =
-          card.wait !== undefined &&
-          (moved.stage !== card.stage || moved.movedAt !== card.movedAt || moved.wait === undefined)
-            ? `Wait ${waitingFor(card.wait, waitTargets)} ${
-                moved.wait === undefined
-                  ? "cleared by this move; set it again with card_wait or pass keepWait"
-                  : "kept"
-              }`
+          const dependency = card.wait?.card
+            ? yield* service.card(KanbanCardId.make(card.wait.card)).pipe(
+                Effect.map((detail) => detail.card),
+                Effect.catchTags({ KanbanError: () => Effect.succeed(null) }),
+              )
             : null;
-        return {
-          card: moved,
-          ...(waitMessage === null ? {} : { message: waitMessage }),
-          ...(moved.stage === card.stage && waitMessage === null
-            ? {
-                message:
-                  input.to === moved.stage
-                    ? moved.stage === "needs_review" && caller.link?.role === "work"
-                      ? "already queued for review; note added"
-                      : `already in ${moved.stage}; nothing changed`
-                    : `already moved to ${input.to}; now ${moved.stage}, nothing changed`,
-              }
-            : {}),
-        };
-      }),
-    ),
+          const dependencyBoard =
+            dependency !== null && dependency.boardId !== card.boardId
+              ? ((yield* service.boards).find((board) => board.id === dependency.boardId)?.name ??
+                dependency.boardId)
+              : undefined;
+          const waitTargets =
+            dependency === null
+              ? undefined
+              : new Map([
+                  [
+                    dependency.id as string,
+                    {
+                      ...dependency,
+                      ...(dependencyBoard === undefined ? {} : { boardName: dependencyBoard }),
+                    },
+                  ],
+                ]);
+          const waitMessage =
+            card.wait !== undefined &&
+            (moved.stage !== card.stage ||
+              moved.movedAt !== card.movedAt ||
+              moved.wait === undefined)
+              ? `Wait ${waitingFor(card.wait, waitTargets)} ${
+                  moved.wait === undefined
+                    ? "cleared by this move; set it again with card_wait or pass keepWait"
+                    : "kept"
+                }`
+              : null;
+          return {
+            card: moved,
+            ...(waitMessage === null ? {} : { message: waitMessage }),
+            ...(moved.stage === card.stage && waitMessage === null
+              ? {
+                  message:
+                    input.to === moved.stage
+                      ? moved.stage === "needs_review" && caller.link?.role === "work"
+                        ? "already queued for review; note added"
+                        : `already in ${moved.stage}; nothing changed`
+                      : `already moved to ${input.to}; now ${moved.stage}, nothing changed`,
+                }
+              : {}),
+          };
+        }),
+      ),
+    InputValidation.card_move,
   ),
 
-  card_ask: McpToolAccess.actsAsCaller((input) =>
-    withCaller((service, caller) =>
-      Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card, input.boardId);
-        yield* ownCard(caller, card);
-        if (caller.link?.role === "review") {
-          return yield* refuse(
-            "Review threads put questions in their findings.",
-            "role_not_allowed",
+  card_ask: McpToolAccess.actsAsCaller(
+    (input) =>
+      withCaller((service, caller) =>
+        Effect.gen(function* () {
+          const card = yield* cardFor(service, caller, input.card, input.boardId);
+          yield* ownCard(caller, card);
+          if (caller.link?.role === "review") {
+            return yield* refuse(
+              "Review threads put questions in their findings.",
+              "role_not_allowed",
+            );
+          }
+          const board = yield* service.resolveBoard(caller.threadId, { boardId: card.boardId });
+          const asked = yield* service.askOwner(
+            card.id,
+            { ...askFieldsOf(input), question: input.question, blocking: input.blocking ?? false },
+            caller.actor,
+            isCardThread(caller) ? "cardThread" : "evaluator",
           );
-        }
-        const board = yield* service.resolveBoard(caller.threadId, { boardId: card.boardId });
-        const asked = yield* service.askOwner(
-          card.id,
-          { ...askFieldsOf(input), question: input.question, blocking: input.blocking ?? false },
-          caller.actor,
-          isCardThread(caller) ? "cardThread" : "evaluator",
-        );
-        // The newest ask is the one just added.
-        const ask = asked.asks.at(-1);
-        const warning = ask ? Asks.approvalWarning(asked, ask, board.guessedGates) : undefined;
-        const note = ask ? askGateNote(asked, ask, board.guessedGates) : "";
-        return {
-          card: Asks.askSummary(asked, ask?.id ?? ""),
-          ...(warning === undefined ? {} : { warning }),
-          ...(note ? { note } : {}),
-        };
-      }),
-    ),
+          // The newest ask is the one just added.
+          const ask = asked.asks.at(-1);
+          const warning = ask ? Asks.approvalWarning(asked, ask, board.guessedGates) : undefined;
+          const note = ask ? askGateNote(asked, ask, board.guessedGates) : "";
+          return {
+            card: Asks.askSummary(asked, ask?.id ?? ""),
+            ...(warning === undefined ? {} : { warning }),
+            ...(note ? { note } : {}),
+          };
+        }),
+      ),
+    InputValidation.card_ask,
   ),
 
   card_ask_change: McpToolAccess.actsAsCaller((input) =>
@@ -970,17 +984,19 @@ const handlers = {
     ),
   ),
 
-  card_flag: McpToolAccess.actsAsCaller((input) =>
-    withCaller((service, caller) =>
-      Effect.gen(function* () {
-        const problem = textProblem([["reason", input.reason]]);
-        if (problem) return yield* invalid(problem, "invalid_args");
-        const card = yield* cardFor(service, caller, input.card, input.boardId);
-        yield* ownCard(caller, card);
-        const reason = input.stalled ? input.reason?.trim() || "Stalled" : null;
-        return { card: yield* service.flagCard(card.id, reason, caller.actor) };
-      }),
-    ),
+  card_flag: McpToolAccess.actsAsCaller(
+    (input) =>
+      withCaller((service, caller) =>
+        Effect.gen(function* () {
+          const problem = textProblem([["reason", input.reason]]);
+          if (problem) return yield* invalid(problem, "invalid_args");
+          const card = yield* cardFor(service, caller, input.card, input.boardId);
+          yield* ownCard(caller, card);
+          const reason = input.stalled ? input.reason?.trim() || "Stalled" : null;
+          return { card: yield* service.flagCard(card.id, reason, caller.actor) };
+        }),
+      ),
+    InputValidation.card_flag,
   ),
 
   board_standing_approval: McpToolAccess.actsAsCaller((input) =>
@@ -1015,75 +1031,77 @@ const handlers = {
     ),
   ),
 
-  card_wait: McpToolAccess.actsAsCaller((input) =>
-    withCaller((service, caller) =>
-      Effect.gen(function* () {
-        const problem = textProblem([["note", input.note]]);
-        if (problem) return yield* invalid(problem, "invalid_args");
-        const card = yield* cardFor(service, caller, input.card);
-        yield* ownCard(caller, card);
-        if (input.clear) {
-          return { card: yield* service.waitCard(card.id, null, caller.actor) };
-        }
-        // Naming a script is enough to say what kind of wait it is.
-        const on = input.on ?? (input.script === undefined ? undefined : "script");
-        if (on === undefined)
-          return yield* invalid(
-            "Pass on (what the card waits on) or clear.",
-            "invalid_args",
-            "missing_required",
-            "on",
+  card_wait: McpToolAccess.actsAsCaller(
+    (input) =>
+      withCaller((service, caller) =>
+        Effect.gen(function* () {
+          const problem = textProblem([["note", input.note]]);
+          if (problem) return yield* invalid(problem, "invalid_args");
+          const card = yield* cardFor(service, caller, input.card);
+          yield* ownCard(caller, card);
+          if (input.clear) {
+            return { card: yield* service.waitCard(card.id, null, caller.actor) };
+          }
+          // Naming a script is enough to say what kind of wait it is.
+          const on = input.on ?? (input.script === undefined ? undefined : "script");
+          if (on === undefined)
+            return yield* invalid(
+              "Pass on (what the card waits on) or clear.",
+              "invalid_args",
+              "missing_required",
+              "on",
+            );
+          if (input.script !== undefined && on !== "script") {
+            return yield* invalid(
+              `script goes with on: script. ${on} is one of the board's own checks, and a script can't stand in for it.`,
+              "invalid_args",
+            );
+          }
+          if (!input.note?.trim()) {
+            return yield* invalid(
+              "A wait needs a one-line note: what exactly is awaited.",
+              "invalid_args",
+            );
+          }
+          // One PR on the card needs no naming.
+          const prs = card.links.filter((link) => link.kind === "pr");
+          const pr = input.pr ?? (prs.length === 1 ? prs[0]?.url : undefined);
+          const waitsOn =
+            on === "card" && input.waitsOn?.trim()
+              ? yield* cardFor(service, caller, input.waitsOn, card.boardId, false, false)
+              : null;
+          const waiting = yield* service.waitCard(
+            card.id,
+            {
+              on,
+              note: input.note,
+              pr,
+              card: waitsOn?.id ?? null,
+              ask: input.ask,
+              until: input.until,
+              head: input.head,
+              wakeRole: input.wakeRole,
+              script: input.script,
+              args: input.args,
+            },
+            caller.actor,
           );
-        if (input.script !== undefined && on !== "script") {
-          return yield* invalid(
-            `script goes with on: script. ${on} is one of the board's own checks, and a script can't stand in for it.`,
-            "invalid_args",
-          );
-        }
-        if (!input.note?.trim()) {
-          return yield* invalid(
-            "A wait needs a one-line note: what exactly is awaited.",
-            "invalid_args",
-          );
-        }
-        // One PR on the card needs no naming.
-        const prs = card.links.filter((link) => link.kind === "pr");
-        const pr = input.pr ?? (prs.length === 1 ? prs[0]?.url : undefined);
-        const waitsOn =
-          on === "card" && input.waitsOn?.trim()
-            ? yield* cardFor(service, caller, input.waitsOn, card.boardId, false, false)
-            : null;
-        const waiting = yield* service.waitCard(
-          card.id,
-          {
-            on,
-            note: input.note,
-            pr,
-            card: waitsOn?.id ?? null,
-            ask: input.ask,
-            until: input.until,
-            head: input.head,
-            wakeRole: input.wakeRole,
-            script: input.script,
-            args: input.args,
-          },
-          caller.actor,
-        );
-        return WAITS_ENGINE_WIRED
-          ? {
-              card: waiting,
-              ...(caller.actor._tag === "thread" &&
-              waiting.activeThreadId === caller.actor.threadId &&
-              waiting.activeRole === "work"
-                ? { note: "Wait set; it starts when your turn ends. End your turn now." }
-                : {}),
-            }
-          : {
-              card: waiting,
-              note: "Saved and shown on the board. The board does not end waits by itself yet: keep your own check until it does.",
-            };
-      }),
-    ),
+          return WAITS_ENGINE_WIRED
+            ? {
+                card: waiting,
+                ...(caller.actor._tag === "thread" &&
+                waiting.activeThreadId === caller.actor.threadId &&
+                waiting.activeRole === "work"
+                  ? { note: "Wait set; it starts when your turn ends. End your turn now." }
+                  : {}),
+              }
+            : {
+                card: waiting,
+                note: "Saved and shown on the board. The board does not end waits by itself yet: keep your own check until it does.",
+              };
+        }),
+      ),
+    InputValidation.card_wait,
   ),
 
   card_review_result: McpToolAccess.actsAsCaller((input) =>
@@ -1118,46 +1136,53 @@ const handlers = {
     ),
   ),
 
-  discussion_post: McpToolAccess.actsAsCaller((input) =>
-    withCaller((service, caller) =>
-      Effect.gen(function* () {
-        const problem = textProblem([
-          ["message", input.text],
-          ...messageTextFields(input.blocks ?? []),
-        ]);
-        if (problem) return yield* invalid(problem, "invalid_args");
-        const blocks = blocksOf(input);
-        if (blocks.length === 0)
-          return yield* invalid("Pass text or blocks.", "invalid_args", "missing_required", "text");
-        const askId = input.ask?.trim();
-        if (askId) {
-          // A reply on one ask goes to its card's discussion and never closes the ask.
-          const card = yield* cardFor(service, caller, input.card, input.boardId, true);
-          yield* ownCard(caller, card);
+  discussion_post: McpToolAccess.actsAsCaller(
+    (input) =>
+      withCaller((service, caller) =>
+        Effect.gen(function* () {
+          const problem = textProblem([
+            ["message", input.text],
+            ...messageTextFields(input.blocks ?? []),
+          ]);
+          if (problem) return yield* invalid(problem, "invalid_args");
+          const blocks = blocksOf(input);
+          if (blocks.length === 0)
+            return yield* invalid(
+              "Pass text or blocks.",
+              "invalid_args",
+              "missing_required",
+              "text",
+            );
+          const askId = input.ask?.trim();
+          if (askId) {
+            // A reply on one ask goes to its card's discussion and never closes the ask.
+            const card = yield* cardFor(service, caller, input.card, input.boardId, true);
+            yield* ownCard(caller, card);
+            return {
+              message: yield* service.replyOnAsk(
+                card.id,
+                askId,
+                caller.actor,
+                blocks,
+                isCardThread(caller) ? "cardThread" : "evaluator",
+              ),
+            };
+          }
+          const target = yield* postTargetFor(
+            service,
+            caller,
+            input.discussionId,
+            input.card,
+            input.boardId,
+          );
           return {
-            message: yield* service.replyOnAsk(
-              card.id,
-              askId,
-              caller.actor,
-              blocks,
-              isCardThread(caller) ? "cardThread" : "evaluator",
-            ),
+            message: yield* target.kind === "card"
+              ? service.postToCard(target.id, caller.actor, blocks)
+              : service.post(target.id, caller.actor, blocks),
           };
-        }
-        const target = yield* postTargetFor(
-          service,
-          caller,
-          input.discussionId,
-          input.card,
-          input.boardId,
-        );
-        return {
-          message: yield* target.kind === "card"
-            ? service.postToCard(target.id, caller.actor, blocks)
-            : service.post(target.id, caller.actor, blocks),
-        };
-      }),
-    ),
+        }),
+      ),
+    InputValidation.discussion_post,
   ),
 
   discussion_read: McpToolAccess.readsAsCaller((input) =>
@@ -1217,153 +1242,162 @@ const handlers = {
     ),
   ),
 
-  wiki_read: McpToolAccess.readsAsCaller((input) =>
-    withCaller((service, caller) =>
-      Effect.gen(function* () {
-        if (input.slug !== undefined && input.slugs !== undefined) {
-          return yield* invalid(
-            "Pass slug or slugs, not both.",
-            "invalid_args",
-            "conflict",
-            "slug",
+  wiki_read: McpToolAccess.readsAsCaller(
+    (input) =>
+      withCaller((service, caller) =>
+        Effect.gen(function* () {
+          if (input.slug !== undefined && input.slugs !== undefined) {
+            return yield* invalid(
+              "Pass slug or slugs, not both.",
+              "invalid_args",
+              "conflict",
+              "slug",
+            );
+          }
+          const board = yield* WikiReadTiming.step(
+            "board",
+            boardFor(service, caller, input.boardId, true),
           );
-        }
-        const board = yield* WikiReadTiming.step(
-          "board",
-          boardFor(service, caller, input.boardId, true),
-        );
-        if (
-          input.slug === undefined &&
-          input.slugs === undefined &&
-          input.section === undefined &&
-          !input.outline
-        ) {
-          return {
-            pages: [],
-            index: (yield* service.wikiIndex(board.id)).toSorted((a, b) =>
-              a.slug.localeCompare(b.slug),
-            ),
-            hint: "Pass slug to read a page.",
-          };
-        }
-        const pages = yield* service.wiki(board.id, {
-          slug: input.slug,
-          slugs: input.slugs,
-          section: input.section,
-          outline: input.outline,
-        });
-        if (input.slug !== undefined) {
+          if (
+            input.slug === undefined &&
+            input.slugs === undefined &&
+            input.section === undefined &&
+            !input.outline
+          ) {
+            return {
+              pages: [],
+              index: (yield* service.wikiIndex(board.id)).toSorted((a, b) =>
+                a.slug.localeCompare(b.slug),
+              ),
+              hint: "Pass slug to read a page.",
+            };
+          }
+          const pages = yield* service.wiki(board.id, {
+            slug: input.slug,
+            slugs: input.slugs,
+            section: input.section,
+            outline: input.outline,
+          });
+          if (input.slug !== undefined) {
+            return { pages };
+          }
+          if (input.slugs !== undefined) {
+            const bySlug = new Map(pages.map((page) => [page.slug, page]));
+            return {
+              pages: input.slugs.flatMap((slug) => {
+                const page = bySlug.get(slug);
+                return page === undefined ? [] : [page];
+              }),
+              missing: input.slugs.filter((slug) => !bySlug.has(slug)),
+            };
+          }
           return { pages };
-        }
-        if (input.slugs !== undefined) {
-          const bySlug = new Map(pages.map((page) => [page.slug, page]));
-          return {
-            pages: input.slugs.flatMap((slug) => {
-              const page = bySlug.get(slug);
-              return page === undefined ? [] : [page];
-            }),
-            missing: input.slugs.filter((slug) => !bySlug.has(slug)),
-          };
-        }
-        return { pages };
-      }),
-    ),
+        }),
+      ),
+    InputValidation.wiki_read,
   ),
 
-  card_create: McpToolAccess.actsAsCaller((input) =>
-    withCaller((service, caller) =>
-      Effect.gen(function* () {
-        if (input.forThread !== undefined) {
-          if (caller.link?.role !== "evaluator")
+  card_create: McpToolAccess.actsAsCaller(
+    (input) =>
+      withCaller((service, caller) =>
+        Effect.gen(function* () {
+          if (input.forThread !== undefined) {
+            if (caller.link?.role !== "evaluator")
+              return yield* refuse(
+                "Only evaluators create cards with forThread. Nothing was saved.",
+                "role_not_allowed",
+              );
+            if (input.assignToSelf)
+              return yield* refuse(
+                "Use forThread or assignToSelf, not both. Nothing was saved.",
+                "invalid_args",
+              );
+            if (input.priority === KANBAN_BACKLOG || input.stage === "needs_owner")
+              return yield* refuse(
+                "forThread needs a todo card outside the backlog. Nothing was saved.",
+                "stage_not_allowed",
+              );
+          }
+          if (caller.link?.role === "review") {
             return yield* refuse(
-              "Only evaluators create cards with forThread. Nothing was saved.",
+              "Review threads report findings; they don't create cards.",
               "role_not_allowed",
             );
-          if (input.assignToSelf)
+          }
+          const isWorker = caller.link?.role === "work";
+          if (input.assignToSelf && !isWorker) {
             return yield* refuse(
-              "Use forThread or assignToSelf, not both. Nothing was saved.",
-              "invalid_args",
+              "Only a card's work thread can take a card with assignToSelf.",
+              "role_not_allowed",
             );
-          if (input.priority === KANBAN_BACKLOG || input.stage === "needs_owner")
+          }
+          if (input.assignToSelf && input.priority === KANBAN_BACKLOG) {
             return yield* refuse(
-              "forThread needs a todo card outside the backlog. Nothing was saved.",
-              "stage_not_allowed",
+              "A backlog card isn't picked up; leave out assignToSelf.",
+              "role_not_allowed",
             );
-        }
-        if (caller.link?.role === "review") {
-          return yield* refuse(
-            "Review threads report findings; they don't create cards.",
-            "role_not_allowed",
+          }
+          const board = yield* boardFor(service, caller, input.boardId);
+          if (isWorker && board.id !== caller.link?.boardId) {
+            return yield* refuse(
+              "Work threads create cards only on their own board.",
+              "cross_board",
+            );
+          }
+          const blockedBy = yield* cardIds(service, caller, input.blockedBy, board.id);
+          const apply = input.model || input.models ? yield* selectionRoutingEnabled : false;
+          const model = input.model ? yield* modelOf(input.model, apply) : undefined;
+          const models = yield* modelsOf(input.models, apply);
+          // Follow-up work keeps the review chain and goal of the card it came from.
+          const origin = isWorker ? yield* workOrigin(service, caller) : null;
+          const fields = {
+            prompt: input.prompt,
+            title: input.title,
+            description: input.description,
+            priority: input.priority,
+            goalId: input.goalId ? KanbanGoalId.make(input.goalId) : (origin?.goalId ?? null),
+            projects: input.projects,
+            model,
+            models,
+            projectId: input.projectId ? ProjectId.make(input.projectId) : null,
+            links: input.links,
+            blockedBy,
+            reviewChain: origin ? origin.reviewChain : (input.reviewChain ?? null),
+            subtasks: input.subtasks,
+          };
+          if (input.forThread !== undefined) {
+            const result = yield* service.createForThread(ThreadId.make(input.forThread), fields, {
+              boardId: board.id,
+              actor: { _tag: "evaluator", threadId: caller.threadId },
+            });
+            return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
+          }
+          if (input.assignToSelf) {
+            // Taken at once: the caller's subtasks are the whole plan, so the ids
+            // the reply names are the input's own, with no packet in front.
+            const result = yield* service.createForThread(caller.threadId, fields);
+            return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
+          }
+          if (isWorker && input.stage === "needs_owner") {
+            return yield* refuse(
+              "Work threads ask the owner with card_ask on their own card.",
+              "role_not_allowed",
+            );
+          }
+          const card = yield* service.createCard(
+            board.id,
+            { ...fields, stage: input.stage, question: input.question ?? null },
+            caller.actor,
           );
-        }
-        const isWorker = caller.link?.role === "work";
-        if (input.assignToSelf && !isWorker) {
-          return yield* refuse(
-            "Only a card's work thread can take a card with assignToSelf.",
-            "role_not_allowed",
-          );
-        }
-        if (input.assignToSelf && input.priority === KANBAN_BACKLOG) {
-          return yield* refuse(
-            "A backlog card isn't picked up; leave out assignToSelf.",
-            "role_not_allowed",
-          );
-        }
-        const board = yield* boardFor(service, caller, input.boardId);
-        if (isWorker && board.id !== caller.link?.boardId) {
-          return yield* refuse("Work threads create cards only on their own board.", "cross_board");
-        }
-        const blockedBy = yield* cardIds(service, caller, input.blockedBy, board.id);
-        const apply = input.model || input.models ? yield* selectionRoutingEnabled : false;
-        const model = input.model ? yield* modelOf(input.model, apply) : undefined;
-        const models = yield* modelsOf(input.models, apply);
-        // Follow-up work keeps the review chain and goal of the card it came from.
-        const origin = isWorker ? yield* workOrigin(service, caller) : null;
-        const fields = {
-          prompt: input.prompt,
-          title: input.title,
-          description: input.description,
-          priority: input.priority,
-          goalId: input.goalId ? KanbanGoalId.make(input.goalId) : (origin?.goalId ?? null),
-          projects: input.projects,
-          model,
-          models,
-          projectId: input.projectId ? ProjectId.make(input.projectId) : null,
-          links: input.links,
-          blockedBy,
-          reviewChain: origin ? origin.reviewChain : (input.reviewChain ?? null),
-          subtasks: input.subtasks,
-        };
-        if (input.forThread !== undefined) {
-          const result = yield* service.createForThread(ThreadId.make(input.forThread), fields, {
-            boardId: board.id,
-            actor: { _tag: "evaluator", threadId: caller.threadId },
-          });
-          return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
-        }
-        if (input.assignToSelf) {
-          const result = yield* service.createForThread(caller.threadId, fields);
-          return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
-        }
-        if (isWorker && input.stage === "needs_owner") {
-          return yield* refuse(
-            "Work threads ask the owner with card_ask on their own card.",
-            "role_not_allowed",
-          );
-        }
-        const card = yield* service.createCard(
-          board.id,
-          { ...fields, stage: input.stage, question: input.question ?? null },
-          caller.actor,
-        );
-        // The engine puts the packet first for a thread's or a script's card, so
-        // the ids the reply names must be numbered with it in front.
-        const planInput = needsPacketStep(caller.actor)
-          ? withPacketStep(input.subtasks ?? [])
-          : input.subtasks;
-        return { card, ...gatedResult(card, planInput, board.guessedGates) };
-      }),
-    ),
+          // The engine puts the packet first for a thread's or a script's card, so
+          // the ids the reply names must be numbered with it in front.
+          const planInput = needsPacketStep(caller.actor)
+            ? withPacketStep(input.subtasks ?? [])
+            : input.subtasks;
+          return { card, ...gatedResult(card, planInput, board.guessedGates) };
+        }),
+      ),
+    InputValidation.card_create,
   ),
 
   card_claim: McpToolAccess.actsAsCaller((input) =>
@@ -1423,106 +1457,114 @@ const handlers = {
     ),
   ),
 
-  card_edit: McpToolAccess.actsAsCaller((input) =>
-    asEvaluator((service, caller) =>
-      Effect.gen(function* () {
-        if ((input.prompt !== undefined || input.subtasks !== undefined) && !input.basedOn?.trim())
-          return yield* invalid(
-            "card_edit with prompt or subtasks requires basedOn from the updatedAt of the card you read; use card_get, merge your change, and retry",
-            "invalid_args",
+  card_edit: McpToolAccess.actsAsCaller(
+    (input) =>
+      asEvaluator((service, caller) =>
+        Effect.gen(function* () {
+          if (
+            (input.prompt !== undefined || input.subtasks !== undefined) &&
+            !input.basedOn?.trim()
+          )
+            return yield* invalid(
+              "card_edit with prompt or subtasks requires basedOn from the updatedAt of the card you read; use card_get, merge your change, and retry",
+              "invalid_args",
+            );
+          if (
+            input.subtasks?.some((subtask) => subtask.clearGate !== undefined) &&
+            (yield* ancestorThreadIds(caller)).length > 0
+          ) {
+            return yield* refuse(
+              "only the board evaluator can clear a guessed gate",
+              "approval_required",
+            );
+          }
+          const card = yield* cardFor(service, caller, input.card, input.boardId);
+          const blockedBy = yield* cardIds(service, caller, input.blockedBy, card.boardId);
+          const model = input.model ? yield* modelOf(input.model, false) : undefined;
+          const models = yield* modelsOf(input.models, false);
+          const edited = yield* service.editCard(
+            card.id,
+            {
+              title: input.title,
+              description: input.description,
+              prompt: input.prompt,
+              promptEdits: input.promptEdits,
+              subtaskEdits: input.subtaskEdits,
+              basedOn: input.basedOn,
+              priority: input.priority,
+              ...(input.goalId !== undefined
+                ? { goalId: input.goalId === null ? null : KanbanGoalId.make(input.goalId) }
+                : {}),
+              projects: input.projects,
+              model,
+              models,
+              ...(input.projectId !== undefined
+                ? { projectId: input.projectId === null ? null : ProjectId.make(input.projectId) }
+                : {}),
+              links: input.links,
+              removeLinks: input.removeLinks,
+              blockedBy,
+              ...(input.reviewChain !== undefined ? { reviewChain: input.reviewChain } : {}),
+              subtasks: input.subtasks,
+              comment: input.comment,
+            },
+            caller.actor,
           );
-        if (
-          input.subtasks?.some((subtask) => subtask.clearGate !== undefined) &&
-          (yield* ancestorThreadIds(caller)).length > 0
-        ) {
-          return yield* refuse(
-            "only the board evaluator can clear a guessed gate",
-            "approval_required",
-          );
-        }
-        const card = yield* cardFor(service, caller, input.card, input.boardId);
-        const blockedBy = yield* cardIds(service, caller, input.blockedBy, card.boardId);
-        const model = input.model ? yield* modelOf(input.model, false) : undefined;
-        const models = yield* modelsOf(input.models, false);
-        const edited = yield* service.editCard(
-          card.id,
-          {
-            title: input.title,
-            description: input.description,
-            prompt: input.prompt,
-            promptEdits: input.promptEdits,
-            subtaskEdits: input.subtaskEdits,
-            basedOn: input.basedOn,
-            priority: input.priority,
-            ...(input.goalId !== undefined
-              ? { goalId: input.goalId === null ? null : KanbanGoalId.make(input.goalId) }
-              : {}),
-            projects: input.projects,
-            model,
-            models,
-            ...(input.projectId !== undefined
-              ? { projectId: input.projectId === null ? null : ProjectId.make(input.projectId) }
-              : {}),
-            links: input.links,
-            removeLinks: input.removeLinks,
-            blockedBy,
-            ...(input.reviewChain !== undefined ? { reviewChain: input.reviewChain } : {}),
-            subtasks: input.subtasks,
-            comment: input.comment,
-          },
-          caller.actor,
-        );
-        const board = yield* boardFor(service, caller, card.boardId);
-        const planInput =
-          input.subtasks ??
-          (input.subtaskEdits === undefined
-            ? undefined
-            : edited.subtasks
-                .filter(
-                  (entry) =>
-                    entry.text !== card.subtasks.find((previous) => previous.id === entry.id)?.text,
-                )
-                .map(({ id }) => ({ id })));
-        return { card: edited, ...gatedResult(edited, planInput, board.guessedGates, card) };
-      }),
-    ),
+          const board = yield* boardFor(service, caller, card.boardId);
+          const planInput =
+            input.subtasks ??
+            (input.subtaskEdits === undefined
+              ? undefined
+              : edited.subtasks
+                  .filter(
+                    (entry) =>
+                      entry.text !==
+                      card.subtasks.find((previous) => previous.id === entry.id)?.text,
+                  )
+                  .map(({ id }) => ({ id })));
+          return { card: edited, ...gatedResult(edited, planInput, board.guessedGates, card) };
+        }),
+      ),
+    InputValidation.card_edit,
   ),
 
-  subtask_done: McpToolAccess.actsAsCaller((input) =>
-    withCaller((service, caller) =>
-      Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card, input.boardId);
-        if (input.state === "skipped" && caller.actor._tag !== "owner") {
-          const subtask = card.subtasks.find((entry) => entry.id === input.subtask);
-          const board = yield* boardFor(service, caller, card.boardId);
-          if (
-            subtask &&
-            gateOf(subtask, board.guessedGates) !== undefined &&
-            (yield* ancestorThreadIds(caller)).length > 0
-          )
-            return yield* refuse(
-              "only the board evaluator can skip a gated step",
-              "role_not_allowed",
-            );
-        }
-        yield* boundCard(caller, card);
-        const role =
-          caller.link?.role === "work" || caller.link?.role === "review"
-            ? caller.link.role
-            : "evaluator";
-        return {
-          card: yield* service.markSubtask(
-            card.id,
-            input.subtask,
-            input.state,
-            input.note ?? null,
-            caller.actor,
-            role,
-            input.releasedAt,
-          ),
-        };
-      }),
-    ),
+  subtask_done: McpToolAccess.actsAsCaller(
+    (input) =>
+      withCaller((service, caller) =>
+        Effect.gen(function* () {
+          const card = yield* cardFor(service, caller, input.card, input.boardId);
+          if (input.state === "skipped" && caller.actor._tag !== "owner") {
+            const subtask = card.subtasks.find((entry) => entry.id === input.subtask);
+            const board = yield* boardFor(service, caller, card.boardId);
+            if (
+              subtask &&
+              gateOf(subtask, board.guessedGates) !== undefined &&
+              (yield* ancestorThreadIds(caller)).length > 0
+            )
+              return yield* refuse(
+                "only the board evaluator can skip a gated step",
+                "role_not_allowed",
+              );
+          }
+          yield* boundCard(caller, card);
+          const role =
+            caller.link?.role === "work" || caller.link?.role === "review"
+              ? caller.link.role
+              : "evaluator";
+          return {
+            card: yield* service.markSubtask(
+              card.id,
+              input.subtask,
+              input.state,
+              input.note ?? null,
+              caller.actor,
+              role,
+              input.releasedAt,
+            ),
+          };
+        }),
+      ),
+    InputValidation.subtask_done,
   ),
 
   card_thread: McpToolAccess.actsAsCaller((input) =>
@@ -1552,6 +1594,7 @@ const handlers = {
         return {
           pools: yield* service.setPool(board.id, model, input.slots, {
             replaces: input.replaces,
+            actor: { actorKind: "evaluator", actorId: caller.threadId },
           }),
         };
       }),
@@ -1598,7 +1641,11 @@ const handlers = {
         const board = yield* boardFor(service, caller, input.boardId);
         const apply = yield* selectionRoutingEnabled;
         const model = yield* modelOf(input.model, apply);
-        return { pools: yield* service.removePool(board.id, model) };
+        return {
+          pools: yield* service.removePool(board.id, model, {
+            actor: { actorKind: "evaluator", actorId: caller.threadId },
+          }),
+        };
       }),
     ),
   ),
@@ -1656,20 +1703,22 @@ const handlers = {
     ),
   ),
 
-  wiki_write: McpToolAccess.actsAsCaller((input) =>
-    asEvaluator((service, caller) =>
-      Effect.gen(function* () {
-        const board = yield* boardFor(service, caller, input.boardId);
-        const page = yield* service.writeWiki(
-          board.id,
-          { slug: input.slug, title: input.title, body: input.body, edits: input.edits },
-          caller.actor,
-        );
-        if (input.edits === undefined) return { page };
-        const { body, ...metadata } = page;
-        return { page: { ...metadata, bodyLength: body.length, edits: input.edits.length } };
-      }),
-    ),
+  wiki_write: McpToolAccess.actsAsCaller(
+    (input) =>
+      asEvaluator((service, caller) =>
+        Effect.gen(function* () {
+          const board = yield* boardFor(service, caller, input.boardId);
+          const page = yield* service.writeWiki(
+            board.id,
+            { slug: input.slug, title: input.title, body: input.body, edits: input.edits },
+            caller.actor,
+          );
+          if (input.edits === undefined) return { page };
+          const { body, ...metadata } = page;
+          return { page: { ...metadata, bodyLength: body.length, edits: input.edits.length } };
+        }),
+      ),
+    InputValidation.wiki_write,
   ),
 
   board_open: McpToolAccess.actsAsCaller((input) =>

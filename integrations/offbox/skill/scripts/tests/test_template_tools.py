@@ -166,6 +166,17 @@ __offbox_curl -fsSL https://example.invalid/node.tar.xz -o /tmp/fixture
         self.assertIn('--set javac /usr/lib/jvm/java-21-openjdk-amd64/bin/javac', body)
         self.assertIn("javac -version 2>&1 | grep -q '^javac 21\\.'", body)
 
+    def test_system_toolchain_archives_never_import_archive_owners(self):
+        body = (TEMPLATES.parents[1] / 'server/base-image.sh').read_text()
+        self.assertIn('NODE=v24.22.3\n', body)
+        for line in body.splitlines():
+            if '| tar ' in line:
+                self.assertIn('--no-same-owner', line)
+        for name in ('generic', 'crpko-go', 'crpko-harness'):
+            body = (TEMPLATES / (name + '.sh')).read_text()
+            extraction = next(line for line in body.splitlines() if 'sudo tar -C /usr/local' in line)
+            self.assertIn('--no-same-owner', extraction)
+
     def test_base_and_stack_templates_install_the_shim_interpreter(self):
         base = TEMPLATES.parents[1] / 'server/base-image.sh'
         paths = [base, *(TEMPLATES / (name + '.sh') for name in common.TEMPLATES)]

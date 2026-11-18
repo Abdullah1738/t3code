@@ -1,4 +1,6 @@
+import { ProbeBudget } from "./probe-policy.ts";
 import { RemoteBox, remoteBoxConfig } from "./remote-box.ts";
+import { createChatMirror, type ChatMirror } from "./mirror.ts";
 import { readFileSync } from "node:fs";
 import { toolError, toolLog, type LogLine } from "./toollog.ts";
 import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
@@ -49,7 +51,15 @@ export type MainIo = {
   removeStaleSocket: (path: string) => Promise<void>;
 };
 
-type Parts = { remote?: RemoteBox; router?: Router; delivery?: Delivery; replyGap?: ReplyGapMonitor; api: (request: Request) => Promise<Response>; backend?: ChatBackend; busy: boolean };
+type Parts = { remote?: RemoteBox; mirror?: ChatMirror; router?: Router; delivery?: Delivery; replyGap?: ReplyGapMonitor; api: (request: Request) => Promise<Response>; backend?: ChatBackend; busy: boolean };
+
+export function acknowledgeSendblue(chat: Pick<ChatCore, "store" | "context" | "remote">, input: unknown, log: MainIo["log"]): void {
+  if (chat.remote && (input as { logSource?: string }).logSource === "backfill") return;
+  void acknowledgeReceived(chat.store, chat.context, input).catch(caughtError => {
+    toolError("sb-main", "sb-main.catch7", caughtError);
+    log("receipt-ack-failed");
+  });
+}
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -133,6 +143,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   });
   await chmod(socketPath, 0o600);
   const ownerStore = new Store(join(stateRoot, "state.sqlite"));
+  const probeBudget = new ProbeBudget(ownerStore);
   // A separate key from Photon's "identity", so rolling back to Photon still starts.
   const identity = { line: line.number, owner: config.owner };
   const previousIdentity = ownerStore.get<typeof identity>("sendblueIdentity");
@@ -212,7 +223,12 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const build = (chat: ChatCore): Parts => {
     const remoteConfig = remoteBoxConfig(config, chat.info.slug);
     if (remoteConfig) {
+      const mirror = createChatMirror(remoteConfig.mirror, chat.store, undefined, {
+        download: (url, maxBytes, timeoutMs) => observed.download(url, maxBytes, timeoutMs),
+      });
+      mirror?.backfill();
       const remote = new RemoteBox(remoteConfig, chat.store, { log, ownerAlert: fenceOwnerAlert(telegramBridgeSocket),
+        mirror,
         active: () => {
           try { const live = JSON.parse(readFileSync(join(stateRoot, "config.json"), "utf8"));
             return remoteBoxConfig(live, "moni")?.epoch === remoteConfig.epoch; } catch { return false; }
@@ -220,7 +236,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
         notice: async (id, text) => { await remote.send(hash(`notice:${id}`), text, undefined, observed, chat.info.key); },
       });
       chat.remote = remote;
-      return { remote, api: async () => Response.json({ error: "This chat lives on its box" }, { status: 403 }), busy: false };
+      return { remote, mirror, api: async () => Response.json({ error: "This chat lives on its box" }, { status: 403 }), busy: false };
     }
     const isOwner = chat.info.kind === "owner";
     const chatBackend = !isOwner && backend instanceof RobobBackend
@@ -231,7 +247,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     // getMessage may resolve undefined for an unknown handle; the router's reply lookup already treats a throw there as unavailable.
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
-      medsFold: {},
+      medsFold: {}, probeBudget,
       transcribe: input => transcribe(input), notifyUnanswered: outlet.notify, notifyFailure: notifyFailedInbound, log, context: chat.context,
       ...(chat.info.kind === "group" ? { groupJudge } : {}),
       swipes: { find: swipes, line: config.sendblueNumber ?? "" },
@@ -265,7 +281,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const replyGap = new ReplyGapMonitor(chat.store, { chat: chat.info.slug, notify: outlet.notify });
     return { router, delivery, replyGap, api: chatApi, backend: chatBackend, busy: false };
   };
-  registry = new ChatRegistry<Parts>({ line, owner: config.owner, ownerStore, stateRoot, access: () => access, build });
+  registry = new ChatRegistry<Parts>({ line, owner: config.owner, ownerStore, stateRoot, access: () => access, build, backend: kind });
   registry.restore();
   if (remoteBoxConfig(config, "moni") && !registry.bySlugName("moni")) {
     const person = access.people.find(person => person.name.toLowerCase() === "moni");
@@ -319,7 +335,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     maxRequestBodySize: 28 * 1024 * 1024,
     fetch: createSbApi({ registry: chats, line, agentBus, accessPath: accessFile, enabled: ready, health: () => ({}) }, remoteCallback),
   }) : undefined;
-  process.once("exit", () => callbackServer?.stop(true));
+  process.once("exit", () => { callbackServer?.stop(true); remoteCallback?.stop(); toolLog.flush(); });
 
   // Unknown senders: one Telegram note per address, so the owner can allow them.
   const note = async (address: string, text: string) => {
@@ -329,7 +345,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const ingress = runIngress({
     line: observed, owner: config.owner, ownerStore, access: async () => access,
     sink: chats.sink(note, () => config.enabled, message => guestDesk.unknown(message),
-      (chat, input) => { if (chat.remote) return; void acknowledgeReceived(chat.store, chat.context, input).catch((caughtError) => { toolError("sb-main", "sb-main.catch7", caughtError); return log("receipt-ack-failed"); }); }), log,
+      (chat, input) => acknowledgeSendblue(chat, input, log)), log,
     notify: (text, key) => outlet.notify("attention", text, key),
   }, abort.signal);
 
@@ -378,11 +394,15 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     }
   }
   const unansweredTimer = setInterval(() => {
-    if (ready()) for (const chat of chats.all()) void chat.parts.router?.checkUnanswered().catch(error => toolError("sb-main", "unanswered.check", error));
+    if (ready()) for (const chat of chats.all()) void (chat.parts.remote ?? chat.parts.router)?.checkUnanswered().catch(error => toolError("sb-main", "unanswered.check", error));
   }, 60_000);
   const timer = setInterval(() => {
     for (const chat of chats.all()) {
-      if (chat.parts.remote) { if (ready()) void chat.parts.remote.tick(); continue; }
+      if (chat.parts.remote) {
+        void chat.parts.mirror?.tick().catch(() => log("mirror-worker-failed"));
+        if (ready()) void chat.parts.remote.tick();
+        continue;
+      }
       void chat.parts.delivery?.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
       if (ready()) void chat.parts.router?.checkCompletion();
       if (ready()) void chat.parts.replyGap?.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });
@@ -405,9 +425,13 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     clearInterval(timer);
     clearInterval(unansweredTimer);
     await server.stop(true);
+    await callbackServer?.stop(true);
     await apps?.stop().catch((caughtError) => { toolError("sb-main", "sb-main.catch17", caughtError);});
     await shares.stopAll().catch((caughtError) => { toolError("sb-main", "sb-main.catch18", caughtError);});
+    for (const chat of chats.all()) chat.parts.remote?.stop();
+    toolLog.flush();
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.
+    toolLog.flush();
     process.exit(0);
   };
   process.once("SIGTERM", () => { void stop(); });

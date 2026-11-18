@@ -25,7 +25,36 @@ export { installCommandTimeout } from "./install-readiness.mjs";
 // Exit 75: the bundle is installed, but sustained reads did not pass. Do not reinstall.
 export const READ_CHECK_FAILED = 75;
 const exec = NodeUtil.promisify(NodeChildProcess.execFile);
-export const INSTALL_DATABASE_FILE = /^(statev2|boards)\.sqlite(?:-wal)?$/;
+export const INSTALL_DATABASE_FILE = /^(statev2|boards|archive)\.sqlite(?:-wal)?$/;
+
+// Clones share data blocks; reserve metadata headroom and never fall back to a full copy.
+export const BACKUP_FREE_BYTES = 1024 ** 3;
+export async function cloneClosedDatabases({
+  data, destination, timeoutMs, run, fs: io = NodeFSP,
+}) {
+  await io.mkdir(destination, { recursive: true, mode: 0o700 });
+  const names = (await io.readdir(data)).filter((name) => INSTALL_DATABASE_FILE.test(name)).sort();
+  if (!names.includes("statev2.sqlite")) throw new Error("Missing state database");
+  const target = await io.stat(destination);
+  const space = await io.statfs(destination, { bigint: true });
+  if (space.bavail * space.bsize < BigInt(BACKUP_FREE_BYTES))
+    throw new Error("Install backup requires at least 1 GiB free for clone metadata");
+  for (const name of names) {
+    const source = await io.lstat(NodePath.join(data, name));
+    if (!source.isFile() || source.dev !== target.dev)
+      throw new Error(`Install backup requires regular files on the same volume: ${name}`);
+  }
+  for (const name of names) {
+    // cp -c can silently copy; Node's FICLONE_FORCE is unsupported on macOS.
+    // clonefile fails rather than falling back when the filesystem cannot clone.
+    // A child process keeps a stalled filesystem operation inside the aggregate backup deadline.
+    await run("/usr/bin/python3", ["-I", "-c",
+      "import ctypes, os, sys\nclone = ctypes.CDLL(None, use_errno=True).clonefile\nclone.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]\nclone.restype = ctypes.c_int\nif clone(os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2]), 0):\n error = ctypes.get_errno()\n raise OSError(error, os.strerror(error))",
+      NodePath.join(data, name), NodePath.join(destination, name),
+    ], timeoutMs());
+  }
+  return names;
+}
 
 export const INSTALL_PLAN = [
   "pre-stage",
@@ -99,6 +128,22 @@ export async function install(ops, { rollback = false } = {}) {
   await ops.report();
   if (ops.prune)
     await ops.prune().catch((error) => ops.phase("prune_failed", { error: String(error) }));
+}
+
+export async function requestInstallerQuit({
+  home, pid, rollback = false, run, now = Date.now(), requesterPid = process.pid, fs: io = NodeFSP,
+}) {
+  const file = NodePath.join(home, ".robob/userdata/logs/desktop-quit-request.json");
+  await io.mkdir(NodePath.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${requesterPid}.tmp`;
+  await io.writeFile(temporary, JSON.stringify({
+    at: now, targetPid: pid, requesterPid, initiator: "installer",
+    reason: rollback ? "release-rollback" : "release-install",
+  }), { mode: 0o600 });
+  await io.rename(temporary, file);
+  try {
+    await run("/usr/bin/osascript", ["-e", 'tell application "Robob" to quit'], 2000);
+  } catch {}
 }
 
 async function writeBackupMarker(file, value, io) {
@@ -768,18 +813,8 @@ export async function main(args, {
     // Exact names only: the 226 GB statev2.pre-shrink-*.sqlite copy matched the old prefix pattern
     // and was cloned on every install (11 Nov 2026).
     (await NodeFSP.readdir(data)).filter((name) => INSTALL_DATABASE_FILE.test(name));
-  const clone = async (destination, timeoutMs) => {
-    await NodeFSP.mkdir(destination, { recursive: true, mode: 0o700 });
-    const names = await inputs();
-    if (!names.includes("statev2.sqlite")) throw new Error("Missing state database");
-    for (const name of names)
-      await run(
-        "/bin/cp",
-        ["-c", NodePath.join(data, name), NodePath.join(destination, name)],
-        timeoutMs(),
-      );
-    return names;
-  };
+  const clone = (destination, timeoutMs) =>
+    cloneClosedDatabases({ data, destination, timeoutMs, run });
   const cfg = JSON.parse(
     await NodeFSP.readFile(
       env.T3_CONTROL_TOKEN_FILE || NodePath.join(home, ".robob/components/t3ctl.json"),
@@ -912,9 +947,7 @@ export async function main(args, {
         NodePath.join(app, "Contents/MacOS/Robob"),
       );
       quitTree = tree;
-      try {
-        await run("/usr/bin/osascript", ["-e", 'tell application "Robob" to quit'], 2000);
-      } catch {}
+      await requestInstallerQuit({ home, pid, rollback, run });
       while ((await survivingOwned(tree, true, quitAbort)).length && Date.now() - quitAt < 12_000)
         await sleep(100);
       await cleanupOwnedTree(tree, 250, true, Math.max(1, 15_000 - (Date.now() - quitAt)));

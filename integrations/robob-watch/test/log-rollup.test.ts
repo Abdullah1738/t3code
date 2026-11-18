@@ -42,11 +42,11 @@ test("ndjson rollup attributes watcher runs, helper failures, tags and wakes wit
   copyFileSync(join(import.meta.dir, "fixtures/rollup.ndjson"), join(dir, `${day}.ndjson`));
   const result = await rollup(day, dir);
   expect(result?.byWatcher).toEqual({
-    "ride-share-updates": { runs: 5, outcomes: { no_change: 1, fire: 1, fail: 2, timeout: 1, busy: 0 }, fires: 1,
+    "ride-share-updates": { runs: 5, actualRuns: 5, expectedRuns: null, missedTicks: null, lateMs: { p50: null, p95: null, max: null }, outcomes: { no_change: 1, fire: 1, fail: 2, timeout: 1, busy: 0 }, fires: 1,
       durationMs: { p50: 30, p95: 70, max: 70 }, queuedMs: { p95: 100 }, slotWaitMs: { count: 0, total: 0, p95: null }, lateRuns: 0, longestFailStreak: 2, lastFailureTag: "watch.check_failed" },
-    "flighty-bookings": { runs: 3, outcomes: { no_change: 1, fire: 1, fail: 0, timeout: 1, busy: 0 }, fires: 1,
+    "flighty-bookings": { runs: 3, actualRuns: 3, expectedRuns: null, missedTicks: null, lateMs: { p50: null, p95: null, max: null }, outcomes: { no_change: 1, fire: 1, fail: 0, timeout: 1, busy: 0 }, fires: 1,
       durationMs: { p50: 50, p95: 60, max: 60 }, queuedMs: { p95: 5 }, slotWaitMs: { count: 0, total: 0, p95: null }, lateRuns: 0, longestFailStreak: 1, lastFailureTag: "watch.timeout" },
-    "inbox-triage": { runs: 1, outcomes: { no_change: 1, fire: 0, fail: 0, timeout: 0, busy: 0 }, fires: 0,
+    "inbox-triage": { runs: 1, actualRuns: 1, expectedRuns: null, missedTicks: null, lateMs: { p50: null, p95: null, max: null }, outcomes: { no_change: 1, fire: 0, fail: 0, timeout: 0, busy: 0 }, fires: 0,
       durationMs: { p50: 25, p95: 25, max: 25 }, queuedMs: { p95: 1 }, slotWaitMs: { count: 0, total: 0, p95: null }, lateRuns: 0, longestFailStreak: 0, lastFailureTag: null },
   });
   expect(result?.watcherTotals).toEqual({ watchers: 3, runs: 9, outcomes: { no_change: 3, fire: 2, fail: 2, timeout: 2, busy: 0 }, fires: 2 });
@@ -114,7 +114,7 @@ test("failed and quiet-held sends count only when their retries complete on the 
   ] as const;
   for (const { watcher, outcome, completed } of cases) {
     expect(pending?.byWatcher[watcher]).toMatchObject({ runs: 1, outcomes: { [outcome]: 1, busy: 0 }, fires: 0 });
-    if (completed) expect(retried?.byWatcher[watcher]).toEqual({ runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0, busy: 0 }, fires: 1,
+    if (completed) expect(retried?.byWatcher[watcher]).toEqual({ runs: 0, actualRuns: 0, expectedRuns: null, missedTicks: null, lateMs: { p50: null, p95: null, max: null }, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0, busy: 0 }, fires: 1,
       durationMs: { p50: null, p95: null, max: null }, queuedMs: { p95: null }, slotWaitMs: { count: 0, total: 0, p95: null }, lateRuns: 0, longestFailStreak: 0, lastFailureTag: null });
     else expect(retried?.byWatcher[watcher]).toBeUndefined();
   }
@@ -168,7 +168,7 @@ test("a day with only empty and malformed lines still has empty aggregates", asy
   writeFileSync(join(dir, `${day}.ndjson`), '\nmalformed\nnull\n{}\n[]\n{"tool":"watchers","kind":"perf"}\n');
   expect(await rollup(day, dir)).toEqual({ day, tool: "watchers", total: 0, counts: {}, kinds: {}, ok: 0, failed: 0, okRate: null, errorRate: 0, durations: {}, errors: [],
     byDependency: {}, dependencyTotals: { dependencies: 0, busyRuns: 0 },
-    slots: { allSlotsBusyMinutes: 0, topHolders: [] }, byWatcher: {}, watcherTotals: { watchers: 0, runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0, busy: 0 }, fires: 0 },
+    loadMode: { minutes: 0, switches: 0 }, slots: { allSlotsBusyMinutes: 0, topHolders: [] }, byWatcher: {}, watcherTotals: { watchers: 0, runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0, busy: 0 }, fires: 0 },
     byHelper: {}, helperTotals: { helpers: 0, runs: 0, failures: 0, exitCodes: {} }, errorsByTagAndSource: [], hourly: [], markers: [],
     wake: { attempts: 0, sent: 0, failed: 0, replyGuard: { total: 0, accepted: 0, blocked: 0 } },
   });

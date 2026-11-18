@@ -5,7 +5,9 @@ import {
   MessageId,
   NodeId,
   ProviderInstanceId,
+  ProviderSessionId,
   ProviderThreadId,
+  RunAttemptId,
   RunId,
   ThreadId,
   TurnItemId,
@@ -16,7 +18,9 @@ import {
   AnalyticsEvent,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
@@ -25,7 +29,7 @@ import * as Guard from "./DelegatedTaskProgressGuard.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as Threads from "./ThreadManagementService.ts";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
-import { normalizeIdleTimeout, stalledSummary } from "./delegatedTaskProgress.ts";
+import { progressBlockers, normalizeIdleTimeout, stalledSummary } from "./delegatedTaskProgress.ts";
 
 const threadId = ThreadId.make("child");
 const runId = RunId.make("run");
@@ -38,6 +42,11 @@ const makeHarness = Effect.gen(function* () {
   let failPromptRead = false;
   let interruptRace: Effect.Effect<void> | undefined;
   let selectedTimeout: number | undefined;
+  const retryChecks: number[] = [];
+  let stopForRetry = false;
+  let retryLookup:
+    | NonNullable<Threads.ThreadManagementServiceShape["getDelegatedRetryCheck"]>
+    | undefined;
   let run = {
     id: runId,
     threadId,
@@ -45,6 +54,7 @@ const makeHarness = Effect.gen(function* () {
     delegatedTaskId: NodeId.make("task"),
     status: "running",
     activeAttemptId: null,
+    providerThreadId: ProviderThreadId.make("provider-thread"),
     ordinal: 1,
     startedAt: DateTime.makeUnsafe(-3_600_000),
   } as OrchestrationV2Run;
@@ -103,6 +113,14 @@ const makeHarness = Effect.gen(function* () {
                   projection = { ...projection, runs: [run] };
                   return { run } as never;
                 }),
+              getDelegatedRetryCheck: (input) =>
+                retryLookup?.(input) ??
+                Effect.succeed(
+                  Effect.gen(function* () {
+                    retryChecks.push(DateTime.toEpochMillis(yield* DateTime.now));
+                    return stopForRetry;
+                  }),
+                ),
               interruptThread: (input) =>
                 Effect.gen(function* () {
                   if (interruptRace !== undefined) {
@@ -235,8 +253,8 @@ const makeHarness = Effect.gen(function* () {
     projectItems: (items: ReadonlyArray<OrchestrationV2TurnItem>) => {
       projection = { ...projection, turnItems: items };
     },
-    enableCodex: () => {
-      const instanceId = ProviderInstanceId.make("codex");
+    enableProvider: (driver: "codex" | "claudeAgent" = "codex") => {
+      const instanceId = ProviderInstanceId.make(driver);
       const providerThreadId = ProviderThreadId.make("provider-child");
       run = {
         ...run,
@@ -245,14 +263,14 @@ const makeHarness = Effect.gen(function* () {
         userMessageId: MessageId.make("original"),
         modelSelection: {
           instanceId,
-          model: "gpt-6.1-sol",
-          options: [{ id: "reasoningEffort", value: "max" }],
+          model: driver === "codex" ? "gpt-6.1-sol" : "claude-sonnet-5-5",
+          options: [{ id: driver === "codex" ? "reasoningEffort" : "effort", value: "max" }],
         },
       };
       projection = {
         ...projection,
         runs: [run],
-        providerThreads: [{ id: providerThreadId, driver: "codex" }],
+        providerThreads: [{ id: providerThreadId, driver }],
         messages: [
           {
             id: run.userMessageId,
@@ -263,6 +281,37 @@ const makeHarness = Effect.gen(function* () {
           },
         ],
       } as unknown as OrchestrationV2ThreadProjection;
+    },
+    retryChecks,
+    markNetworkRecovery: () => {
+      run = {
+        ...run,
+        transientRecovery: {
+          since: DateTime.formatIso(now),
+          firstError: {
+            class: "transport_error",
+            code: "claude_network_error",
+            category: "transient",
+            retryable: true,
+            message: "Connection dropped (ECONNRESET)",
+          },
+        },
+      };
+      projection = { ...projection, runs: [run] };
+    },
+    useRetryLookup: (
+      lookup: NonNullable<Threads.ThreadManagementServiceShape["getDelegatedRetryCheck"]>,
+    ) => {
+      retryLookup = lookup;
+    },
+    resumeAttempt: (status: OrchestrationV2Run["status"] = "running") =>
+      Effect.gen(function* () {
+        run = { ...run, status, activeAttemptId: RunAttemptId.make("resumed") };
+        projection = { ...projection, runs: [run] };
+        yield* send({ type: "run.updated", payload: run });
+      }),
+    stopForRetry: () => {
+      stopForRetry = true;
     },
     start,
     item,
@@ -293,7 +342,7 @@ describe("DelegatedTaskProgressGuard", () => {
   it.effect("a failed original-prompt read does not disable later recovery", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness;
-      h.enableCodex();
+      h.enableProvider();
       yield* h.start(60_000);
       yield* TestClock.adjust("1 minute");
       h.failNextPromptRead();
@@ -303,6 +352,38 @@ describe("DelegatedTaskProgressGuard", () => {
       yield* h.guard.check();
       assert.lengthOf(h.recoveries, 1);
       assert.equal(h.recoveries[0]!.text, "Review this patch");
+      assert.lengthOf(h.analytics, 1);
+    }),
+  );
+
+  it.effect("a no-progress guard row includes active retry context", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      yield* h.start(60000);
+      const retryItem = {
+        id: TurnItemId.make("retry"),
+        runId,
+        type: "error",
+        status: "running",
+        ordinal: 2,
+        retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 1000 },
+        failure: {
+          class: "transport_error",
+          code: null,
+          message: "Request timed out.",
+          retryable: true,
+        },
+      } as OrchestrationV2TurnItem;
+      h.projectItems([retryItem]);
+      yield* TestClock.adjust("1 minute");
+      yield* h.guard.check();
+      assert.lengthOf(h.analytics, 1);
+      assert.equal(h.analytics[0]!.props?.attempt, 2);
+      assert.equal(h.analytics[0]!.props?.maxRetries, 10);
+      assert.equal(h.analytics[0]!.props?.errorMessage, "Request timed out.");
+      assert.equal(h.analytics[0]!.props?.waitSinceResponseMs, 60000);
+      assert.isTrue(h.analytics[0]!.props?.guardFiredDuringRetry);
+      yield* h.guard.check();
       assert.lengthOf(h.analytics, 1);
     }),
   );
@@ -355,7 +436,7 @@ describe("DelegatedTaskProgressGuard", () => {
     (phase) =>
       Effect.gen(function* () {
         const h = yield* makeHarness;
-        h.enableCodex();
+        h.enableProvider();
         yield* h.start(60_000);
         if (phase === "post_tool") yield* h.item("dynamic_tool", "completed");
         if (phase === "mid_turn") yield* h.item("reasoning");
@@ -609,6 +690,7 @@ describe("DelegatedTaskProgressGuard", () => {
       assert.lengthOf(h.stops, 0);
       yield* TestClock.adjust("1 second");
       assert.lengthOf(h.stops, 1);
+      assert.equal(h.analytics[0]!.props?.waitSinceResponseMs, 60_000);
     }),
   );
   it.effect("time queued before the first provider start does not consume the idle budget", () =>
@@ -708,6 +790,55 @@ describe("DelegatedTaskProgressGuard", () => {
       assert.lengthOf(h.stops, 1);
     }),
   );
+  it.effect.each([600_000, 120_000])(
+    "fails a silent foreground command after timeout %s plus grace",
+    (timeoutMs) =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness;
+        yield* h.start();
+        const item = {
+          id: TurnItemId.make("bounded-bash"),
+          runId,
+          type: "command_execution",
+          input: "offbox wait run-proof --timeout 570",
+          timeoutMs,
+          status: "running",
+          startedAt: h.now,
+          updatedAt: h.now,
+        } as OrchestrationV2TurnItem;
+        h.projectItems([item]);
+        yield* h.send({ type: "turn-item.updated", payload: item });
+        yield* TestClock.adjust(timeoutMs + 59_999);
+        yield* h.guard.check();
+        assert.lengthOf(h.stops, 0);
+        yield* TestClock.adjust(1);
+        yield* h.guard.check();
+        assert.lengthOf(h.stops, 1);
+        assert.equal(h.stops[0]!.delegatedTaskStall!.lastProgressKind, "command_execution_timeout");
+        assert.include(h.stops[0]!.reason!, "tool timeout plus 60 s grace");
+        assert.lengthOf(h.recoveries, 0);
+      }),
+  );
+  it.effect("explicit background commands remain exempt", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      yield* h.start();
+      const item = {
+        id: TurnItemId.make("background"),
+        runId,
+        type: "command_execution",
+        timeoutMs: 0,
+        status: "running",
+        startedAt: h.now,
+        updatedAt: h.now,
+      } as OrchestrationV2TurnItem;
+      h.projectItems([item]);
+      yield* h.send({ type: "turn-item.updated", payload: item });
+      yield* TestClock.adjust("2 hours");
+      yield* h.guard.check();
+      assert.lengthOf(h.stops, 0);
+    }),
+  );
   it.effect("text and tools reset the clock", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness;
@@ -780,4 +911,322 @@ describe("DelegatedTaskProgressGuard", () => {
       "Partial assistant result:\nPartial text",
     );
   });
+});
+
+it.effect(
+  "checks no-response before the longer progress deadline and does not replace its failure",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      yield* h.start();
+      yield* TestClock.adjust("5 minutes");
+      h.stopForRetry();
+      yield* h.guard.check();
+      assert.lengthOf(h.retryChecks, 1);
+      assert.lengthOf(h.stops, 0);
+    }),
+);
+
+it.effect("a five-minute cutoff stays fenced through the fifteen-minute scan", () =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness;
+    h.enableProvider("claudeAgent");
+    let interrupts = 0;
+    let checks = 0;
+    h.useRetryLookup(() =>
+      Effect.succeed(
+        Effect.sync(() => {
+          if (++checks !== 1) return false;
+          interrupts++;
+          return true;
+        }),
+      ),
+    );
+    yield* h.start();
+    yield* TestClock.adjust("5 minutes");
+    yield* h.guard.check();
+    yield* TestClock.adjust("10 minutes");
+    yield* h.guard.check();
+    assert.equal(interrupts, 1);
+    assert.lengthOf(h.stops, 0);
+    assert.lengthOf(h.recoveries, 0);
+    yield* h.resumeAttempt();
+    yield* h.guard.check();
+    assert.equal(checks, 2);
+    assert.equal(interrupts, 1);
+    assert.lengthOf(h.stops, 0);
+    assert.lengthOf(h.recoveries, 0);
+  }),
+);
+
+it.effect.each(["first_event", "post_tool"] as const)(
+  "the silent restart does not recover Claude in %s",
+  (phase) =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      h.enableProvider("claudeAgent");
+      yield* h.start(60_000);
+      if (phase === "post_tool") yield* h.item("dynamic_tool", "completed");
+      yield* TestClock.adjust("1 minute");
+      yield* h.guard.check();
+      assert.lengthOf(h.recoveries, 0);
+      assert.lengthOf(h.stops, 1);
+    }),
+);
+
+it.effect("an old health result cannot fence the resumed attempt", () =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness;
+    const entered = yield* Deferred.make<void>();
+    const released = yield* Deferred.make<void>();
+    let checks = 0;
+    h.useRetryLookup(() =>
+      Effect.succeed(
+        Effect.gen(function* () {
+          if (++checks !== 1) return false;
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(released);
+          return true;
+        }),
+      ),
+    );
+    yield* h.start();
+    const checking = yield* h.guard.check().pipe(Effect.forkScoped);
+    yield* Deferred.await(entered);
+    yield* h.resumeAttempt();
+    yield* Deferred.succeed(released, undefined);
+    yield* Fiber.join(checking);
+    yield* h.guard.check();
+    assert.equal(checks, 2);
+    assert.lengthOf(h.stops, 0);
+  }),
+);
+
+it.effect("waiting to start a resumed attempt does not consume its progress budget", () =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness;
+    yield* h.start();
+    yield* h.resumeAttempt("starting");
+    yield* TestClock.adjust("16 minutes");
+    yield* h.guard.check();
+    assert.lengthOf(h.stops, 0);
+    yield* h.resumeAttempt();
+    yield* h.guard.check();
+    assert.lengthOf(h.stops, 0);
+    yield* TestClock.adjust("15 minutes");
+    yield* h.guard.check();
+    assert.lengthOf(h.stops, 1);
+  }),
+);
+
+it.effect.each(["first_event", "post_tool"] as const)(
+  "a previous network recovery consumes the silent restart in %s",
+  (phase) =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      h.enableProvider();
+      h.markNetworkRecovery();
+      yield* h.start(60_000);
+      if (phase === "post_tool") yield* h.item("dynamic_tool", "completed");
+      yield* TestClock.adjust("1 minute");
+      yield* h.guard.check();
+      assert.lengthOf(h.recoveries, 0);
+      assert.lengthOf(h.stops, 1);
+      assert.equal(h.analytics[0]?.props?.reasonClass, "recovery_exhausted");
+    }),
+);
+
+it.effect.each(["attempt", "session", "run", "blocker"] as const)(
+  "does not cache a retry lookup invalidated by a changed %s",
+  (change) =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const checks: number[] = [];
+      let lookups = 0;
+      h.useRetryLookup(() =>
+        Effect.gen(function* () {
+          const lookup = ++lookups;
+          if (lookup === 1) {
+            yield* Deferred.succeed(started, undefined);
+            yield* Deferred.await(release);
+          }
+          return Effect.sync(() => {
+            checks.push(lookup);
+            return false;
+          });
+        }),
+      );
+      yield* h.start();
+      const checking = yield* h.guard.check().pipe(Effect.forkChild);
+      yield* Deferred.await(started);
+      if (change === "attempt") yield* h.resumeAttempt();
+      else if (change === "session")
+        yield* h.send({
+          type: "provider-thread.updated",
+          payload: {
+            id: ProviderThreadId.make("provider-thread"),
+            providerSessionId: ProviderSessionId.make("new-session"),
+          },
+        } as never);
+      else if (change === "run") yield* h.followup();
+      else yield* h.item("command_execution");
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(checking);
+      assert.deepEqual(checks, []);
+      if (change === "blocker") yield* h.item("command_execution", "completed");
+      yield* h.guard.check();
+      yield* h.guard.check();
+      assert.equal(lookups, 2);
+      assert.deepEqual(checks, [2, 2]);
+    }),
+);
+
+it.effect("slow settlements do not serialize sibling cutoffs or repeat an in-flight check", () =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness;
+    const entered = yield* Deferred.make<void>();
+    const released = yield* Deferred.make<void>();
+    const checked = new Set<string>();
+    h.useRetryLookup((input) =>
+      Effect.succeed(
+        Effect.gen(function* () {
+          assert.isFalse(checked.has(input.threadId));
+          checked.add(input.threadId);
+          if (checked.size === 31) yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(released);
+          return true;
+        }),
+      ),
+    );
+    yield* h.start();
+    for (let i = 1; i < 31; i++)
+      yield* h.guard.handle({
+        id: EventId.make(`run-${i}`),
+        type: "run.updated",
+        threadId: ThreadId.make(`child-${i}`),
+        occurredAt: yield* DateTime.now,
+        payload: {
+          id: RunId.make(`run-${i}`),
+          delegatedTaskId: NodeId.make(`task-${i}`),
+          status: "running",
+          activeAttemptId: null,
+          ordinal: 1,
+        },
+      } as OrchestrationV2DomainEvent);
+    yield* TestClock.adjust("5 minutes");
+    const first = yield* h.guard.check().pipe(Effect.forkScoped);
+    yield* Deferred.await(entered);
+    yield* h.guard.check();
+    assert.equal(checked.size, 31);
+    assert.lengthOf(h.stops, 0);
+    yield* Deferred.succeed(released, undefined);
+    yield* Fiber.join(first);
+  }),
+);
+
+it.effect("keeps ticking while an older child's settlement is pending", () =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness;
+    const entered = yield* Deferred.make<void>();
+    const released = yield* Deferred.make<void>();
+    const laterChecked = yield* Deferred.make<void>();
+    let pendingCalls = 0;
+    h.useRetryLookup((input) =>
+      Effect.succeed(
+        Effect.gen(function* () {
+          if (input.threadId === threadId) {
+            pendingCalls++;
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(released);
+          } else yield* Deferred.succeed(laterChecked, undefined);
+          return true;
+        }),
+      ),
+    );
+    yield* h.start();
+    yield* h.guard.start();
+    yield* TestClock.adjust("1 second");
+    yield* Deferred.await(entered);
+    yield* h.guard.handle({
+      id: EventId.make("later-run"),
+      type: "run.updated",
+      threadId: ThreadId.make("later-child"),
+      occurredAt: yield* DateTime.now,
+      payload: {
+        id: RunId.make("later-run"),
+        delegatedTaskId: NodeId.make("later-task"),
+        status: "running",
+        activeAttemptId: null,
+        ordinal: 1,
+      },
+    } as OrchestrationV2DomainEvent);
+    yield* TestClock.adjust("1 second");
+    yield* Deferred.await(laterChecked);
+    assert.equal(pendingCalls, 1);
+    yield* Deferred.succeed(released, undefined);
+  }),
+);
+
+it.each([
+  {
+    name: "declared foreground timeout",
+    timeoutMs: 120_000,
+    driver: "claudeAgent",
+    at: 180_000,
+    blocked: false,
+  },
+  { name: "grace period", timeoutMs: 120_000, driver: "claudeAgent", at: 179_999, blocked: true },
+  { name: "legacy Claude timeout", driver: "claudeAgent", at: 660_000, blocked: false },
+  { name: "legacy Claude grace", driver: "claudeAgent", at: 659_999, blocked: true },
+  {
+    name: "explicit background",
+    timeoutMs: 0,
+    driver: "claudeAgent",
+    at: 7_200_000,
+    blocked: true,
+  },
+  { name: "unbounded other provider", driver: "codex", at: 7_200_000, blocked: true },
+  {
+    name: "fresh output extends grace",
+    timeoutMs: 120_000,
+    driver: "claudeAgent",
+    updated: 180_000,
+    at: 200_000,
+    blocked: true,
+  },
+  {
+    name: "stale output expires",
+    timeoutMs: 120_000,
+    driver: "claudeAgent",
+    updated: 180_000,
+    at: 240_000,
+    blocked: false,
+  },
+  {
+    name: "approval still pending",
+    timeoutMs: 120_000,
+    driver: "claudeAgent",
+    at: 660_000,
+    pending: true,
+    blocked: true,
+  },
+])("stall fencing: $name", ({ timeoutMs, driver, at, updated, pending, blocked }) => {
+  const item = {
+    id: TurnItemId.make("command"),
+    runId,
+    type: "command_execution",
+    status: "running",
+    timeoutMs,
+    startedAt: DateTime.makeUnsafe(0),
+    updatedAt: DateTime.makeUnsafe(updated ?? 0),
+    nativeItemRef: { driver, nativeId: "bash", strength: "strong" },
+  } as OrchestrationV2TurnItem;
+  const projection = {
+    turnItems: [item],
+    messages: [],
+    runtimeRequests: pending ? [{ status: "pending" }] : [],
+  } as unknown as OrchestrationV2ThreadProjection;
+  assert.equal(progressBlockers(projection, runId, at), blocked);
 });

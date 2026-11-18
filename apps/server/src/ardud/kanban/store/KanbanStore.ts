@@ -34,6 +34,7 @@ import {
 } from "@t3tools/contracts";
 
 import { makeDecodeCache } from "./decodeCache.ts";
+import { backfillRelease12 } from "./releaseBackfill.ts";
 import { SummaryCard } from "./summaryCard.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import { initializeKanbanSchema } from "../../persistence/kanbanSchema.ts";
@@ -47,6 +48,14 @@ export class KanbanStoreError extends Schema.TaggedError<KanbanStoreError>()("Ka
     return `Missions board storage failed during ${this.operation}.`;
   }
 }
+
+export class KanbanJsonTooLarge extends Schema.TaggedError<KanbanJsonTooLarge>()(
+  "KanbanJsonTooLarge",
+  { table: Schema.String, id: Schema.String, bytes: Schema.Number, limit: Schema.Number },
+) {}
+
+// Bound UTF-8 transferred from SQLite before a worker creates the JS strings.
+const JSON_CHUNK_BYTES = 4 * 1024 * 1024;
 
 const codec = <S extends Schema.Top>(schema: S) => {
   const json = Schema.fromJsonString(schema);
@@ -108,6 +117,10 @@ interface KeyedVersionRow extends EntityVersionRow {
   readonly board_id: string;
 }
 interface KeyedJsonRow extends KeyedVersionRow, JsonRow {}
+interface GuardedJsonRow extends KeyedVersionRow {
+  readonly json: string | null;
+  readonly json_bytes: number;
+}
 interface IdJsonRow extends JsonRow {
   readonly id: number;
 }
@@ -160,6 +173,7 @@ export interface DecodeCacheStats {
   readonly misses: number;
   readonly evictions: number;
   readonly entries: number;
+  readonly sourceBytes: number;
 }
 
 export interface KanbanStoreShape {
@@ -289,6 +303,10 @@ export interface KanbanStoreShape {
     boardId: KanbanBoardId,
     cardIds: ReadonlyArray<KanbanCardId>,
     beforeId: number,
+  ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
+  /** Latest event on each unsettled completed/deployed card, using the card-event index. */
+  readonly evaluatorStepEvents: (
+    boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
   readonly activityHistory: (
     boardId: KanbanBoardId,
@@ -466,6 +484,7 @@ export interface KanbanStoreShape {
   /** Cards a work thread has carried, in the order it took them. */
   readonly threadCards: (
     threadId: string,
+    options?: { readonly before?: string },
   ) => Effect.Effect<ReadonlyArray<KanbanCardId>, KanbanStoreError>;
 }
 
@@ -499,6 +518,10 @@ const make = Effect.gen(function* () {
     initializeKanbanSchema(sql).pipe(Effect.andThen(ensureKanbanCacheVersions(sql))),
   ).pipe(Effect.mapError(fail("create tables")));
 
+  yield* BoardsDatabase.onReady(
+    backfillRelease12(sql).pipe(Effect.mapError(fail("backfill release ledger"))),
+  );
+
   const callerWrites = Context.Reference<Array<() => void> | undefined>("KanbanCallerWrites", {
     defaultValue: () => undefined,
   });
@@ -506,7 +529,12 @@ const make = Effect.gen(function* () {
   // metadata only after that enclosing operation succeeds, including bulk writes.
   const observeCallerWrites: KanbanStoreShape["observeCallerWrites"] = Effect.fnUntraced(
     function* (effect) {
-      if ((yield* callerWrites) !== undefined) return yield* effect;
+      const pending = yield* callerWrites;
+      if (pending !== undefined) {
+        const start = pending.length;
+        // A caught savepoint failure must not publish its rolled-back metadata at the outer commit.
+        return yield* effect.pipe(Effect.onError(() => Effect.sync(() => pending.splice(start))));
+      }
       const updates: Array<() => void> = [];
       const parent = yield* NodeSqliteClient.TransactionCommitObserver;
       const apply = () => {
@@ -634,8 +662,9 @@ const make = Effect.gen(function* () {
   const jsonFetchCounters = Context.Reference<{
     jsonRowsFetched: number;
     jsonBytesFetched: number;
+    maxJsonChunkBytes: number;
   }>("KanbanJsonFetchCounters", {
-    defaultValue: () => ({ jsonRowsFetched: 0, jsonBytesFetched: 0 }),
+    defaultValue: () => ({ jsonRowsFetched: 0, jsonBytesFetched: 0, maxJsonChunkBytes: 0 }),
   });
 
   // Observers exist only while a dispatch pass is alive; no card data or
@@ -674,7 +703,11 @@ const make = Effect.gen(function* () {
   const poolKey = (row: KeyedVersionRow) => JSON.stringify([row.board_id, row.id]);
   const decoders = {
     board: cached("board", Board.decode, rowKey),
-    card: cached("card", Card.decode, rowKey),
+    // The live open-card working set charges about 176 MiB at json.length * 2.
+    card: makeDecodeCache("card", Card.decode, rowKey, readCounters, {
+      maxEntries: 8_192,
+      maxBytes: 320 * 1024 * 1024,
+    }),
     feed: cached("feed", Card.decode, rowKey),
     scheduling: cached("scheduling", SchedulingCard.decode, rowKey),
     summary: cached("summary", Summary.decode, rowKey),
@@ -752,6 +785,7 @@ const make = Effect.gen(function* () {
       ) => Effect.Effect<A, E>;
     },
     reconcile?: (rows: ReadonlyArray<KeyedVersionRow>) => Effect.Effect<void>,
+    oversized: "skip" | "fail" = "skip",
   ) {
     // Check before our read transaction: caller-owned transactions must neither
     // consume nor publish shared revisions, since rollback can reuse a version.
@@ -763,6 +797,7 @@ const make = Effect.gen(function* () {
         const counters = yield* readCounters;
         const counts = (counters[decoder.name] ??= { hits: 0, misses: 0, evictions: 0 });
         const values = new Map<string, A>();
+        const skipped = new Set<string>();
         const missing: string[] = [];
         for (const row of rows) {
           const hit = decoder.lookup(row, counts, shared);
@@ -770,14 +805,57 @@ const make = Effect.gen(function* () {
           else values.set(row.id, hit.value);
         }
         for (let offset = 0; offset < missing.length; offset += 128) {
-          const ids = missing.slice(offset, offset + 128);
-          const fetched = yield* sql<KeyedJsonRow>`
-          SELECT id, board_id, cache_version, json FROM ${sql(table)} WHERE ${sql.in("id", ids)}
-        `;
-          const decoded = yield* decodeAll(fetched, decoder, shared);
-          for (let i = 0; i < fetched.length; i++) values.set(fetched[i]!.id, decoded[i]!);
+          let ids = missing.slice(offset, offset + 128);
+          while (ids.length > 0) {
+            // The materialized CTE contains lengths only. CASE avoids reading TEXT
+            // into V8 for rows past this reply's byte budget, including one huge row.
+            const page = yield* sql<GuardedJsonRow>`
+              WITH sizes AS MATERIALIZED (
+                SELECT id, board_id, cache_version, length(CAST(json AS BLOB)) AS json_bytes
+                FROM ${sql(table)} WHERE ${sql.in("id", ids)}
+              ), page AS (
+                SELECT *, sum(json_bytes) OVER (ORDER BY id) AS page_bytes FROM sizes
+              )
+              SELECT id, board_id, cache_version, json_bytes,
+                CASE WHEN page_bytes <= ${JSON_CHUNK_BYTES} THEN
+                  (SELECT json FROM ${sql(table)} AS source WHERE source.id = page.id)
+                END AS json
+              FROM page ORDER BY id
+            `;
+            const fetched: KeyedJsonRow[] = [];
+            const deferred: string[] = [];
+            let bytes = 0;
+            for (const row of page) {
+              if (row.json === null) {
+                if (row.json_bytes > JSON_CHUNK_BYTES) {
+                  const error = new KanbanJsonTooLarge({
+                    table,
+                    id: row.id,
+                    bytes: row.json_bytes,
+                    limit: JSON_CHUNK_BYTES,
+                  });
+                  if (oversized === "fail") return yield* Effect.fail(error);
+                  skipped.add(row.id);
+                  yield* Effect.logWarning("Kanban JSON row exceeds hydration limit; skipped", {
+                    table,
+                    id: row.id,
+                    bytes: row.json_bytes,
+                    limit: JSON_CHUNK_BYTES,
+                  });
+                } else deferred.push(row.id);
+              } else {
+                fetched.push({ ...row, json: row.json });
+                bytes += row.json_bytes;
+              }
+            }
+            const counters = yield* jsonFetchCounters;
+            counters.maxJsonChunkBytes = Math.max(counters.maxJsonChunkBytes, bytes);
+            const decoded = yield* decodeAll(fetched, decoder, shared);
+            for (let i = 0; i < fetched.length; i++) values.set(fetched[i]!.id, decoded[i]!);
+            ids = deferred;
+          }
         }
-        return rows.map((row) => values.get(row.id)!);
+        return rows.filter((row) => !skipped.has(row.id)).map((row) => values.get(row.id)!);
       }),
     );
   });
@@ -785,37 +863,44 @@ const make = Effect.gen(function* () {
   const first = <A>(items: ReadonlyArray<A>): A | null => items[0] ?? null;
 
   const run = <A, E>(operation: string, effect: Effect.Effect<A, E>) =>
-    effect.pipe(Effect.mapError(fail(operation)));
+    effect.pipe(Effect.provideService(SavedWrite.writing, true), Effect.mapError(fail(operation)));
 
   // Reads inside a write transaction stay on the writer for read-your-writes.
   const runRead = <A, E>(operation: string, effect: Effect.Effect<A, E>) =>
-    run(
-      operation,
-      Effect.suspend(() => {
-        const counters: Record<string, { hits: number; misses: number; evictions: number }> = {};
-        const fetched = { jsonRowsFetched: 0, jsonBytesFetched: 0 };
-        return SavedWrite.stage(NodeSqliteClient.readOnly(effect), "read").pipe(
-          Effect.provideService(readCounters, counters),
-          Effect.provideService(jsonFetchCounters, fetched),
-          Effect.ensuring(
-            Effect.suspend(() =>
-              Effect.annotateCurrentSpan({
-                ...fetched,
-                ...Object.fromEntries(
-                  Object.entries(counters).flatMap(([name, counts]) =>
-                    Object.entries(counts).map(([kind, count]) => [
-                      `kanban.decode.${name}.${kind}`,
-                      count,
-                    ]),
-                  ),
+    Effect.suspend(() => {
+      const counters: Record<string, { hits: number; misses: number; evictions: number }> = {};
+      const fetched = { jsonRowsFetched: 0, jsonBytesFetched: 0, maxJsonChunkBytes: 0 };
+      return SavedWrite.stage(
+        Effect.gen(function* () {
+          // A SELECT within a mutation or an existing transaction must not open
+          // an interruptible timeout child or borrow a background reader.
+          const transaction = yield* Effect.serviceOption(sql.transactionService);
+          return yield* (yield* SavedWrite.writing) || transaction._tag === "Some"
+            ? effect
+            : SavedWrite.read(NodeSqliteClient.readOnly(effect));
+        }),
+        "read",
+      ).pipe(
+        Effect.provideService(readCounters, counters),
+        Effect.provideService(jsonFetchCounters, fetched),
+        Effect.ensuring(
+          Effect.suspend(() =>
+            Effect.annotateCurrentSpan({
+              ...fetched,
+              ...Object.fromEntries(
+                Object.entries(counters).flatMap(([name, counts]) =>
+                  Object.entries(counts).map(([kind, count]) => [
+                    `kanban.decode.${name}.${kind}`,
+                    count,
+                  ]),
                 ),
-              }),
-            ),
+              ),
+            }),
           ),
-          Effect.withSpan("KanbanStore.read", { attributes: { "kanban.operation": operation } }),
-        );
-      }),
-    );
+        ),
+        Effect.withSpan("KanbanStore.read", { attributes: { "kanban.operation": operation } }),
+      );
+    }).pipe(Effect.mapError(fail(operation)));
 
   const boards = runRead(
     "read boards",
@@ -1048,12 +1133,32 @@ const make = Effect.gen(function* () {
     runRead(
       "read card page",
       readCollection(
-        sql<KeyedVersionRow>`
-          SELECT id, board_id, cache_version, number FROM ardud_kanban_cards
-          WHERE board_id = ${boardId} AND number > ${page.after}
-            ${page.open ? sql`AND json_extract(json, '$.settledAt') IS NULL` : sql``}
-          ORDER BY number LIMIT ${page.limit}
-        `,
+        Effect.gen(function* () {
+          // Exclude oversized rows before LIMIT, so an empty degraded page cannot
+          // hide the good cards after it or prevent a caller's cursor advancing.
+          const rows = yield* sql<KeyedVersionRow & { readonly number: number }>`
+            SELECT id, board_id, cache_version, number FROM ardud_kanban_cards
+            WHERE board_id = ${boardId} AND number > ${page.after}
+              ${page.open ? sql`AND json_extract(json, '$.settledAt') IS NULL` : sql``}
+              AND length(CAST(json AS BLOB)) <= ${JSON_CHUNK_BYTES}
+            ORDER BY number LIMIT ${page.limit}
+          `;
+          const skipped = yield* sql<{ readonly id: string; readonly bytes: number }>`
+            SELECT id, length(CAST(json AS BLOB)) AS bytes FROM ardud_kanban_cards
+            WHERE board_id = ${boardId} AND number > ${page.after}
+              ${rows.length === page.limit ? sql`AND number <= ${rows.at(-1)!.number}` : sql``}
+              ${page.open ? sql`AND json_extract(json, '$.settledAt') IS NULL` : sql``}
+              AND length(CAST(json AS BLOB)) > ${JSON_CHUNK_BYTES}
+          `;
+          for (const row of skipped)
+            yield* Effect.logWarning("Kanban JSON row exceeds hydration limit; skipped", {
+              table: "ardud_kanban_cards",
+              id: row.id,
+              bytes: row.bytes,
+              limit: JSON_CHUNK_BYTES,
+            });
+          return rows;
+        }),
         "ardud_kanban_cards",
         decoders.card,
       ),
@@ -1105,22 +1210,34 @@ const make = Effect.gen(function* () {
     runRead(
       "read card",
       Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json FROM ardud_kanban_cards WHERE id = ${cardId}`,
-        (rows) =>
+        readCollection(
+          sql<KeyedVersionRow>`SELECT id, board_id, cache_version FROM ardud_kanban_cards WHERE id = ${cardId}`,
+          "ardud_kanban_cards",
+          decoders.card,
+          undefined,
+          "fail",
+        ),
+        (cards) =>
           Effect.gen(function* () {
-            if (rows.length === 0)
+            if (cards.length === 0)
               for (const decoder of [decoders.card, decoders.feed, decoders.summary])
                 yield* decoder.drop(cardId);
-            return first(yield* decodeAll(rows, decoders.card));
+            return first(cards);
           }),
       ),
     );
   const cardByNumber = (boardId: KanbanBoardId, number: number) =>
     runRead(
       "read card by number",
-      Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json FROM ardud_kanban_cards WHERE board_id = ${boardId} AND number = ${number}`,
-        (rows) => Effect.map(decodeAll(rows, decoders.card), first),
+      Effect.map(
+        readCollection(
+          sql<KeyedVersionRow>`SELECT id, board_id, cache_version FROM ardud_kanban_cards WHERE board_id = ${boardId} AND number = ${number}`,
+          "ardud_kanban_cards",
+          decoders.card,
+          undefined,
+          "fail",
+        ),
+        first,
       ),
     );
   const schedulingCards = (boardId: KanbanBoardId) =>
@@ -1202,6 +1319,7 @@ const make = Effect.gen(function* () {
         decoders.card,
       ),
     );
+  // Keep allocation on the writer, with the SELECT budget outside run's write marker.
   const nextCardNumber = (boardId: KanbanBoardId) =>
     run(
       "next card number",
@@ -1211,7 +1329,7 @@ const make = Effect.gen(function* () {
         `,
         (rows) => Number(rows[0]?.next ?? 1),
       ),
-    );
+    ).pipe(SavedWrite.read);
   const saveCard = (value: KanbanCard, before?: KanbanCard) =>
     run(
       "write card",
@@ -1391,6 +1509,28 @@ const make = Effect.gen(function* () {
             AND c.board_id = ${boardId}
           ORDER BY e.id
         `,
+        (rows) =>
+          Effect.forEach(rows, (row) =>
+            Effect.map(
+              CardEvent.decode(row.json),
+              (event) => ({ ...event, id: Number(row.id) }) as KanbanCardEvent,
+            ),
+          ),
+      ),
+    );
+
+  const evaluatorStepEvents: KanbanStoreShape["evaluatorStepEvents"] = (boardId) =>
+    runRead(
+      "read evaluator step events",
+      Effect.flatMap(
+        sql<IdJsonRow>`
+        SELECT e.id, e.json FROM ardud_kanban_cards c
+        JOIN ardud_kanban_card_events e ON e.id = (
+          SELECT MAX(id) FROM ardud_kanban_card_events INDEXED BY ardud_kanban_card_events_card WHERE card_id = c.id
+        )
+        WHERE c.board_id = ${boardId} AND c.stage IN ('completed', 'deployed')
+          AND json_extract(c.json, '$.settledAt') IS NULL
+      `,
         (rows) =>
           Effect.forEach(rows, (row) =>
             Effect.map(
@@ -2069,12 +2209,13 @@ const make = Effect.gen(function* () {
         ON CONFLICT (thread_id, card_id) DO NOTHING
       `.pipe(Effect.asVoid),
     );
-  const threadCards = (threadId: string) =>
+  const threadCards = (threadId: string, options?: { readonly before?: string }) =>
     runRead(
       "read thread cards",
       Effect.map(
         sql<{ readonly card_id: string }>`
           SELECT card_id FROM ardud_kanban_thread_cards WHERE thread_id = ${threadId}
+          ${options?.before === undefined ? sql`` : sql`AND joined_at < ${options.before}`}
           ORDER BY joined_at, rowid
         `,
         (rows) => rows.map((row) => KanbanCardId.make(row.card_id)),
@@ -2135,6 +2276,7 @@ const make = Effect.gen(function* () {
     pendingInstructionApplications,
     cardEvents,
     boardEvents,
+    evaluatorStepEvents,
     activityHistory,
     lastTransitions,
     goals,

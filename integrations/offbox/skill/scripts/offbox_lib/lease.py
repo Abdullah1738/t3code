@@ -16,6 +16,7 @@ from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUS
                      SshHostKeyMismatch, file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner, write)
 from .identity import remote_dir_for
 from .home import StartWaitFailed
+import offbox_protection
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
 ARCHIVING_WAIT_S = 120
@@ -407,12 +408,95 @@ def find_lease(con, owner: str, root: str):
                        "ORDER BY last_used_at DESC LIMIT 1", (owner, root)).fetchone()
 
 
-def active_runs(con, box_id: str) -> int:
-    return con.execute("SELECT COUNT(*) FROM runs WHERE box_id=? AND (status IN ('starting','running') "
+UNCERTAIN_HOLDER_SQL = """((status IN ('infra','lost') OR (status='failed' AND
+    (error LIKE '%1006%' OR error LIKE '%websocket%' OR error LIKE '%remote process lost%')))
+    AND (process_id IS NOT NULL OR command_id IS NOT NULL)
+    AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id
+                    AND v IN ('not_admitted','fenced'))
+    AND NOT EXISTS (SELECT 1 FROM kv WHERE k='holder_gone:' || runs.run_id))"""
+BASE_RESERVED_RUN_SQL = ("status IN ('starting','running') "
+                       "OR (pulls IS NOT NULL AND pulls!='[]' AND "
+                       "(pull_state IS NULL OR pull_state IN ('pending','running')) AND "
+                       "(pull_state='running' OR NOT EXISTS (SELECT 1 FROM kv "
+                       "WHERE k='lost_confirmed:' || runs.run_id AND v='fenced' "
+                       "AND runs.status='lost' AND runs.exit_code IS NULL))) "
                        "OR EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id) "
                        "OR (status='lost' AND exit_code IS NULL AND NOT EXISTS "
-                       "(SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)))",
+                       "(SELECT 1 FROM kv WHERE k IN ('lost_confirmed:' || runs.run_id, 'holder_gone:' || runs.run_id))) "
+                       "OR 0")
+
+
+def uncertain_holder_sql():
+    # Boat has its own liveness protocol; the command_probe fence belongs to the home server.
+    return UNCERTAIN_HOLDER_SQL if api.BACKEND == 'server' else '0'
+
+
+def reserved_run_sql():
+    return BASE_RESERVED_RUN_SQL + ' OR ' + uncertain_holder_sql()
+
+
+def active_runs(con, box_id: str) -> int:
+    # Command completion can precede the pull claim, including receipts from older clients.
+    return con.execute('SELECT COUNT(*) FROM runs WHERE box_id=? AND (' + reserved_run_sql() + ')',
                        (box_id,)).fetchone()[0]
+
+
+def reconcile_holds(con, box_id):
+    """Only the server's existing receipt/process probe can release an uncertain terminal holder."""
+    # Queue progress reads use a stable SQLite snapshot. Reconcile at selection, outside that snapshot.
+    if con.in_transaction:
+        return
+    rows = con.execute('SELECT * FROM runs WHERE box_id=? AND ' + uncertain_holder_sql(),
+                       (box_id,)).fetchall()
+    for row in rows:
+        try:
+            if api.BACKEND != 'server':
+                continue
+            if not holder_gone(box_id, row['run_id']):
+                continue
+        except OffboxError:
+            continue
+        with write(con):
+            snapshot = protection(con, box_id)
+            con.execute('DELETE FROM kv WHERE k=?', ('start_unknown:' + row['run_id'],))
+            common.event_once(con, box_id, 'lease_free', json.dumps(offbox_protection.envelope(
+                'lease_free', 'server receipt/process probe confirmed holder gone', snapshot,
+                run_id=row['run_id'], holder=row['owner'])), 'holder_gone:' + row['run_id'])
+
+
+def holder_gone(box_id, run_id):
+    from urllib.parse import quote
+    result = api.call('GET', f'/sandboxes/{box_id}/protection?run_id={quote(run_id)}', timeout=5, retries=0)
+    return isinstance(result, dict) and result.get('confirmedGone') is True
+
+
+def protection(con, box_id):
+    until = pinned_until(con, box_id)
+    holds = [dict(run_id=r['run_id'], holder=r['owner'], state=r['status']) for r in con.execute(
+        'SELECT * FROM runs WHERE box_id=? AND (' + reserved_run_sql() + ')',
+        (box_id,))]
+    holds += [dict(run_id=r['run_id'], holder='checkout cleanup', state='unconfirmed') for r in con.execute(
+        'SELECT run_id FROM prune_holds WHERE box_id=?', (box_id,))]
+    return dict(pin=dict(active=until > now(), until=iso(until) if until else None,
+                         holder=kv_get(con, 'pin_owner:' + box_id)), holds=holds)
+
+
+def check_protection(con, box_id, *, override=False, reuse=False, holder=None):
+    reconcile_holds(con, box_id)
+    snapshot = protection(con, box_id)
+    reason = offbox_protection.blocked(snapshot, holder=holder, automatic=not override, override=override, reuse=reuse)
+    if reason:
+        raise PinnedLeaseError(f'{box_id} is {reason}; refusing to stop, delete or reuse it. '
+                               'Only an explicit release --override-protection can override protection', code=2)
+    return snapshot
+
+
+def remote_protection(box_id):
+    snapshot = api.box_protection(box_id)
+    if (not isinstance(snapshot, dict) or snapshot.get('ok') is not True or
+            type(snapshot.get('pin', {}).get('active')) is not bool or not isinstance(snapshot.get('holds'), list)):
+        raise OffboxError(f'{box_id}: server protection unavailable; reuse refused', code=2)
+    return snapshot
 
 
 def box_name(me: dict, repo_key: str) -> str:
@@ -420,10 +504,19 @@ def box_name(me: dict, repo_key: str) -> str:
     return f"offbox {repo_key} | {who}"
 
 
-def ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> bool:
+def ensure_ttl(box_id: str, ttl: int, s: dict | None = None, *, pin_locked=False) -> bool:
+    with (file_lock('pin-' + box_id, timeout=120) if api.BACKEND != 'server' and not pin_locked
+          else contextlib.nullcontext()):
+        return _ensure_ttl(box_id, ttl, s)
+
+
+def _ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> bool:
     """Make the boat auto-stop deadline at least `ttl` seconds away (PATCH resets it to now+ttl).
     True when the deadline is far enough already or the PATCH succeeded; False when the PATCH failed (warned)."""
     try:
+        if api.BACKEND != 'server':
+            with contextlib.closing(db()) as con:
+                ttl = max(ttl, int(pinned_until(con, box_id) - now()) + 60)
         if s and s.get("archiveAfter"):
             from .common import iso_ts
             left = (iso_ts(s["archiveAfter"]) or 0) - now()
@@ -453,15 +546,15 @@ def idle_ttl(box_id: str) -> None:
         # Grace past the reaper's limit so its stop (which archives Docker images first) usually wins over boat's ttl.
         ttl += 300
     try:
-        api.set_ttl(box_id, ttl)
+        ensure_ttl(box_id, ttl)
     except OffboxError:
         pass
 
 
 def bootstrap_fresh(box_id: str) -> None:
     """Fresh box (not from a template/base): put tool caches under $HOME so stop/fork keep them."""
-    script = ("bash -c " + shlex.quote((TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n" +
-                                     (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) +
+    fetch = (TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n"
+    script = (fetch + "bash -c " + shlex.quote(fetch + (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) +
               " || exit 1\n" + (TEMPLATES_DIR / "common-env.sh").read_text()).encode()
     p = ssh_sync.ssh(box_id, "bash -s", input=script, timeout=120)
     if p.returncode != 0:
@@ -714,12 +807,24 @@ def _check_held(box_id, remote):
     if remote and remote.get('heldRuns'):
         from . import allocation
         raise allocation.Busy(f"{box_id} is held by an unfinished command: {', '.join(remote['heldRuns'])}")
+    if api.BACKEND == 'server' and remote:
+        import offbox_protection
+        snapshot = remote.get('protection') or remote_protection(box_id)
+        reason = offbox_protection.blocked(snapshot, automatic=False, reuse=True,
+                                          holder=offbox_protection.caller().get('holder'))
+        if reason:
+            from . import allocation
+            raise allocation.Busy(f'{box_id} is {reason}')
 
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
-              since: float | None = None, stale_error: str | None = None, on_state=None) -> dict:
+              since: float | None = None, stale_error: str | None = None, on_state=None, read_budget=None, observe_state=None) -> dict:
     from . import outage, prepare
     options = {"on_state": on_state} if on_state is not None else {}
+    if observe_state is not None:
+        options["observe_state"] = observe_state
+    if read_budget is not None:
+        options["read_budget"] = read_budget
     with prepare.phase("bring_up", box_id), outage.accepted_machine():
         s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
         _check_held(box_id, s)
@@ -739,6 +844,10 @@ def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_h
 
 def refresh_box(con, box_id: str) -> None:
     """Resume and stop a stopped box: boat counts its 14-day data limit from the last stop."""
+    check_protection(con, box_id)
+    from . import unfit
+    if unfit.get(con, box_id):
+        return
     row = con.execute('SELECT note FROM leases WHERE box_id=?', (box_id,)).fetchone()
     if row and (row['note'] or '').startswith(BOX_WEDGED_NOTE):
         return
@@ -747,7 +856,7 @@ def refresh_box(con, box_id: str) -> None:
     capacity.check(con)
     _resume_confirmed(con, box_id, 600, None)
     api.wait_state(box_id, api.LIVE_STATES, timeout=60)
-    api.stop(box_id)
+    request_stop(con, box_id, 'retention refresh')
     event(con, box_id, "refresh", "resume + stop restarts boat's 14-day data limit")
 
 
@@ -968,8 +1077,18 @@ class _ResumeExpired(Exception):
 
 def _forget_expired(con, box_id: str, why: str) -> None:
     """boat deleted this stopped box's data (14 days after its stop): nothing to resume, a new box replaces it."""
+    _pin_disk_unavailable(con, box_id, why)
     forget_box(con, box_id, "lease_expired", why)
     say(f"lease {box_id} expired ({why}); starting a new box")
+
+
+def _pin_disk_unavailable(con, box_id, why):
+    if pinned_until(con, box_id) > now():
+        saved = kv_get(con, 'pin_saved:' + box_id)
+        reason = (f'{box_id}: pinned disk unavailable ({why}); ' +
+                  (f'saved snapshot {saved} requires explicit restoration' if saved else 'no saved snapshot is recorded'))
+        event(con, box_id, 'pin_restore_required', reason)
+        raise PinnedLeaseError(reason, code=2)
 
 
 class DiskTooBig(OffboxError):
@@ -1057,6 +1176,106 @@ class ResumeProvisionStalled(OffboxError):
         super().__init__(message, outage=home.may_fail_over())
 
 
+class ResumeNoProgress(ResumeProvisionStalled):
+    """A quarantined resume can yield to another healthy pool member."""
+
+
+class _ResumeWatch:
+    """Keep response diagnostics separate from progress: changing error text is not a start."""
+
+    def __init__(self, con, box_id, *, retained=False):
+        from . import home, prepare
+        self.con, self.box_id = con, box_id
+        self.home = home.active()
+        self.started = self.progress_at = time.monotonic()
+        self.seen_states = set()
+        self.changes = []
+        self.last = None
+        self.resent = False
+        self.sends = int(retained)
+        self.logged_stuck = False
+        self.paused_at = None
+        self.preparation = prepare.track_resume(self)
+
+    @contextlib.contextmanager
+    def pause(self):
+        self.paused_at = time.monotonic()
+        try:
+            yield
+        finally:
+            elapsed = time.monotonic() - self.paused_at
+            self.progress_at += elapsed
+            self.paused_at = None
+
+    def clock(self):
+        return self.paused_at if self.paused_at is not None else time.monotonic()
+
+    def sent(self):
+        self.sends += 1
+        if self.sends == 1 and not self.changes:
+            self.started = self.progress_at = time.monotonic()
+        else:
+            self.resent = True
+
+    def observe(self, state):
+        # Status responses may grow credentials in the future; retain the diagnostic fields only.
+        last = {key: state[key] for key in ('id', 'state', 'error', 'message', 'updatedAt', 'type') if key in state}
+        signature = {key: last.get(key) for key in ('state', 'error', 'message')}
+        previous = {key: (self.last or {}).get(key) for key in signature}
+        self.last = last
+        if not self.changes or signature != previous:
+            change = dict(signature, elapsed_s=round(self.clock() - self.started, 3))
+            self.changes.append(change)
+            event(self.con, self.box_id, 'resume_state', json.dumps(change, separators=(',', ':')))
+        status = state.get('state')
+        if status not in self.seen_states:
+            # A new startup phase is progress; bouncing to archived or changing an error is not.
+            if self.seen_states and status in api.STARTING_STATES + api.LIVE_STATES:
+                self.progress_at = self.clock()
+            self.seen_states.add(status)
+
+    def remaining(self):
+        self.check()
+        return max(.001, self.deadline() - self.clock())
+
+    def limit(self):
+        # Acknowledged home bring-up includes the server's bounded 30+120 s proxy retry.
+        if self.home and (self.last or {}).get('state') in api.STARTING_STATES:
+            return capacity.setting('OFFBOX_RESUME_PROVISION_SECONDS', 300, minimum=1, maximum=900)
+        return RESUME_STUCK_S
+
+    def deadline(self):
+        end = self.progress_at + self.limit()
+        return min(end, self.preparation.end) if self.preparation is not None else end
+
+    def check(self):
+        if self.home and self.clock() >= self.deadline():
+            self.stuck()
+            elapsed = self.clock() - self.started
+            raise ResumeNoProgress(
+                f'stuck resume of {self.box_id} after {elapsed:.1f}s '
+                f'({self.clock()-self.progress_at:.1f}s without progress, state={(self.last or {}).get("state", "unknown")}); '
+                f'set aside for checking; nothing ran')
+
+    def stuck(self, phase=None):
+        if self.logged_stuck:
+            return
+        self.logged_stuck = True
+        # Persist the quarantine before emitting diagnostics. Never stop/delete a potentially late resume.
+        self.con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?",
+                         ('resume_stuck: set aside for checking', self.box_id))
+        self.con.commit()
+        detail = json.dumps(dict(phase=phase, elapsed_s=round(self.clock() - self.started, 3),
+                                 no_progress_s=round(self.clock() - self.progress_at, 3),
+                                 states=self.changes, last_response=self.last, resend_sent=self.resent,
+                                 disposition='set_aside_for_checking', server_events='not_exposed'),
+                            separators=(',', ':'))
+        # event() truncates long diagnostics; this line must retain the complete response and timeline.
+        self.con.execute('INSERT INTO events VALUES (?,?,?,?)', (now(), self.box_id, 'resume_stuck', detail))
+        self.con.commit()
+        log(f'resume_stuck {self.box_id} {detail}')
+
+
 def _readiness_get(box_id, *, deadline=None):
     from . import home
     try:
@@ -1065,7 +1284,7 @@ def _readiness_get(box_id, *, deadline=None):
         return home.recover_slow_read(error, lambda end: api.get(box_id, deadline=end), box=box_id, deadline=deadline)
 
 
-def _wait_unanswered_resume(con, box_id):
+def _wait_unanswered_resume(con, box_id, watch=None):
     from . import outage, allocation
     from .pool import PoolBusyError
     seconds = capacity.setting("OFFBOX_RESUME_PROVISION_SECONDS", 300, minimum=1, maximum=900)
@@ -1084,6 +1303,8 @@ def _wait_unanswered_resume(con, box_id):
             queue_left = allocation.queue_left()
             if queue_left is not None:
                 left = min(left, queue_left)
+            if watch is not None and watch.home:
+                left = min(left, watch.remaining())
             budget_left = api.left()
             if budget_left is not None:
                 if budget_left <= 0.05:
@@ -1096,8 +1317,10 @@ def _wait_unanswered_resume(con, box_id):
                                              "nothing ran; set aside and trying a new box")
             try:
                 state = _readiness_get(box_id, deadline=time.time() + left)
-            except (api.BudgetExpired, StartWaitFailed, PoolBusyError):
+            except (api.BudgetExpired, StartWaitFailed, PoolBusyError) as error:
                 allocation.check_queue()
+                if isinstance(error, api.BudgetExpired) and watch is not None:
+                    watch.check()
                 raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
@@ -1107,6 +1330,8 @@ def _wait_unanswered_resume(con, box_id):
                 state = None
             else:
                 network_failures = 0
+                if watch is not None and state is not None:
+                    watch.observe(state)
                 if state is None or state.get('dataExpiredAt'):
                     _forget_expired(con, box_id, 'confirmed missing or expired during resume provisioning')
                     raise _ResumeExpired
@@ -1118,6 +1343,8 @@ def _wait_unanswered_resume(con, box_id):
             if failure:
                 raise failure
             pause = min(2, max(0, end - time.time()))
+            if watch is not None and watch.home:
+                pause = min(pause, watch.remaining())
             budget_left = api.left()
             if budget_left is not None:
                 pause = min(pause, max(0, budget_left))
@@ -1125,20 +1352,22 @@ def _wait_unanswered_resume(con, box_id):
 
 
 def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
-                      confirm_only: bool = False, retired: bool = False):
+                      confirm_only: bool = False, retired: bool = False, watch=None):
     from . import allocation, prepare
     allocation.check_queue()
     from . import home
     lock_wait = HOME_RESUME_LOCK_WAIT_S if home.may_fail_over() else None
     with prepare.phase("resume_confirm" if pending else "resume_request", box_id), allocation.guard(box_id, reconcile=pending, lock_wait=lock_wait):
-        return _resume_under_guard(con, box_id, ttl, size, pending, retry, confirm_only, retired)
+        return _resume_under_guard(con, box_id, ttl, size, pending, retry, confirm_only, retired, watch=watch)
 
 
 def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
-                        confirm_only: bool = False, retired: bool = False):
+                        confirm_only: bool = False, retired: bool = False, watch=None):
     if retired and not (pending and confirm_only):
         raise ValueError('retired resumes can only be observed, never sent')
     key = f"resume_unanswered:{box_id}"
+    if pending and watch is not None:
+        watch.sends = max(1, watch.sends)
 
     def mark_pending():
         con.execute("INSERT OR REPLACE INTO kv(k,v,ts) VALUES (?, ?, ?)", (key, size or "", now()))
@@ -1175,7 +1404,11 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
         network_failures = 0
         while True:
             allocation.check_queue()
+            if watch is not None and watch.home:
+                watch.check()
             left = end - time.monotonic()
+            if watch is not None and watch.home:
+                left = min(left, watch.remaining())
             from . import outage
             remaining = outage.allocation_left()
             if remaining is not None:
@@ -1191,7 +1424,9 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
                 break
             try:
                 last = _readiness_get(box_id, deadline=time.time() + left)
-            except (api.BudgetExpired, StartWaitFailed):
+            except (api.BudgetExpired, StartWaitFailed) as error:
+                if isinstance(error, api.BudgetExpired) and watch is not None:
+                    watch.check()
                 raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
@@ -1203,6 +1438,8 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
                 unreadable = True
             else:
                 network_failures = 0
+                if watch is not None and last is not None:
+                    watch.observe(last)
                 if last is None or last.get('dataExpiredAt'):
                     _forget_expired(con, box_id, 'confirmed missing or expired after unanswered resume')
                     raise _ResumeExpired
@@ -1250,7 +1487,10 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             if left <= 0:
                 break
             # Leave time for a final observation near the boundary, not a second after it.
-            time.sleep(min(1, left / 2) if retired else min(2, max(0, left - 0.05)))
+            pause = min(1, left / 2) if retired else min(2, max(0, left - 0.05))
+            if watch is not None and watch.home:
+                pause = min(pause, watch.remaining())
+            time.sleep(pause)
             if left <= 0.05:
                 break
         if queue_limited:
@@ -1275,8 +1515,13 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             raise PoolBusyError("allocation wait expired before resume; nothing ran")
         allocation.check_queue()
         mark_pending()
+        if watch is not None:
+            watch.sent()
         try:
-            api.resume(box_id, ttl, size)
+            con.execute('DELETE FROM kv WHERE k=?', ('pin_saved:' + box_id,))
+            con.commit()
+            request_ttl = max(ttl, int(pinned_until(con, box_id)-now())+60) if api.BACKEND != 'server' else ttl
+            api.resume(box_id, request_ttl, size)
         except OffboxError as e:
             if isinstance(e, api.NetworkError) or (isinstance(e, api.ApiError) and e.status in (502, 504, 520, 524)):
                 return e
@@ -1312,15 +1557,20 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
 
 
 def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, since=None, stale_error=None,
-                      skip_archiving=False):
+                      skip_archiving=False, watch=None):
+    watch = watch or _ResumeWatch(con, box_id)
+    watch.resent = watch.resent or retried
     _check_held(box_id, confirmed)
     left_stopped = bool(confirmed)
     if confirmed and confirmed.get('state') in api.STARTING_STATES:
-        _wait_unanswered_resume(con, box_id)
+        _wait_unanswered_resume(con, box_id, watch)
     sent_at = now()
 
     def check_resume(state):
         nonlocal sent_at, retried, left_stopped
+        if watch.home:
+            watch.check()
+            return
         if state.get('state') not in api.STOPPED_STATES:
             left_stopped = True
         if left_stopped or now() - sent_at < RESUME_STUCK_S:
@@ -1331,7 +1581,7 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
             if observed:
                 left_stopped = True
                 if observed.get('state') in api.STARTING_STATES:
-                    _wait_unanswered_resume(con, box_id)
+                    _wait_unanswered_resume(con, box_id, watch)
             sent_at = now()
             event(con, box_id, 'resume_resent', f'still archived after {RESUME_STUCK_S}s')
             return
@@ -1345,7 +1595,8 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
 
     from . import allocation
     try:
-        return _bring_up(box_id, since=since, stale_error=stale_error, on_state=check_resume)
+        return _bring_up(box_id, since=since, stale_error=stale_error, on_state=check_resume, observe_state=watch.observe,
+                         **({"read_budget": watch.remaining} if watch.home else {}))
     except (allocation.Busy, allocation.Fenced) as error:
         error.resume_retry_box = box_id
         raise
@@ -1355,6 +1606,7 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
     except OffboxError as e:
         if isinstance(e, common.SourceGone):
             raise
+        watch.check()
         raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
 
 
@@ -1385,6 +1637,9 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
 
 
 def _reuse_available(con, row, size, skip_archiving=False, retrying=False, before_grow=None):
+    from . import unfit
+    if not unfit.available(con, row['box_id']):
+        return None
     check_deletion(con, row['box_id'])
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
@@ -1402,6 +1657,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
         if allocation.resume_inflight(con, box_id):
             raise allocation.Busy(f"{box_id} resume is in flight; waiting for its caller")
         t = now()
+        watch = _ResumeWatch(con, box_id, retained=True)
         prior = con.execute("SELECT kind, detail FROM events WHERE box_id=? "
                             "AND kind IN ('lease_resume_from','lease_resume') ORDER BY rowid DESC LIMIT 1",
                             (box_id,)).fetchone()
@@ -1409,8 +1665,8 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
         pending_size = pending[0] if pending[0] in SIZES else None
         try:
             confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True,
-                                                  confirm_only=skip_archiving)
-            up = _bring_up_resumed(con, box_id, confirmed, retried, skip_archiving=skip_archiving)
+                                                  confirm_only=skip_archiving, watch=watch)
+            up = _bring_up_resumed(con, box_id, confirmed, retried, skip_archiving=skip_archiving, watch=watch)
         except _ResumeExpired:
             return None
         want = up.get("type") if isinstance(up, dict) else None
@@ -1457,6 +1713,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
             raise ResumeUnresolved(f"could not read {box_id} before resume; nothing ran: {error}", error) from error
         raise
     if s is None or s.get("state") in ("error", "cancelled"):
+        _pin_disk_unavailable(con, box_id, f"state={s and s.get('state')}")
         forget_box(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
     _check_held(box_id, s)
@@ -1498,7 +1755,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
         # Keep the grow intent across the pool's archiving skip, even if a smaller caller resumes next.
         con.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)", (f"resize_size:{box_id}", want, now()))
         con.commit()
-        api.stop(box_id)
+        request_stop(con, box_id, f'resize: {have} -> {want}')
         con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
         con.commit()
         event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
@@ -1551,11 +1808,12 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
         say(f"resuming stopped lease {box_id} ({want})")
         # Retain the last observed boat state across an unanswered resume and the next allocator call.
         event(con, box_id, 'lease_resume_from', st)
+        watch = _ResumeWatch(con, box_id, retained=retrying)
         def request_resume(retry=True):
             nonlocal want
             try:
                 confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S,
-                                                       want if want != s.get("type") else None, retry=retry)
+                                                       want if want != s.get("type") else None, retry=retry, watch=watch)
             except api.ApiError as e:
                 if e.api_code in api.DATA_GONE:
                     _forget_expired(con, box_id, str(e))
@@ -1572,7 +1830,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
                 say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
                 want = s.get("type")
                 try:
-                    confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, None, retry=retry)
+                    confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, None, retry=retry, watch=watch)
                 except api.ApiError as e2:
                     tb = _too_big(con, box_id, e2)
                     if tb:
@@ -1583,15 +1841,21 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
         try:
             confirmed, retried = request_resume(retry=not retrying)
             up = _bring_up_resumed(con, box_id, confirmed, retrying or retried, request_resume,
-                                  since=t, stale_error=s.get('error'), skip_archiving=skip_archiving)
+                                  since=t, stale_error=s.get('error'), skip_archiving=skip_archiving, watch=watch)
         except _ResumeExpired:
             return None
         if isinstance(up, dict) and up.get("type") in SIZES:
             want = up["type"]
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
         try:
-            _bring_up(box_id)
-        except (allocation.Busy, allocation.Fenced, api.BoxBootFailed, BoxNotReady, SshHostKeyMismatch, StartWaitFailed):
+            if st in api.STARTING_STATES:
+                watch = _ResumeWatch(con, box_id)
+                watch.observe(s)
+                _bring_up_resumed(con, box_id, None, False, watch=watch, skip_archiving=skip_archiving)
+            else:
+                _bring_up(box_id)
+        except (allocation.Busy, allocation.Fenced, api.BoxBootFailed, ResumeProvisionStalled,
+                BoxNotReady, SshHostKeyMismatch, StartWaitFailed):
             raise
         except OffboxError as e:
             raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e
@@ -1724,16 +1988,33 @@ def release_hold_if_worker_gone(con, box_id: str) -> bool:
         return False
 
 
+@offbox_protection.reasoned
+def request_stop(con, box_id, reason):
+    """Direct snapshot/resize callers still serialize their decision with keep."""
+    with file_lock('pin-' + box_id, timeout=120):
+        snapshot = check_protection(con, box_id)
+        result = api.stop(box_id)
+        event(con, box_id, 'stop', json.dumps(offbox_protection.envelope('stop', reason, snapshot)), limit=None)
+        return result
+
+
+@offbox_protection.reasoned
 def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True, locked: bool = False,
-             pin_locked: bool = False) -> bool:
+             pin_locked: bool = False, override: bool = False) -> bool:
+    with contextlib.nullcontext() if pin_locked else file_lock('pin-' + box_id, timeout=120):
+        return _stop_box(con, box_id, reason, wait, images, locked, True, override)
+
+
+def _stop_box(con, box_id, reason, wait, images, locked, pin_locked, override):
     """Stop a box. locked=True when the caller already holds 'box-<id>' (reap, release, save); then the hold is
     released with _release_locked, since the lock is not reentrant. pin_locked=True also requires 'pin-<id>'
     held, including when a 404 settles the missing lease."""
+    snapshot = check_protection(con, box_id, override=override)
     if images:
         keep_images(box_id)
     release = _release_locked if locked else release_if_confirmed
     try:
-        api.stop(box_id)
+        api.stop(box_id, **({'override': True} if override else {}))
         if wait:
             api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
     except api.ApiError as e:
@@ -1753,13 +2034,15 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
     # Clear the hold only after boat confirms the box is stopped; a stop merely accepted, or a box resumed in the
     # meantime, keeps its hold.
     release(con, box_id)
-    event(con, box_id, "stop", reason)
+    event(con, box_id, "stop", json.dumps(offbox_protection.envelope('stop', reason, snapshot, override=override)), limit=None)
     return True
 
 
-def delete_box(con, box_id: str, reason: str, *, usage: bool = True) -> bool:
+@offbox_protection.reasoned
+def delete_box(con, box_id: str, reason: str, *, usage: bool = True, override: bool = False) -> bool:
     from .spend import record_final_usage
-    with unpinned(con, box_id):
+    with file_lock('pin-' + box_id, timeout=120) if override else unpinned(con, box_id):
+        snapshot = check_protection(con, box_id, override=override)
         if usage:
             record_final_usage(con, box_id)
         ssh_sync.close_master(box_id)
@@ -1767,14 +2050,15 @@ def delete_box(con, box_id: str, reason: str, *, usage: bool = True) -> bool:
         # an explicit retry may delete this same box again, but cannot pin new work onto the doomed disk.
         kv_set(con, 'delete_pending:' + box_id, reason)
         event(con, box_id, 'delete_pending', reason)
-        d = api.delete(box_id)
+        d = api.delete(box_id, **({'override': True} if override else {}))
         op = (d.get("operation") or {}).get("id")
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
         from . import allocation
         allocation.clear_resume(con, box_id)
         con.execute("DELETE FROM kv WHERE k=?", ('delete_pending:' + box_id,))
         clear_prune_hold(con, box_id)  # deleted: no remote process survives
-        event(con, box_id, "delete", f"{reason} op={op}")
+        event(con, box_id, "delete", json.dumps(offbox_protection.envelope('delete', reason, snapshot,
+                                                                         operation=op, override=override)), limit=None)
     return True
 
 

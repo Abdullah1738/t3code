@@ -1,4 +1,8 @@
 """Narrow offline checks for filtering and no-loss cursor/outbox behavior."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import copy
 import datetime as dt
 import importlib.util
@@ -7,7 +11,6 @@ import contextlib
 import hashlib
 import io
 import json
-import os
 from pathlib import Path
 import sqlite3
 import shutil
@@ -264,7 +267,7 @@ class TriageTests(unittest.TestCase):
                 if operation == 'SEARCH': return 'OK', [b'1 2']
                 return 'OK', [(b'1 (UID 1)', b''), (b'2 (BODY[HEADER]', b'')]
             def shutdown(self): pass
-        request = {'now': 2000, 'cursor': {'validity': 1, 'uid': 0}, 'initialized_at': 1000, 'seen': [], 'rules': []}
+        request = {'credential': 'fixture', 'now': 2000, 'cursor': {'validity': 1, 'uid': 0}, 'initialized_at': 1000, 'seen': [], 'rules': []}
         before = copy.deepcopy(request)
         with patch.object(t, 'load_module', return_value=type('Mail', (), {'connect': lambda *args: FakeImap()})):
             with self.assertRaisesRegex(ValueError, 'missing UID'):
@@ -314,7 +317,7 @@ class TriageTests(unittest.TestCase):
             def shutdown(self): pass
         imap = FakeImap()
         mail = type('Mail', (), {'connect': lambda *args: imap})
-        request = {'now': 2000, 'cursor': {'validity': 7, 'uid': 999}, 'initialized_at': 1000,
+        request = {'credential': 'fixture', 'now': 2000, 'cursor': {'validity': 7, 'uid': 999}, 'initialized_at': 1000,
                    'seen': [], 'rules': []}
         with patch.object(t, 'load_module', return_value=mail):
             result = t.mail_worker('icloud', request)
@@ -330,7 +333,7 @@ class TriageTests(unittest.TestCase):
                 return 'OK', [b'']
             def shutdown(self): pass
         imap = FakeImap()
-        request = {'now': 2000, 'cursor': None, 'initialized_at': 1000, 'baseline': False,
+        request = {'credential': 'fixture', 'now': 2000, 'cursor': None, 'initialized_at': 1000, 'baseline': False,
                    'seen': [], 'rules': []}
         with patch.object(t, 'load_module', return_value=type('Mail', (), {'connect': lambda *args: imap})):
             t.mail_worker('icloud', request)
@@ -344,7 +347,7 @@ class TriageTests(unittest.TestCase):
                 if operation == 'SEARCH': return 'OK', [b'1 2 3 4']
                 return 'OK', [(f'{uid} (UID {uid})'.encode(), b'') for uid in range(1, 5)]
             def shutdown(self): pass
-        request = {'now': 2000, 'cursor': {'validity': 1, 'uid': 0}, 'initialized_at': 1000,
+        request = {'credential': 'fixture', 'now': 2000, 'cursor': {'validity': 1, 'uid': 0}, 'initialized_at': 1000,
                    'seen': [], 'rules': []}
         for error, transient in (
             (TimeoutError(), True),
@@ -394,7 +397,7 @@ class TriageTests(unittest.TestCase):
                  patch.object(t, 'collect', return_value=({}, {'gmail': 'timeout'})), patch.object(t, 'build_context', return_value={}), \
                  patch.object(t, 'classify', side_effect=TimeoutError) as model, patch('builtins.print'):
                 self.assertEqual(t.run(args), 1)
-                model.assert_called_once()
+                self.assertEqual(model.call_count, 2)
             state = t.read_json(wd / 'cursor.json')
             self.assertEqual(state['cursors']['gmail']['uid'], 8)
             self.assertEqual(state['queue'], [])
@@ -406,7 +409,7 @@ class TriageTests(unittest.TestCase):
             wd = Path(tmp)
             t.atomic(wd / 'cursor.json', {'version': 1, 'initialized_at': 1000, 'cursors': {}, 'queue': [self.item()]})
             args = types.SimpleNamespace(dry_run_hours=None, report=None)
-            # Collection took 43.5 s, so the call would have to answer by second 44: no whole second left.
+            # Collection exhausted the minimum useful classification window.
             ticks = [1000.0, 1043.5]
             def clock():
                 return ticks.pop(0) if len(ticks) > 1 else ticks[0]
@@ -418,12 +421,14 @@ class TriageTests(unittest.TestCase):
                 self.assertEqual(t.run(args), 0)
             model.assert_not_called()
             state = t.read_json(wd / 'cursor.json')
-            self.assertEqual(t.read_json(Path(state['outbox']['batch']))['hits'][0]['reason'], 'Classifier unavailable; manually review')
-        # With 6 s left the call gets a 6 s timer, not the usual 20, re-firing each second after.
-        with patch.object(t, 'classify', return_value=([], {})), patch.object(t.signal, 'setitimer') as timer:
-            t.classify_batch([self.item()], {}, 6)
-        self.assertEqual(timer.call_args_list[0].args, (t.signal.ITIMER_REAL, 6, 1))
-        self.assertEqual(timer.call_args_list[-1].args, (t.signal.ITIMER_REAL, 0))
+            self.assertNotIn('outbox', state)
+            self.assertEqual([i['id'] for i in state['queue']], ['mail:a:1:1'])
+        with patch.object(t, 'classify') as model:
+            hits, meta = t.classify_batch([self.item()], {}, 6)
+        model.assert_not_called()
+        self.assertEqual(hits, [])
+        self.assertTrue(meta['classifier_deferred'])
+        self.assertEqual(meta['classifier_budget_ms'], 6000)
 
     def test_the_deadline_survives_code_that_swallows_timeouts(self):
         # socket.create_connection catches OSError (TimeoutError is one) and tries the next
@@ -439,10 +444,10 @@ class TriageTests(unittest.TestCase):
                     pass
             raise AssertionError('the deadline never stopped the call')
         started = time.monotonic()
-        with patch.object(t, 'classify', side_effect=stubborn):
-            hits, meta = t.classify_batch([self.item()], {}, 1)
+        with patch.object(t, 'CLASSIFIER_MIN_SECONDS', 0), patch.object(t, 'classify', side_effect=stubborn):
+            hits, meta = t.classify_batch([self.item()], {}, 2)
         self.assertLess(time.monotonic() - started, 3)
-        self.assertEqual(meta['classifier_error'], 'TimeoutError')
+        self.assertIn('deadline', meta['classifier_error'])
         self.assertEqual(hits[0]['reason'], 'Classifier unavailable; manually review')
         self.assertEqual(t.signal.getitimer(t.signal.ITIMER_REAL), (0.0, 0.0))
 
@@ -454,10 +459,10 @@ class TriageTests(unittest.TestCase):
             real(which, seconds, interval)
             if len(calls) == 1:
                 time.sleep(1.5)  # descheduled between arming and the call; macOS fires a 1 s timer at ~1.15 s
-        with patch.object(t.signal, 'setitimer', side_effect=slow_to_return), \
+        with patch.object(t, 'CLASSIFIER_MIN_SECONDS', 0), patch.object(t.signal, 'setitimer', side_effect=slow_to_return), \
              patch.object(t, 'classify', side_effect=AssertionError('the deadline came first')):
-            hits, meta = t.classify_batch([self.item()], {}, 1)
-        self.assertEqual(meta['classifier_error'], 'TimeoutError')
+            hits, meta = t.classify_batch([self.item()], {}, 2)
+        self.assertIn('deadline', meta['classifier_error'])
         self.assertEqual(hits[0]['reason'], 'Classifier unavailable; manually review')
         self.assertEqual(t.signal.getitimer(t.signal.ITIMER_REAL), (0.0, 0.0))
         self.assertIs(t.signal.getsignal(t.signal.SIGALRM), t.signal.SIG_DFL)

@@ -45,6 +45,7 @@ import * as ProviderEventIngestor from "../ProviderEventIngestor.ts";
 import * as ProviderRuntimeRecoveryService from "../ProviderRuntimeRecoveryService.ts";
 import * as ProviderSessionManager from "../ProviderSessionManager.ts";
 import * as CommandOutputRecorder from "./CommandOutputRecorder.ts";
+import type * as CommandOutputHub from "../CommandOutputHub.ts";
 import * as ProviderSwitchService from "../ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "../ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "../ProviderTurnStartService.ts";
@@ -248,11 +249,13 @@ export function layerProviderReplay<Transcript extends ProviderReplayTranscript,
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
   | EffectWorker.OrchestrationEffectWorkerV2
+  | EffectWorker.OrchestrationEffectExecutorV2
   | EffectOutbox.EffectOutboxV2
   | ProviderEventIngestor.ProviderEventIngestorV2
   | ThreadManagementService.ThreadManagementService
   | EventSink.EventSinkV2
   | CommandOutputRecorder.CommandOutputRecorder
+  | CommandOutputHub.CommandOutputHub
   | ProviderSessionManager.ProviderSessionManagerV2
   | McpProviderSessions.McpProviderSessions,
   Error | MigrationError | PlatformError.PlatformError | SqlError
@@ -291,12 +294,15 @@ export function layerWithRegistry<Error>(
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
   | EffectWorker.OrchestrationEffectWorkerV2
+  | EffectWorker.OrchestrationEffectExecutorV2
+  | RunExecutionService.RunExecutionServiceV2
   | EffectOutbox.EffectOutboxV2
   | ProviderEventIngestor.ProviderEventIngestorV2
   | ThreadManagementService.ThreadManagementService
   | EventSink.EventSinkV2
   | ProviderSessionManager.ProviderSessionManagerV2
   | CommandOutputRecorder.CommandOutputRecorder
+  | CommandOutputHub.CommandOutputHub
   | McpProviderSessions.McpProviderSessions,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
@@ -506,6 +512,7 @@ export function layerWithRegistry<Error>(
     Layer.provide(
       Layer.mergeAll(
         layerCheckpointServiceProvided,
+        layerCommandOutputHubProvided,
         CommandPolicy.layer,
         layerContextHandoffServiceProvided,
         layerPersistence,
@@ -573,6 +580,8 @@ export function layerWithRegistry<Error>(
     layerOrchestratorProvided,
     layerProviderSessionManagerProvided,
     layerEffectWorkerProvided,
+    layerEffectExecutorProvided,
+    layerRunExecutionServiceProvided,
     layerEventSinkProvided,
     layerContinuationWorkerProvided,
     layerCommandOutputHubProvided,

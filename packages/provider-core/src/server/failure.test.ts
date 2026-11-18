@@ -14,6 +14,7 @@ import * as Effect from "effect/Effect";
 import {
   makeProviderFailure,
   makeProviderFailureTurnItem,
+  withPreviousFailure,
   MAX_PROVIDER_FAILURE_CODE_LENGTH,
   MAX_PROVIDER_FAILURE_MESSAGE_LENGTH,
   ClaudeTurnPreparationTimeoutError,
@@ -22,6 +23,28 @@ import {
 } from "./failure.ts";
 import * as IdAllocator from "./IdAllocator.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+
+it("retains Claude API diagnostics when an automatic resume also fails", () => {
+  const claudeApiError = {
+    model: "claude-opus-5-5",
+    host: "router.test",
+    path: "/v1",
+    status: 404,
+    errorCode: "model_not_found",
+    errorType: "not_found_error",
+    errorText: "Model missing",
+    attempt: 2,
+    resume: true,
+  };
+  const failure = {
+    ...makeProviderFailure({ message: "HTTP 404", code: "api_error_404" }),
+    claudeApiError,
+  };
+  const resumed = withPreviousFailure(failure, makeProviderFailure({ message: "HTTP 503" }));
+  assert.deepEqual(resumed.claudeApiError, claudeApiError);
+  assert.include(resumed.message, "First error: HTTP 503");
+  assert.include(resumed.message, "Resume error: HTTP 404");
+});
 
 it("redacts credentials and URL secrets from provider failures", () => {
   const failure = makeProviderFailure({

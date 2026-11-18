@@ -1,4 +1,4 @@
-/** Board administration uses the operate scope; the owner's words and picks need his own session. */
+/** Words, picks and permanent board erasure need the owner's session; other administration uses operate. */
 // @effect-diagnostics-next-line nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 
@@ -278,12 +278,12 @@ const handlersFor = (session: OwnerGateSession) => {
   return { ran: engine.ran, handlers };
 };
 
-const OWNER_RPCS: ReadonlySet<string> = new Set([M.cardAsk, M.messagePost, M.answer]);
+const OWNER_RPCS: ReadonlySet<string> = new Set([M.cardAsk, M.messagePost, M.answer, M.boardPurge]);
 /** Streams: the feed of boards and of one board. */
 const STREAMS: ReadonlySet<string> = new Set([M.boards, M.subscribe]);
 
 it.effect(
-  "WS keeps owner words and picks gated while board administration accepts operate sessions",
+  "WS gates owner words, picks and board erasure while other administration accepts operate sessions",
   () =>
     Effect.gen(function* () {
       const guarded = Object.keys(KANBAN_GUARDED_SCOPES);

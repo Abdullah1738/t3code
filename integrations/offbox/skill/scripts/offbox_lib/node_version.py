@@ -7,6 +7,7 @@ tests/test_node_version.py).
 import json
 import re
 import shlex
+from collections import Counter
 from pathlib import Path
 
 TOP = 10**12
@@ -15,6 +16,53 @@ LTS = {"argon": 4, "boron": 6, "carbon": 8, "dubnium": 10, "erbium": 12, "fermiu
 VER = re.compile(r"^v?(\d+|[xX*])(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?(?:[-+][0-9A-Za-z.-]*)?$")
 
 from . import toolchain
+
+NVM_FETCH = r'''mkdir -p "$NVM_DIR" &&
+  { [ -s "$NVM_DIR/nvm.sh" ] ||
+    { __offbox_curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/nvm.sh -o "$NVM_DIR/nvm.sh.tmp" &&
+      [ -s "$NVM_DIR/nvm.sh.tmp" ] && mv "$NVM_DIR/nvm.sh.tmp" "$NVM_DIR/nvm.sh"; }; }
+'''
+
+# nvm auto-uses a repo's .nvmrc even with no default alias, returning 3 when
+# only system Node exists. Keep offbox's selection until the caller asks nvm.
+NVM_ENTRYPOINT = r'''export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+if [ -e "$NVM_DIR/alias/default" ]; then
+  . "$NVM_DIR/.offbox-nvm-v0.40.3.sh" "$@"
+else
+  . "$NVM_DIR/.offbox-nvm-v0.40.3.sh" --no-use "$@"
+fi
+'''
+
+
+def command_uses_nvm(cmd: str) -> bool:
+    """Inspect only submitted text, including shell file tests and nested -c strings."""
+    return bool(re.search(r'(?:~|\$(?:HOME|\{HOME\})|/[^\s;\'"<>]*)/\.nvm/nvm\.sh(?![\w./-])'
+                          r'|\$(?:NVM_DIR|\{NVM_DIR\})/nvm\.sh(?![\w./-])'
+                          r'|(?<![\w./-])nvm\s+(?:use|install|exec|run)\b', cmd))
+
+
+def command_nvm_block(run_id: str) -> str:
+    """Supply the shell entry point without sourcing it or selecting another Node."""
+    receipt = shlex.quote(f'offbox-nvm-sh: {run_id} ')
+    return toolchain.SHELL + r'''
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+  printf '%spresent\n' @RECEIPT@ >&2
+else
+  if ! {
+@FETCH@
+    mv "$NVM_DIR/nvm.sh" "$NVM_DIR/.offbox-nvm-v0.40.3.sh" &&
+      printf '%s' @ENTRYPOINT@ > "$NVM_DIR/nvm.sh.tmp" &&
+      mv "$NVM_DIR/nvm.sh.tmp" "$NVM_DIR/nvm.sh"
+  }; then
+    printf '%sfailed\n' @RECEIPT@ >&2
+    __offbox_stop 'nvm.sh download failed (your command sources ~/.nvm/nvm.sh)'
+  fi
+  printf '%sinstalled\n' @RECEIPT@ >&2
+  echo "offbox: installed nvm.sh (nvm v0.40.3) because your command sources it; no nvm Node versions are installed, box Node stays $(command -v node) ($(node --version))" >&2
+fi
+'''.replace('@FETCH@', NVM_FETCH.rstrip() + ' &&').replace('@RECEIPT@', receipt).replace(
+        '@ENTRYPOINT@', shlex.quote(NVM_ENTRYPOINT))
 
 BLOCK = r"""__offbox_want=@WANT@
 __offbox_nk() { local IFS=.; set -- ${1#v}; echo $(( 10#${1:-0} * 1000000 + 10#${2:-0} * 1000 + 10#${3:-0} )); }
@@ -36,11 +84,7 @@ elif [ "${__offbox_require_nvm:-0}" != 1 ] && [[ "$__offbox_cur" =~ ^v[0-9]+\.[0
 else
   __offbox_reason="$__offbox_want (box default ${__offbox_cur:-none}; nvm:${__offbox_have:- none})"
   export NVM_DIR="$HOME/.nvm"
-  mkdir -p "$NVM_DIR" || __offbox_stop "$__offbox_reason: cannot create nvm directory"
-  if [ ! -s "$NVM_DIR/nvm.sh" ]; then
-    __offbox_curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/nvm.sh -o "$NVM_DIR/nvm.sh.tmp" &&
-      mv "$NVM_DIR/nvm.sh.tmp" "$NVM_DIR/nvm.sh" || __offbox_stop "$__offbox_reason: nvm download failed"
-  fi
+  { @NVM_FETCH@ } || __offbox_stop "$__offbox_reason: nvm download failed"
   __offbox_index="$NVM_DIR/.offbox-index.tab"
   __offbox_curl -fsSL https://nodejs.org/dist/index.tab -o "$__offbox_index.tmp" &&
     mv "$__offbox_index.tmp" "$__offbox_index" || __offbox_stop "$__offbox_reason: Node index download failed"
@@ -184,7 +228,7 @@ hash -r
 unset -f __offbox_nk __offbox_in
 unset __offbox_want __offbox_best __offbox_bk __offbox_have __offbox_d __offbox_v __offbox_k __offbox_cur __offbox_actual __offbox_installed __offbox_install __offbox_reason __offbox_index __offbox_rest
 unset __offbox_original_nvm_dir __offbox_nvm_dir __offbox_nvm_root __offbox_node_executable __offbox_node_dir __offbox_node_bin __offbox_node_nvm_dir __offbox_node_suffix __offbox_node_path __offbox_sep __offbox_tail __offbox_entry __offbox_command
-"""
+""".replace('@NVM_FETCH@', NVM_FETCH)
 
 
 NO_PIN_BLOCK = r"""__offbox_default=$(
@@ -479,7 +523,17 @@ def _ci_values(text):
     return entries
 
 
-def _ci_want(root):
+def _major_ranges(ranges):
+    merged = []
+    for lo, hi in sorted((lo // 1_000_000, (hi - 1) // 1_000_000 + 1) for lo, hi in ranges):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _ci_want(root, *, within=None):
     signals = []
     workflows = root / '.github/workflows'
     for path in sorted([*workflows.glob('*.yml'), *workflows.glob('*.yaml')]):
@@ -495,30 +549,66 @@ def _ci_want(root):
             if parsed:
                 ranges.extend(parsed)
                 versions.append(value)
+        if within is not None:
+            ranges = _isect(ranges, within)
         if ranges:
             signals.append((ranges, f"{path.relative_to(root).as_posix()} node-version {', '.join(dict.fromkeys(versions))}"))
     if not signals:
         return None
-    # Matrices remain a union; conflicting workflows use the one with the highest major.
-    majors = {max(lo for lo, _ in ranges) // 1_000_000 for ranges, _ in signals}
-    if len(majors) > 1:
-        highest = max(majors)
-        signals = [(ranges, label) for ranges, label in signals
-                   if max(lo for lo, _ in ranges) // 1_000_000 == highest]
-        suffix = f'; workflows disagree, highest major {highest}'
-    else:
-        suffix = ''
+    # Agreeing matrices remain unions; each workflow votes once per supported major.
+    candidates = {major for ranges, _ in signals for lo, hi in ranges
+                  for major in ([lo // 1_000_000, (hi - 1) // 1_000_000]
+                                if hi != TOP else [lo // 1_000_000])}
+    support = [{major for major in candidates
+                if _isect(ranges, [(_key(major), _key(major + 1))])}
+               for ranges, _ in signals]
+    majors = Counter(major for choices in support for major in choices)
+    coverage = [_major_ranges(ranges) for ranges, _ in signals]
+    minority = ''
+    if any(major_ranges != coverage[0] for major_ranges in coverage[1:]):
+        chosen = max(majors, key=lambda major: (majors[major], major))
+        excluded = Counter(max(choices) for choices in support if chosen not in choices)
+        signals = [(_isect(ranges, [(_key(chosen), _key(chosen + 1))]), label)
+                   for (ranges, label), choices in zip(signals, support) if chosen in choices]
+        minority = '; ' + ', '.join(f'{count} workflow{"s" if count != 1 else ""} '
+                                   f'{"use" if count != 1 else "uses"} {major}'
+                                   for major, count in sorted(excluded.items())) if excluded else ''
     label = signals[0][1]
-    if len(signals) > 1:
-        label += f' (+{len(signals) - 1} workflows)'
-    return sorted({r for ranges, _ in signals for r in ranges}), label + suffix
+    if len(signals) > 1 or minority:
+        extra = f'+{len(signals) - 1} workflows' if len(signals) > 1 else ''
+        label += f' ({extra}{minority if extra else minority[2:]})'
+    return sorted({r for ranges, _ in signals for r in ranges}), label
+
+
+def _open_range(ranges):
+    """Whether the union admits more than one major (upper bounds are exclusive)."""
+    return bool(ranges) and (any(hi == TOP for _, hi in ranges) or
+                             min(lo for lo, _ in ranges) // 1_000_000 !=
+                             max(hi - 1 for _, hi in ranges) // 1_000_000)
+
+
+def _selection_label(ranges, label):
+    return label + ('; open range, newest on this box' if _open_range(ranges) else '')
 
 
 def want(root: Path, cwd: Path):
     """(ranges, label) for the repo at root as seen from cwd, or None. Never raises."""
     try:
         root = Path(root)
-        return _want(root, Path(cwd)) or _ci_want(root)
+        pin = _want(root, Path(cwd))
+        if pin is None:
+            return _ci_want(root)
+        ranges, label = pin
+        if _open_range(ranges):
+            try:
+                ci = _ci_want(root, within=ranges)
+            except Exception:
+                return pin
+            if ci is not None:
+                narrowed = _isect(ranges, ci[0])
+                if narrowed:
+                    return narrowed, f'{label}, narrowed by {ci[1]}'
+        return pin
     except Exception:
         return None
 
@@ -528,6 +618,7 @@ def block(w, *, require_nvm=False) -> str:
     if w is None:
         return NO_PIN_BLOCK
     ranges, label = w
+    label = _selection_label(ranges, label)
     rng = " ".join(f"{lo} {hi}" for lo, hi in ranges)
     return toolchain.SHELL + f"__offbox_require_nvm={int(require_nvm)}\n" + (BLOCK.replace("@RANGES@", rng)
             .replace("@WANT@", shlex.quote(label)))

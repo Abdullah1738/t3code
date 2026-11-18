@@ -11,7 +11,8 @@ test('retry and scan diagnostics enforce fixed targets, token names, numbers and
   assert.deepEqual(cleanProps({target:'control',tag:'EPIPE',ok:true,loopBlockMaxMs:75,longestSyncOp:'failedRunsSince',longestSyncMs:74}),
     {target:'control',tag:'EPIPE',ok:true,loopBlockMaxMs:75,longestSyncOp:'failedRunsSince',longestSyncMs:74});
   assert.deepEqual(cleanProps({target:'opencode',ok:false}), {target:'opencode',ok:false});
-  for (const value of ['private text', 'sk-private', 'https://user:password@example.invalid', '', NaN, Infinity, -1, false, null, {}, []]) {
+  assert.deepEqual(cleanProps({target:'https://user:password@example.invalid/path?token=private'}), {target:'https://example.invalid:443'});
+  for (const value of ['private text', 'sk-private', '', NaN, Infinity, -1, false, null, {}, []]) {
     const result = cleanProps({target:value,ok:value,loopBlockMaxMs:value,longestSyncMs:value,longestSyncOp:value,
       url:'https://private.invalid',path:'/private',message:'private'});
     assert.deepEqual(result, value === false ? {ok:false} : undefined);

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -54,12 +55,16 @@ class BoxDiskTests(Isolated):
         acquire = self.stack.enter_context(patch.object(pool, 'acquire', side_effect=rows))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
         self.stack.enter_context(patch.object(runs.node_version, 'want', return_value=None))
+        self.stack.enter_context(patch.object(runs.quint_tools, 'ensure_archive'))
         self.stack.enter_context(patch.object(runs.Runner, '_check_box', return_value=None))
         self.stack.enter_context(patch.object(ssh_sync, 'put_file'))
         self.stack.enter_context(patch.object(ssh_sync, 'push', return_value={}))
         start = self.stack.enter_context(patch.object(api, 'cmd_start', return_value={'processId': 7, 'commandId': 'c'}))
-        def stream(rn):
+        def stream(rn, *, echo=True):
             rn.log_path.write_text('offbox-command-started: run\n')
+            if self.a.bg:
+                self.assertFalse(echo)
+                signal.raise_signal(signal.SIGTERM)
             return 0
         self.stack.enter_context(patch.object(runs.Runner, 'stream', stream))
         self.stack.enter_context(patch.object(runs, 'follow', return_value=runs._COMMAND_RUNNING))
@@ -207,7 +212,7 @@ class BoxDiskTests(Isolated):
              patch.object(runs.Runner,'_sync_box',sync), \
              patch.object(box_disk,'reclaim',return_value=space(tmp=4096)), \
              patch.object(api,'get',return_value={'state':'running'}),patch.object(lease,'ensure_ttl',return_value=True):
-            self.assertEqual(runs.run_remote(self.a,self.me),0)
+            self.assertEqual(runs.run_remote(self.a,self.me),common.EXIT_DETACHED)
         self.assertEqual(acquire.call_count,2)
         self.assertEqual(start.call_count,1)
         row=self.con.execute("SELECT * FROM runs WHERE run_id='run-disk-background'").fetchone()
@@ -256,7 +261,7 @@ class BoxDiskTests(Isolated):
              patch.object(box_disk,'safe_to_stop',return_value=True), \
              patch.object(ssh_sync,'ssh',side_effect=AssertionError('retired box is stopped')) as receipt, \
              patch.object(box_disk,'reclaim',side_effect=cleanup):
-            self.assertEqual(runs.run_remote(self.a,self.me),0)
+            self.assertEqual(runs.run_remote(self.a,self.me),common.EXIT_DETACHED)
         receipt.assert_not_called()
         self.stop.assert_called_once()
         self.assertEqual(acquire.call_count,2)
@@ -267,7 +272,7 @@ class BoxDiskTests(Isolated):
         self.assertEqual((row['box_id'],row['status']),('bxB','running'))
         handoffs=[call for call in lifecycle.call_args_list if call.args[1] == 'handoff']
         self.assertEqual(len(handoffs),1)
-        self.assertEqual(handoffs[0].args,('run-disk-gate','handoff','handoff'))
+        self.assertEqual(handoffs[0].args,('run-disk-gate','handoff','following'))
         self.assertEqual(handoffs[0].kwargs,dict(box_id='bxB',process_id=7))
 
     def _recovered_gate_case(self, backend, bg):
@@ -286,7 +291,7 @@ class BoxDiskTests(Isolated):
                           json.dumps(dict(phase='gate',space=space(tmp=4096))).encode(),b'')) as receipt, \
              patch.object(box_disk,'reclaim',return_value=space(tmp=4096)), \
              patch.object(box_disk,'safe_to_stop',return_value=True):
-            self.assertEqual(runs.run_remote(self.a,self.me),0)
+            self.assertEqual(runs.run_remote(self.a,self.me),common.EXIT_DETACHED if bg else 0)
         fetched.assert_called_once()
         self.assertEqual(sum(call.args[1].startswith('head -c 65536') for call in receipt.call_args_list),1)
         self.assertEqual(acquire.call_count,2)
@@ -345,8 +350,9 @@ class BoxDiskTests(Isolated):
             return 'complete'
         with patch.dict(os.environ,{runs.BACKGROUND_RUN_ENV:'run-lost-gate-stream'} if bg else {}), \
              patch.object(api,'BACKEND',backend), \
-             patch.object(runs.Runner,'stream',lambda rn:real_follow(rn.box,rn.pid,rn.log_path,
-                              echo=False,run_id=rn.run_id,stop_evt=NoPause())), \
+             patch.object(runs.Runner,'stream',lambda rn,*,echo=True:
+                          signal.raise_signal(signal.SIGTERM) if bg else real_follow(
+                              rn.box,rn.pid,rn.log_path,echo=False,run_id=rn.run_id,stop_evt=NoPause())), \
              patch.object(runs,'follow',lambda *args,**kw:real_follow(*args,stop_evt=NoPause(),**kw)), \
              patch.object(api,'cmd_attach',side_effect=attach), \
              patch.object(api,'cmd_status',return_value=dict(status='exited',running=False,exitCode=90)), \
@@ -356,7 +362,7 @@ class BoxDiskTests(Isolated):
              patch.object(misc,'_catch_up_log',side_effect=catch_up) as fetched, \
              patch.object(box_disk,'reclaim',return_value=space(tmp=4096)), \
              patch.object(runs,'settle_docker'),patch.object(runs.resources,'finalize'):
-            self.assertEqual(runs.run_remote(self.a,self.me),0)
+            self.assertEqual(runs.run_remote(self.a,self.me),common.EXIT_DETACHED if bg else 0)
         self.assertEqual(fetched.call_count,0 if partial else 1)
         receipt.assert_called_once()
         self.assertEqual(start.call_count,2)
@@ -418,10 +424,11 @@ class BoxDiskTests(Isolated):
             return space(workspace=0) if box=='bxA' and failed else space()
         with patch.dict(os.environ,{runs.BACKGROUND_RUN_ENV:'run-setup-full'} if bg else {}), \
              patch.object(api,'BACKEND',backend),patch.object(box_disk,'measure',side_effect=measure), \
-             patch.object(runs.Runner,'stream',lambda rn:output(rn.box,rn.log_path)), \
+             patch.object(runs.Runner,'stream',lambda rn,*,echo=True:
+                          signal.raise_signal(signal.SIGTERM) if bg else output(rn.box,rn.log_path)), \
              patch.object(runs,'follow',side_effect=lambda box,pid,path,**kw:output(box,path)), \
              patch.object(box_disk.prune,'run') as prune:
-            self.assertEqual(runs.run_remote(self.a,self.me),0)
+            self.assertEqual(runs.run_remote(self.a,self.me),common.EXIT_DETACHED if bg else 0)
         prune.assert_called_once()
         self.assertEqual(acquire.call_count,2)
         self.assertEqual(start.call_count,2)
@@ -533,7 +540,7 @@ class BoxDiskTests(Isolated):
             yield dict(type='stdout',data='interleaved stdout\n')
             yield dict(type='stderr',data=stderr[1])
             yield dict(type='exit',exitCode=code)
-        with patch.object(runs.Runner,'stream',lambda rn:real_follow(rn.box,rn.pid,rn.log_path,
+        with patch.object(runs.Runner,'stream',lambda rn,*,echo=True:real_follow(rn.box,rn.pid,rn.log_path,
                           echo=False,run_id=rn.run_id)), \
              patch.object(api,'cmd_attach',side_effect=frames), \
              patch.object(api,'history_logs',return_value=dict(data=''.join(stderr),done=True)), \
@@ -567,7 +574,7 @@ class BoxDiskTests(Isolated):
                             yield dict(type='stdout',data='stdout\n')
                             yield dict(type='stderr',data=stderr[15:])
                         yield dict(type='exit',exitCode=code)
-                    with patch.object(runs.Runner,'stream',lambda rn:real_follow(rn.box,rn.pid,rn.log_path,
+                    with patch.object(runs.Runner,'stream',lambda rn,*,echo=True:real_follow(rn.box,rn.pid,rn.log_path,
                                       echo=False,run_id=rn.run_id)), \
                          patch.object(api,'cmd_attach',side_effect=frames), \
                          patch.object(api,'history_logs',return_value=dict(data=stderr,done=True)), \
@@ -585,7 +592,7 @@ class BoxDiskTests(Isolated):
                 with self.subTest(code=code,proof=proof):
                     acquire.side_effect=None;acquire.return_value=dict(self.row('bxA'),remote_dir='w/r')
                     acquire.reset_mock();start.reset_mock()
-                    def stream(rn):
+                    def stream(rn, *, echo=True):
                         rn.log_path.write_text(marker+'\n')
                         return code
                     history=(common.OffboxError('unavailable') if proof=='unavailable' else
@@ -638,7 +645,7 @@ class BoxDiskTests(Isolated):
              patch.object(runs,'follow',side_effect=admission), \
              patch.object(box_disk.prune,'run',side_effect=prune) as cleaned, \
              patch.object(ssh_sync,'ssh',return_value=subprocess.CompletedProcess([],0,b'',b'')):
-            self.assertEqual(runs.run_remote(self.a,self.me),0)
+            self.assertEqual(runs.run_remote(self.a,self.me),common.EXIT_DETACHED)
         cleaned.assert_called_once()
         self.assertEqual(start.call_count,2)
 
@@ -748,9 +755,12 @@ class BoxDiskTests(Isolated):
         box_disk.retire(self.con,'b',space(tmp=4096),'tmp',stop=False)
         with patch.object(api,'list_boxes',return_value=[dict(id='b',state=api.STOPPED_STATES[0],
                            stoppedAt='2026-10-01T00:00:00Z')]), \
-             patch.object(bases,'upkeep'),patch.object(lease,'refresh_box') as refresh:
+             patch.object(bases,'upkeep'),patch.object(lease,'refresh_box') as refresh, \
+             patch.object(bases,'keep_pin_saved',return_value=True) as saved:
             reap.reap(False)
-        refresh.assert_called_once()
+        refresh.assert_not_called()
+        saved.assert_called_once()
+        self.assertEqual(saved.call_args.args[1],'b')
         self.assertTrue(self.row('b')['note'].startswith(box_disk.NOTE))
 
     def test_lost_disk_full_retention_resume_does_not_starve_healthy_peer(self):
@@ -763,9 +773,9 @@ class BoxDiskTests(Isolated):
         with patch.dict(os.environ, {'OFFBOX_RESUME_CONFIRM_SECONDS':'0'}), \
              patch.object(lease.capacity, 'check'), \
              patch.object(api, 'resume', side_effect=api.NetworkError('resume reply lost')):
-            with self.assertRaises(lease.ResumeUnresolved):
+            with self.assertRaises(lease.PinnedLeaseError):
                 lease.refresh_box(self.con, 'bad')
-        self.assertTrue(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:bad'").fetchone())
+        self.assertFalse(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:bad'").fetchone())
         def reuse(con, row, *args, **kwargs):
             self.assertEqual(row['box_id'], 'good', 'retired resumes must not enter dispatch selection')
             return dict(row)
@@ -853,6 +863,9 @@ class BoxDiskTests(Isolated):
     def test_retired_resume_http_observations_have_usable_budgets_on_both_backends(self):
         from offbox_lib import allocation
         from test_pool_affinity import Clock
+        # Real parent-process inspection would run subprocess waits against this test's fake clock.
+        token = lease.offbox_protection.CALLER.set({'actor': 'test:retired-resume', 'holder': None})
+        self.addCleanup(lease.offbox_protection.CALLER.reset, token)
         self.box('bad', member=True, state='stopped')
         box_disk.retire(self.con, 'bad', space(tmp=4096), 'tmp', stop=False)
         for backend in ('boat', 'server'):

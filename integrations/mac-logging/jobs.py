@@ -9,6 +9,7 @@ import math
 import os
 import plistlib
 import re
+import resource
 import signal
 import statistics
 import stat
@@ -121,8 +122,8 @@ def source_error(component, name, source, started, exc, props=None):
         failure = 'permission' if exc.errno in (errno.EACCES, errno.EPERM) else 'exit'
         message = str(exc)
     emit(component, 'error', name, ok=False,
-         props=dict(source=str(source), failure=failure, exitCode=code,
-                    elapsedMs=max(0, (time.monotonic()-started)*1000), **(props or {})),
+         props={**dict(source=str(source), failure=failure, exitCode=code,
+                    elapsedMs=max(0, (time.monotonic()-started)*1000)), **(props or {})},
          error_tag=component+'.source_unavailable', error_message=message)
     return failure
 
@@ -141,7 +142,19 @@ def confirmed_absent(path, exc):
         return False
 
 
-def du_total(path, run, timeout):
+def inventory_du(run, command, measurement, **kwargs):
+    started = time.monotonic()
+    cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
+    try:
+        return run(command, **kwargs)
+    finally:
+        used = resource.getrusage(resource.RUSAGE_CHILDREN)
+        measurement.update(allowanceS=kwargs['timeout'],
+            elapsedMs=max(0, time.monotonic()-started)*1000,
+            cpuS=max(0, used.ru_utime+used.ru_stime-cpu.ru_utime-cpu.ru_stime))
+
+
+def du_total(path, run, timeout, measurement=None):
     # Child entries are cached/refreshed independently. Count every hardlink
     # consistently in both single and batched scans; cross-argument inode
     # deduplication would assign bytes to a different child on each scan.
@@ -149,7 +162,8 @@ def du_total(path, run, timeout):
     # git clone --local) and are an upper bound, not freeable space.
     if timeout <= 0:
         raise SourceFailure('timeout', 'directory inventory overall budget exhausted')
-    result = run(['/usr/bin/du', '-skl', str(path)], capture_output=True, text=True,
+    runner = run if measurement is None else lambda command, **kw: inventory_du(run, command, measurement, **kw)
+    result = runner(['/usr/bin/du', '-skl', str(path)], capture_output=True, text=True,
                  timeout=timeout, env={**os.environ, 'LC_ALL': 'C'})
     stderr = getattr(result, 'stderr', '') or ''
     denied = sum(permission_denied(line) for line in stderr.splitlines())
@@ -191,8 +205,8 @@ INVENTORY_DEEP_FRESH_S = 48*3600
 # after one night would restart that same prefix forever.
 INVENTORY_PARTS_FRESH_S = 3*24*3600
 DEEP_PROBE_S = 15
-# Night 1 lost 3,097/5,400 s to timeouts: 170 probes stopped at 15 s,
-# while successful t3code-wt siblings took 10–13 s.
+# b54e6df2 lost 2,902 s to 15/30 s probes on a busy night.
+DEEP_FIRST_S = 60
 DEEP_PROBE_MAX_S = 120
 DEEP_CHILD_CAP_S = 600
 
@@ -218,8 +232,7 @@ def inventory_migrate_probe(value):
 
 def inventory_probe_allowance(value, successful_ms):
     elapsed = value.get('elapsedMs')
-    allowance = (1.5*elapsed/1000 if number(elapsed) else
-                 2*statistics.median(successful_ms)/1000 if successful_ms else DEEP_PROBE_S)
+    allowance = 1.5*elapsed/1000 if number(elapsed) else DEEP_FIRST_S
     if number(value.get('lastProbeS')):
         allowance = max(allowance, 2*value['lastProbeS'])
     return min(DEEP_CHILD_CAP_S, DEEP_PROBE_MAX_S, max(DEEP_PROBE_S, allowance))
@@ -232,17 +245,32 @@ def inventory_deep_owned(value, now):
 
 
 @contextmanager
-def inventory_lock():
+def inventory_lock(wait_s=0, stopped=lambda: False, on_wait=lambda: None):
     # Never unlink a flock file: another process may already have it open.
     path = state_path('disk-inventory').with_suffix('.lock')
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-        else:
-            yield fd
+        deadline = time.monotonic()+max(0, wait_s)
+        waiting = acquired = False
+        while True:
+            if wait_s > 0 and stopped():
+                break
+            if waiting and time.monotonic() >= deadline:
+                break
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    break
+                if not waiting:
+                    # Let callers measure contention without counting an uncontended open.
+                    on_wait()
+                    waiting = True
+                time.sleep(min(2, remaining))
+        yield fd if acquired else False
     finally:
         os.close(fd)
 
@@ -377,7 +405,7 @@ class InventoryLog:
         if self.slowest_path is None or elapsed_ms > self.slowest_ms:
             self.slowest_ms, self.slowest_path = elapsed_ms, key
 
-    def child(self, key, size, previous, elapsed_ms, partial=False, denied=0, code=0):
+    def child(self, key, size, previous, elapsed_ms, partial=False, denied=0, code=0, measurement=None):
         # Diagnostics are never sampled, including legacy ok=true partial rows.
         # Batch timing is amortized: du does not report individual durations.
         try:
@@ -388,10 +416,10 @@ class InventoryLog:
             old = self.previous_sizes.get(key, previous.get('bytes') if isinstance(previous, dict) else None)
             changed = (abs(size-old) >= 1024**3 or abs(size-old)*5 >= old) if number(old) and old > 0 else (
                 size > 0 if old == 0 else size >= 1024**3)
-            if partial or denied or changed or elapsed_ms >= 10000:
+            if measurement is not None or partial or denied or changed or elapsed_ms >= 10000:
                 emit('disk', 'event', 'disk.inventory.source', ok=True,
-                     props=dict(source=key, bytes=size, partial=partial, deniedCount=denied,
-                                exitCode=code, elapsedMs=elapsed_ms))
+                     props={**dict(source=key, bytes=size, partial=partial, deniedCount=denied,
+                                exitCode=code, elapsedMs=elapsed_ms), **(measurement or {})})
         except Exception:
             pass
 
@@ -446,11 +474,12 @@ def inventory_skipped_logs(roots, previous, reason):
 def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_only=False, refresh_only=False,
                        deep=False, checkpoint=None, attempted=None, max_batches=None, single_paths=None,
                        parts_mode=False, metrics=None, turn_seconds=None, part_work=None,
-                       due_at=None, descend=True, inventory_log=None, source_failures=None):
+                       due_at=None, descend=True, inventory_log=None, source_failures=None, probe_retries=None):
     cache = {} if cache is None else cache
     inventory_log = inventory_log if inventory_log is not None else InventoryLog(path, cache)
     single_paths = set() if single_paths is None else single_paths
     part_work = {} if part_work is None else part_work
+    probe_retries = set() if probe_retries is None else probe_retries
     now = time.time()
     freshness_s = INVENTORY_PARTS_FRESH_S if parts_mode else None
     turn_started = time.monotonic()
@@ -542,11 +571,16 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
         # with bounded argv, rotating the first unfinished
         # child after a timeout instead of rescanning du -d 1's fixed prefix.
         batch, argv_bytes, batch_cost_ms = [], 0, 0
+        batch_timeout = min(60, DEEP_PROBE_MAX_S, DEEP_CHILD_CAP_S, deadline-time.monotonic())
         for entry in selected[:128] if len(entries) >= 128 and not inventory_has_timeout(old) and first.path not in single_paths and not (deep and old.get('lastProbeS')) else selected[:1]:
             if deep and batch and (entry.path in single_paths or cache.get(entry.path, {}).get('lastProbeS') or inventory_has_timeout(cache.get(entry.path, {})) or 'parts' in cache.get(entry.path, {})):
                 break
-            cost_ms = part_cost_ms(cache.get(entry.path, {})) if parts_mode else 0
-            if batch and parts_mode and batch_cost_ms+cost_ms > timeout*1000:
+            cost_ms = part_cost_ms(cache.get(entry.path, {})) if deep else 0
+            # A 60 s batch must not recreate short probes for ordinary worktrees.
+            # Learn one cost before batching; reserve 2x estimated work within
+            # the batch deadline. This estimate never sizes a child's allowance.
+            batch_limit_ms = batch_timeout*1000/2 if deep and not parts_mode else timeout*1000
+            if batch and deep and (not cost_ms or batch_cost_ms+cost_ms > batch_limit_ms):
                 break
             length = len(os.fsencode(entry.path))+1
             if batch and argv_bytes+length > 32768:
@@ -556,22 +590,27 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
             batch_cost_ms += cost_ms
         selected = selected[len(batch):]
         if deep and not parts_mode and len(batch) > 1:
-            timeout = min(60, deadline-time.monotonic())
+            timeout = batch_timeout
         if deep and not parts_mode and len(batch) == 1 and metrics is not None:
             metrics.setdefault('probeAllowances', []).append(timeout)
         paths = {entry.path: entry for entry in batch}
         started = time.monotonic()
+        measurement = {}
+        first_attempt = deep and not parts_mode and len(batch) == 1 and not number(old.get('elapsedMs'))
+        if first_attempt and metrics is not None:
+            metrics['firstAttempts'] = metrics.get('firstAttempts', 0)+1
         done = set()
         uncertain = rejected = retry_probe = False
         effective = timeout
         try:
             if len(batch) == 1:
-                size, denied, code = du_total(Path(first.path), run, timeout)
+                size, denied, code = du_total(Path(first.path), run, timeout, measurement if deep else None)
                 values = [(first.path, size)]
             else:
                 command = ['/usr/bin/du', '-skl', *paths]
                 try:
-                    result = run(command, capture_output=True, text=True, timeout=timeout,
+                    runner = (lambda command, **kw: inventory_du(run, command, measurement, **kw)) if deep else run
+                    result = runner(command, capture_output=True, text=True, timeout=timeout,
                                  env={**os.environ, 'LC_ALL': 'C'})
                     output, stderr, code = result.stdout, result.stderr, result.returncode
                 except subprocess.TimeoutExpired as exc:
@@ -616,18 +655,23 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
                 done.add(key)
                 completed += 1
                 inventory_log.child(key, size, previous_value, (time.monotonic()-started)*1000/(1 if partial else len(batch)),
-                                    partial, denied, code)
+                                    partial, denied, code, measurement if deep and len(batch) == 1 else None)
             if code is None and len(done) == len(batch):
                 # Complete rows remain valid, even if du hangs after printing
                 # its last total. The command timeout still spent the budget.
                 if metrics is not None:
                     metrics['timeouts'] += 1
                     metrics['secondsInTimeouts'] += time.monotonic()-started
+                    metrics['secondsWasted'] = metrics.get('secondsWasted', 0)+measurement.get('elapsedMs', 0)/1000
                 source_error('disk', 'disk.inventory.source', path, started,
-                    SourceFailure('timeout', 'source command timed out'), props={'allowanceS': effective})
+                    SourceFailure('timeout', 'source command timed out'), props={**measurement, 'allowanceS': effective})
             if len(done) != len(batch):
                 raise SourceFailure('timeout' if code is None else 'missing-total',
                                     'source command timed out' if code is None else 'du did not print a child total', code)
+            if deep and len(batch) > 1 and code is not None:
+                emit('disk', 'event', 'disk.inventory.source', ok=True,
+                     props=dict(source=str(path), completedCount=len(done), partial=bool(denied or uncertain),
+                                deniedCount=denied, exitCode=code, **measurement))
         except Exception as exc:
             failures += 1
             timed_out = isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc, SourceFailure) and exc.failure == 'timeout'
@@ -648,33 +692,43 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
                     # do not establish that this child needs decomposition.
                     effective = exc.timeout if isinstance(exc, subprocess.TimeoutExpired) else effective
                     full = number(effective) and effective+0.000001 >= allowance
-                    if len(batch) == 1 and not parts_mode and number(effective) and effective < 60:
+                    short_probe = (len(batch) == 1 and not parts_mode and full
+                                   and number(old.get('elapsedMs')) and effective < 60)
+                    if short_probe:
                         value['probeTimeouts'] = value.get('probeTimeouts', 0)+1
                         value['lastProbeS'] = max(value.get('lastProbeS', 0), effective)
                         if full:
                             value['lastTimeoutAt'] = time.time()
                         value['lastTimeoutS'] = effective
-                        retry_probe = full
+                        retry_probe = first.path not in probe_retries
+                        probe_retries.add(first.path)
                     elif len(batch) == 1 and full:
                         value['timeouts'] = value.get('timeouts', 0)+1
                         value['lastTimeoutAt'] = time.time()
                         value['lastTimeoutS'] = effective
-                    if len(batch) == 1 and not parts_mode and number(effective) and effective < 60 and metrics is not None:
+                    if short_probe and metrics is not None:
                         metrics['probeTimeouts'] = metrics.get('probeTimeouts', 0)+1
                         metrics['secondsInProbeTimeouts'] = metrics.get('secondsInProbeTimeouts', 0)+time.monotonic()-started
-                    if metrics is not None:
+                    if first_attempt and full and metrics is not None:
+                        metrics['firstAttemptTimeouts'] = metrics.get('firstAttemptTimeouts', 0)+1
+                    if metrics is not None and (full or len(batch) > 1 or parts_mode):
                         metrics['timeouts'] += 1
                         metrics['secondsInTimeouts'] += time.monotonic()-started
+                    if metrics is not None:
+                        metrics['secondsWasted'] = metrics.get('secondsWasted', 0)+measurement.get('elapsedMs', 0)/1000
                 if not deep and timeout+0.000001 >= allowance:
                     value['slow'] = True
                     if allowance == 60:
                         value['limited'] = True
             inventory_log.timing(unfinished.path, max(0, (time.monotonic()-started)*1000))
             failure = source_error('disk', 'disk.inventory.source', unfinished.path, started, exc,
-                props={'allowanceS': effective if deep else timeout} if timed_out else None)
+                props={**measurement, **({'allowanceS': effective if deep else timeout} if timed_out else {})})
             if source_failures is not None:
                 source_failures.add(failure)
         finally:
+            if deep and metrics is not None:
+                metrics['cpuSecondsDu'] = metrics.get('cpuSecondsDu', 0)+measurement.get('cpuS', 0)
+                metrics['wallSecondsDu'] = metrics.get('wallSecondsDu', 0)+measurement.get('elapsedMs', 0)/1000
             if attempted is not None:
                 attempted.update(done)
                 unfinished = next((e for e in batch if e.path not in done), None)
@@ -736,12 +790,14 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
             checkpoint(*inventory_status(cache, entries, listed, time.time(), root=Path(entry.path).parent))
         return False
     if not stat.S_ISDIR(own.st_mode):
+        measurement = {}
         try:
-            total, denied, code = du_total(Path(entry.path), run, max(0, deadline-time.monotonic()))
+            total, denied, code = du_total(Path(entry.path), run, max(0, deadline-time.monotonic()), measurement)
             if not denied:
                 value.update(bytes=total, at=time.time(), partial=False, isDirectory=False, deniedCount=0,
                              elapsedMs=(time.monotonic()-started)*1000)
-                inventory_log.child(entry.path, total, previous_value, (time.monotonic()-started)*1000)
+                inventory_log.child(entry.path, total, previous_value, (time.monotonic()-started)*1000,
+                                    measurement=measurement)
                 value.pop('limited', None)
                 value.pop('slow', None)
                 for field in ('parts', 'partsDone', 'partsTotal'):
@@ -754,8 +810,13 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
                 if metrics is not None:
                     metrics['timeouts'] += 1
                     metrics['secondsInTimeouts'] += time.monotonic()-started
+                    metrics['secondsWasted'] = metrics.get('secondsWasted', 0)+measurement.get('elapsedMs', 0)/1000
             source_error('disk', 'disk.inventory.source', entry.path, started, exc,
-                props={'allowanceS': exc.timeout} if isinstance(exc, subprocess.TimeoutExpired) else None)
+                props={**measurement, **({'allowanceS': exc.timeout} if isinstance(exc, subprocess.TimeoutExpired) else {})})
+        finally:
+            if metrics is not None:
+                metrics['cpuSecondsDu'] = metrics.get('cpuSecondsDu', 0)+measurement.get('cpuS', 0)
+                metrics['wallSecondsDu'] = metrics.get('wallSecondsDu', 0)+measurement.get('elapsedMs', 0)/1000
         inventory_log.timing(entry.path, max(0, (time.monotonic()-started)*1000))
         if checkpoint:
             checkpoint(*inventory_status(cache, entries, listed, time.time(), root=Path(entry.path).parent))
@@ -814,12 +875,18 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
     return False
 
 
+def disk_throttle(command):
+    # Disk policy only: background scheduling (-b) can stall at high load.
+    return (['/usr/sbin/taskpolicy', '-d', 'throttle', *command]
+            if sys.platform == 'darwin' else command)
+
+
 def directory_inventory(paths=None, run=subprocess.run, deadline=None):
     started = time.monotonic()
     with inventory_lock() as acquired:
         if acquired is not False:
             def locked_run(command, **kwargs):
-                return run(command, pass_fds=(acquired,), **kwargs)
+                return run(disk_throttle(command), pass_fds=(acquired,), **kwargs)
             return _directory_inventory(paths, locked_run, deadline)
         previous = read_state('disk-inventory')
         roots = list(DIRECTORY_ROOTS if paths is None else paths)

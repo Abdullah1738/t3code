@@ -10,6 +10,7 @@ import {
   type OrchestrationV2Command,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2RunStatus,
+  type OrchestrationV2ProviderSession,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
   type OrchestrationV2UserMessageInputIntent,
@@ -315,6 +316,7 @@ export interface ProviderOrchestratorReplayVariant {
   readonly modelSelection: ModelSelection;
   readonly runtimePolicyOverride?: RuntimePolicyV2Override;
   readonly runContinuationWorker?: boolean;
+  readonly finalProviderSessionStatus?: OrchestrationV2ProviderSession["status"];
   readonly expectedAbsentWorkspacePaths?: ReadonlyArray<string>;
   readonly assertOutput: (
     result: OrchestratorV2ScenarioResult,

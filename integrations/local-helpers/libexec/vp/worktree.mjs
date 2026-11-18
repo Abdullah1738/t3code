@@ -1,8 +1,10 @@
 import fs from "node:fs";
+import { brokenToolchainPath, danglingNotice, hasToolchain, logEvent } from "./events.mjs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { runChild } from "./child.mjs";
 import {
   checkToolchain,
   loadToolchain,
@@ -20,6 +22,13 @@ while (input[0]?.startsWith("--candidate=")) {
 if (input.shift() !== "--") throw new Error("missing candidate separator");
 const [command, ...args] = input;
 let main;
+const started = Number(process.env.VP_SHIM_STARTED) || Date.now();
+const cwd = process.cwd();
+const reasons = JSON.parse(process.env.VP_SHIM_REASONS || "[]");
+const skipped = JSON.parse(process.env.VP_SHIM_SKIPPED || "[]");
+let selectedCandidate = null;
+let outcome = "refused";
+let toolchainHead = null;
 const hint = `run offbox run -- vp ${[command, ...args].filter(Boolean).join(" ")}`;
 function refuse(reason) {
   throw new Error(reason);
@@ -159,9 +168,23 @@ try {
   let selectedConfig;
   let staleToolchain = false;
   for (const candidate of candidates) {
-    main = fs.realpathSync(candidate.dir);
-    if (main === root) continue;
     try {
+      main = candidate.dir;
+      if (!hasToolchain(main)) {
+        console.error(danglingNotice(candidate.kind, main));
+        const reason = {
+          candidate: candidate.kind,
+          reason: "dangling-vite-plus",
+          diagnosis: null,
+          file: path.join(main, "node_modules/vite-plus/bin/vp"),
+        };
+        reasons.push(reason);
+        skipped.push({ ...reason, directory: main, brokenRealpath: brokenToolchainPath(main) });
+        refuse("vite-plus/bin/vp does not resolve");
+      }
+      fs.accessSync(path.join(main, "node_modules/.bin/vp"), fs.constants.X_OK);
+      main = fs.realpathSync(main);
+      if (main === root) continue;
       if (candidate.kind === "toolchain copy") syncToolchain(root, main);
       process.chdir(root);
       const snapshot = await configSnapshot(root, main);
@@ -193,8 +216,25 @@ try {
         config.jsPlugins = config.jsPlugins?.map((plugin) => requireConfig.resolve(plugin));
       }
       selectedConfig = config;
+      selectedCandidate = candidate.kind;
+      toolchainHead =
+        spawnSync("git", ["-C", main, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+          timeout: 5000,
+        }).stdout?.trim() || null;
       break;
     } catch (error) {
+      if (
+        !reasons.some(
+          (reason) => reason.candidate === candidate.kind && reason.reason === "dangling-vite-plus",
+        )
+      )
+        reasons.push({
+          candidate: candidate.kind,
+          reason: "toolchain-validation-failed",
+          diagnosis: null,
+          file: null,
+        });
       if (candidate.kind === "toolchain copy" && error instanceof ToolchainMismatch)
         staleToolchain = true;
       failures.push(
@@ -225,7 +265,7 @@ try {
       ? `vp: no node_modules in this worktree; running fmt with ${main}'s dependencies and the worktree config`
       : `vp: no node_modules in this worktree; running lint from ${main} with absolute paths`,
   );
-  const child = spawnSync(
+  const status = await runChild(
     path.join(main, "node_modules/.bin/vp"),
     [command, "--config", temporary, ...ignores, ...forwarded],
     {
@@ -233,12 +273,35 @@ try {
       stdio: "inherit",
     },
   );
-  if (child.error) throw child.error;
-  process.exitCode = child.status ?? 1;
+  outcome = "ran";
+  process.exitCode = status;
 } catch (error) {
+  if (!reasons.length)
+    reasons.push({ candidate: null, reason: "worktree-refused", diagnosis: null, file: null });
   console.error(`vp: ${error.message.replaceAll("\n", " ")}; ${hint}`);
   process.exitCode = 127;
 } finally {
+  const record = {
+    event: skipped.length ? "dangling-toolchain" : "outcome",
+    command: ["fmt", "lint"].includes(command) ? command : "other",
+    root,
+    cwd,
+    outcome,
+    candidate: selectedCandidate,
+    exitCode: process.exitCode ?? 127,
+    reasons,
+    skipped,
+    toolchainHead,
+    durationMs: Date.now() - started,
+  };
+  if (process.send) {
+    await new Promise((resolve) =>
+      process.send({ type: "vp-shim-outcome", record }, () => {
+        process.disconnect();
+        resolve();
+      }),
+    );
+  } else logEvent(record);
   if (temporary) fs.unlinkSync(temporary);
   for (const directory of snapshots) fs.rmSync(directory, { recursive: true, force: true });
 }
