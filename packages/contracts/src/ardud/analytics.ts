@@ -68,11 +68,19 @@ const McpOutcome = Schema.Literals([
   "interrupted",
   "interrupted_by_shutdown",
 ]);
-const McpPhase = Schema.Literals([
+export const McpPhase = Schema.Literals([
   "caller",
   "dispatch",
   "result",
   "handler",
+  "parent_records",
+  "child_records",
+  "catalog",
+  "request_key",
+  "receipt",
+  "settings",
+  "selection",
+  "workspace",
   "lane_wait",
   "query",
   "render",
@@ -496,6 +504,9 @@ const GeneralEvent = Schema.Struct({
       receiptState: Schema.optionalKey(Schema.Literal("accepted")),
       missingLookup: Schema.optionalKey(Schema.Literals(["subagents", "child_thread_id"])),
       dispatchFenceRecovered: Schema.optionalKey(Schema.Boolean),
+      retryPath: Schema.optionalKey(
+        Schema.Literals(["receipt_fast", "attached_pending", "dispatched"]),
+      ),
       idShape: Schema.optionalKey(
         Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),
       ),

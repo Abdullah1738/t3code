@@ -18,6 +18,7 @@ import * as Exit from "effect/Exit";
 import * as Queue from "effect/Queue";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
 
 import {
   KanbanError,
@@ -2484,7 +2485,23 @@ it.effect.each(["approved", "picked"] as const)(
           owner,
           "owner",
         );
-        yield* kanban.tick;
+        const noticeDrained = yield* Deferred.make<void>();
+        const tracer = Tracer.make({
+          span(options) {
+            const span = new Tracer.NativeSpan(options);
+            if (options.name === "KanbanService.drainOwnerRoutes") {
+              const end = span.end.bind(span);
+              span.end = (time, exit) => {
+                end(time, exit);
+                Deferred.doneUnsafe(noticeDrained, Effect.void);
+              };
+            }
+            return span;
+          },
+        });
+        // The tick's notice must settle before the answer invalidates its snapshot.
+        yield* kanban.tick.pipe(Effect.withTracer(tracer));
+        yield* Deferred.await(noticeDrained);
         assert.isNotNull((yield* now).card.stalled);
         const ask = (yield* now).card.asks.at(-1)!;
         yield* kanban.answerAsk(

@@ -22,6 +22,8 @@ NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt', 'clien
 NUMBERS.update({"since", "expires_at"})
 NUMBERS.add("waited_s")
 NUMBERS.add("sample")
+NUMBERS.update({"tracked_total", "tracked_heavy", "tracked_heavy_sent",
+                "tracked_node_modules_sent", "tracked_secret_sent"})
 NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
 NUMBERS.update({'outageS', 'waitedMs', 'placeBefore', 'placeAfter'})
 NUMBERS.update({'ageSeconds', 'runCount', 'waitSeconds', 'serving', 'held', 'pending', 'cap'})
@@ -137,6 +139,12 @@ def _props(values, *, name=None):
             markers = ('Lost connection to the event listener', 'websocket: close 1006',
                        'unexpected EOF', 'Incus is shutting down')
             out[k] = '; '.join(s for s in markers if s in v)
+        elif name == "run.sync" and k == "tracked_left_out" and isinstance(v, dict):
+            out[k] = {reason: count for reason, count in v.items()
+                      if reason in {"secret", "node_modules"} and type(count) is int and count >= 0}
+        elif name == "run.sync" and k == "tracked_left_out_first" and isinstance(v, list):
+            out[k] = [p for p in v if isinstance(p, str) and len(p) <= 4096
+                      and not p.startswith("/") and ".." not in p.split("/")][:5]
         elif k in NUMBERS and type(v) in (int, float) and math.isfinite(v):
             out[k] = v
         elif k in BOOLEANS and type(v) is bool:
@@ -313,7 +321,10 @@ def rollup(day=None, *, live_only=False):
     def stats(xs):
         xs.sort()
         return {"p50": xs[max(0, math.ceil(len(xs)*.50)-1)], "p95": xs[math.ceil(len(xs)*.95)-1], "max": xs[-1]}
-    result = {"day": day, "total": total, "sampled": sampled, "countsByName": dict(counts), "countsByKind": dict(kinds),
+    generated = datetime.now(timezone.utc)
+    complete = day < generated.strftime("%Y-%m-%d") and (generated.hour > 0 or generated.minute >= 5)
+    result = {"day": day, "generatedAt": generated.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+              "complete": complete, "total": total, "sampled": sampled, "countsByName": dict(counts), "countsByKind": dict(kinds),
               "okRate": ok/checked if checked else None, "errorRate": bad/total if total else None,
               "durationMs": {name: stats(xs) for name, xs in durations.items()}, "malformedLines": malformed,
               "topErrors": [{"tag": tag, "count": count, "sampleIds": samples[tag]} for tag, count in errors.most_common(20)]}
@@ -340,8 +351,34 @@ def rollup_previous():
             return
         day = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         root = directory()
-        if root is not None and not (root / ("rollup-" + day + ".json")).exists():
-            rollup(day)
+        if root is None:
+            return
+        path = root / ("rollup-" + day + ".json")
+        try:
+            previous = json.loads(path.read_text())
+        except (OSError, ValueError):
+            previous = None
+        if isinstance(previous, dict) and previous.get("complete") is True:
+            return
+        rollup(day)
+    except Exception:
+        pass
+
+
+def rollup_today(max_age_s=3600):
+    try:
+        now = datetime.now(timezone.utc)
+        day = now.strftime("%Y-%m-%d")
+        root = directory()
+        if root is None:
+            return
+        path = root / ("rollup-" + day + ".json")
+        try:
+            if now.timestamp() - path.stat().st_mtime < max_age_s:
+                return
+        except FileNotFoundError:
+            pass
+        rollup(day)
     except Exception:
         pass
 

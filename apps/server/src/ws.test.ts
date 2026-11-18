@@ -984,7 +984,8 @@ it.live("background sweep scans stay off a held writer unless switched back", ()
       });
       assert.deepEqual(yield* routes(sweeps), ["reader:background"]);
       assert.deepEqual(yield* routes(dedupe), ["reader:foreground"]);
-      const switchedBack = ProjectionStore.layer.pipe(
+      // Keep the constructor's foreground index probe outside the statement capture.
+      const switchedBack = yield* ProjectionStore.layer.pipe(
         Layer.fresh,
         Layer.provide(
           Layer.succeed(Switches, {
@@ -993,9 +994,10 @@ it.live("background sweep scans stay off a held writer unless switched back", ()
             ingestDedupeForeground: false,
           }),
         ),
+        Layer.build,
       );
-      assert.deepEqual(yield* routes(sweeps.pipe(Effect.provide(switchedBack))), ["writer"]);
-      assert.deepEqual(yield* routes(dedupe.pipe(Effect.provide(switchedBack))), [
+      assert.deepEqual(yield* routes(sweeps.pipe(Effect.provideContext(switchedBack))), ["writer"]);
+      assert.deepEqual(yield* routes(dedupe.pipe(Effect.provideContext(switchedBack))), [
         "reader:background",
       ]);
 

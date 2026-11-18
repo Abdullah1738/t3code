@@ -471,6 +471,7 @@ def _main(argv: list[str] | None = None) -> int:
             return 0
         if a.sub == "reap":
             toollog.rollup_previous()
+            toollog.rollup_today()
         me = whoami()
         if a.sub == "exec":
             from . import execute

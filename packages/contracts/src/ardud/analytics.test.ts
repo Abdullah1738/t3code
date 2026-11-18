@@ -85,6 +85,31 @@ describe("analytics ingest contract", () => {
     ).toMatchObject({ tool: "card_update", outcome: "timeout", responseDelivery: "closed" });
     expect(() => decodeRead({ day: "2026-11-13", outcome: "maybe" })).toThrow();
   });
+  it.each([
+    "caller",
+    "dispatch",
+    "result",
+    "handler",
+    "parent_records",
+    "child_records",
+    "catalog",
+    "request_key",
+    "receipt",
+    "settings",
+    "selection",
+    "workspace",
+    "lane_wait",
+    "query",
+    "render",
+  ])("decodes MCP rows with phase %s", (errorPhase) => {
+    const row = { ...event, kind: "mcp.call", errorPhase };
+    expect(decodeEvent(row)).toEqual(row);
+  });
+  it("keeps historical MCP rows without a phase and rejects unknown phases", () => {
+    const row = { ...event, kind: "mcp.call" };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(() => decodeEvent({ ...row, errorPhase: "unknown" })).toThrow();
+  });
   it("accepts bounded batches and strips unrecognized content", () => {
     const input = decode({
       events: [

@@ -13,6 +13,7 @@ export type RemoteBoxConfig = { kind: "remote-box"; url: string; tokenFile: stri
 type Outage = { id: string; unreachableSince: number | null; reachableSince: number | null; noticeAttempted?: boolean };
 type Fence = { id: string; since: number; queuedBehind: number };
 type FenceAlert = { key: string; text: string };
+type WaitingNotice = { id: string; since: number; attempted?: boolean };
 type BoxEvent = { id: string; state: string; failure: string | null; kind: "inbound" | "wake"; interruptedAt: number | null; hasSend: boolean; watcher?: string };
 export class RemoteRequestError extends Error {
   constructor(readonly status: number) { super("Box request failed"); }
@@ -63,6 +64,12 @@ export class RemoteBox {
       // Old ciphertext cannot be classified on the relay. Unknown rows never cause a notice.
       store.db.exec("ALTER TABLE remote_inbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'unknown'");
     }
+    for (const name of ["received_at", "delivered_at", "finished_at"]) {
+      if (!store.db.query<{ name: string }, []>("PRAGMA table_info(remote_inbox)").all().some(c => c.name === name)) store.db.exec(`ALTER TABLE remote_inbox ADD COLUMN ${name} INTEGER`);
+    }
+    // Historical ciphertext has no receipt timestamp. Begin a conservative observation window at upgrade.
+    store.db.query("UPDATE remote_inbox SET received_at=? WHERE kind='inbound' AND received_at IS NULL").run(this.now());
+    store.db.query("UPDATE remote_inbox SET delivered_at=received_at WHERE kind='inbound' AND sealed IS NULL AND delivered_at IS NULL").run();
     if (store.get("remoteNoticeAt") === undefined) {
       // Older sends have no kind. Conservatively count the newest send during the upgrade.
       const at = store.db.query<{ at: number | null }, []>("SELECT max(at) at FROM remote_sends").get()?.at;
@@ -93,8 +100,8 @@ export class RemoteBox {
   accept(id: string, input: unknown, receipt?: AgentAnswerReceipt, kind: "inbound" | "wake" = "inbound"): boolean {
     const key = opaqueId(id);
     return this.store.db.transaction(() => {
-      const created = this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind) VALUES (?,?,?,?)")
-        .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind).changes === 1;
+      const created = this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind,received_at) VALUES (?,?,?,?,?)")
+        .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind, this.now()).changes === 1;
       if (created && kind === "inbound") this.unanswered.accept(key, this.now());
       return created;
     })();
@@ -146,15 +153,15 @@ export class RemoteBox {
       this.store.set("remoteFence", null);
       this.emit("moni-box-unfenced", undefined, undefined, { event: saved.id.slice(0, 12), fencedMs: Math.max(0, this.now() - saved.since) });
     }
-    if (head?.state !== "interrupted") return;
+    if (head?.state !== "interrupted") {
+      return !!head && (remaining ?? 0) > 0 && !!await this.inboundBehind(head.id);
+    }
     const queuedBehind = remaining ?? 0;
     const fence = saved?.id === head.id ? saved : { id: head.id, since: head.interruptedAt ?? this.now(), queuedBehind: -1 };
     const ageMs = Math.max(0, this.now() - fence.since), event = head.id.slice(0, 12);
     const autoKey = `remoteWakeAutoFail:${head.id}`;
     if (head.kind === "wake" && !head.hasSend && ageMs >= (this.config.wakeFenceAutoFailMs ?? 600_000)) {
-      let page = await this.events(head.id);
-      while (!page.events.some(row => row.kind === "inbound") && page.nextCursor) page = await this.events(page.nextCursor);
-      if (page.events.some(row => row.kind === "inbound")) {
+      if (await this.inboundBehind(head.id)) {
         const alert = { key: `moni-box-wake-autofailed:${event}`,
           text: `Moni's interrupted watcher wake${head.watcher ? ` (${head.watcher})` : ""} (${event}) sent nothing and was retired after ${Math.floor(ageMs / 60_000)} min; ${queuedBehind} later items can continue.` };
         // Persist the exact notification before resolving, including an ambiguous resolve acknowledgement.
@@ -169,6 +176,9 @@ export class RemoteBox {
     }
     const alertKey = `remoteFenceAlert:${head.id}`;
     const savedAlert = this.store.get<true | FenceAlert>(alertKey);
+    const firstInbound = await this.inboundBehind(head.id);
+    const initialInboundKey = `remoteFenceInitialInbound:${head.id}`;
+    if (!savedAlert) this.store.set(initialInboundKey, !!firstInbound);
     if (this.io.ownerAlert && savedAlert !== true) {
       const age = ageMs < 60_000 ? `${Math.floor(ageMs / 1000)}s` : `${Math.floor(ageMs / 60_000)}m`;
       const alert = savedAlert ?? { key: `moni-box-fenced:${event}`,
@@ -180,22 +190,90 @@ export class RemoteBox {
         else this.emit("moni-box-fence-alert-error");
       } catch { this.emit("moni-box-fence-alert-error"); }
     }
+    if (savedAlert === true && firstInbound && !this.store.get(initialInboundKey)) {
+      const key = `remoteFenceInboundAlert:${head.id}`;
+      const saved = this.store.get<true | FenceAlert>(key);
+      if (saved !== true && this.io.ownerAlert) {
+        const alert = saved ?? { key: `moni-box-fenced:${event}:inbound:${firstInbound.id}`,
+          text: `Moni's interrupted ${head.kind} (${event}) is now holding her messages; ${queuedBehind} later items are waiting. Check her box queue.` };
+        if (!saved) this.store.set(key, alert);
+        try { if (await this.io.ownerAlert("attention", alert.text, alert.key)) this.store.set(key, true); }
+        catch { this.emit("moni-box-fence-alert-error"); }
+      }
+    }
+  }
+  private async inboundBehind(id: string) {
+    let page = await this.events(id);
+    for (;;) {
+      const inbound = page.events.find(row => row.kind === "inbound");
+      if (inbound || !page.nextCursor) return inbound;
+      page = await this.events(page.nextCursor);
+    }
+  }
+  private waiting() {
+    return this.store.db.query<{ id: string; received_at: number }, []>(`SELECT id,received_at FROM remote_inbox
+      WHERE kind='inbound' AND finished_at IS NULL ORDER BY received_at,seq LIMIT 1`).get();
+  }
+  private finish(id: string) {
+    this.store.db.transaction(() => {
+      this.store.db.query("UPDATE remote_inbox SET finished_at=COALESCE(finished_at,?) WHERE id=?").run(this.now(), id);
+      // Retiring the final DM ends its episode before a new arrival can inherit its reservation.
+      if (!this.waiting()) this.store.set("remoteWaitingNotice", null);
+    }).immediate();
+  }
+  private async reconcileDelivered() {
+    const after = this.store.get<number>("remoteStatusCursor") ?? 0;
+    const rows = this.store.db.query<{ id: string; seq: number }, [number]>(`SELECT id,seq FROM remote_inbox
+      WHERE kind='inbound' AND delivered_at IS NOT NULL AND finished_at IS NULL AND seq>? ORDER BY seq LIMIT 100`).all(after);
+    if (!rows.length) { this.store.set("remoteStatusCursor", 0); return; }
+    const result = await this.request("/events", { ids: rows.map(row => row.id) });
+    if (result.lookup !== true || !Array.isArray(result.events)) throw new Error("Invalid event lookup");
+    const ids = new Set(rows.map(row => row.id));
+    for (const event of result.events) {
+      if (!event || typeof event !== "object" || !validId(event.id) || !ids.has(event.id)
+        || !["pending", "running", "interrupted", "attachment-failed", "done"].includes(String(event.state)) || typeof event.hasReply !== "boolean") throw new Error("Invalid event lookup");
+    }
+    this.store.db.transaction(() => {
+      for (const event of result.events as { id: string; state: string; hasReply: boolean }[]) if (event.state === "done" || event.hasReply) this.finish(event.id);
+      this.store.set("remoteStatusCursor", rows.length === 100 ? rows.at(-1)!.seq : 0);
+    })();
+  }
+  private async noticeWaiting() {
+    const waiting = this.waiting();
+    if (!waiting) { this.store.set("remoteWaitingNotice", null); this.emit("moni-notice-suppressed", "not-waiting"); return; }
+    const previous = this.store.get<WaitingNotice | null>("remoteWaitingNotice");
+    const outage = this.store.get<Outage | null>("remoteOutage");
+    const state = previous ?? { id: outage?.id ?? opaqueId(`waiting:${waiting.id}`), since: waiting.received_at };
+    state.since = Math.max(state.since, waiting.received_at);
+    const lastNotice = this.store.get<number | null>("remoteNoticeAt");
+    const reason = this.now() - state.since < (this.config.noticeAfterMs ?? 120_000) ? "grace"
+      : state.attempted || outage?.noticeAttempted ? "already-sent"
+      : lastNotice !== undefined && lastNotice !== null && this.now() - lastNotice < (this.config.noticeMinGapMs ?? 21_600_000) ? "rate-limited" : undefined;
+    if (reason) { if (!previous) this.store.set("remoteWaitingNotice", state); this.emit("moni-notice-suppressed", reason); return; }
+    if (!this.io.active()) return;
+    this.store.db.transaction(() => {
+      this.store.set("remoteNoticeAt", this.now()); this.store.set("remoteWaitingNotice", { ...state, attempted: true });
+      if (outage) this.store.set("remoteOutage", { ...outage, noticeAttempted: true });
+    })();
+    try { await this.io.notice(state.id, "I’m temporarily offline. I’ll reply when I’m back."); }
+    catch { this.emit("moni-notice-error"); }
   }
   async tick(): Promise<void> {
     if (this.now() >= this.nextStateLog) this.backendState();
     if (this.busy || this.now() < this.nextProbe || !this.io.active()) return;
     this.busy = true;
-    let healthy = false;
+    let healthy = false, dependenciesReady = true;
     try {
       const status = await this.request("/lease", { epoch: this.config.epoch, boxId: this.config.boxId });
       if (status.boxId !== this.config.boxId || status.epoch !== this.config.epoch) throw new Error("Box identity mismatch");
+      dependenciesReady = status.routerReady !== false && status.callbackReady !== false;
       this.failures = 0;
       const rows = this.store.db.query<{ id: string; seq: number; sealed: string }, []>("SELECT id,seq,sealed FROM remote_inbox WHERE sealed IS NOT NULL ORDER BY seq LIMIT 50").all();
       let delivered = 0;
       for (const row of rows) {
         const ack = await this.request("/deliver", { id: row.id, sealed: JSON.parse(row.sealed) as Sealed, epoch: this.config.epoch });
         if (ack.id !== row.id || ack.accepted !== true) throw new Error("Invalid box acknowledgement");
-        this.store.db.query("UPDATE remote_inbox SET sealed=NULL WHERE id=?").run(row.id);
+        this.store.db.query("UPDATE remote_inbox SET sealed=NULL,delivered_at=COALESCE(delivered_at,?) WHERE id=?").run(this.now(), row.id);
         delivered++;
       }
       const outage = this.store.get<Outage | null>("remoteOutage");
@@ -212,30 +290,25 @@ export class RemoteBox {
       healthy = true;
     } catch {
       const saved = this.store.get<Outage | null>("remoteOutage");
-      const outage: Outage = saved ?? { id: opaqueId(String(this.now())), unreachableSince: this.now(), reachableSince: null };
+      // A stall notice reserves the transport outage too, even after its waiting episode ends.
+      const outage: Outage = saved ?? { id: opaqueId(String(this.now())), unreachableSince: this.now(), reachableSince: null,
+        noticeAttempted: this.store.get<WaitingNotice | null>("remoteWaitingNotice")?.attempted === true };
       outage.unreachableSince ??= this.now(); outage.reachableSince = null;
       this.store.set("remoteOutage", outage);
       if (!saved) this.emit("moni-box-down");
-      const lastNotice = this.store.get<number | null>("remoteNoticeAt");
-      const reason = this.now() - outage.unreachableSince < (this.config.noticeAfterMs ?? 120_000) ? "grace"
-        : !this.store.db.query("SELECT 1 FROM remote_inbox WHERE sealed IS NOT NULL AND kind='inbound' LIMIT 1").get() ? "not-waiting"
-        : outage.noticeAttempted ? "already-sent"
-        : lastNotice !== undefined && lastNotice !== null && this.now() - lastNotice < (this.config.noticeMinGapMs ?? 21_600_000) ? "rate-limited" : undefined;
-      if (reason) this.emit("moni-notice-suppressed", reason);
-      else {
-        // Reserve before the side effect: an ambiguous send or process exit must not reset the cap.
-        this.store.db.transaction(() => {
-          this.store.set("remoteNoticeAt", this.now()); outage.noticeAttempted = true; this.store.set("remoteOutage", outage);
-        })();
-        try { await this.io.notice(outage.id, "I’m temporarily offline. I’ll reply when I’m back."); } catch { this.emit("moni-notice-error"); }
-      }
+      await this.noticeWaiting();
       this.nextProbe = this.now() + Math.min(60_000, 1_000 * 2 ** Math.min(++this.failures, 6));
       this.emit("moni-runner-error", "unreachable");
     } finally { this.busy = false; }
     // Observational requests must not hold up lease renewal, including while Telegram is stalled.
     if (healthy && !this.fenceBusy) {
       this.fenceBusy = true;
-      try { await this.probeFence(); await this.flushAutoFailAlerts(); } catch { this.emit("moni-box-events-error"); }
+      try {
+        try { await this.reconcileDelivered(); } catch { this.emit("moni-box-status-error"); }
+        const heldInbound = await this.probeFence(); await this.flushAutoFailAlerts();
+        if (!this.waiting()) this.store.set("remoteWaitingNotice", null);
+        else if (!dependenciesReady || heldInbound || this.store.get("remoteFence")) await this.noticeWaiting();
+      } catch { this.emit("moni-box-events-error"); }
       finally { this.fenceBusy = false; }
     }
   }
@@ -313,7 +386,7 @@ export class RemoteBox {
       if (["/share", "/unshare", "/shares"].includes(path)) return reply(200, await this.request(path, body));
       if (path === "/react") {
         if (typeof body.target !== "string" || !this.hasMessage(body.target) || typeof body.kind !== "string" || !["like", "love", "dislike", "laugh", "emphasize", "question"].includes(body.kind)) return reply(403, { error: "Forbidden" });
-        await io.line.react(body.target, body.kind); this.unanswered.answered(opaqueId(body.target), this.now()); return reply(200, { accepted: true });
+        await io.line.react(body.target, body.kind); this.unanswered.answered(opaqueId(body.target), this.now()); this.finish(opaqueId(body.target)); return reply(200, { accepted: true });
       }
       if (path === "/files") {
         if (typeof body.data !== "string" || body.data.length > 28_000_000 || typeof body.name !== "string" || typeof body.mime !== "string") return reply(400, { error: "Invalid file" });
@@ -322,7 +395,7 @@ export class RemoteBox {
       if (!validId(body.id) || typeof body.text !== "string" || body.text.length > 12_000 || (body.mediaUrl !== undefined && (typeof body.mediaUrl !== "string" || !body.mediaUrl.startsWith("https://")))) return reply(400, { error: "Invalid send" });
       if (body.inboxId !== undefined && !validId(body.inboxId)) return reply(400, { error: "Invalid inbox id" });
       const result = await this.send(body.id, body.text, typeof body.mediaUrl === "string" ? body.mediaUrl : undefined, io.line, io.chat);
-      if (validId(body.inboxId)) this.unanswered.answered(body.inboxId, this.now());
+      if (validId(body.inboxId)) { this.unanswered.answered(body.inboxId, this.now()); this.finish(body.inboxId); }
       return reply(200, result);
     } catch (error) { this.emit("moni-runner-error", "callback"); return reply(error instanceof RemoteSendError ? error.status : 502, { error: "Operation failed" }); }
   }

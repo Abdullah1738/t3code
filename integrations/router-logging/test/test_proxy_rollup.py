@@ -53,6 +53,62 @@ class ProxyRollupTests(unittest.TestCase):
             self.assertEqual(result['attemptsHistogram'], {'1': 2, '3': 1, '6': 1})
             self.assertEqual(result['abortTtfbMs'], dict(p50=20, p95=100, max=100))
 
+    def test_caller_identity_counts_and_abort_denominators(self):
+        fixture = Path(__file__).parent / 'fixtures/caller-identity.json'
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [dict(tool='9router', kind='perf', name='proxy.request',
+                         props=dict(model='a', route='/v1/responses', stream=True, **props))
+                    for props in json.loads(fixture.read_text())]
+            (Path(tmp) / '2026-11-17.ndjson').write_text('\n'.join(map(json.dumps, rows)))
+            result = rollup('2026-11-17', tmp)['proxySummary']
+            def group(dimension, value, count, aborted):
+                return dict(**{dimension: value}, count=count, aborted=aborted, clientAbortRate=aborted/count)
+            self.assertEqual(result['byKeyId'], [
+                group('keyId', '0123456789abcdef', 2, 1),
+                group('keyId', 'lookup_failed', 2, 1),
+                group('keyId', 'none', 1, 0),
+                group('keyId', 'unknown', 2, 2),
+                group('keyId', 'unreg:0123456789ab', 2, 1),
+                group('keyId', 'unreg:abcdef012345', 3, 1),
+            ])
+            self.assertEqual(result['byClient'], [
+                group('client', 'ai-sdk', 1, 0),
+                group('client', 'claude-code', 2, 1),
+                group('client', 'codex', 2, 1),
+                group('client', 'opencode', 2, 1),
+                group('client', 'other', 4, 2),
+                group('client', 'unknown', 1, 1),
+            ])
+            self.assertEqual(result['otherByUaProduct'], [
+                group('uaProduct', '', 2, 1), group('uaProduct', 'weird-agent', 2, 1),
+            ])
+            self.assertEqual(result['unregisteredRequests'], 5)
+            self.assertEqual(result['distinctUnregisteredKeys'], 2)
+            self.assertEqual(result['lookupFailedRequests'], 2)
+            self.assertNotIn('RAW_KEY_CANARY_65', json.dumps(result))
+            self.assertEqual(result['abortsByKeyId']['lookup_failed'], 1)
+            self.assertEqual(result['abortsByClient']['opencode'], 1)
+
+    def test_invalid_caller_dimensions_never_become_rollup_labels(self):
+        key_forms = [None, {}, [], 'unreg:short', 'unreg:0123456789ABC', 'unreg:0123456789ab\n', 'raw-key']
+        product_forms = [None, {}, [], 'odd space', 'a'*25, 'UPPER', 'trailing\n']
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [dict(tool='9router', kind='error', name='proxy.request',
+                         props=dict(model='a', route='/v1/responses', stream=False, status=499,
+                                    client='other', keyId=key_id, uaProduct=product))
+                    for key_id, product in zip(key_forms, product_forms)]
+            rows.append(dict(tool='9router', kind='perf', name='proxy.request',
+                             props=dict(model='a', route='/v1/responses', stream=False, client=['bad'])))
+            (Path(tmp) / '2026-11-17.ndjson').write_text('\n'.join(map(json.dumps, rows)))
+            result = rollup('2026-11-17', tmp)
+            self.assertEqual(result['malformed'], 0)
+            self.assertEqual(result['proxySummary']['byKeyId'], [
+                dict(keyId='unknown', count=8, aborted=7, clientAbortRate=7/8),
+            ])
+            self.assertEqual(result['proxySummary']['otherByUaProduct'], [
+                dict(uaProduct='', count=7, aborted=7, clientAbortRate=1),
+            ])
+
 
 if __name__ == '__main__':
     unittest.main()

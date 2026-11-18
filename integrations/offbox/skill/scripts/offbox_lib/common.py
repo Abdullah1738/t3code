@@ -45,6 +45,7 @@ BACKEND_STATE = _HOME_STATE / "backend-state.json"
 HOME_FAILURES = _HOME_STATE / "home-failures.jsonl"
 PERSON_PREFIX = "person:"          # OFFBOX_THREAD=person:<name>, set by offbox-person for someone's own box
 DEFAULT_OWNER = "ardud"
+OFFBOX_BUN_DEFAULT = "1.4.1"
 _BACKEND_REASON: str | None = None
 _BACKEND: str | None = None        # set by select_backend(); None = decide from the files and the environment
 
