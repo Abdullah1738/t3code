@@ -45,6 +45,9 @@ export class BoxRunner {
         WHERE state IN ('running','interrupted') AND EXISTS (SELECT 1 FROM actions WHERE path='/send');`))();
     }
     this.db.exec("CREATE INDEX IF NOT EXISTS actions_inbox ON actions(inbox_id)");
+    for (const [name, type] of [["attempts", "INTEGER DEFAULT 0"], ["last_status", "INTEGER"], ["next_at", "INTEGER"]]) {
+      if (!this.db.query<{ name: string }, []>("PRAGMA table_info(actions)").all().some(c => c.name === name)) this.db.exec(`ALTER TABLE actions ADD COLUMN ${name} ${type}`);
+    }
     // A killed harness might already have used a tool. An operator reconciles it; never replay it automatically.
     this.interrupt();
   }
@@ -87,7 +90,10 @@ export class BoxRunner {
       || !!sent.get(row.id, opaqueId(`reply:${row.id}:0`), opaqueId(`attachment-failed:${row.id}`)) }));
     const last = rows.at(-1);
     const remaining = last ? this.db.query<{ n: number }, [number]>("SELECT count(*) n FROM inbox WHERE state!='done' AND seq>?").get(last.seq)!.n : 0;
-    return { events, ...(remaining ? { nextCursor: last!.id, remaining } : {}) };
+    const actions = headOnly ? [] : this.db.query<{ id: string; path: string; attempts: number; lastStatus: number | null; nextAt: number | null; inboxId: string | null }, []>(`SELECT
+      substr(id,1,12) id,path,attempts,last_status lastStatus,next_at nextAt,substr(inbox_id,1,12) inboxId
+      FROM actions WHERE state='pending' AND path IN ('/send','/files','/react','/agent-ask','/agent-answer','/agent-requests','/share','/unshare','/shares') ORDER BY rowid`).all();
+    return { events, ...(actions.length ? { actions } : {}), ...(remaining ? { nextCursor: last!.id, remaining } : {}) };
   }
   active() { return this.now() < this.leaseUntil; }
   pause() { this.leaseUntil = 0; this.turnAbort?.abort("disabled"); }
@@ -122,14 +128,18 @@ export class BoxRunner {
     if (!this.active() || this.flushing) return;
     this.flushing = true;
     try {
-    const rows = this.db.query<{ id: string; path: string; payload: string; inbox_id: string | null }, []>("SELECT * FROM actions WHERE state='pending' ORDER BY rowid").all();
+    const rows = this.db.query<{ id: string; path: string; payload: string; inbox_id: string | null; attempts: number; next_at: number | null }, []>("SELECT * FROM actions WHERE state='pending' ORDER BY rowid").all();
     for (const row of rows) {
       if (!this.active()) return;
-      const payload = JSON.parse(row.payload);
+      const nonessential = row.path === "/react" || row.path === "/metrics";
+      if (nonessential && row.next_at !== null && row.next_at > this.now()) continue;
+      let status: number | null = null;
       try {
+      const payload = JSON.parse(row.payload);
       const response = await (this.io.fetch ?? fetch)(this.config.callbackUrl + row.path, { method: "POST", redirect: "error",
         headers: { authorization: `Bearer ${this.config.callbackToken}`, "content-type": "application/json" },
         body: JSON.stringify({ ...payload, operationId: row.id, ...(row.path === "/send" ? { id: row.id, ...(row.inbox_id ? { inboxId: row.inbox_id } : {}) } : {}), epoch: this.config.epoch }), signal: AbortSignal.timeout(15_000) });
+      status = response.status;
       if (!response.ok) {
         if (([400, 403, 404, 413, 422].includes(response.status) || response.status === 409 && row.path !== "/send") && row.path !== "/metrics") {
           this.db.query("UPDATE actions SET state='failed',result=? WHERE id=?").run(JSON.stringify({ error: "Action refused", status: response.status }), row.id); continue;
@@ -140,8 +150,12 @@ export class BoxRunner {
       const result = await jsonBody(response as unknown as Request);
       this.db.query("UPDATE actions SET result=?,state='done' WHERE id=?").run(JSON.stringify(result), row.id);
       } catch (error) {
-        if (row.path !== "/metrics") throw error;
-        this.db.query("UPDATE actions SET state='done' WHERE id=?").run(row.id);
+        if (row.path === "/metrics") { this.db.query("UPDATE actions SET state='done' WHERE id=?").run(row.id); continue; }
+        if (!nonessential) throw error;
+        const attempts = row.attempts + 1;
+        this.db.query("UPDATE actions SET attempts=?,last_status=?,next_at=?,state=?,result=? WHERE id=?")
+          .run(attempts, status, this.now() + [5_000, 30_000, 120_000][Math.min(attempts - 1, 2)]!, attempts >= 3 ? "failed" : "pending",
+            attempts >= 3 ? JSON.stringify({ error: "Nonessential action gave up", status, attempts }) : null, row.id);
       }
     }
     } finally { this.flushing = false; }

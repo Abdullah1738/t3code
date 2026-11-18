@@ -715,7 +715,7 @@ export class RobobBackend implements ChatBackend {
    * exactly, and `inboundId` lets Robob check them against this store.
    */
   async prompt(id: string, _directory: string, messageId: string, text: string, system = "", files: readonly FilePart[] = [],
-    model?: PreferredModel, owner?: OwnerWords): Promise<void> {
+    model?: PreferredModel, owner?: OwnerWords, beforeSend?: () => void): Promise<void> {
     const threadId = await this.resolve(id);
     const attachments = await this.sendAttachments(threadId, messageId, files);
     const words = owner !== undefined && text.endsWith(owner.text) ? owner : undefined;
@@ -725,6 +725,7 @@ export class RobobBackend implements ChatBackend {
     const receipt = this.firstTurnStore?.get<{ at: number; runId?: string }>(receiptKey) ?? this.sendRuns.get(receiptKey) ?? { at: Date.now() };
     this.sendRuns.set(receiptKey, receipt);
     this.firstTurnStore?.set(receiptKey, receipt);
+    beforeSend?.();
     this.messageCache.afterWrite(threadId);
     try {
       const accepted = await this.client.request<{ runId?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, this.sendBody(threadId, messageId, {

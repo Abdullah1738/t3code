@@ -161,6 +161,165 @@ it.each(
   },
 );
 
+const assistantArtifacts = (phase?: OrchestrationV2AssistantPhase) => {
+  const artifacts = makeSubagentConversationArtifacts({
+    messageId: MessageId.make("assistant"),
+    turnItemId: TurnItemId.make("assistant"),
+    threadId: run.threadId,
+    rootNodeId: run.rootNodeId!,
+    providerThreadId: run.providerThreadId,
+    providerTurnId: null,
+    nativeItemRef: null,
+    role: "assistant",
+    text:
+      phase === "answer" ? "All checks passed." : "I'll continue reviewing the remaining files.",
+    ordinal: 1,
+    now: DateTime.makeUnsafe("2026-11-05T17:14:25Z"),
+  });
+  if (artifacts.turnItem.type !== "assistant_message") throw new Error("Expected assistant item");
+  return {
+    message: {
+      ...artifacts.message,
+      runId: run.id,
+      ...(phase === undefined ? {} : { phase }),
+    },
+    turnItem: {
+      ...artifacts.turnItem,
+      runId: run.id,
+      ...(phase === undefined ? {} : { phase }),
+    },
+  };
+};
+
+it.each(
+  (["cancelled", "interrupted"] as const).flatMap((status) =>
+    (["narration", "answer", "unknown", undefined] as const).flatMap((phase) =>
+      (["both", "message", "turn_item"] as const).map((source) => ({ status, phase, source })),
+    ),
+  ),
+)("reports $status with labelled partial findings (phase=$phase source=$source)", (test) => {
+  const artifacts = assistantArtifacts(test.phase);
+  const result = subagentResultForRun(
+    {
+      messages: test.source === "turn_item" ? [] : [artifacts.message],
+      turnItems: test.source === "message" ? [] : [artifacts.turnItem],
+      providerTurns: [
+        {
+          id: ProviderTurnId.make("finished-step"),
+          providerThreadId: run.providerThreadId!,
+          nodeId: run.rootNodeId!,
+          runAttemptId: run.activeAttemptId,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "completed",
+          startedAt: artifacts.message.createdAt,
+          completedAt: artifacts.message.createdAt,
+          finish: "end_turn",
+        },
+      ],
+    },
+    { ...run, status: test.status },
+  );
+  assert.deepEqual(result, {
+    text: `Child task ${test.status}; no final report.\n\nPartial assistant findings (not a final report):\n${artifacts.message.text}`,
+    incomplete: `the child task was ${test.status} without a final report`,
+    messageId: artifacts.message.id,
+    turnItemId: test.source === "message" ? null : artifacts.turnItem.id,
+  });
+  assert.notProperty(result, "finalReport");
+});
+
+it.each(["cancelled", "interrupted"] as const)(
+  "reports %s without an assistant result or a started attempt",
+  (status) => {
+    const artifacts = assistantArtifacts("answer");
+    const otherRunId = RunId.make("other-run");
+    const result = subagentResultForRun(
+      {
+        messages: [makeMessage({ runId: run.id }), { ...artifacts.message, runId: otherRunId }],
+        turnItems: [{ ...artifacts.turnItem, runId: otherRunId }],
+        providerTurns: [],
+      },
+      { ...run, status, startedAt: null, activeAttemptId: null, rootNodeId: null },
+    );
+    assert.equal(result.text, `Child task ${status}; no final report.`);
+    assert.isNotNull(result.incomplete);
+    assert.isNull(result.messageId);
+    assert.isNull(result.turnItemId);
+  },
+);
+
+const cancellationMetadata: ReadonlyArray<{
+  metadata: Pick<OrchestrationV2Run, "cancelReason" | "cancelDetail">;
+  suffix: string;
+}> = [
+  {
+    metadata: {
+      cancelReason: "task_cancel",
+      cancelDetail: " \n The parent cancelled this task. \n ",
+    },
+    suffix: "\nReason: task_cancel\nDetail: The parent cancelled this task.",
+  },
+  {
+    metadata: { cancelReason: "provider_interrupted" },
+    suffix: "\nReason: provider_interrupted",
+  },
+  {
+    metadata: { cancelDetail: " Provider connection closed. " },
+    suffix: "\nDetail: Provider connection closed.",
+  },
+  {
+    metadata: { cancelReason: "unknown", cancelDetail: " \n " },
+    suffix: "\nReason: unknown",
+  },
+  { metadata: { cancelDetail: "" }, suffix: "" },
+];
+it.each(
+  (["cancelled", "interrupted"] as const).flatMap((status) =>
+    cancellationMetadata.map((test) => ({ ...test, status })),
+  ),
+)("reports $status with cancellation metadata $metadata", ({ status, metadata, suffix }) => {
+  const result = subagentResultForRun(
+    { messages: [], turnItems: [], providerTurns: [] },
+    { ...run, status, ...metadata },
+  );
+  assert.equal(result.text, `Child task ${status}; no final report.${suffix}`);
+  assert.isNotNull(result.incomplete);
+  assert.isNull(result.messageId);
+  assert.isNull(result.turnItemId);
+});
+
+it("keeps provider errors ahead of narration for failed runs", () => {
+  const artifacts = assistantArtifacts("narration");
+  const failure = {
+    class: "provider_error" as const,
+    message: "The provider rejected the request.",
+    code: null,
+    retryable: false,
+  };
+  const error = {
+    ...artifacts.turnItem,
+    id: TurnItemId.make("failure"),
+    type: "error" as const,
+    ordinal: 2,
+    failure,
+  };
+  const result = subagentResultForRun(
+    {
+      messages: [artifacts.message],
+      turnItems: [error, artifacts.turnItem],
+      providerTurns: [],
+    },
+    { ...run, status: "failed" },
+  );
+  assert.deepEqual(result, {
+    text: failure.message,
+    incomplete: null,
+    messageId: null,
+    turnItemId: error.id,
+  });
+});
+
 const root: OrchestrationV2ExecutionNode = {
   id: NodeId.make("runless-root"),
   threadId: run.threadId,
@@ -446,3 +605,16 @@ it.each([
     tagged.id,
   );
 });
+
+it.each(["server_restart", "server_shutdown"] as const)(
+  "leaves %s output to restart completion",
+  (cancelReason) => {
+    const artifacts = assistantArtifacts("narration");
+    const result = subagentResultForRun(
+      { messages: [artifacts.message], turnItems: [artifacts.turnItem], providerTurns: [] },
+      { ...run, status: "cancelled", cancelReason },
+    );
+    assert.include(result.text, artifacts.message.text);
+    assert.notInclude(result.text, "Child task cancelled; no final report.");
+  },
+);

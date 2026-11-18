@@ -337,7 +337,7 @@ export interface ChatBackend {
    * words alone, with the inbound id, and everything else as guidance.
    */
   prompt(id: string, directory: string, messageId: string, text: string, system?: string, files?: readonly FilePart[],
-    model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }, owner?: OwnerWords): Promise<void>;
+    model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }, owner?: OwnerWords, beforeSend?: () => void): Promise<void>;
   /**
    * Adds a message to the session's running turn, never queueing behind it. Backends
    * without it (OpenChamber) keep follow-ups as their own turns.
@@ -665,6 +665,8 @@ export class OpenChamber implements ChatBackend {
     system = DEFAULT_CHANNEL_SYSTEM,
     files: readonly FilePart[] = [],
     model?: { providerID: string; modelID: string; variant?: string; instanceId?: string },
+    _owner?: OwnerWords,
+    beforeSend?: () => void,
   ): Promise<void> {
     const session = `/api/session/${encodeURIComponent(id)}`;
     // OpenCode takes `provider/model` only; another Robob instance's slashless id means nothing here.
@@ -683,6 +685,7 @@ export class OpenChamber implements ChatBackend {
         },
       });
     }
+    beforeSend?.();
     await this.request(`${session}/prompt`, {
       method: "POST", directory,
       body: {

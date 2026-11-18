@@ -1258,6 +1258,62 @@ test("a steer the server refuses goes out once as its own turn after the current
   expect(steers).toHaveLength(1);
 });
 
+for (const replyMode of ["final", "tool"] as const) for (const readback of ["accepted", "absent", "unreadable"] as const) {
+  test(`refused steer reads acceptance before structured requeue (${replyMode}, ${readback})`, async () => {
+    const h = setup(":memory:", { replyMode });
+    const order: string[] = [];
+    const failure = new ControlError(409, "conflict", { reason: "no_steerable_turn", retrySafe: false, holder: { runId: "run-holder" } });
+    Object.assign(h.backend, {
+      async steer(_id: string, _directory: string, prompt: string, text: string, _guidance?: string, _files?: readonly FilePart[], guard?: SteerGuard): Promise<SteerDelivery> {
+        order.push("post");
+        guard?.onFailure?.(failure);
+        if (readback === "accepted") h.backend.records.push({ id: prompt, type: "user", text, time: { created: Date.now() } });
+        return "refused";
+      },
+    });
+    h.input("first", "Original");
+    await h.router.tick();
+    const promptAccepted = h.backend.promptAccepted.bind(h.backend);
+    spyOn(h.backend, "promptAccepted").mockImplementation(async (id, directory, prompt) => {
+      if (prompt !== messageId("followup")) return promptAccepted(id, directory, prompt);
+      order.push("readback");
+      expect(h.store.get<boolean>("human-own-turn:followup")).not.toBe(true);
+      expect(h.store.get("steer-attempt:followup")).toBeTruthy();
+      if (readback === "unreadable") throw new Error("readback unavailable");
+      return readback === "accepted";
+    });
+    h.input("followup", "Please answer");
+    h.input("member", "And this");
+    const logs = await captureLogs(async () => { await h.router.tick(); });
+    expect(order).toEqual(["post", "readback"]);
+    expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["Original"]);
+    const requeued = logs.filter(line => line.name === "inbound.requeued");
+    const refused = logs.filter(line => line.name === "steer-refused");
+    if (readback === "absent") {
+      expect(inbounds(h.store).map(row => [row.id, row.state])).toEqual([["first", "done"], ["followup", "pending"], ["member", "batched"]]);
+      expect(h.store.get<boolean>("human-own-turn:followup")).toBe(true);
+      expect(h.store.get("steer-attempt:followup")).toBeNull();
+      expect(requeued).toHaveLength(1);
+      expect(requeued[0]).toMatchObject({ ids: { inboundId: "followup" }, props: { reason: "steer_failed", controlReason: "no_steerable_turn", retrySafe: false, holderRunId: "run-holder" } });
+      expect(refused).toHaveLength(1);
+      expect(refused[0]?.props).toMatchObject({ controlReason: "no_steerable_turn", retrySafe: false, holderRunId: "run-holder" });
+    } else {
+      expect(requeued).toEqual([]);
+      expect(refused).toEqual([]);
+      if (readback === "accepted") {
+        expect(inbounds(h.store).slice(1).map(row => row.state)).toEqual(["admitted", "admitted"]);
+        expect(h.store.get<boolean>("human-own-turn:followup")).toBe(false);
+        expect(h.store.get("steer-attempt:followup")).toBeNull();
+        expect(h.store.get<{ covered: string[] }>("activeTurn")?.covered).toEqual(["followup", "member"]);
+      } else {
+        expect(inbounds(h.store).slice(1).map(row => row.state)).toEqual(["processing", "batched"]);
+        expect(h.store.get("steer-attempt:followup")).toBeTruthy();
+        expect(h.store.get<boolean>("human-own-turn:followup")).not.toBe(true);
+      }
+    }
+  });
+}
+
 test("an uncertain steer is reconciled before another steer or fallback turn", async () => {
   const h = setup();
   const steers = steering(h.backend, async call => {
@@ -10824,6 +10880,11 @@ test("control recovery: uncertain conflict waits for admission readback before r
   expect(h.backend.prompts).toHaveLength(1);
   expect(steers).toHaveLength(1);
   h.backend.promptAccepted = async (_id, _directory, prompt) => h.backend.records.some(record => record.id === prompt);
+  const nextAt = h.store.get<{ nextAt: number }>("replay-probe-backoff:human")!.nextAt;
+  setSystemTime(nextAt - 1);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  setSystemTime(nextAt);
   await h.router.tick(); await h.router.tick();
   expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["Original", "Follow up"]);
 });
@@ -12118,7 +12179,7 @@ test("unanswered Telegram failures retry three times across ticks and persist ac
   expect(calls).toBe(3);
 });
 
-test("unanswered watchdog requeues one sealed human batch and excludes every member of an outage notice", async () => {
+test("unanswered watchdog requeues one sealed human batch even when an outage notice was sent", async () => {
   const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
   const h = setup();
   for (const id of ["first", "second"]) h.input(id, id, { source: "typed" });
@@ -12132,12 +12193,18 @@ test("unanswered watchdog requeues one sealed human batch and excludes every mem
   for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
   expect(inbounds(h.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt !== undefined)).toBe(true);
 
-  const other = setup();
+  const alerts: string[][] = [];
+  const other = setup(":memory:", { notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
   for (const id of ["held", "held-member"]) other.input(id, id, { source: "typed" });
   await other.router.tick();
   other.store.enqueue({ id: "outage:notice", kind: "control", text: "Technical problem", replyTo: "held" });
-  setSystemTime(start + 11 * 60_000); await other.router.checkUnanswered();
-  expect(inbounds(other.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).unanswered === undefined)).toBe(true);
+  other.store.outboxState("outage:notice", "sent");
+  setSystemTime(start + 16 * 60_000);
+  const logs = await captureLogs(async () => { await other.router.checkUnanswered(); });
+  expect(inbounds(other.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt === undefined)).toBe(true);
+  expect(logs.filter(row => row.name === "inbound.overdue").map(row => row.ids?.inboundId)).toEqual(["held", "held-member"]);
+  expect(alerts.map(args => args[2])).toEqual(["imessage-unanswered:held", "imessage-unanswered:held-member"]);
+  expect(inbounds(other.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).unanswered?.overdueAt !== undefined)).toBe(true);
 });
 
 test("unanswered watchdog rechecks later candidates after an alert awaits while their reply sends", async () => {
@@ -12375,3 +12442,18 @@ for (const retained of ["response", "sameMode", "reconcileOnly"] as const) for (
     expect(logs.some(line => line.name === "inbound.requeued" || line.name === "inbound.unanswered")).toBe(false);
   });
 }
+
+test.each(["/status", "/Status", "/new", "/New"])("outage telemetry: substantive %s command response covers only its own human row", async command => {
+  const h = setup();
+  h.input("earlier", "Earlier question", { source: "typed" });
+  await h.router.tick();
+  h.input("command", command, { source: "typed" });
+  await h.router.tick();
+  const op = h.controls().find(op => op.replyTo === "command")!;
+  expect(op.answersInbound).toBe(true);
+  expect(h.store.get<string[]>(`reply-covered:${op.id}`)).toEqual(["command"]);
+  h.store.outboxState(op.id, "sent");
+  const payloads = inbounds(h.store).map(row => row.payload as import("../src/unanswered.ts").AnsweredInput);
+  expect(payloads.find(input => input.id === "command")?.answeredAt).toBeNumber();
+  expect(payloads.find(input => input.id === "earlier")?.answeredAt).toBeUndefined();
+});

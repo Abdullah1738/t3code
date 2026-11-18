@@ -1,5 +1,6 @@
 import {
   type ThreadId,
+  TurnItemId,
   isOrchestrationV2WorkActive,
   OrchestrationV2CommandOutputError,
   type OrchestrationV2CommandOutputFrame,
@@ -62,6 +63,8 @@ interface Subscriber {
 export type CommandOutputTarget = OrchestrationV2SubscribeCommandOutputInput;
 
 export interface CommandOutputHubShape {
+  /** Last real output per live command; shared by timeout checks without persisting chunks. */
+  readonly activity: (threadId: ThreadId) => Effect.Effect<ReadonlyMap<TurnItemId, number>>;
   readonly forgetThread: (threadId: ThreadId) => Effect.Effect<void>;
   /** Add raw output for a running command. Called for every provider chunk. */
   readonly append: (input: CommandOutputTarget & { readonly chunk: string }) => Effect.Effect<void>;
@@ -143,6 +146,8 @@ export const make = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   // Insertion order doubles as recency: every write re-inserts its entry.
   const tails = new Map<string, TerminalOutputState>();
+  const activityAt = new Map<string, number>();
+  let pruneActivityAt = 0;
   const finished = new Map<string, TerminalOutputState>();
   const subscribers = new Map<string, Set<Subscriber>>();
 
@@ -163,24 +168,35 @@ export const make = Effect.gen(function* () {
       { discard: true },
     );
 
-  const append: CommandOutputHubShape["append"] = ({ chunk, ...target }) =>
-    Effect.suspend(() => {
-      if (chunk.length === 0) return Effect.void;
-      const key = commandKey(target);
-      const tail = appendTerminalOutput(tails.get(key) ?? EMPTY_TERMINAL_OUTPUT, chunk);
-      setBounded(tails, key, tail, MAX_LIVE_COMMANDS, (oldest) => {
-        // Its viewers no longer share the hub's state; resync them on the next frame.
-        for (const subscriber of subscribers.get(oldest) ?? []) {
-          subscriber.needsReplace = true;
-          subscriber.pendingAppend = "";
-        }
-      });
-      return wakeAll(key, chunk);
+  // Every output chunk passes here; a span per chunk would dominate this bookkeeping.
+  const append: CommandOutputHubShape["append"] = Effect.fnUntraced(function* ({
+    chunk,
+    ...target
+  }: Parameters<CommandOutputHubShape["append"]>[0]) {
+    if (chunk.length === 0) return;
+    const key = commandKey(target);
+    const now = yield* Clock.currentTimeMillis;
+    if (now >= pruneActivityAt) {
+      for (const [candidate, at] of activityAt)
+        if (at + 60_000 <= now) activityAt.delete(candidate);
+      pruneActivityAt = now + 60_000;
+    }
+    activityAt.set(key, now);
+    const tail = appendTerminalOutput(tails.get(key) ?? EMPTY_TERMINAL_OUTPUT, chunk);
+    setBounded(tails, key, tail, MAX_LIVE_COMMANDS, (oldest) => {
+      // Its viewers no longer share the hub's state; resync them on the next frame.
+      for (const subscriber of subscribers.get(oldest) ?? []) {
+        subscriber.needsReplace = true;
+        subscriber.pendingAppend = "";
+      }
     });
+    yield* wakeAll(key, chunk);
+  });
 
   const finish: CommandOutputHubShape["finish"] = (target) =>
     Effect.sync(() => {
       const key = commandKey(target);
+      activityAt.delete(key);
       const tail = tails.get(key);
       if (tail === undefined) return;
       tails.delete(key);
@@ -344,7 +360,7 @@ export const make = Effect.gen(function* () {
   const forgetThread = Effect.fn("CommandOutputHub.forgetThread")((threadId: ThreadId) =>
     Effect.sync(() => {
       const prefix = `${threadId}\u0000`;
-      for (const map of [tails, finished])
+      for (const map of [tails, finished, activityAt])
         for (const key of map.keys()) if (key.startsWith(prefix)) map.delete(key);
       for (const [key, listeners] of subscribers)
         if (key.startsWith(prefix))
@@ -354,7 +370,16 @@ export const make = Effect.gen(function* () {
           }
     }),
   );
-  return CommandOutputHub.of({ append, finish, subscribe, forgetThread });
+  const activity: CommandOutputHubShape["activity"] = (threadId) =>
+    Effect.sync(() => {
+      const prefix = `${threadId}\u0000`;
+      return new Map(
+        [...activityAt].flatMap(([key, at]) =>
+          key.startsWith(prefix) ? [[TurnItemId.make(key.slice(prefix.length)), at] as const] : [],
+        ),
+      );
+    });
+  return CommandOutputHub.of({ activity, append, finish, subscribe, forgetThread });
 });
 
 export const layer: Layer.Layer<

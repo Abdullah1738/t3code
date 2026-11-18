@@ -14,6 +14,7 @@ import { imessagePreferences } from "../src/preferred-model.ts";
 import { Router, turnRanTools } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 import { firstTurnAlert } from "../src/telegram-fallback.ts";
+import { ProbeBudget } from "../src/probe-policy.ts";
 
 const inbounds = (store: Store) => store.db.query<{ id: string; state: string }, []>("SELECT id, state FROM inbound ORDER BY rowid").all();
 const wakeBody = (title = "Daily board") => `[Watcher event from robob-watch daily-backlog, not typed by the owner. Handle it; reply only if the owner needs to know or act now, otherwise log it to the activity log and end with NO_REPLY.]\n${title}\n\nEvent:\nWORKING #5`;
@@ -1467,6 +1468,34 @@ function delegatedRouter() {
   });
   return { control, backend, store, router };
 }
+
+test("incremental admission reads respect persisted cooldown and retry cap while normal polling proceeds", async () => {
+  const start = Date.parse("2026-11-18T03:00:00Z"); setSystemTime(start);
+  const h = delegatedRouter(), chat = await h.backend.createChat(), id = "cached-admission";
+  const messageId = `msg_${createHash("sha256").update(id).digest("hex")}`;
+  h.store.set("route", { ...chat, generation: 1 });
+  h.store.acceptInbound(id, { id, text: "Please check", source: "typed", attachments: [], isAudioMessage: false, receivedAt: start - 120_000 } satisfies NormalizedInbound);
+  h.store.updateInbound(id, "processing");
+  h.store.set(`failed-delivery:${id}`, { ...chat, generation: 1, inboundId: id, messageId, startedAt: start - 120_000, phase: "unknown" });
+  expect(await h.backend.promptAccepted(chat.id, chat.directory, messageId)).toBe(false);
+  const reads = spyOn(ControlClient.prototype, "messages").mockRejectedValueOnce(new ControlError(503));
+  try {
+    await h.router.checkInboundLatency();
+    expect(reads).toHaveBeenCalledTimes(1);
+    expect(reads.mock.calls[0]![1]).toBeNumber();
+    setSystemTime(start + 1_000); await h.router.checkInboundLatency();
+    expect(reads).toHaveBeenCalledTimes(1);
+    setSystemTime(start + 60_000);
+    const budget = new ProbeBudget(h.store);
+    while (budget.take()) {}
+    await h.router.checkInboundLatency();
+    expect(reads).toHaveBeenCalledTimes(1);
+    expect(inbounds(h.store)).toEqual([{ id, state: "processing" }]);
+    await h.backend.messages(chat.id, chat.directory);
+    expect(reads).toHaveBeenCalledTimes(2);
+    expect(h.control.calls.filter(call => call.path.endsWith("/send"))).toEqual([]);
+  } finally { reads.mockRestore(); }
+});
 
 test.each([false, true])("a completed parent replies before its delegated child, even with older busy work (%s)", async olderBusy => {
   const { control, backend, store, router } = delegatedRouter();

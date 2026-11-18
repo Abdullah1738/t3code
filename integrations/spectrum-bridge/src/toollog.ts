@@ -1,3 +1,4 @@
+import { probeDeferred } from "./probe-policy.ts";
 import { safeLineFailureCode, sendblueErrorKey } from "./line.ts";
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -33,12 +34,13 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "outboxId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId", "requestId", "serverRequestId", "outageId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "generation", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "generation", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews", "linkFailureCount"]);
 const ENUMS: Record<string, readonly string[]> = {
   controlReason: CONTROL_REASONS,
   route: ["new_turn", "steer", "question_answer", "held_for_wake"],
   readMode: ["full", "incremental", "cached-skip", "shared"],
   fullReason: ["first-read", "route-change", "missing-until", "resync", "merge-conflict", "clock-skew"],
+  kind: ["control", "conversation", "notification", "outage", "dropped", "failed", "nudge", "request", "other"],
   state: ["pending", "admitted", "processing", "batched", "done", "failed", "unknown", "cancelled", "observed"],
   action: ["requeued", "in_turn"], leaderKind: ["human", "wake", "reset", "background", "none"],
   telegram: ["sent", "failed"], severity: ["warn"],
@@ -76,6 +78,12 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
       props[key] = value; continue;
     }
+    if (entry.component === "remote-box" && entry.name === "moni-runner-error") {
+      if (key === "path" && typeof value === "string" && ["/send", "/files", "/react", "/agent-ask", "/agent-answer", "/agent-requests", "/share", "/unshare", "/shares", "/metrics", "/ready"].includes(value)
+        || key === "errorClass" && typeof value === "string" && ["LineError", "RemoteSendError", "Error", "UnknownError"].includes(value)
+        || key === "retryable" && typeof value === "boolean") { props[key] = value; continue; }
+      if (key === "code" && typeof value === "string") { props.code = safeLineFailureCode(value); continue; }
+    }
     if (["moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "moni-box-backend-state"].includes(entry.name)) {
       if (key === "event" && typeof value === "string" && /^[a-f0-9]{12}$/.test(value)
         || key === "kind" && (value === "inbound" || value === "wake")
@@ -84,9 +92,10 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
         props[key] = value; continue;
       }
     }
+    if (entry.name === "robob.link_state" && key === "resumedByRun" && typeof value === "string" && /^[a-f0-9-]{36}$/.test(value)) { props[key] = value; continue; }
     if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1)) continue;
     if ((NUMBERS.has(key) || key === "replies" && entry.name === "notice.reply") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
-    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders", "linkRecovery", "retrySafe"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
+    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders", "linkRecovery", "retrySafe", "answersInbound"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
     else if (key === "holderRunId" && typeof value === "string" && value.length <= 250 && /^[a-zA-Z0-9_:%.@-]+$/.test(value)) props[key] = value;
     else if (typeof value === "string" && ENUMS[key]?.includes(value)) props[key] = value;
     // A route template is code-owned; no query strings, ids, or URLs enter the log.
@@ -151,7 +160,11 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   let recovery: Promise<void> | undefined;
   const calls = createCallAggregation(processRunId);
   const messageReads = createMessageReadAggregation();
-  const robobLink = createRobobLinkState();
+  const robobLink = createRobobLinkState({ root, now, checkpoint: () => {
+    const day = new Date(now()).toISOString().slice(0, 10);
+    const path = join(root(), `${day}.ndjson`);
+    return { day, offset: existsSync(path) ? statSync(path).size : 0 };
+  } });
   const renders = createRenderAggregation();
   let writeFailed = false;
   function append(entry: Entry, stamp?: string): void {
@@ -185,8 +198,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && line.level !== "warn" && !["turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
-
+        if (line.kind !== "error" && line.level !== "warn" && !["msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }
@@ -205,6 +217,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   function flush(): void {
     scheduled = false;
     for (const line of pending.splice(0)) append(line, line.ts);
+    robobLink.save();
   }
   function enqueue(line: LogLine): void {
     if (!options.defer) { append(line, line.ts); return; }
@@ -223,6 +236,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       const link = robobLink.accept(line);
       for (const event of link.events) enqueue(event);
       for (const messageRead of messageReads.accept(line)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
+      if (!options.defer) robobLink.save();
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
       if (["turn.start", "reply.sent", "inbound.answered"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
         refreshChains(`${line.ids.chat}\0${line.ids.inboundId}`);
@@ -454,7 +468,7 @@ function loggedRequestId(error: unknown): string | undefined {
   }
 }
 export function toolError(component: string, tag: string, cause: unknown, ids?: LogLine["ids"], props?: LogLine["props"]): void {
-  if (cause === completionReady) return;
+  if (cause === completionReady || cause === probeDeferred) return;
   const requestId = loggedRequestId(cause);
   toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids: { ...ids, ...(requestId ? { requestId } : {}) }, props: { ...controlFailureProps(cause), ...props },
     ...(requestId ? { alreadyLogged: true } : {}), error: { tag, cause } });

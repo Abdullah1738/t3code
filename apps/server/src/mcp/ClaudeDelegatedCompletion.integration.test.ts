@@ -74,6 +74,7 @@ interface QueryProbe {
   readonly input: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput;
   readonly nativeSessionId: string;
   readonly frames: Queue.Queue<SdkFrame>;
+  readonly exited: Deferred.Deferred<{ code: number | null; signal: NodeJS.Signals | null }>;
 }
 
 const sendSdkFrame = Effect.fn("sendSdkFrame")(function* (query: QueryProbe, message: SDKMessage) {
@@ -133,9 +134,9 @@ const completeSdkTurn = Effect.fn("completeSdkTurn")(function* (
   });
 });
 
-it.live.each([false, true])(
-  "returns Claude SDK results while another session status write is blocked (queued follow-up: %s)",
-  (queueFollowup) =>
+it.live.each(["single", "queued", "cli_exit"] as const)(
+  "returns Claude SDK results while another session status write is blocked (%s)",
+  (scenario) =>
     Effect.scoped(
       Effect.gen(function* () {
         const cwd = yield* checkpointWorkspace("claude-delegated-completion");
@@ -170,9 +171,14 @@ it.live.each([false, true])(
                       input,
                       nativeSessionId: input.options.sessionId ?? input.options.resume!,
                       frames: yield* Queue.unbounded<SdkFrame>(),
+                      exited: yield* Deferred.make<{
+                        code: number | null;
+                        signal: NodeJS.Signals | null;
+                      }>(),
                     };
                     queries.push(query);
                     return {
+                      processExit: Deferred.await(query.exited),
                       messages: Stream.fromQueue(query.frames).pipe(
                         Stream.flatMap(({ message, processed }) =>
                           Stream.make(message).pipe(
@@ -216,6 +222,7 @@ it.live.each([false, true])(
           {
             configureMcp: true,
             runEffectWorker: false,
+            runContinuationWorker: scenario === "cli_exit",
             beforeEventWrite: (input) =>
               blockParentStatus &&
               input.events.some(
@@ -400,14 +407,95 @@ it.live.each([false, true])(
           expect(firstOffer.query.input.providerSessionId).not.toBe(
             parentOffer.query.input.providerSessionId,
           );
-          const queued = queueFollowup
-            ? yield* invoke("t3_thread_send", {
-                threadId: first.childThreadId,
-                message: "Inspect the queued delegated boundary.",
-                mode: "queue",
-                clientRequestId: "claude-delegated-followup",
-              }).pipe(Effect.flatMap(Schema.decodeUnknownEffect(OrchestratorMcpThreadSendResult)))
-            : null;
+          if (scenario === "cli_exit") {
+            yield* sendSdkFrame(firstOffer.query, {
+              type: "assistant",
+              uuid: "00000000-0000-4000-8000-00000000e183",
+              session_id: firstOffer.query.nativeSessionId,
+              user_message_uuid: firstOffer.message.uuid!,
+              parent_tool_use_id: null,
+              message: {
+                id: "exit-bash",
+                container: null,
+                context_management: null,
+                role: "assistant",
+                type: "message",
+                model: selection.model,
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "exit-bash-tool",
+                    name: "Bash",
+                    input: { command: "offbox wait run-proof --timeout 570", timeout: 600000 },
+                    caller: { type: "direct" },
+                  },
+                ],
+                stop_details: null,
+                stop_reason: "tool_use",
+                stop_sequence: null,
+                usage: sdkUsage,
+              },
+            });
+            yield* Deferred.succeed(firstOffer.query.exited, { code: null, signal: "SIGKILL" });
+            yield* awaitEvent(
+              first.childThreadId,
+              (event) =>
+                event.type === "provider-turn.updated" && event.payload.status === "failed",
+            );
+            yield* worker.drain();
+            yield* awaitEvent(
+              first.childThreadId,
+              (event) =>
+                event.type === "run.updated" &&
+                event.payload.id === first.childRunId &&
+                event.payload.status === "failed",
+            );
+            yield* awaitEvent(
+              parentThreadId,
+              (event) =>
+                event.type === "context-transfer.created" &&
+                event.payload.type === "subagent_result" &&
+                event.payload.sourceThreadId === first.childThreadId,
+            );
+            const child = yield* orchestrator.getThreadProjection(first.childThreadId);
+            expect(child.turnItems.find((item) => item.type === "command_execution")?.status).toBe(
+              "failed",
+            );
+            expect(
+              child.turnItems
+                .filter((item) => item.type === "error")
+                .map((item) => item.type === "error" && item.failure.code),
+            ).toContain("cli_process_exited");
+            yield* Deferred.succeed(release, undefined);
+            yield* awaitEvent(
+              parentThreadId,
+              (event) =>
+                event.type === "message.updated" &&
+                event.payload.delegatedCompletion?.taskIds.includes(first.taskId) === true,
+            );
+            yield* worker.drain();
+            const wake = yield* Queue.take(offers);
+            expect(wake.query.input.threadId).toBe(parentThreadId);
+            expect(JSON.stringify(wake.message)).toContain("SIGKILL");
+            const failed = yield* status(first.taskId);
+            expect(failed).toMatchObject({
+              status: "failed",
+              workState: "result_available",
+              hasPendingChildRuns: false,
+            });
+            expect(failed.summary).toContain("SIGKILL");
+            expect(failed).not.toHaveProperty("finalReport");
+            return;
+          }
+          const queued =
+            scenario === "queued"
+              ? yield* invoke("t3_thread_send", {
+                  threadId: first.childThreadId,
+                  message: "Inspect the queued delegated boundary.",
+                  mode: "queue",
+                  clientRequestId: "claude-delegated-followup",
+                }).pipe(Effect.flatMap(Schema.decodeUnknownEffect(OrchestratorMcpThreadSendResult)))
+              : null;
           if (queued !== null) {
             expect(queued).toMatchObject({ status: "queued", delivery: "queued" });
             expect(queued.runId).not.toBe(first.childRunId);

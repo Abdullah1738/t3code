@@ -1,4 +1,4 @@
-import { deliveredReplyCoverage, markAnswered, type AnsweredInput } from "./unanswered.ts";
+import { deliveredReplyCoverage, humanRow, markControlAcked, markAnswered, type AnsweredInput } from "./unanswered.ts";
 import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
@@ -31,6 +31,8 @@ export type OutboxOperation = {
   id: string;
   // "notification" survives only for reference lookup of historical rows.
   kind: "notification" | "conversation" | "control";
+  /** A direct command response, such as /status, can complete its own inbound row. */
+  answersInbound?: true;
   text: string;
   sessionId?: string;
   generation?: number;
@@ -208,7 +210,7 @@ export class Store {
   enqueue(op: OutboxOperation, attribution?: ReplyAttribution): boolean {
     // Normalize property order and omit unrelated caller fields before comparing content.
     const payload = json({
-      id: op.id, kind: op.kind, text: op.text, sessionId: op.sessionId,
+      id: op.id, kind: op.kind, ...(op.answersInbound ? { answersInbound: true } : {}), text: op.text, sessionId: op.sessionId,
       generation: op.generation, replyTo: op.replyTo,
       attachment: op.attachment ? { sha256: op.attachment.sha256, name: op.attachment.name,
         mimeType: op.attachment.mimeType, size: op.attachment.size } : undefined,
@@ -223,10 +225,11 @@ export class Store {
       const result = this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
         ON CONFLICT(id) DO NOTHING`).run(op.id, payload);
       if (result.changes) {
-        this.set(`reply-covered:${op.id}`, attribution?.covered ?? [...new Set([
+        this.set(`reply-covered:${op.id}`, (attribution?.covered ?? [...new Set([
           ...this.replyAttribution(op.sessionId, op.generation).covered,
           ...(op.replyTo ? this.get<{ batchIds?: string[] }>(`batch:${op.replyTo}`)?.batchIds ?? [op.replyTo] : []),
-        ])]);
+        ])]).filter(humanRow));
+        if (op.kind === "control" && !op.answersInbound) deliveredReplyCoverage(this, op);
         if (op.app?.updateOf) this.set(`app-latest:${op.app.updateOf}`, op.id);
         toolLog.capture(() => {
           this.set(`log-queued:${op.id}`, Date.now());
@@ -312,8 +315,11 @@ export class Store {
         state = ?, providerId = COALESCE(?, providerId) WHERE id = ?`
       ).run(state, state, providerId ?? null, id);
       if (!result.changes) throw new Error(`Unknown outbox operation: ${id}`);
-      const op = state === "sent" ? this.getOperation(id) : undefined;
-      if (op?.kind === "conversation") markAnswered(this, deliveredReplyCoverage(this, op));
+      if (state === "sent") {
+        const op = this.getOperation(id)!;
+        if (op.kind === "control" && !op.answersInbound) markControlAcked(this, op);
+        else markAnswered(this, deliveredReplyCoverage(this, op));
+      }
       rememberHealthReceipt(this, id, state);
     }).immediate();
   }
