@@ -17,6 +17,8 @@ _seen = set()
 _last_report = time.monotonic()
 PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx', 'phase', 'durationMaxMs', 'omitted', 'provider', 'scope', 'cause', 'lockMs', 'until', 'previousBackoffLevel', 'backoffLevel', 'source'}
 IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session', 'writer'}
+PROPS.update({'downSince', 'downMs', 'pid', 'ppid', 'initiator', 'stopReason', 'script', 'releaseDir',
+              'startedAtMs', 'finishedAtMs', 'lastErrorCode', 'outcome', 'ownerPid', 'lockAgeMs'})
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
             'The operation was aborted due to timeout', 'The operation was aborted'}
@@ -116,7 +118,7 @@ def _write(root, day, now, row, state):
                 except FileExistsError:
                     pass
                 # Drop counters must remain visible after the daily cap.
-                if row['kind'] != 'error' and not is_volume:
+                if row['kind'] != 'error' and row['component'] not in ('guard', 'supervisor') and not is_volume:
                     volume.dropped(state, 'daily_cap')
                     return False
             os.write(fd, (json.dumps(row, separators=(',', ':')) + '\n').encode())
