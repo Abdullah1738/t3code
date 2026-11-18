@@ -1,4 +1,5 @@
 import copy
+import os
 from pathlib import Path
 import signal
 import sys
@@ -203,8 +204,9 @@ class XcodeTests(JanitorTestCase):
                 self.assertEqual((m['worktree'], m['state_pid'], m['log_path']), (str(root), 10, str(log)))
                 self.assertEqual(m['log_mtime'], log.stat().st_mtime)
                 (state / 'pid').write_text('999')
-                with self.assertRaises(ValueError):
-                    lp.xcode_metadata(self.rows[20], self.rows)
+                m = lp.xcode_metadata(self.rows[20], self.rows)
+                self.assertIsNone(m['state_pid'])
+                self.assertEqual(m['log_path'], str(log))
 
     def test_scan_observes_full_minute_and_metadata_conflicts_keep(self):
         with patch.object(lp, 'cpu_processes', side_effect=[self.rows, self.after]), patch.object(lp, 'run') as run, patch.object(lp, 'launch_services', return_value={}), patch.object(lp, 'detect_xcode_builds', return_value={}) as detect, patch.object(lp.time, 'monotonic', side_effect=[100, 160]):
@@ -285,7 +287,6 @@ class XcodeTests(JanitorTestCase):
                 shared_log = root / 'server.log'
                 for log in [build_log, launcher_log, shared_log]:
                     log.write_text('output')
-                import os
                 os.utime(build_log, (self.now - 20000, self.now - 20000))
                 os.utime(launcher_log, (self.now - 10000, self.now - 10000))
                 os.utime(shared_log, (self.now, self.now))
@@ -299,3 +300,66 @@ class XcodeTests(JanitorTestCase):
                 uses_launcher = mode in {'state_launcher', 'worktree_launcher'}
                 self.assertEqual(metadata['log_path'], str(launcher_log if uses_launcher else build_log))
                 self.assertEqual(run.call_args.args[0][run.call_args.args[0].index('-p') + 1], '10,20' if uses_launcher else '20')
+
+    def test_detached_state_lifecycle_matrix_does_not_hide_current_build(self):
+        cases = [('absent', None, False, None), ('foreign_live', '999', False, None),
+                 ('foreign_complete', '999', True, None), ('blank', '', False, None),
+                 ('malformed', 'old-pid', False, None), ('zero', '0', False, None),
+                 ('negative', '-10', False, None), ('matching_complete', '10', True, None),
+                 ('matching_launcher', '10', False, 10), ('matching_root', '20', False, 20)]
+        for name, pid, completed, expected_pid in cases:
+            with self.subTest(state=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / '.git').touch()
+                state = root / 'tmp/build/state'
+                state.mkdir(parents=True)
+                current_log, old_log = root / 'current.log', root / 'previous-build.log'
+                current_log.write_text('current build')
+                old_log.write_text('previous build')
+                os.utime(current_log, (self.now - 20000, self.now - 20000))
+                os.utime(old_log, (self.now, self.now))
+                if pid is not None:
+                    (state / 'pid').write_text(pid)
+                if completed:
+                    (state / 'exit').write_text('0')
+                # A stale state log pointer must not override this build's fd.
+                (state / 'log').write_text(str(current_log if expected_pid is not None else old_log))
+                raw = f'p20\nf1\ntREG\nn{current_log}\n'
+                with patch.object(lp, 'cwd_inventory', return_value={20: str(root)}), patch.object(lp, 'native_binding', return_value={'CODEX_THREAD_ID': 'native-owner'}), patch.object(lp, 'run', return_value=raw):
+                    metadata = lp.xcode_metadata(self.rows[20], self.rows)
+                    report = self.detect(metadata=lp.xcode_metadata)
+                self.assertEqual(metadata['state_pid'], expected_pid)
+                self.assertEqual(metadata['log_path'], str(current_log))
+                self.assertEqual([item['pid'] for item in report['candidates']], [20])
+                self.assertEqual(report['candidates'][0]['owner'], 'owner')
+
+    def test_same_worktree_logs_must_belong_to_current_build(self):
+        cases = [('redirect', None), ('state_log', 'log'), ('state_log_path', 'log_path')]
+        for name, state_key in cases:
+            with self.subTest(log_source=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / '.git').touch()
+                state = root / 'tmp/build/state'
+                state.mkdir(parents=True)
+                (state / 'pid').write_text('10')
+                logs = root / 'tmp/build/logs'
+                logs.mkdir()
+                current_log, other_log = logs / 'xcodebuild.log', logs / 'other-build.log'
+                current_log.write_text('stalled build')
+                other_log.write_text('another build is working')
+                os.utime(current_log, (self.now - 20000, self.now - 20000))
+                os.utime(other_log, (self.now, self.now))
+                if state_key:
+                    (state / state_key).write_text(str(current_log.relative_to(root)))
+                self.rows[900] = {**self.rows[20], 'pid': 900, 'ppid': 1}
+                self.after = copy.deepcopy(self.rows)
+                hints = {20: str(root), 10: str(root), 900: str(root)}
+                raw = (f'p20\nf1\ntREG\nn{current_log}\n' if state_key is None else '')
+                raw += f'p900\nf1\ntREG\nn{other_log}\n'
+                with patch.object(lp, 'cwd_inventory', return_value=hints), patch.object(lp, 'native_binding', return_value={'CODEX_THREAD_ID': 'native-owner'}), patch.object(lp, 'run', return_value=raw):
+                    metadata = lp.xcode_metadata(self.rows[20], self.rows)
+                    report = self.detect(metadata=lp.xcode_metadata)
+                self.assertEqual(metadata['log_path'], str(current_log))
+                self.assertIn(20, [item['pid'] for item in report['candidates']])
+                current = next(item for item in report['candidates'] if item['pid'] == 20)
+                self.assertEqual(current['log_mtime'], self.now - 20000)

@@ -815,12 +815,17 @@ def xcode_metadata(row, rows):
             bindings[key] = value
     state = worktree / 'tmp/build/state'
     state_pid = None
-    if (state / 'pid').exists():
-        state_pid = int((state / 'pid').read_text().strip())
-        if state_pid not in {p['pid'] for p in chain}:
-            raise ValueError("detached state belongs to another launcher")
+    if (state / 'pid').is_file() and not (state / 'exit').exists():
+        try:
+            recorded_pid = int((state / 'pid').read_text().strip())
+        except ValueError:
+            recorded_pid = None
+        if recorded_pid in {p['pid'] for p in chain}:
+            state_pid = recorded_pid
+    # Detached state survives completion. Only a current pid-linked launcher
+    # may supply state metadata; subsequent builds use their own bindings/fds.
     logs = set()
-    for key in ('log', 'log_path'):
+    for key in ('log', 'log_path') if state_pid is not None else ():
         path = state / key
         if path.is_file():
             value = Path(path.read_text().strip())
@@ -852,8 +857,6 @@ def xcode_metadata(row, rows):
             regular = line == 'tREG'
         elif regular and log_pid in log_pids and line.startswith('n/'):
             logs.add(Path(line[1:]))
-    if state_pid is not None:
-        logs.update((worktree / 'tmp/build/logs').glob('*.log'))
     existing = [(p, p.stat().st_mtime) for p in logs if p.is_file()]
     log, mtime = max(existing, key=lambda entry: entry[1]) if existing else (None, None)
     argv = shlex.split(row['args'])
