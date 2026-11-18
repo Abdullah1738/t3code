@@ -4,6 +4,7 @@ import { toolLog, toolError } from "./toollog.ts";
 import { StderrCause, stderrCause, type DependencyBusy } from "./cause.ts";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
+import { CheckGroups, type CheckGroup } from "./check-groups.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -643,13 +644,20 @@ export function log(id: string | null, message: string): void {
 export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
 
 export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean; ms: number; busy?: DependencyBusy };
-const liveCheckGroups = new Map<number, Promise<void>>();
+export const checkGroups = new CheckGroups(log, (name, group, diagnostic) => {
+  toolLog({ component: "runner", kind: "event", name, ids: { watcher: group.watcher.id },
+    props: { pgid: group.pgid, pid: group.pid, killedAt: group.killedAt, diagnostic } });
+});
+const liveCheckGroups = checkGroups.groups;
+export class CheckStuckError extends Error {
+  constructor(readonly group: CheckGroup) { super(`Previous check group ${group.pgid} is still alive`); }
+}
 let stoppingChecks = false;
 let shutdownInstalled = false;
 let shutdownStarted = false;
 let beforeCheckShutdown: (() => void) | undefined;
 
-export const checkGroupExit = (pgid: number): Promise<void> | undefined => liveCheckGroups.get(pgid);
+export const checkGroupExit = (pgid: number): Promise<void> | undefined => liveCheckGroups.get(pgid)?.closed;
 export const checkProcessTag = (id: string, run: string = randomUUID()): string => `${id}:${run}:${process.pid}`;
 
 export function installCheckShutdown(beforeShutdown?: () => void): void {
@@ -681,24 +689,16 @@ async function waitForChecks(closed: Promise<void>[], timeoutMs: number): Promis
   } finally { clearTimeout(timer); }
 }
 
-function trackCheckGroup(pgid: number, child: ReturnType<typeof spawn>): void {
-  let release!: () => void;
-  liveCheckGroups.set(pgid, new Promise<void>(resolve => { release = resolve; }));
+function trackCheckGroup(group: CheckGroup, child: ReturnType<typeof spawn>): void {
   let watching = false;
   const closed = () => {
     if (watching) return;
     watching = true;
     // Closing the shell's pipes does not mean its redirected descendants have exited.
     const reap = () => {
-      try { process.kill(-pgid, 0); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-          liveCheckGroups.delete(pgid);
-          release();
-          return;
-        }
-      }
-      setTimeout(reap, 25).unref();
+      if (checkGroups.reap(group)) return;
+      // Stuck groups are probed on runner ticks, not forty times per second forever.
+      if (!group.stuck) setTimeout(reap, 25).unref();
     };
     reap();
   };
@@ -711,21 +711,27 @@ export async function killRunningChecks(signal: NodeJS.Signals = "SIGTERM"): Pro
   const groups = [...liveCheckGroups];
   for (const [pgid] of groups) signalCheckGroup(pgid, signal);
   if (!groups.length || signal === "SIGKILL") return;
-  await waitForChecks(groups.map(([, closed]) => closed), 500);
+  await waitForChecks(groups.map(([, group]) => group.closed), 500);
   for (const [pgid] of groups) if (liveCheckGroups.has(pgid)) signalCheckGroup(pgid, "SIGKILL");
   // Let the runner reap direct children before it exits, including TERM-resistant checks.
-  await waitForChecks(groups.map(([, closed]) => closed), 250);
+  await waitForChecks(groups.map(([, group]) => group.closed), 250);
 }
 
 /**
  * Runs a check in its own process group so a timeout kills everything it started. The result never waits more
  * than KILL_GRACE_MS past the timeout: a SIGKILLed process that the scheduler has not reaped yet must not keep
- * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
+ * the shared check pool blocked. Its watcher resumes once that group exits (3 Oct 2026: reaping took 9+ minutes).
  */
-export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance = watcherInstance(watcher.id)): Promise<CheckResult> {
+export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance?: string): Promise<CheckResult> {
   if (stoppingChecks) return Promise.reject(new Error("Runner is shutting down"));
+  const previous = checkGroups.previous(watcher.id);
+  if (previous) return Promise.reject(new CheckStuckError(previous));
   installCheckShutdown();
-  const run = () => spawnCheck(watcher, dir, extraEnv, timeoutMs, instance);
+  const run = () => {
+    const previous = checkGroups.previous(watcher.id);
+    if (previous) throw new CheckStuckError(previous);
+    return spawnCheck(watcher, dir, extraEnv, timeoutMs, instance ?? watcherInstance(watcher.id));
+  };
   return dir === watcherDir(watcher.id) ? withRelayLockAsync(run) : run();
 }
 
@@ -744,7 +750,7 @@ function spawnCheck(watcher: Watcher, dir: string, extraEnv: Record<string, stri
       if (done) return;
       done = true;
       clearTimeout(timer);
-      clearTimeout(grace);
+      if (!timedOut || !group || checkGroups.reap(group)) clearTimeout(grace);
       const ms = now() - started;
       cause.add(extra);
       const busy = cause.busy(code);
@@ -767,14 +773,17 @@ function spawnCheck(watcher: Watcher, dir: string, extraEnv: Record<string, stri
       if (!current || current.paused || (extraEnv.WATCH_PENDING === "1" ? !pending : !checking(state) || current.check !== watcher.check)) throw new Error("Watcher check changed before admission");
       return spawnChild(state.status === "closing" || state.reply_handoff ? "1" : "0");
     }) : spawnChild();
-    if (child.pid) trackCheckGroup(child.pid, child);
+    const group = child.pid ? checkGroups.track(watcher, child.pid) : undefined;
+    if (group) trackCheckGroup(group, child);
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", (chunk: string) => { cause.add(chunk); if (stderr.length < 20_000) stderr += chunk; });
     const timer = setTimeout(() => {
       timedOut = true;
+      if (group) group.killedAt = now();
       try { process.kill(-child.pid!, "SIGKILL"); } catch { toolError("runner", "watch.kill_failed", { watcher: watcher.id }); }
       grace = setTimeout(() => {
+        if (group) checkGroups.markStuck(group);
         try { child.stdout!.destroy(); child.stderr!.destroy(); child.unref(); } catch { toolError("runner", "watch.pipe_cleanup_failed", { watcher: watcher.id }); }
         finish(child.exitCode, child.signalCode, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
       }, KILL_GRACE_MS);
