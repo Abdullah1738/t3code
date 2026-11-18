@@ -2625,7 +2625,7 @@ test.each(["event-before-detail", "detail-before-event"])("older idle detail nev
   expect(await detail).toBe(order === "event-before-detail");
   if (order === "detail-before-event") f.event("owner", "running");
   expect(await f.backend.statuses()).toEqual({ owner: { type: "busy", root: null } });
-  expect(f.reads).toHaveBeenCalledTimes(order === "event-before-detail" ? 2 : 1);
+  expect(f.reads).toHaveBeenCalledTimes(1);
 });
 
 test("a repeated busy event also fences an older idle route detail", async () => {
@@ -2639,7 +2639,7 @@ test("a repeated busy event also fences an older idle route detail", async () =>
   response.resolve({ thread: idle });
   expect(await detail).toBe(true);
   expect(await f.backend.statuses()).toHaveProperty("owner");
-  expect(f.reads).toHaveBeenCalledTimes(2);
+  expect(f.reads).toHaveBeenCalledTimes(1);
 });
 
 test.each(["running", "queued"])("another thread's %s event cannot discard a fresh idle route detail", async state => {
@@ -2856,7 +2856,7 @@ test.each([
   expect(f.roster.status()).toMatchObject({ misses: 1, roster_event: 1 });
 });
 
-test.each(["opened", "waiting", "completed", "detail-fetch"])("real backend steer admission finds a child's question after %s", async transition => {
+test.each(["opened", "waiting", "completed", "detail-fetch", "detail-race"])("real backend steer admission finds a child's question after %s", async transition => {
   const start = Date.now(); setSystemTime(start);
   const h = delegatedRouter({
     chat: { key: "dm:+15555550123", slug: "owner", kind: "owner", title: "Owner" },
@@ -2868,7 +2868,7 @@ test.each(["opened", "waiting", "completed", "detail-fetch"])("real backend stee
   const request: PendingRequest = { requestId: "child-question", kind: "question", requestKind: "user_input", canRespond: true,
     questions: [{ id: "choice", header: "Pick", question: "Which?", options: [{ label: "A" }] }] };
   const child: Thread = { ...h.control.threads.get(route.id)!, threadId: "asking", parentThreadId: route.id,
-    runs: [{ runId: "child-run", ordinal: 1, status: "waiting" }], messages: [], pending: ["opened", "detail-fetch"].includes(transition) ? [] : [request] };
+    runs: [{ runId: "child-run", ordinal: 1, status: transition === "detail-race" ? "running" : "waiting" }], messages: [], pending: ["opened", "detail-fetch", "detail-race"].includes(transition) ? [] : [request] };
   h.control.threads.set(child.threadId, child);
   h.backend.activeRoster.streamState(true);
   rosterEvent(h.backend.activeRoster, { type: "thread.created", threadId: child.threadId });
@@ -2878,7 +2878,26 @@ test.each(["opened", "waiting", "completed", "detail-fetch"])("real backend stee
   const statuses = h.backend.statuses.bind(h.backend);
   const admission = spyOn(h.backend, "statuses").mockImplementation(async complete => {
     if (complete) {
-      if (transition === "detail-fetch") {
+      if (transition === "detail-race") {
+        const original = h.backend.client.thread.bind(h.backend.client);
+        const { thread: old } = await original(child.threadId);
+        const permission = Promise.withResolvers<{ thread: typeof old }>(), question = Promise.withResolvers<{ thread: typeof old }>();
+        const entered = Promise.withResolvers<void>(), landed = Promise.withResolvers<void>();
+        let reads = 0;
+        spyOn(h.backend.client, "thread").mockImplementation(async id => {
+          if (id !== child.threadId || reads >= 2) return original(id);
+          if (++reads === 2) entered.resolve();
+          return reads === 1 ? permission.promise : question.promise;
+        });
+        const permissions = h.backend.permissions.bind(h.backend);
+        spyOn(h.backend, "permissions").mockImplementation(async (...args) => { const result = await permissions(...args); if (args[0] === child.threadId) landed.resolve(); return result; });
+        const scan = h.router["requests"](h.store.get<Parameters<typeof h.router["requests"]>[0]>("activeTurn")!, await statuses(true), true);
+        await entered.promise;
+        child.pending = [request];
+        permission.resolve(await original(child.threadId)); await landed.promise;
+        question.resolve({ thread: { ...old, state: "waiting", pendingRequest: null, pendingRequests: [] } }); await scan;
+      }
+      else if (transition === "detail-fetch") {
         const read = h.backend.activeRoster.checkpoint(child.threadId);
         const { thread: older } = await h.backend.client.thread(child.threadId);
         const list = h.backend.client.listThreads.bind(h.backend.client);
@@ -2907,7 +2926,7 @@ test.each(["opened", "waiting", "completed", "detail-fetch"])("real backend stee
   expect(admission.mock.calls.some(([complete]) => complete)).toBe(true);
   expect(h.control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
   expect(h.router.routerStatus().pending).toMatchObject([{ sessionId: child.threadId, kind: "question", state: "pending" }]);
-  expect(h.control.calls.filter(call => call.path.includes("active=true"))).toHaveLength(initial + (transition === "detail-fetch" ? 1 : 0));
+  expect(h.control.calls.filter(call => call.path.includes("active=true"))).toHaveLength(initial + (["detail-fetch", "detail-race"].includes(transition) ? 1 : 0));
 });
 
 test.each([undefined, "9", "10", "bad", "9007199254740992"])("unordered event sequence %s retains busy and refetches once", async id => {
@@ -2928,9 +2947,9 @@ test.each(["before", "during", "after"])("detail started %s the latest fetch cle
   const response = Promise.withResolvers<typeof f.server>();
   f.advance(30_000); f.reads.mockReturnValueOnce(response.promise);
   const refresh = f.backend.statuses(true);
-  if (order === "during") read = f.roster.checkpoint("owner");
+  if (order === "during") { f.roster.finish("owner", read); read = f.roster.checkpoint("owner"); }
   response.resolve(structuredClone(f.server)); await refresh;
-  if (order === "after") read = f.roster.checkpoint("owner");
+  if (order === "after") { f.roster.finish("owner", read); read = f.roster.checkpoint("owner"); }
   f.server.threads[0]!.state = "idle";
   f.roster.observe(f.server.threads[0]!, read);
   if (order === "after") expect(await f.backend.statuses()).toEqual({});

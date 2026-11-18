@@ -25,7 +25,7 @@ export function rosterStatuses(threads: Iterable<ThreadSummary>, native: Readonl
 }
 
 type Snapshot = { threads: ThreadSummary[]; total: number; fetchedAt: number; complete: boolean };
-type DetailRead = { revision: number; fetch: number; fetching: boolean };
+type DetailRead = { ticket: number; revision: number; fetch: number; fetching: boolean };
 function sameRow(a: ThreadSummary, b: ThreadSummary): boolean {
   return a.state === b.state && a.status === b.status && a.parentThreadId === b.parentThreadId
     && a.rootThreadId === b.rootThreadId && a.nativeSessionId === b.nativeSessionId
@@ -41,12 +41,14 @@ export class ActiveRoster {
   private busy: Record<string, SessionStatus> = {};
   private known = new Map<string, ThreadSummary>();
   private fetching?: Promise<void>;
-  private pending = new Map<string, ThreadSummary>();
+  private pending = new Map<string, { row: ThreadSummary; ticket: number }>();
   private sequences = new Map<string, number>();
   private fetchVersion = 0;
   private ambiguousRefresh = false;
   private ambiguousGeneration = -1;
   private revisions = new Map<string, number>();
+  private tickets = new Map<string, number>();
+  private details = new Map<string, Set<number>>();
   private dirty = 0;
   private clean = 0;
   private stream = false;
@@ -111,12 +113,23 @@ export class ActiveRoster {
   }
 
   checkpoint(threadId: string): DetailRead {
-    return { revision: this.revision(threadId), fetch: this.fetchVersion, fetching: !!this.fetching };
+    const ticket = this.nextTicket(threadId);
+    let details = this.details.get(threadId);
+    if (!details) this.details.set(threadId, details = new Set());
+    details.add(ticket);
+    return { ticket, revision: this.revision(threadId), fetch: this.fetchVersion, fetching: !!this.fetching };
+  }
+
+  finish(threadId: string, read: DetailRead): void {
+    const details = this.details.get(threadId);
+    details?.delete(read.ticket);
+    if (!details?.size) this.details.delete(threadId);
   }
 
   /** Route detail reads also reconcile state while the event stream is reconnecting. */
   observe(thread: ThreadSummary, read = this.checkpoint(thread.threadId)): void {
-    if (!this.cache) return;
+    this.finish(thread.threadId, read);
+    if (!this.cache || read.ticket < this.revision(thread.threadId)) return;
     const row: ThreadSummary = { threadId: thread.threadId, projectId: thread.projectId, title: thread.title,
       state: thread.state, status: thread.status, origin: thread.origin, nativeSessionId: thread.nativeSessionId,
       runtimeMode: thread.runtimeMode, parentThreadId: thread.parentThreadId, rootThreadId: thread.rootThreadId,
@@ -125,24 +138,38 @@ export class ActiveRoster {
     const previous = this.known.get(row.threadId);
     // Repeated detail reads add no evidence and must not perpetuate a reconciliation fetch.
     if (previous ? sameRow(previous, row) : !BUSY.has(row.state) && !row.pendingRequest) return;
-    // Only ordered facts may clear a thread: same-run identity is not a freshness token.
-    // Unordered reads/events retain busy evidence and share one aggregate reconciliation.
-    if (read.fetching || this.fetching || read.fetch !== this.fetchVersion || read.revision !== this.revision(row.threadId)) {
+    // Only ordered facts may clear a thread. A concurrent detail can still bring busy/request
+    // evidence; retain that evidence and share reconciliation until the read order is known.
+    const clears = previous && (BUSY.has(previous.state) && !BUSY.has(row.state)
+      || previous.pendingRequest && previous.pendingRequest.requestId !== row.pendingRequest?.requestId
+      || previous.state === "needs-input" && row.state !== "needs-input");
+    if (read.fetching || this.fetching || read.fetch !== this.fetchVersion || read.revision !== this.revision(row.threadId)
+      || clears && this.details.has(row.threadId)) {
       this.ambiguous(row, read); return;
     }
-    this.patch(row);
+    this.patch(row, read.ticket);
   }
 
   revision(threadId: string): number { return this.revisions.get(threadId) ?? 0; }
 
-  private touch(threadId: string): void { this.revisions.set(threadId, ++this.generation); }
+  private nextTicket(threadId: string): number {
+    const ticket = (this.tickets.get(threadId) ?? 0) + 1;
+    this.tickets.set(threadId, ticket);
+    return ticket;
+  }
+
+  private touch(threadId: string): void {
+    this.revisions.set(threadId, this.nextTicket(threadId));
+    this.generation++;
+  }
 
   private ambiguous(row?: ThreadSummary, read?: DetailRead): void {
     if (row) {
       const current = this.known.get(row.threadId) ?? row;
       const request = current.pendingRequest ?? row.pendingRequest;
       this.patch({ ...current, pendingRequest: request,
-        state: request ? "needs-input" : BUSY.has(current.state) ? current.state : BUSY.has(row.state) ? row.state : "running" });
+        state: request ? "needs-input" : BUSY.has(current.state) ? current.state : BUSY.has(row.state) ? row.state : "running" },
+      read?.ticket ?? this.revision(row.threadId));
     }
     this.count("misses");
     const generation = read?.fetch ?? this.fetchVersion;
@@ -155,11 +182,13 @@ export class ActiveRoster {
     this.invalidate();
   }
 
-  private patch(row: ThreadSummary): void {
+  private patch(row: ThreadSummary, ticket: number): void {
+    if (ticket < this.revision(row.threadId)) return;
     const previous = this.known.get(row.threadId);
     this.known.set(row.threadId, row);
-    if (this.fetching) this.pending.set(row.threadId, row);
+    if (this.fetching) this.pending.set(row.threadId, { row, ticket });
     if (previous && sameRow(previous, row)) return;
+    this.revisions.set(row.threadId, ticket);
     if (this.cache) {
       const index = this.cache.threads.findIndex(thread => thread.threadId === row.threadId);
       if (index < 0) this.cache.threads.push(row);
@@ -203,7 +232,7 @@ export class ActiveRoster {
       const pendingRequest: NonNullable<ThreadSummary["pendingRequest"]> = { requestId: data.requestId, kind: data.kind, requestKind: data.requestKind };
       const row = { ...thread, state: "needs-input" as const, pendingRequest };
       if (!ordered || this.fetching) this.ambiguous(row);
-      else this.patch(row);
+      else this.patch(row, this.revision(thread.threadId));
       return;
     }
     const runId = typeof data.runId === "string" ? data.runId : undefined;
@@ -214,7 +243,7 @@ export class ActiveRoster {
       this.ambiguous(thread); return;
     }
     this.patch({ ...thread, state: thread.pendingRequest ? "needs-input" : data.state as ThreadState,
-      status: typeof data.status === "string" ? data.status : thread.status });
+      status: typeof data.status === "string" ? data.status : thread.status }, this.revision(thread.threadId));
   }
 
   private async listen(signal: AbortSignal): Promise<void> {
@@ -289,7 +318,9 @@ export class ActiveRoster {
         const { total, threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
         const rows = threads.map(thread => ({ ...thread }));
         // Unordered patches only hold busy/request evidence; the shared fetch covers their generation.
-        for (const [id, held] of this.pending) {
+        for (const [id, patch] of this.pending) {
+          const held = patch.ticket < this.revision(id) ? this.known.get(id) : patch.row;
+          if (!held) continue;
           const index = rows.findIndex(row => row.threadId === id);
           if (index < 0) rows.push(held);
           else {
@@ -308,8 +339,9 @@ export class ActiveRoster {
         for (const row of rows) this.known.set(row.threadId, row);
         if (isComplete || this.known.size > 2_000) {
           // Rows leaving the active set must not retain an old pending request for later run events.
+          // Their fences still reject detail responses started before removal.
           const current = new Set(rows.map(row => row.threadId));
-          for (const id of this.known.keys()) if (!current.has(id)) { this.known.delete(id); this.revisions.delete(id); }
+          for (const id of this.known.keys()) if (!current.has(id)) this.known.delete(id);
         }
         this.clean = version;
         this.fetchEpoch = epoch;
