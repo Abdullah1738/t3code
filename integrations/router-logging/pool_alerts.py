@@ -18,10 +18,15 @@ class PoolAlerts:
         self.state, self.notify, self.save = state, notify, save
 
     def step(self, now, episodes):
+        cutoff = now - 30 * 86400000
         for episode in episodes:
             if not valid(episode):
                 continue
             identity = episode['id']
+            # API history has no age limit. Do not recreate delivery state after
+            # cleanup, but keep draining any previously persisted pending entry.
+            if not episode['open'] and episode['endedAt'] < cutoff and identity not in self.state:
+                continue
             entry = self.state.setdefault(identity, {})
             entry['episode'] = episode
         # Retained deliveries outlive the API's bounded episode history and
@@ -55,7 +60,7 @@ class PoolAlerts:
         for identity, entry in list(self.state.items()):
             episode = entry.get('episode', {})
             delivered = entry.get('recovered') or episode.get('endedAt', now) - episode.get('since', now) < 120000
-            if delivered and not episode.get('open', True) and episode.get('endedAt', now) < now - 30 * 86400000:
+            if delivered and not episode.get('open', True) and episode.get('endedAt', now) < cutoff:
                 del self.state[identity]
         self.save()
 

@@ -97,6 +97,58 @@ class PoolTests(unittest.TestCase):
                 alerts.step(BASE+32*86400000,[])
                 self.assertEqual(self.alerts,before)
 
+    def test_old_delivered_snapshots_stay_quiet_after_cleanup_and_restart(self):
+        ended = {**self.episode(), 'open':False, 'endedAt':BASE+150000}
+        for present_during_cleanup in (True, False):
+            with self.subTest(present_during_cleanup=present_during_cleanup):
+                alerts = self.rig()
+                alerts.step(BASE+120000,[self.episode()])
+                alerts.step(BASE+150000,[ended])
+                self.assertEqual(len(self.alerts),2)
+                alerts.step(BASE+31*86400000,[ended] if present_during_cleanup else [])
+                self.assertNotIn(IDENTITY,alerts.state)
+                self.assertEqual(len(self.alerts),2)
+                for tick in range(3):
+                    alerts = self.rig(json.loads(json.dumps(alerts.state)))
+                    alerts.step(BASE+31*86400000+tick*15000,[ended])
+                    self.assertEqual(self.alerts,[])
+                    self.assertNotIn(IDENTITY,alerts.state)
+
+    def test_completed_snapshot_retention_boundary_and_old_open_episode(self):
+        ended = {**self.episode(), 'open':False, 'endedAt':BASE+150000}
+        for extra_age, count in ((-1,2),(0,2),(1,0)):
+            with self.subTest(extra_age=extra_age):
+                alerts = self.rig()
+                alerts.step(ended['endedAt']+30*86400000+extra_age,[ended])
+                self.assertEqual(len(self.alerts),count)
+        alerts = self.rig()
+        alerts.step(BASE+31*86400000,[self.episode()])
+        self.assertEqual(len(self.alerts),1)
+
+    def test_old_pending_deliveries_replay_unchanged_across_snapshots_cleanup_and_restart(self):
+        ended = {**self.episode(), 'open':False, 'endedAt':BASE+150000}
+        for pending in ('alert','recovery'):
+            with self.subTest(pending=pending):
+                alerts = self.rig()
+                if pending == 'recovery':
+                    alerts.step(BASE+120000,[self.episode()])
+                calls=[]
+                alerts.notify=lambda text,key:calls.append((text,key)) or False
+                alerts.step(BASE+150000,[ended])
+                original=calls[0]
+                for tick in range(3):
+                    alerts = self.rig(json.loads(json.dumps(alerts.state)))
+                    calls=[]
+                    alerts.notify=lambda text,key:calls.append((text,key)) or False
+                    alerts.step(BASE+31*86400000+tick*15000,[ended] if tick%2 else [])
+                    self.assertEqual(calls,[original])
+                    self.assertIn(IDENTITY,alerts.state)
+                alerts = self.rig(json.loads(json.dumps(alerts.state)))
+                alerts.step(BASE+32*86400000,[ended])
+                self.assertEqual(self.alerts[0],original)
+                alerts.step(BASE+32*86400000+15000,[ended])
+                self.assertEqual(self.alerts.count(original),1)
+
     def test_rollup_dedupes_events_and_cache_and_clips_utc_days(self):
         since = dt.datetime(2026, 11, 18, 23, 59, tzinfo=dt.timezone.utc)
         ended = since + dt.timedelta(minutes=3)
