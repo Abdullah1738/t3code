@@ -3,6 +3,8 @@ import type * as NodeHttp from "node:http";
 import type * as NodeNet from "node:net";
 import type * as NodeStream from "node:stream";
 
+import * as HttpRequestLifecycle from "./HttpRequestLifecycle.ts";
+
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -134,6 +136,8 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
       };
     });
     server.on("request", (request, response) => {
+      if (request.url?.startsWith("/api/ardud/control/"))
+        HttpRequestLifecycle.observe(request, response);
       const state = states.get(request.socket);
       if (!state) return;
       state.idle = false;
