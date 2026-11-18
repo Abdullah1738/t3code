@@ -41,7 +41,7 @@ describe("standard-mode policy", () => {
 
   it("keeps every vendored Codex model off priority by default", () => {
     const catalog = decodeCatalog(
-      JSON.parse(readRepoFile("integrations/harness-homes/vendor/codex-models-0.166.0.json")),
+      JSON.parse(readRepoFile("integrations/harness-homes/vendor/codex-models-0.169.1.json")),
     );
 
     expect(catalog.models.length).toBeGreaterThan(0);

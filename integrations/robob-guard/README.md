@@ -33,6 +33,8 @@ The guard rechecks health and the install hold under the hold lock before acting
 then rechecks desktop identity and health after the provenance handoff. Recovery
 or a new desktop cancels the stale action. Surviving workers without a registered
 desktop do not prevent ordinary absent-desktop reopening.
+A dead PID retained by LaunchServices counts as an absent desktop. The quit-reason
+CLI reports `no desktop` and the watchdog hold skips its reason handoff in that case.
 
 After each attempt it allows 90 seconds to start. If still unavailable, it waits
 2, 5, 10, then 10 minutes between failure detection and the next retry,
@@ -40,6 +42,11 @@ forever. A ready backend resets the failure count and backoff. Reopen
 history spans recovery so repeated crashes can still be detected. One
 Telegram attention alert reports three consecutive failed reopens, and one
 reports more than four reopens in an hour. Ordinary reopens are silent.
+An `open` exit status of zero does not prove launch or readiness: silent no-ops
+consume the same failed-reopen budget while backend health stays unavailable.
+Four consecutive check errors with readiness unavailable or unknown queue one
+attention alert per error episode. A successful check ends that episode; errors
+still reset the consecutive-unready observation window without selecting a target.
 Failed notifications retry on subsequent checks using the same key. Crash
 loop episodes end after an hour without a reopen; failure episodes end on
 recovery or an install hold. Alert times use Dubai time; log times use UTC.
@@ -99,6 +106,10 @@ State, log, locks and beater identity live in `~/.local/state/robob-guard/`:
 `state.json`, `guard.log`, `check.lock`, `hold.lock`, `hold-beater.json`.
 The log has one UTC line per check (`up`, `down n`, `hold:NAME`, or
 `stale-hold:NAME` plus the action). Over 1 MiB it trims to the last 2000 lines.
+Unready and check-error rows include the LaunchServices PID, its liveness, and up
+to five other Robob-executable processes (PID, PPID, first 160 argument characters).
+Check-error rows also name the failing step and consecutive error count. Diagnostic
+read failures appear in the row and do not change the recovery decision.
 The guard writes only in this directory. The hold helper also writes the
 install hold file. Nothing uses `~/.robob/userdata` or SQLite.
 
