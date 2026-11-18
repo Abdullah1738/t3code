@@ -1,0 +1,19 @@
+offbox-command-started: run-1117-080716-6799c319
+offbox evidence end step=1 rc=1
+offbox step 1 rc=1: python3 -m unittest discover -s integrations/harness-homes/t
+offbox evidence end step=2 rc=0
+offbox step 2 rc=0: python3 -m unittest discover -s integrations/local-helpers/t
+offbox evidence end step=3 rc=0
+offbox step 3 rc=0: python3 -m unittest discover -s integrations/local-helpers/t
+offbox-command-started: run-late
+offbox-command-started: run-late
+offbox step 1 rc=0: a
+offbox-command-started: run-late
+offbox: steps incomplete: got 0 of 1 step results; remote exit unknown
+offbox: steps incomplete: got 0 of 4 step results; remote exit unknown
+offbox evidence end step=4 rc=0
+offbox step 4 rc=0: OFFBOX_STATE_DIR=$(mktemp -d) python3 -m unittest discover -
+offbox evidence end step=5 rc=0
+offbox step 5 rc=0: python3 -m unittest discover -s integrations/offbox/tests -p
+offbox evidence end step=6 rc=0
+offbox step 6 rc=0: bun test integrations/opencode-plugins/test/install.test.ts

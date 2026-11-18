@@ -367,7 +367,7 @@ chmod +x "$4/bin/quint"
         # Compose retry diagnostics without letting an old command's output
         # supply the final prelude result.
         failure = json.dumps(dict(attempt='result', result='failed', duration_s=2, trigger='command'))
-        path = self.root / 'retry.log'
+        path = self.root / 'run-test.log'
         retry = 'offbox-server: the server restarted while this run was going (attempt 1 is lost); it is queued again as attempt 2\n'
         path.write_text(first.stderr + 'offbox-command-started: run-test\n' + first.stderr + retry +
                         quint_tools.PREFIX + failure + '\n')

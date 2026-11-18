@@ -456,13 +456,19 @@ class RestartReceipts(Base):
             self.assertTrue(boatd.commands_busy(self.con,b))
 
     def test_started_marker_alone_prevents_queued_readmission(self):
-        b=self.box(); p=self.cmd(b,status='queued')
-        (boatd.cmd_dir(b)/f'{p}.out').write_text('offbox-command-started: run-old\n')
-        boatd.reconcile(self.con)
-        self.assertEqual(self.status(b,p)['exit_code'],94)
-        self.assertEqual(self.f.spawned,[])
-        with patch.object(boatd,'ct_exec',return_value=subprocess.CompletedProcess([],0,b'{"busy":true}')):
-            self.assertTrue(boatd.commands_busy(self.con,b))
+        for ext in ('out', 'err'):
+            for nonce in (None, '1234567890abcdef'):
+                with self.subTest(stream=ext, nonce=nonce):
+                    b=self.box(bid=f'bx_start_{ext}_{bool(nonce)}'); p=self.cmd(b,status='queued')
+                    self.con.execute('UPDATE commands SET run_id=?,protocol_nonce=? WHERE box_id=? AND pid=?',
+                                     ('run-old',nonce,b,p))
+                    token=f' [n={nonce}]' if nonce else ''
+                    (boatd.cmd_dir(b)/f'{p}.{ext}').write_text(f'offbox-command-started: run-old{token}\n')
+                    boatd.reconcile(self.con)
+                    self.assertEqual(self.status(b,p)['exit_code'],94)
+                    self.assertEqual(self.f.spawned,[])
+                    with patch.object(boatd,'ct_exec',return_value=subprocess.CompletedProcess([],0,b'{"busy":true}')):
+                        self.assertTrue(boatd.commands_busy(self.con,b))
 
     def test_fake_restart_while_real_wrapper_is_alive_executes_only_once(self):
         # Real shell/PID/exit receipts, fake Incus and systemd. No home daemon is touched.
