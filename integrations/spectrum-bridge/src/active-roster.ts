@@ -25,6 +25,7 @@ export function rosterStatuses(threads: Iterable<ThreadSummary>, native: Readonl
 }
 
 type Snapshot = { threads: ThreadSummary[]; total: number; fetchedAt: number; complete: boolean };
+type Patch = { row: ThreadSummary; state?: ThreadState; request?: ThreadSummary["pendingRequest"] };
 const counters = () => ({ fetches: 0, startup: 0, roster_event: 0, safety: 0, stream_down: 0, incomplete: 0, error_retry: 0,
   joins: 0, hits: 0, patches: 0, misses: 0, streamUp: 0, streamDown: 0, errors: 0, children: 0 });
 
@@ -34,7 +35,8 @@ export class ActiveRoster {
   private busy: Record<string, SessionStatus> = {};
   private known = new Map<string, ThreadSummary>();
   private fetching?: Promise<void>;
-  private pending = new Map<string, ThreadSummary>();
+  private pending = new Map<string, Patch>();
+  private revisions = new Map<string, number>();
   private dirty = 0;
   private clean = 0;
   private stream = false;
@@ -99,22 +101,29 @@ export class ActiveRoster {
   }
 
   /** Route detail reads also reconcile state while the event stream is reconnecting. */
-  observe(thread: ThreadSummary, generation = this.generation): void {
-    if (!this.cache || generation !== this.generation) return;
+  observe(thread: ThreadSummary, revision = this.revision(thread.threadId)): void {
+    if (!this.cache || revision !== this.revision(thread.threadId)) return;
     const row: ThreadSummary = { threadId: thread.threadId, projectId: thread.projectId, title: thread.title,
       state: thread.state, status: thread.status, origin: thread.origin, nativeSessionId: thread.nativeSessionId,
       runtimeMode: thread.runtimeMode, parentThreadId: thread.parentThreadId, rootThreadId: thread.rootThreadId,
       worktreePath: thread.worktreePath, pendingRequest: thread.pendingRequest, createdAt: thread.createdAt, updatedAt: thread.updatedAt,
       activeRunId: thread.activeRunId, latestRunId: thread.latestRunId };
-    this.patch(row);
+    this.patch(row, { state: row.state, request: row.pendingRequest });
   }
 
-  private patch(row: ThreadSummary): void {
+  revision(threadId: string): number { return this.revisions.get(threadId) ?? 0; }
+
+  private touch(threadId: string): void { this.revisions.set(threadId, ++this.generation); }
+
+  private patch(row: ThreadSummary, change: Omit<Patch, "row">): void {
+    // An unchanged busy event still fences an older idle detail for this thread alone.
+    this.touch(row.threadId);
     const previous = this.known.get(row.threadId);
     this.known.set(row.threadId, row);
-    if (this.fetching) this.pending.set(row.threadId, row);
-    if (previous && previous.state === row.state && previous.parentThreadId === row.parentThreadId
+    if (this.fetching) this.pending.set(row.threadId, { ...this.pending.get(row.threadId), ...change, row });
+    if (previous && previous.state === row.state && previous.status === row.status && previous.parentThreadId === row.parentThreadId
       && previous.rootThreadId === row.rootThreadId && previous.nativeSessionId === row.nativeSessionId
+      && previous.pendingRequest?.requestId === row.pendingRequest?.requestId
       && previous.activeRunId === row.activeRunId && previous.latestRunId === row.latestRunId) return;
     if (this.cache) {
       const index = this.cache.threads.findIndex(thread => thread.threadId === row.threadId);
@@ -130,23 +139,42 @@ export class ActiveRoster {
     if (data.type === "error") { this.streamState(false); this.invalidate(); return; }
     if (data.type === "ready") { this.streamState(true); this.invalidate(); return; }
     const id = typeof data.threadId === "string" ? data.threadId : undefined;
+    if (data.type === "request.resolved") {
+      // A summary contains only one pending request; resolution needs the aggregate server view.
+      if (id) this.touch(id);
+      this.invalidate(); return;
+    }
     if (data.type === "thread.created" || data.type === "resync"
-      || data.type === "thread.updated" && CHANGES.has(String(data.change))) { this.invalidate(); return; }
-    if (data.type !== "thread.status") return;
-    // Even a repeated busy event fences an older idle detail response.
+      || data.type === "thread.updated" && CHANGES.has(String(data.change))) {
+      if (id) this.touch(id);
+      this.invalidate(); return;
+    }
+    if (data.type !== "thread.status" && data.type !== "request.opened") return;
     this.generation++;
     const thread = id ? this.known.get(id) : undefined;
-    if (!thread || !STATES.has(data.state) || thread.parentThreadId !== null && !thread.rootThreadId) {
+    if (!thread || thread.parentThreadId !== null && !thread.rootThreadId) {
+      if (id) this.touch(id);
       this.count("misses"); this.invalidate(); return;
+    }
+    if (data.type === "request.opened") {
+      if (typeof data.requestId !== "string" || (data.kind !== "question" && data.kind !== "approval") || typeof data.requestKind !== "string") {
+        this.touch(thread.threadId); this.count("misses"); this.invalidate(); return;
+      }
+      const request: NonNullable<ThreadSummary["pendingRequest"]> = { requestId: data.requestId, kind: data.kind, requestKind: data.requestKind };
+      this.patch({ ...thread, state: "needs-input", pendingRequest: request }, { request });
+      return;
     }
     // A run event describes that run, not necessarily the thread's current run.
     // Never let an old background completion clear a newer busy foreground.
     const runId = typeof data.runId === "string" ? data.runId : undefined;
     const current = thread.activeRunId ?? thread.latestRunId;
-    if (runId && current && runId !== current) {
+    if (!STATES.has(data.state) || runId && current && runId !== current) {
+      this.touch(thread.threadId);
       this.count("misses"); this.invalidate(); return;
     }
-    this.patch({ ...thread, state: data.state as ThreadState });
+    const state = data.state as ThreadState;
+    this.patch({ ...thread, state: thread.pendingRequest ? "needs-input" : state,
+      status: typeof data.status === "string" ? data.status : thread.status }, { state });
   }
 
   private async listen(signal: AbortSignal): Promise<void> {
@@ -220,19 +248,34 @@ export class ActiveRoster {
         const rows = threads.map(thread => ({ ...thread }));
         for (const [id, patched] of this.pending) {
           const index = rows.findIndex(row => row.threadId === id);
-          if (index < 0) rows.push(patched);
-          else rows[index] = { ...rows[index]!, state: patched.state };
+          if (index < 0) rows.push(patched.row);
+          else {
+            const fetched = rows[index]!;
+            const sameRun = (fetched.activeRunId ?? fetched.latestRunId ?? null)
+              === (patched.row.activeRunId ?? patched.row.latestRunId ?? null);
+            // Request openings affect the thread across runs. Run patches apply only to their run.
+            const request = patched.request !== undefined && (patched.request !== null || sameRun) ? patched.request : fetched.pendingRequest;
+            let state = sameRun ? patched.state ?? fetched.state : fetched.state;
+            if (!sameRun && patched.state && BUSY.has(patched.state) && !BUSY.has(fetched.state)) {
+              // Neither read proves which run is current. Keep dispatch blocked until reconciliation.
+              state = patched.state; this.dirty++; this.count("misses");
+            }
+            rows[index] = { ...fetched, state: request ? "needs-input" : state, pendingRequest: request,
+              ...(sameRun && patched.state ? { status: patched.row.status } : {}) };
+          }
         }
         const isComplete = total <= threads.length;
         // A truncated refresh cannot erase busy families from the last good read.
         if (!isComplete) for (const row of this.cache?.threads ?? []) {
           if (BUSY.has(row.state) && !rows.some(next => next.threadId === row.threadId)) rows.push(row);
         }
+        for (const id of new Set([...this.cache?.threads ?? [], ...rows].map(row => row.threadId))) this.touch(id);
         this.cache = { threads: rows, total, complete: isComplete, fetchedAt: this.now() };
         for (const row of rows) this.known.set(row.threadId, row);
-        if (this.known.size > 2_000) {
+        if (isComplete || this.known.size > 2_000) {
+          // Rows leaving the active set must not retain an old pending request for later run events.
           const current = new Set(rows.map(row => row.threadId));
-          for (const id of this.known.keys()) if (!current.has(id)) this.known.delete(id);
+          for (const id of this.known.keys()) if (!current.has(id)) { this.known.delete(id); this.revisions.delete(id); }
         }
         this.clean = version;
         this.fetchEpoch = epoch;

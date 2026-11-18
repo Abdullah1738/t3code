@@ -262,9 +262,10 @@ export class RobobBackend implements ChatBackend {
   }
 
   private async detail(id: string): Promise<ThreadDetail> {
-    const generation = this.activeRoster.generation;
-    const { thread } = await this.client.thread(await this.resolve(id));
-    this.activeRoster.observe(thread, generation);
+    const threadId = await this.resolve(id);
+    const revision = this.activeRoster.revision(threadId);
+    const { thread } = await this.client.thread(threadId);
+    this.activeRoster.observe(thread, revision);
     return thread;
   }
 
