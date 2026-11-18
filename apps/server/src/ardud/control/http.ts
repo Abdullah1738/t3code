@@ -1024,8 +1024,7 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
-  const listThreads = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationReadScope);
+  const threadListPage = Effect.gen(function* () {
     const params = yield* searchParams;
     const cursor = yield* decodeThreadListCursor(params.get("cursor"));
     const archived = boolParam(params.get("archived")) === true;
@@ -1101,19 +1100,21 @@ const makeRoutes = Effect.gen(function* () {
         nextCursor: nextThreadListCursor(page, limit),
       });
     });
-    // Live polling must not queue behind board sweeps. Share the single control
-    // permit with message reads so lists cannot consume both foreground slots.
-    return yield* liveOnly && !archived
-      ? ReplyBuilders.bounded(readPage.pipe(NodeSqliteClient.foregroundReads), "controlRead")
-      : readPage;
-  }).pipe(NodeSqliteClient.backgroundReads);
+    return yield* readPage;
+  }).pipe(NodeSqliteClient.foregroundReads);
+
+  const listThreads = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    // Candidate pages (including deep health) must bypass background sweeps too.
+    // One shared permit leaves a foreground reader for the UI during list bursts.
+    return yield* ReplyBuilders.bounded(threadListPage, "controlRead");
+  });
 
   const getThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
     // ardud: bridges poll this per chat (the iMessage reply path). Admit it on the
-    // poll lane like /messages and read on the foreground reader, not behind sweeps
-    // and thread lists on the background lane (p95 wait 10-115 s on 11 Nov 2026).
+    // poll lane and read on the foreground reader, not behind background sweeps.
     const thread = yield* ReplyBuilders.bounded(
       threadDetail(threadId).pipe(NodeSqliteClient.foregroundReads),
       "poll",
