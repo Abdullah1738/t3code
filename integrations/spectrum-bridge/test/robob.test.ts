@@ -1154,7 +1154,7 @@ function nativeRouter(path: string) {
 function nativeDb(session: string, rows: [string, unknown][]) {
   const dirPath = mkdtempSync(join(tmpdir(), "robob-native-"));
   dirs.push(dirPath);
-  const path = join(dirPath, "opencode.db");
+  const path = join(dirPath, "synthetic-fixture.sqlite");
   const db = new Database(path);
   db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
   // Rows are written after the run starts (the run's requestedAt is `base`), as native execution would write them.
@@ -1193,7 +1193,7 @@ test("an errored step classified between OpenCode's commits, before the native i
   // Between the two native commits: the step is `error` with no retry yet and the run has no idle marker.
   const dirPath = mkdtempSync(join(tmpdir(), "robob-between-"));
   dirs.push(dirPath);
-  const path = join(dirPath, "opencode.db");
+  const path = join(dirPath, "synthetic-fixture.sqlite");
   const base = Date.now();
   const db = new Database(path);
   db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
@@ -1276,7 +1276,7 @@ test("a new chat's first-call error with reasoning is reported without replaying
 test("a run whose tool call sits past a truncated scan is never retried, through the real router and OpenCode's run rows", async () => {
   const dirPath = mkdtempSync(join(tmpdir(), "robob-truncated-"));
   dirs.push(dirPath);
-  const path = join(dirPath, "opencode.db");
+  const path = join(dirPath, "synthetic-fixture.sqlite");
   // 200 stop steps, then the run's tool step: the tool row is past the old 200-row cap.
   const db = new Database(path);
   db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
@@ -1318,7 +1318,7 @@ test("a run whose tool call sits past a truncated scan is never retried, through
 test("a later provider 400 keeps the existing tool-free retry behavior", async () => {
   const dirPath = mkdtempSync(join(tmpdir(), "robob-first-call-"));
   dirs.push(dirPath);
-  const path = join(dirPath, "opencode.db");
+  const path = join(dirPath, "synthetic-fixture.sqlite");
   // OpenCode's record of the failed first call: finish error, no content, error aborted.
   const db = new Database(path);
   db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)");
