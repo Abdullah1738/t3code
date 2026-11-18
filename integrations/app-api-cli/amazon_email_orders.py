@@ -25,6 +25,7 @@ import subprocess
 import time
 import uuid
 from urllib.parse import parse_qs, unquote, urlsplit
+from order_status import delivered_elapsed
 
 UTC = dt.timezone.utc
 SOURCE = 'amazon_email'
@@ -93,7 +94,7 @@ def classify_subject(subject):
         return 'unknown'
     if re.match(r'^(?:cancelled|canceled)\s*:', s) or re.search(r'\b(?:order|item|package)(?: .{0,35})? (?:has been |was |is )?(?:cancelled|canceled)\b', s):
         return 'cancelled'
-    if (re.fullmatch(r'delivered in \d+ (?:hrs?|hours?)(?: \d+ (?:mins?|minutes?))?[.!]?', s)
+    if (delivered_elapsed(s)
             or re.match(r'^delivered\s*[:!\-]', s)
             or re.search(r'\b(?:your (?:order|package)|shipment) (?:has been |was |is )delivered\b', s)):
         return 'delivered'

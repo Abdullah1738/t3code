@@ -24,6 +24,7 @@ import sys
 import time
 from email.utils import parseaddr, parsedate_to_datetime
 import order_identity
+from order_status import delivered_elapsed
 import delivery_store as store
 import delivery_cards
 import order_bank_charge
@@ -520,7 +521,7 @@ def classify(text, *, web=False, order=None):
         r'(?![a-z])\s*[:#=-]?\s*#?' + identifier +
         r'(?![a-z0-9_-])\s*(?:[:\-]\s*)?(?:(?:has been|was|is|successfully)\s+)?delivered\b|'
         r'\b(?:item|parcel)\s+delivered\b', t)
-    if numbered_delivery or re.search(r'\b(has been delivered|was delivered|order delivered|package delivered|successfully delivered|we.ve delivered|your order is delivered)\b', t) or re.match(r'^delivered\s*[:!\-]', t):
+    if numbered_delivery or delivered_elapsed(t) or re.search(r'\b(has been delivered|was delivered|order delivered|package delivered|successfully delivered|we.ve delivered|your order is delivered)\b', t) or re.match(r'^delivered\s*[:!\-]', t):
         full = web and bool(re.search(r'\b(?:all|both)\s+(?:[0-9]+\s+)?(?:item|package|parcel|shipment)s?\b|'
                                       r'\bdelivered in full\b', t))
         if web and (re.search(
@@ -1890,6 +1891,10 @@ def main(argv=None, _locked=False):
             args.merchant_domain = order_identity.merchant_domain(args.merchant_domain)
     except ValueError as exc:
         parser.error(str(exc))
+    if app == 'web' and args.command == 'add':
+        from amazon_email_orders import trusted_domain
+        if trusted_domain(args.merchant_domain):
+            parser.error('Amazon marketplace domains require the Amazon tracker; use --app amazon')
     if app != 'web' and (args.merchant_domain is not None or args.merchant_name is not None):
         parser.error('--merchant-domain and --merchant-name require --app web')
     if args.merchant_name is not None and (not args.merchant_name.strip() or len(args.merchant_name) > 180
