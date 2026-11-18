@@ -431,6 +431,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     for (const chat of chats.all()) chat.parts.remote?.stop();
     toolLog.flush();
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.
+    toolLog.flush();
     process.exit(0);
   };
   process.once("SIGTERM", () => { void stop(); });

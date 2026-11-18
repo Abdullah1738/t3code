@@ -1,5 +1,10 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Node stream/worker boundary, owned by the spawner layer.
 import * as NodeWorkerThreads from "node:worker_threads";
+import {
+  workerMemoryLimits,
+  workerMemoryHeartbeatSource,
+  trackWorkerMemory,
+} from "@t3tools/shared/workerMemory";
 import * as NodeStream from "node:stream";
 import type * as NodeChildProcess from "node:child_process";
 import { spawnWorker, type SpawnEvent } from "./spawnWorker.ts";
@@ -13,10 +18,14 @@ export class SpawnClient {
   private readonly createWorker;
   constructor(
     createWorker = () =>
-      new NodeWorkerThreads.Worker(
-        `(${spawnWorker.toString()})(require('node:child_process'), require('node:worker_threads').parentPort,
-          (${createCommandResolver.toString()})(require('node:fs'), require('node:path')))`,
-        { eval: true, execArgv: [] },
+      trackWorkerMemory(
+        new NodeWorkerThreads.Worker(
+          workerMemoryHeartbeatSource("spawn") +
+            `(${spawnWorker.toString()})(require('node:child_process'), require('node:worker_threads').parentPort,
+              (${createCommandResolver.toString()})(require('node:fs'), require('node:path')))`,
+          { eval: true, execArgv: [], resourceLimits: workerMemoryLimits.spawn },
+        ),
+        "spawn",
       ),
   ) {
     this.createWorker = createWorker;

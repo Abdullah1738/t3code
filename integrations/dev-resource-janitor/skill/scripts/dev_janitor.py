@@ -107,7 +107,8 @@ def keep_list():
 
 def running_sessions(snap=None):
     snap = active_sessions.checked_snapshot(timeout=20) if snap is None else snap
-    dirs, err = active_sessions.directories(snap)
+    # The hourly scan keeps its existing one-request-per-id liveness budget.
+    dirs, err = active_sessions.directories(snap, max_attempts=1)
     if err:
         return None, {}, err
     return set(snap["opencode"]), dirs, None

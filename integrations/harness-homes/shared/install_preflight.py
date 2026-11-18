@@ -8,13 +8,17 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import generate_homes as gh
 from shared.opencode import patch, remote_entries
+from shared.runtime_paths import validate_plist
 
 
 def preflight(staged, baseline=None):
     for name in ('com.ardud.shared-mcp-flighty', 'com.ardud.shared-mcp-inbody', 'com.ardud.harness-homes'):
         with (gh.PKG / 'launchd' / (name + '.plist')).open('rb') as stream:
             plistlib.load(stream)
-    for relative in ('shared/check.py', 'shared/serve.py', 'shared/flighty_python.py'):
+        if name.startswith('com.ardud.shared-mcp-'):
+            validate_plist(gh.PKG / 'launchd' / (name + '.plist'))
+    for relative in ('shared/check.py', 'shared/serve.py', 'shared/flighty_python.py',
+                     'shared/inbody_python.py', 'shared/runtime_paths.py'):
         (gh.PKG / relative).read_bytes()
     manifest = gh.load_manifest()
     gh.validate_manifest(manifest)

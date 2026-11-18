@@ -1,4 +1,9 @@
 import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
+import {
+  workerMemoryLimits,
+  workerMemoryHeartbeatSource,
+  trackWorkerMemory,
+} from "@t3tools/shared/workerMemory";
 // Worker lifecycle is the native boundary; SQL work stays off the event loop.
 // @effect-diagnostics nodeBuiltinImport:off
 import * as Context from "effect/Context";
@@ -94,10 +99,17 @@ export const archiveCheckpointLayer = (filename: string) =>
               }
               if (worker === undefined) {
                 try {
-                  const instance = new NodeWorkerThreads.Worker(archiveCheckpointWorkerSource, {
-                    eval: true,
-                    workerData: { filename, archiveFilename: archiveFilename(filename) },
-                  });
+                  const instance = trackWorkerMemory(
+                    new NodeWorkerThreads.Worker(
+                      workerMemoryHeartbeatSource("checkpoint") + archiveCheckpointWorkerSource,
+                      {
+                        eval: true,
+                        resourceLimits: workerMemoryLimits.checkpoint,
+                        workerData: { filename, archiveFilename: archiveFilename(filename) },
+                      },
+                    ),
+                    "checkpoint",
+                  );
                   worker = instance;
                   const failed = (failure: "worker_error" | "worker_exit") => {
                     if (worker !== instance) return;

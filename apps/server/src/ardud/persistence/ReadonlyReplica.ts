@@ -1,4 +1,9 @@
 import { resolveHistoryBasePath } from "./historySourceFiles.ts";
+import {
+  workerMemoryLimits,
+  workerMemoryHeartbeatSource,
+  trackWorkerMemory,
+} from "@t3tools/shared/workerMemory";
 import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
 import { StatementStats } from "@t3tools/shared/nodeSqliteClient";
 import * as NodeWorkerThreads from "node:worker_threads";
@@ -512,11 +517,15 @@ const make = Effect.gen(function* () {
   const source = exportWorkerSource(createReadonlyReplica.toString());
   return yield* makeCoordinatedReplica(
     () =>
-      new NodeWorkerThreads.Worker(source, {
-        eval: true,
-        execArgv: [],
-        workerData: options,
-      }) as unknown as ExportWorker,
+      trackWorkerMemory(
+        new NodeWorkerThreads.Worker(workerMemoryHeartbeatSource("exporter") + source, {
+          eval: true,
+          execArgv: [],
+          resourceLimits: workerMemoryLimits.exporter,
+          workerData: options,
+        }),
+        "exporter",
+      ) as unknown as ExportWorker,
   );
 });
 

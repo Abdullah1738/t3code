@@ -24,6 +24,8 @@ from .common import (OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, l
                      token_owner, person)
 from . import capacity
 
+_HISTORY_PHASE = contextvars.ContextVar('history_phase', default=None)
+
 BACKEND = backend()
 NAME = "offbox server" if BACKEND == "server" else "boat"
 
@@ -532,6 +534,9 @@ def _own_box(path: str) -> None:
 def _call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
     global _DEADLINE
+    phase = _HISTORY_PHASE.get()
+    if phase is not None:
+        phase['phase'] = 'ownership'
     _own_box(path)
     from . import home
     scope = _REQUEST_SCOPE.get()
@@ -633,6 +638,9 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
     url = API + path
     h = {"Authorization": "Bearer " + _key(), "Content-Type": "application/json", "Accept": "application/json"}
     h.update(headers or {})
+    if BACKEND == 'server':
+        import offbox_protection
+        h.update(offbox_protection.header())
     data = json.dumps(body).encode() if body is not None else None
     is_start = method == "POST" and (path == "/sandboxes" or path.endswith(("/fork", "/resume")))
     attempt = 0
@@ -706,8 +714,15 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             if scope is not None:
                 scope.check()
             check_start_queue(request_id)
+            phase = _HISTORY_PHASE.get()
+            if phase is not None:
+                phase['phase'] = 'connect_headers'
             with _open(req, timeout=req_timeout) as r:
+                if phase is not None:
+                    phase['phase'] = 'body'
                 raw = _read_response(r, deadline)
+                if phase is not None:
+                    phase['phase'] = 'decode'
                 result = json.loads(raw) if raw.strip() else {}
                 if scope is not None:
                     scope.acknowledge()
@@ -921,6 +936,10 @@ def stream(path: str, timeout: float = 120, deadline: float | None = None):
 
 # ---------------------------------------------------------------- sandboxes
 
+def box_protection(box_id: str) -> dict:
+    return call('GET', f'/sandboxes/{box_id}/protection', timeout=5, retries=0)
+
+
 def get(box_id: str, *, deadline: float | None = None) -> dict | None:
     if deadline is None:
         d = call("GET", f"/sandboxes/{box_id}", ok404=True)
@@ -1033,12 +1052,22 @@ def resume(box_id: str, ttl: int, size: str | None = None) -> dict:
         raise _refused(e, box_id) or e from e
 
 
-def stop(box_id: str) -> dict:
-    return call("POST", f"/sandboxes/{box_id}/stop", {}, retries=1)
+def stop(box_id: str, *, override=False) -> dict:
+    import offbox_protection
+    token = offbox_protection.CALLER.set(offbox_protection.caller(override=override))
+    try:
+        return call("POST", f"/sandboxes/{box_id}/stop", {}, retries=1)
+    finally:
+        offbox_protection.CALLER.reset(token)
 
 
-def delete(box_id: str) -> dict:
-    return call("DELETE", f"/sandboxes/{box_id}", headers={"X-Ascii-Confirm-Delete": box_id}, ok404=True) or {}
+def delete(box_id: str, *, override=False) -> dict:
+    import offbox_protection
+    token = offbox_protection.CALLER.set(offbox_protection.caller(override=override))
+    try:
+        return call("DELETE", f"/sandboxes/{box_id}", headers={"X-Ascii-Confirm-Delete": box_id}, ok404=True) or {}
+    finally:
+        offbox_protection.CALLER.reset(token)
 
 
 def rename(box_id: str, name: str) -> None:
@@ -1309,11 +1338,25 @@ def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0, timeou
 
 
 def history_logs(box_id: str, command_id: str, which: str, offset: int = 0,
-                 *, deadline: float | None = None) -> dict:
-    qs = urllib.parse.urlencode({"stream": which, "offset": offset})
-    result = call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}", deadline=deadline)
-    remember_execution(box_id, result, command_id=command_id)
-    return result
+                 *, deadline: float | None = None, limit_bytes: int | None = None) -> dict:
+    query = {"stream": which, "offset": offset}
+    if limit_bytes is not None and BACKEND == 'server':
+        query['limitBytes'] = limit_bytes
+    qs = urllib.parse.urlencode(query)
+    phase = dict(box=box_id, command=command_id, stream=which, offset=offset, phase='preflight', result='error')
+    token = _HISTORY_PHASE.set(phase)
+    started = time.monotonic()
+    try:
+        result = call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}", deadline=deadline)
+        phase['result'] = 'ok'
+        remember_execution(box_id, result, command_id=command_id)
+        return result
+    finally:
+        _HISTORY_PHASE.reset(token)
+        phase['ms'] = round((time.monotonic() - started) * 1000, 3)
+        if phase['ms'] >= 1000 or phase['result'] != 'ok':
+            with contextlib.suppress(OSError):
+                log('history_read ' + json.dumps(phase, separators=(',', ':')))
 
 
 def history_get(box_id: str, command_id: str) -> dict:

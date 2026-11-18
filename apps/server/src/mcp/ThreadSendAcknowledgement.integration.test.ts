@@ -72,6 +72,7 @@ it.effect.each([
   "canonical reader running auto",
   "canonical reader running steer",
   "canonical reader completed auto",
+  "checkpoint size target",
 ] as const)(
   "acknowledges idle sends and bounds a blocked %s without duplicating a retry",
   (blocked) =>
@@ -173,7 +174,9 @@ it.effect.each([
         };
         const registry = ProviderAdapterRegistry.layerSingle(adapter);
         const database =
-          blocked.startsWith("background reader") || blocked.startsWith("canonical reader")
+          blocked.startsWith("background reader") ||
+          blocked.startsWith("canonical reader") ||
+          blocked === "checkpoint size target"
             ? Sqlite.layerFromPath(`${cwd}/send.sqlite`).pipe(Layer.provide(NodeServices.layer))
             : Sqlite.layerMemory;
         const runtime = ProviderReplayHarness.layerWithRegistry(
@@ -251,6 +254,51 @@ it.effect.each([
             creationSource: "web",
           });
           const request = { threadId, message: "Start the idle child", clientRequestId: "idle" };
+          if (blocked === "checkpoint size target") {
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`PRAGMA journal_size_limit = 1`;
+            yield* sql`CREATE TABLE checkpoint_pages(payload BLOB)`;
+            const held = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const reader = yield* sql
+              .withTransaction(
+                sql`SELECT COUNT(*) FROM checkpoint_pages`.pipe(
+                  Effect.andThen(Deferred.succeed(held, undefined)),
+                  Effect.andThen(Deferred.await(release)),
+                ),
+              )
+              .pipe(NodeSqliteClient.readOnly, Effect.forkChild);
+            yield* Deferred.await(held);
+            yield* Effect.gen(function* () {
+              yield* sql`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
+                INSERT INTO checkpoint_pages SELECT zeroblob(4000) FROM n`;
+              const state = yield* sql<{
+                log: number;
+                checkpointed: number;
+              }>`PRAGMA wal_checkpoint(NOOP)`;
+              assert.isAbove(state[0]!.log, 1000);
+              assert.isBelow(state[0]!.log, 10000);
+              assert.isBelow(state[0]!.checkpointed, state[0]!.log);
+              const [result] = yield* Effect.all(
+                [
+                  service.sendToThread(scope, request),
+                  sql.withTransaction(sql`INSERT INTO checkpoint_pages VALUES (x'01')`),
+                ],
+                { concurrency: 2 },
+              ).pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+              assert.equal(result.delivery, "started");
+              const replay = yield* service
+                .sendToThread(scope, request)
+                .pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+              assert.equal(replay.messageId, result.messageId);
+              assert.isUndefined(reader.pollUnsafe());
+              assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).messages, 1);
+            }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+            yield* Fiber.join(reader);
+            yield* worker.drain().pipe(TestClock.withLive);
+            assert.equal(starts, 1);
+            return;
+          }
           if (blocked.startsWith("canonical reader")) {
             const initial = yield* service.sendToThread(scope, request);
             const runningEvent = yield* orchestrator.streamDomainEvents.pipe(

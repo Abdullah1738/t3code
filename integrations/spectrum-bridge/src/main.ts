@@ -320,6 +320,7 @@ async function main(): Promise<void> {
     if (chatGuid) await photon.typing(chatGuid, false).catch((caughtError) => { toolError("main", "main.catch18", caughtError);});
     await photon.close();
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.
+    toolLog.flush();
     process.exit(0);
   };
   process.once("SIGTERM", () => { void stop(); });

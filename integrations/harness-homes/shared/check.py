@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import generate_homes as gh
 import toollog
 from opencode import SHARED_IDS
+from runtime_paths import validate_inbody, validate_plist
 
 
 def logged_probe(fn):
@@ -76,6 +77,10 @@ def main():
         if server["id"] not in SHARED_IDS:
             continue
         try:
+            interpreter = validate_plist(Path.home() / 'Library/LaunchAgents' /
+                f"com.ardud.shared-mcp-{server['id']}.plist", require_interpreter=True)
+            if server['id'] == 'inbody':
+                validate_inbody(interpreter)
             names = probe(server["url"], server["id"])
             print(f"OK {server['id']} {server['url']} ({len(names)} tools)")
         except Exception as exc:

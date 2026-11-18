@@ -1,3 +1,5 @@
+import { bounded } from "./bounded.ts";
+import { PromptProbeTracker } from "./prompt-probe.ts";
 import { ProbeBackoff, ProbeBudget, probeDeferred } from "./probe-policy.ts";
 import { findOverdue, reconcileLegacyReplies, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
 import { toolLog as watcherLog } from "./watcherlog.ts";
@@ -681,20 +683,10 @@ Bridge CLI: ${CLI} COMMAND ... --session CURRENT_SESSION_ID --key UNIQUE_KEY
 Secure forms and the other commands are in the imessage skill.`;
 }
 
-// Existing client methods do not accept cancellation signals. Bound the wait, but
-// treat timed-out mutations as ambiguous: their underlying request can finish later.
-export async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([operation, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(Object.assign(new Error("Router request timed out"), { name: "TimeoutError", code: "timeout" })), timeout);
-    })]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+export { bounded } from "./bounded.ts";
 
 export class Router {
+  private readonly promptProbes = new PromptProbeTracker(toolLog.write);
   private completionRead?: { key: string; result: Promise<MessageRecord[]>; timing: ReadTiming; records?: MessageRecord[]; at?: number };
   private completionTargetKey?: string;
   private completionWake = Promise.withResolvers<void>();
@@ -715,7 +707,8 @@ export class Router {
     }));
   }
 
-  private async probeAccepted(route: Route & { inboundId?: string }, prompt: string, leader = route.inboundId ?? prompt, timeout = this.readTimeout()): Promise<boolean> {
+  private async probeAccepted(route: Route & { inboundId?: string }, prompt: string, leader = route.inboundId ?? prompt, timeout = this.readTimeout(),
+    observe?: () => ReturnType<PromptProbeTracker["start"]>): Promise<boolean> {
     const promptKey = `prompt:${route.id}:${prompt}`;
     const retry = this.probeBackoff.retry(leader) || this.probeBackoff.retry(promptKey);
     if (this.probeBackoff.cooling(leader) || this.probeBackoff.cooling(promptKey)
@@ -724,14 +717,18 @@ export class Router {
     const promptLease = this.probeBackoff.reserve(promptKey);
     const ownsLease = () => this.probeBackoff.get(leader)?.token === leaderLease.token
       && this.probeBackoff.get(promptKey)?.token === promptLease.token;
+    const observation: { probe?: ReturnType<PromptProbeTracker["start"]> } = {};
+    if (observe) toolLog.capture(() => { observation.probe = observe(); });
     try {
       const accepted = await bounded(this.backend.promptAccepted(route.id, route.directory, prompt), timeout);
+      if (observation.probe) toolLog.capture(() => observation.probe?.complete(accepted));
       if (!ownsLease()) throw probeDeferred;
       if (accepted) this.probeBackoff.clear(leader);
       else this.probeBackoff.release(leader);
       this.probeBackoff.clear(promptKey);
       return accepted;
     } catch (error) {
+      if (observation.probe && error !== probeDeferred) toolLog.capture(() => observation.probe?.failure(error));
       // A receipt can settle this read while it is pending; late failures cannot restore its history.
       if (!ownsLease()) throw probeDeferred;
       const backoff = this.probeBackoff.failed(leader);
@@ -1142,10 +1139,22 @@ export class Router {
       if (original) {
         if (this.probeBackoff.cooling(leader)) absent = false;
         else {
+          const steer = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
           const ids = [original.messageId, ...original.earlier ?? []];
           for (const [probeIndex, id] of ids.entries()) {
+            const steeredAt = id === original.messageId && id === `msg_${hash(leader)}`
+              && steer?.id === original.id && steer.directory === original.directory && steer.generation === original.generation
+              ? steer.startedAt : undefined;
+            const sentAt = id === original.messageId ? steeredAt ?? original.attemptAt ?? original.startedAt : original.startedAt;
+            const probeFailure: { value?: { error: unknown; props: Parameters<typeof toolError>[4] } } = {};
             try {
-              if (await this.probeAccepted(original, id, leader, 10_000)) {
+              if (await this.probeAccepted(original, id, leader, 10_000, () => {
+                const probe = this.promptProbes.start(original.id, id, sentAt);
+                return { ...probe, failure: (error: unknown) => {
+                  probeFailure.value = { error, props: undefined };
+                  return probeFailure.value.props = probe.failure(error);
+                } };
+              })) {
                 this.store.db.transaction(() => {
                   const retry = this.store.get<string>(`human-retry-prompt:${leader}`);
                   if (retry && retry !== original.messageId) return;
@@ -1170,7 +1179,8 @@ export class Router {
                 break;
               }
             } catch (caughtError) {
-              toolError("router", "router.catch1", caughtError, { inboundId: `row_${hash(leader).slice(0, 16)}` }, { probeIndex, probeCount: ids.length });
+              toolError("router", "router.catch1", probeFailure.value ? probeFailure.value.error : caughtError, { threadId: original.id, inboundId: `row_${hash(leader).slice(0, 16)}` },
+                { probeIndex, probeCount: ids.length, ...probeFailure.value?.props });
               absent = false;
               break;
             }

@@ -143,6 +143,45 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(self.state['failed_reopens'],0);self.assertEqual(self.tick()[1],'none');self.assertEqual(self.tick()[1],'reopen')
 
 class IOTests(unittest.TestCase):
+    def test_bounded_process_diagnostics_and_failed_reads(self):
+        output = "malformed\n1 0 /sbin/launchd /sbin/launchd\n42 1 %s desktop\n" % guard.EXECUTABLE
+        output += "\n".join("%s 43 %s %s" % (pid, guard.EXECUTABLE, "x" * 300) for pid in range(43, 53))
+        with patch('quit_reason.registered_desktop_pids',return_value={42}), \
+                patch('guard.subprocess.run',return_value=subprocess.CompletedProcess('ps',0,stdout=output)):
+            detail=json.loads(guard.process_diagnostics().removeprefix('processes='))
+        self.assertEqual(detail['lsappinfo_pid'],42)
+        self.assertTrue(detail['lsappinfo_alive'])
+        self.assertEqual([p['pid'] for p in detail['robob_processes']],list(range(43,48)))
+        self.assertTrue(all(len(p['args'])==160 and p['ppid']==43 for p in detail['robob_processes']))
+        with patch('quit_reason.registered_desktop_pids',side_effect=OSError('lsa')), \
+                patch('guard.subprocess.run',side_effect=subprocess.TimeoutExpired('ps',5)):
+            detail=guard.process_diagnostics()
+        self.assertIn('"lsappinfo_alive":"unknown"',detail)
+        self.assertIn('"lsappinfo_error":"OSError"',detail)
+        self.assertIn('"processes_error":"TimeoutExpired"',detail)
+
+    def test_check_error_notification_text(self):
+        with patch('guard.subprocess.run') as run:
+            self.assertTrue(guard.notify(Path('/fake'),'robob-guard:10000:check-error',dict(kind='check-error',at=10090)))
+        command=run.call_args.args[0]
+        message=command[command.index('--text')+1]
+        self.assertIn('checks keep failing',message)
+        self.assertIn('guard.log',message)
+        self.assertEqual(command[-1],'robob-guard:10000:check-error')
+
+    def test_check_error_state_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'state'
+            state=guard.initial_state()
+            guard.record_check_error(state,10000,False)
+            for now in [10030,10060,10090]:guard.record_check_error(state,now,False)
+            guard.atomic_json(path,state)
+            self.assertEqual(guard.read_state(path),state)
+            for key,value in [('check_error_count',-1),('check_error_count',True),('check_error_since','bad')]:
+                with self.subTest(key=key,value=value):
+                    guard.atomic_json(path,dict(state,**{key:value}))
+                    self.assertEqual(guard.read_state(path),guard.initial_state())
+
     def test_exact_process(self):
         self.assertTrue(guard.robob_present(' 12 '+guard.EXECUTABLE+'\n'))
         for value in ['Robob',guard.EXECUTABLE+' Helper','python script Robob',guard.EXECUTABLE+'-old']:
