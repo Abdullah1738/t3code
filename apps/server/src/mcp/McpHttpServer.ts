@@ -599,7 +599,7 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
           fiber.context,
           McpInvocationContext.McpInvocationContext,
         );
-        return built.handle("preview_snapshot", payload).pipe(
+        return built.handle("preview_snapshot", payload, undefined, { errors: "all" }).pipe(
           Stream.unwrap,
           Stream.run(Sink.last()),
           Effect.flatMap(Effect.fromOption),
@@ -842,7 +842,7 @@ const registerDeviceScreenshot = Effect.fn("McpHttpServer.registerDeviceScreensh
     DeviceScreenshotTool,
     (payload) =>
       built
-        .handle("device_screenshot", payload)
+        .handle("device_screenshot", payload, undefined, { errors: "all" })
         .pipe(Stream.unwrap, Stream.run(Sink.last()), Effect.flatMap(Effect.fromOption)),
     (effect) =>
       effect.pipe(
@@ -864,7 +864,7 @@ const registerHtmlPreview = Effect.fn("McpHttpServer.registerHtmlPreview")(funct
     HtmlPreviewTool,
     (payload) =>
       built
-        .handle("html_preview", payload)
+        .handle("html_preview", payload, undefined, { errors: "all" })
         .pipe(Stream.unwrap, Stream.run(Sink.last()), Effect.flatMap(Effect.fromOption)),
     (effect) =>
       effect.pipe(

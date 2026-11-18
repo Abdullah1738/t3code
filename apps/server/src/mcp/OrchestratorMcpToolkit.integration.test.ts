@@ -4947,7 +4947,12 @@ describe("orchestrator MCP toolkit", () => {
 });
 
 describe("MCP input rejections", () => {
-  const definitions = [OrchestratorToolkit.tools.t3_thread_read, KanbanToolkit.tools.card_get];
+  const decodeJsonNumber = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Number));
+  const definitions = [
+    OrchestratorToolkit.tools.t3_thread_read,
+    OrchestratorToolkit.tools.t3_thread_wait,
+    KanbanToolkit.tools.card_get,
+  ];
   // Keep the shipped parameter schemas; no service should run for rejected input.
   const toolkit = Toolkit.make(
     ...definitions.map((definition) =>
@@ -4963,6 +4968,7 @@ describe("MCP input rejections", () => {
     toolkit,
     McpToolAccess.toLayer(toolkit, {
       t3_thread_read: McpToolAccess.reads(() => Effect.die("rejected input reached handler")),
+      t3_thread_wait: McpToolAccess.reads(() => Effect.die("rejected input reached handler")),
       card_get: McpToolAccess.reads(() => Effect.die("rejected input reached handler")),
     }),
   ).pipe(
@@ -4982,6 +4988,18 @@ describe("MCP input rejections", () => {
       input: { view: "bogus" },
       field: "view",
       expected: ["messages", "activity", "string"],
+    },
+    {
+      name: "t3_thread_wait",
+      input: { threadId: "overflow-thread", timeoutMs: decodeJsonNumber("1e400") },
+      field: "timeoutMs",
+      expected: ["finite number", "Infinity"],
+    },
+    {
+      name: "t3_thread_wait",
+      input: { threadId: "overflow-thread", timeoutMs: decodeJsonNumber("-1e400") },
+      field: "timeoutMs",
+      expected: ["finite number", "-Infinity"],
     },
     {
       name: "card_get",

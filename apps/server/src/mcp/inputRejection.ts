@@ -35,14 +35,31 @@ function expected(ast: SchemaAST.AST | undefined): string {
     });
     return constraints.length > 0 ? [...new Set(constraints)].join(" and ") : type;
   }
-  for (const representation of representations) {
-    const payload = representation.payload;
-    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) continue;
-    const bounds = payload as Readonly<Record<string, unknown>>;
+  if (representations.some((r) => r.id === "effect/schema/isFinite"))
+    type = type === "an integer" ? "a finite integer" : "a finite number";
+  const constraints: string[] = [];
+  for (const check of checks) {
+    const representation = check.annotations?.representation;
+    if (
+      representation?.id === "effect/schema/isInt" ||
+      representation?.id === "effect/schema/isFinite"
+    )
+      continue;
+    const payload = representation?.payload;
+    const bounds =
+      payload !== null && typeof payload === "object" && !Array.isArray(payload)
+        ? (payload as Readonly<Record<string, unknown>>)
+        : {};
     const minimum = bounds.minimum ?? bounds.exclusiveMinimum;
     const maximum = bounds.maximum ?? bounds.exclusiveMaximum;
     const exclusiveMinimum = typeof bounds.exclusiveMinimum === "number";
     const exclusiveMaximum = typeof bounds.exclusiveMaximum === "number";
+    if (typeof minimum !== "number" && typeof maximum !== "number") {
+      const description = check.annotations?.expected;
+      if (typeof description === "string")
+        constraints.push(description.replace(/^a value\b/, type));
+      continue;
+    }
     if (
       typeof minimum === "number" &&
       typeof maximum === "number" &&
@@ -57,7 +74,7 @@ function expected(ast: SchemaAST.AST | undefined): string {
         type += ` ${exclusiveMaximum ? "less than" : "at most"} ${maximum}`;
     }
   }
-  return type;
+  return [...new Set([type, ...constraints])].join(" and ");
 }
 
 function rejection(failures: ReadonlyMap<string, { field: string; message: string }>, hint = "") {

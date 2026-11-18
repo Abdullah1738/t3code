@@ -17,6 +17,61 @@ const schema = Schema.Struct({
 });
 
 describe("input rejection details", () => {
+  it.each([
+    {
+      name: "positive overflow",
+      field: Schema.Finite,
+      value: Number("1e400"),
+      constraint: "a finite number",
+    },
+    {
+      name: "negative overflow",
+      field: Schema.Finite,
+      value: Number("-1e400"),
+      constraint: "a finite number",
+    },
+    { name: "NaN", field: Schema.Finite, value: NaN, constraint: "a finite number" },
+    { name: "finite type", field: Schema.Finite, value: false, constraint: "a finite number" },
+    {
+      name: "multiple",
+      field: Schema.Number.check(Schema.isMultipleOf(5)),
+      value: 3,
+      constraint: "a number that is a multiple of 5",
+    },
+    {
+      name: "safe integer",
+      field: Schema.Int,
+      value: Number.MAX_SAFE_INTEGER + 1,
+      constraint: "an integer",
+    },
+    {
+      name: "static custom check",
+      field: Schema.Number.check(
+        Schema.makeFilter<number>(() => false, { expected: "a prime number" }),
+      ),
+      value: 4,
+      constraint: "a prime number",
+    },
+    {
+      name: "finite integer range",
+      field: Schema.Finite.check(Schema.isInt(), Schema.isBetween({ minimum: 1, maximum: 10 })),
+      value: Infinity,
+      constraint: "a finite integer from 1 to 10",
+    },
+  ])("$name keeps its numeric constraint", ({ field, value, constraint }) => {
+    const payload = { field: value };
+    const decoded = Schema.decodeUnknownResult(Schema.Struct({ field }))(payload);
+    if (decoded._tag !== "Failure") throw new Error("expected invalid input");
+    const result = inputRejection(decoded.failure.issue, payload);
+    expect(result.invalidFields).toEqual(["field"]);
+    expect(result.message).toContain(constraint);
+    expect(result.message).toContain(
+      `(got ${typeof value === "number" ? String(value) : typeof value})`,
+    );
+    expect(result.message.length).toBeLessThanOrEqual(300);
+    expect(result.message).not.toMatch(/[\r\n]/);
+  });
+
   it.each([false, true])(
     "retains excess siblings and deduplicates the safe path (nested=%s)",
     (nested) => {

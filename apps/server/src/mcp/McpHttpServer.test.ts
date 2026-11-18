@@ -48,6 +48,8 @@ import * as CredentialStore from "../ardud/mcp/CredentialStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
+import * as DeviceService from "../device/DeviceService.ts";
+import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
 import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import * as ReplyBuilders from "../ardud/http/ReplyBuilders.ts";
@@ -93,6 +95,19 @@ const layerTest = McpHttpServer.layerPreviewToolkit.pipe(
   Layer.provideMerge(PreviewAutomationBroker.layer),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-http-server-test-" })),
   Layer.provideMerge(NodeServices.layer),
+);
+const layerImageInputTest = Layer.mergeAll(
+  McpHttpServer.layerPreviewToolkit,
+  McpHttpServer.layerDeviceToolkit,
+  McpHttpServer.layerHtmlToolkit,
+).pipe(
+  Layer.provideMerge(McpServer.McpServer.layer),
+  Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+  Layer.provide(PreviewAutomationBroker.layer),
+  Layer.provide(Layer.mock(DeviceService.DeviceService)({})),
+  Layer.provide(Layer.mock(PreviewBrowser.PreviewBrowser)({})),
+  Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-image-input-test-" })),
+  Layer.provide(NodeServices.layer),
 );
 const layerPullRequestsTest = McpHttpServer.layerPullRequestsToolkit.pipe(
   Layer.provideMerge(McpServer.McpServer.layer),
@@ -1433,6 +1448,65 @@ it.effect("refuses preview tools to a client outside a thread before they run", 
       { type: "text", text: expect.stringContaining("needs an agent running inside T3 Code") },
     ]);
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each([
+  {
+    name: "html_preview",
+    input: { html: "", width: false, appearance: "bogus" },
+    fields: ["html", "width", "appearance"],
+    constraints: ["length of at least 1", "integer", '"dark"', '"light"'],
+  },
+  {
+    name: "preview_snapshot",
+    input: { includeImage: "private-image", save: "private-save" },
+    fields: ["includeImage", "save"],
+    constraints: ["boolean"],
+  },
+  {
+    name: "device_screenshot",
+    input: { deviceId: false, hostId: 42 },
+    fields: ["deviceId", "hostId"],
+    constraints: ["string"],
+  },
+])("$name reports every invalid image input field and records only paths", (scenario) =>
+  Effect.gen(function* () {
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const registration = layerImageInputTest.pipe(
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const result = yield* callTool(scenario.name, scenario.input);
+      const part = result.content[0];
+      if (part?.type !== "text") throw new Error("missing input rejection text");
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toEqual({
+        code: "invalid_request",
+        message: part.text,
+        invalidFields: scenario.fields,
+      });
+      for (const field of scenario.fields) expect(part.text).toContain(`${field} must be`);
+      for (const constraint of scenario.constraints) expect(part.text).toContain(constraint);
+      expect(part.text.length).toBeLessThanOrEqual(300);
+      expect(part.text).not.toMatch(/[\r\n]/);
+      expect(part.text).not.toMatch(/private|bogus/);
+      const row = yield* Deferred.await(recorded);
+      expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+        tool: scenario.name,
+        outcome: "error",
+        errorTag: "invalid_request",
+        errorFields: scenario.fields,
+      });
+      expect(JSON.stringify(row)).not.toMatch(/private|bogus|got|Invalid input/);
+    }).pipe(Effect.provide(registration));
+  }),
 );
 
 it.effect("rejects non-boolean snapshot image options before selecting a browser host", () =>
