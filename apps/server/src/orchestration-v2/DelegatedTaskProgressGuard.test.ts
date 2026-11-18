@@ -29,7 +29,7 @@ import * as Guard from "./DelegatedTaskProgressGuard.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as Threads from "./ThreadManagementService.ts";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
-import { normalizeIdleTimeout, stalledSummary } from "./delegatedTaskProgress.ts";
+import { progressBlockers, normalizeIdleTimeout, stalledSummary } from "./delegatedTaskProgress.ts";
 
 const threadId = ThreadId.make("child");
 const runId = RunId.make("run");
@@ -790,6 +790,55 @@ describe("DelegatedTaskProgressGuard", () => {
       assert.lengthOf(h.stops, 1);
     }),
   );
+  it.effect.each([600_000, 120_000])(
+    "fails a silent foreground command after timeout %s plus grace",
+    (timeoutMs) =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness;
+        yield* h.start();
+        const item = {
+          id: TurnItemId.make("bounded-bash"),
+          runId,
+          type: "command_execution",
+          input: "offbox wait run-proof --timeout 570",
+          timeoutMs,
+          status: "running",
+          startedAt: h.now,
+          updatedAt: h.now,
+        } as OrchestrationV2TurnItem;
+        h.projectItems([item]);
+        yield* h.send({ type: "turn-item.updated", payload: item });
+        yield* TestClock.adjust(timeoutMs + 59_999);
+        yield* h.guard.check();
+        assert.lengthOf(h.stops, 0);
+        yield* TestClock.adjust(1);
+        yield* h.guard.check();
+        assert.lengthOf(h.stops, 1);
+        assert.equal(h.stops[0]!.delegatedTaskStall!.lastProgressKind, "command_execution_timeout");
+        assert.include(h.stops[0]!.reason!, "tool timeout plus 60 s grace");
+        assert.lengthOf(h.recoveries, 0);
+      }),
+  );
+  it.effect("explicit background commands remain exempt", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      yield* h.start();
+      const item = {
+        id: TurnItemId.make("background"),
+        runId,
+        type: "command_execution",
+        timeoutMs: 0,
+        status: "running",
+        startedAt: h.now,
+        updatedAt: h.now,
+      } as OrchestrationV2TurnItem;
+      h.projectItems([item]);
+      yield* h.send({ type: "turn-item.updated", payload: item });
+      yield* TestClock.adjust("2 hours");
+      yield* h.guard.check();
+      assert.lengthOf(h.stops, 0);
+    }),
+  );
   it.effect("text and tools reset the clock", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness;
@@ -1119,3 +1168,65 @@ it.effect("keeps ticking while an older child's settlement is pending", () =>
     yield* Deferred.succeed(released, undefined);
   }),
 );
+
+it.each([
+  {
+    name: "declared foreground timeout",
+    timeoutMs: 120_000,
+    driver: "claudeAgent",
+    at: 180_000,
+    blocked: false,
+  },
+  { name: "grace period", timeoutMs: 120_000, driver: "claudeAgent", at: 179_999, blocked: true },
+  { name: "legacy Claude timeout", driver: "claudeAgent", at: 660_000, blocked: false },
+  { name: "legacy Claude grace", driver: "claudeAgent", at: 659_999, blocked: true },
+  {
+    name: "explicit background",
+    timeoutMs: 0,
+    driver: "claudeAgent",
+    at: 7_200_000,
+    blocked: true,
+  },
+  { name: "unbounded other provider", driver: "codex", at: 7_200_000, blocked: true },
+  {
+    name: "fresh output extends grace",
+    timeoutMs: 120_000,
+    driver: "claudeAgent",
+    updated: 180_000,
+    at: 200_000,
+    blocked: true,
+  },
+  {
+    name: "stale output expires",
+    timeoutMs: 120_000,
+    driver: "claudeAgent",
+    updated: 180_000,
+    at: 240_000,
+    blocked: false,
+  },
+  {
+    name: "approval still pending",
+    timeoutMs: 120_000,
+    driver: "claudeAgent",
+    at: 660_000,
+    pending: true,
+    blocked: true,
+  },
+])("stall fencing: $name", ({ timeoutMs, driver, at, updated, pending, blocked }) => {
+  const item = {
+    id: TurnItemId.make("command"),
+    runId,
+    type: "command_execution",
+    status: "running",
+    timeoutMs,
+    startedAt: DateTime.makeUnsafe(0),
+    updatedAt: DateTime.makeUnsafe(updated ?? 0),
+    nativeItemRef: { driver, nativeId: "bash", strength: "strong" },
+  } as OrchestrationV2TurnItem;
+  const projection = {
+    turnItems: [item],
+    messages: [],
+    runtimeRequests: pending ? [{ status: "pending" }] : [],
+  } as unknown as OrchestrationV2ThreadProjection;
+  assert.equal(progressBlockers(projection, runId, at), blocked);
+});

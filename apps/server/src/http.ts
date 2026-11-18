@@ -323,6 +323,7 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
             recorded = true;
             const route = safeAnalyticsLabel(path.replaceAll("*", ":rest"), "unmatched");
             const remote = Option.getOrElse(request.remoteAddress, () => "");
+            const failureTag = errorTag ?? controlProps.errorTag;
             return Effect.flatMap(DateTime.now, (now) =>
               recordServerAnalytics(analytics.value, {
                 ts: DateTime.formatIso(now),
@@ -360,8 +361,8 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
                   status,
                   originKind,
                   span: safeAnalyticsLabel(`http.${request.method}.${route}`, "http.request"),
-                  ...(errorTag !== undefined
-                    ? { errorTag }
+                  ...(failureTag !== undefined
+                    ? { errorTag: failureTag }
                     : status >= 400
                       ? { errorTag: status >= 500 ? "Http5xx" : "Http4xx" }
                       : {}),

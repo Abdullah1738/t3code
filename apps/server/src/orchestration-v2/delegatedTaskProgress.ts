@@ -2,10 +2,30 @@ import type {
   OrchestrationV2Run,
   OrchestrationV2ThreadProjection,
   OrchestrationV2TurnItem,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
+export function parentTaskCancellationRequest(
+  runId: OrchestrationV2Run["id"] | undefined,
+  items: ReadonlyArray<OrchestrationV2TurnItem>,
+) {
+  return items
+    .filter((item) => item.type === "run_interrupt_request")
+    .findLast((item) => item.runId === runId);
+}
+
+export function restartInterrupted(task: {
+  readonly status: string;
+  readonly cancelReason?: string | undefined;
+}): boolean {
+  return (
+    (task.status === "cancelled" || task.status === "interrupted") &&
+    (task.cancelReason === "server_shutdown" || task.cancelReason === "server_restart")
+  );
+}
+
 export function normalizeIdleTimeout(value?: number): number {
   return value === undefined || value === 0 || !Number.isFinite(value)
     ? DEFAULT_IDLE_TIMEOUT_MS
@@ -22,8 +42,12 @@ export function stalledSummary(
       ? "run start"
       : phase === "post_tool"
         ? `tool ${stall.lastProgressTool ?? stall.lastProgressKind}`
-        : stall.lastProgressKind;
-  return `stalled: no model output for ${Math.floor((stall.silentSeconds ?? stall.idleTimeoutMs / 1000) / 60)} min after ${after} at ${DateTime.formatIso(stall.lastProgressAt)}; no final report${partial ? `\n\nPartial assistant result:\n${partial}` : ""}`;
+        : stall.lastProgressKind === "command_execution_timeout"
+          ? "foreground command exceeding its tool timeout plus 60 s grace"
+          : stall.lastProgressKind;
+  const exit =
+    stall.lastProgressExitCode === undefined ? "" : ` (exit ${stall.lastProgressExitCode})`;
+  return `stalled: no model output for ${Math.floor((stall.silentSeconds ?? stall.idleTimeoutMs / 1000) / 60)} min after ${after}${exit} at ${DateTime.formatIso(stall.lastProgressAt)}; no final report${partial ? `\n\nPartial assistant result:\n${partial}` : ""}`;
 }
 
 const toolFinishedKinds = new Set([
@@ -100,14 +124,39 @@ const activityTypes = new Set([
 export const isProgressActivity = (item: OrchestrationV2TurnItem): boolean =>
   activityTypes.has(item.type) || (item.type === "subagent" && item.origin === "provider_native");
 
+export function commandProgressDeadline(
+  item: OrchestrationV2TurnItem,
+  lastOutputAt = -Infinity,
+): number {
+  if (item.type !== "command_execution" || item.timeoutMs === 0) return Infinity;
+  // Older Claude projections predate timeout metadata. Bash cannot run in the
+  // foreground for more than ten minutes, even when its requested limit is lost.
+  const timeout =
+    item.timeoutMs ?? (item.nativeItemRef?.driver === "claudeAgent" ? 600_000 : undefined);
+  if (timeout === undefined || item.startedAt === null) return Infinity;
+  return (
+    Math.max(
+      DateTime.toEpochMillis(item.startedAt) + timeout,
+      DateTime.toEpochMillis(item.updatedAt),
+      lastOutputAt,
+    ) + 60_000
+  );
+}
+
 export function progressBlockers(
   projection: ProgressProjection,
   runId: OrchestrationV2Run["id"],
+  now = -Infinity,
+  outputActivity?: ReadonlyMap<TurnItemId, number>,
 ): boolean {
   return (
     projection.runtimeRequests.some((request) => request.status === "pending") ||
     projection.turnItems.some(
-      (item) => item.runId === runId && active(item.status) && isProgressActivity(item),
+      (item) =>
+        item.runId === runId &&
+        active(item.status) &&
+        isProgressActivity(item) &&
+        commandProgressDeadline(item, outputActivity?.get(item.id)) > now,
     )
   );
 }

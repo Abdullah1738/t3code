@@ -31,6 +31,7 @@ import {
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -62,7 +63,7 @@ import {
   type ControlErrorCode,
   errorDetail,
   fail,
-  operationFailure,
+  operationFailure as controlOperationFailure,
   rejectionDetails,
 } from "./ControlErrors.ts";
 import * as ControlRequestAnalytics from "./ControlRequestAnalytics.ts";
@@ -178,6 +179,17 @@ const nextThreadListCursor = (shells: ReadonlyArray<OrchestrationV2ThreadShell>,
     : null;
 };
 
+const withFailure = (error: ControlError, cause: unknown) =>
+  new ControlError({
+    code: error.code,
+    message: error.message,
+    ...(error.rejection === undefined ? {} : { rejection: error.rejection }),
+    failure: ControlRequestAnalytics.failureDetails(cause),
+  });
+
+const operationFailure = (cause: unknown) =>
+  cause instanceof ControlError ? cause : withFailure(controlOperationFailure(cause), cause);
+
 const STATUS: Record<ControlErrorCode, number> = {
   unauthorized: 401,
   forbidden: 403,
@@ -258,13 +270,20 @@ const errorResponse = (error: ControlError) => {
 };
 
 // The request span already measures the route; retain refusal diagnostics there.
-const logRejection = Effect.fnUntraced(function* (code: string, rejection: ControlRejection) {
+const logRejection = Effect.fnUntraced(function* (
+  code: string,
+  rejection: ControlRejection,
+  details?: ControlRequestAnalytics.FailureDetails,
+) {
   yield* Effect.annotateCurrentSpan({
     "control.reason": rejection.reason,
     "control.retry_safe": rejection.retrySafe,
     "control.holder": rejection.holder,
   });
-  yield* Effect.logWarning("Control request rejected", { code, ...rejection });
+  yield* ControlRequestAnalytics.failure(
+    code,
+    details ?? { errorTag: "ControlError", reason: rejection.reason },
+  );
 });
 
 type Scope = typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope;
@@ -299,6 +318,7 @@ const decodeBody = Effect.fn("ControlHttp.decodeBody")(function* <A>(
       : yield* decodeJsonText(text).pipe(
           Effect.mapError(() => fail("invalid_request", "The request body is not valid JSON.")),
         );
+  yield* ControlRequestAnalytics.sendInput(raw);
   return yield* decode(raw).pipe(
     Effect.mapError((error) => fail("invalid_request", error.message)),
   );
@@ -558,7 +578,7 @@ const makeRoutes = Effect.gen(function* () {
 
   const getShell = (threadId: string) =>
     threads.getThreadShell(ThreadId.make(threadId)).pipe(
-      Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+      Effect.mapError((cause) => withFailure(fail("internal", errorDetail(cause)), cause)),
       Effect.flatMap((shell) =>
         shell === null || shell.deletedAt !== null
           ? Effect.fail(fail("not_found", `Thread ${threadId} was not found.`))
@@ -1329,6 +1349,7 @@ const makeRoutes = Effect.gen(function* () {
     const result = yield* SendAcknowledgement.bounded(
       (clientRequestId) =>
         Effect.gen(function* () {
+          yield* ControlRequestAnalytics.sendRequestId(clientRequestId);
           const shell = yield* getShell(threadId);
           const commandId = yield* commandIdFor(`send:${threadId}`, clientRequestId);
           // ardud: channel guidance is framed as the bridge's, so only it may send some.
@@ -1348,7 +1369,7 @@ const makeRoutes = Effect.gen(function* () {
             body.providerInstanceId !== undefined ||
             body.options !== undefined;
           const settings = yield* settingsService.getSettings.pipe(
-            Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+            Effect.mapError((cause) => withFailure(fail("internal", errorDetail(cause)), cause)),
           );
           const modelSelection =
             hasSelection || selectionMigrationApplies(settings)
@@ -1912,15 +1933,22 @@ const makeRoutes = Effect.gen(function* () {
           Effect.gen(function* () {
             const rejection = rejectionDetails(error);
             if (rejection !== undefined) {
-              yield* logRejection(error.code, rejection);
+              yield* logRejection(error.code, rejection, error.failure);
+            } else {
+              yield* ControlRequestAnalytics.failure(error.code, error.failure);
             }
             return errorResponse(error);
           }),
       }),
       Effect.catchCause((cause) =>
-        Effect.logWarning("ardud control request failed", { cause }).pipe(
-          Effect.as(errorResponse(fail("internal", "Internal error."))),
-        ),
+        ControlRequestAnalytics.failure("internal", {
+          errorTag: Cause.hasDies(cause)
+            ? "Defect"
+            : Cause.hasInterrupts(cause)
+              ? "Interrupted"
+              : "UnknownError",
+          reason: "unexpected_failure",
+        }).pipe(Effect.as(errorResponse(fail("internal", "Internal error.")))),
       ),
     );
 
@@ -1933,7 +1961,20 @@ const makeRoutes = Effect.gen(function* () {
       .slice(p.length + 1)
       .replaceAll("/", ".")
       .replaceAll(":", "")}`,
-  ) => HttpRouter.route(method, path, observeControl(operation, effect, { path, method }));
+  ) =>
+    HttpRouter.route(
+      method,
+      path,
+      observeControl(
+        operation,
+        Effect.gen(function* () {
+          const params = yield* HttpRouter.params;
+          yield* ControlRequestAnalytics.requestThread(params.threadId);
+          return yield* effect;
+        }),
+        { path, method },
+      ),
+    );
   return [
     // These bridge reads otherwise share the cleanup snapshot's background lane.
     route("GET", `${p}/health`, handle(health.pipe(NodeSqliteClient.foregroundReads))),

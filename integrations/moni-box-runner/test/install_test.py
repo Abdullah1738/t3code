@@ -19,6 +19,8 @@ class Tests(unittest.TestCase):
             env = {**os.environ, 'HOME': td, 'PATH': str(bindir) + ':' + os.environ['PATH'], 'INSTALL_LOG': str(root / 'calls')}
             result = subprocess.run(['zsh', '-f', str(INSTALL), 'bx_moni', '/usr/local/bin/bun'], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('curl -fsS http://127.0.0.1:19466/livez', result.stdout)
+            self.assertIn('boxLivezPort if overridden', result.stdout)
             calls = (root / 'calls').read_text().splitlines()
             self.assertEqual(len(calls), 2)
             self.assertTrue(all(line.startswith('person:moni:server:ssh bx_moni -- ') for line in calls), calls)

@@ -5,7 +5,7 @@ import { Store } from "../../spectrum-bridge/src/store.ts";
 import { Shares, cloudflaredTunnel, shareRoute } from "../../spectrum-bridge/src/share.ts";
 import { BoxRunner, type RunnerConfig } from "./runner.ts";
 import { claudeHarness } from "./claude.ts";
-import { routerConfig, routerReachable } from "./router-auth.ts";
+import { routerConfig, routerReady } from "./router-auth.ts";
 
 export function loadRunnerConfig(path: string) {
   const config = JSON.parse(readFileSync(path, "utf8"));
@@ -26,7 +26,7 @@ if (import.meta.main) {
   await startShareMaintenance(shares, code => console.log(JSON.stringify({ code })));
   const runner = new BoxRunner(config, claudeHarness(config.root, config.claude, config.model, config, (code, detail) => console.log(JSON.stringify({ code, ...detail }))), {
     log: (code, ms, detail) => console.log(JSON.stringify({ code, ms, ...detail })),
-    modelReady: () => routerReachable(config),
+    modelReady: () => routerReady(config, (code, detail) => console.log(JSON.stringify({ code, ...detail }))),
     share: async (path, body) => { const result = await shareRoute(shares, path, body); if (result.status >= 400) throw new Error("Share failed"); return result.body; },
   });
   const watchers = new BoxWatchers(runner);

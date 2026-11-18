@@ -14,6 +14,10 @@ import {
   type OrchestrationV2Run,
 } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -484,4 +488,90 @@ it.effect.each(
       );
       assert.lengthOf((yield* engine.getThreadProjection(threadId)).subagents, 0);
     }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["accepted", "rejected", "revoked", "thread.create"] as const)(
+  "replays %s receipt while the parent dispatch lock is held",
+  (outcome) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { engine, threadId, command } = yield* seed;
+        const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+        const locks = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const replay =
+          outcome === "thread.create"
+            ? {
+                type: "thread.create" as const,
+                commandId: CommandId.make("parent:create"),
+                threadId,
+                projectId: ProjectId.make("project:delegate-admission"),
+                title: "Parent",
+                modelSelection,
+                runtimeMode: "full-access" as const,
+                interactionMode: "default" as const,
+                branch: null,
+                worktreePath: null,
+                createdBy: "user" as const,
+                creationSource: "web" as const,
+              }
+            : command;
+        yield* engine.dispatch(replay);
+        const accepted = yield* engine.dispatch(replay);
+        if (outcome === "rejected")
+          yield* receipts.upsert({
+            commandId: command.commandId,
+            threadId,
+            commandType: command.type,
+            acceptedAt: yield* DateTime.now,
+            resultSequence: accepted.sequence,
+            status: "rejected",
+            error: "Rejected for test",
+          });
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const held = yield* locks
+          .withLock(
+            threadId,
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          )
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(entered);
+        const result = yield* engine
+          .dispatch(replay, {
+            isStale: () => outcome === "revoked",
+          })
+          .pipe(Effect.exit);
+        assert.isUndefined(held.pollUnsafe(), "receipt replay must leave the lock held");
+        if (outcome === "rejected" || outcome === "revoked") {
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure") {
+            const error = result.cause.reasons.find((r) => r._tag === "Fail")?.error;
+            assert.equal(
+              error?._tag,
+              outcome === "rejected"
+                ? "OrchestratorCommandPreviouslyRejectedError"
+                : "OrchestratorCommandRejectedError",
+            );
+            if (error?._tag === "OrchestratorCommandRejectedError") assert.isTrue(error.revoked);
+          }
+        } else {
+          assert.equal(result._tag, "Success");
+          if (result._tag === "Success") assert.deepEqual(result.value, accepted);
+          assert.lengthOf(
+            (yield* engine.getThreadProjection(threadId)).subagents,
+            outcome === "thread.create" ? 0 : 1,
+          );
+        }
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(held);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            layer,
+            ThreadCommandExecutor.layer,
+            CommandReceiptStore.layer.pipe(Layer.provide(database)),
+          ),
+        ),
+      ),
+    ),
 );

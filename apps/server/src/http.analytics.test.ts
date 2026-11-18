@@ -309,6 +309,95 @@ it.each(["buffered", "stream", "head", "closed"])(
   },
 );
 
+it.each([
+  {
+    status: 409,
+    failure: {
+      code: "conflict",
+      errorTag: "ThreadManagementNoSteerableRunError",
+      reason: "no_steerable_run",
+    },
+    expectedTag: "ThreadManagementNoSteerableRunError",
+  },
+  {
+    status: 503,
+    failure: {
+      code: "unavailable",
+      errorTag: "ServerRuntimeStartupError",
+      reason: "startup_unavailable",
+    },
+    expectedTag: "ServerRuntimeStartupError",
+  },
+  { status: 404, failure: undefined, expectedTag: "Http4xx" },
+  { status: 503, failure: undefined, expectedTag: "Http5xx" },
+])(
+  "preserves $expectedTag for a $status control response",
+  async ({ status, failure, expectedTag }) => {
+    const events: AnalyticsEvent[] = [];
+    const recorded = Promise.withResolvers<void>();
+    const route = "/api/ardud/control/threads/:threadId/send";
+    const source = new Request("http://test/api/ardud/control/threads/private/send", {
+      method: "POST",
+      headers: { "x-request-id": "rejection-test" },
+    });
+    const responseEvents = new NodeEvents.EventEmitter();
+    HttpRequestLifecycle.observe(source, responseEvents, () => 0);
+    const response = HttpServerResponse.empty({ status });
+    const app = Layer.mergeAll(
+      Layer.unwrap(
+        Effect.map(ControlRequestAnalytics.make, (observeControl) =>
+          HttpRouter.add(
+            "POST",
+            route,
+            failure === undefined
+              ? response
+              : observeControl(
+                  "control.send",
+                  Effect.gen(function* () {
+                    yield* ControlRequestAnalytics.sendMode("steer");
+                    yield* ControlRequestAnalytics.failure(failure.code, failure);
+                    return response;
+                  }),
+                  { path: route, method: "POST" },
+                ),
+          ),
+        ),
+      ),
+      layerHttpAnalytics,
+    ).pipe(
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (event) =>
+            Effect.sync(() => {
+              events.push(event);
+              if (event.kind === "server.http") recorded.resolve();
+            }),
+        }),
+      ),
+    );
+    const { handler, dispose } = HttpRouter.toWebHandler(app, { disableLogger: true });
+    try {
+      assert.equal((await handler(source)).status, status);
+      responseEvents.emit("finish");
+      await recorded.promise;
+      const http = events.filter((event) => event.kind === "server.http");
+      assert.lengthOf(http, 1);
+      assert.equal(http[0]?.props?.errorTag, expectedTag);
+      assert.equal(http[0]?.props?.status, status);
+      const rpc = events.filter((event) => event.kind === "rpc.request");
+      assert.lengthOf(rpc, failure === undefined ? 0 : 1);
+      if (failure !== undefined) {
+        for (const event of [http[0]!, rpc[0]!]) {
+          assert.deepInclude(event.props!, { ...failure, requestId: "rejection-test" });
+        }
+      }
+      for (const event of events) decodeAnalyticsEvent(event);
+    } finally {
+      await dispose();
+    }
+  },
+);
+
 it("retains normalized unknown paths and a bounded caller hint", () => {
   const a = ControlHttpTelemetry.pathHint("/api/secret-token/messages?token=query-secret");
   const b = ControlHttpTelemetry.pathHint("/api/another-value/messages");

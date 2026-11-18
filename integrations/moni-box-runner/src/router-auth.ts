@@ -2,12 +2,15 @@ import { chmodSync, closeSync, constants, fstatSync, mkdirSync, openSync, readFi
 import { isAbsolute, join } from "node:path";
 
 export const ROUTER_KEY_ERROR = "router-key-unavailable";
-export function routerConfig(config: { boxRouterPort?: unknown; macRouterPort?: unknown; routerKeyFile?: unknown }) {
+export function routerConfig(config: { boxRouterPort?: unknown; macRouterPort?: unknown; boxLivezPort?: unknown; macLivezPort?: unknown; routerKeyFile?: unknown }) {
   const boxRouterPort = config.boxRouterPort === undefined ? 19465 : config.boxRouterPort, macRouterPort = config.macRouterPort === undefined ? 20128 : config.macRouterPort;
+  const boxLivezPort = config.boxLivezPort === undefined ? 19466 : config.boxLivezPort, macLivezPort = config.macLivezPort === undefined ? 20129 : config.macLivezPort;
   const routerKeyFile = config.routerKeyFile === undefined ? "/home/user/person/secrets/9router-key" : config.routerKeyFile;
-  if (![boxRouterPort, macRouterPort].every(p => typeof p === "number" && Number.isInteger(p) && p >= 1024 && p <= 65535)
+  if (![boxRouterPort, macRouterPort, boxLivezPort, macLivezPort].every(p => typeof p === "number" && Number.isInteger(p) && p >= 1024 && p <= 65535)
+    || boxLivezPort === boxRouterPort
     || typeof routerKeyFile !== "string" || !isAbsolute(routerKeyFile) || /[\0\r\n]/.test(routerKeyFile)) throw new Error("Invalid router configuration");
-  return { boxRouterPort: boxRouterPort as number, macRouterPort: macRouterPort as number, routerKeyFile };
+  return { boxRouterPort: boxRouterPort as number, macRouterPort: macRouterPort as number,
+    boxLivezPort: boxLivezPort as number, macLivezPort: macLivezPort as number, routerKeyFile };
 }
 export function readRouterKey(path: string): string {
   let fd: number | undefined;
@@ -21,11 +24,18 @@ export function readRouterKey(path: string): string {
   } catch { throw new Error(ROUTER_KEY_ERROR); }
   finally { if (fd !== undefined) closeSync(fd); }
 }
-export async function routerReachable(config: ReturnType<typeof routerConfig>): Promise<boolean> {
+export async function routerReady(config: ReturnType<typeof routerConfig>, log: (code: string, detail: { reason: string }) => void = () => {}): Promise<boolean> {
   try {
-    const response = await fetch(`http://127.0.0.1:${config.boxRouterPort}/api/health`, { redirect: "error", signal: AbortSignal.timeout(5_000) });
-    await response.body?.cancel();
-    return response.ok;
+    const response = await fetch(`http://127.0.0.1:${config.boxLivezPort}/livez`, { redirect: "error", signal: AbortSignal.timeout(1_500) });
+    try {
+      const body: unknown = await response.json().catch(() => null);
+      const data = body && typeof body === "object" ? body as Record<string, unknown> : {};
+      if (response.status === 503) {
+        const reason = typeof data.reason === "string" && ["no_worker", "not_ready", "heartbeat_stale", "shutting_down"].includes(data.reason) ? data.reason : "unknown";
+        log("router-unready", { reason });
+      }
+      return response.status === 200 && data.ready === true;
+    } finally { await response.body?.cancel().catch(() => {}); }
   } catch { return false; }
 }
 export function startRouterGate(config: ReturnType<typeof routerConfig>, unavailable: () => void) {

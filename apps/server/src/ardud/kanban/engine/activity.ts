@@ -20,6 +20,7 @@ import {
   type KanbanBoard,
   type KanbanCard,
   type KanbanCardEvent,
+  type KanbanDiscussion,
   type KanbanOwnerAsk,
   type KanbanPool,
   type KanbanPoolChange,
@@ -77,6 +78,185 @@ const minutesBetween = (from: string, to: string) =>
 const hours = (ms: number) => Math.round((ms / HOUR) * 100) / 100;
 const inWindow = (iso: string | null | undefined, window: ActivityWindow): iso is string =>
   iso !== null && iso !== undefined && iso >= window.since && iso < window.until;
+
+/** Shared with the nightly launch's supplied discussion IDs. Messages decide inclusion in the exact window. */
+export const discussionSources = (
+  discussions: ReadonlyArray<KanbanDiscussion>,
+  since: string,
+  exclude?: string,
+) =>
+  discussions.filter(
+    (source) =>
+      source.id !== exclude &&
+      Date.parse(source.lastMessageAt ?? source.createdAt) >= Date.parse(since),
+  );
+
+interface DiscussionDigestMessage {
+  readonly at: string;
+  readonly author: string;
+  readonly text: string;
+}
+
+export const discussionDigestRow = (
+  discussion: KanbanDiscussion,
+  card: KanbanCard | undefined,
+  messages: ReadonlyArray<DiscussionDigestMessage>,
+  window: ActivityWindow,
+) => {
+  const matching = messages.filter((message) => inWindow(message.at, window));
+  const last = matching.at(-1);
+  if (last === undefined) return null;
+  return {
+    discussionId: discussion.id,
+    ...(card === undefined ? {} : { card: card.number }),
+    title: oneLine(card?.title ?? discussion.title, 200),
+    messagesInWindow: matching.length,
+    ownerMessages: matching
+      .filter((message) => message.author === "owner")
+      .map((message) => ({ at: message.at, text: oneLine(message.text, 300) })),
+    // Pin priority to the cutoff so later ask closures cannot shift an index cursor.
+    openAsks: (card?.asks ?? [])
+      .filter(
+        (ask) => ask.at < window.until && (ask.closedAt === null || ask.closedAt >= window.until),
+      )
+      .map((ask) => ask.id),
+    last: { at: last.at, author: last.author, text: oneLine(last.text, 200) },
+  };
+};
+
+export const discussionDigestRows = (
+  rows: ReadonlyArray<NonNullable<ReturnType<typeof discussionDigestRow>>>,
+) =>
+  rows
+    .toSorted(
+      (left, right) =>
+        Number(right.ownerMessages.length > 0 || right.openAsks.length > 0) -
+          Number(left.ownerMessages.length > 0 || left.openAsks.length > 0) ||
+        right.last.at.localeCompare(left.last.at) ||
+        left.discussionId.localeCompare(right.discussionId),
+    )
+    .flatMap((row) => {
+      // Preserve every owner message even when one busy discussion exceeds a page.
+      // Continuations carry the same id and an offset; ordinary discussions stay one row.
+      const parts: Array<
+        typeof row & { ownerMessagesOffset?: number; ownerMessagesTotal?: number }
+      > = [];
+      let part = { ...row, ownerMessages: [] as typeof row.ownerMessages };
+      let offset = 0;
+      for (const message of row.ownerMessages) {
+        const next = { ...part, ownerMessages: [...part.ownerMessages, message] };
+        if (part.ownerMessages.length > 0 && JSON.stringify(next).length > 25_000) {
+          parts.push({
+            ...part,
+            ownerMessagesOffset: offset,
+            ownerMessagesTotal: row.ownerMessages.length,
+          });
+          offset += part.ownerMessages.length;
+          part = { ...row, ownerMessages: [message] };
+        } else part = next;
+      }
+      parts.push(
+        parts.length === 0
+          ? part
+          : { ...part, ownerMessagesOffset: offset, ownerMessagesTotal: row.ownerMessages.length },
+      );
+      return parts;
+    });
+
+type ThreadDigestFlag = "run_failed" | "restarted" | "stalled" | "refused_call";
+
+export const threadDigestRows = (
+  cards: ReadonlyArray<KanbanCard>,
+  threads: ReadonlyArray<KanbanThreadLink>,
+  events: ReadonlyArray<KanbanCardEvent>,
+  window: ActivityWindow,
+  threadCards: ReadonlyMap<string, ReadonlyArray<KanbanCard["id"]>> = new Map(),
+) => {
+  const byCard = new Map(cards.map((card) => [card.id, card]));
+  const associated = new Map(
+    threads.map((link) => [
+      link.threadId,
+      [
+        ...new Set([
+          ...(link.cardId === null ? [] : [link.cardId]),
+          ...(threadCards.get(link.threadId) ?? []),
+        ]),
+      ].flatMap((id) => {
+        const card = byCard.get(id);
+        return card === undefined ? [] : [card];
+      }),
+    ]),
+  );
+  return threads
+    .flatMap((link) => {
+      const carried = associated.get(link.threadId) ?? [];
+      const card = carried[0];
+      if (
+        card === undefined ||
+        link.startedAt >= window.until ||
+        (link.endedAt !== null && link.endedAt < window.since)
+      )
+        return [];
+      const flags = new Set<ThreadDigestFlag>();
+      for (const event of events) {
+        if (!carried.some((entry) => entry.id === event.cardId) || !inWindow(event.at, window))
+          continue;
+        if (isFailure(event)) flags.add("run_failed");
+        if (isStall(event)) flags.add("stalled");
+        if (
+          failureKind(event) === "verdict_refused" ||
+          event.body?.startsWith(Retries.REFUSED_VERDICT_PREFIX)
+        )
+          flags.add("refused_call");
+      }
+      if (
+        inWindow(link.startedAt, window) &&
+        threads.some(
+          (other) =>
+            link.cardId !== null &&
+            other.cardId === link.cardId &&
+            other.role === link.role &&
+            other.startedAt < link.startedAt,
+        )
+      )
+        flags.add("restarted");
+      return [
+        {
+          threadId: link.threadId,
+          card: card.number,
+          ...(carried.length > 1 ? { cards: carried.map((entry) => entry.number) } : {}),
+          role: link.role,
+          model: link.model,
+          startedAt: link.startedAt,
+          endedAt: link.endedAt,
+          flags: [...flags],
+        },
+      ];
+    })
+    .toSorted(
+      (left, right) =>
+        Number(right.flags.length > 0) - Number(left.flags.length > 0) ||
+        right.startedAt.localeCompare(left.startedAt) ||
+        left.threadId.localeCompare(right.threadId),
+    );
+};
+
+/** Index cursor, unlike board_get's card-number cursor: priority order isn't card order. */
+export const digestPage = <R>(rows: ReadonlyArray<R>, after = 0) => {
+  const items: Array<R> = [];
+  let chars = 0;
+  for (const row of rows.slice(after)) {
+    const size = JSON.stringify(row).length + 1;
+    if (items.length >= 40 || (items.length > 0 && chars + size > 29_000)) break;
+    items.push(row);
+    chars += size;
+  }
+  const hasMore = after + items.length < rows.length;
+  return {
+    rows: items,
+    page: { limit: 40, hasMore, nextAfter: hasMore ? after + items.length : null },
+  };
+};
 
 export const isPass = (event: KanbanCardEvent) =>
   event.kind === "review" && event.body?.trim() === "clear";
