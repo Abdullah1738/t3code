@@ -7,9 +7,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 PKG = Path(__file__).resolve().parent.parent
 LABELS = ["com.ardud.shared-mcp-flighty", "com.ardud.shared-mcp-inbody"]
+sys.path.insert(0, str(PKG / 'shared'))
+import inbody_python
 
 
 def write(path, text, executable=False):
@@ -51,6 +54,11 @@ class InstallFixture:
         write(self.config, 'original config with private fixture value\n')
         write(self.pkg / "install.zsh", (PKG / "install.zsh").read_text())
         write(self.pkg / "shared/flighty_python.py", (PKG / "shared/flighty_python.py").read_text())
+        write(self.pkg / 'shared/inbody_python.py', '''import sys
+from pathlib import Path
+if '--dry-run' not in sys.argv:
+ (Path.home()/'inbody-prepared').touch()
+''')
         helper = PKG.parent / 'local-helpers/libexec'
         for directory in ('opencode-reload', 'toollog'):
             shutil.copytree(helper / directory, root / 'integrations/local-helpers/libexec' / directory)
@@ -170,6 +178,76 @@ source "$installer" "$@"
                 and (version is None or call["version"] == version)]
 
 
+class InbodyPythonTests(unittest.TestCase):
+    def test_build_dry_run_idempotence_and_source_changes_in_temp_home(self):
+        with tempfile.TemporaryDirectory(prefix='inbody runtime ') as tmp:
+            root = Path(tmp).resolve()
+            home, source = root / 'home', root / 'source'
+            write(source / 'pyproject.toml', '[project]\nname = "inbody-api-mcp"\nversion = "0.1.0"\n')
+            write(source / 'uv.lock', '[[package]]\nname = "inbody-api-mcp"\nversion = "0.1.0"\n')
+            write(source / 'README.md', 'fixture')
+            write(source / 'src/inbody_api_mcp/__init__.py', '')
+            write(source / 'src/inbody_api_mcp/server.py', 'VALUE = "installed"\n')
+            write(source / '.env', 'never stage this')
+            uv = root / 'bin/uv'
+            # Exercise a real isolated venv and imports without network or macOS Python.
+            write(uv, f'#!{sys.executable}\n' + '''import json, os, shutil, subprocess, sys
+from pathlib import Path
+dest = Path(os.environ['UV_PROJECT_ENVIRONMENT'])
+stage = Path(sys.argv[sys.argv.index('--project') + 1])
+assert not (stage/'.env').exists()
+assert not (stage/'.venv').exists()
+subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(dest)], check=True)
+site = next((dest/'lib').glob('python*/site-packages'))
+shutil.copytree(stage/'src/inbody_api_mcp', site/'inbody_api_mcp', dirs_exist_ok=True)
+with (dest.parent/'uv-calls').open('a') as log:
+ log.write(json.dumps(sys.argv[1:])+'\\n')
+''', executable=True)
+            destination = home / '.local/share/shared-mcp-inbody/python'
+            real_output = subprocess.check_output
+
+            def base_info(args, **kwargs):
+                if args[1:3] == ['-I', '-c']:
+                    return json.dumps([[3, 14, 7], str(Path(sys.executable).parent.parent)])
+                return real_output(args, **kwargs)
+
+            with mock.patch.dict(os.environ, {'HOME': str(home)}), \
+                    mock.patch.object(inbody_python.subprocess, 'check_output', side_effect=base_info):
+                options = dict(source=source, python=Path(sys.executable), uv=str(uv))
+                inbody_python.prepare(**options, dry_run=True)
+                self.assertFalse(home.exists())
+                inbody_python.prepare(**options)
+                python = destination / 'bin/python'
+                before = {p: (p.stat().st_ino, p.stat().st_mtime_ns) for p in destination.rglob('*') if p.is_file()}
+                inbody_python.prepare(**options)
+                self.assertEqual({p: (p.stat().st_ino, p.stat().st_mtime_ns) for p in before}, before)
+                calls = (destination.parent / 'uv-calls').read_text().splitlines()
+                self.assertEqual(len(calls), 1)
+                flags = json.loads(calls[0])
+                for flag in ('--frozen', '--no-dev', '--no-editable', '--no-managed-python', '--no-python-downloads'):
+                    self.assertIn(flag, flags)
+                self.assertEqual(flags[flags.index('--link-mode') + 1], 'copy')
+                write(source / 'src/inbody_api_mcp/server.py', 'VALUE = "changed package"\n')
+                inbody_python.prepare(**options)
+                self.assertEqual(len((destination.parent / 'uv-calls').read_text().splitlines()), 2)
+                shutil.rmtree(source)
+                output = real_output([str(python), '-I', '-c',
+                    'from inbody_api_mcp.server import VALUE; print(VALUE)'], text=True)
+                self.assertEqual(output.strip(), 'changed package')
+                self.assertEqual(list(destination.parent.glob('inbody-build-*')), [])
+                self.assertFalse((home / 'Library').exists())
+                self.assertFalse((home / '.local/share/shared-mcp-flighty').exists())
+
+    def test_rejects_external_python_destination_and_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / 'mounted'
+            link.symlink_to('/Volumes/ExternalSSD/runtime')
+            for kwargs in ({'python': Path('/Volumes/ExternalSSD/python')},
+                           {'destination': Path('/Volumes/Data/runtime')}, {'destination': link}):
+                with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, '/Volumes/'):
+                    inbody_python.prepare(**kwargs, dry_run=True)
+
+
 @unittest.skipUnless(shutil.which("zsh") and shutil.which("rsync"), "requires installer shell and rsync")
 class SharedInstallTests(unittest.TestCase):
     def test_prepare_only_copies_base_and_preserves_unchanged_binary(self):
@@ -230,6 +308,7 @@ class SharedInstallTests(unittest.TestCase):
         self.assertEqual((fixture.dst / "shared/serve.py").read_text(), "new server code")
         self.assertEqual((fixture.dst / "manifest.json").read_text(), "new manifest")
         self.assertEqual(fixture.config.read_text(), "migrated config")
+        self.assertTrue((fixture.home / 'inbody-prepared').exists())
         self.assertEqual(list(fixture.root.glob("harness-homes-install.*")), [])
         for label in fixture.labels:
             self.assertEqual((fixture.state / label).read_text(), "new " + label)
@@ -317,6 +396,9 @@ class SharedInstallTests(unittest.TestCase):
         for failures, success in ((1, True), (100, False)):
             with self.subTest(failures=failures), tempfile.TemporaryDirectory() as tmp:
                 fixture = InstallFixture(Path(tmp).resolve(), check_failures=failures, ready_secs="5")
+                log = fixture.home / 'Library/Logs/com.ardud.shared-mcp-inbody.err.log'
+                write(log, ''.join(f'crash {i}\n' for i in range(50)))
+                before = log.stat()
                 result = fixture.run()
                 if success:
                     self.assert_installed(fixture, result)
@@ -330,6 +412,11 @@ class SharedInstallTests(unittest.TestCase):
                     self.assertIn(f"check error {checks}", result.stderr)
                     self.assertNotIn("check error 1\n", result.stderr)
                     self.assertIn("Shared MCP startup failed; configs were not switched", result.stderr)
+                    self.assertIn('crash 30\n', result.stderr)
+                    self.assertIn('crash 49\n', result.stderr)
+                    self.assertNotIn('crash 29\n', result.stderr)
+                self.assertEqual(log.stat().st_mtime_ns, before.st_mtime_ns)
+                self.assertEqual(log.stat().st_size, before.st_size)
 
     def test_default_readiness_window_exceeds_fifteen_checks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -345,13 +432,14 @@ class SharedInstallTests(unittest.TestCase):
             result = fixture.run('--dry-run')
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse(fixture.dedicated.exists())
+            self.assertFalse((fixture.home / 'inbody-prepared').exists())
             self.assertFalse(fixture.log.exists())
             self.assertNotIn('opencode-reload:', result.stdout)
             for path, expected in before.items():
                 self.assertEqual((path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns), expected)
 
     def test_mode_flags_are_exclusive_in_every_order(self):
-        modes = ('--dry-run', '--check', '--flighty-python')
+        modes = ('--dry-run', '--check', '--flighty-python', '--inbody-python')
         for first in modes:
             for second in modes:
                 with self.subTest(first=first, second=second), tempfile.TemporaryDirectory() as tmp:
@@ -359,11 +447,21 @@ class SharedInstallTests(unittest.TestCase):
                     before = fixture.config.stat()
                     result = fixture.run(first, second)
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                    self.assertIn('choose --check, --dry-run or --flighty-python', result.stderr)
+                    self.assertIn('choose --check, --dry-run, --flighty-python or --inbody-python', result.stderr)
                     self.assertFalse(fixture.dedicated.exists())
                     self.assertFalse(fixture.log.exists())
                     self.assertEqual(fixture.config.stat().st_ino, before.st_ino)
                     self.assertEqual(fixture.config.stat().st_mtime_ns, before.st_mtime_ns)
+
+    def test_inbody_only_mode_does_not_prepare_flighty_or_touch_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = InstallFixture(Path(tmp).resolve())
+            result = fixture.run('--inbody-python')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((fixture.home / 'inbody-prepared').exists())
+            self.assertFalse(fixture.dedicated.exists())
+            self.assertFalse(fixture.log.exists())
+            self.assertEqual(fixture.config.read_text(), 'original config with private fixture value\n')
 
     def test_guard_preflight_rejects_invalid_settings_and_symlink_before_setup(self):
         cases = [(key, value) for key, values in (

@@ -16,6 +16,8 @@ import * as McpDeadline from "./McpDeadline.ts";
 export type CallerIdentity = CallerActiveRow &
   Pick<OrchestrationV2ThreadShell, "pendingBackgroundTasks">;
 
+const IDENTITY_CALLER_WAIT = "statev2 identity caller row";
+
 export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* (
   threads: ThreadManagement.ThreadManagementService["Service"],
   threadId: ThreadId,
@@ -34,16 +36,17 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
   const row = yield* McpDeadline.waitingOn(
     threads.getCallerRow(threadId).pipe(
       NodeSqliteClient.identityReadOnly,
-      Effect.mapError((cause) =>
-        NodeSqliteClient.readerLaneFailure(cause) === undefined
+      Effect.mapError((cause) => {
+        const failure = NodeSqliteClient.readerLaneFailure(cause);
+        return failure === undefined
           ? cause
           : new OrchestratorMcpFailure({
               code: "caller_unresolved",
-              message: `Caller resolution could not acquire the reserved identity reader for thread ${threadId}. Nothing was saved; retry the same call.`,
-            }),
-      ),
+              message: `Caller resolution failed while waiting on "${IDENTITY_CALLER_WAIT}" for thread ${threadId} (identity reader ${failure === "retryable" ? "unavailable before execution" : "busy or stopped"}). Nothing was saved; retry the same call.`,
+            });
+      }),
     ),
-    "statev2 identity caller row",
+    IDENTITY_CALLER_WAIT,
   );
   if (row === null || row.deletedAt !== null) return null;
   if (call._tag === "Some")
@@ -58,7 +61,7 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
     row.pendingBackgroundTasks !== undefined ||
     row.archivedAt !== null ||
     row.providerInstanceId !== providerInstanceId ||
-    ((row.forkedFrom === null || row.forkedFrom.type === "node") && row.activeRunId !== null)
+    row.activeRunId !== null
   ) {
     if (call._tag === "Some") {
       call.value.callerResolved = true;
@@ -71,7 +74,7 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
       pendingBackgroundTasks: row.pendingBackgroundTasks ?? [],
     } satisfies CallerIdentity;
   }
-  // Only fork history or work exceeding the caller caps needs the exact shell.
+  // An inactive fork or work exceeding the caller caps still needs the exact shell.
   if (call._tag === "Some") {
     call.value.callerReaderLane = "background";
     call.value.readerLane = "background";

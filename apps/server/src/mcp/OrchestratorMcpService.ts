@@ -8,7 +8,11 @@ import { resolveCallerRuntime } from "./callerCredential.ts";
 import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as McpDeadline from "./McpDeadline.ts";
 import * as McpTaskTrace from "../ardud/observability/McpTaskTrace.ts";
-import { delegationTaskIdentity, delegationIdShape } from "./delegationTaskIdentity.ts";
+import {
+  fullyDecodedThreadId,
+  delegationTaskIdentity,
+  delegationIdShape,
+} from "./delegationTaskIdentity.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { readCallerIdentity } from "./callerIdentity.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
@@ -167,9 +171,9 @@ const remainingWaitMs = (startNanos: bigint, timeoutMs: number | undefined) =>
       ),
     ),
   );
-// Async callers expect a prompt receipt: allow 5 s after the fence, then
+// Async callers expect a prompt receipt: allow 2 s after the fence, then
 // fall back to the bounded 1 s command-state and 1 s task-projection reads.
-const ASYNC_DISPATCH_GRACE = "5 seconds";
+const ASYNC_DISPATCH_GRACE = "2 seconds";
 const TASK_WAKE_EVENTS = [
   { thread: "parent", eventType: "subagent.updated" },
   { thread: "child", eventType: "run.updated" },
@@ -271,6 +275,13 @@ const isProjectionStoreThreadNotFoundError = Schema.is(ProjectionStoreThreadNotF
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 const encodeDetachedAnalytics = Schema.encodeEffect(Schema.fromJsonString(AnalyticsEvent));
 const uncertainAsyncExit = (exit: Exit.Exit<unknown, unknown>) => {
+  if (Exit.isSuccess(exit))
+    return (
+      typeof exit.value === "object" &&
+      exit.value !== null &&
+      "status" in exit.value &&
+      exit.value.status === "creating"
+    );
   const error = Exit.isFailure(exit)
     ? exit.cause.reasons.find((reason) => reason._tag === "Fail")?.error
     : undefined;
@@ -1253,6 +1264,8 @@ const make = Effect.gen(function* () {
     readonly threadId: ThreadId;
     readonly providerInstanceId: ProviderInstanceId;
     readonly callerRuntime: ProviderSessionId | undefined;
+    readonly selection: ModelSelection;
+    readonly worktree: boolean;
     readonly accepted: Deferred.Deferred<
       Effect.Success<ReturnType<typeof threadManagement.dispatch>>,
       OrchestratorMcpFailure
@@ -1546,16 +1559,98 @@ const make = Effect.gen(function* () {
             ),
           );
 
-  const loadTargetThread = Effect.fn("OrchestratorMcpService.loadTargetThread")(function* (
-    threadId: ThreadId,
+  const unavailableThread = (threadId: ThreadId, deletedAt: DateTime.Utc | null = null) =>
+    failure(
+      "thread_not_found",
+      deletedAt === null
+        ? `Thread ${threadId} never existed under this id. Copy the canonical threadId from delegate_task or task_status.`
+        : `Thread ${threadId} was deleted at ${DateTime.formatIso(deletedAt)} by an unrecorded actor (deletion records do not retain actor identity).`,
+    );
+
+  const recoverCopiedChildId = Effect.fn("OrchestratorMcpService.recoverCopiedChildId")(function* (
+    parent: CallerParent | undefined,
+    givenId: ThreadId,
   ) {
-    const shell = yield* threadManagement
+    if (parent === undefined) return givenId;
+    const decoded = fullyDecodedThreadId(givenId);
+    if (!decoded.startsWith("thread:delegated-task:")) return givenId;
+    const records = yield* loadProjection(parent.thread.id, ["subagents"]);
+    const matches = [
+      ...new Set(
+        records.subagents
+          .filter(
+            (task) =>
+              task.origin === "app_owned" &&
+              task.threadId === parent.thread.id &&
+              task.childThreadId !== null &&
+              fullyDecodedThreadId(task.childThreadId) === decoded,
+          )
+          .map((task) => task.childThreadId!),
+      ),
+    ];
+    if (matches.length > 1)
+      return yield* failure(
+        "invalid_request",
+        `Thread id ${givenId} matches multiple direct children. Use a canonical id: ${matches.join(", ")}`,
+      );
+    const canonicalId = matches[0];
+    if (canonicalId === undefined) return givenId;
+    yield* Effect.logInfo("MCP delegated child id recovered", {
+      callerThreadId: parent.thread.id,
+      givenId,
+      canonicalId,
+    });
+    return canonicalId;
+  });
+
+  const assertThreadNotDeleted = Effect.fn("OrchestratorMcpService.assertThreadNotDeleted")(
+    function* (threadId: ThreadId) {
+      // Shell listings exclude deleted rows; the metadata-only projection retains them.
+      const deletedAt = yield* threadManagement
+        .getThreadRecords(threadId, [], undefined, { projectionOnly: true })
+        .pipe(
+          Effect.map((records) => records.thread.deletedAt),
+          Effect.catchIf(
+            (cause) =>
+              cause._tag === "OrchestratorProjectionError" &&
+              isProjectionStoreThreadNotFoundError(cause.cause),
+            () => Effect.succeed(null),
+          ),
+          Effect.mapError(threadManagementFailure),
+        );
+      if (deletedAt !== null) return yield* unavailableThread(threadId, deletedAt);
+    },
+  );
+
+  const loadThreadShell = Effect.fn("OrchestratorMcpService.loadThreadShell")(function* (
+    parent: CallerParent | undefined,
+    givenId: ThreadId,
+  ) {
+    let threadId = givenId;
+    let shell = yield* threadManagement
       .getThreadShell(threadId)
       .pipe(Effect.mapError(threadManagementFailure));
-    if (shell === null || shell.deletedAt !== null) {
-      return yield* failure("thread_not_found", `Thread ${threadId} was not found.`);
+    if (shell === null) {
+      yield* assertThreadNotDeleted(threadId);
+      threadId = yield* recoverCopiedChildId(parent, givenId);
+      if (threadId !== givenId) {
+        shell = yield* threadManagement
+          .getThreadShell(threadId)
+          .pipe(Effect.mapError(threadManagementFailure));
+        if (shell === null) yield* assertThreadNotDeleted(threadId);
+      }
     }
-    return yield* loadProjectThread(shell.projectId, threadId);
+    if (shell === null || shell.deletedAt !== null)
+      return yield* unavailableThread(threadId, shell?.deletedAt);
+    return shell;
+  });
+
+  const loadTargetThread = Effect.fn("OrchestratorMcpService.loadTargetThread")(function* (
+    threadId: ThreadId,
+    parent: CallerParent | undefined,
+  ) {
+    const shell = yield* loadThreadShell(parent, threadId);
+    return yield* loadProjectThread(shell.projectId, shell.id);
   });
 
   const loadScopedThread = Effect.fn("OrchestratorMcpService.loadScopedThread")(function* (
@@ -1575,7 +1670,7 @@ const make = Effect.gen(function* () {
             "contextTransfers",
             "turnItems",
           ])
-        : yield* loadTargetThread(threadId);
+        : yield* loadTargetThread(threadId, caller.parent);
     return { ...caller, target } as const;
   });
 
@@ -1642,17 +1737,11 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
   ) {
     const { parent } = yield* ThreadReadMetrics.read("caller", loadCaller(scope));
-    const shell = yield* ThreadReadMetrics.read(
-      "shell",
-      threadManagement.getThreadShell(threadId).pipe(Effect.mapError(threadManagementFailure)),
-    );
-    if (shell === null || shell.deletedAt !== null) {
-      return yield* failure("thread_not_found", `Thread ${threadId} is no longer available.`);
-    }
+    const shell = yield* ThreadReadMetrics.read("shell", loadThreadShell(parent, threadId));
     const target = yield* ThreadReadMetrics.read(
       "records",
       threadManagement
-        .getProjectThreadRecords({ projectId: shell.projectId, threadId }, [
+        .getProjectThreadRecords({ projectId: shell.projectId, threadId: shell.id }, [
           "runs",
           "runtimeRequests",
           "contextTransfers",
@@ -3663,6 +3752,45 @@ const make = Effect.gen(function* () {
         }
         return yield* continueDelegation(expectedTaskId, result, undefined, selection);
       });
+      // The entry lives only until the detached dispatch exits; storage cannot prove liveness.
+      const pendingCreateReceipt = Effect.fnUntraced(function* () {
+        const pending = pendingDelegations.get(commandId);
+        if (
+          input.mode === "wait" ||
+          input.isolation === "worktree" ||
+          pending === undefined ||
+          pending.worktree ||
+          pending.threadId !== scope.thread.threadId ||
+          pending.providerInstanceId !== scope.thread.providerInstanceId ||
+          pending.callerRuntime !== callerRuntime ||
+          (yield* Deferred.isDone(pending.accepted))
+        )
+          return undefined;
+        yield* McpCallAnalytics.setSaved("pending_create");
+        yield* Effect.annotateCurrentSpan("t3.delegate.outcome", "pending_create");
+        return {
+          taskId: expectedTaskId,
+          childNodeId: expectedTaskId,
+          childThreadId: IdAllocator.derive.delegatedTaskThread({ commandId }),
+          childRunId: null,
+          status: "creating",
+          startPending: true,
+          workState: "working",
+          hasPendingChildRuns: false,
+          providerInstanceId: pending.selection.instanceId,
+          model: pending.selection.model,
+          options: pending.selection.options ?? [],
+          summary: null,
+          resultContextTransferId: null,
+          latestTerminalRunId: null,
+          latestTerminalStatus: null,
+          latestTerminalSummary: null,
+          latestTerminalResultContextTransferId: null,
+          hasPendingQuestion: false,
+          pendingApproval: null,
+          waitTimedOut: false,
+        } satisfies OrchestratorMcpDelegateTaskResult;
+      });
       // Dispatch acknowledgement failures can follow COMMIT, including for attached waiters.
       const reconcileAsyncCreateFailure = Effect.fnUntraced(function* (
         error: OrchestratorMcpFailure,
@@ -3691,6 +3819,10 @@ const make = Effect.gen(function* () {
           return yield* yield* rejected(
             state.status === "abandoned" ? state.reason : "The create was never saved.",
           );
+        if (state === undefined || state.status === "pending") {
+          const pending = yield* pendingCreateReceipt();
+          if (pending !== undefined) return pending;
+        }
         return yield* error;
       });
       if (input.mode !== "wait" && isRetryOfAcceptedDelegation) {
@@ -3866,6 +3998,8 @@ const make = Effect.gen(function* () {
       const racedPending = input.mode !== "wait" ? ownPending() : undefined;
       if (racedPending !== undefined) return yield* attachPending(racedPending);
       const pendingCreate: PendingDelegation = {
+        selection: target.modelSelection,
+        worktree: input.isolation === "worktree",
         threadId: scope.thread.threadId,
         providerInstanceId: scope.thread.providerInstanceId,
         callerRuntime,
@@ -4119,7 +4253,9 @@ const make = Effect.gen(function* () {
                 if (input.mode !== "wait" && error.code === "delegation_timeout") {
                   const accepted = yield* Deferred.await(dispatchAccepted).pipe(
                     Effect.exit,
-                    Effect.timeoutOption(ASYNC_DISPATCH_GRACE),
+                    Effect.timeoutOption(
+                      input.isolation === "worktree" ? "5 seconds" : ASYNC_DISPATCH_GRACE,
+                    ),
                   );
                   if (Option.isSome(accepted)) {
                     if (Exit.isSuccess(accepted.value))
@@ -4733,7 +4869,7 @@ const make = Effect.gen(function* () {
         const timeline = yield* ThreadReadMetrics.read(
           "timeline",
           threadManagement
-            .getTimelinePage(input.threadId, {
+            .getTimelinePage(target.thread.id, {
               afterPosition,
               limit,
               view,
@@ -4869,12 +5005,12 @@ const make = Effect.gen(function* () {
                 ? []
                 : (yield* SendAcknowledgement.waitingOn(
                     threadManagement
-                      .getThreadRecords(input.threadId, ["messages"], {
+                      .getThreadRecords(target.thread.id, ["messages"], {
                         messageRoles: ["user"],
                         turnItemTypes: [],
                       })
                       .pipe(Effect.mapError(threadManagementFailure)),
-                    `prior send read for thread ${input.threadId}`,
+                    `prior send read for thread ${target.thread.id}`,
                   )).messages;
             const prior =
               scope.thread === undefined
@@ -4908,7 +5044,7 @@ const make = Effect.gen(function* () {
                 .sendToThread({
                   projectId: target.thread.projectId,
                   commandId,
-                  threadId: input.threadId,
+                  threadId: target.thread.id,
                   ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
                   messageId,
                   text: input.message,
@@ -4923,16 +5059,16 @@ const make = Effect.gen(function* () {
                       ? threadManagementFailure(error)
                       : failure(
                           "orchestration_error",
-                          `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
+                          `Unable to send to thread ${target.thread.id}: ${errorMessage(error)}`,
                         ),
                   ),
                 ),
-              `message dispatch for thread ${input.threadId}`,
+              `message dispatch for thread ${target.thread.id}`,
             );
             // Delivery is the committed route, not provider acceptance. Claude's priority-next
             // steer may wait for a tool boundary; that wait must never hold the MCP reply.
             return {
-              threadId: input.threadId,
+              threadId: target.thread.id,
               messageId,
               runId: result.run.id,
               ...(result.run.delegatedTaskId === undefined
@@ -4952,7 +5088,8 @@ const make = Effect.gen(function* () {
         input.clientRequestId,
       ).pipe(Effect.provideService(Crypto.Crypto, crypto));
     }),
-    waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {
+    waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, rawInput) {
+      let input = rawInput;
       const waitStartedAt = yield* Clock.monotonicTimeNanos;
       const call = yield* Effect.serviceOption(McpCallAnalytics.McpCall);
       if (Option.isSome(call)) call.value.waitStage = "lookup.caller";
@@ -4960,35 +5097,49 @@ const make = Effect.gen(function* () {
       let snapshotRun: OrchestrationV2Run | null | undefined;
       let acceptedAttemptId: RunAttemptId | null | undefined;
       const waiting = Effect.gen(function* () {
-        yield* loadCaller(scope);
+        const { parent } = yield* loadCaller(scope);
         if (Option.isSome(call)) {
           call.value.waitStage = "lookup.target";
           call.value.readerLane = "foreground";
         }
         // This path needs one thread row and one run, never shell/history hydration.
-        const records = yield* threadManagement
-          .getThreadRecords(
-            input.threadId,
+        const readRecords = (threadId: ThreadId) =>
+          threadManagement.getThreadRecords(
+            threadId,
             ["runs"],
             input.runId === undefined ? { latestRunOnly: true } : { runIds: [input.runId] },
             { projectionOnly: true },
-          )
-          .pipe(
-            NodeSqliteClient.foregroundReads,
-            Effect.mapError((cause) =>
-              NodeSqliteClient.readerLaneFailure(cause) !== undefined
+          );
+        const records = yield* readRecords(input.threadId).pipe(
+          Effect.catchIf(
+            (cause) =>
+              cause._tag === "OrchestratorProjectionError" &&
+              isProjectionStoreThreadNotFoundError(cause.cause),
+            () =>
+              Effect.gen(function* () {
+                const canonicalId = yield* recoverCopiedChildId(parent, input.threadId);
+                if (canonicalId === input.threadId) return yield* unavailableThread(input.threadId);
+                input = { ...input, threadId: canonicalId };
+                return yield* readRecords(canonicalId);
+              }),
+          ),
+          NodeSqliteClient.foregroundReads,
+          Effect.mapError((cause) =>
+            cause._tag === "OrchestratorMcpFailure"
+              ? cause
+              : NodeSqliteClient.readerLaneFailure(cause) !== undefined
                 ? failure(
                     "lookup_timeout",
                     `Robob could not acquire the foreground reader for thread ${input.threadId}. Nothing changed. Retry t3_thread_wait, or check the task with task_status.`,
                   )
                 : cause._tag === "OrchestratorProjectionError" &&
                     isProjectionStoreThreadNotFoundError(cause.cause)
-                  ? failure("thread_not_found", `Thread ${input.threadId} was not found.`)
+                  ? unavailableThread(input.threadId)
                   : threadManagementFailure(cause),
-            ),
-          );
+          ),
+        );
         if (records.thread.deletedAt !== null)
-          return yield* failure("thread_not_found", `Thread ${input.threadId} was not found.`);
+          return yield* unavailableThread(input.threadId, records.thread.deletedAt);
         const selected = records.runs[0];
         if (input.runId !== undefined && selected === undefined)
           return yield* failure(
@@ -5087,6 +5238,7 @@ const make = Effect.gen(function* () {
     }, untilShutdown),
     interruptThread: Effect.fn("OrchestratorMcpService.interruptThread")(function* (scope, input) {
       const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
+      input = { ...input, threadId: target.thread.id };
       yield* assertLiveCallerForOtherThread(scope, parent, target);
       yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
       yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);

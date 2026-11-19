@@ -2321,6 +2321,10 @@ def _database_reference(source):
 
 def refusal_reason(rule, cause, cwd):
     if rule == "live-database-script-unresolved":
+        python_hint = None
+        if cause and cause.startswith('python3: bare executable lookup unproved; '):
+            python_hint = ('retry this same call with /usr/bin/python3 -I … instead of bare python3; '
+                           'the executable, startup and mutation checks still apply.')
         zsh_hint = None
         if cause and 'zsh: implicit startup unproved' in cause:
             zsh_hint = 'Use zsh -f -n to skip user startup files; check one file per call.'
@@ -2330,7 +2334,9 @@ def refusal_reason(rule, cause, cwd):
             zsh_hint = "Check zsh's startup environment and executable, then retry."
         if cause and '\nAccepted: ' in cause:
             detail, hint = cause.split('\nAccepted: ', 1)
-            if zsh_hint:
+            if python_hint:
+                hint = python_hint
+            elif zsh_hint:
                 hint = zsh_hint
             elif 'startup' in detail or 'repo-node-pin' in detail:
                 hint = 'Resolve the named startup input, then retry.'
@@ -2343,7 +2349,9 @@ def refusal_reason(rule, cause, cwd):
             return ("statev2 guard: this command was NOT run.\n"
                     f"Could not check {detail}. Resolved workdir: {cwd}.\nAccepted: {hint}")
         fix = "Use a literal absolute script path."
-        if cause and "unbalanced quote" in cause:
+        if python_hint:
+            fix = 'Accepted: ' + python_hint
+        elif cause and "unbalanced quote" in cause:
             fix = "Close the shell quote before running the command."
         elif cause and ('script source changed after its heredoc write' in cause or 'unchecked copy at script path' in cause):
             fix = "An intervening command may replace the checked source. Split source preparation and execution into separate calls."
@@ -3149,6 +3157,96 @@ def _attached_script_operand(word, binary):
     return value if equal and flag in options else word
 
 
+FIXTURE_STATUS_ECHOES = ([';', 'echo', 'exit=$?'], [';', 'echo', '$?'], ['&&', 'echo', 'ok'])
+# Unquoted, these expand to several words: `grep files/*` gains file operands.
+FIXTURE_EXPANSION = re.compile(r'[*?\[\]{}~]')
+
+
+def _fixture_output_filter(words, raws, quoted):
+    if words[0] in {'tail', 'head'}:
+        return (len(words) == 2 and re.fullmatch(r'-n?\d+', words[1]) is not None or
+                len(words) == 3 and words[1] == '-n' and words[2].isdigit())
+    if words[0] == 'grep' and len(words) >= 2:
+        *options, pattern = words[1:]
+        # Only one wholly quoted word stays literal; unquoted, `files/*` or
+        # `{a,b}` becomes a pattern plus file operands.
+        if pattern in quoted:
+            pattern = quoted[pattern]
+        elif not re.fullmatch(r"'[^']*'|\"[^\"$`]*\"", raws[-1]) and FIXTURE_EXPANSION.search(pattern):
+            return False
+        return (all(re.fullmatch(r'-[Eiv]+', option) for option in options) and
+                not pattern.startswith('-') and not re.search(r'[$`\0]', pattern) and
+                not re.fullmatch(r'[;&|(){}\n<>]+', pattern))
+    return False
+
+
+def _fixture_wrapped_invocation(command):
+    """Strip the closed set of wrappers agents put around a test run.
+
+    Accepted: one leading `cd <literal> &&` without `..`, a `2>&1` on the
+    run, up to two `| tail/head -N` or `| grep [-Eiv] <pattern>` stages that
+    take no file operand, and a trailing status echo. Returns (cd target or
+    None, run words). Anything else returns None: a substitution, escape,
+    comment, other operator, unquoted expansion, or quoted punctuation
+    outside a whole grep pattern. The walker still scans every stage on its
+    own, so this only decides whether the run is the command's whole effect.
+    """
+    if re.search(r'[\\#`\0\n\r]', command):
+        return None
+    masked, quoted = _quoted_punctuation(command)
+    if any(re.search(r'[$`]', value) for value in quoted.values()):
+        return None
+    # The non-POSIX pass keeps each word's quotes; both passes must agree on
+    # word boundaries for a quote to count.
+    lexed = []
+    for posix in (True, False):
+        lexer = shlex.shlex(masked, posix=posix, punctuation_chars=';&|(){}\n<>')
+        lexer.whitespace_split = True
+        lexer.commenters = ''
+        try:
+            lexed.append(list(lexer))
+        except ValueError:
+            return None
+    tokens, raws = lexed
+    if len(tokens) != len(raws):
+        return None
+    target = None
+    if tokens[:1] == ['cd']:
+        if len(tokens) < 4 or tokens[2] != '&&':
+            return None
+        target = tokens[1]
+        # Absolute or ./-anchored only: bare names follow CDPATH. Bash's
+        # logical cd drops `..` against $PWD, not the resolved directory.
+        if (not re.fullmatch(r'(?:/|\./)[^$`*?\[\]{}~\s\0]*', target) or
+                '..' in target.split('/')):
+            return None
+        tokens, raws = tokens[3:], raws[3:]
+    for suffix in FIXTURE_STATUS_ECHOES:
+        if tokens[-3:] == suffix:
+            tokens, raws = tokens[:-3], raws[:-3]
+            break
+    stages, stage = [], []
+    for token, raw in zip(tokens, raws):
+        if token == '|':
+            stages.append(stage)
+            stage = []
+        else:
+            stage.append((token, raw))
+    stages.append(stage)
+    run, filters = [word for word, _ in stages[0]], stages[1:]
+    if run[-3:] == ['2', '>&', '1']:
+        if masked.count('>&') != 1 or not re.search(r'(?<=[ \t])2>&1(?=[ \t]*(?:\||;|&&|$))', masked):
+            return None
+        run = run[:-3]
+    if len(filters) > 2 or not all(stage and _fixture_output_filter([word for word, _ in stage], [raw for _, raw in stage], quoted)
+                                   for stage in filters):
+        return None
+    if not run or any(re.fullmatch(r'[;&|(){}\n<>]+', word) or re.search(r'[$\0]', word) or
+                      FIXTURE_EXPANSION.search(word) for word in run):
+        return None
+    return target, run
+
+
 def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None, _preservation=True, _budget=None, _glob_writes=None, _cwd_candidates=None) -> list[Path]:
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
@@ -3204,6 +3302,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     copied_opaque = set()
     noclobber = False
     proof_failure = 'opaque binary'
+    python_lookup_unproved = False
     execution_site = 'script operand'
     execution_binary = 'script'
 
@@ -3556,7 +3655,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 name in SHELL_SPECIAL_BINDINGS or name.startswith(('LD_', 'DYLD_')))
 
     def preservation_tool(words, directory, *, builtin=False):
-        nonlocal proof_failure
+        nonlocal proof_failure, python_lookup_unproved
         label = binary_label(words)
         if not _preservation:
             proof_failure = label + ': command wrapper proof failed'
@@ -3575,10 +3674,15 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     return False
                 if os.environ.get(name) and not inherited_startup_safe(name, directory):
                     return False
-        if not builtin and (not _trusted_fixture_tool(words[0], os.path.basename(words[0]), directory) or
-                            not unchanged_tool(words[0], directory)):
-            proof_failure = label + ': executable provenance or mutation proof failed'
-            return False
+        if not builtin:
+            trusted = _trusted_fixture_tool(words[0], os.path.basename(words[0]), directory)
+            if not trusted or not unchanged_tool(words[0], directory):
+                proof_failure = label + ': executable provenance or mutation proof failed'
+                if not trusted and words[0] == 'python3' and unchanged_tool(words[0], directory):
+                    python_lookup_unproved = True
+                if None in tool_changes and unbounded_predecessors:
+                    proof_failure += '; preceding ' + unbounded_predecessors[0]
+                return False
         return True
 
     def interpreter_startup_proved(words, directory):
@@ -4433,6 +4537,23 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 raise LiveRead('live-database-script', f"{path}:1 has an unsafe output redirect.")
             plain = proof_command[:redirect.start()] if redirect else proof_command
             invocation = _fixture_invocation(plain)
+            wrapped = None if redirect or invocation else _fixture_wrapped_invocation(plain)
+            if wrapped is not None:
+                target, run = wrapped
+                invocation = _fixture_invocation(shlex.join(run))
+                # The walker resolved this cd; the proof must run where it
+                # landed. select.py walks $PWD, which keeps a symlinked
+                # target's logical path (the fixture's HERE cd included, so
+                # pass the script), and the caller's shell started in cwd.
+                logical = os.path.normpath(os.path.join(str(cwd), target)) if cwd is not None and target is not None else None
+                if target is not None and (
+                        caller_command is not None or 'offbox' in map(os.path.basename, run) or
+                        cwd is None or directory is None or
+                        os.path.realpath(logical) != os.path.realpath(directory) or
+                        any(os.environ.get(name) and not (inherited_startup_safe(name, str(cwd)) and
+                                                          inherited_startup_safe(name, logical, value))
+                            for name in ('BASH_ENV', 'ENV'))):
+                    invocation = []
         except ValueError:
             invocation = []
         shell = (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(invocation) == 2 and
@@ -5795,7 +5916,14 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
 
         return walk(0, directory)[0]
 
-    scan(command, Path(cwd) if cwd is not None else None, _depth)
+    try:
+        scan(command, Path(cwd) if cwd is not None else None, _depth)
+    except AmbiguousScript as error:
+        if python_lookup_unproved:
+            # Hint selection must not infer provenance from caller-controlled
+            # operands that happen to contain a diagnostic phrase.
+            raise AmbiguousScript('python3: bare executable lookup unproved; ' + str(error)) from error
+        raise
     return paths
 
 

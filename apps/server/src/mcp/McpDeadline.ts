@@ -202,6 +202,8 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
       orElse: Effect.fn("McpDeadline.expired")(function* () {
         const now = yield* Clock.monotonicTimeNanos;
         deadline.firedAt = now;
+        const call = yield* Effect.serviceOption(McpCallAnalytics.McpCall);
+        if (input.stage === "dispatch" && Option.isSome(call)) call.value.dispatchFenceAt = now;
         yield* McpCallAnalytics.failedPhase(input.stage);
         yield* Effect.logWarning("MCP operation timed out", {
           code: input.code,
@@ -223,6 +225,7 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
             code: input.code,
             message:
               `${input.code === "caller_unresolved" ? "Caller resolution" : "delegate_task"} timed out during ${input.stage} for thread ${input.threadId ?? "unknown"}.` +
+              (input.code === "caller_unresolved" ? ` Waiting on "${pending.wait}".` : "") +
               ((input.code === "caller_unresolved" && input.stage === "caller") ||
               input.stage === "parent_records" ||
               (input.code === "delegation_timeout" &&

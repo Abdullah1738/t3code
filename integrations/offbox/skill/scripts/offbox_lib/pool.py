@@ -43,13 +43,7 @@ def _pin_available(con, box_id, me=None, *, record=True):
         if con.execute('SELECT 1 FROM runs WHERE box_id=? AND ' + lease.uncertain_holder_sql(), (box_id,)).fetchone():
             return False
         if api.BACKEND == 'server' and not con.in_transaction and not lease.active_runs(con, box_id):
-            import offbox_protection
-            try:
-                snapshot = lease.remote_protection(box_id)
-                return offbox_protection.blocked(snapshot, automatic=False, reuse=True,
-                                                 holder=(me or {}).get('owner')) is None
-            except OffboxError:
-                return False
+            return not lease.remote_reuse_blocked(box_id, holder=(me or {}).get('owner'))
         return True
     seen = _PIN_SKIPS.get()
     if record and seen is not None and box_id not in seen['boxes']:
@@ -810,7 +804,7 @@ def _reconcile_pinned(con, row):
 
 
 def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=None):
-    from . import allocation, api, home, lease, outage
+    from . import allocation, api, home, lease, outage, ssh_outage
     from .identity import require_proven
     # A pooled box is mapped to the caller's owner string. An unproven caller's string is shared, so it can't take one.
     require_proven(me, "run")
@@ -1279,6 +1273,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                             "It stays stopped with its disk and no longer counts toward the pool. "
                             "Trying other pool boxes, then a fresh lease.")
                         continue
+                    except ssh_outage.SshUnreachable:
+                        raise
                     except OffboxError as e:
                         if isinstance(e, home.StartWaitFailed):
                             raise
@@ -1350,7 +1346,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         last_error = e
                         break
                     except OffboxError as e:
-                        if isinstance(e, (common.SourceGone, home.StartWaitFailed)):
+                        if isinstance(e, (common.SourceGone, home.StartWaitFailed, ssh_outage.SshUnreachable)):
                             raise
                         if resume_stall is not None:
                             refused = 400 <= (getattr(e, 'status', None) or 0) < 500
@@ -1485,7 +1481,8 @@ def _try_warm(me, size, source, exclude, run_id):
                     # A prior holder may have changed the lease or marked it cold after our first scan.
                     current, _ = candidates(con, key, size, source, me)
                     row = next((r for r in current if r['box_id'] == bid), None)
-                    if row is None or row['state'] != 'running' or row['size'] != size or lease.active_runs(con, bid):
+                    if (row is None or row['state'] != 'running' or row['size'] != size or
+                            lease.active_runs(con, bid) or lease.remote_reuse_blocked(bid, holder=me['owner'])):
                         continue
                     if con.execute("SELECT 1 FROM events WHERE box_id=? AND kind='cold_home' AND ts>? LIMIT 1",
                                    (bid, now() - 15 * 60)).fetchone():

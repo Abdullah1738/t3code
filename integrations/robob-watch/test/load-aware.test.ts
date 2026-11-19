@@ -14,7 +14,8 @@ appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) +
   const env: Record<string, string | undefined> = { ...process.env, BUN_INSPECT: undefined, ROBOB_WATCH_TEST_BATCH_MS: "0", ROBOB_WATCH_ROOT: root,
     ROBOB_WATCH_TELEGRAM_CLI: stub, ROBOB_WATCH_SPECTRUM_CLI: stub,
     ROBOB_WATCH_BRIDGE_DB: join(sandbox, "absent.sqlite"), WACLI_STORE_DIR: join(sandbox, "wacli"),
-    ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_CHECK_TIMEOUT_MS: "40", ...options };
+    // macOS loads the owner's noninteractive shell hooks before even a `true` check can run.
+    ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_CHECK_TIMEOUT_MS: process.platform === "darwin" ? "400" : "40", ...options };
   const path = (id: string, file: string) => join(root, "watchers", id, file);
   const state = (id: string): State => JSON.parse(readFileSync(path(id, "state.json"), "utf8"));
   const save = (id: string, s: State) => writeFileSync(path(id, "state.json"), JSON.stringify(s));
@@ -72,7 +73,7 @@ test("b: repeated load timeouts never count, alert, escalate or pause", async ()
   for (let n = 1; n <= 6; n++) await f.run("loaded", s => s.load_timeouts === n);
   const s = f.state("loaded"); expect(s.consecutive_failures).toBe(0); expect(s.failing_since).toBeUndefined();
   expect(s.failure_paused_at).toBeUndefined(); expect(s.failure_escalated).toBeUndefined(); expect(f.calls()).toHaveLength(0);
-  expect(s.load_timeout_since).toBeString(); expect(s.last_error).toBe("timed out after 0.12s under host load 9.0/core");
+  expect(s.load_timeout_since).toBeString(); expect(s.last_error).toBe(`timed out after ${Number(f.env.ROBOB_WATCH_CHECK_TIMEOUT_MS) * 3 / 1000}s under host load 9.0/core`);
   expect(s.next_at! - Date.now()).toBeGreaterThan(115_000); expect(s.next_at! - Date.now()).toBeLessThanOrEqual(120_000);
   for (const args of [["list"], ["show", "loaded"]]) expect(f.cli(...args).stdout.toString()).toContain("load-timeouts 6");
   expect(f.cli("resume", "loaded").exitCode).toBe(0); expect(f.state("loaded").load_timeouts).toBeUndefined(); expect(f.state("loaded").load_timeout_since).toBeUndefined();
@@ -82,7 +83,7 @@ test("c: a 61-minute load timeout streak enters the normal failure path", async 
   const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9" }); f.add("hung");
   f.save("hung", { ...f.state("hung"), load_timeouts: 10, load_timeout_since: new Date(Date.now() - 61 * 60_000).toISOString() });
   await f.run("hung", s => s.consecutive_failures === 1);
-  expect(f.state("hung").last_error).toBe("timed out after 0.12s"); expect(f.state("hung").failing_since).toBeString();
+  expect(f.state("hung").last_error).toBe(`timed out after ${Number(f.env.ROBOB_WATCH_CHECK_TIMEOUT_MS) * 3 / 1000}s`); expect(f.state("hung").failing_since).toBeString();
 });
 
 test("grace safety valve still alerts, pauses and escalates a hung wake check", async () => {
@@ -94,7 +95,7 @@ test("grace safety valve still alerts, pauses and escalates a hung wake check", 
 
 test("d: low-load timeouts count as failures", async () => {
   const f = fixture(); f.add("low"); await f.run("low", s => s.consecutive_failures === 1);
-  expect(f.state("low").last_error).toBe("timed out after 0.04s"); expect(f.state("low").load_timeouts).toBeUndefined();
+  expect(f.state("low").last_error).toBe(`timed out after ${Number(f.env.ROBOB_WATCH_CHECK_TIMEOUT_MS) / 1000}s`); expect(f.state("low").load_timeouts).toBeUndefined();
 });
 
 test("e: high load triples a 1s timeout, allowing a 2s check to succeed", async () => {
@@ -122,7 +123,7 @@ test("slot cap changes live, preserving running checks and opening slots on reco
 });
 
 test("g: an unmounted SSD holds checks, counts, schedule and pending deliveries until remounted", async () => {
-  const f = fixture(), mount = join(f.sandbox, "ssd"); f.env.ROBOB_WATCH_SSD_PATH = mount;
+  const f = fixture({ ROBOB_WATCH_CHECK_TIMEOUT_MS: "5000" }), mount = join(f.sandbox, "ssd"); f.env.ROBOB_WATCH_SSD_PATH = mount;
   mkdirSync(mount); expect(isMounted(mount)).toBe(false); expect(isMounted("/dev")).toBe(true);
   f.add("ssd", { depends: ["ssd"], check: "true" }); f.add("pending", { depends: ["ssd"], check: "exit 99" }); f.add("plain", { check: "true" });
   f.save("ssd", { ...f.state("ssd"), consecutive_failures: 3, next_at: 0 });
@@ -188,6 +189,7 @@ test.each(["exit 7", "sleep 10", "echo event"])("SSD removal during a check uses
 }, 15_000);
 
 const pipeExitCases = [0, 7, 127].flatMap(code => ["stdout", "stderr"].map(pipe => [code, pipe] as const));
+// Pipe cleanup may use the full 5s kill grace, beyond Bun's default test deadline.
 test.each(pipeExitCases)("known exit %s with a descendant holding %s past timeout", async (code, pipe) => {
   const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9" });
   f.add("pipe", { max_consecutive_failures: 1, check: `/bin/sleep 2 ${pipe === "stdout" ? "2>/dev/null" : ">/dev/null"} & exit ${code}` });
@@ -201,7 +203,7 @@ test.each(pipeExitCases)("known exit %s with a descendant holding %s past timeou
   } else {
     expect(s.consecutive_failures).toBe(0); expect(s.last_error).toContain("under host load"); expect(f.calls()).toHaveLength(0);
   }
-});
+}, 15_000);
 
 test.each(pipeExitCases)("known exit %s survives kill grace with detached descendant holding %s", async (code, pipe) => {
   const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9" });

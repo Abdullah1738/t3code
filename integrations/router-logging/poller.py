@@ -32,7 +32,7 @@ class Router:
 
     def get(self, route):
         # Exact allowlist prevents accidentally polling a mutating GET endpoint.
-        if route not in ('/api/providers', '/api/usage/logs', '/api/usage/stats?period=today'):
+        if route not in ('/api/providers', '/api/usage/logs', '/api/usage/stats?period=today', '/api/monitoring/pools'):
             raise ValueError('route not allowed')
         start = time.monotonic()
         status = 0

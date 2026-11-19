@@ -30,8 +30,17 @@ class AllocationWaitTests(Isolated):
             'import fcntl,sys; f=open(sys.argv[1],"a+"); fcntl.flock(f,fcntl.LOCK_EX); '
             'print("held",flush=True); sys.stdin.read()', str(path)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        self.addCleanup(child.wait)
-        self.addCleanup(child.stdout.close)
+        def reap_child():
+            if not child.stdin.closed:
+                child.stdin.close()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+            finally:
+                child.stdout.close()
+        self.addCleanup(reap_child)
         self.assertEqual(child.stdout.readline().strip(), 'held')
         real = allocation.file_lock
         attempts = []

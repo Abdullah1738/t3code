@@ -39,6 +39,13 @@ class Policy(unittest.TestCase):
         self.assertEqual(disk.level({'free_bytes': 5*G, 'total_bytes': 10*G, 'free_inodes': 0, 'total_inodes': 10}), 'full')
         self.assertEqual(disk.level({'free_bytes': 5*G, 'total_bytes': 10*G, 'free_inodes': 4, 'total_inodes': 100}), 'low')
 
+    def test_large_pool_thresholds_have_absolute_ceilings(self):
+        for free, expected in ((39, 'full'), (40, 'low'), (90, 'low'), (91, 'ok'), (131, 'ok')):
+            with self.subTest(free=free):
+                self.assertEqual(storage(free*G, 1744*G)['level'], expected)
+        self.assertEqual(disk.pool_thresholds(1744*G)['target'], 130*G)
+        self.assertEqual(disk.pool_thresholds(100*G), {'hard': 10*G, 'warn': 20*G, 'target': 25*G})
+
     def test_oldest_first_keeps_newest_three_run_points_clone_origins_and_timer_kinds(self):
         rows = snaps('a') + snaps('b') + snaps('a', kind='stop') + snaps('a', kind='hourly')
         rows[0]['clones'] = True
@@ -87,6 +94,30 @@ class ServerPressure(Base):
         self.stack.enter_context(patch.object(disk,'sample',return_value=storage()))
         self.stack.enter_context(patch.object(disk,'inventory',return_value=({},[])))
         self.stack.enter_context(patch.object(disk,'cleanup_pressure',return_value={'freeing_bytes':0,'io_full_avg10':0,'io_some_avg10':0}))
+
+    def test_large_pool_admission_and_health_use_capped_floor(self):
+        boatd.READY.set()
+        self.f.sh[('zpool','list')]=(0,'ONLINE')
+        for free, admitted in ((90, True), (39, False)):
+            with self.subTest(free=free), patch.object(disk, 'sample', return_value=storage(free*G,1744*G)):
+                boatd.disk_state(fresh=True)
+                if admitted:
+                    boatd.disk_admit()
+                else:
+                    with self.assertRaises(boatd.Fail) as caught:
+                        boatd.disk_admit()
+                    self.assertEqual(caught.exception.code, 'server_disk_low')
+                self.assertEqual(boatd.health(fresh=True)['ok'], admitted)
+
+    def test_large_pool_cleanup_caps_persisted_target_and_clears_shortfall(self):
+        self.con.execute("INSERT INTO meta(k,v) VALUES('disk_cleanup',?)", (json.dumps({'target_bytes':436*G}),))
+        for free, shortfall in ((90,40), (131,0)):
+            with self.subTest(free=free), patch.object(disk,'sample',return_value=storage(free*G,1744*G)):
+                result=boatd.disk_maintenance(self.con)
+                self.assertEqual(result['cleanup']['shortfall_bytes'],shortfall*G)
+                state=json.loads(self.con.execute("SELECT v FROM meta WHERE k='disk_cleanup'").fetchone()[0])
+                self.assertEqual(state['target_bytes'],130*G if shortfall else 0)
+        self.assertFalse(any(c[:2]==('snapshot','delete') for c in self.f.calls))
 
     def test_cached_health_keeps_disk_truth_without_waiting_for_slow_refresh(self):
         boatd.READY.set()
@@ -222,6 +253,32 @@ class Round2(Base):
                 boatd.disk_maintenance(self.con)
                 self.assertEqual(self.deletes(), [])
                 self.assertTrue(any(c.args[1] == 'snapshot.yield' for c in emit.call_args_list))
+
+    def test_count_retention_has_a_bounded_number_of_full_command_scans(self):
+        for i in range(80):
+            self.box('bx_'+str(i).zfill(8))
+        queries=[]
+        self.con.set_trace_callback(queries.append)
+        try:
+            boatd.disk_maintenance(self.con)
+        finally:
+            self.con.set_trace_callback(None)
+        scans=[q for q in queries if q.upper().startswith('SELECT') and 'FROM COMMANDS' in q.upper()
+               and 'WHERE BOX_ID' not in q.upper()]
+        self.assertLess(len(scans),10, 'full protection scans must not grow with box count')
+
+    def test_pin_added_during_count_selection_is_rechecked_before_delete(self):
+        bid=self.box()
+        self.install_rows(snaps(bid),{})
+        original=boatd.snaps_to_prune
+        def pin_during_selection(*args):
+            selected=original(*args)
+            self.con.execute('UPDATE boxes SET pinned=1 WHERE id=?',(bid,))
+            return selected
+        with patch.object(boatd,'snaps_to_prune',side_effect=pin_during_selection):
+            boatd.disk_maintenance(self.con)
+        self.assertEqual(self.deletes(),[])
+        self.assertTrue(self.state(bid)['pinned'])
 
     def test_unreadable_backpressure_yields_instead_of_deleting(self):
         bid=self.box();self.install_rows(snaps(bid),{})
@@ -427,12 +484,16 @@ class Round2(Base):
 
     def test_container_stop_failure_still_propagates_without_archiving(self):
         bid=self.box()
-        with patch.object(boatd,'incus',side_effect=subprocess.TimeoutExpired(['incus','stop'],120)), \
+        def stop_failure(*args,**kwargs):
+            if args[0]=='stop': raise subprocess.TimeoutExpired(['incus','stop'],120)
+            return self.f.incus(*args,**kwargs)
+        with patch.object(boatd,'incus',side_effect=stop_failure) as incus, \
              patch.object(boatd.toollog,'emit') as emit:
             with self.assertRaises(subprocess.TimeoutExpired):
                 boatd.stop_box(self.con,bid,'idle')
         self.assertIn(bid,self.f.running)
         self.assertEqual(self.state(bid)['state'],'stopping')
+        self.assertTrue(any(c.args[0]=='stop' for c in incus.call_args_list))
         self.assertFalse(any(c.args[1]=='snapshot.defer' for c in emit.call_args_list))
 
 

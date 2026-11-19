@@ -168,32 +168,37 @@ class IncusSlowTests(Base):
                 self.assertEqual(events[0]['props']['outcome'], label)
                 self.assertGreaterEqual(events[0]['duration_ms'], 0)
 
-    def test_command_stream_records_success_nonzero_and_spawn_failure(self):
+    def test_command_launcher_records_success_nonzero_and_spawn_failure(self):
         bid = self.box()
         for pid, outcome in enumerate((0, 7, OSError('cannot spawn')), start=1001):
             with self.subTest(outcome=outcome), contextlib.ExitStack() as stack:
                 self.cmd(bid, pid=pid, status='queued')
                 self.con.execute('UPDATE commands SET sync=1,command=? WHERE pid=?', ('private command', pid))
-                for name in ('load_cfg', 'ct_exec'):
-                    stack.enter_context(patch.object(boatd, name))
+                stack.enter_context(patch.object(boatd, 'load_cfg'))
+                stack.enter_context(patch.object(boatd, 'incus', self.saved['incus']))
+                stack.enter_context(patch.object(boatd, 'guest_command', return_value={'state': 'absent'}))
                 stack.enter_context(patch.object(boatd, 'disk_preflight', return_value=False))
-                stack.enter_context(patch.object(boatd, 'box_window', return_value={}))
-                stack.enter_context(patch.object(boatd, 'read_cg', return_value={}))
-                stack.enter_context(patch.object(boatd, 'record_command_result', return_value='following'))
-                process = stack.enter_context(patch.object(boatd.subprocess, 'Popen'))
-                if isinstance(outcome, Exception):
-                    process.side_effect = outcome
-                else:
-                    process.return_value = Mock(wait=Mock(return_value=outcome))
+                follow = stack.enter_context(patch.object(boatd, 'follow_guest'))
+                def run(argv, **kwargs):
+                    if argv[-1].startswith('nohup /usr/local/sbin/boatd-wrap '):
+                        if isinstance(outcome, Exception):
+                            raise outcome
+                        return subprocess.CompletedProcess(argv, outcome, b'', b'')
+                    return subprocess.CompletedProcess(argv, 0, b'', b'')
+                process = stack.enter_context(patch.object(boatd.subprocess, 'run', side_effect=run))
                 emit = stack.enter_context(patch.object(boatd.toollog, 'emit'))
                 self.assertEqual(boatd.run_cmd(bid, pid), 0)
+                follow.assert_called_once()
+                self.assertIs(follow.call_args.kwargs['launching'], True)
+                self.assertEqual(len(process.call_args_list), 3)
+                self.assertTrue(process.call_args.args[0][-1].startswith('nohup /usr/local/sbin/boatd-wrap '))
                 events = [c.kwargs for c in emit.call_args_list if c.args[1] == 'incus_call']
-                self.assertEqual(len(events), 1)
-                props = events[0]['props']
+                self.assertEqual(len(events), 3)
+                props = events[-1]['props']
                 self.assertEqual(props['commandKind'], 'exec')
                 self.assertEqual(props['exitCode'], None if isinstance(outcome, Exception) else outcome)
                 self.assertEqual(props['outcome'], 'ok' if outcome == 0 else 'error')
-                self.assertGreaterEqual(events[0]['duration_ms'], 0)
+                self.assertGreaterEqual(events[-1]['duration_ms'], 0)
                 self.assertNotIn('private command', repr(events))
 
     def test_late_add_commit_is_read_back_without_duplicate_add(self):

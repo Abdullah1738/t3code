@@ -460,7 +460,11 @@ export const runOrderedV2StartupPhases = Effect.fn(
   readonly startEffectWorker: Effect.Effect<void, WorkerError, WorkerContext>;
   readonly autoBootstrap: Effect.Effect<Bootstrap, BootstrapError, BootstrapContext>;
 }) {
-  yield* input.reapProviderProcesses;
+  yield* input.reapProviderProcesses.pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("provider.previous-boot-reap-failed", { cause }),
+    ),
+  );
   const recovery = yield* input.recover;
   yield* input.importLegacyShells;
   yield* input.startEffectWorker;

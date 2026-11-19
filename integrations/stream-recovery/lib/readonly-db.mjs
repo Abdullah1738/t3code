@@ -24,7 +24,7 @@ export function replicaPath(env = process.env, home = env.HOME || homedir()) {
 // stat/realpath only: never open the writer to identify aliases of it.
 export function assertReplicaPath(path, home = process.env.HOME || homedir(), env = process.env) {
   if (typeof path !== 'string' || !path || path.startsWith('file:') || path.includes('\0')) {
-    throw new Error('replica must be a filesystem path');
+    throw Object.assign(new Error('replica must be a filesystem path'), { code: 'REPLICA_PATH_INVALID' });
   }
   const candidate = resolve(path);
   const expandHome = (value) => value === '~' ? home : value.startsWith('~/') ? join(home, value.slice(2)) : value;
@@ -34,17 +34,17 @@ export function assertReplicaPath(path, home = process.env.HOME || homedir(), en
   livePaths.push(join(home, '.local/share/opencode/opencode.db'));
   if (env.XDG_DATA_HOME) livePaths.push(resolve(expandHome(env.XDG_DATA_HOME), 'opencode/opencode.db'));
   for (const live of livePaths) {
-    if (candidate === resolve(live)) throw new Error('refusing live Robob/OpenCode database');
+    if (candidate === resolve(live)) throw Object.assign(new Error('refusing live Robob/OpenCode database'), { code: 'REPLICA_LIVE_PATH' });
   }
   const real = realpathSync(candidate);
   const info = statSync(candidate);
-  if (!info.isFile()) throw new Error('replica is not a regular file');
+  if (!info.isFile()) throw Object.assign(new Error('replica is not a regular file'), { code: 'REPLICA_PATH_INVALID' });
   for (const live of livePaths) {
     let liveReal, liveInfo;
     try { liveReal = realpathSync(live); liveInfo = statSync(live); }
     catch (e) { if (e.code === 'ENOENT') continue; throw e; }
     if (real === liveReal || (info.dev === liveInfo.dev && info.ino === liveInfo.ino)) {
-      throw new Error('refusing live Robob/OpenCode database alias');
+      throw Object.assign(new Error('refusing live Robob/OpenCode database alias'), { code: 'REPLICA_LIVE_PATH' });
     }
   }
   return real;

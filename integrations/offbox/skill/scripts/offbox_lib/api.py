@@ -53,10 +53,11 @@ REDACT_KEYS = ("url", "desktopUrl", "viewerUrl", "signedUrl")
 
 
 class BoxBootFailed(OffboxError):
-    """A terminal box response, distinct from an unreachable backend."""
+    """A classified start failure from a box response or a direct resume refusal."""
 
     def __init__(self, box_id, state, reason, status, api_code):
-        super().__init__(f"box {box_id} went to {state}: {reason}")
+        transition = f" went to {state}" if state is not None else ""
+        super().__init__(f"box {box_id}{transition}: {reason}")
         self.box_id, self.reason = box_id, reason
         self.status, self.api_code = status, api_code
         self.box_error = {'box_id': box_id, 'error': reason}

@@ -7,7 +7,7 @@ import signal
 import threading
 import time
 
-from . import api, capacity
+from . import api, capacity, ssh_outage
 from .common import OffboxError, SshHostKeyMismatch, log, say
 
 _ACTIVE = contextvars.ContextVar('prepare', default=None)
@@ -110,7 +110,7 @@ def guard(box, end=None, seconds=None):
             with phase('bring_up', box):
                 yield budget
             budget.check()
-    except (SshHostKeyMismatch, api.BoxBootFailed):
+    except (SshHostKeyMismatch, api.BoxBootFailed, ssh_outage.SshUnreachable):
         raise
     except (Exception, _Expired) as error:
         if not isinstance(error, _Expired) and time.monotonic() < budget.end:
@@ -184,7 +184,7 @@ def track_resume(watch):
 
 
 @contextlib.contextmanager
-def pause_for_home_start():
+def pause_for_home_start(*, extra_seconds=0):
     """An answering home server's startup has its own bound, outside box preparation time."""
     budget = _ACTIVE.get()
     if budget is None:
@@ -195,10 +195,10 @@ def pause_for_home_start():
     timer = signal.setitimer(signal.ITIMER_REAL, 0) if main else None
     token = _ACTIVE.set(None)
     try:
-        with budget.resume_watch.pause() if budget.resume_watch is not None else contextlib.nullcontext():
+        with budget.resume_watch.pause(extra_seconds=extra_seconds) if budget.resume_watch is not None else contextlib.nullcontext():
             yield
     finally:
-        elapsed = time.monotonic() - began
+        elapsed = time.monotonic() - began + extra_seconds
         for field in ('start', 'end', 'total_start', 'phase_start', 'next_progress'):
             setattr(budget, field, getattr(budget, field) + elapsed)
         _ACTIVE.reset(token)

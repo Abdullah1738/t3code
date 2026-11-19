@@ -1,3 +1,4 @@
+import './log-dir.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openCodeSession, cutoverOwns, parseCutoverStatus } from '../lib/harness.mjs';

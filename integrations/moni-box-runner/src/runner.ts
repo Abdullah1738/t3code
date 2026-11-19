@@ -4,14 +4,20 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { jsonBody, object, opaqueId, tokenMatches, unseal, validId, type Fetch, type Sealed } from "../../spectrum-bridge/src/remote-protocol.ts";
 import { HarnessFailure } from "./harness-failure.ts";
+import { initStats, recordInterruption, runnerStats } from "./stats.ts";
 
-export type Harness = { ready?(): boolean; run(input: { id: string; session: string; resume: boolean; text: string; system: string; signal?: AbortSignal }): Promise<string> };
+export type Harness = { ready?(): boolean; run(input: { id: string; session: string; resume: boolean; text: string; system: string; signal?: AbortSignal; onStarted?: () => void }): Promise<string> };
 export type RunnerConfig = { root: string; boxId: string; epoch: string; token: string; privateKey: string;
   callbackToken: string; callbackUrl: string; system: string };
 class AttachmentFailure extends Error {
   constructor(readonly code: "invalid" | "unavailable" | "too-large") { super("Attachment failed"); }
 }
 const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+type InboxRow = { id: string; payload: string; state: string; expires_at: number | null };
+const busWake = (input: Record<string, unknown>) => typeof input.id === "string" && input.id.startsWith("wake:agent-bus:");
+const humanInput = (input: Record<string, unknown>) => typeof input.id !== "string" || !/^(secret:|wake:|reset:)/.test(input.id);
+const legacyAsk = (input: Record<string, unknown>) => busWake(input) && typeof input.text === "string" && /^\[Agent request areq_[a-f0-9]{64} from /.test(input.text);
+const deadline = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
 export class BoxRunner {
   readonly db: Database;
   watch?: (body: Record<string, unknown>) => Promise<void>;
@@ -37,6 +43,9 @@ export class BoxRunner {
         exit_code INTEGER, signal TEXT, stderr_bytes INTEGER, sends INTEGER, bus_actions INTEGER, tool_actions INTEGER, retried INTEGER);`);
     const previousLease = this.db.query<{ value: string }, []>("SELECT value FROM settings WHERE key='last-lease-at'").get();
     if (previousLease) this.lastLeaseAt = Number(previousLease.value);
+    const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(inbox)").all();
+    for (const column of ["delivered_at", "expires_at"]) if (!columns.some(c => c.name === column)) this.db.exec(`ALTER TABLE inbox ADD COLUMN ${column} INTEGER`);
+    this.db.exec("UPDATE inbox SET expires_at=json_extract(payload,'$.agentExpiresAt') WHERE expires_at IS NULL AND json_type(payload,'$.agentExpiresAt')='integer'");
     this.db.query("INSERT OR IGNORE INTO settings VALUES ('session',?)").run(randomUUID());
     if (!this.db.query<{ name: string }, []>("PRAGMA table_info(inbox)").all().some(c => c.name === "interrupted_at")) this.db.exec("ALTER TABLE inbox ADD COLUMN interrupted_at INTEGER");
     if (!this.db.query<{ name: string }, []>("PRAGMA table_info(actions)").all().some(c => c.name === "inbox_id")) {
@@ -48,6 +57,7 @@ export class BoxRunner {
     for (const [name, type] of [["attempts", "INTEGER DEFAULT 0"], ["last_status", "INTEGER"], ["next_at", "INTEGER"]]) {
       if (!this.db.query<{ name: string }, []>("PRAGMA table_info(actions)").all().some(c => c.name === name)) this.db.exec(`ALTER TABLE actions ADD COLUMN ${name} ${type}`);
     }
+    initStats(this.db, this.now());
     // A killed harness might already have used a tool. An operator reconciles it; never replay it automatically.
     this.interrupt();
   }
@@ -70,6 +80,7 @@ export class BoxRunner {
       const detail = error instanceof HarnessFailure ? error.detail : { exitCode: null, signal: null, stderrBytes: 0 };
       this.db.query("INSERT OR REPLACE INTO interruptions VALUES (?,?,?,?,?,?,?,?,?,?,?)")
         .run(row.id, reason, this.now(), this.lastLeaseAt, detail.exitCode, detail.signal, detail.stderrBytes, effects.sends, effects.bus, effects.tools, Number(retry));
+      recordInterruption(this.db, reason, this.now(), retry);
       this.db.query("UPDATE inbox SET state=?,interrupted_at=? WHERE id=? AND state='running'").run(retry ? "pending" : "interrupted", this.now(), row.id);
       this.io.log?.("turn-interrupted", undefined, { reason, lastLeaseAt: this.lastLeaseAt, ...detail,
         sends: effects.sends, busActions: effects.bus, toolActions: effects.tools, retried: retry });
@@ -109,9 +120,22 @@ export class BoxRunner {
       const ack = await jsonBody(response as unknown as Request); return response.ok && ack.epoch === this.config.epoch;
     } catch { return false; }
   }
-  enqueue(id: string, payload: unknown): boolean {
+  enqueue(id: string, payload: unknown, expiresAt?: number | null): boolean {
     if (!validId(id)) throw new Error("Invalid event id");
-    return this.db.query("INSERT OR IGNORE INTO inbox(id,payload,state) VALUES (?,?,'pending')").run(id, JSON.stringify(payload)).changes === 1;
+    const embedded = object(payload) && deadline(payload.agentExpiresAt) ? payload.agentExpiresAt : undefined;
+    const expiry = expiresAt == null ? embedded : embedded === undefined ? expiresAt : Math.min(embedded, expiresAt);
+    const created = this.db.query("INSERT OR IGNORE INTO inbox(id,payload,state,expires_at) VALUES (?,?,'pending',?)").run(id, JSON.stringify(payload), expiry ?? null).changes === 1;
+    if (expiry !== undefined) this.retainDeadline(id, expiry);
+    return created;
+  }
+  private retainDeadline(id: string, expiresAt: number) {
+    this.db.query("UPDATE inbox SET expires_at=CASE WHEN expires_at IS NULL THEN ? ELSE MIN(expires_at,?) END WHERE id=?").run(expiresAt, expiresAt, id);
+  }
+  private expired(id: string) {
+    const expiry = this.db.query<{ expires_at: number | null }, [string]>("SELECT expires_at FROM inbox WHERE id=?").get(id)?.expires_at;
+    if (expiry == null || this.now() < expiry) return false;
+    this.db.query("UPDATE inbox SET state='done' WHERE id=?").run(id);
+    return true;
   }
   async action(id: string, path: string, body: Record<string, unknown>): Promise<unknown> {
     if (!validId(id) || !["/send", "/files", "/react", "/agent-ask", "/agent-answer", "/agent-requests", "/metrics"].includes(path)) throw new Error("Invalid action");
@@ -167,10 +191,22 @@ export class BoxRunner {
     const started = this.now();
     try {
       await this.flush();
-      const row = this.db.query<{ id: string; payload: string; state: string }, []>("SELECT * FROM inbox WHERE state NOT IN ('done','attachment-failed') ORDER BY seq LIMIT 1").get();
-      if (!row || row.state !== "pending") return;
+      const queued = this.db.query<InboxRow, []>("SELECT * FROM inbox WHERE state NOT IN ('done','attachment-failed') ORDER BY seq").all();
+      // Interrupted work remains a fence; changing scheduling must never replay or pass it.
+      const fence = queued.findIndex(row => row.state !== "pending");
+      const pending = (fence < 0 ? queued : queued.slice(0, fence)).map(row => ({ row, input: JSON.parse(row.payload) as Record<string, unknown> }))
+        .filter(({ row, input }) => {
+          // Legacy ciphertext cannot carry the Mac's migrated deadline. Wait for its metadata receipt.
+          if (row.expires_at === null && legacyAsk(input)) return false;
+          return !this.expired(row.id);
+        });
+      const human = pending.find(({ input }) => humanInput(input));
+      const yieldHuman = this.db.query<{ value: string }, []>("SELECT value FROM settings WHERE key='bus-yield-human'").get()?.value === "true";
+      const dueBus = pending.find(({ input }) => busWake(input) && typeof input.receivedAt === "number" && this.now() - input.receivedAt >= 60_000);
+      const selected = yieldHuman && human ? human : dueBus ?? pending[0];
+      if (!selected) return;
+      const { row, input } = selected;
       if (this.harness.ready && !this.harness.ready()) return;
-      const input = JSON.parse(row.payload);
       let text: string;
       try { text = await this.prepare(input); }
       catch (error) {
@@ -190,15 +226,27 @@ export class BoxRunner {
       const [modelReady, callbackReady] = await Promise.all([this.modelReady(), this.callbackReady()]);
       if (!modelReady || !callbackReady || !this.active()) return;
       if (this.harness.ready && !this.harness.ready()) return;
+      if (this.expired(row.id)) return;
       this.db.query("UPDATE inbox SET state='running' WHERE id=?").run(row.id);
       const session = this.db.query<{ value: string }, []>("SELECT value FROM settings WHERE key='session'").get()!.value;
       const resume = !!this.db.query("SELECT 1 FROM settings WHERE key='started'").get();
-      this.db.exec("INSERT OR IGNORE INTO settings VALUES ('started','true')");
+      let pickedUp = false;
+      const onStarted = () => {
+        if (pickedUp) return;
+        this.db.transaction(() => {
+          this.db.query("UPDATE inbox SET delivered_at=COALESCE(delivered_at,?) WHERE id=?").run(this.now(), row.id);
+          this.db.exec("INSERT OR IGNORE INTO settings VALUES ('started','true')");
+          if (busWake(input) || humanInput(input)) this.db.query("INSERT OR REPLACE INTO settings VALUES ('bus-yield-human',?)").run(busWake(input) ? "true" : "false");
+        }).immediate();
+        pickedUp = true;
+      };
       this.turnAbort = new AbortController();
-      const output = await this.harness.run({ id: row.id, session, resume, text, system: this.config.system, signal: this.turnAbort.signal });
+      const output = await this.harness.run({ id: row.id, session, resume, text, system: this.config.system, signal: this.turnAbort.signal, onStarted });
       // A harness that races its abort must not commit a result after losing authority.
       if (!this.active()) this.turnAbort.abort("authority-expired");
       this.turnAbort.signal.throwIfAborted();
+      // A completed result proves handoff even for a harness without early acknowledgement.
+      onStarted();
       const reply = output.trim();
       this.db.transaction(() => {
         if (reply && reply !== "NO_REPLY" && !reply.endsWith("\nNO_REPLY")) {
@@ -263,14 +311,26 @@ export class BoxRunner {
         this.leaseUntil = this.now() + 20_000;
         this.db.query("INSERT OR REPLACE INTO settings VALUES ('last-lease-at',?)").run(String(this.lastLeaseAt));
         const [routerReady, callbackReady] = await Promise.all([this.modelReady(), this.callbackReady()]);
-        return reply(200, { boxId: this.config.boxId, epoch: this.config.epoch, routerReady, callbackReady });
+        return reply(200, { boxId: this.config.boxId, epoch: this.config.epoch, routerReady, callbackReady, stats: runnerStats(this.db, this.now()) });
       }
       if (path === "/pause") { this.pause(); return reply(200, { paused: true }); }
       if (!this.active()) return reply(503, { error: "Runner paused" });
       if (path === "/deliver") {
-        if (!validId(body.id) || body.epoch !== this.config.epoch || !object(body.sealed)) return reply(400, { error: "Invalid envelope" });
-        this.enqueue(body.id, unseal(this.config.privateKey, body.sealed as Sealed));
+        if (!validId(body.id) || body.epoch !== this.config.epoch || !object(body.sealed) || body.expiresAt != null && !deadline(body.expiresAt)) return reply(400, { error: "Invalid envelope" });
+        this.enqueue(body.id, unseal(this.config.privateKey, body.sealed as Sealed), body.expiresAt as number | null | undefined);
         return reply(200, { id: body.id, accepted: true });
+      }
+      if (path === "/delivery-status") {
+        if (body.epoch !== this.config.epoch || !Array.isArray(body.ids) || body.ids.length > 50 || !body.ids.every(validId)) return reply(400, { error: "Invalid delivery query" });
+        const ids = body.ids;
+        const deadlines = body.deadlines ?? [];
+        if (!Array.isArray(deadlines) || deadlines.length > 50 || !deadlines.every(entry => object(entry) && validId(entry.id) && ids.includes(entry.id) && deadline(entry.expiresAt))) return reply(400, { error: "Invalid delivery deadlines" });
+        for (const entry of deadlines) this.retainDeadline(entry.id, entry.expiresAt);
+        const query = this.db.query<{ deliveredAt: number | null; state: string }, [string]>("SELECT delivered_at AS deliveredAt,state FROM inbox WHERE id=?");
+        return reply(200, { deliveries: body.ids.map(id => {
+          const row = query.get(id);
+          return { id, accepted: !!row, deliveredAt: row?.deliveredAt ?? null };
+        }) });
       }
       if (path === "/events") {
         if (body.ids !== undefined) {

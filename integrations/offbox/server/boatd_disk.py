@@ -6,12 +6,15 @@ import subprocess
 import time
 
 GIB = 1024 ** 3
-# On 14 Nov a 1.7 TiB pool lost ~40 GB/h, with ~200 GB pinned per repository box.
-# 20% warns hours before exhaustion; 10% stops growth above ZFS's ~3% slop.
-# Cleanup aims for 25% to avoid churning at the warning threshold.
+# ZFS available already excludes ~3% slop. On the home pool bclone means
+# deletes return about 25% of their logical size, so shares need absolute caps.
+# Small pools retain their percentage thresholds and cleanup hysteresis.
 WARN = .20
 HARD = .10
 TARGET = .25
+HARD_CEILING = 40 * GIB
+WARN_CEILING = 90 * GIB
+TARGET_CEILING = 130 * GIB
 KEEP_RUN = 3
 SNAPSHOT_RATIO = .50
 
@@ -30,15 +33,23 @@ def filesystem(path):
             "total_inodes": st.f_files}
 
 
+def pool_thresholds(total):
+    return {'hard': max(256 * 1024 ** 2, min(total * HARD, HARD_CEILING)),
+            'warn': max(GIB, min(total * WARN, WARN_CEILING)),
+            'target': min(total * TARGET, TARGET_CEILING)}
+
+
 def level(row, pool=False):
     free, total = row['free_bytes'], row['total_bytes']
     fraction = free / total if total else 0
     inode_fraction = row.get('free_inodes', 0) / row['total_inodes'] if row.get('total_inodes') else 1
-    hard = max(256 * 1024 ** 2, total * HARD) if pool else 256 * 1024 ** 2
-    warn = max(GIB, total * WARN) if pool else GIB
+    thresholds = pool_thresholds(total) if pool else {'hard': 256 * 1024 ** 2, 'warn': GIB}
+    hard, warn = thresholds['hard'], thresholds['warn']
     if free < hard or inode_fraction < .01:
         return 'full'
-    if free < warn or inode_fraction < .05:
+    # At the absolute warning ceiling, keep the warning visible; retain small-pool boundaries.
+    capped_warning = pool and total * WARN > WARN_CEILING and free == warn
+    if free < warn or capped_warning or inode_fraction < .05:
         return 'low'
     return 'ok'
 

@@ -297,6 +297,7 @@ export function layerWithRegistry<Error>(
   | EffectWorker.OrchestrationEffectExecutorV2
   | RunExecutionService.RunExecutionServiceV2
   | EffectOutbox.EffectOutboxV2
+  | ProviderTurnControlService.ProviderTurnControlServiceV2
   | ProviderEventIngestor.ProviderEventIngestorV2
   | ThreadManagementService.ThreadManagementService
   | EventSink.EventSinkV2
@@ -579,8 +580,10 @@ export function layerWithRegistry<Error>(
     McpProviderSessions.layer,
     layerOrchestratorProvided,
     layerProviderSessionManagerProvided,
+    layerProviderTurnControlServiceProvided,
     layerEffectWorkerProvided,
     layerEffectExecutorProvided,
+    layerStores,
     layerRunExecutionServiceProvided,
     layerEventSinkProvided,
     layerContinuationWorkerProvided,

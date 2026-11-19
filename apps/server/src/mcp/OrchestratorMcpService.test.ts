@@ -98,8 +98,6 @@ import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { McpCall, callOutcome } from "../ardud/analytics/McpCall.ts";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
-import { withFailureStructuredContent } from "./McpHttpServer.ts";
-import { McpSchema } from "effect/ai";
 
 const decodeMcpFailureJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestratorMcpFailure),
@@ -3152,7 +3150,7 @@ describe("OrchestratorMcpService provider resolution", () => {
               mode: "async",
               clientRequestId: "cancelled-first-run",
             })
-            .pipe(Effect.flip, Effect.forkChild);
+            .pipe(Effect.exit, Effect.forkChild);
           yield* Deferred.await(entered);
           if (interrupted) yield* Fiber.interrupt(call);
           else yield* TestClock.adjust("30 seconds");
@@ -3169,9 +3167,11 @@ describe("OrchestratorMcpService provider resolution", () => {
             attributes["t3.delegate.outcome"],
             interrupted
               ? "interrupted"
-              : stage === "caller"
-                ? "caller_unresolved"
-                : "timeout_dispatch",
+              : stage === "dispatch"
+                ? "pending_create"
+                : stage === "caller"
+                  ? "caller_unresolved"
+                  : "timeout_dispatch",
           );
           assert.equal(attributes["t3.delegate.mode"], "async");
           assert.isNumber(attributes[`t3.delegate.stage_ms.${stage}`]);
@@ -3183,14 +3183,22 @@ describe("OrchestratorMcpService provider resolution", () => {
           }
           assert.notInclude(JSON.stringify(attributes), "Check the diff");
           if (interrupted) return;
-          const error = yield* Fiber.join(call);
+          const exit = yield* Fiber.join(call);
+          if (stage === "dispatch") {
+            assert.isTrue(Exit.isSuccess(exit));
+            if (Exit.isSuccess(exit)) assert.equal(exit.value.status, "creating");
+            assert.equal(dispatches, 1);
+            return;
+          }
+          assert.isTrue(Exit.isFailure(exit));
+          if (Exit.isSuccess(exit)) return assert.fail("expected pre-dispatch timeout");
+          const error = Cause.squash(exit.cause) as OrchestratorMcpFailure;
           assert.equal(error.code, stage === "caller" ? "caller_unresolved" : "delegation_timeout");
           assert.include(error.message, parentThreadId);
           if (stage !== "caller") assert.include(error.message, stage);
           if (stage === "parent_records")
             assert.include(error.message, "Nothing was saved; retry the same call.");
-          if (stage === "dispatch") assert.include(error.message, "cancelled-first-run");
-          assert.equal(dispatches, stage === "dispatch" ? 1 : 0);
+          assert.equal(dispatches, 0);
         }).pipe(
           Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
           Effect.withTracer(tracer),
@@ -3260,11 +3268,15 @@ describe("OrchestratorMcpService provider resolution", () => {
           : [{ ...testCase, targetForm: "full", claude: false }];
       }),
   )(
-    "returns an async receipt only for a saved create: $scenario read=$read failed=$failRead claude=$claude target=$targetForm",
+    "returns a saved or in-flight async receipt: $scenario read=$read failed=$failRead claude=$claude target=$targetForm",
     ({ scenario, read, failRead, claude, targetForm }) =>
       Effect.scoped(
         Effect.gen(function* () {
-          const { ended, tracer } = captureSpans();
+          const retryAttached = yield* Deferred.make<void>();
+          const { ended, tracer } = captureSpans((key, value) => {
+            if (key === "t3.delegate.retry_path" && value === "attached_pending")
+              Deferred.doneUnsafe(retryAttached, Effect.void);
+          });
           const entered = yield* Deferred.make<void>();
           const stateEntered = yield* Deferred.make<void>();
           const readEntered = yield* Deferred.make<void>();
@@ -3505,7 +3517,7 @@ describe("OrchestratorMcpService provider resolution", () => {
                 scenario === "abandoned" ||
                 scenario === "never_saved"
               ) {
-                yield* TestClock.adjust(scenario === "near_grace_end" ? "4999 millis" : "1 second");
+                yield* TestClock.adjust(scenario === "near_grace_end" ? "1999 millis" : "1 second");
                 yield* Deferred.succeed(release, undefined);
               } else {
                 if (scenario === "accepted_after_grace") saved = true;
@@ -3517,44 +3529,45 @@ describe("OrchestratorMcpService provider resolution", () => {
               yield* TestClock.adjust("1 second");
             }
             const exit = yield* Fiber.join(call);
-            if (
-              scenario === "unknown" ||
-              scenario === "rejected" ||
-              scenario === "abandoned" ||
-              scenario === "never_saved"
-            ) {
+            if (scenario === "unknown") {
+              assert.isTrue(Exit.isSuccess(exit));
+              if (Exit.isFailure(exit)) return assert.fail("expected pending receipt");
+              assert.deepInclude(decodeDelegateTaskResult(exit.value), {
+                taskId: expectedTaskId,
+                status: "creating",
+                startPending: true,
+                providerInstanceId: targetInstanceId,
+                model: targetModel,
+                waitTimedOut: false,
+              });
+              const row = callOutcome(Exit.succeed({ content: [] }), state);
+              assert.equal(row.saved, "pending_create");
+              assert.equal(row.outcome, "ok");
+              assert.isDefined(state.dispatchFenceAt);
+              assert.isUndefined(state.dispatchFenceRecovered);
+              // A second waiter times out while the original create is still held.
+              const retryCall = yield* service
+                .delegateTask(scope, {
+                  task: "Review",
+                  mode: "async",
+                  clientRequestId: key,
+                  target,
+                })
+                .pipe(Effect.forkScoped);
+              yield* Deferred.await(retryAttached);
+              yield* TestClock.adjust("10 seconds");
+              const retryReceipt = yield* Fiber.join(retryCall);
+              assert.equal(retryReceipt.taskId, expectedTaskId);
+              assert.equal(retryReceipt.status, "creating");
+              assert.equal(creates, 1);
+            } else if (["rejected", "abandoned", "never_saved"].includes(scenario)) {
               assert.isTrue(Exit.isFailure(exit));
-              if (Exit.isSuccess(exit)) return assert.fail("expected an unsaved create error");
+              if (Exit.isSuccess(exit)) return assert.fail("expected unsaved create error");
               const error = Cause.squash(exit.cause) as OrchestratorMcpFailure;
-              assert.equal(
-                error.code,
-                scenario === "unknown" ? "delegation_timeout" : "orchestration_error",
-              );
-              assert.equal(error.saved, scenario === "unknown" ? undefined : false);
-              if (scenario !== "unknown") {
-                assert.include(error.message, "not created; safe to retry");
-                assert.notInclude(error.message, "may still be created");
-              }
-              if (scenario === "unknown") {
-                assert.equal(
-                  error.message,
-                  `delegate_task timed out during dispatch for thread ${parentThreadId}. Task ${expectedTaskId} may still be created; use task_status to check whether it was saved. Retry only with the same clientRequestId: ${key}.`,
-                );
-                const reply = withFailureStructuredContent(
-                  new McpSchema.CallToolResult({
-                    isError: true,
-                    content: [{ type: "text", text: yield* encodeMcpFailureJson(error) }],
-                  }),
-                );
-                assert.isFalse(reply instanceof McpSchema.InputRequired);
-                if (reply instanceof McpSchema.InputRequired)
-                  return assert.fail("expected failure");
-                assert.deepInclude(reply.structuredContent, {
-                  code: "delegation_timeout",
-                  message: error.message,
-                });
-                assert.notProperty(reply.structuredContent, "saved");
-              }
+              assert.equal(error.code, "orchestration_error");
+              assert.equal(error.saved, false);
+              assert.include(error.message, "not created; safe to retry");
+              assert.notInclude(error.message, "may still be created");
               assert.isUndefined(state.dispatchFenceRecovered);
             } else {
               assert.isTrue(Exit.isSuccess(exit));
@@ -4151,9 +4164,11 @@ describe("OrchestratorMcpService provider resolution", () => {
             yield* TestClock.adjust("10 seconds");
             yield* TestClock.adjust("5 seconds");
             const second = yield* Fiber.join(retry);
-            assert.isTrue(Exit.isFailure(second));
-            if (Exit.isFailure(second))
-              assert.include(String(Cause.squash(second.cause)), "may still be created");
+            assert.isTrue(Exit.isSuccess(second));
+            if (Exit.isSuccess(second)) {
+              assert.equal(second.value.status, "creating");
+              assert.isTrue(second.value.startPending);
+            }
             if (outcome === "concurrent_retry_saved")
               yield* Deferred.succeed(outcomeRelease, undefined);
             else yield* TestClock.adjust("105 seconds");
@@ -4300,7 +4315,11 @@ describe("OrchestratorMcpService provider resolution", () => {
             assert.isFalse(yield* Deferred.isDone(writerClosed));
           }
           const result = yield* Fiber.join(call);
-          assert.isTrue(Exit.isFailure(result));
+          if (outcome === "wait" || outcome === "definite") assert.isTrue(Exit.isFailure(result));
+          else {
+            assert.isTrue(Exit.isSuccess(result));
+            if (Exit.isSuccess(result)) assert.equal(result.value.status, "creating");
+          }
           if (outcome === "wait") {
             assert.deepEqual(yield* receipts.listDelegationTimeouts(), []);
             assert.deepEqual(notifications, []);
@@ -4702,7 +4721,12 @@ describe("OrchestratorMcpService provider resolution", () => {
           if (scenario === "async") yield* TestClock.adjust("5 seconds");
           if (scenario === "budget" || scenario === "async") {
             const exit = yield* Fiber.join(call);
-            assert.isTrue(Exit.isFailure(exit));
+            assert.equal(Exit.isFailure(exit), scenario === "budget");
+            if (Exit.isSuccess(exit)) {
+              assert.equal(exit.value.taskId, expectedTaskId);
+              assert.equal(exit.value.status, "creating");
+              assert.isTrue(exit.value.startPending);
+            }
             if (Exit.isFailure(exit)) {
               const error = Cause.squash(exit.cause) as OrchestratorMcpFailure;
               assert.equal(error.code, "delegation_timeout");
@@ -5749,6 +5773,8 @@ describe("OrchestratorMcpService provider resolution", () => {
       retryTimeout: true,
     },
     { mode: "async", legacy: false },
+    { mode: "async", legacy: false, reuseChild: "plain" },
+    { mode: "async", legacy: false, reuseChild: "encoded" },
     { mode: "async", legacy: false, stall: true, parentFinished: false },
     { mode: "async", legacy: false, stall: true, parentFinished: true },
     { mode: "async", legacy: false, rejectBeforeAdmission: true },
@@ -5896,9 +5922,15 @@ describe("OrchestratorMcpService provider resolution", () => {
     },
     { mode: "wait", legacy: true, dispatchTimeout: "before commit", noRetry: true },
   ] as const)(
-    "replays the same delegation across any namespace rebind (stall=$stall, parentFinished=$parentFinished, parentEnds=$parentEnds, rejectBeforeAdmission=$rejectBeforeAdmission, replayReadFailure=$replayReadFailure, $mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease, cancelOnArrival=$cancelOnArrival, maskedCommit=$maskedCommit, finishBeforeReply=$finishBeforeReply, finishDuringRetry=$finishDuringRetry, commitInGrace=$commitInGrace, expireCreate=$expireCreate, failCreate=$failCreate, singleDispatch=$singleDispatch, retryTimeout=$retryTimeout, foreignCaller=$foreignCaller, commitError=$commitError, admissionRace=$admissionRace)",
+    "replays the same delegation across any namespace rebind (stall=$stall, parentFinished=$parentFinished, parentEnds=$parentEnds, rejectBeforeAdmission=$rejectBeforeAdmission, replayReadFailure=$replayReadFailure, $mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease, cancelOnArrival=$cancelOnArrival, maskedCommit=$maskedCommit, finishBeforeReply=$finishBeforeReply, finishDuringRetry=$finishDuringRetry, commitInGrace=$commitInGrace, expireCreate=$expireCreate, failCreate=$failCreate, singleDispatch=$singleDispatch, retryTimeout=$retryTimeout, foreignCaller=$foreignCaller, commitError=$commitError, admissionRace=$admissionRace, reuseChild=$reuseChild)",
     (testCase) => {
       const { mode, legacy } = testCase;
+      const parentThreadId = ThreadId.make(
+        "reuseChild" in testCase && testCase.reuseChild === "encoded"
+          ? "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:parent"
+          : scope.thread!.threadId,
+      );
+
       const stillRunning = "stillRunning" in testCase;
       const recoveryTimeout = "recoveryTimeout" in testCase;
       const dispatchTimeout = "dispatchTimeout" in testCase ? testCase.dispatchTimeout : undefined;
@@ -6167,7 +6199,7 @@ describe("OrchestratorMcpService provider resolution", () => {
               ...unitCredential(parentThreadId),
               runtimeProviderSessionId: callerRuntimeId,
             });
-            const boundScope = scope;
+            const boundScope = { ...scope, thread: { ...scope.thread!, threadId: parentThreadId } };
             const request = {
               task: "Review.",
               mode,
@@ -6321,11 +6353,16 @@ describe("OrchestratorMcpService provider resolution", () => {
               const savedAsync =
                 mode === "async" &&
                 (dispatchTimeout === "after commit" || legacy || "commitInGrace" in testCase);
-              if (savedAsync) {
+              const pendingAsync = mode === "async" && !savedAsync && !("worktree" in testCase);
+              if (savedAsync || pendingAsync) {
                 assert.isTrue(Exit.isSuccess(response));
                 if (Exit.isFailure(response)) return assert.fail("expected the saved receipt");
                 timeoutTaskId = response.value.taskId;
                 assert.equal(response.value.waitTimedOut, false);
+                if (pendingAsync) {
+                  assert.equal(response.value.status, "creating");
+                  assert.isTrue(response.value.startPending);
+                }
                 if (inFlightRetry !== undefined) {
                   const retry = yield* Fiber.join(inFlightRetry);
                   assert.equal(retry.taskId, response.value.taskId);
@@ -6469,9 +6506,9 @@ describe("OrchestratorMcpService provider resolution", () => {
                 if ("singleDispatch" in testCase) assert.equal(createAttempts, 1);
                 if ("retryTimeout" in testCase) {
                   yield* TestClock.adjust("10 seconds");
-                  const failure = yield* Fiber.join(concurrent!).pipe(Effect.flip);
-                  assert.equal(failure.code, "delegation_timeout");
-                  assert.include(failure.message, recoveringId);
+                  const pending = yield* Fiber.join(concurrent!);
+                  assert.equal(pending.status, "creating");
+                  assert.equal(pending.taskId, recoveringId);
                   assert.equal(createAttempts, 1);
                 }
               }
@@ -6733,6 +6770,113 @@ describe("OrchestratorMcpService provider resolution", () => {
                 (yield* threads.getDelegationCommandState(commandId)).status,
                 "accepted",
               );
+              return;
+            }
+            if ("reuseChild" in testCase) {
+              const copied = ThreadId.make(
+                testCase.reuseChild === "encoded"
+                  ? first.childThreadId.replace("project%25253A%25252F", "project%253A%25252F")
+                  : first.childThreadId,
+              );
+              if (testCase.reuseChild === "encoded") assert.notEqual(copied, first.childThreadId);
+              const threads = yield* ThreadManagementService.ThreadManagementService;
+              const store = yield* ProjectionStore.ProjectionStoreV2;
+              assert.equal(
+                (yield* threads.getThreadShell(first.childThreadId))?.id,
+                first.childThreadId,
+              );
+              assert.equal(
+                (yield* service.readThread(boundScope, { threadId: first.childThreadId })).thread
+                  .threadId,
+                first.childThreadId,
+              );
+              assert.equal(
+                (yield* service.readThread(boundScope, { threadId: copied })).thread.threadId,
+                first.childThreadId,
+              );
+              const queued = yield* service.sendToThread(boundScope, {
+                threadId: copied,
+                mode: "queue",
+                message: "Second round",
+                clientRequestId: "reuse-before-completion",
+              });
+              assert.equal(queued.threadId, first.childThreadId);
+              const child = yield* orchestrator.getThreadProjection(first.childThreadId);
+              const now = yield* DateTime.now;
+              for (const run of child.runs)
+                yield* store.apply({
+                  type: "run.updated",
+                  id: EventId.make(`reuse:complete:${run.ordinal}`),
+                  threadId: first.childThreadId,
+                  runId: run.id,
+                  occurredAt: now,
+                  payload: { ...run, status: "completed", completedAt: now },
+                });
+              yield* orchestrator.recoverDelegatedTasks;
+              const terminal = yield* service.taskStatus(boundScope, first.taskId);
+              assert.equal(terminal.childThreadId, first.childThreadId);
+              assert.equal(terminal.status, "completed");
+              const shell = yield* threads.getThreadShell(first.childThreadId);
+              assert.equal(shell?.deletedAt, null);
+              for (const id of [first.childThreadId, copied]) {
+                const read = yield* service.readThread(boundScope, { threadId: id });
+                assert.equal(read.thread.threadId, first.childThreadId);
+                const wait = yield* service.waitForThread(boundScope, {
+                  threadId: id,
+                  runId: child.runs[0]!.id,
+                });
+                assert.equal(wait.threadId, first.childThreadId);
+                assert.equal(wait.status, "completed");
+              }
+              const followup = yield* service.sendToThread(boundScope, {
+                threadId: copied,
+                mode: "queue",
+                message: "Third round",
+                clientRequestId: "reuse-after-completion",
+              });
+              assert.equal(followup.threadId, first.childThreadId);
+              assert.isDefined(followup.taskId);
+              const retry = yield* service.sendToThread(boundScope, {
+                threadId: first.childThreadId,
+                mode: "queue",
+                message: "Third round",
+                clientRequestId: "reuse-after-completion",
+              });
+              assert.equal(retry.runId, followup.runId);
+              assert.equal(retry.taskId, followup.taskId);
+              const beforeDelete = yield* orchestrator.getThreadProjection(first.childThreadId);
+              yield* store.apply({
+                type: "thread.deleted",
+                id: EventId.make("reuse:deleted"),
+                threadId: first.childThreadId,
+                occurredAt: now,
+                payload: { ...beforeDelete.thread, deletedAt: now },
+              });
+              assert.equal(yield* threads.getThreadShell(first.childThreadId), null);
+              for (const id of new Set([first.childThreadId, copied])) {
+                const operations: ReadonlyArray<Effect.Effect<unknown, OrchestratorMcpFailure>> = [
+                  service.readThread(boundScope, { threadId: id }),
+                  service.sendToThread(boundScope, {
+                    threadId: id,
+                    mode: "queue",
+                    message: "Deleted follow-up",
+                    clientRequestId: "reuse-after-deletion",
+                  }),
+                  service.waitForThread(boundScope, { threadId: id }),
+                  service.interruptThread(boundScope, {
+                    threadId: id,
+                    clientRequestId: "reuse-deleted-interrupt",
+                  }),
+                ];
+                for (const operation of operations) {
+                  const error = yield* operation.pipe(Effect.asVoid, Effect.flip);
+                  assert.equal(error.code, "thread_not_found");
+                  assert.include(
+                    error.message,
+                    `deleted at ${DateTime.formatIso(now)} by an unrecorded actor`,
+                  );
+                }
+              }
               return;
             }
             if (timeoutTaskId !== undefined) assert.equal(first.taskId, timeoutTaskId);

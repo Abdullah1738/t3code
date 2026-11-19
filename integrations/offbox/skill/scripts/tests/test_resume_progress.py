@@ -32,6 +32,7 @@ class ResumeProgressTests(Isolated):
             self.stack.enter_context(patch.object(lease.ssh_sync, name))
         self.stack.enter_context(patch.object(lease, 'ensure_ttl'))
         self.starts = []
+        self.real_resume = api.resume
         self.stack.enter_context(patch.object(api, 'resume', side_effect=lambda bid, *a, **kw: self.starts.append(bid)))
         self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
 
@@ -206,6 +207,112 @@ class ResumeProgressTests(Isolated):
                                 records = [json.loads(line) for line in common.HOME_FAILURES.read_text().splitlines()]
                                 self.assertEqual(records[-1]['class'], code)
                                 self.assertEqual(records[-1]['run'], ids[0])
+
+    def test_stopped_push_resume_failure_at_preparation_expiry_retains_run_evidence(self):
+        self.box('cold', 'stopped')
+        for background in (False, True):
+            for terminal in ('archived', 'stopping'):
+                for healthy in (False, True):
+                    with self.subTest(background=background, terminal=terminal, healthy=healthy), \
+                            contextlib.ExitStack() as stack:
+                        self.clock.t = 1000
+                        self.starts.clear()
+                        stack.enter_context(patch.dict(os.environ, OFFBOX_BACKEND='server'))
+                        stack.enter_context(patch.object(home, 'may_fail_over', return_value=False))
+                        probe = stack.enter_context(patch.object(home, 'probe', return_value=(
+                            None if healthy else common.OffboxError('home unavailable'))))
+                        if background:
+                            stack.enter_context(patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: common.new_id('run')}))
+                        reason = '503 incus_slow: config.device.set exceeded 120s'
+                        def get(bid, **kwargs):
+                            if not self.starts:
+                                return dict(id=bid, state='archived', type='large')
+                            self.clock.sleep(150)
+                            return dict(id=bid, state=terminal, type='large', error=reason,
+                                        startError={'class': 'incus_slow', 'cleanup': 'unknown'},
+                                        updatedAt=dt.datetime.fromtimestamp(self.clock.t, dt.timezone.utc).isoformat())
+                        stack.enter_context(patch.object(api, 'readiness_get', side_effect=get))
+                        ids, classes = [], []
+                        def start(runner):
+                            ids.append(runner.run_id)
+                            runner.box = 'cold'
+                            runner.lease_row = dict(self.con.execute(
+                                "SELECT * FROM leases WHERE box_id='cold'").fetchone())
+                            try:
+                                with prepare.guard('cold', seconds=150):
+                                    runner._resume_stopped_push(self.con)
+                            except api.BoxBootFailed as caught:
+                                classes.append(caught.api_code)
+                                raise
+                        stack.enter_context(patch.object(runs.Runner, 'start', start))
+                        args = cli.build_parser().parse_args(['run', '--remote', '--', 'true'])
+                        self.assertEqual(cli.cmd_run(args, self.me), common.EXIT_INFRA)
+                        self.assertEqual(self.starts, ['cold'])
+                        self.assertEqual(classes, ['incus_slow'])
+                        probe.assert_not_called()
+                        self.assertIsNone(prepare._ACTIVE.get())
+                        self.assertFalse(self.events('cold', 'resume_stuck'))
+                        self.assertIsNone(lease.boot_dead(self.con, 'cold'))
+                        state = runs.read_json(runs.LOGS_DIR / f'{ids[0]}.state.json', {})
+                        self.assertIs(state['infra_failure'], True)
+                        self.assertEqual(state['infra_reason'], 'box_error')
+                        self.assertEqual(state['box_error'], {'box_id': 'cold', 'error': reason})
+
+    def test_stopped_push_resume_post_refusal_retains_run_evidence(self):
+        self.box('cold', 'stopped')
+        for background in (False, True):
+            for elapsed in (0, 150):
+                for code in ('incus_slow', 'boot_timeout', 'incus_failed', 'port_in_use'):
+                    with self.subTest(background=background, elapsed=elapsed, code=code), \
+                            contextlib.ExitStack() as stack:
+                        self.clock.t = 1000
+                        stack.enter_context(patch.dict(os.environ, OFFBOX_BACKEND='server'))
+                        stack.enter_context(patch.object(home, 'may_fail_over', return_value=False))
+                        probe = stack.enter_context(patch.object(home, 'probe'))
+                        if background:
+                            stack.enter_context(patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: common.new_id('run')}))
+                        stack.enter_context(patch.object(api, 'readiness_get', return_value={
+                            'id': 'cold', 'state': 'archived', 'type': 'large'}))
+                        message = 'failed start cleanup is still pending'
+                        refusal = api.ApiError(503, code, message)
+                        def call(method, path, body, **kwargs):
+                            self.assertEqual((method, path), ('POST', '/sandboxes/cold/resume'))
+                            self.clock.sleep(elapsed)
+                            raise refusal
+                        post = stack.enter_context(patch.object(api, 'call', side_effect=call))
+                        stack.enter_context(patch.object(api, 'resume', self.real_resume))
+                        ids, failures = [], []
+                        def start(runner):
+                            ids.append(runner.run_id)
+                            runner.box = 'cold'
+                            runner.lease_row = dict(self.con.execute(
+                                "SELECT * FROM leases WHERE box_id='cold'").fetchone())
+                            try:
+                                with prepare.guard('cold', seconds=150):
+                                    runner._resume_stopped_push(self.con)
+                            except api.BoxBootFailed as caught:
+                                failures.append(caught)
+                                raise
+                        stack.enter_context(patch.object(runs.Runner, 'start', start))
+                        args = cli.build_parser().parse_args(['run', '--remote', '--', 'true'])
+                        self.assertEqual(cli.cmd_run(args, self.me), common.EXIT_INFRA)
+                        post.assert_called_once()
+                        failure, = failures
+                        self.assertIs(failure.__cause__, refusal)
+                        self.assertEqual((failure.box_id, failure.status, failure.api_code), ('cold', 503, code))
+                        self.assertEqual(failure.reason, f'503 {code}: {message}')
+                        probe.assert_not_called()
+                        self.assertIsNone(prepare._ACTIVE.get())
+                        self.assertFalse(self.events('cold', 'resume_stuck'))
+                        self.assertIsNone(lease.boot_dead(self.con, 'cold'))
+                        state = runs.read_json(runs.LOGS_DIR / f'{ids[0]}.state.json', {})
+                        self.assertIs(state['infra_failure'], True)
+                        self.assertEqual(state['infra_reason'], 'box_error')
+                        self.assertEqual(state['box_error'], {'box_id': 'cold', 'error': failure.reason})
+                        if code == 'incus_slow':
+                            records = [json.loads(line) for line in common.HOME_FAILURES.read_text().splitlines()]
+                            self.assertEqual(records[-1]['class'], code)
+                            self.assertEqual(records[-1]['run'], ids[0])
 
     def test_return_to_archived_with_error_does_not_restart_progress_timer(self):
         self.box('cold', 'stopped', member=True)

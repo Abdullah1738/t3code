@@ -170,6 +170,7 @@ const makeHarness = (
               rootThreadId: string;
               ticket: string;
               state: string;
+              silentForMs?: number;
               quarantinedAt: string | null;
               openCallId: string | null;
             } | null;
@@ -360,7 +361,10 @@ describe("desktop lease HTTP", () => {
           assert.strictEqual(reconciled.status, 200);
           assert.isNull(reconciled.body.lease);
         }),
-      { scopes: ["orchestration:read", "orchestration:operate", "environment:maintain"] },
+      {
+        scopes: ["orchestration:read", "orchestration:operate", "environment:maintain"],
+        holderTurnActive: () => true,
+      },
     ),
   );
 
@@ -414,11 +418,11 @@ describe("desktop lease HTTP", () => {
         yield* request("GET", "");
         assert.deepEqual(
           events().map((e) => e.reason),
-          ["queued_withdrawn", "queue_expired"],
+          ["queued_withdrawn", "queue_expired", "auto_reconciled"],
         );
         assert.deepEqual(
           events().map((e) => e.kind),
-          ["desktop_lease.transition", "desktop_lease.transition"],
+          ["desktop_lease.transition", "desktop_lease.transition", "desktop_lease.transition"],
         );
         assert.equal(events()[0]?.ticket, queued.body.ticket);
         assert.equal(events()[0]?.mode, "cua-driver");
@@ -443,11 +447,9 @@ describe("desktop lease HTTP", () => {
             advance(QUIET_MS);
             const quarantined = yield* request("GET", "");
             assert.equal(quarantined.body.lease?.state, "quarantined");
+            assert.equal(quarantined.body.lease?.silentForMs, QUIET_MS);
             assert.equal(quarantined.body.lease?.openCallId, "hung");
             assert.equal(quarantined.body.lease?.quarantinedAt, "2025-06-15T15:16:40.000Z");
-            advance(QUIET_MS - 1);
-            assert.equal((yield* request("GET", "")).body.lease?.state, "quarantined");
-            advance(1);
             const recovered = yield* request("GET", "");
             if (active === false) {
               assert.isNull(recovered.body.lease);

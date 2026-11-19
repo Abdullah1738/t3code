@@ -1,3 +1,4 @@
+import * as ProviderRuntimeInventory from "../providers/ProviderRuntimeInventory.ts";
 import * as DatabaseDiagnostics from "../../persistence/DatabaseDiagnostics.ts";
 /**
  * `/threads?active=true` and `/requests` start from the live and pending ids
@@ -9,6 +10,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { assert, describe, it } from "@effect/vitest";
 import {
   AuthSessionId,
+  type AuthEnvironmentScopes,
   OrchestrationV2AppThreadJson,
   AnalyticsEvent,
   type OrchestrationV2ThreadProjection,
@@ -256,6 +258,7 @@ const makeHarness = (
   realSnapshots = false,
   heldList?: { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   heldMessage?: { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  authScopes: AuthEnvironmentScopes = ["orchestration:read", "orchestration:operate"],
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -395,7 +398,7 @@ const makeHarness = (
                               sessionId: AuthSessionId.make("session-cli"),
                               subject: "cli-issued-session",
                               method: "bearer-access-token" as const,
-                              scopes: ["orchestration:read", "orchestration:operate"],
+                              scopes: authScopes,
                             }),
                           ),
                     ),
@@ -423,6 +426,15 @@ const makeHarness = (
                   scratchRoot: Effect.succeed(Option.none()),
                 }),
                 Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+                Layer.mock(ProviderRuntimeInventory.ProviderRuntimeInventory)({
+                  snapshot: Effect.succeed({
+                    sampledAt: 1000,
+                    sampleAgeMs: 2000,
+                    tagsAvailable: true,
+                    runtimes: [],
+                    truncated: { runtimes: 0, retiredRuntimes: 0, tagProcesses: 0 },
+                  }),
+                }),
                 ServerSettings.layerTest(),
                 Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
                   enqueueCommand: (effect) => effect,
@@ -1683,7 +1695,12 @@ describe("control listings", () => {
     "/threads/quiet/messages",
     "/threads/quiet/messages?since=0&role=user&all=true",
     "/messages?since=0&limit=1000",
+    "/threads?limit=1&updatedSince=2025-01-01T00:00:00.000Z",
+    "/threads?active=true&limit=5",
+    "/threads?active=true&includeSubagents=true&limit=5",
+    "/threads?active=true&limit=500",
     "/threads?active=true&includeSubagents=true&limit=500",
+    "/identity/resolve?nativeId=codex-session-uuid&driver=codex",
     "/threads?active=1&limit=500",
     "/threads?state=running,queued&limit=500",
     "/threads?ids=live-running&active=true&limit=1",
@@ -1735,7 +1752,7 @@ describe("control listings", () => {
             harness.get(
               index % 2 === 0
                 ? "/threads/quiet/messages?all=true"
-                : "/threads?active=true&limit=500",
+                : "/threads?limit=1&updatedSince=2025-01-01T00:00:00.000Z",
             ),
           ),
           { concurrency: "unbounded" },
@@ -1760,7 +1777,7 @@ describe("control listings", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.live("a held list transaction leaves both foreground slots available", () =>
+  it.live("a control list burst leaves a foreground reader for the UI", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -1775,10 +1792,18 @@ describe("control listings", () => {
         });
         // Initialize lazy route layers without entering the held shell read.
         assert.equal((yield* harness.get("/projects")).status, 200);
-        const list = yield* harness.get("/threads?limit=500").pipe(Effect.forkChild);
+        const list = yield* harness.get("/threads?active=true&limit=500").pipe(Effect.forkChild);
         yield* Deferred.await(entered);
+        yield* Queue.take(harness.authenticated);
+        yield* Queue.take(harness.authenticated);
+        const burst = yield* Effect.all(
+          ["/threads?limit=500", "/threads?origin=none", "/messages?since=0"].map((endpoint) =>
+            harness.get(endpoint),
+          ),
+          { concurrency: "unbounded" },
+        ).pipe(Effect.forkChild);
+        yield* Effect.forEach(Array.from({ length: 3 }), () => Queue.take(harness.authenticated));
         const first = yield* Deferred.make<void>();
-        const second = yield* Deferred.make<void>();
         const probe = (ready: Deferred.Deferred<void>) =>
           sql
             .withTransaction(
@@ -1789,29 +1814,34 @@ describe("control listings", () => {
             )
             .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads, Effect.forkChild);
         const one = yield* probe(first);
-        const two = yield* probe(second);
-        yield* Effect.all([Deferred.await(first), Deferred.await(second)]).pipe(
+        yield* Deferred.await(first).pipe(
+          Effect.andThen(Effect.sync(() => assert.isUndefined(burst.pollUnsafe()))),
           Effect.timeout("2 seconds"),
           Effect.ensuring(Deferred.succeed(release, undefined)),
         );
         assert.equal((yield* Fiber.join(list)).status, 200);
         yield* Fiber.join(one);
-        yield* Fiber.join(two);
+        for (const response of yield* Fiber.join(burst)) assert.equal(response.status, 200);
       }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  // Historical listings stay off the interactive reader slots, including enrichment.
+  // Candidate, live-id and explicit-id paths must all bypass background sweeps.
   it.live.each([
     "limit=1",
+    "limit=1&active=true",
     "limit=1&ids=quiet",
     "limit=1&ids=quiet&active=false",
     "limit=1&state=idle",
     "limit=1&updatedSince=2025-01-01T00:00:00.000Z",
     "limit=1&origin=none",
+    "limit=500&origin=imessage",
+    "limit=500&creationSource=web,mobile,desktop,mcp&updatedSince=0",
+    "limit=500&creationSource=provider&includeSubagents=true&updatedSince=0",
     "limit=1&archived=true",
     "limit=1&includeSubagents=true",
-  ])("GET threads %s completes while foreground slots and the writer are held", (query) =>
+    `limit=1&cursor=${Buffer.from(JSON.stringify({ u: 1_800_000_000_000, id: "cursor-0001" })).toString("base64url")}`,
+  ])("GET threads %s completes while the background reader and writer are held", (query) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -1819,14 +1849,13 @@ describe("control listings", () => {
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         const harness = yield* makeHarness();
-        assert.equal((yield* harness.get(`/threads?${query}`)).status, 200);
+        const expected = yield* harness.get(`/threads?${query}`);
+        assert.equal(expected.status, 200);
         const readerHeld = yield* Deferred.make<void>();
         const writerHeld = yield* Deferred.make<void>();
-        const secondReaderHeld = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const hold = (signal: Deferred.Deferred<void>) =>
           Deferred.succeed(signal, undefined).pipe(Effect.andThen(Deferred.await(release)));
-        // Occupy both foreground slots so the old list routing cannot pass.
         const reader = yield* sql
           .withTransaction(
             sql`SELECT thread_id, json_extract(payload_json, '$.lineage.parentThreadId')
@@ -1834,13 +1863,9 @@ describe("control listings", () => {
               Effect.andThen(hold(readerHeld)),
             ),
           )
-          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads, Effect.forkChild);
-        const secondReader = yield* sql
-          .withTransaction(hold(secondReaderHeld))
-          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads, Effect.forkChild);
+          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
         const writer = yield* sql.withTransaction(hold(writerHeld)).pipe(Effect.forkChild);
         yield* Deferred.await(readerHeld);
-        yield* Deferred.await(secondReaderHeld);
         yield* Deferred.await(writerHeld);
         yield* Effect.gen(function* () {
           const responses = yield* Effect.all(
@@ -1849,7 +1874,7 @@ describe("control listings", () => {
           );
           for (const response of responses) {
             assert.equal(response.status, 200);
-            assert.lengthOf(response.body.threads, 1);
+            assert.deepEqual(response.body, expected.body);
           }
           assert.isUndefined(reader.pollUnsafe());
           assert.isUndefined(writer.pollUnsafe());
@@ -1860,7 +1885,6 @@ describe("control listings", () => {
           Effect.ensuring(Deferred.succeed(release, undefined)),
         );
         yield* Fiber.join(reader);
-        yield* Fiber.join(secondReader);
         yield* Fiber.join(writer);
       }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
@@ -2904,3 +2928,32 @@ describe("control listings", () => {
     ),
   );
 });
+
+it.effect(
+  "provider inventory is an authenticated cached read with explicit freshness and bounds",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const result = yield* harness.get("/provider-runtimes/inventory");
+      assert.strictEqual(result.status, 200);
+      assert.deepEqual(result.body, {
+        ok: true,
+        sampledAt: 1000,
+        sampleAgeMs: 2000,
+        tagsAvailable: true,
+        runtimes: [],
+        truncated: { runtimes: 0, retiredRuntimes: 0, tagProcesses: 0 },
+      });
+      assert.strictEqual(yield* Ref.get(harness.snapshotReads), 0);
+      assert.notInclude(JSON.stringify(result.body), "Bearer");
+    }).pipe(Effect.scoped, Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("provider inventory requires orchestration read scope", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness(undefined, [], new Set(), [], false, undefined, undefined, [
+      "orchestration:operate",
+    ]);
+    assert.strictEqual((yield* harness.get("/provider-runtimes/inventory")).status, 403);
+  }).pipe(Effect.scoped, Effect.provide(Sqlite.layerMemory)),
+);

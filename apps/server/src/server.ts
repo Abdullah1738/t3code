@@ -1,3 +1,4 @@
+import * as ProviderRuntimeInventory from "./ardud/providers/ProviderRuntimeInventory.ts";
 import * as RunStartDeadline from "./orchestration-v2/RunStartDeadline.ts";
 import * as McpCallLedger from "./ardud/analytics/McpCallLedger.ts";
 import * as McpAvailability from "./ardud/analytics/McpAvailability.ts";
@@ -135,6 +136,7 @@ import * as SourceControlRepositoryService from "./sourceControl/SourceControlRe
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as Observability from "./observability/Observability.ts";
 import * as HeapSnapshot from "./observability/HeapSnapshot.ts";
+import * as MainThreadWatchdog from "./observability/MainThreadWatchdog.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
 import * as LargeReplyLog from "./observability/LargeReplyLog.ts";
 import * as ReplyBuilders from "./ardud/http/ReplyBuilders.ts";
@@ -234,7 +236,10 @@ const HTTP_ROUTER_CONFIG = {
 // already closes the websocket gracefully.
 const HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS = 0;
 const layerResourceAttribution = ResourceAttribution.layer;
-const layerApplicationObservability = EventLoopMonitor.layer.pipe(
+const layerApplicationObservability = Layer.mergeAll(
+  EventLoopMonitor.layer,
+  MainThreadWatchdog.layer,
+).pipe(
   Layer.provideMerge(HttpSocketTelemetry.layer),
   Layer.provideMerge(Observability.layer),
   Layer.provideMerge(layerResourceAttribution),
@@ -328,7 +333,6 @@ const layerResourceDiagnostics = Layer.mergeAll(
   layerResourceTelemetry,
   ProcessDiagnostics.layer.pipe(Layer.provide(layerResourceTelemetry)),
   ProcessResourceMonitor.layer.pipe(Layer.provide(layerResourceTelemetry)),
-  ProcessGroupMetrics.layer.pipe(Layer.provide(layerResourceTelemetry)),
 ).pipe(StartupPhaseLog.withStartupLayer("server.diagnostics"));
 
 const layerRelayClient = Layer.unwrap(
@@ -751,7 +755,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
   StartupPhaseLog.withStartupLayer("server.runtime-core"),
 );
 
-const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
+const layerRuntimeDependenciesBase = layerRuntimeCoreDependencies.pipe(
   Layer.provideMerge(layerUsage),
   Layer.provideMerge(layerBackground),
   Layer.provideMerge(layerResourceDiagnostics),
@@ -763,6 +767,11 @@ const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
   Layer.provideMerge(ServerLifecycleEvents.layer),
   Layer.provide(NetService.layer),
   StartupPhaseLog.withStartupLayer("server.dependencies"),
+);
+
+const layerRuntimeDependencies = ProviderRuntimeInventory.layer.pipe(
+  Layer.provide(ProviderRuntimeInventory.layerProcessTags),
+  Layer.provideMerge(layerRuntimeDependenciesBase),
 );
 
 const layerCommandReadiness = HttpRouter.middleware(
@@ -778,6 +787,7 @@ const layerCommandReadiness = HttpRouter.middleware(
 );
 
 const layerMakeRoutes = Layer.mergeAll(
+  ProcessGroupMetrics.layer,
   Layer.mergeAll(
     HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
       Layer.provide(AuthHttp.layer),
