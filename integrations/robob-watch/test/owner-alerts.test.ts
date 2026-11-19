@@ -343,6 +343,10 @@ test("opted-in auto-pause texts once across two runner restarts and resume texts
   expect(f.accepted()[1]).toContain("Missed messages: checking.");
   expect(f.state().owner_imessage_episodes).toBeUndefined();
   expect(f.events().filter(row => row.name === "alert.imessage.sent").map(row => row.props.alertKind)).toEqual(["pause", "recovered"]);
+  const helpers = f.events().filter(row => row.name === "helper.run" && row.ids.helper !== "critical");
+  expect(helpers.some(row => row.ids.helper === "sqlite3")).toBe(true);
+  expect(helpers.some(row => row.ids.helper !== "sqlite3" && row.props.timeoutMs === 20_000)).toBe(true);
+  for (const row of helpers) expect(row).toMatchObject({ ids: { watcher: "critical" }, props: { timeoutMs: expect.any(Number), timedOut: false } });
 }, 20_000);
 
 test("bridge acceptance before a crash replays the same key and immutable payload", async () => {

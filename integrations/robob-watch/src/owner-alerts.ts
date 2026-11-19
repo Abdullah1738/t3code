@@ -98,7 +98,7 @@ async function flush(id: string): Promise<void> {
   let ok = false;
   let retryKey: string | undefined;
   try {
-    const result = await imessage(pending.text, pending.deliveryKey ?? `${pending.key}:${pending.kind}`, { reconcile: true });
+    const result = await imessage(pending.text, pending.deliveryKey ?? `${pending.key}:${pending.kind}`, { reconcile: true, watcher: id });
     if (result.pending) return;
     ok = result.ok;
     retryKey = result.retryKey;
