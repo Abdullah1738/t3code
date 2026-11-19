@@ -39,6 +39,13 @@ class Policy(unittest.TestCase):
         self.assertEqual(disk.level({'free_bytes': 5*G, 'total_bytes': 10*G, 'free_inodes': 0, 'total_inodes': 10}), 'full')
         self.assertEqual(disk.level({'free_bytes': 5*G, 'total_bytes': 10*G, 'free_inodes': 4, 'total_inodes': 100}), 'low')
 
+    def test_large_pool_thresholds_have_absolute_ceilings(self):
+        for free, expected in ((39, 'full'), (40, 'low'), (90, 'low'), (91, 'ok'), (131, 'ok')):
+            with self.subTest(free=free):
+                self.assertEqual(storage(free*G, 1744*G)['level'], expected)
+        self.assertEqual(disk.pool_thresholds(1744*G)['target'], 130*G)
+        self.assertEqual(disk.pool_thresholds(100*G), {'hard': 10*G, 'warn': 20*G, 'target': 25*G})
+
     def test_oldest_first_keeps_newest_three_run_points_clone_origins_and_timer_kinds(self):
         rows = snaps('a') + snaps('b') + snaps('a', kind='stop') + snaps('a', kind='hourly')
         rows[0]['clones'] = True
@@ -87,6 +94,30 @@ class ServerPressure(Base):
         self.stack.enter_context(patch.object(disk,'sample',return_value=storage()))
         self.stack.enter_context(patch.object(disk,'inventory',return_value=({},[])))
         self.stack.enter_context(patch.object(disk,'cleanup_pressure',return_value={'freeing_bytes':0,'io_full_avg10':0,'io_some_avg10':0}))
+
+    def test_large_pool_admission_and_health_use_capped_floor(self):
+        boatd.READY.set()
+        self.f.sh[('zpool','list')]=(0,'ONLINE')
+        for free, admitted in ((90, True), (39, False)):
+            with self.subTest(free=free), patch.object(disk, 'sample', return_value=storage(free*G,1744*G)):
+                boatd.disk_state(fresh=True)
+                if admitted:
+                    boatd.disk_admit()
+                else:
+                    with self.assertRaises(boatd.Fail) as caught:
+                        boatd.disk_admit()
+                    self.assertEqual(caught.exception.code, 'server_disk_low')
+                self.assertEqual(boatd.health(fresh=True)['ok'], admitted)
+
+    def test_large_pool_cleanup_caps_persisted_target_and_clears_shortfall(self):
+        self.con.execute("INSERT INTO meta(k,v) VALUES('disk_cleanup',?)", (json.dumps({'target_bytes':436*G}),))
+        for free, shortfall in ((90,40), (131,0)):
+            with self.subTest(free=free), patch.object(disk,'sample',return_value=storage(free*G,1744*G)):
+                result=boatd.disk_maintenance(self.con)
+                self.assertEqual(result['cleanup']['shortfall_bytes'],shortfall*G)
+                state=json.loads(self.con.execute("SELECT v FROM meta WHERE k='disk_cleanup'").fetchone()[0])
+                self.assertEqual(state['target_bytes'],130*G if shortfall else 0)
+        self.assertFalse(any(c[:2]==('snapshot','delete') for c in self.f.calls))
 
     def test_cached_health_keeps_disk_truth_without_waiting_for_slow_refresh(self):
         boatd.READY.set()

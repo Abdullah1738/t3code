@@ -596,8 +596,11 @@ def disk_maintenance(con, error=None):
         state = con.execute("SELECT v FROM meta WHERE k='disk_cleanup'").fetchone()
         cleanup = json.loads(state[0]) if state else {}
         pool = next((r for r in value['filesystems'] if r['filesystem'] == CFG['zpool']), None)
-        if pool and pool['free_bytes'] < pool['total_bytes'] * disk.WARN:
-            cleanup['target_bytes'] = int(pool['total_bytes'] * disk.TARGET)
+        if pool:
+            target = int(disk.pool_thresholds(pool['total_bytes'])['target'])
+            cleanup['target_bytes'] = min(cleanup.get('target_bytes', 0), target)
+            if pool['level'] in ('low', 'full'):
+                cleanup['target_bytes'] = target
         if pool and pool['free_bytes'] >= cleanup.get('target_bytes', 0):
             cleanup['target_bytes'] = 0
         live = {(r['box'], r['name']) for r in snaps}
