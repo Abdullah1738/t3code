@@ -2,6 +2,8 @@
 import datetime as dt
 import json
 
+from guard import recent_failure
+
 
 def timestamp(value):
     try:
@@ -15,11 +17,11 @@ def transitions(path):
     try:
         with path.open() as lines:
             for line in lines:
-                if 'listener.down' not in line and 'listener.up' not in line:
+                if 'listener.' not in line and 'deploy.result' not in line:
                     continue
                 try:
                     row = json.loads(line)
-                    if row.get('tool') == '9router' and row.get('name') in ('listener.down', 'listener.up') and timestamp(row.get('ts')) is not None:
+                    if row.get('tool') == '9router' and row.get('name') in ('listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved', 'deploy.result') and timestamp(row.get('ts')) is not None:
                         yield row
                 except (ValueError, AttributeError):
                     continue
@@ -31,35 +33,59 @@ def windows(day, root, generated):
     start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc)
     floor, ceiling = start.timestamp() * 1000, min((start + dt.timedelta(days=1)).timestamp() * 1000, generated.timestamp() * 1000)
     rows = []
-    # Only the last prior transition matters for a window still open at midnight.
+    # Keep the prior day's sparse transitions so recovery evidence and unknown
+    # intervals beginning at the same tick both survive midnight.
     for source in sorted((p for p in root.glob('????-??-??.ndjson') if p.stem < day), reverse=True):
         prior = list(transitions(source))
-        if prior:
-            rows.append(max(prior, key=lambda row: timestamp(row['ts'])))
+        if any(row['name'] in ('listener.down', 'listener.up', 'listener.state_resolved') or
+               row.get('props', {}).get('unknownSince') for row in prior):
+            rows.extend(prior)
             break
     rows.extend(transitions(root / (day + '.ndjson')))
     # Recovery may follow several missing or empty days; downSince joins it back.
     for source in sorted(p for p in root.glob('????-??-??.ndjson') if day < p.stem <= generated.date().isoformat()):
         rows.extend(transitions(source))
     incidents = {}
+    failures = [row.get('props', {}) for row in rows if row['name'] == 'deploy.result'
+                and timestamp(row['ts']) <= generated.timestamp() * 1000]
     for row in sorted(rows, key=lambda row: timestamp(row['ts'])):
         at = timestamp(row['ts'])
-        if at > generated.timestamp() * 1000:
+        if at > generated.timestamp() * 1000 or row['name'] == 'deploy.result':
             continue
         props = row.get('props') if isinstance(row.get('props'), dict) else {}
-        since = timestamp(props.get('downSince'))
+        unknown = row['name'] in ('listener.state_unknown', 'listener.state_resolved')
+        since_key = 'unknownSince' if unknown else 'downSince'
+        since = timestamp(props.get(since_key))
         if since is None:
             since = at if row['name'] == 'listener.down' else None
         if since is None or since > at:
             continue
-        incident = incidents.setdefault(since, dict(start=props.get('downSince') or row['ts'], end=None, cause=props.get('cause', 'unknown')))
-        if row['name'] == 'listener.up':
+        probe = props.get('downListener') if row['name'] == 'listener.up' else props.get('listener')
+        # Older guards omitted TCP results. Only an explicit refusal/timeout
+        # cause proves their unhealthy decision came from the listener check.
+        confirmed = not unknown and (probe in ('refused', 'unreachable') or
+                    props.get('cause') in ('listener_refused', 'listener_unreachable'))
+        key = (since, 'unknown' if unknown else 'listener')
+        incident = incidents.setdefault(key, dict(start=props.get(since_key) or row['ts'], end=None,
+                                                 cause='state_unknown', confirmed=False))
+        if confirmed:
+            incident.update(confirmed=True, cause=props.get('cause') or 'listener_' + probe)
+        if row['name'] in ('listener.up', 'listener.state_resolved'):
             incident['end'] = row['ts']
-    output = []
-    for since, incident in sorted(incidents.items()):
+    down, unknown = [], []
+    for (since, _), incident in sorted(incidents.items()):
         end = timestamp(incident['end']) if incident['end'] is not None else ceiling
         elapsed = max(0, min(ceiling, end) - max(floor, since))
         if elapsed > 0:
-            output.append(dict(**incident, downMs=round(elapsed, 3)))
-    return dict(count=len(output), totalDownMs=round(sum(row['downMs'] for row in output), 3),
-                maxDownMs=max((row['downMs'] for row in output), default=0), windows=output)
+            confirmed = incident.pop('confirmed')
+            # A failure result can be logged after detection but before recovery.
+            # Attribute only the recorded transaction, never today's live marker.
+            if confirmed and any(recent_failure(marker, since) and
+                                 marker.get('finishedAtMs', marker.get('startedAtMs')) <= end for marker in failures):
+                incident['cause'] = 'deploy_failed'
+            bucket, duration = (down, 'downMs') if confirmed else (unknown, 'unknownMs')
+            bucket.append(dict(**incident, **{duration: round(elapsed, 3)}))
+    confirmed_ms = round(sum(row['downMs'] for row in down), 3)
+    return dict(count=len(down), totalDownMs=confirmed_ms, confirmedDownMs=confirmed_ms,
+                maxDownMs=max((row['downMs'] for row in down), default=0), windows=down,
+                unknownStateMs=round(sum(row['unknownMs'] for row in unknown), 3), unknownWindows=unknown)
