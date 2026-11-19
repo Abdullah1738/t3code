@@ -17,13 +17,13 @@ const row = (id: string, extra: Partial<ThreadDetail> = {}): ThreadDetail => ({
   createdAt: null, updatedAt: null, activeRunId: "run-1", latestRunId: "run-1", ...extra,
 });
 
-function fixture() {
+function fixture(now: () => number = Date.now) {
   const server = { child: row("child") };
   const client = new ControlClient({ url: "http://127.0.0.1:1", token: "test" });
   const lists = spyOn(client, "listThreads").mockImplementation(async () => ({ total: 1, threads: [structuredClone(server.child)] }));
   const detail = spyOn(client, "thread").mockImplementation(async id => ({ thread: id === "owner"
     ? row("owner", { state: "idle", status: "idle", parentThreadId: null, rootThreadId: "owner" }) : structuredClone(server.child) }));
-  const roster = new ActiveRoster(client); roster.streamState(true);
+  const roster = new ActiveRoster(client, now); roster.streamState(true);
   const backend = new RobobBackend({ chatRoot: "/chats", client, activeRoster: roster, finishes: () => new Map() });
   const store = new Store(":memory:"); stores.push(store);
   const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } }, {
@@ -172,7 +172,7 @@ test("an aggregate removal fences both parallel details against reviving a child
 test.each(["running", "needs-input"] as const)("fetch merge retains %s detail facts across a later non-state event", async state => {
   const f = fixture(); const statuses = await f.backend.statuses(true);
   const response = Promise.withResolvers<{ total: number; threads: ThreadDetail[] }>();
-  f.lists.mockImplementation(async args => args?.active ? response.promise : { total: 1, threads: [f.server.child] });
+  f.lists.mockImplementationOnce(async () => response.promise);
   f.roster.event({ id: "1", data: { type: "thread.updated", threadId: "child", change: "thread.metadata-updated" } });
   f.server.child = row("child", { state, pendingRequest: state === "needs-input" ? question : null,
     pendingRequests: state === "needs-input" ? [question] : [] });
@@ -181,5 +181,201 @@ test.each(["running", "needs-input"] as const)("fetch merge retains %s detail fa
   response.resolve({ total: 1, threads: [row("child", { state: "idle", status: "idle" })] });
   expect(await f.backend.statuses(true)).toEqual({ child: { type: "busy", root: "owner" } });
   if (state === "needs-input") expect((await f.scan()).map(item => item.request.id)).toEqual(["question"]);
+  expect(f.reads()).toBe(3);
+});
+
+const listDetailRaces = (["question", "running"] as const).flatMap(change =>
+  [true, false].flatMap(listed => (["list-first", "detail-first"] as const).map(order => ({ change, listed, order }))));
+
+test.each(listDetailRaces)("overlapping list/detail preserve $change: listed=$listed, $order", async ({ change, listed, order }) => {
+  let clock = 1_000;
+  const f = fixture(() => clock), statuses = await f.backend.statuses(true);
+  const aggregate = Promise.withResolvers<{ total: number; threads: ThreadDetail[] }>();
+  const reconciliation = Promise.withResolvers<{ total: number; threads: ThreadDetail[] }>();
+  const reconciling = Promise.withResolvers<void>();
+  const responses = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+  const stale = listed ? [row("child", { state: "waiting", status: "waiting", activeRunId: null })] : [];
+  let fetches = 0, childReads = 0;
+  f.lists.mockImplementation(async args => {
+    if (!args?.active) return { total: 1, threads: [structuredClone(f.server.child)] };
+    if (++fetches === 1) return aggregate.promise;
+    reconciling.resolve(); return reconciliation.promise;
+  });
+  f.detail.mockImplementation(async id => {
+    if (id === "owner") return { thread: row("owner", { state: "idle", status: "idle", parentThreadId: null }) };
+    const snapshot = structuredClone(f.server.child);
+    if (++childReads === 2) entered.resolve();
+    if (childReads <= 2) await responses.promise;
+    return { thread: snapshot };
+  });
+  clock += 30_000; const refresh = f.backend.statuses(true);
+  f.server.child = change === "question" ? row("child", { state: "needs-input", pendingRequest: question, pendingRequests: [question] })
+    : row("child", { state: "running", status: "running", activeRunId: "run-2", latestRunId: "run-2" });
+  const scan = f.router["requests"]({ id: "owner", directory: "/chats", generation: 1,
+    messageId: "msg_work", startedAt: clock, phase: "running" }, statuses, true);
+  await entered.promise;
+  if (order === "list-first") { aggregate.resolve({ total: stale.length, threads: stale }); await reconciling.promise; }
+  responses.resolve(); await scan;
+  if (order === "detail-first") { aggregate.resolve({ total: stale.length, threads: stale }); await reconciling.promise; }
+  // Incoming evidence is visible while reconciliation is held, without waiting for a list GET.
+  expect(f.roster.isBusy("child")).toBe(true);
+  const admissions = Array.from({ length: 6 }, () => f.backend.statuses(true));
+  reconciliation.resolve({ total: 1, threads: [structuredClone(f.server.child)] });
+  await refresh;
+  for (const status of await Promise.all(admissions)) expect(status).toEqual({ child: { type: "busy", root: "owner" } });
+  expect((await f.scan()).map(item => item.request.id)).toEqual(change === "question" ? ["question"] : []);
+  expect(childReads).toBe(4);
+  expect(f.reads()).toBe(3);
+  expect(f.roster.status()).toMatchObject({ complete: true, ambiguous: 1 });
+});
+
+const eventPairs = (["running", "question", "idle", "resolved", "deleted", "archived"] as const).flatMap(change =>
+  (["event-first", "list-first"] as const).map(order => ({ change, order })));
+test.each(eventPairs)("list/SSE writers: $change, $order", async ({ change, order }) => {
+  let clock = 1_000;
+  const f = fixture(() => clock);
+  if (change === "resolved") f.server.child = row("child", { state: "needs-input", pendingRequest: question, pendingRequests: [question] });
+  await f.backend.statuses(true);
+  const stale = structuredClone(f.server.child), aggregate = Promise.withResolvers<{ total: number; threads: ThreadDetail[] }>();
+  let lists = 0;
+  f.lists.mockImplementation(async args => {
+    const threads = change === "deleted" || change === "archived" ? [] : [structuredClone(f.server.child)];
+    return args?.active && ++lists === 1 ? aggregate.promise : { total: threads.length, threads };
+  });
+  clock += 30_000; const refresh = f.backend.statuses(true);
+  const event = () => {
+    f.server.child = change === "question" ? row("child", { state: "needs-input", pendingRequest: question, pendingRequests: [question] })
+      : row("child", { state: change === "running" ? "running" : "idle", status: change === "running" ? "running" : "completed" });
+    f.roster.event({ id: "30", data: change === "question" ? { type: "request.opened", threadId: "child", ...question }
+      : change === "resolved" ? { type: "request.resolved", threadId: "child", requestId: "question" }
+      : change === "deleted" || change === "archived" ? { type: "thread.updated", threadId: "child", change: `thread.${change}` }
+      : { type: "thread.status", threadId: "child", runId: "run-1", state: f.server.child.state, status: f.server.child.status } });
+  };
+  if (order === "event-first") event();
+  aggregate.resolve({ total: 1, threads: [stale] }); await refresh;
+  if (order === "list-first") event();
+  const statuses = await f.backend.statuses(true);
+  expect(statuses).toEqual(change === "running" || change === "question" ? { child: { type: "busy", root: "owner" } } : {});
+  expect((await f.scan()).map(item => item.request.id)).toEqual(change === "question" ? ["question"] : []);
+  expect(f.reads()).toBeLessThanOrEqual(3);
+  expect(f.roster.status().ambiguous).toBeLessThanOrEqual(1);
+});
+
+test.each((["running", "needs-input"] as const).flatMap(state =>
+  (["event-first", "detail-first"] as const).map(order => ({ state, order })) ))("non-state event/detail writers: $state, $order", async ({ state, order }) => {
+  const f = fixture(), statuses = await f.backend.statuses(true);
+  const response = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+  let details = 0;
+  f.server.child = row("child", { state, pendingRequest: state === "needs-input" ? question : null,
+    pendingRequests: state === "needs-input" ? [question] : [] });
+  f.detail.mockImplementation(async id => {
+    if (id === "owner") return { thread: row("owner", { state: "idle", parentThreadId: null }) };
+    const snapshot = structuredClone(f.server.child);
+    if (++details === 2) entered.resolve();
+    if (details <= 2) await response.promise;
+    return { thread: snapshot };
+  });
+  const scan = f.router["requests"]({ id: "owner", directory: "/chats", generation: 1,
+    messageId: "msg_work", startedAt: Date.now(), phase: "running" }, statuses, true);
+  await entered.promise;
+  if (order === "event-first") f.roster.event({ id: "20", data: { type: "message.completed", threadId: "child" } });
+  response.resolve(); await scan;
+  if (order === "detail-first") f.roster.event({ id: "20", data: { type: "message.completed", threadId: "child" } });
+  expect(await f.backend.statuses(true)).toEqual({ child: { type: "busy", root: "owner" } });
+  expect((await f.scan()).map(item => item.request.id)).toEqual(state === "needs-input" ? ["question"] : []);
+  expect(f.reads()).toBe(1);
+});
+
+test.each(["running", "needs-input"] as const)("later-started idle reads clear held %s evidence", async state => {
+  let clock = 1_000;
+  const f = fixture(() => clock);
+  f.server.child = row("child", { state, pendingRequest: state === "needs-input" ? question : null,
+    pendingRequests: state === "needs-input" ? [question] : [] });
+  await f.backend.statuses(true);
+  f.server.child = row("child", { state: "idle", status: "completed", activeRunId: null });
+  clock += 30_000;
+  expect(await f.backend.statuses(true)).toEqual({});
+  expect(await f.scan()).toEqual([]);
   expect(f.reads()).toBe(2);
+  expect(f.roster.status().ambiguous).toBe(0);
+});
+
+test.each((["running", "question", "deleted", "archived"] as const).flatMap(change =>
+  (["event-first", "detail-first"] as const).map(order => ({ change, order }))))("detail/SSE writers: $change, $order", async ({ change, order }) => {
+  const f = fixture(), statuses = await f.backend.statuses(true);
+  const responses = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+  let details = 0;
+  f.detail.mockImplementation(async id => {
+    if (id === "owner") return { thread: row("owner", { state: "idle", parentThreadId: null }) };
+    if (++details === 2) entered.resolve();
+    if (details <= 2) { await responses.promise; return { thread: row("child", { state: "idle", activeRunId: null }) }; }
+    return { thread: structuredClone(f.server.child) };
+  });
+  const scan = f.router["requests"]({ id: "owner", directory: "/chats", generation: 1,
+    messageId: "msg_work", startedAt: Date.now(), phase: "running" }, statuses, true);
+  await entered.promise;
+  const event = () => {
+    f.server.child = change === "question" ? row("child", { state: "needs-input", pendingRequest: question, pendingRequests: [question] })
+      : row("child", { state: "running", status: "running" });
+    if (change === "deleted" || change === "archived") f.lists.mockResolvedValue({ total: 0, threads: [] });
+    f.roster.event({ id: "50", data: change === "question" ? { type: "request.opened", threadId: "child", ...question }
+      : change === "running" ? { type: "thread.status", threadId: "child", runId: "run-1", state: "running" }
+      : { type: "thread.updated", threadId: "child", change: `thread.${change}` } });
+  };
+  if (order === "event-first") event();
+  responses.resolve(); await scan;
+  if (order === "detail-first") event();
+  expect(await f.backend.statuses(true)).toEqual(change === "running" || change === "question" ? { child: { type: "busy", root: "owner" } } : {});
+  expect((await f.scan()).map(item => item.request.id)).toEqual(change === "question" ? ["question"] : []);
+  expect(f.reads()).toBeLessThanOrEqual(3);
+});
+
+test.each((["running", "needs-input"] as const).flatMap(state => [true, false].map(listed => ({ state, listed }))))("unchanged detail reaffirms $state against an older list: listed=$listed", async ({ state, listed }) => {
+  let clock = 1_000;
+  const f = fixture(() => clock);
+  f.server.child = row("child", { state, pendingRequest: state === "needs-input" ? question : null,
+    pendingRequests: state === "needs-input" ? [question] : [] });
+  const statuses = await f.backend.statuses(true);
+  const aggregate = Promise.withResolvers<{ total: number; threads: ThreadDetail[] }>();
+  f.lists.mockImplementationOnce(async () => aggregate.promise);
+  clock += 30_000; const refresh = f.backend.statuses(true);
+  await f.router["requests"]({ id: "owner", directory: "/chats", generation: 1,
+    messageId: "msg_work", startedAt: clock, phase: "running" }, statuses, true);
+  const stale = listed ? [row("child", { state: "waiting", pendingRequest: null })] : [];
+  aggregate.resolve({ total: stale.length, threads: stale }); await refresh;
+  expect(await f.backend.statuses(true)).toEqual({ child: { type: "busy", root: "owner" } });
+  expect((await f.scan()).map(item => item.request.id)).toEqual(state === "needs-input" ? ["question"] : []);
+  expect(f.reads()).toBe(3);
+  expect(f.roster.status().ambiguous).toBe(1);
+});
+
+test.each((["running", "needs-input"] as const).flatMap(state =>
+  (["new-first", "old-first"] as const).map(order => ({ state, order }))))("unchanged parallel detail reaffirms $state: $order", async ({ state, order }) => {
+  const f = fixture();
+  f.server.child = row("child", { state, pendingRequest: state === "needs-input" ? question : null,
+    pendingRequests: state === "needs-input" ? [question] : [] });
+  await f.backend.statuses(true);
+  const permissions = Promise.withResolvers<{ thread: ThreadDetail }>(), questions = Promise.withResolvers<{ thread: ThreadDetail }>();
+  const entered = Promise.withResolvers<void>(), landed = Promise.withResolvers<void>();
+  let childReads = 0;
+  f.detail.mockImplementation(async id => {
+    if (id === "owner") return { thread: row("owner", { state: "idle", parentThreadId: null }) };
+    if (++childReads === 1) return permissions.promise;
+    if (childReads === 2) { entered.resolve(); return questions.promise; }
+    return { thread: structuredClone(f.server.child) };
+  });
+  const first = order === "new-first" ? "questions" : "permissions";
+  signalDetail(f.backend, first, () => landed.resolve());
+  const scan = f.scan(); await entered.promise;
+  const snapshots = { permissions: row("child", { state: "waiting", status: "waiting", activeRunId: null }),
+    questions: structuredClone(f.server.child) };
+  const responses = { permissions, questions };
+  responses[first].resolve({ thread: snapshots[first] }); await landed.promise;
+  const second = first === "permissions" ? "questions" : "permissions";
+  responses[second].resolve({ thread: snapshots[second] }); await scan;
+  expect(await f.backend.statuses(true)).toEqual({ child: { type: "busy", root: "owner" } });
+  expect((await f.scan()).map(item => item.request.id)).toEqual(state === "needs-input" ? ["question"] : []);
+  expect(childReads).toBe(4);
+  expect(f.reads()).toBe(2);
+  expect(f.roster.status().ambiguous).toBe(1);
 });
