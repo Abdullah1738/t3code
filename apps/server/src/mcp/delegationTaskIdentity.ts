@@ -48,3 +48,23 @@ export function delegationIdShape(value: unknown) {
     return "thread_id";
   return "other";
 }
+
+/** Copied ids can lose one encoding layer at an interior separator. */
+export function fullyDecodedThreadId(value: string): string {
+  for (;;) {
+    // Decode one UTF-8 character at a time so literal or malformed percent text
+    // in a request key cannot prevent unrelated parent-id escapes from decoding.
+    const decoded = value.replace(
+      /%[0-7][\da-f]|%[cd][\da-f]%[89ab][\da-f]|%e[\da-f](?:%[89ab][\da-f]){2}|%f[0-4](?:%[89ab][\da-f]){3}/gi,
+      (encoded) => {
+        try {
+          return decodeURIComponent(encoded);
+        } catch {
+          return encoded;
+        }
+      },
+    );
+    if (decoded === value) return value;
+    value = decoded;
+  }
+}

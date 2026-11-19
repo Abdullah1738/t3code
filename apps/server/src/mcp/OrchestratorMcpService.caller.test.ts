@@ -22,6 +22,9 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Logger from "effect/Logger";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { McpCall } from "../ardud/analytics/McpCall.ts";
 import * as TestClock from "effect/testing/TestClock";
@@ -916,6 +919,229 @@ it.effect("listThreads times out a held foreground reader and records the stalle
         }),
       ),
       Effect.provideService(McpCall, call),
+    );
+  }),
+);
+
+const baseDelegatedId = ThreadId.make(
+  `thread:delegated-task:${encodeURIComponent(
+    "command:mcp:delegate-task:env:thread%3Aproject%3Aimport%253Aproject%253A%252Frepo:review",
+  )}`,
+);
+const copiedChildIds = [
+  { name: "interior layer lost", id: baseDelegatedId.replace("project%25253A", "project%253A") },
+  {
+    name: "interior layer gained",
+    id: baseDelegatedId.replace("project%25253A", "project%2525253A"),
+  },
+  {
+    name: "outer layer lost",
+    id: `thread:delegated-task:${decodeURIComponent(baseDelegatedId.slice(22))}`,
+  },
+  {
+    name: "outer layer gained",
+    id: `thread:delegated-task:${encodeURIComponent(baseDelegatedId.slice(22))}`,
+  },
+  { name: "lowercase escapes", id: baseDelegatedId.replaceAll("%3A", "%3a") },
+  { name: "entire id re-encoded", id: encodeURIComponent(baseDelegatedId) },
+  { name: "entire id decoded", id: decodeURIComponent(decodeURIComponent(baseDelegatedId)) },
+];
+
+it.effect.each([
+  ...copiedChildIds.map((form) => ({ ...form, state: "own", canonicalId: baseDelegatedId })),
+  ...[
+    { name: "literal percent", key: "review-100%" },
+    { name: "truncated escape", key: "review-%2" },
+    { name: "non-hex escape", key: "review-%GG" },
+    { name: "invalid UTF-8 byte", key: "review-%FF%3A" },
+    { name: "truncated UTF-8", key: "review-%E2%82" },
+    { name: "overlong UTF-8", key: "review-%C0%AF" },
+    { name: "surrogate UTF-8", key: "review-%ED%A0%80" },
+    { name: "out-of-range UTF-8", key: "review-%F4%90%80%80" },
+    { name: "valid UTF-8", key: "review-%C3%A9%E2%82%AC%F0%9F%98%80" },
+    { name: "Unicode and percent", key: "review-é€😀-%" },
+    { name: "nested valid escapes", key: "review-%25253A" },
+  ].map(({ name, key }) => {
+    const canonicalId = ThreadId.make(
+      baseDelegatedId.replace(/review$/, encodeURIComponent(encodeURIComponent(key))),
+    );
+    return {
+      name,
+      state: "own",
+      canonicalId,
+      id: canonicalId.replace("project%25253A", "project%253A"),
+    };
+  }),
+  ...[
+    "foreign",
+    "native",
+    "client",
+    "ambiguous",
+    "deleted",
+    "unknown",
+    "exact",
+    "exact_deleted",
+    "deleted_alias",
+    "wrong_key",
+  ].map((state) => ({
+    name: state,
+    state,
+    canonicalId: baseDelegatedId,
+    id:
+      state === "exact_deleted"
+        ? baseDelegatedId
+        : state === "wrong_key"
+          ? copiedChildIds[0]!.id.replace("review", "another-review")
+          : copiedChildIds[0]!.id,
+  })),
+])("resolves a copied child id: $name", (testCase) =>
+  Effect.gen(function* () {
+    const givenId = ThreadId.make(testCase.id);
+    const delegatedId = testCase.canonicalId;
+    if (testCase.state !== "exact_deleted") assert.notEqual(givenId, delegatedId);
+    const childShell = {
+      ...liveThreadShell(delegatedId, { activeRunId: null }),
+      deletedAt:
+        testCase.state === "deleted" || testCase.state === "exact_deleted"
+          ? DateTime.makeUnsafe(0)
+          : null,
+    };
+    const alternateId = ThreadId.make(delegatedId.replace("project%25253A", "project%2525253A"));
+    const task = {
+      id: NodeId.make("node:child"),
+      threadId: testCase.state === "foreign" ? targetId : callerId,
+      origin: testCase.state === "native" ? "provider_native" : "app_owned",
+      childThreadId: delegatedId,
+    };
+    const logs: Array<unknown> = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(message);
+    });
+    const lookup = (id: ThreadId) =>
+      id === delegatedId
+        ? childShell
+        : testCase.state === "exact" && id === givenId
+          ? liveThreadShell(givenId)
+          : testCase.state === "deleted_alias" && id === givenId
+            ? { ...liveThreadShell(givenId), deletedAt: DateTime.makeUnsafe(0) }
+            : null;
+    yield* Effect.gen(function* () {
+      const mcp = yield* OrchestratorMcp.OrchestratorMcpService;
+      const callerScope = testCase.state === "client" ? { ...scope, thread: undefined } : scope;
+      const operations = [
+        () =>
+          mcp
+            .readThread(callerScope, { threadId: givenId })
+            .pipe(Effect.map((r) => r.thread.threadId)),
+        () =>
+          mcp
+            .sendToThread(callerScope, {
+              threadId: givenId,
+              message: "Follow up",
+              mode: "queue",
+              clientRequestId: "copied-child",
+            })
+            .pipe(Effect.map((r) => r.threadId)),
+        () =>
+          mcp.waitForThread(callerScope, { threadId: givenId }).pipe(Effect.map((r) => r.threadId)),
+        () =>
+          mcp
+            .interruptThread(callerScope, {
+              threadId: givenId,
+              clientRequestId: "copied-interrupt",
+            })
+            .pipe(Effect.map((r) => r.threadId)),
+      ];
+      for (const operation of operations) {
+        if (testCase.state === "own" || testCase.state === "exact") {
+          assert.equal(yield* operation(), testCase.state === "exact" ? givenId : delegatedId);
+        } else {
+          const error = yield* operation().pipe(Effect.flip);
+          if (testCase.state === "ambiguous") {
+            assert.equal(error.code, "invalid_request");
+            assert.include(error.message, delegatedId);
+            assert.include(error.message, alternateId);
+          } else {
+            assert.equal(error.code, "thread_not_found");
+            assert.include(
+              error.message,
+              testCase.state === "deleted" ||
+                testCase.state === "exact_deleted" ||
+                testCase.state === "deleted_alias"
+                ? "deleted at 1970-01-01T00:00:00.000Z by an unrecorded actor"
+                : "never existed under this id",
+            );
+          }
+        }
+      }
+      const recoveries = logs.filter(
+        (m) => Array.isArray(m) && m[0] === "MCP delegated child id recovered",
+      );
+      assert.lengthOf(recoveries, testCase.state === "own" || testCase.state === "deleted" ? 4 : 0);
+      if (recoveries.length > 0)
+        assert.deepEqual(recoveries[0], [
+          "MCP delegated child id recovered",
+          {
+            callerThreadId: callerId,
+            givenId,
+            canonicalId: delegatedId,
+          },
+        ]);
+    }).pipe(
+      Effect.provide([
+        layer({
+          getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+          getThreadShell: (id) => {
+            const shell = lookup(id);
+            return Effect.succeed(shell?.deletedAt === null ? shell : null);
+          },
+          getThreadRecords: (id) => {
+            if (id === callerId) {
+              const projection = idleThreadProjection(liveThreadShell(callerId));
+              return Effect.succeed({
+                ...projection,
+                subagents:
+                  testCase.state === "unknown"
+                    ? []
+                    : [
+                        task,
+                        ...(testCase.state === "ambiguous"
+                          ? [{ ...task, childThreadId: alternateId }]
+                          : []),
+                      ],
+              } as unknown as OrchestrationV2ThreadProjection);
+            }
+            const shell = lookup(id);
+            return shell === null
+              ? Effect.fail(
+                  new OrchestratorProjectionError({
+                    threadId: id,
+                    cause: new ProjectionStore.ProjectionStoreThreadNotFoundError({ threadId: id }),
+                  }),
+                )
+              : Effect.succeed(idleThreadProjection(shell));
+          },
+          getProjectThreadRecords: ({ threadId }) =>
+            Effect.succeed(idleThreadProjection(lookup(threadId)!)),
+          getTimelinePage: (id) => {
+            assert.equal(id, testCase.state === "exact" ? givenId : delegatedId);
+            return Effect.succeed({ items: [], totalItems: 0, hasMore: false });
+          },
+          sendToThread: ({ threadId }) => {
+            assert.equal(threadId, testCase.state === "exact" ? givenId : delegatedId);
+            return Effect.succeed({
+              delivery: "queued",
+              run: { id: RunId.make("run:followup"), status: "queued" },
+            } as never);
+          },
+          waitForThread: ({ threadId }) => Effect.succeed({ threadId, run: null, timedOut: false }),
+          interruptThread: ({ threadId }) => {
+            assert.equal(threadId, testCase.state === "exact" ? givenId : delegatedId);
+            return Effect.succeed({ type: "no_active_run" });
+          },
+        }),
+        Logger.layer([logger], { mergeWithExisting: false }),
+      ]),
     );
   }),
 );
