@@ -47,6 +47,16 @@ class FakeHost:
         self.launches = {}
         self.lookups = []
         self.checks = dict(pid=1, started=NOW-3600, hold=None, restart=False, install=False, building=[])
+        self.apps = {}
+
+    def app_info(self, p):
+        return self.apps.get(p['comm'])
+
+    def quit_app(self, p):
+        self.effects.append(('quit', p['pid'], p['bundleId']))
+
+    def ssd_blocked(self):
+        return False
 
     def identity(self, p):
         q = self.live.get(p['pid'])
@@ -1000,7 +1010,7 @@ class PlumbingTests(unittest.TestCase):
         def run(argv, **kw):
             calls.append((argv, kw))
             if argv == m.PS:
-                text = '20 10 0:00.00 2048 S Mon Nov 16 00:00:00 2026 02:00:00 node\n'
+                text = '20 10 0:00.00 2048 S Mon Nov 16 00:00:00 2026 02:00:00 501 node\n'
             elif argv[0] == '/bin/ps':
                 text = '20 '+p['start']+' node next-server\n'
             elif argv[0] == '/bin/launchctl':
@@ -1031,7 +1041,7 @@ class PlumbingTests(unittest.TestCase):
             with self.subTest(namespace=namespace):
                 def run(argv, **kw):
                     if argv == m.PS:
-                        output = '10 1 0:00.00 2048 S Mon Nov 16 00:00:00 2026 02:00:00 node\n'
+                        output = '10 1 0:00.00 2048 S Mon Nov 16 00:00:00 2026 02:00:00 501 node\n'
                     elif argv[0] == '/bin/launchctl':
                         output = '10 0 '+namespace+'service\n'
                     elif argv[0] == '/bin/ps':
@@ -1048,6 +1058,26 @@ class PlumbingTests(unittest.TestCase):
                 parent = sample['rows'][0]
                 child = proc(20, 'node', ppid=10, args='node child.js')
                 self.assertTrue(m.protected(child, {10: parent, 20: child}))
+
+    def test_current_ps_schema_preserves_full_comm_paths_and_uid(self):
+        comms = ['node', '/Applications/Robob.app/Contents/MacOS/Robob',
+                 '/System/Library/CoreServices/System Utility', '/Users/ardud/bin/with spaces']
+        def run(argv, **kw):
+            if argv == m.PS:
+                output = '\n'.join('%s 1 0:00.00 2048 S Mon Nov 16 00:00:00 2026 02:00:00 %s %s' %
+                                   (20+i, 501+i, comm) for i, comm in enumerate(comms))
+            elif argv[0] == '/bin/ps':
+                output = '\n'.join('%s Mon Nov 16 00:00:00 2026 %s' % (20+i, comm) for i, comm in enumerate(comms))
+            elif argv[0] == '/bin/launchctl':
+                output = ''
+            elif argv[0] == '/usr/bin/top':
+                output = 'PID COMMAND MEM CMPRS\n20 node 1G 0G\n'
+            else:
+                output = 'total = 4G used = 0G' if argv[-1] == 'vm.swapusage' else '1'
+            return subprocess.CompletedProcess(argv, 0, output)
+        with patch.object(m, 'cpu_ticks', return_value=[1, 2, 3, 4]):
+            sample = m.Host(run).collect(1)
+        self.assertEqual([(p['uid'], p['comm']) for p in sample['rows']], list(zip(range(501,505), comms)))
 
     def test_provider_wrapper_forms(self):
         forms = [

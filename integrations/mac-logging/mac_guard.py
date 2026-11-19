@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import shlex
 import signal
@@ -36,6 +37,16 @@ MEMORY_EXEMPT = {
     'app_path': '/Applications/Robob.app/',
     'service_labels': ('com.ardud.opencode-service',),
 }
+# Owner #142 q2: these bundle identities never qualify for the slow GUI rule.
+GUI_NEVER_QUIT = {
+    'company.thebrowser.dia', 'com.apple.MobileSMS', 'com.ardud.robob',
+    'com.apple.finder', 'com.apple.Terminal', 'com.googlecode.iterm2',
+    'com.mitchellh.ghostty', 'dev.warp.Warp-Stable', 'dev.warp.Warp',
+    'dev.warp.Warp-Preview',
+}
+SLOW_LEAK_GIB = 8
+SLOW_LEAK_GIB_HOUR = 1
+SLOW_LEAK_SECONDS = 1800
 OVERLOAD_SCRIPT = Path.home() / '.robob/board-artifacts/main-thread-overload-20261113/overload-restart/robob-overload-restart.py'
 WORKER = ('codex', 'gpt-6.1-sol')
 STATE = Path.home() / '.local/state/mac-guard'
@@ -178,9 +189,9 @@ def label(p, rows):
     return next((q['label'] for q in [p]+chain(p, rows) if q.get('label')), None)
 
 
-def exempt(p, rows):
+def exempt(p, rows, system_gui=False):
     if (label(p, rows) in MEMORY_EXEMPT['service_labels'] or p.get('sessionWrapper')
-            or p['pid'] == os.getpid() or system(p) or provider(p) or robob(p, rows)):
+            or p['pid'] == os.getpid() or (system(p) and not system_gui) or provider(p) or robob(p, rows)):
         return True
     # Interpreter wrappers above a provider must never be killed as a tree root.
     return False
@@ -191,7 +202,54 @@ def protected(p, rows):
 
 
 def gui(p):
-    return '.app/' in p['comm'] and p['comm'].startswith('/Applications/') and not JOBS.fullmatch(Path(p['comm']).name)
+    return '.app/' in p['comm'] and p['comm'].startswith('/') and not JOBS.fullmatch(Path(p['comm']).name)
+
+
+def app_info(comm):
+    executable = Path(comm)
+    # Only a bundle's main executable can authorize quitting an application.
+    # A helper, XPC service or system daemon never inherits this exception.
+    bundle = executable.parent.parent.parent
+    if bundle.suffix != '.app' or executable.parent != bundle/'Contents/MacOS':
+        return None
+    if any(parent.suffix == '.app' for parent in bundle.parents):
+        return None
+    with (bundle/'Contents/Info.plist').open('rb') as stream:
+        info = plistlib.loads(stream.read(262144))
+    bid = info.get('CFBundleIdentifier')
+    if (info.get('CFBundleExecutable') != executable.name or info.get('CFBundlePackageType') != 'APPL'
+            or info.get('LSUIElement') or info.get('LSBackgroundOnly')
+            or not isinstance(bid, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]+', bid)):
+        return None
+    return dict(app=str(bundle), bundleId=bid)
+
+
+def quit_gui(pid, api=None):
+    """Send the normal Quit AppleEvent to a kernel PID, without launching an app."""
+    import ctypes as c
+    class Desc(c.Structure):
+        _fields_ = [('type', c.c_uint32), ('data', c.c_void_p)]
+    api = api or c.CDLL('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
+    if isinstance(api, c.CDLL):
+        api.AECreateDesc.argtypes = [c.c_uint32, c.c_void_p, c.c_long, c.POINTER(Desc)]
+        api.AECreateAppleEvent.argtypes = [c.c_uint32, c.c_uint32, c.POINTER(Desc), c.c_int16, c.c_int32, c.POINTER(Desc)]
+        api.AESendMessage.argtypes = [c.POINTER(Desc), c.POINTER(Desc), c.c_int32, c.c_int32]
+        api.AEDisposeDesc.argtypes = [c.POINTER(Desc)]
+    target, event, reply = Desc(), Desc(), Desc()
+    def checked(code):
+        if code:
+            raise OSError(code, 'Quit AppleEvent failed')
+    try:
+        process = c.c_int32(pid)
+        checked(api.AECreateDesc(int.from_bytes(b'kpid', 'big'), c.byref(process), c.sizeof(process), c.byref(target)))
+        checked(api.AECreateAppleEvent(int.from_bytes(b'aevt', 'big'), int.from_bytes(b'quit', 'big'),
+                                     c.byref(target), -1, 0, c.byref(event)))
+        # No reply; allow interaction so unsaved-work prompts retain normal Quit semantics.
+        checked(api.AESendMessage(c.byref(event), c.byref(reply), 0x01 | 0x20, 60))
+    finally:
+        for desc in (reply, event, target):
+            if desc.type:
+                api.AEDisposeDesc(c.byref(desc))
 
 
 def overload_checks(path=OVERLOAD_SCRIPT):
@@ -241,6 +299,20 @@ class Host:
         # Revalidate between commands too.
         if self.identity(p):
             self.cmd(['/usr/bin/taskpolicy', '-b', '-p', str(p['pid'])], 2)
+
+    def app_info(self, p):
+        try:
+            return json.loads(self.cmd(['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--app-info', p['comm']], 3))
+        except (ProbeError, ValueError):
+            return None
+
+    def quit_app(self, p):
+        request = {k: p[k] for k in ('pid', 'start', 'comm', 'argsHash', 'bundleId')}
+        request['stateDir'] = str(p['guardState'])
+        self.cmd(['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--quit-gui', json.dumps(request)], 10)
+
+    def ssd_blocked(self):
+        return (Path.home()/'.local/state/mac-upkeep/ssd-launchd-read-blocked').exists()
 
     def notify(self, key, text):
         self.cmd([str(Path.home()/'.bun/bin/bun'), str(Path.home()/'.local/share/telegram-bridge/src/cli.ts'),
@@ -356,8 +428,6 @@ class Host:
     def collect(self, cycle):
         raw = self.cmd(PS, 20)
         rows = parse_ps(raw)
-        comms = {int(line.split(None, 1)[0]): line.split(None, 11)[11].strip().strip('()')
-                 for line in raw.splitlines() if len(line.split(None, 11)) == 12 and line.split()[0].isdigit()}
         # cpu.PS deliberately omits argv. This separate read is identity-qualified
         # and is needed to exempt node/bun provider wrappers before any action.
         args = {}
@@ -378,7 +448,7 @@ class Host:
             # Without a service inventory only memory-exempt alerts are safe.
             labels = {p['pid']: 'unknown-service-inventory' for p in rows}
         for p in rows:
-            p.update(comm=comms.get(p['pid'], ''), label=labels.get(p['pid']))
+            p['label'] = labels.get(p['pid'])
             value = args.get(p['pid'])
             p['args'] = value[1] if value and value[0] == p['start'] else ''
         snapshot = dict(rows=rows, load=list(os.getloadavg()), ncpu=os.cpu_count() or 1, errors=[])
@@ -443,6 +513,10 @@ class Guard:
         if self.dry:
             self.saved, self.worker = {}, {}
         self.history, self.previous = {}, {}
+        self.slow_history = {(p['pid'], p['start']): deque(p['history'], maxlen=241)
+                             for p in self.saved.get('slowHistory', [])}
+        self.gui_jobs = {(p['pid'], p['start']): p for p in self.saved.get('guiJobs', [])}
+        self.slow_incidents = set()
         self.strain, self.streak, self.calm, self.cycle = bool(self.saved.get('strain')), 0, 0, 0
         self.lag = None
         self.since = (self.saved.get('strainSince') or self.saved.get('lastSample') or self.clock()) if self.strain else None
@@ -475,6 +549,8 @@ class Guard:
             return dict(p, args=command_label(p.get('args', '')))
         pending = [dict(e, proc=private_proc(e['proc'])) for e in self.pending]
         self.saved.update(pending=pending, stopped=[private_proc(p) for p in self.stopped],
+                          slowHistory=[dict(pid=pid, start=start, history=list(h)) for (pid, start), h in self.slow_history.items()],
+                          guiJobs=list(self.gui_jobs.values()),
                           hogs=[dict(pid=pid, start=start, **v) for (pid, start), v in self.hogs.items()],
                           restoreDue=self.restore_due, lastSample=self.now, strain=self.strain, strainSince=self.since)
         write_json(self.state/'state.json', self.saved)
@@ -484,6 +560,7 @@ class Guard:
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         value = dict(self.sample, summary=summary, actions=list(self.actions),
                      history={str(pid): list(h) for (pid, _), h in self.history.items() if pid in self.rows},
+                     slowHistory={str(pid): list(h) for (pid, _), h in self.slow_history.items() if pid in self.rows},
                      cpuTop30=self.cpu_top[:30], rZeroFamilies=self.r_zero)
         if value.get('top') is not None:
             value['top'] = sorted(value['top'], key=lambda p: -p['memMb'])[:20]
@@ -508,15 +585,30 @@ class Guard:
 
     def action(self, p, cls, action):
         current = self.rows.get(p['pid'])
-        if current and current['start'] == p['start'] and current['comm'] == p['comm']:
+        matched = current and current['start'] == p['start'] and current['comm'] == p['comm']
+        if matched:
             # Saved argv is redacted. Classify fresh argv, but verify the hash
             # captured when this action was authorized across daemon restarts.
-            p = dict(p, args=current.get('args', ''), sessionWrapper=current.get('sessionWrapper', False))
+            p = dict(current, argsHash=p.get('argsHash', current.get('argsHash')))
         allowed = cls not in ('A', 'B', 'C') or self.strain or action == 'CONT'
         result, errno = ('cancelled_strain_clear' if not allowed else 'would_'+action if self.muted else 'skipped_identity'), None
         stop_intent, prior_stage = False, None
+        gui_job = self.gui_jobs.get((p['pid'], p['start']))
+        gui_ok = (cls == 'G' and gui_job and gui_job['phase'] == 'force'
+                  and self.gui_force_growth(p, gui_job) and self.gui_allowed(p, gui_job))
+        if cls == 'G':
+            safe = gui_ok
+        elif cls == 'D' or action == 'CONT':
+            safe = not exempt(p, self.rows)
+        else:
+            safe = not protected(p, self.rows)
+        if allowed and not safe:
+            result = 'cancelled_gui_authorization' if cls == 'G' else 'cancelled_protection'
+        elif not matched:
+            result = 'skipped_identity'
         if (allowed and not self.muted and p['pid'] in self.rows and self.rows[p['pid']]['start'] == p['start']
-                and not exempt(p, self.rows) and not p['state'].startswith('?') and self.host.identity(p) and not self.muted):
+                and safe
+                and not p['state'].startswith('?') and self.host.identity(p) and not self.muted):
             try:
                 if action == 'STOP':
                     # A daemon crash after SIGSTOP must leave enough durable
@@ -546,11 +638,15 @@ class Guard:
                     self.save()
         value = dict(pid=p['pid'], start=p['start'], comm=p['comm'], args=command_label(p.get('args', '')),
                      action=action, result=result, errno=errno, actionClass=cls, owner=p.get('owner', {}).get('state', 'unknown'),
-                     cpuDelta=p.get('cpuDelta', 0), footprintGiB=p.get('footprintGiB'))
+                     cpuDelta=p.get('cpuDelta', 0), footprintGiB=p.get('footprintGiB'), label=label(p, self.rows))
+        if cls == 'G':
+            value.update(step='force-quit', **{k: p.get(k) for k in ('app', 'bundleId', 'growthGiBHour', 'footprintSeries')})
         self.actions.append(value)
         self.log('action', **value)
-        performed = result == 'sent' or self.dry and allowed
+        performed = result == 'sent' or self.dry and allowed and safe and matched
         if performed:
+            if cls == 'G' and action == 'KILL' and gui_job:
+                gui_job['phase'] = 'complete'
             if self.strain and self.first_action is None:
                 self.first_action = self.now
             if not self.restore_due:
@@ -559,6 +655,120 @@ class Guard:
                 self.stopped.append(dict(p))
                 self.hogs[(p['pid'], p['start'])] = dict(stage=2, at=self.now, confirmed=True)
         return performed
+
+    def slow_sample(self, p, footprint):
+        ident = (p['pid'], p['start'])
+        if not footprint:
+            return False
+        # Track plausible holders; history size is bounded independently of uptime.
+        if p['footprintGiB'] < 4 and ident not in self.slow_history:
+            return False
+        hist = self.slow_history.setdefault(ident, deque(maxlen=241))
+        while hist and (hist[0]['at'] < self.now-7200 or hist[-1]['at'] >= self.now):
+            hist.popleft()
+        hist.append(dict(at=self.now, footprintGiB=p['footprintGiB']))
+        old = next((v for v in reversed(hist) if self.now-v['at'] >= SLOW_LEAK_SECONDS), None)
+        p['growthGiBHour'] = (p['footprintGiB']-old['footprintGiB'])*3600/(self.now-old['at']) if old else 0
+        p['footprintSeries'] = list(hist)
+        return bool(old and p['footprintGiB'] > SLOW_LEAK_GIB and p['growthGiBHour'] > SLOW_LEAK_GIB_HOUR)
+
+    def gui_allowed(self, p, job=None):
+        info = self.host.app_info(p) if gui(p) else None
+        if not info:
+            return False
+        p.update(info)
+        if info['bundleId'] in GUI_NEVER_QUIT:
+            return False
+        # Activity Monitor is a main GUI executable in /System/Applications.
+        # No other /System path, app helper or daemon gets this exception.
+        system_gui = p['comm'].startswith('/System/Applications/') and Path(p['comm']).name not in MEMORY_EXEMPT['system_names']
+        if protected(p, self.rows) and (not system_gui or exempt(p, self.rows, system_gui=True) or label(p, self.rows)):
+            return False
+        return not job or info['bundleId'] == job['bundleId'] and info['app'] == job['app']
+
+    def gui_log(self, p, step, result, evidence=None):
+        value = {k: p.get(k) for k in ('pid', 'start', 'comm', 'app', 'bundleId', 'footprintGiB', 'footprintSeries', 'growthGiBHour')}
+        value.update(action=step, step=step, actionClass='G', result=result, evidence=evidence)
+        self.actions.append(value)
+        self.log('action', **value)
+
+    def gui_force_growth(self, p, job):
+        hist = self.slow_history.get((p['pid'], p['start']), [])
+        footprint = p.get('footprintGiB')
+        if footprint is None:
+            return False
+        return (self.now >= job['at']+120 and len(hist) >= 2
+                and 0 <= self.now-hist[-1]['at'] <= 60 and hist[-2]['at'] >= job['at']
+                and footprint > max(SLOW_LEAK_GIB, job['footprintGiB'], hist[-2]['footprintGiB'])
+                and p.get('growthGiBHour', 0) > SLOW_LEAK_GIB_HOUR)
+
+    def slow_actions(self, leaks):
+        current = {(p['pid'], p['start']) for p in leaks}
+        pending = {(e['proc']['pid'], e['proc']['start']) for e in self.pending}
+        for ident, job in list(self.gui_jobs.items()):
+            p = self.rows.get(ident[0])
+            if not p or p['start'] != ident[1]:
+                if self.host.same_birth(job) is not False:
+                    continue
+                self.gui_log(job, 'appgone', 'gone', job['evidence'])
+                self.gui_jobs.pop(ident)
+                continue
+            if job['phase'] == 'force' and ident not in pending:
+                # A crash may preserve TERM intent without delivery. Re-run
+                # the full growth/identity checks, then start a fresh KILL grace.
+                job['phase'] = 'waiting'
+            if job['phase'] != 'waiting' or self.now < job['at']+120 or self.muted and not self.dry:
+                continue
+            if p.get('footprintGiB') is None:
+                continue  # top failed: wait for current footprint evidence
+            if (ident in current and self.gui_force_growth(p, job) and self.gui_allowed(p, job)
+                    and not p['state'].startswith('?') and self.host.identity(p) and (not self.muted or self.dry)):
+                job['phase'] = 'force'
+                self.save()
+                self.terminate([p], 'G')
+                self.worker_needed(Path(job['evidence']), 'slow GUI leak: force-quit pid '+str(p['pid']), urgent=True)
+            else:
+                self.gui_log(p, 'force-quit', 'cancelled_not_growing_or_protected', job['evidence'])
+            self.save()
+        for p in leaks:
+            ident = (p['pid'], p['start'])
+            if ident in self.slow_incidents or ident in pending:
+                continue
+            allowed = self.gui_allowed(p)
+            path = self.snapshot('slow footprint leak pid '+str(p['pid']))
+            kind = 'gui' if allowed else 'protected' if protected(p, self.rows) or gui(p) else 'hog'
+            self.log('slow_leak', pid=p['pid'], start=p['start'], comm=p['comm'],
+                     footprintGiB=p['footprintGiB'], growthGiBHour=p['growthGiBHour'],
+                     footprintSeries=p['footprintSeries'], bundleId=p.get('bundleId'), memoryClass=kind,
+                     action='quit' if allowed else 'protected_alert' if kind == 'protected' else 'ladder', evidence=str(path))
+            if allowed and ident not in self.gui_jobs:
+                job = {k: p.get(k) for k in ('pid', 'start', 'comm', 'app', 'bundleId', 'footprintGiB', 'growthGiBHour', 'footprintSeries')}
+                job.update(at=self.now, phase='unknown', evidence=str(path))
+                if self.dry:
+                    job['phase'] = 'waiting'
+                    self.gui_jobs[ident] = job
+                    self.gui_log(p, 'quit', 'would_quit', str(path))
+                elif not self.muted and self.host.identity(p) and not self.muted:
+                    # Ambiguous Quit never authorizes force-quit after a crash.
+                    self.gui_jobs[ident] = job
+                    self.save()
+                    try:
+                        p['guardState'] = str(self.state)
+                        self.host.quit_app(p)
+                        job['phase'] = 'waiting'
+                        job['at'] = max(self.now, self.clock())
+                        self.gui_log(p, 'quit', 'sent', str(path))
+                        self.restore_due.append(job['at']+120)
+                    except (ProbeError, OSError) as exc:
+                        self.gui_log(p, 'quit', 'unknown', str(path))
+                        self.log('error', probe='gui_quit', failure=type(exc).__name__, errno=getattr(exc, 'errno', None), evidence=str(path))
+                    self.save()
+            text = 'mac-guard slow leak: %s pid %s at %.2f GiB, growing %.2f GiB/h (%s)' % (
+                p['comm'], p['pid'], p['footprintGiB'], p['growthGiBHour'], kind)
+            self.notify('mac-guard:slow-leak:%s:%s' % (p.get('bundleId') or label(p, self.rows) or p['comm'], iso(self.now)[:8]), text)
+            self.worker_needed(path, text+'; report evidence and actions on Mac Upkeep board', urgent=True)
+        if not self.muted or self.dry:
+            self.slow_incidents = current
 
     def terminate(self, processes, cls):
         sent = []
@@ -684,6 +894,8 @@ class Guard:
         p = max(procs, key=lambda q: q.get('footprintGiB', 0))
         path = self.snapshot('Robob memory runaway')
         reason = 'dry_run' if self.dry else 'paused' if self.muted else None
+        if not reason and self.host.ssd_blocked():
+            reason = 'ssd_read_blocked'
         if not reason and self.now-self.saved.get('lastRestartAt', 0) < 3600:
             reason = 'memory_restart_cooldown'
         if not reason:
@@ -785,7 +997,7 @@ class Guard:
         top = {p['pid']: p for p in sample.get('top') or []}
         current = set()
         new_incidents = set()
-        memory, robobs, memory4 = [], [], set()
+        memory, robobs, memory4, slow = [], [], set(), []
         signals = []
         for p in self.rows.values():
             ident = (p['pid'], p['start'])
@@ -810,9 +1022,15 @@ class Guard:
             if footprint and (p['footprintGiB'] >= 48 or p['footprintGiB'] >= 16 and p['growthGiBMin'] >= 1):
                 memory.append(p)
             hist.append(dict(at=now, cpuS=p['cpuS'], footprintGiB=p.get('footprintGiB')))
+            if self.slow_sample(p, footprint):
+                slow.append(p)
             if robob(p, self.rows):
                 robobs.append(p)
         self.history = {k: v for k, v in self.history.items() if k in current}
+        # Missing samples retain the window. A positively observed new birth
+        # resets it; absent holders expire after two hours.
+        self.slow_history = {k: v for k, v in self.slow_history.items() if v and v[-1]['at'] >= now-7200
+                             and (k[0] not in self.rows or self.rows[k[0]]['start'] == k[1])}
         self.hogs = {k: v for k, v in self.hogs.items() if k in current}
         if sample['load'][0] >= 4*sample['ncpu']:
             signals.append(1)
@@ -840,9 +1058,12 @@ class Guard:
             signals.append(5)
         if robob_trip:
             signals.append(6)
+        slow_offenders = {p['pid'] for p in slow if not protected(p, self.rows) and not gui(p)}
+        if slow:
+            signals.append(7)
         self.streak = self.streak+1 if signals else 0
         self.calm = 0 if signals else self.calm+1
-        if not self.strain and (self.streak >= 2 or memory or robob_trip):
+        if not self.strain and (self.streak >= 2 or memory or robob_trip or slow):
             self.strain, self.since = True, now
             self.log('strain_start', signals=signals)
         if self.strain and self.calm >= 10:
@@ -888,7 +1109,10 @@ class Guard:
                 self.notify(key, text.replace('TERMINATION_RESULT', 'termination failed for'))
                 self.worker_needed(path, '%s memory runaway pid %s' % (kind, p['pid']), urgent=incident not in self.incidents)
         self.incidents = new_incidents
-        offenders = self.cpu_actions(memory4) if self.strain else 0
+        # Fast runaways take priority over bundle probes and slow-leak worker calls.
+        if not memory and not robob_trip:
+            self.slow_actions(slow)
+        offenders = self.cpu_actions(memory4 | slow_offenders) if self.strain else 0
         if self.strain and not memory and not robob_trip and (not offenders or now-(self.first_action if self.first_action is not None else self.since) >= 180):
             path = self.snapshot('strain persists' if offenders else 'strain without an identified offender')
             self.worker_needed(path, 'strain: signals '+str(signals))
@@ -1014,8 +1238,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--restart-check', action='store_true')
     parser.add_argument('--diagnostic', type=Path)
+    parser.add_argument('--app-info')
+    parser.add_argument('--quit-gui')
     parser.add_argument('--worker-control', action='store_true')
     args = parser.parse_args()
+    if args.app_info:
+        print(json.dumps(app_info(args.app_info)))
+        return
+    if args.quit_gui:
+        request = json_object(args.quit_gui)
+        request['args'] = 'identity verified by hash'
+        info = app_info(request['comm'])
+        if (not info or info['bundleId'] != request['bundleId'] or info['bundleId'] in GUI_NEVER_QUIT
+                or not Host().identity(request) or (Path(request['stateDir'])/'paused').exists()
+                or os.environ.get('MAC_GUARD_DRY_RUN') == '1'):
+            raise SystemExit(1)
+        quit_gui(request['pid'])
+        return
     if args.restart_check:
         print(json.dumps(overload_checks()))
         return

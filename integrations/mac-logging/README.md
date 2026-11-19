@@ -14,9 +14,10 @@ input (including invalid timestamps) or a launchd state other than `loaded`,
 and 2 for invalid option syntax.
 JSON includes an overall `ok` boolean and `launchd`, mapping each of
 `com.abdullah.mac-log-collector`, `com.abdullah.mac-deep-inventory`,
-`com.abdullah.mac-memory`, `com.abdullah.mac-cpu` and `com.abdullah.mac-guard` to `loaded`, `not-loaded`
+`com.abdullah.mac-memory`, `com.abdullah.mac-cpu`, `com.abdullah.mac-ssd-read-probe`
+and `com.abdullah.mac-guard` to `loaded`, `not-loaded`
 or `unknown`. Each read-only `launchctl print gui/<uid>/<label>` has a two-second
-timeout (ten seconds total for five timeouts). Only an explicit
+timeout per label. Only an explicit
 `Could not find service` error means `not-loaded`; other failures are `unknown`.
 Status never loads or restarts agents, and does not send notifications.
 It reads the UTC day files covering the last 36 hours (three files before noon
@@ -831,6 +832,27 @@ growth. It terminates the offending PID only, including integration workers
 and GUI apps; agents, OpenCode, Robob and macOS remain exempt. Protected
 runaways alert and call one critical responder. All signals recheck PID birth
 identity. Evidence lives in `~/.robob/board-artifacts/mac-guard/`.
+
+Signal 7 catches slow leaks without waiting for load or pressure: footprint
+over 8 GiB and growth over 1 GiB/hour across at least 30 minutes. Its bounded
+history persists by PID and birth time, retaining missing-sample gaps. Other
+processes use the strain ladder; protected holders alert the responder.
+Eligible leaking GUI apps get a normal Quit AppleEvent addressed to the exact
+PID. Two minutes later, only a surviving identical app still over the slow-leak
+threshold and still growing may receive TERM, then KILL ten seconds later.
+Each step rechecks identity and bundle ID. Queued force-quits also require
+current growth and service protection after a
+pause or restart. Foreground app main executables in
+`/System/Applications` (such as Activity Monitor) qualify; system daemons,
+background apps, helpers, agents, OpenCode and Robob do not.
+Dia (`company.thebrowser.dia`), Messages (`com.apple.MobileSMS`), Robob
+(`com.ardud.robob`), Finder (`com.apple.finder`), Terminal (`com.apple.Terminal`),
+iTerm2 (`com.googlecode.iterm2`), Ghostty (`com.mitchellh.ghostty`) and Warp
+(`dev.warp.Warp-Stable`, `dev.warp.Warp`, `dev.warp.Warp-Preview`) are exempt
+from this slow GUI exception even when renamed. A failed or ambiguous Quit
+alerts the responder and never authorizes force-quit. `macguard.slow_leak`
+and `macguard.action` include bundle identity, footprint series and growth;
+the responder reports evidence and actions on the Mac board.
 The single ten-second-bounded top read includes every process so Robob's tree
 total cannot disappear below the twenty largest holders; snapshots retain the
 top twenty plus footprint history for all matched PIDs.
@@ -838,7 +860,7 @@ top twenty plus footprint history for all matched PIDs.
 A Robob process crossing the growth threshold, or the app tree totaling
 >=24 GiB, requests the overload watchdog's detached `restart` subcommand.
 Missing helpers, install holds, restart/install tmux sessions, release builds,
-server uptime under ten minutes and a memory restart within an hour skip it
+server uptime under ten minutes, the SSD read-blocked interlock and a memory restart within an hour skip it
 and alert the responder. The watchdog script is an external prerequisite;
 its tracker owns it through 23 November 2026 and must keep its interface stable.
 

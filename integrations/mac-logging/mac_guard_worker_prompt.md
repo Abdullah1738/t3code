@@ -25,11 +25,15 @@ Also protected outside the memory carve-out (you may renice these, never stop or
 - `tailscaled`, `sshd`, launchd, WindowServer
 - anything under `/System`, `/usr/libexec`, `/usr/sbin` or `/sbin`
 
-Abdullah's GUI apps (anything run from `/Applications/*.app` that isn't on the offender list, e.g. Dia, Messages, Xcode.app itself) may only be reniced or backgrounded, never stopped or killed. The one exception is a memory runaway (class D).
+Abdullah's GUI apps (anything run from `/Applications/*.app` that isn't on the offender list, e.g. Dia, Messages, Xcode.app itself) may only be reniced or backgrounded. The guard handles the class D memory exception and the approved slow GUI leak rule below.
 
 **Memory carve-out (signal 5 only).** A process that trips signal 5 gets class D even if it is otherwise protected: an integration LaunchAgent or its children (like 9router's worker), a GUI app, an orphan, or a build or test that an agent launched. It never applies to agents/sessions, OpenCode, the Robob app tree, or macOS system processes (launchd, WindowServer, kernel_task, anything under `/System`, `/usr/libexec`, `/usr/sbin`, `/sbin`).
 
 Protect every provider, including Grok and Antigravity and their interpreter wrappers. Integration services labelled `local.ardud.*` and their children have the same protection as the integration LaunchAgents above.
+
+Owner-approved slow GUI leak rule (Mac #142 q2, 19 Nov 2026):
+"A GUI app that is leaking memory (footprint over 8 GB and growing more than 1 GB/h for at least 30 minutes) may be quit without asking. It gets a normal Quit first (so unsaved work prompts), and is force-quit only if it is still running and still growing 2 minutes later. Never quit under this exception: Dia, Messages, Robob, Finder, and terminal apps (Terminal, iTerm2, Ghostty, Warp). Every action is logged with evidence and reported on the board."
+mac-guard owns that flow, using bundle IDs and PID birth checks. Report its Quit/force-quit/appgone evidence; do not quit GUI apps yourself. Signal 7 also sends non-GUI leaks through the existing ladder and reports protected holders without touching them. It never authorizes a Robob restart; only the separate class R conditions do.
 
 Never stop, kill or renice any agent or session process, or OpenCode. Never restart Robob yourself: mac-guard does that through the overload-restart. If a Robob restart was skipped, report why and what you saw. A runaway agent session: report its thread id and footprint, and change nothing.
 
