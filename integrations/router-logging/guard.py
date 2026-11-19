@@ -3,6 +3,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -29,6 +30,16 @@ def fresh(marker, now):
             and 0 <= now - started < FRESH_MS) if isinstance(marker, dict) else False
 
 
+def recent_failure(marker, now):
+    if not isinstance(marker, dict) or marker.get('status') != 'failed':
+        return False
+    started = marker.get('startedAtMs')
+    finished = marker.get('finishedAtMs', started)
+    # The transaction covers its start through five minutes after completion.
+    return (all(type(value) in (int, float) and math.isfinite(value) for value in (started, finished))
+            and started <= finished and started <= now < finished + FRESH_MS)
+
+
 class Guard:
     def __init__(self, state=None, event=None, action=None, notify=None, save=None):
         self.state = state or {}
@@ -43,17 +54,41 @@ class Guard:
         recovery = state.get('recovery')
         if recovery and self.notify(recovery['text'], recovery['key']):
             del state['recovery']
-        healthy = job == 'loaded' and listener == 'open'
-        if healthy:
+        failed = listener in ('refused', 'unreachable')
+        if job == 'unknown':
+            if not state.get('jobUnknown') or (not failed and 'unknownSinceMs' not in state):
+                props = dict(state=job, listener=listener)
+                if not failed:
+                    state['unknownSinceMs'] = now
+                    props['unknownSince'] = iso(now)
+                self.event('listener.state_unknown', **props)
+            state['jobUnknown'] = True
+        else:
+            state.pop('jobUnknown', None)
+        if (job != 'unknown' or failed) and 'unknownSinceMs' in state:
+            since = state.pop('unknownSinceMs')
+            self.event('listener.state_resolved', unknownSince=iso(since), unknownMs=max(0, now - since),
+                       state=job, listener=listener)
+        # A persisted window from the old guard may have no TCP evidence.
+        # Close that uncertainty before starting a newly observed refusal.
+        if (failed and 'downSinceMs' in state and 'downListener' not in state
+                and state.get('cause') not in ('listener_refused', 'listener_unreachable')):
+            since = state['downSinceMs']
+            self.event('listener.up', downSince=iso(since), downMs=max(0, now - since),
+                       cause=state['cause'], listener=listener, downListener='unknown', action=state.get('lastAction', 'none'))
+            for key in ('downSinceMs', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
+                state.pop(key, None)
+        if not failed:
             if 'downSinceMs' in state:
                 since = state['downSinceMs']
                 elapsed = max(0, now - since)
                 self.event('listener.up', downSince=iso(since), downMs=elapsed,
-                           cause=state['cause'], action=state.get('lastAction', 'none'))
+                           cause=state['cause'], listener=listener, downListener=state.get('downListener', 'unknown'),
+                           action=state.get('lastAction', 'none'))
                 if state.get('alerted'):
                     state['recovery'] = dict(text=f'9router recovered after {round(elapsed / 1000)} s; action {state.get("lastAction", "none")}',
                                              key=f'9router-down:{iso(since)}:recovered')
-                for key in ('downSinceMs', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
+                for key in ('downSinceMs', 'downListener', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
                     state.pop(key, None)
                 self.save(state)
                 if state.get('recovery') and self.notify(state['recovery']['text'], state['recovery']['key']):
@@ -61,12 +96,12 @@ class Guard:
             self.save(state)
             return
         if 'downSinceMs' not in state:
-            cause = 'job_missing' if job == 'absent' else 'job_query_failed' if job == 'unknown' else 'listener_' + listener
-            if isinstance(marker, dict) and marker.get('status') == 'failed':
+            cause = 'listener_' + listener
+            if recent_failure(marker, now):
                 cause = 'deploy_failed'
-            state.update(downSinceMs=now, cause=cause, alerted=False, attempts=0, nextActionMs=now)
+            state.update(downSinceMs=now, downListener=listener, cause=cause, alerted=False, attempts=0, nextActionMs=now)
             self.save(state)
-            self.event('listener.down', downSince=iso(now), cause=cause, state=job)
+            self.event('listener.down', downSince=iso(now), cause=cause, state=job, listener=listener)
         if listener == 'refused':
             state.setdefault('refusedSinceMs', now)
         else:
