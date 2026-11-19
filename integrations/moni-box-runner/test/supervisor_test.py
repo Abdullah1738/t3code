@@ -784,4 +784,77 @@ class CallbackRepairTests(SupervisorTestCase):
         self.assertEqual(self.logs()[-1]['torn_down'], ['callback'])
 
 
+class RunnerStatsTests(SupervisorTestCase):
+    def stats(self, count=0):
+        counts = {'authority-expired': count, 'disabled': 0, 'harness-exit': 0}
+        return {'interruptions': {'total': dict(counts), 'last24h': dict(counts)}, 'autoRetry': {'retried': count},
+                'lastInterruptionAt': 1000 if count else None, 'lastInterruptionReason': 'authority-expired' if count else None,
+                'stuck': count, 'historySince': 100, 'legacyRetained': 0}
+
+    def deps(self):
+        deps = module.OffboxDeps.__new__(module.OffboxDeps)
+        deps.config = {'boxId': 'bx_moni', 'epoch': 'test', 'url': 'unused', 'tokenFile': 'unused'}
+        self.reply = {'boxId': 'bx_moni', 'epoch': 'test', 'routerReady': True, 'callbackReady': True}
+        deps.post = lambda *args: self.reply
+        return deps
+
+    def test_logs_on_change_only_with_count_deltas_and_a_null_initial_baseline(self):
+        deps = self.deps(); self.reply['stats'] = self.stats()
+        deps.both_ready(); deps.both_ready()
+        self.assertEqual(len(self.logs()), 1); self.assertIsNone(self.logs()[0]['deltas'])
+        self.reply['stats'] = self.stats(2); deps.both_ready(); deps.both_ready()
+        self.assertEqual(len(self.logs()), 2)
+        self.assertEqual(self.logs()[-1]['deltas']['interruptions']['total']['authority-expired'], 2)
+        self.assertEqual(self.logs()[-1]['deltas']['autoRetry']['retried'], 2)
+        self.reply['stats']['interruptions']['last24h']['authority-expired'] = 0
+        self.reply['stats']['stuck'] = 0; deps.both_ready()
+        self.assertEqual(self.logs()[-1]['deltas']['interruptions']['last24h']['authority-expired'], -2)
+        self.assertEqual(self.logs()[-1]['deltas']['stuck'], -2)
+
+    def test_missing_and_invalid_stats_do_not_change_readiness_or_baseline(self):
+        deps = self.deps(); deps.both_ready()
+        for invalid in (None, [], True, {}, 'PRIVATE_TEXT'):
+            self.reply['stats'] = invalid; deps.both_ready()
+        for invalid in (-1, True, 1.5, 'PRIVATE_KEY', 9007199254740992, None, []):
+            self.reply['stats'] = self.stats(); self.reply['stats']['autoRetry']['retried'] = invalid
+            deps.both_ready()
+        for at, reason in ((None, 'disabled'), (1000, None), (1000, 'PRIVATE_REASON'), (True, 'disabled')):
+            self.reply['stats'] = self.stats(); self.reply['stats']['lastInterruptionAt'] = at
+            self.reply['stats']['lastInterruptionReason'] = reason; deps.both_ready()
+        self.assertEqual(self.logs(), [])
+        self.reply['stats'] = self.stats(); deps.both_ready()
+        self.reply['stats'] = {}; deps.both_ready()
+        self.reply['stats'] = self.stats(); deps.both_ready()
+        self.assertEqual(len(self.logs()), 1)
+
+    def test_history_change_or_cumulative_counter_reset_starts_a_new_delta_baseline(self):
+        for change in ('history', 'legacy', 'authority-expired', 'disabled', 'harness-exit', 'retry'):
+            with self.subTest(change=change):
+                previous = self.stats(2); current = self.stats(2)
+                if change == 'history': current['historySince'] = 200
+                elif change == 'legacy': current['legacyRetained'] = 1
+                elif change == 'retry': current['autoRetry']['retried'] = 0
+                else:
+                    previous['interruptions']['total'][change] = 3
+                    current['interruptions']['total'][change] = 2
+                self.assertIsNone(module.stats_delta(current, previous))
+                self.assertEqual(module.stats_delta(current, current)['autoRetry']['retried'], 0)
+
+    def test_stats_are_logged_for_a_valid_lease_even_when_dependencies_are_unready(self):
+        deps = self.deps(); self.reply['stats'] = self.stats(1)
+        self.reply['callbackReady'] = False
+        for _ in range(2):
+            with self.assertRaises(module.ReadinessError): deps.both_ready()
+        self.assertEqual(len(self.logs()), 1)
+        self.assertEqual(self.logs()[0]['event'], 'moni-box-runner-stats')
+
+    def test_only_whitelisted_metadata_is_copied_to_the_log(self):
+        deps = self.deps(); stats = self.stats(1)
+        stats['token'] = 'PRIVATE_TOKEN'; stats['id'] = 'PRIVATE_MESSAGE_ID'
+        stats['autoRetry']['text'] = 'PRIVATE_TEXT'; stats['interruptions']['total']['PRIVATE_REASON'] = 3
+        self.reply['stats'] = stats; deps.both_ready()
+        self.assertEqual(self.logs()[0]['stats'], self.stats(1))
+        self.assertNotIn('PRIVATE_', self.output.getvalue())
+
+
 if __name__ == '__main__': unittest.main()

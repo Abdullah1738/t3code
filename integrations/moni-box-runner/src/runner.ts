@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { jsonBody, object, opaqueId, tokenMatches, unseal, validId, type Fetch, type Sealed } from "../../spectrum-bridge/src/remote-protocol.ts";
 import { HarnessFailure } from "./harness-failure.ts";
+import { initStats, recordInterruption, runnerStats } from "./stats.ts";
 
 export type Harness = { ready?(): boolean; run(input: { id: string; session: string; resume: boolean; text: string; system: string; signal?: AbortSignal; onStarted?: () => void }): Promise<string> };
 export type RunnerConfig = { root: string; boxId: string; epoch: string; token: string; privateKey: string;
@@ -56,6 +57,7 @@ export class BoxRunner {
     for (const [name, type] of [["attempts", "INTEGER DEFAULT 0"], ["last_status", "INTEGER"], ["next_at", "INTEGER"]]) {
       if (!this.db.query<{ name: string }, []>("PRAGMA table_info(actions)").all().some(c => c.name === name)) this.db.exec(`ALTER TABLE actions ADD COLUMN ${name} ${type}`);
     }
+    initStats(this.db, this.now());
     // A killed harness might already have used a tool. An operator reconciles it; never replay it automatically.
     this.interrupt();
   }
@@ -78,6 +80,7 @@ export class BoxRunner {
       const detail = error instanceof HarnessFailure ? error.detail : { exitCode: null, signal: null, stderrBytes: 0 };
       this.db.query("INSERT OR REPLACE INTO interruptions VALUES (?,?,?,?,?,?,?,?,?,?,?)")
         .run(row.id, reason, this.now(), this.lastLeaseAt, detail.exitCode, detail.signal, detail.stderrBytes, effects.sends, effects.bus, effects.tools, Number(retry));
+      recordInterruption(this.db, reason, this.now(), retry);
       this.db.query("UPDATE inbox SET state=?,interrupted_at=? WHERE id=? AND state='running'").run(retry ? "pending" : "interrupted", this.now(), row.id);
       this.io.log?.("turn-interrupted", undefined, { reason, lastLeaseAt: this.lastLeaseAt, ...detail,
         sends: effects.sends, busActions: effects.bus, toolActions: effects.tools, retried: retry });
@@ -308,7 +311,7 @@ export class BoxRunner {
         this.leaseUntil = this.now() + 20_000;
         this.db.query("INSERT OR REPLACE INTO settings VALUES ('last-lease-at',?)").run(String(this.lastLeaseAt));
         const [routerReady, callbackReady] = await Promise.all([this.modelReady(), this.callbackReady()]);
-        return reply(200, { boxId: this.config.boxId, epoch: this.config.epoch, routerReady, callbackReady });
+        return reply(200, { boxId: this.config.boxId, epoch: this.config.epoch, routerReady, callbackReady, stats: runnerStats(this.db, this.now()) });
       }
       if (path === "/pause") { this.pause(); return reply(200, { paused: true }); }
       if (!this.active()) return reply(503, { error: "Runner paused" });
