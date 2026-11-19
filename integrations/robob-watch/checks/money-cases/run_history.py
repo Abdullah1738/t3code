@@ -30,7 +30,7 @@ SOURCE_PREFIX = r'(?:(?:his threads|receipt|orders|merchant history|refund mail|
 ERROR = re.compile(
     SOURCE_PREFIX +
     r'(?:Robob control: (?:message provenance unavailable; server update required|credentials unavailable|'
-    r'request failed or timed out|invalid response|owner cache save failed|incomplete thread list|'
+    r'owner read stale|owner cache missing or incomplete|request failed or timed out|invalid response|owner cache save failed|incomplete thread list|'
     r'invalid thread list|invalid thread count|invalid thread|missing thread id|invalid message list|'
     r'invalid message count|incomplete message list|lookup over time|invalid message|invalid message timestamp|'
     r'message id unavailable; server update required|thread updatedAt unavailable; server update required|'
@@ -89,7 +89,11 @@ def run_row(values):
     row['exit'] = values.get('exit') if type(values.get('exit')) is int else None
     row['slowest'] = values.get('slowest') if values.get('slowest') in PHASES else 'unknown'
     row['owner_result'] = values.get('owner_result') if values.get('owner_result') in {
-        'ok', 'incomplete', 'list_failed', 'not_read'} else 'not_read'
+        'ok', 'incomplete', 'list_failed', 'not_read', 'cache_missing', 'cache_stale'} else 'not_read'
+    for key, allowed in (('owner_source', {'live', 'incremental', 'cache'}),
+                         ('owner_refresh_result', {'ok', 'incomplete', 'list_failed', 'error', 'not_read'})):
+        if values.get(key) in allowed:
+            row[key] = values[key]
     row.setdefault('owner_timeouts', 0)
     row.setdefault('owner_threads_fetched', 0)
     row['question_errors'] = [safe_error(e) for e in values.get('question_errors', [])[:10]]
@@ -294,7 +298,16 @@ def summary(wd, since='24h', now=None):
     rows.sort(key=lambda row: dt.datetime.fromisoformat(row['at'].replace('Z', '+00:00')))
     totals = sorted(row['total_s'] for row in rows)
     errors = Counter(e for row in rows for e in row.get('question_errors', []))
-    return {'since': cutoff.isoformat(), 'run_count': len(rows),
+    ages = [row['owner_cache_age_s'] for row in rows if 'owner_cache_age_s' in row]
+    windows = [row['owner_list_window_s'] for row in rows if 'owner_list_window_s' in row]
+    last = next((row for row in reversed(rows) if row.get('owner_refresh_at')), {})
+    return {'owner': {'sources': dict(Counter(row.get('owner_source', 'unknown') for row in rows)),
+                      'cache_age_s_max': max(ages) if ages else None,
+                      'list_window_s_max': max(windows) if windows else None,
+                      'last_refresh': {key: last[key] for key in (
+                          'owner_refresh_at', 'owner_refresh_ms', 'owner_refresh_result', 'owner_refresh_timeouts')
+                                       if key in last}},
+            'since': cutoff.isoformat(), 'run_count': len(rows),
             'over_40_count': sum(row['total_s'] > 40 for row in rows),
             'total_s': {'p50': percentile(totals, .5), 'p95': percentile(totals, .95),
                         'max': max(totals) if totals else None},
@@ -310,6 +323,9 @@ def format_summary(result):
              f"Total seconds: p50={totals['p50']} p95={totals['p95']} max={totals['max']}",
              'Owner results: ' + (', '.join(f'{key}={n}' for key, n in result['owner_results'].items()) or 'none'),
              'Question errors: ' + ('none' if not result['question_errors'] else '')]
+    owner = result['owner']
+    lines.insert(3, f"Owner: sources={owner['sources']}; cache age max={owner['cache_age_s_max']} s; "
+                    f"list window max={owner['list_window_s_max']} s; last refresh={owner['last_refresh']}")
     lines += [f'  {n}x {error}' for error, n in result['question_errors'].items()]
     lines += [f"  {row['at']}: {row['total_s']} s, slowest={row['slowest']}" for row in result['slow_runs']]
     if result['invalid_lines']:

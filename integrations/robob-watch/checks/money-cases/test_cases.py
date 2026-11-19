@@ -109,7 +109,8 @@ def screen_sources(root, corrupt=False, locks=True):
     owner = {'a': {'version': mc.charges.OWNER_CACHE_VERSION, 'updatedAt': '2026-10-24T00:00:00Z',
                   'coveredFrom': '2026-10-23T00:00:00Z', 'title': 'iMessage test', 'texts': []}}
     files = {'cases.json': {'version': 1, 'cases': [], 'purchases': []}, 'questions.json': book,
-             'owner-texts.json': owner, 'order-details.json': [], 'msgs-searches.json': {},
+             'owner-texts.json': owner, 'owner-snapshot.json': {'version': 1, 'since': '2026-10-23T00:00:00Z',
+                 'as_of': dt.datetime.now(dt.timezone.utc).isoformat(), 'threads': {}, 'rows': []}, 'order-details.json': [], 'msgs-searches.json': {},
              'subscriptions.json': {'version': 1, 'subscriptions': []},
              'cards.json': {'dead': {}}}
     import marketplace
@@ -164,27 +165,28 @@ class ScreenReadOnly(unittest.TestCase):
                     self.assertEqual(data_snapshot(data), before)
                     self.assertTrue(orders)
                     self.assertTrue(calls.read_text().strip())
-                    self.assertTrue(any(path.endswith('/messages') for path, _, _ in server.calls))
+                    self.assertEqual(server.calls, [])
 
     def test_read_only_screen_does_not_create_a_missing_data_directory(self):
         with tempfile.TemporaryDirectory() as tmp, screen_sources(Path(tmp)) as fixture:
             data, text, charged, now, server, orders, calls = fixture
             missing = data.parent / 'missing-data'
             result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=missing, record=False)
-            self.assertEqual(result['verdict'], 'ask', result)
+            self.assertEqual(result['verdict'], 'unverified', result)
+            self.assertIn('owner cache missing', str(result['errors']))
             self.assertFalse(missing.exists())
 
-    def test_recording_still_saves_both_caches_and_question(self):
+    def test_recording_saves_order_cache_and_question_but_only_reads_owner_cache(self):
         with tempfile.TemporaryDirectory() as tmp, screen_sources(Path(tmp)) as fixture:
             data, text, charged, now, server, orders, calls = fixture
             before = data_snapshot(data)
             result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=True)
             self.assertEqual(result['verdict'], 'ask', result)
             after = data_snapshot(data)
-            for name in ('owner-texts.json', 'order-details.json', 'questions.json'):
+            for name in ('order-details.json', 'questions.json'):
                 self.assertNotEqual(before[name], after[name], name)
-            self.assertEqual(json.loads((data / 'owner-texts.json').read_text())['a']['texts'][0]['text'],
-                             'unrelated owner words')
+            self.assertEqual(before['owner-texts.json'], after['owner-texts.json'])
+            self.assertEqual(before['owner-snapshot.json'], after['owner-snapshot.json'])
             self.assertEqual(json.loads((data / 'order-details.json').read_text())[0]['order'], 'new-order')
 
 
@@ -578,6 +580,9 @@ class CheckEntry(Base):
         book = {'version': 1, 'questions': []}
         mc.new_question(book, mc.charges.parse(ALERT, BANK), ALERT, now, now)
         mc.write_json(self.data / 'questions.json', book)
+        mc.write_json(self.data / 'owner-snapshot.json', {
+            'version': 1, 'since': (now - dt.timedelta(hours=1)).isoformat(),
+            'as_of': now.isoformat(), 'threads': {}, 'rows': []})
         fake = self.tmp / 'msgs'
         fake.write_text('#!/usr/bin/python3\nimport json, sys\n'
                         'assert sys.stdin.read() == ""\n'
@@ -590,6 +595,7 @@ class CheckEntry(Base):
                                 '/bin', '/usr/sbin', '/sbin'])
         env = {'HOME': str(home), 'PATH': runner_path, 'LANG': 'en_US.UTF-8', 'WATCH_DIR': str(self.wd),
                'WATCH_ID': 'money-cases', 'MONEY_CASES_DIR': str(self.data),
+               'MONEY_CASES_REFRESH_DISABLED': '1',
                'MONEY_CASES_MSGS': str(fake), 'ROBOB_TOOL_LOG_DIR': str(self.tmp / 'runner-logs')}
         started = time.monotonic()
         with ControlServer(threads=[{'threadId': 'a', 'title': 'iMessage test',
@@ -602,16 +608,15 @@ class CheckEntry(Base):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertLess(time.monotonic() - started, 5)
         state = json.loads((self.wd / 'pings.json').read_text())
-        self.assertEqual(state['timing']['owner_queries'], 3)
+        self.assertEqual(state['timing']['owner_queries'], 0)
         timing = state['timing']
-        expected = {'owner_list_pages': 2, 'owner_threads_selected': 1,
-                    'owner_threads_fresh': 0, 'owner_threads_needed': 1,
-                    'owner_threads_fetched': 1, 'owner_timeouts': 0, 'owner_cache_size': 1}
+        expected = dict.fromkeys(mc.charges.OWNER_TIMING_KEYS, 0)
         for key, value in expected.items():
             self.assertEqual(timing[key], value, key)
         for key in ('owner_list_ms', 'owner_fetch_ms_max'):
             self.assertGreaterEqual(timing[key], 0)
-        self.assertEqual(timing['owner_result'], 'ok')
+        self.assertIn(timing['owner_result'], ('ok', 'cache_missing'))
+        self.assertEqual(timing['owner_source'], 'cache')
         self.assertNotIn('I paid', json.dumps(timing))
         self.assertNotIn('iMessage', json.dumps(timing))
         self.assertNotIn('test-secret', json.dumps(timing))
@@ -3273,14 +3278,14 @@ class CheckBudget(Base):
         now = at('2026-10-25T12:00')
         self.seed([now - dt.timedelta(hours=1)])
         with ControlServer() as server:
-            mc.charges.owner_texts(now - dt.timedelta(hours=2), now,
+            mc.charges.live_owner_texts(now - dt.timedelta(hours=2), now,
                                    cache_path=self.data / 'owner-texts.json')
             server.calls.clear()
             clock, sequence = [1000.0], []
             def owner(*args, deadline=None):
                 sequence.append('owner')
                 self.assertEqual(deadline - clock[0], mc.charges.OWNER_BUDGET)
-                return mc.charges.owner_texts(*args, deadline=deadline, stats=stats,
+                return mc.charges.live_owner_texts(*args, deadline=deadline, stats=stats,
                                               cache_path=self.data / 'owner-texts.json')
             def msgs(*args, **kwargs):
                 sequence.append('msgs')
@@ -3943,7 +3948,9 @@ class CheckBudget(Base):
         times = [now - dt.timedelta(hours=2*n) for n in range(5)]
         self.seed(times)
         rows = [summary(f'I paid Acme, item {n}', createdAt=mc.charges.iso(when)) for n, when in enumerate(times)]
+        from owner_refresh import refresh
         with ControlServer(rows), patch.object(mc.charges, 'owner_texts', wraps=mc.charges.owner_texts) as query:
+            self.assertEqual(refresh(self.data, min(times) - mc.charges.OWNER_AROUND), 'ok')
             mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
         self.assertEqual(query.call_count, 1)
         self.assertTrue((self.data / 'owner-texts.json').exists())
@@ -3951,7 +3958,7 @@ class CheckBudget(Base):
             self.assertEqual(q['status'], 'closed')
             self.assertIn(f'item {n}', q['outcome'])
         state = json.loads((self.wd / 'pings.json').read_text())
-        self.assertEqual(state['timing']['owner_queries'], 3)
+        self.assertEqual(state['timing']['owner_queries'], 0)
 
     def test_stalled_control_lookup_keeps_check_in_budget_and_questions_unverified(self):
         now = at('2026-10-25T12:00')
@@ -3959,9 +3966,8 @@ class CheckBudget(Base):
         with ControlServer(stall='/messages') as server, patch.object(mc, 'CHECK_BUDGET', 11):
             started = time.time()
             mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
-            self.assertGreater(time.time() - started, 1)
             self.assertLess(time.time() - started, mc.CHECK_BUDGET + 2)
-            self.assertTrue(any(path.endswith('/messages') for path, _, _ in server.calls))
+            self.assertEqual(server.calls, [])
         state = json.loads((self.wd / 'pings.json').read_text())
         self.assertIn('Robob control:', str(state['question_errors']))
         self.assertTrue(all(q['status'] != 'closed' for q in self.questions()))

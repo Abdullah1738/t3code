@@ -31,6 +31,23 @@ class HistoryTests(unittest.TestCase):
                     'owner_list_ms': 123, 'lookups': 5, 'writes_n': 3,
                     'question_errors': ['his threads: Robob control: request failed or timed out']}
 
+    def test_owner_source_freshness_and_last_refresh_summary(self):
+        self.row.update(owner_source='cache', owner_cache_age_s=125, owner_list_window_s=86400,
+                        owner_refresh_at=1794823140, owner_refresh_ms=27001,
+                        owner_refresh_result='ok', owner_refresh_timeouts=0)
+        self.assertTrue(history.append(self.wd, self.row))
+        result = history.summary(self.wd, now=dt.datetime(2026, 11, 16, 11, tzinfo=dt.timezone.utc))
+        self.assertEqual(result['owner']['sources'], {'cache': 1})
+        self.assertEqual(result['owner']['cache_age_s_max'], 125)
+        self.assertEqual(result['owner']['list_window_s_max'], 86400)
+        self.assertEqual(result['owner']['last_refresh']['owner_refresh_ms'], 27001)
+        line = next(line for line in history.format_summary(result).splitlines() if line.startswith('Owner:'))
+        for value in ('cache', '125', '86400', '27001', 'ok', '1794823140', 'timeouts'):
+            self.assertIn(value, line)
+        for key in ('owner_source', 'owner_refresh_result'):
+            row = history.run_row({**self.row, key: 'PRIVATE TEXT'})
+            self.assertNotIn(key, row)
+
     def test_append_retains_counts_and_bounded_safe_errors(self):
         self.row.update(question_errors=self.row['question_errors'] * 12, text='private owner message',
                         password='test-secret', secret_detail={'text': 'private receipt'})
