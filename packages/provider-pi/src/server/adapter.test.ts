@@ -20,10 +20,12 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -498,6 +500,112 @@ const expectModelFailure = (errorMessage: string) =>
   }).pipe(Effect.scoped, Effect.provide(layerTest));
 
 describe("PiAdapterV2", () => {
+  it.effect.each(["settles", "times out"] as const)(
+    "stops a native-only attempt and releases its ownership after native completion when Stop %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const adapter = yield* makeAdapter(fake);
+        const runtime = yield* adapter.openSession({
+          threadId: THREAD_ID,
+          providerSessionId: SESSION_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        // No consumer has ingested even the initial provider-turn event.
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_start" });
+        const runId = RunId.make(`run:${THREAD_ID}:1`);
+        const target = {
+          providerThread,
+          runId,
+          attemptId: RunAttemptId.make(`run-attempt:${runId}:1`),
+        };
+        for (const mismatch of [
+          { ...target, runId: RunId.make("another-run") },
+          { ...target, attemptId: RunAttemptId.make("another-attempt") },
+          {
+            ...target,
+            providerThread: { ...providerThread, id: ProviderThreadId.make("another-owner") },
+          },
+          {
+            ...target,
+            providerThread: {
+              ...providerThread,
+              nativeThreadRef: { ...providerThread.nativeThreadRef!, nativeId: "another-session" },
+            },
+          },
+        ])
+          yield* runtime.interruptStartingRun!(mismatch);
+        assert.isFalse(fake.allRequests().some((request) => request.type === "abort"));
+        const finished = yield* Deferred.make<void>();
+        const stopping = yield* runtime.interruptStartingRun!(target).pipe(
+          Effect.result,
+          Effect.ensuring(Deferred.succeed(finished, undefined)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* fake.takeRequest("abort");
+        const duplicate = yield* runtime.interruptStartingRun!(target).pipe(
+          Effect.result,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        assert.isFalse(yield* Deferred.isDone(finished));
+        assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+        assert.equal(
+          (yield* startTurn(runtime, providerThread, "default", [], "Too early", undefined, 2).pipe(
+            Effect.result,
+          ))._tag,
+          "Failure",
+        );
+        if (outcome === "times out") {
+          yield* TestClock.adjust("10 seconds");
+          assert.equal((yield* Fiber.join(stopping))._tag, "Failure");
+          assert.equal((yield* Fiber.join(duplicate))._tag, "Failure");
+          assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+        }
+        if (outcome === "times out") {
+          const retried = yield* runtime.interruptStartingRun!(target).pipe(
+            Effect.result,
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* TestClock.adjust("10 seconds");
+          assert.equal((yield* Fiber.join(retried))._tag, "Failure");
+        }
+        yield* fake.emit({ type: "agent_end", messages: [], willRetry: false });
+        yield* fake.emit({ type: "agent_settled", aborted: true });
+        const terminal = Option.getOrThrow(
+          yield* runtime.events.pipe(
+            Stream.filter((event) => event.type === "turn.terminal"),
+            Stream.runHead,
+          ),
+        );
+        assert.equal(terminal.type === "turn.terminal" && terminal.status, "interrupted");
+        if (outcome === "settles") {
+          assert.equal((yield* Fiber.join(stopping))._tag, "Success");
+          assert.equal((yield* Fiber.join(duplicate))._tag, "Success");
+        }
+        assert.isFalse(yield* runtime.holdsWorkForThread!(providerThread));
+        yield* startTurn(
+          runtime,
+          providerThread,
+          "default",
+          [],
+          "After native completion",
+          undefined,
+          3,
+        );
+        yield* fake.takeRequest("prompt");
+        assert.equal(fake.allRequests().filter((request) => request.type === "abort").length, 1);
+        assert.equal(fake.allRequests().filter((request) => request.type === "prompt").length, 2);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect.each(["manual compaction", "queued prompt"] as const)(
     "timeout cleanup preserves an older Pi wake behind %s",
     (kind) =>

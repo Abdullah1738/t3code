@@ -583,7 +583,28 @@ def log_render(started, ok, *, chat=None, outcome=None, failure_code=None):
         pass
 
 
-def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
+def build(cfg, data, meta=None, outdir=None, url=None, *, public=False, _checkout_projected=False):
+    if cfg.get('app') == 'amazon' and cfg.get('checkout') and not _checkout_projected:
+        from amazon_checkout import card_key, card_view, remember_card_terminal
+        path = ROOT / 'cards' / (card_key(cfg) + '.json')
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with path.with_suffix('.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = read(path)
+            cfg, data = card_view(cfg, data, state)
+            meta = {**(meta or {}), **cfg.get('card_meta', {})}
+            live_folder = APPS / (state.get('slug') or card_slug(cfg))
+            live = outdir is None or Path(outdir).resolve() == live_folder.resolve()
+            if live:
+                outdir = live_folder
+                url = url or state.get('url')
+                public = ((cfg.get('delivery_card') or {}).get('chat') or cfg.get('chat') or cfg.get('for')) != 'owner'
+            result = build(cfg, data, meta, outdir, url, public=public, _checkout_projected=True)
+            if live:
+                state.update(result)
+                remember_card_terminal(cfg, data, state, time.time())
+                atomic(path, state)
+            return result
     started = time.monotonic()
     ok = False
     completed = False
@@ -964,6 +985,10 @@ def prune_completed_shares():
     by_app = {r['app']: r for r in records if isinstance(r,dict) and isinstance(r.get('app'),str)}
     for path in sorted((ROOT / 'cards').glob('*.json')):
         state = read(path)
+        cfg = read(ROOT / 'orders' / path.name)
+        if cfg.get('checkout') and (state.get('checkout_terminal_id') != cfg['checkout']
+                                    or state.get('checkout_terminal_status') not in ('delivered', 'cancelled')):
+            continue
         finished = state.get('terminal_at')
         if not finished or time.time() - finished < 3600 or state.get('unshared'):
             continue
@@ -1037,15 +1062,26 @@ def stage_update(state, rendered, folder, save):
 
 
 def sync(cfg, data, *, send=False, recover=False, update=False):
+    checkout = cfg.get('app') == 'amazon' and cfg.get('checkout')
+    if checkout:
+        # Every watcher refreshes the one checkout card. Only its leader may
+        # publish placement; sibling discovery must never create another send.
+        from amazon_checkout import card_key, card_view, remember_card_terminal
+        member = cfg['order'] != cfg.get('checkout_leader')
+        if member and send:
+            return {'status': 'skipped', 'rendered': False}
     settings = cfg.get('delivery_card')
     if not isinstance(settings, dict):
         return {'status': 'legacy_not_enrolled', 'rendered': False}
-    key = cfg['watcher']
+    key = card_key(cfg) if checkout else cfg['watcher']
     statepath = ROOT / 'cards' / (key + '.json')
     statepath.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with statepath.with_suffix('.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = read(statepath)
+        if checkout:
+            cfg, data = card_view(cfg, data, state)
+            settings = cfg.get('delivery_card', {})
         recipient = settings.get('chat') or cfg.get('chat') or cfg['for']
         # Public shares get a separate allowlisted directory. Legacy items.json
         # and arbitrary files must never become public through directory reuse.
@@ -1060,8 +1096,10 @@ def sync(cfg, data, *, send=False, recover=False, update=False):
                 state.update(status='failed:public_directory_has_extra_files')
                 atomic(statepath, state)
                 return {'status': state['status'], 'slug': public_slug, 'rendered': False}
-        rendered = build(cfg, data, outdir=folder, url=state.get('url'), public=recipient != 'owner')
+        rendered = build(cfg, data, outdir=folder, url=state.get('url'), public=recipient != 'owner', _checkout_projected=True)
         state.update(rendered)
+        if checkout:
+            remember_card_terminal(cfg, data, state, time.time())
         if rendered['stage'] in ('Delivered', 'Cancelled'):
             state.setdefault('terminal_at', time.time())
         if state.get('status') == 'sent' and state.get('send_args') and (not state.get('bridge_confirmed') or not state.get('bridge_id')):
@@ -1110,7 +1148,7 @@ def sync(cfg, data, *, send=False, recover=False, update=False):
                             raise ValueError('public_card_url_required')
                         state['url'] = url
                         atomic(statepath, state)
-                        build(cfg, data, outdir=folder, url=url, public=recipient != 'owner')
+                        build(cfg, data, outdir=folder, url=url, public=recipient != 'owner', _checkout_projected=True)
                     final = None
                     if not state.get('send_args'):
                         state['open'] = []
@@ -1167,56 +1205,72 @@ def sync(cfg, data, *, send=False, recover=False, update=False):
 
 def repair_link(cfg, data):
     """Explicit replacement for a confirmed-sent link; never a progress ping."""
+    checkout = cfg.get('app') == 'amazon' and cfg.get('checkout')
+    if checkout:
+        from amazon_checkout import card_key, card_view
+    key = card_key(cfg) if checkout else cfg['watcher']
+    path = ROOT / 'cards' / (key + '.json')
+    with path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read(path)
+        if checkout:
+            cfg, data = card_view(cfg, data, state)
+        return _repair_link(cfg, data, path, state)
+
+
+def _repair_link(cfg, data, path, state):
     settings = cfg.get('delivery_card', {})
     recipient = settings.get('chat') or cfg.get('chat') or cfg.get('for')
     if recipient == 'owner' or settings.get('held') or settings.get('skip_send'):
         raise ValueError('public_sent_card_required')
-    path = ROOT / 'cards' / (cfg['watcher'] + '.json')
-    with path.with_suffix('.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        state = read(path)
-        if state.get('status') not in ('sent', 'relayed') or not state.get('url'):
-            raise ValueError('public_sent_card_required')
-        repair = state.get('repair')
-        if not repair or repair.get('status') in ('sent', 'relayed'):
-            shared = recorded_bridge(['shares'], state, lambda: atomic(path, state)).get('shares', [])
-            current = next((r for r in shared if r.get('app') == state['slug'] and r.get('live')), None)
-            url = current.get('url') if current else None
-            if not url:
-                url = recorded_bridge(['share','--app',state['slug'],'--days',str(share_days(cfg))], state,
-                                      lambda: atomic(path, state), timeout=65).get('url')
-            if not isinstance(url,str) or not public_url(url):
-                raise ValueError('public_card_url_required')
-            if url == state['url']:
-                state['link_health'] = 'ok'; atomic(path,state)
-                return {'status':'unchanged','url':url}
-            key = 'delivery-card-repair:' + cfg['watcher'] + ':' + hashlib.sha256(url.encode()).hexdigest()[:12]
-            repair = {'status':'attempting','url':url,'open':[],'args':['send','--to',recipient,'--text='+url,
-                      '--session',route(),'--key',key]}
-            state['repair'] = repair
-            atomic(path,state)
-        build(cfg,data,outdir=APPS/state['slug'],url=repair['url'],public=True)
-        final = None
-        if repair.get('tried'):
-            final, repair['args'] = reconcile(repair['args'], repair, 'args')
-        if not final:
-            repair['args'] = live_session(repair['args'])
-            repair['tried'] = True
-            try:
-                final = attempt(repair, 'args', lambda: atomic(path, state))
-            except (BridgeError, OSError, subprocess.TimeoutExpired) as exc:
-                remember_bridge_error(repair, exc)
-                repair['status'] = 'failed:bridge_request_failed'
-                atomic(path, state)
-                raise
-        if final not in ('sent', 'relayed'):
-            repair['status'] = final
-            atomic(path,state)
-            raise ValueError('repair_may_have_sent_check_chat')
-        repair.update(status=final)
-        state.update(url=repair['url'],link_health='ok',link_checked_at=time.time())
+    if state.get('status') not in ('sent', 'relayed') or not state.get('url'):
+        raise ValueError('public_sent_card_required')
+    repair = state.get('repair')
+    if not repair or repair.get('status') in ('sent', 'relayed'):
+        shared = recorded_bridge(['shares'], state, lambda: atomic(path, state)).get('shares', [])
+        current = next((r for r in shared if r.get('app') == state['slug'] and r.get('live')), None)
+        url = current.get('url') if current else None
+        if not url:
+            url = recorded_bridge(['share','--app',state['slug'],'--days',str(share_days(cfg))], state,
+                                  lambda: atomic(path, state), timeout=65).get('url')
+        if not isinstance(url,str) or not public_url(url):
+            raise ValueError('public_card_url_required')
+        if url == state['url']:
+            state.update(build(cfg,data,outdir=APPS/state['slug'],url=url,public=True,_checkout_projected=True))
+            from amazon_checkout import remember_card_terminal
+            remember_card_terminal(cfg, data, state, time.time())
+            state['link_health'] = 'ok'; atomic(path,state)
+            return {'status':'unchanged','url':url}
+        key = 'delivery-card-repair:' + cfg['watcher'] + ':' + hashlib.sha256(url.encode()).hexdigest()[:12]
+        repair = {'status':'attempting','url':url,'open':[],'args':['send','--to',recipient,'--text='+url,
+                  '--session',route(),'--key',key]}
+        state['repair'] = repair
         atomic(path,state)
-        return {'status':final,'url':state['url']}
+    state.update(build(cfg,data,outdir=APPS/state['slug'],url=repair['url'],public=True,_checkout_projected=True))
+    from amazon_checkout import remember_card_terminal
+    remember_card_terminal(cfg, data, state, time.time())
+    atomic(path,state)
+    final = None
+    if repair.get('tried'):
+        final, repair['args'] = reconcile(repair['args'], repair, 'args')
+    if not final:
+        repair['args'] = live_session(repair['args'])
+        repair['tried'] = True
+        try:
+            final = attempt(repair, 'args', lambda: atomic(path, state))
+        except (BridgeError, OSError, subprocess.TimeoutExpired) as exc:
+            remember_bridge_error(repair, exc)
+            repair['status'] = 'failed:bridge_request_failed'
+            atomic(path, state)
+            raise
+    if final not in ('sent', 'relayed'):
+        repair['status'] = final
+        atomic(path,state)
+        raise ValueError('repair_may_have_sent_check_chat')
+    repair.update(status=final)
+    state.update(url=repair['url'],link_health='ok',link_checked_at=time.time())
+    atomic(path,state)
+    return {'status':final,'url':state['url']}
 
 
 def safe_sync(cfg, data, *, send=False, recover=False, update=False):

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { AgentBus, type AgentAnswerReceipt, type AgentBusDeps } from "../src/agent-bus.ts";
+import { AgentBus, agentWakeId, type AgentAnswerReceipt, type AgentBusDeps } from "../src/agent-bus.ts";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,7 +37,9 @@ function setup() {
       if (fail || target.slug === failedSlug) throw new Error("delivery unavailable");
       if (!wakes.some(wake => wake.key === key)) wakes.push({ slug: target.slug, text, key, receipt });
       if (failAfter) throw new Error("crash after target insert");
+      return { id: agentWakeId(key), remote: false, confirmed: true };
     },
+    delivery: (target, key) => ({ id: agentWakeId(key), remote: false, confirmed: wakes.some(w => w.slug === target.slug && w.key === key) }),
     receipt: (target, key) => wakes.find(wake => wake.slug === target.slug && wake.key === key)?.receipt,
     log: (event, code) => { logs.push([event, code]); }, now: () => now,
   };
@@ -87,7 +89,7 @@ test.each(["owner", "moni"])("group requests tell %s the audience and return the
   expect(env.answer(id, "done", to).status).toBe(202);
   expect(env.wakes.map(wake => wake.slug)).toEqual([to, "group-family"]);
   expect(env.wakes[1]?.text).toEndWith("\nPRIVATE_ANSWER");
-  expect(env.logs).toContainEqual(["agent-ask", `group-family>${to} hop=1 group=1`]);
+  expect(env.logs).toContainEqual(["agent-ask", expect.stringContaining(`group-family>${to} hop=1 group=1`)]);
   expect(JSON.stringify(env.logs)).not.toMatch(/PRIVATE|Family|Abdullah|Moni|Sam/);
 });
 
@@ -131,8 +133,8 @@ test.each(["owner", "moni"])("group audience survives the second hop through %s 
     expect(header).toContain(`owner-go record-delegated --principal moni --bus-request ${env.id(second)}`);
     expect(header).toContain(rule);
   }
-  expect(env.logs).toContainEqual(["agent-ask", `group-family>${via} hop=1 group=1`]);
-  expect(env.logs).toContainEqual(["agent-ask", `${via}>${to} hop=2`]);
+  expect(env.logs).toContainEqual(["agent-ask", expect.stringContaining(`group-family>${via} hop=1 group=1`)]);
+  expect(env.logs).toContainEqual(["agent-ask", expect.stringContaining(`${via}>${to} hop=2`)]);
   expect(JSON.stringify(env.logs)).not.toMatch(/PRIVATE|Family|Abdullah|Moni|Sam|tell me/);
 });
 
@@ -198,6 +200,7 @@ test("pending is sent once, then a final answer closes the request", () => {
 
 test.each([false, true])("timeout is sent once, late final delivered, pending first = %s", pending => {
   const env = setup(); const id = env.id(env.ask());
+  env.deps.delivery = (_target, key) => ({ id: agentWakeId(key), remote: false, confirmed: true, deliveredAt: 1_100 });
   if (pending) env.answer(id, "pending");
   env.time(601_000); env.bus.sweep();
   expect(env.logs.filter(([event]) => event === "agent-timeout")).toHaveLength(0);
@@ -218,7 +221,7 @@ test("completed requests never time out", () => {
 
 test("failed request delivery retains metadata and recovers with the same key", () => {
   const env = setup(); env.fail(true);
-  expect(() => env.ask()).toThrow("delivery unavailable");
+  expect(env.ask().status).toBe(503);
   expect(env.store.db.query("SELECT * FROM agent_requests").all()).toHaveLength(1);
   env.fail(false); const retry = env.ask();
   expect(retry.status).toBe(200); expect(env.wakes).toHaveLength(1);
@@ -228,7 +231,7 @@ test("failed request delivery retains metadata and recovers with the same key", 
 test("recovery cannot redirect an old request through a newly allowed target", () => {
   const env = setup(); env.fail(true);
   writeFileSync(env.policyPath, JSON.stringify({ ...defaultAgentPolicy(), pairs: [...defaultAgentPolicy().pairs, { from: "moni", to: "group-family", approval: "none" }] }));
-  expect(() => env.ask("moni", "group-family")).toThrow();
+  expect(env.ask("moni", "group-family").status).toBe(503);
   writeFileSync(env.policyPath, JSON.stringify(defaultAgentPolicy()));
   env.fail(false);
   expect(env.ask("moni", "owner").status).toBe(200);
@@ -240,7 +243,7 @@ test.each(["ask", "answer", "timeout"])("failure after %s wake insertion converg
   const env = setup();
   let id: string;
   if (operation === "ask") {
-    env.failAfter(true); expect(() => env.ask()).toThrow("crash after target insert");
+    env.failAfter(true); expect(env.ask().status).toBe(202);
     env.failAfter(false); id = env.id(env.ask()); expect(env.wakes).toHaveLength(1);
   } else {
     id = env.id(env.ask()); env.failAfter(true);
@@ -284,7 +287,7 @@ test("table and event log retain metadata only; lists are scoped and capped at 2
   for (let i = 0; i < 25; i++) env.ask("owner", "moni", `PRIVATE_KEY_${i}`);
   const id = env.id(env.ask("group-family", "owner", "group")); env.answer(id, "done", "owner");
   const row = env.store.db.query("SELECT * FROM agent_requests WHERE id = ?").get(id);
-  expect(row).toEqual({ id, from_slug: "group-family", to_slug: "owner", parent_id: null, hop: 1, status: "done",
+  expect(row).toEqual({ id, from_slug: "group-family", to_slug: "owner", parent_id: null, hop: 1, status: "done", queued_at: 1000, delivered_at: null,
     text_chars: "PRIVATE_QUESTION".length, answer_chars: "PRIVATE_ANSWER".length, created_at: 1000, answered_at: 1000, timed_out_at: null });
   expect(JSON.stringify(env.store.db.query("SELECT * FROM agent_requests").all())).not.toContain("PRIVATE");
   expect(JSON.stringify(env.logs)).not.toContain("PRIVATE");
@@ -380,4 +383,139 @@ test("a pending wake committed before rollback is audited from repaired state", 
   env.failAfter(false);
   expect(env.answer(id, "pending", "owner").status).toBe(409);
   expect(env.logs.filter(([event]) => event === "agent-needs-owner")).toEqual([["agent-needs-owner", `${id} required=true`]]);
+});
+
+
+test("unconfirmed remote delivery retries, confirms the ack then records target pickup without text", () => {
+  const env = setup();
+  let ack = false, attempts = 0, deliveredAt: number | undefined;
+  env.deps.delivery = (_target, key) => ({ id: agentWakeId(key), remote: true, retained: true, confirmed: ack, deliveredAt });
+  env.deps.deliver = (target, text, key, receipt) => {
+    if (key.startsWith("agent-ask:")) { attempts++; return env.deps.delivery(target, key); }
+    env.wakes.push({ slug: target.slug, text, key, receipt });
+    return { id: agentWakeId(key), remote: false, confirmed: true };
+  };
+  const id = env.id(env.ask());
+  const row = () => env.store.db.query<{ status: string; delivered_at: number | null }, [string]>("SELECT status,delivered_at FROM agent_requests WHERE id=?").get(id)!;
+  expect(row()).toEqual({ status: "undelivered", delivered_at: null });
+  env.time(31_001); env.bus.sweep();
+  expect(attempts).toBe(2);
+  expect(env.wakes.at(-1)?.text).toContain("has not been delivered");
+  ack = true; env.time(32_001); env.bus.sweep();
+  expect(row().status).toBe("open");
+  deliveredAt = 33_001; env.time(34_001); env.bus.sweep(); env.bus.sweep();
+  expect(row().delivered_at).toBe(33_001);
+  expect(env.logs.filter(([e]) => e === "agent-deliver")).toEqual([["agent-deliver", `${id} moni row=${agentWakeId(`agent-ask:${id}`)} remote=1`]]);
+  expect(env.logs.filter(([e]) => e === "agent-delivered")).toEqual([["agent-delivered", `${id} ms=32001`]]);
+  expect(JSON.stringify(env.logs)).not.toMatch(/PRIVATE|has not|delivery unavailable/);
+});
+
+test("no ack times out as undelivered and does not retry past its deadline", () => {
+  const env = setup(); let attempts = 0;
+  env.deps.delivery = (_target, key) => ({ id: agentWakeId(key), remote: true, retained: true, confirmed: false });
+  const deliver = env.deps.deliver;
+  env.deps.deliver = (target, text, key, receipt) => {
+    if (key.startsWith("agent-ask:")) { attempts++; return env.deps.delivery(target, key); }
+    return deliver(target, text, key, receipt);
+  };
+  const id = env.id(env.ask()); env.time(601_001); env.bus.sweep(); env.bus.sweep();
+  expect(attempts).toBe(1);
+  expect(env.wakes.find(w => w.key === `agent-timeout:${id}`)?.text).toContain("was not delivered to a target turn");
+  expect(JSON.stringify(env.store.db.query("SELECT * FROM agent_requests").all())).not.toContain("PRIVATE");
+});
+
+
+test("unretained delivery is rejected and the same request can recover after restart", () => {
+  const env = setup(); env.fail(true); expect(env.ask().status).toBe(503);
+  const restarted = new AgentBus(env.deps); env.fail(false);
+  expect(restarted.ask({ sessionId: "session-owner", to: "moni", text: "PRIVATE_QUESTION", dedupeKey: "key" }).status).toBe(200);
+  expect(env.wakes).toHaveLength(1); restarted.sweep(); expect(env.wakes).toHaveLength(1);
+});
+
+
+test("an answer before a lost ack does not stop delivery receipt reconciliation", () => {
+  const env=setup(); let ack=false;
+  env.deps.delivery=(_target,key)=>({id:agentWakeId(key),remote:true,retained:true,confirmed:ack,...(ack?{deliveredAt:1500}:{})});
+  const deliver=env.deps.deliver;
+  env.deps.deliver=(target,text,key,receipt)=>key.startsWith("agent-ask:")?env.deps.delivery(target,key):deliver(target,text,key,receipt);
+  const id=env.id(env.ask()); expect(env.answer(id).status).toBe(202);
+  ack=true; env.time(2000); env.bus.sweep();
+  expect(env.store.db.query("SELECT queued_at,delivered_at FROM agent_requests WHERE id=?").get(id)).toEqual({queued_at:2000,delivered_at:1500});
+  expect(env.logs.filter(([event])=>event==="agent-delivered")).toEqual([["agent-delivered",`${id} ms=500`]]);
+});
+
+test.each([false, true])("progress follows confirmed pickup once across restart, remote=%s", remote => {
+  const env = setup();
+  let ack = false, deliveredAt: number | undefined, notices = 0;
+  const delivery = env.deps.delivery;
+  const deliver = env.deps.deliver;
+  env.deps.delivery = (target, key) => key.startsWith("agent-ask:")
+    ? { id: agentWakeId(key), remote, retained: true, confirmed: ack, deliveredAt }
+    : delivery(target, key);
+  env.deps.deliver = (target, text, key, receipt) => {
+    if (key.startsWith("agent-ask:")) return env.deps.delivery(target, key);
+    if (key.startsWith("agent-progress:")) notices++;
+    return deliver(target, text, key, receipt);
+  };
+  const id = env.id(env.ask("moni", "owner"));
+  env.time(31_001); env.bus.sweep();
+  expect(notices).toBe(0);
+  ack = true; env.time(32_001); env.bus.sweep();
+  expect(notices).toBe(0);
+  deliveredAt = 33_001; env.time(34_001); env.bus.sweep();
+  expect(notices).toBe(1);
+  const notice = env.wakes.find(wake => wake.key === `agent-progress:${id}`)!;
+  expect(notice.slug).toBe("moni");
+  expect(notice.text).toContain("was picked up by a target turn");
+  expect(notice.text).not.toContain("PRIVATE");
+  env.bus.sweep();
+  const restarted = new AgentBus(env.deps); restarted.sweep();
+  expect(notices).toBe(1);
+  expect(env.store.db.query("SELECT status FROM agent_requests WHERE id=?").get(id)).toEqual({ status: "open" });
+  env.time(601_001); restarted.sweep();
+  expect(env.wakes.find(wake => wake.key === `agent-timeout:${id}`)?.text).toContain("no answer for 10 minutes");
+  expect(restarted.answer({ sessionId: "session-owner", request: id, text: "PRIVATE_LATE_ANSWER" }).body)
+    .toEqual({ id, status: "done_late" });
+  restarted.sweep();
+  expect(env.wakes.filter(wake => wake.key === `agent-answer:${id}:final`)).toHaveLength(1);
+  expect(env.wakes.at(-1)?.text).toContain("PRIVATE_LATE_ANSWER");
+  expect(notices).toBe(1);
+  expect(JSON.stringify(env.logs)).not.toMatch(/PRIVATE|Work has started/);
+  expect(JSON.stringify(env.store.db.query("SELECT * FROM agent_requests").all())).not.toContain("PRIVATE");
+});
+
+test.each(["pending", "done", "declined", "expired"] as const)("no progress after %s", status => {
+  const env = setup(); const id = env.id(env.ask());
+  if (status === "expired") { env.time(601_001); env.bus.sweep(); }
+  else env.answer(id, status);
+  const delivery = env.deps.delivery;
+  env.deps.delivery = (target, key) => key.startsWith("agent-ask:")
+    ? { id: agentWakeId(key), remote: false, confirmed: true, deliveredAt: 2_000 }
+    : delivery(target, key);
+  env.bus.sweep();
+  expect(env.wakes.filter(wake => wake.key.startsWith("agent-progress:"))).toHaveLength(0);
+});
+
+test("progress retries failed retention and leaves a retained remote notice to its queue", () => {
+  const env = setup(); const id = env.id(env.ask());
+  const delivery = env.deps.delivery;
+  let retained = false, attempts = 0;
+  env.deps.delivery = (target, key) => key.startsWith("agent-ask:")
+    ? { id: agentWakeId(key), remote: false, confirmed: true, deliveredAt: 1_100 }
+    : key.startsWith("agent-progress:")
+      ? { id: agentWakeId(key), remote: true, confirmed: false, retained }
+      : delivery(target, key);
+  const deliver = env.deps.deliver;
+  env.deps.deliver = (target, text, key, receipt) => {
+    if (!key.startsWith("agent-progress:")) return deliver(target, text, key, receipt);
+    if (++attempts === 1) throw new Error("PRIVATE_TRANSPORT_ERROR");
+    retained = true;
+    return env.deps.delivery(target, key);
+  };
+  env.time(2_000); env.bus.sweep();
+  expect(attempts).toBe(1);
+  env.bus.sweep(); new AgentBus(env.deps).sweep();
+  expect(attempts).toBe(2);
+  expect(env.logs).toContainEqual(["agent-timeout-failed", id]);
+  expect(JSON.stringify(env.logs)).not.toContain("PRIVATE");
 });

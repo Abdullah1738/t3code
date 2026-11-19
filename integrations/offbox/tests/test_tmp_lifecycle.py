@@ -114,7 +114,8 @@ class ScratchLifecycle(Base):
                 if args[0] == 'init':
                     raise RuntimeError('instance already exists')
                 if args[0] == 'query':
-                    return subprocess.CompletedProcess(args, 0, json.dumps({'config': config}).encode(), b'')
+                    value={'status':'Stopped'} if args[1].endswith('/state') else {'config':config}
+                    return subprocess.CompletedProcess(args, 0, json.dumps(value).encode(), b'')
                 self.fail(f'unexpected mutation of foreign instance: {args}')
             with self.subTest(config=config), patch.object(boatd, 'incus', side_effect=foreign):
                 boatd.provision(bid, ('image', 'offbox-base'), 'default')

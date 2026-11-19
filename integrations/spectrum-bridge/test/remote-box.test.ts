@@ -6,7 +6,9 @@ import { join } from "node:path";
 import { RemoteBox, remoteBoxConfig, type RemoteBoxConfig } from "../src/remote-box.ts";
 import { opaqueId } from "../src/remote-protocol.ts";
 import { Store } from "../src/store.ts";
-import { BoxRunner } from "../../moni-box-runner/src/runner.ts";
+import { BoxRunner, type Harness } from "../../moni-box-runner/src/runner.ts";
+import { claudeHarness } from "../../moni-box-runner/src/claude.ts";
+import { AgentBus, agentWakeId } from "../src/agent-bus.ts";
 import { ChatRegistry, createAgentBus, createSbApi } from "../src/runtime.ts";
 import { chatKey, LineError, type Line } from "../src/line.ts";
 import { parseCommand } from "../src/cli.ts";
@@ -19,7 +21,7 @@ import { summarizeLog } from "../src/log-rollup.ts";
 import { ChatMirror, type MirrorSink, type MirrorItem } from "../src/mirror.ts";
 const roots: string[] = [], closes: (() => void)[] = [];
 afterEach(() => { closes.splice(0).forEach(f => f()); roots.splice(0).forEach(p => rmSync(p, { recursive: true, force: true })); });
-function setup(mirrorSink?: MirrorSink) {
+function setup(mirrorSink?: MirrorSink, harness?: (root: string) => Harness) {
   const root = mkdtempSync(join(tmpdir(), "remote-box-test-")); roots.push(root);
   const mac = join(root, "mac"), box = join(root, "box"); mkdirSync(mac); mkdirSync(box);
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
@@ -31,8 +33,9 @@ function setup(mirrorSink?: MirrorSink) {
   let eventsFail = false, routerReady = true, callbackReady = true;
   let requestHook: ((path: string) => Promise<void>) | undefined;
   let now = 1000, online = true, dropAck = false, active = true;
+  let afterStatus: (()=>Promise<void>) | undefined;
   const store = new Store(join(mac, "state.sqlite")); closes.push(() => store.close());
-  const runner = new BoxRunner({ root: box, boxId: config.boxId, epoch: config.epoch, token, callbackToken, privateKey: keys.privateKey, callbackUrl: "http://127.0.0.1:12346", system: "system" }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, { now: () => now, modelReady: async () => routerReady, callbackReady: async () => callbackReady, fetch: (async () => Response.json({ epoch: "test", accepted: true })) });
+  const runner = new BoxRunner({ root: box, boxId: config.boxId, epoch: config.epoch, token, callbackToken, privateKey: keys.privateKey, callbackUrl: "http://127.0.0.1:12346", system: "system" }, harness?.(box) ?? { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, { now: () => now, modelReady: async () => routerReady, callbackReady: async () => callbackReady, fetch: (async () => Response.json({ epoch: "test", accepted: true })) });
   closes.push(() => runner.db.close());
   const io = { now: () => now, active: () => active,
     mirror: mirrorSink ? new ChatMirror(store, mirrorSink, { now: () => now, timeoutMs: 20 }) : undefined,
@@ -43,6 +46,7 @@ function setup(mirrorSink?: MirrorSink) {
       await requestHook?.(path);
       if (path === "/events" && eventsFail) return Response.json({ error: "PRIVATE_EVENTS_ERROR" }, { status: 503 });
       const response = await runner.handle(new Request(String(url), init));
+      if (String(url).endsWith("/delivery-status") && afterStatus) { const hook=afterStatus; afterStatus=undefined; await hook(); }
       if (String(url).endsWith("/deliver") && dropAck) { dropAck = false; throw new Error("lost ack"); } return response; }),
   } satisfies ConstructorParameters<typeof RemoteBox>[2];
   let remote = new RemoteBox(config, store, io);
@@ -53,16 +57,53 @@ function setup(mirrorSink?: MirrorSink) {
     requestLocation: async () => {}, location: async () => undefined, setOptOut: async () => {}, download: async () => ({ data: new Uint8Array(), name: "", mimeType: "" }) };
   return { root, mac, box, get remote() { return remote; }, mirror: io.mirror, runner, store, config, logs, notices, texts, alerts, requests, line,
     failEvents: () => { eventsFail = true; },
+    failReadyLog: () => { const log = io.log; io.log = (name, code) => { if (name === "moni-callback-ready") throw new Error("PRIVATE_LOG_FAILURE"); return log(name, code); }; },
     readiness: (router: boolean, callback: boolean) => { routerReady = router; callbackReady = callback; },
     ownerAlert: (alert: typeof io.ownerAlert) => { io.ownerAlert = alert; },
     requestHook: (hook: typeof requestHook) => { requestHook = hook; },
     restart: () => { remote.stop(); const reopened = new Store(join(mac, "state.sqlite")); closes.push(() => reopened.close()); remote = new RemoteBox(config, reopened, io); },
     failNotice: () => { io.notice = async id => { notices.push(id); throw new Error("ambiguous notice"); }; },
     advance: (ms = 65_000) => { now += ms; }, offline: () => { online = false; }, online: () => { online = true; }, drop: () => { dropAck = true; }, rollback: () => { active = false; },
+    afterStatus: (hook: ()=>Promise<void>) => {afterStatus=hook;},
     request: (path: string, body: unknown = {}, auth = callbackToken) => new Request(`http://bridge${path}`, { method: "POST", headers: { authorization: `Bearer ${auth}` }, body: JSON.stringify({ epoch: "test", ...body as object }) }),
   };
 }
 function files(root: string): string { return readdirSync(root, { withFileTypes: true }).map(e => e.isDirectory() ? files(join(root, e.name)) : readFileSync(join(root, e.name)).toString()).join(""); }
+
+test.each(["ready", "invalid", "paused"])("a timing log failure preserves the %s readiness response", async state => {
+  const s = setup(); s.failReadyLog();
+  if (state === "paused") s.rollback();
+  const rows = await captureLogs(async () => {
+    const response = await s.remote.callback(s.request("/ready", state === "invalid" ? { epoch: "PRIVATE_EPOCH" } : {}),
+      { line: s.line, chat: chatKey.dm("+15555550199"), bus: async () => { throw new Error("not called"); } });
+    expect(response.status).toBe(state === "ready" ? 200 : state === "invalid" ? 403 : 503);
+    expect(await response.json()).toEqual(state === "ready" ? { epoch: "test" } : { error: state === "invalid" ? "Forbidden" : "Backend paused" });
+  });
+  expect(JSON.stringify([rows, s.logs])).not.toContain("PRIVATE_");
+});
+
+test("authenticated readiness logs handler and event-loop timing without callback payloads", async () => {
+  const s = setup();
+  const rows = await captureLogs(async () => {
+    for (const [body, expected] of [[{ marker: "PRIVATE_TEXT" }, 200], [{ epoch: "PRIVATE_EPOCH" }, 403]] as const) {
+      const response = await s.remote.callback(s.request("/ready", body), { line: s.line, chat: chatKey.dm("+15555550199"), bus: async () => { throw new Error("not called"); } });
+      expect(response.status).toBe(expected);
+    }
+    const denied = await s.remote.callback(s.request("/ready", {}, "PRIVATE_TOKEN"), { line: s.line, chat: chatKey.dm("+15555550199"), bus: async () => { throw new Error("not called"); } });
+    expect(denied.status).toBe(403);
+  });
+  const timings = rows.filter(row => row.name === "moni-callback-ready");
+  expect(timings).toHaveLength(2);
+  expect(timings.map(row => row.props?.status)).toEqual([200, 403]);
+  for (const row of timings) {
+    expect(row.durationMs).toBeGreaterThanOrEqual(0);
+    expect(row.props?.handlerMs).toBe(row.durationMs!);
+    expect(row.props?.loopDelayMs).toBeGreaterThanOrEqual(0);
+  }
+  expect(s.texts).toHaveLength(0);
+  const logged = JSON.stringify([rows, s.logs]);
+  for (const value of ["PRIVATE_", "a".repeat(40), "b".repeat(40), "authorization"]) expect(logged).not.toContain(value);
+});
 
 test("delivered human backlog behind a fence gets one notice and one refreshed owner alert across flaps and restart", async () => {
   const s = setup(), head = opaqueId("held-message");
@@ -842,8 +883,8 @@ test.each(["before", "after"])("delivery card bus retry recovers a failure %s th
     if (fail) throw new Error("fixture acknowledgement lost");
     return created;
   };
-  expect((await ask()).status).toBe(500);
-  expect(ownerStore.db.query<{ status: string }, []>("SELECT status FROM agent_requests").all()).toEqual([{ status: "open" }]);
+  expect((await ask()).status).toBe(failure === "before" ? 503 : 202);
+  expect(ownerStore.db.query<{ status: string }, []>("SELECT status FROM agent_requests").all()).toEqual([{ status: "undelivered" }]);
   expect(s.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox").get()!.n).toBe(failure === "before" ? 0 : 1);
   fail = false;
   const recovered = await ask();
@@ -1110,4 +1151,135 @@ test("a hung mirror never holds Moni's reply or prevents the next successful sen
   await s.remote.send("one", "answer", undefined, s.line, chatKey.dm("moni"));
   await s.remote.send("two", "second answer", undefined, s.line, chatKey.dm("moni"));
   expect(sends).toBe(2); expect(appends).toBe(1); await running;
+});
+
+test("remote bus confirmation requires ack and reports pickup from the box without text", async () => {
+  const s = setup(); const id = "wake:agent-bus:delivery-canary";
+  const privateText = randomUUID();
+  s.remote.accept(id, { id, text: privateText, agentExpiresAt: 9999999999999 });
+  expect(s.remote.delivery(id)).toEqual({ retained: true, confirmed: false });
+  s.drop(); await s.remote.tick();
+  expect(s.remote.delivery(id)).toEqual({ retained: true, confirmed: false });
+  s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id)).toEqual({ retained: true, confirmed: true });
+  await s.runner.tick(); s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id).deliveredAt).toBeGreaterThan(0);
+  expect(s.texts.join()).toContain(privateText);
+  expect(files(s.mac)).not.toContain(privateText);
+  expect(s.logs.join()).not.toContain(privateText);
+});
+
+test("an acknowledged remote bus request with a failed Claude launch never reports work started", async () => {
+  const s = setup(undefined, root => {
+    mkdirSync(join(root, "work"));
+    const keyFile = join(root, "router-key"); writeFileSync(keyFile, "test-router-key", { mode: 0o600 });
+    return claudeHarness(root, join(root, "missing-claude"), "test", { routerKeyFile: keyFile });
+  });
+  const owner = { slug: "owner", title: "Owner", kind: "owner" as const, key: chatKey.dm("owner") };
+  const moni = { slug: "moni", title: "Moni", kind: "dm" as const, key: chatKey.dm("moni") };
+  const notices = new Map<string, string>(), logs: string[] = []; let now = 1_000;
+  const bus = new AgentBus({ db: s.store.db, policyPath: join(s.mac, "agent-policy.json"), now: () => now,
+    forSession: id => id === "owner-session" ? owner : undefined, bySlug: slug => slug === "moni" ? moni : owner, groupMembers: () => [],
+    deliver: (target, text, key, _receipt, expiresAt) => {
+      const id = agentWakeId(key);
+      if (target.slug === "moni") { s.remote.accept(id, { id, text, agentExpiresAt: expiresAt }); return { id, remote: true, ...s.remote.delivery(id) }; }
+      notices.set(key, text); return { id, remote: false, confirmed: true };
+    },
+    delivery: (target, key) => target.slug === "moni" ? { id: agentWakeId(key), remote: true, ...s.remote.delivery(agentWakeId(key)) }
+      : { id: agentWakeId(key), remote: false, confirmed: notices.has(key) },
+    receipt: () => undefined, log: (event, detail) => logs.push(`${event} ${detail ?? ""}`),
+  });
+  const ask = bus.ask({ sessionId: "owner-session", to: "moni", text: "PRIVATE_BUS_TEXT", dedupeKey: "launch-failure" });
+  expect(ask.status).toBe(202); const id = (ask.body as { id: string }).id;
+  await s.remote.tick(); bus.sweep();
+  await s.runner.tick(); s.advance(); now += 65_000; await s.remote.tick(); bus.sweep();
+  expect(s.remote.delivery(agentWakeId(`agent-ask:${id}`))).toEqual({ retained: true, confirmed: true });
+  expect(s.store.db.query("SELECT delivered_at FROM agent_requests WHERE id=?").get(id)).toEqual({ delivered_at: null });
+  expect(logs.some(line => line.startsWith("agent-deliver "))).toBe(true);
+  expect(logs.some(line => line.startsWith("agent-delivered "))).toBe(false);
+  expect(notices.has(`agent-progress:${id}`)).toBe(false);
+  now = 601_001; bus.sweep();
+  expect(notices.get(`agent-timeout:${id}`)).toContain("was not delivered to a target turn");
+  expect(notices.get(`agent-timeout:${id}`)).not.toContain("no answer");
+  expect(logs.join()).not.toContain("PRIVATE_BUS_TEXT");
+});
+
+
+test("expired acked requests do not starve later pickup receipts", async () => {
+  const s = setup();
+  for (let i=0; i<50; i++) s.remote.accept(`expired-${i}`, { text: "PRIVATE", agentExpiresAt: 2_000 });
+  await s.remote.tick(); s.advance(); await s.remote.tick();
+  for (let i=0; i<50; i++) await s.runner.tick();
+  const id = "wake:agent-bus:after-expired";
+  s.remote.accept(id, { text: "next", agentExpiresAt: 9999999999999 });
+  s.advance(); await s.remote.tick(); await s.runner.tick(); s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id).deliveredAt).toBeGreaterThan(0); expect(s.texts).toEqual(["next"]);
+});
+
+test("lost ack pickup is reconciled after expiry without resending", async () => {
+  const s = setup(), id = "wake:agent-bus:lost-ack";
+  s.remote.accept(id, { text: "PRIVATE", agentExpiresAt: 20_000 });
+  s.drop(); await s.remote.tick(); await s.runner.tick(); expect(s.remote.delivery(id).confirmed).toBe(false);
+  s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id)).toMatchObject({ confirmed: true, deliveredAt: 1_000 }); expect(s.texts).toEqual(["PRIVATE"]);
+});
+
+
+test("a pre-expiry receipt snapshot arriving after expiry stays eligible for reconciliation", async () => {
+  const s=setup(),id="wake:agent-bus:receipt-race";
+  s.remote.accept(id,{text:"PRIVATE",agentExpiresAt:20_000});
+  s.afterStatus(async()=>{await s.runner.tick();s.advance();}); await s.remote.tick();
+  expect(s.remote.delivery(id).deliveredAt).toBeUndefined();
+  s.advance(); await s.remote.tick(); expect(s.remote.delivery(id).deliveredAt).toBe(1000);
+  expect(s.texts).toEqual(["PRIVATE"]);
+});
+
+test("slow pickup receipts allow concurrent lease renewal with one status probe", async () => {
+  const s = setup(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  s.remote.accept("wake:agent-bus:slow-receipt", { text: "PRIVATE", agentExpiresAt: 200_000 });
+  let leases = 0, probes = 0;
+  s.requestHook(async path => {
+    if (path === "/lease") { leases++; s.advance(8_000); }
+    if (path === "/delivery-status") { probes++; entered.resolve(); await release.promise; }
+  });
+  const probing = s.remote.tick(); await entered.promise;
+  try {
+    expect(s.runner.active()).toBe(true);
+    s.advance(5_000); await s.remote.tick();
+    expect(leases).toBe(2); expect(probes).toBe(1);
+    expect(s.runner.active()).toBe(true);
+    s.advance(8_000);
+    expect(s.runner.active()).toBe(true);
+  } finally { release.resolve(); await probing; }
+  expect(s.logs).not.toContain("moni-box-down ");
+});
+
+test("remote transfer acknowledgement and legacy migration never fabricate target pickup", async () => {
+  const s = setup(); const id = "wake:agent-bus:legacy-pickup";
+  s.remote.accept(id, { id, text: `[Agent request areq_${"b".repeat(64)} from Owner's assistant]PRIVATE`, receivedAt: 1_000 });
+  await s.remote.tick();
+  expect(s.store.db.query("SELECT delivered_at,picked_up_at FROM remote_inbox WHERE id=?").get(opaqueId(id)))
+    .toEqual({ delivered_at: 1_000, picked_up_at: null });
+  expect(s.remote.delivery(id)).toEqual({ retained: true, confirmed: true });
+  s.store.db.query("UPDATE remote_inbox SET expires_at=200000 WHERE id=?").run(opaqueId(id));
+  s.restart(); s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id).deliveredAt).toBeUndefined();
+  await s.runner.tick(); s.advance(); await s.remote.tick();
+  expect(s.remote.delivery(id).deliveredAt).toBe(66_000);
+  expect(s.texts).toHaveLength(1);
+});
+
+test.each([false, true])("legacy encrypted asks receive deadline metadata before delayed pickup, acked=%s", async acked => {
+  const s = setup(); const id = "wake:agent-bus:legacy-deadline";
+  s.remote.accept(id, { id, text: `[Agent request areq_${"a".repeat(64)} from Owner's assistant]PRIVATE`, receivedAt: 1_000 });
+  if (acked) { await s.remote.tick(); await s.runner.tick(); expect(s.texts).toEqual([]); }
+  // The bridge migration can update metadata without decrypting the retained envelope.
+  s.store.db.query("UPDATE remote_inbox SET expires_at=2000 WHERE id=?").run(opaqueId(id));
+  s.advance();
+  // Exercise transfer just before expiry as well as an existing acknowledged box row.
+  if (!acked) s.store.db.query("UPDATE remote_inbox SET expires_at=67000 WHERE id=?").run(opaqueId(id));
+  await s.remote.tick(); s.advance();
+  await s.remote.tick(); await s.runner.tick(); expect(s.texts).toEqual([]);
+  expect(s.runner.db.query<{ expires_at: number; state: string; delivered_at: number | null }, [string]>("SELECT expires_at,state,delivered_at FROM inbox WHERE id=?").get(opaqueId(id)))
+    .toEqual({ expires_at: acked ? 2000 : 67000, state: "done", delivered_at: null });
 });

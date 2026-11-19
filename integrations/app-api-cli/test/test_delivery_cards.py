@@ -505,6 +505,144 @@ class CardTests(unittest.TestCase):
         self.assertIn('https://cards.trycloudflare.com/preview.png',doc)
         self.assertIn('Delivered', doc)
 
+    def test_amazon_checkout_uses_one_card_until_every_order_is_terminal(self):
+        import amazon_checkout
+        from test_amazon_checkout import split_confirmation
+        from test_amazon_email_orders import parse, OID, OTHER
+        import amazon_email_orders
+        group = amazon_email_orders.checkout_details(OID, parse(split_confirmation()))
+        configs = []
+        for oid in group['order_ids']:
+            cfg = {**self.cfg, 'app': 'amazon', 'order': oid, 'watcher': 'order-amazon-' + oid,
+                   'vertical': 'same-day', 'chat': 'moni', 'delivery_card': {'ready': True}}
+            amazon_checkout.apply(cfg, group)
+            t.write(amazon_checkout.config_path(t, oid), cfg)
+            t.write(t.WATCHERS / cfg['watcher'] / 'order-tracker-state.json',
+                    {'status': 'placed', 'last_result': {'status': 'placed', 'whole_order_complete': False}})
+            configs.append(cfg)
+        for cfg in reversed(configs):
+            c.sync(cfg, {'status': 'placed'}, send=True)
+        c.sync(configs[0], {'status': 'placed'}, send=True)
+        self.assertEqual(len([a for a in self.calls if a[0] == 'send']), 1)
+        self.assertEqual(len([a for a in self.calls if a[0] == 'share']), 1)
+        delivered = {'status': 'delivered', 'whole_order_complete': True}
+        first = c.sync(configs[0], delivered)
+        self.assertNotEqual(c.read(c.ROOT / 'cards' / (configs[0]['watcher'] + '.json'))['stage'], 'Delivered')
+        # Standalone renders and the CLI must use the same checkout projection.
+        standalone = c.build(configs[0], delivered)
+        self.assertNotEqual(standalone['stage'], 'Delivered')
+        fixture = self.root / 'delivery.json'
+        c.atomic(fixture, delivered)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            c.main(['--app', 'amazon', '--order', configs[0]['order'], '--data-file', str(fixture)])
+        self.assertNotEqual(json.loads(output.getvalue())['stage'], 'Delivered')
+        t.write(t.WATCHERS / configs[0]['watcher'] / 'order-tracker-state.json',
+                {'status': 'delivered', 'last_result': delivered})
+        final = c.sync(configs[1], delivered)
+        self.assertEqual(c.read(c.ROOT / 'cards' / (configs[0]['watcher'] + '.json'))['stage'], 'Delivered')
+        # This snapshot was captured before the other sibling finished. Its
+        # delayed refresh must not replace the confirmed terminal page/image.
+        c.sync(configs[0], {'status': 'out for delivery', 'whole_order_complete': False}, update=True)
+        self.assertEqual(c.read(c.ROOT / 'cards' / (configs[0]['watcher'] + '.json'))['stage'], 'Delivered')
+        doc = (c.APPS / final['slug'] / 'index.html').read_text()
+        self.assertIn('Fixture Tea', doc)
+        self.assertIn('Fixture Root', doc)
+        self.assertIn('20.00', doc)
+        self.assertEqual(len([a for a in self.calls if a[0] == 'send']), 1)
+
+    def test_amazon_discovery_preserves_the_existing_card_and_repair_identity(self):
+        import amazon_checkout
+        import amazon_email_orders
+        from test_amazon_checkout import split_confirmation
+        from test_amazon_email_orders import parse, OID, OTHER
+        group = amazon_email_orders.checkout_details(OID, parse(split_confirmation()))
+        def register(args, timeout=12):
+            wid = args[args.index('--id') + 1]
+            t.write(t.WATCHERS / wid / 'watcher.json', {'id': wid, 'check': 'fixture'})
+            t.write(t.WATCHERS / wid / 'order-tracker-state.json',
+                    {'status': 'placed', 'last_result': {'status': 'placed', 'whole_order_complete': False}})
+            return 'registered'
+        argv = ['add', '--app', 'amazon', '--for', 'moni', '--order', OTHER]
+        with patch.object(t, 'run', side_effect=register), patch.object(t.store, 'reconcile'), \
+                patch.object(t, 'cwd_chat', return_value=None), patch.object(t, 'known_chat', return_value=True), \
+                patch.object(amazon_email_orders, 'track', return_value={}) as track, \
+                contextlib.redirect_stdout(io.StringIO()):
+            t.main(argv)
+            old = c.read(c.ROOT / 'cards' / ('order-amazon-' + OTHER + '.json'))
+            track.return_value = {'checkout': group, 'errors': []}
+            t.main([*argv, '--order', OID])
+        self.assertEqual(len([a for a in self.calls if a[0] == 'send']), 1)
+        cfg = c.read(c.ROOT / 'orders' / ('order-amazon-' + OID + '.json'))
+        self.assertEqual(cfg['checkout_leader'], OTHER)
+        retained = c.read(c.ROOT / 'cards' / ('order-amazon-' + OTHER + '.json'))
+        self.assertEqual((retained['url'], retained['send_args']), (old['url'], old['send_args']))
+        new_url = 'https://changed.trycloudflare.com/'
+        with patch.object(c, 'recorded_bridge', return_value={'shares': [
+                {'app': old['slug'], 'live': True, 'url': new_url}]}), \
+                patch.object(c, 'attempt', return_value='sent'):
+            repaired = c.repair_link(cfg, {'status': 'delivered', 'whole_order_complete': True})
+        self.assertEqual(repaired['url'], new_url)
+        data = c.read(c.APPS / old['slug'] / 'status.json')
+        self.assertNotEqual(data['stage'], 'Delivered')
+        self.assertEqual(len(data['items']), 2)
+
+    def amazon_terminal_fixture(self):
+        import amazon_checkout
+        import amazon_email_orders
+        from test_amazon_checkout import split_confirmation
+        from test_amazon_email_orders import parse, OID
+        group = amazon_email_orders.checkout_details(OID, parse(split_confirmation()))
+        configs = []
+        delivered = {'status': 'delivered', 'whole_order_complete': True}
+        active = {'status': 'out for delivery', 'whole_order_complete': False}
+        for i, oid in enumerate(group['order_ids']):
+            cfg = {**self.cfg, 'app': 'amazon', 'order': oid, 'watcher': 'order-amazon-' + oid,
+                   'vertical': 'same-day', 'chat': 'moni', 'delivery_card': {'ready': True}}
+            amazon_checkout.apply(cfg, group)
+            t.write(amazon_checkout.config_path(t, oid), cfg)
+            data = active if i else delivered
+            t.write(t.WATCHERS / cfg['watcher'] / 'order-tracker-state.json', {'status': data['status'], 'last_result': data})
+            configs.append(cfg)
+        card = c.sync(configs[0], delivered, send=True)
+        path = c.ROOT / 'cards' / (configs[0]['watcher'] + '.json')
+        return configs, delivered, active, card, path
+
+    def test_standalone_checkout_completion_survives_older_watcher_snapshots(self):
+        configs, delivered, active, card, path = self.amazon_terminal_fixture()
+        self.assertEqual(c.build(configs[1], delivered)['stage'], 'Delivered')
+        self.assertEqual(c.read(path)['checkout_terminal_status'], 'delivered')
+        c.sync(configs[1], active, update=True)
+        self.assertEqual(c.read(path)['stage'], 'Delivered')
+
+    def test_repair_checkout_completion_survives_older_watcher_snapshots(self):
+        configs, delivered, active, card, path = self.amazon_terminal_fixture()
+        with patch.object(c, 'recorded_bridge', return_value={'shares': [
+                {'app': card['slug'], 'live': True, 'url': 'https://changed.trycloudflare.com/'}]}), \
+                patch.object(c, 'attempt', return_value='sent'):
+            c.repair_link(configs[1], delivered)
+        self.assertEqual(c.read(path)['checkout_terminal_status'], 'delivered')
+        c.sync(configs[1], active, update=True)
+        self.assertEqual(c.read(path)['stage'], 'Delivered')
+
+    def test_checkout_export_does_not_commit_live_terminal_state(self):
+        configs, delivered, active, card, path = self.amazon_terminal_fixture()
+        c.build(configs[1], delivered, outdir=self.root / 'export')
+        self.assertNotIn('checkout_terminal_status', c.read(path))
+        self.assertEqual(c.read(path)['stage'], 'Out for delivery')
+
+    def test_active_checkout_cannot_prune_legacy_single_order_completion(self):
+        configs, delivered, active, card, path = self.amazon_terminal_fixture()
+        state = c.read(path)
+        state['terminal_at'] = time.time() - 7200
+        c.atomic(path, state)
+        with patch.object(c, 'bridge', return_value={'shares': [
+                {'app': card['slug'], 'live': True, 'url': card['url']}]}), \
+                patch.object(c, 'recorded_bridge', side_effect=AssertionError('active checkout may not unshare')):
+            c.prune_completed_shares()
+        c.sync(configs[0], delivered)
+        self.assertNotIn('terminal_at', c.read(path))
+        self.assertNotIn('unshared', c.read(path))
+
     def test_public_links_on_the_share_origin_count_and_tailnet_links_do_not(self):
         for url in ('https://cards.abdullah.fund/s/AbCdEfGhIjKlMnOpQrStUv/', 'https://quiet-words.trycloudflare.com/'):
             self.assertTrue(c.public_url(url), url)

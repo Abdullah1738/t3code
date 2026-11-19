@@ -4399,6 +4399,30 @@ it.effect.each(
     }),
 );
 
+it.effect.each([false, true])(
+  "reconciles late expired-run output with native ownership (busy: %s)",
+  (busy) =>
+    Effect.gen(function* () {
+      const stops: ProviderTurnId[] = [];
+      const result = yield* captureRootRunTermination({
+        key: `expired-native-ownership:${busy}`,
+        shouldFinalizeRun: () => Effect.succeed(false),
+        loadRunSettlement: () => Effect.succeed({ status: "failed", completedAt: null }),
+        holdsWorkForThread: () => Effect.succeed(busy),
+        events: (ids) =>
+          Stream.make(backgroundTurnItemEvent(ids, "command_execution", "running", 1)),
+        interruptTurn: (input) =>
+          Effect.sync(() => {
+            stops.push(input.providerTurnId);
+          }),
+      });
+      assert.deepEqual(stops, busy ? [`provider-turn:expired-native-ownership:${busy}`] : []);
+      assert.isEmpty(result.written);
+      assert.isEmpty(result.observed);
+      assert.isTrue(result.previewActivityEnded);
+    }),
+);
+
 it.effect("stops a settled run by exact attempt when late activity precedes its turn id", () =>
   Effect.gen(function* () {
     const stops: string[] = [];
@@ -5728,6 +5752,7 @@ function captureRootRunTermination(input: {
   readonly startTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
   readonly interruptStartingRun?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptStartingRun"];
   readonly interruptTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
+  readonly holdsWorkForThread?: ProviderAdapter.ProviderAdapterV2SessionRuntime["holdsWorkForThread"];
   readonly awaitSessionExit?: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"];
   readonly unsafeProcessStop?: Effect.Effect<void>;
   readonly sharedSessionId?: ProviderSessionId;
@@ -5934,6 +5959,9 @@ function captureRootRunTermination(input: {
             ? {}
             : { interruptStartingRun: input.interruptStartingRun }),
           interruptTurn: input.interruptTurn ?? (() => Effect.void),
+          ...(input.holdsWorkForThread === undefined
+            ? {}
+            : { holdsWorkForThread: input.holdsWorkForThread }),
           ...(input.awaitSessionExit === undefined
             ? {}
             : { awaitSessionExit: input.awaitSessionExit }),

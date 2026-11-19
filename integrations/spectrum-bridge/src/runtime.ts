@@ -27,7 +27,8 @@ import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
 import { sessionMatches } from "./session.ts";
 import { Store } from "./store.ts";
 import { agentPolicyPath, validNotifyId, validNotifyText } from "./agent-policy.ts";
-import { AGENT_BUS_WAKE_PREFIX, AgentBus, validAgentRequestId, validAnswerStatus, type AgentAnswerReceipt } from "./agent-bus.ts";
+import { opaqueId } from "./remote-protocol.ts";
+import { AGENT_BUS_WAKE_PREFIX, agentWakeId, AgentBus, validAgentRequestId, validAnswerStatus, type AgentAnswerReceipt } from "./agent-bus.ts";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -164,9 +165,10 @@ export class ChatRegistry<P> {
   }
 
   /** Machine input for a chat's agent (owner decisions, questions from other chats). Deduped by key. */
-  wake(chat: Chat<P>, text: string, dedupeKey: string, metadata: { agentAnswer?: AgentAnswerReceipt; agentBus?: boolean } = {}): { id: string; created: boolean } {
+  wake(chat: Chat<P>, text: string, dedupeKey: string, metadata: { agentAnswer?: AgentAnswerReceipt; agentBus?: boolean; expiresAt?: number } = {}): { id: string; created: boolean } {
     const id = `${metadata.agentBus ? AGENT_BUS_WAKE_PREFIX : "wake:"}${hash(dedupeKey)}`;
     const payload = { id, text, attachments: [], isAudioMessage: false, receivedAt: this.now(),
+      ...(metadata.expiresAt === undefined ? {} : { agentExpiresAt: metadata.expiresAt }),
       ...(metadata.agentAnswer ? { agentAnswer: metadata.agentAnswer } : {}) };
     const created = chat.remote ? chat.remote.accept(id, payload, metadata.agentAnswer, "wake") : chat.store.acceptInbound(id, payload);
     if (created) this.touch(chat);
@@ -273,7 +275,7 @@ const adminGroup = <P>(caller: Chat<P> | undefined, target: Chat<P> | undefined)
   && target.store.hasInboundFrom([chatKey.target(caller.info.key), ...(caller.info.person?.addresses ?? [])]);
 
 export function createAgentBus<P>(registry: ChatRegistry<P>, log: (event: string, code?: string) => void = () => {}, policyPath?: string): AgentBus {
-  return new AgentBus({
+  const bus = new AgentBus({
     db: registry.owner.store.db,
     forSession: id => registry.forSession(id)?.info,
     bySlug: slug => registry.bySlugName(slug)?.info,
@@ -282,10 +284,20 @@ export function createAgentBus<P>(registry: ChatRegistry<P>, log: (event: string
       const chat = registry.bySlugName(info.slug);
       return chat ? [...new Set(chat.store.groupAudience().map(address => chat.context.roleOf(address).name))] : [];
     },
-    deliver: (target, text, key, receipt) => {
+    deliver: (target, text, key, receipt, expiresAt) => {
       const chat = registry.bySlugName(target.slug);
       if (!chat) throw new Error("Agent target unavailable");
-      registry.wake(chat, text, key, { agentAnswer: receipt, agentBus: true });
+      const wake = registry.wake(chat, text, key, { agentAnswer: receipt, agentBus: true, expiresAt });
+      if (chat.remote) return { id: wake.id, remote: true, ...chat.remote.delivery(wake.id) };
+      return { id: wake.id, remote: false, confirmed: !!chat.store.db.query("SELECT 1 FROM inbound WHERE id=?").get(wake.id),
+        deliveredAt: chat.store.get<number>(`inbound-delivered:${wake.id}`) };
+    },
+    delivery: (target, key) => {
+      const chat = registry.bySlugName(target.slug);
+      const id = `${AGENT_BUS_WAKE_PREFIX}${hash(key)}`;
+      if (chat?.remote) return { id, remote: true, ...chat.remote.delivery(id) };
+      return { id, remote: false, confirmed: !!chat?.store.db.query("SELECT 1 FROM inbound WHERE id=?").get(id),
+        deliveredAt: chat?.store.get<number>(`inbound-delivered:${id}`) };
     },
     receipt: (target, key) => {
       const chat = registry.bySlugName(target.slug);
@@ -297,6 +309,27 @@ export function createAgentBus<P>(registry: ChatRegistry<P>, log: (event: string
     },
     log,
   });
+  // Older queues have no deadline. Enabling bus retries must not replay historical asks,
+  // including sealed rows retained by a rollback from the remote backend.
+  if (!registry.owner.store.get("agent-bus-deadlines-v1")) {
+    const rows = registry.owner.store.db.query<{ id: string; to_slug: string; created_at: number }, []>("SELECT id,to_slug,created_at FROM agent_requests").all();
+    for (const request of rows) {
+      const chat = registry.bySlugName(request.to_slug);
+      if (!chat) continue;
+      const id = agentWakeId(`agent-ask:${request.id}`), expiresAt = request.created_at + 10 * 60_000;
+      const row = chat.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id=?").get(id);
+      if (row) {
+        const input = JSON.parse(row.payload) as { agentExpiresAt?: number };
+        if (input.agentExpiresAt === undefined) chat.store.db.query("UPDATE inbound SET payload=? WHERE id=?").run(JSON.stringify({ ...input, agentExpiresAt: expiresAt }), id);
+      }
+      if (chat.store.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_inbox'").get()) {
+        if (!chat.store.db.query<{ name: string }, []>("PRAGMA table_info(remote_inbox)").all().some(column => column.name === "expires_at")) chat.store.db.exec("ALTER TABLE remote_inbox ADD COLUMN expires_at INTEGER");
+        chat.store.db.query("UPDATE remote_inbox SET expires_at=COALESCE(expires_at,?) WHERE id=?").run(expiresAt, opaqueId(id));
+      }
+    }
+    registry.owner.store.set("agent-bus-deadlines-v1", true);
+  }
+  return bus;
 }
 
 /**

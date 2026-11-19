@@ -11,6 +11,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
+import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 import * as TestClock from "effect/testing/TestClock";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
@@ -29,6 +30,42 @@ import { readCallerIdentity } from "./callerIdentity.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const callerId = ThreadId.make("caller:foreground");
+
+it.effect.each([
+  ["readerAdmission", "Reader lane admission queue full"],
+  ["readerBusy", "Reader lane busy: not admitted within 5500 ms"],
+  ["readerSnapshot", "Reader lane snapshot limit exceeded"],
+  ["execute", "Database reader retired: request interrupted"],
+  ["execute", "no such table: private_table"],
+] as const)("a %s failure names the identity wait without exposing SQL", ([operation, message]) =>
+  Effect.gen(function* () {
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const cause = new OrchestratorProjectionError({
+      threadId: callerId,
+      cause: new SqlError({
+        reason: classifySqliteError(new Error(message), { operation, message }),
+      }),
+    });
+    const error = yield* readCallerIdentity(
+      {
+        ...threads,
+        getCallerRow: () => Effect.fail(cause),
+        getThreadShell: () => Effect.die("lane failure must not load a background shell"),
+      },
+      callerId,
+      ProviderInstanceId.make("codex"),
+    ).pipe(Effect.flip);
+    if (message.startsWith("no such table")) {
+      assert.strictEqual(error, cause);
+      return;
+    }
+    assert.equal(error._tag, "OrchestratorMcpFailure");
+    assert.include(error.message, 'waiting on "statev2 identity caller row"');
+    assert.include(error.message, "identity reader");
+    assert.include(error.message, "Nothing was saved; retry the same call.");
+    assert.notInclude(error.message, message);
+  }).pipe(Effect.provide(Layer.mock(ThreadManagement.ThreadManagementService)({}))),
+);
 
 it.effect.each(["board", "send", "status", "delegate"] as const)(
   "%s fails safely with an unavailable identity caller reader and foreground held",
@@ -107,6 +144,8 @@ it.effect.each(["board", "send", "status", "delegate"] as const)(
           Effect.flip,
         );
         assert.equal(error._tag, "OrchestratorMcpFailure");
+        assert.include(error.message, 'waiting on "statev2 identity caller row"');
+        assert.include(error.message, "identity reader");
         assert.include(error.message, "Nothing was saved; retry the same call.");
         if (error._tag === "OrchestratorMcpFailure") assert.equal(error.code, "caller_unresolved");
         if (operation === "delegate")
@@ -333,7 +372,7 @@ it.effect.each(["ended", "fork"] as const)(
       const base = liveThreadShell(callerId);
       const shell = {
         ...base,
-        activeRunId: state === "ended" ? null : base.activeRunId,
+        activeRunId: null,
         forkedFrom:
           state === "fork"
             ? { type: "run" as const, threadId: callerId, runId: base.activeRunId! }

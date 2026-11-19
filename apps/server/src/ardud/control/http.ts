@@ -1,3 +1,4 @@
+import * as ProviderRuntimeInventory from "../providers/ProviderRuntimeInventory.ts";
 import * as DatabaseDiagnostics from "../../persistence/DatabaseDiagnostics.ts";
 import { bootId, continuationReport } from "../fast-install/report.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
@@ -480,6 +481,9 @@ const makeRoutes = Effect.gen(function* () {
   const identities = yield* ExecutionIdentity.ExecutionIdentity;
   const observeControl = yield* ControlRequestAnalytics.make;
   const recovery = yield* RecoverySnapshot.RecoverySnapshot;
+  const providerInventory = yield* Effect.serviceOption(
+    ProviderRuntimeInventory.ProviderRuntimeInventory,
+  );
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -893,6 +897,13 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   // Read-only recovery view for stream-recovery; see ardud/recovery/RecoverySnapshot.ts.
+  const runtimeInventory = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    if (Option.isNone(providerInventory))
+      return yield* fail("internal", "Provider runtime inventory unavailable.");
+    return json({ ok: true, ...(yield* providerInventory.value.snapshot) });
+  });
+
   const recoverySnapshot = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const params = yield* searchParams;
@@ -1024,8 +1035,7 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
-  const listThreads = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationReadScope);
+  const threadListPage = Effect.gen(function* () {
     const params = yield* searchParams;
     const cursor = yield* decodeThreadListCursor(params.get("cursor"));
     const archived = boolParam(params.get("archived")) === true;
@@ -1101,19 +1111,21 @@ const makeRoutes = Effect.gen(function* () {
         nextCursor: nextThreadListCursor(page, limit),
       });
     });
-    // Live polling must not queue behind board sweeps. Share the single control
-    // permit with message reads so lists cannot consume both foreground slots.
-    return yield* liveOnly && !archived
-      ? ReplyBuilders.bounded(readPage.pipe(NodeSqliteClient.foregroundReads), "controlRead")
-      : readPage;
-  }).pipe(NodeSqliteClient.backgroundReads);
+    return yield* readPage;
+  }).pipe(NodeSqliteClient.foregroundReads);
+
+  const listThreads = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    // Candidate pages (including deep health) must bypass background sweeps too.
+    // One shared permit leaves a foreground reader for the UI during list bursts.
+    return yield* ReplyBuilders.bounded(threadListPage, "controlRead");
+  });
 
   const getThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
     // ardud: bridges poll this per chat (the iMessage reply path). Admit it on the
-    // poll lane like /messages and read on the foreground reader, not behind sweeps
-    // and thread lists on the background lane (p95 wait 10-115 s on 11 Nov 2026).
+    // poll lane and read on the foreground reader, not behind background sweeps.
     const thread = yield* ReplyBuilders.bounded(
       threadDetail(threadId).pipe(NodeSqliteClient.foregroundReads),
       "poll",
@@ -2001,6 +2013,7 @@ const makeRoutes = Effect.gen(function* () {
     route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
     route("GET", `${p}/identity/resolve`, handle(identityResolve), "control.identity.resolve"),
     route("GET", `${p}/recovery/snapshot`, handle(recoverySnapshot)),
+    route("GET", `${p}/provider-runtimes/inventory`, handle(runtimeInventory)),
     route("GET", `${p}/threads/:threadId`, handle(getThread), "control.thread"),
     route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
     route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),

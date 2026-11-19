@@ -297,8 +297,9 @@ returns infra exit 90 (internal exit 98); its log is `~/.offbox/repo-setup-<repo
 ## Save state for later (do this!)
 
 Stopped boxes are free, but boat deletes a stopped box's data 14 days after its last stop. Bases and templates
-are also kept as boat saved snapshots (no expiry; the plan includes 50, offbox never pays for more), and the reaper
-resumes+stops pinned leases and unsaved bases/templates before day 14. Save generously:
+are also kept as boat saved snapshots (no expiry; the plan includes 50, offbox never pays for more). The reaper
+refreshes unsaved bases/templates before day 14. A stopped pinned lease is kept in a free saved snapshot;
+if no slot is free, a pinned box may be resumed and kept running until its pin expires. Save generously:
 
 - After an expensive setup (the repo-selected install above, `go mod download`, harness images pulled, a seeded database), run
   `offbox save --default --note "repo deps installed at <sha>"`. New threads on this repo then start from that state and
@@ -307,8 +308,10 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
   later with `offbox run --base pg-seeded -- ...` (only for a new lease).
 - `offbox bases` lists saved bases and whether each is kept (saved snapshot), box-only (with the date boat deletes
   it) or EXPIRED; `offbox base rm <name>` removes one. Bases are never auto-deleted by offbox.
-- `offbox keep --days 30` pins your current lease so the reaper never deletes it and keeps its disk past boat's
-  14 days (it still stops when idle). Unpinned leases stopped 14 days are gone; the next run starts a new box.
+- `offbox keep --days 30` pins your current lease until the expiry it shows. While pinned, automatic cleanup never
+  stops, archives, deletes or reuses the box, and other callers can't stop or delete it without
+  `--override-protection`. `offbox status` lists pins expiring within 24 h with their holder; renew before then if
+  you still need the box. Unpinned leases stopped 14 days are gone; the next run starts a new box.
 - Leases are deleted only when their thread has been archived for 7 days, or unused for 30 days and not pinned.
 
 A saved base retains its checkout path in project build state. When offbox relocates that checkout for another local path, it clears project `.gradle` directories before the move, including nested Gradle builds; shared Gradle user-home dependency caches and module build outputs stay warm. For a lease created before this fix, move aside the project's `.gradle` once before rerunning Gradle. When a base is restored under a new directory, offbox removes CMake caches that name the old path.
@@ -464,6 +467,8 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
 
 ## Troubleshooting
 
+- uv 'failed to open file …archive-v0…': offbox moves the broken cache entry aside; rerun.
+
 - A box held by an unconfirmed checkout cleanup is rechecked by reap, release and the pool queue; it frees itself once the cleanup is confirmed gone.
 
 - A just-resumed box can have a cold disk: its first sync, installs and Docker databases can be slow for 5-25 min. Offbox moves a first sync once to a free warm box when available; otherwise use `offbox run --bg` and the harness route in **Waiting for a run**, then end your turn.
@@ -490,6 +495,8 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
 - Hung box run: `offbox kill <run>` first (it confirms the stop on boat), then `offbox release --delete` if the box
   is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.
 - Weird box with no active run: `offbox release --delete`, then rerun (fresh lease from base/template).
+- If release/stop/delete refuses because another holder pins or holds the box, or a command on it is still alive,
+  it names the holder. Leave it alone; use `--override-protection` only when you know the holder is gone.
 - A bg run that settled while nobody followed it gets its log completed from boat's history the next time you run `offbox logs` or `offbox wait`; if that fails, offbox says the output is incomplete.
 - When asked for progress, plain `offbox logs <id>` once fetches and saves available output when no follower owns the box. For completion, follow **Waiting for a run**; do not loop logs or timed waits.
 - Logs and state: `~/.local/share/offbox/` (`offbox.log`, `offbox.db`, `logs/<run>.log`). Code:

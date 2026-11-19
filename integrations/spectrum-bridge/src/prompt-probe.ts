@@ -38,6 +38,11 @@ export class PromptProbeTracker {
       return true;
     };
     return {
+      cancel: () => {
+        if (finished) return;
+        finished = true;
+        state.attempts--;
+      },
       complete: (accepted: boolean) => {
         const first = accepted && !state.accepted;
         if (record(accepted ? "accepted" : "notAcceptedYet", first ? {

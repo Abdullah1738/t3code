@@ -1,6 +1,6 @@
 import { MessageCache } from "./message-cache.ts";
 import { toolError } from "./toollog.ts";
-import { IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
+import { assertPromptUnexpired, IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
@@ -160,6 +160,8 @@ const nativeAliases = new WeakMap<ControlClient, Map<string, string>>();
 
 /** The iMessage router's backend on Robob's control API. Accepts thread ids and OpenCode `ses_` ids alike. */
 export class RobobBackend implements ChatBackend {
+  get linkAvailable(): boolean { return this.client.linkGate?.available ?? true; }
+
   readonly brand = { app: "Robob" };
   readonly client: ControlClient;
   private readonly chatRoot: string;
@@ -219,7 +221,7 @@ export class RobobBackend implements ChatBackend {
     if (!options.chatRoot.startsWith("/") || options.chatRoot.includes("\0")) throw new Error("Invalid iMessage chat root");
     this.chatRoot = options.chatRoot.replace(/\/+$/, "");
     if (options.subdir !== undefined && !/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/.test(options.subdir)) throw new Error("Invalid iMessage chat folder");
-    this.client = options.client ?? new ControlClient(options);
+    this.client = options.client ?? new ControlClient({ ...options, linkGate: options.linkGate ?? true });
     this.native = nativeAliases.get(this.client) ?? new Map();
     nativeAliases.set(this.client, this.native);
     this.directories = new ThreadDirectories(this.client);
@@ -739,7 +741,8 @@ export class RobobBackend implements ChatBackend {
    * exactly, and `inboundId` lets Robob check them against this store.
    */
   async prompt(id: string, _directory: string, messageId: string, text: string, system = "", files: readonly FilePart[] = [],
-    model?: PreferredModel, owner?: OwnerWords, beforeSend?: () => void): Promise<void> {
+    model?: PreferredModel, owner?: OwnerWords, beforeSend?: () => void, expiresAt?: number): Promise<void> {
+    assertPromptUnexpired(expiresAt);
     const threadId = await this.resolve(id);
     const attachments = await this.sendAttachments(threadId, messageId, files);
     const words = owner !== undefined && text.endsWith(owner.text) ? owner : undefined;
@@ -750,6 +753,7 @@ export class RobobBackend implements ChatBackend {
     this.sendRuns.set(receiptKey, receipt);
     this.firstTurnStore?.set(receiptKey, receipt);
     beforeSend?.();
+    assertPromptUnexpired(expiresAt);
     this.messageCache.afterWrite(threadId);
     try {
       const accepted = await this.client.request<{ runId?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, this.sendBody(threadId, messageId, {

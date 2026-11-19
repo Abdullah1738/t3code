@@ -122,10 +122,17 @@ export class McpCall extends Context.Service<
     readerLane: string;
     boundedRead?: { readonly phase: string; readonly waitedMs: number };
     readDeadlineExpired?: true;
+    activityStages?: Array<{
+      stage: NonNullable<NonNullable<AnalyticsEvent["props"]>["activityStages"]>[number]["stage"];
+      durationMs: number;
+      completed: boolean;
+      started?: number;
+    }>;
     waitStage?: "lookup.caller" | "lookup.target" | "waiting";
     waitLookupMs?: number;
     phase: Phase;
-    saved: boolean | "unknown";
+    saved: boolean | "unknown" | "pending_create";
+    dispatchFenceAt?: bigint;
     dispatchFenceRecovered?: boolean;
     retryPath?: "receipt_fast" | "attached_pending" | "dispatched";
     taskLookup?: TaskLookup;
@@ -282,7 +289,7 @@ export const failedPhase = Effect.fnUntraced(function* (phase: string) {
 });
 
 // Dispatch owns the commit span; observing the receipt must not add per-event spans.
-export const setSaved = Effect.fnUntraced(function* (saved: boolean) {
+export const setSaved = Effect.fnUntraced(function* (saved: boolean | "pending_create") {
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "Some" && call.value.saved !== true) call.value.saved = saved;
 });
@@ -365,6 +372,10 @@ export function callOutcome(
   exit: Exit.Exit<McpSchema.CallToolResult | McpSchema.InputRequired, unknown>,
   state: McpCall["Service"],
 ): Pick<AnalyticsEvent, "outcome" | "errorTag" | "errorPhase" | "saved" | "props"> {
+  const activityStages = state.activityStages?.map(({ started, ...row }) => ({
+    ...row,
+    durationMs: started === undefined ? row.durationMs : Math.max(0, performance.now() - started),
+  }));
   const { notFoundReason, ...taskLookup } = state.taskLookup ?? {};
   if (exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause))
     return {
@@ -377,6 +388,7 @@ export function callOutcome(
       errorPhase: state.phase,
       props: {
         ...taskLookup,
+        ...(activityStages === undefined ? {} : { activityStages }),
         ...(state.retryPath === undefined ? {} : { retryPath: state.retryPath }),
         ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
         code: "unknown",
@@ -516,6 +528,7 @@ export function callOutcome(
     ...(state.readOnly && state.taskLookup === undefined ? {} : { saved }),
     props: {
       ...taskLookup,
+      ...(activityStages === undefined ? {} : { activityStages }),
       ...(state.retryPath === undefined ? {} : { retryPath: state.retryPath }),
       ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
       ...(notFoundReason === undefined ? {} : { notFoundReason }),
