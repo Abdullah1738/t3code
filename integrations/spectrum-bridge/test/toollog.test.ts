@@ -26,6 +26,26 @@ test("notice suppression reasons survive structured-log redaction", () => {
   expect(lines().map(line => line.props?.reason)).toEqual(reasons);
 });
 
+test("wake lifecycle rows survive the log cap and keep only delivery metadata", () => {
+  const { log, lines } = setup({ capBytes: 1 });
+  for (const name of ["wake.accepted", "wake.turn_start", "wake.send_ambiguous", "wake.admitted", "wake.retry_scheduled", "wake.failed"]) {
+    log.write({ component: "router", kind: "event", name, ids: { inboundId: "wake:fixture", threadId: "thread-1" },
+      durationMs: 60_000, props: { source: "robob-watch reauth failing", waitMs: 300, batchSize: 2, holderRunId: "run-1",
+        route: "/threads/:id/send", causeKey: "code.ECONNRESET", attempt: 2, nextAt: at + 60_000,
+        reason: "ambiguity_deadline", ageMs: 1_800_000, text: "PRIVATE_EVENT", body: "PRIVATE_BODY", token: "PRIVATE_TOKEN" } });
+  }
+  const kept = lines().filter(line => line.name.startsWith("wake."));
+  expect(kept).toHaveLength(6);
+  for (const line of kept) {
+    expect(line.ids?.inboundId).toBe("wake:fixture");
+    expect(line.props).toMatchObject({ source: "robob-watch reauth failing", holderRunId: "run-1", nextAt: at + 60_000,
+      causeKey: "code.ECONNRESET", reason: "ambiguity_deadline" });
+    expect(JSON.stringify(line)).not.toContain("PRIVATE_");
+  }
+  log.write({ component: "router", kind: "error", name: "other", props: { source: "PRIVATE_SOURCE", causeKey: "PRIVATE_CAUSE", nextAt: at } });
+  expect(lines().at(-1)?.props).toBeUndefined();
+});
+
 test("shared format, UTC milliseconds, append-only and private modes", () => {
   const { root, log, lines } = setup();
   chmodSync(root, 0o755);

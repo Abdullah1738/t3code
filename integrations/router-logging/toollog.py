@@ -22,7 +22,8 @@ CONNECTION_ERRNOS = {'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EAI_AG
 SYSCALLS = {'connect', 'read', 'write', 'getaddrinfo', 'send', 'recv', 'shutdown'}
 IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session', 'writer'}
 PROPS.update({'downSince', 'downMs', 'pid', 'ppid', 'initiator', 'stopReason', 'script', 'releaseDir',
-              'startedAtMs', 'finishedAtMs', 'lastErrorCode', 'outcome', 'ownerPid', 'lockAgeMs'})
+              'startedAtMs', 'finishedAtMs', 'lastErrorCode', 'outcome', 'ownerPid', 'lockAgeMs',
+              'listener', 'downListener', 'unknownSince', 'unknownMs'})
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
             'The operation was aborted due to timeout', 'The operation was aborted'}

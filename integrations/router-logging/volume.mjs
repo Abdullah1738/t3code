@@ -4,6 +4,8 @@ export const VOLUME_INTERVAL_MS = 300000;
 const writer = randomBytes(8).toString('hex');
 const states = new Map();
 const names = new Set(['proxy.request','proxy.retry','proxy.progress','proxy.fallback','proxy.sticky_miss','account.health','account.locked','account.lock','account.unlock','endpoint.get','poll.complete','usage.errors','usage.coverage','spend.snapshot','spend.unavailable','log.cap','log.rollup','restart.scan','restart.phase','restart.decision','restart.late','stream.scan','stream.phase','stall.scan','catalog.check','catalog.decision','relogin.tick','relogin.needed','img.request','img.result','img.fallback','img.fallback.result','img.write','auth.helper','recovery.sendToThread','recovery.dispatchCommand','recovery.telegram','other']);
+names.add('pool.exhausted');
+names.add('pool.recovered');
 const reasons = new Set(['daily_cap','line_size','queue_full','invalid_event','write_error']);
 const integer = value => Number.isSafeInteger(value) && value >= 0;
 

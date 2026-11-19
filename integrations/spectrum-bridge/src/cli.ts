@@ -1,5 +1,6 @@
 import { readHealthSidecar } from "./health-receipts.ts";
 import { messageLengthError } from "./message-length.ts";
+import { wakeId } from "./wake-delivery.ts";
 import { cardKind, logCardRender, toolError, toolLog } from "./toollog.ts";
 import { validNotifyId, validNotifyText } from "./agent-policy.ts";
 import { validAgentRequestId, validAnswerStatus } from "./agent-bus.ts";
@@ -34,7 +35,7 @@ class RawOutput {
   constructor(readonly value: string) {}
 }
 
-const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
+const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, wake-status, secret-request, secret, publish, unpublish, ban, unban, or bans."
   + " Sendblue mode adds location-request, location, messages, ask-owner, agent-ask, agent-answer, agent-requests, notify-rule, chats, allow, allow-group,"
   + " guest-allow, guest-revoke, guests, guest-send, share-contact, opt-in, remote-events, and remote-resolve."
   + " Logs: log-rollup [--day YYYY-MM-DD]."
@@ -73,6 +74,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   "cancel-send": ["session", "key"],
   poll: ["title", "option", "session", "key"],
   wake: ["text", "source", "key", "chat", "session"],
+  "wake-status": ["key"],
   "location-request": ["session", "key", "chat"],
   location: ["session", "chat"],
   messages: ["session", "chat", "limit", "before", "id"],
@@ -329,6 +331,11 @@ export function parseCommand(args: string[]): Command {
       const subject = label(values.subject, "--subject", 256);
       if (subject !== undefined) body.subject = subject;
       return { method: "POST", path: "/send", body };
+    }
+    case "wake-status": {
+      const key = required(values.key, "--key");
+      if (key.length > 200) throw new CliError("--key must be at most 200 characters");
+      return { method: "GET", path: `/wake/${wakeId(key)}` };
     }
     case "wake": {
       const text = required(values.text, "--text");

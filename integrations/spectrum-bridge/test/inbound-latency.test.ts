@@ -19,6 +19,7 @@ import { PromptProbeTracker } from "../src/prompt-probe.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { FAILED_INBOUND_REPLAY_MAX_AGE_MS } from "../src/inbound-failure.ts";
 import { markAnswered } from "../src/unanswered.ts";
+import { WakeDelivery } from "../src/wake-delivery.ts";
 
 const hash = (id: string) => `msg_${createHash("sha256").update(id).digest("hex")}`;
 const now = Date.parse("2026-11-13T10:00:00Z");
@@ -419,13 +420,14 @@ test("latency receipt repair preserves an already failed batch member and its re
   expect(h.backend.prompts).toEqual([]);
 });
 
-test("three unaccepted wake members return to pending together on delivery failure", async () => {
+test("three unaccepted wake members retain their sealed batch while backing off", async () => {
   const h = setup(); for (const id of ["wake:a", "wake:b", "wake:c"]) h.input(id, 0);
   h.backend.unavailable = true;
   await h.router.tick();
   setSystemTime(now + 60_000); await h.router.tick();
   setSystemTime(now + 120_000); await h.router.tick();
-  expect(h.states()).toEqual(["pending", "pending", "pending"]);
+  expect(h.states()).toEqual(["pending", "batched", "batched"]);
+  expect(h.store.get<{ batchIds: string[] }>("batch:wake:a")?.batchIds).toEqual(["wake:a", "wake:b", "wake:c"]);
 });
 
 test("latency deadline overrides quiet extended by a later row", async () => {
@@ -673,7 +675,9 @@ test.each(["wake:slow", "typed:slow"])("later ambiguous body survives watchdog r
   h.store.set(`batch-phase:${leader}`, "submitting");
   h.store.updateInbound(leader, "processing"); h.store.updateInbound(member, "batched");
   h.store.set(`synthetic-retry:${first}`, { attempts: 1, nextAt: now + 10 * 60_000, prompts: [] });
-  for (const id of [leader, member]) h.store.set(`synthetic-retry:${id}`, { attempts: 0, nextAt: 0, prompts: [{ sessionId: route.id, directory: route.directory, generation: 1, messageId: hash(leader), startedAt: now - 15 * 60_000 }] });
+  for (const id of [leader, member]) h.store.set(`synthetic-retry:${id}`, { attempts: 0, nextAt: 0,
+    delivery: { turn: original(leader), body: { inboundId: leader, text: `${leader}\n${member}`, system: "original sealed guidance", parts: [] } },
+    prompts: [{ sessionId: route.id, directory: route.directory, generation: 1, messageId: hash(leader), startedAt: now - 15 * 60_000 }] });
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   h.backend.promptAccepted = async (_session, _directory, id) => { if (id === hash(first)) await gate; return h.backend.records.some(r => r.id === id && r.type === "user"); };
@@ -682,10 +686,13 @@ test.each(["wake:slow", "typed:slow"])("later ambiguous body survives watchdog r
   release(); await sweep;
   // A typed message has priority over the released wake; finish its run before checking the wake body.
   if (!first.startsWith("wake:")) h.backend.records.push(
+    { id: hash(first), type: "user", text: first, time: { created: now } },
     { id: "typed-answer", type: "assistant", content: [{ type: "text", text: "Answered" }], finish: "stop", time: { created: now + 60_000, completed: now + 60_000 } },
     { id: "typed-finished", type: "idle", outcome: "succeeded", time: { created: now + 60_000 } });
   setSystemTime(now + 60_000);
   await Promise.all([h.router.checkInboundLatency(), h.router.tick(), h.router.checkFailedInbound()]);
+  // Read the completion after the concurrent latency read has adopted the human's receipt.
+  if (!first.startsWith("wake:")) await h.router.tick();
   expect(h.backend.records.find(r => r.id === hash(leader))).toMatchObject({ text: `${leader}\n${member}` });
   expect(h.states().slice(1)).toEqual(["done", "done"]);
 });
@@ -1284,6 +1291,7 @@ test("normal turn and completion polling bypass an exhausted retry budget", asyn
 
 test("repeated failed reads pause wake preparation attempts until admission can resume", async () => {
   const id = "wake:cooling-preparation"; const h = stalledProbe(id, 15 * 60_000);
+  new WakeDelivery(h.store).accept(id);
   h.store.set(`latency-route:${id}`, h.store.get(`failed-delivery:${id}`));
   h.store.set(`batch:${id}`, { id, text: "update", attachments: [], receivedAt: now - 15 * 60_000, batchIds: [id] });
   h.store.set(`batch-phase:${id}`, "queued-steer"); h.store.updateInbound(id, "pending");
@@ -1569,7 +1577,7 @@ test("bus wake survives a refused human steer and takes the next turn despite co
   expect(h.store.db.query<{state:string},[]>("SELECT state FROM inbound WHERE id='human-continuous'").get()?.state).toBe("pending");
 });
 
-test("a legacy mixed bus batch is not permanently barred by its first stuck-wake attempt", async () => {
+test("migration retires a legacy mixed bus batch past the admission cutoff", async () => {
   const h = setup(); const leader = "wake:watcher-leading-bus", member = "wake:agent-bus:legacy-member";
   h.input(leader, 31 * 60_000); h.input(member, 30 * 60_000);
   h.store.updateInbound(member, "batched");
@@ -1577,9 +1585,9 @@ test("a legacy mixed bus batch is not permanently barred by its first stuck-wake
   h.store.set(`batch-phase:${leader}`, "deferred-wake");
   for (const id of [leader, member]) { h.store.set(`stuck-wake-retry:${id}`, now - 15 * 60_000); h.store.set(`stuck-wake-attempt:${id}`, now - 10 * 60_000); }
   await h.router.tick();
-  expect(h.backend.prompts).toEqual([hash(leader)]);
-  expect(h.states()).toEqual(["done", "done"]);
-  expect(h.store.get<number>(`inbound-delivered:${member}`)).toBe(now);
+  expect(h.backend.prompts).toEqual([]);
+  expect(h.states()).toEqual(["failed", "failed"]);
+  expect(h.store.get<number>(`inbound-delivered:${member}`)).toBeUndefined();
 });
 
 

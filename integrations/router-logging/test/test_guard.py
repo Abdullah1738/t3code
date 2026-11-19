@@ -43,6 +43,56 @@ class GuardTests(unittest.TestCase):
             guard.step(BASE + seconds * 1000, 'loaded', 'refused')
         self.assertEqual(self.actions, ['kickstart'])
 
+    def test_unknown_launchd_with_open_tcp_never_opens_down_window(self):
+        guard = self.rig()
+        for seconds in (0, 15, 120, 180):
+            guard.step(BASE + seconds * 1000, 'unknown', 'open', dict(status='failed', startedAtMs=BASE))
+        guard.step(BASE + 195000, 'loaded', 'open')
+        self.assertEqual([name for name, _ in self.events], ['listener.state_unknown', 'listener.state_resolved'])
+        self.assertEqual(self.events[1][1]['unknownMs'], 195000)
+        self.assertNotIn('downSinceMs', guard.state)
+        self.assertEqual(self.actions, [])
+        self.assertEqual(self.alerts, [])
+
+    def test_failed_marker_age_class(self):
+        cases = [({}, False), ({'startedAtMs': BASE - 10822586}, False),
+                 ({'startedAtMs': BASE - 300000}, False), ({'startedAtMs': BASE - 299999}, True),
+                 ({'startedAtMs': BASE}, True), ({'startedAtMs': BASE + 1}, False),
+                 ({'startedAtMs': 'bad'}, False), ({'startedAtMs': True}, False),
+                 ({'startedAtMs': float('nan')}, False), ({'startedAtMs': float('inf')}, False),
+                 ({'startedAtMs': BASE - 600000, 'finishedAtMs': BASE - 1}, True),
+                 ({'startedAtMs': BASE - 1, 'finishedAtMs': BASE + 1}, True),
+                 ({'startedAtMs': BASE, 'finishedAtMs': BASE - 1}, False),
+                 ({'startedAtMs': BASE - 1, 'finishedAtMs': 'bad'}, False)]
+        for fields, recent in cases:
+            for job in ('loaded', 'absent', 'unknown'):
+                with self.subTest(fields=fields, job=job):
+                    guard = self.rig()
+                    guard.step(BASE, job, 'refused', dict(status='failed', **fields))
+                    self.assertEqual(guard.state['cause'], 'deploy_failed' if recent else 'listener_refused')
+                    down = next(props for name, props in self.events if name == 'listener.down')
+                    self.assertEqual(down['listener'], 'refused')
+
+    def test_tcp_recovery_closes_down_even_when_launchd_unknown(self):
+        guard = self.rig()
+        guard.step(BASE, 'loaded', 'refused')
+        guard.step(BASE + 15000, 'unknown', 'open')
+        self.assertNotIn('downSinceMs', guard.state)
+        up = next(props for name, props in self.events if name == 'listener.up')
+        self.assertEqual(up['downMs'], 15000)
+        self.assertEqual(up['listener'], 'open')
+        self.assertEqual(up['downListener'], 'refused')
+
+    def test_legacy_unknown_window_does_not_become_retroactively_confirmed(self):
+        guard = self.rig(dict(downSinceMs=BASE - 600000, cause='deploy_failed', alerted=True))
+        guard.step(BASE, 'loaded', 'refused')
+        self.assertEqual(guard.state['downSinceMs'], BASE)
+        self.assertEqual(guard.state['downListener'], 'refused')
+        self.assertEqual(guard.state['cause'], 'listener_refused')
+        self.assertEqual(self.alerts, [])
+        self.assertEqual([name for name, _ in self.events], ['listener.up', 'listener.down'])
+        self.assertEqual(self.events[0][1]['downListener'], 'unknown')
+
     def test_refusal_clock_restarts_after_timeout_and_unknown_job_does_not_heal(self):
         guard = self.rig()
         for seconds, listener in ((0, 'refused'), (59, 'unreachable'), (60, 'refused'), (119, 'refused')):
@@ -262,6 +312,9 @@ class RuntimeTests(unittest.TestCase):
         row = clean(dict(name='listener.up', component='guard', kind='event', props=dict(downSince='2026-11-18T02:22:40.000Z', downMs=120000, cause='job_missing')), dt.datetime.now(dt.timezone.utc))
         self.assertEqual(row['props']['downMs'], 120000)
         self.assertIn('downSince', row['props'])
+        props = dict(listener='open', downListener='refused', unknownSince='2026-11-18T02:22:40.000Z', unknownMs=120000)
+        row = clean(dict(name='listener.state_resolved', component='guard', kind='event', props=props), dt.datetime.now(dt.timezone.utc))
+        self.assertEqual(row['props'], props)
         for pid in (424242, 'unknown'):
             row = clean(dict(name='guard.lock_override', component='guard', kind='event',
                              props=dict(ownerPid=pid, lockAgeMs=300000)), dt.datetime.now(dt.timezone.utc))

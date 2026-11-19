@@ -14,11 +14,12 @@ _TOKEN = re.compile(r'[a-zA-Z][a-zA-Z0-9_.-]{0,79}')
 _NAME = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}')
 _DATED = re.compile(r'(?:rollup-)?(\d{4}-\d{2}-\d{2})(?:\.ndjson|\.json|\.cap)')
 _IDS = frozenset(('watcher', 'run', 'thread', 'chat', 'key', 'operation', 'reminder', 'update', 'item', 'helper'))
-_NUMERIC = frozenset(('exitCode', 'attempt', 'count', 'bytes', 'queuedMs', 'failedSources', 'totalSources'))
+_NUMERIC = frozenset(('exitCode', 'timeoutMs', 'attempt', 'count', 'bytes', 'queuedMs', 'failedSources', 'totalSources'))
 _BOOLEAN = frozenset(('deduped', 'accepted', 'timedOut'))
 _ERRNO = frozenset(name for name in dir(errno) if name.startswith('E') and type(getattr(errno, name)) is int) | {'UNKNOWN'}
 _SIGNALS = frozenset(s.name for s in signal.Signals)
 _VALUES = {
+    'op': ('native', 'native_retry', 'status', 'status_retry', 'send', 'confirm'),
     'severity': ('info', 'attention', 'error'),
     'outcome': ('fire', 'no_change', 'fail', 'timeout'),
     'source': ('mail', 'sms', 'bank', 'charge'),

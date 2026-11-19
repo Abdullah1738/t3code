@@ -793,22 +793,33 @@ function spawnCheck(watcher: Watcher, dir: string, extraEnv: Record<string, stri
   });
 }
 
-async function run(args: string[], timeoutMs = 20_000, maxOutput = 500): Promise<{ ok: boolean; out: string; stderr: string; code: number; signal: NodeJS.Signals | null }> {
+async function run(args: string[], timeoutMs = 20_000, maxOutput = 500, ctx?: { watcher?: string; op?: string }): Promise<{ ok: boolean; out: string; stderr: string; code: number; signal: NodeJS.Signals | null }> {
   const started = now();
+  const ids = { helper: args[1]?.endsWith(".ts") ? args[1]!.split("/").at(-2) : args[0]?.split("/").at(-1), watcher: ctx?.watcher };
+  const op = ctx?.op ?? (args[0] === t3ctlCli() ? args[1] : undefined);
+  let timedOut = false;
   try {
-    const child = Bun.spawn(args, { env: { HOME, PATH, ...testEnv() }, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL" });
-    const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-    toolLog({ component: "helpers", kind: code === 0 ? "perf" : "error", name: "helper.run", durationMs: now() - started, ok: code === 0, ids: { helper: args[1]?.endsWith(".ts") ? args[1]!.split("/").at(-2) : args[0]?.split("/").at(-1) }, props: { exitCode: code, ...(code === 0 ? {} : stderrCause(stderr)) }, ...(code === 0 ? {} : { error: { tag: "helper.exit_failed" } }) });
+    const child = Bun.spawn(args, { env: { HOME, PATH, ...testEnv() }, stdout: "pipe", stderr: "pipe" });
+    // Own the same SIGKILL deadline so an external kill is not reported as our timeout.
+    const timer = setTimeout(() => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    // A pipe read can fail while the child is alive; its deadline still applies.
+    const exited = child.exited.finally(() => clearTimeout(timer));
+    const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), exited]);
+    toolLog({ component: "helpers", kind: code === 0 ? "perf" : "error", name: "helper.run", durationMs: now() - started, ok: code === 0, ids, props: { op, timeoutMs, timedOut, exitCode: code, ...(code === 0 ? {} : stderrCause(stderr)) }, ...(code === 0 ? {} : { error: { tag: "helper.exit_failed" } }) });
     return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, maxOutput), stderr: stderr.trim().slice(0, 300), code, signal: child.signalCode };
   } catch (error) {
-    toolLog({ component: "helpers", kind: "error", name: "helper.run", durationMs: now() - started, ok: false, props: stderrCause(error instanceof Error ? error.message : ""), error: { tag: "helper.spawn_failed" } });
+    toolLog({ component: "helpers", kind: "error", name: "helper.run", durationMs: now() - started, ok: false, ids, props: { op, timeoutMs, timedOut, ...stderrCause(error instanceof Error ? error.message : "") }, error: { tag: "helper.spawn_failed" } });
     throw error;
   }
 }
 
 /** Async on purpose: a blocking spawnSync here would freeze every watcher's timers for up to 10s. */
-export async function liveSession(): Promise<string | undefined> {
-  const result = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB, "select json_extract(value,'$.id') from kv where key='route'"], 10_000);
+export async function liveSession(watcher?: string): Promise<string | undefined> {
+  const result = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB, "select json_extract(value,'$.id') from kv where key='route'"], 10_000, undefined, { watcher });
   const id = result.out.trim();
   // Robob routes are thread ids ("ardud-control:thread:<uuid>"); older OpenCode routes were "ses_...".
   return result.ok && id && /^[A-Za-z0-9_][A-Za-z0-9_%:.-]{0,199}$/.test(id) ? id : undefined;
@@ -822,9 +833,9 @@ export const wakeInboundId = (key: string) => `wake:${hash(key)}`;
  * processing/batched/done/cancelled/failed/unknown all mean the router has taken it. "missing" if absent,
  * undefined if the database could not be read.
  */
-export async function inboundState(id: string): Promise<string | undefined> {
+export async function inboundState(id: string, watcher?: string): Promise<string | undefined> {
   if (!/^wake:[a-f0-9]{64}$/.test(id)) return undefined;
-  const result = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB, `select state from inbound where id='${id}'`], 10_000);
+  const result = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB, `select state from inbound where id='${id}'`], 10_000, undefined, { watcher });
   if (!result.ok) return undefined;
   return result.out.trim() || "missing";
 }
@@ -885,20 +896,20 @@ async function creatorRoute(watcher: Watcher, session: string, cli: string, diag
     routeLog(null, `creator lookup failed watcher=${watcher.id} session=${session.slice(0, 12)} reason=${reason}`);
     if (diagnostics) creatorFallback(watcher, step, reason, started);
   };
-  const ownerSession = await liveSession().catch(() => undefined);
+  const ownerSession = await liveSession(watcher.id).catch(() => undefined);
   if (session === ownerSession) return { kind: "owner", reason: "live owner session" };
   let thread = session;
   if (session.startsWith("ses_")) {
     const started = now();
     let nativeTimedOut = false;
     try {
-      let result = await run([cli, "native", session], creatorTimeout(), 100_000);
+      let result = await run([cli, "native", session], creatorTimeout(), 100_000, { watcher: watcher.id, op: "native" });
       const diagnostics = [probeDetail("native", result, started)];
       const timedOut = !result.ok && result.signal === "SIGKILL";
       nativeTimedOut = timedOut;
       if (!result.ok && result.signal === "SIGKILL") {
         const retryStarted = now();
-        result = await run([cli, "native", session], creatorTimeout(true), 100_000);
+        result = await run([cli, "native", session], creatorTimeout(true), 100_000, { watcher: watcher.id, op: "native_retry" });
         diagnostics.push(probeDetail("retry", result, retryStarted));
       }
       if (!result.ok) {
@@ -930,11 +941,11 @@ async function creatorRoute(watcher: Watcher, session: string, cli: string, diag
     if (thread === ownerSession) return { kind: "owner", reason: "live owner session" };
     started = now();
     const diagnostics: string[] = [];
-    let result = await run([cli, "status", thread], creatorTimeout(), 100_000);
+    let result = await run([cli, "status", thread], creatorTimeout(), 100_000, { watcher: watcher.id, op: "status" });
     diagnostics.push(probeDetail("status", result, started));
     if (!result.ok && (result.signal === "SIGKILL" || !result.out.trim())) {
       const retryStarted = now();
-      result = await run([cli, "status", thread], creatorTimeout(true), 100_000);
+      result = await run([cli, "status", thread], creatorTimeout(true), 100_000, { watcher: watcher.id, op: "status_retry" });
       diagnostics.push(probeDetail("retry", result, retryStarted));
     }
     const detail = diagnostics.join(", ");
@@ -1026,9 +1037,9 @@ function resolveCreator(watcher: Watcher, cli: string): Promise<CreatorRoute> {
 
 const ambiguousSend = (result: { code: number; signal: NodeJS.Signals | null }) => result.signal === "SIGKILL" || result.code === 4;
 
-function wakeThread(cli: string, thread: string, text: string, key: string) {
+function wakeThread(cli: string, thread: string, text: string, key: string, watcher: string) {
   if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return Promise.resolve({ ...refused("t3ctl send"), code: 127, signal: null });
-  return run([cli, "send", thread, clip(text, MAX_WAKE), "--request-id", key, "--mode", "queue"], creatorSendTimeout());
+  return run([cli, "send", thread, clip(text, MAX_WAKE), "--request-id", key, "--mode", "queue"], creatorSendTimeout(), undefined, { watcher, op: "send" });
 }
 
 function creatorSendAt(watcher: Watcher, key: string, thread: string): number {
@@ -1051,26 +1062,26 @@ function clearCreatorSend(watcher: Watcher, key: string): void {
   saveState(watcher.id, fresh);
 }
 
-export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
+export function wake(source: string, text: string, key: string, watcher?: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return Promise.resolve(refused("wake"));
-  return run([BUN, spectrumCli(), "wake", `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`]);
+  return run([BUN, spectrumCli(), "wake", `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`], undefined, undefined, { watcher });
 }
 
 /**
  * Wakes another chat's agent (`wake --chat`). The bridge only takes this from the owner's chat, so the owner's live
  * route id is the caller; the event itself lands only in the target chat.
  */
-export async function wakeChat(chat: string, source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
+export async function wakeChat(chat: string, source: string, text: string, key: string, watcher?: string): Promise<{ ok: boolean; out: string }> {
   const cli = spectrumCli();
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("wake --chat");
-  const session = await liveSession();
+  const session = await liveSession(watcher);
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, cli, "wake", `--chat=${chat}`, `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
+  return run([BUN, cli, "wake", `--chat=${chat}`, `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`], undefined, undefined, { watcher });
 }
 
 type ImessageResult = { ok: boolean; out: string; pending?: boolean; retryKey?: string };
 
-async function imessageReceipt(text: string, key: string): Promise<ImessageResult | undefined> {
+async function imessageReceipt(text: string, key: string, watcher?: string): Promise<ImessageResult | undefined> {
   const id = `send:${hash(key)}`;
   // Read acceptance, its actual operation (including early-reply aliases), and
   // transport evidence in one snapshot. /send's 202 only means queued.
@@ -1085,7 +1096,7 @@ async function imessageReceipt(text: string, key: string): Promise<ImessageResul
       'fenced',exists(select 1 from kv where key in ('cancelledSend:${id}','cancelledSend:'||identity.id)),
       'attempted',exists(select 1 from kv where key in ('firstAttempt:'||identity.id,'sendAmbiguous:'||identity.id,'sent-at:'||identity.id))
         or exists(select 1 from kv where key >= 'chunk:'||identity.id||':' and key < 'chunk:'||identity.id||';'))
-      from identity left join outbox on outbox.id=identity.id`], 10_000, 100_000);
+      from identity left join outbox on outbox.id=identity.id`], 10_000, 100_000, { watcher });
   if (!receipt.ok) return { ok: false, out: "bridge delivery lookup failed" };
   try {
     const row = JSON.parse(receipt.out) as { saved: string | null;
@@ -1129,24 +1140,24 @@ async function imessageReceipt(text: string, key: string): Promise<ImessageResul
   } catch { return { ok: false, out: "bridge delivery receipt unreadable" }; }
 }
 
-export async function imessage(text: string, key: string, options: { reconcile?: boolean } = {}): Promise<ImessageResult> {
+export async function imessage(text: string, key: string, options: { reconcile?: boolean; watcher?: string } = {}): Promise<ImessageResult> {
   // Decide the CLI before the await: an override removed while liveSession() is pending must not reopen the live path.
   const cli = spectrumCli();
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
   if (options.reconcile) {
-    const receipt = await imessageReceipt(text, key);
+    const receipt = await imessageReceipt(text, key, options.watcher);
     if (receipt) return receipt;
   }
-  const session = await liveSession();
+  const session = await liveSession(options.watcher);
   if (!session) return { ok: false, out: "no live route session" };
-  const sent = await run([BUN, cli, "send", `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
+  const sent = await run([BUN, cli, "send", `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`], undefined, undefined, { watcher: options.watcher });
   if (!options.reconcile || !sent.ok) return sent;
-  return await imessageReceipt(text, key) ?? { ok: false, pending: true, out: "bridge acceptance awaiting receipt" };
+  return await imessageReceipt(text, key, options.watcher) ?? { ok: false, pending: true, out: "bridge acceptance awaiting receipt" };
 }
 
-export function telegram(source: string, text: string, key: string, severity = "info", burstKey?: string): Promise<{ ok: boolean; out: string }> {
+export function telegram(source: string, text: string, key: string, severity = "info", burstKey?: string, watcher?: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_TELEGRAM_CLI) return Promise.resolve(refused("telegram notify"));
-  return run([BUN, telegramCli(), "notify", `--source=${telegramSource(source)}`, `--severity=${severity}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`, ...(burstKey ? [`--burst-key=${burstKey}`] : [])]);
+  return run([BUN, telegramCli(), "notify", `--source=${telegramSource(source)}`, `--severity=${severity}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`, ...(burstKey ? [`--burst-key=${burstKey}`] : [])], undefined, undefined, { watcher });
 }
 
 /** Env a check child gets: its own inputs plus, under a test run, the test markers and every stub override,
@@ -1402,7 +1413,7 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
     if (watcher.chat) {
       // Someone else's data: only her chat may see it. A failed wake stays pending and is retried with the same key.
       const text = `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this chat.]\n${wakeText(watcher, event, state, test)}`;
-      const result = await wakeChat(watcher.chat, `robob-watch ${watcher.id}`, text, key);
+      const result = await wakeChat(watcher.chat, `robob-watch ${watcher.id}`, text, key, watcher.id);
       return finish(result.ok ? { ok: true, via: `wake:${watcher.chat}`, detail: result.out } : { ok: false, via: "none", detail: `wake --chat ${watcher.chat}: ${result.out}` });
     }
     if (watcher.mode === "wake") {
@@ -1422,7 +1433,7 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
         const sendStarted = now();
         let reason = "error";
         try {
-          const result = await wakeThread(cli, creator.thread, `${prefix}\n${text}`, key);
+          const result = await wakeThread(cli, creator.thread, `${prefix}\n${text}`, key, watcher.id);
           if (result.ok) { route = "creator"; return queued(`thread:${shortThread(creator.thread)}`, result.out,
             { ...confirmation(), sentAt: firstSentAt, thread: creator.thread }); }
           reason = exitReason(result);
@@ -1444,15 +1455,15 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
         log(watcher.id, `creator wake fallback thread=${missed.thread} ${missed.reason}`);
         tried.push(`thread:${shortThread(missed.thread)}: ${missed.reason}`);
       }
-      const result = await wake(`robob-watch ${watcher.id}`, text, key);
+      const result = await wake(`robob-watch ${watcher.id}`, text, key, watcher.id);
       if (result.ok) return queued(missed ? "wake:owner-fallback" : "wake", result.out,
         { ...confirmation(), thread: missed?.thread, ownerFallback: !!missed }, missed?.thread);
       tried.push(`wake: ${result.out}`);
     }
-    const sent = await imessage(plain, key);
+    const sent = await imessage(plain, key, { watcher: watcher.id });
     if (sent.ok) return finish({ ok: true, via: "imessage-send", detail: [...tried, sent.out].join(" | ") });
     tried.push(`send: ${sent.out}`);
-    const notified = await telegram(`Watcher ${watcher.id}`, plain, key);
+    const notified = await telegram(`Watcher ${watcher.id}`, plain, key, undefined, undefined, watcher.id);
     if (notified.ok) return finish({ ok: true, via: "telegram", detail: [...tried, notified.out].join(" | ") });
     tried.push(`telegram: ${notified.out}`);
     return finish({ ok: false, via: "none", detail: tried.join(" | ") });
@@ -1470,12 +1481,12 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
 }
 
 async function deliverToOwner(watcher: Watcher, event: string, text: string, key: string): Promise<Delivery> {
-  const result = await wake(`robob-watch ${watcher.id}`, text, key);
+  const result = await wake(`robob-watch ${watcher.id}`, text, key, watcher.id);
   if (result.ok) return { ok: true, via: "wake", detail: result.out };
   const plain = `${watcher.title}\n${clip(event.trim(), MAX_EVENT)}`;
-  const sent = await imessage(plain, key);
+  const sent = await imessage(plain, key, { watcher: watcher.id });
   if (sent.ok) return { ok: true, via: "imessage-send", detail: sent.out };
-  const notified = await telegram(`Watcher ${watcher.id}`, plain, key);
+  const notified = await telegram(`Watcher ${watcher.id}`, plain, key, undefined, undefined, watcher.id);
   return { ok: notified.ok, via: notified.ok ? "telegram" : "none", detail: notified.out };
 }
 
@@ -1513,7 +1524,7 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
         if (!update(entry)) return;
         const sendStarted = now();
         const result = await wakeThread(cli, route.thread,
-          `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]\n${entry.text}`, entry.key)
+          `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]\n${entry.text}`, entry.key, watcher.id)
           .catch(error => ({ ok: false, code: 127, signal: null, out: String(error).slice(0, 300) }));
         log(watcher.id, `native wake resolved thread=${route.thread} accepted=${result.ok} ${result.out.slice(0, 300)}`);
         if (!result.ok && !ambiguousSend(result)) {
@@ -1538,13 +1549,13 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
         entry.sentAt = now();
         entry.ownerFallback = true;
         if (!update(entry)) return;
-        await wake(`robob-watch ${watcher.id}`, entry.text, entry.key);
+        await wake(`robob-watch ${watcher.id}`, entry.text, entry.key, watcher.id);
       }
       if (!update(entry)) return;
     }
     if (entry.thread && !entry.ownerFallback && !(underTest() && !process.env.ROBOB_WATCH_T3CTL)) {
       try {
-        const result = await run([t3ctlCli(), "status", entry.thread], creatorTimeout(), 100_000);
+        const result = await run([t3ctlCli(), "status", entry.thread], creatorTimeout(), 100_000, { watcher: watcher.id, op: "confirm" });
         if (result.ok) {
           const value: unknown = JSON.parse(result.out);
           if (jsonObject(value) && jsonObject(value.thread) && value.thread.threadId === entry.thread) {
@@ -1558,7 +1569,7 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
       } catch { /* A failed probe leaves the wake pending; its deadline still escalates below. */ }
     }
     if (!confirmed && ((!entry.thread && !entry.nativeSession) || entry.ownerFallback)) {
-      const row = await inboundState(wakeInboundId(entry.key));
+      const row = await inboundState(wakeInboundId(entry.key), watcher.id);
       confirmed = row !== undefined && row !== "pending" && row !== "missing";
     }
     if (!loadWatcher(watcher.id) || watcherInstance(watcher.id) !== instance) return;
@@ -1607,10 +1618,10 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
 /** Housekeeping notices (failures, expiry) go to the alert channel first, iMessage second. */
 export async function alert(watcher: Watcher, text: string, key: string, severity = "attention", imessageFallback = true): Promise<Delivery> {
   const notified = await telegram(`Watcher ${watcher.id}`, text, key, severity,
-    severity === "error" ? `watcher-failure:${watcher.id}` : undefined);
+    severity === "error" ? `watcher-failure:${watcher.id}` : undefined, watcher.id);
   if (notified.ok) return { ok: true, via: "telegram", detail: notified.out };
   if (!imessageFallback) return { ok: false, via: "none", detail: notified.out };
-  const sent = await imessage(`${watcher.title}: ${text}`, key);
+  const sent = await imessage(`${watcher.title}: ${text}`, key, { watcher: watcher.id });
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
 }
 
@@ -1749,12 +1760,12 @@ export async function escalate(watcher: Watcher, state: State, key: string, imes
   try {
     const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.dependency_busy?.since ?? state.failing_since!)) / 60_000);
     const text = (state.failure_paused_at && state.failure_pause_escalation) || escalationText(watcher, state, mins);
-    const woke = await wake(`robob-watch ${watcher.id} ${state.dependency_busy ? "dependency busy" : "failing"}`, text, key);
+    const woke = await wake(`robob-watch ${watcher.id} ${state.dependency_busy ? "dependency busy" : "failing"}`, text, key, watcher.id);
     if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
     else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
     else {
       const summary = (state.failure_paused_at && state.failure_pause_escalation_fallback) || escalationFallbackText(watcher, state, mins);
-      const sent = await imessage(summary, key);
+      const sent = await imessage(summary, key, { watcher: watcher.id });
       delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
     }
     return delivery;

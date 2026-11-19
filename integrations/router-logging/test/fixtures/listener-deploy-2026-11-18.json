@@ -1,0 +1,27 @@
+[
+  {
+    "ts": "2026-11-18T15:51:09.186Z",
+    "tool": "9router",
+    "component": "supervisor",
+    "kind": "event",
+    "name": "deploy.result",
+    "ids": {
+      "supervisor": "70962"
+    },
+    "props": {
+      "startedAtMs": 1795017064172,
+      "pid": 70962,
+      "script": "install-launchagent.sh",
+      "releaseDir": "/Users/ardud/tmp/9router/.releases/current",
+      "stopReason": "plist_unchanged",
+      "action": "reload",
+      "status": "failed",
+      "finishedAtMs": 1795017069186,
+      "lastErrorCode": 1,
+      "ppid": 70916,
+      "initiator": "install-launchagent.sh",
+      "outcome": "failed",
+      "error": "kickstart delivery failed"
+    }
+  }
+]

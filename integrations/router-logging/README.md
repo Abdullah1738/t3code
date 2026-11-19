@@ -8,14 +8,20 @@ processes and languages. Writes are best effort with no tool-work lock.
 The existing `com.ardud.9router-log-poll` LaunchAgent runs an independent guard
 every 15 seconds. It checks launchd and a TCP connection, restores an absent job,
 and kickstarts a loaded job after 60 seconds of continuous refused connections.
-It logs listener transitions and backs off repair attempts to five minutes. The
+Only a refused or unreachable TCP check opens a down window. Unknown launchd
+state logs `listener.state_unknown`; uncertainty with no failed TCP check is
+timed separately until `listener.state_resolved` or a confirmed failure.
+Every transition records the TCP result; recovery also carries `downListener`
+with the original failure evidence. Repairs back off to five minutes. The
 guard sends one local Telegram alert after two minutes down and a recovery note
 using the same incident key prefix. Delivery retries retain that key across guard
 restarts. The HTTP snapshot runs in a separate child every five minutes.
 
 `~/.local/state/9router/deploy.json` coordinates the guard with the router's
 installer and release script. Only a `status: running` marker younger than five
-minutes suppresses repair; failed markers permit repair immediately. The shared
+minutes suppresses repair; failed markers permit repair immediately. A failed
+transaction attributes an outage to `deploy_failed` only from its start through
+five minutes after completion (start is used when completion is absent). The shared
 directory lock prevents concurrent launchctl actions for up to five minutes.
 The guard reclaims a dead owner's lock once its marker expires. At five minutes
 it logs `guard.lock_override` with `ownerPid` (`unknown` if unavailable) and
@@ -45,7 +51,12 @@ these cumulative snapshots must not be summed as hourly spend.
 fixture or real day file and writes a private `rollup-YYYY-MM-DD.json` with name
 and kind counts, rates, duration percentiles and top error tags. `supervisor`
 counts starts, stops, exits, reloads and deploy actions. `listener` contains
-outage windows and their total/max duration clipped to the requested UTC day;
+confirmed outage windows with `confirmedDownMs` (`totalDownMs` is its compatible
+alias), plus `unknownStateMs` and `unknownWindows`, clipped to the UTC day.
+Legacy transitions without TCP evidence or an explicit listener-failure cause
+count as unknown state. Failed deploy-result events can attribute a confirmed
+outage within the same transaction bound; live markers never rewrite history.
+For both kinds of window,
 their start and end retain the actual transition timestamps. Open windows end
 at generation time or UTC midnight for duration calculation. The poller makes
 yesterday's rollup on its first successful run after 00:05 UTC. Invalid lines

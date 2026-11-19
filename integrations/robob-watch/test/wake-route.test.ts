@@ -19,6 +19,8 @@ type Fixture = {
   statusError?: boolean;
   nativeError?: boolean;
   sendError?: boolean;
+  sendKilled?: boolean;
+  sendExit137?: boolean;
   requireSendJournal?: boolean;
   sendAmbiguous?: boolean;
   strictWakeKey?: boolean;
@@ -55,6 +57,8 @@ const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ cli: ${JSON.stringify(cli)}, args }) + '\\n');
 const config = JSON.parse(readFileSync(${JSON.stringify(config)}, 'utf8'));
 if (${JSON.stringify(cli)} === 't3ctl') {
+  if (args[0] === 'send' && config.sendKilled) process.kill(process.pid, 'SIGKILL');
+  if (args[0] === 'send' && config.sendExit137) process.exit(137);
   if (args[0] === 'send' && config.requireSendJournal) {
     const state = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'root/watchers/route-test/state.json'))}, 'utf8'));
     if (state.pending?.creatorSend?.thread !== args[1] || !(state.pending.creatorSend.sentAt <= Date.now())) process.exit(1);
@@ -145,9 +149,19 @@ console.log(JSON.stringify(await (async () => (${body}))()));`;
 }
 
 const wakeText = (calls: Call[]) => calls.find(c => c.cli === "spectrum" && c.args[0] === "wake")!.args.find(a => a.startsWith("--text="))!.slice(7);
+const helperRuns = (logs: LogEntry[], op: string) => logs.filter(row => row.name === "helper.run" && row.props?.op === op);
+const helperContext = (op: string, timedOut: boolean, timeoutMs = 2000) => ({
+  ids: { watcher: "route-test" }, props: { op, timeoutMs, timedOut },
+});
 
 test("a project creator gets one queued send with its event key, context and provenance, without a bridge wake", async () => {
-  const { result, calls, fallbacks, runnerLog, log } = await fixture({ status: { recentRuns: [{ data: "x".repeat(2000) }] } });
+  const { result, calls, fallbacks, runnerLog, log, logs } = await fixture({ status: { recentRuns: [{ data: "x".repeat(2000) }] } });
+  for (const op of ["status", "send"]) {
+    expect(helperRuns(logs, op)).toHaveLength(1);
+    expect(helperRuns(logs, op)[0]).toMatchObject({ ok: true, ...helperContext(op, false) });
+  }
+  expect(logs.find(row => row.name === "helper.run" && row.ids?.helper === "sqlite3"))
+    .toMatchObject({ ids: { watcher: "route-test" }, props: { timeoutMs: 10_000, timedOut: false } });
   expect(fallbacks).toHaveLength(0);
   expect(runnerLog).not.toContain("creator wake fallback");
   expect(log).not.toContain("creator wake fallback");
@@ -165,7 +179,12 @@ test.each([
   { name: "exit", sendError: true, reason: "exit:1" },
     { name: "spawn error", sendSpawnError: true, reason: "error" },
 ])("creator send $name logs one fallback and wakes the owner once", async ({ name, reason, ...options }) => {
-  const { result, calls, fallbacks, runnerLog, log } = await fixture(options);
+  const { result, calls, fallbacks, runnerLog, log, logs } = await fixture(options);
+  expect(helperRuns(logs, "send")).toHaveLength(1);
+  expect(helperRuns(logs, "send")[0]).toMatchObject({ ok: false, ...helperContext("send", false),
+    error: { tag: options.sendSpawnError ? "helper.spawn_failed" : "helper.exit_failed" } });
+  if (!options.sendSpawnError) expect(helperRuns(logs, "send")[0]!.props!.exitCode).toBe(1);
+  expect(logs.filter(row => row.name === "helper.run").every(row => row.ids?.watcher === "route-test")).toBe(true);
   expect(result).toMatchObject({ ok: false, accepted: true, via: "wake:owner-fallback", route: "owner" });
   expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(1);
   expect(calls.filter(c => c.cli === "telegram")).toHaveLength(0);
@@ -182,6 +201,62 @@ test.each([
   if (options.sendSleep) expect(fallbacks[0]!.durationMs).toBeLessThan(5_000);
   expect(fallbacks[0]).toMatchObject({ component: "wakes", kind: "error", ok: false, ids: { watcher: "route-test" },
     props: { step: "send", reason, durationMs: expect.any(Number) } });
+});
+
+test.each([{ sendKilled: true }, { sendExit137: true }])("an external send kill or exit 137 is not a helper timeout (%j)", async options => {
+  const { logs } = await fixture(options);
+  expect(helperRuns(logs, "send")).toHaveLength(1);
+  expect(helperRuns(logs, "send")[0]).toMatchObject({ ok: false,
+    ...helperContext("send", false), props: { op: "send", timeoutMs: 2000, timedOut: false, exitCode: 137 } });
+});
+
+test.each(["stdout", "stderr"])("a %s read failure keeps the live helper's deadline", async pipe => {
+  const { logs, result } = await fixture({ sendSleep: true }, `(async () => {
+    const spawn = Bun.spawn;
+    let send;
+    Bun.spawn = (args, options) => {
+      const child = spawn(args, options);
+      if (args[0] !== process.env.ROBOB_WATCH_T3CTL || args[1] !== 'send') return child;
+      send = child;
+      return {
+        stdout: child.stdout, stderr: child.stderr,
+        ${pipe}: new ReadableStream({ start(controller) { controller.error(new Error('fixture pipe failed')); } }),
+        exited: child.exited, kill: child.kill.bind(child),
+        get exitCode() { return child.exitCode; }, get signalCode() { return child.signalCode; },
+      };
+    };
+    const delivery = await deliver(watcher, 'event happened', key, state);
+    if (!send || await send.exited !== 137 || send.signalCode !== 'SIGKILL') throw new Error('pipe failure cancelled the deadline');
+    return delivery;
+  })()`);
+  expect(result.via).toBe("wake:owner-fallback");
+  expect(helperRuns(logs, "send")).toHaveLength(1);
+  expect(helperRuns(logs, "send")[0]).toMatchObject({ ok: false, ...helperContext("send", false),
+    error: { tag: "helper.spawn_failed" } });
+});
+
+test.each(["stdout", "stderr"])("a %s pipe draining after exit does not turn success into a timeout", async pipe => {
+  const { logs, result } = await fixture({}, `(async () => {
+    const spawn = Bun.spawn;
+    Bun.spawn = (args, options) => {
+      const child = spawn(args, options);
+      if (args[0] !== process.env.ROBOB_WATCH_T3CTL || args[1] !== 'send') return child;
+      // Simulate an inherited pipe held past the helper's 2s deadline after it exits.
+      const held = new ReadableStream({ start(controller) {
+        child.exited.then(async () => { await Bun.sleep(2100); controller.close(); });
+      } });
+      return {
+        stdout: child.stdout, stderr: child.stderr, ${pipe}: held,
+        exited: child.exited, kill: child.kill.bind(child),
+        get exitCode() { return child.exitCode; }, get signalCode() { return child.signalCode; },
+      };
+    };
+    return await deliver(watcher, 'event happened', key, state);
+  })()`);
+  expect(result.via).toBe("thread:abcd1234");
+  expect(helperRuns(logs, "send")).toHaveLength(1);
+  expect(helperRuns(logs, "send")[0]).toMatchObject({ ok: true, ...helperContext("send", false) });
+  expect(helperRuns(logs, "send")[0]!.durationMs).toBeGreaterThanOrEqual(2000);
 });
 
 test.each([
@@ -426,7 +501,15 @@ for (const entry of [
   { name: 'one native timeout', nativeSleepOnce: true, watcher: { created_by_session: 'ses_old' }, probes: 1 },
 ]) {
   test(`${entry.name} still queues to creator`, async () => {
-    const { result, calls, log } = await fixture(entry);
+    const { result, calls, log, logs } = await fixture(entry);
+    const op = entry.nativeSleepOnce ? "native" : "status";
+    const timeout = !!(entry.nativeSleepOnce || entry.statusSleepOnce || entry.statusSleep);
+    expect(helperRuns(logs, op)).toHaveLength(1);
+    expect(helperRuns(logs, op)[0]).toMatchObject(helperContext(op, timeout));
+    const retries = helperRuns(logs, `${op}_retry`);
+    expect(retries).toHaveLength(timeout || entry.statusEmptyError ? 1 : 0);
+    if (retries.length) expect(retries[0]).toMatchObject(helperContext(`${op}_retry`, !!entry.statusSleep));
+    if (process.env.TOOLLOG_SAMPLES && timeout) console.log("LOG_SAMPLE " + JSON.stringify(helperRuns(logs, op)[0]));
     expect(result).toMatchObject({ ok: false, accepted: true, confirmed: 'pending', via: 'thread:abcd1234' });
     expect(calls.filter(call => call.args[0] === 'status')).toHaveLength(entry.probes);
     expect(calls.filter(call => call.args[0] === 'send' && call.cli === 't3ctl')).toHaveLength(1);
@@ -483,6 +566,9 @@ for (const status of [
       writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false, ...status } }));
       await tickOne(watcher.id);
     `));
+    expect(helperRuns(logs, "confirm")).toHaveLength(1);
+    expect(helperRuns(logs, "confirm")[0]).toMatchObject({ ok: true, ...helperContext("confirm", false) });
+    expect(helperRuns(logs, "send")[0]).toMatchObject(helperContext("send", sendSleep));
     expect(result.state.confirm).toBeUndefined();
     expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
     expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(1);
@@ -556,7 +642,7 @@ test('an old run does not confirm, and multiple fires retain separate once-only 
 });
 
 test('a slow confirmation probe yields to runner timers and a done watcher still confirms', async () => {
-  const { result, calls } = await fixture({}, confirmBody(`
+  const { result, calls, logs } = await fixture({}, confirmBody(`
     const fresh = loadState(watcher.id);
     fresh.status = 'done';
     saveState(watcher.id, fresh);
@@ -568,6 +654,9 @@ test('a slow confirmation probe yields to runner timers and a done watcher still
     clearTimeout(timer);
     if (!timerRan) throw new Error('confirmation blocked timers');
   `));
+  expect(helperRuns(logs, "confirm")).toHaveLength(1);
+  expect(helperRuns(logs, "confirm")[0]).toMatchObject({ ok: false, ...helperContext("confirm", true),
+    props: { op: "confirm", timeoutMs: 2000, timedOut: true, exitCode: 137 } });
   expect(result.state.confirm?.attempts).toBe(1);
   expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
 });

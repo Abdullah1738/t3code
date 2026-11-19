@@ -32,7 +32,7 @@ class Router:
 
     def get(self, route):
         # Exact allowlist prevents accidentally polling a mutating GET endpoint.
-        if route not in ('/api/providers', '/api/usage/logs', '/api/usage/stats?period=today'):
+        if route not in ('/api/providers', '/api/usage/logs', '/api/usage/stats?period=today', '/api/monitoring/pools'):
             raise ValueError('route not allowed')
         start = time.monotonic()
         status = 0
@@ -162,7 +162,8 @@ def refresh_listener_rollups(root, now):
         try:
             dt.date.fromisoformat(day)
             previous = json.loads(report.read_text()).get('listener', {})
-            pending = any(row.get('end') is None for row in previous.get('windows', []))
+            pending = any(row.get('end') is None for row in
+                          [*previous.get('windows', []), *previous.get('unknownWindows', [])])
         except (OSError, ValueError, AttributeError, TypeError):
             continue
         if pending and listener_windows(day, root, now) != previous:
