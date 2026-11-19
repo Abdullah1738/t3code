@@ -8,7 +8,7 @@ import test, { after } from 'node:test';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { acquireLease, leaseOwner, releaseLease } from './lease.mjs';
-import { assertCleared, assertIncident, lazyControlClient, liveProviders, notificationId, notificationState, pendingConnections, phaseReporter, readState, RouterUnavailableError, ROUTER_UNAVAILABLE_LIMIT_MS, ROUTER_STREAK_GAP_MS, runBoundedCommand, runObserved, SUPERVISOR_DEADLINE_MS, telegramHealthy, threadIdFor, tick, workerPrompt, writeState } from './supervisor.mjs';
+import { assertCleared, assertIncident, BOOT_SKIP_HARD_CEILING_MS, lazyControlClient, liveProviders, MIN_FETCH_BUDGET_MS, notificationId, notificationState, pendingConnections, phaseReporter, readState, RouterUnavailableError, ROUTER_UNAVAILABLE_LIMIT_MS, ROUTER_STREAK_GAP_MS, runBoundedCommand, runObserved, SAVE_RESERVE_MS, SUPERVISOR_DEADLINE_MS, telegramHealthy, threadIdFor, tick, workerPrompt, writeState } from './supervisor.mjs';
 
 const HAS_LOCKF = process.platform === 'darwin' && existsSync('/usr/bin/lockf');
 const LOCKF_SKIP_REASON = 'needs macOS /usr/bin/lockf (watcher is macOS-only)';
@@ -1144,6 +1144,17 @@ function deadlineHarness(t, { bootMs = 36_000, outcomes = [{ ms: 5_000 }], backo
   return { h, clock, lines, errors, signals, exits, options, calls: () => calls, run: () => clock.settle(runObserved(h.ctx, options)) };
 }
 
+for (const bootMs of [49_000, 72_000]) test(`${bootMs}ms boot skips without fetching or exceeding the deadline`, async t => {
+  const d = deadlineHarness(t, { bootMs });
+  await d.run();
+  assert.equal(d.calls(), 0);
+  assert.equal(d.h.state().routerUnavailableCount, 1);
+  assert.equal(d.h.state().routerUnavailableLastAt, d.h.ctx.now());
+  assert.match(d.lines.join('\n'), new RegExp(`no fetch: boot_exhausted, boot ${bootMs}ms`));
+  assert.match(d.lines.join('\n'), /skipped this tick/);
+  assert.deepEqual(d.exits, []); assert.deepEqual(d.errors, []);
+});
+
 test('38-second boot skips a would-be five-second fetch and logs boot without deadline failure', async t => {
   const d = deadlineHarness(t, { bootMs: 38_000 });
   await d.run();
@@ -1152,10 +1163,101 @@ test('38-second boot skips a would-be five-second fetch and logs boot without de
   assert.equal(d.h.state().routerUnavailableLastAt, d.h.ctx.now());
   assert.match(d.lines.join('\n'), /phase durations: boot=38000.0ms/);
   assert.match(d.lines.join('\n'), /below_minimum.*2000ms remaining/);
+  assert.match(d.lines.join('\n'), /no fetch: below_minimum, 2000ms left/);
   assert.match(d.lines.join('\n'), /skipped this tick/);
   assert.deepEqual(d.errors, []);
   const rows = readFileSync(join(testLogDir, new Date().toISOString().slice(0,10) + '.ndjson'), 'utf8').trim().split('\n').map(JSON.parse);
   assert.ok(rows.some(row => row.name === 'supervisor.boot' && row.durationMs === 38_000));
+  assert.ok(rows.some(row => row.name === 'providers.fetch.skipped' && row.props?.reason === 'below_minimum'));
+});
+
+test('boot-exhausted skip preserves incidents and checkpoints a continuing streak before skipping', async t => {
+  const d = deadlineHarness(t, { bootMs: 49_000 });
+  const initial = { version: 1, active: null, incidents: [], detectorIncidents: [{ id: 'pending', kind: 'detector', accountId: 'alpha', marker: bad().reauthRequiredAt, notified: true, alertState: 'pending', mayHaveQueued: true, firstEnqueuedAt: 1 }],
+    routerUnavailableSince: d.h.sim.time - 60_000, routerUnavailableLastAt: d.h.sim.time - 60_000, routerUnavailableCount: 2 };
+  writeState(d.h.path, initial);
+  const saves = [], save = d.h.ctx.save, load = d.h.ctx.load;
+  d.h.ctx.load = () => { d.clock.jump(3_000); return load(); };
+  d.h.ctx.save = state => { d.clock.jump(200); saves.push(structuredClone(state)); save(state); };
+  d.h.ctx.providers = () => assert.fail('boot skip must not call providers');
+  await d.run();
+  assert.equal(saves.length, 2);
+  assert.equal(saves[0].routerUnavailableCount, 2);
+  assert.equal(saves[0].routerUnavailableLastAt, d.h.sim.time + 3_000);
+  assert.equal(saves[1].routerUnavailableCount, 3);
+  assert.equal(saves[1].routerUnavailableLastAt, d.h.sim.time + 3_200);
+  const { routerUnavailableSince, routerUnavailableLastAt, routerUnavailableCount, ...incidents } = d.h.state();
+  const { routerUnavailableSince: since, routerUnavailableLastAt: last, routerUnavailableCount: count, ...original } = initial;
+  assert.equal(routerUnavailableSince, since); assert.deepEqual(incidents, original);
+  assert.equal(d.h.sim.alerts.length, 0); assert.equal(d.h.sim.creates.length, 0); assert.equal(d.h.sim.lookups.length, 0);
+  assert.deepEqual(d.errors, []);
+  const rows = readFileSync(join(testLogDir, new Date().toISOString().slice(0,10) + '.ndjson'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(rows.some(row => row.name === 'providers.fetch.skipped' && row.props?.reason === 'boot_exhausted'));
+});
+
+for (const target of ['load', 'checkpoint save', 'skip save']) test(`boot-exhausted ${target} crossing the hard ceiling fails`, async t => {
+  const bootMs = 49_000, d = deadlineHarness(t, { bootMs });
+  if (target === 'checkpoint save') writeState(d.h.path, { version: 1, active: null, incidents: [], routerUnavailableSince: d.h.sim.time - 60_000, routerUnavailableLastAt: d.h.sim.time - 60_000, routerUnavailableCount: 1 });
+  const original = target === 'load' ? d.h.ctx.load : d.h.ctx.save;
+  d.h.ctx[target === 'load' ? 'load' : 'save'] = (...args) => { d.clock.jump(BOOT_SKIP_HARD_CEILING_MS - bootMs); return original(...args); };
+  await assert.rejects(d.run(), /synthetic supervisor exit 1/);
+  assert.deepEqual(d.exits, [1]); assert.equal(d.calls(), 0);
+  assert.match(d.errors.join('\n'), /exceeded deadline/);
+  assert.doesNotMatch(d.lines.join('\n'), /skipped this tick/);
+});
+
+for (const bootMs of [BOOT_SKIP_HARD_CEILING_MS, BOOT_SKIP_HARD_CEILING_MS + 1]) test(`boot ${bootMs}ms at or past the ceiling fails before saving`, async t => {
+  const d = deadlineHarness(t, { bootMs });
+  d.h.ctx.save = () => assert.fail('expired boot must not save');
+  await assert.rejects(d.run(), /synthetic supervisor exit 1/);
+  assert.deepEqual(d.exits, [1]); assert.equal(d.calls(), 0);
+  assert.equal(d.h.state().routerUnavailableCount, undefined);
+});
+
+test('boot-exhausted skips retain the 15-minute bound and recover only on a real snapshot', async t => {
+  const h = harness(t), started = h.sim.time;
+  for (let n = 0; n <= 15; n++) {
+    h.sim.time = started + n * 60_000;
+    const d = deadlineHarness(t, { h, bootMs: 49_000 });
+    if (n < 15) await d.run();
+    else { await assert.rejects(d.run(), RouterUnavailableError); assert.match(d.errors.join('\n'), /for 15 min/); }
+    assert.equal(d.calls(), 0); assert.deepEqual(d.exits, []);
+    assert.equal(h.state().routerUnavailableCount, n + 1);
+    assert.equal(h.state().routerUnavailableSince, started);
+    assert.equal(h.state().routerUnavailableLastAt, h.sim.time);
+    assert.doesNotMatch(d.lines.join('\n'), /router recovered/);
+  }
+  h.sim.time += 60_000;
+  const recovered = deadlineHarness(t, { h, bootMs: 0, outcomes: [{ ms: 10 }] });
+  await recovered.run();
+  assert.match(recovered.lines.join('\n'), /router recovered after 16 consecutive unavailable ticks/);
+  assert.equal(h.state().routerUnavailableCount, undefined);
+});
+
+for (const raw of [undefined, 'garbage', '0', '-1', 'Infinity', '2000000']) test(`WATCH_STARTED_AT ${raw ?? 'missing'} uses the normal budget`, async t => {
+  const previous = process.env.WATCH_STARTED_AT;
+  t.after(() => { if (previous === undefined) delete process.env.WATCH_STARTED_AT; else process.env.WATCH_STARTED_AT = previous; });
+  if (raw === undefined) delete process.env.WATCH_STARTED_AT; else process.env.WATCH_STARTED_AT = raw;
+  const d = deadlineHarness(t, { outcomes: [{ ms: 10 }] });
+  delete d.options.startedAt;
+  await d.run();
+  assert.equal(d.calls(), 1); assert.deepEqual(d.exits, []); assert.deepEqual(d.errors, []);
+  assert.equal(d.h.state().routerUnavailableCount, undefined);
+  assert.match(d.lines.join('\n'), /boot=0.0ms/);
+});
+
+for (const delta of [-1, 0, 1]) test(`initial fetch admission boundary ${delta}ms`, async t => {
+  const d = deadlineHarness(t, { bootMs: SUPERVISOR_DEADLINE_MS - SAVE_RESERVE_MS - MIN_FETCH_BUDGET_MS + delta, outcomes: [{ ms: 1 }] });
+  await d.run();
+  assert.equal(d.calls(), delta <= 0 ? 1 : 0);
+  assert.equal(d.h.state().routerUnavailableCount, delta <= 0 ? undefined : 1);
+  assert.deepEqual(d.errors, []);
+});
+
+test('attempt duration wording is unchanged when both attempts ran', async t => {
+  const h = harness(t), f = fetchHarness(t, [{ error: timeoutError(), ms: 6_012 }, { error: timeoutError(), ms: 15_003 }]);
+  routerTick(h, f); await h.tick();
+  assert.match(f.lines.at(-1), /router slow\/unavailable \(attempt ms 6012\/15003\); skipped this tick/);
 });
 
 for (const budget of [0, 1, 2_999]) test(`fetch budget ${budget}ms is below minimum and never fetches`, async t => {
@@ -1176,6 +1278,8 @@ test('budget aborts an in-flight fetch and preserves a pending incident unchange
   assert.deepEqual(incidentState, state);
   assert.equal(routerUnavailableCount, 1); assert.equal(routerUnavailableSince, routerUnavailableLastAt);
   assert.equal(d.h.sim.alerts.length, 0); assert.deepEqual(d.errors, []);
+  assert.match(d.lines.join('\n'), /router slow\/unavailable \(fetch interrupted: unavailable\)/);
+  assert.doesNotMatch(d.lines.join('\n'), /no fetch:/);
 });
 
 test('slow first attempt leaves a shortened retry that succeeds and processes markers', async t => {
@@ -1193,6 +1297,7 @@ test('retry is dropped when backoff would leave less than the minimum budget', a
   await d.run();
   assert.equal(d.calls(), 1); assert.equal(d.clock.now(), 6_000);
   assert.match(d.lines.join('\n'), /retry_dropped/); assert.match(d.lines.join('\n'), /skipped this tick/);
+  assert.match(d.lines.join('\n'), /router slow\/unavailable \(attempt ms 6000\)/);
 });
 
 for (const phase of ['providers:fetch', 'providers:body', 'providers:backoff', 'providers:fetch:retry']) test(`budget expiry during ${phase} uses the skip path`, async t => {
@@ -1201,6 +1306,8 @@ for (const phase of ['providers:fetch', 'providers:body', 'providers:backoff', '
   await d.run();
   assert.equal(d.h.state().routerUnavailableCount, 1);
   assert.match(d.lines.join('\n'), /skipped this tick/); assert.deepEqual(d.errors, []);
+  assert.match(d.lines.join('\n'), /fetch interrupted: unavailable/);
+  assert.doesNotMatch(d.lines.join('\n'), /no fetch:/);
 });
 
 for (const phase of ['providers:fetch', 'providers:body', 'providers:backoff', 'providers:fetch:retry']) test(`late supervisor timer during ${phase} still skips`, async t => {
@@ -1212,6 +1319,8 @@ for (const phase of ['providers:fetch', 'providers:body', 'providers:backoff', '
   assert.equal(d.clock.now(), 9_000);
   assert.equal(d.h.state().routerUnavailableCount, 1);
   assert.match(d.lines.join('\n'), /skipped this tick/); assert.deepEqual(d.errors, []);
+  assert.match(d.lines.join('\n'), /fetch interrupted: unavailable/);
+  assert.doesNotMatch(d.lines.join('\n'), /no fetch:/);
 });
 
 test('consecutive deadline skips reach the 15-minute outage bound and then recover', async t => {
