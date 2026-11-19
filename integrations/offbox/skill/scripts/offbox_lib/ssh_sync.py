@@ -215,10 +215,11 @@ def ssh_base(box_id: str, *, probe: bool = True) -> list[str]:
                        "use the home control API (`offbox exec`, #95)")
 
 
-def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 120, check: bool = False):
+def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 120, check: bool = False,
+        *, base: list[str] | None = None):
     until = time.time() + timeout
     with api.budget(timeout):
-        argv = ssh_base(box_id) + [box_id, command]
+        argv = (ssh_base(box_id) if base is None else base) + [box_id, command]
         remaining = until - time.time()
         left = api.left()
         if left is not None:
