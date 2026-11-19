@@ -37,7 +37,7 @@ import { makeDecodeCache } from "./decodeCache.ts";
 import { backfillRelease12 } from "./releaseBackfill.ts";
 import { SummaryCard } from "./summaryCard.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
-import { initializeKanbanSchema } from "../../persistence/kanbanSchema.ts";
+import { activityMarkers, initializeKanbanSchema } from "../../persistence/kanbanSchema.ts";
 import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions.ts";
 
 export class KanbanStoreError extends Schema.TaggedError<KanbanStoreError>()("KanbanStoreError", {
@@ -1594,29 +1594,23 @@ const make = Effect.gen(function* () {
       "read activity boundary history",
       Effect.flatMap(
         sql<IdJsonRow>`
-          WITH history AS (
-            SELECT e.id, e.card_id, json_extract(e.json, '$.at') AS at,
-              json_extract(e.json, '$.kind') AS kind,
-              substr(json_extract(e.json, '$.body'), 1, length('Wait expired: ')) AS body,
-              json_extract(e.json, '$.toStage') AS to_stage,
-              json_extract(e.json, '$.fromStage') AS from_stage
-            FROM ardud_kanban_cards c
-            JOIN ardud_kanban_card_events e INDEXED BY ardud_kanban_card_events_card ON e.card_id = c.id
-            WHERE c.board_id = ${boardId}
-              AND (json_extract(e.json, '$.at') < ${window.since} OR json_extract(e.json, '$.at') >= ${window.until})
-          ), markers AS (
-            SELECT *, (to_stage IS NOT NULL AND to_stage IS NOT from_stage) AS is_stage,
-              (kind IN ('wait_set', 'wait_cleared', 'wait_expired') OR
-                (kind = 'edited' AND (body GLOB 'Waiting *' OR body GLOB 'Wait ended: *' OR body GLOB 'Wait expired: *'))) AS is_wait,
-              (kind IN ('flagged', 'moved', 'review', 'wait_set') OR
-                (to_stage IS NOT NULL AND to_stage IS NOT from_stage) OR
-                (kind = 'edited' AND body GLOB 'Waiting *')) AS is_stall
-            FROM history
+          WITH candidates AS MATERIALIZED (
+            SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId}
+              AND json_extract(json, '$.createdAt') < ${window.until}
+              AND (json_extract(json, '$.settledAt') IS NULL OR json_extract(json, '$.settledAt') > ${window.since})
           ), picked AS (
-            SELECT MAX(id) AS id FROM markers WHERE at < ${window.since} AND is_wait GROUP BY card_id
-            UNION SELECT MAX(id) AS id FROM markers WHERE at < ${window.since} AND is_stall GROUP BY card_id
-            UNION SELECT MAX(id) AS id FROM markers WHERE at < ${window.since} AND is_stage GROUP BY card_id
-            UNION SELECT MIN(id) AS id FROM markers WHERE at >= ${window.until} AND is_stage GROUP BY card_id
+            SELECT (SELECT id FROM ardud_kanban_card_events INDEXED BY ardud_kanban_card_events_activity_wait
+              WHERE card_id = c.id AND (${sql.literal(activityMarkers.wait)})
+                AND json_extract(json, '$.at') < ${window.since} ORDER BY id DESC LIMIT 1) AS id FROM candidates c
+            UNION SELECT (SELECT id FROM ardud_kanban_card_events INDEXED BY ardud_kanban_card_events_activity_stall
+              WHERE card_id = c.id AND (${sql.literal(activityMarkers.stall)})
+                AND json_extract(json, '$.at') < ${window.since} ORDER BY id DESC LIMIT 1) AS id FROM candidates c
+            UNION SELECT (SELECT id FROM ardud_kanban_card_events INDEXED BY ardud_kanban_card_events_activity_stage
+              WHERE card_id = c.id AND (${sql.literal(activityMarkers.stage)})
+                AND json_extract(json, '$.at') < ${window.since} ORDER BY id DESC LIMIT 1) AS id FROM candidates c
+            UNION SELECT (SELECT MIN(id) FROM ardud_kanban_card_events INDEXED BY ardud_kanban_card_events_activity_after
+              WHERE card_id = c.id AND (${sql.literal(activityMarkers.stage)})
+                AND json_extract(json, '$.at') >= ${window.until}) AS id FROM candidates c
           )
           SELECT id, json FROM ardud_kanban_card_events WHERE id IN (SELECT id FROM picked) ORDER BY id
         `,

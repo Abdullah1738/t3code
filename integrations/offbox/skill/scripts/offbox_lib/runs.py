@@ -29,6 +29,7 @@ from . import native_crash
 from . import ssh_outage, home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence, quint_tools
 from . import bun_version, command_usage, common, containers, java_version, prune, prepare, userns, toolchain
 from . import resources, box_disk, queue_lifecycle
+from . import uv_cache
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, checkpoint, db, db_retry, event, file_lock, local_error, log, new_id, now,
                      is_silenced, offsets_path, person, read_json, record_delivery, say, silence, size_summary, write)
@@ -4418,6 +4419,8 @@ def _run_remote(a, rn) -> int:
     if killed is not None and killed['process_id']:
         return report_killed(killed, rn.log_path)
     go_std_glitch(rn.box, rn.run_id, rn.log_path, code)
+    from .misc import _raw_log
+    uv_cache.report(rn.box, rn.run_id, _raw_log(rn.log_path), code)
     if code is None:
         say("remote process was lost (box restarted?); treating as infra failure")
     resources.display(rn.run_id)
