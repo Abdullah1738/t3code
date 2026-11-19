@@ -357,7 +357,7 @@ class StatusTests(unittest.TestCase):
         with (self.root / '2026-11-15.ndjson').open('a') as stream:
             stream.write('{broken\n')
         result = rollup('2026-11-15', self.root)
-        old = dict(day='2026-11-15', tool='mac', total=1, countsByName={'disk.sample': 1},
+        old = dict(day='2026-11-15', tool='mac', boots=0, uncleanBoots=0, total=1, countsByName={'disk.sample': 1},
                    countsByKind={'perf': 1}, outcomes=1, okRate=1, errorRate=0, failedRate=0,
                    durationMs={'disk.sample': dict(p50=42, p95=42, max=42)}, malformed=1,
                    topErrors=[], uEpisodes=[],

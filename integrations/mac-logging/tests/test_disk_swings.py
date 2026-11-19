@@ -515,7 +515,7 @@ class DiskSwingShellTests(unittest.TestCase):
                     root, home, fake, logs, env = self.fixture()
                     watch = root/'watch'; watch.mkdir(); (watch/'tmp_kb').write_text('1')
                     helper = root/'helper'; helper.mkdir()
-                    for name in ('toollog.py', 'toollog.sh', 'jobs.py'):
+                    for name in ('boot_identity.py', 'toollog.py', 'toollog.sh', 'jobs.py'):
                         text = (HERE/name).read_text()
                         for command in ('/usr/sbin/diskutil', '/usr/bin/tmutil'):
                             text = text.replace(command, str(fake/Path(command).name))
