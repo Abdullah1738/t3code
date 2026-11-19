@@ -34,6 +34,7 @@ import { criticalWake, FAILED_INBOUND_ALERT_MAX_AGE_MS, FAILED_INBOUND_REPLAY_MA
 import { isAgentBusWake } from "./agent-bus.ts";
 import { leaderKind, requeueHuman, type RequeueReason } from "./inbound-routing.ts";
 import { controlDisposition, controlFailureProps } from "./control-errors.ts";
+import { WakeDelivery, wakeStatus, WAKE_AMBIGUITY_MS } from "./wake-delivery.ts";
 export { leaderKind, requeueHuman } from "./inbound-routing.ts";
 
 /**
@@ -464,7 +465,7 @@ type PreparingDelivery = {
 };
 /** A prompt POSTed for a synthetic row. It is checked again before any further POST for that row. */
 type SentPrompt = { sessionId: string; directory: string; generation?: number; messageId: string; startedAt: number };
-type SyntheticRetry = { attempts: number; nextAt: number; prompts: SentPrompt[]; reason?: DropReason };
+type SyntheticRetry = { attempts: number; nextAt: number; prompts: SentPrompt[]; reason?: DropReason; delivery?: { turn: Turn; body: ResendBody } };
 type DropReason = "undelivered" | "failed" | "errored" | "expired";
 /** A dropped synthetic row waiting to be sent in the combined notice. */
 type DroppedNotice = { id: string; label: string; reason: DropReason; text: string; at: number };
@@ -897,6 +898,7 @@ export class Router {
     private readonly transport: Pick<Photon, "typing" | "read" | "downloadAttachment"> & Partial<Pick<Photon, "getMessage">>,
     private readonly options: Options,
   ) {
+    this.wakes = new WakeDelivery(store);
     this.probeBackoff = new ProbeBackoff(store);
     this.probeBudget = options.probeBudget ?? new ProbeBudget(store);
     if (!options.context && !ownerChatGuid(options.chatGuid, options.owner)) throw new Error("Invalid owner chat");
@@ -933,6 +935,79 @@ export class Router {
       // A persisted running turn can poll without passing through setTurn again.
       if (restored && restored.phase !== "failed" && this.current(restored)) this.logTurnStart(restored);
     });
+  }
+
+  private readonly wakes: WakeDelivery;
+
+  /** Finalize local failure independently of link state or a prior admission receipt. Call inside a transaction. */
+  private failWake(id: string, reason: Parameters<WakeDelivery["failed"]>[1]): void {
+    this.wakes.accept(id);
+    const status = wakeStatus(this.store, id);
+    if (!status) return;
+    const row = this.store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id=?").get(id);
+    if (!row) return;
+    if (status.state === "admitted" && ["done", "admitted"].includes(row.state)) return;
+    const input = JSON.parse(row.payload) as NormalizedInbound;
+    if (status.state !== "failed" && !["failed", "cancelled"].includes(row.state)) {
+      this.wakes.failed(id, reason);
+      if (!isAgentBusWake(id) && !replyNudgeRow(id) && Date.now() - status.acceptedAt <= 24 * 60 * 60_000) {
+        this.queueDropped(id, input.text, "undelivered");
+        this.carryMissed(id, input.text, { uncertain: reason === "stale" || status.firstSendAt !== undefined });
+      } else this.store.set(`failed-stale:${id}`, true);
+    }
+    const retry = this.store.get<SyntheticRetry>(this.retryKey(id)) ?? { attempts: 0, nextAt: 0, prompts: [] };
+    this.store.set(this.retryKey(id), { ...retry, attempts: Math.max(MAX_SYNTHETIC_ATTEMPTS, retry.attempts), nextAt: 0 });
+    this.store.updateInbound(id, "failed", undefined, { stage: "synthetic", message: `Wake delivery failed: ${reason}`, threadId: status.threadId ?? null, at: Date.now() });
+    const turn = this.store.get<Turn | null>("activeTurn");
+    if (turn?.inboundId === id && !this.typedInto(turn)) {
+      this.setTurn(null);
+      this.store.set("resendBody", null);
+    }
+    if (this.store.get<PreparingDelivery>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
+    this.store.set(`latency-route:${id}`, null);
+  }
+
+  private expireWakeBatch(leader: string): boolean {
+    const ids = this.syntheticBatch(leader)?.filter(id => id.startsWith("wake:")) ?? [];
+    const expired = ids.find(id => {
+      if (isAgentBusWake(id) || replyNudgeRow(id)) return false;
+      const status = wakeStatus(this.store, id);
+      return status && status.state !== "admitted" && status.state !== "failed" && (
+        this.wakes.legacy(id) && Date.now() - status.acceptedAt >= WAKE_AMBIGUITY_MS
+        || status.firstSendAt !== undefined && Date.now() - status.firstSendAt >= WAKE_AMBIGUITY_MS);
+    });
+    if (!expired) return false;
+    const reason = this.wakes.legacy(expired) && Date.now() - wakeStatus(this.store, expired)!.acceptedAt >= WAKE_AMBIGUITY_MS
+      ? "stale" : "ambiguity_deadline";
+    this.store.db.transaction(() => { for (const id of ids) this.failWake(id, reason); }).immediate();
+    return true;
+  }
+
+  private sweepWakeDelivery(): void {
+    const now = Date.now();
+    this.store.db.transaction(() => {
+      const rows = this.store.db.query<{ id: string; payload: string; state: string }, []>(
+        "SELECT id, payload, state FROM inbound WHERE id GLOB 'wake:*' AND state IN ('pending', 'processing', 'batched') ORDER BY rowid",
+      ).all();
+      for (const row of rows) {
+        const separateExpiry = isAgentBusWake(row.id) || replyNudgeRow(row.id);
+        const legacy = !this.store.get(`wake-delivery:${row.id}`) || this.wakes.legacy(row.id);
+        const input = JSON.parse(row.payload) as NormalizedInbound;
+        this.wakes.accept(row.id, undefined, legacy && !separateExpiry);
+        const status = wakeStatus(this.store, row.id)!;
+        if (status.state === "admitted" || status.state === "failed") continue;
+        const expired = !separateExpiry && status.firstSendAt !== undefined && now - status.firstSendAt >= WAKE_AMBIGUITY_MS;
+        const stale = legacy && now - (input.receivedAt ?? now) >= WAKE_AMBIGUITY_MS;
+        if (!expired && !stale) continue;
+        const parent = row.state === "batched" ? this.store.db.query<{ leader: string }, [string]>(
+          `SELECT substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
+            JOIN inbound ON inbound.id = substr(kv.key, 7)
+            WHERE kv.key GLOB 'batch:*' AND member.value = ? AND inbound.state IN ('pending', 'processing')`,
+        ).get(row.id)?.leader : undefined;
+        // One sealed operation owns every member, including unsent siblings with later receipt times.
+        if (!this.expireWakeBatch(parent ?? row.id)) this.failWake(row.id, stale ? "stale" : "ambiguity_deadline");
+      }
+    }).immediate();
   }
 
   tick(): Promise<void> {
@@ -1063,6 +1138,7 @@ export class Router {
       if (row.state === "pending" && this.store.get(`human-own-turn:${id}`) || row.state === "admitted") continue;
       if (succeeded || row.state !== "failed") this.store.updateInbound(id, "done");
       if (this.store.get<number>(`inbound-delivered:${id}`) !== undefined) continue;
+      if (id.startsWith("wake:")) this.wakes.admitted(id);
       if (!synthetic(id)) this.store.set("bus-yield-human", false);
       if (isAgentBusWake(id)) this.store.set("bus-yield-human", true);
       this.store.set(`inbound-delivered:${id}`, deliveredAt);
@@ -1359,6 +1435,7 @@ export class Router {
 
   private failInbound(id: string, stage: string, error: unknown, route = this.store.get<Route | null>("route")): void {
     if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) return;
+    if (id.startsWith("wake:")) this.wakes.failed(id, "attempts_exhausted");
     // Keep the transport exception rather than replacing it with a generic timeout notice.
     const prior = this.store.inboundFailure(id);
     if (!prior || prior.stage !== stage) this.recordFailure(id, stage, error, route);
@@ -1667,6 +1744,9 @@ export class Router {
    */
   private retrySynthetic(leader: string, reason: DropReason): void {
     const ids = this.syntheticBatch(leader) ?? [leader];
+    const sealed = reason === "undelivered" && this.wakeBatch(leader)
+      && this.store.get<SyntheticRetry>(this.retryKey(leader))?.delivery
+      ? this.store.get<NormalizedInbound>(`batch:${leader}`) : undefined;
     this.store.set(`batch:${leader}`, null);
     this.store.set(`batch-phase:${leader}`, null);
     const payload = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?");
@@ -1711,14 +1791,27 @@ export class Router {
       // It waits longer than an undelivered row: the failure is usually a provider outage.
       const limit = reason === "errored" ? ERRORED_RETRY_MS : SYNTHETIC_RETRY_MS;
       if (attempts < MAX_SYNTHETIC_ATTEMPTS) {
-        this.store.set(key, { ...state, attempts, reason, nextAt: Date.now() + limit * 2 ** (attempts - 1) } satisfies SyntheticRetry);
+        const nextAt = Date.now() + limit * 2 ** (attempts - 1);
+        this.store.set(key, { ...state, attempts, reason, nextAt } satisfies SyntheticRetry);
+        this.wakes.retry(id, attempts, nextAt);
         this.store.updateInbound(id, "pending");
         continue;
       }
       this.store.set(key, { ...state, attempts, reason, nextAt: 0 } satisfies SyntheticRetry);
+      if (id.startsWith("wake:") && reason === "undelivered") {
+        this.failWake(id, "attempts_exhausted");
+        continue;
+      }
+      this.wakes.failed(id, "attempts_exhausted");
       this.queueDropped(id, text, reason);
-      if (!isAgentBusWake(id)) this.carryMissed(id, text);
+      if (!isAgentBusWake(id)) this.carryMissed(id, text, { uncertain: reason === "undelivered" && wakeStatus(this.store, id)?.firstSendAt !== undefined });
       this.failInbound(id, "synthetic", reason);
+    }
+    if (sealed && this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(leader)?.state === "pending") {
+      this.store.set(`batch:${leader}`, sealed);
+      this.store.set(`batch-phase:${leader}`, "deferred-wake");
+      this.store.set(`wake-deferred:${leader}`, true);
+      for (const id of ids.slice(1)) this.store.updateInbound(id, "batched");
     }
   }
 
@@ -1843,6 +1936,7 @@ export class Router {
   }
 
   private async run(): Promise<void> {
+    this.sweepWakeDelivery();
     const linkDown = () => this.backend.linkAvailable === false;
     if (linkDown()) {
       toolLog.skipRobob("router.tick");
@@ -1984,7 +2078,10 @@ export class Router {
       const turn = currentTurn;
       const busy = turn && turn.phase !== "failed" && this.current(turn);
       toolLog.capture(() => {
-        if (busy) for (const row of rows) if (row.state === "pending" && row.id !== turn.inboundId && !this.store.get(`log-queued-behind:${row.id}`)) this.store.set(`log-queued-behind:${row.id}`, true);
+        if (busy) for (const row of rows) if (row.state === "pending" && row.id !== turn.inboundId) {
+          if (!this.store.get(`log-queued-behind:${row.id}`)) this.store.set(`log-queued-behind:${row.id}`, true);
+          if (row.id.startsWith("wake:")) this.wakes.waiting(row.id, toolLog.runIds(turn.id).runId ?? turn.messageId);
+        }
       });
       // Typed follow-ups join the running turn instead of waiting for it to end.
       const steer = !!busy && this.steerable(turn);
@@ -2890,10 +2987,14 @@ export class Router {
       && !(turn?.inboundId && resetRow(turn.inboundId) && this.current(turn))
       && !this.store.pendingInbound().some(row => resetRow(row.id));
     this.store.db.transaction(() => {
+      const cancel = (id: string) => {
+        if (id.startsWith("wake:")) this.failWake(id, "route_retired");
+        this.store.updateInbound(id, "cancelled");
+      };
       for (const row of this.store.pendingInbound()) {
         // A watcher event still needs handling; it carries over into the fresh chat.
         if (resetRow(row.id) || (preceding.has(row.id) && !(row.id.startsWith("wake:") && row.state === "pending"))) {
-          for (const id of this.store.get<NormalizedInbound | null>(`batch:${row.id}`)?.batchIds ?? [row.id]) this.store.updateInbound(id, "cancelled");
+          for (const id of this.store.get<NormalizedInbound | null>(`batch:${row.id}`)?.batchIds ?? [row.id]) cancel(id);
         }
       }
       // A synthetic row whose turn failed is queued for a retry and carries over like any pending wake.
@@ -2905,6 +3006,7 @@ export class Router {
         if (!this.answered(id)) this.store.db.query("UPDATE inbound SET state = 'cancelled' WHERE id = ? AND state = 'admitted'").run(id);
       }
       if (turn?.inboundId && this.owns(turn.inboundId) && !this.answered(turn.inboundId)) {
+        if (turn.inboundId.startsWith("wake:")) this.failWake(turn.inboundId, "route_retired");
         // Tracked human rows become done only after delivery; ordinary prompt rows are done at admission.
         this.store.db.query("UPDATE inbound SET state = 'cancelled' WHERE id = ? AND (state != 'done' OR ?)").run(turn.inboundId, covered.includes(turn.inboundId) ? 0 : 1);
       }
@@ -2919,7 +3021,7 @@ export class Router {
           const original = this.store.get<Turn | null>(`failed-delivery:${preparing.id}`);
           if (original) this.logTurnEnd(original, original.earlySent ? "replied" : "no_reply", false);
         });
-        for (const id of this.store.get<NormalizedInbound | null>(`batch:${preparing.id}`)?.batchIds ?? [preparing.id]) this.store.updateInbound(id, "cancelled");
+        for (const id of this.store.get<NormalizedInbound | null>(`batch:${preparing.id}`)?.batchIds ?? [preparing.id]) cancel(id);
         this.store.set(`batch:${preparing.id}`, null);
         this.store.set(`batch-phase:${preparing.id}`, null);
       }
@@ -3823,6 +3925,11 @@ export class Router {
 
   private async submit(row: InboundRecord, handled: Set<string>): Promise<void> {
     if (this.probeBackoff.cooling(row.id)) return;
+    const retry = this.store.get<SyntheticRetry>(this.retryKey(row.id));
+    if (retry?.reason === "undelivered" && retry.delivery && this.wakeBatch(row.id)) {
+      await this.resumeWake(row.id, retry.delivery, handled);
+      return;
+    }
     const input = this.store.get<NormalizedInbound>(`batch:${row.id}`) ?? row.payload as NormalizedInbound;
     const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
     const steerAttempt = this.store.get<SteerAttempt | null>(`steer-attempt:${row.id}`);
@@ -4014,8 +4121,21 @@ export class Router {
         }).immediate();
         return;
       }
-      // Each attempt gets its own record id, so a retry never collides with an earlier record.
-      const attempts = this.store.get<SyntheticRetry | null>(this.retryKey(row.id))?.attempts ?? 0;
+      const retry = this.store.get<SyntheticRetry | null>(this.retryKey(row.id));
+      if (this.wakeBatch(row.id) && retry?.reason === "undelivered" && earlier.length) {
+        // Older builds did not retain the body. Absence cannot authorize a different operation under its key.
+        this.store.db.transaction(() => {
+          for (const id of members) {
+            const saved = this.store.get<SyntheticRetry>(this.retryKey(id)) ?? { attempts: 0, nextAt: 0, prompts: [] };
+            this.store.set(this.retryKey(id), { ...saved, attempts: MAX_SYNTHETIC_ATTEMPTS });
+          }
+          this.retrySynthetic(row.id, "undelivered");
+          this.store.set("preparingDelivery", null);
+        }).immediate();
+        return;
+      }
+      // Execution retries need a new turn. An unadmitted wake retains its sealed operation above.
+      const attempts = retry?.attempts ?? 0;
       if (attempts) promptId = `msg_${hash(`${row.id}:${attempts}`)}`;
     }
     if (latencyRoute) promptId = latencyRoute.messageId;
@@ -4122,7 +4242,8 @@ export class Router {
       if (members.every(synthetic)) for (const id of members) {
         const key = this.retryKey(id);
         const retry = this.store.get<SyntheticRetry | null>(key) ?? { attempts: 0, nextAt: 0, prompts: [] };
-        this.store.set(key, { ...retry, nextAt: 0, prompts: [...retry.prompts, { sessionId: turn.id, directory: turn.directory, generation: turn.generation, messageId: turn.messageId, startedAt: turn.startedAt }] } satisfies SyntheticRetry);
+        this.store.set(key, { ...retry, nextAt: 0, prompts: [...retry.prompts, { sessionId: turn.id, directory: turn.directory, generation: turn.generation, messageId: turn.messageId, startedAt: turn.startedAt }],
+          ...(this.wakeBatch(row.id) ? { delivery: { turn, body: this.store.get<ResendBody>("resendBody")! } } : {}) } satisfies SyntheticRetry);
       }
       // A rotation recap only covers what came after the latest reset nudge.
       if (members.some(resetRow)) this.store.set("resetMark", { sessionId: turn.id, messageId: turn.messageId });
@@ -4146,10 +4267,54 @@ export class Router {
     } catch (error) {
       if (error instanceof PromptExpiredError) { this.fail(turn, "", undefined, "undelivered"); return; }
       toolError("router", "router.catch40", error);
+      this.wakeAmbiguous(turn, error);
       if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) { this.holdDelivery(turn); return; }
       if (error === probeDeferred) { this.deferUnsentWake(turn); return; }
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
+    }
+  }
+
+  private async resumeWake(id: string, delivery: NonNullable<SyntheticRetry["delivery"]>, handled: Set<string>): Promise<void> {
+    const { turn: original, body } = delivery;
+    if (!this.current(original)) {
+      this.store.db.transaction(() => {
+        for (const member of this.syntheticBatch(id) ?? [id]) this.failWake(member, "route_retired");
+        this.store.set(`batch:${id}`, null);
+        this.store.set(`batch-phase:${id}`, null);
+        this.store.set("preparingDelivery", null);
+      }).immediate();
+      return;
+    }
+    let accepted: boolean;
+    try { accepted = await this.reading(this.probeAccepted(original, original.messageId)); }
+    catch (error) {
+      toolError("router", "router.wake_retry_probe", error);
+      if (this.expireWakeBatch(id)) return;
+      this.deferBusyBatch({ id });
+      return;
+    }
+    if (this.expireWakeBatch(id)) return;
+    if (!this.current(original) || this.controlArrived(handled)) { this.deferBusyBatch({ id }); return; }
+    const turn: Turn = { ...original, phase: accepted ? "running" : "submitting", attempt: 1, attemptAt: Date.now() };
+    this.store.db.transaction(() => {
+      this.store.set("preparingDelivery", null);
+      this.store.set(`batch-phase:${id}`, "submitting");
+      this.setTurn(turn);
+      this.store.set("resendBody", body);
+      if (accepted) this.landed(turn);
+    }).immediate();
+    if (!accepted) await this.sendDelivery(turn, body, handled);
+  }
+
+  private wakeSending(turn: Turn): void {
+    for (const id of this.syntheticBatch(turn.inboundId) ?? []) if (id.startsWith("wake:")) this.wakes.sending(id, turn.id);
+  }
+
+  private wakeAmbiguous(turn: Turn, error: unknown): void {
+    for (const id of this.syntheticBatch(turn.inboundId) ?? []) if (id.startsWith("wake:")) {
+      if (error instanceof RobobLinkDown || error === probeDeferred) this.wakes.unsent(id);
+      else this.wakes.ambiguous(id, error, Math.max(0, Date.now() - (turn.attemptAt ?? turn.startedAt)));
     }
   }
 
@@ -4528,12 +4693,14 @@ export class Router {
 
   private beforePromptPost(turn: Turn, leader: string, handled: Set<string>): void {
     const allowed = this.store.db.transaction(() => {
+      if (this.expireWakeBatch(leader)) return false;
       if (this.probeBackoff.cooling(leader) || !this.current(turn)
         || this.store.get<Turn | null>("activeTurn")?.messageId !== turn.messageId
         || this.controlArrived(handled) || this.expireFailedReplay(leader)) return false;
       return this.claimStuckWakeAttempt(leader);
     }).immediate();
     if (!allowed) throw probeDeferred;
+    this.wakeSending(turn);
   }
 
   private deferUnsentWake(turn: Turn): void {
@@ -4571,6 +4738,7 @@ export class Router {
     } catch (error) {
       if (error instanceof PromptExpiredError) { this.fail(turn, "", undefined, "undelivered"); return; }
       toolError("router", "router.catch44", error);
+      this.wakeAmbiguous(turn, error);
       if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) { this.holdDelivery(turn); return; }
       if (error === probeDeferred) { this.deferUnsentWake(turn); return; }
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
@@ -5450,6 +5618,8 @@ export class Router {
   }
 
   private logTurnStart(turn: Turn): void {
+    for (const id of this.syntheticBatch(turn.inboundId) ?? []) if (id.startsWith("wake:"))
+      this.wakes.start(id, turn.id, this.syntheticBatch(turn.inboundId)!.length);
     toolLog.capture(() => {
       toolLog.beginRun(turn.id, turn.messageId);
       if (this.store.get(`log-turn-start:${turn.messageId}`)) return;
