@@ -619,8 +619,9 @@ def disk_maintenance(con, error=None):
         # Count-retention uses the same pacing gate. Otherwise run completion or
         # personal timers could bypass sampler backpressure with a bulk delete.
         count_gone = set()
+        count_protected = snapshot_protected(con, pressure=False)
         for box in con.execute('SELECT id FROM boxes WHERE deleted_at IS NULL'):
-            if box['id'] in snapshot_protected(con, pressure=False):
+            if box['id'] in count_protected:
                 continue
             rows = con.execute('SELECT * FROM snaps WHERE box_id=? ORDER BY created_at DESC', (box['id'],)).fetchall()
             count_gone.update((box['id'], name) for name in snaps_to_prune(rows, CFG['retention'], now()))

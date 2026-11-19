@@ -254,6 +254,32 @@ class Round2(Base):
                 self.assertEqual(self.deletes(), [])
                 self.assertTrue(any(c.args[1] == 'snapshot.yield' for c in emit.call_args_list))
 
+    def test_count_retention_has_a_bounded_number_of_full_command_scans(self):
+        for i in range(80):
+            self.box('bx_'+str(i).zfill(8))
+        queries=[]
+        self.con.set_trace_callback(queries.append)
+        try:
+            boatd.disk_maintenance(self.con)
+        finally:
+            self.con.set_trace_callback(None)
+        scans=[q for q in queries if q.upper().startswith('SELECT') and 'FROM COMMANDS' in q.upper()
+               and 'WHERE BOX_ID' not in q.upper()]
+        self.assertLess(len(scans),10, 'full protection scans must not grow with box count')
+
+    def test_pin_added_during_count_selection_is_rechecked_before_delete(self):
+        bid=self.box()
+        self.install_rows(snaps(bid),{})
+        original=boatd.snaps_to_prune
+        def pin_during_selection(*args):
+            selected=original(*args)
+            self.con.execute('UPDATE boxes SET pinned=1 WHERE id=?',(bid,))
+            return selected
+        with patch.object(boatd,'snaps_to_prune',side_effect=pin_during_selection):
+            boatd.disk_maintenance(self.con)
+        self.assertEqual(self.deletes(),[])
+        self.assertTrue(self.state(bid)['pinned'])
+
     def test_unreadable_backpressure_yields_instead_of_deleting(self):
         bid=self.box();self.install_rows(snaps(bid),{})
         with patch.object(disk,'cleanup_pressure',side_effect=OSError('unavailable')),patch.object(boatd.toollog,'emit') as emit:
