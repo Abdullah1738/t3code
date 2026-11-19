@@ -356,7 +356,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
     try {
       if (request.method === "GET") {
         if (path === "/health") return reply(200, options.health());
-        if (path === "/router") return registry.owner.parts.api(request);
+        if (path === "/router" || path.startsWith("/wake/")) return registry.owner.parts.api(request);
         return reply(404, { error: "Not found" });
       }
       if (request.method !== "POST") return reply(404, { error: "Not found" });

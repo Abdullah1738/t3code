@@ -6,6 +6,15 @@ import { join } from 'node:path';
 import { clean, emit, observed, tagFailurePhase } from '../toollog.mjs';
 
 import {fixture} from './support.mjs';
+test('provider skip reasons retain only fixed reason codes', () => {
+  const reasonProps = reason => clean({component:'reauth',name:'providers.fetch.skipped',kind:'event',props:{reason}}).props;
+  for (const reason of ['boot_exhausted', 'below_minimum', 'exhausted', 'retry_dropped', 'unavailable']) {
+    assert.deepEqual(reasonProps(reason), {reason});
+  }
+  for (const reason of ['private', 'https://private.invalid', 'sk-private', 'token', null, true, 1, {}, []]) {
+    assert.equal(reasonProps(reason), undefined);
+  }
+});
 test('retry and scan diagnostics enforce fixed targets, token names, numbers and booleans', () => {
   const cleanProps = props => clean({component:'stream-recovery',name:'http.retry',kind:'event',props}).props;
   assert.deepEqual(cleanProps({target:'control',tag:'EPIPE',ok:true,loopBlockMaxMs:75,longestSyncOp:'failedRunsSince',longestSyncMs:74}),

@@ -1,4 +1,5 @@
 import { markAnswered } from "./unanswered.ts";
+import { WakeDelivery, wakeId, wakeStatus } from "./wake-delivery.ts";
 import { parseHealthSidecar } from "./health-receipts.ts";
 import { messageLengthError } from "./message-length.ts";
 import { toolError } from "./toollog.ts";
@@ -239,6 +240,11 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
           const active = router();
           return json(active ? active.routerStatus() : { route: null, pending: [] });
         }
+        if (path.startsWith("/wake/")) {
+          const status = wakeStatus(store, decodeURIComponent(path.slice("/wake/".length)));
+          if (!status) throw new ApiError(404);
+          return json(status);
+        }
         throw new ApiError(404);
       }
       if (request.method !== "POST" || !["/files", "/react", "/send", "/cancel-send", "/poll", "/app", "/wake", "/secret-request", "/secret-read",
@@ -369,7 +375,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const { text, source, dedupeKey } = body;
         if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
         if (!string(text, 12_000) || !line(source, 100) || !string(dedupeKey, 200)) throw new ApiError(400);
-        const id = `wake:${hash(dedupeKey)}`;
+        const id = wakeId(dedupeKey);
         const created = store.db.transaction(() => {
           const key = `api:wake:${id}`;
           const spec = JSON.stringify({ text, source });
@@ -378,9 +384,10 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
           const created = store.acceptInbound(id, { id, text: wakeText(source, text), attachments: [], isAudioMessage: false,
             receivedAt: Date.now() });
           store.set(key, { spec });
+          new WakeDelivery(store).accept(id, source, !created);
           return created;
         }).immediate();
-        return json({ id, created }, created ? 202 : 200);
+        return json({ id, created, state: wakeStatus(store, id)!.state }, created ? 202 : 200);
       }
 
       if (path === "/poll") {

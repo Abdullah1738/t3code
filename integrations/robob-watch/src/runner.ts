@@ -147,7 +147,7 @@ async function headsUps(watcher: Watcher, state: State): Promise<void> {
   const keep: TrackedWake[] = [];
   for (const wake of state.wakes) {
     const age = now() - wake.delivered_at;
-    const row = await inboundState(wake.inbound);
+    const row = await inboundState(wake.inbound, watcher.id);
     if (watcherInstance(watcher.id) !== instance) return;
     // A just-delivered wake's row can briefly read as missing; only trust "missing" after a short grace.
     if (row === "missing" && age < 15_000) { keep.push(wake); continue; }
@@ -163,10 +163,10 @@ async function headsUps(watcher: Watcher, state: State): Promise<void> {
     const key = `robob-watch:${watcher.id}:headsup:${hash(wake.key).slice(0, 32)}`;
     const text = headsUpText(watcher, wake.event);
     let via = "none";
-    const sent = await imessage(text, key);
+    const sent = await imessage(text, key, { watcher: watcher.id });
     if (sent.ok) via = "imessage-send";
     else {
-      const notified = await telegram(`Watcher ${watcher.id}`, text, key);
+      const notified = await telegram(`Watcher ${watcher.id}`, text, key, undefined, undefined, watcher.id);
       if (notified.ok) via = "telegram";
       else log(watcher.id, `heads-up failed send: ${sent.out} | telegram: ${notified.out}`);
     }

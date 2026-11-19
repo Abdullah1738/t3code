@@ -192,6 +192,30 @@ test.each(["native", "status", "send"])("creator fallbacks retain stable %s fiel
   expect(all.every(row => row.props.step === step && row.props.durationMs === 12)).toBe(true);
 });
 
+test.each(["native", "native_retry", "status", "status_retry", "send", "confirm"])("helper runs retain %s attribution and timeout fields", op => {
+  const dir = fixture();
+  const entries = [false, true].map(timedOut => ({ component: "helpers", kind: "error" as const, name: "helper.run", ok: false,
+    ids: { helper: "t3ctl", watcher: "fixture" }, props: { op, timeoutMs: 10_000, timedOut, exitCode: 137 } }));
+  for (const entry of entries) toolLog(entry);
+  const script = `import json, sys\nsys.path.insert(0, "helpers")\nfrom toollog import tool_log\nfor entry in json.loads(sys.argv[1]): tool_log(entry)\n`;
+  const result = Bun.spawnSync(["python3", "-I", "-B", "-c", script, JSON.stringify(entries)], { env: { ...process.env, TOOLLOG_DIR: dir } });
+  expect(result.exitCode).toBe(0);
+  expect(rows(dir).map(row => ({ ids: row.ids, props: row.props }))).toEqual([false, true, false, true].map(timedOut => ({
+    ids: { helper: "t3ctl", watcher: "fixture" }, props: { op, timeoutMs: 10_000, timedOut, exitCode: 137 },
+  })));
+});
+
+test("helper attribution drops arbitrary operations and invalid timeout fields", () => {
+  const dir = fixture();
+  const entry = { component: "helpers", kind: "error" as const, name: "helper.run",
+    props: { op: "private payload", timeoutMs: Infinity, timedOut: "true", exitCode: 137 } };
+  toolLog(entry);
+  const script = `import json, sys\nsys.path.insert(0, "helpers")\nfrom toollog import tool_log\ntool_log(json.loads(sys.argv[1]))\n`;
+  const result = Bun.spawnSync(["python3", "-I", "-B", "-c", script, JSON.stringify(entry)], { env: { ...process.env, TOOLLOG_DIR: dir } });
+  expect(result.exitCode).toBe(0);
+  expect(rows(dir).map(row => row.props)).toEqual([{ exitCode: 137 }, { exitCode: 137 }]);
+});
+
 test("logging drops IO and serialization failures without raising", () => {
   const dir = fixture(); process.env.TOOLLOG_DIR = join(dir, "blocked"); writeFileSync(process.env.TOOLLOG_DIR, "file");
   expect(() => toolLog({ component: "runner", kind: "event", name: "watch.run" })).not.toThrow();

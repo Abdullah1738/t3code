@@ -120,6 +120,7 @@ const props = new Set(['model','size','count','status','enabled','locked','limit
 for (const prop of ['target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'lastTs', 'ok', 'loopBlockMaxMs', 'longestSyncOp', 'longestSyncMs', 'httpStatus']) props.add(prop);
 const numericScanProps = new Set(['loopBlockMaxMs', 'longestSyncMs']);
 const safeProp = (key, value) => {
+  if (key === 'reason') return ['boot_exhausted', 'below_minimum', 'exhausted', 'retry_dropped', 'unavailable'].includes(value);
   if (key === 'httpStatus') return Number.isFinite(value);
   if (numericScanProps.has(key)) return Number.isFinite(value) && value >= 0;
   if (key === 'longestSyncOp') return Boolean(token(value));
@@ -134,7 +135,7 @@ const safeProp = (key, value) => {
 };
 const ids = new Set(['account','connection','thread','incident','request','session']);
 ids.add('writer');
-for (const prop of ['firstAttemptMs', 'retryAttemptMs', 'outcome', 'consecutive', 'sinceMs']) props.add(prop);
+for (const prop of ['firstAttemptMs', 'retryAttemptMs', 'outcome', 'consecutive', 'sinceMs', 'reason']) props.add(prop);
 const token = v => typeof v === 'string' && /^[A-Za-z0-9_.:/-]{1,100}$/.test(v) && !/(sk-|bearer|password|secret|token|api.?key|otp|cookie|prompt|@)/i.test(v) ? v : undefined;
 const errorTag = v => typeof v === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(v) ? token(v) : undefined;
 // Only fixed operational messages survive. Exception text can contain arbitrary

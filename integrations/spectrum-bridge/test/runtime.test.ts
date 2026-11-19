@@ -15,6 +15,7 @@ import { ChatRegistry, createAgentBus, createSbApi, optOutHealth, type ChatCore 
 import { handleInbound, runIngress, type IngressDeps } from "../src/sb-ingress.ts";
 import { Shares } from "../src/share.ts";
 import { Store, type OutboxOperation } from "../src/store.ts";
+import { WakeDelivery, wakeId } from "../src/wake-delivery.ts";
 import type { BackendKind } from "../src/backend.ts";
 
 const owner = "+15555550123";
@@ -89,6 +90,37 @@ function setup(realApi = false) {
 const message = (overrides: Partial<LineInbound>): LineInbound => ({
   handle: "h-1", chat: chatKey.dm(owner), from: owner, text: "hi", kind: "message", service: "iMessage",
   participants: [], sentAt: 1_000, ...overrides,
+});
+
+test("Sendblue wake status reads the owner store without a session or delivery readiness", async () => {
+  const env = setup(true), registry = env.registry();
+  let enabled = true;
+  const handler = createSbApi({ registry, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+    enabled: () => enabled, health: () => ({}) });
+  for (const state of ["queued", "sending", "ambiguous", "admitted", "failed"] as const) {
+    const key = `status:${state}`, id = wakeId(key);
+    const post = await handler(new Request("http://bridge/wake", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+      text: "PRIVATE_EVENT", source: "watch", dedupeKey: key,
+    }) }));
+    expect(await post.json()).toEqual({ id, created: true, state: "queued" });
+    const tracker = new WakeDelivery(registry.owner.store);
+    if (state !== "queued") tracker.sending(id, "owner-thread");
+    if (state === "ambiguous") tracker.ambiguous(id, new Error("network"), 60_000);
+    if (state === "admitted") tracker.admitted(id);
+    if (state === "failed") tracker.failed(id, "ambiguity_deadline");
+    enabled = false;
+    const response = await handler(new Request(`http://bridge/wake/${id}`));
+    expect(response.status).toBe(200);
+    const status = await response.json();
+    expect(status).toMatchObject({ id, state });
+    expect(JSON.stringify(status)).not.toContain("PRIVATE_EVENT");
+    enabled = true;
+  }
+  const elsewhere = registry.open(chatKey.dm(moni));
+  const otherId = wakeId("only-in-other-chat");
+  elsewhere.store.acceptInbound(otherId, { text: "PRIVATE_OTHER", receivedAt: Date.now() });
+  for (const id of [otherId, wakeId("missing")])
+    expect((await handler(new Request(`http://bridge/wake/${id}`))).status).toBe(404);
 });
 
 const recoveryRaces = (["text", "file", "poll", "app"] as const).flatMap(kind =>

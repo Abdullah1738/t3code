@@ -162,7 +162,8 @@ def refresh_listener_rollups(root, now):
         try:
             dt.date.fromisoformat(day)
             previous = json.loads(report.read_text()).get('listener', {})
-            pending = any(row.get('end') is None for row in previous.get('windows', []))
+            pending = any(row.get('end') is None for row in
+                          [*previous.get('windows', []), *previous.get('unknownWindows', [])])
         except (OSError, ValueError, AttributeError, TypeError):
             continue
         if pending and listener_windows(day, root, now) != previous:
