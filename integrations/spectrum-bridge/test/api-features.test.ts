@@ -216,12 +216,12 @@ test("wake queues one framed inbound row per dedupe key, following whatever sess
   const id = `wake:${hash(body.dedupeKey)}`;
   const first = await h.post("/wake", body);
   expect(first.status).toBe(202);
-  expect(await first.json()).toEqual({ id, created: true });
+  expect(await first.json()).toEqual({ id, created: true, state: "queued" });
   // Not session-bound: a rotated or missing route still accepts it.
   h.store.set("route", null);
   const again = await h.post("/wake", body);
   expect(again.status).toBe(200);
-  expect(await again.json()).toEqual({ id, created: false });
+  expect(await again.json()).toEqual({ id, created: false, state: "queued" });
   expect((await h.post("/wake", { ...body, text: "changed" })).status).toBe(409);
   const rows = h.store.pendingInbound();
   expect(rows).toHaveLength(1);
