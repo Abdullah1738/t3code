@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ardud.robob-overload-restart</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/zsh</string><string>-f</string><string>@INSTALL@/launchd-entry.zsh</string><string>check</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>ROBOB_OVERLOAD_HOME</key><string>@INSTALL@</string><key>ROBOB_OVERLOAD_STATE</key><string>@STATE@</string></dict>
+  <key>WorkingDirectory</key><string>/</string>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardOutPath</key><string>@STATE@/launchd.out</string>
+  <key>StandardErrorPath</key><string>@STATE@/launchd.err</string>
+</dict>
+</plist>
