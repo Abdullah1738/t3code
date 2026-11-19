@@ -16,6 +16,24 @@ else:
 
 
 class RestartReceipts(Base):
+    def test_fresh_guest_probe_separates_run_id_and_fence_mode(self):
+        for run_id in (None, 'run-fixture'):
+            for fence in (False, True):
+                with self.subTest(run_id=run_id, fence=fence):
+                    b = self.box(bid=f'bx_fresh_{bool(run_id)}_{fence}')
+                    p = self.cmd(b, status='queued')
+                    self.con.execute('UPDATE commands SET run_id=? WHERE box_id=?', (run_id, b))
+                    root = self.tmp / b
+                    root.mkdir()
+                    def execute(box, command, **kw):
+                        return subprocess.run(['bash', '-c', command.replace('/run/boatd', str(root))],
+                                              capture_output=True, check=True, timeout=10)
+                    with patch.object(boatd, 'ct_exec', side_effect=execute), \
+                            patch.object(boatd, 'command_probe', return_value={'pids': []}):
+                        result = boatd.guest_command(self.status(b, p), fence=fence)
+                    self.assertEqual(result['state'], 'gone' if fence else 'absent')
+                    self.assertEqual((root / f'{p}.receipt/fenced').exists(), fence)
+
     def test_interrupted_output_commit_resumes_without_duplicating_published_bytes(self):
         for cut in ('journal', 'partial-write', 'before-cursor', 'after-cursor'):
             for streams in ('out', 'err', 'both'):

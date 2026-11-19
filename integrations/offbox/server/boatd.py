@@ -2783,7 +2783,7 @@ def _guest_command(c, fence=None) -> dict:
     if fence is None:
         fence = command_was_started(c)
     probe = ct_exec(box_id, 'python3 -I -c ' + shlex.quote(GUEST_PROBE) +
-                    f' {pid} {offsets[0]} {offsets[1]} ' + shlex.quote(run) + (' fence' if fence else 'check'), timeout=30)
+                    f' {pid} {offsets[0]} {offsets[1]} ' + shlex.quote(run) + (' fence' if fence else ' check'), timeout=30)
     result = json.loads(probe.stdout)
     if result['state'] in ('absent', 'gone'):
         legacy = command_probe(c)
