@@ -95,6 +95,18 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       && (key === "handlerMs" || key === "loopDelayMs") && typeof value === "number" && Number.isFinite(value) && value >= 0) {
       props[key] = value; continue;
     }
+    if (entry.component === "remote-box" && ["moni-box-down", "moni-runner-error"].includes(entry.name)) {
+      if (key === "step" && typeof value === "string" && ["lease", "identity", "deliver", "ack"].includes(value)
+        || key === "errorClass" && typeof value === "string" && ["RemoteRequestError", "Error", "TypeError", "SyntaxError", "Timeout", "Object", "String", "Number", "Boolean", "BigInt", "Symbol", "Function", "undefined", "object"].includes(value)
+        || ["latencyMs", "failures"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0
+        || entry.name === "moni-runner-error" && key === "code" && value === "unreachable") {
+        props[key] = value; continue;
+      }
+    }
+    if (entry.component === "remote-box" && entry.name === "moni-box-up"
+      && ["unreachableMs", "failedProbes", "clearMs"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      props[key] = value; continue;
+    }
     if (entry.component === "remote-box" && entry.name === "moni-runner-error") {
       if (key === "path" && typeof value === "string" && ["/send", "/files", "/react", "/agent-ask", "/agent-answer", "/agent-requests", "/share", "/unshare", "/shares", "/metrics", "/ready"].includes(value)
         || key === "errorClass" && typeof value === "string" && ["LineError", "RemoteSendError", "Error", "UnknownError"].includes(value)
