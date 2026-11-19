@@ -434,3 +434,24 @@ it("bounds MCP error paths and accepts nested schema fields without values", () 
   ])
     expect(() => decodeEvent({ ...row, errorFields })).toThrow();
 });
+
+it.each([null, 680])(
+  "retains late-start identity and settlement timing (%s ms)",
+  (msAfterRunEnded) => {
+    const row = {
+      ...event,
+      surface: "server",
+      kind: "provider_turn.late_start_interrupt_queued",
+      threadId: "thread:late",
+      props: {
+        runId: "run:late",
+        providerTurnId: "provider-turn:late",
+        providerThreadId: "provider-thread:late",
+        providerSessionId: "provider-session:late",
+        runStatus: "interrupted",
+        msAfterRunEnded,
+      },
+    };
+    expect(decodeEvent(row)).toEqual(row);
+  },
+);

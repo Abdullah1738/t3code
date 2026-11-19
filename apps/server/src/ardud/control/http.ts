@@ -1478,9 +1478,13 @@ const makeRoutes = Effect.gen(function* () {
     return json({
       ok: true,
       threadId: shell.id,
-      interrupted: result.type === "interrupt_requested",
+      interrupted:
+        result.type === "interrupt_requested" || result.type === "orphan_turn_interrupted",
       result: result.type,
-      runId: result.type === "no_active_run" ? null : result.run.id,
+      runId:
+        result.type === "no_active_run" || result.type === "orphan_turn_interrupted"
+          ? null
+          : result.run.id,
     });
   });
 

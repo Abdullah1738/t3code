@@ -8764,6 +8764,31 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             ),
           ),
           mcpApps,
+          interruptOrphanedTurn: Effect.fn("CodexAdapterV2.interruptOrphanedTurn")(
+            function* ({ providerThread }) {
+              const threadId = yield* getNativeThreadId(providerThread);
+              const response = yield* ensureInitialized.pipe(
+                Effect.andThen(client.request("thread/read", { threadId, includeTurns: true })),
+              );
+              const turn = response.thread.turns.findLast(
+                (candidate) => candidate.status === "inProgress",
+              );
+              if (turn === undefined) return false;
+              const context = (yield* Ref.get(activeTurns)).get(turn.id);
+              if (context !== undefined)
+                yield* runtime.interruptTurn({
+                  providerThread,
+                  providerTurnId: context.providerTurnId,
+                  requestRuntimeRestart: false,
+                  stopBackgroundWork: false,
+                });
+              else yield* interruptAbandonedNativeTurn(threadId, turn.id);
+              return true;
+            },
+            Effect.mapError((cause) =>
+              toProtocolError("Failed to interrupt an orphaned Codex turn.", cause),
+            ),
+          ),
           readThreadSnapshot: Effect.fn("CodexAdapterV2.readThreadSnapshot")(
             function* (threadInput) {
               const threadId = yield* getNativeThreadId(threadInput.providerThread);

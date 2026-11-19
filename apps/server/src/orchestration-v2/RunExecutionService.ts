@@ -2093,6 +2093,38 @@ export const layer: Layer.Layer<
               if (event.type === "turn.terminal") {
                 yield* Ref.set(rootTerminalSeen, true);
                 yield* Ref.set(terminalEvent, event);
+                // Some adapters report only the terminal control signal. Persist
+                // that confirmation before a terminal run can look like an orphan.
+                if (
+                  observedRootTurn?.id === event.providerTurnId &&
+                  (observedRootTurn.status === "pending" || observedRootTurn.status === "running")
+                ) {
+                  const ended = {
+                    ...observedRootTurn,
+                    status: event.status,
+                    completedAt: yield* DateTime.now,
+                  };
+                  yield* withIngestionStep(
+                    providerEventIngestor.ingestNormalized({
+                      analyticsContext: {
+                        modelSelection: input.modelSelection,
+                        runtimeMode: input.runtimePolicy.runtimeMode,
+                        interactionMode: input.runtimePolicy.interactionMode,
+                      },
+                      providerSessionId: input.providerSessionId,
+                      providerInstanceId: input.run.providerInstanceId,
+                      threadId: input.run.threadId,
+                      runId: input.run.id,
+                      nodeId: input.rootNode.id,
+                      event: {
+                        type: "provider_turn.updated",
+                        driver: event.driver,
+                        providerTurn: ended,
+                      },
+                    }),
+                  );
+                  observedRootTurn = ended;
+                }
               }
               let storedEventCount = 0;
               const guardRunActivity =
@@ -2101,13 +2133,12 @@ export const layer: Layer.Layer<
                 // Only our committed finalization permits trailing background output.
                 !(yield* Ref.get(rootFinalizationOwned)) &&
                 event.type !== "turn.terminal" &&
-                // Restart supersedes the attempt before interrupting it. Cleanup
-                // still needs its exact root turn's terminal projection.
+                // Identity must reach the orchestrator even after cancellation,
+                // so it can queue Stop for a native start that lost ownership.
                 !(
                   event.type === "provider_turn.updated" &&
                   event.providerTurn.id === rootTurnId &&
-                  event.providerTurn.runAttemptId === input.attempt.id &&
-                  isTerminalProviderTurnStatus(event.providerTurn.status)
+                  event.providerTurn.runAttemptId === input.attempt.id
                 );
               const deliveredEvent = filterAssistantEvent(
                 event.type === "provider_turn.updated" &&
