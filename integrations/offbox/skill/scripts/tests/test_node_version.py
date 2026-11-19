@@ -948,8 +948,8 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         a = cli.build_parser().parse_args(['run', '--bg', '--', 'echo hello'])
         runner = runs.Runner(a, self.me)
         first, receipt = node_receipt('v24.22.1', runner.run_id)
-        marker = f'{runs.COMMAND_STARTED_MARKER} {runner.run_id}\n'
-        initial = 'offbox evidence wrapper pid=1\n' + receipt + marker
+        marker = f'{runs.COMMAND_STARTED_MARKER} {runner.run_id} [n={runner.protocol_nonce}]\n'
+        initial = f'offbox evidence wrapper pid=1 [n={runner.protocol_nonce}]\n' + receipt + marker
         with patch.object(pool, 'acquire', return_value=dict(box_id='bx', remote_dir='w/r', size='large')), \
                 patch.object(runs.Runner, '_prepare_box', return_value=None), patch.object(runs, '_ttl_keeper'), \
                 patch.object(lease, 'touch'), patch.object(lease, 'ensure_ttl'), patch.object(lease, 'idle_ttl'), \
@@ -964,7 +964,8 @@ runpy.run_path(sys.argv[0], run_name='__main__')
             self.assertNotIn('box pressure', runner.log_path.read_text())
             final, receipt = node_receipt('v24.22.3', runner.run_id)
             retained = (initial + 'offbox-server: the server restarted while this run was going (attempt 1 is lost); '
-                        'it is queued again as attempt 2\noffbox evidence wrapper pid=2\n' + receipt + marker)
+                        f'it is queued again as attempt 2 [run={runner.run_id} n={runner.protocol_nonce}]\n'
+                        f'offbox evidence wrapper pid=2 [n={runner.protocol_nonce}]\n' + receipt + marker)
             def history(box, cmd, which, offset, **kw):
                 data = retained if which == 'stderr' else ''
                 return dict(data=data[offset:], nextOffset=len(data), size=len(data), done=False,
