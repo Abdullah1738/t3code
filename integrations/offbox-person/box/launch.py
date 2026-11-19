@@ -8,6 +8,8 @@ tunnel is down the browser has no internet, on purpose: it must never fall back 
 {"locale": "..."} the browser language (geoip would pick ar-AE for a Dubai IP).
 """
 
+from __future__ import annotations
+
 import json
 import signal
 import socket

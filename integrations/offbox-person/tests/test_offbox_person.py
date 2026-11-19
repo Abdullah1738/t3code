@@ -56,6 +56,7 @@ class OffboxPersonTest(unittest.TestCase):
             "FAKE_AB_LOG": str(self.ab_log),
             "FAKE_CUA_LOG": str(self.cua_log),
             "TMPDIR": str(self.mac_tmp),
+            "SPECTRUM_BRIDGE_CONFIG": str(self.tmp / "spectrum-config.json"),
         }
 
     def tearDown(self):
@@ -293,6 +294,16 @@ class OffboxPersonTest(unittest.TestCase):
 
     def test_wa_setup_verifies_all_pushes_then_runs_the_file(self):
         # Exercise the real setup script; only its installed dependency and systemd are faked.
+        runtime = tempfile.TemporaryDirectory(prefix="wa-", dir="/tmp")
+        self.addCleanup(runtime.cleanup)
+        user_runtime = Path(runtime.name) / str(os.getuid())
+        user_runtime.mkdir()
+        bus = socket.socket(socket.AF_UNIX)
+        bus.bind(str(user_runtime / "bus"))
+        self.addCleanup(bus.close)
+        self.env["WA_RUNTIME_DIR_BASE"] = runtime.name
+        self.env.pop("XDG_RUNTIME_DIR", None)
+        self.env.pop("DBUS_SESSION_BUS_ADDRESS", None)
         bindir = self.boxhome / "person" / "bin"
         bindir.mkdir()
         wacli = bindir / "wacli"

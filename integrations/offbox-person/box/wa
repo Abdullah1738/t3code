@@ -22,6 +22,17 @@
 #                                   that key (cursor + outbox in ~/person/wa/watch/<key>, see wa-db new)
 #   wa events [N]                   last N sync events (connected, logged_out, ...)
 set -uo pipefail
+# SSH does not establish a PAM user session. The browser has a separate D-Bus bus;
+# systemctl must use the user manager's socket instead.
+runtime_dir="${WA_RUNTIME_DIR_BASE:-/run/user}/$(id -u)"
+if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "$runtime_dir" ]; then
+  export XDG_RUNTIME_DIR="$runtime_dir"
+fi
+USER_BUS="$runtime_dir/bus"
+if [ -S "$USER_BUS" ]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$USER_BUS"
+fi
+NO_SESSION="sync: unknown (no systemd user session; is lingering on?)"
 export TZ=Asia/Dubai
 P="$HOME/person"
 export WACLI_STORE_DIR="$P/wa/store"
@@ -30,7 +41,20 @@ DB="$P/bin/wa-db"
 SVC=wacli-sync.service
 die() { echo "wa: $*" >&2; exit 2; }
 norm() { local j=$1; [[ $j == *@* ]] || j="${j//[^0-9]/}@s.whatsapp.net"; printf '%s\n' "$j"; }
-uctl() { systemctl --user "$@"; }
+have_user_bus() { [ -S "$USER_BUS" ]; }
+uctl() { have_user_bus || return 1; systemctl --user "$@" 2>/dev/null; }
+need_user_bus() { uctl show-environment >/dev/null || die "$NO_SESSION"; }
+unit_state() {
+  local state rc=0
+  state=$(uctl is-active "$1") || rc=$?
+  # is-active reports inactive/absent units with a nonzero exit too. A bus error
+  # has no unit state, and must not masquerade as an offline linked device.
+  case "$rc:$state" in
+    0:active|0:reloading|3:inactive|3:failed|3:activating|3:deactivating|3:maintenance|3:refreshing|3:unknown|4:unknown)
+      printf '%s\n' "$state" ;;
+    *) return 1 ;;
+  esac
+}
 authed() { "$W" auth status --json 2>/dev/null | grep -q '"authenticated":[[:space:]]*true'; }
 need_link() { [ -f "$WACLI_STORE_DIR/session.db" ] && authed || die "not linked yet (wa link <her number>)"; catchup; }
 # Right after a box resume the service has only just reconnected: wait (max ~25 s) for WhatsApp's offline sync, so a
@@ -65,26 +89,32 @@ PY
 cmd=${1:-status}; shift || true
 case $cmd in
   status)
-    if uctl is-active --quiet $SVC; then
+    state=$(unit_state $SVC) || { echo "$NO_SESSION"; exit 1; }
+    if [ "$state" = active ]; then
       pid=$(sed -n 's/^pid=\([0-9]*\).*/\1/p' "$WACLI_STORE_DIR/LOCK" 2>/dev/null)
       echo "online pid ${pid:-?}"
-    elif uctl is-active --quiet wa-link.service; then
-      echo "linking (link job running)"; exit 1
     else
+      link_state=$(unit_state wa-link.service) || { echo "$NO_SESSION"; exit 1; }
+      if [ "$link_state" = active ]; then
+        echo "linking (link job running)"; exit 1
+      fi
       echo "offline ($(authed && echo linked || echo 'not linked'))"; exit 1
     fi
     ;;
   link)
     [ $# -ge 1 ] || die "usage: wa link <phone> | wa link --qr"
+    need_user_bus
     uctl stop wa-link.service 2>/dev/null; uctl reset-failed wa-link.service 2>/dev/null
     authed && die "already linked; to re-link, unlink this device on her phone first (then wa stop; rm -rf ~/person/wa/store)"
-    uctl stop $SVC
+    uctl stop $SVC || die "could not stop sync"
     log="$P/wa/link.events.log"; : > "$log"
     if [ "$1" = --qr ]; then mode=(--qr-format text); kind=qr_code; else mode=(--phone "$1"); kind=pair_code; fi
     # Own transient unit: survives this ssh session. After pairing, auth bootstraps history and exits once idle;
     # sync then takes over.
     systemd-run --user --unit=wa-link --collect --quiet \
       --setenv=WACLI_STORE_DIR="$WACLI_STORE_DIR" \
+      --setenv=XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$runtime_dir}" \
+      --setenv=DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
       bash -c "'$W' auth ${mode[*]} --events --idle-exit 90s >/dev/null 2>>'$log' && systemctl --user enable --now $SVC" \
       || die "could not start the link job"
     for _ in $(seq 1 45); do
@@ -97,12 +127,22 @@ case $cmd in
     ;;
   link-status)
     if authed; then echo "linked"; else echo "not linked"; fi
-    echo "link job: $(uctl is-active wa-link.service 2>/dev/null || true)"
-    echo "sync: $(uctl is-active $SVC 2>/dev/null || true)"
+    link_state=$(unit_state wa-link.service) && state=$(unit_state $SVC) || { echo "$NO_SESSION"; exit 1; }
+    echo "link job: $link_state"
+    echo "sync: $state"
     tail -3 "$P/wa/link.events.log" 2>/dev/null | cut -c1-300 | grep -v '"code"' || true
     ;;
-  start|restart) need_link; uctl enable --quiet $SVC; uctl restart $SVC; sleep 3; exec "$0" status ;;
-  stop) uctl stop wa-link.service $SVC 2>/dev/null; echo stopped ;;
+  start|restart) need_user_bus; need_link; uctl enable --quiet $SVC && uctl restart $SVC || die "could not start sync"; sleep 3; exec "$0" status ;;
+  stop)
+    need_user_bus
+    link_load=$(uctl show -p LoadState --value wa-link.service) || die "could not inspect link job"
+    # --collect removes the transient link unit once pairing has finished.
+    if [ "$link_load" != not-found ]; then
+      uctl stop wa-link.service || die "could not stop link job"
+    fi
+    uctl stop $SVC || die "could not stop sync"
+    echo stopped
+    ;;
   chats) need_link; exec "$DB" chats "${1:-40}" ;;
   find) need_link; [ $# -ge 1 ] || die "usage: wa find <name|number>"; exec "$DB" find "$*" ;;
   read) need_link; [ $# -ge 1 ] || die "usage: wa read <jid> [N]"; exec "$DB" read "$(norm "$1")" --limit "${2:-40}" ;;
@@ -110,13 +150,19 @@ case $cmd in
     need_link; [ $# -ge 1 ] || die "usage: wa search <query> [--chat JID] [--from JID] [--after D] [--limit N]"
     q=$1; shift
     "$W" --read-only --json messages search "$q" "$@" | python3 -c '
-import json, sys, time, datetime
+import json, sys, re, datetime
 d = json.load(sys.stdin).get("data") or {}
 for m in d.get("messages") or []:
-    ts = datetime.datetime.fromisoformat(m["Timestamp"].replace("Z", "+00:00")).astimezone()
+    stamp = m["Timestamp"].replace("Z", "+00:00")
+    # Python before 3.11 only accepts 3 or 6 fractional second digits.
+    stamp = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d+)", lambda x: x[1] + "." + (x[2] + "000000")[:6], stamp)
+    ts = datetime.datetime.fromisoformat(stamp).astimezone()
     who = "Me" if m.get("FromMe") else (m.get("SenderName") or m.get("SenderJID", "").split("@")[0])
     text = (m.get("Text") or m.get("MediaCaption") or m.get("Filename") or ("[" + m["MediaType"] + "]" if m.get("MediaType") else "")).replace("\n", " / ")
-    print(f"({ts:%d-%m-%y %H:%M}) {m.get(\"ChatName\") or m[\"ChatJID\"]} | {who}: {text[:300]}  [{m[\"ChatJID\"]} {m[\"MsgID\"]}]")'
+    chat = m.get("ChatName") or m["ChatJID"]
+    jid = m["ChatJID"]
+    mid = m["MsgID"]
+    print(f"({ts:%d-%m-%y %H:%M}) {chat} | {who}: {text[:300]}  [{jid} {mid}]")'
     ;;
   ids)
     need_link; [ $# -ge 1 ] || die "usage: wa ids <jid> [N]"
@@ -145,6 +191,7 @@ for m in d.get("messages") or []:
     # wa new <jid> <watch-key> [run-id] [last-acked-run-id] (the Mac runner's WATCH_RUN and .run-ok)
     [ $# -ge 2 ] || die "usage: wa new <jid> <watch-key> [run] [run-ok]"
     [[ $2 =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] || die "bad watch key"
+    need_user_bus
     uctl is-active --quiet $SVC || { echo "her wacli sync is not running ($(authed && echo linked || echo 'not linked'))" >&2; exit 1; }
     catchup
     wd="$P/wa/watch/$2"; mkdir -p "$wd"

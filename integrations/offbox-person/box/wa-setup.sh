@@ -5,6 +5,17 @@
 # Her store lives only here: ~/person/wa/store. Nothing is linked until `wa link <phone>` runs.
 set -euo pipefail
 
+runtime_dir="${WA_RUNTIME_DIR_BASE:-/run/user}/$(id -u)"
+if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "$runtime_dir" ]; then
+  export XDG_RUNTIME_DIR="$runtime_dir"
+fi
+if [ -S "$runtime_dir/bus" ]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
+else
+  echo "wa setup: no systemd user session; is lingering on?" >&2
+  exit 2
+fi
+
 P="$HOME/person"
 WA="$P/wa"
 VER=0.20.0
