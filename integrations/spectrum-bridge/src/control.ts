@@ -212,6 +212,16 @@ export class ControlClient {
         : route === "/threads" && !new URLSearchParams(path.split("?")[1]).has("ids") ? "discoveryReads" : undefined;
       if (field) toolLog.write({ component: "robob", kind: "perf", name: "robob.messages_read",
         ids: { ...loggingIds, threadId: loggingIds.threadId ?? "discovery:unscoped" }, props: { [field]: 1 } });
+      const query = new URLSearchParams(path.split("?")[1]);
+      const marker = method === "GET" && route === "/threads" && query.has("ids");
+      const crossThread = method === "GET" && route === "/messages" && query.has("threadIds");
+      // Physical reads are counted only after guard admission, including requests that later fail.
+      if (marker || crossThread) (query.get(marker ? "ids" : "threadIds") ?? "").split(",").forEach((threadId, index, ids) => {
+        toolLog.write({ component: "robob", kind: "perf", name: "robob.messages_read",
+          ids: { ...loggingIds, threadId, callBatchId: requestId }, props: marker
+            ? { markerPolls: index === 0 ? 1 : 0, markerChecks: 1, trackedThreads: ids.length }
+            : { crossThreadReads: index === 0 && !query.has("cursor") ? 1 : 0, crossThreadPages: index === 0 ? 1 : 0, crossThreadChecks: 1 } });
+      });
     });
     let loggingOk = false;
     let responseStatus: number | undefined;

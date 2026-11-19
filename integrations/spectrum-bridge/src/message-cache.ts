@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { ControlError, type ControlClient, type ControlMessage, type ThreadDetail, type ThreadSummary, type RunEvidence } from "./control.ts";
 import { randomUUID } from "node:crypto";
 import { toolLog } from "./toollog.ts";
+import { RobobLinkDown } from "./robob-link-gate.ts";
 
 type Snapshot = { messages: ControlMessage[]; updatedAt: number; fullAt: number; readAt: number; full: boolean; marker?: string };
 type Read = { generation: number; writes: number | undefined; key: string; promise: Promise<Snapshot> };
@@ -57,9 +58,9 @@ export class MessageCache {
     return tick.ready;
   }
 
-  private pollLog(tick: Tick, threadId: string, props: Record<string, string | number>, callBatchId?: string): void {
+  private pollLog(tick: Tick, threadId: string, props: Record<string, string | number>): void {
     toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "robob.messages_read",
-      ids: { threadId, tickId: tick.id, ...(callBatchId ? { callBatchId } : {}) }, props }));
+      ids: { threadId, tickId: tick.id }, props }));
   }
 
   private reason(cached: Snapshot | undefined, now: number, threadId: string): FullReason | undefined {
@@ -69,6 +70,10 @@ export class MessageCache {
   }
 
   private async poll(tick: Tick, ids: string[]): Promise<void> {
+    if (this.client.linkGate?.available === false) {
+      toolLog.skipRobob("robob.marker_poll");
+      return;
+    }
     const generation = this.generation;
     const versions = new Map(ids.map(id => [id, this.readVersions.get(id)]));
     const writes = new Map(ids.map(id => [id, this.writes.get(id)]));
@@ -78,8 +83,6 @@ export class MessageCache {
     try {
       for (let offset = 0; offset < ids.length; offset += 50) {
         const chunk = ids.slice(offset, offset + 50);
-        const callBatchId = randomUUID();
-        chunk.forEach((id, index) => this.pollLog(tick, id, { markerPolls: index === 0 ? 1 : 0, markerChecks: 1, trackedThreads: chunk.length }, callBatchId));
         const result = await this.client.threadSummaries(chunk);
         for (const id of chunk) {
           let summary = result.threads.find(thread => thread.threadId === id);
@@ -175,7 +178,7 @@ export class MessageCache {
       tick.summaries.clear();
       for (const id of ids) {
         tick.failed.add(id);
-        this.pollLog(tick, id, { fallbacks: 1, fallbackReason, status });
+        if (!(error instanceof RobobLinkDown)) this.pollLog(tick, id, { fallbacks: 1, fallbackReason, status });
       }
     }
   }
@@ -185,9 +188,6 @@ export class MessageCache {
     let cursor: string | undefined;
     const seen = new Set<string>();
     do {
-      const callBatchId = randomUUID();
-      ids.forEach((id, index) => this.pollLog(tick, id, { crossThreadReads: index === 0 && cursor === undefined ? 1 : 0,
-        crossThreadPages: index === 0 ? 1 : 0, crossThreadChecks: 1 }, callBatchId));
       const response = await this.client.crossThreadMessages({ threadIds: ids, since, cursor, limit: 1000 });
       if (!Array.isArray(response.messages) || !(response.nextCursor === null || typeof response.nextCursor === "string")) throw new Error("Invalid message page");
       this.pollLog(tick, ids[0]!, { bytesReturned: Buffer.byteLength(JSON.stringify(response)) });
@@ -373,9 +373,10 @@ export class MessageCache {
       }
       this.pollLog(tick, threadId, { fullReason: reason });
       return messages;
-    } catch {
+    } catch (error) {
       tick.failed.add(threadId);
       tick.messages.delete(threadId);
+      if (error instanceof RobobLinkDown) throw error;
       this.pollLog(tick, threadId, { fallbacks: 1, fallbackReason: "cross-thread-error" });
       return (await this.refresh(threadId, "rebuild-fallback", reason).promise).messages;
     }
@@ -406,7 +407,7 @@ export class MessageCache {
     }
     const since = reason ? undefined : Math.max(0, cached!.updatedAt - SKEW_MS);
     const response = await this.client.messages(threadId, since).catch(error => {
-      this.log(threadId, reason ? "full" : "incremental", 0, 0, reason, tick?.id);
+      if (!(error instanceof RobobLinkDown)) this.log(threadId, reason ? "full" : "incremental", 0, 0, reason, tick?.id);
       throw error;
     });
     const incoming = response.messages;

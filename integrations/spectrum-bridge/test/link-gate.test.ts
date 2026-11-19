@@ -3,6 +3,7 @@ import { ControlClient, ControlError, type PendingRequest } from "../src/control
 import type { NormalizedInbound } from "../src/photon.ts";
 import { RobobLinkDown, RobobLinkGate } from "../src/robob-link-gate.ts";
 import { RobobBackend } from "../src/robob.ts";
+import { MessageCache } from "../src/message-cache.ts";
 import { ChatMirror, HttpMirrorSink, type MirrorItem } from "../src/mirror.ts";
 import { Router } from "../src/router.ts";
 import { ProbeBackoff, ProbeBudget } from "../src/probe-policy.ts";
@@ -17,7 +18,7 @@ import { join } from "node:path";
 const start = Date.parse("2026-11-18T08:00:00Z");
 const stores: Store[] = [];
 afterEach(() => { stores.splice(0).forEach(s => s.close()); setSystemTime(); });
-function harness(random = 0.5, network = false, options: { storePath?: string; replies?: boolean } = {}) {
+function harness(random = 0.5, network = false, options: { storePath?: string; replies?: boolean; markers?: boolean } = {}) {
   let at = start, healthy = false, booting = false, healthStatus = "healthy";
   let loseReplyResponse = false, recoverBeforeLostReply = false;
   let mirrorBodyFailure: Error | undefined;
@@ -68,8 +69,12 @@ function harness(random = 0.5, network = false, options: { storePath?: string; r
         creates.push("thread");
         return ok({ threadId: "thread", directory: "/test/chat" });
       }
+      const ids = new URL(String(url)).searchParams.get("ids")?.split(",") ?? [];
+      if (options.markers && ids.length) return ok({ threads: ids.map(threadId => ({ ...thread, threadId, changeMarker: 1 })), total: ids.length });
       return ok({ threads: [], total: 0 });
     }
+    if (options.markers && path === "/messages") return ok({ messages: [], nextCursor: null });
+    if (options.markers && /^\/threads\/[^/]+$/.test(path)) return ok({ thread: { ...thread, threadId: decodeURIComponent(path.split("/")[2]!), changeMarker: 1 } });
     if (path === "/threads/thread") return ok({ thread });
     if (path === "/threads/thread/messages") return ok({ messages });
     if (path.endsWith("/evidence")) return ok({ toolEvidence: "ran", complete: !!options.replies, status: options.replies ? "completed" : "running" });
@@ -149,6 +154,89 @@ function harness(random = 0.5, network = false, options: { storePath?: string; r
     set recoverBeforeLostReply(value: boolean) { recoverBeforeLostReply = value; },
     get at() { return at; }, set healthy(value: boolean) { healthy = value; if (network) { if (value && !listener) listener = serve(port!); if (!value) { listener?.stop(true); listener = undefined; } } }, set booting(value: boolean) { booting = value; }, set healthStatus(value: string) { healthStatus = value; } };
 }
+
+test("closed-gate marker ticks coalesce outage logs and count no physical polling GETs", async () => {
+  const h = harness(0.5, false, { markers: true });
+  const ids = Array.from({ length: 5 }, (_, i) => `thread-${i}`);
+  try {
+    const rows = await captureLogs(async () => {
+      await h.down();
+      for (let tick = 0; tick < 60; tick++) await h.backend.beginMessageTick(ids);
+      expect(h.calls).toHaveLength(3);
+      h.healthy = true; await h.advance(start + 1_000);
+      await h.backend.beginMessageTick(ids);
+      await h.backend.beginMessageTick(ids);
+      expect(h.calls.filter(path => path === "/threads")).toHaveLength(2);
+      expect(h.calls.filter(path => path === "/messages")).toHaveLength(1);
+    });
+    const reads = rows.filter(row => row.name === "robob.message_reads");
+    const sum = (field: string) => reads.reduce((total, row) => total + Number(row.props?.[field] ?? 0), 0);
+    expect(sum("markerPolls")).toBe(2);
+    expect(sum("crossThreadPages")).toBe(1);
+    expect(sum("fallbacks")).toBe(0);
+    const up = rows.find(row => row.name === "robob.link_up")!;
+    expect(up.link).toMatchObject({ skippedCalls: 60, bySite: { "robob.marker_poll": 60 } });
+    expect(rows.filter(row => row.ts < up.ts && row.name === "robob.messages_read")).toEqual([]);
+    expect(rows.filter(row => row.name === "robob.link_down_summary").length).toBeLessThanOrEqual(1);
+  } finally { h.fetcher.mockRestore(); }
+});
+
+test.each(["marker", "first page", "next page"])("a gate closing before %s counts only admitted polling GETs", async stage => {
+  const h = harness(0.5, false, { markers: true });
+  const cache = new MessageCache(h.client);
+  const summaries = h.client.threadSummaries.bind(h.client), messages = h.client.crossThreadMessages.bind(h.client);
+  const intercepts = [
+    spyOn(h.client, "threadSummaries").mockImplementation(async ids => {
+      if (stage === "marker") { h.healthy = false; await h.down(); }
+      return summaries(ids);
+    }),
+    spyOn(h.client, "crossThreadMessages").mockImplementation(async options => {
+      if (stage === "first page" || options.cursor) { h.healthy = false; await h.down(); }
+      const page = await messages(options);
+      return stage === "next page" ? { ...page, nextCursor: "page2" } : page;
+    }),
+  ];
+  try {
+    const rows = await captureLogs(async () => {
+      h.healthy = true;
+      await cache.beginTick(["thread"]);
+      expect(h.gate.available).toBe(false);
+      expect(await cache.prepared("thread")).toBe(false);
+      await cache.beginTick(["thread"]);
+      await expect(cache.read("thread", "fallback")).rejects.toBeInstanceOf(RobobLinkDown);
+    });
+    const reads = rows.filter(row => row.name === "robob.message_reads");
+    const sum = (field: string) => reads.reduce((total, row) => total + Number(row.props?.[field] ?? 0), 0);
+    expect(sum("markerPolls")).toBe(stage === "marker" ? 0 : 1);
+    expect(sum("crossThreadReads")).toBe(stage === "next page" ? 1 : 0);
+    expect(sum("crossThreadPages")).toBe(stage === "next page" ? 1 : 0);
+    expect(sum("fullReads") + sum("incrementalReads") + sum("fallbacks")).toBe(0);
+    expect(h.calls.filter(path => path === "/threads")).toHaveLength(stage === "marker" ? 0 : 1);
+    expect(h.calls.filter(path => path === "/messages")).toHaveLength(stage === "next page" ? 1 : 0);
+  } finally { intercepts.forEach(intercept => intercept.mockRestore()); h.fetcher.mockRestore(); }
+});
+
+test("a gate refusal during a prepared transcript rebuild remains outage uncertainty", async () => {
+  const h = harness(0.5, false, { markers: true });
+  const cache = new MessageCache(h.client);
+  try {
+    const rows = await captureLogs(async () => {
+      h.healthy = true;
+      await cache.beginTick(["thread"]);
+      await cache.beginTick(["thread"]);
+      expect(await cache.prepared("thread")).toBe(true);
+      h.healthy = false; await h.down();
+      await expect(cache.read("thread", "missing-until", () => false)).rejects.toBeInstanceOf(RobobLinkDown);
+      expect(await cache.prepared("thread")).toBe(false);
+    });
+    const reads = rows.filter(row => row.name === "robob.message_reads");
+    const sum = (field: string) => reads.reduce((total, row) => total + Number(row.props?.[field] ?? 0), 0);
+    expect(sum("markerPolls")).toBe(2);
+    expect(sum("crossThreadPages")).toBe(1);
+    expect(sum("fallbacks") + sum("fullReads") + sum("incrementalReads")).toBe(0);
+    expect(h.calls.filter(path => path === "/messages")).toHaveLength(1);
+  } finally { h.fetcher.mockRestore(); }
+});
 
 test.each([false, true].flatMap(retry => [false, true].map(split => ({ retry, split }))))(
   "a racing gate refusal cancels probe telemetry and refunds only its retry slot (retry=$retry split=$split)", async ({ retry, split }) => {
