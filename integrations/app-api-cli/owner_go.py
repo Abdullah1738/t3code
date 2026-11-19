@@ -4,8 +4,11 @@
 Quotes and source references are caller attestations, not authentication. No
 command infers approval from an answer or from an agent's summary of a decision.
 Standing delegation authorizes records only against bridge-owned bus metadata.
-Revoking a delegation prevents new records; existing records keep their window
-until individually revoked or expired.
+Standing test budgets retain the owner's original quote and time, with a per-run
+cap and no total ceiling. They cover test spend only, never orders, rides or
+subscriptions. Each record-standing approval starts now and lasts at most 24h.
+Revoking a delegation or standing budget prevents new records; existing records
+keep their window until individually revoked or expired.
 """
 import argparse
 from contextlib import contextmanager
@@ -65,6 +68,14 @@ def delegation_pair(principal, channel):
         raise ApprovalError('UNSUPPORTED_DELEGATION: only moni via agent-bus is supported')
 
 
+def standing_terms(vendor, scope, per_run_cap, currency):
+    data = terms(vendor, scope, per_run_cap, text(currency))
+    if per_run_cap <= 0:
+        raise ApprovalError('per-run cap must be a positive integer in minor units')
+    return dict(vendor=data['vendor'], scope=data['item'], per_run_cap=data['amount'],
+                currency=data['currency'])
+
+
 def standing_delegate(rows, principal, channel):
     revoked = {r['target'] for r in rows if r['kind'] == 'revoke'}
     return next((r for r in reversed(rows) if r['kind'] == 'delegate' and r['id'] not in revoked
@@ -105,7 +116,7 @@ class Ledger:
     def validate(rows):
         ids = set()
         for row in rows:
-            if row['id'] in ids or row['kind'] not in ('record', 'ask', 'answer', 'revoke', 'delegate'):
+            if row['id'] in ids or row['kind'] not in ('record', 'ask', 'answer', 'revoke', 'delegate', 'standing'):
                 raise ApprovalError('invalid event')
             ids.add(row['id'])
             timestamp(row['logged_at'])
@@ -122,6 +133,9 @@ class Ledger:
                 text(row['thread'])
             if row['kind'] == 'delegate':
                 delegation_pair(row['principal'], row['channel'])
+                text(row['quote']); text(row['source'])
+            if row['kind'] == 'standing':
+                standing_terms(row['vendor'], row['scope'], row['per_run_cap'], row['currency'])
                 text(row['quote']); text(row['source'])
             if row['kind'] in ('answer', 'revoke'):
                 text(row['target']); text(row['quote']); text(row['source'])
@@ -237,6 +251,62 @@ class Ledger:
                             'currency': data['currency'], 'hours': hours})
         return row
 
+    def standing(self, *, vendor, scope, per_run_cap, currency, quote, source, at, now=None):
+        now = now or dt.datetime.now(UTC)
+        when = timestamp(at)
+        if when > now:
+            raise ApprovalError('future standing approval')
+        data = standing_terms(vendor, scope, per_run_cap, currency)
+        quote, source = text(quote), text(source)
+        with self.events(True) as (_, stream):
+            row = self.append(stream, 'standing', now, **data, quote=quote, source=source,
+                              at=when.isoformat())
+        toollog.emit('owner-go', 'standing.created', ok=True,
+                     ids={'standingId': row['id'], 'vendorId': data['vendor']},
+                     props={'amountMinor': per_run_cap, 'currency': data['currency']})
+        return row
+
+    def record_standing(self, *, standing, item, amount, currency, hours=2, now=None):
+        vendor = None
+        try:
+            if type(amount) is not int or amount <= 0:
+                raise ApprovalError('INVALID_AMOUNT: amount must be a positive integer in minor units')
+            if not 0 < hours <= 24:
+                raise ApprovalError('INVALID_LIFETIME: lifetime must be greater than 0 and at most 24 hours')
+            now = now or dt.datetime.now(UTC)
+            expires = now + dt.timedelta(hours=hours)
+            if not now < expires <= now + MAX_AGE:
+                raise ApprovalError('INVALID_LIFETIME: computed expiry is outside the approval window')
+            with self.events(True) as (rows, stream):
+                budget = next((r for r in rows if r['id'] == standing), None)
+                if budget is None:
+                    raise ApprovalError('STANDING_NOT_FOUND: unknown standing id')
+                if budget['kind'] != 'standing':
+                    raise ApprovalError('NOT_STANDING: id is not a standing budget')
+                vendor = budget['vendor']
+                if any(r['kind'] == 'revoke' and r['target'] == standing for r in rows):
+                    raise ApprovalError('STANDING_REVOKED: standing budget was revoked')
+                data = terms(vendor, item, amount, text(currency), None)
+                if data['currency'] != budget['currency']:
+                    raise ApprovalError('STANDING_CURRENCY_MISMATCH: currency differs from standing budget')
+                if amount > budget['per_run_cap']:
+                    raise ApprovalError('STANDING_CAP_EXCEEDED: amount exceeds per-run cap')
+                row = self.append(stream, 'record', now, **data, at=now.isoformat(),
+                                  expires_at=expires.isoformat(), quote=f'standing:{standing}',
+                                  source=f"standing:{standing}:{budget['source']}", standing_id=standing)
+        except (ValueError, OSError) as exc:
+            code = str(exc).split(':', 1)[0]
+            if code not in toollog.STANDING_REASONS:
+                code = 'STANDING_RECORD_INVALID'
+            toollog.emit('owner-go', 'standing_record.refused', kind='error', ok=False,
+                         ids={'standingId': standing, 'vendorId': vendor, 'itemId': item},
+                         props={'reason': code, 'amountMinor': amount}, error=code)
+            raise ApprovalError(f'{code}: standing approval refused') from exc
+        toollog.emit('owner-go', 'standing_record.created', ok=True,
+                     ids={'standingId': standing, 'vendorId': vendor, 'itemId': data['item']},
+                     props={'amountMinor': amount, 'currency': data['currency'], 'hours': hours})
+        return row
+
     def ask(self, *, vendor, item, amount, thread, currency='AED', recurring=None, now=None):
         now = now or dt.datetime.now(UTC)
         data = terms(vendor, item, amount, currency, recurring)
@@ -252,7 +322,7 @@ class Ledger:
         when = timestamp(at)
         if when > now:
             raise ApprovalError('future answer or revocation')
-        expected = ('ask',) if kind == 'answer' else ('record', 'delegate')
+        expected = ('ask',) if kind == 'answer' else ('record', 'delegate', 'standing')
         with self.events(True) as (rows, stream):
             original = next((r for r in rows if r['id'] == target and r['kind'] in expected), None)
             if original is None or when < timestamp(original['at']):
@@ -286,7 +356,8 @@ def commerce_item(binding):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog='owner-go')
+    parser = argparse.ArgumentParser(prog='owner-go',
+        description='Record owner approvals, standing test budgets, and open money questions.')
     commands = parser.add_subparsers(dest='command', required=True)
     for name in ('record', 'verify', 'ask', 'record-delegated'):
         command = commands.add_parser(name)
@@ -305,10 +376,21 @@ def main(argv=None):
     delegate = commands.add_parser('delegate')
     delegate.add_argument('--principal', required=True)
     delegate.add_argument('--channel', required=True)
+    standing = commands.add_parser('standing',
+        help='record a standing test budget with a per-run cap and no total ceiling',
+        description='Test spend only; never orders, rides or subscriptions. Revoke the id to end it.')
+    for arg in ('vendor', 'scope', 'per-run-cap', 'currency'):
+        standing.add_argument('--' + arg, required=True, type=int if arg == 'per-run-cap' else str)
+    record_standing = commands.add_parser('record-standing',
+        help='approve one test run under an unrevoked standing budget')
+    for arg in ('standing', 'item', 'amount', 'currency'):
+        record_standing.add_argument('--' + arg, required=True, type=int if arg == 'amount' else str)
+    record_standing.add_argument('--hours', type=float, default=2,
+                                 help='approval lifetime from now, greater than 0 and at most 24 (default: 2)')
     for name in ('answer', 'revoke'):
         command = commands.add_parser(name)
         command.add_argument('target')
-    for name in ('record', 'answer', 'revoke', 'delegate'):
+    for name in ('record', 'answer', 'revoke', 'delegate', 'standing'):
         command = commands.choices[name]
         for arg in ('quote', 'source', 'at'):
             command.add_argument('--' + arg, required=True)

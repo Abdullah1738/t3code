@@ -268,10 +268,13 @@ def finalize(row):
                 return  # Legacy runs have no telemetry; leave their delivery/empty-output evidence alone.
             if api.BACKEND == 'server':
                 old_host = data.get('host_boxes')
+                from offbox_protocol import for_run
+                identity = for_run(run_id, path)
                 for line in text.splitlines():
-                    if line.startswith('offbox-command-started:') or ('server restarted while this run' in line):
+                    marker = identity.parse(line)
+                    if marker and marker.kind in ('command_started', 'retry'):
                         data = unavailable('missing', 1)
-                    if 'server restarted while this run' in line:
+                    if marker and marker.kind == 'retry':
                         old_host = None
                     if line.startswith(PREFIX + run_id + ' '):
                         try:

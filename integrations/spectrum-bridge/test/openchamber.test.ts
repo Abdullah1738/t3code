@@ -771,3 +771,18 @@ describe("SSE events", () => {
     expect(destinationHits).toBe(0);
   });
 });
+
+test.each(["/model", "/synthetic"])("bus expiry after %s preparation prevents the actual OpenCode prompt POST", async delayed => {
+  let now = 1_000; const paths: string[] = [];
+  const clock = spyOn(Date, "now").mockImplementation(() => now);
+  try {
+    const client = new OpenChamber(serve(request => {
+      const path = new URL(request.url).pathname; paths.push(path);
+      if (path.endsWith(delayed)) now = 2_000;
+      return new Response(null, { status: 204 });
+    }));
+    await expect(client.prompt("ses_chat", "/Chats/test", "msg_bus", "PRIVATE_REQUEST", "guidance", [], { providerID: "p", modelID: "m" }, undefined, undefined, 2_000))
+      .rejects.toThrow("Agent delivery expired");
+    expect(paths.some(path => path.endsWith("/prompt"))).toBe(false);
+  } finally { clock.mockRestore(); }
+});

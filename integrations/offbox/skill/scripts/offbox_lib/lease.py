@@ -498,6 +498,20 @@ def remote_protection(box_id):
     return snapshot
 
 
+def remote_reuse_blocked(box_id, holder=None):
+    if api.BACKEND != 'server':
+        return False
+    try:
+        snapshot = remote_protection(box_id)
+        return offbox_protection.blocked(snapshot, automatic=False, reuse=True,
+                                         holder=holder or offbox_protection.caller().get('holder')) is not None
+    except api.ApiError as error:
+        # A confirmed deletion must reach reuse's existing lease retirement path.
+        return not (error.status == 404 and error.api_code == 'sandbox_not_found')
+    except OffboxError:
+        return True
+
+
 def box_name(me: dict, repo_key: str) -> str:
     who = (me.get("title") or me.get("thread") or me.get("owner") or "local")[:50]
     return f"offbox {repo_key} | {who}"
@@ -1630,6 +1644,8 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
     if not unfit.available(con, row['box_id']):
         return None
     check_deletion(con, row['box_id'])
+    if remote_reuse_blocked(row['box_id']):
+        return None
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
     if not current or current['state'] not in ('running', 'stopped') or \

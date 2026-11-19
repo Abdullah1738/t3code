@@ -539,6 +539,7 @@ const makeThreads = (watch: Watch) => {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      liveThreadIds: () => Effect.succeed([]),
       remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: (threadId) =>

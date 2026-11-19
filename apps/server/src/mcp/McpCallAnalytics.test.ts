@@ -1,5 +1,6 @@
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
+import { KanbanArgumentKeys } from "../ardud/kanban/tools/tools.ts";
 import { expect, it } from "@effect/vitest";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- isolated loopback MCP integration.
 import * as NodeHttp from "node:http";
@@ -560,8 +561,12 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
           .pipe(Effect.provideService(McpSchema.McpServerClient, client));
         const response = yield* Effect.gen(function* () {
           if ("invalid" in testCase) {
-            const exit = yield* call.pipe(Effect.exit);
-            expect(Exit.isFailure(exit)).toBe(true);
+            const result = yield* call;
+            expect(result.isError).toBe(true);
+            expect(result.structuredContent).toMatchObject({
+              code: "invalid_request",
+              invalidFields: ["taskId"],
+            });
             return undefined;
           }
           if (!("pause" in testCase)) return yield* call;
@@ -2620,6 +2625,12 @@ it.effect.each([
     reasonClass: "too_many",
     invalidField: "subtasks",
   },
+  {
+    name: "unexpected key",
+    input: { title: "ok", stage: "todo", private_token: "private" },
+    reasonClass: "other",
+    invalidField: undefined,
+  },
 ])("schema refusal $name retains only the declared field and issue class", (scenario) =>
   Effect.gen(function* () {
     const recorded = yield* Deferred.make<AnalyticsEvent>();
@@ -2641,7 +2652,15 @@ it.effect.each([
         success: Schema.Unknown,
         failure: OrchestratorMcpFailure,
         failureMode: "return",
-      }),
+      }).annotate(KanbanArgumentKeys, [
+        "title",
+        "stage",
+        "choice",
+        "nullableStage",
+        "optionalText",
+        "objectChoice",
+        "subtasks",
+      ]),
     );
     const registration = McpHttpServer.toolkitRegistration(
       toolkit,
@@ -2665,15 +2684,26 @@ it.effect.each([
     );
     yield* Effect.gen(function* () {
       const server = yield* McpServer.McpServer;
-      yield* server
+      const result = yield* server
         .callTool({ name: "card_create", arguments: scenario.input })
-        .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.exit);
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({ code: "invalid_request" });
       const row = yield* Deferred.await(recorded);
       expect(row).toMatchObject({
         reasonClass: scenario.reasonClass,
-        invalidField: scenario.invalidField,
+        ...(scenario.invalidField === undefined ? {} : { invalidField: scenario.invalidField }),
+        errorFields: expect.arrayContaining([
+          scenario.name === "unexpected key"
+            ? "input"
+            : scenario.name === "union missing key"
+              ? "objectChoice.label"
+              : scenario.invalidField,
+        ]),
+        errorTag: "invalid_request",
         saved: false,
       });
+      if (scenario.invalidField === undefined) expect(row.invalidField).toBeUndefined();
       expect(JSON.stringify(row)).not.toContain("private");
     }).pipe(Effect.provide(registration));
   }),

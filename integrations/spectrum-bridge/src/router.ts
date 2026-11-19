@@ -1,3 +1,6 @@
+import { bounded } from "./bounded.ts";
+import { PromptProbeTracker } from "./prompt-probe.ts";
+import { RobobLinkDown } from "./robob-link-gate.ts";
 import { ProbeBackoff, ProbeBudget, probeDeferred } from "./probe-policy.ts";
 import { findOverdue, reconcileLegacyReplies, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
 import { toolLog as watcherLog } from "./watcherlog.ts";
@@ -12,7 +15,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming, savePreview } from "./inbound-files.ts";
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
-import { assistantText, isCompletionNoticeText, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { assistantText, isCompletionNoticeText, PromptExpiredError, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
 import { commandWord, controlCommand, isCommand } from "./commands.ts";
@@ -85,7 +88,7 @@ type Turn = Route & {
 };
 /** Older persisted steer attempts contain only their route. */
 type ResponseRetry = { request: PermissionRequest | QuestionRequest; answers: string[][]; decision?: "once" | "reject"; typedReply?: string; outbox: number; before?: string[] | "unknown" };
-type SteerAttempt = Route & { inboundId?: string; text?: string; guidance?: string; parts?: FilePart[]; fileGuidance?: string; startedAt?: number; outbox?: number; sameMode?: boolean; reconcileOnly?: boolean; requeueReason?: RequeueReason; response?: { sessionId: string; directory: string; requestId: string; turn: Turn; operation?: ResponseRetry; retry?: ResponseRetry; preflight?: boolean } };
+type SteerAttempt = Route & { inboundId?: string; text?: string; guidance?: string; parts?: FilePart[]; fileGuidance?: string; startedAt?: number; outbox?: number; sameMode?: boolean; reconcileOnly?: boolean; requeueReason?: RequeueReason; response?: { sessionId: string; directory: string; requestId: string; turn: Turn; operation?: ResponseRetry; retry?: ResponseRetry; preflight?: boolean; linkRetry?: boolean; linkUncertain?: boolean; priorUncertain?: boolean } };
 /** The sealed prompt body, retained until delivery is confirmed. */
 type ResendBody = {
   inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string };
@@ -681,20 +684,10 @@ Bridge CLI: ${CLI} COMMAND ... --session CURRENT_SESSION_ID --key UNIQUE_KEY
 Secure forms and the other commands are in the imessage skill.`;
 }
 
-// Existing client methods do not accept cancellation signals. Bound the wait, but
-// treat timed-out mutations as ambiguous: their underlying request can finish later.
-export async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([operation, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(Object.assign(new Error("Router request timed out"), { name: "TimeoutError", code: "timeout" })), timeout);
-    })]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+export { bounded } from "./bounded.ts";
 
 export class Router {
+  private readonly promptProbes = new PromptProbeTracker(toolLog.write);
   private completionRead?: { key: string; result: Promise<MessageRecord[]>; timing: ReadTiming; records?: MessageRecord[]; at?: number };
   private completionTargetKey?: string;
   private completionWake = Promise.withResolvers<void>();
@@ -715,23 +708,39 @@ export class Router {
     }));
   }
 
-  private async probeAccepted(route: Route & { inboundId?: string }, prompt: string, leader = route.inboundId ?? prompt, timeout = this.readTimeout()): Promise<boolean> {
+  private async probeAccepted(route: Route & { inboundId?: string }, prompt: string, leader = route.inboundId ?? prompt, timeout = this.readTimeout(),
+    observe?: () => ReturnType<PromptProbeTracker["start"]>): Promise<boolean> {
+    if (this.backend.linkAvailable === false) throw probeDeferred;
     const promptKey = `prompt:${route.id}:${prompt}`;
     const retry = this.probeBackoff.retry(leader) || this.probeBackoff.retry(promptKey);
+    const budgetAt = Date.now();
     if (this.probeBackoff.cooling(leader) || this.probeBackoff.cooling(promptKey)
-      || retry && !this.probeBudget.take()) throw probeDeferred;
+      || retry && !this.probeBudget.take(budgetAt)) throw probeDeferred;
     const leaderLease = this.probeBackoff.reserve(leader, promptKey);
     const promptLease = this.probeBackoff.reserve(promptKey);
     const ownsLease = () => this.probeBackoff.get(leader)?.token === leaderLease.token
       && this.probeBackoff.get(promptKey)?.token === promptLease.token;
+    const observation: { probe?: ReturnType<PromptProbeTracker["start"]> } = {};
+    if (observe) toolLog.capture(() => { observation.probe = observe(); });
     try {
       const accepted = await bounded(this.backend.promptAccepted(route.id, route.directory, prompt), timeout);
+      if (observation.probe) toolLog.capture(() => observation.probe?.complete(accepted));
       if (!ownsLease()) throw probeDeferred;
       if (accepted) this.probeBackoff.clear(leader);
       else this.probeBackoff.release(leader);
       this.probeBackoff.clear(promptKey);
       return accepted;
     } catch (error) {
+      if (error instanceof RobobLinkDown) {
+        // A gate refusal provides no probe outcome and consumes no retry slot.
+        if (observation.probe) toolLog.capture(() => observation.probe?.cancel());
+        if (retry) this.probeBudget.refund(budgetAt);
+        if (ownsLease()) {
+          this.probeBackoff.release(leader); this.probeBackoff.release(promptKey);
+        }
+        throw error;
+      }
+      if (observation.probe && error !== probeDeferred) toolLog.capture(() => observation.probe?.failure(error));
       // A receipt can settle this read while it is pending; late failures cannot restore its history.
       if (!ownsLease()) throw probeDeferred;
       const backoff = this.probeBackoff.failed(leader);
@@ -778,6 +787,7 @@ export class Router {
 
   /** Read-only producer: the sender timer calls this even while a mutating tick is waiting. */
   checkCompletion(): Promise<void> {
+    if (this.backend.linkAvailable === false) { toolLog.skipRobob("router.completion_read"); return Promise.resolve(); }
     const turn = this.store.get<Turn | null>("activeTurn");
     if (!turn || !this.current(turn) || turn.phase === "failed") return Promise.resolve();
     const key = this.completionKey(turn);
@@ -1027,6 +1037,7 @@ export class Router {
 
   /** Runs from the sender timer, independently of maintenance/health reads. */
   checkInboundLatency(): Promise<void> {
+    if (this.backend.linkAvailable === false) { toolLog.skipRobob("router.latency"); return Promise.resolve(); }
     return this.checkingLatency ??= this.sweepInboundLatency().finally(() => { this.checkingLatency = undefined; });
   }
 
@@ -1052,6 +1063,8 @@ export class Router {
       if (row.state === "pending" && this.store.get(`human-own-turn:${id}`) || row.state === "admitted") continue;
       if (succeeded || row.state !== "failed") this.store.updateInbound(id, "done");
       if (this.store.get<number>(`inbound-delivered:${id}`) !== undefined) continue;
+      if (!synthetic(id)) this.store.set("bus-yield-human", false);
+      if (isAgentBusWake(id)) this.store.set("bus-yield-human", true);
       this.store.set(`inbound-delivered:${id}`, deliveredAt);
       toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "inbound.delivered",
         ids: { chat: this.options.context?.chat.slug ?? this.store.get<string>("unanswered-chat") ?? "other", inboundId: id } }));
@@ -1142,10 +1155,22 @@ export class Router {
       if (original) {
         if (this.probeBackoff.cooling(leader)) absent = false;
         else {
+          const steer = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
           const ids = [original.messageId, ...original.earlier ?? []];
           for (const [probeIndex, id] of ids.entries()) {
+            const steeredAt = id === original.messageId && id === `msg_${hash(leader)}`
+              && steer?.id === original.id && steer.directory === original.directory && steer.generation === original.generation
+              ? steer.startedAt : undefined;
+            const sentAt = id === original.messageId ? steeredAt ?? original.attemptAt ?? original.startedAt : original.startedAt;
+            const probeFailure: { value?: { error: unknown; props: Parameters<typeof toolError>[4] } } = {};
             try {
-              if (await this.probeAccepted(original, id, leader, 10_000)) {
+              if (await this.probeAccepted(original, id, leader, 10_000, () => {
+                const probe = this.promptProbes.start(original.id, id, sentAt);
+                return { ...probe, failure: (error: unknown) => {
+                  probeFailure.value = { error, props: undefined };
+                  return probeFailure.value.props = probe.failure(error);
+                } };
+              })) {
                 this.store.db.transaction(() => {
                   const retry = this.store.get<string>(`human-retry-prompt:${leader}`);
                   if (retry && retry !== original.messageId) return;
@@ -1170,7 +1195,8 @@ export class Router {
                 break;
               }
             } catch (caughtError) {
-              toolError("router", "router.catch1", caughtError, { inboundId: `row_${hash(leader).slice(0, 16)}` }, { probeIndex, probeCount: ids.length });
+              toolError("router", "router.catch1", probeFailure.value ? probeFailure.value.error : caughtError, { threadId: original.id, inboundId: `row_${hash(leader).slice(0, 16)}` },
+                { probeIndex, probeCount: ids.length, ...probeFailure.value?.props });
               absent = false;
               break;
             }
@@ -1230,7 +1256,7 @@ export class Router {
       if (!absent || age > FAILED_INBOUND_REPLAY_MAX_AGE_MS || parent?.state === "failed") continue;
       // Idempotency is scoped to the destination thread. Never replay across a rotation.
       if (original && (!this.current(original) || original.earlier?.length)) continue;
-      if (wake && this.store.get(`stuck-wake-attempt:${row.id}`) !== undefined) continue;
+      if (wake && !this.busBatch(leader) && this.store.get(`stuck-wake-attempt:${row.id}`) !== undefined) continue;
       // Batched rows retain the leader's original request id and sealed body. An orphan
       // without a known destination cannot be safely replayed, but still earns the wake alert.
       if ((row.state === "batched" || parent?.state === "processing") && !original) continue;
@@ -1253,13 +1279,33 @@ export class Router {
     if (due) await this.tick();
   }
 
+  private busBatch(id: string): boolean {
+    return (this.syntheticBatch(id) ?? [id]).some(isAgentBusWake);
+  }
+
+  private busExpiresAt(id: string): number | undefined {
+    const deadlines = (this.syntheticBatch(id) ?? [id]).flatMap(member => {
+      if (!isAgentBusWake(member)) return [];
+      const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id=?").get(member);
+      const expiresAt = row ? (JSON.parse(row.payload) as { agentExpiresAt?: number }).agentExpiresAt : undefined;
+      return expiresAt === undefined ? [] : [expiresAt];
+    });
+    return deadlines.length ? Math.min(...deadlines) : undefined;
+  }
+
+  private busExpired(id: string): boolean {
+    const expiresAt = this.busExpiresAt(id);
+    return expiresAt !== undefined && Date.now() >= expiresAt;
+  }
+
   private stuckWakeAttempted(id: string | undefined): boolean {
-    return id !== undefined && id.startsWith("wake:") && this.store.get(`inbound-delivered:${id}`) === undefined
+    return id !== undefined && !this.busBatch(id) && id.startsWith("wake:") && this.store.get(`inbound-delivered:${id}`) === undefined
       && this.store.get(`stuck-wake-attempt:${id}`) !== undefined;
   }
 
   private claimStuckWakeAttempt(id: string): boolean {
     const ids = this.syntheticBatch(id) ?? [id];
+    if (ids.some(isAgentBusWake)) return true;
     // Once admitted, the existing no-tool execution retry policy owns this row.
     if (ids.every(member => this.store.get(`inbound-delivered:${member}`) !== undefined)) return true;
     if (!ids.some(member => member.startsWith("wake:") && this.store.get(`stuck-wake-retry:${member}`) !== undefined)) return true;
@@ -1304,6 +1350,7 @@ export class Router {
   }
 
   private recordFailure(id: string, stage: string, error: unknown, route = this.store.get<Route | null>("route")): void {
+    if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) return;
     const bus = isAgentBusWake(id) || this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds?.some(isAgentBusWake);
     const failure = { stage, message: bus ? "Agent bus delivery failed" : failureMessage(error), threadId: route?.id ?? null, at: Date.now() };
     this.store.recordInboundFailure(id, failure);
@@ -1311,6 +1358,7 @@ export class Router {
   }
 
   private failInbound(id: string, stage: string, error: unknown, route = this.store.get<Route | null>("route")): void {
+    if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) return;
     // Keep the transport exception rather than replacing it with a generic timeout notice.
     const prior = this.store.inboundFailure(id);
     if (!prior || prior.stage !== stage) this.recordFailure(id, stage, error, route);
@@ -1640,7 +1688,17 @@ export class Router {
         this.options.log?.("reply-nudge-dropped", reason);
         continue;
       }
-      const text = (JSON.parse(payload.get(id)?.payload ?? "{}") as Partial<NormalizedInbound>).text ?? "";
+      const saved = JSON.parse(payload.get(id)?.payload ?? "{}") as Partial<NormalizedInbound> & { agentExpiresAt?: number };
+      const text = saved.text ?? "";
+      if (isAgentBusWake(id) && reason === "undelivered" && saved.agentExpiresAt !== undefined && Date.now() >= saved.agentExpiresAt) {
+        this.failInbound(id, "synthetic", reason);
+        continue;
+      }
+      if (isAgentBusWake(id) && reason === "undelivered" && saved.agentExpiresAt !== undefined && Date.now() < saved.agentExpiresAt) {
+        this.store.set(key, { ...state, attempts, reason, nextAt: Date.now() + Math.min(30_000, SYNTHETIC_RETRY_MS * 2 ** Math.min(attempts - 1, 5)) } satisfies SyntheticRetry);
+        this.store.updateInbound(id, "pending");
+        continue;
+      }
       if (reason === "failed") {
         // The agent had it and started work: running it again could repeat side
         // effects, and the event is already in the session's history.
@@ -1785,6 +1843,13 @@ export class Router {
   }
 
   private async run(): Promise<void> {
+    const linkDown = () => this.backend.linkAvailable === false;
+    if (linkDown()) {
+      toolLog.skipRobob("router.tick");
+      this.holdLinkWork();
+      await this.updateTyping(false);
+      return;
+    }
     let completed = false;
     try {
       // Recover before taking the control snapshot so /new also sees restored members.
@@ -1809,6 +1874,13 @@ export class Router {
       for (const row of rows) {
         const input = row.payload as NormalizedInbound;
         if (row.state === "processing") {
+          const response = this.store.get<SteerAttempt>(`steer-attempt:${row.id}`)?.response;
+          if (response?.linkRetry || response?.linkUncertain) {
+            await this.steer(row, preceding);
+            if (linkDown() || this.store.get<SteerAttempt>(`steer-attempt:${row.id}`)?.response?.linkRetry) return;
+            preceding.add(row.id);
+            continue;
+          }
           // A steer cut short is retried under its prompt id below, never dropped.
           if (!this.owns(row.id) && !this.steering(row.id) && this.store.get<PreparingDelivery | null>("preparingDelivery")?.id !== row.id && !this.store.get(`latency-route:${row.id}`)) {
             this.acknowledge(row.id, "Something interrupted that one before I could get to it. Mind sending it again?", "unknown");
@@ -1817,6 +1889,7 @@ export class Router {
           this.controlNow = row.id;
           try { await this.control(row, input, preceding); } finally { this.controlNow = undefined; }
         }
+        if (linkDown()) return;
         preceding.add(row.id);
       }
       for (const row of this.store.pendingInbound()) if (row.state === "processing" && this.steering(row.id)
@@ -1884,7 +1957,12 @@ export class Router {
       const now = Date.now();
       let latestReceivedAt = 0;
       for (const row of rows) {
-        const input = row.payload as NormalizedInbound;
+        const input = row.payload as NormalizedInbound & { agentExpiresAt?: number };
+        if (row.state === "pending" && isAgentBusWake(row.id) && input.agentExpiresAt !== undefined && now >= input.agentExpiresAt
+          && !this.store.get<SyntheticRetry | null>(this.retryKey(row.id))?.prompts.length) {
+          this.retrySynthetic(row.id, "undelivered");
+          row.state = "failed";
+        }
         if (row.state !== "pending" || controlCommand(input.text)) continue;
         // Legacy rows get a durable receipt time once, including while another turn runs.
         if (input.receivedAt === undefined || !Number.isSafeInteger(input.receivedAt) || input.receivedAt < 0) {
@@ -1893,6 +1971,7 @@ export class Router {
         }
         latestReceivedAt = Math.max(latestReceivedAt, input.receivedAt);
       }
+      rows = this.store.pendingInbound();
       // A failed or retired turn never blocks the conversation.
       let currentTurn = this.store.get<Turn | null>("activeTurn");
       if (currentTurn?.origin === "request" && rows.some(row => row.state === "pending" && !synthetic(row.id)
@@ -1918,7 +1997,6 @@ export class Router {
         }
         return;
       }
-      if (rows.some(row => row.state === "pending" && !handled.has(row.id))) return;
       // Commands are never conversation, even if one was left queued. A synthetic
       // row waiting out a retry backoff does not hold up anything behind it.
       // A reset nudge goes first, so texts sent right after /new reach the fresh context.
@@ -1930,8 +2008,21 @@ export class Router {
         && (!this.store.get(`human-own-turn:${row.id}`) || !this.store.get(`steer-attempt:${row.id}`) || this.store.get(`steer-reconciled:${row.id}`) === true)
         && !(this.store.get(`batch-phase:${row.id}`) === "deferred-wake" && this.probeBackoff.cooling(row.id))
         && (!controlCommand((row.payload as NormalizedInbound).text) || !!this.store.get(`human-own-turn:${row.id}`));
+      const dueBus = rows.find(row => sendable(row) && this.busBatch(row.id)
+        && now - ((row.payload as NormalizedInbound).receivedAt ?? now) >= 60_000);
+      const humanNext = this.store.get<boolean>("bus-yield-human")
+        ? rows.find(row => sendable(row) && !synthetic(row.id)) : undefined;
+      if (rows.some(row => row.state === "pending" && !handled.has(row.id))
+        && (!dueBus || humanNext || this.controlArrived(handled) || this.isGroup())) return;
+      // One overdue bus turn is followed by the waiting human, even if more bus work is overdue.
+      if (steer && dueBus && !humanNext) {
+        for (const row of rows) if (row.state === "pending" && !synthetic(row.id)) this.store.set(`human-own-turn:${row.id}`, true);
+        return;
+      }
       const leader = steer ? rows.find(row => row.state === "pending" && !synthetic(row.id) && !this.store.get(`human-own-turn:${row.id}`))
         : rows.find(row => row.state === "pending" && resetRow(row.id))
+        ?? humanNext
+        ?? dueBus
         ?? rows.find(row => sendable(row) && !synthetic(row.id))
         ?? rows.find(row => sendable(row) && !row.id.startsWith("wake:"))
         ?? rows.find(sendable);
@@ -1980,6 +2071,7 @@ export class Router {
           if (["queued-steer", "deferred-wake"].includes(this.store.get<string>(`batch-phase:${row.id}`) ?? "")
             || row.state !== "pending" || isCommand(next.text) || next.replyTo !== input.replyTo
             || (this.options.swipes && next.replyTo && !sameAttachmentMessage(input, next))
+            || isAgentBusWake(row.id) !== isAgentBusWake(leader.id)
             || row.id.startsWith("wake:") !== leader.id.startsWith("wake:") || resetRow(row.id) || this.backingOff(row.id, now)
             || (steer && !steerText({ id: row.id, payload: next }))) break;
           members.push({ ...row, payload: next });
@@ -2069,7 +2161,7 @@ export class Router {
   private steerBlocked(turn: Turn): string | undefined {
     if (!this.backend.steer) return "backend";
     if (turn.phase !== "running") return `phase-${turn.phase}`;
-    if (turn.background) return "background";
+    if (turn.background || this.busBatch(turn.inboundId ?? "")) return "background";
     if (turn.origin !== undefined) return "request-turn";
     const id = turn.inboundId;
     if (id === undefined) return "missing-inbound";
@@ -2184,6 +2276,17 @@ export class Router {
             this.backend.permissions(response.sessionId, response.directory)]).then(() => true)))
           .catch(error => { toolError("router", "router.respond_reconcile", error); return undefined; });
         if (resolved === undefined) return;
+        if (response.linkUncertain) {
+          // A pending read permits only this sealed retry. Its later refusal
+          // cannot settle the earlier POST whose receipt was lost.
+          if (!resolved && response.operation) {
+            this.store.set(`steer-attempt:${row.id}`, { ...attempt,
+              response: { ...response, retry: response.operation, linkRetry: true, priorUncertain: true } } satisfies SteerAttempt);
+            await this.postResponse(row.id, response.turn, response.sessionId, response.directory, response.requestId, response.operation);
+          }
+          // A disappearing request cannot prove whose response landed.
+          return;
+        }
         this.store.set(`steer-attempt:${row.id}`, null);
         this.requeueHuman(row.id, "respond_failed");
         return;
@@ -2216,7 +2319,7 @@ export class Router {
         if (delivery !== "refused") { this.consumeSteer(row.id, attempt); return; }
         if (!valid()) return;
         this.requeueRefusedSteer(row.id);
-      } catch (error) { toolError("router", "router.steer_retry", error); }
+      } catch (error) { toolError("router", "router.steer_retry", error); if (error instanceof RobobLinkDown) throw error; }
       finally { abort.abort(); }
       return;
     }
@@ -2327,6 +2430,7 @@ export class Router {
     } catch (caughtError) { toolError("router", "router.catch9", caughtError);
       // Keep the sealed attempt: the next tick reads acceptance before retrying its id.
       this.options.log?.("steer-uncertain");
+      if (caughtError instanceof RobobLinkDown) throw caughtError;
       if (controlDisposition(caughtError) === "same_mode") {
         this.store.set(`steer-attempt:${row.id}`, { ...sent, sameMode: true });
         this.store.set(`human-own-turn:${row.id}`, true);
@@ -2853,6 +2957,10 @@ export class Router {
       }).immediate();
       this.retireOthers();
     } catch (caughtError) { toolError("router", "router.catch20", caughtError);
+      if (caughtError instanceof RobobLinkDown || this.backend.linkAvailable === false) {
+        this.store.updateInbound(inboundId, "pending");
+        throw caughtError;
+      }
       this.acknowledge(inboundId, "Couldn't start fresh just now. Try /new again in a moment.", "unknown");
     }
   }
@@ -2900,6 +3008,7 @@ export class Router {
         ? this.backend.permissions(sessionId, directory) : this.backend.questions(sessionId, directory));
       request = requests?.find(r => r.id === pending.id && r.sessionID === sessionId);
     } catch (caughtError) { toolError("router", "router.catch21", caughtError);
+      if (caughtError instanceof RobobLinkDown || this.backend.linkAvailable === false) throw caughtError;
       // Leave the message queued; the next tick retries.
       return;
     }
@@ -3033,6 +3142,7 @@ export class Router {
     try {
       request = (await this.reading(this.backend.questions(sessionId, directory)))?.find(r => r.id === pending.id && r.sessionID === sessionId);
     } catch (caughtError) { toolError("router", "router.catch24", caughtError);
+      if (caughtError instanceof RobobLinkDown || this.backend.linkAvailable === false) throw caughtError;
       this.acknowledge(inboundId, "Couldn't check that question just now. Try again in a moment.");
       return;
     }
@@ -3730,7 +3840,12 @@ export class Router {
     }
     const interrupted = () => {
       if (this.expireFailedReplay(row.id)) return true;
-      const held = latencyRoute !== undefined && latencyRoute !== null
+      const busReceivedAt = (this.syntheticBatch(row.id) ?? [row.id]).filter(isAgentBusWake).map(id => {
+        const member = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id=?").get(id);
+        return member ? (JSON.parse(member.payload) as NormalizedInbound).receivedAt ?? Date.now() : Date.now();
+      });
+      const busDue = busReceivedAt.some(at => Date.now() - at >= 60_000);
+      const held = busDue || latencyRoute !== undefined && latencyRoute !== null
         || steerAttempt !== undefined && steerAttempt !== null
         || preparing?.id === row.id && (preparing.attempt > 1 || preparing.held);
       const arrived = held ? this.controlArrived(handled)
@@ -3810,7 +3925,7 @@ export class Router {
         const statuses = await this.statusesFor(activeRoute);
         busy = statuses[activeRoute.id] !== undefined;
         if (!busy && !steerAttempt && !latencyRoute) activeRoute = await this.rotate(activeRoute, statuses);
-      } catch (caughtError) { toolError("router", "router.catch35", caughtError); /* Unknown status: keep the current conversation. */ }
+      } catch (caughtError) { toolError("router", "router.catch35", caughtError); if (this.backend.linkAvailable === false) return; /* Unknown status: keep the current conversation. */ }
       if (busy) {
         // The agent is still finishing something on its own. Let that land first.
         this.deferBusyBatch(row);
@@ -3834,6 +3949,7 @@ export class Router {
         }).immediate();
         this.retireOthers();
       } catch (error) { toolError("router", "router.catch36", error);
+        if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) return;
         this.recordFailure(row.id, "create-chat", error);
         if (replyNudgeRow(row.id)) this.store.db.transaction(() => {
           this.retrySynthetic(row.id, "undelivered");
@@ -3988,6 +4104,11 @@ export class Router {
         this.clearDeferredNew();
       }
       this.store.set(`batch-phase:${row.id}`, "submitting");
+      if (this.busExpired(row.id)) {
+        this.retrySynthetic(row.id, "undelivered");
+        this.store.set("preparingDelivery", null);
+        return false;
+      }
       this.store.set("preparingDelivery", null);
       if (this.options.swipes) this.freezeSwipe(row.id);
       // Anything the agent sends for this turn lands after this mark.
@@ -4016,13 +4137,16 @@ export class Router {
     if (!submitting) return;
     try {
       await this.sending(this.backend.prompt(turn.id, turn.directory, turn.messageId, body, system, parts, preferences.model, owner,
-        () => this.beforePromptPost(turn, row.id, handled)), handled, turn.messageId);
+        () => this.beforePromptPost(turn, row.id, handled), this.busExpiresAt(row.id)), handled, turn.messageId);
       if (this.current(turn)) this.store.db.transaction(() => {
         this.setTurn({ ...turn, phase: "running" });
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch (error) { toolError("router", "router.catch40", error);
+    } catch (error) {
+      if (error instanceof PromptExpiredError) { this.fail(turn, "", undefined, "undelivered"); return; }
+      toolError("router", "router.catch40", error);
+      if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) { this.holdDelivery(turn); return; }
       if (error === probeDeferred) { this.deferUnsentWake(turn); return; }
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
@@ -4270,6 +4394,15 @@ export class Router {
     return outage;
   }
 
+  private holdLinkWork(): void {
+    const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
+    const turn = this.store.get<Turn | null>("activeTurn");
+    const id = preparing?.id ?? (turn && ["held", "submitting", "unknown"].includes(turn.phase) ? turn.inboundId : undefined)
+      ?? this.store.pendingInbound().find(row => !synthetic(row.id) && !controlCommand((row.payload as NormalizedInbound).text))?.id;
+    if (id) this.outageNotice(id);
+    this.flushOutageNotice();
+  }
+
   private flushOutageNotice(): void {
     const outage = this.store.get<Outage | null>("deliveryOutage");
     if (!outage || outage.noticed !== false || Date.now() < outage.noticeAt) return;
@@ -4278,10 +4411,10 @@ export class Router {
       const turn = this.store.get<Turn | null>("activeTurn");
       const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
       // A rebuilt held batch can be awaiting acceptance again when its notice comes due.
-      if (!(turn?.inboundId === id && ["held", "submitting", "unknown"].includes(turn.phase)) && preparing?.id !== id) return;
+      if (!(turn?.inboundId === id && ["held", "submitting", "unknown"].includes(turn.phase)) && preparing?.id !== id && this.backend.linkAvailable !== false) return;
       if (this.wakeBatch(id) || this.store.get(`inbound-delivered:${id}`) !== undefined) return;
       const row = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id);
-      if (row?.state !== "processing") return;
+      if (row?.state !== "processing" && !(row?.state === "pending" && this.backend.linkAvailable === false)) return;
       this.store.enqueue({ id: outage.id, kind: "control", text: OUTAGE_TEXT, ...this.replyTarget(id) });
       this.store.set("deliveryOutage", { ...outage, noticed: true });
       this.watchdogLog("notice", { inboundId: id, messageId: this.promptId(id) });
@@ -4424,17 +4557,21 @@ export class Router {
     if (this.probeBackoff.cooling(body.inboundId)) return;
     if (this.expireFailedReplay(body.inboundId)) return;
     if (this.controlArrived(handled)) return;
+    if (this.busExpired(body.inboundId)) { this.fail(turn, "", undefined, "undelivered"); return; }
     const input = this.store.get<NormalizedInbound | null>(`batch:${body.inboundId}`);
     const system = replay ? body.system + this.delayNote(input, turn.startedAt) : body.system;
     try {
       await this.sending(this.backend.prompt(turn.id, turn.directory, turn.messageId, body.text, system, body.parts, body.model, body.owner,
-        () => this.beforePromptPost(turn, body.inboundId, handled)), handled, turn.messageId);
+        () => this.beforePromptPost(turn, body.inboundId, handled), this.busExpiresAt(body.inboundId)), handled, turn.messageId);
       if (this.current(turn) && this.store.get<Turn | null>("activeTurn")?.messageId === turn.messageId) this.store.db.transaction(() => {
         this.setTurn({ ...turn, phase: "running" });
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch (error) { toolError("router", "router.catch44", error);
+    } catch (error) {
+      if (error instanceof PromptExpiredError) { this.fail(turn, "", undefined, "undelivered"); return; }
+      toolError("router", "router.catch44", error);
+      if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) { this.holdDelivery(turn); return; }
       if (error === probeDeferred) { this.deferUnsentWake(turn); return; }
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
@@ -5346,11 +5483,18 @@ export class Router {
   private async postResponse(id: string, turn: Turn, sessionId: string, directory: string, requestId: string, retry: ResponseRetry): Promise<void> {
     // Persist before POST: a timeout or restart cannot turn an unresolved response into a new send.
     let preflight = !this.toolMode && sessionId === turn.id && !Array.isArray(retry.before);
+    let linkRetry = this.store.get<SteerAttempt>(`steer-attempt:${id}`)?.response?.linkRetry === true;
+    const priorUncertain = this.store.get<SteerAttempt>(`steer-attempt:${id}`)?.response?.priorUncertain === true;
     const handled = new Set(this.handledNow).add(id);
+    // Controls already behind a gate-held answer must wait for its original response.
+    if (linkRetry) for (const row of this.store.pendingInbound()) handled.add(row.id);
     const valid = () => this.current(turn) && !this.controlArrived(handled)
       && this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state === "processing";
     const save = (deferred: boolean) => this.store.set(`steer-attempt:${id}`, { ...turn,
-      response: { sessionId, directory, requestId, turn, operation: retry, ...(deferred ? { retry } : {}), ...(preflight ? { preflight: true } : {}) },
+      response: { sessionId, directory, requestId, turn, operation: retry, ...(deferred ? { retry } : {}), ...(preflight ? { preflight: true } : {}),
+        ...(deferred && linkRetry ? { linkRetry: true } : {}),
+        ...(priorUncertain ? { priorUncertain: true, linkUncertain: true } : {}),
+        ...(!deferred && (linkRetry || this.backend.linkAvailable !== undefined) ? { linkUncertain: true } : {}) },
       requeueReason: "respond_failed" } satisfies SteerAttempt);
     save(true);
     this.store.set(`batch-phase:${id}`, "steering");
@@ -5361,7 +5505,10 @@ export class Router {
         if (!valid()) return;
         const snapshot = async () => {
           const read = this.backend.messages(turn.id, turn.directory, { until: turn.messageId, since: turn.startedAt, limit: 200 });
-          const existing = await (sessionId === turn.id ? this.reading(read, false) : bounded(read, 100)).catch(() => undefined);
+          const existing = await (sessionId === turn.id ? this.reading(read, false) : bounded(read, 100)).catch(error => {
+            if (preflight && (error instanceof RobobLinkDown || this.backend.linkAvailable === false)) throw error;
+            return undefined;
+          });
           return existing?.filter(record => record.type === "assistant").map(record => record.id) ?? "unknown";
         };
         if (preflight) {
@@ -5414,6 +5561,13 @@ export class Router {
       } catch (error) {
         toolError("router", "router.respond_failed", error);
         if (this.current(turn)) {
+          if (error instanceof RobobLinkDown || preflight) {
+            // The gate refused before POST; retain the exact operation and any preflight fence.
+            if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) linkRetry = true;
+            save(true);
+            if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) throw error;
+            return;
+          }
           const entries = this.pending();
           const entry = entries.find(item => item.id === requestId && (item.requestSessionId ?? item.sessionId) === sessionId);
           if (entry) { entry.state = "unknown"; this.store.set("pendingApprovals", entries); }
@@ -5422,17 +5576,26 @@ export class Router {
       } finally { this.responsesInFlight.delete(id); }
     })();
     // Observe the original promise even after this wait expires; its eventual receipt owns settlement.
-    await bounded(operation, SEND_WAIT_MS).catch(error => toolError("router", "router.respond_wait", error));
+    await bounded(operation, SEND_WAIT_MS).catch(error => {
+      toolError("router", "router.respond_wait", error);
+      if (error instanceof RobobLinkDown) throw error;
+    });
   }
 
   private answerFailed(id: string, turn: Turn, sessionId: string, directory: string, requestId: string, error: unknown, retry?: ResponseRetry): void {
-    if (controlDisposition(error) === "same_mode" && retry) {
+    const disposition = controlDisposition(error);
+    const priorUncertain = this.store.get<SteerAttempt>(`steer-attempt:${id}`)?.response?.priorUncertain === true;
+    const linkUncertain = priorUncertain || disposition !== "refused" && (this.backend.linkAvailable === false
+      || disposition === "reconcile" && this.store.get<SteerAttempt>(`steer-attempt:${id}`)?.response?.linkUncertain === true);
+    if (disposition === "same_mode" && retry && !priorUncertain) {
       this.store.set(`steer-attempt:${id}`, { ...turn, response: { sessionId, directory, requestId, turn, operation: retry, retry }, requeueReason: "respond_failed" } satisfies SteerAttempt);
       this.store.set(`human-own-turn:${id}`, true);
       this.store.set(`batch-phase:${id}`, "steering");
       this.store.updateInbound(id, "processing");
-    } else if (controlDisposition(error) === "reconcile" && !(error && typeof error === "object" && "reconciled" in error && error.reconciled === true)) {
-      this.store.set(`steer-attempt:${id}`, { ...turn, response: { sessionId, directory, requestId, turn, operation: retry }, requeueReason: "respond_failed" } satisfies SteerAttempt);
+    } else if (linkUncertain || disposition === "reconcile" && !(error && typeof error === "object" && "reconciled" in error && error.reconciled === true)) {
+      this.store.set(`steer-attempt:${id}`, { ...turn, response: { sessionId, directory, requestId, turn, operation: retry,
+        ...(priorUncertain ? { priorUncertain: true } : {}),
+        ...(linkUncertain ? { linkUncertain: true } : {}) }, requeueReason: "respond_failed" } satisfies SteerAttempt);
       this.store.set(`human-own-turn:${id}`, true);
       this.store.set(`batch-phase:${id}`, "steering");
       this.store.updateInbound(id, "processing");
@@ -5504,7 +5667,9 @@ export class Router {
     const live = this.store.get<Turn | null>("activeTurn");
     if (live?.messageId === turn.messageId) this.setTurn({ ...live, covered: [...new Set([...live.covered ?? [], ...members])] });
     this.store.set(`human-settled:${turn.messageId}`, false);
-    this.store.set(`turn-human:${turn.messageId}`, [...new Set([...this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? [], id])]);
+    const leaders = this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? [];
+    if (!leaders.includes(id)) this.store.set("bus-yield-human", false);
+    this.store.set(`turn-human:${turn.messageId}`, [...new Set([...leaders, id])]);
     for (const member of members) this.store.updateInbound(member, this.answered(member) ? "done" : "admitted");
   }
 

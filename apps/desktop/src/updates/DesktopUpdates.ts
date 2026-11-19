@@ -1,4 +1,8 @@
 import {
+  BACKEND_STOP_DEADLINE_MS,
+  waitForBackendShutdown,
+} from "../backend/DesktopBackendProcess.ts";
+import {
   DESKTOP_UPDATE_RESTART_MARKER_FILE,
   DesktopUpdateChannelSchema,
   type DesktopRuntimeInfo,
@@ -759,13 +763,20 @@ export const make = Effect.gen(function* () {
             instance.snapshot.pipe(Effect.map((snapshot) => snapshot.desiredRunning)),
           );
           yield* Ref.set(installRunningBackendsRef, runningInstances);
-          yield* Effect.forEach(
-            instances,
-            (instance) => instance.stop({ timeout: Duration.seconds(5) }),
-            { concurrency: "unbounded" },
-          );
           yield* DesktopQuit.prepare({ trigger: "quitAndInstall" }).pipe(
             Effect.provideService(DesktopState.DesktopState, desktopState),
+          );
+          yield* Effect.promise(() =>
+            waitForBackendShutdown(
+              Effect.runPromise(
+                Effect.forEach(
+                  instances,
+                  (instance) =>
+                    instance.stop({ timeout: Duration.millis(BACKEND_STOP_DEADLINE_MS) }),
+                  { concurrency: "unbounded" },
+                ),
+              ),
+            ),
           );
           yield* electronUpdater.quitAndInstall({
             isSilent: true,

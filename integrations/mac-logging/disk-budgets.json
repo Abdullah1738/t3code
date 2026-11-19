@@ -1,0 +1,12 @@
+[
+  {"path":"~/.local/share/offbox","owner_board":"offbox","budget_gb":5,"note":"Offbox #277 owns log retention and this budget."},
+  {"path":"~/.robob/logs/tools/offbox","owner_board":"offbox","budget_gb":0.5,"note":"Offbox tool logs; retention owned by Offbox #277."},
+  {"path":"~/.local/share/opencode","owner_board":"mac","budget_gb":30,"note":"Mac Upkeep #76 owns growth investigation."},
+  {"path":"~/.robob","owner_board":"mac","budget_gb":60,"note":"Exclude userdata, the ExternalSSD symlink."},
+  {"path":"~/.robob/logs","owner_board":"mac","budget_gb":2,"note":"Shared tool logs."},
+  {"path":"~/Library/Caches","owner_board":"mac","budget_gb":20,"note":"macOS and application caches."},
+  {"path":"~/.npm","owner_board":"mac","budget_gb":10,"note":"npm cache."},
+  {"path":"~/.cache","owner_board":"mac","budget_gb":10,"note":"User tool caches."},
+  {"path":"~/.gradle","owner_board":"mac","budget_gb":10,"note":"Gradle caches."},
+  {"path":"/Volumes/ExternalSSD/caches/go-build","owner_board":"mac","budget_gb":100,"note":"Go build cache on ExternalSSD."}
+]

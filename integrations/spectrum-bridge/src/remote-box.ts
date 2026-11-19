@@ -1,3 +1,4 @@
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { createPublicKey, createHmac } from "node:crypto";
 import { toolLog } from "./toollog.ts";
 import { readFileSync } from "node:fs";
@@ -46,11 +47,13 @@ export class RemoteBox {
   private readonly callbackToken: string;
   private busy = false;
   private fenceBusy = false;
+  private deliveryBusy = false;
   private nextProbe = 0;
   private failures = 0;
   private nextStateLog = 0;
   private readonly callbackErrors = new Map<string, { at: number; count: number; props: Record<string, string | number | boolean> }>();
   private readonly unanswered: RemoteUnanswered;
+  private readonly callbackLoopDelay = monitorEventLoopDelay({ resolution: 100 });
   constructor(readonly config: RemoteBoxConfig, readonly store: Store, private readonly io: {
     fetch?: Fetch; now?: () => number; log: (event: string, code?: string) => void;
     notice: (id: string, text: string) => Promise<void>; active: () => boolean;
@@ -87,6 +90,9 @@ export class RemoteBox {
       outage.unreachableSince = null; outage.reachableSince = null; store.set("remoteOutage", outage);
     }
     this.backendState();
+    const columns = store.db.query<{ name: string }, []>("PRAGMA table_info(remote_inbox)").all();
+    for (const column of ["expires_at", "picked_up_at", "delivery_checked_at", "delivery_final"]) if (!columns.some(c => c.name === column)) store.db.exec(`ALTER TABLE remote_inbox ADD COLUMN ${column} INTEGER`);
+    this.callbackLoopDelay.enable();
   }
   private backendState() {
     this.nextStateLog = this.now() + 300_000;
@@ -114,7 +120,7 @@ export class RemoteBox {
       if (all || this.now() - window.at >= 60_000) this.emitCallbackError(key);
     }
   }
-  stop() { this.flushCallbackErrors(true); }
+  stop() { this.callbackLoopDelay.disable(); this.flushCallbackErrors(true); }
   private callbackError(path: string, status: number, error: unknown) {
     // Emit the completed window so count includes every suppressed repeat, even if the failure stops.
     this.flushCallbackErrors();
@@ -129,8 +135,9 @@ export class RemoteBox {
   accept(id: string, input: unknown, receipt?: AgentAnswerReceipt, kind: "inbound" | "wake" = "inbound"): boolean {
     const key = opaqueId(id);
     return this.store.db.transaction(() => {
-      const created = this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind,received_at) VALUES (?,?,?,?,?)")
-        .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind, this.now()).changes === 1;
+      const created = this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind,received_at,expires_at) VALUES (?,?,?,?,?,?)")
+        .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind, this.now(),
+          typeof input === "object" && input !== null && "agentExpiresAt" in input && Number.isSafeInteger(input.agentExpiresAt) ? input.agentExpiresAt as number : null).changes === 1;
       if (created && kind === "inbound") this.unanswered.accept(key, this.now());
       if (kind === "inbound") this.io.mirror?.inbound(id, input);
       return created;
@@ -142,6 +149,10 @@ export class RemoteBox {
   }
   hasMessage(id: string): boolean {
     return !!this.store.db.query("SELECT 1 FROM remote_inbox WHERE id=?").get(opaqueId(id));
+  }
+  delivery(id: string): { retained: boolean; confirmed: boolean; deliveredAt?: number } {
+    const row = this.store.db.query<{ sealed: string | null; picked_up_at: number | null }, [string]>("SELECT sealed,picked_up_at FROM remote_inbox WHERE id=?").get(opaqueId(id));
+    return { retained: !!row, confirmed: row?.sealed === null, ...(row?.picked_up_at == null ? {} : { deliveredAt: row.picked_up_at }) };
   }
   async request(path: string, body: unknown): Promise<Record<string, unknown>> {
     const response = await (this.io.fetch ?? fetch)(this.config.url + path, { method: "POST", redirect: "error",
@@ -313,10 +324,10 @@ export class RemoteBox {
       if (status.boxId !== this.config.boxId || status.epoch !== this.config.epoch) throw new Error("Box identity mismatch");
       dependenciesReady = status.routerReady !== false && status.callbackReady !== false;
       this.failures = 0;
-      const rows = this.store.db.query<{ id: string; seq: number; sealed: string }, []>("SELECT id,seq,sealed FROM remote_inbox WHERE sealed IS NOT NULL ORDER BY seq LIMIT 50").all();
+      const rows = this.store.db.query<{ id: string; seq: number; sealed: string; expires_at: number | null }, [number]>("SELECT id,seq,sealed,expires_at FROM remote_inbox WHERE sealed IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) ORDER BY seq LIMIT 50").all(this.now());
       let delivered = 0;
       for (const row of rows) {
-        const ack = await this.request("/deliver", { id: row.id, sealed: JSON.parse(row.sealed) as Sealed, epoch: this.config.epoch });
+        const ack = await this.request("/deliver", { id: row.id, sealed: JSON.parse(row.sealed) as Sealed, epoch: this.config.epoch, expiresAt: row.expires_at });
         if (ack.id !== row.id || ack.accepted !== true) throw new Error("Invalid box acknowledgement");
         this.store.db.query("UPDATE remote_inbox SET sealed=NULL,delivered_at=COALESCE(delivered_at,?) WHERE id=?").run(this.now(), row.id);
         delivered++;
@@ -346,6 +357,7 @@ export class RemoteBox {
       this.emit("moni-runner-error", "unreachable");
     } finally { this.busy = false; }
     // Observational requests must not hold up lease renewal, including while Telegram is stalled.
+    const delivery = healthy ? this.checkDeliveries() : undefined;
     if (healthy && !this.fenceBusy) {
       this.fenceBusy = true;
       try {
@@ -356,6 +368,27 @@ export class RemoteBox {
       } catch { this.emit("moni-box-events-error"); }
       finally { this.fenceBusy = false; }
     }
+    await delivery;
+  }
+  private async checkDeliveries(): Promise<void> {
+    if (this.deliveryBusy || !this.io.active()) return;
+    this.deliveryBusy = true;
+    try {
+      const waiting = this.store.db.query<{ id: string; expires_at: number }, []>("SELECT id,expires_at FROM remote_inbox WHERE picked_up_at IS NULL AND expires_at IS NOT NULL AND delivery_final IS NULL ORDER BY COALESCE(delivery_checked_at,0),seq LIMIT 50").all();
+      if (!waiting.length) return;
+      const probedAt = this.now();
+      const status = await this.request("/delivery-status", { ids: waiting.map(r => r.id), deadlines: waiting.map(r => ({ id: r.id, expiresAt: r.expires_at })), epoch: this.config.epoch });
+      if (!Array.isArray(status.deliveries)) throw new Error("Invalid delivery status");
+      for (const receipt of status.deliveries) {
+        if (!receipt || !waiting.some(r => r.id === receipt.id) || typeof receipt.accepted !== "boolean"
+          || receipt.deliveredAt !== null && (!Number.isSafeInteger(receipt.deliveredAt) || receipt.deliveredAt < 0)) throw new Error("Invalid delivery receipt");
+        this.store.db.query(`UPDATE remote_inbox SET picked_up_at=?,
+          sealed=CASE WHEN ? THEN NULL ELSE sealed END, delivery_checked_at=?,
+          delivery_final=CASE WHEN expires_at<=? THEN 1 ELSE NULL END WHERE id=?`)
+          .run(receipt.deliveredAt, Number(receipt.accepted), this.now(), probedAt, receipt.id);
+      }
+    } catch { this.emit("moni-box-delivery-status-error"); }
+    finally { this.deliveryBusy = false; }
   }
   private async flushAutoFailAlerts() {
     const rows = this.store.db.query<{ key: string; value: string }, []>("SELECT key,value FROM kv WHERE key GLOB 'remoteWakeAutoFail:*'").all();
@@ -411,11 +444,25 @@ export class RemoteBox {
     }
   }
   async callback(request: Request, io: { line: Line; chat: ChatKey; bus: (path: string, body: Record<string, unknown>, id: string, fingerprint: string) => Promise<Response> }): Promise<Response> {
-    const reply = (status: number, body: unknown) => Response.json(body, { status });
-    // This entry is used by a dedicated loopback listener, never by the trusted Unix socket.
-    if (!tokenMatches(request.headers.get("authorization"), this.callbackToken)) return reply(403, { error: "Forbidden" });
-    if (!this.io.active()) return reply(503, { error: "Backend paused" });
+    const started = performance.now();
     const path = new URL(request.url).pathname;
+    const authorized = tokenMatches(request.headers.get("authorization"), this.callbackToken);
+    const reply = (status: number, body: unknown) => {
+      const response = Response.json(body, { status });
+      if (authorized && path === "/ready") {
+        toolLog.capture(() => {
+          const handlerMs = Math.max(0, performance.now() - started);
+          // Max sampled loop delay since the preceding /ready, including stalls outside this handler.
+          const loopDelayMs = this.callbackLoopDelay.max / 1_000_000;
+          this.callbackLoopDelay.reset();
+          this.emit("moni-callback-ready", undefined, handlerMs, { status, handlerMs, loopDelayMs });
+        });
+      }
+      return response;
+    };
+    // This entry is used by a dedicated loopback listener, never by the trusted Unix socket.
+    if (!authorized) return reply(403, { error: "Forbidden" });
+    if (!this.io.active()) return reply(503, { error: "Backend paused" });
     if (request.method !== "POST" || !["/send", "/files", "/react", "/agent-ask", "/agent-answer", "/agent-requests", "/share", "/unshare", "/shares", "/ready", "/metrics"].includes(path)) return reply(403, { error: "Forbidden" });
     try {
       const body = await jsonBody(request);

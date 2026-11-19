@@ -17,6 +17,53 @@ VER = re.compile(r"^v?(\d+|[xX*])(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?(?:[-+][0-9
 
 from . import toolchain
 
+NVM_FETCH = r'''mkdir -p "$NVM_DIR" &&
+  { [ -s "$NVM_DIR/nvm.sh" ] ||
+    { __offbox_curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/nvm.sh -o "$NVM_DIR/nvm.sh.tmp" &&
+      [ -s "$NVM_DIR/nvm.sh.tmp" ] && mv "$NVM_DIR/nvm.sh.tmp" "$NVM_DIR/nvm.sh"; }; }
+'''
+
+# nvm auto-uses a repo's .nvmrc even with no default alias, returning 3 when
+# only system Node exists. Keep offbox's selection until the caller asks nvm.
+NVM_ENTRYPOINT = r'''export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+if [ -e "$NVM_DIR/alias/default" ]; then
+  . "$NVM_DIR/.offbox-nvm-v0.40.3.sh" "$@"
+else
+  . "$NVM_DIR/.offbox-nvm-v0.40.3.sh" --no-use "$@"
+fi
+'''
+
+
+def command_uses_nvm(cmd: str) -> bool:
+    """Inspect only submitted text, including shell file tests and nested -c strings."""
+    return bool(re.search(r'(?:~|\$(?:HOME|\{HOME\})|/[^\s;\'"<>]*)/\.nvm/nvm\.sh(?![\w./-])'
+                          r'|\$(?:NVM_DIR|\{NVM_DIR\})/nvm\.sh(?![\w./-])'
+                          r'|(?<![\w./-])nvm\s+(?:use|install|exec|run)\b', cmd))
+
+
+def command_nvm_block(run_id: str) -> str:
+    """Supply the shell entry point without sourcing it or selecting another Node."""
+    receipt = shlex.quote(f'offbox-nvm-sh: {run_id} ')
+    return toolchain.SHELL + r'''
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+  printf '%spresent\n' @RECEIPT@ >&2
+else
+  if ! {
+@FETCH@
+    mv "$NVM_DIR/nvm.sh" "$NVM_DIR/.offbox-nvm-v0.40.3.sh" &&
+      printf '%s' @ENTRYPOINT@ > "$NVM_DIR/nvm.sh.tmp" &&
+      mv "$NVM_DIR/nvm.sh.tmp" "$NVM_DIR/nvm.sh"
+  }; then
+    printf '%sfailed\n' @RECEIPT@ >&2
+    __offbox_stop 'nvm.sh download failed (your command sources ~/.nvm/nvm.sh)'
+  fi
+  printf '%sinstalled\n' @RECEIPT@ >&2
+  echo "offbox: installed nvm.sh (nvm v0.40.3) because your command sources it; no nvm Node versions are installed, box Node stays $(command -v node) ($(node --version))" >&2
+fi
+'''.replace('@FETCH@', NVM_FETCH.rstrip() + ' &&').replace('@RECEIPT@', receipt).replace(
+        '@ENTRYPOINT@', shlex.quote(NVM_ENTRYPOINT))
+
 BLOCK = r"""__offbox_want=@WANT@
 __offbox_nk() { local IFS=.; set -- ${1#v}; echo $(( 10#${1:-0} * 1000000 + 10#${2:-0} * 1000 + 10#${3:-0} )); }
 __offbox_in() { local k=$1; set -- @RANGES@; while [ $# -ge 2 ]; do [ "$k" -ge "$1" ] && [ "$k" -lt "$2" ] && return 0; shift 2; done; return 1; }
@@ -37,11 +84,7 @@ elif [ "${__offbox_require_nvm:-0}" != 1 ] && [[ "$__offbox_cur" =~ ^v[0-9]+\.[0
 else
   __offbox_reason="$__offbox_want (box default ${__offbox_cur:-none}; nvm:${__offbox_have:- none})"
   export NVM_DIR="$HOME/.nvm"
-  mkdir -p "$NVM_DIR" || __offbox_stop "$__offbox_reason: cannot create nvm directory"
-  if [ ! -s "$NVM_DIR/nvm.sh" ]; then
-    __offbox_curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/nvm.sh -o "$NVM_DIR/nvm.sh.tmp" &&
-      mv "$NVM_DIR/nvm.sh.tmp" "$NVM_DIR/nvm.sh" || __offbox_stop "$__offbox_reason: nvm download failed"
-  fi
+  { @NVM_FETCH@ } || __offbox_stop "$__offbox_reason: nvm download failed"
   __offbox_index="$NVM_DIR/.offbox-index.tab"
   __offbox_curl -fsSL https://nodejs.org/dist/index.tab -o "$__offbox_index.tmp" &&
     mv "$__offbox_index.tmp" "$__offbox_index" || __offbox_stop "$__offbox_reason: Node index download failed"
@@ -185,7 +228,7 @@ hash -r
 unset -f __offbox_nk __offbox_in
 unset __offbox_want __offbox_best __offbox_bk __offbox_have __offbox_d __offbox_v __offbox_k __offbox_cur __offbox_actual __offbox_installed __offbox_install __offbox_reason __offbox_index __offbox_rest
 unset __offbox_original_nvm_dir __offbox_nvm_dir __offbox_nvm_root __offbox_node_executable __offbox_node_dir __offbox_node_bin __offbox_node_nvm_dir __offbox_node_suffix __offbox_node_path __offbox_sep __offbox_tail __offbox_entry __offbox_command
-"""
+""".replace('@NVM_FETCH@', NVM_FETCH)
 
 
 NO_PIN_BLOCK = r"""__offbox_default=$(

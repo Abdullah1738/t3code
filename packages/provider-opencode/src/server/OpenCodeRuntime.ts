@@ -1,3 +1,4 @@
+import * as Clock from "effect/Clock";
 import * as NodeURL from "node:url";
 
 import type { ChatAttachment, ProviderApprovalDecision, RuntimeMode } from "@t3tools/contracts";
@@ -89,6 +90,7 @@ const OPENCODE_SERVER_STARTUP_MAX_OUTPUT_CHARS = 64 * 1024;
 const OPENCODE_SERVER_EXIT_DRAIN_TIMEOUT = "500 millis";
 const OPENCODE_SKILL_DISCOVERY_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 export interface OpenCodeServerProcess {
+  readonly runtimeProcess?: { readonly pid: number; readonly spawnedAtMs: number };
   readonly url: string;
   readonly serverPassword?: string;
   readonly version: string;
@@ -97,6 +99,7 @@ export interface OpenCodeServerProcess {
 }
 
 export interface OpenCodeServerConnection {
+  readonly runtimeProcess?: { readonly pid: number; readonly spawnedAtMs: number };
   readonly url: string;
   readonly serverPassword?: string;
   readonly version: string;
@@ -713,6 +716,7 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
     // Scopes close in reverse order. Forking this before the group kill is
     // registered forgets the ledger entry only once the group is stopped.
     const ledgerScope = yield* Scope.fork(runtimeScope);
+    const spawnedAtMs = yield* Clock.currentTimeMillis;
     const child = yield* spawner
       .spawn(
         ChildProcess.make(spawnCommand.command, spawnCommand.args, {
@@ -880,6 +884,7 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
       url,
       ...(serverPassword !== undefined ? { serverPassword } : {}),
       version,
+      runtimeProcess: { pid: Number(child.pid), spawnedAtMs },
       isRunning: child.isRunning.pipe(Effect.orElseSucceed(() => false)),
       exitCode: child.exitCode.pipe(
         Effect.map(Number),
@@ -948,6 +953,7 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
     }).pipe(
       Effect.map((server) => ({
         url: server.url,
+        ...(server.runtimeProcess === undefined ? {} : { runtimeProcess: server.runtimeProcess }),
         ...(server.serverPassword !== undefined ? { serverPassword: server.serverPassword } : {}),
         version: server.version,
         exitCode: server.exitCode,

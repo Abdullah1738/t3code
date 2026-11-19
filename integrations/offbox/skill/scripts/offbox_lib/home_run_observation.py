@@ -50,7 +50,9 @@ def queued_on_home(row, read, *, path=None):
             tail = log.read()
     except OSError:
         tail = b''
-    lines = tail.splitlines()
+    from offbox_protocol import for_run
+    identity = for_run(row, path)
+    lines = tail.split(b'\n')
     boundary, attempt = 0, None
     for i, line in enumerate(lines):
         if line.startswith(b'offbox-space: '):
@@ -60,13 +62,13 @@ def queued_on_home(row, read, *, path=None):
                     boundary, attempt = i + 1, marker.get('attempt')
             except (ValueError, AttributeError):
                 pass
-        retry = re.search(rb'it is queued again as attempt ([0-9]+)\s*$', line)
-        if retry:
-            boundary, attempt = i + 1, int(retry[1])
+        marker = identity.parse(line.decode(errors='replace'))
+        if marker and marker.kind == 'retry':
+            boundary, attempt = i + 1, marker.fields['attempt']
     if isinstance(read, dict) and read.get('attempt') and attempt and read['attempt'] != attempt:
         return False
     tail = b'\n'.join(lines[boundary:])
-    if b'offbox-command-started:' in tail or b'"phase": "start"' in tail or b'"phase": "server_start"' in tail:
+    if identity.command_started(tail.decode(errors='replace')) or b'"phase": "start"' in tail or b'"phase": "server_start"' in tail:
         return False
     return (isinstance(read, dict) and read.get('kind') == 'queued') or \
         b'offbox-server: waiting' in tail

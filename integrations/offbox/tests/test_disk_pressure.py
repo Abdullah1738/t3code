@@ -427,12 +427,16 @@ class Round2(Base):
 
     def test_container_stop_failure_still_propagates_without_archiving(self):
         bid=self.box()
-        with patch.object(boatd,'incus',side_effect=subprocess.TimeoutExpired(['incus','stop'],120)), \
+        def stop_failure(*args,**kwargs):
+            if args[0]=='stop': raise subprocess.TimeoutExpired(['incus','stop'],120)
+            return self.f.incus(*args,**kwargs)
+        with patch.object(boatd,'incus',side_effect=stop_failure) as incus, \
              patch.object(boatd.toollog,'emit') as emit:
             with self.assertRaises(subprocess.TimeoutExpired):
                 boatd.stop_box(self.con,bid,'idle')
         self.assertIn(bid,self.f.running)
         self.assertEqual(self.state(bid)['state'],'stopping')
+        self.assertTrue(any(c.args[0]=='stop' for c in incus.call_args_list))
         self.assertFalse(any(c.args[1]=='snapshot.defer' for c in emit.call_args_list))
 
 

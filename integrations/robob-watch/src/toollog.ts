@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { constants } from "node:os";
 import { safeDependency } from "./cause.ts";
+import { sanitizeGroupState } from "./check-groups.ts";
 
 export type LogEntry = {
   component: string; kind: "event" | "perf" | "error"; name: string;
@@ -18,7 +19,7 @@ const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
   alertKind: ["pause", "failing", "recovered"],
-  severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy"],
+  severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy", "stuck_previous"],
   source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored", "logged"],
   authKind: ["otp", "signin_link"],
   senderLabel: ["Emirates NBD", "Emirates Islamic", "Mashreq", "ADCB", "Wio", "Apple", "Google", "WHOOP", "Claude", "Virgin", "e&", "du", "your bank", "an inbox sender"],
@@ -66,10 +67,24 @@ function fields(entry: LogEntry, at: Date) {
   }
   const props: Record<string, unknown> = {};
   const fileEvent = ["data_read.retried", "data_read.failed", "data_write.retried", "data_write.failed", "runs_log.write_failed"].includes(entry.name);
+  const stuckEvent = entry.component === "runner" && ["watch.skip", "watch.stuck_group", "watch.stuck_exited"].includes(entry.name);
   for (const [key, value] of Object.entries(entry.props ?? {})) {
     // Only triage supplies a bounded, credential-redacted classifier diagnostic.
     if (entry.component === "triage" && entry.name === "triage.classify" && key === "classifier_error"
       && typeof value === "string" && value.length <= 400 && !/[\x00-\x1f]/.test(value)) props[key] = value;
+    else if (entry.name === "watch.pause_probe" && key === "error_first_line" && typeof value === "string") {
+      props[key] = value.split(/[\r\n]/, 1)[0]!.replace(/[\x00-\x1f]/g, " ")
+        .replace(/https?:\/\/\S+/gi, "[url]")
+        .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[credential]")
+        .replace(/((?:password|secret|token|api[_-]?key|authorization)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*(?:"|\\?$)|'(?:\\.|[^'\\])*(?:'|\\?$)|[^\s,;]+)/gi, "$1[redacted]")
+        .replace(/\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]+/g, "[redacted]").slice(0, 500);
+    }
+    else if ((entry.name === "watch.pause_probe" || entry.name === "watch.auto_resumed")
+      && ["attempts", "paused_ms", "duration_ms"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if (entry.name === "watch.pause_probe" && key === "ok" && typeof value === "boolean") props[key] = value;
+    else if (entry.name === "watch.pause_probe" && key === "next_at" && typeof value === "string" && Number.isFinite(Date.parse(value))) props[key] = new Date(value).toISOString();
+    else if (stuckEvent && key === "diagnostic" && typeof value === "string") props[key] = sanitizeGroupState(value);
+    else if (stuckEvent && ["pgid", "pid", "killedAt", "ageMs"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (fileEvent && key === "path" && typeof value === "string" && value.length <= 1024 && value.startsWith("/") && !/[\x00-\x1f]/.test(value)) props[key] = value;
     else if (fileEvent && (key === "attempts" || key === "ms") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (fileEvent && key === "dataless" && typeof value === "boolean") props[key] = value;

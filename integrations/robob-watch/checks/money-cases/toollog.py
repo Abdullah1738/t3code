@@ -26,8 +26,12 @@ DELEGATION_REASONS = {'NO_STANDING_DELEGATION', 'DUPLICATE_DELEGATED_RECORD',
     'BUS_REQUEST_MISSING', 'BUS_WRONG_SENDER', 'BUS_WRONG_TARGET', 'BUS_REQUEST_CLOSED',
     'BUS_REQUEST_STALE', 'BUS_UNREADABLE', 'INVALID_LIFETIME', 'UNSUPPORTED_DELEGATION',
     'DELEGATED_RECORD_INVALID'}
+STANDING_REASONS = {'STANDING_NOT_FOUND', 'NOT_STANDING', 'STANDING_REVOKED',
+    'STANDING_CURRENCY_MISMATCH', 'STANDING_CAP_EXCEEDED', 'INVALID_AMOUNT',
+    'INVALID_LIFETIME', 'STANDING_RECORD_INVALID'}
 _NAMES = {
     'record.refused',
+    'standing.created', 'standing_record.created', 'standing_record.refused',
     'delegate.created', 'delegate.revoked', 'delegated_record.created', 'delegated_record.refused',
     'moni_go.bus_checked', 'moni_go.bus_refused',
     'cmd.start', 'cmd.end', 'cmd.error', 'guard.refused', 'payment.may_have_sent',
@@ -41,13 +45,15 @@ _NAMES = {
     'order_watch.item_drop_check', 'order_watch.can_report',
     'collector.hold_seen', 'collector.hold_cleared',
     'bridge.error',
+    'track.checkout_link', 'track.checkout_auto_add', 'track.checkout_mismatch',
 }
 _ENUMS = {
     'route': {'cdp', 'phone', 'unspecified'},
     'field': {'card_name', 'card_number', 'card_expiry', 'card_cvc'},
     'cardNickname': {'Marriott', 'MashreqNoon', 'Skywards', 'Mashreq'},
-    'reason': DELEGATION_REASONS | {'expired_at_write'},
-    'refusal': {'none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage'},
+    'reason': DELEGATION_REASONS | STANDING_REASONS | {'expired_at_write'},
+    'refusal': {'none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage',
+                'checkout_unavailable', 'checkout_untracked'},
     'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
              'quik', 'shops', 'box', 'same-day'},
@@ -76,7 +82,7 @@ _NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exi
             'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
             'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms',
             'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
-            'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'dataless_files', 'edeadlk_skips_before'}
+            'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'eintr_retries', 'dataless_files', 'edeadlk_skips_before'}
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
 _MONEY_PROPS = {
@@ -91,7 +97,7 @@ _MONEY_PROPS = {
                   'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
                   'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by',
                   'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
-                  'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'dataless_files', 'edeadlk_skips_before', 'owner_result'},
+                  'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'eintr_retries', 'dataless_files', 'dataless_error', 'edeadlk_skips_before', 'owner_result'},
 }
 _COMMANDS = {'test-talabat-shops', 'capabilities', 'restaurant-cart-contract', 'item-options', 'cart',
              'clear-cart', 'menu', 'choices', 'inspect', 'open-flows', 'recover-payment',
@@ -247,7 +253,7 @@ SUPERMALL_SILENT_DELIVERY_NOT_ACTIVE TALABAT_ADDRESS_CHECK_FAILED TALABAT_RETIRE
 UNSUPPORTED_NATIVE_MARKETPLACE_QUIET_DELIVERY UNSUPPORTED_QUIET_OPTION_SEMANTICS
 """.split())
 
-_KNOWN_TAGS = _GUARD_TAGS | DELEGATION_REASONS | frozenset("""
+_KNOWN_TAGS = _GUARD_TAGS | DELEGATION_REASONS | STANDING_REASONS | frozenset("""
 BRIDGE_REQUEST_FAILED
 OPERATION_FAILED LOG_CAP TRACK_REGISTRATION_FAILED TRACK_POLL_SOURCE_ERROR
 AUTH_EXPIRED AUTH_FORBIDDEN ACCOUNT_CAPTURE_REQUIRED INVALID_ORDER_ID INVALID_ARGUMENTS
@@ -584,7 +590,12 @@ def _fields(props):
         elif key in _BOOLS and type(value) is bool:
             result[key] = value
         elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12 \
-                and (not (key.endswith('_ms') or key.startswith('msgs_') or key == 'writes_n' or key.startswith('owner_') or key.startswith('edeadlk_') or key == 'dataless_files') or value >= 0):
+                and (not (key.endswith('_ms') or key.startswith('msgs_') or key == 'writes_n' or key.startswith('owner_') or key.startswith('edeadlk_') or key in {'eintr_retries', 'dataless_files'}) or value >= 0):
+            result[key] = value
+        elif key == 'dataless_files' and value is None:
+            result[key] = None
+        elif key == 'dataless_error' and isinstance(value, str) \
+                and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]{0,80} errno=(?:None|-?\d{1,6})', value):
             result[key] = value
         elif key == 'hours' and type(value) in (int, float) and math.isfinite(value) and 0 < value <= 24:
             result[key] = value
@@ -676,7 +687,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher', 'vendorId', 'itemId', 'cardId'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'standingId', 'watcher', 'vendorId', 'itemId', 'cardId'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):
@@ -1107,12 +1118,12 @@ def consumed(fn):
 
 def registration(fn):
     @functools.wraps(fn)
-    def wrapped(argv=None, _locked=False):
+    def wrapped(argv=None, _locked=False, **kwargs):
         import sys
         args = sys.argv[1:] if argv is None else argv
         with deferred():
             try:
-                return fn(argv, _locked=_locked)
+                return fn(argv, _locked=_locked, **kwargs)
             except Exception as exc:
                 if args[:1] == ['add'] and not _locked:
                     def option(flag, default=None):

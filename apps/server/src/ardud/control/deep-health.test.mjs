@@ -972,3 +972,195 @@ NodeTest.test(
     NodeAssert.doesNotMatch(JSON.stringify(report), /fixture-secret/);
   },
 );
+
+NodeTest.test("watchdog summary names ongoing and recent blockers with frames", async () => {
+  const { summarizeMainThread, healthLine } = await import("./deep-health.mjs");
+  const blocked = {
+    kind: "blocked",
+    pid: 12,
+    bootId: localRuntime.bootId,
+    reportIntervalMs: 30_000,
+    episode: "12:1",
+    at: new Date(now - 30_000).toISOString(),
+    blockedForMs: 10_000,
+    inFlight: [{ tool: "board_activity", boardId: "board-test" }],
+    frames: [{ functionName: "testBlockingLoop", url: "watchdog.ts", lineNumber: 42 }],
+  };
+  const tail = (rows) => ({ text: rows.map((row) => JSON.stringify(row)).join("\n") + "\n" });
+  const summarize = (rows, at = now, pid = 12, bootId = localRuntime.bootId) =>
+    summarizeMainThread(tail(rows), at, pid, bootId);
+  const mainThread = summarize([blocked]);
+  NodeAssert.equal(mainThread.ongoing, true);
+  NodeAssert.match(
+    mainThread.summary,
+    /main thread blocked 40s by board_activity\(board-test\).*testBlockingLoop.*watchdog.ts:42/,
+  );
+  NodeAssert.match(
+    healthLine({
+      verdict: "stalled",
+      lag: summarizeLag(fixture(), now),
+      connection: ok,
+      roundTrip: ok,
+      mainThread,
+    }),
+    /main thread blocked 40s/,
+  );
+  const ended = {
+    ...blocked,
+    kind: "unblocked",
+    at: new Date(now - 1000).toISOString(),
+    blockedForMs: 39_000,
+  };
+  // Rotation reader returns newest file first, so chronology must not depend on file order.
+  NodeAssert.equal(summarize([ended, blocked]).ongoing, false);
+  NodeAssert.equal(summarize([ended], now + 900_001), null);
+  NodeAssert.equal(summarize([blocked], now, 13), null);
+  NodeAssert.equal(
+    summarizeMainThread({ text: '{"secret":"' }, now, 12, localRuntime.bootId),
+    null,
+  );
+});
+
+for (const [name, ageMs, kind, rowBootId, runtimeBootId, interval, expected] of [
+  ["fresh blocked", 30_000, "blocked", localRuntime.bootId, localRuntime.bootId, 30_000, true],
+  ["freshness boundary", 62_000, "blocked", localRuntime.bootId, localRuntime.bootId, 30_000, true],
+  ["missing recovery", 62_001, "blocked", localRuntime.bootId, localRuntime.bootId, 30_000, false],
+  [
+    "custom repeat interval",
+    90_000,
+    "blocked",
+    localRuntime.bootId,
+    localRuntime.bootId,
+    60_000,
+    true,
+  ],
+  ["recent recovery", 30_000, "unblocked", localRuntime.bootId, localRuntime.bootId, 30_000, false],
+  [
+    "expired recovery",
+    900_001,
+    "unblocked",
+    localRuntime.bootId,
+    localRuntime.bootId,
+    30_000,
+    null,
+  ],
+  [
+    "expired unfinished episode",
+    900_001,
+    "blocked",
+    localRuntime.bootId,
+    localRuntime.bootId,
+    30_000,
+    null,
+  ],
+  [
+    "reused PID",
+    1000,
+    "blocked",
+    "f2493692-950c-4f64-9025-73e929d67f42",
+    localRuntime.bootId,
+    30_000,
+    null,
+  ],
+  ["missing record boot", 1000, "blocked", undefined, localRuntime.bootId, 30_000, null],
+  ["missing runtime boot", 1000, "blocked", localRuntime.bootId, undefined, 30_000, null],
+])
+  NodeTest.test(`watchdog evidence eligibility: ${name}`, async () => {
+    const { summarizeMainThread } = await import("./deep-health.mjs");
+    const summary = summarizeMainThread(
+      {
+        text: JSON.stringify({
+          kind,
+          pid: 12,
+          bootId: rowBootId,
+          reportIntervalMs: interval,
+          episode: "fixture",
+          at: new Date(now - ageMs).toISOString(),
+          blockedForMs: 10_000,
+        }),
+      },
+      now,
+      12,
+      runtimeBootId,
+    );
+    NodeAssert.equal(summary?.ongoing ?? null, expected);
+    if (name === "missing recovery") {
+      NodeAssert.equal(summary.durationMs, 10_000);
+      NodeAssert.match(summary.summary, /recovery unconfirmed/);
+    }
+  });
+
+NodeTest.test("stale unfinished watchdog evidence cannot override successful probes", async () => {
+  const current = Date.now();
+  const lagText = fixture()
+    .text.split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const row = JSON.parse(line);
+      return JSON.stringify({
+        ...row,
+        time: new Date(Date.parse(row.time) + current - now).toISOString(),
+      });
+    })
+    .join("\n");
+  const report = await deepHealth({
+    client: localClient,
+    readRuntime: () => localRuntime,
+    readTail: (file) => ({
+      text: file.endsWith("main-thread-blocked.ndjson")
+        ? JSON.stringify({
+            kind: "blocked",
+            pid: process.pid,
+            bootId: localRuntime.bootId,
+            reportIntervalMs: 30_000,
+            episode: "fixture",
+            at: new Date(current - 90_000).toISOString(),
+            blockedForMs: 10_000,
+            inFlight: [{ tool: "board_activity" }],
+          })
+        : lagText,
+      bytesRead: 2000,
+    }),
+  });
+  NodeAssert.equal(report.mainThread.recoveryUnconfirmed, true);
+  NodeAssert.equal(report.verdict, "healthy");
+});
+
+NodeTest.test("deep health reads the independent watchdog log while HTTP resets", async () => {
+  const report = await deepHealth({
+    client: {
+      url: localClient.url,
+      request: async () => {
+        throw Object.assign(new Error("private body"), { code: "ECONNRESET" });
+      },
+    },
+    readRuntime: () => localRuntime,
+    checkListener: async () => true,
+    readTail: (file) =>
+      file.endsWith("main-thread-blocked.ndjson")
+        ? {
+            text:
+              JSON.stringify({
+                kind: "blocked",
+                pid: process.pid,
+                bootId: localRuntime.bootId,
+                reportIntervalMs: 30_000,
+                episode: "fixture:1",
+                at: new Date(Date.now() - 1000).toISOString(),
+                blockedForMs: 6000,
+                inFlight: [{ tool: "board_activity", boardId: "board-crpko" }],
+                frames: [{ functionName: "queued", url: "activity.ts", lineNumber: 19 }],
+              }) + "\n",
+            bytesRead: 100,
+          }
+        : fixture(),
+  });
+  NodeAssert.equal(report.localIdentity.ok, true);
+  NodeAssert.equal(report.mainThread.ongoing, true);
+  NodeAssert.equal(report.verdict, "stalled");
+  NodeAssert.match(
+    report.summary,
+    /main thread blocked 7s by board_activity\(board-crpko\).*queued/,
+  );
+  NodeAssert.doesNotMatch(report.summary, /private body/);
+});

@@ -123,6 +123,65 @@ export function summarizeLag(tail, now = Date.now()) {
   };
 }
 
+export function summarizeMainThread(tail, now = Date.now(), pid, bootId) {
+  // A PID can be reused; only this server boot can identify its own blocked episodes.
+  if (!validBootId(bootId)) return null;
+  const episodes = new Map();
+  for (const line of tail.text.split("\n")) {
+    try {
+      const row = JSON.parse(line);
+      if (
+        !["blocked", "unblocked"].includes(row.kind) ||
+        !Number.isFinite(Date.parse(row.at)) ||
+        Date.parse(row.at) > now ||
+        typeof row.episode !== "string" ||
+        !Number.isFinite(row.blockedForMs) ||
+        row.blockedForMs < 0 ||
+        row.pid !== pid ||
+        row.bootId !== bootId
+      )
+        continue;
+      const prior = episodes.get(row.episode);
+      if (!prior || Date.parse(prior.at) < Date.parse(row.at)) episodes.set(row.episode, row);
+    } catch {
+      /* An unfinished or malformed line cannot identify a blocker. */
+    }
+  }
+  const latest = [...episodes.values()].sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
+  if (!latest || now - Date.parse(latest.at) > 15 * 60_000) return null;
+  const ageMs = now - Date.parse(latest.at);
+  const reportIntervalMs =
+    Number.isFinite(latest.reportIntervalMs) && latest.reportIntervalMs > 0
+      ? latest.reportIntervalMs
+      : 30_000;
+  // Missing recovery is not proof of a continuing block if the worker stopped writing.
+  const recoveryUnconfirmed = latest.kind === "blocked" && ageMs > 2 * reportIntervalMs + 2000;
+  const ongoing = latest.kind === "blocked" && !recoveryUnconfirmed;
+  const safe = (value) =>
+    typeof value === "string" && /^[\w.$ <>:/#@%+!~'()*-]{0,512}$/.test(value) ? value : "unknown";
+  const calls = (Array.isArray(latest.inFlight) ? latest.inFlight : []).slice(0, 16);
+  const tools = [
+    ...new Set(
+      calls.map((call) => `${safe(call.tool)}${call.boardId ? `(${safe(call.boardId)})` : ""}`),
+    ),
+  ];
+  const frames = (Array.isArray(latest.frames) ? latest.frames : [])
+    .slice(0, 3)
+    .map(
+      (frame) =>
+        `${safe(frame.functionName)} (${safe(frame.url)}:${Number.isInteger(frame.lineNumber) ? frame.lineNumber : 0})`,
+    );
+  const durationMs = latest.blockedForMs + (ongoing ? ageMs : 0);
+  return {
+    ongoing,
+    recoveryUnconfirmed,
+    durationMs,
+    tools,
+    frames,
+    summary: `main thread blocked ${(durationMs / 1000).toFixed(0)}s by ${tools.join(", ") || "unknown handler"}${frames.length ? `; ${frames.join(" → ")}` : ""}${recoveryUnconfirmed ? `; last observed ${(ageMs / 1000).toFixed(0)}s ago, recovery unconfirmed` : ""}`,
+  };
+}
+
 export function healthVerdict(lag, connection, roundTrip) {
   if (roundTrip.status === "timeout" || connection.status === "timeout" || lag.stalls5s >= 3)
     return { verdict: "stalled", exitCode: 2 };
@@ -140,6 +199,7 @@ export function healthVerdict(lag, connection, roundTrip) {
 
 export function healthLine(report) {
   const { lag, roundTrip } = report;
+  const blocked = report.mainThread ? `; ${report.mainThread.summary}` : "";
   const worst = lag.worstAt ? `, worst ${(lag.worstMs / 1000).toFixed(1)}s at ${lag.worstAt}` : "";
   const trip =
     roundTrip.status === "ok" ? `${(roundTrip.ms / 1000).toFixed(2)}s` : roundTrip.status;
@@ -151,7 +211,7 @@ export function healthLine(report) {
       : report.connection.readiness !== "healthy"
         ? `; readiness ${report.connection.readiness ?? "unavailable"}`
         : "";
-  return `${report.verdict}: ${lag.stalls1s} stalls >=1s in 10 min (${lag.stalls5s} >=5s)${worst}; round trip ${trip}; rss ${rss}${unknown}${connection}`;
+  return `${report.verdict}: ${lag.stalls1s} stalls >=1s in 10 min (${lag.stalls5s} >=5s)${worst}; round trip ${trip}; rss ${rss}${unknown}${connection}${blocked}`;
 }
 
 function safeFileError(error) {
@@ -359,7 +419,7 @@ export async function deepHealth({
   // Leave a small part of the same budget for local evidence during an HTTP stall.
   const probeBudget = budget - Math.min(2000, budget / 5);
   const stages = Object.fromEntries(
-    ["connection", "roundTrip", "runtime", "listener", "lagTail"].map((name) => [
+    ["connection", "roundTrip", "runtime", "listener", "lagTail", "mainThreadTail"].map((name) => [
       name,
       { status: "skipped", ms: 0 },
     ]),
@@ -455,18 +515,28 @@ export async function deepHealth({
         bytesRead: 0,
         error: `local runtime identity unverified (${localIdentity.reason}${localIdentity.code ? ` ${localIdentity.code}` : ""}) at ${localIdentity.stage}`,
       };
+  const blockedTail = localIdentity.ok
+    ? await stage(
+        "mainThreadTail",
+        () => readTail(NodePath.join(NodePath.dirname(logPath), "main-thread-blocked.ndjson")),
+        { text: "", bytesRead: 0 },
+      )
+    : { text: "", bytesRead: 0 };
   for (const controller of controllers) controller.abort();
   const now = Date.now();
   const lag = summarizeLag(tail, now);
+  const mainThread = summarizeMainThread(blockedTail, now, runtime?.pid, runtime?.bootId);
   const timedOut = Object.keys(stages).filter((name) => stages[name].status === "timeout");
   const report = {
     at: new Date(now).toISOString(),
     connection,
     lag,
     localIdentity,
+    mainThread,
     roundTrip,
     stages,
     ...healthVerdict(lag, connection, roundTrip),
+    ...(mainThread?.ongoing ? { verdict: "stalled", exitCode: 2 } : {}),
     ...(timedOut.length ? { status: "timeout", stage: timedOut[0], exitCode: 2 } : {}),
   };
   return {

@@ -18,6 +18,7 @@ import type * as Scope from "effect/Scope";
 import * as ServerConfig from "../config.ts";
 import * as HttpSocketTelemetry from "../ardud/http/HttpSocketTelemetry.ts";
 import * as Metrics from "./Metrics.ts";
+import * as FileDescriptors from "./FileDescriptorTelemetry.ts";
 
 // Node's delay histogram wakes a native timer every RESOLUTION_MS and records the
 // gap between wakeups, so an idle loop reads about RESOLUTION_MS and a stall of S
@@ -216,6 +217,7 @@ export const layerWith = (
   heapLimitBytes: number = NodeV8.getHeapStatistics().heap_size_limit,
   sampleSockets: Effect.Effect<void> = Effect.void,
   sampleArchiveWalBytes: Effect.Effect<number | null | undefined> = Effect.succeed(undefined),
+  fileDescriptors?: FileDescriptors.FileDescriptorTelemetry,
 ) =>
   Layer.effectDiscard(
     Effect.gen(function* () {
@@ -235,6 +237,15 @@ export const layerWith = (
           }).pipe(Effect.as(undefined)),
         ),
       );
+      const fdLimits = fileDescriptors === undefined ? undefined : yield* fileDescriptors.limits;
+      if (fdLimits !== undefined) {
+        yield* Effect.logInfo("server file descriptor limits", {
+          pid: process.pid,
+          openFdSoftLimit: fdLimits.soft,
+          openFdHardLimit: fdLimits.hard,
+        });
+      }
+      let fdPressure = false;
       let heapUsedMbPrev = 0;
       let nextMemoryLogAt = 0;
       const tick = Effect.gen(function* () {
@@ -260,6 +271,34 @@ export const layerWith = (
         }
         yield* sampleSockets;
         const archiveWalBytes = yield* sampleArchiveWalBytes;
+        const openFdCount = fileDescriptors === undefined ? null : yield* fileDescriptors.count;
+        const fdAttributes =
+          fdLimits === undefined
+            ? {}
+            : {
+                pid: process.pid,
+                openFdCount,
+                openFdSoftLimit: fdLimits.soft,
+                openFdHardLimit: fdLimits.hard,
+              };
+        let fdPressureWarning = false;
+        if (openFdCount !== null && typeof fdLimits?.soft === "number" && fdLimits.soft > 0) {
+          const aboveThreshold = openFdCount > fdLimits.soft * 0.8;
+          if (aboveThreshold && !fdPressure) {
+            yield* Effect.logWarning(
+              "server file descriptors above 80% of soft limit",
+              fdAttributes,
+            );
+            fdPressureWarning = true;
+          }
+          fdPressure = aboveThreshold;
+        }
+        // Keep warning metadata on the heartbeat/stall row so existing lag readers
+        // still recognize every row without inventing a second sampling boundary.
+        const fdLogAttributes = {
+          ...fdAttributes,
+          ...(fdPressureWarning ? { level: "WARN", fdPressureWarning: true } : {}),
+        };
         if (
           readings.heapUsedBytes > Math.min(HIGH_HEAP_BYTES, heapLimitBytes * HIGH_HEAP_RATIO) &&
           stallSink !== undefined
@@ -296,6 +335,7 @@ export const layerWith = (
             yield* encodeStallLine({
               time,
               kind: "sample",
+              ...fdLogAttributes,
               archiveWalBytes,
               gcTotalMs: readings.gc.totalMs,
               gcMajorMaxMs: readings.gc.majorMaxMs,
@@ -313,6 +353,7 @@ export const layerWith = (
         }
         const { utilization, usage, rssBytes } = readings;
         const attributes = {
+          ...fdLogAttributes,
           ...(archiveWalBytes === undefined ? {} : { archiveWalBytes }),
           delayMaxMs,
           gcCount: readings.gc.count,
@@ -384,6 +425,7 @@ export const layer = Layer.unwrap(
       Effect.tryPromise(
         async () => (await NodeFSP.stat(`${archiveFilename(dbPath)}-wal`)).size,
       ).pipe(Effect.orElseSucceed(() => null)),
+      yield* FileDescriptors.nodeTelemetry,
     );
   }),
 );

@@ -34,5 +34,6 @@ def _load(name):
 
 
 Isolated = _load("test_capacity").Isolated
+command_block = sys.modules['offbox_lib.runs'].command_block
 FakeClock = _load("test_exit_and_queue").FakeClock
 background_queue_tests = _load("test_bg_queue_detach")
