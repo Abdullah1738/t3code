@@ -577,6 +577,9 @@ export function reviewerQuietDue(
 const OUTAGE_TEXT =
   /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired|timed out waiting for response headers|model unavailable/i;
 
+export const isUnconfirmedPromptAcceptance = (failure: { readonly code: string | null }): boolean =>
+  failure.code?.startsWith("provider_prompt_acceptance_") === true;
+
 /**
  * A failed run the same request would pass once the provider is back. The normalized
  * category decides when a driver sets one: quota, transient and expired auth are outages,
@@ -589,6 +592,8 @@ export function isOutage(failure: {
   readonly message: string;
   readonly category?: string | undefined;
 }): boolean {
+  // Model health cannot prove whether a timed-out submission was admitted.
+  if (isUnconfirmedPromptAcceptance(failure)) return false;
   switch (failure.category) {
     case "quota":
     case "transient":

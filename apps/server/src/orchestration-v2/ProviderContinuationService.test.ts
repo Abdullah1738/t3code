@@ -11,6 +11,10 @@ import {
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2Notification,
 } from "@t3tools/contracts";
+import {
+  makeProviderFailure,
+  ProviderPromptAcceptanceError,
+} from "@t3tools/provider-core/server/failure";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -144,6 +148,76 @@ function layerTest(input: {
 }
 
 describe("ProviderContinuationService", () => {
+  it.effect.each(
+    (["timeout", "transport", "acknowledgement", null] as const).flatMap((reason) =>
+      (["completed", "failed", "cancelled"] as const).map((status) => ({ reason, status })),
+    ),
+  )(
+    "holds a queued uncertain mailbox steer across service recreation ($reason, $status)",
+    ({ reason, status }) =>
+      Effect.gen(function* () {
+        const original = delegatedProjection();
+        const recovered = {
+          ...original,
+          providerTurns: [],
+          runs: original.runs.map((run) => ({
+            ...run,
+            status,
+            userMessageId: MessageId.make("original-input"),
+          })),
+          messages: [
+            {
+              id: delegatedMessageId,
+              runId: parentRunId,
+              delegatedCompletion: { parentRunId, generation: 1, taskIds: [] },
+              ...(reason === null
+                ? {}
+                : {
+                    deliveryFailure: makeProviderFailure({
+                      cause: new ProviderPromptAcceptanceError({
+                        driver: ProviderDriverKind.make("opencode"),
+                        serverOrigin: "http://opencode.test",
+                        reason,
+                        budgetSeconds: 60,
+                      }),
+                    }),
+                  }),
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        for (let incarnation = 0; incarnation < 2; incarnation++) {
+          const dispatched = yield* Queue.unbounded<unknown>();
+          yield* Effect.gen(function* () {
+            const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+            const barrier = ThreadId.make(`barrier-${incarnation}`);
+            yield* requests.offer({
+              ...request(),
+              delivery: "message_text",
+              delegatedCompletion: { parentRunId, generation: 1, messageId: delegatedMessageId },
+            });
+            yield* requests.offer({ ...request(), threadId: barrier });
+            const first = (yield* Queue.take(dispatched)) as {
+              threadId: ThreadId;
+              messageId: MessageId;
+            };
+            if (reason === null) {
+              assert.equal(first.messageId, delegatedMessageId);
+              assert.equal(
+                ((yield* Queue.take(dispatched)) as { threadId: ThreadId }).threadId,
+                barrier,
+              );
+            } else assert.equal(first.threadId, barrier);
+          }).pipe(
+            Effect.provide(
+              Layer.fresh(
+                layerTest({ dispatched, getThreadRecords: () => Effect.succeed(recovered) }),
+              ),
+            ),
+            Effect.scoped,
+          );
+        }
+      }),
+  );
   it.effect("preserves the board's background completion delivery identity", () =>
     Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();

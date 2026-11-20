@@ -20,9 +20,36 @@ import {
   ClaudeTurnPreparationTimeoutError,
   ContextHandoffBudgetError,
   ContextHandoffBackgroundWorkError,
+  ProviderPromptAcceptanceError,
 } from "./failure.ts";
 import * as IdAllocator from "./IdAllocator.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+
+it.each(["timeout", "transport", "acknowledgement"] as const)(
+  "preserves uncertain prompt acceptance %s through error wrappers",
+  (reason) => {
+    const acceptance = new ProviderPromptAcceptanceError({
+      driver: ProviderDriverKind.make("opencode"),
+      serverOrigin: "http://localhost:49374",
+      reason,
+      budgetSeconds: 60,
+      cause: new TypeError("fetch failed: Bearer private-credential"),
+    });
+    for (const cause of [
+      acceptance,
+      { _tag: "ProviderAdapterTurnStartError", cause: Cause.fail(acceptance) },
+      { _tag: "ProviderAdapterSteerRunError", cause: JSON.parse(JSON.stringify(acceptance)) },
+    ]) {
+      const failure = makeProviderFailure({ cause, class: "provider_error" });
+      assert.equal(failure.category, "transient");
+      assert.equal(failure.code, `provider_prompt_acceptance_${reason}`);
+      assert.equal(failure.retryable, false);
+      assert.include(failure.message, "http://localhost:49374");
+      assert.include(failure.message, "Acceptance is unconfirmed");
+      assert.notInclude(failure.message, "private-credential");
+    }
+  },
+);
 
 it("retains Claude API diagnostics when an automatic resume also fails", () => {
   const claudeApiError = {

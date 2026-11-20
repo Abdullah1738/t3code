@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - command ids only need a random UUID.
 import * as NodeCrypto from "node:crypto";
 import * as EvaluatorAnalytics from "./evaluatorAnalytics.ts";
-import { BACKGROUND_GRACE_MS } from "./rules.ts";
+import { BACKGROUND_GRACE_MS, isUnconfirmedPromptAcceptance } from "./rules.ts";
 
 import {
   CommandId,
@@ -690,30 +690,47 @@ const make = Effect.gen(function* () {
 
   const findLastFailure: KanbanThreadsShape["findLastFailure"] = (threadId) =>
     threads.getThreadRecords(threadId, ["runs", "turnItems"], { turnItemTypes: ["error"] }).pipe(
-      Effect.map((records) => {
-        const run = latestExecutedRun(records.runs);
-        const failure =
-          latestRootProviderFailure(run, records.turnItems) ??
-          rootRuntimeLoss(run, records.turnItems) ??
-          (run?.status === "failed" ? (run.failure ?? null) : null);
-        // A failed run can leave no error item on its root node; it still counts as failed.
-        if (failure === null && run?.status === "failed") {
-          return {
-            class: "unknown",
-            message: "The run failed without an error message.",
-            code: null,
-            retryable: null,
-            runId: run.id,
-            model: run.modelSelection,
-          } as OrchestrationV2ProviderFailure & {
-            readonly runId?: string | null;
-            readonly model?: ModelSelection | null;
-          };
-        }
-        return failure === null
-          ? null
-          : { ...failure, runId: run?.id ?? null, model: run?.modelSelection ?? null };
-      }),
+      Effect.flatMap((records) =>
+        Effect.gen(function* () {
+          const run = latestExecutedRun(records.runs);
+          // A steer can lose acceptance while its original run stays healthy.
+          // Only this executed run owns recovery; older inputs cannot hold a successor.
+          const messages =
+            run === null
+              ? []
+              : (yield* threads.getThreadRecords(threadId, ["messages"], {
+                  messageRunIds: [run.id],
+                  messageRoles: ["user"],
+                })).messages;
+          const unconfirmed = messages.findLast(
+            (message) =>
+              message.deliveryFailure !== undefined &&
+              isUnconfirmedPromptAcceptance(message.deliveryFailure),
+          )?.deliveryFailure;
+          const failure =
+            unconfirmed ??
+            latestRootProviderFailure(run, records.turnItems) ??
+            rootRuntimeLoss(run, records.turnItems) ??
+            (run?.status === "failed" ? (run.failure ?? null) : null);
+          // A failed run can leave no error item on its root node; it still counts as failed.
+          if (failure === null && run?.status === "failed") {
+            return {
+              class: "unknown",
+              message: "The run failed without an error message.",
+              code: null,
+              retryable: null,
+              runId: run.id,
+              model: run.modelSelection,
+            } as OrchestrationV2ProviderFailure & {
+              readonly runId?: string | null;
+              readonly model?: ModelSelection | null;
+            };
+          }
+          return failure === null
+            ? null
+            : { ...failure, runId: run?.id ?? null, model: run?.modelSelection ?? null };
+        }),
+      ),
       Effect.mapError(
         (error) => new KanbanThreadError({ operation: "lastFailure", detail: detailOf(error) }),
       ),

@@ -2169,6 +2169,19 @@ describe("isHandoffBudget", () => {
 });
 
 describe("isOutage category", () => {
+  it.each(["timeout", "transport", "acknowledgement"])(
+    "does not recover uncertain prompt acceptance: %s",
+    (reason) => {
+      expect(
+        isOutage({
+          class: "provider_error",
+          code: `provider_prompt_acceptance_${reason}`,
+          category: "transient",
+          message: "OpenCode prompt acceptance unconfirmed",
+        }),
+      ).toBe(false);
+    },
+  );
   it("treats quota, transient and expired-auth categories as outages", () => {
     for (const category of ["quota", "transient", "auth_expired"]) {
       expect(isOutage({ class: "provider_error", code: null, message: "anything", category })).toBe(

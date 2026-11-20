@@ -132,11 +132,12 @@ const replayHttpClient = (
   controller: OpenCodeReplayController,
   replayGate: ProviderReplayGate | undefined,
   onPrompt: ((input: unknown) => void) | undefined,
+  onRequest: ((operation: string, signal: AbortSignal) => void) | undefined,
   beforeResponse: ((operation: string) => Promise<void>) | undefined,
 ) =>
   HttpClient.make((request, url) =>
     Effect.tryPromise({
-      try: async () => {
+      try: async (signal) => {
         if (controller.exited && controller.finished) {
           throw new Error("The replayed OpenCode server has exited.");
         }
@@ -155,6 +156,7 @@ const replayHttpClient = (
         // is matched only once what was recorded before it was delivered.
         if (operation.type !== "event.subscribe") await controller.untilInboundDelivered();
         if (operation.type === "session.prompt") onPrompt?.(operation.input);
+        onRequest?.(operation.type, signal);
         await controller.expectOutbound(operation);
         if (operation.type === "event.subscribe") {
           controller.exited = false;
@@ -174,6 +176,23 @@ const replayHttpClient = (
         const body = await controller.response(operation.type);
         await beforeResponse?.(operation.type);
         if (body === "<hang>") return new Promise<Response>(() => {});
+        if (body === "<transport-error>") throw new TypeError("fetch failed");
+        if (body === "<body-error>") {
+          const encoder = new TextEncoder();
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(stream) {
+                stream.enqueue(encoder.encode('{"data":'));
+              },
+              pull(stream) {
+                stream.error(new TypeError("terminated"));
+              },
+            }),
+            { headers: { "content-type": "application/json" } },
+          );
+        }
+        if (body === "<invalid-json>")
+          return new Response('{"data":', { headers: { "content-type": "application/json" } });
         if (typeof body === "object" && body !== null && "status" in body && "body" in body) {
           return new Response(encodeJson(body.body), {
             status: Number(body.status),
@@ -196,6 +215,7 @@ export const replayServer = (
   options?: {
     readonly external?: boolean;
     readonly onPrompt?: (input: unknown) => void;
+    readonly onRequest?: (operation: string, signal: AbortSignal) => void;
     readonly beforeResponse?: (operation: string) => Promise<void>;
     readonly replayGate?: ProviderReplayGate;
     readonly borrowers?: { current: number };
@@ -216,6 +236,7 @@ export const replayServer = (
           controller,
           options?.replayGate,
           options?.onPrompt,
+          options?.onRequest,
           options?.beforeResponse,
         ),
       ),
@@ -249,6 +270,7 @@ const makeReplayAdapter = (
   options?: {
     readonly external?: boolean;
     readonly onPrompt?: (input: unknown) => void;
+    readonly onRequest?: (operation: string, signal: AbortSignal) => void;
     readonly beforeResponse?: (operation: string) => Promise<void>;
     readonly replayGate?: ProviderReplayGate;
     readonly borrowers?: { current: number };
@@ -294,6 +316,7 @@ export const openCode2ReplayRuntime = (
     readonly cwd?: string;
     readonly external?: boolean;
     readonly onPrompt?: (input: unknown) => void;
+    readonly onRequest?: (operation: string, signal: AbortSignal) => void;
     readonly beforeResponse?: (operation: string) => Promise<void>;
     readonly borrowers?: { current: number };
     readonly replayGate?: ProviderReplayGate;

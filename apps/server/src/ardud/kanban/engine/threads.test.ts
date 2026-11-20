@@ -35,6 +35,10 @@ import {
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import {
+  makeProviderFailure,
+  ProviderPromptAcceptanceError,
+} from "@t3tools/provider-core/server/failure";
 
 import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 
@@ -426,6 +430,7 @@ it.effect.each(["failed", "completed"] as const)(
         Effect.succeed({
           runs: [{ id: runId, status, modelSelection: model, failure }],
           turnItems: [],
+          messages: [],
         } as never),
     });
     return Effect.gen(function* () {
@@ -444,6 +449,101 @@ it.effect.each(["failed", "completed"] as const)(
     );
   },
 );
+
+it.effect.each(
+  (["timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
+    (["running", "completed", "failed", "cancelled"] as const).map((status) => ({
+      reason,
+      status,
+    })),
+  ),
+)("current steering acceptance remains a failure after $reason ($status)", ({ reason, status }) => {
+  const threadId = ThreadId.make("thread-steer-failure");
+  const runId = RunId.make("run-steer-failure");
+  const model = { instanceId: ProviderInstanceId.make("opencode"), model: "beam-free" };
+  const failure = makeProviderFailure({
+    cause: new ProviderPromptAcceptanceError({
+      driver: ProviderDriverKind.make("opencode"),
+      serverOrigin: "http://opencode.test",
+      reason,
+      budgetSeconds: 60,
+    }),
+  });
+  const run = {
+    id: runId,
+    status,
+    ordinal: 1,
+    startedAt: at(QUESTION_AT),
+    completedAt: status === "running" ? null : at(FINISHED_AT),
+    modelSelection: model,
+    failure: null,
+  };
+  let reconciled = false;
+  let successor = false;
+  const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadRecords: (_id, fields, filter) => {
+      const current = successor ? { ...run, id: RunId.make("clean-successor"), ordinal: 2 } : run;
+      return Effect.succeed({
+        runs: [current],
+        turnItems: [],
+        messages:
+          fields.some((field) => field === "messages") && filter?.messageRunIds?.includes(runId)
+            ? [{ deliveryFailure: reconciled ? undefined : failure }]
+            : [],
+      } as never);
+    },
+  });
+  return Effect.gen(function* () {
+    const threads = yield* KanbanThreads;
+    expect(yield* threads.findLastFailure(threadId)).toEqual({ ...failure, runId, model });
+    reconciled = true;
+    expect((yield* threads.findLastFailure(threadId))?.code ?? null).toBeNull();
+    // The old message is still unresolved, but a clean executed successor owns recovery now.
+    reconciled = false;
+    successor = true;
+    expect((yield* threads.findLastFailure(threadId))?.code ?? null).toBeNull();
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(management),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  );
+});
+
+it.effect("a failed steering failure read cannot report a clean current run", () => {
+  const threadId = ThreadId.make("thread-steer-read-failed");
+  const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadRecords: (_id, fields) =>
+      fields.some((field) => field === "messages")
+        ? Effect.fail(
+            new Orchestrator.OrchestratorProjectionError({
+              threadId,
+              cause: "message read failed",
+            }),
+          )
+        : Effect.succeed({
+            runs: [{ id: RunId.make("active"), status: "running" }],
+            turnItems: [],
+          } as never),
+  });
+  return Effect.gen(function* () {
+    const threads = yield* KanbanThreads;
+    const result = yield* Effect.result(threads.findLastFailure(threadId));
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result)) expect(result.failure.operation).toBe("lastFailure");
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(management),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  );
+});
 
 it.effect.each(["first", "second", "missing", "completed", "none"] as const)(
   "active model reads the recorded run instead of a next-turn selection (%s)",
