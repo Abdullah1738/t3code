@@ -550,17 +550,19 @@ class CheckEntry(Base):
 
     def test_watchdog_dumps_and_exits_during_a_c_level_hang(self):
         script = Path(__file__).with_name('cases.py')
+        # Enter the C hang before lock/cache I/O can consume the short watchdog allowance.
         code = (f'import ctypes, runpy, time\nns = runpy.run_path({str(script)!r})\n'
                 'def hang(*args):\n'
                 '    print(time.time(), flush=True)\n'
                 '    ctypes.CDLL(None).sleep(3)\n'
-                'ns["main"].__globals__["run_check"] = hang\n'
+                'ns["main"].__globals__["check_command"] = hang\n'
                 'raise SystemExit(ns["main"](["check"]))')
         env = {'HOME': str(self.tmp), 'PATH': '/usr/bin:/bin', 'LANG': 'en_US.UTF-8',
                'WATCH_DIR': str(self.wd), 'MONEY_CASES_DIR': str(self.data), 'MONEY_CASES_HARD_STOP': '0.15'}
         done = subprocess.run(['/usr/bin/python3', '-B', '-c', code], env=env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, start_new_session=True, timeout=5)
         # The watchdog is armed inside main; imports on the checkout mount are outside its budget.
+        self.assertTrue(done.stdout.strip(), done.stderr)
         self.assertLess(time.time() - float(done.stdout.strip()), 1)
         self.assertEqual(done.returncode, 1)
         self.assertIn('Timeout', done.stderr)
