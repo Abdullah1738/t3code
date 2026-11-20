@@ -2753,6 +2753,54 @@ bash "$TASK_DIR/step5r.sh"
                         with self.subTest(command=command):
                             self.assertEqual(self.classify(command), expected)
 
+    def test_bun_115_exec_value_options_select_shell_operand(self):
+        self.write('empty.env', '')
+        self.write('empty.toml', '')
+        self.write('tsconfig.json', '{}')
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        options = {
+            '--env-file': 'empty.env', '--cwd': '.', '--config': 'empty.toml', '-c': 'empty.toml',
+            '--filter': 'pkg*', '-F': 'pkg*', '--elide-lines': '2', '--shell': 'bun',
+            '--watch-kill-signal': 'SIGTERM', '--cpu-prof-name': 'cpu', '--cpu-prof-dir': '.',
+            '--cpu-prof-interval': '1000', '--heap-prof-name': 'heap', '--heap-prof-dir': '.',
+            '--heap-prof-interval': '524288', '--install': 'fallback', '--port': '3000',
+            '--conditions': 'development', '--fetch-preconnect': 'https://example.invalid',
+            '--max-http-header-size': '16384', '--dns-result-order': 'verbatim',
+            '--redirect-warnings': 'warnings.log', '--disable-warning': 'DEP0005',
+            '--title': 'bun exec test', '--unhandled-rejections': 'strict', '--console-depth': '2',
+            '--user-agent': 'bun test', '--cron-title': 'test', '--cron-period': '1000',
+            '--main-fields': 'main', '--extension-order': '.ts,.js',
+            '--tsconfig-override': 'tsconfig.json', '--define': 'TEST:true', '-d': 'TEST:true',
+            '--drop': 'console', '--feature': 'TEST', '--loader': '.js:js', '-l': '.js:js',
+            '--jsx-factory': 'React.createElement', '--jsx-fragment': 'React.Fragment',
+            '--jsx-import-source': 'react', '--jsx-runtime': 'automatic',
+        }
+        for flag, value in options.items():
+            for operand_separator in (' ', '='):
+                option = flag + operand_separator + shlex.quote(value)
+                for prefix in ('bun ' + option + ' exec', 'bun exec ' + option,
+                               'bun ' + option + ' exec ' + option):
+                    for separator in (' ', ' -- '):
+                        for name, expected in (('safe', None), ('bad', SCRIPT)):
+                            command = prefix + separator + shlex.quote('node ' + name + '.js')
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_exec_optional_inspect_values(self):
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        # Bun only takes an inspector address when attached with '='.
+        for flag in ('--inspect', '--inspect-wait', '--inspect-brk'):
+            for suffix in ('', '=127.0.0.1:0'):
+                option = flag + suffix
+                for prefix in ('bun ' + option + ' exec', 'bun exec ' + option):
+                    for separator in (' ', ' -- '):
+                        for name, expected in (('safe', None), ('bad', SCRIPT)):
+                            command = prefix + separator + shlex.quote('node ' + name + '.js')
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), expected)
+
     def test_bun_115_exec_delimiter_preserves_leading_dash_body(self):
         self.write('safe.js', 'console.log("ok")')
         self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')

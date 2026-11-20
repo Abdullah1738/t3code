@@ -90,7 +90,19 @@ BUN_SUBCOMMANDS = {
     'dedupe', 'prune', 'link', 'unlink', 'publish', 'patch', 'pm', 'info', 'why',
     'build', 'init', 'create', 'c', 'upgrade', 'completions', 'x', 'repl', 'exec',
 }
-BUN_VALUE_OPTIONS = {'--cwd', '--filter', '-F', '--elide-lines', '--shell'}
+# Required global operands from Bun 1.4 help. Inspector addresses are '=' only;
+# preload and inline code operands stay on their content-scanning paths.
+BUN_VALUE_OPTIONS = {
+    '--cwd', '--filter', '-F', '--elide-lines', '--shell', '--watch-kill-signal',
+    '--cpu-prof-name', '--cpu-prof-dir', '--cpu-prof-interval', '--heap-prof-name',
+    '--heap-prof-dir', '--heap-prof-interval', '--install', '--port', '--conditions',
+    '--fetch-preconnect', '--max-http-header-size', '--dns-result-order',
+    '--redirect-warnings', '--disable-warning', '--title', '--unhandled-rejections',
+    '--console-depth', '--user-agent', '--cron-title', '--cron-period', '--main-fields',
+    '--extension-order', '--tsconfig-override', '--define', '-d', '--drop', '--feature',
+    '--loader', '-l', '--jsx-factory', '--jsx-fragment', '--jsx-import-source',
+    '--jsx-runtime', '--env-file', '--config', '-c',
+}
 # Bun 1.4 test options; optional numeric operands must not swallow a test file.
 BUN_TEST_VALUE_OPTIONS = {
     '-t', '--test-name-pattern', '--timeout', '--rerun-each', '--retry', '--seed',
