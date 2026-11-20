@@ -93,6 +93,9 @@ def rollup(day, root=None, now=None):
     clients = defaultdict(lambda: dict(count=0, aborted=0))
     keys = defaultdict(lambda: dict(count=0, aborted=0))
     other_products = defaultdict(lambda: dict(count=0, aborted=0))
+    providers = defaultdict(lambda: dict(count=0, aborted=0, statuses=Counter()))
+    provider_tokens, model_tokens = defaultdict(Counter), defaultdict(Counter)
+    upstream_codes = Counter()
     attempts = Counter()
     abort_ttfb = []
     locks, lock_accounts = {}, Counter()
@@ -257,6 +260,23 @@ def rollup(day, root=None, now=None):
                         group['count'] += 1
                         aborted = props.get('status') == 499 or props.get('clientState', props.get('client')) == 'aborted'
                         group['aborted'] += aborted
+                        provider = props.get('provider')
+                        provider = provider if isinstance(provider, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', provider) else 'unknown'
+                        served = providers[provider]
+                        served['count'] += 1
+                        served['aborted'] += aborted
+                        status = props.get('status')
+                        served['statuses'][str(status) if type(status) is int and 100 <= status <= 599 else 'unknown'] += 1
+                        usage = props.get('usage')
+                        if isinstance(usage, dict):
+                            for field in ('in', 'out', 'reasoning', 'cacheRead', 'cacheWrite'):
+                                value = usage.get(field)
+                                if metric(value):
+                                    provider_tokens[provider][field] += value
+                                    model_tokens[(provider, key[0])][field] += value
+                        upstream_code = props.get('upstreamCode')
+                        if isinstance(upstream_code, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', upstream_code):
+                            upstream_codes[upstream_code] += 1
                         model = models[key[0]]
                         model['count'] += 1
                         model['aborted'] += aborted
@@ -323,6 +343,10 @@ def rollup(day, root=None, now=None):
         byModel=caller_breakdown(models, 'model'),
         byClient=caller_breakdown(clients, 'client'),
         byKeyId=caller_breakdown(keys, 'keyId'),
+        byProvider=caller_breakdown(providers, 'provider'),
+        tokensByProvider=[dict(provider=p, usage=dict(u)) for p, u in sorted(provider_tokens.items())],
+        tokensByProviderModel=[dict(provider=p, model=m, usage=dict(u)) for (p, m), u in sorted(model_tokens.items())],
+        upstreamCodeCounts=dict(sorted(upstream_codes.items())),
         otherByUaProduct=caller_breakdown(other_products, 'uaProduct'),
         unregisteredRequests=sum(g['count'] for k, g in keys.items() if k.startswith('unreg:')),
         distinctUnregisteredKeys=sum(k.startswith('unreg:') for k in keys),
