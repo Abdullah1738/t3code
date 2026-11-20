@@ -72,8 +72,8 @@ backup keys are `backup.run:health` and `backup.run:memory`.
 
 Each row includes the exact `kern.boottime` epoch and UTC `bootTime` when
 available. The minute CPU sampler and hourly collector share a nonblocking boot
-lock. After a three-minute startup grace, `boot.observed` records the previous
-boot, the last prior sample's uptime, the gap from the last prior log row,
+lock. After the ten-minute panic-file window closes, `boot.observed` records
+the previous boot, the last prior sample's uptime, the gap from the last prior log row,
 ResetCounter faults/failure count, panic files within ten minutes of boot and
 Jetsam reports in the preceding two hours. Missing evidence remains null or
 carries a per-field source error. The gap measures logging silence; it does
@@ -87,7 +87,12 @@ three minutes of boot, with a 15-second process-group deadline and timestamp
 post-filtering. ResetCounter uses plain reads, without sudo. Observations are
 timestamped at boot (`observedAt` records collection time), persisted once per
 boot and survive the daily log cap. Unclean boots queue one
-Telegram alert with a stable boot key; failed sends retry that same key/text.
+Telegram alert with a stable boot key; failed sends retry that same key/text,
+even across later boots. Unfinished observations remain in a persistent queue;
+each invocation retries one queued boot alongside the current boot. A late
+append to an earlier UTC day rebuilds that day's rollup and publishes updated
+`log.rollup` counts with its `day`; failed repairs remain queued. Rollup writers
+share a per-day lock so an older snapshot cannot overwrite a repair.
 CPU process, host-tick and child baselines reset on boot changes. Rollups add
 `boots` and `uncleanBoots`, also emitted in `log.rollup`.
 

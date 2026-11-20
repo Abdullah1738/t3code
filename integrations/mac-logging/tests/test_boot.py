@@ -1,4 +1,5 @@
 import datetime as dt
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -97,7 +98,7 @@ class BootTests(unittest.TestCase):
                 self.assertIn(props['source']['bootFaults']['error'], ('missing', 'reset_unreadable'))
                 props['bootTime'] = boot.iso(BOOT+int(unreadable))
                 with patch.object(boot, 'collect', return_value=props):
-                    boot.observe(boot=BOOT+int(unreadable), now=BOOT+400, notify=lambda *a, **kw: True)
+                    boot.observe(boot=BOOT+int(unreadable), now=BOOT+700, notify=lambda *a, **kw: True)
         self.assertEqual(len([r for r in self.rows() if r['name'] == 'boot.observed']), 2)
 
     def test_source_timeouts_do_not_suppress(self):
@@ -115,7 +116,7 @@ class BootTests(unittest.TestCase):
             return True
         with patch.object(boot, 'collect', return_value=self.collect()) as collect:
             for _ in range(3):
-                boot.observe(boot=BOOT, now=BOOT+400, notify=notify)
+                boot.observe(boot=BOOT, now=BOOT+700, notify=notify)
         self.assertEqual(collect.call_count, 1)
         self.assertEqual(len(sent), 1)
         self.assertEqual(len([r for r in self.rows() if r['name'] == 'boot.observed']), 1)
@@ -129,7 +130,7 @@ class BootTests(unittest.TestCase):
                 raise subprocess.TimeoutExpired('notify', 10)
             return True
         with patch.object(boot, 'collect', return_value=self.collect()):
-            for offset in (400, 500, 600):
+            for offset in (700, 800, 900):
                 boot.observe(boot=BOOT, now=BOOT+offset, notify=notify)
         self.assertEqual(sends, [sends[0], sends[0]])
         self.assertEqual(len([r for r in self.rows() if r['name'] == 'boot.observed']), 1)
@@ -144,14 +145,16 @@ class BootTests(unittest.TestCase):
 
     def test_failed_append_does_not_advance(self):
         with patch.object(boot, 'collect', return_value=self.collect()), patch.object(boot, 'emit', return_value=False):
-            boot.observe(boot=BOOT, now=BOOT+400)
+            boot.observe(boot=BOOT, now=BOOT+700)
         self.assertFalse(jobs.read_state('boot')['emitted'])
 
     def test_grace_period(self):
         with patch.object(boot, 'collect') as collect:
-            boot.observe(boot=BOOT, now=BOOT+179)
+            for offset in (0, 179, 200, 599.999):
+                boot.observe(boot=BOOT, now=BOOT+offset)
         collect.assert_not_called()
-        self.assertFalse((self.root/'logs').exists())
+        self.assertEqual(self.rows(), [])
+        self.assertFalse((self.root/'logs/state/boot.json').exists())
 
     def test_prior_sample_gap_and_legacy_memory_epoch(self):
         root = self.root/'logs'
@@ -180,7 +183,7 @@ class BootTests(unittest.TestCase):
         props = self.collect()
         props['clean'] = True
         with patch.object(boot, 'collect', return_value=props), patch.object(boot, 'alert_text') as alert:
-            boot.observe(boot=BOOT, now=BOOT+400)
+            boot.observe(boot=BOOT, now=BOOT+700)
         alert.assert_not_called()
 
     def test_row_identity_microseconds(self):
@@ -192,7 +195,7 @@ class BootTests(unittest.TestCase):
 
     def test_rollup_and_cap_preserve_boot(self):
         props = self.collect()
-        at = dt.datetime.fromtimestamp(BOOT+400, boot.UTC)
+        at = dt.datetime.fromtimestamp(BOOT+700, boot.UTC)
         with patch.object(toollog, 'CAP_BYTES', 0):
             for _ in range(2):
                 self.assertTrue(toollog.emit('boot', 'event', 'boot.observed', props=props, now=at))
@@ -228,7 +231,7 @@ class BootTests(unittest.TestCase):
         props = self.collect()
         props['bootTime'] = boot.iso(at)
         with patch.object(boot, 'collect', return_value=props):
-            boot.observe(boot=at, now=at+400, notify=lambda *a, **kw: True)
+            boot.observe(boot=at, now=at+700, notify=lambda *a, **kw: True)
         self.assertTrue((self.root/'logs/2026-11-16.ndjson').exists())
         self.assertEqual(rollup('2026-11-16', self.root/'logs')['boots'], 1)
         self.assertEqual(rollup('2026-11-17', self.root/'logs')['boots'], 0)
@@ -263,11 +266,11 @@ class BootTests(unittest.TestCase):
         jobs.save_state('boot', dict(bootEpoch=BOOT, props=props, emitted=False, alerted=False, eventAt=BOOT))
         with patch.object(boot, 'recovered', side_effect=boot.SourceFailure('timeout', 'fixture')):
             with self.assertRaises(boot.SourceFailure):
-                boot.observe(boot=BOOT, now=BOOT+400)
+                boot.observe(boot=BOOT, now=BOOT+700)
         self.assertFalse(jobs.read_state('boot')['emitted'])
         self.assertFalse(jobs.read_state('boot')['alerted'])
         self.assertFalse(any(r['name'] == 'boot.observed' for r in self.rows()))
-        boot.observe(boot=BOOT, now=BOOT+500, notify=lambda *a, **kw: True)
+        boot.observe(boot=BOOT, now=BOOT+800, notify=lambda *a, **kw: True)
         self.assertEqual(len([r for r in self.rows() if r['name'] == 'boot.observed']), 1)
 
     def test_first_append_ignores_oversized_log_prefix(self):
@@ -279,7 +282,7 @@ class BootTests(unittest.TestCase):
             stream.seek(52*1024*1024)
             stream.write(b'\n')
         with patch.object(boot, 'collect', return_value=self.collect()), patch.object(boot, 'recovered') as recovery:
-            boot.observe(boot=BOOT, now=BOOT+400, notify=lambda *a, **kw: True)
+            boot.observe(boot=BOOT, now=BOOT+700, notify=lambda *a, **kw: True)
         recovery.assert_not_called()
         self.assertTrue(jobs.read_state('boot')['emitted'])
         with path.open('rb') as stream:
@@ -299,7 +302,7 @@ class BootTests(unittest.TestCase):
         sent = []
         with patch.object(boot, 'RECOVERY_BYTES', 30):
             for index in range(12):
-                boot.observe(boot=BOOT, now=BOOT+400+index, notify=lambda *a, **kw: sent.append(a) or True)
+                boot.observe(boot=BOOT, now=BOOT+700+index, notify=lambda *a, **kw: sent.append(a) or True)
                 if index < 9:
                     state = jobs.read_state('boot')
                     self.assertEqual(state['recoveryOffset'], (index+1)*30)
@@ -318,7 +321,7 @@ class BootTests(unittest.TestCase):
         sent = []
         with patch.object(boot, 'RECOVERY_BYTES', 30):
             for index in range(12):
-                boot.observe(boot=BOOT, now=BOOT+400+index, notify=lambda *a, **kw: sent.append(a) or True)
+                boot.observe(boot=BOOT, now=BOOT+700+index, notify=lambda *a, **kw: sent.append(a) or True)
         self.assertEqual(len(sent), 1)
         self.assertEqual(path.read_text().count('boot.observed'), 1)
         self.assertTrue(jobs.read_state('boot')['emitted'])
@@ -332,7 +335,7 @@ class BootTests(unittest.TestCase):
         jobs.save_state('boot', dict(bootEpoch=BOOT, props=props, emitted=False, alerted=False, eventAt=BOOT))
         with patch.object(boot, 'recovered', side_effect=expire):
             with self.assertRaises(boot.SourceFailure):
-                boot.observe(boot=BOOT, now=BOOT+400)
+                boot.observe(boot=BOOT, now=BOOT+700)
         self.assertFalse(jobs.read_state('boot')['emitted'])
 
     def test_stop_after_recovery_checkpoint_cannot_skip_marker(self):
@@ -347,9 +350,225 @@ class BootTests(unittest.TestCase):
             raise RuntimeError('collector stopped after atomic checkpoint')
         with patch.object(boot, 'save_state', side_effect=stop_after_commit):
             with self.assertRaises(RuntimeError):
-                boot.observe(boot=BOOT, now=BOOT+400)
+                boot.observe(boot=BOOT, now=BOOT+700)
         self.assertTrue(jobs.read_state('boot')['emitted'])
         sent = []
-        boot.observe(boot=BOOT, now=BOOT+500, notify=lambda *a, **kw: sent.append(a) or True)
+        boot.observe(boot=BOOT, now=BOOT+800, notify=lambda *a, **kw: sent.append(a) or True)
         self.assertEqual(len([r for r in self.rows() if r['name'] == 'boot.observed']), 1)
         self.assertEqual(len(sent), 1)
+
+    def test_delayed_panic_before_window_close(self):
+        # Cover both panic report forms and each side of the inclusive window.
+        real_collect = boot.collect
+        forms = [('panic', '.panic', 300, True), ('ips', '.ips', 300, True),
+                 ('window_end', '.panic', 600, True), ('outside', '.panic', 601, False)]
+        for label, suffix, offset, present in forms:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                with patch.dict(os.environ, TOOLLOG_DIR=tmp), \
+                     patch.object(boot, 'parse_last', return_value=(True, BOOT-86400)), \
+                     patch.object(boot, 'collect', side_effect=lambda at, **kw: real_collect(at, roots=[self.reports], run=self.runner, root=Path(tmp))) as collect:
+                    sent = []
+                    notify = lambda *args, **kw: sent.append(args[:2]) or True
+                    boot.observe(boot=BOOT, now=BOOT+200, notify=notify)
+                    collect.assert_not_called()
+                    self.assertEqual(list(Path(tmp).glob('*.ndjson')), [])
+                    path = self.reports/(label+suffix)
+                    path.write_text(json.dumps(dict(timestamp=boot.iso(BOOT+offset), bug_type='210'))
+                                    if suffix == '.ips' else 'panic')
+                    os.utime(path, (BOOT+offset, BOOT+offset))
+                    for now in (BOOT+660, BOOT+720):
+                        boot.observe(boot=BOOT, now=now, notify=notify)
+                    rows = [json.loads(line) for p in Path(tmp).glob('*.ndjson') for line in p.read_text().splitlines()]
+                    observed = [r for r in rows if r['name'] == 'boot.observed']
+                    self.assertEqual(len(observed), 1)
+                    self.assertEqual(observed[0]['props']['panic']['present'], present)
+                    self.assertEqual(observed[0]['props']['clean'], not present)
+                    self.assertEqual(len(sent), int(present))
+                    self.assertEqual(collect.call_count, 1)
+                    self.assertEqual(jobs.read_state('boot')['props']['panic']['present'], present)
+                    path.unlink()
+
+    def test_failed_alert_survives_new_boots(self):
+        for failure in ('false', 'timeout'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                with patch.dict(os.environ, TOOLLOG_DIR=tmp):
+                    attempts, successes = [], []
+                    available = False
+                    def notify(text, key, *args, **kwargs):
+                        attempts.append((text, key))
+                        if not available:
+                            if failure == 'timeout':
+                                raise subprocess.TimeoutExpired('notify', 10)
+                            return False
+                        successes.append((text, key))
+                        return True
+                    def collect(at, **kwargs):
+                        props = self.collect(at)
+                        props['lastSampleGapS'] = at-BOOT+10
+                        return props
+                    boot.observe(boot=BOOT, now=BOOT+700, collect_fn=collect, notify=notify)
+                    # Simulate a pending state from the previous release/schema.
+                    state = jobs.read_state('boot')
+                    state.pop('pending')
+                    jobs.save_state('boot', state)
+                    next_boot = BOOT+3600
+                    boot.observe(boot=next_boot, now=next_boot+700, collect_fn=collect, notify=notify)
+                    state = jobs.read_state('boot')
+                    self.assertEqual([s['bootEpoch'] for s in state['pending']], [BOOT])
+                    self.assertFalse(state['alerted'])
+                    available = True
+                    third_boot = next_boot+3600
+                    boot.observe(boot=third_boot, now=third_boot+700, collect_fn=collect, notify=notify)
+                    state = jobs.read_state('boot')
+                    self.assertEqual([s['bootEpoch'] for s in state['pending']], [next_boot])
+                    for _ in range(2):
+                        boot.observe(boot=third_boot, now=third_boot+760, collect_fn=collect, notify=notify)
+                    self.assertEqual(len(successes), 3)
+                    self.assertEqual({key for _, key in successes},
+                                     {'mac-boot:%.6f' % at for at in (BOOT, next_boot, third_boot)})
+                    self.assertEqual(successes[0], attempts[0])
+                    self.assertEqual(successes[-1], attempts[2])
+                    self.assertEqual(jobs.read_state('boot')['pending'], [])
+                    rows = [json.loads(line) for p in Path(tmp).glob('*.ndjson') for line in p.read_text().splitlines()]
+                    self.assertEqual(len([r for r in rows if r['name'] == 'boot.observed']), 3)
+
+    def test_pending_alert_retries_during_next_boot_grace(self):
+        with patch.object(boot, 'collect', return_value=self.collect()) as collect:
+            boot.observe(boot=BOOT, now=BOOT+700, notify=lambda *a, **kw: False)
+            sent = []
+            boot.observe(boot=BOOT+3600, now=BOOT+3800, notify=lambda *a, **kw: sent.append(a) or True)
+        self.assertEqual(collect.call_count, 1)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1], 'mac-boot:%.6f' % BOOT)
+        self.assertTrue(jobs.read_state('boot')['alerted'])
+
+    def test_pending_append_survives_next_boot(self):
+        def collect(at, **kwargs):
+            return self.collect(at)
+        with patch.object(boot, 'emit', return_value=False):
+            boot.observe(boot=BOOT, now=BOOT+700, collect_fn=collect)
+        sent = []
+        for _ in range(2):
+            boot.observe(boot=BOOT+3600, now=BOOT+4300, collect_fn=collect,
+                         notify=lambda *a, **kw: sent.append(a) or True)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(jobs.read_state('boot')['pending'], [])
+        self.assertEqual(len([r for r in self.rows() if r['name'] == 'boot.observed']), 2)
+
+    def test_failed_queued_alert_does_not_block_current_boot(self):
+        for clean in (False, True):
+            with self.subTest(clean=clean), tempfile.TemporaryDirectory() as tmp:
+                with patch.dict(os.environ, TOOLLOG_DIR=tmp):
+                    def collect(at, **kwargs):
+                        props = self.collect(at)
+                        props['clean'] = clean if at != BOOT else False
+                        return props
+                    boot.observe(boot=BOOT, now=BOOT+700, collect_fn=collect, notify=lambda *a, **kw: False)
+                    sent = []
+                    def notify(text, key, *args, **kw):
+                        sent.append(key)
+                        return key != 'mac-boot:%.6f' % BOOT
+                    boot.observe(boot=BOOT+3600, now=BOOT+4300, collect_fn=collect, notify=notify)
+                    state = jobs.read_state('boot')
+                    self.assertTrue(state['alerted'])
+                    self.assertFalse(state['pending'][0]['alerted'])
+                    self.assertEqual(len(sent), 1 if clean else 2)
+                    boot.observe(boot=BOOT+3600, now=BOOT+4360, collect_fn=collect,
+                                 notify=lambda *a, **kw: sent.append(a[1]) or True)
+                    self.assertEqual(jobs.read_state('boot')['pending'], [])
+                    self.assertEqual(sent.count('mac-boot:%.6f' % (BOOT+3600)), int(not clean))
+
+    def test_queued_recovery_timeout_does_not_block_current_boot(self):
+        props = self.collect()
+        jobs.save_state('boot', dict(bootEpoch=BOOT, props=props, emitted=False, alerted=False,
+                                    eventAt=BOOT, appendAttempted=True))
+        with patch.object(boot, 'recovered', side_effect=boot.SourceFailure('timeout', 'fixture')):
+            boot.observe(boot=BOOT+3600, now=BOOT+4300, collect_fn=lambda at, **kw: self.collect(at),
+                         notify=lambda *a, **kw: True)
+        state = jobs.read_state('boot')
+        self.assertTrue(state['emitted'])
+        self.assertTrue(state['alerted'])
+        self.assertFalse(state['pending'][0]['emitted'])
+        self.assertEqual(len([r for r in self.rows() if r['name'] == 'boot.observed']), 1)
+
+    def test_queued_append_keeps_original_boot_identity(self):
+        first = BOOT+.673004
+        second = first+86400
+        def collect(at, **kwargs):
+            return self.collect(at)
+        with patch.object(boot, 'emit', return_value=False):
+            boot.observe(boot=first, now=first+700, collect_fn=collect)
+        with patch.object(toollog, 'identity', return_value=dict(bootEpoch=second, bootTime=boot.iso(second))):
+            boot.observe(boot=second, now=second+700, collect_fn=collect, notify=lambda *a, **kw: True)
+        rows = [r for r in self.rows() if r['name'] == 'boot.observed']
+        self.assertEqual(len(rows), 2)
+        for row, at in zip(rows, (first, second)):
+            self.assertEqual(row['bootEpoch'], at)
+            self.assertEqual(row['bootTime'], boot.iso(at))
+            self.assertEqual(row['bootTime'], row['props']['bootTime'])
+
+    def test_after_midnight_boot_repairs_completed_rollup(self):
+        import collector
+        at = boot.epoch('2026-11-16T23:59:00Z')
+        def collect(value, **kwargs):
+            return self.collect(value)
+        boot.observe(boot=at, now=at+420, collect_fn=collect)
+        self.assertTrue(collector.collect(now=at+420, roots=[], log_reader=lambda *a: {}))
+        path = self.root/'logs/rollup-2026-11-16.json'
+        self.assertEqual(json.loads(path.read_text())['boots'], 0)
+        self.assertEqual(jobs.read_state('crashes')['rollupDay'], '2026-11-16')
+        for _ in range(2):
+            boot.observe(boot=at, now=at+660, collect_fn=collect, notify=lambda *a, **kw: True)
+        daily = json.loads(path.read_text())
+        self.assertEqual((daily['boots'], daily['uncleanBoots']), (1, 1))
+        rows = [r for r in self.rows() if r['name'] == 'log.rollup' and r.get('ok')]
+        self.assertEqual([r['props']['boots'] for r in rows], [0, 1])
+        self.assertEqual(rows[-1]['props']['day'], '2026-11-16')
+        self.assertTrue(jobs.read_state('boot')['rollupDone'])
+
+    def test_queued_append_repairs_older_rollup(self):
+        with patch.object(boot, 'emit', return_value=False):
+            boot.observe(boot=BOOT, now=BOOT+700, collect_fn=lambda at, **kw: self.collect(at))
+        rollup('2026-11-16', self.root/'logs')
+        jobs.save_state('crashes', dict(rollupDay='2026-11-17'))
+        at = BOOT+2*86400
+        boot.observe(boot=at, now=at+700, collect_fn=lambda value, **kw: self.collect(value),
+                     notify=lambda *a, **kw: True)
+        daily = json.loads((self.root/'logs/rollup-2026-11-16.json').read_text())
+        self.assertEqual((daily['boots'], daily['uncleanBoots']), (1, 1))
+        self.assertEqual(jobs.read_state('crashes')['rollupDay'], '2026-11-17')
+        self.assertEqual(jobs.read_state('boot')['pending'], [])
+        published = [r['props'] for r in self.rows() if r['name'] == 'log.rollup' and r.get('ok')]
+        self.assertEqual([(r['day'], r['boots']) for r in published], [('2026-11-16', 1)])
+
+    def test_rollup_lock_and_publication_failure_remain_retryable(self):
+        import rollup as daily
+        at = boot.epoch('2026-11-16T23:59:00Z')
+        self.root.joinpath('logs/state').mkdir(parents=True)
+        sent = []
+        notify = lambda *a, **kw: sent.append(a) or True
+        def collect(value, **kwargs):
+            return self.collect(value)
+        lock_path = self.root/'logs/state/rollup-2026-11-16.lock'
+        with lock_path.open('a') as lock, patch.object(daily, 'aggregate', wraps=daily.aggregate) as aggregate:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Neither the normal collector nor a late-boot repair may read an
+            # older snapshot and publish it over another writer's newer counts.
+            with self.assertRaises(BlockingIOError):
+                rollup('2026-11-16', self.root/'logs', publish=True)
+            boot.observe(boot=at, now=at+660, collect_fn=collect, notify=notify)
+            aggregate.assert_not_called()
+        state = jobs.read_state('boot')
+        self.assertFalse(state.get('rollupDone', False))
+        self.assertTrue(state['alerted'])
+        with patch.object(daily, 'emit', return_value=False):
+            boot.observe(boot=at, now=at+720, collect_fn=collect, notify=notify)
+        self.assertFalse(jobs.read_state('boot').get('rollupDone', False))
+        next_boot = at+86400
+        # The incomplete repair also survives a second reboot.
+        for _ in range(2):
+            boot.observe(boot=next_boot, now=next_boot+700, collect_fn=collect, notify=notify)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(jobs.read_state('boot')['pending'], [])
+        self.assertEqual(json.loads((self.root/'logs/rollup-2026-11-16.json').read_text())['boots'], 1)
+        self.assertEqual(len([r for r in self.rows() if r['name'] == 'boot.observed']), 2)

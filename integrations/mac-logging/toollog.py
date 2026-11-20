@@ -681,6 +681,13 @@ def safe_fields(values, event=None):
         return host_fields(values, event)
     if event == 'boot.observed':
         return boot_fields(values)
+    if event == 'log.rollup':
+        result = safe_fields(values)
+        try:
+            result['day'] = dt.date.fromisoformat(values['day']).isoformat()
+        except (KeyError, TypeError, ValueError):
+            pass
+        return result
     if event == 'scan.volume_crawl':
         result = {}
         for key, value in (values or {}).items():
@@ -906,7 +913,9 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
         raise ValueError('invalid component')
     row = dict(ts=now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), tool='mac',
                component=component, kind=kind, name=name)
-    boot_id = identity()
+    # Boot observations use the original boot timestamp, including queued writes.
+    boot_id = (dict(bootEpoch=now.timestamp(), bootTime=now.isoformat().replace('+00:00', 'Z'))
+               if name == 'boot.observed' else identity())
     if boot_id:
         row.update(boot_id)
     if finite_number(duration_ms) and duration_ms >= 0:

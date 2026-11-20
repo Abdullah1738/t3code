@@ -285,68 +285,109 @@ def recovered(path, boot_time, offset):
         return False, 0, True
 
 
+def observation_done(state):
+    return state.get('emitted') and state.get('alerted') and state.get('rollupDone')
+
+
+def finish_observation(state, checkpoint, run, notify, now):
+    if not state.get('emitted'):
+        path = directory()/(dt.datetime.fromtimestamp(state['eventAt'], UTC).date().isoformat()+'.ndjson')
+        found = False
+        if state.get('appendAttempted', True):
+            # Recover an append completed before its state checkpoint.
+            # Older pending states start at zero and make bounded progress.
+            found, offset, complete = deadline_call(time.monotonic()+5, recovered, path,
+                state['props']['bootTime'], state.get('recoveryOffset', 0))
+            # A recovered marker and its consumed cursor commit together;
+            # saving only the cursor could skip that marker after a crash.
+            state.update(recoveryOffset=offset, emitted=found)
+            checkpoint()
+            if not complete:
+                return
+        if not found:
+            # Record the earliest possible append position before calling
+            # emit: a crash/uncertain write only needs to scan this tail.
+            state.update(appendAttempted=True,
+                         recoveryOffset=deadline_call(time.monotonic()+5, log_size, path))
+            checkpoint()
+            if not emit('boot', 'event', 'boot.observed', props=state['props'], ok=True,
+                        now=dt.datetime.fromtimestamp(state['eventAt'], UTC)):
+                return
+        state['emitted'] = True
+        checkpoint()
+    if not state.get('alerted'):
+        if notify is None:
+            from collector import notify as send
+        else:
+            send = notify
+        key = 'mac-boot:%.6f' % state['bootEpoch']
+        try:
+            sent = send(alert_text(state['props']), key, run, timeout=10)
+        except Exception:
+            sent = False
+        state['alerted'] = bool(sent)
+        checkpoint()
+        emit('boot', 'event' if sent else 'error', 'boot.alert', ok=bool(sent),
+             error_tag=None if sent else 'boot.notify_failed')
+    if not state.get('rollupDone'):
+        event_day = dt.datetime.fromtimestamp(state['eventAt'], UTC).date()
+        if event_day < dt.datetime.fromtimestamp(now, UTC).date():
+            from rollup import rollup
+            try:
+                deadline_call(time.monotonic()+5, rollup, event_day.isoformat(), publish=True,
+                              now=dt.datetime.fromtimestamp(now, UTC))
+            except Exception:
+                emit('rollup', 'error', 'log.rollup', ok=False, error_tag='rollup.failed')
+                return
+        state['rollupDone'] = True
+        checkpoint()
+
+
 def observe(now=None, run=subprocess.run, boot=None, collect_fn=None, notify=None):
     boot_id = identity() if boot is None else dict(bootEpoch=boot)
     if not boot_id:
         return
     boot = boot_id['bootEpoch']
     now = time.time() if now is None else now
-    # ResetCounter is normally written a minute after boot. Do not freeze a
-    # missing-file verdict on launchd's first early invocation.
-    if now < boot+180:
-        return
     with state_path('boot').with_suffix('.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
         state = read_state('boot')
-        if state.get('bootEpoch') != boot:
+        # A panic report may arrive throughout the ten-minute evidence window.
+        # Retry older boots during the grace period, but finalize this boot only
+        # after that window closes. The unified-log query stays at three minutes.
+        ready = now >= boot+600
+        if state.get('bootEpoch') != boot and ready:
             props = (collect_fn or collect)(boot, run=run, previous=state.get('bootEpoch'))
             props['observedAt'] = now
+            pending = state.pop('pending', [])
+            if state and not observation_done(state):
+                pending.append(state)
             state = dict(bootEpoch=boot, props=props, emitted=False, alerted=props['clean'],
-                         eventAt=boot, appendAttempted=False)
+                         eventAt=boot, appendAttempted=False, pending=pending)
             save_state('boot', state)
-        if not state.get('emitted'):
-            path = directory()/(dt.datetime.fromtimestamp(state['eventAt'], UTC).date().isoformat()+'.ndjson')
-            found = False
-            if state.get('appendAttempted', True):
-                # Recover an append completed before its state checkpoint.
-                # Older pending states start at zero and make bounded progress.
-                found, offset, complete = deadline_call(time.monotonic()+5, recovered, path,
-                    state['props']['bootTime'], state.get('recoveryOffset', 0))
-                # A recovered marker and its consumed cursor commit together;
-                # saving only the cursor could skip that marker after a crash.
-                state.update(recoveryOffset=offset, emitted=found)
-                save_state('boot', state)
-                if not complete:
-                    return
-            if not found:
-                # Record the earliest possible append position before calling
-                # emit: a crash/uncertain write only needs to scan this tail.
-                state.update(appendAttempted=True,
-                             recoveryOffset=deadline_call(time.monotonic()+5, log_size, path))
-                save_state('boot', state)
-                if not emit('boot', 'event', 'boot.observed', props=state['props'], ok=True,
-                            now=dt.datetime.fromtimestamp(state['eventAt'], UTC)):
-                    return
-            state['emitted'] = True
+
+        def checkpoint():
             save_state('boot', state)
-        if not state.get('alerted'):
-            if notify is None:
-                from collector import notify as send
-            else:
-                send = notify
-            key = 'mac-boot:%.6f' % boot
+
+        pending = state.get('pending', [])
+        if pending:
+            # Bound backlog work to one record per invocation. A bridge outage
+            # must neither discard earlier boots nor delay today's observation.
+            record = pending[0]
             try:
-                sent = send(alert_text(state['props']), key, run, timeout=10)
-            except Exception:
-                sent = False
-            state['alerted'] = bool(sent)
-            save_state('boot', state)
-            emit('boot', 'event' if sent else 'error', 'boot.alert', ok=bool(sent),
-                 error_tag=None if sent else 'boot.notify_failed')
-        return state['props']
+                finish_observation(record, checkpoint, run, notify, now)
+            except (OSError, SourceFailure):
+                emit('boot', 'error', 'boot.collect', ok=False, error_tag='boot.collect_failed')
+            if observation_done(record):
+                pending.pop(0)
+                checkpoint()
+        if 'props' in state:
+            finish_observation(state, checkpoint, run, notify, now)
+            if state['bootEpoch'] == boot:
+                return state['props']
 
 
 def check():

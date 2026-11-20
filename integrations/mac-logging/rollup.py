@@ -3,12 +3,13 @@
 import argparse
 from collections import Counter, defaultdict
 import datetime as dt
+import fcntl
 import json
 import math
 import os
 from pathlib import Path
 import tempfile
-from toollog import directory, private_dir, safe_fields, finite_number, memory_command
+from toollog import directory, private_dir, safe_fields, finite_number, memory_command, emit
 from status import report
 from jobs import INVENTORY_PARTS_FRESH_S
 
@@ -66,7 +67,25 @@ def budget_rollup(day, root):
     return dict(pathsMeasured=len(latest), topOverBudget=sorted(over, key=lambda p: (-p['overBy'], p['path']))[:10])
 
 
-def rollup(day, root=None):
+def rollup(day, root=None, publish=False, now=None):
+    day = dt.date.fromisoformat(day).isoformat()
+    root = Path(root) if root else directory()
+    private_dir(root/'state')
+    # A delayed boot can repair a completed day while the hourly collector is
+    # rolling it up. Serialize the snapshot, replacement and published counts.
+    with (root/'state'/('rollup-'+day+'.lock')).open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = aggregate(day, root)
+        if publish:
+            props = {'backup.'+key+'.'+target: count
+                     for key, targets in result['backup'].items() for target, count in targets.items()}
+            props.update(day=day, boots=result['boots'], uncleanBoots=result['uncleanBoots'])
+            if not emit('rollup', 'event', 'log.rollup', ok=True, props=props, now=now):
+                raise OSError('rollup publication failed')
+        return result
+
+
+def aggregate(day, root):
     day = dt.date.fromisoformat(day).isoformat()
     root = Path(root) if root else directory()
     names, kinds, durations, tags, samples = Counter(), Counter(), defaultdict(list), Counter(), {}
