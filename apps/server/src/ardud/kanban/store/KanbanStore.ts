@@ -130,7 +130,13 @@ const InstructionApplication = Schema.Struct({
   boardId: KanbanBoardId,
   boardSlug: Schema.String,
   cardId: KanbanCardId,
-  field: Schema.Literals(["escalation", "modelRouting", "reviewerRouting", "guessedGates"]),
+  field: Schema.Literals([
+    "escalation",
+    "modelRouting",
+    "reviewerRouting",
+    "guessedGates",
+    "criticalOverflowSlots",
+  ]),
   askId: Schema.String,
   threadId: ThreadId,
 });

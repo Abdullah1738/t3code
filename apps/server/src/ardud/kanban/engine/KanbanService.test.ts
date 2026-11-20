@@ -3774,6 +3774,7 @@ it.effect.each(["slot", "blocker", "dependency"] as const)(
       ).pipe(Layer.provide(KanbanStore.layer));
       yield* Effect.gen(function* () {
         const { kanban, board } = yield* toyBoard;
+        yield* kanban.updateBoard(board.id, { criticalOverflowSlots: 0 });
         const first = yield* kanban.createCard(
           board.id,
           { title: "First", prompt: "First", priority: 1 },
@@ -9908,6 +9909,7 @@ it.effect("respects pool sizes and blocked cards", () =>
         name: "Toy",
         defaultProjectId: ProjectId.make("project-1"),
       });
+      yield* kanban.updateBoard(board.id, { criticalOverflowSlots: 0 });
       yield* kanban.setPool(board.id, board.defaultCardModel, 1);
       const first = yield* kanban.createCard(
         board.id,
@@ -11452,6 +11454,7 @@ it.effect.each(["pool_full", "batch_full", "paused", "fresh_blocked", "no_pool",
       });
       yield* Effect.gen(function* () {
         const { kanban, board } = yield* toyBoard;
+        yield* kanban.updateBoard(board.id, { criticalOverflowSlots: 0 });
         const store = yield* KanbanStore.KanbanStore;
         const card = yield* kanban.createCard(
           board.id,
@@ -11904,6 +11907,7 @@ it.effect.each(["todo", "needs_review"] as const)(
       const fake = yield* makeFake;
       yield* Effect.gen(function* () {
         const { kanban, board } = yield* toyBoard;
+        yield* kanban.updateBoard(board.id, { criticalOverflowSlots: 0 });
         const store = yield* KanbanStore.KanbanStore;
         const cards = [];
         for (const [title, movedAt] of [

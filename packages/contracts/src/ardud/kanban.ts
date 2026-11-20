@@ -2118,6 +2118,10 @@ export const KanbanRelease = Schema.Struct({
 });
 export type KanbanRelease = typeof KanbanRelease.Type;
 
+export const KanbanCriticalOverflowSlots = Schema.Int.check(
+  Schema.isBetween({ minimum: 0, maximum: 4 }),
+);
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
@@ -2133,6 +2137,9 @@ export const KanbanBoard = Schema.Struct({
   defaultCardModel: ModelSelection,
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
+  criticalOverflowSlots: Schema.optional(KanbanCriticalOverflowSlots).pipe(
+    Schema.withDecodingDefault(Effect.succeed(1)),
+  ),
   guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
   releaseLedger: Schema.optional(Schema.Array(KanbanRelease)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),

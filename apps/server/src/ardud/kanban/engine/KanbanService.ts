@@ -57,6 +57,7 @@ import {
   type KanbanBlock,
   type ChatAttachment,
   type KanbanBoard,
+  KanbanCriticalOverflowSlots,
   KanbanStandingApproval,
   type KanbanBoardListEntry,
   type KanbanBoardSnapshot,
@@ -393,6 +394,7 @@ export type BoardPatch = {
     | "reviewChains"
     | "defaultReviewChain"
     | "guessedGates"
+    | "criticalOverflowSlots"
     | "instructions"
   >
 >;
@@ -529,8 +531,8 @@ export interface KanbanServiceShape {
   >;
   readonly applyApprovedSettings: (
     boardId: KanbanBoardId,
-    setting: "guessedGates",
-    value: NonNullable<KanbanBoard["guessedGates"]>,
+    setting: "guessedGates" | "criticalOverflowSlots",
+    value: NonNullable<KanbanBoard["guessedGates"]> | number,
     cardId: KanbanCard["id"],
     askId: string,
     actor: KanbanActor,
@@ -3671,6 +3673,7 @@ const make = Effect.gen(function* () {
     why: SlotEventWhy,
     cardId: string | null,
     knownCards?: ReadonlyArray<KanbanCard>,
+    overflow?: Pick<Rules.Dispatch, "overflow" | "slots" | "used">,
   ) {
     const pending = yield* pendingSlotState;
     const cards = (knownCards ?? (yield* rawStore.cardsByThread(threadId))).filter(
@@ -3713,7 +3716,13 @@ const make = Effect.gen(function* () {
                 boardId,
                 threadId,
                 ...(cardId === null ? {} : { cardId }),
-                props: { poolKey, slot: kind, why, held: held !== undefined },
+                props: {
+                  poolKey,
+                  slot: kind,
+                  why,
+                  held: held !== undefined,
+                  ...(kind === "take" ? overflow : {}),
+                },
               }),
               undefined,
             );
@@ -3798,6 +3807,7 @@ const make = Effect.gen(function* () {
     slotWhy?: SlotEventWhy | false,
     releaseBoard?: KanbanBoard,
     snapshot?: CardWriteSnapshot,
+    overflow?: Pick<Rules.Dispatch, "overflow" | "slots" | "used">,
   ) {
     yield* prepareTransition(incoming, snapshot?.before);
     const actor: KanbanActor = analyticsActors.get(incoming) ??
@@ -3939,8 +3949,9 @@ const make = Effect.gen(function* () {
                     why,
                     card.id,
                     snapshot?.slots.get(threadId)?.map((row) => (row.id === card.id ? card : row)),
+                    overflow,
                   )
-                : writeSlot(card.boardId, threadId, why, card.id);
+                : writeSlot(card.boardId, threadId, why, card.id, undefined, overflow);
           }
         }
       }),
@@ -4076,7 +4087,7 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const event = yield* write;
         yield* Effect.logInfo(
-          application.field === "guessedGates"
+          ["guessedGates", "criticalOverflowSlots"].includes(application.field)
             ? "kanban board settings applied"
             : "kanban board instructions applied",
           {
@@ -10271,6 +10282,7 @@ const make = Effect.gen(function* () {
   const saveDispatchCard = Effect.fn("KanbanService.saveDispatchCard")(function* (
     card: KanbanCard,
     slotWhy?: SlotEventWhy,
+    overflow?: Pick<Rules.Dispatch, "overflow" | "slots" | "used">,
   ) {
     const current = yield* cardOf(card.id);
     const saved = {
@@ -10280,7 +10292,7 @@ const make = Effect.gen(function* () {
       updatedAt: yield* nowIso,
     };
     if (preparedTransitions.has(card)) preparedTransitions.add(saved);
-    yield* saveCard(saved, undefined, false, slotWhy);
+    yield* saveCard(saved, undefined, false, slotWhy, undefined, undefined, overflow);
     return saved;
   });
 
@@ -10390,18 +10402,30 @@ const make = Effect.gen(function* () {
     }
     const card = yield* cardOf(dispatch.cardId);
     // Planning and starting use separate snapshots; confirm before any side effect.
+    const dispatchCards = yield* pass.read;
+    const dispatchPools = Rules.maskDownPools(
+      yield* store.pools(board.id),
+      new Set((yield* Ref.get(down)).keys()),
+    );
+    const dispatchHolds = yield* boardHolds(board.id, `${board.id}:${dispatch.cardId}`);
     const confirmed = Rules.confirmDispatch(
       board,
       planned,
-      yield* pass.read,
-      Rules.maskDownPools(yield* store.pools(board.id), new Set((yield* Ref.get(down)).keys())),
-      yield* boardHolds(board.id, `${board.id}:${dispatch.cardId}`),
+      dispatchCards,
+      dispatchPools,
+      dispatchHolds,
       dispatch,
     );
     if (!confirmed) {
       destination.skipReason = "dispatch_changed";
       return;
     }
+    const selectedPool = dispatchPools.find((pool) => pool.key === dispatch.pool)!;
+    const holders = Rules.poolThreads(dispatchCards, dispatchHolds).get(dispatch.pool)?.size ?? 0;
+    const overflow =
+      !dispatch.joins && holders >= selectedPool.slots
+        ? { overflow: true as const, slots: selectedPool.slots, used: holders + 1 }
+        : undefined;
     const projectId = card.projectId ?? board.defaultProjectId;
     const at = yield* nowIso;
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
@@ -11082,7 +11106,11 @@ const make = Effect.gen(function* () {
     }
     yield* Effect.gen(function* () {
       yield* logEvent(next, system, "moved", { fromStage: card.stage, toStage: to });
-      destination.expectedCard = yield* saveDispatchCard(next, dispatch.joins ? "join" : "start");
+      destination.expectedCard = yield* saveDispatchCard(
+        next,
+        dispatch.joins ? "join" : "start",
+        overflow,
+      );
       if (dispatch.role === "review" && card.reviewThreadId !== threadId) {
         yield* endReviewLink(card.reviewThreadId, at);
       }
@@ -11185,7 +11213,12 @@ const make = Effect.gen(function* () {
       cardId: card.id,
       threadId,
       durationMs: Math.max(0, dispatchedAt - Date.parse(card.movedAt)),
-      props: { poolKey: dispatch.pool, phase: dispatch.role, span: "KanbanService.startCard" },
+      props: {
+        poolKey: dispatch.pool,
+        phase: dispatch.role,
+        span: "KanbanService.startCard",
+        ...overflow,
+      },
     });
     if (destination.skipReason !== "assignment_revoked") destination.skipReason = undefined;
   });
@@ -11597,7 +11630,7 @@ const make = Effect.gen(function* () {
                         const reason = skipReasons.get(card.id) ?? entry.reason;
                         if (
                           !skipReasons.has(card.id) &&
-                          ["would_start", "joins_thread"].includes(reason)
+                          ["would_start", "critical_overflow", "joins_thread"].includes(reason)
                         )
                           continue;
                         yield* recordDispatchSkip(
@@ -11688,6 +11721,7 @@ const make = Effect.gen(function* () {
                       });
                       const boardAssignmentState = (row: KanbanBoard) => ({
                         archivedAt: row.archivedAt,
+                        criticalOverflowSlots: row.criticalOverflowSlots ?? 1,
                         held: row.pause !== null && !row.pause.keep.includes(card.id),
                         settingUp: row.setup?.status === "running",
                         projectId: card.projectId ?? row.defaultProjectId,
@@ -11778,9 +11812,12 @@ const make = Effect.gen(function* () {
                         // Occupancy admits new claims; unrelated reservations cannot revoke a claim that owns its slot.
                         if (
                           !claimed &&
+                          !dispatch.joins &&
                           (Rules.poolThreads(cards, yield* boardHolds(board.id, key)).get(
                             dispatch.pool,
-                          )?.size ?? 0) > currentPool.slots
+                          )?.size ?? 0) >
+                            currentPool.slots +
+                              (dispatch.overflow ? (currentBoard.criticalOverflowSlots ?? 1) : 0)
                         )
                           return invalid("pool_capacity");
                         if (
@@ -11818,16 +11855,14 @@ const make = Effect.gen(function* () {
                         };
                         const eligible = Rules.planDispatch(
                           currentBoard,
-                          cards.map((entry) =>
-                            entry.id === card.id
-                              ? selected
-                              : { ...entry, settledAt: entry.settledAt ?? card.updatedAt },
-                          ),
+                          cards.map((entry) => (entry.id === card.id ? selected : entry)),
                           pools.filter((pool) => pool.key === dispatch.pool),
                           yield* boardHolds(board.id, key),
                           undefined,
                           yield* nowMillis,
-                          undefined,
+                          new Set(
+                            cards.filter((entry) => entry.id !== card.id).map((entry) => entry.id),
+                          ),
                           kanbanReviewAlreadyDone(selected)
                             ? new Map([
                                 [selected.id, yield* reviewEvidence(currentBoard, selected)],
@@ -17397,6 +17432,7 @@ const make = Effect.gen(function* () {
       reviewChains: [],
       defaultReviewChain: null,
       guessedGates: undefined,
+      criticalOverflowSlots: 1,
       standingApprovals: [],
       instructions: Defaults.DEFAULT_INSTRUCTIONS,
       setup: null,
@@ -17443,6 +17479,11 @@ const make = Effect.gen(function* () {
         "Only the owner can delete or restore a board.",
         "role_not_allowed",
       );
+    if (
+      patch.criticalOverflowSlots !== undefined &&
+      !Schema.is(KanbanCriticalOverflowSlots)(patch.criticalOverflowSlots)
+    )
+      return yield* failWith("invalid", "criticalOverflowSlots must be an integer from 0 to 4");
     const { archived, ...fields } = patch;
     if (patch.name !== undefined && patch.name.trim() === "") {
       return yield* failWith("invalid", "A board needs a name");
@@ -17917,7 +17958,16 @@ const make = Effect.gen(function* () {
           );
         }
         const board = yield* boardOf(boardId);
-        const namesField = ["guessed gates", "guessedGates"];
+        if (
+          setting === "criticalOverflowSlots"
+            ? !Schema.is(KanbanCriticalOverflowSlots)(value)
+            : typeof value === "number"
+        )
+          return yield* failWith("invalid", `invalid value for ${setting}`);
+        const namesField =
+          setting === "guessedGates"
+            ? ["guessed gates", "guessedGates"]
+            : ["criticalOverflowSlots"];
         const names = (label: string, name: string) => {
           const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
           return new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}($|[^\\p{L}\\p{N}_])`, "iu").test(label);
@@ -17937,10 +17987,17 @@ const make = Effect.gen(function* () {
           );
         }
         const normalized = (value: string) => value.replace(/\r\n/g, "\n").trim();
-        const guessedGates = [...value].sort();
-        const text = guessedGates.join(", ");
+        const patch =
+          typeof value === "number"
+            ? { criticalOverflowSlots: value }
+            : { guessedGates: [...value].sort() };
+        const text = typeof value === "number" ? String(value) : [...value].sort().join(", ");
         const current =
-          board.guessedGates === undefined ? "(unset)" : [...board.guessedGates].sort().join(", ");
+          setting === "criticalOverflowSlots"
+            ? String(board.criticalOverflowSlots ?? 1)
+            : board.guessedGates === undefined
+              ? "(unset)"
+              : [...board.guessedGates].sort().join(", ");
         const approved = changes.filter((entry) => normalized(entry.after) === normalized(text));
         if (approved.length === 0) {
           return yield* failWith(
@@ -17968,13 +18025,7 @@ const make = Effect.gen(function* () {
           askId,
           threadId: actor.threadId,
         };
-        const next = yield* updateBoardUnlocked(
-          board.id,
-          {
-            guessedGates,
-          },
-          application,
-        );
+        const next = yield* updateBoardUnlocked(board.id, patch, application);
         return { board: next, applied: true };
       }),
     );

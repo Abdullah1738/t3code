@@ -385,7 +385,7 @@ const GeneralEvent = Schema.Struct({
       distinctCwds: Schema.optionalKey(Measurement),
       maxPerSecond: Schema.optionalKey(Measurement),
       windowMs: Schema.optionalKey(Measurement),
-      overflow: Schema.optionalKey(Measurement),
+      overflow: Schema.optionalKey(Schema.Union([Measurement, Schema.Boolean])),
       top: Schema.optionalKey(
         Schema.Array(
           Schema.Struct({
