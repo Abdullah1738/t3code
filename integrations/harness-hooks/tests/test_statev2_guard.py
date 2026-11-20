@@ -1929,6 +1929,99 @@ bash "$TASK_DIR/step5r.sh"
         self.assertEqual(rule, UNRESOLVED, cause)
         self.assertIn('python: non-isolated startup', cause)
 
+    def cwd_fixture(self):
+        self.write('t/a.test.mjs', "import test from 'node:test'; test('a', () => {});")
+        self.write('t/b.test.mjs', "import test from 'node:test'; test('b', () => {});")
+        self.write('x.mjs', 'console.log(1)')
+        self.write('sub/x.mjs', 'console.log(2)')
+        self.write('sub/only.mjs', f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        self.write('tmp/v.X/check.py', 'print(1)')
+        self.write('s.sh', 'echo ok')
+        self.write('live.mjs', f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        os.symlink('live.mjs', self.root / 'link.mjs')
+
+    @staticmethod
+    def cwd_forms(path, directory):
+        # The literal twins first, then every cwd-derived spelling (#235).
+        return [path, f'{directory}/{path}', f'"$PWD/{path}"', f'"${{PWD}}/{path}"', f'$PWD/{path}',
+                f'"$(pwd)/{path}"', f'"`pwd`/{path}"', f'"$(realpath {path})"', f'$(realpath "{path}")',
+                f'`realpath {path}`']
+
+    @trusted_node_test
+    def test_cwd_derived_script_paths_match_literal_twins(self):
+        self.cwd_fixture()
+        root, sub = str(self.root), str(self.root / 'sub')
+        writer = self.heredoc('{p}', f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        rows = [
+            ('node --test {p} {q}', 't/a.test.mjs', 't/b.test.mjs', root, None),
+            ('node {p}', 'x.mjs', None, root, None),
+            ('python3 -I {p} --head 623161af', 'tmp/v.X/check.py', None, root, None),
+            ('bash {p}', 's.sh', None, root, None),
+            ('cd sub && node {p}', 'x.mjs', None, sub, None),
+            ('cd sub && node {p}', 'only.mjs', None, sub, SCRIPT),
+            ('node {p}', 'live.mjs', None, root, SCRIPT),
+            ('node {p}', 'link.mjs', None, root, SCRIPT),
+            (writer + 'node {p}', 'x.mjs', None, root, SCRIPT),
+            ("offbox run --bg -- 'node --test {p} && terraform -chdir=tf test'", 't/a.test.mjs', None, root, None),
+            ("offbox run -- 'node --test {p} && terraform -chdir=tf test'", 't/a.test.mjs', None, root, None),
+            ("offbox run --bg -- 'node --test --test-concurrency=1 {p} {q}'", 't/a.test.mjs', 't/b.test.mjs', root, None),
+            ("offbox run --bg --step 'node --test {p} {q}' --step 'terraform -chdir=tf init -backend=false -input=false'",
+             't/a.test.mjs', 't/b.test.mjs', root, None),
+            ("offbox run --bg --git --step 'git rev-parse HEAD' --step 'node --test {p}'", 't/a.test.mjs', None, root, None),
+            ("offbox run --bg --git --include tmp/v.X --pull tmp/v.X --step 'python3 -I {p} --head 623161af'",
+             'tmp/v.X/check.py', None, root, None),
+            ("offbox run --bg -- bash -lc 'node --version && export TERRAFORM_BINARY=\"$(command -v terraform)\" && node --test {p}'",
+             't/a.test.mjs', None, root, None),
+            ("offbox run --bg -- 'node {p}'", 'live.mjs', None, root, SCRIPT),
+            ('offbox run --bg -- node --test {p}', 't/a.test.mjs', None, root, None),
+            ('offbox run --bg -- node {p}', 'live.mjs', None, root, SCRIPT),
+            ('env A=1 timeout 60 node {p}', 'x.mjs', None, root, None),
+            ('env A=1 timeout 60 node {p}', 'live.mjs', None, root, SCRIPT),
+            ('d={p}; node --test "$d/a.test.mjs"', 't', None, root, None),
+            ('d={p}; node "$d/live.mjs"', 'tmp/..', None, root, SCRIPT),
+            ('node --test {p}', 't/*.test.mjs', None, root, None),
+            ("bash -c 'node {p}'", 'x.mjs', None, root, None),
+            ("bash -c 'node {p}'", 'live.mjs', None, root, SCRIPT),
+            (self.heredoc('{p}', 'console.log(1)') + 'node {p}', 'x.mjs', None, root, None),
+        ]
+        for template, first, second, directory, expected in rows:
+            for p, q in zip(self.cwd_forms(first, directory), self.cwd_forms(second or first, directory)):
+                command = template.replace('{p}', p).replace('{q}', q)
+                if "'" in template and "'" in p + q or '*' in p and 'realpath' in p:
+                    continue
+                with self.subTest(command=command):
+                    rule, cause = guard.classify_detail(command, root)
+                    self.assertEqual(rule, expected, cause)
+
+    def test_cwd_derived_live_reads_stay_reads(self):
+        self.cwd_fixture()
+        relative = os.path.relpath(LIVE, self.root)
+        for path in self.cwd_forms(relative, str(self.root)):
+            with self.subTest(path=path):
+                self.assertEqual(self.classify('sqlite3 ' + path + ' .tables'), READ)
+
+    @trusted_node_test
+    def test_cwd_derived_paths_stay_unresolved_when_pwd_may_change(self):
+        self.cwd_fixture()
+        target = '"$PWD/x.mjs"'
+        for command in [
+            'PWD=/elsewhere node "$PWD/x.mjs"', 'export PWD=/x; node "$PWD/x.mjs"', 'P""WD=/x; node "$PWD/x.mjs"',
+            'unset PWD; node "$PWD/x.mjs"', 'read -r PWD; node "$PWD/x.mjs"', 'declare PWD=/x; node "$PWD/x.mjs"',
+            'printf -v PWD /x; node "$PWD/x.mjs"', 'node "${PWD:-/x}/x.mjs"',
+            'cd "$unknown"; node "$PWD/x.mjs"', 'cd -P sub && node "$PWD/x.mjs"', 'set -P; cd sub && node "$PWD/x.mjs"',
+            'CDPATH=/x cd sub && node "$PWD/x.mjs"', "eval 'cd /'; node \"$PWD/x.mjs\"", 'source ./env.sh; node "$PWD/x.mjs"',
+            '. ./env.sh; node "$PWD/x.mjs"', 'pushd sub; node "$PWD/x.mjs"',
+            "node '$PWD/x.mjs'", 'node "\\$PWD/x.mjs"', 'f() { cd /; }; f; node "$PWD/x.mjs"',
+            'realpath() { echo /x; }; node "$(realpath x.mjs)"', 'alias realpath=echo; node "$(realpath x.mjs)"',
+            'pwd() { echo /x; }; node "$(pwd)/x.mjs"', 'PATH=/evil:$PATH node "$(realpath x.mjs)"',
+            'node "$(realpath "$v")"', 'node "$(realpath -m x.mjs)"', 'node "$(realpath x.mjs y.mjs)"',
+            'node "$(pwd -P)/x.mjs"', 'node "$(cat x.mjs)"', 'node "$(realpath $HOME/x.mjs)"',
+            "offbox run --bg -- 'export PWD=/x; node \"$PWD/x.mjs\"'", "export PWD=/x; offbox run --bg -- 'node \"$PWD/x.mjs\"'",
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.classify(command))
+        self.assertIsNone(self.classify('node ' + target))
+
     @trusted_node_test
     def test_same_call_offbox_steps_keep_wrapper_proof(self):
         for runner, filename, body in [('python3 -I', 'step.py', 'print(1)'),

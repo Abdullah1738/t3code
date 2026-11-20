@@ -2816,6 +2816,31 @@ def _direct_read(words, directory):
     return False
 
 
+# $PWD, ${PWD}, $(pwd) and $(realpath <literal>) name the tracked cwd only
+# while nothing in the call can rebind PWD, change cd's mode or shadow the
+# two commands. The check is textual over the whole caller command (offbox
+# payloads included) and fails closed: any match keeps the word unresolved.
+CWD_READ = re.compile(r'\$PWD(?!\w)|\$\{PWD\}')
+CWD_UNPROVED = re.compile(
+    r'(?<![\w$])PWD(?!\w)'
+    r'|(?<![\w-])(?:eval|alias|unalias|source|enable|hash|shopt|setopt|unsetopt|pushd|popd|builtin|function|chpwd)(?![\w-])'
+    r'|(?:^|[;&|(){}\n])\s*\.\s'
+    r'|(?:^|[;&|(){}\n])\s*[A-Za-z_][\w-]*\s*\(\s*\)|\(\s*\)\s*\{'
+    r'|(?<![\w-])cd\s+(?:-[A-Za-z]*\s+)*-[A-Za-z]*P'
+    r'|(?<![\w-])set\s+(?:[-+][A-Za-z]*\s+)*(?:-[A-Za-z]*P|[-+]o\s+physical)'
+    r'|CDPATH|(?<![\w$])PATH\+?=')
+CWD_PATH = re.compile(r'[A-Za-z0-9_./@%+=:,-]+')
+CWD_SUBSTITUTION = re.compile(r'\$\{PWD\}|\$\(\s*pwd\s*\)|`\s*pwd\s*`|'
+                              r'\$\(\s*realpath\s+([\'"]?)(?!-)([A-Za-z0-9_./@%+=:,-]+)\1\s*\)|'
+                              r'`\s*realpath\s+([\'"]?)(?!-)([A-Za-z0-9_./@%+=:,-]+)\3\s*`')
+
+
+def _cwd_unproved(command: str) -> bool:
+    # Quotes and backslashes do not hide a binding from the shell (P""WD=).
+    return any(CWD_UNPROVED.search(CWD_READ.sub('', text))
+               for text in (command, re.sub(r'[\'"\\]', '', command)))
+
+
 def _literal_path(value: str, cwd: Path | None) -> Path | None:
     value = re.sub(r"^(?:~|\$HOME|\$\{HOME\})(?=/|$)", str(Path.home()), value)
     if not value or re.search(r"[$`*?\[\]]", value) or value == "-":
@@ -3247,7 +3272,7 @@ def _fixture_wrapped_invocation(command):
     return target, run
 
 
-def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None, _preservation=True, _budget=None, _glob_writes=None, _cwd_candidates=None) -> list[Path]:
+def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None, _preservation=True, _budget=None, _glob_writes=None, _cwd_candidates=None, _cwd_unproved_text=None) -> list[Path]:
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
     script_files, node_test_files = _budget if _budget is not None else (set(), set())
@@ -3270,6 +3295,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     unknown_directories = set(_cwd_candidates or ())
     conditional = 0
     inherited_values, inherited_unsafe, caller_command = _environment or ({}, False, None)
+    cwd_unproved = (_cwd_unproved_text if _cwd_unproved_text is not None else
+                    _cwd_unproved(command) or caller_command is not None and _cwd_unproved(caller_command))
     shell_values = {"HOME": str(Path.home()), **inherited_values}
     path_values = {}
     live_assignments = set()
@@ -4612,9 +4639,37 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return (preservation_tool(words, directory) and
                 _trusted_fixture_tool(words[0], 'mktemp', directory) and unchanged_tool(words[0], directory))
 
+    def tracked_cwd(directory):
+        if cwd_unproved or unsafe_bindings or directory is None or 'PWD' in shell_values or 'PWD' in script_values:
+            return None
+        return str(directory) if CWD_PATH.fullmatch(str(directory)) else None
+
+    def resolve_cwd_reads(text, directory):
+        # Unquoted or double-quoted $PWD; an escaped \$PWD stays literal.
+        base = tracked_cwd(directory)
+        return text if base is None else re.sub(r'(?<!\\)\$(?:PWD(?!\w)|\{PWD\})', lambda _: base, text)
+
+    def resolve_cwd_substitution(literal, directory):
+        match = CWD_SUBSTITUTION.fullmatch(literal)
+        base = tracked_cwd(directory) if match else None
+        if base is None:
+            return None
+        target = match[2] or match[4]
+        # realpath follows symlinks; check the path the shell would pass.
+        resolved = os.path.realpath(os.path.join(base, target)) if target else base
+        return resolved if CWD_PATH.fullmatch(resolved) else None
+
     def decode_word(value, directory, depth, quoted, checked, cwd_only=False, bodies=None, preserve_mktemp=False):
         nonlocal conditional, uncertain_write, last_invalidation
+        value = resolve_cwd_reads(value, directory)
         for key, literal in reversed(quoted.items()):
+            if key in value and key.startswith('\0guard_quoted_'):
+                resolved = resolve_cwd_substitution(literal, directory)
+                if resolved is not None:
+                    value = value.replace(key, resolved)
+                    continue
+            if key in value and key.startswith('\0guard_double_'):
+                literal = resolve_cwd_reads(literal, directory)
             if key in value and key not in checked and not key.startswith('\0guard_literal_') and literal.startswith(("${", "$(", "`")) and not cwd_only:
                 checked.add(key)
                 for substitution in _substitutions(literal, shell=True):
@@ -4673,7 +4728,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                   _stdin=(input_words, input_bodies or {}), _environment=environment, _opaque=opaque,
                                   _preservation=_preservation and preservation,
                                   _budget=(script_files, node_test_files), _glob_writes=glob_writes,
-                                  _cwd_candidates=unknown_directories)
+                                  _cwd_candidates=unknown_directories, _cwd_unproved_text=cwd_unproved)
         paths.extend(path for path in remote_paths if path not in paths)
         check_budget()
 
@@ -4813,7 +4868,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 pieces.append((text[end:], None))
                 result = {''}
                 for key, literal in pieces:
-                    if literal is not None:
+                    cwd = resolve_cwd_substitution(literal, directory) if key.startswith('\0guard_quoted_') else None
+                    if cwd is not None:
+                        values = {cwd}
+                    elif literal is not None:
                         if key.startswith('\0guard_literal_double_'):
                             values = resolve(double_text(literal), True)
                         elif key.startswith('\0guard_literal_'):
