@@ -24,19 +24,64 @@ export function readRouterKey(path: string): string {
   } catch { throw new Error(ROUTER_KEY_ERROR); }
   finally { if (fd !== undefined) closeSync(fd); }
 }
-export async function routerReady(config: ReturnType<typeof routerConfig>, log: (code: string, detail: { reason: string }) => void = () => {}): Promise<boolean> {
-  try {
-    const response = await fetch(`http://127.0.0.1:${config.boxLivezPort}/livez`, { redirect: "error", signal: AbortSignal.timeout(1_500) });
-    try {
-      const body: unknown = await response.json().catch(() => null);
-      const data = body && typeof body === "object" ? body as Record<string, unknown> : {};
-      if (response.status === 503) {
-        const reason = typeof data.reason === "string" && ["no_worker", "not_ready", "heartbeat_stale", "shutting_down"].includes(data.reason) ? data.reason : "unknown";
-        log("router-unready", { reason });
+type RouterFailure = { reason: "no_worker" | "not_ready" | "heartbeat_stale" | "shutting_down" | "unknown" | "timeout" | "unreachable" | "not_ready_body"; ms: number }
+  | { reason: "bad_status"; ms: number; status: number };
+type RouterOutcome = RouterFailure | { reason: "ready"; ms: number };
+type RouterReadinessLog = ({ code: "router-unready" } & RouterFailure)
+  | { code: "router-ready"; downMs: number; failures: number };
+
+export function createRouterReadinessTracker(log: (event: RouterReadinessLog) => void, now: () => number = () => performance.now()) {
+  let episode: { since: number; reason: RouterFailure["reason"]; failures: number } | undefined;
+  return (outcome: RouterOutcome) => {
+    if (outcome.reason === "ready") {
+      if (episode) {
+        const { since, failures } = episode; episode = undefined;
+        log({ code: "router-ready", downMs: Math.round(now() - since), failures });
       }
-      return response.status === 200 && data.ready === true;
+      return;
+    }
+    const previousReason = episode?.reason;
+    episode ??= { since: now(), reason: outcome.reason, failures: 0 };
+    episode.failures++;
+    episode.reason = outcome.reason;
+    if (previousReason !== outcome.reason) {
+      log(outcome.reason === "bad_status"
+        ? { code: "router-unready", reason: outcome.reason, ms: outcome.ms, status: outcome.status }
+        : { code: "router-unready", reason: outcome.reason, ms: outcome.ms });
+    }
+  };
+}
+
+export async function routerReady(config: ReturnType<typeof routerConfig>, track: (outcome: RouterOutcome) => void = () => {}, now: () => number = () => performance.now()): Promise<boolean> {
+  const start = now(), signal = AbortSignal.timeout(1_500);
+  let outcome: RouterOutcome;
+  const elapsed = () => Math.round(now() - start);
+  try {
+    const response = await fetch(`http://127.0.0.1:${config.boxLivezPort}/livez`, { redirect: "error", signal });
+    try {
+      if (response.status !== 200 && response.status !== 503) {
+        outcome = { reason: "bad_status", status: response.status, ms: elapsed() };
+      } else {
+        let body: unknown;
+        try { body = await response.json(); }
+        catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+        const data = body && typeof body === "object" ? body as Record<string, unknown> : {};
+        let reason: RouterOutcome["reason"];
+        if (response.status === 503) {
+          switch (data.reason) {
+            case "no_worker": case "not_ready": case "heartbeat_stale": case "shutting_down": reason = data.reason; break;
+            default: reason = "unknown";
+          }
+        } else reason = data.ready === true ? "ready" : "not_ready_body";
+        outcome = { reason, ms: elapsed() };
+      }
     } finally { await response.body?.cancel().catch(() => {}); }
-  } catch { return false; }
+  } catch (error) {
+    const timeout = signal.aborted || error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name);
+    outcome = { reason: timeout ? "timeout" : "unreachable", ms: elapsed() };
+  }
+  track(outcome);
+  return outcome.reason === "ready";
 }
 export function startRouterGate(config: ReturnType<typeof routerConfig>, unavailable: () => void) {
   // Claude can substitute an empty header when apiKeyHelper fails. Refuse before any prompt reaches the Mac.
