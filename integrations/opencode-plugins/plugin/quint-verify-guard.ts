@@ -1,5 +1,5 @@
 import { hook as toolLogHook } from "../lib/toollog";
-import { spawn } from "node:child_process";
+import { failureProps, runClassifier } from "../lib/classifier";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -9,21 +9,7 @@ type Event = { tool: string; sessionID?: string; input?: Input };
 type Verdict = { denied: boolean; reason: string | null };
 
 export function classify(command: string, cwd: string, script = classifier, python = "/opt/homebrew/bin/python3"): Promise<Verdict> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(python, [script], { stdio: ["pipe", "pipe", "ignore"] });
-    let output = "";
-    const timer = setTimeout(() => { child.kill(); reject(new Error("Quint verify classifier timed out")); }, 2000);
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { output += chunk; });
-    child.on("error", (error) => { clearTimeout(timer); reject(error); });
-    child.stdin.on("error", () => {});
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) return reject(new Error("Quint verify classifier unavailable"));
-      try { resolve(JSON.parse(output)); } catch (error) { reject(error); }
-    });
-    child.stdin.end(JSON.stringify({ command, cwd }));
-  });
+  return runClassifier(python, script, { command, cwd }, { timeout: "Quint verify classifier timed out", unavailable: "Quint verify classifier unavailable" });
 }
 
 const shellTools = new Set(["shell", "bash", "Bash", "exec_command", "shell_command"]);
@@ -42,7 +28,7 @@ export function createGuardHook(directory: string, check = classify) {
     const cwd = input.workdir ?? input.cwd ?? directory;
     let verdict: Verdict;
     try { verdict = await check(command, cwd); }
-    catch { toolLogHook("quint-verify", "allowed", "classifier-unavailable", started, command, "hook.classifier_failed", {sessionId:event.sessionID}, {cwd}); return; }
+    catch (error) { toolLogHook("quint-verify", "allowed", "classifier-unavailable", started, command, "hook.classifier_failed", {sessionId:event.sessionID}, {cwd}, failureProps(classifier, error, command, started)); return; }
     toolLogHook("quint-verify", verdict.denied && verdict.reason ? "denied" : "allowed", "quint-verify", started, command, undefined, {sessionId:event.sessionID}, {cwd});
     if (verdict.denied && verdict.reason) {
       event.input = { ...input, [field]: `printf '%s\\n' ${quote(verdict.reason)} >&2; exit 3`, background: false };

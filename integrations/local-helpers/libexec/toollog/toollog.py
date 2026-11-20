@@ -33,7 +33,9 @@ _FIELDS = {'harness', 'guard', 'decision', 'rule', 'firstWord', 'commandLength',
            'cwdClass', 'matchedRoot', 'argv0Class', 'repeatCount', 'threadIdSource',
            'method', 'toolName', 'load1', 'load5', 'load15', 'sampleRate',
            'httpMethod', 'ttfbMs', 'reason', 'identity_source', 'driver', 'route', 'httpStatus',
-           'resolution', 'attempt', 'command', 'attempts', 'waitedMs'}
+           'resolution', 'attempt', 'command', 'attempts', 'waitedMs',
+           'classifier', 'errorClass', 'failMode', 'spawnMs', 'classifyMs', 'totalMs', 'cmdKind',
+           'holder', 'adbVerb', 'source'}
 _IDS = {'sessionId', 'threadId', 'nativeAgentId', 'cardNumber', 'serverId', 'home', 'sampleId'}
 _WORDS = set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split())
 
@@ -307,7 +309,13 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
         pass
 
 
-def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None, identity_source=None):
+def run_source():
+    """'test' inside a test runner. Until #185 tags test runs, the environment is the only signal."""
+    return 'test' if ('unittest' in sys.modules or 'pytest' in sys.modules or os.environ.get('NODE_ENV') == 'test'
+                      or os.environ.get('ROBOB_TEST') or os.environ.get('PYTEST_CURRENT_TEST')) else 'real'
+
+
+def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None, identity_source=None, extra=None):
     try:
         identity, source = hook_ids(harness, ids)
         command_fields = command_props(command)
@@ -315,7 +323,7 @@ def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=No
             command_fields['identity_source'] = identity_source
         emit('hooks', 'error' if decision == 'denied' or error_tag else 'perf', 'hook.decision',
              duration_ms=duration_ms, ok=decision != 'denied' and not error_tag, ids=identity,
-             props=hook_props({'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
+             props=hook_props({**(extra or {}), 'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
                     'threadIdSource': source, 'cwdClass': cwd_class(cwd), 'matchedRoot': matched_root(matched),
                     'repeatCount': _repeat_count(harness, identity, guard, rule, command_fields.get('firstWord', 'none')),
                     'argv0Class': 'none', **command_fields}, error=decision == 'denied' or bool(error_tag)),
