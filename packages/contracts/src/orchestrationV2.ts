@@ -1422,6 +1422,7 @@ export const OrchestrationV2ProviderFailureCategory = Schema.Literals([
   "model_invalid",
   "context_exhausted",
   "content_filter",
+  "persistence",
   "unknown",
 ]);
 export type OrchestrationV2ProviderFailureCategory =
