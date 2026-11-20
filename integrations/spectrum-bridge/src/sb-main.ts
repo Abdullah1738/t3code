@@ -3,6 +3,7 @@ import { RemoteBox, remoteBoxConfig } from "./remote-box.ts";
 import { createChatMirror, type ChatMirror } from "./mirror.ts";
 import { readFileSync } from "node:fs";
 import { toolError, toolLog, type LogLine } from "./toollog.ts";
+import { createLoopStallMonitor } from "./loop-stall.ts";
 import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 /**
  * Sendblue serve loop. Kept apart from main.ts so the Photon path stays exactly as it was:
@@ -133,6 +134,9 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   let api: ((request: Request) => Promise<Response>) | undefined;
   const releaseLock = acquireLock(join(stateRoot, "bridge.lock"));
   process.once("exit", releaseLock);
+  const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }));
+  loopStalls.start();
+  process.once("exit", () => loopStalls.stop());
   const socketPath = join(stateRoot, "bridge.sock");
   await io.removeStaleSocket(socketPath);
   // Bind before opening SQLite: a second process must not run crash recovery on live sends.
@@ -420,6 +424,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    loopStalls.stop();
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     abort.abort();
     clearInterval(timer);

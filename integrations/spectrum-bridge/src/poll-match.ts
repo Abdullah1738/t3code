@@ -13,7 +13,7 @@ const WINDOW = 10 * 60_000;
 const key = (options: readonly string[]) => JSON.stringify(options.map(option => option.trim()).sort());
 
 function entries<T>(store: Store, prefix: string): { key: string; value: T }[] {
-  return (store.db.query("SELECT key, value FROM kv WHERE key LIKE ? ESCAPE '\\'")
+  return (store.db.query("SELECT key, value FROM kv WHERE key LIKE ? ESCAPE '\\' ORDER BY rowid")
     .all(`${prefix.replace(/[\\%_]/g, "\\$&")}%`) as { key: string; value: string }[])
     .map(row => ({ key: row.key, value: JSON.parse(row.value) as T }));
 }

@@ -1,5 +1,6 @@
 import { ProbeBudget } from "./probe-policy.ts";
 import { toolError, toolLog } from "./toollog.ts";
+import { createLoopStallMonitor } from "./loop-stall.ts";
 import { acknowledgePhoton, notifyFailedInbound } from "./inbound-failure.ts";
 import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -113,6 +114,9 @@ async function main(): Promise<void> {
   let api: ReturnType<typeof createApi> | undefined;
   const releaseLock = acquireLock(join(stateRoot, "bridge.lock"));
   process.once("exit", releaseLock);
+  const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }));
+  loopStalls.start();
+  process.once("exit", () => loopStalls.stop());
   const socketPath = join(stateRoot, "bridge.sock");
   await removeStaleSocket(socketPath);
   // Bind before opening SQLite: a second process must not run crash recovery on live sends.
@@ -311,6 +315,7 @@ async function main(): Promise<void> {
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    loopStalls.stop();
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     clearInterval(timer);
     clearInterval(unansweredTimer);
