@@ -538,7 +538,7 @@ def details(oid, service, timeout):
                     self.assertEqual(snapshot['walked_at'], saved['walked_at'])
                     self.assertIn(saved['orders']['OLD']['createdAt'], marketplace.lane(snapshot, [])[1]['hold_times'])
 
-    def test_detail_failures_preserve_previous_proof_and_save_successful_progress(self):
+    def test_detail_failures_preserve_snapshot_and_save_successful_receipts(self):
         forms = ('exception', 'timeout', 'unzoned', 'wrong_order', 'unverified', 'not_ok', 'bad_receipt')
         good = dict(row('GOOD', -60), whole_order_complete=True, detail_status='delivered')
         bad = row('BAD', 120)
@@ -575,8 +575,8 @@ def details(oid, service, timeout):
                     self.assertIsNone(reason)
                     self.assertEqual(snapshot['walked_at'], before['walked_at'])
                     self.assertEqual(snapshot['complete'], before['complete'])
-                    self.assertTrue(snapshot['orders']['GOOD']['delivered'])
-                    self.assertTrue(before['orders'].items() <= snapshot['orders'].items())
+                    self.assertEqual(snapshot, before)
+                    self.assertIn('GOOD', {r['order'] for r in lookup.load_cache(self.cache)})
                     rows, lane = marketplace.lane(snapshot, lookup.load_cache(self.cache))
                     self.assertEqual(lane['exhaustive'], previous != 'cold')
                     if previous != 'cold':
