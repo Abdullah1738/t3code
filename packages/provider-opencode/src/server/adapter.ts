@@ -291,6 +291,7 @@ interface ActiveOpenCodeTurn {
   nativeUserMessageId: string | null;
   admissionMessageId: string | null;
   interrupted: boolean;
+  abortAcknowledged?: boolean;
   finalized: boolean;
   readonly stepFinishes: Map<string, { readonly messageId: string; readonly reason: string }>;
   planId: PlanId | null;
@@ -384,6 +385,8 @@ interface OpenCodeThreadState {
   providerThread: OrchestrationV2ProviderThread;
   appThread: OrchestrationV2AppThread | null;
   activeTurn: ActiveOpenCodeTurn | null;
+  unsettledTurn: ActiveOpenCodeTurn | null;
+  activityGeneration: number;
   readonly providerTurns: Map<string, OrchestrationV2ProviderTurn>;
   readonly runtimeRequests: Map<string, OrchestrationV2RuntimeRequest>;
   readonly messageRoles: Map<string, "user" | "assistant">;
@@ -1425,6 +1428,8 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               providerThread: childProviderThread,
               appThread: childThread,
               activeTurn: null,
+              unsettledTurn: null,
+              activityGeneration: 0,
               providerTurns: new Map(),
               runtimeRequests: new Map(),
               messageRoles: new Map(),
@@ -2033,9 +2038,28 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           terminal?: {
             readonly failure?: OrchestrationV2ProviderFailure;
             readonly threadDisposition?: "reusable" | "broken";
+            readonly nativeWorkEnded?: true;
           },
         ) {
+          if (terminal?.nativeWorkEnded === true) {
+            if (state.unsettledTurn === turn) state.unsettledTurn = null;
+            if (turn.finalized) {
+              yield* emitProviderEvent({
+                type: "turn.terminal",
+                nativeWorkEnded: true,
+                driver: OPENCODE_PROVIDER,
+                providerThreadId: turn.providerThreadId,
+                providerTurnId: turn.providerTurnId,
+                runOrdinal: turn.runOrdinal,
+                status: turn.interrupted ? "interrupted" : "completed",
+                failure: null,
+                threadDisposition: "reusable",
+              });
+              return;
+            }
+          }
           if (turn.finalized) return;
+          if (terminal?.nativeWorkEnded !== true) state.unsettledTurn = turn;
           if (nativeStreamFailure !== null) {
             status = "failed";
             terminal = { failure: nativeStreamFailure, threadDisposition: "broken" };
@@ -2100,6 +2124,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             status === "failed"
               ? {
                   type: "turn.terminal",
+                  ...(terminal?.nativeWorkEnded === true ? { nativeWorkEnded: true as const } : {}),
                   driver: OPENCODE_PROVIDER,
                   providerThreadId: turn.providerThreadId,
                   providerTurnId: turn.providerTurnId,
@@ -2116,6 +2141,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 }
               : {
                   type: "turn.terminal",
+                  ...(terminal?.nativeWorkEnded === true ? { nativeWorkEnded: true as const } : {}),
                   driver: OPENCODE_PROVIDER,
                   providerThreadId: turn.providerThreadId,
                   providerTurnId: turn.providerTurnId,
@@ -2172,7 +2198,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               return;
             }
             if (status === "idle") {
-              yield* finalizeTurn(state, turn, "completed");
+              yield* finalizeTurn(state, turn, "completed", { nativeWorkEnded: true });
               return;
             }
             if (status === "busy") return;
@@ -2616,6 +2642,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               switch (event.properties.status.type) {
                 case "busy":
                 case "retry":
+                  if (threads.has(sessionId)) threads.get(sessionId)!.activityGeneration++;
                   if (threads.has(sessionId) || relatedSessionOwners.has(sessionId)) {
                     busySessionIds.add(sessionId);
                   }
@@ -2639,8 +2666,13 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   state,
                   state.activeTurn,
                   state.activeTurn.interrupted ? "interrupted" : "completed",
+                  { nativeWorkEnded: true },
                 );
               }
+              if (event.properties.status.type === "idle" && state.unsettledTurn !== null)
+                yield* finalizeTurn(state, state.unsettledTurn, "completed", {
+                  nativeWorkEnded: true,
+                });
               return;
             }
             case "session.idle": {
@@ -2655,8 +2687,13 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   state,
                   state.activeTurn,
                   state.activeTurn.interrupted ? "interrupted" : "completed",
+                  { nativeWorkEnded: true },
                 );
               }
+              if (state?.unsettledTurn != null)
+                yield* finalizeTurn(state, state.unsettledTurn, "completed", {
+                  nativeWorkEnded: true,
+                });
               return;
             }
             case "session.error": {
@@ -2817,6 +2854,8 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             providerThread,
             appThread,
             activeTurn: null,
+            unsettledTurn: null,
+            activityGeneration: 0,
             providerTurns: new Map(),
             runtimeRequests: new Map(),
             messageRoles: new Map(),
@@ -3009,7 +3048,36 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           );
         });
 
+        const joinTurnStop = ProviderAdapter.makeTurnStopJoiner();
+        const holdsWorkForThread = Effect.fn("OpencodeAdapter.holdsWorkForThread")(function* (
+          providerThread: OrchestrationV2ProviderThread,
+        ) {
+          const state = threads.get(nativeThreadId(providerThread));
+          if (state === undefined) return false;
+          if (state.activeTurn !== null) return true;
+          const unsettled = state.unsettledTurn;
+          if (unsettled === null) return busySessionIds.has(state.nativeSessionId);
+          const generation = state.activityGeneration;
+          const status = yield* sdkCall(
+            "session.status",
+            { sessionID: state.nativeSessionId },
+            () => client.session.status(),
+          ).pipe(
+            Effect.flatMap((response) => Effect.try(() => unwrapData("session.status", response))),
+            Effect.timeoutOption("5 seconds"),
+            Effect.orElseSucceed(() => Option.none()),
+          );
+          if (state.activeTurn !== null || generation !== state.activityGeneration) return true;
+          if (Option.isNone(status)) return true;
+          const current = status.value[state.nativeSessionId];
+          if (current !== undefined && current.type !== "idle") return true;
+          if (state.unsettledTurn === unsettled)
+            yield* finalizeTurn(state, unsettled, "completed", { nativeWorkEnded: true });
+          busySessionIds.delete(state.nativeSessionId);
+          return false;
+        });
         const runtimeSession: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+          holdsWorkForThread,
           runtimeInventory: Effect.sync(() => ({
             roots: connection.runtimeProcess === undefined ? [] : [connection.runtimeProcess],
             loads: [],
@@ -3020,7 +3088,11 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           providerSessionId: input.providerSessionId,
           providerSession: sessionEntity,
           events: Stream.fromEffectRepeat(Queue.take(events)),
-          hasPendingBackgroundWork: Effect.sync(() => busySessionIds.size > 0),
+          hasPendingBackgroundWork: Effect.sync(
+            () =>
+              busySessionIds.size > 0 ||
+              Array.from(threads.values()).some((state) => state.unsettledTurn !== null),
+          ),
           ensureThread: Effect.fn("OpencodeAdapter.ensureThread")(
             function* (threadInput) {
               if (threadInput.existingProviderThread?.nativeThreadRef != null) {
@@ -3122,6 +3194,15 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               if (state === undefined) {
                 return yield* protocolError(`OpenCode session ${sessionId} is not registered`);
               }
+              if (
+                state.unsettledTurn !== null &&
+                (yield* holdsWorkForThread(turnInput.providerThread))
+              )
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: OPENCODE_PROVIDER,
+                  detail: "OpenCode has not confirmed that the previous turn stopped",
+                  reason: "previous_turn_active",
+                });
               if (state.activeTurn !== null) {
                 return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                   driver: OPENCODE_PROVIDER,
@@ -3216,6 +3297,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               const admissionSettled = turn.admissionSettled;
               const admissionAbortController = turn.admissionAbortController;
               state.appThread = turnInput.appThread;
+              state.activityGeneration++;
               state.activeTurn = turn;
               state.providerTurns.set(String(providerTurnId), providerTurn);
               yield* emitProviderTurn(state, turn, "running", null);
@@ -3241,7 +3323,9 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                       : emitCompactionItem(state, turn),
                   ),
                   Effect.tap(() =>
-                    finalizeTurn(state, turn, turn.interrupted ? "interrupted" : "completed"),
+                    finalizeTurn(state, turn, turn.interrupted ? "interrupted" : "completed", {
+                      nativeWorkEnded: true,
+                    }),
                   ),
                   Effect.tapError((cause) =>
                     finalizeTurn(state, turn, turn.interrupted ? "interrupted" : "failed", {
@@ -3416,11 +3500,35 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 ),
               ),
           ),
+          interruptStartingRun: Effect.fn("OpencodeAdapter.interruptStartingRun")(function* (run) {
+            const state = threads.get(nativeThreadId(run.providerThread));
+            const turn = state?.activeTurn ?? state?.unsettledTurn;
+            // Native settlement can clear the active context while cancellation's
+            // session-wide abort is still being delivered. The unique attempt
+            // keeps that delivery joinable before a successor is admitted.
+            const target =
+              turn?.runId === run.runId &&
+              turn.runAttemptId === run.attemptId &&
+              turn.providerThreadId === run.providerThread.id
+                ? turn.providerTurn
+                : [...(state?.providerTurns.values() ?? [])].find(
+                    (candidate) =>
+                      candidate.runAttemptId === run.attemptId &&
+                      candidate.providerThreadId === run.providerThread.id,
+                  );
+            if (target === undefined) return;
+            yield* runtimeSession.interruptTurn({
+              providerThread: run.providerThread,
+              providerTurnId: target.id,
+              requestRuntimeRestart: false,
+              stopBackgroundWork: false,
+            });
+          }),
           interruptTurn: Effect.fn("OpencodeAdapter.interruptTurn")(
             function* (interruptInput) {
               const sessionId = nativeThreadId(interruptInput.providerThread);
               const state = threads.get(sessionId);
-              const turn = state?.activeTurn;
+              const turn = state?.activeTurn ?? state?.unsettledTurn;
               if (
                 (turn === undefined || turn === null) &&
                 interruptInput.requestRuntimeRestart === true
@@ -3456,19 +3564,25 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   Effect.ignore,
                 );
               }
-              yield* sdkCall("session.abort", { sessionID: sessionId }, (signal) =>
-                client.session.abort({ sessionID: sessionId }, { signal }),
-              ).pipe(
-                Effect.timeout("10 seconds"),
-                Effect.catch((cause) =>
-                  turn.finalized
-                    ? Effect.void
-                    : Effect.suspend(() => {
-                        turn.interrupted = false;
-                        return Effect.fail(cause);
-                      }),
-                ),
-              );
+              if (!turn.abortAcknowledged)
+                yield* sdkCall("session.abort", { sessionID: sessionId }, (signal) =>
+                  client.session.abort({ sessionID: sessionId }, { signal }),
+                ).pipe(
+                  Effect.timeout("10 seconds"),
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      turn.abortAcknowledged = true;
+                    }),
+                  ),
+                  Effect.catch((cause) =>
+                    turn.finalized
+                      ? Effect.void
+                      : Effect.suspend(() => {
+                          turn.interrupted = false;
+                          return Effect.fail(cause);
+                        }),
+                  ),
+                );
               // Root abort does not stop child sessions. Report incomplete cleanup
               // even if the root has already emitted its terminal event.
               if (interruptInput.stopBackgroundWork !== false) yield* abortDescendants(sessionId);
@@ -3486,6 +3600,10 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                       }),
                 ),
               ),
+            (effect, target) =>
+              target.stopBackgroundWork === false
+                ? joinTurnStop(target.providerTurnId, effect)
+                : effect,
           ),
           respondToRuntimeRequest: Effect.fn("OpencodeAdapter.respondToRuntimeRequest")(
             function* (requestInput) {

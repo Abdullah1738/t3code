@@ -344,11 +344,12 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   before it is sent, with one line (`... this run goes to Boat instead`). A run that moved to Boat waits with no time limit for a Boat box or for home, and goes back to home as soon as home is ready. **Once the server accepted a run it
   never moves**, so nothing runs twice. A server that says it is starting is waited for (up to 600 s) instead of failing over. A slow but reachable server is waited for; runs move to Boat only when home is offline or refusing work, or has not answered for 5 minutes.
 - A run naming `--base` saved only on home waits for home (exit **93** when the wait expires) and never runs on Boat's template.
-- The server restarts under an accepted run (power cut, reboot, boatd restart): the client reconnects for up to
-  15 minutes and carries on from where the output stopped. If the machine itself restarted, the server runs the
-  command **again from the start, once**, and you get one line saying so (`... running it again from the start
-  (attempt 2)`). Runs the server had queued start after it. `--no-retry` turns the second run off; the run then
-  ends with **94**. An Incus restart or exec-stream drop on home counts as a server restart: a command still running is re-attached; otherwise it is retried once, or ends 94 with `--no-retry`, with the message saying whether processes remain on the box.
+- The server restarts under an accepted run (power cut, reboot, boatd or Incus restart, exec-stream drop): the
+  client reconnects for up to 15 minutes. **A command that has started is never run again.** Still running: it is
+  re-attached and `wait`/`logs` follow it to its real exit code. Finished while the server was down: you get that
+  exit code. Processes gone: it ends with **94** and one line naming the restart time and that nothing was re-run.
+  Runs the server had queued but not started start after it. The pool never hands out a box whose previous
+  command is still alive or unsettled.
 - Each backend has its own boxes, saved states and templates. `offbox bases` lists both backends; expired bases
   are hidden unless `--all`. An unpinned run naming a base that exists only on Boat uses Boat and says so.
   `offbox list` shows the selected backend; `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the
@@ -415,8 +416,8 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   runs held the pool's lock that long). Runs that moved to Boat wait with no time limit for a Boat box or for home. Nothing ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
 - **93** = person work (`offbox-person`) while the home server is down. Nothing ran and nothing went to Boat. It
   is not a failure of the command: the task waits for the server. Don't retry in a loop and don't route around it.
-- **94** = the home command was interrupted by a server/Incus restart or exec-stream loss and was not run again (`--no-retry`, person work, or it
-  had already been retried once). The command ran partly: check what it did before running it again; the message reports clean, stopped leftovers, or unknown cleanup.
+- **94** = the home command was interrupted by a server/Incus restart or exec-stream loss, its processes were gone, and it
+  was not run again (a started command never is). The command ran partly: check what it did before running it again; the message reports clean, stopped leftovers, or unknown cleanup.
 - **96** = local state DB failure. Before start: 'nothing ran, safe to retry'. After start: the message names the run and tells you to use `offbox wait <run>`; do not rerun the command. No automatic local fallback. A local bookkeeping failure after a known remote exit warns and returns that remote exit code.
 - **100** from `offbox wait` / `offbox logs` = the client ended before it got a box. The run never started; nothing ran, safe to rerun.
 - **143** = a started run was killed by `offbox kill`, on either backend. Run, wait, and logs report the kill rather than an infrastructure failure; missing step results do not change it to 90. A queued kill that never started retains exit 130.
@@ -466,6 +467,8 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
 `offbox log-rollup --day YYYY-MM-DD` writes `rollup-YYYY-MM-DD.json` beside the day file; omit `--day` for today. Rollups include `generatedAt` (UTC) and `complete`. Monitor/reaper ticks finalize yesterday after 00:05 UTC and refresh today's partial at most hourly. For nightly review, read yesterday's complete rollup plus today's partial through `generatedAt`. Logs keep 30 days; after 50 MB in a day, only errors continue. Home-server services write their own local file at the same path.
 
 ## Troubleshooting
+
+- uv 'failed to open file …archive-v0…': offbox moves the broken cache entry aside; rerun.
 
 - A box held by an unconfirmed checkout cleanup is rechecked by reap, release and the pool queue; it frees itself once the cleanup is confirmed gone.
 

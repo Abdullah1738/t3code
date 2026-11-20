@@ -596,8 +596,11 @@ def disk_maintenance(con, error=None):
         state = con.execute("SELECT v FROM meta WHERE k='disk_cleanup'").fetchone()
         cleanup = json.loads(state[0]) if state else {}
         pool = next((r for r in value['filesystems'] if r['filesystem'] == CFG['zpool']), None)
-        if pool and pool['free_bytes'] < pool['total_bytes'] * disk.WARN:
-            cleanup['target_bytes'] = int(pool['total_bytes'] * disk.TARGET)
+        if pool:
+            target = int(disk.pool_thresholds(pool['total_bytes'])['target'])
+            cleanup['target_bytes'] = min(cleanup.get('target_bytes', 0), target)
+            if pool['level'] in ('low', 'full'):
+                cleanup['target_bytes'] = target
         if pool and pool['free_bytes'] >= cleanup.get('target_bytes', 0):
             cleanup['target_bytes'] = 0
         live = {(r['box'], r['name']) for r in snaps}
@@ -616,8 +619,9 @@ def disk_maintenance(con, error=None):
         # Count-retention uses the same pacing gate. Otherwise run completion or
         # personal timers could bypass sampler backpressure with a bulk delete.
         count_gone = set()
+        count_protected = snapshot_protected(con, pressure=False)
         for box in con.execute('SELECT id FROM boxes WHERE deleted_at IS NULL'):
-            if box['id'] in snapshot_protected(con, pressure=False):
+            if box['id'] in count_protected:
                 continue
             rows = con.execute('SELECT * FROM snaps WHERE box_id=? ORDER BY created_at DESC', (box['id'],)).fetchall()
             count_gone.update((box['id'], name) for name in snaps_to_prune(rows, CFG['retention'], now()))
@@ -2779,7 +2783,7 @@ def _guest_command(c, fence=None) -> dict:
     if fence is None:
         fence = command_was_started(c)
     probe = ct_exec(box_id, 'python3 -I -c ' + shlex.quote(GUEST_PROBE) +
-                    f' {pid} {offsets[0]} {offsets[1]} ' + shlex.quote(run) + (' fence' if fence else 'check'), timeout=30)
+                    f' {pid} {offsets[0]} {offsets[1]} ' + shlex.quote(run) + (' fence' if fence else ' check'), timeout=30)
     result = json.loads(probe.stdout)
     if result['state'] in ('absent', 'gone'):
         legacy = command_probe(c)

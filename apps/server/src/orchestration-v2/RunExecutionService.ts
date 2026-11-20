@@ -545,6 +545,8 @@ export function routeProviderEvent(
     case "command_output.delta":
       // The session manager hands live output to the command output hub; runs never see it.
       return [false, state];
+    case "turn.native-ended":
+      return [false, state];
     case "turn.terminal":
       return event.providerTurnId === state.rootProviderTurnId
         ? [true, { ...state, rootTurnEnded: true }]
@@ -1817,6 +1819,14 @@ export const layer: Layer.Layer<
             const stopped = yield* Effect.gen(function* () {
               while (attempts < 10) {
                 if ((yield* nativeEndConfirmed) || (yield* Ref.get(orphanStopConfirmed)))
+                  return true;
+                // Expiry can already have stopped this turn through the durable outbox.
+                // Late output must not issue another cancellation against an idle owner.
+                if (
+                  settled &&
+                  input.session.holdsWorkForThread !== undefined &&
+                  !(yield* input.session.holdsWorkForThread(providerThread))
+                )
                   return true;
                 attempts++;
                 providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;

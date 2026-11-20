@@ -5775,6 +5775,8 @@ describe("OrchestratorMcpService provider resolution", () => {
       retryTimeout: true,
     },
     { mode: "async", legacy: false },
+    { mode: "async", legacy: false, reuseChild: "plain" },
+    { mode: "async", legacy: false, reuseChild: "encoded" },
     { mode: "async", legacy: false, stall: true, parentFinished: false },
     { mode: "async", legacy: false, stall: true, parentFinished: true },
     { mode: "async", legacy: false, rejectBeforeAdmission: true },
@@ -5922,9 +5924,15 @@ describe("OrchestratorMcpService provider resolution", () => {
     },
     { mode: "wait", legacy: true, dispatchTimeout: "before commit", noRetry: true },
   ] as const)(
-    "replays the same delegation across any namespace rebind (stall=$stall, parentFinished=$parentFinished, parentEnds=$parentEnds, rejectBeforeAdmission=$rejectBeforeAdmission, replayReadFailure=$replayReadFailure, $mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease, cancelOnArrival=$cancelOnArrival, maskedCommit=$maskedCommit, finishBeforeReply=$finishBeforeReply, finishDuringRetry=$finishDuringRetry, commitInGrace=$commitInGrace, expireCreate=$expireCreate, failCreate=$failCreate, singleDispatch=$singleDispatch, retryTimeout=$retryTimeout, foreignCaller=$foreignCaller, commitError=$commitError, admissionRace=$admissionRace)",
+    "replays the same delegation across any namespace rebind (stall=$stall, parentFinished=$parentFinished, parentEnds=$parentEnds, rejectBeforeAdmission=$rejectBeforeAdmission, replayReadFailure=$replayReadFailure, $mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease, cancelOnArrival=$cancelOnArrival, maskedCommit=$maskedCommit, finishBeforeReply=$finishBeforeReply, finishDuringRetry=$finishDuringRetry, commitInGrace=$commitInGrace, expireCreate=$expireCreate, failCreate=$failCreate, singleDispatch=$singleDispatch, retryTimeout=$retryTimeout, foreignCaller=$foreignCaller, commitError=$commitError, admissionRace=$admissionRace, reuseChild=$reuseChild)",
     (testCase) => {
       const { mode, legacy } = testCase;
+      const parentThreadId = ThreadId.make(
+        "reuseChild" in testCase && testCase.reuseChild === "encoded"
+          ? "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:parent"
+          : scope.thread!.threadId,
+      );
+
       const stillRunning = "stillRunning" in testCase;
       const recoveryTimeout = "recoveryTimeout" in testCase;
       const dispatchTimeout = "dispatchTimeout" in testCase ? testCase.dispatchTimeout : undefined;
@@ -6193,7 +6201,7 @@ describe("OrchestratorMcpService provider resolution", () => {
               ...unitCredential(parentThreadId),
               runtimeProviderSessionId: callerRuntimeId,
             });
-            const boundScope = scope;
+            const boundScope = { ...scope, thread: { ...scope.thread!, threadId: parentThreadId } };
             const request = {
               task: "Review.",
               mode,
@@ -6764,6 +6772,113 @@ describe("OrchestratorMcpService provider resolution", () => {
                 (yield* threads.getDelegationCommandState(commandId)).status,
                 "accepted",
               );
+              return;
+            }
+            if ("reuseChild" in testCase) {
+              const copied = ThreadId.make(
+                testCase.reuseChild === "encoded"
+                  ? first.childThreadId.replace("project%25253A%25252F", "project%253A%25252F")
+                  : first.childThreadId,
+              );
+              if (testCase.reuseChild === "encoded") assert.notEqual(copied, first.childThreadId);
+              const threads = yield* ThreadManagementService.ThreadManagementService;
+              const store = yield* ProjectionStore.ProjectionStoreV2;
+              assert.equal(
+                (yield* threads.getThreadShell(first.childThreadId))?.id,
+                first.childThreadId,
+              );
+              assert.equal(
+                (yield* service.readThread(boundScope, { threadId: first.childThreadId })).thread
+                  .threadId,
+                first.childThreadId,
+              );
+              assert.equal(
+                (yield* service.readThread(boundScope, { threadId: copied })).thread.threadId,
+                first.childThreadId,
+              );
+              const queued = yield* service.sendToThread(boundScope, {
+                threadId: copied,
+                mode: "queue",
+                message: "Second round",
+                clientRequestId: "reuse-before-completion",
+              });
+              assert.equal(queued.threadId, first.childThreadId);
+              const child = yield* orchestrator.getThreadProjection(first.childThreadId);
+              const now = yield* DateTime.now;
+              for (const run of child.runs)
+                yield* store.apply({
+                  type: "run.updated",
+                  id: EventId.make(`reuse:complete:${run.ordinal}`),
+                  threadId: first.childThreadId,
+                  runId: run.id,
+                  occurredAt: now,
+                  payload: { ...run, status: "completed", completedAt: now },
+                });
+              yield* orchestrator.recoverDelegatedTasks;
+              const terminal = yield* service.taskStatus(boundScope, first.taskId);
+              assert.equal(terminal.childThreadId, first.childThreadId);
+              assert.equal(terminal.status, "completed");
+              const shell = yield* threads.getThreadShell(first.childThreadId);
+              assert.equal(shell?.deletedAt, null);
+              for (const id of [first.childThreadId, copied]) {
+                const read = yield* service.readThread(boundScope, { threadId: id });
+                assert.equal(read.thread.threadId, first.childThreadId);
+                const wait = yield* service.waitForThread(boundScope, {
+                  threadId: id,
+                  runId: child.runs[0]!.id,
+                });
+                assert.equal(wait.threadId, first.childThreadId);
+                assert.equal(wait.status, "completed");
+              }
+              const followup = yield* service.sendToThread(boundScope, {
+                threadId: copied,
+                mode: "queue",
+                message: "Third round",
+                clientRequestId: "reuse-after-completion",
+              });
+              assert.equal(followup.threadId, first.childThreadId);
+              assert.isDefined(followup.taskId);
+              const retry = yield* service.sendToThread(boundScope, {
+                threadId: first.childThreadId,
+                mode: "queue",
+                message: "Third round",
+                clientRequestId: "reuse-after-completion",
+              });
+              assert.equal(retry.runId, followup.runId);
+              assert.equal(retry.taskId, followup.taskId);
+              const beforeDelete = yield* orchestrator.getThreadProjection(first.childThreadId);
+              yield* store.apply({
+                type: "thread.deleted",
+                id: EventId.make("reuse:deleted"),
+                threadId: first.childThreadId,
+                occurredAt: now,
+                payload: { ...beforeDelete.thread, deletedAt: now },
+              });
+              assert.equal(yield* threads.getThreadShell(first.childThreadId), null);
+              for (const id of new Set([first.childThreadId, copied])) {
+                const operations: ReadonlyArray<Effect.Effect<unknown, OrchestratorMcpFailure>> = [
+                  service.readThread(boundScope, { threadId: id }),
+                  service.sendToThread(boundScope, {
+                    threadId: id,
+                    mode: "queue",
+                    message: "Deleted follow-up",
+                    clientRequestId: "reuse-after-deletion",
+                  }),
+                  service.waitForThread(boundScope, { threadId: id }),
+                  service.interruptThread(boundScope, {
+                    threadId: id,
+                    clientRequestId: "reuse-deleted-interrupt",
+                  }),
+                ];
+                for (const operation of operations) {
+                  const error = yield* operation.pipe(Effect.asVoid, Effect.flip);
+                  assert.equal(error.code, "thread_not_found");
+                  assert.include(
+                    error.message,
+                    `deleted at ${DateTime.formatIso(now)} by an unrecorded actor`,
+                  );
+                }
+              }
               return;
             }
             if (timeoutTaskId !== undefined) assert.equal(first.taskId, timeoutTaskId);

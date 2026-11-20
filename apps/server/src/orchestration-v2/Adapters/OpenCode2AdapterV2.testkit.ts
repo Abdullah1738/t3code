@@ -132,6 +132,7 @@ const replayHttpClient = (
   controller: OpenCodeReplayController,
   replayGate: ProviderReplayGate | undefined,
   onPrompt: ((input: unknown) => void) | undefined,
+  beforeResponse: ((operation: string) => Promise<void>) | undefined,
 ) =>
   HttpClient.make((request, url) =>
     Effect.tryPromise({
@@ -171,6 +172,7 @@ const replayHttpClient = (
         }
         // Recorded responses are the raw HTTP bodies; `null` is an empty 204.
         const body = await controller.response(operation.type);
+        await beforeResponse?.(operation.type);
         if (body === "<hang>") return new Promise<Response>(() => {});
         if (typeof body === "object" && body !== null && "status" in body && "body" in body) {
           return new Response(encodeJson(body.body), {
@@ -194,6 +196,7 @@ export const replayServer = (
   options?: {
     readonly external?: boolean;
     readonly onPrompt?: (input: unknown) => void;
+    readonly beforeResponse?: (operation: string) => Promise<void>;
     readonly replayGate?: ProviderReplayGate;
     readonly borrowers?: { current: number };
   },
@@ -209,7 +212,12 @@ export const replayServer = (
     const opencode = yield* OpenCode2Client.make.pipe(
       Effect.provideService(
         HttpClient.HttpClient,
-        replayHttpClient(controller, options?.replayGate, options?.onPrompt),
+        replayHttpClient(
+          controller,
+          options?.replayGate,
+          options?.onPrompt,
+          options?.beforeResponse,
+        ),
       ),
     );
     const connection = {
@@ -241,6 +249,7 @@ const makeReplayAdapter = (
   options?: {
     readonly external?: boolean;
     readonly onPrompt?: (input: unknown) => void;
+    readonly beforeResponse?: (operation: string) => Promise<void>;
     readonly replayGate?: ProviderReplayGate;
     readonly borrowers?: { current: number };
   },
@@ -282,8 +291,10 @@ function layerRegistry(
 export const openCode2ReplayRuntime = (
   entries: ReadonlyArray<ProviderReplayEntry>,
   options?: {
+    readonly cwd?: string;
     readonly external?: boolean;
     readonly onPrompt?: (input: unknown) => void;
+    readonly beforeResponse?: (operation: string) => Promise<void>;
     readonly borrowers?: { current: number };
     readonly replayGate?: ProviderReplayGate;
     readonly attachmentsDir?: string;
@@ -313,7 +324,7 @@ export const openCode2ReplayRuntime = (
       runtimePolicy: {
         runtimeMode: "full-access",
         interactionMode: "default",
-        cwd: "/work/opencode2",
+        cwd: options?.cwd ?? "/work/opencode2",
       },
     });
   }).pipe(

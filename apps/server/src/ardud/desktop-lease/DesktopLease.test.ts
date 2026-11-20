@@ -10,7 +10,7 @@ import {
   DesktopLease,
   DesktopLeaseError,
   QUIET_MS,
-  QUARANTINE_MAX_MS,
+  QUARANTINE_EXPIRE_MS,
   STALE_MS,
   type AcquireResult,
   type Caller,
@@ -163,7 +163,7 @@ describe("desktop lease", () => {
     const stopped = store.release(caller("1"), first.ticket).lease!;
     addTime(100_000);
     store.touchHolder("child-1");
-    expect(store.currentLease()).toEqual(stopped);
+    expect(store.currentLease()).toEqual({ ...stopped, silentForMs: 100_000 });
     addTime(QUIET_MS - 100_000);
     const quarantined = store.status().lease!;
     expect(quarantined.state).toBe("quarantined");
@@ -171,7 +171,7 @@ describe("desktop lease", () => {
     expect(quarantined).not.toHaveProperty("heartbeatBy");
     addTime(100_000);
     store.touchHolder("child-1");
-    expect(store.currentLease()).toEqual(quarantined);
+    expect(store.currentLease()).toEqual({ ...quarantined, silentForMs: QUIET_MS + 100_000 });
   });
 
   it("serializes connections, preserves FIFO, and grants the head only on its retry", () => {
@@ -385,6 +385,8 @@ describe("desktop lease", () => {
     expect(transitions).toEqual([
       {
         ticket: queued.ticket,
+        rootThreadId: "root-2",
+        childThreadId: "child-2",
         taskId: "task-2",
         mode: "native",
         from: "queued",
@@ -399,10 +401,11 @@ describe("desktop lease", () => {
     "recovers quarantine only with a known idle holder (%s)",
     (active) => {
       const roots: string[] = [];
+      let activity: false | true | "unknown" = "unknown";
       const { open, addTime, filename, transitions } = setup({
         holderTurnActive: (root) => {
           roots.push(root);
-          return active;
+          return activity;
         },
       });
       const store = open();
@@ -417,10 +420,8 @@ describe("desktop lease", () => {
         quarantinedAt: "2025-06-15T15:16:40.000Z",
       });
       const queued = store.acquire(caller("2"), request("2"));
-      pollFor(addTime, QUIET_MS - 1, () => store.acquire(caller("2"), request("2")));
-      expect(store.status().lease?.state).toBe("quarantined");
-      expect(roots).toEqual([]);
-      addTime(1);
+      roots.length = 0;
+      activity = active;
       const result = store.acquire(caller("2"), request("2"));
       expect(roots).toEqual(["root-1"]);
       if (active === false) {
@@ -440,8 +441,8 @@ describe("desktop lease", () => {
             request_state: "finished",
           });
           expect(db.prepare("SELECT state, ended_at FROM ardud_desktop_calls").all()).toEqual([
-            { state: "failed", ended_at: 1750001200000 },
-            { state: "failed", ended_at: 1750001200000 },
+            { state: "failed", ended_at: 1750000600000 },
+            { state: "failed", ended_at: 1750000600000 },
           ]);
         } finally {
           db.close();
@@ -572,22 +573,32 @@ describe("desktop lease", () => {
     expect(store.status().lease?.state).toBe("quarantined");
   });
 
-  it.each([
-    ["unknown", QUARANTINE_MAX_MS, true],
-    ["unknown", 5 * 60 * 60_000, false],
-    ["unknown", QUARANTINE_MAX_MS - 1, false],
-    [true, 7 * 60 * 60_000, false],
-  ] as const)("bounds quarantine age (liveness %s, age %s)", (active, age, clears) => {
-    const { open, addTime, filename, transitions } = setup({ holderTurnActive: () => active });
-    const store = open();
-    const held = store.acquire(caller("1"), request("1"));
-    store.callStart(caller("1"), "hung-age");
-    addTime(QUIET_MS);
-    store.status();
-    addTime(age);
-    expect(store.status().lease === null).toBe(clears);
-    if (clears) {
+  it.each(["unknown", true] as const)(
+    "expires a silent quarantine at the deadline (liveness %s)",
+    (active) => {
+      const { open, addTime, filename, transitions } = setup({ holderTurnActive: () => active });
+      const store = open();
+      const held = store.acquire(caller("1"), request("1"));
+      store.callStart(caller("1"), "hung-age");
+      addTime(QUIET_MS);
+      expect(store.status().lease?.silentForMs).toBe(QUIET_MS);
+      const queued = store.acquire(caller("2"), request("2"));
+      pollFor(addTime, QUARANTINE_EXPIRE_MS - QUIET_MS - 1, () => {
+        expect(store.acquire(caller("2"), request("2")).state).toBe("queued");
+      });
+      expect(store.status().lease).toMatchObject({
+        state: "quarantined",
+        silentForMs: QUARANTINE_EXPIRE_MS - 1,
+      });
+      addTime(1);
+      expect(open().acquire(caller("2"), request("2"))).toMatchObject({
+        ticket: queued.ticket,
+        state: "held",
+      });
       expect(transitions.at(-1)).toMatchObject({
+        ticket: held.ticket,
+        rootThreadId: "root-1",
+        childThreadId: "child-1",
         from: "quarantined",
         to: "finished",
         reason: "quarantine_max_age",
@@ -599,38 +610,121 @@ describe("desktop lease", () => {
             .prepare("SELECT evidence, request_state FROM ardud_desktop_requests WHERE ticket = ?")
             .get(held.ticket),
         ).toEqual({
-          evidence: `auto-reconciled: quarantined ${age}ms with no heartbeat and liveness unknown`,
+          evidence: "auto-expired: holder silent since 2025-06-15T15:06:40.000Z",
           request_state: "finished",
         });
-        expect(db.prepare("SELECT state FROM ardud_desktop_calls").all()).toEqual([
-          { state: "failed" },
+        expect(db.prepare("SELECT state, ended_at FROM ardud_desktop_calls").all()).toEqual([
+          { state: "failed", ended_at: 1_750_000_000_000 + QUARANTINE_EXPIRE_MS },
         ]);
       } finally {
         db.close();
       }
-    } else {
-      expect(transitions.map((event) => event.reason)).toEqual(["open_call_timeout"]);
+      conflict(() => store.callEnd("hung-age", "completed"));
+      expect(store.callEnd("hung-age", "failed").lease?.ticket).toBe(queued.ticket);
+    },
+  );
+
+  it.each(
+    (["held", "stopping", "quarantined"] as const).flatMap((state) =>
+      [-1, 0, 1].map((offset) => [state, offset] as const),
+    ),
+  )("advances a %s holder after uninterrupted silence at expiry %+dms", (state, offset) => {
+    const { open, addTime, transitions } = setup();
+    const store = open();
+    const held = store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "uninterrupted-hung");
+    let elapsed = 0;
+    if (state === "stopping") store.release(caller("1"), held.ticket);
+    if (state === "quarantined") {
+      addTime(QUIET_MS);
+      expect(store.status().lease?.state).toBe("quarantined");
+      elapsed = QUIET_MS;
     }
+    addTime(QUARANTINE_EXPIRE_MS + offset - elapsed);
+    const next = store.acquire(caller("2"), request("2"));
+    if (offset < 0) {
+      expect(next.state).toBe("queued");
+      expect(next.status.lease).toMatchObject({
+        ticket: held.ticket,
+        state: "quarantined",
+        silentForMs: QUARANTINE_EXPIRE_MS - 1,
+      });
+    } else {
+      expect(next.state).toBe("held");
+      expect(next.status.lease?.ticket).toBe(next.ticket);
+      conflict(() => store.callEnd("uninterrupted-hung", "completed"));
+      expect(store.callEnd("uninterrupted-hung", "failed").lease?.ticket).toBe(next.ticket);
+    }
+    expect(transitions.map((event) => event.reason)).toEqual(
+      offset < 0 ? ["open_call_timeout"] : ["open_call_timeout", "quarantine_max_age"],
+    );
   });
 
-  it("keeps an unknown quarantine with a heartbeat after quarantine", () => {
-    const { open, addTime, filename } = setup();
+  it("preserves quarantine while its holder keeps sending heartbeats", () => {
+    const { open, addTime } = setup();
     const store = open();
     const held = store.acquire(caller("1"), request("1"));
     store.callStart(caller("1"), "hung-heartbeat");
     addTime(QUIET_MS);
-    store.status();
-    const db = new NodeSqlite.DatabaseSync(filename);
-    try {
-      db.prepare(
-        "UPDATE ardud_desktop_requests SET heartbeat_at = quarantined_at + 1 WHERE ticket = ?",
-      ).run(held.ticket);
-    } finally {
-      db.close();
-    }
-    addTime(QUARANTINE_MAX_MS);
     expect(store.status().lease?.state).toBe("quarantined");
+    pollFor(addTime, QUARANTINE_EXPIRE_MS * 2, () => {
+      conflict(() => store.heartbeat(caller("1"), held.ticket));
+      expect(store.status().lease).toMatchObject({ state: "quarantined", silentForMs: 0 });
+    });
+    conflict(() => store.callStart(caller("1"), "still-blocked"));
   });
+
+  it.each(["started_at", "ended_at"] as const)(
+    "counts the latest call %s as activity",
+    (column) => {
+      const { open, addTime, filename } = setup();
+      const store = open();
+      const held = store.acquire(caller("1"), request("1"));
+      store.callStart(caller("1"), "hung");
+      addTime(60_000);
+      store.callStart(caller("1"), "later");
+      addTime(QUIET_MS);
+      expect(store.status().lease?.state).toBe("quarantined");
+      if (column === "ended_at") store.callEnd("later", "completed");
+      // Call admission also heartbeats; isolate the call timestamps from that heartbeat.
+      const db = new NodeSqlite.DatabaseSync(filename);
+      try {
+        db.prepare(
+          "UPDATE ardud_desktop_requests SET heartbeat_at = acquired_at WHERE ticket = ?",
+        ).run(held.ticket);
+      } finally {
+        db.close();
+      }
+      const elapsed = column === "started_at" ? QUIET_MS : 0;
+      expect(store.status().lease?.silentForMs).toBe(elapsed);
+      addTime(QUARANTINE_EXPIRE_MS - elapsed - 1);
+      expect(store.status().lease?.state).toBe("quarantined");
+      addTime(1);
+      expect(store.status().lease).toBeNull();
+    },
+  );
+
+  it.each(["stopping", "quarantined"] as const)(
+    "immediately frees a %s terminal holder",
+    (state) => {
+      let active: false | "unknown" = "unknown";
+      const { open, addTime } = setup({ holderTurnActive: () => active });
+      const store = open();
+      const held = store.acquire(caller("1"), request("1"));
+      expect(held.status.lease).not.toHaveProperty("silentForMs");
+      store.callStart(caller("1"), "abandoned");
+      if (state === "stopping") store.release(caller("1"), held.ticket);
+      else addTime(QUIET_MS);
+      expect(store.status().lease).toMatchObject({
+        state,
+        silentForMs: state === "stopping" ? 0 : QUIET_MS,
+      });
+      active = false;
+      expect(store.acquire(caller("2"), request("2")).state).toBe("held");
+      conflict(() => store.callEnd("abandoned", "completed"));
+      expect(store.callEnd("abandoned", "failed").lease?.childThreadId).toBe("child-2");
+    },
+  );
 
   it.each(["stopping", "quarantined"] as const)(
     "explains a %s holder in refusals and queued snapshots",
@@ -643,7 +737,7 @@ describe("desktop lease", () => {
       else addTime(QUIET_MS);
       const queued = store.acquire(caller("2"), request("2"));
       const since = state === "stopping" ? "2025-06-15T15:06:40.000Z" : "2025-06-15T15:16:40.000Z";
-      const message = `Held by ${held.ticket} (task-1, ${state} since ${since}). It clears itself once its threads are idle, after a reboot, or after 6 h. To clear it now, the owner runs: t3ctl desktop-lease reconcile --ticket ${held.ticket} --evidence "<why>" (needs environment:maintain, an admin login).`;
+      const message = `Held by ${held.ticket} (task-1, ${state} since ${since}). It clears itself once its threads are idle or after a reboot; quarantine also clears after 30 min without holder activity. To clear it now, the owner runs: t3ctl desktop-lease reconcile --ticket ${held.ticket} --evidence "<why>" (needs environment:maintain, an admin login).`;
       expect(queued.status.message).toBe(message);
       for (const who of [caller("1"), caller("2")]) {
         expect(() => store.callStart(who, "refused")).toThrow(
@@ -668,6 +762,8 @@ describe("desktop lease", () => {
     expect(transitions).toEqual([
       {
         ticket: queued.ticket,
+        rootThreadId: "root-2",
+        childThreadId: "child-2",
         taskId: "task-2",
         mode: "native",
         from: "queued",
@@ -679,13 +775,14 @@ describe("desktop lease", () => {
   });
 
   it("keeps auto-reconciliation final when call-end itself reaches the recovery deadline", () => {
-    const { open, addTime, transitions } = setup({ holderTurnActive: () => false });
+    let activity: false | "unknown" = "unknown";
+    const { open, addTime, transitions } = setup({ holderTurnActive: () => activity });
     const store = open();
     store.acquire(caller("1"), request("1"));
     store.callStart(caller("1"), "hung");
     addTime(QUIET_MS);
-    store.status();
-    addTime(QUIET_MS);
+    expect(store.status().lease?.state).toBe("quarantined");
+    activity = false;
     conflict(() => store.callEnd("hung", "completed"));
     expect(store.status().lease).toBeNull();
     expect(store.callEnd("hung", "failed").lease).toBeNull();
@@ -696,9 +793,11 @@ describe("desktop lease", () => {
   });
 
   it("discards transition observations when storage work rolls back", () => {
+    let failLookup = false;
     const { open, addTime, transitions } = setup({
       holderTurnActive: () => {
-        throw new Error("lookup unavailable");
+        if (failLookup) throw new Error("lookup unavailable");
+        return "unknown";
       },
     });
     const store = open();
@@ -708,12 +807,13 @@ describe("desktop lease", () => {
     store.status();
     store.acquire(caller("2"), request("2"));
     addTime(QUIET_MS);
+    failLookup = true;
     expect(() => store.status()).toThrow("lookup unavailable");
     expect(transitions.map((event) => event.reason)).toEqual(["open_call_timeout"]);
   });
 
   it("dates a legacy quarantine from migration only once", () => {
-    const { open, addTime, filename } = setup({ holderTurnActive: () => false });
+    const { open, addTime, filename } = setup();
     const store = open();
     store.acquire(caller("1"), request("1"));
     store.callStart(caller("1"), "hung");

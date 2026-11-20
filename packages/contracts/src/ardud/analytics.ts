@@ -594,6 +594,29 @@ const GeneralEvent = Schema.Struct({
           Schema.isMaxLength(3),
         ),
       ),
+      activityStages: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            stage: Schema.Literals([
+              "load",
+              "cards",
+              "events",
+              "history",
+              "threads",
+              "slots",
+              "board",
+              "pools",
+              "evaluatorEvents",
+              "dispatch",
+              "analytics",
+              "rollup",
+              "compact",
+            ]),
+            durationMs: Measurement,
+            completed: Schema.Boolean,
+          }),
+        ).check(Schema.isMaxLength(16)),
+      ),
       tickId: Schema.optionalKey(Id),
       activeTickId: Schema.optionalKey(Id),
       byRead: Schema.optionalKey(

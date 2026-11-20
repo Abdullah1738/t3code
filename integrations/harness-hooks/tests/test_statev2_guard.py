@@ -653,6 +653,85 @@ class GuardTests(unittest.TestCase):
                 self.adapters(command)
 
     @trusted_node_test
+    def test_same_call_python_provenance_retry_hint(self):
+        hint = ('Accepted: retry this same call with /usr/bin/python3 -I … instead of bare python3; '
+                'the executable, startup and mutation checks still apply.')
+        shadow = self.write('shadow-bin/python3', '#!/bin/sh\necho WRAPPER_MUST_NOT_RUN\n')
+        shadow.chmod(0o755)
+        self.write('config/sibling.txt', 'old')
+        shapes = {
+            'case3': ('d=$(mktemp -d)\n'
+                      'PYTHON -I -c \'print("PRIVATE_CODE (( ${t.name}")\'\n' +
+                      self.heredoc('"$d/x.mjs"', 'console.log(1)') + 'node "$d/x.mjs"'),
+            '4504': (self.heredoc('scripts/a.mjs', 'console.log(1)', append=True) +
+                     "PYTHON -I - <<'EDIT'\nfrom pathlib import Path\n"
+                     "Path('config/sibling.txt').write_text('new')\nEDIT\nnode --test scripts/a.mjs"),
+            'script': ('d=$(mktemp -d)\n' + self.heredoc('"$d/port.py"', 'print(1)') +
+                       'PYTHON -I "$d/port.py"'),
+        }
+        with patch.dict(os.environ, {'PATH': str(shadow.parent) + os.pathsep + os.environ['PATH']}):
+            for label, shape in shapes.items():
+                for python in ('python3', 'command python3'):
+                    command = shape.replace('PYTHON', python)
+                    with self.subTest(shape=label, python=python):
+                        rule, cause = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, UNRESOLVED, cause)
+                        self.assertIn('python3: executable provenance or mutation proof failed', cause)
+                        reason = guard.refusal_reason(rule, cause, str(self.root))
+                        self.assertIn(hint, reason)
+                        self.assertEqual(reason.count('Accepted:'), 1)
+                        self.assertNotIn('PRIVATE_CODE', reason)
+                        self.assertNotIn('WRAPPER_MUST_NOT_RUN', reason)
+                        self.adapters(command, UNRESOLVED, expected_reason=hint)
+                command = shape.replace('PYTHON', '/usr/bin/python3')
+                with self.subTest(shape=label, python='absolute'):
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+                    self.adapters(command)
+
+    @trusted_node_test
+    def test_same_call_python_retry_preserves_refusals(self):
+        writer = self.heredoc('scripts/a.mjs', 'console.log(1)')
+        rows = {
+            'checked source write': writer + "/usr/bin/python3 -I - <<'EDIT'\n"
+                                    "from pathlib import Path\nPath('scripts/a.mjs').write_text('changed')\n"
+                                    'EDIT\nnode --test scripts/a.mjs',
+            'binary mutation': writer + 'cp replacement /usr/bin/python3\n'
+                               "/usr/bin/python3 -I -c 'print(1)'\nnode --test scripts/a.mjs",
+            'non-isolated': writer + "/usr/bin/python3 -c 'print(1)'\nnode --test scripts/a.mjs",
+            'live read': writer + "/usr/bin/python3 -I -c " + shlex.quote(f'open({LIVE!r}).read()') +
+                         '\nnode --test scripts/a.mjs',
+            'arbitrary function': writer + 'python3() { echo changed; }\n'
+                                  "python3 -I -c 'print(1)'\nnode --test scripts/a.mjs",
+        }
+        for label, command in rows.items():
+            with self.subTest(case=label):
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertIsNotNone(rule, cause)
+                self.assertNotIn('instead of bare python3', guard.refusal_reason(rule, cause, str(self.root)))
+                self.adapters(command, rule)
+
+        for predecessor in ('opaque-mutator', "sed 's/a/b/e' config/sibling.txt",
+                            "python3 -c 'print(1)'", "perl -e 'print 1'"):
+            command = writer + predecessor + "\n/usr/bin/python3 -I -c 'print(1)'\nnode scripts/a.mjs"
+            with self.subTest(predecessor=predecessor):
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                reason = guard.refusal_reason(rule, cause, str(self.root))
+                self.assertNotIn('instead of bare python3', reason)
+                self.assertIn('Split source preparation and execution into separate calls', reason)
+                self.adapters(command, rule, expected_reason='Split source preparation and execution into separate calls')
+
+        for marker in ('python3: executable provenance or mutation proof failed',
+                       'python3: bare executable lookup unproved; '):
+            for target in (shlex.quote('$d/' + marker + '.mjs'), '"$d/' + marker + '.mjs"'):
+                command = 'd=$(mktemp -d)\nnode ' + target
+                with self.subTest(filename=target):
+                    rule, cause = guard.classify_detail(command, str(self.root))
+                    self.assertEqual(rule, UNRESOLVED, cause)
+                    self.assertNotIn('instead of bare python3', guard.refusal_reason(rule, cause, str(self.root)))
+                    self.adapters(command, rule, expected_reason='same-call heredoc')
+
+    @trusted_node_test
     def test_same_call_inline_node_does_not_run_sibling(self):
         prefix = 'W=$(mktemp -d)\n' + self.heredoc('"$W/prep.py"', 'print(1)')
         prefix += self.heredoc('scripts/a.mjs', 'console.log(1)', append=True)

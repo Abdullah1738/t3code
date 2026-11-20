@@ -22,6 +22,7 @@ import {
   ProviderSessionId,
   ThreadId,
   type ProviderThreadId,
+  type ProviderTurnId,
   RunId,
   type RunAttemptId,
 } from "@t3tools/contracts";
@@ -304,6 +305,14 @@ interface LiveSessionEntry {
   readonly runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
   readonly lastPersistedSession: OrchestrationV2ProviderSession;
   readonly exposedRuntime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
+  readonly observedTurns: Map<
+    ProviderTurnId,
+    {
+      readonly providerThreadId: ProviderThreadId;
+      readonly attemptId: RunAttemptId | null;
+      readonly ended: boolean;
+    }
+  >;
   readonly eventSubscribers: Ref.Ref<ReadonlyMap<number, EventSubscriber> | undefined>;
   readonly requestEventPermit: Semaphore.Semaphore;
   readonly scope: Scope.Closeable;
@@ -2567,6 +2576,7 @@ export const layerWithOptions = (
       const decorateRuntime = (
         runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
         eventSubscribers: Ref.Ref<ReadonlyMap<number, EventSubscriber> | undefined>,
+        observedTurns: LiveSessionEntry["observedTurns"],
       ): ProviderAdapter.ProviderAdapterV2SessionRuntime => {
         const providerSessionId = runtime.providerSessionId;
         const subscribeEvents = makeEventSubscription(eventSubscribers);
@@ -2690,6 +2700,25 @@ export const layerWithOptions = (
             return runtime.providerSession;
           },
           subscribeEvents,
+          hasObservedTurnEnd: (target) =>
+            Effect.suspend(() => {
+              if (target.attemptId === undefined) {
+                const turn = observedTurns.get(target.providerTurnId);
+                if (turn !== undefined)
+                  return Effect.succeed(
+                    turn.providerThreadId === target.providerThreadId && turn.ended,
+                  );
+                return runtime.hasObservedTurnEnd?.(target) ?? Effect.succeed(false);
+              }
+              const turns = [...observedTurns.values()].filter(
+                (turn) =>
+                  turn.providerThreadId === target.providerThreadId &&
+                  turn.attemptId === target.attemptId,
+              );
+              return turns.length > 0
+                ? Effect.succeed(turns.every((turn) => turn.ended))
+                : (runtime.hasObservedTurnEnd?.(target) ?? Effect.succeed(false));
+            }),
           subscribeEventsForIngestion: makeEventSubscription(eventSubscribers, true),
           events: Stream.unwrap(
             subscribeEvents.pipe(Effect.map((subscription) => subscription.events)),
@@ -3032,6 +3061,32 @@ export const layerWithOptions = (
         return entry.runtime.events.pipe(
           Stream.runForEach((event) => {
             if (shutdownSignal.received) return Effect.void;
+            // Expiry marks projections failed before native work ends. Keep
+            // native terminal evidence outside that projection, including when
+            // a buffered wake still holds the session for a continuation.
+            if (event.type === "provider_turn.updated") {
+              const turn = event.providerTurn;
+              entry.observedTurns.set(turn.id, {
+                providerThreadId: turn.providerThreadId,
+                attemptId: turn.runAttemptId,
+                ended: entry.observedTurns.get(turn.id)?.ended ?? false,
+              });
+            } else if (
+              event.type === "turn.native-ended" ||
+              (event.type === "turn.terminal" && event.nativeWorkEnded === true)
+            ) {
+              entry.observedTurns.set(event.providerTurnId, {
+                providerThreadId: event.providerThreadId,
+                attemptId:
+                  event.type === "turn.native-ended"
+                    ? event.attemptId
+                    : (entry.observedTurns.get(event.providerTurnId)?.attemptId ?? null),
+                ended: true,
+              });
+            }
+            // Confirmation after local terminalization must not project another completion.
+            if (event.type === "turn.native-ended")
+              return publishToSubscribers(entry.eventSubscribers, { type: "event", event });
             // Live output skips run subscribers and ingestion entirely: it is
             // never persisted, and a flood of it must not queue ahead of real events.
             if (event.type === "command_output.delta") {
@@ -3531,7 +3586,8 @@ export const layerWithOptions = (
               const eventSubscribers = yield* Ref.make<
                 ReadonlyMap<number, EventSubscriber> | undefined
               >(new Map());
-              const exposedRuntime = decorateRuntime(runtime, eventSubscribers);
+              const observedTurns: LiveSessionEntry["observedTurns"] = new Map();
+              const exposedRuntime = decorateRuntime(runtime, eventSubscribers, observedTurns);
               const now = yield* Clock.currentTimeMillis;
               const attachedSession = runtime.providerSession;
               const entry: LiveSessionEntry = {
@@ -3545,6 +3601,7 @@ export const layerWithOptions = (
                   attachedSession.capabilities.sessions.supportsMultipleProviderThreadsPerSession,
                 runtime,
                 exposedRuntime,
+                observedTurns,
                 lastPersistedSession: attachedSession,
                 eventSubscribers,
                 requestEventPermit: yield* Semaphore.make(1),
