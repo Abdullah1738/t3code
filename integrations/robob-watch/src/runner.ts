@@ -109,7 +109,7 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   const delivery = await deliver(accepted, pending.event, pending.key, state);
   for (const run of pending.healthRuns ?? [pending.healthRun]) await recordHealthDelivery(watcher.id, run, delivery);
   if (watcherInstance(watcher.id) !== instance) return false;
-  log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via}${delivery.meantFor ? ` meant_for=${delivery.meantFor.split(":").at(-1)!.slice(0, 8)}` : ""} confirmed=${delivery.confirmed ?? "n/a"} ${delivery.detail}`);
+  log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via}${delivery.meantFor ? ` meant_for=${delivery.meantFor.split(":").at(-1)!.slice(0, 8)}` : ""} confirmed=${delivery.confirmed ?? "n/a"}${delivery.sendDeferred ? " send=deferred" : ""} ${delivery.detail}`);
   const definition = loadWatcher(watcher.id);
   if (!definition) return false;
   const current = loadState(watcher.id);

@@ -39,6 +39,9 @@ type Fixture = {
   statusSleepOnce?: boolean;
   nativeSleepOnce?: boolean;
   statusEmptyError?: boolean;
+  statusFailure?: string;
+  sendFailure?: string;
+  sendOutput?: string;
 };
 
 // Each delivery runs in a fresh process: caches, bridge rows, logs and every CLI stay inside its fixture.
@@ -72,6 +75,7 @@ if (${JSON.stringify(cli)} === 't3ctl') {
   }
   if (config[args[0] + 'Sleep']) { console.error('probe waiting'); await Bun.sleep(10_000); }
   if (args[0] === 'status' && config.statusEmptyError) process.exit(1);
+  if (config[args[0] + 'Failure']) { console.error(config[args[0] + 'Failure']); process.exit(1); }
   if (config[args[0] + 'Error']) { console.error((args[0] === 'status' ? 'not_found: ' : '') + args[0] + ' stub failure'); process.exit(1); }
   console.log(config[args[0] + 'Output'] ?? JSON.stringify(args[0] === 'send' ? { ok: true, duplicate: false } : { ok: true, thread: config.status }));
 } else {
@@ -535,6 +539,258 @@ const confirmBody = (body: string) => `(async () => {
   return { before, state: loadState(watcher.id) };
 })()`;
 
+test.each([
+  'fetch failed', 'ECONNREFUSED: connect failed', 'ECONNRESET', 'socket hang up', 'EPIPE',
+  'http_error: HTTP 502', 'http_error: HTTP 503', 'http_error: HTTP 504', 'server_restart',
+  'TimeoutError: The operation was aborted due to timeout',
+])('transport failure %s stays deferred on its thread', async failure => {
+  const { result, calls, sentLogs, log } = await fixture({ statusFailure: 'fetch failed', sendFailure: failure }, confirmBody(''));
+  expect(result.before.confirm).toMatchObject({ sendPending: true, sendAttempts: 0, thread: projectThread });
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+  expect(log).toContain('via=thread:abcd1234 confirmed=pending send=deferred');
+  expect(sentLogs[0]?.props).toMatchObject({ sendDeferred: true,
+    failureClass: failure.startsWith('TimeoutError') ? 'timeout' : 'control_api_unavailable' });
+});
+
+test('an outage recovers with the same key and payload on the next retry tick', async () => {
+  const { result, calls, logs, log } = await fixture({ statusFailure: 'fetch failed', sendFailure: 'fetch failed' }, confirmBody(`
+    Date.now = () => before.confirm.nextAt;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false } }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.before.confirm?.sendPending).toBe(true);
+  expect(result.state.confirm).toMatchObject({ sendAttempts: 1, sentAt: result.before.confirm!.sentAt });
+  expect(result.state.confirm?.sendPending).toBeUndefined();
+  const sends = calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send');
+  expect(sends).toHaveLength(2);
+  expect(sends[0]!.args).toEqual(sends[1]!.args);
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+  expect(log).toContain('creator send delivered after 1 retries');
+  expect(logs.find(row => row.name === 'wake.send_retry')).toMatchObject({ durationMs: expect.any(Number), ids: { watcher: 'route-test' }, props: { op: 'send', attempt: 1, outcome: 'accepted' } });
+  expect(logs.find(row => row.name === 'wake.send_delivered_late')).toMatchObject({ ids: { watcher: 'route-test' }, props: { op: 'send', retries: 1, totalDelayMs: result.before.confirm!.nextAt! - result.before.confirm!.sentAt } });
+});
+
+test('show exposes deferred attempts and the next retry', async () => {
+  const { result } = await fixture({ sendFailure: 'fetch failed' }, confirmBody(`
+    const show = Bun.spawnSync([process.execPath, ${JSON.stringify(join(import.meta.dir, '../src/cli.ts'))}, 'show', watcher.id], { env: process.env });
+    if (show.exitCode !== 0 || !show.stdout.toString().includes('send=deferred attempts=0 next_retry=')) throw new Error('show omitted deferred state');
+  `));
+  expect(result.state.confirm?.sendPending).toBe(true);
+});
+
+test('an ambiguous retry clears sendPending and reconciles a subsequent run', async () => {
+  const { result, calls } = await fixture({ sendFailure: 'fetch failed' }, confirmBody(`
+    Date.now = () => before.confirm.nextAt;
+    writeFileSync(configPath, JSON.stringify({ sendAmbiguous: true, status: { threadId: watcher.created_by_session, archived: false } }));
+    await tickOne(watcher.id);
+    if (loadState(watcher.id).confirm.sendPending) throw new Error('ambiguous retry still deferred');
+    const delivered = loadState(watcher.id).confirm.sentAt;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false,
+      recentRuns: [{ requestedAt: new Date(delivered).toISOString() }] } }));
+    const next = loadState(watcher.id).confirm.nextAt;
+    Date.now = () => next;
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toBeUndefined();
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+});
+
+test.each([
+  'unavailable: Thread send timed out waiting for message command admission for thread ' + projectThread,
+  'unavailable: Thread send is temporarily unavailable',
+  'send_timeout: Thread send timed out waiting for message command admission for thread ' + projectThread,
+])('admission failure %s defers and retries the same key', async failure => {
+  const { result, calls, logs, log } = await fixture({ sendFailure: failure }, confirmBody(`
+    Date.now = () => before.confirm.nextAt;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false } }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.before.confirm?.sendPending).toBe(true);
+  expect(result.state.confirm?.sendPending).toBeUndefined();
+  const sends = calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send');
+  expect(sends).toHaveLength(2);
+  expect(sends[0]!.args).toEqual(sends[1]!.args);
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+  expect(log).toContain('send=deferred');
+  expect(log).toContain('creator send delivered after 1 retries');
+  expect(logs.find(row => row.name === 'wake.sent')?.props?.failureClass).toBe('timeout');
+});
+
+test('a deferred escalation retry can confirm the original completed run', async () => {
+  const { result, calls, log } = await fixture({}, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ sendFailure: 'fetch failed', status: { threadId: watcher.created_by_session, archived: false } }));
+    await tickOne(watcher.id);
+    if (!loadState(watcher.id).confirm.sendPending) throw new Error('escalation did not defer');
+    const due = loadState(watcher.id).confirm.nextAt;
+    Date.now = () => due;
+    writeFileSync(configPath, JSON.stringify({ sendOutput: JSON.stringify({ ok: true, duplicate: true }),
+      status: { threadId: watcher.created_by_session, archived: false, state: 'idle',
+        recentRuns: [{ requestedAt: new Date(base + 1).toISOString(), status: 'completed' }] } }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toBeUndefined();
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+  expect(log).toContain('creator send delivered after 2 retries');
+});
+
+test('deferred recovery follows a rotated iMessage creator to the live owner route', async () => {
+  const { result, calls } = await fixture({ statusFailure: 'fetch failed', sendFailure: 'fetch failed' }, confirmBody(`
+    Date.now = () => before.confirm.nextAt;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false, origin: 'imessage' } }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm?.ownerFallback).toBe(true);
+  expect(result.state.last_delivery).toBe('wake');
+  expect(calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send')).toHaveLength(1);
+  expect(wakeText(calls)).toStartWith('Routing event\n');
+  expect(wakeText(calls)).not.toContain('meant for thread');
+});
+
+test('native recovery defers a transport error once its thread resolves', async () => {
+  const { result, calls } = await fixture({ nativeSleep: true, watcher: { created_by_session: 'ses_old' } }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ sendFailure: 'fetch failed', status: { threadId: ${JSON.stringify(projectThread)}, archived: false } }));
+    Date.now = () => base + 60_000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toMatchObject({ sendPending: true, thread: projectThread });
+  expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+});
+
+test.each(['not_found', 'archived', 'invalid_thread'])('a deferred send falls back only after a definite %s re-check', async failure => {
+  const { result, calls } = await fixture({ sendFailure: 'fetch failed' }, confirmBody(`
+    Date.now = () => before.confirm.nextAt;
+    writeFileSync(configPath, JSON.stringify({ statusFailure: ${JSON.stringify(failure)} }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toMatchObject({ ownerFallback: true });
+  expect(result.state.confirm?.sendPending).toBeUndefined();
+  expect(wakeText(calls)).toStartWith('(meant for thread abcd1234, which could not be reached)\n');
+  expect(calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send')).toHaveLength(1);
+});
+
+test('a definite send failure takes precedence over outage text', async () => {
+  const { result, calls, sentLogs } = await fixture({ sendFailure: 'not_found: thread gone after server_restart' });
+  expect(result.via).toBe('wake:owner-fallback');
+  expect(wakeText(calls)).toContain('which could not be reached');
+  expect(sentLogs[0]?.props?.failureClass).toBe('definite');
+});
+
+test.each([false, true])('a slow or unavailable target escalates to the same thread (unavailable: %j)', async unavailable => {
+  const { result, calls, logs, log } = await fixture({ sendAmbiguous: true }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ ${unavailable ? "statusFailure: 'fetch failed', sendFailure: 'fetch failed'" : "status: { threadId: watcher.created_by_session, archived: false }"} }));
+    await tickOne(watcher.id);
+    Date.now = () => at + 31_000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm?.ownerFallback).not.toBe(true);
+  expect(logs.filter(row => row.name === 'wake.unconfirmed')).toHaveLength(1);
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(1);
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+  expect(log).toContain(`confirmed=pending (target ${unavailable ? 'unverified' : 'live'})`);
+  expect(log).not.toContain('via=wake:owner-fallback');
+});
+
+test('an archived escalation target falls back to the owner', async () => {
+  const { result, calls } = await fixture({ sendAmbiguous: true }, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: true } }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm?.ownerFallback).toBe(true);
+  expect(wakeText(calls)).toStartWith('(meant for thread abcd1234, which could not be reached)\n');
+});
+
+test('busy thread queue acceptance confirms a one-shot wake during escalation', async () => {
+  const { result, calls, logs, log } = await fixture({ watcher: { max_fires: 1 }, sendAmbiguous: true }, confirmBody(`
+    if (before.status !== 'done') throw new Error('one-shot watcher did not finish');
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false,
+      recentRuns: [{ requestedAt: new Date(base - 60_000).toISOString() }] },
+      sendOutput: JSON.stringify({ ok: true, status: 'queued', delivery: 'queued' }) }));
+    await tickOne(watcher.id);
+    Date.now = () => at + 31_000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.status).toBe('done');
+  expect(result.state.confirm).toBeUndefined();
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(1);
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+  const sends = calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send');
+  expect(sends).toHaveLength(2);
+  expect(sends[0]!.args).toEqual(sends[1]!.args);
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(1);
+  expect(log).not.toContain('via=wake:owner-fallback');
+});
+
+test('a busy thread queue receipt confirms the first send too', async () => {
+  const { result } = await fixture({ sendOutput: JSON.stringify({ ok: true, status: 'queued', delivery: 'queued' }) });
+  expect(result.ok).toBe(true);
+  expect(result.confirmation).toBeUndefined();
+});
+
+test('deferred retries follow exponential backoff and the five-minute cap', async () => {
+  const { result, calls } = await fixture({ sendFailure: 'fetch failed' }, confirmBody(`
+    const { wakeSendBackoff } = await import(${JSON.stringify(libPath)});
+    process.env.ROBOB_WATCH_SEND_RETRY_MS = '1000';
+    if (wakeSendBackoff(0) !== 1000 || wakeSendBackoff(20) !== 300_000) throw new Error('configured backoff');
+    delete process.env.ROBOB_WATCH_SEND_RETRY_MS;
+    for (let attempt = 0; attempt < 7; attempt++) {
+      const fresh = loadState(watcher.id);
+      const due = fresh.confirm.nextAt;
+      Date.now = () => due - 1;
+      await tickOne(watcher.id);
+      if ((loadState(watcher.id).confirm.sendAttempts ?? 0) !== attempt) throw new Error('early retry');
+      Date.now = () => due;
+      await tickOne(watcher.id);
+      const after = loadState(watcher.id).confirm;
+      if (after.sendAttempts !== attempt + 1 || after.nextAt - due !== Math.min(300_000, 30_000 * 2 ** (attempt + 1))) throw new Error('wrong backoff');
+    }
+  `));
+  expect(result.state.confirm).toMatchObject({ sendPending: true, sendAttempts: 7 });
+  expect(calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send')).toHaveLength(8);
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+});
+
+test('send backoff does not delay the ten-minute alert or trigger an early retry', async () => {
+  const { result, calls, logs } = await fixture({ sendFailure: 'fetch failed' }, confirmBody(`
+    for (let i = 0; i < 4; i++) {
+      const due = loadState(watcher.id).confirm.nextAt;
+      Date.now = () => due;
+      await tickOne(watcher.id);
+    }
+    const due = loadState(watcher.id).confirm.nextAt;
+    if (due <= at) throw new Error('fixture did not span the alert deadline');
+    Date.now = () => at;
+    await tickOne(watcher.id);
+    if (loadState(watcher.id).confirm.nextAt !== due) throw new Error('alert changed retry schedule');
+    Date.now = () => at + 1000;
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toMatchObject({ sendPending: true, sendAttempts: 4, alertDone: true });
+  expect(calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send')).toHaveLength(5);
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(1);
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+  expect(logs.filter(row => row.name === 'wake.unconfirmed')).toHaveLength(1);
+});
+
+test('deferred sends respect quiet hours and their asynchronous probes yield to timers', async () => {
+  const { result, calls } = await fixture({ sendFailure: 'fetch failed' }, confirmBody(`
+    const hour = new Date(at).getUTCHours();
+    watcher.quiet = { start: hour, end: (hour + 1) % 24, time_zone: 'UTC' };
+    await confirmWakes(watcher);
+    const held = loadState(watcher.id);
+    if (held.confirm.sendAttempts !== 0) throw new Error('retried during quiet hours');
+    delete watcher.quiet;
+    Date.now = () => at + 31_000;
+    writeFileSync(configPath, JSON.stringify({ statusSleep: true, sendFailure: 'fetch failed' }));
+    let timerRan = false;
+    const timer = setTimeout(() => { timerRan = true; }, 10);
+    await confirmWakes(watcher);
+    clearTimeout(timer);
+    if (!timerRan) throw new Error('deferred send blocked timers');
+  `));
+  expect(result.state.confirm?.sendAttempts).toBe(1);
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+});
+
 test.each([false, true])('an unconfirmed send escalates once, including a send timeout (%j)', async sendSleep => {
   const { result, calls, logs, runnerLog, log } = await fixture({ sendSleep }, confirmBody(`
     await tickOne(watcher.id);
@@ -543,12 +799,14 @@ test.each([false, true])('an unconfirmed send escalates once, including a send t
   `));
   expect(result.before.confirm).toMatchObject({ key: 'robob-watch:route-test:1:stable-event', thread: projectThread, attempts: 0 });
   expect(result.before.pending).toBeUndefined();
-  expect(result.state.confirm).toMatchObject({ escalated: true, ownerFallback: true });
+  expect(result.state.confirm).toMatchObject({ escalated: true, fallbackDone: true });
+  expect(result.state.confirm?.ownerFallback).not.toBe(true);
   expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(1);
   expect(calls.filter(call => call.cli === 'telegram')[0]!.args).toContain('--severity=attention');
-  expect(calls.filter(call => call.cli === 'spectrum' && call.args[0] === 'wake')).toHaveLength(1);
-  expect(calls.filter(call => call.cli === 'spectrum')[0]!.args).toContain('--key=robob-watch:route-test:1:stable-event');
-  expect(calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send')).toHaveLength(1);
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+  const sends = calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send');
+  expect(sends).toHaveLength(2);
+  expect(sends[0]!.args).toEqual(sends[1]!.args);
   expect(logs.filter(row => row.name === 'wake.unconfirmed')).toHaveLength(1);
   expect(runnerLog).toContain('wake unconfirmed');
   expect(log).toContain('wake unconfirmed');
@@ -693,7 +951,8 @@ test.each(['alert', 'fallback'])('interrupted escalation resumes only the unfini
     await tickOne(watcher.id);
   `));
   expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(unfinished === 'alert' ? 1 : 0);
-  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(unfinished === 'fallback' ? 1 : 0);
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+  expect(calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send')).toHaveLength(unfinished === 'fallback' ? 2 : 1);
   expect(logs.filter(row => row.name === 'wake.unconfirmed')).toHaveLength(0);
   expect(result.state.confirm).toMatchObject({ alertDone: true, fallbackDone: true });
 });
