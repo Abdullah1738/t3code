@@ -7,8 +7,36 @@ BUN_PATH=${2:?usage: install.zsh BOX_ID BUN_PATH}
 cd "$HOME/.local/share/offbox-person/moni"
 export OFFBOX_THREAD=person:moni OFFBOX_BACKEND=server
 # Caller resumes this exact box with supervisor.py --ensure-only first. Explicit ssh cannot allocate.
-tar -C "$HERE/../.." -cf - integrations/moni-box-runner/src integrations/spectrum-bridge/src |
-  offbox ssh "$BOX" -- 'umask 077; mkdir -p ~/person/agent/code; tar -xf - -C ~/person/agent/code'
+# tar can emit a valid but incomplete archive before failing; finish it before the box can promote it.
+archive_dir=$(mktemp -d)
+trap 'rm -rf "$archive_dir"' EXIT
+trap 'exit 1' HUP INT TERM
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$HERE/../.." -cf - integrations/moni-box-runner/src integrations/spectrum-bridge/src > "$archive_dir/source.tar"
+offbox ssh "$BOX" -- '
+set -eu
+umask 077
+agent_dir=$HOME/person/agent
+mkdir -p "$agent_dir"
+stage=$(mktemp -d "$agent_dir/code.new.XXXXXX")
+cleanup() {
+  result=$?
+  trap - EXIT
+  # A failed promotion must put the complete old tree back before removing staging.
+  if [ -e "$stage/old" ] && [ ! -e "$agent_dir/code" ]; then
+    mv "$stage/old" "$agent_dir/code" || exit 1
+  fi
+  rm -rf "$stage"
+  exit "$result"
+}
+trap cleanup EXIT
+trap "exit 1" HUP INT TERM
+mkdir "$stage/code"
+tar -xf - -C "$stage/code"
+if [ -e "$agent_dir/code" ]; then
+  mv "$agent_dir/code" "$stage/old"
+fi
+mv "$stage/code" "$agent_dir/code"
+' < "$archive_dir/source.tar"
 offbox ssh "$BOX" -- "bash -s -- '$BUN_PATH'" <<'BOXSETUP'
 set -euo pipefail
 bun_bin=$1
