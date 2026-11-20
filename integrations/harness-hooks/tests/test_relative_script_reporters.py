@@ -156,7 +156,8 @@ class RelativeScriptReporterTests(unittest.TestCase):
                     with self.subTest(variant=variant, shape=shape, harness=harness, tool=tool):
                         event = self.event(command, tool)
                         event['tool_input']['workdir'] = str(cwd)
-                        self.check(event, expected, harness)
+                        # A remote-only run never executes the backup copy here (#221).
+                        self.check(event, None if shape == 'offbox-options' else expected, harness)
 
     def test_fixture_and_migration_review_corpus_through_hooks(self):
         isolated_source_cases.write_migration_helpers(self.root)
@@ -170,7 +171,8 @@ class RelativeScriptReporterTests(unittest.TestCase):
             for prefix in prefixes:
                 for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:
                     with self.subTest(case=label, prefix=prefix, harness=harness, tool=tool):
-                        self.check(self.event(prefix + command, tool), expected, harness)
+                        # A remote-only run never executes the fixture here (#221).
+                        self.check(self.event(prefix + command, tool), None if '--remote' in prefix else expected, harness)
         self.write('tmp/fixture.sh', backup.read_text())
         for destination in (LIVE, '~/.t3/userdata/statev2.sqlite', '$HOME/.robob/userdata/statev2.sqlite'):
             for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:
@@ -336,7 +338,8 @@ class RelativeScriptReporterTests(unittest.TestCase):
             self.write('run.sh', 'sqlite3 ' + database + ' .tables')
             for command in invocations:
                 with self.subTest(command=command, database=database):
-                    self.check(self.event(command), 'live-database-script')
+                    # --bg never runs run.sh on the Mac, so its body isn't scanned (#221).
+                    self.check(self.event(command), None if '--bg' in command else 'live-database-script')
 
     def test_create_run_and_syntax_only_shapes(self):
         rows = [
@@ -351,8 +354,12 @@ class RelativeScriptReporterTests(unittest.TestCase):
             for database in (LIVE, OPENCODE):
                 with self.subTest(name=name, invocation=invocation, database=database):
                     command = f"cat > {name} <<'EOF'\n{body}EOF\n{invocation}"
-                    expected = 'live-database-script-unresolved' if name in {'tmp/quint/3464/fix_rules.py', 'tmp/implement.py', 'tmp/followup.cjs', 'tmp/acceptance.sh'} else None
+                    expected = 'live-database-script-unresolved' if name in {'tmp/quint/3464/fix_rules.py', 'tmp/implement.py', 'tmp/followup.cjs'} else None
                     self.check(self.event(command), expected)
+                    if '--bg' in invocation:
+                        # The box runs it whatever it reads (#221).
+                        self.check(self.event(command.replace('\nEOF', '\nsqlite3 ' + database + ' .tables\nEOF', 1)))
+                        continue
                     read = f'open({database!r}).read()' if interpreter == 'python3' else f'require("fs").readFileSync({database!r})' if interpreter == 'node' else 'sqlite3 ' + database + ' .tables'
                     twin = command.replace('\nEOF', '\n' + read + '\nEOF', 1)
                     if not invocation or ' -n ' in invocation:

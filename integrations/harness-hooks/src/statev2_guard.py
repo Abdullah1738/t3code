@@ -3151,10 +3151,22 @@ LIVE_DIRECTORY = re.compile(
 
 
 def _names_live_database(text):
-    # A remote-only payload is harmless on the box, but no real payload spells
-    # a live DB, including a cd into its directory and a bare name.
+    # A remote-only payload is harmless on the box, but no real payload names a
+    # live DB or the directory holding one (cd there, glob *.sqlite, ...).
     text = REPLICA.sub(' ', text)
-    return bool(LIVE.search(text) or DATABASE_NAME.search(text) and LIVE_DIRECTORY.search(text))
+    return bool(LIVE.search(text) or LIVE_DIRECTORY.search(text))
+
+
+def _offbox_syncs_from_live_directory(cwd):
+    # Outside a git repo offbox syncs cwd itself (offbox_lib/identity.repo_root),
+    # so a run from inside or above a live DB directory copies it off the Mac.
+    if cwd is None:
+        return True
+    path = Path(os.path.realpath(cwd))
+    if LIVE_DIRECTORY.search(str(path) + '/'):
+        return True
+    return any(path == database.parent or database.parent in path.parents or path in database.parents
+               for database in protected_databases())
 
 
 def _syncs_live_database(value, cwd):
@@ -4748,7 +4760,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     def scan_remote(source, directory, depth, input_words=(), input_bodies=None, inherit_environment=False, opaque=None, preservation=True):
         # Synced source evidence may be read remotely, but remote writes,
         # bindings and cwd cannot prove anything about the caller's files.
-        # offbox may fall back to running locally, so its payload keeps the
+        # Only payloads offbox may run locally after an outage reach here
+        # (remote-only ones use check_remote_only), so the payload keeps the
         # caller's startup and lookup bindings (BASH_ENV, PATH, ...), and the
         # exact-invocation proof still reads the caller's whole command.
         environment = None
@@ -4774,7 +4787,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         # spells, and stdin the caller's shell opens here, still reach the Mac.
         for text in texts:
             if _names_live_database(text):
-                raise LiveRead('live-database-read')
+                directory_match = LIVE_DIRECTORY.search(REPLICA.sub(' ', text))
+                raise LiveRead('live-database-read', None if LIVE.search(REPLICA.sub(' ', text)) else
+                               f"The offbox payload names the live database directory {_token(directory_match[0])}.")
         for _, target in inputs:
             if any(direct_read(['cat', *values], directory) for values in variants([target])):
                 raise LiveRead('live-database-read')
@@ -5025,7 +5040,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             child_directory = True
                             directory = change_directory(value, directory)
             elif binary == "offbox" and words[1:2] == ['run']:
-                remote_only = _offbox_remote_only(words, raw_words[len(raw_words) - len(words):], quoted)
+                # A PATH/startup binding or a spelled path may run some other
+                # local program named offbox; only the plain lookup is trusted.
+                remote_only = (not unsafe_bindings and words[0] == 'offbox' and
+                               not _offbox_syncs_from_live_directory(directory) and
+                               _offbox_remote_only(words, raw_words[len(raw_words) - len(words):], quoted))
                 options_end = words.index('--') if '--' in words else len(words)
                 for index in range(2, options_end):
                     flag, equal, value = words[index].partition('=')
