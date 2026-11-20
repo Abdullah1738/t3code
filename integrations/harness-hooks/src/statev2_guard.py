@@ -3081,6 +3081,95 @@ def _offbox_payload(words, *, known_only=True):
     return None
 
 
+# offbox_lib/fallback.allowed refuses a local fallback for any command string
+# containing one of these; cli.py joins several --step values with '; '.
+OFFBOX_NO_FALLBACK_CHARACTERS = frozenset(';|&`$\n<>')
+# Characters a double-quoted word keeps literally; $ and ` still expand there.
+OFFBOX_DOUBLE_QUOTED_LITERALS = frozenset(';|&\n<>')
+OFFBOX_VALUE_FLAGS = frozenset({'--include', '--size', '--template', '--base', '--pull', '--env', '--step'})
+
+
+def _offbox_certain_text(raw, quoted):
+    # Only characters offbox is sure to receive count. Caller-side expansions
+    # ($X, $(...), unquoted globs) may vanish before offbox parses its argv.
+    text = []
+    for key in re.findall(r'\0guard_[a-z_]+_\d+__', raw):
+        value = quoted.get(key, '')
+        if key.startswith(('\0guard_literal_double_', '\0guard_double_')):
+            text.append(''.join(char for char in value if char in OFFBOX_DOUBLE_QUOTED_LITERALS))
+        elif key.startswith('\0guard_literal_'):
+            text.append(value)
+    return ''.join(text)
+
+
+def _offbox_remote_only(words, raw_words, quoted):
+    """True when offbox can never run this `offbox run` on the Mac.
+
+    Mirrors offbox_lib/cli.py: --bg, --no-fallback and --remote never fall back
+    (_pre_start_wait_applies and the "--bg can't fall back" branch), several
+    --step values run as one '; '-joined string, and fallback.allowed refuses
+    any command string with OFFBOX_NO_FALLBACK_CHARACTERS. Its executable
+    allowlist is deliberately not mirrored: widening it in offbox must never
+    widen this skip. Anything unrecognised counts as able to fall back.
+    """
+    if (len(words) < 3 or len(raw_words) != len(words) or
+            os.path.basename(words[0]) != 'offbox' or words[1] != 'run'):
+        return False
+    steps, index = [], 2
+    while index < len(words):
+        word = words[index]
+        flag, equal, value = word.partition('=')
+        # argparse's REMAINDER starts the command at the first positional.
+        if word == '--' or not word.startswith('-'):
+            break
+        if flag in {'--bg', '--no-fallback', '--remote'} and not equal:
+            return True
+        if flag not in OFFBOX_VALUE_FLAGS and flag not in {'--git', '--fresh', '--no-sync', '--no-retry'}:
+            return False
+        if flag in OFFBOX_VALUE_FLAGS and not equal:
+            index += 1
+            if index >= len(words) or words[index].startswith('-'):
+                return False
+            value, raw = words[index], raw_words[index]
+        else:
+            raw = raw_words[index]
+        if flag == '--step':
+            steps.append(raw)
+        index += 1
+    command = raw_words[index + 1:] if index < len(words) and words[index] == '--' else raw_words[index:]
+    if steps and command or not steps and not command:
+        return False
+    if len(steps) > 1:
+        return True
+    return any(char in OFFBOX_NO_FALLBACK_CHARACTERS
+               for raw in steps or command for char in _offbox_certain_text(raw, quoted))
+
+
+LIVE_DIRECTORY = re.compile(
+    r"(?:\.robob|robob-data)/userdata(?![\w.-])|(?:\.local/share/opencode|opencode-data)(?![\w.-])|"
+    rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata(?![\w.-])")
+
+
+def _names_live_database(text):
+    # A remote-only payload is harmless on the box, but no real payload spells
+    # a live DB, including a cd into its directory and a bare name.
+    text = REPLICA.sub(' ', text)
+    return bool(LIVE.search(text) or DATABASE_NAME.search(text) and LIVE_DIRECTORY.search(text))
+
+
+def _syncs_live_database(value, cwd):
+    # --include copies a local path to the box and --pull writes one back, so
+    # both act on the Mac whether or not the payload can fall back.
+    if _names_live_database(value):
+        return True
+    path = _literal_path(value, cwd)
+    if path is None:
+        return bool(LIVE_DIRECTORY.search(value))
+    return any(path == database or path in database.parents or
+               path.parent == database.parent and path.name.startswith(database.name + '-')
+               for database in protected_databases())
+
+
 def _safe_fixture_assignment(word):
     match = re.fullmatch(r'([A-Za-z_]\w*)=([\s\S]*)', word)
     if not match:
@@ -3315,7 +3404,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return binary if binary in {'node', 'bun', 'deno', 'bash', 'sh', 'zsh', 'dash', 'ksh',
                                     'cat', 'tee', 'sed', 'chmod', 'mkdir', 'ls', 'test', 'echo',
                                     'cp', 'mv', 'rsync', 'ditto', 'install', 'git', 'offbox',
-                                    'perl', 'truncate', 'true', 'printf', 'mktemp'} else 'opaque binary'
+                                    'perl', 'truncate', 'true', 'printf', 'mktemp', 'curl', 'wget', 'uv'} else 'opaque binary'
 
     def invalidate(paths, site, words=(), reason=None, destination=None):
         target = invalidated_written if destination is None else destination
@@ -4677,6 +4766,19 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         paths.extend(path for path in remote_paths if path not in paths)
         check_budget()
 
+    def check_remote_only(texts, directory, inputs=()):
+        # offbox never runs this payload on the Mac (_offbox_remote_only), so
+        # the scripts and test files it executes, its writes and its mktemp
+        # paths all act on the box, which has no live database. Owner, 18 Nov
+        # (#221): skip what runs inside it. Only live-DB paths the caller
+        # spells, and stdin the caller's shell opens here, still reach the Mac.
+        for text in texts:
+            if _names_live_database(text):
+                raise LiveRead('live-database-read')
+        for _, target in inputs:
+            if any(direct_read(['cat', *values], directory) for values in variants([target])):
+                raise LiveRead('live-database-read')
+
     def inspect(words, directory, depth, bodies, quoted, changed_sources, cwd_only=False, binding_preflight=False):
         nonlocal unknown_cause, invocation_written, invocation_fresh, invocation_literals, invocation_reader_literals, invocation_quoted, invocation_glob_escaped, unsafe_bindings, unsafe_binding_cause, noclobber, last_invalidation, invocation_invalidation
         nonlocal execution_site, execution_binary, proof_failure
@@ -4853,6 +4955,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         assignment_prefix = True
         while words:
             binary = os.path.basename(words[0])
+            if words[0] == 'command' and words[1:2] in (['-v'], ['-V']) and not external_lookup:
+                # The builtin only reports how a name resolves and never runs
+                # it, so `if ! command -v uv` must not void proofs as if uv ran.
+                words = ['true']
+                break
             if binary in {'command', 'exec', 'nohup', 'sudo', 'nice', 'timeout', 'env', 'uv', 'offbox'}:
                 assignment_prefix = False
                 builtin = words[0] in {'command', 'exec'} and not external_lookup
@@ -4918,13 +5025,21 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             child_directory = True
                             directory = change_directory(value, directory)
             elif binary == "offbox" and words[1:2] == ['run']:
+                remote_only = _offbox_remote_only(words, raw_words[len(raw_words) - len(words):], quoted)
                 options_end = words.index('--') if '--' in words else len(words)
                 for index in range(2, options_end):
                     flag, equal, value = words[index].partition('=')
+                    if flag in {'--include', '--pull'}:
+                        target = value if equal else words[index + 1] if index + 1 < options_end else ''
+                        if target and any(_syncs_live_database(values[0], directory) for values in variants([target])):
+                            raise LiveRead('live-database-read', f"offbox {flag} {_token(target)} reaches a protected live database.")
                     if flag == '--step':
                         step = value if equal else words[index + 1] if index + 1 < options_end else ''
                         if not step:
                             raise AmbiguousScript('offbox --step has no command')
+                        if remote_only:
+                            check_remote_only([step], directory)
+                            continue
                         # Steps are shell commands, never exact-invocation
                         # fixture proofs. Inspect them even beside a payload.
                         scan_remote(step, directory, depth + 1, inherit_environment=True,
@@ -4949,7 +5064,16 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 for op, target in redirects:
                     if op in {'<', '<>'}:
                         remote_input.extend([op, target])
-                if words:
+                if words and remote_only:
+                    try:
+                        texts = [argv[0] if len(argv) == 1 else shlex.join(argv) for argv in caller_argv(len(words))]
+                    except AmbiguousScript as error:
+                        word = next((word for word in words if '$' in word and word not in invocation_literals), None)
+                        raise AmbiguousScript(path_refusal(word, directory, os.path.basename(words[0]), unsafe_binding_cause or str(error)) if word else str(error)) from error
+                    texts.extend(documents)
+                    texts.extend(text for text, _ in here_strings)
+                    check_remote_only(texts, directory, [(op, target) for op, target in redirects if op in {'<', '<>'}])
+                if words and not remote_only:
                     trusted, empty, reasons = {}, set(), {}
                     payload_binary = next((os.path.basename(word) for word in words
                                            if os.path.basename(word) in {'bash', 'sh', 'zsh', 'dash', 'ksh', 'node', 'bun', 'deno'} or
@@ -4995,6 +5119,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                     remote_input, remote_bodies, inherit_environment=True,
                                     opaque=(trusted, empty, reasons) if len(words) > 1 else None,
                                     preservation=wrapper_proved)
+                if words:
                     if may_change_scripts(words, directory, documents):
                         tool_changes.add(None)
                         invalidate(written, 'offbox payload', words, destination=changed_sources)
@@ -5046,6 +5171,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 output_redirects.extend(('>', arg) for arg in args if not arg.startswith('-'))
             for op, target in output_redirects:
                 if op not in {'>', '>>', '>|', '&>', '&>>', '<>', '>&'} or op == '>&' and re.fullmatch(r'\d+|-', target):
+                    continue
+                if target == '/dev/null' and op != '<>':
+                    # Discarded output cannot replace a script; without this a
+                    # `>/dev/null` in an if-test is blamed for a later download.
                     continue
                 key = opaque_key(target, directory)
                 # A quoted, contained sibling with a distinct filesystem identity
