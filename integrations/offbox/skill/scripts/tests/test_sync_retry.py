@@ -254,7 +254,10 @@ class PushResumeTests(Isolated):
         self.assertIs(row['_guard'], self.guard)
         self.resume.assert_called_once_with(unittest.mock.ANY, 'box', common.RUN_TTL_S, None,
                                             retry=True, watch=unittest.mock.ANY)
-        self.assertIsInstance(self.resume.call_args.kwargs['watch'], lease._ResumeWatch)
+        watch = self.resume.call_args.kwargs['watch']
+        self.assertIsInstance(watch, lease._ResumeWatch)
+        self.assertIs(watch.con, self.resume.call_args.args[0])
+        self.assertEqual(watch.box_id, 'box')
         self.bring_up.assert_called_once()
         self.assertEqual(self.push.call_count, 2)
         self.assertEqual(self.put_file.call_count, 2)

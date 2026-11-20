@@ -239,10 +239,10 @@ except Exception:
     return setup + '\ntrap ' + shlex.quote(trap) + ' EXIT\n(\n' + command + '\n)'
 
 
-def finalize(row):
+def finalize(row, *, node_only=False):
     """Reuse received metrics and committed log bytes; never fetch, wait for a log holder or change an exit."""
     try:
-        from . import api
+        from . import api, node_version
         from .runs import LOGS_DIR, log_lock, save_run_state
         from .common import read_json, offsets_path, atomic_write_json
         row = dict(row)
@@ -257,13 +257,27 @@ def finalize(row):
                 data = unavailable('missing', 1)
             text = ''
             ck = read_json(offsets_path(path), {})
+            committed = True
             if path.exists():
                 size = path.stat().st_size
-                if ck and size != ck.get('logBytes'):
-                    return  # Never checkpoint a chunk whose stream-offset write did not commit.
-                with path.open('rb') as f:
-                    f.seek(max(0, size - 16384))
-                    text = f.read().decode(errors='replace')
+                committed = not ck or size == ck.get('logBytes')
+                if committed:
+                    with path.open('rb') as f:
+                        f.seek(max(0, size - 16384))
+                        text = f.read().decode(errors='replace')
+            recovered = read_json(Path(str(path) + '.remote.json'), {})
+            remote = Path(str(path) + '.remote')
+            lengths, hashes = recovered.get('lengths'), recovered.get('hashes')
+            verified = (recovered.get('merged') and isinstance(lengths, list) and len(lengths) == 2
+                        and all(type(n) is int and n >= 0 for n in lengths)
+                        and isinstance(hashes, list) and len(hashes) == 2
+                        and all(isinstance(h, str) and len(h) == 64 for h in hashes)
+                        and remote.is_file() and remote.stat().st_size == sum(lengths))
+            if not (verified and node_version.record(row, path, source=remote, start=lengths[0],
+                                                     length=lengths[1], digest=hashes[1])) and committed:
+                node_version.record(row, path, source=path.with_suffix('.node-stderr.log'), projected=True)
+            if node_only or not committed:
+                return
             if 'resources' not in saved and PREFIX + run_id + ' ' not in text:
                 return  # Legacy runs have no telemetry; leave their delivery/empty-output evidence alone.
             if api.BACKEND == 'server':
