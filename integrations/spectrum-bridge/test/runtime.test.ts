@@ -2,11 +2,15 @@ import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Router } from "../src/router.ts";
+import { OpenChamber } from "../src/openchamber.ts";
 import { createApi } from "../src/api.ts";
 import { Delivery } from "../src/delivery.ts";
 import type { Access } from "../src/chats.ts";
 import { chatKey, GROUP_APP_REFUSAL, LineError, type Line, type LineInbound, type LineOutbound } from "../src/line.ts";
 import { TransportError } from "../src/photon.ts";
+import { agentWakeId } from "../src/agent-bus.ts";
+import { opaqueId } from "../src/remote-protocol.ts";
 import { ChatRegistry, createAgentBus, createSbApi, optOutHealth, type ChatCore } from "../src/runtime.ts";
 import { handleInbound, runIngress, type IngressDeps } from "../src/sb-ingress.ts";
 import { Shares } from "../src/share.ts";
@@ -1064,4 +1068,52 @@ test("send and file acknowledgements name the routed recipient for owner, Moni, 
     expect(first).toMatchObject({ status: 202, body: { chat: target.info.slug } });
     expect((await post("/send", { text: "relay", to: target.info.slug, sessionId: "session-0", dedupeKey: `relay-${target.info.slug}` })).body).toMatchObject({ created: false, chat: target.info.slug });
   }
+});
+
+
+test("bus delivery verifies the deduped local row and traces every batched member pickup", () => {
+  const env = setup(); const registry = env.registry(); registry.restore();
+  const moniChat = registry.open(chatKey.dm(moni));
+  registry.owner.store.set("route", { id: "ses_owner", generation: 1 });
+  const logs: string[] = [];
+  const bus = createAgentBus(registry, (event, code) => logs.push(`${event} ${code}`), join(env.stateRoot, "policy.json"));
+  const result = bus.ask({ sessionId: "ses_owner", to: "moni", text: "PRIVATE_REQUEST", dedupeKey: "one" });
+  const id = (result.body as { id: string }).id;
+  const row = moniChat.store.pendingInbound()[0]!;
+  const at = Date.now(); moniChat.store.set(`inbound-delivered:${row.id}`, at);
+  bus.sweep(); bus.sweep();
+  const request = registry.owner.store.db.query<{ delivered_at: number | null }, [string]>("SELECT delivered_at FROM agent_requests WHERE id=?").get(id);
+  expect(request?.delivered_at).toBe(at);
+  expect(logs.filter(s => s.startsWith("agent-deliver "))).toHaveLength(1);
+  expect(logs.filter(s => s.startsWith("agent-delivered "))).toHaveLength(1);
+  expect(logs.join()).not.toContain("PRIVATE_REQUEST");
+});
+
+
+test("upgrading twice expires old local and rollback queues without sending historical requests", async () => {
+  const env = setup(true), registry = env.registry(), chat = registry.open(chatKey.dm(moni));
+  registry.owner.store.set("route", { id: "deadline-owner", generation: 1 });
+  const bus = createAgentBus(registry, undefined, join(env.stateRoot, "policy.json"));
+  const request = bus.ask({ sessionId: "deadline-owner", to: "moni", text: "PRIVATE", dedupeKey: "legacy" });
+  const requestId = (request.body as {id:string}).id;
+  const id = agentWakeId(`agent-ask:${requestId}`);
+  registry.owner.store.db.query("UPDATE agent_requests SET created_at=? WHERE id=?").run(Date.now()-1_200_000,requestId);
+  chat.store.db.query("UPDATE inbound SET payload=json_remove(payload,'$.agentExpiresAt') WHERE id=?").run(id);
+  chat.store.db.exec("CREATE TABLE remote_inbox (seq INTEGER PRIMARY KEY,id TEXT UNIQUE,sealed TEXT,receipt TEXT)");
+  chat.store.db.query("INSERT INTO remote_inbox(id,sealed) VALUES (?,'CIPHERTEXT')").run(opaqueId(id));
+  registry.owner.store.set("agent-bus-deadlines-v1", null);
+  createAgentBus(registry, undefined, join(env.stateRoot, "policy.json"));
+  const local = chat.store.db.query<{expiresAt:number},[string]>("SELECT json_extract(payload,'$.agentExpiresAt') AS expiresAt FROM inbound WHERE id=?").get(id)!;
+  expect(local.expiresAt).toBeLessThan(Date.now());
+  expect(chat.store.db.query("SELECT sealed,expires_at FROM remote_inbox").get()).toEqual({ sealed:"CIPHERTEXT", expires_at: local.expiresAt });
+  let calls=0;
+  class Backend extends OpenChamber { override async request<T>():Promise<T|undefined> {calls++;throw new Error("Historical request must not reach the backend");} }
+  const backend=new Backend("http://127.0.0.1:1"), transport={read:async()=>{},typing:async()=>{},downloadAttachment:async()=>{throw new Error("unexpected attachment");}};
+  const options={owner,context:chat.context,chatGuid:chat.info.key,timezone:"Asia/Dubai",skillPath:"/nonexistent/imessage",alertSkillPath:"/nonexistent/telegram",alertSocketPath:"/nonexistent/socket",openCodeConfigRoot:"/nonexistent/config",quietMs:0};
+  await new Router(chat.store,backend,transport,options).tick();
+  createAgentBus(registry,undefined,join(env.stateRoot,"policy.json"));
+  await new Router(chat.store,backend,transport,options).tick();
+  expect(calls).toBe(0); expect(chat.store.pendingOutbox()).toEqual([]);
+  expect(chat.store.db.query("SELECT state FROM inbound WHERE id=?").get(id)).toEqual({state:"failed"});
+  expect(chat.store.db.query("SELECT sealed,expires_at FROM remote_inbox").get()).toEqual({sealed:"CIPHERTEXT",expires_at:local.expiresAt});
 });

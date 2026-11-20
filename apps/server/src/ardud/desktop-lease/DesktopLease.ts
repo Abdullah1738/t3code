@@ -8,7 +8,7 @@ import * as NodeSqlite from "node:sqlite";
 
 export const STALE_MS = 120_000;
 export const QUIET_MS = 600_000;
-export const QUARANTINE_MAX_MS = 6 * 60 * 60_000;
+export const QUARANTINE_EXPIRE_MS = 30 * 60_000;
 export const QUEUE_POLL_TIMEOUT_MS = 120_000;
 export type DesktopMode = "native" | "cua-driver";
 export type LeaseState = "held" | "stopping" | "quarantined";
@@ -41,6 +41,7 @@ export interface Lease extends IdentifiedRequest {
   readonly openCallId: string | null;
   readonly staleAfterMs?: number;
   readonly heartbeatBy?: string;
+  readonly silentForMs?: number;
 }
 
 export interface QueuedRequest extends IdentifiedRequest {
@@ -157,6 +158,8 @@ const callsTable = `CREATE TABLE IF NOT EXISTS ardud_desktop_calls (
 export type HolderTurnActive = boolean | "unknown";
 export interface LeaseTransition {
   readonly ticket: string;
+  readonly rootThreadId: string;
+  readonly childThreadId: string;
   readonly taskId: string;
   readonly mode: DesktopMode;
   readonly from: RequestState;
@@ -343,6 +346,8 @@ export class DesktopLease {
   private transition(row: Row, to: RequestState, reason: LeaseTransition["reason"], now: number) {
     this.transitions.push({
       ticket: row.ticket,
+      rootThreadId: row.root_thread_id,
+      childThreadId: row.child_thread_id,
       taskId: row.task_id,
       mode: row.mode,
       from: row.request_state === "held" ? row.lease_state! : row.request_state,
@@ -360,10 +365,23 @@ export class DesktopLease {
   }
 
   private leaseOf(row: Row) {
-    return leaseOf(
-      row,
-      row.lease_state === "quarantined" ? (this.openCall(row.ticket)?.call_id ?? null) : null,
-    );
+    return {
+      ...leaseOf(
+        row,
+        row.lease_state === "quarantined" ? (this.openCall(row.ticket)?.call_id ?? null) : null,
+      ),
+      ...(row.lease_state === "stopping" || row.lease_state === "quarantined"
+        ? { silentForMs: Math.max(0, this.now() - this.lastActivity(row)) }
+        : {}),
+    };
+  }
+
+  private lastActivity(row: Row) {
+    const calls = this.db
+      .prepare(`SELECT MAX(started_at) AS started_at, MAX(ended_at) AS ended_at
+      FROM ardud_desktop_calls WHERE ticket = ?`)
+      .get(row.ticket) as { started_at: number | null; ended_at: number | null };
+    return Math.max(row.heartbeat_at!, calls.started_at ?? 0, calls.ended_at ?? 0);
   }
 
   private one(query: string, ...args: string[]): Row | undefined {
@@ -426,7 +444,7 @@ export class DesktopLease {
   private recoveryMessage(holder: Row | undefined) {
     if (holder?.lease_state !== "quarantined" && holder?.lease_state !== "stopping") return "";
     const since = holder.lease_state === "quarantined" ? holder.quarantined_at : holder.stopping_at;
-    return `Held by ${holder.ticket} (${holder.task_id}, ${holder.lease_state} since ${iso(since)}). It clears itself once its threads are idle, after a reboot, or after 6 h. To clear it now, the owner runs: t3ctl desktop-lease reconcile --ticket ${holder.ticket} --evidence "<why>" (needs environment:maintain, an admin login).`;
+    return `Held by ${holder.ticket} (${holder.task_id}, ${holder.lease_state} since ${iso(since)}). It clears itself once its threads are idle or after a reboot; quarantine also clears after 30 min without holder activity. To clear it now, the owner runs: t3ctl desktop-lease reconcile --ticket ${holder.ticket} --evidence "<why>" (needs environment:maintain, an admin login).`;
   }
 
   private advance(now: number) {
@@ -467,30 +485,20 @@ export class DesktopLease {
         this.autoReconcile(holder, evidence, "host_reboot", now);
         return;
       }
-    }
-    if (holder.lease_state === "quarantined") {
-      if (holder.quarantined_at !== null && now - holder.quarantined_at >= QUIET_MS) {
-        const active = this.holderTurnActive(holder.root_thread_id);
-        if (active === false) {
-          const call = this.openCall(holder.ticket);
-          const evidence = `auto-reconciled: holder ${holder.root_thread_id} has no running turn; open call ${call?.call_id ?? "none"} started ${call ? iso(call.started_at) : "unknown"}`;
-          this.autoReconcile(holder, evidence, "auto_reconciled", now);
-        } else if (
-          active === "unknown" &&
-          now - holder.quarantined_at >= QUARANTINE_MAX_MS &&
-          holder.heartbeat_at! <= holder.quarantined_at
-        ) {
-          const evidence = `auto-reconciled: quarantined ${now - holder.quarantined_at}ms with no heartbeat and liveness unknown`;
-          this.autoReconcile(holder, evidence, "quarantine_max_age", now);
-        }
+      if (this.holderTurnActive(holder.root_thread_id) === false) {
+        const call = this.openCall(holder.ticket);
+        const evidence = `auto-reconciled: holder ${holder.root_thread_id} has no running turn; open call ${call?.call_id ?? "none"} started ${call ? iso(call.started_at) : "unknown"}`;
+        this.autoReconcile(holder, evidence, "auto_reconciled", now);
+        return;
       }
-      return;
     }
     // On-demand checks enforce the age limit even while a caller heartbeats.
-    const expiredCall = this.db
-      .prepare(`SELECT 1 FROM ardud_desktop_calls
+    const expiredCall =
+      holder.lease_state !== "quarantined" &&
+      this.db
+        .prepare(`SELECT 1 FROM ardud_desktop_calls
       WHERE ticket = ? AND state = 'started' AND started_at <= ? LIMIT 1`)
-      .get(holder.ticket, now - QUIET_MS);
+        .get(holder.ticket, now - QUIET_MS);
     if (expiredCall) {
       this.db
         .prepare(
@@ -498,6 +506,18 @@ export class DesktopLease {
         )
         .run(now, holder.seq);
       this.transition(holder, "quarantined", "open_call_timeout", now);
+      holder = this.holder()!;
+    }
+    if (holder.lease_state === "quarantined") {
+      const lastActivity = this.lastActivity(holder);
+      if (now - lastActivity >= QUARANTINE_EXPIRE_MS) {
+        this.autoReconcile(
+          holder,
+          `auto-expired: holder silent since ${iso(lastActivity)}`,
+          "quarantine_max_age",
+          now,
+        );
+      }
       return;
     }
     if (holder.lease_state === "stopping" && !this.hasOpenCall(holder.ticket)) {
@@ -625,6 +645,12 @@ export class DesktopLease {
       this.advance(now);
       const row = this.ownedHolder(caller, ticket);
       if (row.lease_state !== "held") {
+        // A rejected heartbeat still proves a quarantined caller is alive; it grants no desktop access.
+        if (row.lease_state === "quarantined") {
+          this.db
+            .prepare("UPDATE ardud_desktop_requests SET heartbeat_at = ? WHERE seq = ?")
+            .run(now, row.seq);
+        }
         return fail(`Lease is not held; do not start desktop work. ${this.recoveryMessage(row)}`);
       }
       this.db

@@ -54,6 +54,19 @@ class HistoryTests(unittest.TestCase):
         for text in ('I paid', 'test-secret', '4111', '123456', 'private'):
             self.assertNotIn(text, self.path.read_text())
 
+    def test_skip_metadata_projection_is_bounded_and_idempotent(self):
+        values = {**self.row, 'skipped': True, 'skip_file': 'questions.json', 'skip_reason': 'deadline',
+                  'skip_phase': 'loads', 'skip_last_file': 'cases.json', 'skip_last_reason': 'edeadlk',
+                  'skip_first_at': 42.5, 'dataless_files': None, 'dataless_error': 'DataUnavailable errno=None'}
+        row = history.run_row(values)
+        self.assertEqual(history.run_row(row), row)
+        for key in values:
+            self.assertEqual(row[key], values[key])
+        for key in ('skip_file', 'skip_last_file', 'skip_reason', 'skip_last_reason', 'dataless_error'):
+            with self.subTest(key=key):
+                row = history.run_row({**self.row, key: '/private/source text'})
+                self.assertNotIn(key, row)
+
     def test_case_error_normalization(self):
         timeout = str(subprocess.TimeoutExpired(
             ['/Users/ardud/.local/bin/msgs', 'search', '("Logic Utilities" OR "Acme Merchant")'], 2))
@@ -301,6 +314,38 @@ class HistoryTests(unittest.TestCase):
 
 
 class CheckHistoryTests(Base):
+    def test_final_save_skip_records_build_write_on_every_path(self):
+        import data_io
+        from contextlib import ExitStack
+        forms = (
+            ('quiet', '2026-10-25T02:00', None),
+            ('retained_outbox', '2026-10-25T12:00', None),
+            ('reconcile_timeout', '2026-10-25T12:00', 'load'),
+            ('follow_timeout', '2026-10-25T12:00', 'reconcile_merchants'),
+        )
+        self.case()
+        for name, clock, timeout_target in forms:
+            with self.subTest(path=name), ExitStack() as stack:
+                real = cases.write_json
+                def fail_pings(path, *args, **kwargs):
+                    if path == self.wd / 'pings.json':
+                        raise data_io.DataUnavailable(path)
+                    return real(path, *args, **kwargs)
+                if name == 'retained_outbox':
+                    (self.wd / 'pings.json').write_text(json.dumps({'sent': {}, 'outbox': {
+                        'run': 'old', 'keys': [], 'at': '2026-10-25T10:00:00+04:00', 'event': 'retained'}}))
+                    stack.enter_context(patch.object(cases, 'runner_owns', return_value=True))
+                if timeout_target:
+                    stack.enter_context(patch.object(cases, timeout_target, side_effect=cases.CheckTimeout('out of time')))
+                stack.enter_context(patch.object(cases, 'write_json', fail_pings))
+                with self.assertRaises(data_io.DataUnavailable):
+                    cases.run_check(self.wd, name, self.data, self.root, at(clock), finder(), nobody)
+                row = json.loads((self.wd / 'runs.jsonl').read_text().splitlines()[-1])
+                self.assertEqual(row['skip_phase'], 'build_write')
+                self.assertEqual(row['skip_file'], 'pings.json')
+                self.assertEqual(row['skip_reason'], 'edeadlk')
+                self.assertEqual(row['exit'], 0)
+
     def test_check_history_and_append_failure_preserve_run(self):
         self.case()
         now = at('2026-10-25T12:00')
@@ -351,7 +396,11 @@ class CheckHistoryTests(Base):
             with self.assertRaises(data_io.DataUnavailable):
                 cases.run_check(self.wd, 'r', self.data, self.root)
         row = json.loads((self.wd / 'runs.jsonl').read_text())
-        self.assertIsNone(row['exit'])
+        self.assertEqual(row['exit'], 0)
+        self.assertTrue(row['skipped'])
+        self.assertEqual(row['skip_file'], 'cases.json')
+        self.assertEqual(row['skip_reason'], 'edeadlk')
+        self.assertEqual(row['skip_phase'], 'loads')
         self.assertEqual(row['owner_result'], 'not_read')
         self.assertEqual(row['stop_reason'], 'data_unavailable')
 

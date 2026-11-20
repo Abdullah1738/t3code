@@ -2301,3 +2301,17 @@ test("a slow response retains the cursor's request-time skew before a later mode
     expect(alerts).toHaveLength(1);
   } finally { release.resolve(); setSystemTime(); }
 });
+
+test.each(["resolve", "upload"])("bus expiry during Robob %s preparation prevents the actual send", async delayed => {
+  const control = fakeControl(), backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  let now = 1_000; const clock = spyOn(Date, "now").mockImplementation(() => now);
+  const resolve = spyOn(backend, "resolve").mockImplementation(async () => { if (delayed === "resolve") now = 2_000; return id; });
+  const upload = spyOn(backend.client, "upload").mockImplementation(async () => { now = 2_000; return { attachmentId: "unused", type: "file", name: "file", mimeType: "text/plain", sizeBytes: 1 }; });
+  try {
+    await expect(backend.prompt(id, directory, "msg_expired_bus", "PRIVATE_REQUEST", "guidance",
+      delayed === "upload" ? [{ type: "file", mime: "text/plain", filename: "file", url: "data:text/plain;base64,YQ==" }] : [], undefined, undefined, undefined, 2_000))
+      .rejects.toThrow("Agent delivery expired");
+    expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(0);
+  } finally { upload.mockRestore(); resolve.mockRestore(); clock.mockRestore(); }
+});

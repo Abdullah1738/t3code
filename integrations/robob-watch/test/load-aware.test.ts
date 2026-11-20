@@ -123,7 +123,7 @@ test("slot cap changes live, preserving running checks and opening slots on reco
 });
 
 test("g: an unmounted SSD holds checks, counts, schedule and pending deliveries until remounted", async () => {
-  const f = fixture(), mount = join(f.sandbox, "ssd"); f.env.ROBOB_WATCH_SSD_PATH = mount;
+  const f = fixture({ ROBOB_WATCH_CHECK_TIMEOUT_MS: "5000" }), mount = join(f.sandbox, "ssd"); f.env.ROBOB_WATCH_SSD_PATH = mount;
   mkdirSync(mount); expect(isMounted(mount)).toBe(false); expect(isMounted("/dev")).toBe(true);
   f.add("ssd", { depends: ["ssd"], check: "true" }); f.add("pending", { depends: ["ssd"], check: "exit 99" }); f.add("plain", { check: "true" });
   f.save("ssd", { ...f.state("ssd"), consecutive_failures: 3, next_at: 0 });
@@ -189,6 +189,7 @@ test.each(["exit 7", "sleep 10", "echo event"])("SSD removal during a check uses
 }, 15_000);
 
 const pipeExitCases = [0, 7, 127].flatMap(code => ["stdout", "stderr"].map(pipe => [code, pipe] as const));
+// Pipe cleanup may use the full 5s kill grace, beyond Bun's default test deadline.
 test.each(pipeExitCases)("known exit %s with a descendant holding %s past timeout", async (code, pipe) => {
   const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9" });
   f.add("pipe", { max_consecutive_failures: 1, check: `/bin/sleep 2 ${pipe === "stdout" ? "2>/dev/null" : ">/dev/null"} & exit ${code}` });
@@ -202,7 +203,7 @@ test.each(pipeExitCases)("known exit %s with a descendant holding %s past timeou
   } else {
     expect(s.consecutive_failures).toBe(0); expect(s.last_error).toContain("under host load"); expect(f.calls()).toHaveLength(0);
   }
-});
+}, 15_000);
 
 test.each(pipeExitCases)("known exit %s survives kill grace with detached descendant holding %s", async (code, pipe) => {
   const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9" });

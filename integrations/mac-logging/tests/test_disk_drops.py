@@ -261,6 +261,25 @@ class DiskDropTests(unittest.TestCase):
                 if status != 'partial':
                     self.assertNotIn('grower1Name', p)
 
+    def test_estimate_and_denial_forms_never_become_growth_baselines(self):
+        forms = [dict(estimate=True), dict(denied=True), dict(deniedCount=1),
+                 dict(estimate=True,denied=True,deniedCount=1)]
+        for flags in forms:
+            for estimate_before in (True, False):
+                with self.subTest(flags=flags,estimate_before=estimate_before):
+                    child = str(self.big/'dir1')
+                    for first, free in ((True,100),(False,85)):
+                        self.inventory(growth=0 if first else 2, partial=first == estimate_before)
+                        if first == estimate_before:
+                            inventory = jobs.read_state('disk-inventory')
+                            inventory['childState'][str(self.big)][child].update(flags)
+                            jobs.save_state('disk-inventory',inventory)
+                            current = jobs.drop_inventory(inventory,'internal',inventory['at'])
+                            self.assertNotIn(child,current['sizes'])
+                        self.sample(free)
+                    props = self.rows('disk.drop')[-1]['props']
+                    self.assertNotIn(child,[props.get('grower%dName'%i) for i in range(1,6)])
+
     def test_corrupt_state_and_recovery(self):
         for text in ('{bad', 'null', '[]', '42', '{"unexpected":1}',
                      '{"sizes":[]}', '{"free":[]}', '{"sizes":{},"freeTs":[]}'):

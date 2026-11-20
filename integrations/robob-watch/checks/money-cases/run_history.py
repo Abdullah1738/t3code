@@ -95,6 +95,21 @@ def run_row(values):
     row['question_errors'] = [safe_error(e) for e in values.get('question_errors', [])[:10]]
     if values.get('stop_reason') in {'out_of_budget', 'pings_save_timeout', 'data_unavailable', 'check_busy', 'error'}:
         row['stop_reason'] = values['stop_reason']
+    if values.get('skipped') is True:
+        row['skipped'] = True
+        row['skip_phase'] = values.get('skip_phase') if values.get('skip_phase') in PHASES else 'unknown'
+    for key in ('skip_file', 'skip_last_file'):
+        value = values.get(key)
+        if isinstance(value, str) and re.fullmatch(r'[a-zA-Z0-9_.-]{1,128}', value):
+            row[key] = value
+    for key in ('skip_reason', 'skip_last_reason'):
+        if values.get(key) in {'edeadlk', 'deadline'}:
+            row[key] = values[key]
+    if values.get('dataless_files', 0) is None:
+        row['dataless_files'] = None
+    value = values.get('dataless_error')
+    if isinstance(value, str) and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]{0,80} errno=(?:None|-?\d{1,6})', value):
+        row['dataless_error'] = value
     return row
 
 
@@ -186,17 +201,26 @@ def recording(wd):
     token = _ACTIVE.set(row)
     try:
         yield row
-        row['exit'] = 0
+        row.setdefault('exit', 0)
     except BaseException as exc:
-        row['stop_reason'] = {'DataUnavailable': 'data_unavailable', 'CheckBusy': 'check_busy'}.get(
-            type(exc).__name__, 'error')
-        row['exit'] = 75 if type(exc).__name__ == 'CheckBusy' else None
+        if type(exc).__name__ == 'DataUnavailable':
+            record_skip(row, exc)
+        else:
+            row['stop_reason'] = 'check_busy' if type(exc).__name__ == 'CheckBusy' else 'error'
+            row['exit'] = 75 if type(exc).__name__ == 'CheckBusy' else None
         raise
     finally:
         _ACTIVE.reset(token)
         row.update(row.pop('stats', {}))
         row.setdefault('total_s', round(time.monotonic() - started, 3))
         append(wd, row)
+
+
+def record_skip(row, error, exit_code=0):
+    row.update(exit=exit_code, skipped=True, skip_file=error.path.name, skip_reason=error.reason,
+               skip_phase=row.get('slowest', 'loads'), stop_reason='data_unavailable', stats=error.stats,
+               edeadlk_retries=error.stats.get('edeadlk_retries', 0), edeadlk_ms=error.stats.get('edeadlk_ms', 0),
+               eintr_retries=error.stats.get('eintr_retries', 0))
 
 
 def current():

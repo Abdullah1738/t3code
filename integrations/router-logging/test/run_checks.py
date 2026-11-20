@@ -14,6 +14,14 @@ with tempfile.TemporaryDirectory(prefix='9router-fixtures-') as scratch:
     subprocess.run([sys.executable, '-I', '-m', 'unittest', 'discover', '-s', str(repo / 'integrations/router-logging/test'), '-p', 'test_*.py'], cwd=repo, env=env, check=True)
     files = [str(p) for package in ['router-logging', 'catalog-guard', 'stream-recovery'] for p in (repo / 'integrations' / package / 'test').glob('*.test.mjs')]
     subprocess.run(['node', '--test', *files], cwd=repo, env=env, check=True)
+    with tempfile.TemporaryDirectory(prefix='9router-test-home-') as home:
+        isolated_env = dict(os.environ, HOME=home)
+        isolated_env.pop('ROUTER_LOG_DIR', None)
+        isolated_env.pop('ROUTER_LOG_CAPTURE', None)
+        isolated_files = [str(p) for package in ['catalog-guard', 'stream-recovery'] for p in (repo / 'integrations' / package / 'test').glob('*.test.mjs')]
+        subprocess.run(['node', '--test', *isolated_files], cwd=repo, env=isolated_env, check=True)
+        assert not (Path(home) / '.robob/logs/tools/9router').exists(), 'test fixtures reached the home log directory'
+        print('ISOLATION stream-recovery and catalog-guard: home log directory absent', flush=True)
     samples = {}
     for path in [capture, *(root / 'logs').glob('*.ndjson')]:
         if not path.exists():

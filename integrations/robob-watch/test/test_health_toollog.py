@@ -248,6 +248,44 @@ class ToolLogTests(unittest.TestCase):
                 self.assertEqual((summary['runs'], summary['missedRuns'], summary['maxGapSeconds']), (1, 24, 86400))
                 self.assertEqual(summary['gapsOver'], [{'startTs': '2026-11-13T00:00:00Z', 'seconds': 86400}])
 
+    def test_gap_threshold_matches_configured_strict_boundary(self):
+        for interval in (300, 3600, 300.5):
+            with self.subTest(interval=interval):
+                times = (0, 2 * interval, 5 * interval, 8 * interval + 1)
+                rows = [self.tagged(t, 'schedule', 'meds-nag') for t in times]
+                result = self.fixture_rollup(rows, {'meds-nag': interval})
+                summary = result['components']['meds-nag']
+                self.assertEqual(summary['gapThresholdSeconds'], 3 * interval)
+                self.assertEqual(summary['medianGapSeconds'], 3 * interval)
+                self.assertEqual([gap['seconds'] for gap in summary['gapsOver']],
+                                 [86400 - times[-1], 3 * interval + 1])
+                stored = json.loads((self.root / 'rollup-2026-11-13.json').read_text())
+                self.assertEqual(stored, result)
+
+
+    def test_gap_threshold_for_configured_watcher_without_schedule_ticks(self):
+        for rows in ([], [self.tagged(300, 'manual', 'meds-nag')]):
+            with self.subTest(rows=rows):
+                summary = self.fixture_rollup(rows, {'meds-nag': 300})['components']['meds-nag']
+                self.assertEqual(summary['gapThresholdSeconds'], 900)
+                self.assertIsNone(summary['medianGapSeconds'])
+                self.assertEqual(summary['gapsOver'],
+                                 [{'startTs': '2026-11-13T00:00:00Z', 'seconds': 86400}])
+
+
+    def test_gap_threshold_preserves_observed_fallback_and_unknown_cadence(self):
+        cases = [((43200,), None, []),
+                 ((0, 300, 600), 900,
+                  [{'startTs': '2026-11-13T00:10:00Z', 'seconds': 85800}])]
+        for times, threshold, gaps in cases:
+            with self.subTest(times=times):
+                rows = [self.run_row(t) for t in times]
+                summary = self.fixture_rollup(rows)['components']['meds-nag']
+                self.assertEqual(summary['gapThresholdSeconds'], threshold)
+                self.assertEqual(summary['gapsOver'], gaps)
+                self.assertNotIn('expectedRuns', summary)
+
+
     def test_legacy_mixed_cadence_uses_configured_threshold(self):
         rows = [self.run_row(t, 'whoop-sync', 'sync.run') for t in range(0, 43200, 600)]
         rows += [self.run_row(t, 'whoop-sync', 'sync.run') for t in range(43200, 86400, 3600)]
@@ -293,13 +331,13 @@ class ToolLogTests(unittest.TestCase):
                 for component, interval in intervals.items():
                     summary = components[component]
                     self.assertEqual(set(summary), {'runs', 'firstRunTs', 'lastRunTs',
-                        'medianGapSeconds', 'maxGapSeconds', 'gapsOver', 'expectedRuns', 'missedRuns', 'runsByTrigger'})
+                        'medianGapSeconds', 'maxGapSeconds', 'gapThresholdSeconds', 'gapsOver', 'expectedRuns', 'missedRuns', 'runsByTrigger'})
                     self.assertEqual(summary['expectedRuns'], elapsed // interval)
                     self.assertEqual(summary['missedRuns'], max(0, elapsed // interval - summary['runs']))
                 if name == 'hole_and_steady':
                     self.assertEqual(components['meds-nag'], {'runs': 253,
                         'firstRunTs': '2026-11-13T00:00:00Z', 'lastRunTs': '2026-11-13T23:55:00Z',
-                        'medianGapSeconds': 300, 'maxGapSeconds': 10800,
+                        'medianGapSeconds': 300, 'maxGapSeconds': 10800, 'gapThresholdSeconds': 900,
                         'gapsOver': [{'startTs': '2026-11-13T01:00:00Z', 'seconds': 10800}],
                         'expectedRuns': 288, 'missedRuns': 35, 'runsByTrigger': {'unknown': 253}})
                     self.assertEqual((components['gym-nudge']['runs'], components['gym-nudge']['gapsOver']), (288, []))
@@ -558,6 +596,68 @@ class ArgumentDiagnosticsTests(unittest.TestCase):
                          props={'command': command, 'subcommand': sub, 'reason': reason}, _now=stamp)
         self.assertEqual(log.rollup(day.isoformat())['repeatBurst'], 1)
 
+
+
+class WhoopAuthSchemaTests(unittest.TestCase):
+    def test_auth_allowlists_and_types(self):
+        for name in ['cli.run', 'sync.run']:
+            for stage in ['token_load', 'token_refresh', 'api_fetch']:
+                for source in ['keychain', 'file', 'env']:
+                    for reason in ['token_missing', 'refresh_rejected', 'refresh_network', 'api_401', 'auth_failed']:
+                        data = {'authStage': stage, 'authSource': source, 'reason': reason,
+                                'refreshHttpStatus': None, 'apiHttpStatus': 401, 'oauthError': 'invalid_grant',
+                                'attempt': 2, 'retried': True}
+                        props = log._props(name, data)
+                        self.assertEqual({k: props[k] for k in data}, data)
+            for value in ['PrivateResponseBody', 123, True, [], {}, '', 'invalid_grant\n', 'a' * 41]:
+                props = log._props(name, {'authStage': value, 'authSource': value, 'reason': value,
+                                         'refreshHttpStatus': value, 'apiHttpStatus': value,
+                                         'oauthError': value, 'attempt': value, 'retried': value,
+                                         'headers': 'PrivateHeader', 'body': 'PrivateResponseBody'})
+                self.assertNotIn('authStage', props)
+                self.assertNotIn('authSource', props)
+                self.assertNotIn('reason', props)
+                self.assertEqual(props['oauthError'], '<redacted>')
+                self.assertNotIn('Private', json.dumps(props))
+            self.assertEqual(log._props(name, {'refreshHttpStatus': 200, 'apiHttpStatus': 599})['apiHttpStatus'], 599)
+            for value in [True, 99, 600, '401', 401.0]:
+                props = log._props(name, {'refreshHttpStatus': value, 'apiHttpStatus': value})
+                self.assertNotIn('refreshHttpStatus', props)
+                self.assertNotIn('apiHttpStatus', props)
+            for value in [True, -1, '2', 2.5]:
+                self.assertNotIn('attempt', log._props(name, {'attempt': value}))
+            self.assertNotIn('authStage', log._props(name, {}))
+            self.assertNotIn('refreshHttpStatus', log._props(name, {}))
+
+    def test_rollup_auth_failures_and_max_consecutive(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, HEALTH_TOOLLOG_DIR=temp):
+            rows = []
+            for n, stage, reason, ok in [(1, 'token_load', 'token_missing', False),
+                     (2, 'token_refresh', 'refresh_network', False), (3, None, None, True),
+                     (4, 'api_fetch', 'api_401', False), (5, 'token_refresh', 'refresh_rejected', False),
+                     (6, None, None, False), (7, None, None, True),
+                     (8, 'token_refresh', 'refresh_network', False)]:
+                rows.append({'ts': '2026-11-13T01:00:%02dZ' % n, 'tool': 'health', 'kind': 'perf' if ok else 'error',
+                             'component': 'whoop-sync', 'name': 'sync.run', 'ok': ok,
+                             'props': {'authStage': stage, 'reason': reason},
+                             'error': {} if ok else {'tag': 'not_authorized'}})
+            # CLI duplicates, unrelated components, unknown labels and success rows do not inflate authFailures.
+            rows += [{**rows[0], 'name': 'cli.run', 'component': 'whoop'},
+                     {**rows[0], 'component': 'forge-workouts'},
+                     {**rows[0], 'props': {'authStage': 'PrivateStage', 'reason': 'PrivateReason'}, 'ok': True, 'error': {}}]
+            Path(temp, '2026-11-13.ndjson').write_text(''.join(json.dumps(r)+'\n' for r in reversed(rows)))
+            with mock.patch.object(log, 'utcnow', return_value=dt.datetime(2026, 11, 14, tzinfo=dt.timezone.utc)):
+                result = log.rollup('2026-11-13')
+            self.assertEqual(result['whoop']['authFailures'], [
+                {'authStage': 'api_fetch', 'reason': 'api_401', 'count': 1},
+                {'authStage': 'token_load', 'reason': 'token_missing', 'count': 1},
+                {'authStage': 'token_refresh', 'reason': 'refresh_network', 'count': 2},
+                {'authStage': 'token_refresh', 'reason': 'refresh_rejected', 'count': 1}])
+            self.assertEqual(result['whoop']['consecutiveFailures'], 3)
+            counts = {(e['tag'], e['reason']): e['count'] for e in result['topErrors']}
+            self.assertEqual(counts['not_authorized', 'token_missing'], 3)
+            self.assertEqual(counts['not_authorized', None], 1)
+            self.assertNotIn('Private', json.dumps(result))
 
 
 if __name__ == '__main__':

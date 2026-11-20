@@ -177,12 +177,18 @@ def _remote_once(a, me) -> int:
 def _outage_wait_applies(a, e: OffboxError) -> bool:
     """Wait out a boat API outage only when nothing started and the run can't fall back to the Mac anyway.
     Small commands that may fall back keep today's immediate fallback."""
-    from . import fallback
     if not (e.outage and not e.started and e.code == EXIT_INFRA):
         return False
-    if a.no_fallback or a.remote or a.bg:
+    return _pre_start_wait_applies(a, e)
+
+
+def _pre_start_wait_applies(a, e: OffboxError) -> bool:
+    from . import fallback
+    if e.started or e.code != EXIT_INFRA:
+        return False
+    if any(getattr(a, flag, False) for flag in ('no_fallback', 'remote', 'bg')):
         return True
-    return not fallback.allowed(a.cmd, e, os.getcwd())
+    return not fallback.allowed(getattr(a, 'cmd', []), e, os.getcwd())
 
 
 def _log_request(a, me):
@@ -395,6 +401,9 @@ def _run_with_wait_budget(a, me) -> int:
                 f"started: {e}. Not re-running locally (it may have side effects). Check: {check}")
             return e.code
         if a.no_fallback or a.remote or explicit_base:
+            say(str(e))
+            return e.code
+        if a.bg and getattr(e, "waited_s", None) is not None:
             say(str(e))
             return e.code
         if a.bg:

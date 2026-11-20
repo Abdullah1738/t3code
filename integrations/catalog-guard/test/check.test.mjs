@@ -1,3 +1,4 @@
+import './log-dir.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { assessCache, planRefresh, missingFromCache, watchPolicy, MIN_REFRESH_GAP_MS } from '../lib/check.mjs';

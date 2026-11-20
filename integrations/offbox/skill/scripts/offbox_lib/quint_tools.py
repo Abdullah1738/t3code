@@ -146,15 +146,17 @@ unset -f __offbox_quint_ready __offbox_quint_ensure __offbox_quint_runtime __off
 '''
 
 
-def setup_events(path: Path):
-    from .runs import COMMAND_STARTED_MARKER, STEP_RETRY
+def setup_events(path: Path, run=None):
+    import offbox_protocol
+    identity = offbox_protocol.for_run(run, path)
     attempt, prelude = 1, True
     with path.open(errors='replace') as stream:
         for line in stream:
-            if STEP_RETRY.fullmatch(line.rstrip('\n')):
-                attempt = int(line.rsplit(' ', 1)[-1])
+            marker = identity.parse(line)
+            if marker and marker.kind == 'retry':
+                attempt = marker.fields['attempt']
                 prelude = True
-            elif line.startswith(COMMAND_STARTED_MARKER):
+            elif identity.blocks_replay(line):
                 prelude = False
             elif prelude and line.startswith(PREFIX):
                 try:
@@ -167,21 +169,23 @@ def setup_events(path: Path):
                     continue
 
 
-def failed_setup(path: Path | None) -> bool:
+def failed_setup(path: Path | None, *, run=None) -> bool:
     if path is None:
         return False
     try:
         text = path.read_text(errors='replace')
-        from .runs import COMMAND_STARTED_MARKER, STEP_RETRY
+        import offbox_protocol
+        identity = offbox_protocol.for_run(run, path)
         # Earlier attempts and command-emitted diagnostics cannot stand in for
         # a failure in the final prelude of a stepped run.
         final = []
         for line in text.splitlines():
-            if STEP_RETRY.fullmatch(line):
+            marker = identity.parse(line)
+            if marker and marker.kind == 'retry':
                 final.clear()
             else:
                 final.append(line)
-        if any(line.startswith(COMMAND_STARTED_MARKER) for line in final):
+        if identity.blocks_replay('\n'.join(final)):
             return False
         for line in reversed(final):
             if not line.startswith(PREFIX):
@@ -201,7 +205,7 @@ def record(con, run, path: Path, backend: str) -> None:
     """Keep setup analytics out of the command stream and deduplicate settlement."""
     import toollog
     try:
-        for attempt, data in setup_events(path):
+        for attempt, data in setup_events(path, run):
             key = f'quint_event:{run["run_id"]}:{attempt}:{data["attempt"]}'
             if con.execute('SELECT 1 FROM kv WHERE k=?', (key,)).fetchone():
                 continue

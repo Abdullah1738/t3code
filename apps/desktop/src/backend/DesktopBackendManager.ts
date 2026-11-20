@@ -1,3 +1,5 @@
+import { BACKEND_TERMINATE_GRACE_MS, captureBackendProcess } from "./DesktopBackendProcess.ts";
+
 import * as Brand from "effect/Brand";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -46,7 +48,7 @@ const DEFAULT_BACKEND_READINESS_INTERVAL = Duration.millis(100);
 const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT = Duration.seconds(1);
 // Same as the service launcher. A killed backend leaves its agents running,
 // and a busy one needs a few seconds to stop every provider session.
-const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.seconds(10);
+const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.millis(BACKEND_TERMINATE_GRACE_MS);
 const DEFAULT_BACKEND_OUTPUT_DRAIN_TIMEOUT = Duration.seconds(5);
 const BACKEND_READINESS_PATH = "/.well-known/t3/environment";
 const { logWarning: logBackendProcessWarning, logInfo: logBackendProcessInfo } =
@@ -68,6 +70,7 @@ export interface BackendProcessContext {
 export type DesktopBackendBootstrapDelivery = "fd3" | "stdin";
 
 export interface DesktopBackendStartConfig extends BackendProcessContext {
+  readonly manageProcessShutdown?: boolean;
   readonly args: ReadonlyArray<string>;
   readonly env: Record<string, string | undefined>;
   // When true the spawner merges the desktop process.env on top of `env`;
@@ -199,6 +202,7 @@ interface RunBackendProcessOptions extends DesktopBackendStartConfig {
   readonly onDesktopTelemetryControl?: (
     message: DesktopTelemetryControlMessageValue,
   ) => Effect.Effect<void>;
+  readonly terminateGraceMs?: number;
   readonly readinessTimeout?: Duration.Duration;
   readonly outputDrainTimeout?: Duration.Duration;
   readonly onStarted?: (pid: number) => Effect.Effect<void>;
@@ -468,6 +472,15 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
         }),
     ),
   );
+  if (options.manageProcessShutdown) {
+    const exited = Effect.runPromise(handle.exitCode.pipe(Effect.exit));
+    const processGuard = captureBackendProcess(
+      Number(handle.pid),
+      exited,
+      options.terminateGraceMs,
+    );
+    yield* Effect.addFinalizer(() => Effect.promise(() => processGuard.stop()));
+  }
   const startedAt = yield* Clock.monotonicTimeNanos;
   const outputFibers: Array<Fiber.Fiber<void, never>> = [];
 

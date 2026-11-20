@@ -149,11 +149,18 @@ it.effect.each(
       },
       stopBackgroundWork: () => Effect.die("Preserved background work must not be stopped"),
     });
-    yield* (yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(Effect.provide(layer))).execute(
-      effect,
+    const result = yield* (yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+      Effect.provide(layer),
+    ))
+      .execute(effect)
+      .pipe(Effect.result);
+    assert.equal(
+      result._tag,
+      kind === "deadline" && outcome === "not-active" ? "Failure" : "Success",
     );
     assert.lengthOf(stopped, 1);
     assert.equal(stopped[0]?.providerTurnId, providerTurnId);
+    if (kind === "deadline") assert.isTrue(stopped[0]?.confirmStopped);
     const preserve = kind === "deadline" || kind === "late";
     assert.equal(
       stopped[0]?.stopBackgroundWork,

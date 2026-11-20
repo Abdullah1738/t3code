@@ -5,6 +5,8 @@ mail OAuth heal and OTP watcher, the shared link-preview helper, the quick
 card builder, the MacBook power alerts and the Juno proxy. Edit them here,
 then install.
 
+`qcard --send CHAT --session ID` targets CHAT: own-chat app reply, `app --to` for another local chat, or an `agent-ask` link relay for a remote chat. Without `--session`, it only publishes/shares. The default key is `qcard:SLUG:CHAT`; retain `--key` across retries. Tests can set `QCARD_BRIDGE` (shell-split command) and `QCARD_BRIDGE_STATE` (bridge state directory).
+
 | Source | Installed as | Used by |
 | --- | --- | --- |
 | `bin/opencode`, `libexec/opencode/` | `~/.local/bin/opencode`, `~/.local/libexec/opencode/` | terminal CLI shim; shares the service binary path with `opencode-web` |
@@ -294,3 +296,32 @@ path from the target worktree. Config snapshots and Vite’s cache stay in a
 private temporary directory; the borrowed install is read-only.
 
 `vp` outcomes: `${XDG_STATE_HOME:-~/.local/state}/vp-shim/events.jsonl` (5 MB rotation).
+
+## vnc-hold
+
+`com.ardud.vnc-hold` holds a shared loopback Screen Sharing session. macOS
+relocks when the remote session that unlocked the console ends; another
+connected session prevents that. Keep Screen Sharing enabled with Apple auth
+(type 30). The helper caches the Keychain login password in memory per
+connection, checks for a locked console twice, and attempts an unlock. An
+unconfirmed attempt pauses typing across restarts until the Keychain password
+changes or `vnc-hold reset-attempts` is requested.
+
+- `vnc-hold status`: state, LaunchAgent state/pid and a fresh lock read; exit 0
+  only when connected, fresh, unlocked and without a typing pause or error.
+- `vnc-hold selftest` (`--once`): authenticate a second shared session and close
+  it, without typing or changing daemon state.
+- `vnc-hold reset-attempts`: request clearing the pause on the next daemon check.
+
+State: `~/.local/state/vnc-hold/state.json` (atomic writes, including keepalives).
+`typing_paused` is a boolean; `typing_paused_reason` explains it. Timestamps are
+Unix seconds. Logs: `~/Library/Logs/vnc-hold.log`, rotated at 256 KiB with two
+backups. Passwords stay out of logs/state/argv; only a paused password's SHA-256
+is persisted. Type-30 AES uses the ephemeral DH key in openssl's `-K` argument;
+openssl cannot read a raw `-K` key from stdin.
+
+Before any install/restart, start a temporary `vnc-hold run` with a separate
+`VNC_HOLD_STATE_DIR` and verify it connected. Keep it alive until the new
+LaunchAgent's pid is connected and the console reads unlocked. Stop only the
+captured temporary pid. Never lock the screen to test this helper. Automatic
+unlock still requires the separately supervised live proof.

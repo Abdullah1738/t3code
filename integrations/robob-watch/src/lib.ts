@@ -4,6 +4,7 @@ import { toolLog, toolError } from "./toollog.ts";
 import { StderrCause, stderrCause, type DependencyBusy } from "./cause.ts";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
+import { CheckGroups, type CheckGroup } from "./check-groups.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -109,6 +110,8 @@ export type Watcher = {
   max_consecutive_failures?: number;
   /** Failures in a row before the per-run failure notice; default 2, 1 = every failure. */
   failure_notice_after?: number;
+  /** False keeps a failure pause manual-only; otherwise probe after 15m, 30m, then hourly. */
+  failure_pause_probe?: boolean;
   depends?: Dependency[];
   /** Opt-in: text the owner a short heads-up when a wake sits queued behind a busy turn. Off by default. */
   headsup?: boolean;
@@ -156,6 +159,12 @@ export type State = {
   load_timeouts?: number;
   load_timeout_since?: string;
   failure_paused_at?: string;
+  failure_probe_attempts?: number;
+  failure_probe_next_at?: string;
+  failure_pause_notice?: string;
+  failure_pause_escalation?: string;
+  failure_pause_escalation_fallback?: string;
+  failure_recovery_notices?: { key: string; text: string; retry_at?: number }[];
   /** Separate from Telegram flags; retained through resume until bridge acceptance. */
   owner_imessage_episodes?: OwnerAlertEpisode[];
   last_error?: string;
@@ -304,6 +313,7 @@ export function removeWatcher(id: string, immediately = false): { archived?: str
     state.status = "closing";
     state.next_at = 0;
     delete state.failure_paused_at;
+    clearFailureProbe(state);
     saveState(id, state);
     if (started) toolLog({ component: "cli", kind: "event", name: "watch.grace_started", ids: { watcher: id }, props: { graceMs: REMOVAL_GRACE_MS } });
     log(id, `closing until ${iso(state.closing_until!)}`);
@@ -551,6 +561,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (maxFailures !== undefined && (!Number.isInteger(maxFailures) || maxFailures < 0)) errors.push("max_consecutive_failures must be an integer >= 0 (0 = never pause)");
   if (input.owner_imessage_alerts !== undefined && typeof input.owner_imessage_alerts !== "boolean") errors.push("owner_imessage_alerts must be boolean");
   if (input.owner_imessage_alerts === true && input.chat !== undefined) errors.push("owner_imessage_alerts requires an owner watcher");
+  if (input.failure_pause_probe !== undefined && typeof input.failure_pause_probe !== "boolean") errors.push("failure_pause_probe must be boolean");
   const noticeAfter = input.failure_notice_after;
   if (noticeAfter !== undefined && (!Number.isInteger(noticeAfter) || noticeAfter < 1)) errors.push("failure_notice_after must be an integer >= 1 (1 = every failure)");
   const depends = input.depends;
@@ -580,6 +591,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
     ...(noticeAfter !== undefined ? { failure_notice_after: noticeAfter } : {}),
+    ...(input.failure_pause_probe !== undefined ? { failure_pause_probe: input.failure_pause_probe } : {}),
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
     ...(input.headsup === true ? { headsup: true } : {}),
@@ -632,13 +644,20 @@ export function log(id: string | null, message: string): void {
 export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
 
 export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean; ms: number; busy?: DependencyBusy };
-const liveCheckGroups = new Map<number, Promise<void>>();
+export const checkGroups = new CheckGroups(log, (name, group, diagnostic) => {
+  toolLog({ component: "runner", kind: "event", name, ids: { watcher: group.watcher.id },
+    props: { pgid: group.pgid, pid: group.pid, killedAt: group.killedAt, diagnostic } });
+});
+const liveCheckGroups = checkGroups.groups;
+export class CheckStuckError extends Error {
+  constructor(readonly group: CheckGroup) { super(`Previous check group ${group.pgid} is still alive`); }
+}
 let stoppingChecks = false;
 let shutdownInstalled = false;
 let shutdownStarted = false;
 let beforeCheckShutdown: (() => void) | undefined;
 
-export const checkGroupExit = (pgid: number): Promise<void> | undefined => liveCheckGroups.get(pgid);
+export const checkGroupExit = (pgid: number): Promise<void> | undefined => liveCheckGroups.get(pgid)?.closed;
 export const checkProcessTag = (id: string, run: string = randomUUID()): string => `${id}:${run}:${process.pid}`;
 
 export function installCheckShutdown(beforeShutdown?: () => void): void {
@@ -670,24 +689,16 @@ async function waitForChecks(closed: Promise<void>[], timeoutMs: number): Promis
   } finally { clearTimeout(timer); }
 }
 
-function trackCheckGroup(pgid: number, child: ReturnType<typeof spawn>): void {
-  let release!: () => void;
-  liveCheckGroups.set(pgid, new Promise<void>(resolve => { release = resolve; }));
+function trackCheckGroup(group: CheckGroup, child: ReturnType<typeof spawn>): void {
   let watching = false;
   const closed = () => {
     if (watching) return;
     watching = true;
     // Closing the shell's pipes does not mean its redirected descendants have exited.
     const reap = () => {
-      try { process.kill(-pgid, 0); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-          liveCheckGroups.delete(pgid);
-          release();
-          return;
-        }
-      }
-      setTimeout(reap, 25).unref();
+      if (checkGroups.reap(group)) return;
+      // Stuck groups are probed on runner ticks, not forty times per second forever.
+      if (!group.stuck) setTimeout(reap, 25).unref();
     };
     reap();
   };
@@ -700,21 +711,27 @@ export async function killRunningChecks(signal: NodeJS.Signals = "SIGTERM"): Pro
   const groups = [...liveCheckGroups];
   for (const [pgid] of groups) signalCheckGroup(pgid, signal);
   if (!groups.length || signal === "SIGKILL") return;
-  await waitForChecks(groups.map(([, closed]) => closed), 500);
+  await waitForChecks(groups.map(([, group]) => group.closed), 500);
   for (const [pgid] of groups) if (liveCheckGroups.has(pgid)) signalCheckGroup(pgid, "SIGKILL");
   // Let the runner reap direct children before it exits, including TERM-resistant checks.
-  await waitForChecks(groups.map(([, closed]) => closed), 250);
+  await waitForChecks(groups.map(([, group]) => group.closed), 250);
 }
 
 /**
  * Runs a check in its own process group so a timeout kills everything it started. The result never waits more
  * than KILL_GRACE_MS past the timeout: a SIGKILLed process that the scheduler has not reaped yet must not keep
- * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
+ * the shared check pool blocked. Its watcher resumes once that group exits (3 Oct 2026: reaping took 9+ minutes).
  */
-export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance = watcherInstance(watcher.id)): Promise<CheckResult> {
+export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance?: string): Promise<CheckResult> {
   if (stoppingChecks) return Promise.reject(new Error("Runner is shutting down"));
+  const previous = checkGroups.previous(watcher.id);
+  if (previous) return Promise.reject(new CheckStuckError(previous));
   installCheckShutdown();
-  const run = () => spawnCheck(watcher, dir, extraEnv, timeoutMs, instance);
+  const run = () => {
+    const previous = checkGroups.previous(watcher.id);
+    if (previous) throw new CheckStuckError(previous);
+    return spawnCheck(watcher, dir, extraEnv, timeoutMs, instance ?? watcherInstance(watcher.id));
+  };
   return dir === watcherDir(watcher.id) ? withRelayLockAsync(run) : run();
 }
 
@@ -733,7 +750,7 @@ function spawnCheck(watcher: Watcher, dir: string, extraEnv: Record<string, stri
       if (done) return;
       done = true;
       clearTimeout(timer);
-      clearTimeout(grace);
+      if (!timedOut || !group || checkGroups.reap(group)) clearTimeout(grace);
       const ms = now() - started;
       cause.add(extra);
       const busy = cause.busy(code);
@@ -756,14 +773,17 @@ function spawnCheck(watcher: Watcher, dir: string, extraEnv: Record<string, stri
       if (!current || current.paused || (extraEnv.WATCH_PENDING === "1" ? !pending : !checking(state) || current.check !== watcher.check)) throw new Error("Watcher check changed before admission");
       return spawnChild(state.status === "closing" || state.reply_handoff ? "1" : "0");
     }) : spawnChild();
-    if (child.pid) trackCheckGroup(child.pid, child);
+    const group = child.pid ? checkGroups.track(watcher, child.pid) : undefined;
+    if (group) trackCheckGroup(group, child);
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", (chunk: string) => { cause.add(chunk); if (stderr.length < 20_000) stderr += chunk; });
     const timer = setTimeout(() => {
       timedOut = true;
+      if (group) group.killedAt = now();
       try { process.kill(-child.pid!, "SIGKILL"); } catch { toolError("runner", "watch.kill_failed", { watcher: watcher.id }); }
       grace = setTimeout(() => {
+        if (group) checkGroups.markStuck(group);
         try { child.stdout!.destroy(); child.stderr!.destroy(); child.unref(); } catch { toolError("runner", "watch.pipe_cleanup_failed", { watcher: watcher.id }); }
         finish(child.exitCode, child.signalCode, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
       }, KILL_GRACE_MS);
@@ -1600,6 +1620,58 @@ export function shouldNotifyFailure(watcher: Watcher, state: State, timedOut: bo
     && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
 }
 
+export function clearFailureProbe(state: State): void {
+  delete state.failure_probe_attempts;
+  delete state.failure_probe_next_at;
+}
+
+/** Shared by manual resume and a passing check; queued recovery receipts survive this reset. */
+export function clearFailureState(state: State): void {
+  clearFailureProbe(state);
+  delete state.failure_paused_at;
+  delete state.failure_pause_notice;
+  delete state.failure_pause_escalation;
+  delete state.failure_pause_escalation_fallback;
+  delete state.trigger_error;
+  delete state.load_timeouts;
+  delete state.load_timeout_since;
+  state.consecutive_failures = 0;
+  state.failure_alerted = false;
+  delete state.failure_escalated;
+  delete state.failing_since;
+  delete state.dependency_busy;
+  delete state.failure_episode;
+  delete state.last_error;
+  delete state.last_error_sources;
+}
+
+export function ensureFailureProbe(watcher: Watcher, state: State): boolean {
+  if (!state.failure_paused_at || watcher.paused || watcher.failure_pause_probe === false || state.status !== "active"
+    || state.failure_probe_next_at) return false;
+  state.failure_probe_attempts = 0;
+  state.failure_probe_next_at = iso(Date.parse(state.failure_paused_at) + 15 * 60_000);
+  return true;
+}
+
+export function failureProbeDue(watcher: Watcher, state: State, t = now()): boolean {
+  return state.status === "active" && !!state.failure_paused_at && !watcher.paused && watcher.failure_pause_probe !== false
+    && !!state.failure_probe_next_at && Date.parse(state.failure_probe_next_at) <= t;
+}
+
+export const failureProbeDelay = (attempt: number) => (attempt < 1 ? 15 : attempt === 1 ? 30 : 60) * 60_000;
+export const dubaiClock = (at: string) => new Intl.DateTimeFormat("en-GB", {
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone: "Asia/Dubai",
+}).format(Date.parse(at));
+export function pausedDuration(ms: number): string {
+  const minutes = Math.max(0, Math.floor(ms / 60_000));
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : `${minutes}m`;
+}
+export function pauseRetryText(watcher: Watcher, state: State): string {
+  return watcher.failure_pause_probe === false || watcher.paused
+    ? `Fix it, then robob-watch resume ${watcher.id}.`
+    : `It retries on its own in 15 min, 30 min, then hourly; or robob-watch resume ${watcher.id}. Next retry: ${dubaiClock(state.failure_probe_next_at ?? iso(Date.parse(state.failure_paused_at!) + 15 * 60_000))} Dubai.`;
+}
+
 export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
   if (state.dependency_busy) return false;
   const threshold = watcher.max_consecutive_failures ?? FAILURE_ALERT_AFTER;
@@ -1631,7 +1703,9 @@ export function escalationText(watcher: Watcher, state: State, mins: number): st
   ].join("\n");
   return [
     `Watcher ${watcher.id} ("${watcher.title}") has been FAILING for ${mins} min (${state.consecutive_failures} runs); ${failureSummary(state)}.`,
-    ...(state.failure_paused_at ? ["It is paused and will not check again until resumed."] : []),
+    ...(state.failure_paused_at ? [watcher.failure_pause_probe === false || watcher.paused
+      ? "It is paused and will not check again until resumed."
+      : `It is paused and retries on its own next at ${dubaiClock(state.failure_probe_next_at ?? iso(Date.parse(state.failure_paused_at) + 15 * 60_000))} Dubai.`] : []),
     `Last error: ${(state.last_error ?? "").slice(0, 500)}`,
     "",
     "Diagnose and repair the cause now (e.g. \"wacli sync daemon is not running\" -> `wa start`, then `wa status`; see the robob-watchers skill's Troubleshooting).",
@@ -1664,18 +1738,22 @@ function failureSummary(state: State): string {
   return sources.length ? `failing sources: ${sources.join(", ")}` : "its check is failing";
 }
 
+export function escalationFallbackText(watcher: Watcher, state: State, mins: number): string {
+  return state.dependency_busy ? `Dependency ${state.dependency_busy.dependency} has been busy for ${mins} min; watcher "${watcher.title}" keeps retrying; nothing is lost.`
+    : `Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`;
+}
+
 export async function escalate(watcher: Watcher, state: State, key: string, imessageFallback = true): Promise<Delivery> {
   const started = now();
   let delivery: Delivery | undefined;
   try {
     const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.dependency_busy?.since ?? state.failing_since!)) / 60_000);
-    const text = escalationText(watcher, state, mins);
+    const text = (state.failure_paused_at && state.failure_pause_escalation) || escalationText(watcher, state, mins);
     const woke = await wake(`robob-watch ${watcher.id} ${state.dependency_busy ? "dependency busy" : "failing"}`, text, key);
     if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
     else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
     else {
-      const summary = state.dependency_busy ? `Dependency ${state.dependency_busy.dependency} has been busy for ${mins} min; watcher "${watcher.title}" keeps retrying; nothing is lost.`
-        : `Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`;
+      const summary = (state.failure_paused_at && state.failure_pause_escalation_fallback) || escalationFallbackText(watcher, state, mins);
       const sent = await imessage(summary, key);
       delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
     }

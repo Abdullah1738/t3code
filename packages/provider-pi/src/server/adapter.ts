@@ -354,6 +354,7 @@ function compactionTitle(status: PiCompactionStatus): string {
 
 interface ActivePiTurn {
   readonly turnInput: ProviderAdapter.ProviderAdapterV2TurnInput;
+  readonly completed: Deferred.Deferred<void>;
   providerTurn: OrchestrationV2ProviderTurn;
   readonly startedAt: DateTime.Utc;
   readonly itemOrdinals: Map<string, number>;
@@ -364,6 +365,7 @@ interface ActivePiTurn {
   readonly toolStartedAt: Map<string, DateTime.Utc>;
   interrupted: boolean;
   nativeAborted: boolean;
+  abortAcknowledged?: boolean;
   sawAgentActivity: boolean;
   adoptedWake: boolean;
   readonly promptMayBeCommandOnly: boolean;
@@ -1489,7 +1491,11 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         };
       });
 
-      const finalizeTurn = Effect.fnUntraced(function* (state: PiThreadState, readUsage = true) {
+      const finalizeTurn = Effect.fnUntraced(function* (
+        state: PiThreadState,
+        readUsage = true,
+        nativeWorkEnded = false,
+      ) {
         const turn = state.activeTurn;
         if (turn === null) return;
         state.activeTurn = null;
@@ -1573,6 +1579,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           }
           yield* emit({
             type: "turn.terminal",
+            ...(nativeWorkEnded ? { nativeWorkEnded: true as const } : {}),
             driver: PI_PROVIDER,
             providerThreadId: state.providerThread.id,
             providerTurnId: turn.providerTurn.id,
@@ -1591,6 +1598,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         } else {
           yield* emit({
             type: "turn.terminal",
+            ...(nativeWorkEnded ? { nativeWorkEnded: true as const } : {}),
             driver: PI_PROVIDER,
             providerThreadId: state.providerThread.id,
             providerTurnId: turn.providerTurn.id,
@@ -1600,6 +1608,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             threadDisposition: "reusable",
           });
         }
+        yield* Deferred.succeed(turn.completed, undefined);
       });
 
       const scheduleSettleProbe = (
@@ -1945,7 +1954,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           }
           case "agent_settled": {
             if (turn?.interrupted === true) {
-              if (state !== null) yield* finalizeTurn(state);
+              if (state !== null) yield* finalizeTurn(state, true, true);
               return;
             }
             if (turn !== null) {
@@ -2115,7 +2124,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               (recordNumber(data, "pendingMessageCount") ?? 0) === 0
             ) {
               turn.settleWhenIdle = false;
-              if (state !== null) yield* finalizeTurn(state);
+              if (state !== null) yield* finalizeTurn(state, true, true);
             }
             return;
           }
@@ -2389,6 +2398,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         return { message, images };
       });
 
+      const joinTurnStop = ProviderAdapter.makeTurnStopJoiner();
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
         instanceId: options.instanceId,
         driver: PI_PROVIDER,
@@ -2402,6 +2412,17 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           Effect.sync(
             () => pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id,
           ),
+        holdsWorkForThread: (owner) =>
+          sessionEventPermit
+            .withPermitsIfAvailable(1)(
+              Effect.sync(
+                () =>
+                  (threadState?.providerThread.id === owner.id &&
+                    threadState.activeTurn !== null) ||
+                  pendingWake?.state.providerThread.id === owner.id,
+              ),
+            )
+            .pipe(Effect.map(Option.getOrElse(() => true))),
         getModelContextWindow: (selection) => {
           if (selection.instanceId !== options.instanceId) return undefined;
           const slug =
@@ -2515,6 +2536,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               completedAt: null,
             };
             const activeTurn: ActivePiTurn = {
+              completed: yield* Deferred.make<void>(),
               turnInput,
               providerTurn,
               startedAt,
@@ -2700,6 +2722,24 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               ),
             ),
         ),
+        interruptStartingRun: Effect.fn("PiAdapter.interruptStartingRun")(function* (run) {
+          const turn = threadState?.activeTurn;
+          if (
+            turn == null ||
+            turn.turnInput.runId !== run.runId ||
+            turn.turnInput.attemptId !== run.attemptId ||
+            turn.turnInput.providerThread.id !== run.providerThread.id ||
+            threadState?.providerThread.nativeThreadRef?.nativeId !==
+              run.providerThread.nativeThreadRef?.nativeId
+          )
+            return;
+          yield* runtime.interruptTurn({
+            providerThread: run.providerThread,
+            providerTurnId: turn.providerTurn.id,
+            requestRuntimeRestart: false,
+            stopBackgroundWork: false,
+          });
+        }),
         interruptTurn: Effect.fn("PiAdapter.interruptTurn")(
           function* (interruptInput) {
             const turn = threadState?.activeTurn ?? null;
@@ -2749,9 +2789,22 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               );
               return;
             }
-            yield* request({ type: "abort" }).pipe(
-              Effect.tapError(() => Effect.sync(() => (turn.interrupted = false))),
-            );
+            if (!turn.abortAcknowledged)
+              yield* request({ type: "abort" }).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    turn.abortAcknowledged = true;
+                  }),
+                ),
+                Effect.tapError(() => Effect.sync(() => (turn.interrupted = false))),
+              );
+            if (interruptInput.stopBackgroundWork === false)
+              yield* Deferred.await(turn.completed).pipe(
+                Effect.timeout("10 seconds"),
+                Effect.mapError((cause) =>
+                  protocolError("Pi has not confirmed that the expired turn stopped.", cause),
+                ),
+              );
           },
           (effect, interruptInput) =>
             effect.pipe(
@@ -2766,6 +2819,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                     }),
               ),
             ),
+          (effect, target) =>
+            target.stopBackgroundWork === false
+              ? joinTurnStop(target.providerTurnId, effect)
+              : effect,
         ),
         respondToRuntimeRequest: Effect.fn("PiAdapter.respondToRuntimeRequest")(
           function* (requestInput) {

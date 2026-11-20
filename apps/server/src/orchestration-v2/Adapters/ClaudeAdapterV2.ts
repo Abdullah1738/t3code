@@ -48,7 +48,6 @@ import {
   type Query as ClaudeQuery,
   type Settings as ClaudeSdkSettings,
   type SpawnOptions as ClaudeSpawnOptions,
-  type SpawnedProcess as ClaudeSpawnedProcess,
   type SDKAssistantMessage,
   type SDKAPIRetryMessage,
   type SDKMessage,
@@ -335,7 +334,7 @@ function spawnClaudeProcessGroup(
   registry: ProviderProcessRegistry.ProviderProcessRegistry["Service"],
   threadId: string,
   providerCommandLine: string,
-): ClaudeSpawnedProcess {
+) {
   const child = NodeChildProcess.spawn(options.command, options.args, {
     cwd: options.cwd,
     env: options.env,
@@ -514,13 +513,27 @@ export interface ClaudeAgentSdkQueryOpenInput {
 }
 
 export interface ClaudeAgentSdkQuerySession {
+  readonly runtimeProcess?: () =>
+    | {
+        readonly pid: number;
+        readonly spawnedAtMs: number;
+        readonly teardown?: {
+          readonly reason: "teardown_sent" | "teardown_failed";
+          readonly since: number;
+          readonly detail: string;
+          readonly sentAt?: number;
+        };
+      }
+    | undefined;
   readonly retryMcp?: Effect.Effect<void>;
   readonly messages: Stream.Stream<SDKMessage, ClaudeAgentSdkQueryRunnerError>;
   readonly processExit?: Effect.Effect<ClaudeProcessExit>;
   readonly offer: (message: SDKUserMessage) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  // Only true proves the prompt was removed before execution. Interrupt delivery
+  // returns false and still requires its native result before releasing ownership.
   readonly cancelPendingPrompt?: (
     uuid: string,
-  ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  ) => Effect.Effect<boolean, ClaudeAgentSdkQueryRunnerError>;
   readonly setModel: (model: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly applyFlagSettings: (
     settings: ClaudeFlagSettings,
@@ -931,17 +944,20 @@ export const cancelClaudePendingPrompt = Effect.fn("ClaudeAgentSdkQueryRunner.ca
       promptQueue,
       pending.filter((message) => message.uuid !== uuid),
     );
-    if (pending.some((message) => message.uuid === uuid)) return;
-    yield* Effect.tryPromise({
+    if (pending.some((message) => message.uuid === uuid)) return true;
+    return yield* Effect.tryPromise({
       try: async () => {
         // The pinned SDK implements this targeted control before its public
         // Query declaration includes the method. Never clear other native input.
         if (queryRuntime.cancelAsyncMessage === undefined)
           throw new Error("Claude does not support cancelling the timed-out queued prompt.");
-        if (await queryRuntime.cancelAsyncMessage(uuid)) return;
+        if (await queryRuntime.cancelAsyncMessage(uuid)) return true;
         const receipt = await queryRuntime.interrupt();
         if (receipt?.still_queued.includes(uuid))
           throw new Error("Claude did not cancel the timed-out queued prompt.");
+        // An interrupt receipt only acknowledges delivery. The running prompt
+        // still owns the query until its native result arrives.
+        return false;
       },
       catch: (cause) => queryRunnerError(cause, "cancelPendingPrompt"),
     });
@@ -982,6 +998,7 @@ export const layerQueryRunner: Layer.Layer<
         const logProtocolEvent = (event: ClaudeAgentSdkProtocolLogEvent) =>
           protocolLogger === undefined ? Effect.void : protocolLogger(event);
         const queryStarted = yield* Clock.currentTimeMillis;
+        const clock = yield* Clock.Clock;
         const processExit = Promise.withResolvers<ClaudeProcessExit>();
         // Native exit callbacks can arrive after the session stream's scope has closed.
         const logNativeExit = Effect.runForkWith(yield* Effect.context<never>());
@@ -1027,6 +1044,7 @@ export const layerQueryRunner: Layer.Layer<
                 pathToClaudeCodeExecutable: launch.command,
                 executableArgs: [...launch.args, ...(queryOptions.executableArgs ?? [])],
               };
+        let runtimeProcess: ReturnType<NonNullable<ClaudeAgentSdkQuerySession["runtimeProcess"]>>;
         const spawnProcess =
           options.spawnClaudeCodeProcess ??
           (platform === "win32"
@@ -1054,11 +1072,20 @@ export const layerQueryRunner: Layer.Layer<
                 ));
         const spawnClaudeCodeProcess = (spawnOptions: ClaudeSpawnOptions) => {
           const child = spawnProcess(spawnOptions);
+          const pid: unknown = Reflect.get(child, "pid");
+          const spawnedAtMs = clock.currentTimeMillisUnsafe();
+          if (typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0)
+            runtimeProcess = { pid, spawnedAtMs };
           let observedExit = false;
           const observeExit = (code: number | null, signal: NodeJS.Signals | null) => {
             if (observedExit) return;
             observedExit = true;
-            const pid = Reflect.get(child, "pid");
+            if (
+              runtimeProcess !== undefined &&
+              runtimeProcess.pid === pid &&
+              runtimeProcess.spawnedAtMs === spawnedAtMs
+            )
+              runtimeProcess = undefined;
             logNativeExit(
               Effect.logInfo("orchestration-v2.claude-process-exited", {
                 threadId: input.threadId,
@@ -1179,6 +1206,7 @@ export const layerQueryRunner: Layer.Layer<
           };
         };
         return {
+          runtimeProcess: () => runtimeProcess,
           processExit: Effect.promise(() => processExit.promise),
           retryMcp: Effect.suspend(() =>
             (registration?.attempt ?? Effect.void).pipe(
@@ -1345,11 +1373,17 @@ export const layerQueryRunner: Layer.Layer<
               }),
             ),
           ),
-          close: Effect.suspend(() =>
-            (registration?.close ?? Effect.void).pipe(
+          close: Effect.suspend(() => {
+            const sentAt = clock.currentTimeMillisUnsafe();
+            if (runtimeProcess !== undefined)
+              runtimeProcess = {
+                ...runtimeProcess,
+                teardown: { reason: "teardown_sent", since: sentAt, sentAt, detail: "stop_sent" },
+              };
+            return (registration?.close ?? Effect.void).pipe(
               Effect.andThen(homeRegistration?.close ?? Effect.void),
-            ),
-          ).pipe(
+            );
+          }).pipe(
             Effect.andThen(Queue.shutdown(promptQueue)),
             Effect.andThen(closeClaudeQuery(queryRuntime)),
             Effect.tap(() =>
@@ -1359,6 +1393,19 @@ export const layerQueryRunner: Layer.Layer<
                 payload: {
                   type: "query.close",
                 },
+              }),
+            ),
+            Effect.onExit((exit) =>
+              Effect.sync(() => {
+                if (Exit.isFailure(exit) && runtimeProcess !== undefined)
+                  runtimeProcess = {
+                    ...runtimeProcess,
+                    teardown: {
+                      reason: "teardown_failed",
+                      since: clock.currentTimeMillisUnsafe(),
+                      detail: "stop_failed",
+                    },
+                  };
               }),
             ),
           ),
@@ -3649,6 +3696,7 @@ interface ClaudeSteerDelivery {
 
 interface ActiveClaudeTurnContext {
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
+  readonly nativeCompletion: Deferred.Deferred<void>;
   readonly nativeThreadId: string;
   readonly nativeTurnId: string;
   nativeMessageCursor: string | null;
@@ -3760,6 +3808,7 @@ interface ActiveClaudeTurnContext {
   promptStarted: boolean;
   promptAcceptedAt: DateTime.Utc | undefined;
   preserveBackgroundWorkOnInterrupt?: boolean;
+  interruptAcknowledged?: boolean;
   nativeWakeStarted: boolean;
   gatedFramesBeforeEcho: number;
   readonly heldRootFrames: Array<SDKMessage>;
@@ -4388,6 +4437,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const interruptedTurns = yield* Ref.make(new Set<OrchestrationV2ProviderTurn["id"]>());
         const steeredTurns = yield* Ref.make(new Set<OrchestrationV2ProviderTurn["id"]>());
         const queryContext = yield* Ref.make<ClaudeLiveQueryContext | null>(null);
+        const inventoryQueries: Array<{
+          nativeThreadId: string;
+          query: ClaudeAgentSdkQuerySession;
+        }> = [];
         const openedNativeThreads = yield* Ref.make(new Set<string>());
         const latestPlanByKind = yield* Ref.make(new Map<string, OrchestrationV2PlanArtifact>());
         // Claude 5 task tools edit one list per native session, across turns.
@@ -7052,6 +7105,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly failure?: OrchestrationV2ProviderFailure;
           readonly threadDisposition?: "reusable" | "broken";
           readonly result?: SDKResultMessage;
+          readonly nativeWorkEnded?: true;
           readonly deferWorkflowTranscripts?: boolean;
         }) {
           yield* Effect.gen(function* () {
@@ -7234,6 +7288,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             input.status === "failed"
               ? {
                   type: "turn.terminal",
+                  ...(input.result !== undefined || input.nativeWorkEnded === true
+                    ? { nativeWorkEnded: true as const }
+                    : {}),
                   driver: CLAUDE_PROVIDER,
                   providerThreadId: input.context.input.providerThread.id,
                   providerTurnId: input.context.providerTurnId,
@@ -7254,6 +7311,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 }
               : {
                   type: "turn.terminal",
+                  ...(input.result !== undefined || input.nativeWorkEnded === true
+                    ? { nativeWorkEnded: true as const }
+                    : {}),
                   driver: CLAUDE_PROVIDER,
                   providerThreadId: input.context.input.providerThread.id,
                   providerTurnId: input.context.providerTurnId,
@@ -7658,6 +7718,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             yield* finalizeActiveTurn({
               context,
               status: interrupted ? "interrupted" : "failed",
+              ...(processExit === undefined ? {} : { nativeWorkEnded: true as const }),
               completedAt: yield* DateTime.now,
               deferWorkflowTranscripts: failure !== undefined || processExit !== undefined,
               ...(interrupted
@@ -10017,7 +10078,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               completedAt,
               result: message,
               ...(terminalFailure === null ? {} : { failure: terminalFailure }),
-            });
+            }).pipe(Effect.ensuring(Deferred.succeed(context.nativeCompletion, undefined)));
           }
         });
 
@@ -10850,6 +10911,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             status: "active",
           });
           const closed = yield* Deferred.make<void, never>();
+          inventoryQueries.push({ nativeThreadId, query: querySession });
           const context: ClaudeLiveQueryContext = {
             resumed: shouldResume,
             generation: yield* Ref.modify(queryGenerations, (current) => {
@@ -10874,6 +10936,29 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ),
           };
           yield* Ref.set(queryContext, context);
+          const processExited = yield* Deferred.make<ClaudeProcessExit>();
+          if (querySession.processExit !== undefined)
+            yield* querySession.processExit.pipe(
+              Effect.flatMap((exit) =>
+                Effect.gen(function* () {
+                  context.processExit = exit;
+                  const owner = context.lastTurn;
+                  yield* Deferred.succeed(processExited, exit);
+                  // SDK EOF is not process exit. Keep this observer alive after
+                  // stream cleanup, bound to this process and its last exact owner.
+                  yield* Deferred.await(closed);
+                  if (owner !== null)
+                    yield* emitProviderEvent({
+                      type: "turn.native-ended",
+                      driver: CLAUDE_PROVIDER,
+                      providerThreadId: owner.input.providerThread.id,
+                      providerTurnId: owner.providerTurnId,
+                      attemptId: owner.input.attemptId,
+                    });
+                }),
+              ),
+              Effect.forkIn(sessionScope),
+            );
           yield* querySession.messages.pipe(
             Stream.runForEach((message) =>
               sdkMessageLock.withPermits(1)(
@@ -10904,9 +10989,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 ? consumeMessages
                 : Effect.raceFirst(
                     consumeMessages,
-                    querySession.processExit.pipe(
+                    Deferred.await(processExited).pipe(
                       Effect.flatMap((exit) => {
-                        context.processExit = exit;
                         return Effect.fail(
                           queryRunnerError(new ClaudeCliProcessExitedError(exit), "processExit"),
                         );
@@ -11039,6 +11123,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
           const context: ActiveClaudeTurnContext = {
             input: turnInput,
+            nativeCompletion: yield* Deferred.make<void>(),
             nativeThreadId,
             nativeTurnId,
             nativeMessageCursor: null,
@@ -11455,6 +11540,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             if (existing.processExit !== undefined) {
               yield* finalizeActiveTurn({
                 context: currentTurn,
+                nativeWorkEnded: true,
                 status: failure === undefined ? "interrupted" : "failed",
                 ...(failure === undefined ? {} : { failure }),
                 completedAt: yield* DateTime.now,
@@ -11464,18 +11550,40 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             }
             currentTurn.preserveBackgroundWorkOnInterrupt = turnInput.stopBackgroundWork === false;
             if (turnInput.stopBackgroundWork === false) {
-              yield* (
-                currentTurn.promptUuid !== null && existing.query.cancelPendingPrompt !== undefined
-                  ? existing.query.cancelPendingPrompt(currentTurn.promptUuid)
-                  : existing.query.interrupt
-              ).pipe(Effect.timeout(CLAUDE_INTERRUPT_SETTLE_TIMEOUT));
-              if ((yield* Ref.get(activeTurn)) === currentTurn)
-                yield* finalizeActiveTurn({
-                  context: currentTurn,
-                  status: failure === undefined ? "interrupted" : "failed",
-                  ...(failure === undefined ? {} : { failure }),
-                  completedAt: yield* DateTime.now,
-                });
+              yield* Effect.gen(function* () {
+                const cancelled = yield* currentTurn.interruptAcknowledged === true
+                  ? Effect.succeed(false)
+                  : currentTurn.promptUuid !== null &&
+                      existing.query.cancelPendingPrompt !== undefined
+                    ? existing.query.cancelPendingPrompt(currentTurn.promptUuid)
+                    : existing.query.interrupt.pipe(Effect.as(false));
+                if (cancelled) {
+                  if ((yield* Ref.get(activeTurn)) === currentTurn)
+                    yield* finalizeActiveTurn({
+                      context: currentTurn,
+                      nativeWorkEnded: true,
+                      status: failure === undefined ? "interrupted" : "failed",
+                      ...(failure === undefined ? {} : { failure }),
+                      completedAt: yield* DateTime.now,
+                    });
+                } else {
+                  currentTurn.interruptAcknowledged = true;
+                  yield* Effect.raceFirst(
+                    Deferred.await(currentTurn.nativeCompletion),
+                    Deferred.await(existing.closed),
+                  );
+                  // A reserved continuation can attach after query cleanup has
+                  // already finalized the prior turn. Release that reservation
+                  // without treating SDK stream closure as native-end evidence.
+                  if ((yield* Ref.get(activeTurn)) === currentTurn)
+                    yield* finalizeActiveTurn({
+                      context: currentTurn,
+                      status: failure === undefined ? "interrupted" : "failed",
+                      ...(failure === undefined ? {} : { failure }),
+                      completedAt: yield* DateTime.now,
+                    });
+                }
+              }).pipe(Effect.timeout(CLAUDE_INTERRUPT_SETTLE_TIMEOUT));
               return;
             }
             existing.stopping = true;
@@ -11884,6 +11992,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           driver: CLAUDE_PROVIDER,
           providerSessionId: input.providerSessionId,
           providerSession: session,
+          runtimeInventory: Effect.sync(() => {
+            for (let i = inventoryQueries.length - 1; i >= 0; i--) {
+              if (inventoryQueries[i]!.query.runtimeProcess?.() === undefined)
+                inventoryQueries.splice(i, 1);
+            }
+            return {
+              roots: inventoryQueries.flatMap(({ nativeThreadId, query }) => {
+                const process = query.runtimeProcess?.();
+                return process === undefined ? [] : [{ ...process, nativeThreadId }];
+              }),
+              loads: [],
+            };
+          }),
           checkRetryHealth: Effect.fn("ClaudeAdapterV2.checkRetryHealth")(function* (healthInput) {
             return yield* turnControlLock.withPermits(1)(
               Effect.gen(function* () {
@@ -12093,6 +12214,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 return false;
               }
               return yield* Effect.sync(() => {
+                const current =
+                  Ref.getUnsafe(activeTurn) ?? Ref.getUnsafe(pendingContinuation)?.context;
+                if (
+                  current?.input.providerThread.id === providerThread.id &&
+                  current.input.providerThread.nativeThreadRef?.nativeId === nativeThreadId
+                )
+                  return true;
                 const roster = rosterForNativeThread(
                   Ref.getUnsafe(pendingBackgroundTasksByNativeThread),
                   nativeThreadId,

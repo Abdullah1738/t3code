@@ -25,6 +25,10 @@ After that grace, replacement requires at least three consecutive unready checks
 spanning another three minutes. Recovery, a hold, a different desktop or a gap
 over 90 seconds resets that observation window. Replacement attempts are limited
 to one per 15 minutes, including failed attempts; the remaining cooldown is logged.
+An orphan runtime owner blocks further opens and raises one `orphan-backend` alert
+per outage. A newer `ServerAlreadyRunningError` in the backend child log also marks
+an attempt blocked. Once ownership is verified clear, the guard retries immediately
+without the failed attempt's cooldown. It never signals the backend.
 Eligible unready desktops get SIGTERM, then SIGKILL after three seconds if needed.
 Every signal rechecks identity; provider/Node workers are never selected. Recovery
 attempts to record a guard quit reason before signalling, with a bounded provenance
@@ -32,7 +36,7 @@ write. An unavailable handoff is logged locally and does not prevent recovery.
 The guard rechecks health and the install hold under the hold lock before acting,
 then rechecks desktop identity and health after the provenance handoff. Recovery
 or a new desktop cancels the stale action. Surviving workers without a registered
-desktop do not prevent ordinary absent-desktop reopening.
+desktop do not prevent ordinary absent-desktop reopening unless they own the backend runtime.
 A dead PID retained by LaunchServices counts as an absent desktop. The quit-reason
 CLI reports `no desktop` and the watchdog hold skips its reason handoff in that case.
 
@@ -106,12 +110,16 @@ State, log, locks and beater identity live in `~/.local/state/robob-guard/`:
 `state.json`, `guard.log`, `check.lock`, `hold.lock`, `hold-beater.json`.
 The log has one UTC line per check (`up`, `down n`, `hold:NAME`, or
 `stale-hold:NAME` plus the action). Over 1 MiB it trims to the last 2000 lines.
-Unready and check-error rows include the LaunchServices PID, its liveness, and up
-to five other Robob-executable processes (PID, PPID, first 160 argument characters).
+Check rows include the LaunchServices PID, its liveness, and up
+to five Robob-executable processes (PID, PPID, desktop/backend/other role, first 160 argument characters).
 Check-error rows also name the failing step and consecutive error count. Diagnostic
-read failures appear in the row and do not change the recovery decision.
+read failures appear in the row. `orphan_backend` records the runtime owner's PID,
+parent, port, start time and loopback listener check, or null. Runtime and child-log
+reads are capped at 64 KiB with a two-second deadline; an uncertain ownership read
+holds recovery until ownership can be checked.
 The guard writes only in this directory. The hold helper also writes the
-install hold file. Nothing uses `~/.robob/userdata` or SQLite.
+install hold file. Runtime ownership and the child log are read from `~/.robob/userdata`;
+the guard never opens SQLite.
 
 After owner approval, from the merged checkout:
 

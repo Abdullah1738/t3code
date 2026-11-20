@@ -12258,3 +12258,452 @@ it.effect.each([
       assert.isTrue((yield* maintenance.rebuild).valid);
     }).pipe(Effect.provide(Layer.fresh(layerTest))),
 );
+
+it.effect.each([
+  { phase: "provider", attachment: "turn", code: PROVIDER_START_TIMEOUT_CODE },
+  { phase: "provider", attachment: "turn", code: "provider_events_lost" },
+  { phase: "restart_admission", attachment: "turn", code: "restart_admission_timeout" },
+  { phase: "provider", attachment: "native", code: PROVIDER_START_TIMEOUT_CODE },
+  { phase: "provider", attachment: "none", code: PROVIDER_START_TIMEOUT_CODE },
+  { phase: "provider", attachment: "turn", code: PROVIDER_START_TIMEOUT_CODE, stopFails: true },
+] as const)("start expiry $code interrupts $attachment exactly once after commit", (row) =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const { threadId, projection } = yield* createDeadlineThread(
+      `stop-${row.code}-${row.attachment}-${"stopFails" in row}`,
+    );
+    const run = projection.runs[0]!;
+    const owner = projection.providerThreads[0]!;
+    const now = yield* DateTime.now;
+    const turnId = ProviderTurnId.make(`${threadId}:native-turn`);
+    const turn = {
+      id: turnId,
+      providerThreadId: owner.id,
+      nodeId: run.rootNodeId!,
+      runAttemptId: run.activeAttemptId,
+      nativeTurnRef: null,
+      ordinal: 1,
+      status: "running" as const,
+      startedAt: now,
+      completedAt: null,
+    };
+    yield* sink.write({
+      events: [
+        ...projection.runs.slice(1).map((queued) => ({
+          id: EventId.make(`${queued.id}:held`),
+          type: "run.updated" as const,
+          threadId,
+          runId: queued.id,
+          occurredAt: now,
+          payload: { ...queued, queueHeld: true },
+        })),
+        {
+          id: EventId.make(`${run.id}:deadline`),
+          type: "run.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            ...run,
+            ...(row.phase === "provider" ? { providerStartDeadlineAt: now } : {}),
+          },
+        },
+        ...(row.attachment === "turn"
+          ? [
+              {
+                id: EventId.make(`${run.id}:turn`),
+                type: "provider-turn.updated" as const,
+                threadId,
+                runId: run.id,
+                occurredAt: now,
+                payload: turn,
+              },
+            ]
+          : []),
+        ...(row.attachment === "native"
+          ? [
+              {
+                id: EventId.make(`${run.id}:native`),
+                type: "provider-thread.updated" as const,
+                threadId,
+                runId: run.id,
+                occurredAt: now,
+                payload: {
+                  ...owner,
+                  nativeThreadRef: { driver, nativeId: "native-only", strength: "strong" as const },
+                },
+              },
+            ]
+          : []),
+      ],
+    });
+    let interrupts = 0;
+    let startingInterrupts = 0;
+    const runtime = {
+      holdsWorkForThread: () => Effect.succeed(false),
+      interruptTurn: (
+        input: Parameters<ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"]>[0],
+      ) =>
+        Effect.sync(() => {
+          interrupts++;
+          assert.equal(input.providerTurnId, turnId);
+          assert.isFalse(input.requestRuntimeRestart);
+          assert.isFalse(input.stopBackgroundWork);
+        }).pipe(
+          Effect.andThen(
+            "stopFails" in row ? Effect.die("hard teardown is already in progress") : Effect.void,
+          ),
+        ),
+      interruptStartingRun: (
+        input: Parameters<
+          NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptStartingRun"]>
+        >[0],
+      ) =>
+        Effect.sync(() => {
+          startingInterrupts++;
+          assert.equal(input.runId, run.id);
+          assert.equal(input.attemptId, run.activeAttemptId);
+          assert.isFalse(input.stopBackgroundWork);
+        }),
+    };
+    const getSpy = vi
+      .spyOn(sessions, "get")
+      .mockReturnValue(
+        Effect.succeedSome(runtime as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime),
+      );
+    const liveSpy = vi.spyOn(sessions, "isLive").mockReturnValue(Effect.succeed(true));
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        getSpy.mockRestore();
+        liveSpy.mockRestore();
+      }),
+    );
+    const command = {
+      type: "run.start-expire" as const,
+      commandId: CommandId.make(`${threadId}:expire`),
+      threadId,
+      runId: run.id,
+      expectedAttemptId: run.activeAttemptId,
+      deadline: now,
+      phase: row.phase,
+      ...(row.code === "provider_events_lost"
+        ? {
+            nativeEvidence: {
+              runId: run.id,
+              attemptId: run.activeAttemptId!,
+              nativeSessionId: "native-evidence",
+              acceptedAt: now,
+            },
+          }
+        : {}),
+    };
+    yield* engine.dispatch(command);
+    yield* engine.dispatch(command);
+    yield* engine.dispatch({ ...command, commandId: CommandId.make(`${threadId}:expire-again`) });
+    const queued = yield* outbox.listByCommandId(command.commandId);
+    assert.equal(
+      queued.filter((effect) => effect.request.type === "provider-turn.interrupt").length,
+      row.attachment === "none" ? 0 : 1,
+    );
+    const stoppedLogs: Array<unknown> = [];
+    const failedLogs: Array<unknown> = [];
+    const capture = Logger.make(({ message }) => {
+      const [text, fields] = Array.isArray(message) ? message : [message];
+      if (text === "t3.run.start_expire_stopped_session") stoppedLogs.push(fields);
+      if (text === "t3.run.start_expire_stop_failed") failedLogs.push(fields);
+    });
+    yield* worker.drain().pipe(Effect.provide(Logger.layer([capture])));
+    assert.lengthOf(stoppedLogs, row.attachment === "none" || "stopFails" in row ? 0 : 1);
+    assert.lengthOf(failedLogs, "stopFails" in row ? 1 : 0);
+    if (stoppedLogs.length > 0)
+      assert.containSubset(stoppedLogs[0], {
+        provider: run.providerInstanceId,
+        runId: run.id,
+        sessionId: owner.providerSessionId,
+        code: row.code,
+        elapsedMs: 0,
+      });
+    if ("stopFails" in row)
+      assert.notEqual(Option.getOrThrow(yield* outbox.get(queued[0]!.id)).status, "succeeded");
+    assert.equal(interrupts, row.attachment === "turn" ? 1 : 0);
+    assert.equal(startingInterrupts, row.attachment === "native" ? 1 : 0);
+    const after = yield* engine.getThreadProjection(threadId);
+    assert.equal(after.runs[0]?.status, "failed");
+    assert.equal(
+      after.turnItems.filter(
+        (item) => item.type === "error" && item.runId === run.id && item.failure.code === row.code,
+      ).length,
+      1,
+    );
+    // Ingestion and terminal finalization use this same persisted attempt guard.
+    const late = yield* sink.writeIfRunCurrent({
+      threadId,
+      runId: run.id,
+      activeAttemptId: run.activeAttemptId!,
+      expectedStatus: "running",
+      events: [
+        {
+          id: EventId.make(`${run.id}:late-native-start`),
+          type: "provider-turn.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...turn, promptAcceptedAt: now },
+        },
+        {
+          id: EventId.make(`${run.id}:late-completion`),
+          type: "run.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...run, status: "completed", completedAt: now },
+        },
+      ],
+    });
+    assert.isFalse(late.committed);
+    assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "failed");
+  }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect(
+  "expired delegated run reports one failure despite late native acceptance and completion",
+  () =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const parentId = ThreadId.make("expiry-parent");
+      const queues = new Set<Queue.Queue<ProviderAdapter.ProviderAdapterV2Event>>();
+      const ingested = yield* Deferred.make<void>();
+      let interrupts = 0;
+      let childId: ThreadId | undefined;
+      let childRuntime: ProviderAdapter.ProviderAdapterV2SessionRuntime | undefined;
+      const openSpy = vi.spyOn(sessions, "open").mockImplementation((input) =>
+        Effect.gen(function* () {
+          const now = yield* DateTime.now;
+          const projection = yield* engine.getThreadProjection(input.threadId).pipe(Effect.orDie);
+          const owner = projection.providerThreads.find(
+            (thread) => thread.providerSessionId === input.providerSessionId,
+          )!;
+          const publish = (event: ProviderAdapter.ProviderAdapterV2Event) =>
+            Effect.forEach(queues, (queue) => Queue.offer(queue, event), { discard: true });
+          let nativeTurn: Extract<
+            ProviderAdapter.ProviderAdapterV2Event,
+            { type: "provider_turn.updated" }
+          >["providerTurn"];
+          const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+            instanceId: modelSelection.instanceId,
+            providerSessionId: input.providerSessionId,
+            driver,
+            providerSession: {
+              id: input.providerSessionId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              status: "ready",
+              cwd: process.cwd(),
+              model: modelSelection.model,
+              capabilities: CodexProviderCapabilitiesV2,
+              createdAt: now,
+              updatedAt: now,
+              lastError: null,
+            },
+            ensureThread: () =>
+              Effect.succeed({
+                ...owner,
+                nativeThreadRef: { driver, nativeId: input.threadId, strength: "strong" },
+              }),
+            resumeThread: ({ providerThread }) => Effect.succeed(providerThread),
+            events: Stream.never,
+            subscribeEvents: Effect.gen(function* () {
+              const queue = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+              queues.add(queue);
+              const executionReader = queues.size === 1;
+              return {
+                events: Stream.fromQueue(queue),
+                close: Effect.sync(() => queues.delete(queue)).pipe(
+                  Effect.andThen(Queue.shutdown(queue)),
+                  Effect.andThen(
+                    executionReader ? Deferred.succeed(ingested, undefined) : Effect.void,
+                  ),
+                  Effect.asVoid,
+                ),
+              };
+            }),
+            startTurn: (turn) =>
+              Effect.gen(function* () {
+                nativeTurn = {
+                  id: ProviderTurnId.make(`${turn.runId}:native-turn`),
+                  providerThreadId: turn.providerThread.id,
+                  nodeId: turn.rootNodeId,
+                  runAttemptId: turn.attemptId,
+                  nativeTurnRef: { driver, nativeId: turn.runId, strength: "strong" },
+                  ordinal: turn.providerTurnOrdinal,
+                  status: "running",
+                  ...(input.threadId === parentId ? { promptAcceptedAt: now } : {}),
+                  startedAt: now,
+                  completedAt: null,
+                };
+                // Persist the fixture's first native event before the start effect returns.
+                yield* sink
+                  .write({
+                    events: [
+                      {
+                        id: EventId.make(`${turn.runId}:native-start`),
+                        type: "provider-turn.updated",
+                        threadId: input.threadId,
+                        runId: turn.runId,
+                        occurredAt: now,
+                        payload: nativeTurn,
+                      },
+                    ],
+                  })
+                  .pipe(Effect.orDie);
+                if (input.threadId !== parentId)
+                  yield* publish({
+                    type: "provider_turn.updated",
+                    driver,
+                    providerTurn: nativeTurn,
+                  });
+              }),
+            holdsWorkForThread: () => Effect.succeed(false),
+            interruptTurn: (stop) =>
+              Effect.gen(function* () {
+                interrupts++;
+                assert.equal(stop.providerTurnId, nativeTurn.id);
+                assert.isFalse(stop.requestRuntimeRestart);
+                assert.isFalse(stop.stopBackgroundWork);
+                // The delayed pump delivers acceptance and a natural completion after expiry.
+                yield* publish({
+                  type: "provider_turn.updated",
+                  driver,
+                  providerTurn: { ...nativeTurn, promptAcceptedAt: now },
+                });
+                yield* publish({
+                  type: "turn.terminal",
+                  nativeWorkEnded: true,
+                  driver,
+                  providerThreadId: nativeTurn.providerThreadId,
+                  providerTurnId: nativeTurn.id,
+                  runOrdinal: 1,
+                  status: "completed",
+                  failure: null,
+                  threadDisposition: "reusable",
+                });
+              }),
+            steerTurn: () => Effect.die("unused steer"),
+            respondToRuntimeRequest: () => Effect.die("unused response"),
+            readThreadSnapshot: () => Effect.die("unused snapshot"),
+            rollbackThread: () => Effect.die("unused rollback"),
+            forkThread: () => Effect.die("unused fork"),
+          };
+          if (input.threadId !== parentId) childRuntime = runtime;
+          // The parent's stream stays detached from the child stop fixture.
+          return input.threadId === parentId
+            ? {
+                ...runtime,
+                subscribeEvents: Effect.succeed({ events: Stream.never, close: Effect.void }),
+              }
+            : runtime;
+        }),
+      );
+      const getSpy = vi
+        .spyOn(sessions, "get")
+        .mockImplementation(() => Effect.succeed(Option.fromUndefinedOr(childRuntime)));
+      const liveSpy = vi.spyOn(sessions, "isLive").mockReturnValue(Effect.succeed(true));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          openSpy.mockRestore();
+          getSpy.mockRestore();
+          liveSpy.mockRestore();
+        }),
+      );
+      yield* engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("expiry-parent:create"),
+        threadId: parentId,
+        createdBy: "user",
+        creationSource: "web",
+        projectId: ProjectId.make("expiry-parent:project"),
+        title: "Expiry parent",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      yield* engine.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("expiry-parent:send"),
+        threadId: parentId,
+        messageId: MessageId.make("expiry-parent:message"),
+        text: "Delegate a task",
+        attachments: [],
+        createdBy: "user",
+        creationSource: "web",
+        dispatchMode: { type: "start_immediately" },
+      });
+      yield* worker.drain();
+      const parent = yield* engine.getThreadProjection(parentId);
+      yield* engine.dispatch({
+        type: "delegated_task.request",
+        commandId: CommandId.make("expiry-parent:delegate"),
+        parentThreadId: parentId,
+        parentRunId: parent.runs[0]!.id,
+        parentNodeId: parent.runs[0]!.rootNodeId!,
+        createdBy: "agent",
+        creationSource: "mcp",
+        task: "Child that times out",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        completionWake: "settled_only",
+      });
+      childId = (yield* engine.getThreadProjection(parentId)).subagents[0]!.childThreadId!;
+      yield* worker.drain();
+      const child = yield* engine.getThreadProjection(childId);
+      const run = child.runs[0]!;
+      assert.equal(run.status, "running");
+      const deadline = run.providerStartDeadlineAt!;
+      yield* TestClock.adjust(PROVIDER_START_TIMEOUT_MS);
+      yield* engine.dispatch({
+        type: "run.start-expire",
+        commandId: CommandId.make("expiry-child:expire"),
+        threadId: childId,
+        runId: run.id,
+        expectedAttemptId: run.activeAttemptId,
+        deadline,
+        phase: "provider",
+      });
+      yield* engine.recoverDelegatedTasks;
+      const failedParent = yield* engine.getThreadProjection(parentId);
+      assert.equal(failedParent.subagents[0]?.status, "failed");
+      assert.lengthOf(
+        failedParent.contextTransfers.filter(
+          (transfer) => transfer.type === "subagent_result" && transfer.sourceThreadId === childId,
+        ),
+        1,
+      );
+      yield* worker.drain();
+      yield* Deferred.await(ingested);
+      yield* engine.recoverDelegatedTasks;
+      yield* worker.drain();
+      const after = yield* engine.getThreadProjection(parentId);
+      assert.equal(interrupts, 1);
+      assert.equal((yield* engine.getThreadProjection(childId)).runs[0]?.status, "failed");
+      assert.equal(after.subagents[0]?.status, "failed");
+      assert.deepEqual(after.subagents[0]?.result, failedParent.subagents[0]?.result);
+      assert.lengthOf(
+        after.contextTransfers.filter(
+          (transfer) => transfer.type === "subagent_result" && transfer.sourceThreadId === childId,
+        ),
+        1,
+      );
+      assert.isEmpty(yield* outbox.listStartTimeoutStops(childId));
+    }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);

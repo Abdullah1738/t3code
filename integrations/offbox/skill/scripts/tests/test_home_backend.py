@@ -1368,7 +1368,7 @@ class PersonNeverOnBoat(HomeFiles):
         with patch.object(api, "BACKEND", "server"):
             self.assertFalse(runs.retry_interrupted(a))
             with patch.dict(os.environ, {"OFFBOX_THREAD": ""}):
-                self.assertTrue(runs.retry_interrupted(a))
+                self.assertFalse(runs.retry_interrupted(a))
                 self.assertFalse(runs.retry_interrupted(cli.build_parser().parse_args(["run", "--no-retry", "--", "true"])))
 
 

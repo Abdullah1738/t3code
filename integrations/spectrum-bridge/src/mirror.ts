@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
-import { ControlClient, ControlError, discoverControlConfig, type ControlConfigOptions } from "./control.ts";
+import { ControlClient, ControlError, type ControlConfigOptions } from "./control.ts";
+import { RobobLinkDown } from "./robob-link-gate.ts";
 import { object } from "./remote-protocol.ts";
 import { Store, MAX_BLOB_BYTES } from "./store.ts";
 import { toolLog } from "./toollog.ts";
@@ -11,22 +12,19 @@ export const MIRROR_CUTOVER = Date.parse("2026-11-17T00:11:00Z");
 export const MIRROR_START_NOTE = "Mirror starts here; earlier box replies aren't on the Mac";
 export type MirrorItem = { id: string; role: "user" | "assistant"; at: string; text: string; attachments?: { attachmentId: string }[] };
 export interface MirrorSink {
+  readonly linkAvailable?: boolean;
   ensure(signal: AbortSignal): Promise<{ threadId: string }>;
   append(threadId: string, items: MirrorItem[], signal: AbortSignal): Promise<unknown>;
   upload(file: { name: string; mimeType: string; bytes: Uint8Array }, signal: AbortSignal): Promise<{ attachmentId: string }>;
 }
 export class HttpMirrorSink implements MirrorSink {
-  constructor(private readonly options: ControlConfigOptions = {}) {}
+  private readonly client: ControlClient;
+  constructor(options: ControlConfigOptions = {}) {
+    this.client = new ControlClient({ ...options, linkGate: options.linkGate ?? true });
+  }
+  get linkAvailable(): boolean { return this.client.linkGate?.available ?? true; }
   private async request(path: string, body: unknown, signal: AbortSignal): Promise<unknown> {
-    const { url, token } = discoverControlConfig(this.options);
-    const response = await fetch(`${url}/api/ardud/control${path}`, {
-      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify(body), signal, redirect: "error", proxy: "", verbose: false,
-    });
-    const result: unknown = await response.json().catch(() => undefined);
-    if (!response.ok) throw new ControlError(response.status, object(result) && object(result.error) && typeof result.error.code === "string" ? result.error.code
-      : object(result) && typeof result.code === "string" ? result.code : "");
-    return result;
+    return this.client.request("POST", path, body, { signal, directResponse: true });
   }
   async ensure(signal: AbortSignal) {
     const result = await this.request("/mirror-threads", {
@@ -41,7 +39,7 @@ export class HttpMirrorSink implements MirrorSink {
       || Number(result.appended) < 0 || Number(result.skipped) < 0 || Number(result.appended) + Number(result.skipped) !== items.length) throw new ControlError(502);
     return result;
   }
-  upload(file: { name: string; mimeType: string; bytes: Uint8Array }, signal: AbortSignal) { return new ControlClient(this.options).upload(file, signal); }
+  upload(file: { name: string; mimeType: string; bytes: Uint8Array }, signal: AbortSignal) { return this.client.upload(file, signal); }
 }
 
 type FileRef = { name: string; mimeType: string; sha256?: string; path?: string; url?: string; attachmentId?: string };
@@ -156,6 +154,8 @@ export class ChatMirror {
   }
   async tick(): Promise<void> {
     if (this.busy) return;
+    const linkDown = () => this.sink.linkAvailable === false;
+    if (linkDown()) { toolLog.skipRobob("mirror.tick"); return; }
     this.busy = true;
     const started = this.now();
     let row: QueueRow | null = null;
@@ -224,6 +224,7 @@ export class ChatMirror {
         throw error;
       } finally { clearTimeout(timer); }
     } catch (error) {
+      if (error instanceof RobobLinkDown || linkDown()) { toolLog.skipRobob("mirror.tick"); attempted = false; return; }
       const attempt = Math.min((row?.attempt ?? 0) + 1, this.options.maxAttempts ?? 12);
       // Authentication and link outages retain content; only consecutive item rejections count toward a drop.
       const rejected = error instanceof ControlError && [400, 413, 422].includes(error.status) ? (row?.rejected ?? 0) + 1 : 0;

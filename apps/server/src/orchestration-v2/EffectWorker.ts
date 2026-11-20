@@ -367,7 +367,8 @@ export const layerExecutor: Layer.Layer<
           }
           case "provider-turn.interrupt": {
             const request = effect.request;
-            return providerTurnControl
+            let liveSession = false;
+            const interrupt = providerTurnControl
               .interrupt({
                 threadId: effect.threadId,
                 providerSessionId: request.providerSessionId,
@@ -378,6 +379,8 @@ export const layerExecutor: Layer.Layer<
                   : request.startTimeout === true
                     ? { stopBackgroundWork: false }
                     : {}),
+                ...(request.startTimeout === true ? { confirmStopped: true } : {}),
+                ...(request.startingRun === undefined ? {} : { startingRun: request.startingRun }),
                 ...(request.replacementProviderSessionId === undefined
                   ? {}
                   : { replacementProviderSessionId: request.replacementProviderSessionId }),
@@ -391,6 +394,32 @@ export const layerExecutor: Layer.Layer<
                     }),
               })
               .pipe(
+                Effect.tap(() =>
+                  request.startTimeout !== true || !liveSession
+                    ? Effect.void
+                    : Effect.gen(function* () {
+                        yield* Effect.logInfo("t3.run.start_expire_stopped_session", {
+                          ...request.startTimeoutContext,
+                          threadId: effect.threadId,
+                          sessionId: request.providerSessionId,
+                          providerTurnId: request.providerTurnId,
+                          elapsedMs:
+                            DateTime.toEpochMillis(yield* DateTime.now) -
+                            Date.parse(effect.createdAt),
+                        });
+                      }),
+                ),
+                Effect.tapCause((cause) =>
+                  request.startTimeout !== true
+                    ? Effect.void
+                    : Effect.logWarning("t3.run.start_expire_stop_failed", {
+                        ...request.startTimeoutContext,
+                        sessionId: request.providerSessionId,
+                        threadId: effect.threadId,
+                        providerTurnId: request.providerTurnId,
+                        cause,
+                      }),
+                ),
                 Effect.tapError((cause) =>
                   request.subagent === undefined
                     ? Effect.void
@@ -400,6 +429,7 @@ export const layerExecutor: Layer.Layer<
                       }),
                 ),
                 Effect.catch((cause) =>
+                  request.startTimeout !== true &&
                   request.subagent === undefined &&
                   isNonRetryableProviderTurnControlFailure(
                     request.type,
@@ -473,6 +503,16 @@ export const layerExecutor: Layer.Layer<
                     }),
                 ),
               );
+            return request.startTimeout === true
+              ? providerSessions.isLive(request.providerSessionId).pipe(
+                  Effect.tap((live) =>
+                    Effect.sync(() => {
+                      liveSession = live;
+                    }),
+                  ),
+                  Effect.andThen(interrupt),
+                )
+              : interrupt;
           }
           case "provider-session.stop-background-work": {
             const request = effect.request;
@@ -1372,7 +1412,9 @@ export const layerWithOptions = (
             return true;
           }
           const error = Cause.pretty(exit.cause);
-          const nonRetryable = isNonRetryableProviderTurnControlFailure(effect.request.type, error);
+          const nonRetryable =
+            !(effect.request.type === "provider-turn.interrupt" && effect.request.startTimeout) &&
+            isNonRetryableProviderTurnControlFailure(effect.request.type, error);
           yield* Effect.logWarning("Orchestration effect execution failed", {
             effectId: effect.id,
             effectType: effect.request.type,

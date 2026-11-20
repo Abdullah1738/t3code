@@ -26,6 +26,7 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Ref from "effect/Ref";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
@@ -406,6 +407,39 @@ it.effect("starts without scanning or rebuilding projection history", () =>
   }),
 );
 
+it.effect("continues ordered startup after provider reaping dies", () =>
+  Effect.gen(function* () {
+    const calls: string[] = [];
+    const logs: Array<ReadonlyArray<unknown>> = [];
+    const record = (label: string) =>
+      Effect.sync(() => {
+        calls.push(label);
+      });
+    const result = yield* ServerRuntimeStartup.runOrderedV2StartupPhases({
+      reapProviderProcesses: Effect.die(new Error("inspection failed")),
+      recover: record("recover").pipe(Effect.as("recovered")),
+      importLegacyShells: record("import"),
+      startEffectWorker: record("worker"),
+      autoBootstrap: record("bootstrap").pipe(Effect.as("bootstrapped")),
+    }).pipe(
+      Effect.provide(
+        Logger.layer(
+          [
+            Logger.make(({ message }) => {
+              logs.push(Array.isArray(message) ? message : [message]);
+            }),
+          ],
+          { mergeWithExisting: false },
+        ),
+      ),
+    );
+    assert.deepEqual(calls, ["recover", "import", "worker", "bootstrap"]);
+    assert.deepEqual(result, { recovery: "recovered", bootstrap: "bootstrapped" });
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0]?.[0], "provider.previous-boot-reap-failed");
+  }),
+);
+
 it.effect("interrupts the effect worker when awareness relay startup fails", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -679,25 +713,4 @@ it.effect("closes admissions again after a ready server begins shutdown", () =>
       );
     }),
   ),
-);
-
-it.effect("does not recover or dispatch when orphan reaping fails", () =>
-  Effect.gen(function* () {
-    const calls: string[] = [];
-    const record = (label: string) =>
-      Effect.sync(() => {
-        calls.push(label);
-      });
-    const exit = yield* Effect.exit(
-      ServerRuntimeStartup.runOrderedV2StartupPhases({
-        reapProviderProcesses: Effect.die("cannot establish process identity"),
-        recover: record("recover"),
-        importLegacyShells: record("import"),
-        startEffectWorker: record("worker"),
-        autoBootstrap: record("bootstrap"),
-      }),
-    );
-    assert.equal(exit._tag, "Failure");
-    assert.deepEqual(calls, []);
-  }),
 );

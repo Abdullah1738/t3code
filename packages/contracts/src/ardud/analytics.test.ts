@@ -417,6 +417,27 @@ it("decodes runtime samples with exact model ids and bounded hourly rollups", ()
   ).toBe(false);
 });
 
+it("accepts tick attribution, rejects negative measurements and strips non-label keys", () => {
+  const input = {
+    ...event,
+    kind: "kanban.tick_phase",
+    props: {
+      phase: "thread_status",
+      count: 2,
+      byRead: { find: { count: 2, ms: 25 } },
+      byStep: { evaluatorStatusPlan: { count: 2, ms: 25 } },
+    },
+  };
+  expect(decodeEvent(input).props).toEqual(input.props);
+  expect(() =>
+    decodeEvent({ ...input, props: { byRead: { find: { count: -1, ms: 25 } } } }),
+  ).toThrow();
+  expect(
+    decodeEvent({ ...input, props: { byStep: { "private words": { count: 1, ms: 25 } } } }).props
+      ?.byStep,
+  ).toEqual({});
+});
+
 it("bounds MCP error paths and accepts nested schema fields without values", () => {
   const row = {
     ...event,

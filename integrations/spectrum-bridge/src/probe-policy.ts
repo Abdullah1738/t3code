@@ -16,6 +16,16 @@ export class ProbeBudget {
       return true;
     }).immediate();
   }
+
+  refund(at: number): void {
+    this.store.db.transaction(() => {
+      const starts = this.store.get<number[]>("replay-probe-starts") ?? [];
+      const index = starts.indexOf(at);
+      if (index < 0) return;
+      starts.splice(index, 1);
+      this.store.set("replay-probe-starts", starts);
+    }).immediate();
+  }
 }
 
 export class ProbeBackoff {

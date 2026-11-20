@@ -305,6 +305,7 @@ const GeneralEvent = Schema.Struct({
   authMs: Schema.optionalKey(Measurement),
   dispatchMs: Schema.optionalKey(Measurement),
   preHandlerMs: Schema.optionalKey(Measurement),
+  fenceToReplyMs: Schema.optionalKey(Measurement),
   totalMs: Schema.optionalKey(Measurement),
   clientRequestId: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
   outcome: Schema.optionalKey(EventOutcome),
@@ -313,7 +314,9 @@ const GeneralEvent = Schema.Struct({
   reuseMissReason: Schema.optionalKey(EvaluatorReuseMissReason),
   errorTag: Schema.optionalKey(Label),
   errorPhase: Schema.optionalKey(McpPhase),
-  saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+  saved: Schema.optionalKey(
+    Schema.Union([Schema.Boolean, Schema.Literals(["unknown", "pending_create"])]),
+  ),
   responseDelivery: Schema.optionalKey(Schema.Literals(["pending", "finished", "closed"])),
   responseElapsedMs: Schema.optionalKey(Measurement),
   responseCloseReason: Schema.optionalKey(
@@ -366,6 +369,18 @@ const GeneralEvent = Schema.Struct({
   props: Schema.optionalKey(
     Schema.Struct({
       ...RuntimeSampleProps,
+      tools: Schema.optionalKey(Schema.Array(Label).check(Schema.isMaxLength(16))),
+      boardIds: Schema.optionalKey(Schema.Array(Id).check(Schema.isMaxLength(16))),
+      frames: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            functionName: Schema.String.check(Schema.isMaxLength(160)),
+            url: Schema.String.check(Schema.isMaxLength(160)),
+            lineNumber: Measurement,
+            columnNumber: Measurement,
+          }),
+        ).check(Schema.isMaxLength(3)),
+      ),
       total: Schema.optionalKey(Measurement),
       distinctCwds: Schema.optionalKey(Measurement),
       maxPerSecond: Schema.optionalKey(Measurement),
@@ -501,7 +516,9 @@ const GeneralEvent = Schema.Struct({
       code: Schema.optionalKey(Label),
       boardId: Schema.optionalKey(Id),
       cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
-      saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+      saved: Schema.optionalKey(
+        Schema.Union([Schema.Boolean, Schema.Literals(["unknown", "pending_create"])]),
+      ),
       foundBy: Schema.optionalKey(
         Schema.Literals(["subagents", "receipt", "request_key_recovery", "none"]),
       ),
@@ -545,6 +562,11 @@ const GeneralEvent = Schema.Struct({
       actorId: Schema.optionalKey(PoolChangeFields.actorId),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
+      rollbackReason: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(256))),
+      failedCheck: Schema.optionalKey(Label),
+      changedKeys: Schema.optionalKey(Schema.Array(Label).check(Schema.isMaxLength(100))),
+      accepted: Schema.optionalKey(Schema.Boolean),
+      touched: Schema.optionalKey(Schema.Boolean),
       itemKind: Schema.optionalKey(Label),
       openToolSince: Schema.optionalKey(Timestamp),
       effectId: Schema.optionalKey(DerivedId),
@@ -573,8 +595,37 @@ const GeneralEvent = Schema.Struct({
           Schema.isMaxLength(3),
         ),
       ),
+      activityStages: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            stage: Schema.Literals([
+              "load",
+              "cards",
+              "events",
+              "history",
+              "threads",
+              "slots",
+              "board",
+              "pools",
+              "evaluatorEvents",
+              "dispatch",
+              "analytics",
+              "rollup",
+              "compact",
+            ]),
+            durationMs: Measurement,
+            completed: Schema.Boolean,
+          }),
+        ).check(Schema.isMaxLength(16)),
+      ),
       tickId: Schema.optionalKey(Id),
       activeTickId: Schema.optionalKey(Id),
+      byRead: Schema.optionalKey(
+        Schema.Record(Label, Schema.Struct({ count: Measurement, ms: Measurement })),
+      ),
+      byStep: Schema.optionalKey(
+        Schema.Record(Label, Schema.Struct({ count: Measurement, ms: Measurement })),
+      ),
       cardsScanned: Schema.optionalKey(Measurement),
       cardsChanged: Schema.optionalKey(Measurement),
       dbMs: Schema.optionalKey(Measurement),
