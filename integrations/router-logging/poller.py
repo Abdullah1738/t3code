@@ -13,6 +13,7 @@ import urllib.request
 from rollup import rollup
 from listener_rollup import windows as listener_windows
 from toollog import directory, emit
+from observer import measured, observed, phase
 
 BASE = 'http://127.0.0.1:20128'
 
@@ -21,7 +22,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 class Router:
-    def __init__(self, data=None):
+    def __init__(self, data=None, component='poller', event_name='endpoint.get'):
+        self.component, self.event_name = component, event_name
         root = Path(data) if data else Path.home() / '.9router'
         machine = (root / 'machine-id').read_text().strip()
         secret = (root / 'auth/cli-secret').read_text().strip()
@@ -35,6 +37,7 @@ class Router:
         if route not in ('/api/providers', '/api/usage/logs', '/api/usage/stats?period=today', '/api/monitoring/pools'):
             raise ValueError('route not allowed')
         start = time.monotonic()
+        wall_start = time.time() * 1000
         status = 0
         ok = False
         error_tag = None
@@ -56,9 +59,10 @@ class Router:
                 error_tag = 'request_failed'
             raise
         finally:
-            emit('poller', 'endpoint.get', kind='perf', ok=ok,
+            emit(self.component, self.event_name, kind='perf', ok=ok,
                  durationMs=(time.monotonic() - start) * 1000,
-                 props={'endpoint': route.split('?')[0], 'status': status},
+                 props={'endpoint': route.split('?')[0], 'status': status,
+                        'startedAtMs': wall_start, 'finishedAtMs': time.time() * 1000},
                  **({'error': {'tag': error_tag}} if error_tag else {}))
 
 
@@ -75,6 +79,7 @@ def locked(value, now):
     return False
 
 
+@measured('snapshot')
 def snapshot(providers, logs, previous, now):
     connections = providers['connections']
     if not isinstance(connections, list) or not isinstance(logs, list) or any(not isinstance(c, dict) or not isinstance(c.get('id'), str) for c in connections):
@@ -135,6 +140,7 @@ def snapshot(providers, logs, previous, now):
     return dict(current)
 
 
+@measured('state_save')
 def save_state(path, state):
     fd, tmp = tempfile.mkstemp(prefix='.poll-', dir=path.parent)
     try:
@@ -153,6 +159,7 @@ def rollup_complete(path):
         return False
 
 
+@measured('history_refresh')
 def refresh_listener_rollups(root, now):
     # Daily counters are final, but a recovery can close an older listener window.
     for report in root.glob('rollup-????-??-??.json'):
@@ -170,6 +177,7 @@ def refresh_listener_rollups(root, now):
             rollup(day, root, now=now)
 
 
+@observed()
 def poll(get=None, root=None, now=None):
     start = time.monotonic()
     root = Path(root) if root is not None else directory()
@@ -184,27 +192,34 @@ def poll(get=None, root=None, now=None):
             state = {}
         yesterday = (now.date() - dt.timedelta(days=1)).isoformat()
         if (now.hour > 0 or now.minute >= 5) and (state.get('finalizedDay') != yesterday or not rollup_complete(root / ('rollup-' + yesterday + '.json'))):
+            rollup_start = time.monotonic()
             rollup(yesterday, root, now=now)
+            rollup_ms = (time.monotonic() - rollup_start) * 1000
             state['finalizedDay'] = yesterday
             save_state(state_path, state)
-            emit('poller', 'log.rollup', kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000)
+            emit('poller', 'log.rollup', kind='perf', ok=True, durationMs=rollup_ms)
         hour = now.strftime('%Y-%m-%dT%H')
         if state.get('rollupHour') != hour:
+            rollup_start = time.monotonic()
             rollup(now.date().isoformat(), root, now=now)
+            rollup_ms = (time.monotonic() - rollup_start) * 1000
             state['rollupHour'] = hour
             save_state(state_path, state)
-            emit('poller', 'log.rollup', kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000)
+            emit('poller', 'log.rollup', kind='perf', ok=True, durationMs=rollup_ms)
         refresh_listener_rollups(root, now)
         get = get or Router().get
-        providers = get('/api/providers')
-        logs = get('/api/usage/logs')
+        with phase('providers_fetch'):
+            providers = get('/api/providers')
+        with phase('usage_fetch'):
+            logs = get('/api/usage/logs')
         seen = snapshot(providers, logs, state.get('seen', {}), now)
         state['seen'] = seen
         save_state(state_path, state)
         if state.get('spendHour') != hour:
             # This endpoint supplies today's cumulative cost, not hourly buckets.
             # Keep the real per-connection cost as an hourly snapshot; never call it hourly spend.
-            stats = get('/api/usage/stats?period=today')
+            with phase('stats_fetch'):
+                stats = get('/api/usage/stats?period=today')
             costs = defaultdict(float)
             for row in stats['byAccount'].values():
                 cost = row.get('cost')

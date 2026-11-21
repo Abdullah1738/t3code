@@ -24,6 +24,12 @@ IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session', 'wri
 PROPS.update({'downSince', 'downMs', 'pid', 'ppid', 'initiator', 'stopReason', 'script', 'releaseDir',
               'startedAtMs', 'finishedAtMs', 'lastErrorCode', 'outcome', 'ownerPid', 'lockAgeMs',
               'listener', 'downListener', 'unknownSince', 'unknownMs'})
+PROPS.update({'launchctlExit', 'launchctlStderr', 'jobState', 'jobPid', 'start', 'end',
+              'monotonicStartMs', 'monotonicEndMs', 'wallGapMs', 'monotonicGapMs', 'sleepGapMs',
+              'previousPid', 'jobStateStart', 'jobStateEnd', 'jobPidStart', 'jobPidEnd', 'jobExitStart', 'jobExitEnd',
+              'historyScanParseMs', 'rollupWriteMs', 'stateSaveMs', 'lockWaitMs', 'listenerHistoryMs',
+              'poolHistoryMs', 'historyRefreshMs', 'launchctlMs', 'tcpMs', 'providersFetchMs',
+              'usageFetchMs', 'statsFetchMs', 'snapshotMs'})
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
             'The operation was aborted due to timeout', 'The operation was aborted'}
@@ -37,6 +43,13 @@ def token(value):
     if re.search(r'(?i)(sk-|bearer|password|secret|token|api.?key|otp|cookie|prompt|@)', value):
         return None
     return value
+
+def trimmed_stderr(value):
+    if not isinstance(value, str):
+        return ''
+    value = re.sub(r'(?i)(bearer\s+|(?:token|password|secret|cookie|api.?key)\s*[=:]\s*)\S+', r'\1[redacted]', value)
+    value = re.sub(r'\bsk-[A-Za-z0-9_-]+', '[redacted]', value)
+    return ' '.join(value.split())[:240]
 
 def safe_target(value):
     try:
@@ -92,7 +105,10 @@ def clean(event, now):
     for k, v in event.get('props', {}).items():
         if k not in PROPS:
             continue
-        v = connection_prop(k, v)
+        if k == 'launchctlStderr':
+            v = trimmed_stderr(v) if name == 'listener.state_unknown' else None
+        else:
+            v = connection_prop(k, v)
         if v is not None and (isinstance(v, (str, bool)) or isinstance(v, (int, float)) and math.isfinite(v)):
             props[k] = v
     if name == 'log.volume':
