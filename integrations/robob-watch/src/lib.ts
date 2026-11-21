@@ -179,6 +179,7 @@ export type State = {
   failure_escalated?: boolean;
   /** Wall time of the last check run, in ms. */
   last_run_ms?: number;
+  recent_check_ms?: number[];
   /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
   pending?: { key: string; event: string; at: string; count?: number; urgent?: boolean; route?: WakeRoute; watcher?: Watcher; creatorSend?: { thread: string; sentAt: number }; context_file?: string; healthRun?: string; healthRuns?: string[] };
   last_delivery?: string;
