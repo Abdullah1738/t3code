@@ -5383,8 +5383,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         bun_mode = None
         if binary == 'bun':
             bun_mode, args, bun_directories = _bun_arguments(args)
-            for value in bun_directories:
-                directory = change_directory(value, directory)
+            if bun_directories:
+                # Bun resolves only the last --cwd against the invocation directory.
+                directory = change_directory(bun_directories[-1], directory)
             remaining, index, options = [], 0, True
             while index < len(args):
                 arg = args[index]

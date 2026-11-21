@@ -2740,6 +2740,63 @@ bash "$TASK_DIR/step5r.sh"
             self.assertIsNone(self.classify('bun exec' + separator + "'node read.js'"))
             self.assertEqual(self.classify('bun exec' + separator + "'node pkg/read.js'"), SCRIPT)
 
+    def test_bun_115_repeated_cwd_uses_last_value(self):
+        for directory in ('one', 'two', 'one/two', 'two/two'):
+            for name in ('safe', 'bad'):
+                content = 'console.log("ok")'
+                if (name == 'bad') == (directory == 'two'):
+                    content = f'require("fs").readFileSync({LIVE!r})'
+                self.write(f'{directory}/{name}.js', content)
+                self.write(f'{directory}/test/{name}.test.ts', content)
+        values = [('one', 'two'), ('two', 'two'),
+                  (str(self.root / 'one'), 'two'), ('one', str(self.root / 'two')),
+                  ('"$unknown"', 'two'), ('one', 'two/../two')]
+        for first, last in values:
+            for first_separator, last_separator in ((' ', ' '), ('=', '='), (' ', '='), ('=', ' ')):
+                earlier = '--cwd' + first_separator + first
+                later = '--cwd' + last_separator + last
+                for mode in ('exec', 'test', 'run', ''):
+                    for name, expected in (('safe', None), ('bad', SCRIPT)):
+                        operand = (shlex.quote('node ' + name + '.js') if mode == 'exec' else
+                                   'test/' + name + ".test.ts -t 'a.*b'" if mode == 'test' else name + '.js')
+                        for prefix in ('bun ' + earlier + ' ' + mode + ' ' + later,
+                                       'bun ' + mode + ' ' + earlier + ' ' + later):
+                            command = prefix + ' ' + operand
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_repeated_cwd_preloads_use_final_directory(self):
+        self.write('one/two/safe.js', f'require("fs").readFileSync({LIVE!r})')
+        self.write('one/two/bad.js', 'console.log("ok")')
+        self.write('two/safe.js', 'console.log("ok")')
+        self.write('two/bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for separator in (' ', '='):
+            for names in (('safe', 'safe'), ('safe', 'bad'), ('bad', 'safe')):
+                expected = SCRIPT if 'bad' in names else None
+                first = '--preload' + separator + './' + names[0] + '.js'
+                last = '--preload' + separator + './' + names[1] + '.js'
+                for mode in ('test', 'exec "echo ok"', 'run check'):
+                    command = 'bun --cwd one ' + first + ' --cwd two ' + last + ' ' + mode
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_other_path_options_preserve_cwd_and_body(self):
+        self.write('pkg/safe.js', 'console.log("ok")')
+        self.write('pkg/bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for option in ('--cpu-prof-name', '--cpu-prof-dir', '--heap-prof-name', '--heap-prof-dir',
+                       '--redirect-warnings', '--tsconfig-override', '--env-file', '--config', '-c',
+                       '--coverage-dir', '--reporter-outfile'):
+            for separator in (' ', '='):
+                values = option + separator + 'one ' + option + separator + 'two'
+                for name, expected in (('safe', None), ('bad', SCRIPT)):
+                    command = 'bun --cwd pkg test ' + values + ' ./' + name + '.js'
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+                    if option not in {'--coverage-dir', '--reporter-outfile'}:
+                        command = 'bun --cwd pkg exec ' + values + ' ' + shlex.quote('node ' + name + '.js')
+                        with self.subTest(command=command):
+                            self.assertEqual(self.classify(command), expected)
+
     def test_bun_115_exec_options_select_shell_operand(self):
         self.write('safe.js', 'console.log("ok")')
         self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
