@@ -288,10 +288,15 @@ thread hit the same rule and shape again within 300 s, so it was stuck; the
 previous UTC day's last 5 minutes count as context), `harness` and `topProjects`.
 Denials rank first; past 100 shapes the rest fold into `other`. Rows marked
 `source: test` are excluded and counted in `excludedTestRows`.
-Hooks write `cmdShape` and `project` on refusals only. A shape keeps operators,
-flag names, env var names, file extensions, the program name and subcommands
-from a fixed vocabulary; paths, quoted text, numbers, variables and other words
-become placeholders (`sqlite3 <path.sqlite> <q>`), and no raw command is stored.
+Hooks write `cmdShape` and `project` on refusals only. A shape fails closed: it
+keeps operators, env var names, one- or two-letter flags, and program names,
+subcommands, file extensions and long options from fixed vocabularies. Anything
+else (paths, quoted text, numbers, variables, attached flag values, unknown
+programs as `<cmd>`, unknown options as `--<opt>`) becomes a placeholder, e.g.
+`sqlite3 <path.sqlite> <q>`. Escaped characters stay inside their word, and a
+heredoc body is dropped; if its delimiter can't be read or its terminator never
+matches exactly, the rest of the command is dropped and the shape ends in `...`.
+No raw command is stored.
 `project` is the folder name of the git repository the command ran in (the main
 checkout for worktrees). Rows written before shapes existed group as
 `coarse:<firstWord> cwd:<cwdClass>`.

@@ -54,22 +54,46 @@ def command_props(command):
     return {'firstWord': first, 'argv0Class': argv_class, 'commandLength': len(command)}
 
 
-# A command shape is a skeleton of a refused command built only from operators,
-# flag names, env var names, file extensions, program names and a short
-# lowercase subcommand vocabulary. Paths, quoted text, numbers, variables and any
-# other word become placeholders, so a shape carries no more of the command than
-# the reader needs to group refusals. The output alphabet has no '/', quotes or
-# backslashes, and _SHAPE_TEXT rejects anything else at the log boundary.
+# A command shape is a skeleton of a refused command for grouping refusals. It
+# fails closed: the only literal text it keeps is operators, env var names, one
+# or two-letter flags, and words from fixed vocabularies (programs, subcommands,
+# file extensions, --long options, long single-dash options). Everything else, including any
+# word it cannot place, becomes a placeholder. The output alphabet has no '/',
+# quotes or backslashes, and _SHAPE_TEXT rejects anything else at the log boundary.
 _SHAPE_TEXT = re.compile(r"[A-Za-z0-9 _.:=<>+|&;()$`,-]{1,240}\Z")
-_SHAPE_TOKENS = re.compile(r"""'[^']*'?|"(?:\\.|[^"\\])*"?|\$\(|`|&&|\|\||<<<|<<-?|&>>?|[0-9]*>>?(?:&[0-9-]?)?|<|[|;&()]|[^\s'"`|;&()<>]+""")
-_HEREDOC = re.compile(r"""<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1""")
-# Program names allow digits only as a short version suffix (python3, python3.15),
-# so a key-like first word (sk-ab12cd...) cannot pass as a program name.
-_SHAPE_PROGRAM = re.compile(r"[a-z][a-z_+-]{0,28}(?:[0-9]{1,2}(?:\.[0-9]{1,2})?)?\Z")
+# Backslash escapes stay inside their word, so `super\;secret` is one argument, not two commands.
+_SHAPE_TOKENS = re.compile(r"""'[^']*'?|"(?:\\.|[^"\\])*"?|\$\(|`|&&|\|\||<<<|<<-?|&>>?|[0-9]*>>?(?:&[0-9-]?)?|<|[|;&()]|(?:\\.|[^\s'"`|;&()<>\\])+""", re.S)
+_HEREDOC_START = re.compile(r"(?<!<)<<(?!<)(-?)")
+_HEREDOC_WORD = re.compile(r"""\s*(?:'([^']*)'|"([^"]*)"|((?:\\.|[^\s;&|<>()'"\\])+))""")
+_SHAPE_PROGRAMS = frozenset('''
+alias apw awk aws az base64 basename bash bat brew bun bunx cargo cat cd chmod chown cliq clickhouse-client cmp
+codesign column comm command cp curl cut date defaults deno df diff dig dirname docker du echo env eslint eval
+exec export expr false fd fdbcli ffmpeg file find fj gcloud gh git go gradle grep gunzip gzip head helm hlog
+hostname id jest jq kill kubectl launchctl less linctl ln ls lsof make man mdfind mkdir mktemp mv mvn mysql nc nice
+node nohup npm npx offbox open openssl osascript perl pgrep php pip pipx pkill plutil pnpm poetry popd
+prettier printenv printf ps psql pushd pwd python rclone read readlink realpath redis-cli restic rg rm rmdir
+rsync ruby rustc say scp security sed seq set sh shasum sips sleep sort source sqlite ssh stat sudo swift
+t3ctl tail tailname tailscale tar tee terraform test time timeout touch tr true tsc type uname uniq unset
+unzip uv uvx vitest vp wait wc which whoami xargs xcodebuild xcrun yarn yq zip zsh
+'''.split())
+_SHAPE_PROGRAM_VERSION = re.compile(r"([a-z][a-z-]*?)(?:[0-9]+(?:\.[0-9]+)*)?\Z")
 _SHAPE_EXTENSION = re.compile(r"\.([A-Za-z][A-Za-z0-9]{0,7})\Z")
-# Long single-dash flags must be lowercase words (find -name, -exec) so an attached
-# value such as mysql -pSecret1 never passes as a flag name.
-_SHAPE_FLAG = re.compile(r"--[a-z][a-z0-9-]{0,31}|-[A-Za-z]{1,3}|-[a-z][a-z-]{1,14}[0-9]?")
+_SHAPE_EXTENSIONS = frozenset('''bash c cjs conf cpp css csv db env go gz h html ini java jpg js json jsonl jsx
+kt log lua md mjs ndjson patch pdf php pl png py qnt rb rs sh sql sqlite sqlite3 svg swift tar tgz toml ts tsx
+txt wal xml yaml yml zip zsh'''.split())
+# Long option names also come from a fixed list; others read --<opt> (with =<v> kept).
+_SHAPE_LONG_OPTIONS = frozenset('''all allow-empty background bg board build cached check config count cwd day db
+debug depth detach dev dir directory dry-run env exclude file files filter fix fixed-strings force format
+frozen-lockfile global glob grep help hidden home-dir host ignore-case include interactive json kind limit
+line-number list max-depth name name-only no-cache no-pager no-verify oneline only-matching out output pattern
+porcelain port prefix preload print project quiet read-only readonly recursive reporter rm root rule run save-dev
+share short silent size staged stat status step table test-name-pattern timeout top tty type verbose version
+watch word-regexp workspace write yes'''.split())
+# One or two letters (-u, -rf) or a known long single-dash option; an attached
+# value (-psecret, -usecret) is never a flag name.
+_SHAPE_SHORT_FLAG = re.compile(r"-[A-Za-z]{1,2}\Z")
+_SHAPE_DASH_WORDS = frozenset('''-name -iname -path -ipath -type -exec -execdir -print -print0 -delete -maxdepth
+-mindepth -newer -mtime -mmin -size -not -and -or -prune -empty -version -help'''.split())
 # Words after the program survive only from this fixed subcommand vocabulary, so
 # an argument (echo hunter2) can never pass as a subcommand.
 _SHAPE_VOCABULARY = frozenset('''add api apply build check checkout cherry-pick clean clone close commit compose
@@ -80,7 +104,7 @@ start stash status stop switch sync tag test tidy typecheck uninstall unittest u
 vet view wait watch worktree pytest'''.split())
 _SHAPE_SEPARATORS = {'&&', '||', '|', ';', '&', '(', ')', '$(', '`'}
 # These run the next word as a command, so it is shaped as a program again.
-_SHAPE_WRAPPERS = frozenset('env sudo timeout nohup xargs time exec command nice caffeinate'.split())
+_SHAPE_WRAPPERS = frozenset('env sudo timeout nohup xargs time exec command nice'.split())
 # After `--` these run a command too (`offbox run -- vp test`); elsewhere `--` only ends options.
 _SHAPE_RUNNERS = _SHAPE_WRAPPERS | frozenset('offbox uv npx bunx pipx poetry'.split())
 _SHAPE_GLOB = re.compile(r"[*?\[]")
@@ -88,9 +112,24 @@ _SHAPE_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
 _SHAPE_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,40}\Z")
 
 
+def _shape_program(name):
+    """The program name when it (minus a version suffix like python3.15) is a known tool, else None."""
+    if name in _SHAPE_PROGRAMS:
+        return name
+    match = _SHAPE_PROGRAM_VERSION.fullmatch(name) if len(name) <= 40 else None
+    return name if match and match[1] in _SHAPE_PROGRAMS else None
+
+
+def _shape_path(extension):
+    suffix = extension[1].lower()
+    return f'<path.{suffix}>' if suffix in _SHAPE_EXTENSIONS else '<path>'
+
+
 def _shape_word(token, slot):
     if token[0] in '\'"':
         return '<qvar>' if token[0] == '"' and '$' in token else '<q>'
+    if '\\' in token:
+        return '<w>'
     if '$' in token:
         return '<var>'
     if _SHAPE_GLOB.search(token):
@@ -99,35 +138,53 @@ def _shape_word(token, slot):
         return '<n>'
     if token[0] == '-' and token != '-':
         name, equals, _ = token.partition('=')
-        return name + ('=<v>' if equals else '') if _SHAPE_FLAG.fullmatch(name) else '<flag>'
+        if name.startswith('--'):
+            return ('--' + name[2:] if name[2:] in _SHAPE_LONG_OPTIONS else '--<opt>') + ('=<v>' if equals else '')
+        known = not equals and (_SHAPE_SHORT_FLAG.match(name) or name in _SHAPE_DASH_WORDS)
+        return name if known else '<flag>'
     tail = token.rstrip('/').rsplit('/', 1)[-1]
     extension = _SHAPE_EXTENSION.search(tail)
     if '/' in token or token[0] in '~.':
-        if slot == 0 and not extension and _SHAPE_PROGRAM.fullmatch(tail):
+        if slot == 0 and not extension and _shape_program(tail):
             return tail
-        return f'<path.{extension[1].lower()}>' if extension else '<path>'
-    if extension:
-        return f'<path.{extension[1].lower()}>'
+        return _shape_path(extension) if extension else '<path>'
     if slot == 0:
-        return token if _SHAPE_PROGRAM.fullmatch(token) else '<w>'
+        return _shape_program(token) or (_shape_path(extension) if extension else '<cmd>')
+    if extension:
+        return _shape_path(extension)
     return token if slot <= 2 and token in _SHAPE_VOCABULARY else '<w>'
+
+
+def _strip_heredoc_bodies(text):
+    """Drop heredoc bodies. A delimiter that cannot be read, or a body whose
+    terminator never appears exactly, drops everything after it."""
+    kept, pending = [], []
+    for line in text.split('\n'):
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            if delimiter is not None and (line.lstrip('\t') if strip_tabs else line) == delimiter:
+                pending.pop(0)
+            continue
+        kept.append(line)
+        for start in _HEREDOC_START.finditer(line):
+            word = _HEREDOC_WORD.match(line, start.end())
+            delimiter = None
+            # Mixed quoting (E"O"F) is not parsed; leaving it unreadable drops the rest.
+            if word and not line[word.end():word.end() + 1] in ('"', "'"):
+                delimiter = word[1] if word[1] is not None else word[2] if word[2] is not None else re.sub(r'\\(.)', r'\1', word[3])
+            pending.append((delimiter or None, bool(start[1])))
+    return ' ; '.join(line for line in kept if line.strip()), bool(pending)
 
 
 def command_shape(command):
     """Privacy-reduced skeleton of a command for grouping refusals, or None."""
     if not isinstance(command, str) or not command.strip():
         return None
-    text = command[:4000]
+    text = command[:4000].replace('\\\n', ' ')
+    truncated = len(command) > 4000
     if '\n' in text:
-        kept, pending = [], []
-        for line in text.split('\n'):
-            if pending:
-                if line.strip() == pending[0]:
-                    pending.pop(0)
-                continue
-            kept.append(line)
-            pending.extend(match[2] for match in _HEREDOC.finditer(line) if '<<<' not in match[0])
-        text = ' ; '.join(line for line in kept if line.strip())
+        text, unterminated = _strip_heredoc_bodies(text)
+        truncated |= unterminated
     out = []
     slot, program, assignments_done, target = 0, None, False, None
     for token in _SHAPE_TOKENS.findall(text):
@@ -171,10 +228,12 @@ def command_shape(command):
         else:
             out.append(word)
         if len(out) >= 32:
-            out.append('...')
+            truncated = True
             break
     while out and out[-1] in {';', '&'}:
         out.pop()
+    if truncated and out:
+        out.append('...')
     shape = ' '.join(out)
     if len(shape) > 240:
         shape = shape[:236].rsplit(' ', 1)[0] + ' ...'
@@ -651,14 +710,14 @@ class _RefusalShapes:
         group['guard'][guard if isinstance(guard, str) and _LABEL.fullmatch(guard) else 'unknown'] += weight
         project = props.get('project')
         group['projects'][project if isinstance(project, str) and _LABEL.fullmatch(project) else _thread_project(thread)] += weight
+        if weight > 1:
+            group['sampled'] = True
         if thread.startswith('unknown:'):
             # One unknown:<harness> bucket mixes many agents: neither a thread nor a retry.
             group['unattributed'] += weight
             return
         group['threads'].add(thread)
-        if weight > 1:
-            group['sampled'] = True
-        elif at is not None:
+        if weight == 1 and at is not None:
             self.times[(thread, rule, shape)].append(at)
 
     def add_previous(self, row, attempt):
