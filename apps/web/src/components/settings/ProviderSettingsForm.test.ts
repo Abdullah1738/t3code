@@ -95,6 +95,8 @@ describe("ProviderSettingsForm helpers", () => {
       "apiKey",
       "gcpProject",
       "gcpLocation",
+      "gatewayBaseUrl",
+      "gatewayApiKey",
       "binaryPath",
     ]);
     const authMethod = fields.find((field) => field.key === "authMethod");
@@ -104,8 +106,10 @@ describe("ProviderSettingsForm helpers", () => {
       "oauth-business",
       "gemini-api-key",
       "agent-platform",
+      "gateway",
     ]);
     expect(fields.find((field) => field.key === "apiKey")?.control).toBe("password");
+    expect(fields.find((field) => field.key === "gatewayApiKey")?.control).toBe("password");
   });
 
   it("shows the auto-compaction threshold for Claude providers", () => {

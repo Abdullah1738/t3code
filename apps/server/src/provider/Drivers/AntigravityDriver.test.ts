@@ -15,7 +15,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
-import { HttpClient } from "effect/http";
+import { HttpClient, HttpClientResponse } from "effect/http";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import * as ServerConfig from "../../config.ts";
@@ -122,6 +122,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     forceFileStorage: string | undefined;
     credentialKeys: ReadonlyArray<string>;
     geminiApiKey: string | undefined;
+    gateway: Readonly<Record<string, string>>;
     tempDirectory: string | undefined;
     handle: ChildProcessSpawner.ChildProcessHandle;
   }> = [];
@@ -175,6 +176,12 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
           blockedCredentialKeys.has(key.toUpperCase()),
         ),
         geminiApiKey: environment.GEMINI_API_KEY,
+        gateway: Object.fromEntries(
+          Object.entries(environment).filter(
+            (entry): entry is [string, string] =>
+              /GATEWAY/i.test(entry[0]) && entry[1] !== undefined,
+          ),
+        ),
         tempDirectory:
           environment.ANTIGRAVITY_HARNESS_PATH === undefined ? undefined : environment.TMPDIR,
         handle,
@@ -198,6 +205,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
       { name: "GEMINI_HOME", value: "/must-not-be-used" },
       { name: "ANTIGRAVITY_HARNESS_PATH", value: "/must-not-be-used" },
       { name: "BROWSER", value: "must-not-run" },
+      { name: "AGY_LLM_GATEWAY_URL", value: "http://must-not-be-used" },
     ].map((variable) => ({ ...variable, sensitive: false })),
   }).pipe(
     Effect.provide(layerInstallation),
@@ -295,6 +303,81 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
       expect(h.acquisitions).toEqual([]);
       expect(h.launches).toEqual([]);
       expect(yield* h.fs.exists(h.profileDirectory)).toBe(false);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "launches the gateway method with the gateway's ag/* models as the runtime fleet",
+    () =>
+      Effect.gen(function* () {
+        const requests: Array<{ url: string; authorization: string | undefined }> = [];
+        const gatewayHttp = HttpClient.make((request) =>
+          Effect.sync(() => {
+            requests.push({ url: request.url, authorization: request.headers.authorization });
+            return HttpClientResponse.fromWeb(
+              request,
+              Response.json({
+                data: [
+                  { id: "ag/gemini-4-neon-xhigh" },
+                  { id: "cx/gpt-6.1-terra" },
+                  { id: "ag/gemini-4-carbon-low" },
+                ],
+              }),
+            );
+          }),
+        );
+        const h = yield* makeHarness({
+          config: {
+            authMethod: "gateway",
+            gatewayBaseUrl: "http://gateway.test:20128",
+            gatewayApiKey: "router-secret",
+          },
+        }).pipe(Effect.provideService(HttpClient.HttpClient, gatewayHttp));
+        yield* h.refresh();
+        const launch = h.launches.find((entry) => entry.harnessPath !== undefined);
+        expect(launch?.gateway).toEqual({
+          AGY_ACP_ENABLE_GATEWAY_AUTH: "1",
+          AGY_LLM_GATEWAY_URL: "http://gateway.test:20128",
+          AGY_LLM_GATEWAY_API_KEY: "router-secret",
+          AGY_LLM_GATEWAY_MODELS: "ag/gemini-4-neon-xhigh,ag/gemini-4-carbon-low",
+        });
+        expect(launch?.credentialKeys).toEqual([]);
+        expect(requests.length).toBeGreaterThan(0);
+        for (const request of requests) {
+          expect(request).toEqual({
+            url: "http://gateway.test:20128/v1/models",
+            authorization: "Bearer router-secret",
+          });
+        }
+        const settings = yield* h.fs.readFileString(
+          h.path.join(h.profileDirectory, "antigravity-acp", "settings.json"),
+        );
+        expect(settings).toContain('"gateway"');
+        expect(settings).not.toContain("router-secret");
+        expect((yield* h.readRequests).find((r) => r.method === "authenticate")?.params).toEqual({
+          methodId: "gateway",
+        });
+        const snapshot = yield* h.instance.snapshot.getSnapshot;
+        expect(snapshot.auth).toMatchObject({ status: "authenticated", type: "gateway" });
+        yield* h.assertClosed;
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect.skipIf(windowsHost)("refuses to launch while the gateway is unreachable", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({
+        config: { authMethod: "gateway", gatewayBaseUrl: "http://gateway.test:20128" },
+      }).pipe(
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) =>
+            Effect.succeed(HttpClientResponse.fromWeb(request, new Response("", { status: 502 }))),
+          ),
+        ),
+      );
+      const error = yield* h.refresh().pipe(Effect.flip);
+      expect(error.detail).toContain("http://gateway.test:20128 is unreachable (HTTP 502)");
+      expect(h.launches.filter((entry) => entry.harnessPath !== undefined)).toEqual([]);
     }).pipe(Effect.scoped),
   );
 

@@ -78,6 +78,15 @@ const removedEnvironmentKeys = new Set([
   "BROWSER",
   "PYTHONUNBUFFERED",
   "ELECTRON_RUN_AS_NODE",
+  // Gateway routing is chosen only by the gateway sign-in method below.
+  "AGY_ACP_ENABLE_GATEWAY_AUTH",
+  "AGY_LLM_GATEWAY_URL",
+  "AGY_LLM_GATEWAY_API_KEY",
+  "AGY_LLM_GATEWAY_HEADERS",
+  "AGY_LLM_GATEWAY_MODELS",
+  "AGY_GATEWAY_URL",
+  "AGY_GATEWAY_API_KEY",
+  "AGY_GATEWAY_HEADERS",
 ]);
 
 export interface AntigravityProfile {
@@ -95,6 +104,10 @@ export interface AntigravityAuthConfig {
   readonly apiKey: string;
   readonly gcpProject: string;
   readonly gcpLocation: string;
+  readonly gatewayBaseUrl: string;
+  readonly gatewayApiKey: string;
+  /** The gateway models offered to the runtime as its fleet, read from the gateway per launch. */
+  readonly gatewayModels?: ReadonlyArray<string>;
 }
 
 export const ANTIGRAVITY_PERSONAL_AUTH: AntigravityAuthConfig = {
@@ -102,6 +115,8 @@ export const ANTIGRAVITY_PERSONAL_AUTH: AntigravityAuthConfig = {
   apiKey: "",
   gcpProject: "",
   gcpLocation: "",
+  gatewayBaseUrl: "",
+  gatewayApiKey: "",
 };
 
 export function antigravityAuthUsesBrowser(authMethod: AntigravityAuthMethod): boolean {
@@ -118,6 +133,8 @@ export function antigravityAuthLabel(authMethod: AntigravityAuthMethod): string 
       return "Gemini API key";
     case "agent-platform":
       return "Agent Platform";
+    case "gateway":
+      return "Gateway (9router)";
   }
 }
 
@@ -135,6 +152,27 @@ export function antigravityAuthConfigIssue(auth: AntigravityAuthConfig): string 
       return auth.apiKey || (auth.gcpProject && auth.gcpLocation)
         ? null
         : "Agent Platform needs an API key, or a GCP project and location, in the Antigravity provider settings.";
+    case "gateway":
+      return isHttpUrl(auth.gatewayBaseUrl)
+        ? null
+        : "Enter an http(s) gateway URL in the Antigravity provider settings.";
+  }
+}
+
+function isHttpUrl(value: string): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    // Credentials, queries and fragments would end up in model-list URLs and status messages.
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      url.username === "" &&
+      url.password === "" &&
+      url.search === "" &&
+      url.hash === ""
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -196,6 +234,20 @@ function quoteBrowserArgument(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+/**
+ * The runtime's native gateway auth: `auth.type: gateway` in the profile selects it, these
+ * variables supply the URL, the bearer key and the model fleet. It sends no Google identity.
+ */
+function antigravityGatewayEnvironment(auth: AntigravityAuthConfig): Record<string, string> {
+  const models = auth.gatewayModels ?? [];
+  return {
+    AGY_ACP_ENABLE_GATEWAY_AUTH: "1",
+    AGY_LLM_GATEWAY_URL: auth.gatewayBaseUrl.replace(/\/+$/, ""),
+    ...(auth.gatewayApiKey ? { AGY_LLM_GATEWAY_API_KEY: auth.gatewayApiKey } : {}),
+    ...(models.length > 0 ? { AGY_LLM_GATEWAY_MODELS: models.join(",") } : {}),
+  };
+}
+
 function antigravityEnvironment(
   profile: AntigravityProfile,
   baseEnv: NodeJS.ProcessEnv,
@@ -214,7 +266,9 @@ function antigravityEnvironment(
       ? { GEMINI_API_KEY: auth.apiKey }
       : auth.authMethod === "agent-platform" && auth.apiKey
         ? { GOOGLE_API_KEY: auth.apiKey }
-        : {};
+        : auth.authMethod === "gateway"
+          ? antigravityGatewayEnvironment(auth)
+          : {};
   // It unpacks about 1 GB into the system temp directory per launch and a force
   // kill leaves that behind. Point it at a T3-owned directory so the driver can
   // reclaim the space.
