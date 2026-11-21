@@ -181,10 +181,17 @@ class OffboxRemoteOnlyTests(unittest.TestCase):
                 self.assert_allowed(command)
 
     def test_reporter_exact_commands(self):
-        # Robob #1824, Crpko #2343, #196's Crpko #4500 and iMessage #53.
-        for name in ('robob1824-exact.sh', 'crpko2343-exact.sh', 'crpko4500-exact.sh', 'imessage53-exact.sh'):
+        # Robob #1824, Crpko #2343, #196's Crpko #4500, iMessage #53 and 9router #93.
+        for name in ('robob1824-exact.sh', 'crpko2343-exact.sh', 'crpko4500-exact.sh', 'imessage53-exact.sh',
+                     'router93-exact.sh'):
             with self.subTest(name=name):
                 self.assert_allowed(fixture(name))
+
+    def test_archive_extract_step_run_locally_is_still_checked(self):
+        # 9router #93's base step without offbox (#195 owns the local half).
+        steps = shlex.split(fixture('router93-exact.sh'))
+        self.assertEqual(steps[:5], ['offbox', 'run', '--bg', '--git', '--no-fallback'])
+        self.assertIsNotNone(self.decide(steps[-1])[0])
 
     def test_heredoc_then_local_run_is_still_checked(self):
         heredoc, _, remote = fixture('crpko2343-exact.sh').partition('\noffbox run ')
