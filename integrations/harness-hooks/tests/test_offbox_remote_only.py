@@ -196,6 +196,18 @@ class OffboxRemoteOnlyTests(unittest.TestCase):
         self.assertEqual(steps[:5], ['offbox', 'run', '--bg', '--git', '--no-fallback'])
         self.assertIsNotNone(self.decide(steps[-1])[0])
 
+    def test_note_heredoc_then_bash_script_under_caller_env_prefix(self):
+        # Crpko #5111: a markdown note heredoc, then `GITHUB_TOKEN="$(gh auth token)" offbox run --bg …
+        # -- bash <dir>/verify.sh`. The caller-side binding is a plain token, so the payload stays remote-only.
+        command = fixture('crpko5111-exact.sh')
+        heredoc, _, remote = command.partition('\nGITHUB_TOKEN="$(gh auth token)" offbox run --bg ')
+        self.assertTrue(remote)
+        self.write('tmp/card-5111.0gffvP/verify.sh',
+                   '#!/usr/bin/env bash\nsqlite3 ~/.t3/userdata/statev2.sqlite .tables\n')
+        self.assert_allowed(command)
+        # The same script run on the Mac (#195's half) still has its source checked.
+        self.assertEqual(self.decide(heredoc + '\nbash tmp/card-5111.0gffvP/verify.sh after-receiver\n')[0], SCRIPT)
+
     def test_heredoc_then_local_run_is_still_checked(self):
         heredoc, _, remote = fixture('crpko2343-exact.sh').partition('\noffbox run ')
         self.assertTrue(remote)
