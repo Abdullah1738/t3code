@@ -64,6 +64,8 @@ const harness = <E = never>(
   const protectedNotes = new Set<string>();
   const statusHooks = new Map<string, () => void>();
   const admissionBlocks = new Map<string, Effect.Effect<void>>();
+  const clearCompletions = new Map<string, Effect.Effect<void>>();
+  const waitingBlocks = new Map<string, Effect.Effect<void>>();
   const sourceBlocks = new Map<string, Effect.Effect<void>>();
   const pendingHooks = new Map<string, Effect.Effect<void>>();
   const positions: Array<{ id: string; position: number | null }> = [];
@@ -128,10 +130,10 @@ const harness = <E = never>(
                   reads.active++;
                   return running.has(runId ?? input.sourceRunId);
                 }),
-          status: (input, position) =>
+          status: (input, position, _wait, isCurrent) =>
             (position === null
               ? (admissionBlocks.get(input.sourceRunId) ?? Effect.void)
-              : Effect.void
+              : (waitingBlocks.get(input.sourceRunId) ?? Effect.void)
             ).pipe(
               Effect.andThen(
                 failStatus
@@ -141,10 +143,16 @@ const harness = <E = never>(
                       }),
                     )
                   : Effect.sync(() => {
+                      if (isCurrent !== undefined && !isCurrent()) return true;
                       statusHooks.get(input.effectId ?? "")?.();
                       positions.push({ id: input.sourceRunId, position });
                       return !protectedNotes.has(input.sourceRunId);
                     }),
+              ),
+              Effect.tap(() =>
+                position === null
+                  ? (clearCompletions.get(input.sourceRunId) ?? Effect.void)
+                  : Effect.void,
               ),
             ),
         }),
@@ -172,6 +180,8 @@ const harness = <E = never>(
     protectedNotes,
     statusHooks,
     admissionBlocks,
+    clearCompletions,
+    waitingBlocks,
     sourceBlocks,
     pendingHooks,
     setLoad: (value: number) => {
@@ -2006,6 +2016,304 @@ it.effect(
     }).pipe(Effect.provide(h.layer));
   },
 );
+
+it.effect(
+  "96 continuously loaded durable waiters drain within an hour after load credit is spent",
+  () => {
+    const h = harness({ maxActive: 4, spacingMs: 20_000 });
+    h.setLoad(2);
+    const starts: number[] = [];
+    const running = new Map<number, number>();
+    const messages: string[] = [];
+    const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+    const executor = Layer.effect(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      Effect.gen(function* () {
+        const pacing = yield* RestartPacing.RestartPacing;
+        return EffectWorker.OrchestrationEffectExecutorV2.of({
+          execute: (effect) =>
+            Effect.gen(function* () {
+              if (effect.request.type !== "provider-turn.start") return;
+              const delay = yield* pacing.acquireRun(
+                effect.threadId,
+                effect.request.runId,
+                effect.id,
+              );
+              if (delay > 0)
+                return yield* new EffectWorker.OrchestrationEffectExecutionError({
+                  effectId: effect.id,
+                  effectType: effect.request.type,
+                  deferMs: delay,
+                });
+              const now = yield* Clock.currentTimeMillis;
+              starts.push(now);
+              const id = Number(effect.id.split(":")[1]);
+              running.set(id, now);
+              h.running.add(effect.request.runId);
+              assert.isAtMost(running.size, 4);
+            }).pipe(
+              Effect.mapError((cause) =>
+                EffectWorker.isOrchestrationEffectExecutionError(cause)
+                  ? cause
+                  : new EffectWorker.OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+              ),
+            ),
+        });
+      }),
+    ).pipe(Layer.provideMerge(h.layer));
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      h.wakeWith((input) =>
+        outbox
+          .wakeRestartEffect(input.effectId!)
+          .pipe(
+            Effect.mapError((cause) => new RestartPacingState.RestartPacingStateError({ cause })),
+          ),
+      );
+      const began = yield* Clock.currentTimeMillis;
+      for (let id = 0; id < 96; id++) {
+        const input = source(id);
+        h.runSources.set(input.sourceRunId, input);
+        yield* pacing.register({ ...input, effectId: `loaded96:${id}` });
+        yield* outbox.enqueue([
+          {
+            id: `loaded96:${id}`,
+            threadId: input.threadId,
+            commandId: CommandId.make(`loaded96:${id}`),
+            request: { type: "provider-turn.start", runId: input.sourceRunId },
+          },
+        ]);
+      }
+      yield* worker.drain();
+      yield* TestClock.adjust(20 * 60_000 - 1);
+      yield* worker.drain();
+      assert.deepEqual(starts, []);
+      yield* TestClock.adjust(1);
+      for (let tick = 0; tick < 600 && starts.length < 96; tick++) {
+        const now = yield* Clock.currentTimeMillis;
+        for (const [id, at] of running) {
+          if (now - at < 60_000) continue;
+          running.delete(id);
+          h.running.delete(source(id).sourceRunId);
+          yield* pacing.releaseRun(source(id).threadId, source(id).sourceRunId, `loaded96:${id}`);
+        }
+        yield* worker.drain();
+        yield* TestClock.adjust(4_000);
+      }
+      assert.lengthOf(starts, 96);
+      assert.isBelow(starts.at(-1)! - began, 60 * 60_000);
+      assert.isFalse(messages.some((row) => row.includes("restart-pacing.bound_failed")));
+      assert.isTrue(messages.some((row) => row.includes('"loadHoldCreditSpent":true')));
+      yield* Effect.logInfo("loaded96.drain-result", {
+        admitted: starts.length,
+        elapsedMs: starts.at(-1)! - began,
+      });
+    }).pipe(
+      Effect.provide(
+        Layer.merge(
+          EffectWorker.layer.pipe(
+            Layer.provideMerge(
+              Layer.merge(
+                executor,
+                EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+              ),
+            ),
+          ),
+          Logger.layer([logger]),
+        ),
+      ),
+    );
+  },
+);
+
+it.effect("a slow non-head waiting note cannot delay the spacing wake or head admission", () => {
+  const h = harness({ maxActive: 4, spacingMs: 20_000 });
+  const wakes: number[] = [];
+  h.wakeWith((input) =>
+    Clock.currentTimeMillis.pipe(
+      Effect.tap((at) =>
+        Effect.sync(() => {
+          if (input.sourceRunId === source(2).sourceRunId) wakes.push(at);
+        }),
+      ),
+      Effect.as(true),
+    ),
+  );
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const entered = yield* Deferred.make<void>();
+    const complete = yield* Deferred.make<void>();
+    const first = { ...source(1), effectId: "slow-note:1" };
+    const head = { ...source(2), effectId: "slow-note:2" };
+    const tail = { ...source(3), effectId: "slow-note:3" };
+    assert.equal(yield* pacing.acquire(first), 0);
+    assert.isAbove(yield* pacing.acquire(head), 0);
+    h.waitingBlocks.set(
+      tail.sourceRunId,
+      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(complete))),
+    );
+    const tailPass = yield* pacing.acquire(tail).pipe(Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(20_000);
+    assert.deepEqual(wakes, [20_000]);
+    assert.equal(yield* pacing.acquire(head), 0);
+    yield* Deferred.succeed(complete, undefined);
+    assert.isAbove(yield* Fiber.join(tailPass), 0);
+  }).pipe(Effect.provide(h.layer));
+});
+
+it.effect("a delayed waiting note cannot restore an admitted wait", () => {
+  const h = harness({ spacingMs: 0 });
+  h.setLoad(2);
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const entered = yield* Deferred.make<void>();
+    const complete = yield* Deferred.make<void>();
+    const waiting = source(1);
+    h.waitingBlocks.set(
+      waiting.sourceRunId,
+      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(complete))),
+    );
+    const oldPass = yield* pacing.acquire(waiting).pipe(Effect.forkChild);
+    yield* Deferred.await(entered);
+    h.setLoad(0);
+    yield* TestClock.adjust(10_000);
+    assert.equal(yield* pacing.acquire(waiting), 0);
+    yield* Deferred.succeed(complete, undefined);
+    assert.equal(yield* Fiber.join(oldPass), 5000);
+    assert.deepEqual(h.positions, [{ id: waiting.sourceRunId, position: null }]);
+  }).pipe(Effect.provide(h.layer));
+});
+
+it.effect.each(["admission", "bound_failure", "retirement", "decline", "successor"] as const)(
+  "a delayed publisher cannot restore waiting during %s clearing",
+  (boundary) => {
+    const h = harness({ spacingMs: 0 });
+    h.setLoad(2);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      const writing = yield* Deferred.make<void>();
+      const publish = yield* Deferred.make<void>();
+      const cleared = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const waiting = { ...source(1), effectId: "clear-race:1" };
+      h.waitingBlocks.set(
+        waiting.sourceRunId,
+        Deferred.succeed(writing, undefined).pipe(Effect.andThen(Deferred.await(publish))),
+      );
+      const oldPass = yield* pacing.acquire(waiting).pipe(Effect.forkChild);
+      yield* Deferred.await(writing);
+      // The clear committed and released its thread lock, but its caller has
+      // not resumed to remove the pending entry yet.
+      h.clearCompletions.set(
+        waiting.sourceRunId,
+        Deferred.succeed(cleared, undefined).pipe(Effect.andThen(Deferred.await(finish))),
+      );
+      let clear = pacing.acquire(waiting).pipe(Effect.asVoid);
+      if (boundary === "bound_failure") {
+        yield* TestClock.adjust("2 hours");
+        clear = pacing.acquire(waiting).pipe(Effect.asVoid);
+      } else if (boundary === "retirement") {
+        h.cancelled.add(waiting.sourceRunId);
+        clear = pacing.acquire(source(2)).pipe(Effect.asVoid);
+      } else if (boundary === "decline") {
+        clear = pacing.dispatched(waiting, true);
+      } else if (boundary === "successor") {
+        clear = pacing.register({ ...source(2), threadId: waiting.threadId });
+      } else {
+        h.setLoad(0);
+        yield* TestClock.adjust(10_000);
+        clear = pacing.acquire(waiting).pipe(Effect.asVoid);
+      }
+      const clearing = yield* clear.pipe(Effect.exit, Effect.forkChild);
+      yield* Deferred.await(cleared);
+      yield* Deferred.succeed(publish, undefined);
+      assert.isAbove(yield* Fiber.join(oldPass), 0);
+      assert.deepEqual(h.positions, [{ id: waiting.sourceRunId, position: null }]);
+      yield* Deferred.succeed(finish, undefined);
+      const result = yield* Fiber.join(clearing);
+      assert.equal(Exit.isFailure(result), boundary === "bound_failure");
+    }).pipe(Effect.provide(h.layer));
+  },
+);
+
+it.effect.each(["effect", "source"] as const)(
+  "a replacement %s does not inherit its predecessor's spacing wake",
+  (kind) => {
+    const h = harness({ maxActive: 4, spacingMs: 20_000 });
+    const messages: string[] = [];
+    const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      const waiting = { ...source(2), effectId: "wake-owner:old" };
+      yield* pacing.acquire(source(1));
+      assert.isAbove(yield* pacing.acquire(waiting), 0);
+      yield* TestClock.adjust(20_000);
+      const replacement = {
+        ...waiting,
+        ...(kind === "source" ? { sourceRunId: source(3).sourceRunId } : {}),
+        effectId: "wake-owner:new",
+      };
+      assert.equal(yield* pacing.acquire(replacement), 0);
+      const admitted = messages.findLast((message) => message.includes("restart-pacing.admitted"));
+      assert.include(admitted!, '"wake":"other"');
+    }).pipe(
+      Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+    );
+  },
+);
+
+it.effect("waiting and admission logs distinguish persistence delay and spacing wake", () => {
+  const h = harness({ maxActive: 4, spacingMs: 20_000 });
+  const messages: string[] = [];
+  const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const entered = yield* Deferred.make<void>();
+    const complete = yield* Deferred.make<void>();
+    const head = { ...source(2), effectId: "timed-note:2" };
+    assert.equal(yield* pacing.acquire(source(1)), 0);
+    h.waitingBlocks.set(
+      head.sourceRunId,
+      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(complete))),
+    );
+    const waiting = yield* pacing.acquire(head).pipe(Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(5000);
+    yield* Deferred.succeed(complete, undefined);
+    assert.equal(yield* Fiber.join(waiting), 10_000);
+    const wait = messages.findLast((message) => message.includes("restart-pacing.waiting"));
+    assert.include(wait!, '"decisionToEmitGapMs":5000');
+    assert.include(wait!, '"passLatencyMs":5000');
+    assert.include(wait!, '"mutexWaitMs":0');
+    assert.include(wait!, '"loadHoldCreditSpent":false');
+    yield* TestClock.adjust(15_000);
+    const admitting = yield* Deferred.make<void>();
+    const persisted = yield* Deferred.make<void>();
+    h.admissionBlocks.set(
+      head.sourceRunId,
+      Deferred.succeed(admitting, undefined).pipe(Effect.andThen(Deferred.await(persisted))),
+    );
+    const admission = yield* pacing.acquire(head).pipe(Effect.forkChild);
+    yield* Deferred.await(admitting);
+    yield* TestClock.adjust(7000);
+    yield* Deferred.succeed(persisted, undefined);
+    assert.equal(yield* Fiber.join(admission), 0);
+    const admitted = messages.findLast((message) => message.includes("restart-pacing.admitted"));
+    assert.include(admitted!, '"wake":"spacing_deadline"');
+    assert.include(admitted!, '"decisionToEmitGapMs":7000');
+    assert.include(admitted!, '"passLatencyMs":7000');
+    assert.include(admitted!, '"mutexWaitMs":0');
+  }).pipe(
+    Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+  );
+});
 
 it.effect("a load-ready waiter retries at the startup spacing deadline on a loaded host", () => {
   const h = harness();
