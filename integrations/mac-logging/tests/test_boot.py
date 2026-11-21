@@ -13,6 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import boot
 import boot_identity
+import shutdown_evidence
 import jobs
 import toollog
 from rollup import rollup
@@ -37,13 +38,18 @@ class BootTests(unittest.TestCase):
         self.assertNotIn('BUN_INSPECT', kwargs['env'])
         if argv[0] == '/usr/bin/last':
             return SimpleNamespace(returncode=0, stdout=(FIX/'last.txt').read_text())
+        if argv[0] == '/usr/sbin/sysctl':
+            return SimpleNamespace(returncode=0, stdout=(FIX/'boot-state-21nov.txt').read_text())
+        if argv[0] == '/usr/sbin/spindump':
+            Path(argv[argv.index('-o')+1]).write_text((FIX/'stall-21nov.txt').read_text())
+            return SimpleNamespace(returncode=0, stdout='')
         self.assertEqual(argv[:5], ['/usr/bin/log', 'show', '--style', 'ndjson', '--timezone'])
         self.assertEqual(kwargs['timeout'], 15)
         start, end = (argv[argv.index(flag)+1] for flag in ('--start', '--end'))
         window = (dt.datetime.fromisoformat(end)-dt.datetime.fromisoformat(start)).total_seconds()
         self.assertGreaterEqual(window, 179)
         self.assertLessEqual(window, 180)
-        return SimpleNamespace(returncode=0, stdout='')
+        return SimpleNamespace(returncode=0, stdout=(FIX/'shutdown-21nov.ndjson').read_text() if '--debug' in argv else '')
 
     def reset(self):
         path = self.reports/'ResetCounter-2026-11-16-122339.diag'
@@ -574,7 +580,7 @@ class BootTests(unittest.TestCase):
         self.assertEqual(len([r for r in self.rows() if r['name'] == 'boot.observed']), 2)
 
     def test_orderly_21_nov_boot_with_shutdown_stall(self):
-        at = boot.epoch('2026-11-21T10:12:28Z')
+        at = boot.epoch('2026-11-21T10:12:28.443847Z')
         self.assertTrue(boot.parse_last((FIX/'last.txt').read_text(), at)[0])
         path = self.reports/'shutdown_stall_2026-11-21-141211_Abdullahs-MacBook-Pro.shutdownStall'
         path.write_bytes(b'not a JSON report')
@@ -585,15 +591,29 @@ class BootTests(unittest.TestCase):
         self.assertFalse(props['source']['clean']['abnormalEvidence'])
         self.assertIsNone(props['bootFaults'])
         self.assertFalse(props['panic']['present'])
-        self.assertEqual(props['shutdownStall'], dict(present=True, path=str(path)))
-        # Report presence uses metadata, never decodes the binary spindump.
-        self.assertEqual(props['source']['shutdownStall'], dict(read='DiagnosticReports mtime', error=None))
-        with patch.object(boot, 'collect', return_value=props), patch.object(boot, 'alert_text') as alert:
-            boot.observe(boot=at, now=at+660)
-        alert.assert_not_called()
+        self.assertEqual(props['shutdownStall'], dict(present=True, path=str(path),
+            sampleStart='2026-11-21T10:11:56.760000Z', sampleEnd='2026-11-21T10:11:57.763000Z'))
+        request = props['shutdownRequest']
+        self.assertEqual(request, dict(operation='restart', requestedAt='2026-11-21T10:11:22.954332Z',
+            confirmedAt='2026-11-21T10:11:31.124134Z', senderPid=19937, senderBundle='com.ardud.robob',
+            senderName='Robob', senderForeground=True, humanActor='not established', softwareUpdate=False,
+            callerChain='shutdown[6066]<-sessionlogoutd[6062]', initiatedAt='2026-11-21T10:11:54.751218Z'))
+        self.assertTrue(props['shutdownRecord'])
+        self.assertIsNone(props['forcedWatchdogTimeout'])
+        for key, sysctl in [('shutdownReason', 'kern.shutdownreason'), ('bootReason', 'kern.bootreason')]:
+            expected = next(line.split(': ', 1)[1] for line in (FIX/'boot-state-21nov.txt').read_text().splitlines() if line.startswith(sysctl+':'))
+            self.assertEqual(props[key], expected)
+        sent = []
+        with patch.object(boot, 'collect', return_value=props):
+            for now in (at+660, at+720):
+                boot.observe(boot=at, now=now, notify=lambda *a, **kw: sent.append(a) or True)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], 'restart requested by Robob at 2026-11-21T10:11:22.954332Z, shutdown stalled.')
         row = next(r for r in self.rows() if r['name'] == 'boot.observed')
         self.assertEqual(row['props']['shutdownStall'], props['shutdownStall'])
         self.assertEqual(row['props']['source']['shutdownStall'], props['source']['shutdownStall'])
+        for field in ('shutdownRequest', 'shutdownRecord', 'shutdownReason', 'bootReason', 'forcedWatchdogTimeout'):
+            self.assertEqual(row['props'][field], props[field])
 
     def test_shutdown_stall_time_window(self):
         for offset, present in [(-601, False), (-600, True), (-17, True), (600, True), (601, False)]:
@@ -605,3 +625,167 @@ class BootTests(unittest.TestCase):
                     props = self.collect()
                 self.assertEqual(props['shutdownStall']['present'], present)
                 self.assertTrue(props['clean'])
+
+    def test_watchdog_tokens_do_not_establish_a_timeout(self):
+        path = self.reset()
+        for raw in ('wdog,reset_in_1', 'wdog,reset_in_1 rst_in,reset_in_1_deassert wdog,reset_in_1 ap_restart'):
+            for failure_count in (0, 1):
+                with self.subTest(raw=raw, failure_count=failure_count):
+                    text = (FIX/'reset-button.diag').read_text().replace('rst btn_rst,btn_seq_reset target_off_restart', raw)
+                    path.write_text(text.replace('Boot failure count: 1', 'Boot failure count: '+str(failure_count)))
+                    with patch.object(boot, 'parse_last', return_value=(True, None)):
+                        props = self.collect()
+                    self.assertEqual(props['clean'], failure_count == 0)
+                    self.assertIsNone(props['forcedWatchdogTimeout'])
+        self.assertIsNone(self.collect()['shutdownReason'])  # Today's sysctl cannot describe 16 Nov.
+
+    def test_request_forms_and_sender_correlation(self):
+        at = boot.epoch('2026-11-21T10:12:28.443847Z')
+        original = (FIX/'shutdown-21nov.ndjson').read_text()
+        for title in ('Restart', 'Shutdown'):
+            for mode in ('exact', 'no_audit', 'old_audit', 'other_receiver', 'type_only'):
+                with self.subTest(title=title, mode=mode):
+                    rows = [json.loads(line) for line in original.replace('Restart', title).replace('restart:', title.lower()+':').splitlines()]
+                    for row in rows:
+                        if 'pid: 19937' in row['eventMessage']:
+                            if mode == 'no_audit': row['eventMessage'] = 'audit token missing'
+                            if mode == 'old_audit': row['timestamp'] = boot.iso(at-100)
+                            if mode == 'other_receiver': row['processID'] = 999
+                        if mode == 'type_only' and 'Received a kAEShow' in row['eventMessage']:
+                            row['eventMessage'] = 'unavailable'
+                    props, _ = shutdown_evidence.parse_shutdown('\n'.join(map(json.dumps, rows)), at)
+                    req = props['shutdownRequest']
+                    self.assertEqual(req['operation'], title.lower())
+                    self.assertEqual(req['senderPid'], 19937 if mode == 'exact' else None)
+                    self.assertEqual(req['senderBundle'], 'com.ardud.robob' if mode == 'exact' else None)
+                    self.assertEqual(req['humanActor'], 'not established')
+
+    def test_shutdown_query_filters_overruns_and_watchdog_evidence(self):
+        at = boot.epoch('2026-11-21T10:12:28Z')
+        for process, msg, established in [
+                ('watchdogd', 'watchdog monitoring services', None),
+                ('launchd', 'Sending SIGTERM to watchdogd', None),
+                ('kernel', 'wdog,reset_in_1', None),
+                ('kernel', 'userspace watchdog timeout: no successful checkins from logd', True),
+                ('watchdogd', 'no successful checkins from logd in 120 seconds', True),
+                ('log', 'query userspace watchdog timeout', None)]:
+            for offset, inside in [(-181, False), (-180, True), (-1, True), (0, False), (1, False)]:
+                with self.subTest(process=process, msg=msg, offset=offset):
+                    row = dict(timestamp=boot.iso(at+offset), processImagePath='/sbin/'+process, eventMessage=msg)
+                    props, source = shutdown_evidence.parse_shutdown(json.dumps(row), at)
+                    self.assertEqual(props['forcedWatchdogTimeout'], established if inside else None)
+                    self.assertEqual(source['droppedRows'], int(not inside))
+
+    def test_cancelled_request_then_every_request_form(self):
+        at = boot.epoch('2026-11-21T10:12:28Z')
+        def row(message, offset, receiver=182):
+            return dict(timestamp=boot.iso(at+offset), processID=receiver,
+                        processImagePath='/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow',
+                        eventMessage=message)
+        def dialog(title):
+            return '-[SessionLogoutManager handleAppleEvent:reply:refCon:] | Received a kAEShow'+title+'Dialog'
+        def logout(title, code):
+            return '-[SessionLogoutManager startLogout:logoutSubType:showConfirmationUI:countDownTime:useTALOption:logoutOptions:] | logoutType:'+code+' - '+title+', subLogoutType:0 - NoSubType'
+        audit = '-[SessionLogoutManager handleAppleEvent:reply:refCon:] | pid: '
+        dictionary = '-[GUIApplicationLogout loadProccessesToQuitArray] | appDictionary:{\n pid = 19937;\n LSDisplayName = Robob;\n BundleIdentifierLowerCase = "com.ardud.robob";\n ApplicationType = Foreground;\n}'
+        for previous in ('Restart', 'Shutdown'):
+            cancelled = [row(audit+'19937', -66), row(dialog(previous), -65),
+                         row(logout(previous, '2'), -65), row(dictionary, -64),
+                         row('-[ShutdownLogoutUIManager _showAlert]_block_invoke | logoutType 2, sublogoutType 0, result 1001 received', -60)]
+            # A cancelled dialog without a later request must not reach the alert.
+            props, _ = shutdown_evidence.parse_shutdown('\n'.join(map(json.dumps, cancelled)), at)
+            self.assertIsNone(props['shutdownRequest']['operation'])
+            self.assertIsNone(props['shutdownRequest']['senderPid'])
+            for title in ('Restart', 'Shutdown'):
+                for form in ('dialog', 'type_only'):
+                    for fresh_sender in (False, True):
+                        with self.subTest(previous=previous, title=title, form=form, fresh_sender=fresh_sender):
+                            rows = list(cancelled)
+                            if fresh_sender:
+                                rows.append(row(audit+'20000', -46))
+                            if form == 'dialog':
+                                rows.append(row(dialog(title), -45))
+                            rows.extend([row(logout(title, '3'), -45),
+                                         row('-[ShutdownLogoutUIManager '+title.lower()+':] | enter', -44)])
+                            props, _ = shutdown_evidence.parse_shutdown('\n'.join(map(json.dumps, rows)), at)
+                            request = props['shutdownRequest']
+                            self.assertEqual(request['operation'], title.lower())
+                            self.assertEqual(request['requestedAt'], boot.iso(at-45))
+                            self.assertEqual(request['confirmedAt'], boot.iso(at-44))
+                            self.assertEqual(request['senderPid'], 20000 if form == 'dialog' and fresh_sender else None)
+                            self.assertIsNone(request['senderBundle'])
+                            alert = boot.alert_text(dict(clean=True, shutdownStall=dict(present=True), shutdownRequest=request))
+                            self.assertTrue(alert.startswith(title.lower()+' requested by unknown process at '+boot.iso(at-45)))
+
+    def test_unmatched_cancel_does_not_clear_active_request(self):
+        at = boot.epoch('2026-11-21T10:12:28.443847Z')
+        original = [json.loads(line) for line in (FIX/'shutdown-21nov.ndjson').read_text().splitlines()]
+        for receiver, code in ((999, '2'), (182, '9')):
+            with self.subTest(receiver=receiver, code=code):
+                cancel = dict(timestamp=boot.iso(at-60), processID=receiver,
+                    processImagePath='/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow',
+                    eventMessage='-[ShutdownLogoutUIManager _showAlert]_block_invoke | logoutType '+code+', sublogoutType 0, result 1001 received')
+                props, _ = shutdown_evidence.parse_shutdown('\n'.join(map(json.dumps, original+[cancel])), at)
+                self.assertEqual(props['shutdownRequest']['senderPid'], 19937)
+                self.assertEqual(props['shutdownRequest']['operation'], 'restart')
+
+    def test_stall_decode_failure_still_observes_and_alerts_once(self):
+        at = boot.epoch('2026-11-21T10:12:28.443847Z')
+        path = self.reports/'shutdown_stall_fixture.shutdownStall'
+        path.write_bytes(b'binary')
+        os.utime(path, (at-17, at-17))
+        for failure in (PermissionError(), subprocess.TimeoutExpired('spindump', 15), ValueError()):
+            with self.subTest(failure=type(failure).__name__), patch.object(shutdown_evidence, 'stall_interval', side_effect=failure):
+                props = self.collect(at)
+            self.assertTrue(props['clean'])
+            self.assertTrue(props['shutdownStall']['present'])
+            self.assertIsNone(props['shutdownStall']['sampleStart'])
+            self.assertEqual(props['source']['shutdownStall']['sampleError'], 'unavailable')
+        sent = []
+        with patch.object(boot, 'collect', return_value=props):
+            boot.observe(boot=at, now=at+660, notify=lambda *a, **kw: False)
+            boot.observe(boot=at+3600, now=at+3700, notify=lambda *a, **kw: sent.append(a) or True)
+            boot.observe(boot=at+3600, now=at+3800, notify=lambda *a, **kw: sent.append(a) or True)
+        self.assertEqual(len(sent), 1)
+        self.assertIn('shutdown stalled', sent[0][0])
+
+    def test_sample_interval_input_forms(self):
+        for zone in ('+0400', '+04:00'):
+            with self.subTest(zone=zone):
+                text = (FIX/'stall-21nov.txt').read_text().replace('+0400', zone)
+                result = shutdown_evidence.sample_interval(text)
+                self.assertEqual(result['sampleStart'], '2026-11-21T10:11:56.760000Z')
+                self.assertEqual(result['sampleEnd'], '2026-11-21T10:11:57.763000Z')
+        for text in ('', 'Date/Time: invalid', 'Date/Time: 2026-11-21 14:11:57 +0400\nEnd time: 2026-11-21 14:11:56 +0400'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                shutdown_evidence.sample_interval(text)
+
+    def test_stall_filename_survives_changed_mtime(self):
+        at = boot.epoch('2026-11-21T10:12:28.443847Z')
+        path = self.reports/'shutdown_stall_2026-11-21-141211_host.shutdownStall'
+        path.write_bytes(b'original diagnostic')
+        for mtime in (at-17, at+7200):
+            with self.subTest(mtime=mtime):
+                os.utime(path, (mtime, mtime))
+                props = self.collect(at)
+                self.assertTrue(props['shutdownStall']['present'])
+                self.assertEqual(props['shutdownStall']['sampleStart'], '2026-11-21T10:11:56.760000Z')
+                self.assertEqual(path.read_bytes(), b'original diagnostic')
+                self.assertEqual(path.stat().st_mtime, mtime)
+
+    def test_native_decoder_can_modify_only_its_private_copy(self):
+        path = self.reports/'stall.shutdownStall'
+        path.write_bytes(b'original')
+        before = path.stat().st_mtime_ns
+        def decoder(argv, **kwargs):
+            self.assertEqual(kwargs['timeout'], 15)
+            copied = Path(argv[argv.index('-i')+1])
+            self.assertNotEqual(copied, path)
+            self.assertEqual(copied.read_bytes(), b'original')
+            copied.write_bytes(b'changed by native decoder')
+            Path(argv[argv.index('-o')+1]).write_text((FIX/'stall-21nov.txt').read_text())
+            return SimpleNamespace(returncode=0, stdout='')
+        result = shutdown_evidence.stall_interval(str(path), decoder)
+        self.assertEqual(result['sampleEnd'], '2026-11-21T10:11:57.763000Z')
+        self.assertEqual(path.read_bytes(), b'original')
+        self.assertEqual(path.stat().st_mtime_ns, before)

@@ -104,8 +104,14 @@ def diagnostics(boot, roots=REPORT_DIRS, read=None):
                         errors.append('reset_faults_unavailable')
                 if abs(at-boot) <= 600 and (path.suffix == '.panic' or header and str(header.get('bug_type')) == '210'):
                     panic.append((at, str(path)))
-                if abs(at-boot) <= 600 and path.suffix == '.shutdownStall':
-                    stalls.append((at, str(path)))
+                if path.suffix == '.shutdownStall':
+                    # Native decoding/retirement can update mtime. The report's
+                    # local timestamp remains in its generated basename.
+                    named = re.match(r'shutdown_stall_(\d{4}-\d{2}-\d{2}-\d{6})_', path.name)
+                    if named:
+                        at = time.mktime(time.strptime(named[1], '%Y-%m-%d-%H%M%S'))
+                    if abs(at-boot) <= 600:
+                        stalls.append((at, str(path)))
                 if boot-7200 <= at <= boot and path.name.startswith('JetsamEvent-'):
                     jetsam.append((at, str(path)))
             except (OSError, ValueError, KeyError, TypeError, IndexError):
@@ -118,7 +124,7 @@ def diagnostics(boot, roots=REPORT_DIRS, read=None):
                     bootFaults=dict(read='ResetCounter', path=str(latest[1]) if latest else None,
                                     error=','.join(sorted(set(errors))) or (None if latest else 'missing')),
                     panic=dict(read='DiagnosticReports', error=','.join(sorted(set(errors))) or None),
-                    shutdownStall=dict(read='DiagnosticReports mtime', error=','.join(sorted(set(errors))) or None),
+                    shutdownStall=dict(read='DiagnosticReports filename/mtime', error=','.join(sorted(set(errors))) or None),
                     jetsamReportsLast2h=dict(read='DiagnosticReports', error=','.join(sorted(set(errors))) or None))
 
 
@@ -201,6 +207,7 @@ def unified(boot, run):
 
 
 def collect(boot, roots=REPORT_DIRS, root=None, run=subprocess.run, previous=None):
+    from shutdown_evidence import shutdown_context, parse_shutdown, kernel_reasons, stall_interval
     try:
         props, sources = deadline_call(time.monotonic()+5, diagnostics, boot, roots)
     except (OSError, SourceFailure):
@@ -208,6 +215,31 @@ def collect(boot, roots=REPORT_DIRS, root=None, run=subprocess.run, previous=Non
                      shutdownStall=dict(present=False, path=None),
                      jetsamReportsLast2h=dict(count=0, newestPath=None))
         sources = {key: dict(read='DiagnosticReports', error='unavailable') for key in props}
+    stall = props['shutdownStall']
+    stall.update(sampleStart=None, sampleEnd=None)
+    if stall['present']:
+        try:
+            stall.update(deadline_call(time.monotonic()+20, stall_interval, stall['path'], run))
+            sources['shutdownStall'].update(sampleRead='spindump -i', sampleError=None)
+        except (OSError, ValueError, SourceFailure, subprocess.TimeoutExpired):
+            sources['shutdownStall'].update(sampleRead='spindump -i', sampleError='unavailable')
+    try:
+        context, context_source = shutdown_context(boot, run)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        context, context_source = parse_shutdown('', boot)
+        context_source['error'] = 'unavailable'
+    props.update(context, shutdownReason=None, bootReason=None)
+    sources.update(shutdownRequest={k: v for k, v in context_source.items() if k != 'verdict'},
+                   forcedWatchdogTimeout=dict(context_source))
+    try:
+        props.update(kernel_reasons(boot, run))
+        reason_source = dict(read='sysctl same kern.boottime', error=None)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        reason_source = dict(read='sysctl same kern.boottime', error='unavailable_or_different_boot')
+    for key in ('shutdownReason', 'bootReason'):
+        sources[key] = dict(reason_source)
+        if props[key] is None:
+            sources[key]['error'] = sources[key]['error'] or 'missing'
     try:
         prior, sample_source = deadline_call(time.monotonic()+5, previous_samples, boot, root or directory(), previous)
     except (OSError, SourceFailure):
@@ -233,15 +265,23 @@ def collect(boot, roots=REPORT_DIRS, root=None, run=subprocess.run, previous=Non
     # #92 proved no numeric mapping on this Mac. Preserve any raw code without
     # silently importing Intel meanings. Positive fault/panic evidence wins.
     faults = props['bootFaults']
-    abnormal = props['panic']['present'] or bool(faults and (
-        faults['bootFailureCount'] > 0 or re.search(r'btn_rst|btn_seq_reset|wdog|crash|panic', faults['raw'] or '', re.I)))
+    abnormal = props['panic']['present'] or props['forcedWatchdogTimeout'] is True or bool(faults and (
+        faults['bootFailureCount'] > 0 or re.search(r'btn_rst|btn_seq_reset|crash|panic', faults['raw'] or '', re.I)))
     props['clean'] = shutdown is True and not abnormal
+    props['shutdownRecord'] = shutdown
+    sources['shutdownRecord'] = dict(sources['clean'])
     sources['clean']['abnormalEvidence'] = bool(abnormal)
     props['source'] = sources
     return props
 
 
 def alert_text(props):
+    if props['clean'] and props.get('shutdownStall', {}).get('present'):
+        request = props.get('shutdownRequest') or {}
+        return '%s requested by %s at %s, shutdown stalled.' % (
+            request.get('operation') or 'restart/shutdown',
+            request.get('senderName') or request.get('senderBundle') or 'unknown process',
+            request.get('requestedAt') or 'unknown time')
     faults = props['bootFaults']
     cause = faults['raw'] if faults and faults['raw'] else 'panic' if props['panic']['present'] else 'unknown cause'
     if faults and faults['bootFailureCount'] > 0:
@@ -370,7 +410,8 @@ def observe(now=None, run=subprocess.run, boot=None, collect_fn=None, notify=Non
             pending = state.pop('pending', [])
             if state and not observation_done(state):
                 pending.append(state)
-            state = dict(bootEpoch=boot, props=props, emitted=False, alerted=props['clean'],
+            state = dict(bootEpoch=boot, props=props, emitted=False,
+                         alerted=props['clean'] and not props.get('shutdownStall', {}).get('present'),
                          eventAt=boot, appendAttempted=False, pending=pending)
             save_state('boot', state)
 

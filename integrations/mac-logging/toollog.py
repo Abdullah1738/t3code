@@ -577,8 +577,17 @@ def boot_fields(values):
             result[key] = text(value, 40)
         elif key in ('uptimeAtPreviousSample', 'lastSampleGapS', 'observedAt'):
             result[key] = value if finite_number(value) and value >= 0 else None
-        elif key == 'clean' and type(value) is bool:
+        elif key in ('clean', 'shutdownRecord', 'forcedWatchdogTimeout') and (value is None or type(value) is bool):
             result[key] = value
+        elif key in ('shutdownReason', 'bootReason'):
+            result[key] = text(value, 2048)
+        elif key == 'shutdownRequest' and isinstance(value, dict):
+            result[key] = {k: text(value.get(k)) for k in (
+                'operation', 'requestedAt', 'confirmedAt', 'senderBundle', 'senderName',
+                'humanActor', 'callerChain', 'initiatedAt')}
+            result[key]['senderPid'] = value.get('senderPid') if type(value.get('senderPid')) is int else None
+            for field in ('softwareUpdate', 'senderForeground'):
+                result[key][field] = value.get(field) if type(value.get(field)) is bool else None
         elif key == 'bootFaults':
             result[key] = (dict(raw=text(value.get('raw'), 256),
                                 bootFailureCount=value.get('bootFailureCount')
@@ -589,6 +598,8 @@ def boot_fields(values):
                                 meaning='unmapped') if isinstance(value, dict) else None)
         elif key in ('panic', 'shutdownStall') and isinstance(value, dict):
             result[key] = dict(present=value.get('present') is True, path=path(value.get('path')))
+            if key == 'shutdownStall':
+                result[key].update({k: text(value.get(k), 40) for k in ('sampleStart', 'sampleEnd')})
         elif key == 'jetsamReportsLast2h' and isinstance(value, dict):
             result[key] = dict(count=value.get('count') if type(value.get('count')) is int else None,
                                newestPath=path(value.get('newestPath')))
@@ -597,12 +608,13 @@ def boot_fields(values):
             for field, source in value.items():
                 if field not in ('bootTime', 'previousBootTime', 'uptimeAtPreviousSample',
                                  'lastSampleGapS', 'clean', 'shutdownCause', 'bootFaults',
-                                 'panic', 'shutdownStall', 'jetsamReportsLast2h') or not isinstance(source, dict):
+                                 'panic', 'shutdownStall', 'jetsamReportsLast2h', 'shutdownRequest',
+                                 'shutdownRecord', 'shutdownReason', 'bootReason', 'forcedWatchdogTimeout') or not isinstance(source, dict):
                     continue
                 result[key][field] = {k: (path(v) if k == 'path' else v if v is None or type(v) in (int, bool) else text(v))
                     for k, v in source.items() if k in ('read', 'error', 'path', 'windowStart',
                     'windowEnd', 'droppedRows', 'dumpPanic', 'lastRow', 'lastSample',
-                    'shutdownRecord', 'abnormalEvidence')}
+                    'shutdownRecord', 'abnormalEvidence', 'sampleRead', 'sampleError', 'verdict')}
     return result
 
 

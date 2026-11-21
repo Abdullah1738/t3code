@@ -82,12 +82,24 @@ not establish how long the Mac froze.
 A clean boot requires the adjacent shutdown record from `last -y reboot shutdown`
 and no positive panic/reset-fault evidence. A shutdown-stall report records a
 slow orderly shutdown; its presence alone does not make the boot unclean.
+The record includes the requested operation, loginwindow sender PID/bundle and
+confirmation time, launchd's caller chain, sessionlogoutd's non-update verdict,
+and the raw `kern.shutdownreason`/`kern.bootreason` values from that same boot.
+The sender identifies a process; the human or automation activating the request
+remains unknown. A `wdog,reset_in_1` token alone does not establish an unclean
+boot or a forced watchdog timeout; `forcedWatchdogTimeout` stays null without
+explicit timeout/check-in-failure evidence. Shutdown-stall files are decoded
+with `spindump -i` on a private copy to obtain the actual sample start/end;
+the filename timestamp (or mtime when absent) matches reports to boots. The
+native decoder appends input metadata, so the original file is never passed
+to it. Decode failures preserve presence and a source error.
 #92 found no numeric shutdown cause on this Apple-silicon host; any future numeric code is retained as unmapped,
-without Intel cause tables. One filtered unified-log query covers only the first
-three minutes of boot, with a 15-second process-group deadline and timestamp
+without Intel cause tables. Filtered unified-log queries cover the three minutes
+before boot for shutdown context and the first three minutes after boot for
+shutdown cause, each with a 15-second process-group deadline and timestamp
 post-filtering. ResetCounter uses plain reads, without sudo. Observations are
 timestamped at boot (`observedAt` records collection time), persisted once per
-boot and survive the daily log cap. Unclean boots queue one
+boot and survive the daily log cap. Unclean boots and orderly shutdown stalls queue one
 Telegram alert with a stable boot key; failed sends retry that same key/text,
 even across later boots. Unfinished observations remain in a persistent queue;
 each invocation retries one queued boot alongside the current boot. A late
