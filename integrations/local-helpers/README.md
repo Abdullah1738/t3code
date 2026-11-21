@@ -278,6 +278,23 @@ or missing identity. `repeatCount` tracks matching session/rule/first-word retri
 until a 60-second gap; native counts are best effort when hooks overlap.
 When an error tag has no IDs, its `sampleId` gives the day file, timestamp and
 one-based physical line number so the original record can still be found.
+
+`toollog refusals --day YYYY-MM-DD [--rule R] [--top N] [--json]` prints the
+day's denied/rewritten hook decisions grouped by rule and command shape; the
+agent-tools rollup carries the same data as `refusalShapes`. Each shape has
+`count` (denied plus sampleRate-weighted rewrites, `~`/`sampled` when estimated),
+`distinctThreads`, `unattributed` (`unknown:*` rows), `retryWithin5m` (the same
+thread hit the same rule and shape again within 300 s, so it was stuck; the
+previous UTC day's last 5 minutes count as context), `harness` and `topProjects`.
+Denials rank first; past 100 shapes the rest fold into `other`. Rows marked
+`source: test` are excluded and counted in `excludedTestRows`.
+Hooks write `cmdShape` and `project` on refusals only. A shape keeps operators,
+flag names, env var names, file extensions, the program name and subcommands
+from a fixed vocabulary; paths, quoted text, numbers, variables and other words
+become placeholders (`sqlite3 <path.sqlite> <q>`), and no raw command is stored.
+`project` is the folder name of the git repository the command ran in (the main
+checkout for worktrees). Rows written before shapes existed group as
+`coarse:<firstWord> cwd:<cwdClass>`.
 The Python logger has one source in `libexec/toollog/`; the other integrations'
 source symlinks are materialized beside their entry points by their installers.
 
