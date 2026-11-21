@@ -406,7 +406,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       void chat.parts.delivery?.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
       if (ready()) void chat.parts.router?.checkCompletion();
       if (ready()) void chat.parts.replyGap?.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });
-      if (ready()) void chat.parts.router?.checkInboundLatency().catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
+      void chat.parts.router?.checkInboundLatency(ready()).catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
       if (ready() && !chat.parts.busy) {
         chat.parts.busy = true;
         const revision = chat.revision;

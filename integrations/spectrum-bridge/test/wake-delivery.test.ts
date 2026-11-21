@@ -1,5 +1,6 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { ControlError } from "../src/control.ts";
 import { OpenChamber, type MessageRecord } from "../src/openchamber.ts";
 import { Router } from "../src/router.ts";
@@ -85,6 +86,176 @@ test.each([false, true])("a timed-out wake that landed is admitted without anoth
   });
 });
 
+test.each([false, true].flatMap(gateDown => [false, true].map(restart => ({ gateDown, restart }))))
+("held wake fails by its receipt deadline despite a stuck holder $gateDown/$restart", async ({ gateDown, restart }) => {
+  const h = setup();
+  new WakeDelivery(h.store).accept(id, "robob-watch held");
+  const holder = { id: "session", directory: "/test/chat", generation: 1, inboundId: "reset:holder",
+    messageId: "msg_holder", phase: "running", startedAt: start - 60_000 };
+  h.store.set("route", { id: holder.id, directory: holder.directory, generation: holder.generation });
+  h.store.set("activeTurn", holder);
+  h.backend.available = !gateDown;
+  const logs = await captureLogs(async () => {
+    let router = h.router();
+    setSystemTime(start + 29 * 60_000);
+    await router.checkInboundLatency();
+    expect(wakeStatus(h.store, id)?.state).toBe("queued");
+    if (restart) router = h.router();
+    setSystemTime(start + 30 * 60_000);
+    await router.checkInboundLatency();
+    await router.checkInboundLatency();
+    expect(wakeStatus(h.store, id)).toMatchObject({ state: "failed", attempts: 0, failedAt: Date.now() });
+    expect(h.state()).toBe("failed");
+    expect(h.store.get<typeof holder>("activeTurn")).toEqual(holder);
+    expect(h.backend.prompts).toEqual([]);
+    expect(h.store.get<{ id: string }[]>("missedSynthetic")?.map(row => row.id)).toEqual([id]);
+  });
+  expect(logs.filter(line => line.name === "wake.failed")).toHaveLength(1);
+  expect(logs.find(line => line.name === "wake.failed")?.props).toMatchObject({ reason: "delivery_deadline", attempt: 0 });
+  expect(logs.some(line => line.name === "wake.waiting" && line.props?.holderPhase === "running")).toBe(true);
+});
+
+test.each(["main.ts", "sb-main.ts"].flatMap(file => [false, true].flatMap(restart =>
+  [false, true].map(initiallyReady => ({ file, restart, initiallyReady })))))
+("$file sender expires receipts while transport is unready ($restart/$initiallyReady)", async ({ file, restart, initiallyReady }) => {
+  const h = setup(); new WakeDelivery(h.store).accept(id);
+  let router = h.router();
+  let backendCalls = 0, deliveryTicks = 0;
+  h.backend.promptAccepted = async () => { backendCalls++; return false; };
+  h.backend.messages = async () => { backendCalls++; return []; };
+  const errors: unknown[] = [], checks: Promise<void>[] = [];
+  const backendWork = async () => { backendCalls++; };
+  const clock = {
+    checkInboundLatency: (...args: Parameters<Router["checkInboundLatency"]>) => {
+      const check = router.checkInboundLatency(...args); checks.push(check); return check;
+    },
+    checkCompletion: backendWork, checkFailedInbound: backendWork, tick: backendWork,
+  };
+  const delivery = { tick: async () => { deliveryTicks++; } };
+  const replyGap = { tick: backendWork };
+  // Execute the production interval callback with isolated dependencies, without booting either service.
+  const source = readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8");
+  const begin = source.indexOf("  const timer = setInterval(() => {");
+  const end = source.indexOf("  }, 1_000);", begin);
+  expect(begin).toBeGreaterThan(0); expect(end).toBeGreaterThan(begin);
+  let fire: (() => void) | undefined;
+  const interval = new Bun.Transpiler({ loader: "ts" }).transformSync(source.slice(begin, end + "  }, 1_000);".length));
+  const install = new Function("setInterval", "ready", "router", "delivery", "replyGap", "chats", "toolError", "log",
+    `let routerBusy = true;\n${interval}`);
+  let ready = initiallyReady;
+  install((callback: () => void, ms: number) => { expect(ms).toBe(1_000); fire = callback; }, () => ready,
+    clock, delivery, replyGap, { all: () => [{ parts: { router: clock, delivery, replyGap, busy: true } }] },
+    (...args: unknown[]) => errors.push(args), (...args: unknown[]) => errors.push(args));
+  fire!(); await Promise.all(checks.splice(0));
+  backendCalls = 0; ready = false;
+  const logs = await captureLogs(async () => {
+    setSystemTime(start + 29 * 60_000);
+    fire!(); await Promise.all(checks.splice(0));
+    expect(wakeStatus(h.store, id)?.state).toBe("queued");
+    if (restart) router = h.router();
+    setSystemTime(start + 30 * 60_000);
+    fire!(); await Promise.all(checks.splice(0));
+    fire!(); await Promise.all(checks.splice(0));
+    expect(wakeStatus(h.store, id)).toMatchObject({ state: "failed", attempts: 0 });
+    expect(h.state()).toBe("failed");
+  });
+  expect(logs.filter(line => line.name === "wake.failed")).toHaveLength(1);
+  expect(deliveryTicks).toBe(4);
+  expect(backendCalls).toBe(0);
+  expect(h.backend.prompts).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+test.each([false, true])("held wake deadline runs while a latency probe is still blocked (lateAccepted=%s)", async accepted => {
+  const h = setup(); new WakeDelivery(h.store).accept(id);
+  const begun = Promise.withResolvers<void>(), result = Promise.withResolvers<boolean>();
+  const route = { id: "session", directory: "/test/chat", generation: 1 };
+  h.store.set("route", route);
+  h.store.set(`failed-delivery:${id}`, { ...route, inboundId: id, messageId: promptId, startedAt: start, phase: "unknown" });
+  h.backend.promptAccepted = async () => { begun.resolve(); return result.promise; };
+  const logs = await captureLogs(async () => {
+    const router = h.router();
+    setSystemTime(start + 29 * 60_000);
+    const scan = router.checkInboundLatency(); await begun.promise;
+    setSystemTime(start + 30 * 60_000);
+    const deadline = router.checkInboundLatency();
+    const stateAtDeadline = wakeStatus(h.store, id)?.state;
+    result.resolve(accepted); await scan; await deadline;
+    expect(stateAtDeadline).toBe("failed");
+    expect(wakeStatus(h.store, id)?.state).toBe("failed");
+    expect(h.backend.prompts).toEqual([]);
+    expect(h.store.get("activeTurn")).toBeUndefined();
+  });
+  expect(logs.filter(line => line.name === "wake.failed")).toHaveLength(1);
+});
+
+test("an unsent wake checks its total deadline at the final POST boundary", async () => {
+  const h = setup(); new WakeDelivery(h.store).accept(id);
+  h.backend.beforePrompt = () => setSystemTime(start + 30 * 60_000);
+  const logs = await captureLogs(async () => {
+    setSystemTime(start + 29 * 60_000);
+    await h.router().tick();
+    expect(wakeStatus(h.store, id)).toMatchObject({ state: "failed", attempts: 0 });
+    expect(h.backend.prompts).toEqual([]);
+  });
+  expect(logs.filter(line => line.name === "wake.failed")).toHaveLength(1);
+});
+
+test("waiting diagnostics are periodic across restart and contain no event body", async () => {
+  const h = setup(); h.backend.available = false; new WakeDelivery(h.store).accept(id);
+  const logs = await captureLogs(async () => {
+    await h.router().checkInboundLatency();
+    setSystemTime(start + 5 * 60_000 - 1); await h.router().checkInboundLatency();
+    setSystemTime(start + 5 * 60_000); await h.router().checkInboundLatency();
+  });
+  const waiting = logs.filter(line => line.name === "wake.waiting");
+  expect(waiting).toHaveLength(2);
+  expect(waiting.map(line => line.props)).toEqual([0, 5 * 60_000].map(waitMs => ({
+    source: "bridge", reason: "link_down", waitMs, boundMs: 30 * 60_000, remainingMs: 30 * 60_000 - waitMs,
+  })));
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_EVENT");
+});
+
+test("a failed reply reminder cannot strand its sealed wake past the delivery deadline", async () => {
+  const h = setup(), reminder = "wake:reply-nudge:sealed-reminder";
+  new WakeDelivery(h.store).accept(id);
+  h.store.acceptInbound(reminder, { id: reminder, text: "PRIVATE_REMINDER", attachments: [], receivedAt: start });
+  const logs = await captureLogs(async () => {
+    const router = h.router(); await router.tick();
+    for (const elapsed of [60_000, 120_000]) { setSystemTime(start + elapsed); await router.tick(); }
+    expect(wakeStatus(h.store, reminder)?.state).toBe("failed");
+    const sent = h.backend.prompts.length;
+    setSystemTime(start + 30 * 60_000); await router.checkInboundLatency();
+    expect(wakeStatus(h.store, id)?.state).toBe("failed");
+    expect(h.state()).toBe("failed");
+    expect(h.store.get<{ id: string; uncertain?: boolean }[]>("missedSynthetic"))
+      .toEqual([expect.objectContaining({ id, uncertain: true })]);
+    await h.router().tick();
+    expect(h.backend.prompts).toHaveLength(sent);
+  });
+  expect(logs.filter(line => line.name === "wake.failed" && line.ids?.inboundId === id)).toHaveLength(1);
+});
+
+test.each(["wake:failed-sibling", "wake:reply-nudge:failed-sibling"].flatMap(failedId =>
+  [false, true].map(failedLeader => ({ failedId, failedLeader }))))
+("a terminal batch member cannot block expiry $failedId/$failedLeader", async ({ failedId, failedLeader }) => {
+  const h = setup();
+  const tracker = new WakeDelivery(h.store); tracker.accept(id);
+  h.store.acceptInbound(failedId, { id: failedId, text: "PRIVATE_FAILED", attachments: [], receivedAt: start });
+  tracker.accept(failedId); tracker.failed(failedId, "attempts_exhausted");
+  const leader = failedLeader ? failedId : id, member = failedLeader ? id : failedId;
+  h.store.set(`batch:${leader}`, { id: leader, text: "PRIVATE_BATCH", attachments: [], batchIds: [leader, member], receivedAt: start });
+  h.store.updateInbound(leader, "processing"); h.store.updateInbound(member, "batched");
+  h.backend.available = false;
+  const logs = await captureLogs(async () => {
+    setSystemTime(start + 30 * 60_000); await h.router().checkInboundLatency();
+    expect(wakeStatus(h.store, id)).toMatchObject({ state: "failed", attempts: 0 });
+    expect(h.state()).toBe("failed");
+    expect(h.backend.prompts).toEqual([]);
+  });
+  expect(logs.filter(line => line.name === "wake.failed" && line.ids?.inboundId === id)).toHaveLength(1);
+});
+
 test.each([30 * 60_000, 24 * 60 * 60_000, 24 * 60 * 60_000 + 1])("legacy wake migration expires age=%s once, with no stale notice after 24 hours", async age => {
   const h = setup();
   setSystemTime(start + age);
@@ -95,7 +266,7 @@ test.each([30 * 60_000, 24 * 60 * 60_000, 24 * 60 * 60_000 + 1])("legacy wake mi
     expect(wakeStatus(h.store, id)?.state).toBe("failed");
     expect(h.backend.prompts).toEqual([]);
     expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toHaveLength(age <= 24 * 60 * 60_000 ? 1 : 0);
-    expect(h.store.get<{ id: string }[]>("missedSynthetic")?.some(row => row.id === id) ?? false).toBe(age <= 24 * 60 * 60_000);
+    expect(h.store.get<{ id: string }[]>("missedSynthetic")?.some(row => row.id === id) ?? false).toBe(age <= 6 * 60 * 60_000);
   });
 });
 
@@ -117,20 +288,20 @@ test("an ambiguous wake expires on the local clock even while the link gate stay
   });
 });
 
-test("a wake held before any POST does not start the ambiguity clock", async () => {
+test("a wake held before any POST expires without inventing a send attempt", async () => {
   const h = setup(); h.backend.available = false;
   await captureLogs(async () => {
     new WakeDelivery(h.store).accept(id);
     const router = h.router(); await router.tick();
     setSystemTime(start + WAKE_AMBIGUITY_MS + 60_000);
     await router.tick();
-    expect(h.state()).toBe("pending");
-    expect(wakeStatus(h.store, id)).toMatchObject({ state: "queued", attempts: 0 });
+    expect(h.state()).toBe("failed");
+    expect(wakeStatus(h.store, id)).toMatchObject({ state: "failed", attempts: 0 });
     expect(wakeStatus(h.store, id)?.firstSendAt).toBeUndefined();
     h.backend.available = true; h.backend.outcome = "landed";
     await router.tick();
-    expect(wakeStatus(h.store, id)?.state).toBe("admitted");
-    expect(h.backend.prompts).toEqual([promptId]);
+    expect(wakeStatus(h.store, id)?.state).toBe("failed");
+    expect(h.backend.prompts).toEqual([]);
   });
 });
 
@@ -342,7 +513,7 @@ test("retiring the sealed retry destination fails every member with notice and c
 });
 
 test.each([false, true].flatMap(modern => [-1, 0, 1].map(offset => ({ modern, offset }))))
-("preparation rechecks the legacy receipt cutoff $modern/$offset", async ({ modern, offset }) => {
+("preparation rechecks the receipt cutoff $modern/$offset", async ({ modern, offset }) => {
   const h = setup();
   if (modern) new WakeDelivery(h.store).accept(id);
   await captureLogs(async () => {
@@ -351,7 +522,7 @@ test.each([false, true].flatMap(modern => [-1, 0, 1].map(offset => ({ modern, of
     setSystemTime(start + WAKE_AMBIGUITY_MS - 2);
     const tick = h.router().tick(); await begun.promise;
     setSystemTime(start + WAKE_AMBIGUITY_MS + offset); created.resolve(); await tick;
-    const expired = !modern && offset >= 0;
+    const expired = offset >= 0;
     expect(h.backend.prompts).toHaveLength(expired ? 0 : 1);
     expect(wakeStatus(h.store, id)?.state).toBe(expired ? "failed" : "ambiguous");
     expect(h.state()).toBe(expired ? "failed" : "processing");
@@ -463,10 +634,10 @@ test("lifecycle logs retain source, waiting run, retry timing and final outcomes
   const logs = await captureLogs(async () => {
     const tracker = new WakeDelivery(h.store);
     tracker.accept(id, source); tracker.waiting(id, "prior-run");
-    setSystemTime(start + 31 * 60_000);
+    setSystemTime(start + 60_000);
     const router = h.router(); await router.tick();
     for (const elapsed of [60_000, 120_000, 150_000, 180_000, 240_000, 300_000, 360_000]) {
-      setSystemTime(start + 31 * 60_000 + elapsed); await router.tick();
+      setSystemTime(start + 60_000 + elapsed); await router.tick();
     }
     expect(wakeStatus(h.store, id)?.state).toBe("failed");
     const next = "wake:admitted-log";
@@ -476,10 +647,10 @@ test("lifecycle logs retain source, waiting run, retry timing and final outcomes
   });
   const lifecycle = logs.filter(line => line.name.startsWith("wake."));
   expect(new Set(lifecycle.map(line => line.name))).toEqual(new Set([
-    "wake.accepted", "wake.turn_start", "wake.send_ambiguous", "wake.retry_scheduled", "wake.failed", "wake.admitted",
+    "wake.accepted", "wake.waiting", "wake.turn_start", "wake.send_ambiguous", "wake.retry_scheduled", "wake.failed", "wake.admitted",
   ]));
   const started = lifecycle.find(line => line.name === "wake.turn_start" && line.ids?.inboundId === id)!;
-  expect(started.props).toMatchObject({ source, holderRunId: "prior-run", waitMs: 31 * 60_000, batchSize: 1 });
+  expect(started.props).toMatchObject({ source, holderRunId: "prior-run", waitMs: 60_000, batchSize: 1 });
   expect(lifecycle.find(line => line.name === "wake.send_ambiguous")?.props).toMatchObject({ route: "/threads/:id/send" });
   expect(lifecycle.filter(line => line.ids?.inboundId === id).every(line => line.props?.source === source)).toBe(true);
   expect(JSON.stringify(lifecycle)).not.toMatch(/PRIVATE_EVENT|PRIVATE_NEXT/);
