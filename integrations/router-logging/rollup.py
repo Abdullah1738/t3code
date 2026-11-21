@@ -12,6 +12,7 @@ from toollog import directory, safe_target, token, CONNECTION_ERRNOS, SYSCALLS
 from volume import REASONS, integer
 from listener_rollup import windows as listener_windows
 from pool_rollup import summarize as pool_summary
+from routing_rollup import RoutingSummary
 
 
 def percentiles(values):
@@ -83,6 +84,7 @@ def rollup(day, root=None, now=None):
     root = Path(root) if root is not None else directory()
     counts, kinds, tags = Counter(), Counter(), Counter()
     pool_rows = []
+    routing = RoutingSummary()
     times, samples = defaultdict(list), {}
     targets = defaultdict(Counter)
     target_components = defaultdict(Counter)
@@ -129,6 +131,7 @@ def rollup(day, root=None, now=None):
                             raise ValueError('invalid lock dimensions')
                     total += 1
                     counts[row['name']] += 1
+                    routing.add(row)
                     if row['name'] in ('pool.exhausted', 'pool.recovered'):
                         pool_rows.append(row)
                     if row['name'] in ('health.request.late', 'supervisor.health_probe'):
@@ -332,6 +335,7 @@ def rollup(day, root=None, now=None):
         attemptsHistogram={str(n): count for n, count in sorted(attempts.items())},
         abortTtfbMs=percentiles(abort_ttfb),
     )
+    result['stickyMoves'], result['fallbacks'] = routing.result()
     result['locks'] = dict(
         count=sum(g['count'] for g in locks.values()), distinct=len(distinct), unlocks=unlocks,
         byProviderModelCause=[dict(provider=p, model=m, cause=c, count=g['count'], distinct=len(g['distinct']), capped=g['capped'], upstreamResetMs=percentiles(g['resets']), lockMs=percentiles(g['durations'])) for (p, m, c), g in sorted(locks.items())],

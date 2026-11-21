@@ -63,6 +63,18 @@ yesterday's rollup on its first successful run after 00:05 UTC. Invalid lines
 are counted and skipped.
 `complete` means `generatedAt` is on or after the next UTC midnight; incomplete rollups are regenerated after 00:05Z, and lock `distinct` counts dedupe account/provider/model/deadline-minute while `count` keeps raw lines.
 
+`stickyMoves` counts every `proxy.sticky_miss` row, including held/unavailable
+selections (`byDecision`), by reason, previous lock cause, model, and UTC hour.
+`byHourReason` shows whether a cluster shares a cause. Legacy dimensions are
+`unknown`; absent reasons never disappear from the totals.
+`fallbacks` groups reasons and from/to provider-model pairs. Its chain histogram
+counts fallback rows per request, including zero for requests with no fallback.
+The denominator is the union of IDs from all observed `proxy.*` rows;
+`rowsWithoutRequest` keeps unjoinable rows visible outside that denominator.
+A partial day or capped log can undercount chains. Replay a retained day without
+rewriting its live report with
+`python3 -I integrations/router-logging/test/replay_routing.py <day-file> --day YYYY-MM-DD`.
+
 `account.lock` and `account.unlock` carry hashed account IDs, scope, classifier
 cause, deadline and the source request ID when known. DB expiry is recorded on
 the next connection read; `until` is the actual deadline, not the observation
