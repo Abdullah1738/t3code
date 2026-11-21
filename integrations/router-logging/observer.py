@@ -20,7 +20,7 @@ FIELDS = {'history_scan_parse': 'historyScanParseMs', 'rollup_write': 'rollupWri
           'history_refresh': 'historyRefreshMs', 'launchctl': 'launchctlMs',
           'tcp': 'tcpMs', 'providers_fetch': 'providersFetchMs',
           'usage_fetch': 'usageFetchMs', 'stats_fetch': 'statsFetchMs',
-          'snapshot': 'snapshotMs'}
+          'snapshot': 'snapshotMs', 'log_write': 'logWriteMs'}
 _active = contextvars.ContextVar('observer_timing', default=None)
 
 

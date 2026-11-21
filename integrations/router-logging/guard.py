@@ -352,9 +352,10 @@ def serve():
                         guard.step(time.time() * 1000, job, listener, read_json(runtime.marker), runtime.lock_age_ms(), runtime.observation)
                     except Exception:
                         emit('guard', 'guard.error', kind='error', error=dict(tag='tick_failed'))
+                    guard.state['observerTick'] = sample
+                    with contextlib.suppress(OSError):
+                        guard.save(guard.state)
                 guard.state['observerTick'] = timing.end
-                with contextlib.suppress(OSError):
-                    guard.save(guard.state)
                 if pool_alerts is None or pool_alerts.poll() is not None:
                     # Delivery can block on several historical bridge retries.
                     # Its own process keeps listener repair on the 15 s cadence.

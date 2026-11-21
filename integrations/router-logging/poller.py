@@ -11,9 +11,9 @@ import time
 import urllib.error
 import urllib.request
 from rollup import rollup
-from listener_rollup import windows as listener_windows
+from listener_rollup import timestamp, windows as listener_windows
 from toollog import directory, emit
-from observer import measured, observed, phase
+from observer import GAP_NAMES, gap_summary, measured, observed, phase
 
 BASE = 'http://127.0.0.1:20128'
 
@@ -159,9 +159,63 @@ def rollup_complete(path):
         return False
 
 
+def late_gap_days(root, days, now, state):
+    # Only new bytes can contain late completions; keep the cursor across poll children.
+    prior = state.get('gapSources', {})
+    if not isinstance(prior, dict):
+        prior = {}
+    sources, changed = {}, set()
+    for path in root.glob('????-??-??.ndjson'):
+        old = prior.get(path.name, {})
+        if not isinstance(old, dict):
+            old = {}
+        try:
+            source = path.open('rb')
+        except FileNotFoundError:
+            continue
+        with source:
+            info = os.fstat(source.fileno())
+            identity = [info.st_dev, info.st_ino]
+            offset = old.get('offset', 0)
+            append = (old.get('identity') == identity and type(offset) is int and 0 <= offset <= info.st_size
+                      and (offset < info.st_size or old.get('mtime') == info.st_mtime_ns))
+            old_days = old.get('days', [])
+            touched = set(day for day in old_days if isinstance(day, str)) & set(days) if isinstance(old_days, list) else set()
+            if not append:
+                changed.update(touched)
+                touched = set()
+                offset = 0
+            source.seek(offset)
+            while line := source.readline():
+                row = None
+                try:
+                    if not line.endswith(b'\n') or any(name.encode() in line for name in GAP_NAMES):
+                        row = json.loads(line)
+                except (ValueError, UnicodeError):
+                    if not line.endswith(b'\n'):
+                        break
+                if isinstance(row, dict) and row.get('tool') == '9router' and isinstance(row.get('name'), str) and row['name'] in GAP_NAMES:
+                    recorded = timestamp(row.get('ts'))
+                    if recorded is not None and recorded > now.timestamp() * 1000:
+                        break
+                    for day in days:
+                        if any(gap_summary([row], day, now).values()):
+                            changed.add(day)
+                            touched.add(day)
+                offset = source.tell()
+            sources[path.name] = dict(identity=identity, offset=offset, mtime=info.st_mtime_ns, days=sorted(touched))
+    for name in prior.keys() - sources.keys():
+        old_days = prior[name].get('days', []) if isinstance(prior[name], dict) else []
+        if isinstance(old_days, list):
+            changed.update(day for day in old_days if isinstance(day, str) and day in days)
+    state['gapSources'] = sources
+    return changed
+
+
 @measured('history_refresh')
-def refresh_listener_rollups(root, now):
+def refresh_listener_rollups(root, now, state):
     # Daily counters are final, but a recovery can close an older listener window.
+    reports = {}
     for report in root.glob('rollup-????-??-??.json'):
         day = report.stem.removeprefix('rollup-')
         if day >= now.date().isoformat():
@@ -171,9 +225,12 @@ def refresh_listener_rollups(root, now):
             previous = json.loads(report.read_text()).get('listener', {})
             pending = any(row.get('end') is None for row in
                           [*previous.get('windows', []), *previous.get('unknownWindows', [])])
+            reports[day] = previous, pending
         except (OSError, ValueError, AttributeError, TypeError):
             continue
-        if pending and listener_windows(day, root, now) != previous:
+    late = late_gap_days(root, reports, now, state)
+    for day, (previous, pending) in reports.items():
+        if day in late or pending and listener_windows(day, root, now) != previous:
             rollup(day, root, now=now)
 
 
@@ -206,7 +263,7 @@ def poll(get=None, root=None, now=None):
             state['rollupHour'] = hour
             save_state(state_path, state)
             emit('poller', 'log.rollup', kind='perf', ok=True, durationMs=rollup_ms)
-        refresh_listener_rollups(root, now)
+        refresh_listener_rollups(root, now, state)
         get = get or Router().get
         with phase('providers_fetch'):
             providers = get('/api/providers')

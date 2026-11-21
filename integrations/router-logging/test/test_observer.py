@@ -10,8 +10,10 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import observer
+import guard
 import poller
 import rollup
+import toollog
 from guard import Guard, Runtime
 from toollog import clean
 
@@ -25,6 +27,142 @@ def sample(wall=BASE, mono=1000, continuous=2000, pid=42, state='running'):
 
 
 class ObserverTests(unittest.TestCase):
+    def test_poll_refreshes_finalized_days_for_late_gap_class(self):
+        cases = [('pool-alerts', 'pool.endpoint.get', 'tick_blocked:pool_fetch'),
+                 ('poller', 'poll.phases', 'tick_blocked:rollup_write'),
+                 ('poller', 'rollup.phases', 'tick_blocked:rollup_write'),
+                 ('guard', 'guard.tick_late', 'tick_blocked:rollup_write'),
+                 ('guard', 'observer.gap', 'sleep_gap')]
+        get = lambda route: {'/api/providers': {'connections': []}, '/api/usage/logs': [],
+                             '/api/usage/stats?period=today': {'byAccount': {}}}[route]
+        for component, name, cause in cases:
+            for late_days in (1, 2):
+                with self.subTest(name=name, late_days=late_days), tempfile.TemporaryDirectory() as directory, patch('poller.emit'), patch('observer.emit'), patch('observer.job_snapshot', return_value={}):
+                    root = Path(directory)
+                    first = dt.datetime(2026, 11, 21, 0, 6, tzinfo=UTC)
+                    self.assertEqual(poller.poll(get, root, first), 0)
+                    report = root / 'rollup-2026-11-20.json'
+                    self.assertEqual(json.loads(report.read_text())['pollGaps'], [])
+                    ended = first.replace(minute=10) + dt.timedelta(days=late_days - 1)
+                    start = dt.datetime(2026, 11, 20, 23, 59, tzinfo=UTC)
+                    event = dict(tool='9router', component=component, name=name, kind='perf',
+                                 ts=observer.iso(ended.timestamp() * 1000), durationMs=(ended - start).total_seconds() * 1000,
+                                 props=dict(start=observer.iso(start.timestamp() * 1000), end=observer.iso(ended.timestamp() * 1000),
+                                            phase='rollup_write', cause=cause))
+                    if late_days == 1:
+                        event['props'].pop('start')
+                        event['props'].pop('end')
+                        event['props'].update(startedAtMs=start.timestamp() * 1000, finishedAtMs=ended.timestamp() * 1000)
+                    source = root / (ended.date().isoformat() + '.ndjson')
+                    # An incomplete append must remain available to the following poll.
+                    source.write_text(json.dumps(event)[:25])
+                    self.assertEqual(poller.poll(get, root, ended + dt.timedelta(minutes=1)), 0)
+                    with source.open('a') as out:
+                        out.write(json.dumps(event)[25:] + '\n')
+                    self.assertEqual(poller.poll(get, root, ended + dt.timedelta(minutes=2)), 0)
+                    result = json.loads(report.read_text())
+                    field = 'guardGaps' if component == 'guard' else 'pollGaps'
+                    self.assertEqual(result[field][0]['durationMs'], 60000)
+                    self.assertEqual(result[field][0]['cause'], cause)
+                    self.assertEqual(result['listener']['unknownWindows'], [])
+                    with patch.object(poller, 'rollup', wraps=rollup.rollup) as build:
+                        self.assertEqual(poller.poll(get, root, ended + dt.timedelta(minutes=3)), 0)
+                    self.assertNotIn('2026-11-20', [call.args[0] for call in build.call_args_list])
+
+    def test_guard_tick_includes_observer_state_write_stall(self):
+        seconds, checks, handlers = [0], [], {}
+        def clock():
+            return sample(BASE + seconds[0] * 1000, seconds[0] * 1000, seconds[0] * 1000)
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = MagicMock()
+            runtime.state_file = Path(directory) / 'guard.json'
+            runtime.marker = Path(directory) / 'deploy.json'
+            runtime.lock_age_ms.return_value = None
+            def observe():
+                checks.append('probe')
+                if len(checks) == 2:
+                    handlers[guard.signal.SIGTERM]()
+                return 'loaded', 'open'
+            runtime.observe.side_effect = observe
+            child = MagicMock()
+            child.poll.return_value = None
+            replace = os.replace
+            delayed = []
+            def slow_save(source, target):
+                state = json.loads(Path(source).read_text())
+                if target == runtime.state_file and 'observerTick' in state and not delayed:
+                    seconds[0] += 180
+                    delayed.append(True)
+                return replace(source, target)
+            with patch('guard.Runtime', return_value=runtime), patch('guard.signal.signal', side_effect=lambda key, callback: handlers.update({key: callback})), patch('guard.subprocess.Popen', return_value=child), patch('guard.job_snapshot', return_value={}), patch('observer.job_snapshot', return_value={}), patch('guard.clock_sample', side_effect=clock), patch('observer.clock_sample', side_effect=clock), patch('observer.time.monotonic', side_effect=lambda: seconds[0]), patch('guard.os.replace', side_effect=slow_save), patch('observer.emit') as emit:
+                guard.serve()
+            self.assertEqual(len(checks), 2)
+            self.assertEqual(emit.call_count, 1)
+            self.assertEqual(emit.call_args.args, ('guard', 'guard.tick_late'))
+            self.assertEqual(emit.call_args.kwargs['props']['stateSaveMs'], 180000)
+            self.assertEqual(emit.call_args.kwargs['props']['cause'], 'tick_blocked:state_save')
+
+    def test_poll_refresh_cursor_handles_future_rows_and_source_removal_class(self):
+        get = lambda route: {'/api/providers': {'connections': []}, '/api/usage/logs': [],
+                             '/api/usage/stats?period=today': {'byAccount': {}}}[route]
+        for change in ('truncate', 'replace', 'delete'):
+            with self.subTest(source_change=change), tempfile.TemporaryDirectory() as directory, patch('poller.emit'), patch('observer.emit'), patch('observer.job_snapshot', return_value={}):
+                root = Path(directory)
+                first = dt.datetime(2026, 11, 21, 0, 6, tzinfo=UTC)
+                source = root / '2026-11-21.ndjson'
+                source.write_text(json.dumps(dict(tool='9router', component='pool-alerts', name='pool.endpoint.get',
+                    kind='perf', ts='2026-11-21T00:10:00Z', durationMs=660000,
+                    props=dict(start='2026-11-20T23:59:00Z', end='2026-11-21T00:10:00Z'))) + '\n')
+                report = root / 'rollup-2026-11-20.json'
+                self.assertEqual(poller.poll(get, root, first), 0)
+                self.assertEqual(json.loads(report.read_text())['pollGaps'], [])
+                self.assertEqual(poller.poll(get, root, first.replace(minute=11)), 0)
+                self.assertEqual(json.loads(report.read_text())['pollGaps'][0]['durationMs'], 60000)
+                if change == 'delete':
+                    source.unlink()
+                elif change == 'replace':
+                    replacement = root / 'replacement'
+                    replacement.write_text('{}\n')
+                    replacement.replace(source)
+                else:
+                    source.write_text('')
+                self.assertEqual(poller.poll(get, root, first.replace(minute=12)), 0)
+                self.assertEqual(json.loads(report.read_text())['pollGaps'], [])
+
+    def test_ndjson_write_stalls_are_separate_from_snapshot_processing(self):
+        for mode in ('normal', 'failure', 'cap', 'volume'):
+            with self.subTest(write_mode=mode), tempfile.TemporaryDirectory() as directory:
+                seconds, delayed = [0], []
+                def clock():
+                    return sample(BASE + seconds[0] * 1000, seconds[0] * 1000, seconds[0] * 1000)
+                write = os.write
+                def slow_write(fd, data):
+                    if not delayed:
+                        seconds[0] += 180
+                        delayed.append(True)
+                        if mode == 'failure':
+                            raise OSError('fixture write failed')
+                    return write(fd, data)
+                with patch.dict(os.environ, ROUTER_LOG_DIR=directory), patch('observer.clock_sample', side_effect=clock), patch('observer.job_snapshot', return_value={}), patch('observer.time.monotonic', side_effect=lambda: seconds[0]), patch('toollog.os.write', side_effect=slow_write):
+                    with observer.Timings():
+                        if mode == 'cap':
+                            with patch.object(toollog, 'CAP', 0):
+                                poller.snapshot({'connections': []}, [], {}, dt.datetime(2026, 11, 20, tzinfo=UTC))
+                        elif mode == 'volume':
+                            state = toollog.volume.state_for(Path(directory), dt.datetime.now(UTC).date().isoformat())
+                            toollog.volume.dropped(state, 'daily_cap')
+                            toollog.report_volume()
+                        else:
+                            poller.snapshot({'connections': []}, [], {}, dt.datetime(2026, 11, 20, tzinfo=UTC))
+                rows = [json.loads(line) for path in Path(directory).glob('*.ndjson') for line in path.read_text().splitlines()]
+                phases = [row for row in rows if row['name'] == 'poll.phases']
+                self.assertEqual(len(phases), 1)
+                props = phases[0]['props']
+                self.assertEqual(props['logWriteMs'], 180000)
+                self.assertEqual(props['snapshotMs'], 0)
+                self.assertEqual(props['stateSaveMs'], 0)
+                self.assertEqual(props['cause'], 'tick_blocked:log_write')
+
     def test_gap_cause_input_class(self):
         before = sample()
         cases = [

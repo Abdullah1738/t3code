@@ -29,7 +29,7 @@ PROPS.update({'launchctlExit', 'launchctlStderr', 'jobState', 'jobPid', 'start',
               'previousPid', 'jobStateStart', 'jobStateEnd', 'jobPidStart', 'jobPidEnd', 'jobExitStart', 'jobExitEnd',
               'historyScanParseMs', 'rollupWriteMs', 'stateSaveMs', 'lockWaitMs', 'listenerHistoryMs',
               'poolHistoryMs', 'historyRefreshMs', 'launchctlMs', 'tcpMs', 'providersFetchMs',
-              'usageFetchMs', 'statsFetchMs', 'snapshotMs'})
+              'usageFetchMs', 'statsFetchMs', 'snapshotMs', 'logWriteMs'})
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
             'The operation was aborted due to timeout', 'The operation was aborted'}
@@ -146,6 +146,13 @@ def emit(component, name, kind='event', **fields):
 
 
 def _write(root, day, now, row, state):
+    # Import after initialization: observer itself uses this logger.
+    from observer import phase
+    with phase('log_write'):
+        return _write_row(root, day, now, row, state)
+
+
+def _write_row(root, day, now, row, state):
     is_volume = row['name'] == 'log.volume'
     try:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
