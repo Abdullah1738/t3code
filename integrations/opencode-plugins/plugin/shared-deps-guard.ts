@@ -1,5 +1,5 @@
 import { hook as toolLogHook } from "../lib/toollog";
-import { failureProps, runClassifier } from "../lib/classifier";
+import { classifierPhases, failureProps, runClassifier } from "../lib/classifier";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -54,6 +54,7 @@ export function createGuardHook(directory: string, check = classify) {
         { sessionId: event.sessionID },
         { cwd },
         failureProps(classifier, error, command, started),
+        classifierPhases(error),
       );
       return;
     }
@@ -66,6 +67,8 @@ export function createGuardHook(directory: string, check = classify) {
       undefined,
       { sessionId: event.sessionID },
       { cwd },
+      {},
+      classifierPhases(verdict),
     );
     if (verdict.denied && verdict.reason) {
       event.input = {

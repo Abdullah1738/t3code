@@ -6,9 +6,13 @@ import { basename, dirname, join, resolve } from 'node:path';
 export const CAP_BYTES = 50 * 1024 * 1024;
 export const HOOKS_CAP_BYTES = 35 * 1024 * 1024;
 export const HOOK_SAMPLE_RATE = 128;
+// Twin of toollog.py: hook rows slower than this carry measured phases and are never sampled or capped out.
+export const SLOW_HOOK_MS = 2000;
+export const HOOK_PHASES = ['identity_ms','lineage_ms','classify_ms','guard_ms','live_db_ms','desktop_ms',
+  'lock_wait_ms','log_write_ms','mask_ms','spawn_ms'] as const;
 const label = /^[A-Za-z0-9_.:-]{1,120}$/;
 const fields = new Set(['harness','guard','decision','rule','firstWord','commandLength','filesChanged','driftFound','differingCount','platform','billedMinutes','exitCode','failingStep','count','dryRun','toolCount','operation','status','cwdClass','matchedRoot','argv0Class','repeatCount','threadIdSource','sampleRate',
-  'classifier','errorClass','errorMessage','failMode','spawnMs','classifyMs','totalMs','cmdKind','holder','adbVerb','source']);
+  'classifier','errorClass','errorMessage','failMode','spawnMs','classifyMs','totalMs','cmdKind','holder','adbVerb','source',...HOOK_PHASES]);
 // Callers build errorMessage from fixed strings only (lib/classifier.ts), so it may hold spaces.
 const messageText = /^[A-Za-z0-9 _.:,()'\/-]{1,200}$/;
 const idFields = new Set(['sessionId','threadId','cardNumber','serverId','home','sampleId']);
@@ -54,6 +58,16 @@ export function hookProps(props: Record<string, unknown>, error = false) {
   // Independent sampling also works for one-shot native hook processes.
   result.sampleRate = HOOK_SAMPLE_RATE;
   return result;
+}
+const roundMs = (value: number) => Math.round(value * 1000) / 1000;
+// Compare the value emit() writes, so the writer and the cap agree at the boundary.
+const isSlow = (durationMs: unknown) => typeof durationMs === 'number' && Number.isFinite(durationMs) && roundMs(durationMs) > SLOW_HOOK_MS;
+/** Integer phase fields for a slow hook row; nothing for a fast one. Unmeasured phases stay absent. */
+export function phaseProps(durationMs: number, phases: Record<string, unknown> = {}) {
+  if (!isSlow(durationMs)) return {};
+  const known = new Set<string>(HOOK_PHASES);
+  return Object.fromEntries(Object.entries(phases).filter(([key, value]) => known.has(key) &&
+    typeof value === 'number' && Number.isFinite(value) && value >= 0).map(([key, value]) => [key, Math.round(value as number)]));
 }
 const cwdCache = new Map<string, string>();
 export function cwdClass(cwd?: unknown) {
@@ -138,7 +152,7 @@ export function emit(component: string, kind: 'event' | 'perf' | 'error', name: 
       }
     }
     const row: Record<string, unknown> = {ts: now.toISOString(), tool: board, component, kind, name};
-    if (typeof options.durationMs === 'number' && Number.isFinite(options.durationMs) && options.durationMs >= 0) row.durationMs = Math.round(options.durationMs * 1000) / 1000;
+    if (typeof options.durationMs === 'number' && Number.isFinite(options.durationMs) && options.durationMs >= 0) row.durationMs = roundMs(options.durationMs);
     if (typeof options.ok === 'boolean') row.ok = options.ok;
     for (const [key, value] of [['ids', metadata(options.ids, idFields)], ['props', metadata(options.props, fields)]] as const) {
       if (Object.keys(value).length) row[key] = value;
@@ -156,20 +170,25 @@ export function emit(component: string, kind: 'event' | 'perf' | 'error', name: 
         kind: 'error', name: 'log.cap', ok: false, props: {component:scope, capBytes:cap},
         error: {tag:'log.cap', message:'Daily log cap reached'}});
     }
-    if (kind !== 'error' && (size >= CAP_BYTES || component === 'hooks' && size >= HOOKS_CAP_BYTES)) return;
+    const slow = name === 'hook.decision' && isSlow(row.durationMs);
+    if (kind !== 'error' && !slow && (size >= CAP_BYTES || component === 'hooks' && size >= HOOKS_CAP_BYTES)) return;
     const rate = options.props?.sampleRate;
     if (kind !== 'error' && typeof rate === 'number' && Number.isSafeInteger(rate) && rate > 1 && Math.random() >= 1 / rate) return;
     append(row);
   } catch {}
 }
-export function hook(guard: string, decision: string, rule: string, started: number, command?: unknown, errorTag?: string, ids?: Record<string, unknown>, context: {cwd?:unknown; matchedRoot?:unknown} = {}, extra: Record<string, unknown> = {}) {
+export function hook(guard: string, decision: string, rule: string, started: number, command?: unknown, errorTag?: string, ids?: Record<string, unknown>, context: {cwd?:unknown; matchedRoot?:unknown} = {}, extra: Record<string, unknown> = {}, phases: Record<string, unknown> = {}) {
   try {
+    const durationMs = performance.now() - started;
     const identity = hookIds(ids), commandFields = commandProps(command);
+    const props = hookProps({...extra, harness:'opencode', guard, decision, rule, threadIdSource:identity.source,
+      cwdClass:cwdClass(context.cwd), matchedRoot:matchedRoot(context.matchedRoot), argv0Class:'none',
+      repeatCount:repeatCount(identity.ids, guard, rule, commandFields.firstWord ?? 'none'), ...commandFields}, decision === 'denied' || !!errorTag);
+    // Every slow row is written, so it weighs 1 in the rollup's estimates.
+    if (isSlow(durationMs)) delete props.sampleRate;
     emit('hooks', decision === 'denied' || errorTag ? 'error' : 'perf', 'hook.decision', {
-      durationMs: performance.now() - started, ok: decision !== 'denied' && !errorTag, ids:identity.ids,
-      props: hookProps({...extra, harness:'opencode', guard, decision, rule, threadIdSource:identity.source,
-        cwdClass:cwdClass(context.cwd), matchedRoot:matchedRoot(context.matchedRoot), argv0Class:'none',
-        repeatCount:repeatCount(identity.ids, guard, rule, commandFields.firstWord ?? 'none'), ...commandFields}, decision === 'denied' || !!errorTag),
+      durationMs, ok: decision !== 'denied' && !errorTag, ids:identity.ids,
+      props: {...props, ...phaseProps(durationMs, phases)},
       errorTag: errorTag ?? (decision === 'denied' ? rule : undefined),
     });
   } catch {}
