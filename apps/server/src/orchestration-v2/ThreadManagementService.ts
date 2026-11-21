@@ -221,6 +221,7 @@ export type ThreadManagementInterruptResult =
       readonly dispatch: Orchestrator.OrchestratorV2DispatchResult;
     }
   | { readonly type: "no_active_run" }
+  | { readonly type: "orphan_turn_interrupted" }
   | {
       readonly type: "already_terminal";
       readonly run: OrchestrationV2Run & { readonly status: ThreadManagementTerminalRunStatus };
@@ -1909,7 +1910,11 @@ const make = Effect.gen(function* () {
   const interruptThread: ThreadManagementServiceShape["interruptThread"] = Effect.fn(
     "ThreadManagementService.interruptThread",
   )(function* (input) {
-    const target = yield* getProjectThreadRecords(input, ["runs", "providerTurns"]);
+    const target = yield* getProjectThreadRecords(input, [
+      "runs",
+      "providerTurns",
+      "providerThreads",
+    ]);
     const explicitRun =
       input.runId === undefined
         ? undefined
@@ -1931,6 +1936,69 @@ const make = Effect.gen(function* () {
     const interruptibleRun = latestActiveRun(target);
     if (interruptibleRun === undefined) {
       if (input.runId === undefined) {
+        const stopped = yield* threadDispatch
+          .withLock(
+            input.threadId,
+            Effect.gen(function* () {
+              // Recheck under the same lock used by sends before probing native state.
+              const current = yield* getProjectThreadRecords(input, [
+                "runs",
+                "providerTurns",
+                "providerThreads",
+              ]);
+              if (latestActiveRun(current) !== undefined) return false;
+              let interrupted = false;
+              for (const owner of current.providerThreads) {
+                if (owner.providerSessionId === null || owner.ownerNodeId !== null) continue;
+                const session = yield* sessions.get(owner.providerSessionId);
+                if (Option.isNone(session)) continue;
+                const turn = current.providerTurns.findLast(
+                  (row) =>
+                    row.providerThreadId === owner.id &&
+                    (row.status === "pending" || row.status === "running"),
+                );
+                if (turn !== undefined) {
+                  const stopped = yield* session.value
+                    .interruptTurn({
+                      providerThread: owner,
+                      providerTurnId: turn.id,
+                      requestRuntimeRestart: false,
+                      stopBackgroundWork: false,
+                    })
+                    .pipe(
+                      Effect.as(true),
+                      Effect.catchTags({
+                        ProviderAdapterTurnNotActiveError: (cause) =>
+                          session.value.interruptOrphanedTurn === undefined
+                            ? Effect.fail(cause)
+                            : Effect.succeed(false),
+                      }),
+                    );
+                  if (stopped) {
+                    interrupted = true;
+                    continue;
+                  }
+                }
+                if (session.value.interruptOrphanedTurn !== undefined) {
+                  interrupted =
+                    (yield* session.value.interruptOrphanedTurn({ providerThread: owner })) ||
+                    interrupted;
+                }
+              }
+              return interrupted;
+            }),
+          )
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new Orchestrator.OrchestratorDispatchError({
+                  commandId: input.commandId,
+                  commandType: "run.interrupt",
+                  cause,
+                }),
+            ),
+          );
+        if (stopped) return { type: "orphan_turn_interrupted" } as const;
         return { type: "no_active_run" } as const;
       }
       return yield* new ThreadManagementThreadNotInterruptibleError({
