@@ -223,6 +223,8 @@ class LoggingTests(unittest.TestCase):
         scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0,
                   agent_browser=dict(inventory=[],candidates=[],problems=[],actions=[],reap_enabled=False),
                   xcode_builds=dict(inventory=[],candidates=[],problems=[],actions=[],stop_enabled=False),
+                  mcp_orphan=dict(inventory=[],candidates=[],problems=[],actions=[],reap_enabled=False,counts={},rules={},
+                                  oldest_age_s=None,rss_kib=0,freed_rss_kib=0,reaped_counts={},owner_calls={}),
                   owner_calls={key: dict(count=0,p50_ms=None,p95_ms=None,max_ms=None,failures={}) for key in ('by_native','detail','recovery')}),resources=resources,candidates=[r['id'] for r in resources])
         with patch.object(watcher,'STATE_DIR',state), patch.object(janitor,'scan',return_value=scan), \
              patch.object(janitor,'act',side_effect=[(True,'done'),(False,'password=secret')]), \
@@ -325,6 +327,8 @@ class LoggingTests(unittest.TestCase):
         scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0,
                   agent_browser=dict(inventory=[],candidates=[],problems=[],actions=[],reap_enabled=False),
                   xcode_builds=dict(inventory=[],candidates=[],problems=[],actions=[],stop_enabled=False),
+                  mcp_orphan=dict(inventory=[],candidates=[],problems=[],actions=[],reap_enabled=False,counts={},rules={},
+                                  oldest_age_s=None,rss_kib=0,freed_rss_kib=0,reaped_counts={},owner_calls={}),
                   owner_calls={key: dict(count=0,p50_ms=None,p95_ms=None,max_ms=None,failures={}) for key in ('by_native','detail','recovery')}),resources=resources,candidates=['expo:1','expo:2'])
         for entry in ('cli','hourly'):
             with self.subTest(entry=entry), patch.object(janitor,'scan',return_value=scan), \

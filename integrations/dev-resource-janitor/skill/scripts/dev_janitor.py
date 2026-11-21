@@ -316,6 +316,18 @@ def stop_xcode_candidates(st):
         audit({"ts": int(time.time()), "event": "xcode_build_stop", **entry})
 
 
+def reap_mcp_candidates(st):
+    report = st.get("processes", {}).get("mcp_orphan")
+    if report is None:
+        return
+    report["actions"] = leftover_processes.reap_mcp_orphans(
+        report, rescan=lambda pid: leftover_processes.scan_mcp_orphans(
+            active_sessions.checked_snapshot(), keep_list(), target_pid=pid,
+            refresh_roster=active_sessions.checked_snapshot))
+    for entry in report["actions"]:
+        audit({"ts": int(time.time()), "event": "mcp_orphan", **entry})
+
+
 def audit(entry):
     os.makedirs(LOG_DIR, exist_ok=True)
     with open(AUDIT, "a") as f:
