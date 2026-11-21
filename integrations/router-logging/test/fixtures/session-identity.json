@@ -1,0 +1,9 @@
+[
+  {"ts":"2026-11-19T04:00:00Z","props":{"sessionId":"s:000000000001","sessionSrc":"hdr_session","client":"t3","uaProduct":"t3","model":"codex/sol","status":499}},
+  {"ts":"2026-11-19T01:00:00Z","props":{"sessionId":"s:000000000001","sessionSrc":"hdr_conversation","client":"t3","uaProduct":"t3","model":"codex/sol","status":499}},
+  {"ts":"2026-11-19T03:00:00Z","props":{"sessionId":"s:000000000001","sessionSrc":"body_cache_key","client":"t3","uaProduct":"t3","model":"codex/astra","status":200}},
+  {"ts":"2026-11-19T02:00:00Z","props":{"sessionId":"s:000000000002","sessionSrc":"hdr_claude","client":"claude-code","model":"claude/opus","status":499}},
+  {"ts":"2026-11-19T01:00:00Z","props":{"sessionId":"s:000000000003","sessionSrc":"hdr_session","client":"codex","model":"codex/sol","status":200}},
+  {"ts":"2026-11-19T02:00:00Z","props":{"sessionId":"none","sessionSrc":"none","client":"other","model":"unknown","status":499}},
+  {"ts":"2026-11-19T03:00:00Z","props":{"client":"other","model":"unknown","status":499}}
+]

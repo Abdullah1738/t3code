@@ -98,6 +98,9 @@ def rollup(day, root=None, now=None):
     providers = defaultdict(lambda: dict(count=0, aborted=0, statuses=Counter()))
     provider_tokens, model_tokens = defaultdict(Counter), defaultdict(Counter)
     upstream_codes = Counter()
+
+    sessions = {}
+    session_sources = Counter()
     attempts = Counter()
     abort_ttfb = []
     locks, lock_accounts = {}, Counter()
@@ -283,17 +286,39 @@ def rollup(day, root=None, now=None):
                         model['count'] += 1
                         model['aborted'] += aborted
                         client = props.get('client')
-                        if client not in ('claude-code', 'codex', 'opencode', 'ai-sdk', 'curl', 'node', 'python', 'browser', 'other'):
+                        if client not in ('claude-code', 'codex', 't3', 'opencode', 'ai-sdk', 'curl', 'node', 'python', 'browser', 'other'):
                             client = 'unknown'
                         key_id = proxy_key_id(props.get('keyId'))
                         for group_identity in (clients[client], keys[key_id]):
                             group_identity['count'] += 1
                             group_identity['aborted'] += aborted
+                        product = props.get('uaProduct', '')
+                        product = product if isinstance(product, str) and re.fullmatch(r'[a-z0-9._-]{0,24}', product) else ''
                         if client == 'other':
-                            product = props.get('uaProduct', '')
-                            product = product if isinstance(product, str) and re.fullmatch(r'[a-z0-9._-]{0,24}', product) else ''
                             other_products[product]['count'] += 1
                             other_products[product]['aborted'] += aborted
+                        source = props.get('sessionSrc')
+                        if source not in ('hdr_session', 'hdr_conversation', 'hdr_claude', 'body_cache_key', 'none'):
+                            source = 'unknown'
+                        session_sources[source] += 1
+                        session_id = props.get('sessionId')
+                        # Missing/legacy identity is not one shared caller session.
+                        if isinstance(session_id, str) and re.fullmatch(r's:[a-f0-9]{12}', session_id):
+                            session = sessions.setdefault(session_id, dict(count=0, aborted=0, clients=Counter(),
+                                products=Counter(), models=Counter(), firstTs=None, lastTs=None))
+                            session['count'] += 1
+                            session['aborted'] += aborted
+                            session['clients'][client] += 1
+                            session['products'][product] += 1
+                            session['models'][key[0]] += 1
+                            try:
+                                at = dt.datetime.fromisoformat(row.get('ts', '').replace('Z', '+00:00'))
+                                if at.tzinfo is not None:
+                                    stamp = at.astimezone(dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+                                    session['firstTs'] = min(session['firstTs'] or stamp, stamp)
+                                    session['lastTs'] = max(session['lastTs'] or stamp, stamp)
+                            except (ValueError, TypeError, AttributeError):
+                                pass
                         attempt_count = props.get('attempts')
                         if isinstance(attempt_count, int) and not isinstance(attempt_count, bool) and attempt_count >= 0:
                             attempts[attempt_count] += 1
@@ -341,6 +366,12 @@ def rollup(day, root=None, now=None):
             ttfbMs=percentiles(group['ttfb']),
             topErrors=[dict(tag=tag, count=count, sampleReq=group['samples'][tag]) for tag, count in group['errors'].most_common(20)],
         ))
+    aborting_sessions = sorted(((sid, group) for sid, group in sessions.items() if group['aborted']),
+                               key=lambda item: (-item[1]['aborted'], item[0]))
+    all_aborts = sum(group['aborted'] for group in models.values())
+    def top_label(counts):
+        return min(counts, key=lambda label: (-counts[label], label))
+
     result['proxySummary'] = dict(
         byModel=caller_breakdown(models, 'model'),
         byClient=caller_breakdown(clients, 'client'),
@@ -355,6 +386,15 @@ def rollup(day, root=None, now=None):
         lookupFailedRequests=keys.get('lookup_failed', {}).get('count', 0),
         abortsByClient={k: g['aborted'] for k, g in sorted(clients.items()) if g['aborted']},
         abortsByKeyId={k: g['aborted'] for k, g in sorted(keys.items()) if g['aborted']},
+        abortsBySession=[dict(sessionId=sid, client=top_label(group['clients']), uaProduct=top_label(group['products']),
+                             model=top_label(group['models']), count=group['count'], aborted=group['aborted'],
+                             clientAbortRate=group['aborted'] / group['count'], firstTs=group['firstTs'], lastTs=group['lastTs'])
+                        for sid, group in aborting_sessions[:20]],
+        sessionsWithAborts=len(aborting_sessions),
+        distinctSessions=len(sessions),
+        sessionSrcCounts=dict(sorted(session_sources.items())),
+        abortConcentration={f'top{n}': sum(group['aborted'] for _, group in aborting_sessions[:n]) / all_aborts if all_aborts else None
+                            for n in (1, 5, 20)},
         attemptsHistogram={str(n): count for n, count in sorted(attempts.items())},
         abortTtfbMs=percentiles(abort_ttfb),
     )
