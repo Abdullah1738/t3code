@@ -364,6 +364,14 @@ sys.exit(int(os.environ.get('FAKE_BROWSER_EXIT', '0')))
         with open(self.fixture, "w") as f:
             json.dump({"status_responses": responses}, f)
 
+    def helper(self):
+        import importlib.util
+        with unittest.mock.patch.dict(os.environ, dict(self.env, RIDE_SHARE_NOW="1000")):
+            spec = importlib.util.spec_from_file_location("heal_log_test", HELPER)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        return module
+
     def browser_calls(self):
         if not os.path.exists(self.browser_log):
             return []
@@ -374,6 +382,23 @@ sys.exit(int(os.environ.get('FAKE_BROWSER_EXIT', '0')))
         with open(self.fixture + ".calls") as f:
             # Any booking/change/cancellation command would fail this assertion.
             self.assertEqual(f.read().splitlines(), ["rides status"] * count)
+
+    def heal_row(self, reopen, retry_ok, error=None):
+        with open(os.path.join(self.dir, "heals.jsonl")) as f:
+            rows = [json.loads(line) for line in f]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(set(row), {"ts", "event", "reopen", "reopen_ms", "retry_ok", "error"})
+        self.assertEqual(row["ts"], "1970-01-01T00:16:40Z")
+        self.assertEqual(row["event"], "session_heal")
+        self.assertEqual(row["reopen"], reopen)
+        self.assertIs(type(row["reopen_ms"]), int)
+        self.assertGreaterEqual(row["reopen_ms"], 0)
+        self.assertIs(row["retry_ok"], retry_ok)
+        self.assertEqual(row["error"], error)
+        if error is not None:
+            self.assertLessEqual(len(error), 200)
+        return row
 
     def check_failed(self, **extra):
         with open(self.state, "w") as f:
@@ -390,6 +415,7 @@ sys.exit(int(os.environ.get('FAKE_BROWSER_EXIT', '0')))
         self.assertEqual(self.run_check(1000), [])
         self.assertEqual(self.browser_calls(), [])
         self.status_calls(1)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "heals.jsonl")))
 
     def test_reopen_saved_profile_once_then_clear_failure_streak(self):
         with open(self.state, "w") as f:
@@ -403,6 +429,8 @@ sys.exit(int(os.environ.get('FAKE_BROWSER_EXIT', '0')))
                          "--headed", "open", "https://m.uber.com/go/home"]])
         with open(self.state) as f:
             self.assertIsNone(json.load(f)["fail_since"])
+        self.assertIn("reopening saved profile once", p.stderr)
+        self.heal_row("ok", True)
 
     def test_recovered_active_trip_still_updates_card(self):
         self.responses(self.stale, {"ok": True, "result": {"trip": trip(A, "Accepted")}})
@@ -410,41 +438,48 @@ sys.exit(int(os.environ.get('FAKE_BROWSER_EXIT', '0')))
         self.assertEqual(self.card(A)["state"], "assigned")
         self.status_calls(2)
         self.assertEqual(len(self.browser_calls()), 1)
+        self.heal_row("ok", True)
 
     def test_second_stale_response_is_failure_without_another_reopen(self):
         self.responses(self.stale, self.stale, self.idle)
         self.check_failed()
         self.status_calls(2)
         self.assertEqual(len(self.browser_calls()), 1)
+        self.heal_row("ok", False, "retry status not ok")
 
     def test_retry_other_error_still_fails(self):
         self.responses(self.stale, {"ok": False, "error": {"code": "network", "message": "offline"}})
         self.check_failed()
         self.status_calls(2)
         self.assertEqual(len(self.browser_calls()), 1)
+        self.heal_row("ok", False, "retry status not ok")
 
     def test_malformed_retry_still_fails(self):
         self.responses(self.stale, "not JSON")
         self.check_failed()
         self.status_calls(2)
         self.assertEqual(len(self.browser_calls()), 1)
+        self.heal_row("ok", False, "retry status failed")
 
     def test_malformed_initial_response_never_opens_browser(self):
         self.responses("not JSON")
         self.check_failed()
         self.status_calls(1)
         self.assertEqual(self.browser_calls(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "heals.jsonl")))
 
     def test_failed_reopen_is_failure_without_retry(self):
         self.responses(self.stale, self.idle)
         self.check_failed(FAKE_BROWSER_EXIT="1")
         self.status_calls(1)
         self.assertEqual(len(self.browser_calls()), 1)
+        self.heal_row("failed", False, "reopen failed")
 
     def test_missing_browser_still_fails(self):
         self.responses(self.stale)
         self.check_failed(UBER_AGENT_BROWSER=os.path.join(self.dir, "missing-browser"))
         self.status_calls(1)
+        self.heal_row("failed", False, "reopen failed")
 
     def test_reopen_timeout_is_bounded_and_preserves_failure(self):
         import contextlib
@@ -474,6 +509,7 @@ sys.exit(int(os.environ.get('FAKE_BROWSER_EXIT', '0')))
             self.assertEqual(len(attempts), 1)
             with open(self.state) as f:
                 self.assertEqual(json.load(f)["fail_since"], 100)
+            self.heal_row("timeout", False, "reopen timed out")
 
     def test_unrelated_errors_never_reopen(self):
         errors = [
@@ -490,6 +526,66 @@ sys.exit(int(os.environ.get('FAKE_BROWSER_EXIT', '0')))
                 self.check_failed()
                 self.assertEqual(self.browser_calls(), [])
                 self.status_calls(i + 1)
+                self.assertFalse(os.path.exists(os.path.join(self.dir, "heals.jsonl")))
+
+    def test_unwritable_watch_dir_preserves_check_success_and_failure(self):
+        # A regular file cannot hold a log even when the test process runs as root.
+        for retry in (self.idle, self.stale):
+            with self.subTest(retry_ok=retry["ok"]):
+                self.responses(self.stale, retry)
+                if retry["ok"]:
+                    p = self.run_check_result(1000, WATCH_DIR=self.fixture)
+                    with open(self.state) as f:
+                        self.assertIsNone(json.load(f)["fail_since"])
+                else:
+                    p = self.check_failed(WATCH_DIR=self.fixture)
+                self.assertIn("ride-share: heal log failed", p.stderr)
+
+    def test_retry_error_details_are_not_logged(self):
+        private = "cookie=SECRET https://example.test/?token=SECRET 25.0712,55.1401"
+        self.responses(self.stale, {"ok": False, "error": {"code": private, "message": private}})
+        self.check_failed()
+        self.heal_row("ok", False, "retry status not ok")
+
+    def test_retry_timeout_preserves_exception_and_reopen_duration(self):
+        module = self.helper()
+        failure = subprocess.TimeoutExpired(["private-command", "token=SECRET"], 15)
+        with unittest.mock.patch.object(module, "uber", side_effect=[self.stale, failure]), \
+                unittest.mock.patch.object(module.subprocess, "run"), \
+                unittest.mock.patch.object(module.time, "monotonic", side_effect=[1, 1.125]), \
+                unittest.mock.patch.object(module, "now_ts", return_value=1000), \
+                self.assertRaises(subprocess.TimeoutExpired) as raised:
+            module.rides_status()
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(self.heal_row("ok", False, "retry status failed")["reopen_ms"], 125)
+
+    def test_unexpected_reopen_error_preserves_exception_without_retry(self):
+        module = self.helper()
+        failure = OSError("cookie=SECRET https://example.test/?token=SECRET 25.0712,55.1401")
+        with unittest.mock.patch.object(module, "uber", return_value=self.stale) as status, \
+                unittest.mock.patch.object(module.subprocess, "run", side_effect=failure), \
+                unittest.mock.patch.object(module, "now_ts", return_value=1000), \
+                self.assertRaises(OSError) as raised:
+            module.rides_status()
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(status.call_count, 1)
+        self.heal_row("failed", False, "reopen failed")
+
+    def test_heal_log_keeps_newest_complete_rows_when_capped(self):
+        module = self.helper()
+        path = os.path.join(self.dir, "heals.jsonl")
+        old = [{"attempt": i} for i in range(40)]
+        with open(path, "w") as f:
+            for row in old:
+                f.write(json.dumps(row) + "\n")
+        with unittest.mock.patch.object(module, "HEAL_LOG_MAX", 300):
+            module.log_heal({"attempt": "new"})
+        with open(path) as f:
+            rows = [json.loads(line) for line in f]
+        self.assertGreater(len(rows), 1)
+        self.assertLess(len(rows), len(old))
+        self.assertEqual(rows[:-1], old[-len(rows) + 1:])
+        self.assertEqual(rows[-1], {"attempt": "new"})
 
 
 class WatcherTest(Base):
