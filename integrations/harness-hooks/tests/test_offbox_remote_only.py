@@ -145,6 +145,10 @@ class OffboxRemoteOnlyTests(unittest.TestCase):
             "offbox run --include=$HOME/.robob/userdata/statev2.sqlite-wal -- ls",
             "offbox run --bg --pull ~/.robob/userdata -- 'ls'",
             "offbox run --pull ~/.t3/userdata/statev2.sqlite -- ls",
+            # Quotes or backslashes splitting one path still spell it.
+            'offbox run --bg -- \'sqlite3 "$HOME"/.t3/userdata/statev2.sqlite .tables\'',
+            'offbox run --bg --step \'sqlite3 "$HOME/.local/share"/opencode/opencode.db .tables\'',
+            'offbox run --bg -- \'sqlite3 "${HOME}"/.robob/user\\data/statev2.sqlite .tables\'',
         ]:
             with self.subTest(command=command):
                 self.assertEqual(self.decide(command)[0], READ)

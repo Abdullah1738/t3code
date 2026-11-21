@@ -3150,11 +3150,22 @@ LIVE_DIRECTORY = re.compile(
     rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata(?![\w.-])")
 
 
-def _names_live_database(text):
+def _live_database_match(text):
     # A remote-only payload is harmless on the box, but no real payload names a
     # live DB or the directory holding one (cd there, glob *.sqlite, ...).
-    text = REPLICA.sub(' ', text)
-    return bool(LIVE.search(text) or LIVE_DIRECTORY.search(text))
+    # Quotes and backslashes may split one path ("$HOME"/.t3/...), so the
+    # dequoted text is matched too.
+    for form in (text, re.sub(r"""["'\\]""", '', text)):
+        form = REPLICA.sub(' ', form)
+        if match := LIVE.search(form):
+            return match, True
+        if match := LIVE_DIRECTORY.search(form):
+            return match, False
+    return None, False
+
+
+def _names_live_database(text):
+    return _live_database_match(text)[0] is not None
 
 
 def _offbox_syncs_from_live_directory(cwd):
@@ -4786,10 +4797,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         # (#221): skip what runs inside it. Only live-DB paths the caller
         # spells, and stdin the caller's shell opens here, still reach the Mac.
         for text in texts:
-            if _names_live_database(text):
-                directory_match = LIVE_DIRECTORY.search(REPLICA.sub(' ', text))
-                raise LiveRead('live-database-read', None if LIVE.search(REPLICA.sub(' ', text)) else
-                               f"The offbox payload names the live database directory {_token(directory_match[0])}.")
+            match, database = _live_database_match(text)
+            if match:
+                raise LiveRead('live-database-read', None if database else
+                               f"The offbox payload names the live database directory {_token(match[0])}.")
         for _, target in inputs:
             if any(direct_read(['cat', *values], directory) for values in variants([target])):
                 raise LiveRead('live-database-read')
