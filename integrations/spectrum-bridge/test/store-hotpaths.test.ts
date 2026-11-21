@@ -1,7 +1,11 @@
 import { expect, test } from "bun:test";
 import { Store } from "../src/store.ts";
 
-const plan = (store: Store, sql: string) => store.db.query<{ detail: string }, []>(`EXPLAIN QUERY PLAN ${sql}`).all().map(row => row.detail).join("\n");
+function plan(store: Store, sql: string) {
+  const query = store.db.prepare<{ detail: string }, []>(`EXPLAIN QUERY PLAN ${sql}`);
+  try { return query.all().map(row => row.detail).join("\n"); }
+  finally { query.finalize(); }
+}
 async function loopBound(work: () => void) {
   const started = performance.now();
   const heartbeat = new Promise<number>(resolve => setTimeout(() => resolve(performance.now() - started), 0));
@@ -31,7 +35,6 @@ test("pending inbox reads skip 50 MiB of terminal history and preserve row order
     store.updateInbound("processing-2", "done");
     store.updateInbound("fixture:0", "pending");
     expect(store.pendingInbound().map(row => row.id)).toEqual(["fixture:0", "pending-1", "pending-3"]);
-    store.db.clearQueryCache();
     store.db.exec("DROP INDEX inbound_state");
     expect(plan(store, sql)).toContain("SCAN inbound");
   } finally { store.close(); }
@@ -57,11 +60,10 @@ test("share and recovery LIKE scans skip 50 MiB of unrelated values, preserving 
       expect(before).toHaveLength(7);
       if (order === "rowid") expect(before.map(row => row.key)).toEqual(["a", "z", "_", "%", "[", ":"].map(suffix => prefix + suffix).concat(prefix.toUpperCase() + "A"));
       await loopBound(() => { for (let i = 0; i < 20; i++) expect(query.all()).toEqual(before); });
-      store.db.clearQueryCache();
+      query.finalize();
       store.db.exec("DROP INDEX kv_key_nocase");
       expect(store.db.query(sql).all()).toEqual(before);
       expect(plan(store, sql)).not.toContain("kv_key_nocase");
-      store.db.clearQueryCache();
       store.db.exec("CREATE INDEX kv_key_nocase ON kv(key COLLATE NOCASE)");
     }
   } finally { store.close(); }
@@ -73,7 +75,6 @@ test.each([true, false])("batch parent lookup preserves first recorded membershi
     store.set("batch:z-first", { batchIds: ["member"] });
     store.set("batch:a-second", { batchIds: ["member"] });
     if (!indexed) {
-      store.db.clearQueryCache();
       store.db.exec("DROP INDEX kv_key_nocase");
     }
     const row = store.db.query<{ id: string }, [string]>(

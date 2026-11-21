@@ -8752,7 +8752,6 @@ test.each([true, false])("failed receipt adoption preserves arrival order (prefi
     h.store.set(`failed-replay-receipt:${id}`, { ...route, inboundId: id, messageId: messageId(id), phase: "failed", startedAt: Date.now() });
   }
   if (!indexed) {
-    h.store.db.clearQueryCache();
     h.store.db.exec("DROP INDEX kv_key_nocase");
   }
   h.backend.single = true;
