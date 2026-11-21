@@ -285,6 +285,8 @@ describe("OrchestratorMcpService", () => {
     { status: "failed", code: "serverOverloaded", category: "transient", partial: false },
     { status: "failed", code: "cyberPolicy", category: "content_filter", partial: true },
     { status: "failed", code: "serverOverloaded", category: "transient", partial: true },
+    { status: "failed", code: "sqlite_14", category: "persistence", partial: false },
+    { status: "failed", code: "sqlite_14", category: "persistence", partial: true },
     { status: "failed", code: null, category: "unknown", partial: false },
     { status: "completed", code: "cyberPolicy", category: null, partial: false },
     { status: "running", code: "cyberPolicy", category: null, partial: false },
@@ -330,7 +332,7 @@ describe("OrchestratorMcpService", () => {
         const providerFailure = makeProviderFailure({
           message: `Provider refused Authorization: Bearer test-private-token ${continuation ? "please retry" : "detail ".repeat(400)}`,
           code,
-          category: codexFailureCategory(code, code),
+          category: code === "sqlite_14" ? "persistence" : codexFailureCategory(code, code),
           retryable: code === "serverOverloaded",
         });
         // Records written before categories existed decode with category unknown.

@@ -5,7 +5,6 @@ import type {
   OrchestrationV2ProviderFailureClass,
   OrchestrationV2ProviderRetry,
   OrchestrationV2TurnItem,
-  ProviderDriverKind,
   ProviderThreadId,
   ProviderTurnId,
   RunId,
@@ -17,6 +16,60 @@ import * as Cause from "effect/Cause";
 import * as IdAllocator from "./IdAllocator.ts";
 import type { ProviderAdapterFailureReason } from "./ProviderAdapter.ts";
 import * as Schema from "effect/Schema";
+import { ProviderDriverKind } from "@t3tools/contracts";
+
+const promptAcceptanceFields = {
+  driver: ProviderDriverKind,
+  serverOrigin: Schema.String,
+  reason: Schema.Literals(["timeout", "transport", "acknowledgement"]),
+  budgetSeconds: Schema.Number,
+};
+
+export class ProviderPromptAcceptanceError extends Schema.TaggedError<ProviderPromptAcceptanceError>()(
+  "ProviderPromptAcceptanceError",
+  {
+    ...promptAcceptanceFields,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message() {
+    const provider = this.driver === "opencode" ? "OpenCode" : this.driver;
+    const reason =
+      this.reason === "timeout"
+        ? `${provider} did not confirm prompt acceptance within ${this.budgetSeconds} seconds at ${this.serverOrigin}. Session preparation or MCP initialization may still be running.`
+        : this.reason === "transport"
+          ? `${provider} prompt connection failed at ${this.serverOrigin}.`
+          : `${provider} prompt acknowledgement could not be read at ${this.serverOrigin}.`;
+    return `${reason} Acceptance is unconfirmed; check the session state before retrying.`;
+  }
+}
+
+// Persisted error wrappers retain fields, but lose the error's prototype.
+const isPromptAcceptanceError = Schema.is(
+  Schema.Struct({
+    _tag: Schema.Literal("ProviderPromptAcceptanceError"),
+    ...promptAcceptanceFields,
+  }),
+);
+
+function promptAcceptanceInCause(cause: unknown): ProviderPromptAcceptanceError | undefined {
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth < 16 && cause != null && !seen.has(cause); depth++) {
+    seen.add(cause);
+    try {
+      if (Cause.isCause(cause)) {
+        cause = Cause.squash(cause);
+        continue;
+      }
+      if (isPromptAcceptanceError(cause)) return new ProviderPromptAcceptanceError(cause);
+      if (typeof cause !== "object") return undefined;
+      cause = (cause as Record<string, unknown>).cause;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
 
 export class ContextHandoffBudgetError extends Schema.TaggedError<ContextHandoffBudgetError>()(
   "ContextHandoffBudgetError",
@@ -320,12 +373,23 @@ export function makeProviderFailure(input: {
   readonly retryable?: boolean | null;
   readonly resetAt?: string | null;
 }): OrchestrationV2ProviderFailure {
-  const rawMessage = input.message ?? causeMessage(input.cause) ?? DEFAULT_PROVIDER_FAILURE_MESSAGE;
+  const promptAcceptance = promptAcceptanceInCause(input.cause);
+  const rawMessage =
+    input.message ??
+    promptAcceptance?.message ??
+    causeMessage(input.cause) ??
+    DEFAULT_PROVIDER_FAILURE_MESSAGE;
   const message = boundedText(rawMessage, MAX_PROVIDER_FAILURE_MESSAGE_LENGTH);
   const usageLimit = usageLimitInCause(input.cause);
   const failureClass = usageLimit === undefined ? (input.class ?? "unknown") : "usage_limit";
   const resetAt = input.resetAt ?? usageLimit?.resetAt;
-  const rawCode = input.code ?? stringField(input.cause, "code") ?? null;
+  const rawCode =
+    input.code ??
+    (promptAcceptance === undefined
+      ? undefined
+      : `provider_prompt_acceptance_${promptAcceptance.reason}`) ??
+    stringField(input.cause, "code") ??
+    null;
   const code =
     rawCode === null ? null : boundedText(rawCode, MAX_PROVIDER_FAILURE_CODE_LENGTH) || null;
 
@@ -333,10 +397,10 @@ export function makeProviderFailure(input: {
     class: failureClass,
     message: message || DEFAULT_PROVIDER_FAILURE_MESSAGE,
     code,
-    retryable: input.retryable ?? null,
-    // Only producers that classify a category set it. Others keep the record shape they
-    // always had, so OpenCode and Pi failures serialize exactly as before.
-    ...(input.category === undefined ? {} : { category: input.category }),
+    retryable: promptAcceptance === undefined ? (input.retryable ?? null) : false,
+    ...(input.category === undefined && promptAcceptance === undefined
+      ? {}
+      : { category: input.category ?? "transient" }),
     ...(failureClass === "usage_limit" && resetAt != null && Number.isFinite(Date.parse(resetAt))
       ? { resetAt: DateTime.formatIso(DateTime.makeUnsafe(resetAt)) }
       : {}),
@@ -387,7 +451,12 @@ export function makeProviderFailureTurnItem(input: {
     parentItemId: null,
     ordinal: input.itemOrdinal,
     status: "failed",
-    title: input.failure.class === "usage_limit" ? "Usage limit reached" : "Provider error",
+    title:
+      input.failure.category === "persistence"
+        ? "Persistence error"
+        : input.failure.class === "usage_limit"
+          ? "Usage limit reached"
+          : "Provider error",
     startedAt: input.retryStartedAt ?? input.occurredAt,
     completedAt: input.occurredAt,
     updatedAt: input.occurredAt,
@@ -419,7 +488,12 @@ export function makeProviderRetryTurnItem(input: {
   if (input.status === "completed") {
     title = "Provider recovered";
   } else if (input.status === "failed") {
-    title = input.failure.class === "usage_limit" ? "Usage limit reached" : "Provider error";
+    title =
+      input.failure.category === "persistence"
+        ? "Persistence error"
+        : input.failure.class === "usage_limit"
+          ? "Usage limit reached"
+          : "Provider error";
   } else if (input.status === "interrupted" || input.status === "cancelled") {
     title = "Provider retry stopped";
   }

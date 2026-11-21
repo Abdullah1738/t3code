@@ -17,8 +17,8 @@ export function isBufferedProviderNotification(
 }
 
 /**
- * Delivery is at least once: provider acceptance and our receipt cannot commit
- * atomically. Reusing the message ID keeps recovery from duplicating timeline items.
+ * A saved message identity prevents duplicate timeline items, but preparation can
+ * run before provider deduplication. Lost acknowledgement must be reconciled first.
  */
 export function isUndeliveredMailboxSteer(
   projection: Pick<OrchestrationV2ThreadProjection, "messages" | "runs" | "providerTurns">,
@@ -26,6 +26,8 @@ export function isUndeliveredMailboxSteer(
 ): boolean {
   const message = projection.messages.find((candidate) => candidate.id === messageId);
   if (message?.delegatedCompletion === undefined) return false;
+  if (message.deliveryFailure?.code?.startsWith("provider_prompt_acceptance_") === true)
+    return false;
   const run = projection.runs.find((candidate) => candidate.id === message.runId);
   return (
     run !== undefined &&

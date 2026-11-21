@@ -43,6 +43,7 @@ import { TestClock } from "effect/testing";
 import { describe } from "vite-plus/test";
 
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -182,6 +183,19 @@ const promptAccepted = replyData("session.prompt", {
   payload: { text: "hi" },
   delivery: "steer",
 });
+
+const promptAcceptanceFailures = [
+  { scenario: "timeout", reason: "timeout", response: "<hang>" },
+  { scenario: "transport", reason: "transport", response: "<transport-error>" },
+  { scenario: "broken body", reason: "acknowledgement", response: "<body-error>" },
+  { scenario: "invalid JSON", reason: "acknowledgement", response: "<invalid-json>" },
+  { scenario: "invalid schema", reason: "acknowledgement", response: { data: null } },
+  {
+    scenario: "unexpected status",
+    reason: "acknowledgement",
+    response: { status: 502, body: "bad gateway" },
+  },
+] as const;
 
 const noOpenRequests: ReadonlyArray<ProviderReplayEntry> = [
   out("permission.list", { sessionID: SESSION }),
@@ -369,6 +383,7 @@ const resumed = (
     readonly attachmentsDir?: string;
     readonly fileSystem?: FileSystem.FileSystem;
     readonly onPrompt?: (input: unknown) => void;
+    readonly onRequest?: (operation: string, signal: AbortSignal) => void;
     readonly beforeResponse?: (operation: string) => Promise<void>;
     readonly idAllocator?: Layer.Layer<IdAllocator.IdAllocatorV2>;
   },
@@ -409,6 +424,7 @@ const resumed = (
       ...(options?.idAllocator === undefined ? {} : { idAllocator: options.idAllocator }),
       ...(options?.fileSystem === undefined ? {} : { fileSystem: options.fileSystem }),
       ...(options?.onPrompt === undefined ? {} : { onPrompt: options.onPrompt }),
+      ...(options?.onRequest === undefined ? {} : { onRequest: options.onRequest }),
       ...(options?.beforeResponse === undefined ? {} : { beforeResponse: options.beforeResponse }),
       ...(options?.external === undefined ? {} : { external: options.external }),
       ...(options?.replayGate === undefined ? {} : { replayGate: options.replayGate }),
@@ -947,6 +963,134 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       yield* runtime.startTurn(turnInput(thread));
       yield* Scope.close(scope, Exit.void);
     }),
+  );
+
+  it.effect.each(
+    (["prompt", "command", "compact"] as const).flatMap((submission) =>
+      promptAcceptanceFailures.map((failure) => ({ submission, ...failure })),
+    ),
+  )(
+    "reports an uncertain prompt acceptance $scenario without replaying $submission",
+    ({ submission, reason, response }) =>
+      Effect.gen(function* () {
+        const sent = yield* Deferred.make<void>();
+        let submissions = 0;
+        let requestSignal: AbortSignal | undefined;
+        const operation = `session.${submission}`;
+        const { runtime, thread } = yield* resumed(
+          [
+            ...(submission === "command"
+              ? [
+                  out("command.list", "<any>"),
+                  reply("command.list", {
+                    location: { directory: WORK },
+                    data: [{ name: "hello" }],
+                  }),
+                  out("message.list", { sessionID: SESSION, order: "desc", limit: "1" }),
+                  reply("message.list", { data: [], cursor: {} }),
+                ]
+              : []),
+            out(operation, "<any>"),
+            reply(operation, response),
+          ],
+          {
+            onRequest: (type, signal) => {
+              if (type !== operation) return;
+              requestSignal = signal;
+              submissions++;
+              Deferred.doneUnsafe(sent, Effect.void);
+            },
+          },
+        );
+        const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        const started = yield* runtime
+          .startTurn({
+            ...turnInput(thread),
+            message: {
+              ...turnInput(thread).message,
+              text:
+                submission === "compact"
+                  ? "/compact"
+                  : submission === "command"
+                    ? "/hello WORLD"
+                    : "Hello",
+            },
+          })
+          .pipe(Effect.flip, Effect.forkScoped);
+        yield* Deferred.await(sent);
+        if (reason === "timeout") yield* TestClock.adjust("60 seconds");
+        const failure = makeProviderFailure({
+          cause: yield* Fiber.join(started),
+          class: "provider_error",
+        });
+        assert.equal(failure.category, "transient");
+        assert.equal(failure.code, `provider_prompt_acceptance_${reason}`);
+        assert.equal(failure.retryable, false);
+        assert.include(
+          failure.message,
+          reason === "timeout"
+            ? "within 60 seconds"
+            : reason === "transport"
+              ? "connection failed"
+              : "acknowledgement could not be read",
+        );
+        assert.include(failure.message, "http://opencode2.replay");
+        assert.include(failure.message, "Acceptance is unconfirmed");
+        assert.deepEqual((yield* Fiber.join(terminal))?.failure, failure);
+        assert.equal(submissions, 1);
+        if (reason === "timeout") assert.isTrue(requestSignal?.aborted);
+      }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect.each(promptAcceptanceFailures)(
+    "preserves uncertain steering acceptance after $scenario",
+    ({ reason, response }) =>
+      Effect.gen(function* () {
+        const sent = yield* Deferred.make<void>();
+        let submissions = 0;
+        const { runtime, thread } = yield* resumed(
+          [
+            out("session.prompt", "<any>"),
+            promptAccepted,
+            event("session.execution.started", { sessionID: SESSION }),
+            out("session.prompt", "<any>"),
+            reply("session.prompt", response),
+          ],
+          {
+            onRequest: (operation) => {
+              if (operation === "session.prompt" && ++submissions === 2)
+                Deferred.doneUnsafe(sent, Effect.void);
+            },
+          },
+        );
+        const input = turnInput(thread);
+        yield* runtime.startTurn(input);
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const steered = yield* runtime
+          .steerTurn({
+            threadId,
+            runId: input.runId,
+            providerThread: thread,
+            providerTurnId: ids.derive.providerTurn({
+              driver: OPENCODE_PROVIDER,
+              nativeTurnId: `${SESSION}:attempt:${input.attemptId}`,
+            }),
+            message: {
+              ...input.message,
+              messageId: MessageId.make("message:uncertain-steer"),
+              text: "Continue",
+            },
+          })
+          .pipe(Effect.flip, Effect.forkScoped);
+        yield* Deferred.await(sent);
+        if (reason === "timeout") yield* TestClock.adjust("60 seconds");
+        const failure = makeProviderFailure({ cause: yield* Fiber.join(steered) });
+        assert.equal(failure.code, `provider_prompt_acceptance_${reason}`);
+        assert.equal(failure.category, "transient");
+        assert.equal(failure.retryable, false);
+        assert.include(failure.message, "Acceptance is unconfirmed");
+        assert.equal(submissions, 2);
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(TestClock.layer(), IdAllocator.layer))),
   );
 
   it.effect("sends nothing for a turn stopped while it reads the workspace's commands", () =>
@@ -3726,7 +3870,11 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         event("session.execution.succeeded", { sessionID: SESSION }),
       ]);
       const ended = yield* terminals(runtime, 2);
-      yield* runtime.startTurn(turnInput(thread)).pipe(Effect.ignore);
+      const rejected = yield* runtime.startTurn(turnInput(thread)).pipe(Effect.flip);
+      assert.notInclude(
+        makeProviderFailure({ cause: rejected }).code ?? "",
+        "provider_prompt_acceptance_",
+      );
       yield* runtime.startTurn(secondTurn(thread));
       const [first, second] = yield* Fiber.join(ended);
       assert.deepEqual([first?.status, second?.status], ["failed", "completed"]);

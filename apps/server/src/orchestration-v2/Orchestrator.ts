@@ -13552,6 +13552,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
+    // A missing acknowledgement cannot prove that preparation did not admit this input.
+    // Keep the claimed generation until acceptance or a definite rejection is reconciled.
+    if (deliveryRun.failure?.code?.startsWith("provider_prompt_acceptance_") === true) return;
+
     // Local registration sets startedAt before native acceptance. Explicitly
     // unsent failures also hold their replacement until an explicit Resume/send.
     const failure =
@@ -13689,6 +13693,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const delivery = cohort?.delivery;
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
+    if (message?.deliveryFailure !== undefined) {
+      const { deliveryFailure: _deliveryFailure, ...acceptedMessage } = message;
+      yield* emitEvent({
+        type: "message.updated",
+        threadId: command.threadId,
+        occurredAt: now,
+        payload: { ...acceptedMessage, updatedAt: now },
+      });
+    }
     if (
       parentRun === undefined ||
       cohort === undefined ||

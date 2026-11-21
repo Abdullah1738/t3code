@@ -187,6 +187,155 @@ class ToolLogTests(unittest.TestCase):
         stamp = dt.datetime(2026, 11, 13, tzinfo=dt.timezone.utc) + dt.timedelta(seconds=seconds)
         return {'ts': stamp.isoformat(), 'tool': 'health', 'component': component, 'kind': kind, 'name': name}
 
+    def test_late_tick_shared_and_solo_day(self):
+        intervals = {c: 300 for c in ('meds-nag', 'gym-nudge', 'nutrition-nudge', 'nutrition-checkin')}
+        rows = []
+        for component, offset, skip in [('meds-nag', 0, 3600), ('gym-nudge', 120, 3720),
+                                         ('nutrition-nudge', 0, 7200), ('nutrition-checkin', 0, None)]:
+            rows += [self.tagged(t, 'schedule', component) for t in range(offset, 86400, 300) if t != skip]
+        result = self.fixture_rollup(list(reversed(rows)), intervals)['components']
+        for component in ('meds-nag', 'gym-nudge', 'nutrition-nudge'):
+            summary = result[component]
+            self.assertEqual(summary['lateRuns'], 1)
+            self.assertEqual(summary['lateRunsByHour'], {'02' if component == 'nutrition-nudge' else '01': 1})
+            self.assertEqual(summary['sameTimeSkips'], 0 if component == 'nutrition-nudge' else 1)
+            self.assertEqual((summary['missedRuns'], summary['p95GapSeconds'], summary['gapsOver']), (1, 300, []))
+        normal = result['nutrition-checkin']
+        self.assertEqual((normal['lateRuns'], normal['sameTimeSkips'], normal['lateRunsByHour']), (0, 0, {}))
+        self.assertEqual((normal['missedRuns'], normal['p95GapSeconds']), (0, 300))
+
+    def test_late_ticks_strict_threshold_and_nearest_rank(self):
+        for interval in (300, 300.5, 3600):
+            for extra, count in ((0, 0), (.001, 1)):
+                with self.subTest(interval=interval, extra=extra):
+                    times = (0, interval, 2 * interval, 3.25 * interval + extra)
+                    rows = [self.tagged(t, 'schedule', 'meds-nag') for t in times]
+                    summary = self.fixture_rollup(rows, {'meds-nag': interval})['components']['meds-nag']
+                    self.assertEqual(summary['lateRuns'], count)
+                    self.assertAlmostEqual(summary['p95GapSeconds'], 1.25 * interval + extra)
+                    self.assertEqual(summary['sameTimeSkips'], 0)
+
+    def test_late_ticks_do_not_guess_boundaries_or_missing_intervals(self):
+        for times in ((), (500,), (500, 800)):
+            with self.subTest(times=times):
+                rows = [self.tagged(t, 'schedule', 'meds-nag') for t in times]
+                summary = self.fixture_rollup(rows, {'meds-nag': 300})['components']['meds-nag']
+                self.assertEqual((summary['lateRuns'], summary['lateRunsByHour'], summary['sameTimeSkips']), (0, {}, 0))
+                self.assertEqual(summary['p95GapSeconds'], 300 if len(times) == 2 else None)
+        self.config.unlink()
+        rows = [self.run_row(t) for t in (0, 300, 900)]
+        summary = self.fixture_rollup(rows)['components']['meds-nag']
+        self.assertEqual((summary['lateRuns'], summary['sameTimeSkips'], summary['p95GapSeconds']), (0, 0, 600))
+
+    def test_late_ticks_keep_schedule_and_legacy_selection(self):
+        schedule = [self.tagged(t, 'schedule', 'meds-nag') for t in (0, 300, 900)]
+        extras = [self.tagged(600, trigger, 'meds-nag') for trigger in ('manual', 'retry', 'chained', 'unknown')]
+        for rows in (schedule + extras, [self.run_row(t) for t in (0, 300, 900)]):
+            with self.subTest(tagged=bool(rows[0].get('props'))):
+                summary = self.fixture_rollup(rows, {'meds-nag': 300})['components']['meds-nag']
+                self.assertEqual((summary['lateRuns'], summary['p95GapSeconds']), (1, 600))
+        summary = self.fixture_rollup(extras, {'meds-nag': 300})['components']['meds-nag']
+        self.assertEqual((summary['lateRuns'], summary['p95GapSeconds']), (0, None))
+
+    def test_shared_late_tick_window_is_inclusive_and_needs_another_component(self):
+        for offset, shared in ((119.999, 1), (120, 1), (120.001, 0)):
+            with self.subTest(offset=offset):
+                rows = [self.tagged(t, 'schedule', 'meds-nag') for t in (0, 600)]
+                rows += [self.tagged(t, 'schedule', 'gym-nudge') for t in (offset, 600 + offset)]
+                # A third nearby late tick must not double-count either component.
+                rows += [self.tagged(t, 'schedule', 'nutrition-nudge') for t in (offset, 600 + offset)]
+                result = self.fixture_rollup(rows, {c: 300 for c in ('meds-nag', 'gym-nudge', 'nutrition-nudge')})['components']
+                self.assertEqual(result['meds-nag']['sameTimeSkips'], shared)
+                self.assertEqual(result['gym-nudge']['sameTimeSkips'], 1)
+        rows = [self.tagged(t, 'schedule', 'meds-nag') for t in (0, 60, 120)]
+        summary = self.fixture_rollup(rows, {'meds-nag': 30})['components']['meds-nag']
+        self.assertEqual((summary['lateRuns'], summary['sameTimeSkips']), (2, 0))
+
+    def test_watcher_start_records_load_before_work_and_unknown_schedule(self):
+        with mock.patch.object(log.os, 'getloadavg', return_value=(12.34, 0, 0)) as load:
+            with log.run('meds-nag', name='watcher.run', trigger='schedule'):
+                load.return_value = (99, 0, 0)
+        load.assert_called_once_with()
+        props = self.rows()[-1]['props']
+        self.assertEqual(props, {'trigger': 'schedule', 'startLagMs': None, 'hostLoad1m': 12.3})
+        self.assertNotIn('scheduledAt', props)
+        with mock.patch.object(log.os, 'getloadavg', side_effect=OSError('PRIVATE_LOAD')):
+            with self.assertRaisesRegex(ValueError, 'original'):
+                with log.run('gym-nudge', name='watcher.run'):
+                    raise ValueError('original')
+        self.assertFalse(self.rows()[-1]['ok'])
+        self.assertIsNone(self.rows()[-1]['props']['startLagMs'])
+        self.assertNotIn('PRIVATE_LOAD', json.dumps(self.rows()))
+
+    def test_watcher_known_schedule_lag_uses_start_and_normalizes_timezone(self):
+        now = dt.datetime(2026, 11, 13, 1, 0, 1, 250000, tzinfo=dt.timezone.utc)
+        with mock.patch.object(log, 'utcnow', return_value=now), mock.patch.object(log.os, 'getloadavg', return_value=(1.26, 0, 0)):
+            with log.Span('meds-nag', 'watcher.run', {'scheduledAt': '2026-11-13T05:00:00+04:00'}, trigger='schedule'):
+                pass
+        props = self.rows()[-1]['props']
+        self.assertEqual(props['scheduledAt'], '2026-11-13T01:00:00Z')
+        self.assertEqual((props['startLagMs'], props['hostLoad1m']), (1250, 1.3))
+
+    def test_watcher_schedule_environment_known_and_unknown_trigger_classes(self):
+        now = dt.datetime(2026, 11, 13, 1, 0, 1, 250000, tzinfo=dt.timezone.utc)
+        for trigger in ('schedule', 'retry', 'manual', 'chained', 'unknown'):
+            with self.subTest(trigger=trigger), mock.patch.dict(os.environ, {
+                    'HEALTH_TOOLLOG_SCHEDULED_AT': '2026-11-13T05:00:00+04:00',
+                    'HEALTH_TOOLLOG_TRIGGER': trigger}), mock.patch.object(log, 'utcnow', return_value=now):
+                with log.run('meds-nag', name='watcher.run', trigger=log.trigger()):
+                    pass
+                props = self.rows()[-1]['props']
+                if trigger in ('schedule', 'retry'):
+                    self.assertEqual(props['scheduledAt'], '2026-11-13T01:00:00Z')
+                    self.assertEqual(props['startLagMs'], 1250)
+                else:
+                    self.assertNotIn('scheduledAt', props)
+                    self.assertIsNone(props['startLagMs'])
+
+    def test_watcher_schedule_environment_timestamp_shapes(self):
+        cases = [('2026-11-13T01:00:00Z', True), ('2026-11-13T01:00:00.123Z', True),
+                 ('2026-11-13T05:00:00+04:00', True), ('2026-11-12T21:00:00-04:00', True),
+                 ('', False), ('1762995600000', False), ('2026-11-13T01:00:00', False),
+                 ('2026-99-13T01:00:00Z', False), ('2026-11-13T01:00:00Z\nPRIVATE', False),
+                 ('PRIVATE_VALUE', False)]
+        for stamp, valid in cases:
+            with self.subTest(stamp=stamp), mock.patch.dict(os.environ, {'HEALTH_TOOLLOG_SCHEDULED_AT': stamp}):
+                with log.run('meds-nag', name='watcher.run', trigger='schedule'):
+                    pass
+                props = self.rows()[-1]['props']
+                self.assertEqual('scheduledAt' in props, valid)
+                if valid:
+                    self.assertIn(type(props['startLagMs']), (int, float))
+                else:
+                    self.assertIsNone(props['startLagMs'])
+        self.assertNotIn('PRIVATE', json.dumps(self.rows()))
+
+    def test_watcher_timing_allowlist_types(self):
+        # Number classes: integer/float, null, bool, text, container, nonfinite.
+        for value in (0, 17, 1.25, -1, None, True, 'SECRET_NUMBER', [], {}, float('nan'), float('inf'), -float('inf')):
+            with self.subTest(value=value):
+                self.assertTrue(log.emit('meds-nag', 'watcher.run', props={
+                    'startLagMs': value, 'hostLoad1m': value, 'scheduledAt': 'SECRET_TIME', 'secret': 'PRIVATE_VALUE'}))
+                props = self.rows()[-1]['props']
+                numeric = type(value) in (int, float) and value == value and value not in (float('inf'), -float('inf'))
+                self.assertEqual('startLagMs' in props, numeric or value is None)
+                self.assertEqual('hostLoad1m' in props, numeric and value >= 0)
+                for key in ('startLagMs', 'hostLoad1m'):
+                    if props.get(key) is not None:
+                        self.assertIn(type(props[key]), (int, float))
+                self.assertNotIn('scheduledAt', props)
+                self.assertNotIn('secret', props)
+        for stamp, valid in [('2026-11-13T05:00:00+04:00', True), ('2026-11-13T01:00:00.123Z', True),
+                             ('2026-11-13T01:00:00', False), ('2026-99-13T01:00:00Z', False),
+                             ('2026-11-13T01:00:00Z\nPRIVATE', False), (None, False), (123, False), ({}, False)]:
+            with self.subTest(stamp=stamp):
+                log.emit('meds-nag', 'watcher.run', props={'scheduledAt': stamp})
+                self.assertEqual('scheduledAt' in self.rows()[-1]['props'], valid)
+        log.emit('food', 'cli.run', props={'scheduledAt': '2026-11-13T01:00:00Z', 'startLagMs': 123, 'hostLoad1m': 1})
+        self.assertFalse({'scheduledAt', 'startLagMs', 'hostLoad1m'} & self.rows()[-1].get('props', {}).keys())
+        self.assertNotIn('SECRET', json.dumps(self.rows()))
+        self.assertNotIn('PRIVATE', json.dumps(self.rows()))
+
     def test_trigger_enum_and_missing_emitters(self):
         values = ['schedule', 'manual', 'chained', 'retry', 'unknown', None, '',
                   'PRIVATE_HEALTH_VALUE', [], {}, True, 123]
@@ -331,7 +480,8 @@ class ToolLogTests(unittest.TestCase):
                 for component, interval in intervals.items():
                     summary = components[component]
                     self.assertEqual(set(summary), {'runs', 'firstRunTs', 'lastRunTs',
-                        'medianGapSeconds', 'maxGapSeconds', 'gapThresholdSeconds', 'gapsOver', 'expectedRuns', 'missedRuns', 'runsByTrigger'})
+                        'medianGapSeconds', 'maxGapSeconds', 'gapThresholdSeconds', 'gapsOver', 'expectedRuns', 'missedRuns', 'runsByTrigger',
+                        'lateRuns', 'lateRunsByHour', 'p95GapSeconds', 'sameTimeSkips'})
                     self.assertEqual(summary['expectedRuns'], elapsed // interval)
                     self.assertEqual(summary['missedRuns'], max(0, elapsed // interval - summary['runs']))
                 if name == 'hole_and_steady':
@@ -339,7 +489,8 @@ class ToolLogTests(unittest.TestCase):
                         'firstRunTs': '2026-11-13T00:00:00Z', 'lastRunTs': '2026-11-13T23:55:00Z',
                         'medianGapSeconds': 300, 'maxGapSeconds': 10800, 'gapThresholdSeconds': 900,
                         'gapsOver': [{'startTs': '2026-11-13T01:00:00Z', 'seconds': 10800}],
-                        'expectedRuns': 288, 'missedRuns': 35, 'runsByTrigger': {'unknown': 253}})
+                        'expectedRuns': 288, 'missedRuns': 35, 'runsByTrigger': {'unknown': 253},
+                        'lateRuns': 1, 'lateRunsByHour': {'04': 1}, 'p95GapSeconds': 300, 'sameTimeSkips': 0})
                     self.assertEqual((components['gym-nudge']['runs'], components['gym-nudge']['gapsOver']), (288, []))
                 elif name == 'single_run':
                     self.assertEqual((components['meds-nag']['runs'], components['meds-nag']['maxGapSeconds'],

@@ -1,32 +1,15 @@
-import { hook as toolLogHook } from "../lib/toollog";
-import { spawn } from "node:child_process";
+import { hook as toolLogHook, runSource } from "../lib/toollog";
+import { failureProps, runClassifier } from "../lib/classifier";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const classifier = join(homedir(), ".local/share/harness-hooks/src/phone_adb_guard.py");
 type Input = { command?: unknown; cmd?: unknown; workdir?: string; cwd?: string; [key: string]: unknown };
 type Event = { tool: string; sessionID?: string; input?: Input };
-type Verdict = { matched: boolean; reason: string | null; rule: string | null; error: string | null };
+type Verdict = { matched: boolean; reason: string | null; rule: string | null; error: string | null; holder?: string | null; adbVerb?: string | null };
 
 export function classify(command: string, script = classifier, python = "/opt/homebrew/bin/python3"): Promise<Verdict> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(python, [script], { stdio: ["pipe", "pipe", "ignore"] });
-    let output = "";
-    const timer = setTimeout(() => { child.kill(); reject(new Error("phone classifier unavailable")); }, 2000);
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      output += chunk;
-      if (output.length > 4096) { child.kill(); reject(new Error("phone classifier output limit")); }
-    });
-    child.on("error", () => { clearTimeout(timer); reject(new Error("phone classifier unavailable")); });
-    child.stdin.on("error", () => {});
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) return reject(new Error("phone classifier unavailable"));
-      try { resolve(JSON.parse(output)); } catch { reject(new Error("phone classifier unavailable")); }
-    });
-    child.stdin.end(JSON.stringify({ command }));
-  });
+  return runClassifier(python, script, { command }, { timeout: "phone classifier unavailable", unavailable: "phone classifier unavailable", outputLimit: 4096 });
 }
 
 const shellTools = new Set(["shell", "bash", "Bash", "exec_command", "shell_command"]);
@@ -43,12 +26,14 @@ export function createGuardHook(directory: string, check = classify) {
     const cwd = input.workdir ?? input.cwd ?? directory;
     let verdict: Verdict;
     try { verdict = await check(command); }
-    catch {
-      toolLogHook("phone-adb", "allowed", "phone-adb-unavailable", started, command, "hook.classifier_failed", { sessionId: event.sessionID }, { cwd });
+    catch (error) {
+      toolLogHook("phone-adb", "allowed", "phone-adb-unavailable", started, command, "hook.classifier_failed", { sessionId: event.sessionID }, { cwd },
+        failureProps(classifier, error, command, started));
       return;
     }
     if (verdict.matched || verdict.error) {
-      toolLogHook("phone-adb", verdict.reason ? "denied" : "allowed", verdict.rule ?? "phone-adb-unavailable", started, command, verdict.error ?? undefined, { sessionId: event.sessionID }, { cwd });
+      toolLogHook("phone-adb", verdict.reason ? "denied" : "allowed", verdict.rule ?? "phone-adb-unavailable", started, command, verdict.error ?? undefined, { sessionId: event.sessionID }, { cwd },
+        { holder: verdict.holder, adbVerb: verdict.adbVerb, source: runSource() });
     }
     if (verdict.reason) {
       event.input = { ...input, [field]: `printf '%s\\n' ${quote(verdict.reason)} >&2; exit 5`, background: false };

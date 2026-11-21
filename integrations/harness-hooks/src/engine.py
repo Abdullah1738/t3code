@@ -103,6 +103,11 @@ _LOG_ERRORS = {
 }
 
 
+def _phone_props(phone):
+    # Values come from the classifier's fixed vocabulary; toollog drops anything else.
+    return {"holder": phone.get("holder"), "adbVerb": phone.get("adbVerb"), "source": toollog.run_source()}
+
+
 def _log_enum(value, allowed):
     return value if isinstance(value, str) and value in allowed else None if value is None else "other"
 
@@ -126,7 +131,8 @@ def _log(**record):
                      ids={"threadId": record.get("robobThreadId"), "sessionId": record.get("sessionId"),
                           "nativeAgentId": record.get("nativeAgentId"),
                           "cardNumber": record.get("cardNumber")}, cwd=record.get("cwd"), matched=record.get("matchedRoot"),
-                     identity_source=_log_enum(record.get("identity_source"), {"cache", "control", "negative-cache"}))
+                     identity_source=_log_enum(record.get("identity_source"), {"cache", "control", "negative-cache"}),
+                     extra=record.get("extra"))
         path = _state()
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         thread_id = record.get("robobThreadId")
@@ -783,6 +789,7 @@ def decide(event, harness):
     binding_only = False
     cwd = None
     matched_root = None
+    log_extra = None
     result = {"decision": "allow", "reason": "", "context": {"rule": "no-policy"}}
     lineage_nodes = None
     lineage_deadline = None
@@ -834,13 +841,14 @@ def decide(event, harness):
                 phone = {"matched": False, "reason": None, "rule": "phone-adb-unavailable", "error": "phone-lock-unavailable"}
             if phone['reason']:
                 error_type = phone['error']
+                log_extra = _phone_props(phone)
                 result = {"decision": "deny", "reason": phone['reason'], "context": {"rule": phone['rule']}}
                 return result
             if phone['matched'] or phone['error']:
                 # Admission continues through the independent guards. Keep a
                 # separate phone decision so unleased calls remain countable.
                 _log(harness=harness, event=kind, tool=tool, command=command, cwd=cwd,
-                     rule=phone['rule'], decision="allow", error=phone['error'])
+                     rule=phone['rule'], decision="allow", error=phone['error'], extra=_phone_props(phone))
             try:
                 shared_reason = shared_deps_guard.classify(command, command_cwd)
             except Exception as error:
@@ -978,7 +986,8 @@ def decide(event, harness):
              sessionId=_native(event, harness)[0] if isinstance(event, dict) else None,
              nativeAgentId=event.get("agent_id") if harness == "claude" and isinstance(event, dict) else None,
              cardNumber=identity.get("cardNumber"), cwd=cwd, matchedRoot=matched_root,
-             command=command, rewritten="updatedInput" in result["context"] or "updatedToolOutput" in result["context"], ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
+             command=command, rewritten="updatedInput" in result["context"] or "updatedToolOutput" in result["context"], ms=round((time.monotonic() - start) * 1000, 3), error=error_type,
+             extra=log_extra)
     return result
 
 

@@ -7,7 +7,10 @@ export const CAP_BYTES = 50 * 1024 * 1024;
 export const HOOKS_CAP_BYTES = 35 * 1024 * 1024;
 export const HOOK_SAMPLE_RATE = 128;
 const label = /^[A-Za-z0-9_.:-]{1,120}$/;
-const fields = new Set(['harness','guard','decision','rule','firstWord','commandLength','filesChanged','driftFound','differingCount','platform','billedMinutes','exitCode','failingStep','count','dryRun','toolCount','operation','status','cwdClass','matchedRoot','argv0Class','repeatCount','threadIdSource','sampleRate']);
+const fields = new Set(['harness','guard','decision','rule','firstWord','commandLength','filesChanged','driftFound','differingCount','platform','billedMinutes','exitCode','failingStep','count','dryRun','toolCount','operation','status','cwdClass','matchedRoot','argv0Class','repeatCount','threadIdSource','sampleRate',
+  'classifier','errorClass','errorMessage','failMode','spawnMs','classifyMs','totalMs','cmdKind','holder','adbVerb','source']);
+// Callers build errorMessage from fixed strings only (lib/classifier.ts), so it may hold spaces.
+const messageText = /^[A-Za-z0-9 _.:,()'\/-]{1,200}$/;
 const idFields = new Set(['sessionId','threadId','cardNumber','serverId','home','sampleId']);
 const words = new Set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split(' '));
 export function commandProps(command?: unknown) {
@@ -21,6 +24,24 @@ export function commandProps(command?: unknown) {
     ['go','cargo','rustc','make'].includes(firstWord) ? 'build' :
     ['git','docker','offbox','sqlite3'].includes(firstWord) ? firstWord : 'other';
   return {firstWord, argv0Class, commandLength: command.length};
+}
+// Agents usually prefix `cd <dir> &&` or VAR=value, which hides the program from firstWord.
+// Only the program's basename, bucketed to the known words, is kept; never the command.
+export function cmdKind(command?: unknown) {
+  if (typeof command !== 'string') return undefined;
+  let rest = command;
+  for (let i = 0; i < 8; i++) {
+    const next = rest.replace(/^\s*cd\s+(?:'[^']*'|"[^"]*"|[^\s;&|]+)\s*(?:&&|;)/, '').replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|[^\s;&|]*)\s+)+/, '');
+    if (next === rest) break;
+    rest = next;
+  }
+  const match = /^\s*([A-Za-z0-9_./+-]+)(?=\s|$)/.exec(rest);
+  const word = match ? basename(match[1]) : '';
+  return words.has(word) ? word : 'other';
+}
+// Until #185 tags test runs, test runners are told apart by their environment.
+export function runSource() {
+  return process.env.NODE_ENV === 'test' || process.env.ROBOB_TEST || process.env.PYTEST_CURRENT_TEST ? 'test' : 'real';
 }
 export function hookProps(props: Record<string, unknown>, error = false) {
   const result = {...props};
@@ -88,7 +109,7 @@ function repeatCount(ids: Record<string, unknown>, guard: string, rule: string, 
 }
 function metadata(values: Record<string, unknown> | undefined, keys: Set<string>) {
   return Object.fromEntries(Object.entries(values ?? {}).filter(([key, value]) => keys.has(key) &&
-    (typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value) || typeof value === 'string' && (keys === idFields ? /^[A-Za-z0-9_.:%/-]{1,300}$/ : label).test(value))));
+    (typeof value === 'boolean' || keys === fields && key === 'errorMessage' && typeof value === 'string' && messageText.test(value) || typeof value === 'number' && Number.isFinite(value) || typeof value === 'string' && (keys === idFields ? /^[A-Za-z0-9_.:%/-]{1,300}$/ : label).test(value))));
 }
 function privateDir(path: string) {
   if (existsSync(path)) return;
@@ -141,12 +162,12 @@ export function emit(component: string, kind: 'event' | 'perf' | 'error', name: 
     append(row);
   } catch {}
 }
-export function hook(guard: string, decision: string, rule: string, started: number, command?: unknown, errorTag?: string, ids?: Record<string, unknown>, context: {cwd?:unknown; matchedRoot?:unknown} = {}) {
+export function hook(guard: string, decision: string, rule: string, started: number, command?: unknown, errorTag?: string, ids?: Record<string, unknown>, context: {cwd?:unknown; matchedRoot?:unknown} = {}, extra: Record<string, unknown> = {}) {
   try {
     const identity = hookIds(ids), commandFields = commandProps(command);
     emit('hooks', decision === 'denied' || errorTag ? 'error' : 'perf', 'hook.decision', {
       durationMs: performance.now() - started, ok: decision !== 'denied' && !errorTag, ids:identity.ids,
-      props: hookProps({harness:'opencode', guard, decision, rule, threadIdSource:identity.source,
+      props: hookProps({...extra, harness:'opencode', guard, decision, rule, threadIdSource:identity.source,
         cwdClass:cwdClass(context.cwd), matchedRoot:matchedRoot(context.matchedRoot), argv0Class:'none',
         repeatCount:repeatCount(identity.ids, guard, rule, commandFields.firstWord ?? 'none'), ...commandFields}, decision === 'denied' || !!errorTag),
       errorTag: errorTag ?? (decision === 'denied' ? rule : undefined),
