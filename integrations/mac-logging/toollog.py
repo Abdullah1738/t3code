@@ -426,6 +426,25 @@ def host_fields(values, event):
 
 
 def safe_fields(values, event=None):
+    if event == 'host.overload':
+        result = host_fields(values, 'host.families_lite')
+        for key in ('phase', 'onset', 'conditions', 'durationS', 'notified'):
+            value = (values or {}).get(key)
+            if key == 'phase' and value in ('onset', 'peak', 'end'):
+                result[key] = value
+            elif key == 'onset' and isinstance(value, str) and re.fullmatch(r'\d{4}-\d\d-\d\dT[0-9:.]+Z', value):
+                result[key] = value
+            elif key == 'conditions' and isinstance(value, list):
+                result[key] = [v for v in value if v in ('swap', 'pressure', 'load', 'self-lag')]
+            elif key == 'durationS' and finite_number(value) and value >= 0:
+                result[key] = value
+            elif key == 'notified' and type(value) is bool:
+                result[key] = value
+        result['peak'] = host_fields((values or {}).get('peak', {}), 'host.families_lite')
+        for key in ('swapUsedBytes', 'swapTotalBytes'):
+            if finite_number(result.get(key)):
+                result[key.replace('Bytes', 'Mb')] = result[key]/2**20
+        return result
     if event in ('host.vitals', 'host.families_lite'):
         return host_fields(values, event)
     if event == 'scan.volume_crawl':
@@ -751,7 +770,7 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                     'crash.unified.skip', 'crash.source', 'crash.collect') and
                     row.get('props', {}).get('skippedS', 0) > 0)
                 # Preserve the bounded host heartbeat through a noisy day's cap.
-                host_sample = name in ('host.vitals', 'host.families_lite')
+                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload')
                 if kind != 'error' and not coverage_gap and not host_sample:
                     return
             append(fd, row)

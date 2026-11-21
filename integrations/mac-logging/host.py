@@ -11,9 +11,10 @@ import socket
 import threading
 import time
 
+from overload_io import Dispatcher
 from host_native import Native
 from host_signal import socket_path
-from toollog import emit
+from toollog import emit, host_fields
 
 COUNTERS = ('pageins', 'pageouts', 'swapins', 'swapouts')
 WRITE_LOCK = threading.Lock()
@@ -169,23 +170,29 @@ def families(native, clock=time.monotonic):
 def write_sample(name, props, duration_ms=None):
     # Both host threads share a process. Avoid making their nonblocking file
     # locks contend when the 30- and 60-second schedules coincide.
+    if name == 'host.overload':
+        # The I/O worker must never hold the heartbeat's in-process lock.
+        # emit uses a nonblocking file lock and failed transitions are retried.
+        return emit('host', 'event', name, ok=True, props=props, duration_ms=duration_ms)
     with WRITE_LOCK:
         return emit('host', 'event', name, ok=not bool(props.get('errors')),
                     props=props, duration_ms=duration_ms)
 
 
-def family_loop(native, stop, interval=60, writer=write_sample):
+def family_loop(native, stop, interval=60, writer=write_sample, overload=None):
     while not stop.is_set():
         started = time.monotonic()
         try:
             props = families(native)
         except (OSError, ValueError, AttributeError):
             props = dict(errors=['processes'], partial=True)
+        if overload is not None:
+            overload.latest_families = host_fields(props, 'host.families_lite').get('families', [])
         writer('host.families_lite', props, (time.monotonic()-started)*1000)
         stop.wait(max(0, interval-(time.monotonic()-started)))
 
 
-def serve(sampler, server, stop, interval=30, duration=None, writer=write_sample):
+def serve(sampler, server, stop, interval=30, duration=None, writer=write_sample, overload=None):
     started = time.monotonic()
     next_tick = started
     end = started+duration if duration is not None else float('inf')
@@ -198,6 +205,8 @@ def serve(sampler, server, stop, interval=30, duration=None, writer=write_sample
             if trigger:
                 props['trigger'] = trigger
             writer('host.vitals', props, (time.monotonic()-before)*1000)
+            if overload is not None:
+                overload.tick(props, time.time())
             if now >= next_tick:
                 next_tick = now+interval
             trigger = None
@@ -229,11 +238,13 @@ def run(duration=None):
             stop = threading.Event()
             for signum in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(signum, lambda *_: stop.set())
+            overload = Dispatcher(write_sample)
+            overload.thread.start()
             states = StateMonitor(Native())
             threading.Thread(target=states.loop, args=(stop,), daemon=True).start()
-            threading.Thread(target=family_loop, args=(Native(), stop), daemon=True).start()
+            threading.Thread(target=family_loop, args=(Native(), stop), kwargs=dict(overload=overload), daemon=True).start()
             try:
-                serve(Sampler(states=states), server, stop, duration=duration)
+                serve(Sampler(states=states), server, stop, duration=duration, overload=overload)
             finally:
                 stop.set()
                 path.unlink(missing_ok=True)
