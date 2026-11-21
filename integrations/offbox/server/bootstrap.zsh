@@ -82,7 +82,7 @@ EOF
       scp -q $SSHO $HERE/../skill/scripts/{toollog,offbox_disk_space,offbox_protocol,offbox_protection}.py root@$IP:/root/offbox-server/
       scp -q $SSHO $HERE/../skill/templates/tools/{sqlite,fetch}.sh root@$IP:/root/offbox-server/
       scp -q $SSHO $HERE/../skill/templates/home/{offbox-mgmt-ssh.service,offbox_mgmt_sshd_config,offbox-ssh-runtime.conf} root@$IP:/root/offbox-server/
-      tar -C $HERE -cf - home/install-update-policy.sh \
+      COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C $HERE -cf - home/install-update-policy.sh \
         home/stick/offbox/target/rootfs/etc/needrestart/conf.d/50-offbox.conf \
         home/stick/offbox/target/rootfs/etc/apt/apt.conf.d/52offbox-unattended \
         home/stick/offbox/target/rootfs/etc/apt/apt.conf.d/zz-offbox-restart-pending \

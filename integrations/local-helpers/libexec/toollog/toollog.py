@@ -33,7 +33,9 @@ _FIELDS = {'harness', 'guard', 'decision', 'rule', 'firstWord', 'commandLength',
            'cwdClass', 'matchedRoot', 'argv0Class', 'repeatCount', 'threadIdSource',
            'method', 'toolName', 'load1', 'load5', 'load15', 'sampleRate',
            'httpMethod', 'ttfbMs', 'reason', 'identity_source', 'driver', 'route', 'httpStatus',
-           'resolution', 'attempt', 'command', 'attempts', 'waitedMs'}
+           'resolution', 'attempt', 'command', 'attempts', 'waitedMs',
+           'classifier', 'errorClass', 'failMode', 'spawnMs', 'classifyMs', 'totalMs', 'cmdKind',
+           'holder', 'adbVerb', 'source'}
 _IDS = {'sessionId', 'threadId', 'nativeAgentId', 'cardNumber', 'serverId', 'home', 'sampleId'}
 _WORDS = set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split())
 
@@ -307,7 +309,13 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
         pass
 
 
-def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None, identity_source=None):
+def run_source():
+    """'test' inside a test runner. Until #185 tags test runs, the environment is the only signal."""
+    return 'test' if ('unittest' in sys.modules or 'pytest' in sys.modules or os.environ.get('NODE_ENV') == 'test'
+                      or os.environ.get('ROBOB_TEST') or os.environ.get('PYTEST_CURRENT_TEST')) else 'real'
+
+
+def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None, identity_source=None, extra=None):
     try:
         identity, source = hook_ids(harness, ids)
         command_fields = command_props(command)
@@ -315,7 +323,7 @@ def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=No
             command_fields['identity_source'] = identity_source
         emit('hooks', 'error' if decision == 'denied' or error_tag else 'perf', 'hook.decision',
              duration_ms=duration_ms, ok=decision != 'denied' and not error_tag, ids=identity,
-             props=hook_props({'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
+             props=hook_props({**(extra or {}), 'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
                     'threadIdSource': source, 'cwdClass': cwd_class(cwd), 'matchedRoot': matched_root(matched),
                     'repeatCount': _repeat_count(harness, identity, guard, rule, command_fields.get('firstWord', 'none')),
                     'argv0Class': 'none', **command_fields}, error=decision == 'denied' or bool(error_tag)),
@@ -728,6 +736,7 @@ def rollup(board, day, top_n=20):
     order_failures, poll_counts = defaultdict(Counter), {}
     can_report_outcomes = {'success': 0, 'refused': 0}
     threads_by_rule, attempts = defaultdict(Counter), defaultdict(list)
+    tag_hours, classifier_failures, classifier_classes = defaultdict(Counter), Counter(), defaultdict(Counter)
     thread_decisions, unattributed = defaultdict(Counter), defaultdict(Counter)
     sampled_threads, sampled_attempts, sampled_unknown = set(), set(), set()
     unrecognized = 0
@@ -921,6 +930,17 @@ def rollup(board, day, top_n=20):
                     'invalid_url', 'file_prepare'}:
                 render_failures[failure_code] += weight
         observe_error(row, line_number, weight)
+        tag = (row.get('error') or {}).get('tag')
+        if board == 'agent-tools' and isinstance(tag, str):
+            hour = str(row.get('ts', ''))[11:13]
+            tag_hours[tag][hour if re.fullmatch(r'[0-2][0-9]', hour) else '??'] += weight
+            if tag == 'hook.classifier_failed':
+                props = row.get('props') if isinstance(row.get('props'), dict) else {}
+                # Rows written before #214 have no classifier; their guard still ranks them.
+                name = props.get('classifier') if isinstance(props.get('classifier'), str) else f"guard:{props.get('guard', 'unknown')}"
+                classifier_failures[name] += weight
+                error_class = props.get('errorClass')
+                classifier_classes[name][error_class if isinstance(error_class, str) else 'unrecorded'] += weight
     def percentiles(values):
         values.sort()
         count = sum(weight for _, weight in values)
@@ -986,6 +1006,12 @@ def rollup(board, day, top_n=20):
                 for rule in sorted({rule for rule, _ in unattributed})}
         result['unrecognizedThreadIds'] = unrecognized
         result['unrecognizedThreadIdsSampled'] = unrecognized_sampled
+        result['errorTagsByHour'] = {tag: dict(sorted(hours.items())) for tag, hours in
+                                     sorted(tag_hours.items(), key=lambda x: (-sum(x[1].values()), x[0]))}
+        result['topClassifierFailures'] = [
+            {'classifier': name, 'count': count,
+             'errorClasses': dict(sorted(classifier_classes[name].items(), key=lambda x: (-x[1], x[0])))}
+            for name, count in sorted(classifier_failures.items(), key=lambda x: (-x[1], x[0]))[:5]]
     if board == 'orders':
         result['canReportByOutcome'] = can_report_outcomes
         result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
@@ -1047,6 +1073,21 @@ def rollup(board, day, top_n=20):
     return result
 
 
+def hourly_table(result, limit=20):
+    """Text table of error tags by UTC hour from a rollup, busiest tags first."""
+    hours = [f'{hour:02d}' for hour in range(24)]
+    tags = list((result.get('errorTagsByHour') or {}).items())[:limit]
+    width = max([len('tag')] + [len(tag) for tag, _ in tags])
+    lines = [' '.join(['tag'.ljust(width)] + [hour.rjust(4) for hour in hours] + ['total'.rjust(6)])]
+    for tag, counts in tags:
+        lines.append(' '.join([tag.ljust(width)] + [str(counts.get(hour, 0) or '.').rjust(4) for hour in hours]
+                              + [str(sum(counts.values())).rjust(6)]))
+    for entry in result.get('topClassifierFailures') or []:
+        classes = ', '.join(f'{name} {count}' for name, count in entry['errorClasses'].items())
+        lines.append(f"classifier_failed {entry['classifier']}: {entry['count']} ({classes})")
+    return '\n'.join(lines)
+
+
 def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1061,6 +1102,7 @@ def main(argv=None):
             p.add_argument('--limit', type=int, default=100)
         else:
             p.add_argument('--top', type=int, default=20)
+            p.add_argument('--table', action='store_true', help='also print error tags by UTC hour after the path')
     args = parser.parse_args(argv)
     try:
         if args.cmd == 'read':
@@ -1087,6 +1129,8 @@ def main(argv=None):
                 if os.path.exists(tmp):
                     os.unlink(tmp)
             print(path)
+            if args.table:
+                print(hourly_table(result))
         return 0
     except (OSError, ValueError) as error:
         print(f'toollog: {error}', file=__import__('sys').stderr)

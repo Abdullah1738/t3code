@@ -85,6 +85,7 @@ const board: KanbanBoard = {
     { name: "Default", steps: [opus] },
   ],
   defaultReviewChain: "Default",
+  criticalOverflowSlots: 0,
   standingApprovals: [],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
@@ -2169,6 +2170,19 @@ describe("isHandoffBudget", () => {
 });
 
 describe("isOutage category", () => {
+  it.each(["timeout", "transport", "acknowledgement"])(
+    "does not recover uncertain prompt acceptance: %s",
+    (reason) => {
+      expect(
+        isOutage({
+          class: "provider_error",
+          code: `provider_prompt_acceptance_${reason}`,
+          category: "transient",
+          message: "OpenCode prompt acceptance unconfirmed",
+        }),
+      ).toBe(false);
+    },
+  );
   it("treats quota, transient and expired-auth categories as outages", () => {
     for (const category of ["quota", "transient", "auth_expired"]) {
       expect(isOutage({ class: "provider_error", code: null, message: "anything", category })).toBe(
@@ -3077,5 +3091,155 @@ describe("idleEvaluatorStall", () => {
       ),
     ).toBeNull();
     expect(idleEvaluatorStall(base(), now, { ...board, nextReleaseWindowAt: next })).not.toBeNull();
+  });
+});
+
+describe("critical overflow", () => {
+  const overflowBoard = { ...board, criticalOverflowSlots: undefined };
+  const available = pools([[opus, 1]]);
+  const held = new Map([["routine", poolKey(opus)]]);
+
+  it("starts P1 above a full pool and leaves P2 waiting with matching diagnostics", () => {
+    const urgent = card({ priority: 1 });
+    const routine = card({ priority: 2 });
+    const cards = [routine, urgent];
+    const plan = planDispatch(overflowBoard, cards, available, held);
+    expect(plan).toMatchObject([{ cardId: urgent.id, overflow: true, slots: 1, used: 2 }]);
+    expect(dispatchQueueStatus(overflowBoard, cards, available, held)).toMatchObject([
+      { card: urgent.number, reason: "critical_overflow" },
+      { card: routine.number, reason: "pool_full" },
+    ]);
+    expect(confirmDispatch(overflowBoard, urgent, cards, available, held, plan[0]!)).toBe(true);
+    expect(confirmDispatch(board, urgent, cards, available, held, plan[0]!)).toBe(false);
+  });
+
+  it("replans a normal start when its slot fills before confirmation", () => {
+    const urgent = card({ priority: 1 });
+    const start = planDispatch(overflowBoard, [urgent], available)[0]!;
+    expect(start.overflow).toBeUndefined();
+    expect(confirmDispatch(overflowBoard, urgent, [urgent], available, held, start)).toBe(false);
+    expect(planDispatch(overflowBoard, [urgent], available, held)[0]?.overflow).toBe(true);
+  });
+
+  it.each([0, 1, 2, 3, 4])("never exceeds %i overflow slots", (criticalOverflowSlots) => {
+    const config = { ...board, criticalOverflowSlots };
+    const cards = Array.from({ length: 6 }, () => card({ priority: 1 }));
+    const plan = planDispatch(config, cards, available, held);
+    expect(plan).toHaveLength(criticalOverflowSlots);
+    expect(plan.every((entry) => entry.overflow)).toBe(true);
+    const used = new Map([
+      ...held,
+      ...plan.map((entry, i) => [`urgent-${i}`, entry.pool] as const),
+    ]);
+    expect(planDispatch(config, [card({ priority: 1 })], available, used)).toEqual([]);
+    expect(dispatchQueueStatus(config, [card({ priority: 1 })], available, used)[0]?.reason).toBe(
+      "pool_full",
+    );
+  });
+
+  it("keeps disabled and missing pools closed", () => {
+    const urgent = card({ priority: 1 });
+    for (const closed of [pools([[opus, 0]]), []]) {
+      expect(planDispatch(overflowBoard, [urgent], closed)).toEqual([]);
+      expect(dispatchQueueStatus(overflowBoard, [urgent], closed)[0]?.reason).toBe("no_pool");
+    }
+  });
+
+  it.each(["work", "review"] as const)("uses inherited P1 urgency for %s", (role) => {
+    const blocker = card({ priority: 3, stage: role === "review" ? "needs_review" : "todo" });
+    const urgent = card({ priority: 1, blockedBy: [blocker.id] });
+    const cards = [blocker, urgent];
+    const plan = planDispatch(overflowBoard, cards, available, held);
+    expect(plan).toMatchObject([{ cardId: blocker.id, role, overflow: true }]);
+    expect(confirmDispatch(overflowBoard, blocker, cards, available, held, plan[0]!)).toBe(true);
+    expect(dispatchQueueStatus(overflowBoard, cards, available, held)).toContainEqual(
+      expect.objectContaining({ card: blocker.number, reason: "critical_overflow" }),
+    );
+    expect(confirmDispatch(overflowBoard, blocker, [blocker], available, held, plan[0]!)).toBe(
+      false,
+    );
+  });
+
+  it("holds non-P1 starts until holders fall below normal capacity", () => {
+    const routine = card({ priority: 2 });
+    for (const occupied of [
+      new Map([...held, ["overflow", poolKey(opus)]]),
+      new Map([["overflow", poolKey(opus)]]),
+    ]) {
+      expect(planDispatch(overflowBoard, [routine], available, occupied)).toEqual([]);
+      expect(dispatchQueueStatus(overflowBoard, [routine], available, occupied)[0]?.reason).toBe(
+        "pool_full",
+      );
+    }
+    expect(planDispatch(overflowBoard, [routine], available)).toMatchObject([
+      { cardId: routine.id },
+    ]);
+  });
+
+  it("does not promote aged or high-fanout non-P1 work into overflow", () => {
+    const blocker = card({ priority: 3 });
+    const waiters = Array.from({ length: 12 }, () =>
+      card({ priority: 2, blockedBy: [blocker.id] }),
+    );
+    const cards = [blocker, ...waiters];
+    expect(
+      planDispatch(
+        overflowBoard,
+        cards,
+        available,
+        held,
+        undefined,
+        Date.parse(blocker.movedAt) + 20 * AGING_STEP_MS,
+      ),
+    ).toEqual([]);
+  });
+
+  it("prefers free pools, then highest overflow weight, with injectable tie breaking", () => {
+    const urgent = card({
+      priority: 1,
+      models: [
+        { model: opus, weight: 10 },
+        { model: sol, weight: 5 },
+        { model: astra, weight: 10 },
+      ],
+    });
+    const all = pools([
+      [opus, 1],
+      [sol, 1],
+      [astra, 1],
+    ]);
+    expect(planDispatch(overflowBoard, [urgent], all, held)[0]).toMatchObject({
+      model: astra,
+      joins: false,
+    });
+    const full = new Map([...held, ["sol", poolKey(sol)], ["astra", poolKey(astra)]]);
+    expect(planDispatch(overflowBoard, [urgent], all, full, () => 1)[0]).toMatchObject({
+      model: astra,
+      overflow: true,
+    });
+    expect(planDispatch(overflowBoard, [urgent], all, full, () => 0)[0]).toMatchObject({
+      model: opus,
+      overflow: true,
+    });
+    const exhausted = new Map([
+      ...full,
+      ["opus-overflow", poolKey(opus)],
+      ["astra-overflow", poolKey(astra)],
+    ]);
+    expect(planDispatch(overflowBoard, [urgent], all, exhausted)[0]).toMatchObject({
+      model: sol,
+      overflow: true,
+    });
+  });
+
+  it("joins a held thread without consuming overflow even above the cap", () => {
+    const urgent = card({ priority: 1, workThreadId: ThreadId.make("routine") });
+    const full = new Map([...held, ["overflow", poolKey(opus)]]);
+    expect(planDispatch(overflowBoard, [urgent], available, full)).toMatchObject([
+      { cardId: urgent.id, joins: true },
+    ]);
+    expect(dispatchQueueStatus(overflowBoard, [urgent], available, full)[0]?.reason).toBe(
+      "joins_thread",
+    );
   });
 });

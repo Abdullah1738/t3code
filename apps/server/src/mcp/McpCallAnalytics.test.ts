@@ -1156,6 +1156,64 @@ const boardBusy = new KanbanError({
   saved: false,
 });
 
+it.effect.each([false, true])(
+  "records task_status failure metadata (cleared: %s)",
+  (clearFailure) =>
+    Effect.gen(function* () {
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const toolkit = probe("task_status");
+      const taskFailure = {
+        category: "persistence" as const,
+        code: "sqlite_14",
+        message: "Robob could not save the run's events: SQLITE(14) unable to open database file",
+      };
+      const handlers = McpToolAccess.toLayer(toolkit, {
+        task_status: McpToolAccess.reads(() =>
+          McpCall.setTaskFailure(taskFailure).pipe(
+            Effect.andThen(clearFailure ? McpCall.setTaskFailure(undefined) : Effect.void),
+            Effect.as(
+              clearFailure ? { status: "running" } : { status: "failed", failure: taskFailure },
+            ),
+          ),
+        ),
+      });
+      const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const result = yield* server
+          .callTool({ name: "task_status", arguments: args })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+        expect(result.isError).not.toBe(true);
+        const row = yield* Deferred.await(recorded);
+        expect(row).toMatchObject({ outcome: "ok", tool: "task_status" });
+        if (clearFailure) {
+          for (const key of ["failureCategory", "failureCode", "errorMessage"]) {
+            expect(row.props).not.toHaveProperty(key);
+          }
+        } else {
+          expect(row.props).toMatchObject({
+            failureCategory: "persistence",
+            failureCode: "sqlite_14",
+            errorMessage: taskFailure.message,
+          });
+        }
+        expect(yield* decodeAnalyticsEvent(row)).toEqual(row);
+      }).pipe(Effect.provide(registration));
+    }),
+);
+
 const outcomes = [
   ["interruption", Effect.interrupt, { outcome: "interrupted" }],
   ["ok", Effect.succeed({ privateResult: "secret body" }), { outcome: "ok", saved: "unknown" }],

@@ -23,6 +23,7 @@ import { ModelSelection } from "../modelSelection.ts";
 import {
   KanbanBlockInput,
   KanbanBoard,
+  KanbanCriticalOverflowSlots,
   KanbanNightlyReviewSettings,
   KanbanBoardIcon,
   KanbanBoardIconImage,
@@ -130,6 +131,7 @@ export const KanbanBoardUpdateInput = Schema.Struct({
   defaultCardModel: Schema.optional(ModelSelection),
   reviewChains: Schema.optional(Schema.Array(KanbanReviewChain)),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
+  criticalOverflowSlots: Schema.optional(KanbanCriticalOverflowSlots),
   guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
   instructions: Schema.optional(KanbanInstructions),
   nightlyReview: Schema.optional(Schema.NullOr(KanbanNightlyReviewSettings)),

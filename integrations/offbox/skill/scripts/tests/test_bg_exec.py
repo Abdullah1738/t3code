@@ -59,6 +59,7 @@ def setup(root, backend='boat'):
                               input=input, capture_output=True, timeout=timeout, check=check)
     ssh_sync.ssh = ssh
     ssh_sync.put_file = lambda *args, **kwargs: None
+    runs.quint_tools.ensure_archive = lambda box: None
     def prepare(self, con, args, rdir, env_file, body):
         self._sync_box(con, args, rdir, env_file, body)
         if args.git:
@@ -203,7 +204,8 @@ class ExecBoundaryTests(Isolated):
         popen = subprocess.Popen
         def spawn(*args, **kwargs):
             child = popen(*args, **kwargs)
-            spawned.append(child)
+            if '_bg-queue' in args[0]:
+                spawned.append(child)
             return child
         with patch.object(runs, 'BG_ENTRY', Path(__file__).resolve()), \
                 patch.object(runs, 'BG_READY_TIMEOUT_S', .2), \

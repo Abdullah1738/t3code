@@ -1,5 +1,5 @@
 import { hook as toolLogHook } from "../lib/toollog";
-import { spawn } from "node:child_process";
+import { failureProps, runClassifier } from "../lib/classifier";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -20,32 +20,9 @@ export function classify(
   script = classifier,
   python = "/opt/homebrew/bin/python3",
 ): Promise<Verdict> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(python, [script], { stdio: ["pipe", "pipe", "ignore"] });
-    let output = "";
-    const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error("Shared dependencies classifier timed out"));
-    }, 2000);
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      output += chunk;
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.stdin.on("error", () => {});
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) return reject(new Error("Shared dependencies classifier unavailable"));
-      try {
-        resolve(JSON.parse(output));
-      } catch (error) {
-        reject(error);
-      }
-    });
-    child.stdin.end(JSON.stringify({ command, cwd }));
+  return runClassifier(python, script, { command, cwd }, {
+    timeout: "Shared dependencies classifier timed out",
+    unavailable: "Shared dependencies classifier unavailable",
   });
 }
 
@@ -66,7 +43,7 @@ export function createGuardHook(directory: string, check = classify) {
     let verdict: Verdict;
     try {
       verdict = await check(command, cwd);
-    } catch {
+    } catch (error) {
       toolLogHook(
         "shared-dependencies",
         "allowed",
@@ -76,6 +53,7 @@ export function createGuardHook(directory: string, check = classify) {
         "hook.classifier_failed",
         { sessionId: event.sessionID },
         { cwd },
+        failureProps(classifier, error, command, started),
       );
       return;
     }

@@ -15,6 +15,7 @@ import {
   KanbanMoveOptions,
   KanbanWaitKind,
   NonNegativeInt,
+  KanbanCriticalOverflowSlots,
   OrchestratorMcpFailure,
   PositiveInt,
   ProviderOptionSelection,
@@ -1029,13 +1030,16 @@ const BoardInstructionsSet = tool(
 const BoardSettingsSet = tool(
   "board_settings_set",
   "Apply approved board settings",
-  'Evaluators: set guessedGates to the value Abdullah approved in a closed change ask with an approved verdict. Its change/changes entry must label "<Board> guessed gates" (board slug or name; guessedGates also accepted), with before equal to the current setting and after equal to value: sort gates and join with ", " ("deploy, money, secret", "money, secret", "" for none; "(unset)" for an absent current setting).',
+  'Evaluators: set guessedGates to the value Abdullah approved in a closed change ask with an approved verdict. Its change/changes entry must label "<Board> guessed gates" (board slug or name; guessedGates also accepted), with before equal to the current setting and after equal to value: sort gates and join with ", " ("deploy, money, secret", "money, secret", "" for none; "(unset)" for an absent current setting). For criticalOverflowSlots, value is an integer 0–4 (default 1; 0 disables P1 overflow). Label the approved change "<Board> criticalOverflowSlots" and use decimal before/after values.',
   {
     boardId: Schema.optional(TrimmedNonEmptyString),
     card: CardRef,
     ask: TrimmedNonEmptyString,
-    setting: Schema.Literals(["guessedGates"]),
-    value: Schema.Array(Schema.Literals(["deploy", "money", "secret"])),
+    setting: Schema.Literals(["guessedGates", "criticalOverflowSlots"]),
+    value: Schema.Union([
+      Schema.Array(Schema.Literals(["deploy", "money", "secret"])),
+      KanbanCriticalOverflowSlots,
+    ]),
   },
   { board: Record, applied: Schema.Boolean, reason: Schema.optional(Schema.String) },
   { readonly: false, destructive: true },

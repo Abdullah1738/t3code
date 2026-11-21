@@ -9,6 +9,33 @@ from rollup import rollup
 
 
 class ProxyRollupTests(unittest.TestCase):
+    def test_provider_statuses_tokens_and_safe_upstream_codes(self):
+        props = [
+            dict(provider='antigravity', model='shared', status=200, usage={'in': 100, 'out': 20, 'reasoning': 5}),
+            dict(provider='antigravity', model='shared', status=429, upstreamCode='RESOURCE_EXHAUSTED'),
+            dict(provider='claude', model='shared', status=200, usage={'in': 30, 'out': 2, 'cacheRead': 10, 'cacheWrite': 3}),
+            dict(provider='claude', model='shared', status=499, usage={'in': 5, 'out': True, 'reasoning': -1, 'cacheRead': 'SECRET'}),
+            dict(model='legacy'),
+            dict(provider=['invalid'], model='bad', status=True, upstreamCode='PRIVATE MESSAGE', usage={'in': float('inf')}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [dict(tool='9router', kind='perf', name='proxy.request', props=dict(route='/v1/messages', stream=True, **p)) for p in props]
+            (Path(tmp) / '2026-11-19.ndjson').write_text('\n'.join(map(json.dumps, rows)))
+            result = rollup('2026-11-19', tmp)['proxySummary']
+            self.assertEqual(result['byProvider'], [
+                dict(provider='antigravity', count=2, aborted=0, statuses={'200': 1, '429': 1}, clientAbortRate=0),
+                dict(provider='claude', count=2, aborted=1, statuses={'200': 1, '499': 1}, clientAbortRate=.5),
+                dict(provider='unknown', count=2, aborted=0, statuses={'unknown': 2}, clientAbortRate=0),
+            ])
+            self.assertEqual(result['tokensByProvider'], [
+                dict(provider='antigravity', usage={'in': 100, 'out': 20, 'reasoning': 5}),
+                dict(provider='claude', usage={'in': 35, 'out': 2, 'cacheRead': 10, 'cacheWrite': 3}),
+            ])
+            self.assertEqual(result['tokensByProviderModel'], [dict(model='shared', **g) for g in result['tokensByProvider']])
+            self.assertEqual(result['upstreamCodeCounts'], {'RESOURCE_EXHAUSTED': 1})
+            self.assertNotIn('SECRET', json.dumps(result))
+            self.assertNotIn('PRIVATE MESSAGE', json.dumps(result))
+
     def test_dimensions_latency_ttfb_and_abort_rate(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows = []

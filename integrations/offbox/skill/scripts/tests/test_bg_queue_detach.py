@@ -56,6 +56,12 @@ def configure_fixture(root, backend):
         lease.auto_size = lambda *args: ('large', '')
     runs.Runner._log_pool = lambda *args: None
     runs.Runner._prepare_box = lambda *args: None
+    if os.environ.get('OFFBOX_TEST_PREPARE_HOLD'):
+        def prepare(*args):
+            _publish(root / 'preparing', str(os.getpid()))
+            with common.file_lock('fixture-prepare', timeout=15):
+                pass
+        runs.Runner._prepare_box = prepare
     runs._keep_ttl = lambda *args: contextlib.nullcontext()
     runs.node_version.want = runs.pnpm_version.want = lambda *args: None
     runs.new_checkout_hint = lambda *args: None
@@ -105,12 +111,18 @@ def configure_fixture(root, backend):
         if out < len(output):
             yield dict(type='stdout', data=output[out:], nextOffset=len(output))
         _publish(root / 'following', str(os.getpid()))
+        if os.environ.get('OFFBOX_TEST_FINITE'):
+            yield dict(type='exit', exitCode=0)
+            return
         while True:
             signal.pause()
 
     pool.acquire = acquire
     api.cmd_start = start
     api.cmd_attach = attach
+    if os.environ.get('OFFBOX_TEST_FINITE'):
+        api.history_logs = lambda box, command, which, offset=0, **kw: dict(data='', nextOffset=offset, done=True, size=offset)
+        api.history_get = lambda *args: dict(status='exited', exitCode=0)
     if os.environ.get('OFFBOX_TEST_HTTP_URL'):
         api.API = os.environ['OFFBOX_TEST_HTTP_URL']
         api._key = lambda: 'fixture'
@@ -186,6 +198,14 @@ class BackgroundQueueTests(Isolated):
         # The child settles its run on SIGTERM; wait for it so it isn't still writing when the tempdir is removed.
         for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
             try:
+                if sig == signal.SIGTERM:
+                    # New background clients accept pre-start cancellation only from offbox kill.
+                    with contextlib.closing(common.db()) as con:
+                        row = con.execute('SELECT * FROM runs WHERE client_pid=? ORDER BY rowid DESC LIMIT 1',
+                                          (pid,)).fetchone()
+                    if row and row['status'] in ('starting', 'running') and not row['process_id']:
+                        from offbox_lib import bg_cancel
+                        bg_cancel.request(row)
                 os.kill(pid, sig)
             except ProcessLookupError:
                 return
@@ -208,7 +228,7 @@ class BackgroundQueueTests(Isolated):
 
     def test_full_pool_survives_caller_group_signals_on_both_backends(self):
         for backend, sig in ((backend, sig) for backend in ('boat', 'server')
-                             for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGKILL)):
+                             for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGKILL)):
             with self.subTest(backend=backend, signal=sig), contextlib.ExitStack() as cleanup:
                 root = Path(self.tmp.name)
                 for name in ('returned', 'waiting', 'starts', 'ttl', 'following'):
@@ -336,10 +356,13 @@ class BackgroundQueueTests(Isolated):
                         self.until(lambda: path.exists() and path.read_bytes().startswith(prefix))
                         release_history.set()
                         expected = (queue + live + marker + resume if first == 'stdout' else queue + marker + live + resume).encode()
-                        self.until(lambda: path.read_bytes() == expected)
+                        committed = dict(stdoutOffset=len(live + resume), stderrOffset=len(queue + marker), logBytes=len(expected))
+                        # Log flush precedes checkpoint commit; synchronize on the durable record.
+                        self.until(lambda: common.checkpoint(path) == committed)
+                        self.assertEqual(path.read_bytes(), expected)
                         elapsed = time.monotonic() - began
                         self.assertLess(elapsed, 10)
-                        self.assertEqual(common.checkpoint(path), dict(stdoutOffset=len(live + resume), stderrOffset=len(queue + marker), logBytes=len(expected)))
+                        self.assertEqual(common.checkpoint(path), committed)
                         self.assertTrue(misc._client_alive(row['client_pid'], row['start_at']))
                         streams = [q for p, q in requests if p.endswith('/stream')]
                         self.assertEqual((int(streams[-1]['stdoutOffset'][0]), int(streams[-1]['stderrOffset'][0])),
@@ -360,6 +383,73 @@ class BackgroundQueueTests(Isolated):
             current = self.con.execute('SELECT status,exit_code FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
             self.assertEqual(tuple(current), ('killed', 130))
         self.assertFalse((Path(self.tmp.name) / 'starts').exists())
+
+    def test_unrequested_signals_preserve_queue_identity_and_start_once(self):
+        for backend in ('boat', 'server'):
+            with self.subTest(backend=backend), contextlib.ExitStack() as cleanup:
+                root = Path(self.tmp.name)
+                for name in ('returned', 'waiting', 'starts', 'ttl'):
+                    (root / name).unlink(missing_ok=True)
+                with common.file_lock('fixture-slot'):
+                    proc, row = self.launch(backend=backend, cleanup=cleanup.callback)
+                    self.until(lambda: (root / 'waiting').exists(), proc)
+                    # End the stand-in caller, then signal its retained child by PID, like Dock's coalition sweep.
+                    self.stop(proc)
+                    path = root / 'LOGS_DIR' / f"{row['run_id']}.client.log"
+                    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                        os.kill(row['client_pid'], sig)
+                        self.until(lambda: f'"reason":"{signal.Signals(sig).name}"' in path.read_text())
+                        self.assertIn('"disposition":"ignored"', path.read_text())
+                        current = dict(self.con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone())
+                        self.assertEqual((current['client_pid'], current['start_at'], current['status'], current['box_id']),
+                                         (row['client_pid'], row['start_at'], 'starting', None))
+                        self.assertTrue(misc._client_alive(row['client_pid'], row['start_at']))
+                    self.assertFalse((root / 'starts').exists())
+                self.until(lambda: (root / 'ttl').exists())
+                self.assertEqual((root / 'starts').read_text().splitlines(), [row['run_id']])
+
+    def test_full_observed_coalition_sweep_then_wait_exits_zero(self):
+        for backend in ('boat', 'server'):
+            with self.subTest(backend=backend), contextlib.ExitStack() as cleanup, \
+                    patch.dict(os.environ, OFFBOX_TEST_FINITE='1'):
+                root = Path(self.tmp.name)
+                for name in ('returned', 'waiting', 'starts', 'ttl', 'following'):
+                    (root / name).unlink(missing_ok=True)
+                with common.file_lock('fixture-slot'):
+                    proc, row = self.launch(backend=backend, cleanup=cleanup.callback)
+                    self.until(lambda: (root / 'waiting').exists(), proc)
+                    # Dock enumerates once and TERM-signals each retained coalition member.
+                    # Its KILL fallback targets the main application only, not these members.
+                    self.stop(proc)
+                    self.assertEqual(os.getsid(row['client_pid']), row['client_pid'])
+                    os.kill(row['client_pid'], signal.SIGTERM)
+                    path = root / 'LOGS_DIR' / f"{row['run_id']}.client.log"
+                    self.until(lambda: '"disposition":"ignored"' in path.read_text())
+                    self.assertTrue(misc._client_alive(row['client_pid'], row['start_at']))
+                    self.assertFalse((root / 'starts').exists())
+                self.until(lambda: self.con.execute('SELECT status FROM runs WHERE run_id=?',
+                                                   (row['run_id'],)).fetchone()[0] == 'done')
+                self.assertEqual((root / 'starts').read_text().splitlines(), [row['run_id']])
+                with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()), \
+                        patch.object(api, 'history_logs', side_effect=lambda box, cmd, which, offset=0, **kw:
+                                     dict(data='', nextOffset=offset, done=True, size=offset)), \
+                        patch.object(api, 'history_get', return_value=dict(status='exited', exitCode=0)):
+                    self.assertEqual(misc.wait(row['run_id'], 1, summary=True), 0)
+                self.assertIn('background output', out.getvalue())
+
+    def test_unrequested_term_after_box_selection_does_not_cancel_preparation(self):
+        root = Path(self.tmp.name)
+        with patch.dict(os.environ, OFFBOX_TEST_PREPARE_HOLD='1'), common.file_lock('fixture-prepare'):
+            proc, row = self.launch()
+            self.until(lambda: (root / 'preparing').exists(), proc)
+            current = self.con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
+            self.assertEqual((current['box_id'], current['process_id']), ('box-fake', None))
+            os.kill(row['client_pid'], signal.SIGTERM)
+            path = root / 'LOGS_DIR' / f"{row['run_id']}.client.log"
+            self.until(lambda: '"disposition":"ignored"' in path.read_text())
+            self.assertFalse((root / 'starts').exists())
+        self.until(lambda: (root / 'ttl').exists())
+        self.assertEqual((root / 'starts').read_text().splitlines(), [row['run_id']])
 
     def test_old_parent_registration_does_not_make_child_look_like_reused_pid(self):
         with common.file_lock('fixture-slot'):

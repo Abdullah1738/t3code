@@ -1,3 +1,4 @@
+import { PersistenceSqlError } from "../persistence/Errors.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it, vi } from "@effect/vitest";
 import {
@@ -4513,6 +4514,67 @@ it.effect("stops the provider turn when ingestion fails the run before a termina
     assert.deepEqual(yield* Ref.get(interrupted), ["provider-turn:ingest-failure:orphaned-turn"]);
     assert.deepEqual(preservation, [[false, false]]);
   }),
+);
+
+it.effect.each([false, true])(
+  "keeps persistence detail when terminal write is rejected: %s",
+  (rejectTerminalWrite) =>
+    Effect.gen(function* () {
+      const analytics: AnalyticsEvent[] = [];
+      const result = yield* captureRootRunTermination({
+        key: "ingest-persistence",
+        rejectTerminalWrite,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        recordUsage: (event) =>
+          Effect.sync(() => {
+            analytics.push(event);
+          }),
+        events: (ids) =>
+          Stream.make({
+            type: "node.updated",
+            driver,
+            node: { id: ids.rootNodeId, threadId: ids.threadId, runId: ids.runId },
+          } as unknown as ProviderAdapter.ProviderAdapterV2Event),
+        ingestNormalized: (ingest) =>
+          Effect.fail(
+            new ProviderEventIngestor.ProviderEventPublishError({
+              providerSessionId: ingest.providerSessionId,
+              eventCount: 1,
+              cause: new PersistenceSqlError({
+                operation: "OrchestrationEventStore.appendAgentEvents:insert",
+                detail: "SQLITE(14) unable to open database file",
+                cause: { errcode: 14, errstr: "unable to open database file" },
+              }),
+            }),
+          ),
+      });
+      if (!rejectTerminalWrite) {
+        const item = result.written.find((item) => item.type === "error");
+        assert.equal(item?.title, "Persistence error", JSON.stringify(item));
+        assert.equal(item?.type === "error" ? item.failure.category : null, "persistence");
+        assert.equal(item?.type === "error" ? item.failure.code : null, "sqlite_14");
+        assert.include(
+          item?.type === "error" ? item.failure.message : "",
+          "SQLITE(14) unable to open database file",
+        );
+        const failed = result.finalEvents.find(
+          (event) => event.type === "run.updated" && event.payload.status === "failed",
+        );
+        assert.equal(
+          failed?.type === "run.updated" ? failed.payload.failure?.category : null,
+          "persistence",
+        );
+      } else {
+        assert.deepEqual(result.finalEvents, []);
+      }
+      assert.deepEqual(analytics.find((event) => event.kind === "run.failed")?.props, {
+        runId: "run:ingest-persistence",
+        failureCategory: "persistence",
+        failureCode: "sqlite_14",
+        errorMessage:
+          "Robob could not save the run's events: SQLITE(14) unable to open database file",
+      });
+    }),
 );
 
 it.effect.each(["ended", "healthy-successor"] as const)(

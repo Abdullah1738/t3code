@@ -46,6 +46,8 @@ import * as Hex from "effect/encoding/Hex";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
+import * as HttpClientError from "effect/http/HttpClientError";
 import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
@@ -75,7 +77,10 @@ import {
   type BackgroundWorkReport,
 } from "@t3tools/provider-core/server/notification";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
-import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
+import {
+  makeProviderFailure,
+  ProviderPromptAcceptanceError,
+} from "@t3tools/provider-core/server/failure";
 import {
   makeSubagentChildThread,
   makeSubagentConversationArtifacts,
@@ -689,6 +694,7 @@ const CLEAR_PROMPT_REJECTIONS: ReadonlySet<string> = new Set([
 export const OPENCODE_2_STILL_STOPPING =
   "OpenCode is still stopping the previous turn. Send the message again in a moment.";
 const REQUEST_REPLY_TIMEOUT = "10 seconds";
+const PROMPT_ACCEPTANCE_BUDGET_SECONDS = 60;
 
 const deliver = <E>(answer: Effect.Effect<void, E>) =>
   answer.pipe(
@@ -3933,6 +3939,51 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       yield* syncRoster(rootOf(state));
     });
 
+    const awaitPromptAcceptance = Effect.fn("OpenCode2Adapter.awaitPromptAcceptance")(
+      <A, E, R>(request: Effect.Effect<A, E, R>) =>
+        request.pipe(
+          Effect.mapError((cause) => {
+            const error =
+              Predicate.isTagged(cause, "ClientError") && Predicate.hasProperty(cause, "cause")
+                ? cause.cause
+                : cause;
+            const http = HttpClientError.isHttpClientError(error) ? error : undefined;
+            // The server can admit input before its body is read or decoded.
+            // Typed server rejections bypass these client-side failure shapes.
+            const reason =
+              http?.reason._tag === "TransportError"
+                ? "transport"
+                : http?.reason._tag === "DecodeError" || Schema.isSchemaError(error)
+                  ? "acknowledgement"
+                  : undefined;
+            return reason !== undefined
+              ? new ProviderPromptAcceptanceError({
+                  driver,
+                  serverOrigin: new URL(connection.url).origin,
+                  reason,
+                  budgetSeconds: PROMPT_ACCEPTANCE_BUDGET_SECONDS,
+                  cause,
+                })
+              : cause;
+          }),
+          Effect.timeoutOrElse({
+            duration: Duration.seconds(PROMPT_ACCEPTANCE_BUDGET_SECONDS),
+            orElse: () =>
+              Effect.fail(
+                new ProviderPromptAcceptanceError({
+                  driver,
+                  serverOrigin: new URL(connection.url).origin,
+                  reason: "timeout",
+                  budgetSeconds: PROMPT_ACCEPTANCE_BUDGET_SECONDS,
+                }),
+              ),
+          }),
+        ),
+    );
+
+    // A missing message after a failed POST does not prove prepare cannot still
+    // admit it. Even a stable inbox id doesn't deduplicate plugin callbacks run
+    // before admission, so these uncertain submissions are never replayed here.
     const submit = Effect.fnUntraced(function* (
       sessionId: string,
       turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
@@ -3950,7 +4001,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const id = turnPromptId(sessionId, turnInput.attemptId);
       if (bare && text === "/compact") {
         if (!sending()) return;
-        return yield* client.session.compact({ sessionID, id }).pipe(Effect.asVoid);
+        return yield* client.session
+          .compact({ sessionID, id })
+          .pipe(awaitPromptAcceptance, Effect.asVoid);
       }
       const location = { directory: turnInput.runtimePolicy.cwd ?? host.paths.cwd };
       const command = bare ? commandOf(text) : undefined;
@@ -3966,7 +4019,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const newest = yield* client.message.list({ sessionID, order: "desc", limit: 1 });
           yield* markBefore(sessionId, newest.data[0]?.id ?? null);
           if (!sending()) return;
-          return yield* client.session.command({ sessionID, ...command });
+          return yield* client.session
+            .command({ sessionID, ...command })
+            .pipe(awaitPromptAcceptance);
         }
       }
       const skills = SKILL_MENTION.test(text)
@@ -3991,7 +4046,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             ? {}
             : { skills: skills.map((id) => ({ id: Skill.ID.make(id) })) }),
         })
-        .pipe(Effect.asVoid);
+        .pipe(awaitPromptAcceptance, Effect.asVoid);
     });
 
     /** The thread's session, with no turn running. */
@@ -4472,6 +4527,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               delivery: "steer",
             })
             .pipe(
+              awaitPromptAcceptance,
               Effect.tapError((cause) =>
                 lock.withPermit(
                   Effect.gen(function* () {
