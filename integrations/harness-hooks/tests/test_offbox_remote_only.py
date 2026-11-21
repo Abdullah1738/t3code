@@ -63,6 +63,8 @@ class OffboxRemoteOnlyTests(unittest.TestCase):
                      'test/router-sendblue.test.ts'):
             self.write(name, LIVE_TEST)
         self.write('unproven.sh', 'sqlite3 ~/.t3/userdata/statev2.sqlite .tables\n')
+        # TorSSH #134's gate script: an env-bash shebang the guard can't prove locally.
+        self.write('scripts/check.sh', '#!/usr/bin/env bash\necho ok\n').chmod(0o755)
 
     def write(self, name, source):
         path = self.root / name
@@ -181,9 +183,10 @@ class OffboxRemoteOnlyTests(unittest.TestCase):
                 self.assert_allowed(command)
 
     def test_reporter_exact_commands(self):
-        # Robob #1824, Crpko #2343, #196's Crpko #4500, iMessage #53 and 9router #93.
+        # Robob #1824, Crpko #2343, #196's Crpko #4500, iMessage #53, 9router #93 and TorSSH #134
+        # (its env-bash ./scripts/check.sh step runs only on the box; #287 owns the local run).
         for name in ('robob1824-exact.sh', 'crpko2343-exact.sh', 'crpko4500-exact.sh', 'imessage53-exact.sh',
-                     'router93-exact.sh'):
+                     'router93-exact.sh', 'torssh134-exact.sh'):
             with self.subTest(name=name):
                 self.assert_allowed(fixture(name))
 
