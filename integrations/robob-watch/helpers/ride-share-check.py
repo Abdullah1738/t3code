@@ -19,8 +19,9 @@ it makes are `shares` and `unshare`, an hour after a ride ended, for that ride's
 (never a stable-origin link, which stays up until someone unshares it on purpose).
 
 Env overrides (all optional):
-  WATCH_DIR          directory for rides.json and polls.jsonl (one line per poll: raw Uber status,
-                     headline, pickup ETA, car-to-pickup metres, card state; default: current dir)
+  WATCH_DIR          directory for rides.json, heals.jsonl (session recovery attempts), and
+                     polls.jsonl (one line per poll: raw Uber status, headline, pickup ETA,
+                     car-to-pickup metres, card state; default: current dir)
   RIDE_SHARE_STATE   full path of the state file
   RIDE_SHARE_HINTS   rider/booker hint directory (default ~/.local/share/rides-notify)
   RIDE_CARD_ROOT     where cards are written. Unset: the live imessage-apps folder only when WATCH_DIR
@@ -119,19 +120,57 @@ def rides_status():
     d = uber("rides", "status", timeout=15)
     if stale_session(d):
         print("ride-share: stale Uber session; reopening saved profile once", file=sys.stderr)
-        browser = os.environ.get("UBER_AGENT_BROWSER") or "agent-browser"
-        profile = Path.home() / "Library/Application Support/uber/profiles/default/browser"
-        subprocess.run([browser, "--session", "uber-cli-default", "--profile", str(profile),
-                        "--headed", "open", "https://m.uber.com/go/home"],
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=15, check=True, env=ENV)
-        d = uber("rides", "status", timeout=15)
+        row = {"ts": rc.iso(now_ts()), "event": "session_heal", "reopen": "failed",
+               "reopen_ms": 0, "retry_ok": False, "error": None}
+        started = time.monotonic()
+        try:
+            try:
+                browser = os.environ.get("UBER_AGENT_BROWSER") or "agent-browser"
+                profile = Path.home() / "Library/Application Support/uber/profiles/default/browser"
+                subprocess.run([browser, "--session", "uber-cli-default", "--profile", str(profile),
+                                "--headed", "open", "https://m.uber.com/go/home"],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=15, check=True, env=ENV)
+                row["reopen"] = "ok"
+            except subprocess.TimeoutExpired:
+                row.update(reopen="timeout", error="reopen timed out")
+                raise
+            except Exception:
+                row["error"] = "reopen failed"
+                raise
+            finally:
+                row["reopen_ms"] = int((time.monotonic() - started) * 1000)
+            try:
+                d = uber("rides", "status", timeout=15)
+                row["retry_ok"] = bool(d.get("ok"))
+                if not row["retry_ok"]:
+                    row["error"] = "retry status not ok"
+            except Exception:
+                row["error"] = "retry status failed"
+                raise
+        finally:
+            log_heal(row)
     if not d.get("ok"):
         raise RuntimeError(json.dumps(d.get("error"))[:200])
     return d
 
 
 POLL_LOG_MAX = 2_000_000    # bytes; polls.jsonl keeps its newest half past this
+HEAL_LOG_MAX = 200_000
+
+
+def log_heal(row):
+    try:
+        path = Path(WD) / "heals.jsonl"
+        line = json.dumps(row) + "\n"
+        if path.exists() and path.stat().st_size > HEAL_LOG_MAX:
+            keep = path.read_bytes()[-HEAL_LOG_MAX // 2:]
+            rc.atomic_write(path, keep[keep.find(b"\n") + 1:], "wb")
+        with open(path, "a") as f:
+            f.write(line)
+    except Exception:
+        # Raw subprocess errors can contain session data; diagnostics stay generic.
+        print("ride-share: heal log failed", file=sys.stderr)
 
 
 def log_poll(trip, card, now):
