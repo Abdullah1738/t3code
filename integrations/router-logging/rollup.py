@@ -12,6 +12,7 @@ from toollog import directory, safe_target, token, CONNECTION_ERRNOS, SYSCALLS
 from volume import REASONS, integer
 from listener_rollup import windows as listener_windows
 from pool_rollup import summarize as pool_summary
+from observer import gap_summary, measured, observed
 
 
 def percentiles(values):
@@ -76,6 +77,7 @@ def lock_identity(row, fallback):
         return fallback
 
 
+@measured('history_scan_parse')
 def rollup(day, root=None, now=None):
     day = dt.date.fromisoformat(day).isoformat()
     generated = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
@@ -422,13 +424,26 @@ def rollup(day, root=None, now=None):
         result['healthByHour'].append(dict(hour=hour, lateRows=len(group['late']),
             acceptToHandlerMs=percentiles(group['late']), probesOver5s=len(probes),
             probesWithLateRow=sum(p['acceptToHandlerMs'] is not None for p in probes), probes=probes))
-    result['listener'] = listener_windows(day, root, generated)
+    observations = []
+    result['listener'] = listener_windows(day, root, generated, observations)
+    result.update(gap_summary(observations, day, generated))
+    result['coverage'] = dict(
+        healthByHour='Threshold events only; healthy probes use supervisor.health_probe_summary.',
+        healthProbeSummaryRows=counts['supervisor.health_probe_summary'],
+        pools='Recorded exhaustion episodes only; empty does not mean no pools or continuous observer coverage.',
+        observerGaps='Measured spans only; legacy ticks without start/end diagnostics cannot be reconstructed.')
     drops = Counter()
     for writer in volume_writers.values():
         drops.update(writer)
     result['droppedLines'] = sum(drops.values()) if volume_writers else None
     result['dropsByReason'] = dict(sorted(drops.items()))
     result['volumeWriters'] = len(volume_writers)
+    write_report(root, day, result)
+    return result
+
+
+@measured('rollup_write')
+def write_report(root, day, result):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
     fd, tmp = tempfile.mkstemp(prefix='.rollup-', dir=root)
@@ -440,9 +455,9 @@ def rollup(day, root=None, now=None):
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
-    return result
 
 
+@observed(name='rollup.phases')
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--day', default=(dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)).isoformat())

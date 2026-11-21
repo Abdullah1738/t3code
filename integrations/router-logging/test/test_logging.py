@@ -145,6 +145,7 @@ class LoggingTests(unittest.TestCase):
         for case, expected_status, expected_ok in cases:
             with self.subTest(case=case):
                 router = object.__new__(poller.Router)
+                router.component, router.event_name = 'poller', 'endpoint.get'
                 router.auth = 'sk-private-auth'
                 router.opener = MagicMock()
                 response = router.opener.open.return_value.__enter__.return_value
@@ -166,7 +167,9 @@ class LoggingTests(unittest.TestCase):
                             router.get('/api/usage/stats?period=today')
                 event = self.rows()[-1]
                 self.assertEqual((event['name'], event['kind'], event['durationMs'], event['ok']), ('endpoint.get', 'perf', 125, expected_ok))
-                self.assertEqual(event['props'], {'endpoint': '/api/usage/stats', 'status': expected_status})
+                self.assertEqual(event['props']['endpoint'], '/api/usage/stats')
+                self.assertEqual(event['props']['status'], expected_status)
+                self.assertLessEqual(event['props']['startedAtMs'], event['props']['finishedAtMs'])
                 self.assertNotIn('private', json.dumps(event))
                 self.assertNotIn('sk-', json.dumps(event))
         with self.assertRaises(ValueError):

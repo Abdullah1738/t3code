@@ -5,6 +5,7 @@ from collections import defaultdict
 from listener_rollup import timestamp
 from pool_alerts import valid
 from guard import write_json
+from observer import measured
 
 
 def transitions(path):
@@ -53,6 +54,7 @@ def historical_transitions(root, paths):
     return rows
 
 
+@measured('pool_history')
 def summarize(day, root, generated, rows):
     floor = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc).timestamp() * 1000
     ceiling = min(floor + 86400000, generated.timestamp() * 1000)
