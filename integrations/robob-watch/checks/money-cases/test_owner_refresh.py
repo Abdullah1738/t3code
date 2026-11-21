@@ -2,6 +2,7 @@
 import os
 os.environ.setdefault('ROBOB_TEST', '1')
 import datetime as dt
+import errno
 import json
 from pathlib import Path
 import subprocess
@@ -136,6 +137,71 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(lock['pid'], os.getpid())
         self.assertGreater(lock['started_at'], 1)
 
+    def test_busy_launch_diagnostics_are_bounded_and_do_not_abort_the_caller(self):
+        self.seed()
+        fd = owner.take_lock(self.data)
+        self.addCleanup(os.close, fd)
+        def slow_read(path):
+            time.sleep(.65)
+            return path.read_text()
+        for remaining in (.05, 1):
+            with self.subTest(remaining=remaining), \
+                    patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                    patch.object(owner.data_io, 'read_text', slow_read), \
+                    owner.data_io.scope(time.time() + remaining):
+                started = time.monotonic()
+                self.assertEqual(owner.launch(self.data, self.since, stats={}), 'busy')
+                self.assertLess(time.monotonic() - started, .3)
+                self.assertFalse(owner.data_io.current_scope()['failed'])
+
+    def test_failed_crash_status_write_preserves_the_only_attempt_journal(self):
+        self.seed()
+        fd = owner.take_lock(self.data)
+        owner.mark_lock(fd, os.getpid())
+        os.close(fd)
+        before = (self.data / 'owner-refresh.lock').read_bytes()
+        with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                patch.object(owner, 'write_json', side_effect=OSError('status write failed')), \
+                patch.object(owner.subprocess, 'Popen') as spawn:
+            self.assertEqual(owner.launch(self.data, self.since), 'error')
+            spawn.assert_not_called()
+        self.assertEqual((self.data / 'owner-refresh.lock').read_bytes(), before)
+        self.assertEqual(owner.refresh_stats(self.data)['owner_refresh_result'], 'error')
+
+    def test_owned_journal_read_error_does_not_erase_a_previous_crash(self):
+        self.seed()
+        fd = owner.take_lock(self.data)
+        owner.mark_lock(fd, os.getpid())
+        os.close(fd)
+        before = (self.data / 'owner-refresh.lock').read_bytes()
+        with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                patch.object(owner.os, 'read', side_effect=OSError('journal unavailable')), \
+                patch.object(owner.subprocess, 'Popen') as spawn:
+            stats = {}
+            self.assertEqual(owner.launch(self.data, self.since, stats=stats), 'error')
+            spawn.assert_not_called()
+        self.assertEqual((self.data / 'owner-refresh.lock').read_bytes(), before)
+        self.assertEqual(stats['owner_refresh_result'], 'error')
+        self.assertEqual(owner.refresh_stats(self.data)['owner_refresh_result'], 'error')
+
+    def test_first_launch_has_no_failed_attempt_and_partial_journals_fail_closed(self):
+        held = []
+        def hold(argv, **kwargs):
+            held.append(os.dup(kwargs['pass_fds'][0]))
+        with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                patch.object(owner.subprocess, 'Popen', side_effect=hold):
+            try:
+                stats = {}
+                self.assertEqual(owner.launch(self.data, self.since, stats=stats), 'started')
+                self.assertNotIn('owner_refresh_result', stats)
+                self.assertFalse((self.data / 'owner-refresh.json').exists())
+                self.assertNotIn('owner_refresh_result', owner.refresh_stats(self.data))
+            finally:
+                for fd in held: os.close(fd)
+        self.assertEqual(owner.refresh_stats(self.data)['owner_refresh_result'], 'error')
+        (self.data / 'owner-refresh.lock').write_text('{partial')
+        self.assertEqual(owner.refresh_stats(self.data)['owner_refresh_result'], 'error')
+
     def test_list_timeout_is_logged_without_renewing_the_snapshot(self):
         before = self.seed()
         with self.server(list_delay=1), patch.object(owner, 'REQUEST_TIMEOUT', .05):
@@ -158,6 +224,22 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual((self.data / 'owner-snapshot.json').read_bytes(), before)
         self.assertEqual(list(self.data.glob('.owner-snapshot.json.*')), [])
         self.assertEqual(owner.refresh_stats(self.data)['owner_refresh_result'], 'error')
+
+    def test_publication_timeout_is_a_failure_after_a_successful_owner_read(self):
+        before = self.seed()
+        replace = state_json.os.replace
+        def interrupted(src, dst):
+            if Path(dst).name == 'owner-snapshot.json':
+                raise failure
+            return replace(src, dst)
+        for failure in (charges.Lookup('Robob control: lookup over time'),
+                        owner.data_io.DataUnavailable(self.data / 'owner-snapshot.json', 'deadline')):
+            with self.subTest(error=type(failure).__name__), self.server(), \
+                    patch.object(state_json.os, 'replace', interrupted):
+                self.assertEqual(owner.refresh(self.data, self.since), 'error')
+            self.assertEqual((self.data / 'owner-snapshot.json').read_bytes(), before)
+            self.assertEqual(owner.refresh_stats(self.data)['owner_refresh_result'], 'error')
+            self.assertEqual(list(self.data.glob('.owner-snapshot.json.*')), [])
 
     def test_detached_process_inherits_lock_and_recovers_after_crash(self):
         processes = []
@@ -183,6 +265,97 @@ class RefreshTests(unittest.TestCase):
 
 
 class CheckTests(Base):
+    def test_post_lock_resource_errors_reach_analytics_without_an_owner_read(self):
+        now = dt.datetime.now(mc.TZ)
+        self.data.mkdir()
+        thread = {'threadId': 'a', 'title': 'App', 'updatedAt': charges.iso(now)}
+        row = summary('I paid Acme', createdAt=charges.iso(now - dt.timedelta(minutes=1)))
+        # All failures after acquiring the lock are errors, including EAGAIN.
+        targets = ((owner.os, 'read'), (owner, 'mark_lock'), (owner.subprocess, 'Popen'))
+        for target, name in targets:
+            with self.subTest(operation=name):
+                with ControlServer([row], threads=[thread]):
+                    self.assertEqual(owner.refresh(self.data, now - dt.timedelta(hours=1)), 'ok')
+                before = (self.data / 'owner-snapshot.json').read_bytes()
+                text = 'Purchase of AED 12.34 with Credit Card ending 1111 at Acme, Dubai.'
+                book = {'version': 1, 'questions': []}
+                mc.new_question(book, charges.parse(text, 'EmiratesNBD'), text,
+                                now - dt.timedelta(minutes=1), now, 'sms')
+                mc.write_json(self.data / 'questions.json', book)
+                with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                        patch.object(target, name, side_effect=BlockingIOError(errno.EAGAIN, 'resource unavailable')), \
+                        patch.object(mc, 'follow', return_value=[]), \
+                        patch('marketplace.launch_refresh', return_value='skipped'), \
+                        patch.object(charges, 'owner_texts', side_effect=AssertionError('unexpected owner read')), \
+                        patch.object(mc, 'record_event') as log:
+                    mc.run_check(self.wd, name, self.data, self.root, now, finder())
+                check = next(c for c in log.call_args_list if c.args[0] == 'check.run')
+                self.assertEqual(check.kwargs['props']['owner_refresh_result'], 'error')
+                report = mc.run_history.summary(self.wd, '24h')
+                self.assertEqual(report['owner']['last_refresh']['owner_refresh_result'], 'error')
+                self.assertEqual(owner.refresh_stats(self.data)['owner_refresh_result'], 'error')
+                self.assertEqual((self.data / 'owner-snapshot.json').read_bytes(), before)
+
+    def test_detached_failures_reach_check_and_runs_without_renewing_the_snapshot(self):
+        now = dt.datetime.now(mc.TZ)
+        since = now - dt.timedelta(hours=1)
+        self.data.mkdir()
+        thread = {'threadId': 'a', 'title': 'App', 'updatedAt': charges.iso(now)}
+        row = summary('I paid Acme', createdAt=charges.iso(now - dt.timedelta(minutes=1)))
+        popen = subprocess.Popen
+        for failure in ('spawn', 'exit', 'signal'):
+            with self.subTest(failure=failure):
+                with ControlServer([row], threads=[thread]):
+                    self.assertEqual(owner.refresh(self.data, since), 'ok')
+                before = (self.data / 'owner-snapshot.json').read_bytes()
+                processes = []
+                def early_child(argv, **kwargs):
+                    # Exit before importing owner_refresh, retaining the real inherited lock.
+                    proc = popen([argv[0], '-I', '-B', '-c',
+                                  'raise SystemExit(1)' if failure == 'exit' else 'import time; time.sleep(30)'],
+                                 **kwargs)
+                    processes.append(proc)
+                    return proc
+                with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                        patch.object(owner.subprocess, 'Popen', side_effect=(
+                            OSError('private credential must not be logged') if failure == 'spawn' else early_child)):
+                    owner.launch(self.data, since)
+                if processes:
+                    if failure == 'signal': processes[0].kill()
+                    self.assertNotEqual(processes[0].wait(timeout=5), 0)
+                self.assertEqual(owner.refresh_stats(self.data)['owner_refresh_result'], 'error')
+                book = {'version': 1, 'questions': []}
+                text = 'Purchase of AED 12.34 with Credit Card ending 1111 at Acme, Dubai.'
+                mc.new_question(book, charges.parse(text, 'EmiratesNBD'), text,
+                                now - dt.timedelta(minutes=1), now, 'sms')
+                mc.write_json(self.data / 'questions.json', book)
+                with patch.object(mc, 'record_event') as log:
+                    mc.run_check(self.wd, failure, self.data, self.root, now, finder(), refresh_owner=False)
+                check = next(c for c in log.call_args_list if c.args[0] == 'check.run')
+                self.assertEqual(check.kwargs['props']['owner_refresh_result'], 'error')
+                report = mc.run_history.summary(self.wd, '24h')
+                self.assertEqual(report['owner']['last_refresh']['owner_refresh_result'], 'error')
+                self.assertIn("'owner_refresh_result': 'error'", mc.run_history.format_summary(report))
+                self.assertEqual((self.data / 'owner-snapshot.json').read_bytes(), before)
+                self.assertNotIn('private credential', (self.wd / 'runs.jsonl').read_text())
+                # The next check starts a new refresh before reading the old failure.
+                # A live child must not hide the failed attempt it is replacing.
+                mc.write_json(self.data / 'questions.json', book)
+                failure = 'signal'
+                with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                        patch.object(owner.subprocess, 'Popen', side_effect=early_child):
+                    try:
+                        mc.run_check(self.wd, 'retry', self.data, self.root, now, finder())
+                        self.assertEqual(owner.refresh_stats(self.data)['owner_refresh_result'], 'error')
+                        persisted = json.loads((self.data / 'owner-refresh.json').read_text())
+                        self.assertEqual(persisted['owner_refresh_result'], 'error')
+                        report = mc.run_history.summary(self.wd, '24h')
+                        self.assertEqual(report['owner']['last_refresh']['owner_refresh_result'], 'error')
+                    finally:
+                        processes[-1].kill()
+                        processes[-1].wait(timeout=5)
+                self.assertEqual((self.data / 'owner-snapshot.json').read_bytes(), before)
+
     def test_scratch_check_never_launches_a_refresh_even_when_globally_enabled(self):
         now = dt.datetime.now(mc.TZ)
         self.data.mkdir()
@@ -207,7 +380,7 @@ class CheckTests(Base):
         row = summary('I paid Acme', createdAt=charges.iso(now - dt.timedelta(minutes=1)))
         sequence = []
         follow = mc.follow
-        def launched(*a): sequence.append('launch'); return 'skipped'
+        def launched(*a, **kw): sequence.append('launch'); return 'skipped'
         def followed(*a, **kw): sequence.append('follow'); return follow(*a, **kw)
         with ControlServer([row], threads=[thread], list_delay=.12) as server, \
                 patch.object(owner, 'launch', launched), patch.object(mc, 'follow', followed), \

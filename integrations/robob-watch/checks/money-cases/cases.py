@@ -3569,10 +3569,7 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *, 
                     (q.get('status') == 'case' and owner_now - at <= FOLLOW_CASE)):
                 owner_times.append(at)
         if refresh_owner and owner_times and said is None:
-            try:
-                launch_owner_refresh(data or DATA, min(owner_times) - charges.OWNER_AROUND)
-            except OSError:
-                pass  # Cache freshness still fails closed if process creation fails.
+            launch_owner_refresh(data or DATA, min(owner_times) - charges.OWNER_AROUND, stats=stats)
         from marketplace import refresh_status
         refresh = refresh_status(data or DATA)
         result = _scoped_run_check(wd, run, data, root, now, find, said, stats, refresh, started)

@@ -46,7 +46,7 @@ def snapshot(data, cache_reset=None):
         return None
 
 
-def refresh_stats(data):
+def _completed_stats(data):
     try:
         obj = json.loads(data_io.read_text(Path(data) / 'owner-refresh.json'))
         result = {key: obj[key] for key in ('owner_refresh_ms', 'owner_refresh_at',
@@ -57,6 +57,70 @@ def refresh_stats(data):
         return result
     except (OSError, ValueError, TypeError, AttributeError):
         return {}
+
+
+def diagnostic_deadline(budget):
+    parent = data_io.current_scope()
+    end = time.time() + budget
+    return min(end, parent['deadline']) if parent is not None else end
+
+
+def refresh_stats(data, *, lock_fd=None):
+    end = diagnostic_deadline(.1)
+    try:
+        with data_io.scope(end), charges.within(end, charges.Lookup('out of time')):
+            return _refresh_stats(data, lock_fd)
+    except (charges.Lookup, data_io.DataUnavailable):
+        if lock_fd is not None:
+            # A launcher must not replace a journal it could not inspect.
+            raise
+        return {}
+
+
+def _refresh_stats(data, lock_fd):
+    fd = lock_fd
+    try:
+        if fd is None:
+            fd = take_lock(data, create=False)
+        result = _completed_stats(data)
+        # The inherited flock outlives the launcher. An idle lock with a newer
+        # attempt and no completion also covers import errors, os._exit and signals.
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 4096)
+        if not raw:
+            return result  # A newly created lock has no attempt yet.
+        try:
+            attempt = json.loads(raw)['started_at']
+            if type(attempt) not in (int, float) or not math.isfinite(attempt):
+                raise ValueError()
+        except (ValueError, TypeError, KeyError):
+            attempt = os.fstat(fd).st_mtime
+        if attempt > result.get('owner_refresh_at', 0):
+            return {'owner_refresh_at': attempt, 'owner_refresh_result': 'error',
+                    'owner_refresh_ms': max(0, round((time.time() - attempt) * 1000)),
+                    'owner_refresh_timeouts': 0}
+        return result
+    except OSError:
+        if lock_fd is not None:
+            raise
+        return _completed_stats(data)
+    except ValueError:
+        return _completed_stats(data)
+    finally:
+        if fd is not None and lock_fd is None:
+            os.close(fd)
+
+
+def save_status(data, values):
+    # Diagnostics get a small slice of the caller's remaining budget, including
+    # a launch failure that must not turn into an unbounded cache write.
+    end = diagnostic_deadline(.1)
+    try:
+        with data_io.scope(end), charges.within(end, charges.Lookup('out of time')):
+            write_json(Path(data) / 'owner-refresh.json', values)
+        return True
+    except (charges.Lookup, OSError, data_io.DataUnavailable):
+        return False
 
 
 def cached_texts(since, until, deadline=None, stats=None, cache_path=None, cache_reset=None):
@@ -84,10 +148,12 @@ def cached_texts(since, until, deadline=None, stats=None, cache_path=None, cache
         return [tuple(row) for row in obj['rows'] if since <= charges.owner_time(row[0]) <= until]
 
 
-def take_lock(data):
+def take_lock(data, *, create=True):
     path = Path(data) / 'owner-refresh.lock'
-    data_io.materialize_io(lambda: path.parent.mkdir(parents=True, exist_ok=True), path.parent)
-    fd = data_io.materialize_io(lambda: os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600), path)
+    if create:
+        data_io.materialize_io(lambda: path.parent.mkdir(parents=True, exist_ok=True), path.parent)
+    flags = os.O_RDWR | os.O_CREAT if create else os.O_RDONLY
+    fd = data_io.materialize_io(lambda: os.open(path, flags | os.O_NOFOLLOW, 0o600), path)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fd
@@ -100,28 +166,55 @@ def mark_lock(fd, pid):
     # The pid and age are diagnostic; flock is authoritative even if a PID is
     # reused. A crash releases the kernel lock without unlink/reclaim races.
     os.lseek(fd, 0, os.SEEK_SET)
-    os.ftruncate(fd, 0)
-    os.write(fd, json.dumps({'pid': pid, 'started_at': time.time()}).encode())
+    payload = json.dumps({'pid': pid, 'started_at': time.time()}).encode()
+    written = os.write(fd, payload)
+    if written != len(payload):
+        raise OSError('incomplete refresh journal write')
+    # Write before trimming: interruption cannot erase the previous journal and
+    # leave an empty inode indistinguishable from the first launch.
+    os.ftruncate(fd, written)
 
 
-def launch(data, since):
+def launch(data, since, *, stats=None):
     if os.environ.get('MONEY_CASES_REFRESH_DISABLED') == '1':
         return 'skipped'
+    started = time.time()
+    end = diagnostic_deadline(.5)
+    fd = None
     try:
-        fd = take_lock(data)
-    except BlockingIOError:
-        return 'busy'
-    try:
-        # Pass the held lock into the child: simultaneous checks cannot spawn
-        # duplicate refreshes during the gap before Python starts.
-        proc = subprocess.Popen([sys.executable, '-I', '-B', str(Path(__file__).resolve()),
-                                 '--data', str(data), '--since', since.isoformat(), '--lock-fd', str(fd)],
-                                pass_fds=(fd,), start_new_session=True, close_fds=True,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        mark_lock(fd, proc.pid)
-        return 'started'
+        with data_io.scope(end), charges.within(end, charges.Lookup('out of time')):
+            try:
+                fd = take_lock(data)
+            except BlockingIOError:
+                if stats is not None:
+                    stats.update(refresh_stats(data))
+                return 'busy'
+            previous = refresh_stats(data, lock_fd=fd)
+            if stats is not None:
+                stats.update(previous)
+            if previous.get('owner_refresh_result') == 'error':
+                # Retain an early child's failure while the next attempt runs.
+                if not save_status(data, previous):
+                    return 'error'
+            mark_lock(fd, os.getpid())
+            # Before spawning, journal the attempt under the inherited lock.
+            # The child records its own PID on entry; no parent write races it.
+            subprocess.Popen([sys.executable, '-I', '-B', str(Path(__file__).resolve()),
+                             '--data', str(data), '--since', since.isoformat(), '--lock-fd', str(fd)],
+                             pass_fds=(fd,), start_new_session=True, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return 'started'
+    except (charges.Lookup, OSError, data_io.DataUnavailable):
+        failure = {'owner_refresh_result': 'error', 'owner_refresh_at': time.time(),
+                   'owner_refresh_ms': max(0, round((time.time() - started) * 1000)),
+                   'owner_refresh_timeouts': 0}
+        save_status(data, failure)
+        if stats is not None:
+            stats.update(failure)
+        return 'error'
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
 
 
 def refresh(data, since, *, budget=REFRESH_BUDGET, lock_fd=None):
@@ -147,18 +240,15 @@ def refresh(data, since, *, budget=REFRESH_BUDGET, lock_fd=None):
                     state = prior['threads']
                     list_since = asof - dt.timedelta(minutes=2)
             threads = {}
-            try:
-                rows = charges.live_owner_texts(since, until, stats=stats,
-                    cache_path=data / 'owner-texts.json', budget=max(.001, end - time.time() - 1),
-                    request_timeout=REQUEST_TIMEOUT, thread_state=state, list_since=list_since,
-                    thread_capture=threads)
-                # Publication is one atomic replace, only after every selected
-                # thread and both list filters completed with provenance checked.
-                write_json(data / 'owner-snapshot.json', {'version': VERSION, 'since': since.isoformat(),
-                           'as_of': until.isoformat(), 'threads': threads, 'rows': rows})
-                result = 'ok'
-            except charges.Lookup:
-                result = stats.get('owner_result', 'error')
+            rows = charges.live_owner_texts(since, until, stats=stats,
+                cache_path=data / 'owner-texts.json', budget=max(.001, end - time.time() - 1),
+                request_timeout=REQUEST_TIMEOUT, thread_state=state, list_since=list_since,
+                thread_capture=threads)
+            # Publication must succeed too; a completed API read alone is not a
+            # successful refresh when atomic replacement times out or fails.
+            write_json(data / 'owner-snapshot.json', {'version': VERSION, 'since': since.isoformat(),
+                       'as_of': until.isoformat(), 'threads': threads, 'rows': rows})
+            result = 'ok'
     except (charges.Lookup, OSError, ValueError, data_io.DataUnavailable):
         result = stats.get('owner_result', 'error')
         if result == 'ok':
@@ -169,7 +259,7 @@ def refresh(data, since, *, budget=REFRESH_BUDGET, lock_fd=None):
             with charges.within(time.time() + max(.001, end - time.time()), charges.Lookup('out of time')):
                 write_json(data / 'owner-refresh.json', {
                     'owner_refresh_ms': round((time.monotonic() - started) * 1000),
-                    'owner_refresh_at': round(time.time()), 'owner_refresh_result': result,
+                    'owner_refresh_at': time.time(), 'owner_refresh_result': result,
                     'owner_refresh_timeouts': stats.get('owner_timeouts', 0),
                     'owner_list_window_s': round(stats.get('owner_list_window_s', 0)),
                     'owner_source': stats.get('owner_source', 'live')})
