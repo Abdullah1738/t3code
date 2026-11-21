@@ -354,9 +354,11 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         );
         expect(settings).toContain('"gateway"');
         expect(settings).not.toContain("router-secret");
-        expect((yield* h.readRequests).find((r) => r.method === "authenticate")?.params).toEqual({
-          methodId: "gateway",
-        });
+        expect(
+          (yield* h.readRequests)
+            .filter((request) => request.method === "auth/login")
+            .map((request) => request.params?.methodId),
+        ).toEqual(["gateway"]);
         const snapshot = yield* h.instance.snapshot.getSnapshot;
         expect(snapshot.auth).toMatchObject({ status: "authenticated", type: "gateway" });
         yield* h.assertClosed;

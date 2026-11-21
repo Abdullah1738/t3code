@@ -158,7 +158,7 @@ describe("Antigravity process environment", () => {
       decodeJson(
         antigravityProfileSettings({
           ...ANTIGRAVITY_PERSONAL_AUTH,
-      authMethod: "oauth-business",
+          authMethod: "oauth-business",
           apiKey: "never-written",
           gcpProject: "proj",
           gcpLocation: "us-central1",
@@ -814,6 +814,7 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
       const profile = yield* prepareAntigravityProfile({
         profileDirectory: temporaryDirectory,
         auth: {
+          ...ANTIGRAVITY_PERSONAL_AUTH,
           authMethod: "agent-platform",
           apiKey: "vertex-secret",
           gcpProject: "proj",

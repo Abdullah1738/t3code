@@ -133,8 +133,7 @@ export const AntigravityDriver: ProviderDriver<
       }).pipe(
         Effect.provideService(HttpClient.HttpClient, httpClient),
         Effect.mapError(
-          (cause) =>
-            new ProviderSetupError({ instanceId, operation, detail: cause.detail, cause }),
+          (cause) => new ProviderSetupError({ instanceId, operation, detail: cause.detail, cause }),
         ),
       );
     });
@@ -142,7 +141,10 @@ export const AntigravityDriver: ProviderDriver<
     const resolveRuntimeAuth = Effect.fn("AntigravityDriver.resolveRuntimeAuth")(function* () {
       if (auth.authMethod !== "gateway") return auth;
       const models = yield* listGatewayModels("start");
-      return { ...auth, gatewayModels: models.map((model) => model.id) } satisfies AntigravityAuthConfig;
+      return {
+        ...auth,
+        gatewayModels: models.map((model) => model.id),
+      } satisfies AntigravityAuthConfig;
     });
     const authConfigIssue = antigravityAuthConfigIssue(auth);
     const processEnvironment = yield* mergeProviderInstanceEnvironment(environment);

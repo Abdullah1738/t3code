@@ -78,19 +78,21 @@ describe("Antigravity gateway models", () => {
     expect(models.find((model) => model.id === "ag/claude-sonnet-5-5-high")?.name).toBe("Sonnet");
   });
 
-  it.effect("reads the list with the key as a bearer token and includes all Neon and Carbon ids", () =>
-    Effect.gen(function* () {
-      const { result, requests } = yield* run(() => Response.json(fixture))({
-        baseUrl: "http://127.0.0.1:20128/",
-        apiKey: "router-secret",
-      });
-      expect(requests).toEqual([
-        { url: "http://127.0.0.1:20128/v1/models", authorization: "Bearer router-secret" },
-      ]);
-      expect(Result.isSuccess(result)).toBe(true);
-      const ids = Result.isSuccess(result) ? result.success.map((model) => model.id) : [];
-      for (const id of neonCarbon) expect(ids).toContain(id);
-    }),
+  it.effect(
+    "reads the list with the key as a bearer token and includes all Neon and Carbon ids",
+    () =>
+      Effect.gen(function* () {
+        const { result, requests } = yield* run(() => Response.json(fixture))({
+          baseUrl: "http://127.0.0.1:20128/",
+          apiKey: "router-secret",
+        });
+        expect(requests).toEqual([
+          { url: "http://127.0.0.1:20128/v1/models", authorization: "Bearer router-secret" },
+        ]);
+        expect(Result.isSuccess(result)).toBe(true);
+        const ids = Result.isSuccess(result) ? result.success.map((model) => model.id) : [];
+        for (const id of neonCarbon) expect(ids).toContain(id);
+      }),
   );
 
   it.effect("sends no authorization header without a key", () =>
