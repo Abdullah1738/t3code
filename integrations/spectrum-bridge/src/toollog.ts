@@ -1,5 +1,9 @@
 import { RobobLinkDown } from "./robob-link-gate.ts";
 import { cleanRosterHealth, createRosterAggregation, ROSTER_ACTIONS } from "./log-active-roster.ts";
+import { homedir } from "node:os";
+import { stateRoot, telegramBridgeSocket } from "./config.ts";
+import { socketPost } from "./telegram-fallback.ts";
+import { createRobobLinkAlert, type LinkAlertOptions } from "./robob-link-alert.ts";
 import { probeDeferred } from "./probe-policy.ts";
 import { safeLineFailureCode, sendblueErrorKey } from "./line.ts";
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync } from "node:fs";
@@ -48,7 +52,7 @@ const ENUMS: Record<string, readonly string[]> = {
   route: ["new_turn", "steer", "question_answer", "held_for_wake"],
   readMode: ["full", "incremental", "cached-skip", "shared"],
   fullReason: ["first-read", "route-change", "missing-until", "resync", "merge-conflict", "clock-skew"],
-  kind: ["control", "conversation", "notification", "outage", "dropped", "failed", "nudge", "request", "other"],
+  kind: ["control", "conversation", "notification", "outage", "dropped", "failed", "nudge", "request", "other", "down", "up"],
   state: ["pending", "admitted", "processing", "batched", "done", "failed", "unknown", "cancelled", "observed"],
   action: ["requeued", "in_turn"], leaderKind: ["human", "wake", "reset", "background", "none"],
   telegram: ["sent", "failed"], severity: ["warn"],
@@ -172,7 +176,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     if (entry.name === "robob.link_state" && key === "resumedByRun" && typeof value === "string" && /^[a-f0-9-]{36}$/.test(value)) { props[key] = value; continue; }
     if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1)) continue;
     if ((NUMBERS.has(key) || key === "replies" && entry.name === "notice.reply") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
-    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders", "linkRecovery", "retrySafe", "answersInbound", "linkGated", "linkProbe", "linkGateDown"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
+    else if ((["ok", "queued", "inboundKnown", "bytesKnown", "pendingOrders", "linkRecovery", "retrySafe", "answersInbound", "linkGated", "linkProbe", "linkGateDown"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
     else if (key === "holderRunId" && typeof value === "string" && value.length <= 250 && /^[a-zA-Z0-9_:%.@-]+$/.test(value)) props[key] = value;
     else if (typeof value === "string" && ENUMS[key]?.includes(value)) props[key] = value;
     // A route template is code-owned; no query strings, ids, or URLs enter the log.
@@ -180,7 +184,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   }
   if (Object.keys(props).length) line.props = props;
   if (entry.name === "router.prompt_probes" && entry.component === "router" && entry.kind === "perf") line.promptProbe = cleanPromptProbe(entry.promptProbe);
-  if (entry.component === "robob" && ["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply"].includes(entry.name)) line.link = cleanRobobLink(entry.link);
+  if (entry.component === "robob" && ["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_alert", "robob.link_reply"].includes(entry.name)) line.link = cleanRobobLink(entry.link);
   if (entry.name === "card.renders" && entry.kind === "perf") line.renders = cleanRenders(entry.renders);
   if (entry.name === "turn.robob_calls" && entry.component === "robob" && entry.kind === "perf") line.calls = cleanCalls(entry.calls);
   if (entry.kind === "error" || entry.name === "turn.robob_call" && entry.ok === false) {
@@ -239,7 +243,7 @@ function chainSources(sources: Record<string, number>, day: string): Record<stri
   return { [day]: sources[day] ?? 0, ...Object.fromEntries(Object.entries(sources).filter(([date]) => date > day)) };
 }
 
-export function createToolLog(options: { root?: string; now?: () => number; capBytes?: number; defer?: boolean } = {}) {
+export function createToolLog(options: { root?: string; now?: () => number; capBytes?: number; defer?: boolean; linkAlert?: LinkAlertOptions | (() => LinkAlertOptions | undefined) } = {}) {
   const root = () => options.root ?? logDirectory("imessage");
   const now = options.now ?? Date.now;
   let maintainedDay = "";
@@ -252,7 +256,21 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   const messageReads = createMessageReadAggregation();
   const promptProbes = createPromptProbeAggregation();
   const roster = createRosterAggregation();
-  const robobLink = createRobobLinkState({ root, now, checkpoint: () => {
+  let linkAlert: ReturnType<typeof createRobobLinkAlert> | undefined;
+  let linkAlertOptions = options.linkAlert;
+  function alert() {
+    const config = typeof linkAlertOptions === "function" ? linkAlertOptions() : linkAlertOptions;
+    if (!config) return;
+    return linkAlert ??= createRobobLinkAlert({ ...config, now, log: entry => {
+      const line = clean(entry, new Date(now()).toISOString(), processRunId);
+      if (line) enqueue(line);
+    } });
+  }
+  function startLinkAlerts(config: LinkAlertOptions): void {
+    linkAlertOptions ??= config;
+    alert();
+  }
+  const robobLink = createRobobLinkState({ root, now, identity: outageId => alert()?.identity(outageId), recovery: () => alert()?.recovery(), checkpoint: () => {
     const day = new Date(now()).toISOString().slice(0, 10);
     const path = join(root(), `${day}.ndjson`);
     return { day, offset: existsSync(path) ? statSync(path).size : 0 };
@@ -291,7 +309,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.robob_calls", "robob.active_roster", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.robob_calls", "robob.active_roster", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_alert", "robob.link_alert_loaded", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }
@@ -331,7 +349,9 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         return;
       }
       const link = robobLink.accept(line);
-      for (const event of link.events) enqueue(event);
+      for (const event of link.events) { alert()?.accept(event); enqueue(event); }
+      alert()?.accept(line);
+      if (line.name === "turn.robob_call" && line.ok === true) void alert()?.tick();
       if (entry.props?.linkGated === true && entry.ok === false && !link.keepDetail) {
         saveLink();
         return;
@@ -435,8 +455,11 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (pending !== undefined) refreshChains(pending);
     });
   }
+  function flushLink(): void {
+    for (const line of robobLink.flush(now)) { alert()?.accept(line); enqueue(line); }
+  }
   function flushAll(): boolean {
-    capture(() => { for (const line of robobLink.flush(now)) enqueue(line); });
+    capture(() => { flushLink(); void alert()?.tick(); });
     for (const line of promptProbes.flush()) enqueue(line);
     for (const line of roster.flush()) enqueue(line);
     for (const line of messageReads.flush()) enqueue(line);
@@ -450,6 +473,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   }
   async function settled(): Promise<void> {
     await Promise.resolve();
+    await linkAlert?.settled();
     while (jobs.size || refreshingChains || recovery) await Promise.all([
       ...jobs.values(), ...(refreshingChains ? [refreshingChains] : []), ...(recovery ? [recovery] : []),
     ]);
@@ -527,6 +551,8 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     try {
       const at = now();
       for (const line of roster.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
+      flushLink();
+      await alert()?.tick();
       for (const line of messageReads.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       for (const line of promptProbes.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       if (rolling) { await settled(); return; }
@@ -552,12 +578,21 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (line) for (const record of calls.accept(line, false)) if (record.name !== "turn.start") enqueue(record);
     });
   }
-  const skipRobob = (site: string) => { for (const event of robobLink.skip(site)) enqueue(event); saveLink(); };
+  const skipRobob = (site: string) => { for (const event of robobLink.skip(site)) { alert()?.accept(event); enqueue(event); } saveLink(); };
   const robobSite = (site: string) => { const first = robobLink.firstAtSite(site); saveLink(); return first; };
-  return { robobLinkDown: robobLink.down, robobSite, skipRobob, write, rollup, tick, capture, flush: flushAll, settled, runIds: calls.ids, beginRun };
+  return { robobLinkDown: robobLink.down, robobSite, skipRobob, write, rollup, tick, capture, flush: flushAll, settled, runIds: calls.ids, beginRun, startLinkAlerts };
 }
 
 export const toolLog = createToolLog({ defer: true });
+/** Called only by a serve loop after it holds bridge.lock; CLI log readers cannot own alert state. */
+export function startRobobLinkAlerts(): void {
+  toolLog.capture(() => {
+    logDirectory("imessage");
+    // Isolated log fixtures must never read live alert state or contact Telegram.
+    if (process.env.TOOLLOG_DIR) return;
+    toolLog.startLinkAlerts({ root: stateRoot, post: socketPost(telegramBridgeSocket, 5_000), holdPath: join(homedir(), ".robob/install-hold.json") });
+  });
+}
 /** Cooperative read yielding is expected control flow, not a backend failure. */
 export const completionReady = Symbol("completionReady");
 // Keep correlation on the error identity without mutating or serializing caller-owned errors.

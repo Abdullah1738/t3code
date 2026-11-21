@@ -369,3 +369,5 @@ After 50 MB, `log.degraded` marks errors-and-turns logging for the rest of the d
 The main OpenChamber repository remains the `upstream` Git remote. This fork is
 owned by `Abdullah1738` so cumulative OpenChamber changes and the companion
 bridge can be synchronized without losing local work.
+
+The bridge alerts Telegram after its Robob link is down for two minutes, once per outage across restarts, and sends the outage duration when the link recovers.

@@ -2,7 +2,7 @@ import { ProbeBudget } from "./probe-policy.ts";
 import { RemoteBox, remoteBoxConfig } from "./remote-box.ts";
 import { createChatMirror, type ChatMirror } from "./mirror.ts";
 import { readFileSync } from "node:fs";
-import { toolError, toolLog, type LogLine } from "./toollog.ts";
+import { startRobobLinkAlerts, toolError, toolLog, type LogLine } from "./toollog.ts";
 import { createLoopStallMonitor } from "./loop-stall.ts";
 import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 /**
@@ -134,6 +134,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   let api: ((request: Request) => Promise<Response>) | undefined;
   const releaseLock = acquireLock(join(stateRoot, "bridge.lock"));
   process.once("exit", releaseLock);
+  startRobobLinkAlerts();
   const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }));
   loopStalls.start();
   process.once("exit", () => loopStalls.stop());
