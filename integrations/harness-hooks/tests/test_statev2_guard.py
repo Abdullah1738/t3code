@@ -1805,9 +1805,10 @@ bash "$TASK_DIR/step5r.sh"
         self.adapters(command, UNRESOLVED)
 
     def test_same_call_watchers47(self):
+        # The heredoc-written suite runs only under `offbox run --bg`, so the box is the only reader.
         command = self.reporter_body('watchers47.sh')
-        self.assertEqual(self.classify(command), UNRESOLVED)
-        self.adapters(command, UNRESOLVED)
+        self.assertIsNone(self.classify(command))
+        self.adapters(command, None)
 
     @trusted_node_test
     def test_same_call_literal_reporters(self):
@@ -6037,11 +6038,13 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
                 for command in self.fixture_wrapper_commands():
                     with self.subTest(case=label, command=command):
                         self.assertIsNone(self.classify(command))
-                # The same wrappers never excuse a fixture that reads a live path.
+                # The same wrappers never excuse a fixture that reads a live path,
+                # unless only the box runs it; an inherited BASH_ENV keeps even that checked.
                 self.write('tmp/fixture.sh', original + '\ncat "' + LIVE + '"\n')
                 for command in self.fixture_wrapper_commands():
+                    remote = label == 'no-bash-env' and command.startswith('offbox run --bg ')
                     with self.subTest(case=label + ':live-fixture', command=command):
-                        self.assertEqual(self.classify(command), SCRIPT)
+                        self.assertEqual(self.classify(command), None if remote else SCRIPT)
 
     def test_fixture_wrapper_refusals(self):
         self.write_plain_subpath_fixture()
@@ -6226,7 +6229,8 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             self.write('integrations/memory-system/tests/test_backup_replica.sh', source)
             for shape, command, cwd in commands:
                 with self.subTest(variant=variant, shape=shape):
-                    self.assertEqual(guard.classify(command, str(cwd)), expected)
+                    # `offbox run --remote --no-fallback` runs the copy only on the box.
+                    self.assertEqual(guard.classify(command, str(cwd)), None if shape == 'offbox-options' else expected)
 
     def test_fixture_review_control_corpus(self):
         backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
