@@ -837,6 +837,8 @@ Signal 7 catches slow leaks without waiting for load or pressure: footprint
 over 8 GiB and growth over 1 GiB/hour across at least 30 minutes. Its bounded
 history persists by PID and birth time, retaining missing-sample gaps. Other
 processes use the strain ladder; protected holders alert the responder.
+Only eligible offenders activate signal 7 and strain. A protected slow leak
+alone cannot authorize strain-ladder actions against other processes.
 Eligible leaking GUI apps get a normal Quit AppleEvent addressed to the exact
 PID. Two minutes later, only a surviving identical app still over the slow-leak
 threshold and still growing may receive TERM, then KILL ten seconds later.

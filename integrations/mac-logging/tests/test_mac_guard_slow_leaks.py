@@ -99,6 +99,61 @@ class SlowLeakTests(unittest.TestCase):
                 self.assertEqual(self.effects('restart'), [])
                 self.assertEqual(self.events_named('slow_leak')[0]['action'], 'protected_alert')
 
+    def test_protected_slow_leak_alone_never_authorizes_other_jobs(self):
+        cases = [(proc(31, 'codex'), owner) for owner in ('live', 'ended', 'unknown')]
+        cases += [(p, 'unknown') for p in (
+            proc(31, 'claude'), proc(31, 'opencode'), proc(31, 'gemini'),
+            proc(31, 'cursor-agent'), proc(31, 'grok'), proc(31, 'antigravity'),
+            proc(31, 'node', args='node /tools/@openai/codex/bin/codex.js'),
+            proc(31, 'node', label='com.ardud.opencode-service'), proc(31, ROBOB),
+            proc(31, '/usr/libexec/leaky'), proc(31, 'leaky', label='com.ardud.integration'),
+            proc(31, 'leaky', label='unknown-service-inventory'))]
+        for holder, owner in cases:
+            with self.subTest(comm=holder['comm'], label=holder.get('label'), owner=owner):
+                self.setUp()
+                self.host.owners[31] = owner
+                orphan = proc(100, 'test-runner')
+                for i in range(61):
+                    result = self.tick([holder, orphan], {31: 8.1+i*.01}, load=0, lag=0, pressure=1)
+                    self.assertFalse(result['strain'])
+                    self.assertEqual(result['signals'], [])
+                self.guard.drain(self.now)
+                self.assertEqual(self.effects('signal'), [])
+                self.assertEqual(self.effects('soften'), [])
+                self.assertEqual(self.effects('quit'), [])
+                self.assertEqual(self.guard.pending, [])
+                self.assertEqual(self.events_named('slow_leak')[0]['action'], 'protected_alert')
+                self.assertEqual(len(self.effects('worker')), 1)
+                self.assertEqual(len(self.effects('notify')), 1)
+
+    def test_exempt_or_unverified_gui_leak_does_not_activate_strain(self):
+        for bid in sorted(m.GUI_NEVER_QUIT)+[None]:
+            with self.subTest(bundle=bid):
+                self.setUp()
+                app = self.app(bid, '/Applications/Renamed.app/Contents/MacOS/Renamed')
+                if bid is None:
+                    self.host.apps.clear()
+                for i in range(61):
+                    result = self.tick([app, proc(100, 'test-runner')], {61946: 8.1+i*.01})
+                    self.assertFalse(result['strain'])
+                    self.assertNotIn(7, result['signals'])
+                self.assertEqual(self.effects('signal'), [])
+                self.assertEqual(self.effects('quit'), [])
+                self.assertEqual(self.events_named('slow_leak')[0]['action'], 'protected_alert')
+
+    def test_eligible_slow_leaks_still_activate_strain_without_load(self):
+        for kind in ('gui', 'non-gui'):
+            with self.subTest(kind=kind):
+                self.setUp()
+                holder = self.app() if kind == 'gui' else proc(20, 'leak')
+                result = None
+                for i in range(61):
+                    result = self.tick([holder], {holder['pid']: 8.1+i*.01})
+                self.assertTrue(result['strain'])
+                self.assertEqual(result['signals'], [7])
+                self.assertEqual(self.effects('quit'), [('quit', 61946, 'com.apple.ActivityMonitor')] if kind == 'gui' else [])
+                self.assertEqual(self.effects('soften'), [('soften', 20)] if kind == 'non-gui' else [])
+
     def test_quit_then_force_only_after_two_minutes(self):
         rows = [self.app()]
         self.series(rows, count=64)
@@ -349,7 +404,9 @@ class SlowLeakTests(unittest.TestCase):
                 app=self.app()
                 self.series([app],count=60)
                 offender=proc(1,ROBOB) if robob else proc(20,'leak')
-                self.tick([app,offender],{61946:8.1,offender['pid']:25 if robob else 50})
+                with patch.object(self.host, 'app_info', wraps=self.host.app_info) as app_probe:
+                    self.tick([app,offender],{61946:8.1,offender['pid']:25 if robob else 50})
+                    app_probe.assert_not_called()
                 self.assertEqual(self.effects('quit'),[])
                 if robob:
                     self.assertEqual(len(self.effects('restart')),1)

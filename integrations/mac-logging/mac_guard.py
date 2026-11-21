@@ -1059,11 +1059,13 @@ class Guard:
         if robob_trip:
             signals.append(6)
         slow_offenders = {p['pid'] for p in slow if not protected(p, self.rows) and not gui(p)}
-        if slow:
+        slow_strain = bool(slow_offenders) or (not memory and not robob_trip
+                       and any(self.gui_allowed(p) for p in slow if gui(p)))
+        if slow_strain:
             signals.append(7)
         self.streak = self.streak+1 if signals else 0
         self.calm = 0 if signals else self.calm+1
-        if not self.strain and (self.streak >= 2 or memory or robob_trip or slow):
+        if not self.strain and (self.streak >= 2 or memory or robob_trip or slow_strain):
             self.strain, self.since = True, now
             self.log('strain_start', signals=signals)
         if self.strain and self.calm >= 10:
