@@ -587,7 +587,7 @@ def boot_fields(values):
         elif key == 'shutdownCause':
             result[key] = (dict(code=value.get('code') if type(value.get('code')) is int else None,
                                 meaning='unmapped') if isinstance(value, dict) else None)
-        elif key == 'panic' and isinstance(value, dict):
+        elif key in ('panic', 'shutdownStall') and isinstance(value, dict):
             result[key] = dict(present=value.get('present') is True, path=path(value.get('path')))
         elif key == 'jetsamReportsLast2h' and isinstance(value, dict):
             result[key] = dict(count=value.get('count') if type(value.get('count')) is int else None,
@@ -597,7 +597,7 @@ def boot_fields(values):
             for field, source in value.items():
                 if field not in ('bootTime', 'previousBootTime', 'uptimeAtPreviousSample',
                                  'lastSampleGapS', 'clean', 'shutdownCause', 'bootFaults',
-                                 'panic', 'jetsamReportsLast2h') or not isinstance(source, dict):
+                                 'panic', 'shutdownStall', 'jetsamReportsLast2h') or not isinstance(source, dict):
                     continue
                 result[key][field] = {k: (path(v) if k == 'path' else v if v is None or type(v) in (int, bool) else text(v))
                     for k, v in source.items() if k in ('read', 'error', 'path', 'windowStart',

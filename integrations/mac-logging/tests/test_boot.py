@@ -572,3 +572,36 @@ class BootTests(unittest.TestCase):
         self.assertEqual(jobs.read_state('boot')['pending'], [])
         self.assertEqual(json.loads((self.root/'logs/rollup-2026-11-16.json').read_text())['boots'], 1)
         self.assertEqual(len([r for r in self.rows() if r['name'] == 'boot.observed']), 2)
+
+    def test_orderly_21_nov_boot_with_shutdown_stall(self):
+        at = boot.epoch('2026-11-21T10:12:28Z')
+        self.assertTrue(boot.parse_last((FIX/'last.txt').read_text(), at)[0])
+        path = self.reports/'shutdown_stall_2026-11-21-141211_Abdullahs-MacBook-Pro.shutdownStall'
+        path.write_bytes(b'not a JSON report')
+        os.utime(path, (at-17, at-17))
+        props = self.collect(at)
+        self.assertTrue(props['clean'])
+        self.assertTrue(props['source']['clean']['shutdownRecord'])
+        self.assertFalse(props['source']['clean']['abnormalEvidence'])
+        self.assertIsNone(props['bootFaults'])
+        self.assertFalse(props['panic']['present'])
+        self.assertEqual(props['shutdownStall'], dict(present=True, path=str(path)))
+        # Report presence uses metadata, never decodes the binary spindump.
+        self.assertEqual(props['source']['shutdownStall'], dict(read='DiagnosticReports mtime', error=None))
+        with patch.object(boot, 'collect', return_value=props), patch.object(boot, 'alert_text') as alert:
+            boot.observe(boot=at, now=at+660)
+        alert.assert_not_called()
+        row = next(r for r in self.rows() if r['name'] == 'boot.observed')
+        self.assertEqual(row['props']['shutdownStall'], props['shutdownStall'])
+        self.assertEqual(row['props']['source']['shutdownStall'], props['source']['shutdownStall'])
+
+    def test_shutdown_stall_time_window(self):
+        for offset, present in [(-601, False), (-600, True), (-17, True), (600, True), (601, False)]:
+            with self.subTest(offset=offset):
+                path = self.reports/'shutdown_stall_fixture.shutdownStall'
+                path.write_bytes(b'binary')
+                os.utime(path, (BOOT+offset, BOOT+offset))
+                with patch.object(boot, 'parse_last', return_value=(True, BOOT-86400)):
+                    props = self.collect()
+                self.assertEqual(props['shutdownStall']['present'], present)
+                self.assertTrue(props['clean'])

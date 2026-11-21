@@ -74,14 +74,15 @@ Each row includes the exact `kern.boottime` epoch and UTC `bootTime` when
 available. The minute CPU sampler and hourly collector share a nonblocking boot
 lock. After the ten-minute panic-file window closes, `boot.observed` records
 the previous boot, the last prior sample's uptime, the gap from the last prior log row,
-ResetCounter faults/failure count, panic files within ten minutes of boot and
-Jetsam reports in the preceding two hours. Missing evidence remains null or
-carries a per-field source error. The gap measures logging silence; it does
+ResetCounter faults/failure count, panic and shutdown-stall reports within ten
+minutes of boot, and Jetsam reports in the preceding two hours. Missing evidence
+remains null or carries a per-field source error. The gap measures logging silence; it does
 not establish how long the Mac froze.
 
 A clean boot requires the adjacent shutdown record from `last -y reboot shutdown`
-and no positive panic/reset-fault evidence. #92 found no numeric shutdown cause
-on this Apple-silicon host; any future numeric code is retained as unmapped,
+and no positive panic/reset-fault evidence. A shutdown-stall report records a
+slow orderly shutdown; its presence alone does not make the boot unclean.
+#92 found no numeric shutdown cause on this Apple-silicon host; any future numeric code is retained as unmapped,
 without Intel cause tables. One filtered unified-log query covers only the first
 three minutes of boot, with a 15-second process-group deadline and timestamp
 post-filtering. ResetCounter uses plain reads, without sudo. Observations are

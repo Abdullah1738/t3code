@@ -70,7 +70,7 @@ def diagnostics(boot, roots=REPORT_DIRS, read=None):
         with path.open() as stream:
             return stream.read(16384)
     read = read or read_header
-    reset, panic, jetsam, errors = [], [], [], []
+    reset, panic, stalls, jetsam, errors = [], [], [], [], []
     for root in roots:
         try:
             paths = list(root.iterdir())
@@ -80,7 +80,7 @@ def diagnostics(boot, roots=REPORT_DIRS, read=None):
             errors.append('directory_unreadable')
             continue
         for path in paths:
-            if not (path.name.startswith(('ResetCounter-', 'JetsamEvent-')) or path.suffix in ('.panic', '.ips')):
+            if not (path.name.startswith(('ResetCounter-', 'JetsamEvent-')) or path.suffix in ('.panic', '.ips', '.shutdownStall')):
                 continue
             try:
                 at = path.stat().st_mtime
@@ -104,6 +104,8 @@ def diagnostics(boot, roots=REPORT_DIRS, read=None):
                         errors.append('reset_faults_unavailable')
                 if abs(at-boot) <= 600 and (path.suffix == '.panic' or header and str(header.get('bug_type')) == '210'):
                     panic.append((at, str(path)))
+                if abs(at-boot) <= 600 and path.suffix == '.shutdownStall':
+                    stalls.append((at, str(path)))
                 if boot-7200 <= at <= boot and path.name.startswith('JetsamEvent-'):
                     jetsam.append((at, str(path)))
             except (OSError, ValueError, KeyError, TypeError, IndexError):
@@ -111,10 +113,12 @@ def diagnostics(boot, roots=REPORT_DIRS, read=None):
     latest = max(reset, key=lambda r: r[0]) if reset else None
     return dict(bootFaults=latest[2] if latest else None,
                 panic=dict(present=bool(panic), path=max(panic)[1] if panic else None),
+                shutdownStall=dict(present=bool(stalls), path=max(stalls)[1] if stalls else None),
                 jetsamReportsLast2h=dict(count=len(jetsam), newestPath=max(jetsam)[1] if jetsam else None)), dict(
                     bootFaults=dict(read='ResetCounter', path=str(latest[1]) if latest else None,
                                     error=','.join(sorted(set(errors))) or (None if latest else 'missing')),
                     panic=dict(read='DiagnosticReports', error=','.join(sorted(set(errors))) or None),
+                    shutdownStall=dict(read='DiagnosticReports mtime', error=','.join(sorted(set(errors))) or None),
                     jetsamReportsLast2h=dict(read='DiagnosticReports', error=','.join(sorted(set(errors))) or None))
 
 
@@ -201,6 +205,7 @@ def collect(boot, roots=REPORT_DIRS, root=None, run=subprocess.run, previous=Non
         props, sources = deadline_call(time.monotonic()+5, diagnostics, boot, roots)
     except (OSError, SourceFailure):
         props = dict(bootFaults=None, panic=dict(present=False, path=None),
+                     shutdownStall=dict(present=False, path=None),
                      jetsamReportsLast2h=dict(count=0, newestPath=None))
         sources = {key: dict(read='DiagnosticReports', error='unavailable') for key in props}
     try:
