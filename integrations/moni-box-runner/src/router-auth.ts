@@ -57,7 +57,7 @@ export async function routerReady(config: ReturnType<typeof routerConfig>, track
   let outcome: RouterOutcome;
   const elapsed = () => Math.round(now() - start);
   try {
-    const response = await fetch(`http://127.0.0.1:${config.boxLivezPort}/livez`, { redirect: "error", signal });
+    const response = await fetch(`http://127.0.0.1:${config.boxLivezPort}/livez`, { redirect: "manual", signal });
     try {
       if (response.status !== 200 && response.status !== 503) {
         outcome = { reason: "bad_status", status: response.status, ms: elapsed() };

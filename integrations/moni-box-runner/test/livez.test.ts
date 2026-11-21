@@ -83,6 +83,24 @@ test.each([
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
 });
 
+test.each([300, 301, 302, 303, 304, 305, 306, 307, 308, 399].flatMap(status =>
+  ["absolute", "relative", "missing", "invalid"].map(location => ({ status, location }))))(
+  "livez $status with $location Location logs bad_status without following", async ({ status, location }) => {
+    let now = 100, probes = 0, followed = 0;
+    const target = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => { followed++; return Response.json({ ready: true }); } });
+    cleanup.push(() => { target.stop(true); });
+    const url = location === "absolute" ? `${target.url}PRIVATE_TOKEN` : location === "relative" ? "/PRIVATE_TOKEN" : "http://[PRIVATE_TOKEN";
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => {
+      if (new URL(request.url).pathname !== "/livez") { followed++; return Response.json({ ready: true }); }
+      probes++; now += 17;
+      return new Response(null, { status, headers: location === "missing" ? {} : { Location: url } });
+    } }); cleanup.push(() => { server.stop(true); });
+    const logs: unknown[] = [], tracker = createRouterReadinessTracker(event => logs.push(event), () => now);
+    expect(await routerReady(routerConfig({ boxLivezPort: server.port }), tracker, () => now)).toBe(false);
+    expect(logs).toEqual([{ code: "router-unready", reason: "bad_status", status, ms: 17 }]);
+    expect(probes).toBe(1); expect(followed).toBe(0);
+  });
+
 test.each(["headers", "body"])("livez's 1.5 s deadline classifies stalled %s as timeout", async part => {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => part === "headers" ? new Promise<Response>(() => {})
     : new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"ready":')); } })) });
