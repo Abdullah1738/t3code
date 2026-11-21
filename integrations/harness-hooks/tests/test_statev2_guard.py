@@ -669,10 +669,13 @@ class GuardTests(unittest.TestCase):
             'script': ('d=$(mktemp -d)\n' + self.heredoc('"$d/port.py"', 'print(1)') +
                        'PYTHON -I "$d/port.py"'),
         }
+        # A version-selector write can change which python3 a shim runs, so
+        # the bare lookup stays unproved (#239 keeps other known writes proved).
+        selector = self.heredoc('.python-version', '3.12')
         with patch.dict(os.environ, {'PATH': str(shadow.parent) + os.pathsep + os.environ['PATH']}):
             for label, shape in shapes.items():
                 for python in ('python3', 'command python3'):
-                    command = shape.replace('PYTHON', python)
+                    command = selector + shape.replace('PYTHON', python)
                     with self.subTest(shape=label, python=python):
                         rule, cause = guard.classify_detail(command, str(self.root))
                         self.assertEqual(rule, UNRESOLVED, cause)
@@ -683,7 +686,7 @@ class GuardTests(unittest.TestCase):
                         self.assertNotIn('PRIVATE_CODE', reason)
                         self.assertNotIn('WRAPPER_MUST_NOT_RUN', reason)
                         self.adapters(command, UNRESOLVED, expected_reason=hint)
-                command = shape.replace('PYTHON', '/usr/bin/python3')
+                command = selector + shape.replace('PYTHON', '/usr/bin/python3')
                 with self.subTest(shape=label, python='absolute'):
                     self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
                     self.adapters(command)
@@ -7608,6 +7611,229 @@ class ZshStartupTests(unittest.TestCase):
                 self.assertEqual(guard.classify(command, str(self.root)), READ)
             with self.subTest(flags=flags, empty_command=True):
                 self.assertEqual(guard.classify('/bin/zsh ' + flags + " ''", str(self.root)), None)
+
+
+class LookupWriteProvenanceTests(unittest.TestCase):
+    """#239: known same-call writes keep Homebrew's python3 proved."""
+
+    def setUp(self):
+        clean = isolated_source_cases.fixture_environment_patch()
+        clean.start()
+        self.addCleanup(clean.stop)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(os.path.realpath(temporary.name))
+        # A Homebrew-shaped install: bin/python3 -> Cellar/.../bin/python3
+        # -> Frameworks/.../Versions/3.14/bin/python3.14. Never executed.
+        brew = self.root / 'opt/brew'
+        version = brew / 'Cellar/python@3.14/3.14.0/Frameworks/Python.framework/Versions/3.14'
+        self.real_python = self.executable(version / 'bin/python3.14')
+        (brew / 'Cellar/python@3.14/3.14.0/bin').mkdir(parents=True)
+        (brew / 'Cellar/python@3.14/3.14.0/bin/python3').symlink_to('../Frameworks/Python.framework/Versions/3.14/bin/python3.14')
+        (brew / 'bin').mkdir()
+        (brew / 'bin/python3').symlink_to('../Cellar/python@3.14/3.14.0/bin/python3')
+        self.site = brew / 'lib/python3.14/site-packages'
+        self.site.mkdir(parents=True)
+        self.stdlib = version / 'lib/python3.14'
+        self.stdlib.mkdir(parents=True)
+        self.brew = brew
+        prefixes = patch.object(guard, 'HOMEBREW_PREFIXES', (str(brew),))
+        prefixes.start()
+        self.addCleanup(prefixes.stop)
+        self.home = self.root / 'home'
+        self.node = self.executable(self.home / '.nvm/versions/node/v24.0.0/bin/node')
+        self.user_bin = self.home / '.local/bin'
+        self.user_bin.mkdir(parents=True)
+        self.missing_bin = self.home / '.cargo/bin'
+        self.work = self.root / 'work/repo'
+        (self.work / 'scripts').mkdir(parents=True)
+        (self.work / 'scripts/check.py').write_text('print(1)\n')
+        self.scratch = self.root / 'scratch'
+        self.scratch.mkdir()
+        search = [str(self.user_bin), str(self.missing_bin), str(brew / 'bin'), str(self.node.parent), '/usr/bin', '/bin']
+        environment = patch.dict(os.environ, {'PATH': os.pathsep.join(search), 'HOME': str(self.home),
+                                              'TMPDIR': str(self.scratch)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def executable(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('#!/bin/sh\nexit 0\n')
+        path.chmod(0o755)
+        return path
+
+    def heredoc(self, target, body='package x\n', append=False):
+        return ('cat >> ' if append else 'cat > ') + target + " <<'EOF'\n" + body.rstrip() + '\nEOF\n'
+
+    def classify(self, command):
+        return guard.classify_detail(command, str(self.work))
+
+    def assert_allowed(self, rows):
+        for label, command in rows.items():
+            with self.subTest(case=label):
+                self.assertEqual(self.classify(command), (None, None))
+
+    def assert_lookup_denied(self, rows, fragment='executable provenance or mutation proof failed'):
+        for label, command in rows.items():
+            with self.subTest(case=label):
+                rule, cause = self.classify(command)
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn(fragment, cause)
+
+    def test_known_data_writes_keep_bare_interpreter_proved(self):
+        self.assertEqual(guard.shutil.which('python3'), str(self.brew / 'bin/python3'))
+        overlay = "python3 -I - \"$PWD\" \"$d\" <<'PY'\nimport json, sys\nprint(json.dumps({'Replace': {}}))\nPY\n"
+        fixture = (Path(__file__).with_name('fixtures') / 'lookup-writes' / 'crpko-4655-go-overlay.sh').read_text()
+        self.assert_allowed({
+            'exact 4655 command': fixture,
+            'row C mktemp scratch': 'd=$(mktemp -d)\n' + self.heredoc('"$d/early_hold_test.go"') + overlay,
+            'row C template scratch': (f'd=$(mktemp -d {self.work}/tmp.XXXXXX)\n' +
+                                       self.heredoc('"$d/early_hold_test.go"') + overlay),
+            'row I literal relative': self.heredoc('tmp-x/early_hold_test.go') + overlay.replace('"$d"', 'tmp-x'),
+            'append to literal .ts': self.heredoc('scripts/remote-box.test.ts', 'test(1)', append=True) +
+                                     'python3 -I scripts/check.py\n',
+            'stdin edit after .py write': (self.heredoc('scripts/sync.py', 'print(2)') +
+                                           "python3 -I - <<'PY'\nprint(3)\nPY\n"),
+            'scratch script run': 'd=$(mktemp -d)\n' + self.heredoc('"$d/probe.py"', 'print(1)') + 'python3 -I "$d/probe.py"\n',
+            'scratch script -I -B': 'd=$(mktemp -d)\n' + self.heredoc('"$d/probe.py"', 'print(1)') + 'python3 -I -B "$d/probe.py"\n',
+            'absolute brew path': ('d=$(mktemp -d)\n' + self.heredoc('"$d/probe.py"', 'print(1)') +
+                                   f'{self.brew}/bin/python3 -I -B "$d/probe.py"\n'),
+            'node -e': 'd=$(mktemp -d)\n' + self.heredoc('"$d/a.go"') + "node -e 'console.log(1)'\n",
+            'node stdin': 'd=$(mktemp -d)\n' + self.heredoc('"$d/a.go"') + "node - <<'JS'\nconsole.log(1)\nJS\n",
+        })
+
+    def test_writes_that_reach_lookup_or_startup_stay_refused(self):
+        link = self.work / 'bin-link'
+        link.symlink_to(self.user_bin)
+        (self.work / 'innocent.txt').symlink_to(self.user_bin / 'python3')
+        (self.work / 'notes.txt').symlink_to(self.work / '.python-version')
+        stdin = "python3 -I - <<'PY'\nprint(1)\nPY\n"
+        rows = {
+            'home PATH dir': '"$HOME/.local/bin/python3"',
+            'PATH dir sibling': f'{self.brew}/bin/notes',
+            'resolved symlink itself': f'{self.brew}/bin/python3',
+            'PATH dir case variant': str(self.user_bin).upper() + '/python3',
+            'missing PATH dir': f'{self.missing_bin}/python3',
+            'python-version': './.python-version',
+            'tool-versions parent': '../.tool-versions',
+            'envrc': 'sub/.envrc',
+            'mise toml': 'mise.toml',
+            'mise dotted toml': '.mise.local.toml',
+            'mise config dir': '.config/mise/config.toml',
+            'pyvenv.cfg': 'pyvenv.cfg',
+            'site pth': f'{self.site}/x.pth',
+            'stdlib sitecustomize': f'{self.stdlib}/sitecustomize.py',
+            'symlinked parent into PATH': 'bin-link/python3',
+            'symlink into PATH': 'innocent.txt',
+            'symlink to selector': 'notes.txt',
+        }
+        self.assert_lookup_denied({label: self.heredoc(target) + stdin for label, target in rows.items()})
+        self.assert_lookup_denied({
+            'fresh selector': 'd=$(mktemp -d)\n' + self.heredoc('"$d/.python-version"') + stdin,
+            'fresh root in site-packages': f'd=$(mktemp -d {self.site}/t.XXXXXX)\n' + self.heredoc('"$d/f.txt"') + stdin,
+            'echo redirect into PATH': self.heredoc('a.go') + f'echo x > {self.user_bin}/python3\n' + stdin,
+            'tee into PATH': f"tee {self.user_bin}/python3 <<'EOF'\nx\nEOF\n" + stdin,
+            'absolute brew path': self.heredoc(f'{self.site}/x.pth') + f"{self.brew}/bin/python3 -I -c 'print(1)'\n",
+        })
+        # Provenance still comes from the install layout: a wrapper ahead on
+        # PATH or a Cellar-shaped copy outside a Homebrew prefix stays unproved.
+        scratch_run = 'd=$(mktemp -d)\n' + self.heredoc('"$d/probe.py"', 'print(1)') + 'python3 -I "$d/probe.py"\n'
+        copy = self.executable(self.root / 'migrated' / self.real_python.relative_to(self.brew))
+        (self.root / 'migrated/bin').mkdir()
+        (self.root / 'migrated/bin/python3').symlink_to(copy)
+        for label, executable in (('wrapper ahead on PATH', self.executable(self.user_bin / 'python3')),
+                                  ('copy outside the prefix', self.root / 'migrated/bin/python3')):
+            with self.subTest(case=label), patch.dict(os.environ, {'PATH': os.pathsep.join((str(executable.parent), os.environ['PATH']))}):
+                rule, cause = self.classify(scratch_run)
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn('python3: executable provenance or mutation proof failed', cause)
+                self.assertNotIn('could change what', cause)
+        (self.user_bin / 'python3').unlink()
+        # With nothing remembered from a heredoc, base never asks for lookup
+        # provenance, so these start from a known checked write.
+        source = self.heredoc('a.go')
+        for label, command in {
+            'unbound root': source + self.heredoc('"$x/f"') + stdin,
+            'PATH-derived dir': source + self.heredoc('"${PATH%%:*}/python3"') + stdin,
+            'glob target': source + self.heredoc(f'{self.user_bin}/py*') + stdin,
+            'in-call symlink': source + f'ln -s {self.user_bin} lnk\n' + self.heredoc('lnk/python3') + stdin,
+            'PATH export': 'export PATH=/tmp/evil:$PATH\n' + self.heredoc('a.go') + stdin,
+            'TMPDIR rebinding': f'TMPDIR={self.site}\nd=$(mktemp -d)\n' + self.heredoc('"$d/f.txt"') + stdin,
+            'non-isolated': self.heredoc('a.go') + "python3 -c 'print(1)'\n",
+            'opaque predecessor before run': (self.heredoc('scripts/new.py', 'print(1)') + 'opaque-tool\n' +
+                                              'python3 -I scripts/new.py\n'),
+            'loop write after run': (source + f'for i in 1 2; do\npython3 -I -c \'print(1)\'\n' +
+                                     self.heredoc(f'{self.user_bin}/python3') + 'done\n'),
+        }.items():
+            with self.subTest(case=label):
+                rule, cause = self.classify(command)
+                self.assertIsNotNone(rule, cause)
+        rule, cause = self.classify(self.heredoc('a.go') + 'python3 -I -c ' + shlex.quote(f'open({LIVE!r}).read()'))
+        self.assertEqual(rule, READ, cause)
+
+    def test_startup_inputs_outside_the_symlink_chain_stay_refused(self):
+        isolated = "python3 -I -c 'print(3)'\n"
+        shared_pth = self.heredoc(f'{self.site}/x.pth', 'import harmless')
+        self.assert_lookup_denied({'Cellar framework path, shared pth': shared_pth + f"{self.real_python} -I -c 'print(3)'\n"})
+        (self.user_bin / 'python3').symlink_to(self.real_python)
+        self.assert_lookup_denied({'direct framework symlink, shared pth': shared_pth + isolated})
+        (self.user_bin / 'python3').unlink()
+        startup = self.stdlib / 'sitecustomize.py'
+        startup.write_text('print(1)\n')
+        (self.work / 'notes.go').hardlink_to(startup)
+        self.assert_lookup_denied({'hard link to sitecustomize': self.heredoc('notes.go', 'print(2)') + isolated},
+                                  'a file with other hard links')
+        (self.work / 'notes.go').unlink()
+        external = self.root / 'editable-package'
+        external.mkdir()
+        (self.site / 'editable.pth').write_text(f'{external}\n')
+        self.assert_lookup_denied({'module in a .pth path dir': self.heredoc(f'{external}/bootprobe.py', 'print(2)') + isolated},
+                                  "install or startup tree")
+        (self.site / 'editable.pth').write_text(f'{external}\nimport bootprobe\n')
+        self.assert_lookup_denied({
+            'module a .pth imports': self.heredoc(f'{external}/bootprobe.py', 'print(2)') + isolated,
+            'any write beside a .pth import': self.heredoc('a.go') + isolated,
+        }, 'runs startup code')
+        bootprobe = self.heredoc(f'{external}/bootprobe.py', 'print(2)') + isolated
+        (self.site / 'editable.pth').write_text('\ufeff' + f'import sys; sys.path.insert(0, {str(external)!r}); import bootprobe\n')
+        self.assert_lookup_denied({'BOM before a .pth import': bootprobe}, 'runs startup code')
+        (self.site / 'editable.pth').write_bytes(b'\xff\xfe' + f'{external}\n'.encode('utf-16-le'))
+        self.assert_lookup_denied({'.pth that is not UTF-8': bootprobe}, 'an unreadable startup file')
+        (self.site / 'editable.pth').unlink()
+        virtual = self.root / 'venv'
+        (virtual / 'bin').mkdir(parents=True)
+        (virtual / 'bin/python3').symlink_to(self.real_python)
+        (virtual / 'pyvenv.cfg').write_text('include-system-site-packages = false\n')
+        venv_site = virtual / 'lib/python3.14/site-packages'
+        venv_site.mkdir(parents=True)
+        (venv_site / 'editable.pth').write_text(f'{external}\nimport bootprobe\n')
+        with patch.dict(os.environ, {'PATH': os.pathsep.join((str(virtual / 'bin'), os.environ['PATH']))}):
+            self.assert_lookup_denied({'venv over the Homebrew framework': bootprobe}, 'a virtual environment interpreter')
+        relocated = self.root / 'relocated-site-packages'
+        self.site.rename(relocated)
+        self.site.symlink_to(relocated)
+        self.assert_lookup_denied({'relocated shared site real path': self.heredoc(f'{relocated}/new.pth', 'import harmless') + isolated},
+                                  'install or startup tree')
+        startup_data = external / 'startup-data'
+        startup_data.write_text('# empty\n')
+        overwrite = self.heredoc(str(startup_data), 'import harmless') + isolated
+        (relocated / 'config.pth').symlink_to(startup_data)
+        self.assert_lookup_denied({'symlinked .pth target': overwrite,
+                                   'unrelated write beside a symlinked .pth': self.heredoc('a.go') + isolated},
+                                  'a symlinked startup file')
+        (relocated / 'config.pth').unlink()
+        startup.unlink()
+        startup.symlink_to(startup_data)
+        self.assert_lookup_denied({'symlinked sitecustomize target': overwrite}, 'a symlinked startup file')
+
+    def test_lookup_refusal_names_the_write_and_the_way_out(self):
+        command = self.heredoc('./.python-version', '3.12') + "python3 -I - <<'PY'\nprint(1)\nPY\n"
+        rule, cause = self.classify(command)
+        self.assertEqual(rule, UNRESOLVED, cause)
+        self.assertIn('python3: executable provenance or mutation proof failed: line 1 writes '
+                      f'{self.work}/.python-version (a version selector file), which could change what python3 '
+                      'resolves to; use /usr/bin/python3 or run it in a separate call', cause)
+        self.assertIn('/usr/bin/python3', guard.refusal_reason(rule, cause, str(self.work)))
 
 
 if __name__ == "__main__":
