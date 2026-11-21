@@ -1,5 +1,5 @@
 import { hook as toolLogHook } from "../lib/toollog";
-import { spawn } from "node:child_process";
+import { failureProps, runClassifier } from "../lib/classifier";
 // Shared Python verdict, with the previous local checks retained for classifier failure.
 import { readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
@@ -22,30 +22,17 @@ export function needsClassifier(command: string): boolean {
     || /[$`\\<>{}();&|'"]|(?:^|\s)(?:\.{1,2}\/|[^\s;&|<>'"]+\.(?:py|mjs|cjs|js|ts|sh)\b)/.test(command)
 }
 
-export function classify(command: string, cwd: string | null, script = classifier, python = "/opt/homebrew/bin/python3"): Promise<Verdict> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(python, [script], { stdio: ["pipe", "pipe", "ignore"] })
-    let output = ""
-    const timer = setTimeout(() => { child.kill(); reject(new Error("State database classifier timed out")) }, 2000)
-    child.stdout.setEncoding("utf8")
-    child.stdout.on("data", (chunk: string) => { output += chunk })
-    child.on("error", (error) => { clearTimeout(timer); reject(error) })
-    child.stdin.on("error", () => {})
-    child.on("close", (code) => {
-      clearTimeout(timer)
-      if (code !== 0) return reject(new Error("State database classifier unavailable"))
-      try {
-        const verdict = JSON.parse(output)
-        if (!verdict || typeof verdict !== "object"
-          || !(verdict.rule === null || typeof verdict.rule === "string" && verdict.rule.length > 0)
-          || !(verdict.detail === null || typeof verdict.detail === "string")) {
-          throw new Error("Invalid state database classifier verdict")
-        }
-        resolve(verdict)
-      } catch (error) { reject(error) }
-    })
-    child.stdin.end(JSON.stringify({ command, cwd }))
+export async function classify(command: string, cwd: string | null, script = classifier, python = "/opt/homebrew/bin/python3"): Promise<Verdict> {
+  const verdict = await runClassifier<unknown>(python, script, { command, cwd }, {
+    timeout: "State database classifier timed out", unavailable: "State database classifier unavailable",
   })
+  if (!verdict || typeof verdict !== "object"
+    || !("rule" in verdict) || !("detail" in verdict)
+    || !(verdict.rule === null || typeof verdict.rule === "string" && verdict.rule.length > 0)
+    || !(verdict.detail === null || typeof verdict.detail === "string")) {
+    throw new Error("Invalid state database classifier verdict")
+  }
+  return { rule: verdict.rule, detail: verdict.detail }
 }
 
 // Failure fallback: preserve the old matcher, plus OpenCode and the legacy T3 home.
@@ -126,6 +113,7 @@ export function createGuardHook(directory: string | null, check = classify, getM
   return async (e: Event) => {
     const started = performance.now()
     let decision = "allowed", rule = "no-policy", command: unknown, errorTag: string | undefined
+    let classifierFailure: ReturnType<typeof failureProps> | undefined
     const input = e.input
     const cwd = input?.workdir ?? input?.cwd ?? directory
     try {
@@ -136,8 +124,9 @@ export function createGuardHook(directory: string | null, check = classify, getM
       if (m === "off" || !needsClassifier(command)) return
       let verdict: Verdict
       try { verdict = await check(command, cwd) }
-      catch {
-        errorTag = "classifier.fallback"
+      catch (error) {
+        errorTag = "hook.classifier_failed"
+        classifierFailure = failureProps(classifier, error, command, started, "fallback")
         verdict = fallback(command, cwd)
       }
       if (!verdict.rule) return
@@ -148,7 +137,7 @@ export function createGuardHook(directory: string | null, check = classify, getM
     } catch {
       errorTag = "hook.error"
     } finally {
-      if (typeof command === "string") record("statev2", decision, rule, started, command, errorTag, {sessionId:e.sessionID}, {cwd})
+      if (typeof command === "string") record("statev2", decision, rule, started, command, errorTag, {sessionId:e.sessionID}, {cwd}, classifierFailure)
     }
   }
 }

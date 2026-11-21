@@ -45,12 +45,12 @@ export function runClassifier<T>(python: string, script: string, payload: unknow
   });
 }
 
-/** Props for a hook.classifier_failed row. Every guard fails open today. */
-export function failureProps(script: string, error: unknown, command: unknown, started: number) {
+/** Props for a hook.classifier_failed row. */
+export function failureProps(script: string, error: unknown, command: unknown, started: number, failMode: "open" | "fallback" = "open") {
   const known = error instanceof ClassifierError ? error : undefined;
   return {
     classifier: basename(script).replace(/\.py$/, ""),
-    failMode: "open",
+    failMode,
     errorClass: known?.errorClass ?? (error instanceof Error ? error.constructor.name : typeof error),
     errorMessage: known?.message ?? "unclassified",
     spawnMs: known?.spawnMs,

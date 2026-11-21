@@ -162,8 +162,9 @@ test("missing wrapper and interpreter fall back and log attribution", async () =
     await hook(event);
     expect(event.input.command).toContain("exit 3");
     expect(record.mock.calls[0]?.slice(0, 3)).toEqual(["statev2", "denied", "live-database-read"]);
-    expect(record.mock.calls[0]?.[5]).toBe("classifier.fallback");
+    expect(record.mock.calls[0]?.[5]).toBe("hook.classifier_failed");
     expect(record.mock.calls[0]?.[6]).toEqual({ sessionId: "fallback-session" });
+    expect(record.mock.calls[0]?.[8]).toMatchObject({ classifier: "statev2_check", failMode: "fallback" });
   }
 });
 
@@ -183,7 +184,10 @@ test("2s timeout, nonzero exit and invalid verdicts use the fallback", async () 
         expect(performance.now() - start).toBeLessThan(4000);
       }
       expect(event.input.command).toContain("exit 3");
-      expect(record.mock.calls[0]?.[5]).toBe("classifier.fallback");
+      expect(record.mock.calls[0]?.[5]).toBe("hook.classifier_failed");
+      const errorClass = body.includes("sleep") ? "timeout" : body.includes("SystemExit") ? "exit:1"
+        : body.includes("bad json") ? "parse" : "Error";
+      expect(record.mock.calls[0]?.[8]).toMatchObject({ classifier: "statev2_check", failMode: "fallback", errorClass, cmdKind: "sqlite3" });
     }
   } finally { rmSync(root, { recursive: true }); }
 }, 10_000);
