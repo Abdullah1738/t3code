@@ -385,7 +385,49 @@ def u_sample_fields(values):
     return result
 
 
+def host_fields(values, event):
+    numbers = set(('ncpu processCount swapTotalBytes swapUsedBytes swapAvailableBytes '
+        'memoryPressure memorystatusLevel pressureLevel pageSize freePages activePages '
+        'inactivePages compressedPages pageins pageouts swapins swapouts pageinsDelta '
+        'pageoutsDelta swapinsDelta swapoutsDelta windowS runnable uninterruptible '
+        'runnableThreads stateProcessesRead stateProcessesSkipped stateScanMs '
+        'processesRead processesSkipped stateAgeS familiesOmitted processesOmitted').split())
+    result = {}
+    omitted_families = omitted_processes = 0
+    for key, value in (values or {}).items():
+        if key in numbers and (value is None or finite_number(value) and value >= 0):
+            result[key] = value
+        elif key in ('partial', 'stateScanPartial', 'stateScanTimedOut', 'statesEnabled', 'statesAvailable') and type(value) is bool:
+            result[key] = value
+        elif key == 'trigger' and value == 'cpu.timeout':
+            result[key] = value
+        elif key == 'load' and (value is None or isinstance(value, list) and len(value) == 3
+                               and all(finite_number(v) and v >= 0 for v in value)):
+            result[key] = value
+        elif key == 'errors' and isinstance(value, list):
+            result[key] = [v for v in value if v in ('load', 'swap', 'vm', 'processes',
+                'states', 'memoryPressure', 'memorystatusLevel', 'pressureLevel')]
+        elif key == 'families' and event == 'host.families_lite' and isinstance(value, list):
+            counts = {}
+            omitted_families = max(0, len(value)-512)
+            omitted_processes = sum(row['count'] for row in value[512:]
+                if isinstance(row, dict) and type(row.get('count')) is int and row['count'] >= 0)
+            for row in value[:512]:
+                if not isinstance(row, dict) or type(row.get('count')) is not int or row['count'] < 0:
+                    continue
+                name = row.get('name')
+                if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.: +()-]{1,96}', name) or SECRET.search(name):
+                    name = '[redacted]'
+                counts[name] = counts.get(name, 0)+row['count']
+            result[key] = [dict(name=name, count=count) for name, count in sorted(counts.items())]
+    if omitted_families:
+        result.update(partial=True, familiesOmitted=omitted_families, processesOmitted=omitted_processes)
+    return result
+
+
 def safe_fields(values, event=None):
+    if event in ('host.vitals', 'host.families_lite'):
+        return host_fields(values, event)
     if event == 'scan.volume_crawl':
         result = {}
         for key, value in (values or {}).items():
@@ -708,7 +750,9 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                 coverage_gap = (component == 'crashes' and name in (
                     'crash.unified.skip', 'crash.source', 'crash.collect') and
                     row.get('props', {}).get('skippedS', 0) > 0)
-                if kind != 'error' and not coverage_gap:
+                # Preserve the bounded host heartbeat through a noisy day's cap.
+                host_sample = name in ('host.vitals', 'host.families_lite')
+                if kind != 'error' and not coverage_gap and not host_sample:
                     return
             append(fd, row)
             return True

@@ -20,13 +20,13 @@ copy_file() {
     install -m "$perm" "$src" "$dst"
   fi
 }
-for file in toollog.py toollog.sh jobs.py collector.py memory.py deep_inventory.py rollup.py status.py cpu.py cpu_labels.py tailnet.py u_sample.py ssd_probe.py volume_crawls.py process_argv.py disk_budgets.py disk-budgets.json disk_low.py; do
+for file in host.py host_native.py host_signal.py toollog.py toollog.sh jobs.py collector.py memory.py deep_inventory.py rollup.py status.py cpu.py cpu_labels.py tailnet.py u_sample.py ssd_probe.py volume_crawls.py process_argv.py disk_budgets.py disk-budgets.json disk_low.py; do
   copy_file "$here/$file" "$HOME/.local/lib/mac-logging/$file" 600
 done
 # A plain executable wrapper keeps imports local to the installed helper directory.
 copy_file "$here/mac-log-rollup" "$HOME/.local/bin/mac-log-rollup" 755
 copy_file "$here/mac-log-status" "$HOME/.local/bin/mac-log-status" 755
-for label in com.abdullah.mac-log-collector com.abdullah.mac-deep-inventory com.abdullah.mac-memory com.abdullah.mac-cpu com.abdullah.mac-tailnet com.abdullah.mac-ssd-read-probe; do
+for label in com.abdullah.mac-host com.abdullah.mac-log-collector com.abdullah.mac-deep-inventory com.abdullah.mac-memory com.abdullah.mac-cpu com.abdullah.mac-tailnet com.abdullah.mac-ssd-read-probe; do
 if [[ $mode == install ]]; then
   /usr/bin/python3 - "$here/launchd/$label.plist" "$HOME/Library/LaunchAgents/$label.plist" <<'PY'
 from pathlib import Path
