@@ -34,6 +34,24 @@ class McpTests(JanitorTestCase):
         self.row['ppid'] = 30
         self.rows[30] = dict(pid=30, ppid=1, start=self.start, tty='??', args=args, rss_kib=100)
 
+    def test_mcp_signal_rechecks_robob_ancestry(self):
+        report = self.detect()
+        self.rows[1]['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+        send = Mock()
+        action = self.reap(report, rescan=lambda pid: copy.deepcopy(report), send=send)[0]
+        send.assert_not_called()
+        self.assertEqual(action['protectedBy'], 'robob-descendant')
+
+    def test_mcp_kill_rechecks_robob_ancestry(self):
+        report = self.detect()
+        send = Mock()
+        def pause(seconds):
+            self.rows[1]['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+        action = self.reap(report, rescan=lambda pid: copy.deepcopy(report), send=send, pause=pause)[0]
+        self.assertEqual(action['signals'], ['SIGTERM'])
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(action['protectedBy'], 'robob-descendant')
+
     def test_exact_executable_entry_matrix(self):
         forms = [(args, key) for key, args in HELPERS.items()] + [
             ('node /opt/dia-agent-bridge/src/server.js', 'dia'),

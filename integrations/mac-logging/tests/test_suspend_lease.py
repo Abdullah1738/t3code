@@ -569,7 +569,7 @@ class SuspendTests(unittest.TestCase):
                 parent = dict(proc(pid=30, comm=comm, command=command), ppid=40)
                 host = m.Host(lambda *a, **kw: subprocess.CompletedProcess([], 0, '', ''))
                 host.process = lambda pid: {30: parent, 40: dict(proc(pid=40), robobServer=True)}[pid]
-                self.assertEqual(host.protected(dict(proc(), ppid=30)), not provider)
+                self.assertTrue(host.protected(dict(proc(), ppid=30)))
 
     def test_expected_birth_and_duplicate_stop_refused(self):
         with self.assertRaises(ValueError):
@@ -580,6 +580,22 @@ class SuspendTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.stop()
         self.assertEqual(self.ledger()['leases']['20']['deadline'], deadline)
+
+    def test_every_signal_refuses_robob_ancestry_across_provider(self):
+        for provider in (False, True):
+            for sig in (signal.SIGSTOP, signal.SIGCONT, signal.SIGTERM, signal.SIGKILL):
+                with self.subTest(provider=provider, sig=sig):
+                    rows = {20: dict(proc(), ppid=30),
+                            30: dict(proc(pid=30, comm='codex' if provider else '/opt/chrome',
+                                          command='codex exec' if provider else '/opt/chrome'), ppid=40),
+                            40: dict(proc(pid=40), robobServer=True)}
+                    host = m.Host(lambda *a, **kw: subprocess.CompletedProcess([], 0, '', ''))
+                    host.process = lambda pid: copy.deepcopy(rows.get(pid))
+                    host.signal = Mock()
+                    service = m.SuspendLease(self.path, host, lambda: self.now, lambda *a, **kw: None)
+                    with self.assertRaisesRegex(ValueError, 'protected process'):
+                        service.send(rows[20], sig, [])
+                    host.signal.assert_not_called()
 
     def test_unknown_birth_retained_other_expired_lease_still_recovers(self):
         self.stop()
