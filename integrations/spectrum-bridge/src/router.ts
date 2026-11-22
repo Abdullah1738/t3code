@@ -1,3 +1,4 @@
+import { traceLoopOperation } from "./loop-stall.ts";
 import { bounded } from "./bounded.ts";
 import { PromptProbeTracker } from "./prompt-probe.ts";
 import { RobobLinkDown } from "./robob-link-gate.ts";
@@ -989,9 +990,9 @@ export class Router {
   private sweepWakeDelivery(): void {
     const now = Date.now();
     this.store.db.transaction(() => {
-      const rows = this.store.db.query<{ id: string; payload: string; state: string }, []>(
+      const rows = traceLoopOperation("inbound.wakes", () => this.store.db.query<{ id: string; payload: string; state: string }, []>(
         "SELECT id, payload, state FROM inbound WHERE id GLOB 'wake:*' AND state IN ('pending', 'processing', 'batched') ORDER BY rowid",
-      ).all();
+      ).all());
       for (const row of rows) {
         const separateExpiry = isAgentBusWake(row.id) || replyNudgeRow(row.id);
         const legacy = !this.store.get(`wake-delivery:${row.id}`) || this.wakes.legacy(row.id);
@@ -1051,9 +1052,9 @@ export class Router {
     const turn = this.store.get<Turn | null>("activeTurn");
     const running = turn && this.current(turn) && ["running", "submitting", "unknown"].includes(turn.phase)
       ? { members: turnMembers(this.store, turn), leaderKind: turn.background ? "background" as const : leaderKind(turn.inboundId) } : undefined;
-    const rows = this.store.db.query<{ id: string; payload: string; state: string }, [number]>(
+    const rows = traceLoopOperation("inbound.unanswered", () => this.store.db.query<{ id: string; payload: string; state: string }, [number]>(
       "SELECT id, payload, state FROM inbound WHERE json_extract(payload, '$.receivedAt') >= ? AND json_extract(payload, '$.answeredAt') IS NULL ORDER BY rowid",
-    ).all(this.unansweredStartedAt - 30 * 60_000).map(row => ({ ...row, payload: JSON.parse(row.payload) }));
+    ).all(this.unansweredStartedAt - 30 * 60_000)).map(row => ({ ...row, payload: JSON.parse(row.payload) }));
     for (const candidate of findOverdue(rows, running, now, { startedAt: this.unansweredStartedAt, chat })) {
       const fresh = this.store.db.query<{ id: string; payload: string; state: string }, [string]>("SELECT id, payload, state FROM inbound WHERE id = ?").get(candidate.row.id);
       if (!fresh) continue;
@@ -1174,10 +1175,10 @@ export class Router {
     const now = Date.now();
     if (now - this.latencyScanAt < 1_000) return;
     this.latencyScanAt = now;
-    const rows = this.store.db.query<{ id: string; payload: string; state: string }, []>(
+    const rows = traceLoopOperation("inbound.latency", () => this.store.db.query<{ id: string; payload: string; state: string }, []>(
       `SELECT id, payload, state FROM inbound WHERE state IN ('pending', 'batched', 'processing')
         OR state = 'failed' AND EXISTS (SELECT 1 FROM kv WHERE key = 'batch-phase:' || inbound.id AND value = '"accepted"') ORDER BY rowid`,
-    ).all().filter(row => {
+    ).all()).filter(row => {
       const input = JSON.parse(row.payload) as NormalizedInbound;
       const wake = row.id.startsWith("wake:") && !replyNudgeRow(row.id);
       const typed = !synthetic(row.id) && input.source === "typed" && !isTapback(input.text)
@@ -1189,10 +1190,10 @@ export class Router {
     if (!rows.length) return;
     // Sealed membership changes on a seal, not on the one-second delivery clock.
     if (now - this.latencyParentsAt >= 60_000) {
-      this.latencyParents = new Map(this.store.db.query<{ member: string; leader: string }, []>(
+      this.latencyParents = new Map(traceLoopOperation("inbound.parents", () => this.store.db.query<{ member: string; leader: string }, []>(
         `SELECT member.value AS member, substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
           JOIN inbound ON inbound.id = member.value WHERE kv.key GLOB 'batch:*' AND inbound.state = 'batched'`,
-      ).all().map(row => [row.member, row.leader]));
+      ).all()).map(row => [row.member, row.leader]));
       this.latencyParentsAt = now;
     }
     const parents = this.latencyParents;
@@ -1497,9 +1498,9 @@ export class Router {
   }
 
   private async reconcileExpiredFailedReplays(): Promise<void> {
-    const rows = this.store.db.query<{ key: string; value: string }, []>(
-      "SELECT key, value FROM kv WHERE key LIKE 'failed-replay-receipt:%' AND value != 'null'",
-    ).all();
+    const rows = traceLoopOperation("inbound.failed-receipts", () => this.store.db.query<{ key: string; value: string }, []>(
+      "SELECT key, value FROM kv WHERE key LIKE 'failed-replay-receipt:%' AND value != 'null' ORDER BY rowid",
+    ).all());
     for (const row of rows) {
       const turn = JSON.parse(row.value) as Turn;
       if (this.store.get(`batch-phase:${turn.inboundId}`) === "accepted") { this.store.set(row.key, null); continue; }
@@ -1556,9 +1557,9 @@ export class Router {
     this.failedScanAt = now;
     await this.reconcileExpiredFailedReplays();
     // A failed notification stays due even if recovery has since delivered the message.
-    const pending = this.store.db.query<{ key: string; value: string }, []>(
-      "SELECT key, value FROM kv WHERE key LIKE 'failed-alert-pending:%' AND value != 'null'",
-    ).all();
+    const pending = traceLoopOperation("inbound.failed-alerts", () => this.store.db.query<{ key: string; value: string }, []>(
+      "SELECT key, value FROM kv WHERE key LIKE 'failed-alert-pending:%' AND value != 'null' ORDER BY rowid",
+    ).all());
     const attempted = new Set<string>();
     for (const row of pending) {
       const id = row.key.slice("failed-alert-pending:".length);
@@ -1577,7 +1578,7 @@ export class Router {
       if (at === undefined || now - at < 120_000) continue;
       const batch = this.store.get<NormalizedInbound | null>(`batch:${row.id}`);
       const parent = this.store.db.query<{ id: string }, [string]>(
-        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key LIKE 'batch:%' AND member.value = ? LIMIT 1",
+        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key LIKE 'batch:%' AND member.value = ? ORDER BY kv.rowid LIMIT 1",
       ).get(row.id)?.id ?? row.id;
       const stillFailed = () => this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state === "failed";
       // landed() writes this receipt. A later failed run must never erase its proof of admission.
