@@ -3,7 +3,7 @@ import { ActiveRoster } from "../src/active-roster.ts";
 import { ControlClient, type ThreadDetail } from "../src/control.ts";
 import { RobobBackend } from "../src/robob.ts";
 
-function fixture() {
+async function fixture() {
   const idle: ThreadDetail = { threadId: "route", projectId: "chats", title: "route", state: "idle", status: "completed",
     origin: "imessage", nativeSessionId: null, runtimeMode: "full-access", parentThreadId: null, rootThreadId: "route",
     worktreePath: "/chats", pendingRequest: null, pendingRequests: [], run: null, recentRuns: [], activeRunId: null,
@@ -16,13 +16,14 @@ function fixture() {
   const roster = new ActiveRoster(client); roster.streamState(true);
   const checkpoint = spyOn(roster, "checkpoint"), finish = spyOn(roster, "finish");
   const backend = new RobobBackend({ chatRoot: "/chats", client, activeRoster: roster, finishes: () => new Map() });
+  await roster.read(false, new Map());
   const busy = () => roster.event({ id: "10", data: { type: "thread.status", threadId: "route", state: "running" } });
   return { idle, client, roster, checkpoint, finish, backend, summaries, detail, pages, busy,
     close() { for (const mock of [lists, summaries, detail, pages, checkpoint, finish]) mock.mockRestore(); } };
 }
 
 test("marker roster: cached idle detail cannot overwrite newer SSE busy evidence", async () => {
-  const f = fixture();
+  const f = await fixture();
   try {
     await f.backend.beginMessageTick(["route"]);
     expect(f.checkpoint).toHaveBeenCalledTimes(1);
@@ -36,7 +37,7 @@ test("marker roster: cached idle detail cannot overwrite newer SSE busy evidence
 });
 
 test.each([false, true])("marker roster: physical detail starts its ticket before newer SSE (marker=%s)", async marker => {
-  const f = fixture(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<{ thread: ThreadDetail }>();
+  const f = await fixture(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<{ thread: ThreadDetail }>();
   f.detail.mockImplementationOnce(async () => { entered.resolve(); return release.promise; });
   try {
     const reading = marker ? f.backend.beginMessageTick(["route"]) : f.backend.sessionBusy("route");
@@ -49,7 +50,7 @@ test.each([false, true])("marker roster: physical detail starts its ticket befor
 });
 
 test("marker roster: fresh batch detail reconciles busy state without a consumer GET", async () => {
-  const f = fixture();
+  const f = await fixture();
   try {
     const busy = { ...f.idle, state: "running" as const, status: "running", changeMarker: 2 };
     f.summaries.mockResolvedValue({ threads: [busy] }); f.detail.mockResolvedValue({ thread: busy });
@@ -61,7 +62,7 @@ test("marker roster: fresh batch detail reconciles busy state without a consumer
 });
 
 test("marker roster: deferred details release tickets and never publish a late idle result", async () => {
-  const f = fixture(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<{ thread: ThreadDetail }>();
+  const f = await fixture(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<{ thread: ThreadDetail }>();
   try {
     await f.backend.beginMessageTick(["route"]);
     f.busy();
