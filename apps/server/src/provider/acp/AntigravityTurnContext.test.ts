@@ -144,18 +144,27 @@ describe("Antigravity turn context", () => {
       const fresh = path.join(dir, "profiles", "fresh");
       const stale = path.join(dir, "profiles", "stale");
       yield* fileSystem.makeDirectory(path.join(stale, "config"), { recursive: true });
-      yield* fileSystem.symlink(path.join(dir, "elsewhere.json"), path.join(stale, "config", "hooks.json"));
-      yield* fileSystem.writeFileString(path.join(stale, "config", "mcp_config.json"), "{\"own\":1}");
+      yield* fileSystem.symlink(
+        path.join(dir, "elsewhere.json"),
+        path.join(stale, "config", "hooks.json"),
+      );
+      yield* fileSystem.writeFileString(path.join(stale, "config", "mcp_config.json"), '{"own":1}');
       for (const profileDirectory of [fresh, stale]) {
         yield* linkAntigravityHarnessConfig({ fileSystem, path, profileDirectory, harnessHome });
       }
       const target = (name: string) => path.join(harnessHome, "config", name);
-      assert.equal(yield* fileSystem.readLink(path.join(fresh, "config", "hooks.json")), target("hooks.json"));
+      assert.equal(
+        yield* fileSystem.readLink(path.join(fresh, "config", "hooks.json")),
+        target("hooks.json"),
+      );
       assert.equal(
         yield* fileSystem.readLink(path.join(fresh, "config", "mcp_config.json")),
         target("mcp_config.json"),
       );
-      assert.equal(yield* fileSystem.readLink(path.join(stale, "config", "hooks.json")), target("hooks.json"));
+      assert.equal(
+        yield* fileSystem.readLink(path.join(stale, "config", "hooks.json")),
+        target("hooks.json"),
+      );
       // A real file is the user's own: it stays.
       assert.equal(
         yield* fileSystem.readFileString(path.join(stale, "config", "mcp_config.json")),
