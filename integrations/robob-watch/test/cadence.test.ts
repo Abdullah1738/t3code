@@ -180,7 +180,8 @@ test("queued watchers keep emitting daily cadence headers across multiple midnig
         clock=Date.parse("2026-11-16T23:59:00Z")+day*86400_000;
         await tick();for(let i=0;i<60;i++)await Promise.resolve();
       }
-      const rows=readdirSync(process.env.TOOLLOG_DIR).filter(x=>x.endsWith(".ndjson")).flatMap(file=>readFileSync(join(process.env.TOOLLOG_DIR,file),"utf8").trim().split("\\n").map(JSON.parse));
+      const {expandTelemetry}=await import(${JSON.stringify(join(import.meta.dir, "../src/log-format.ts"))});
+      const rows=readdirSync(process.env.TOOLLOG_DIR).filter(x=>x.endsWith(".ndjson")).flatMap(file=>readFileSync(join(process.env.TOOLLOG_DIR,file),"utf8").trim().split("\\n").flatMap(line=>expandTelemetry(JSON.parse(line))));
       console.log(JSON.stringify({checks,headers:rows.filter(x=>x.name==="watch.cadence"&&x.ids.watcher==="queued").length,runs:rows.filter(x=>x.name==="watch.run").length}));
     `], { env: { ...process.env, BUN_INSPECT: undefined, ROBOB_TEST: "1", ROBOB_WATCH_ROOT: join(dir, "root"), TOOLLOG_DIR: join(dir, "logs"), ROBOB_WATCH_LOAD_OVERRIDE: ".1", ROBOB_WATCH_MAX_CONCURRENT: "1", ROBOB_WATCH_SSD_PATH: "/dev" } });
     expect(child.stderr.toString()).toBe(""); expect(child.exitCode).toBe(0);

@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { expandTelemetry } from "../src/log-format.ts";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -74,7 +75,7 @@ function fixture(config: { wake?: number; send?: number; notify?: number; receip
   };
   const calls = () => existsSync(join(root, "calls")) ? readFileSync(join(root, "calls"), "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]) : [];
   const events = () => existsSync(join(root, "logs")) ? readdirSync(join(root, "logs")).filter(file => file.endsWith(".ndjson"))
-    .flatMap(file => readFileSync(join(root, "logs", file), "utf8").trim().split("\n").map(line => JSON.parse(line))) : [];
+    .flatMap(file => readFileSync(join(root, "logs", file), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line)))) : [];
   return { root, dir, execute, calls, events };
 }
 
