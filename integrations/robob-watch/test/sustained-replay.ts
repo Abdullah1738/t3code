@@ -9,6 +9,11 @@ export function sustainedOptions(day: 19 | 20, heavy = false): ReplayOptions {
     mix: { ...capture.mix, source: `#97's 54-watcher mix; ${day} Nov synthetic sustained pressure, dynamic runtimes; whoop and inbox are explicit stress probes replacing anonymous matching-interval entries (not identity mappings); no trigger amplification`,
       watchers: [...capture.mix.watchers.map(w => healthChecks.includes(w.watcher) ? { ...w, checkMs: 500 } : w.watcher === "watcher-030" ? { ...w, watcher: "inbox-triage-fastpath", checkMs: 6239 } : w.watcher === "watcher-085" ? { ...w, watcher: "whoop-sync" } : w), ...(heavy ? [{ watcher: "btse-cost-collect-extra", intervalMs: 300_000, checkMs: 20_000, timeout_s: 120 }] : [])] },
     hysteresis: true, fastSlots: 2, accountFrom: start, accountUntil: end,
+    waitWindows: [
+      { name: "normal", from: 0, until: start },
+      { name: "load", from: start, until: end },
+      { name: "steady-load", from: start + 3600_000, until: end },
+    ],
     loads: [{ at: 0, load: .5 }, { at: start, load: 3.2 }, { at: end, load: .5 }],
     runtime: (watcher, at, run) => {
       if (at < start || at >= end) return watcher.checkMs;

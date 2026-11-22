@@ -7,7 +7,8 @@ export type ReplayOptions = { mix?: ReplayMix; loads?: { at: number; load: numbe
   sticky?: boolean; borrowFast?: boolean; runtime?: (watcher: ReplayMix["watchers"][number], at: number, run: number) => number;
   freeze?: { at: number; ms: number }; existingTimeouts?: boolean; accountFrom?: number; accountUntil?: number;
   observedRelease?: (watcher: ReplayMix["watchers"][number], at: number, run: number) => { ms: number; timedOut: boolean };
-  releaseDelayMs?: number; failureProbes?: boolean; initialStates?: Record<string, Partial<State>> };
+  releaseDelayMs?: number; failureProbes?: boolean; initialStates?: Record<string, Partial<State>>;
+  waitWindows?: { name: string; from: number; until: number }[] };
 export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, options: ReplayOptions = {}) {
   const mix = options.mix ?? fixture;
   let clock = 0;
@@ -133,7 +134,18 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
       firstAfterFreezeS: options.freeze ? (rows.find(row => row.at >= options.freeze!.at + options.freeze!.ms)?.at ?? Infinity) / 1000 - (options.freeze.at + options.freeze.ms) / 1000 : undefined,
       lateRuns: rows.filter(row => row.lateMs > w.intervalMs).length };
   });
+  const waitWindows = (options.waitWindows ?? []).map(window => ({ ...window,
+    byWatcher: mix.watchers.map(w => {
+      const admitted = (at: number) => at >= window.from && at < Math.min(window.until, limit);
+      const rows = samples.filter(row => row.watcher === w.watcher && admitted(row.at));
+      // Attribute eventual outcomes to their admission cohort, including runs
+      // released after the window, so a boundary cannot inflate timeout rates.
+      const outcomes = completions.filter(row => row.watcher === w.watcher && admitted(row.started));
+      return { watcher: w.watcher, ...waits(rows), completed: outcomes.filter(row => !row.timedOut).length,
+        timeouts: outcomes.filter(row => row.timedOut).length };
+    }) }));
   return { cap, watchers: mix.watchers.length, hours, assumptions: mix.source, switches,
+    waitWindows,
     windowHolds: Object.fromEntries(windowHolds), windowBorrowed: Object.fromEntries(windowBorrowed),
     hourlyHolds: hourlyHolds.map(holds => Object.fromEntries(holds)), hourlySupplyMs,
     all: waits(measured), fast: waits(measured.filter(row => row.fast)), fastFrequent: waits(measured.filter(row => row.fast && row.frequent)), slow: waits(measured.filter(row => !row.fast)),

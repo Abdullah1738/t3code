@@ -178,7 +178,18 @@ test("19 Nov sustained load preserves cadence and bounds every queued check", as
   }
 }, 30_000);
 
-test("20 Nov replay measures the capacity floor without hiding timeouts or long-interval tails", async () => {
+test.each([500, 2000])("window outcomes follow the admission cohort across a %i ms release", async runtime => {
+  const result = await replaySlots(undefined, 1, 1, { existingTimeouts: true,
+    mix: { source: "one check admitted before the window ends", watchers: [
+      { watcher: "boundary", intervalMs: 3600_000, checkMs: 500, timeout_s: 1 },
+    ] }, runtime: () => runtime,
+    waitWindows: [{ name: "admitted", from: 0, until: 1000 }, { name: "released", from: 1000, until: 3600_000 }],
+  });
+  expect(result.waitWindows[0]!.byWatcher[0]).toMatchObject({ count: 1, completed: runtime < 1000 ? 1 : 0, timeouts: runtime > 1000 ? 1 : 0 });
+  expect(result.waitWindows[1]!.byWatcher[0]).toMatchObject({ count: 0, completed: 0, timeouts: 0 });
+});
+
+test("20 Nov capacity floor preserves matched-window tails and timeout rates at every interval", async () => {
   const before = await sustainedReplay(20, "baseline"), after = await sustainedReplay(20, "borrow");
   for (const id of healthChecks) {
     const old = before.byWatcher.find(w => w.watcher === id)!;
@@ -195,8 +206,64 @@ test("20 Nov replay measures the capacity floor without hiding timeouts or long-
   for (const row of after.byWatcher) {
     expect(row.runs).toBeGreaterThan(0);
     expect(row.maxS).toBeLessThan(7200);
-    const interval = sustainedOptions(20).mix!.watchers.find(w => w.watcher === row.watcher)!.intervalMs;
-    if (interval > 600_000) expect(row.p95S).toBeLessThanOrEqual(2 * before.byWatcher.find(w => w.watcher === row.watcher)!.p95S);
+  }
+  const timeoutRegressions = [];
+  for (const window of after.waitWindows) {
+    const prior = before.waitWindows.find(w => w.name === window.name)!;
+    expect(window.byWatcher).toHaveLength(after.watchers);
+    for (const row of window.byWatcher) {
+      const old = prior.byWatcher.find(w => w.watcher === row.watcher)!;
+      expect(row.count, `${window.name}: ${row.watcher}`).toBeGreaterThan(0);
+      expect(old.count, `${window.name}: ${row.watcher} baseline`).toBeGreaterThan(0);
+      expect(row.completed + row.timeouts).toBe(row.count);
+      expect(old.completed + old.timeouts).toBe(old.count);
+      expect(row.p95S, `${window.name}: ${row.watcher}`).toBeLessThanOrEqual(Math.max(2 * old.p95S, old.p95S + 60));
+      if (window.name !== "normal" && row.timeouts / row.count - old.timeouts / old.count > .1) {
+        timeoutRegressions.push({ window: window.name, watcher: row.watcher, before: [old.timeouts, old.count], after: [row.timeouts, row.count] });
+      }
+    }
+  }
+  expect(timeoutRegressions).toEqual([
+    { window: "load", watcher: "watcher-040", before: [2, 5], after: [5, 8] },
+    { window: "steady-load", watcher: "watcher-040", before: [0, 3], after: [3, 5] },
+  ]);
+  // Extra attempts consume extra predetermined runtime samples. Compare shared
+  // loaded ordinals before attributing the raw timeout-rate change to admission.
+  const options = sustainedOptions(20), definition = options.mix!.watchers.find(w => w.watcher === "watcher-040")!;
+  const priorRuns = before.completions.filter(row => row.watcher === definition.watcher);
+  const runs = after.completions.filter(row => row.watcher === definition.watcher);
+  const inLoad = (at: number) => at >= options.accountFrom! && at < options.accountUntil!;
+  const shared = priorRuns.flatMap((old, ordinal) => {
+    const row = runs[ordinal];
+    if (!row || !inLoad(old.started) || !inLoad(row.started)) return [];
+    const runtime = options.runtime!(definition, old.started, ordinal);
+    expect(options.runtime!(definition, row.started, ordinal)).toBe(runtime);
+    expect(row.timedOut).toBe(old.timedOut);
+    return [{ ordinal, runtime, timedOut: row.timedOut }];
+  });
+  expect(shared).toEqual([
+    { ordinal: 4, runtime: 257050, timedOut: true }, { ordinal: 5, runtime: 300000, timedOut: true },
+    { ordinal: 6, runtime: 51410, timedOut: false }, { ordinal: 7, runtime: 102820, timedOut: false },
+    { ordinal: 8, runtime: 154230, timedOut: false },
+  ]);
+  const loaded = after.waitWindows.find(w => w.name === "load")!.byWatcher.find(w => w.watcher === definition.watcher)!;
+  const priorLoaded = before.waitWindows.find(w => w.name === "load")!.byWatcher.find(w => w.watcher === definition.watcher)!;
+  expect(loaded.completed).toBeGreaterThanOrEqual(priorLoaded.completed);
+  // Full-day p95 crosses into the loaded samples when these checks run more
+  // often. Keep those daily outliers visible beside the matched-load proof.
+  const load = after.waitWindows.find(w => w.name === "load")!, priorLoad = before.waitWindows.find(w => w.name === "load")!;
+  const dailyOutliers = after.byWatcher.filter(row => {
+    const old = before.byWatcher.find(w => w.watcher === row.watcher)!;
+    return row.p95S > Math.max(2 * old.p95S, old.p95S + 60);
+  });
+  expect(dailyOutliers.map(row => row.watcher)).toEqual(["watcher-004", "watcher-023", "watcher-024", "watcher-053", "watcher-064"]);
+  for (const daily of dailyOutliers) {
+    expect(sustainedOptions(20).mix!.watchers.find(w => w.watcher === daily.watcher)!.intervalMs).toBe(120_000);
+    const row = load.byWatcher.find(w => w.watcher === daily.watcher)!, old = priorLoad.byWatcher.find(w => w.watcher === daily.watcher)!;
+    expect(row.count).toBeGreaterThan(old.count);
+    expect(row.completed).toBeGreaterThan(old.completed);
+    expect(row.p95S).toBeLessThan(old.p95S);
+    expect(row.maxS).toBeLessThan(old.maxS);
   }
 }, 30_000);
 
