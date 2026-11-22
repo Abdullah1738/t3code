@@ -22,13 +22,15 @@ def offbox_class(argv):
     from host import python_label
     if not argv or not re.fullmatch(r'(?i)python(?:\d+(?:\.\d+)*)?', argv[0].split('/')[-1]):
         return None, None
-    if python_label(argv) != 'python:offbox.py':
+    if python_label(argv, scripts_only=True) != 'python:offbox.py':
         return None, None
     # Locate the actual script, not a string inside -c/-m or a later argument.
     # Prefix validation excludes option values that happen to be named
     # offbox.py, such as `python -W offbox.py /a/offbox.py wait`.
-    index = next(i for i, word in enumerate(argv) if word.split('/')[-1] == 'offbox.py'
-                 and python_label(argv[:i+1]) == 'python:offbox.py')
+    index = next((i for i, word in enumerate(argv) if word.split('/')[-1] == 'offbox.py'
+                  and python_label(argv[:i+1], scripts_only=True) == 'python:offbox.py'), None)
+    if index is None:
+        return None, None
     args = argv[index+1:]
     kind = args[0] if args and args[0] in ('wait', '_bg-queue', 'run') else 'other'
     run = next((a for a in args if re.fullmatch(r'run-\d{4}-\d{6}-[a-f0-9]{8}', a)), None)

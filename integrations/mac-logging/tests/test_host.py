@@ -174,6 +174,8 @@ class HostTests(unittest.TestCase):
         for form, argv, expected in cases:
             with self.subTest(form=form, argv=argv):
                 self.assertEqual(host.python_label(argv), expected)
+                script_expected = 'python' if form.startswith('module ') else expected
+                self.assertEqual(host.python_label(argv, scripts_only=True), script_expected)
 
     def test_families_counts_and_argv_fallback(self):
         n = SimpleNamespace(pids=lambda: [1, 2, 3, 4, 5, 6],

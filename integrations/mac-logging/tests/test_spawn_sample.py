@@ -251,9 +251,52 @@ class SpawnTests(unittest.TestCase):
         actor=next(p for p in p['top_spawners'] if p['ppid']==9998)
         self.assertEqual(actor['family'],'codex app-server')
     def test_offbox_forms(self):
-        cases=[(['python3','/x/offbox.py','wait'],'wait'),(['python3','-Iu','/x/offbox.py','run'],'run'),(['python3','-W','ignore','/x/offbox.py','_bg-queue'],'_bg-queue'),(['python3','--','/x/offbox.py','logs'],'other'),(['python3','-c','pass','offbox.py','wait'],None),(['python3','-m','x','offbox.py','wait'],None),(['zsh','-c','offbox.py wait'],None),(['python3','/x/offbox.py.other','wait'],None),(['python3','/x/fake.py','offbox.py','wait'],None)]
+        cases=[(['python3','/x/offbox.py','wait'],'wait'),
+               (['/usr/bin/python3.12','offbox.py','run'],'run'),
+               (['python3','-Iu','/x/offbox.py','run'],'run'),
+               (['python3','-W','offbox.py','/x/offbox.py','_bg-queue'],'_bg-queue'),
+               (['python3','-Woffbox.py','/x/offbox.py','wait'],'wait'),
+               (['python3','-X','offbox.py','/x/offbox.py','wait'],'wait'),
+               (['python3','-Xoffbox.py','/x/offbox.py','wait'],'wait'),
+               (['python3','--check-hash-based-pycs','always','/x/offbox.py','wait'],'wait'),
+               (['python3','--check-hash-based-pycs=never','/x/offbox.py','wait'],'wait'),
+               (['python3','--','/x/offbox.py','logs'],'other'),
+               (['python3','offbox.py','-m','offbox.py'],'other'),
+               (['python3','-m','offbox.py','wait'],None),
+               (['python3','-moffbox.py','wait'],None),
+               (['python3','-Im','offbox.py','wait'],None),
+               (['python3','-Imoffbox.py','wait'],None),
+               (['python3','-Wignore','-moffbox.py','wait'],None),
+               (['python3','-X','dev','-m','offbox.py','wait'],None),
+               (['python3','-m','x','offbox.py','wait'],None),
+               (['python3','-c','pass','offbox.py','wait'],None),
+               (['python3','-Iucpass','offbox.py','wait'],None),
+               (['python3','-','offbox.py','wait'],None),
+               (['python3','-m'],None),
+               (['python3','-W'],None),
+               (['python3','--bad-option','offbox.py','wait'],None),
+               (['zsh','-c','offbox.py wait'],None),
+               (['python3','/x/offbox.py.other','wait'],None),
+               (['python3','/x/fake.py','offbox.py','wait'],None)]
         for argv,kind in cases:
             with self.subTest(argv=argv):self.assertEqual(offbox_class(argv)[0],kind)
+    def test_module_forms_do_not_stop_monitor_ticks(self):
+        from types import SimpleNamespace
+        for options in (['-moffbox.py'],['-m','offbox.py'],['-Imoffbox.py'],['-Im','offbox.py']):
+            with self.subTest(options=options):
+                self.setUp()
+                self.n.argv=lambda pid:['python3',*options,'wait'] if pid==1 else ['python3','/x/offbox.py','wait']
+                m=Monitor(self.s,clock=lambda:self.now)
+                def advance(delay):
+                    self.now+=5
+                    if len(m.results)==1:self.n.child()
+                stop=SimpleNamespace(is_set=lambda:len(m.results)>=2,wait=advance)
+                m.loop(stop)
+                self.assertEqual(len(m.results),2)
+                self.assertEqual(m.results[0]['offbox']['wait']['count'],0)
+                self.assertEqual(m.results[1]['offbox']['wait']['count'],1)
+                self.assertEqual(m.results[1]['births'],1)
+                self.now=60;self.assertEqual(m.report()['ticks'],2)
     def test_cap_sleeping(self):
         for pid in range(2,402):self.n.child(pid)
         r=self.s.tick();self.assertEqual(len(self.n.thread_calls),300)

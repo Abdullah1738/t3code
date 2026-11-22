@@ -96,7 +96,7 @@ class Sampler:
         return props
 
 
-def python_label(argv):
+def python_label(argv, *, scripts_only=False):
     def script(value):
         name = Path(value).name
         return 'python:'+name if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}\.py', name) else 'python'
@@ -130,6 +130,8 @@ def python_label(argv):
             if option in ('m', 'W', 'X'):
                 value = options[index+1:] or next(args, '')
                 if option == 'm':
+                    if scripts_only:
+                        return 'python'
                     return 'python:'+value if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', value) else 'python'
                 if not value:
                     return 'python'
