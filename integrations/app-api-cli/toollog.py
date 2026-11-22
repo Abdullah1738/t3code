@@ -595,7 +595,7 @@ def _fields(props):
         elif key == 'dataless_files' and value is None:
             result[key] = None
         elif key == 'dataless_error' and isinstance(value, str) \
-                and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]{0,80} errno=(?:None|-?\d{1,6})', value):
+                and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]{0,80} errno=(?:None|-?\d{1,6})|DataUnavailable reason=(?:deadline|edeadlk)', value):
             result[key] = value
         elif key == 'hours' and type(value) in (int, float) and math.isfinite(value) and 0 < value <= 24:
             result[key] = value

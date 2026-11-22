@@ -67,6 +67,54 @@ class HistoryTests(unittest.TestCase):
                 row = history.run_row({**self.row, key: '/private/source text'})
                 self.assertNotIn(key, row)
 
+    def test_dataless_error_forms_remain_private_and_idempotent(self):
+        accepted = ('DataUnavailable reason=deadline', 'DataUnavailable reason=edeadlk',
+                    'PermissionError errno=13', 'DataUnavailable errno=None')
+        rejected = ('DataUnavailable reason=private text', 'OSError reason=deadline',
+                    'DataUnavailable reason=deadline\nprivate', 'OSError errno=1234567')
+        for value in accepted + rejected:
+            with self.subTest(value=value):
+                row = history.run_row({**self.row, 'dataless_error': value})
+                self.assertEqual(row.get('dataless_error'), value if value in accepted else None)
+                self.assertEqual(history.run_row(row), row)
+
+    def test_failed_history_survives_into_the_next_cli_process(self):
+        import data_io
+        for caller_timer in (0, 2):
+            for error in (OSError('fixture'), data_io.DataUnavailable(self.wd / 'runs.jsonl', 'deadline')):
+                signal.setitimer(signal.ITIMER_REAL, caller_timer)
+                try:
+                    with self.subTest(error=type(error).__name__, caller_timer=caller_timer), \
+                            patch.object(history, 'run_row', side_effect=error):
+                        self.assertFalse(history.append(self.wd, self.row))
+                        if caller_timer:
+                            self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], 1)
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+        script = '''import json,pathlib,sys
+sys.path.insert(0,sys.argv[1])
+import run_history as h
+wd=pathlib.Path(sys.argv[2])
+assert h.APPEND_ERRORS == 0
+assert h.append(wd, {'at':'2026-11-19T17:05:35Z','total_s':1,'exit':0})
+print(json.loads((wd/'runs.jsonl').read_text())['history_append_errors'])
+'''
+        done = subprocess.run([os.sys.executable, '-I', '-B', '-c', script,
+                               str(Path(history.__file__).parent), str(self.wd)],
+                              text=True, capture_output=True, check=True)
+        self.assertEqual(int(done.stdout), 4)
+
+    def test_finalization_alarm_cannot_fail_a_quiet_skip(self):
+        import data_io
+        error = data_io.DataUnavailable(self.wd / 'cases.json', 'deadline')
+        with patch.object(history, 'append', side_effect=data_io.DataUnavailable(self.wd / 'runs.jsonl')):
+            with history.recording(self.wd) as row:
+                history.record_skip(row, error)
+        self.assertEqual(history.persisted_errors(self.wd), 1)
+        self.assertIsNone(history.current())
+        self.assertTrue(history.append(self.wd, self.row))
+        self.assertGreaterEqual(json.loads(self.path.read_text())['history_append_errors'], 1)
+
     def test_case_error_normalization(self):
         timeout = str(subprocess.TimeoutExpired(
             ['/Users/ardud/.local/bin/msgs', 'search', '("Logic Utilities" OR "Acme Merchant")'], 2))
