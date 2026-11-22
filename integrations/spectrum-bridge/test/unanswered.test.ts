@@ -321,6 +321,20 @@ test.each(["source-only", "quote-member"])("legacy steer reply attribution also 
     .toEqual([kind === "source-only" ? legacySteerStart + 2_000 : undefined, legacySteerStart + 2_000, legacySteerStart + 2_000]);
 });
 
+for (const state of ["pending", "processing"] as const) test.each(["root", "member"])(`split answers preserve ${state} retry lifecycle (first=%s)`, first => {
+  const s = store();
+  for (const id of ["root", "member"]) s.acceptInbound(id, input(id));
+  s.set("batch:root", { ...input("root"), batchIds: ["root", "member"] });
+  s.set("human-own-turn:root", true);
+  s.updateInbound("root", state); s.updateInbound("member", "batched");
+  markAnswered(s, [first], at + 1_000);
+  const states = () => s.db.query<{ state: string }, []>("SELECT state FROM inbound ORDER BY rowid").all().map(row => row.state);
+  expect(states()).toEqual([state, "batched"]);
+  const second = first === "root" ? "member" : "root";
+  markAnswered(s, [second], at + 2_000);
+  expect(states()).toEqual(state === "pending" ? ["done", "done"] : ["processing", "batched"]);
+});
+
 test.each(["processing", "partial"])("late coverage does not retire a retry outside a fully covered pending batch: %s", kind => {
   const s = store();
   for (const id of ["root", "member"]) s.acceptInbound(id, { ...input(id), unanswered: { requeuedAt: at + 300_000 } });

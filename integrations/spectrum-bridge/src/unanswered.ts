@@ -177,17 +177,11 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
       const row = store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id = ?").get(id);
       return row ? [{ id, state: row.state, input: JSON.parse(row.payload) as AnsweredInput }] : [];
     });
-    // A late delivery can win before dispatch starts the watchdog retry. Retire only whole,
-    // still-pending batches; a retry already submitted to the backend keeps its lifecycle.
-    const queuedRetries = new Set(rows.filter(({ id, state }) => state === "pending"
-      && store.get(`human-own-turn:${id}`)
-      && sealedBatch(store, id).members.every(member => covered.has(member))).map(row => row.id));
     for (const { id, state, input } of rows) {
       // Explicit reply coverage also settles older normalized rows without a source field.
       if (state === "cancelled" || state === "observed"
         || !humanInput(input) && !(input.source === undefined && input.id === id && Array.isArray(input.attachments))) continue;
-      const retryAnswered = (state === "pending" || state === "batched") && queuedRetries.has(sealedBatch(store, id).leader);
-      const nextState = state === "admitted" || state === "failed" || retryAnswered ? "done" : state;
+      const nextState = state === "admitted" || state === "failed" ? "done" : state;
       if (input.answeredAt !== undefined) {
         if (nextState !== state) store.updateInbound(id, nextState);
         continue;
@@ -201,6 +195,17 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
         if (input.unanswered?.overdueAt !== undefined) toolLog.write({ component: "router", kind: "event", name: "inbound.answered_late",
           ids: { inboundId: id, chat }, props: { ageMs } });
       });
+    }
+    // Separate replies can finish one sealed retry batch. Retire it only after all
+    // answers are persisted; a batch already submitted keeps its backend lifecycle.
+    for (const leader of new Set(rows.map(({ id }) => sealedBatch(store, id).leader))) {
+      if (!store.get(`human-own-turn:${leader}`)
+        || !store.db.query("SELECT 1 FROM inbound WHERE id = ? AND state = 'pending'").get(leader)) continue;
+      const { members } = sealedBatch(store, leader);
+      if (members.every(id => store.db.query(`SELECT 1 FROM inbound WHERE id = ?
+        AND state IN ('pending', 'batched') AND json_type(payload, '$.answeredAt') = 'integer'`).get(id))) {
+        for (const id of members) store.updateInbound(id, "done");
+      }
     }
   }).immediate();
 }

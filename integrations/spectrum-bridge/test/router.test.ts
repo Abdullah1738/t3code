@@ -106,6 +106,59 @@ test.each([false, true])("reply attribution: 21 Nov 5D626782 CLI fallback cancel
   expect(logs.find(l => l.name === "reply.sent")).toMatchObject({ ids: { inboundId }, props: { inboundKnown: true, attribution: "active_turn" } });
 });
 
+test.each([
+  { first: "root", second: "member", via: "reaction" },
+  { first: "member", second: "root", via: "reaction" },
+  { first: "root", second: "member", via: "send" },
+  { first: "member", second: "root", via: "send" },
+])("reply attribution: split answers retire retry batch ($first then $second via $via)", async ({ first, second, via }) => {
+  const start = Date.parse("2026-11-21T13:45:52Z");
+  setSystemTime(start);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { replyMode: "tool", notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  h.input("root", "First", { source: "typed" });
+  h.input("member", "Second", { source: "typed" });
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  h.router.requeueHuman("root", "turn_failed", true);
+  const route = h.store.get<{ id: string; generation: number }>("route")!;
+  h.store.set("activeTurn", { ...route, directory: "/Chats/ses_1", messageId: h.backend.records.at(-1)!.id,
+    phase: "running", background: true, startedAt: Date.now() });
+  const api = createApi({ store: h.store, router: () => h.router, photon: { react: async () => {} },
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const react = (target: string) => api(new Request("http://localhost/react", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ target, kind: "like" }) }));
+  expect((await react(first)).status).toBe(200);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["pending", "batched"]);
+  setSystemTime(start + 1_000);
+  const logs = await captureLogs(async () => {
+    if (via === "reaction") expect((await react(second)).status).toBe(200);
+    else {
+      const response = await api(new Request("http://localhost/send", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: route.id, dedupeKey: "late-cli-split", text: "Done" }) }));
+      expect(response.status).toBe(202);
+      const { id } = await response.json() as { id: string };
+      expect(h.store.get<string[]>(`reply-covered:${id}`)).toEqual([second]);
+      await new Delivery(h.store, { sendText: async () => ({ providerId: "late-reply" }) }, {
+        projectScope: "test", chatGuid: () => options.chatGuid, enabled: () => true,
+      }).tick();
+    }
+  });
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done"]);
+  const answeredAt = (id: string) => (inbounds(h.store).find(row => row.id === id)!.payload as { answeredAt?: number }).answeredAt;
+  expect(answeredAt(first)).toBe(start);
+  expect(answeredAt(second)).toBe(start + 1_000);
+  expect(logs.filter(line => line.name === "inbound.answered").map(line => line.ids?.inboundId)).toEqual([second]);
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  setSystemTime(start + 12 * 60_000);
+  await h.router.checkUnanswered();
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(alerts).toEqual([]);
+});
+
 test.each([RECENT_REPLY_TURN_MS - 1, RECENT_REPLY_TURN_MS, RECENT_REPLY_TURN_MS + 1, 6 * 60_000])(
   "reply attribution: background replacement does not renew failed-turn grace (elapsed=%s)", async elapsed => {
     const h = setup(":memory:", { replyMode: "tool", watchMs: 0, failureNoticeMs: 10 * 60_000 });
