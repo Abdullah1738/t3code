@@ -56,6 +56,7 @@ def boot_dead(con, box_id):
 
 def _set_aside_boot(con, box_id, error):
     from . import allocation, home
+    home.record_box_failure(error)
     if not home.active() or home.probe() is not None:
         # A per-box response alone cannot prove the replacement backend is healthy.
         raise ResumeUnresolved(str(error), OffboxError(str(error), outage=home.may_fail_over())) from error
@@ -1209,7 +1210,7 @@ class _ResumeWatch:
         self.sends = int(retained)
         self.logged_stuck = False
         self.paused_at = None
-        prepare.track_resume(self)
+        self.preparation = prepare.track_resume(self)
 
     @contextlib.contextmanager
     def pause(self, *, extra_seconds=0):
@@ -1250,15 +1251,25 @@ class _ResumeWatch:
 
     def remaining(self):
         self.check()
-        return max(.001, RESUME_STUCK_S - (self.clock() - self.progress_at))
+        return max(.001, self.deadline() - self.clock())
+
+    def limit(self):
+        # Acknowledged home bring-up includes the server's bounded 30+120 s proxy retry.
+        if self.home and (self.last or {}).get('state') in api.STARTING_STATES:
+            return capacity.setting('OFFBOX_RESUME_PROVISION_SECONDS', 300, minimum=1, maximum=900)
+        return RESUME_STUCK_S
+
+    def deadline(self):
+        end = self.progress_at + self.limit()
+        return min(end, self.preparation.end) if self.preparation is not None else end
 
     def check(self):
-        if self.home and self.clock() - self.progress_at >= RESUME_STUCK_S:
+        if self.home and self.clock() >= self.deadline():
             self.stuck()
             elapsed = self.clock() - self.started
             raise ResumeNoProgress(
                 f'stuck resume of {self.box_id} after {elapsed:.1f}s '
-                f'({RESUME_STUCK_S}s without progress, state={(self.last or {}).get("state", "unknown")}); '
+                f'({self.clock()-self.progress_at:.1f}s without progress, state={(self.last or {}).get("state", "unknown")}); '
                 f'set aside for checking; nothing ran')
 
     def stuck(self, phase=None):
@@ -1625,7 +1636,8 @@ def _resumed_row(con, box_id, size, elapsed, prior_state):
     return row
 
 
-def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None):
+def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None,
+           *, preserve_boot_failure: bool = False):
     if boot_dead(con, row['box_id']):
         return None
     try:
@@ -1635,6 +1647,15 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         if not home.active():
             raise
         if not isinstance(error, api.BoxBootFailed) and error.api_code not in api.BOX_BOOT_CODES:
+            raise
+        if preserve_boot_failure:
+            # A stopped push already owns its box; its runner must retain the observed start failure.
+            if isinstance(error, api.ApiError):
+                failure = api.BoxBootFailed(row['box_id'], None,
+                    f'{error.status} {error.api_code}: {error.message}', error.status, error.api_code)
+                failure.outage = error.outage
+                home.record_box_failure(failure)
+                raise failure from error
             raise
         _set_aside_boot(con, row['box_id'], error)
         return None

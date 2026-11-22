@@ -617,7 +617,7 @@ class BoxReadinessFailover(Isolated):
         self.auth_probe = api.probe_backend
         self.stack.enter_context(patch.object(api, "probe_backend", return_value=None))
         self.clock = Clock()
-        for mod in (pool, prepare, api, home):
+        for mod in (pool, prepare, api, home, lease):
             self.stack.enter_context(patch.object(mod, "time", self.clock.time))
         self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
         self.stack.enter_context(patch.object(home, "probe", return_value=None))

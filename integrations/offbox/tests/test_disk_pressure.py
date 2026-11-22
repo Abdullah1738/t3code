@@ -244,6 +244,113 @@ class Round2(Base):
     def deletes(self):
         return [c for c in self.f.calls if c[:2] == ('snapshot','delete')]
 
+    def real_incus(self):
+        self.stack.enter_context(patch.object(boatd, 'incus', self.saved['incus']))
+        self.stack.enter_context(patch.object(boatd, '_INCUS_SLOW_UNTIL', 0))
+        self.stack.enter_context(patch.dict(boatd.REAP_REFUSED, clear=True))
+        self.stack.enter_context(patch.dict(boatd.DISK, {'ts': 0, 'value': None}, clear=True))
+
+        def run(argv, **kwargs):
+            if argv[0] == 'ps':
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            self.assertEqual(argv[0], 'incus')
+            return self.f.incus(*argv[1:], timeout=kwargs['timeout'], check=False)
+
+        self.stack.enter_context(patch.object(boatd.subprocess, 'run', side_effect=run))
+
+    def test_snapshot_yield_retries_after_bringup_without_skipping_to_pool_boxes(self):
+        self.real_incus()
+        self.clock = 100 * 86400
+        source = self.box('bx_source00')
+        pending = self.box('bx_pending0', state='resuming', running=False)
+        old = self.box('bx_old00000', state='archived', running=False,
+                       name='offbox example | repository pool')
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?', (self.clock-30*3600, old))
+        self.install_rows(snaps(source, count=2), {})
+
+        def tick():
+            value = boatd.disk_maintenance(self.con)
+            selected = boatd.reap_stopped_box(self.con, [self.state(old)], self.clock)
+            self.assertIsNone(selected)
+            self.assertIsNone(self.state(old)['deleted_at'])
+            self.assertFalse(any(c[0] == 'delete' for c in self.f.calls))
+            return value
+
+        self.assertEqual(tick()['cleanup']['snapshots_left'], 2)
+        cleanup = json.loads(self.con.execute("SELECT v FROM meta WHERE k='disk_cleanup'").fetchone()[0])
+        self.assertEqual(cleanup['refused_snapshots'], [])
+        self.assertEqual(self.deletes(), [])
+        boatd.set_box(self.con, pending, state='ready')
+        self.clock += 1
+        tick()
+        self.assertEqual(self.deletes(), [], 'a temporary yield still observes delete pacing')
+        self.clock += 61
+        self.assertEqual(tick()['cleanup']['snapshots_left'], 2)
+        self.assertEqual([c[3] for c in self.deletes()], ['auto-0'])
+        self.clock += 61
+        self.assertEqual(tick()['cleanup']['snapshots_left'], 1)
+        self.assertEqual([c[3] for c in self.deletes()], ['auto-0', 'auto-1'])
+        self.assertEqual(self.f.snapshots[boatd.ct(source)], [])
+
+    def test_box_yield_retries_after_bringup_without_refusal_or_new_delete_fence(self):
+        self.real_incus()
+        self.clock = 100 * 86400
+        old = self.box('bx_old00000', state='archived', running=False,
+                       name='offbox example | repository pool')
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?', (self.clock-8*86400, old))
+        pending = self.box('bx_pending0', state='provisioning', running=False)
+        self.install_rows([], {})
+
+        self.assertIsNone(boatd.reap_stopped_box(self.con, [self.state(old)], self.clock))
+        self.assertNotIn(old, boatd.REAP_REFUSED)
+        self.assertIsNone(self.con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:'+old,)).fetchone())
+        self.assertIsNone(self.state(old)['deleted_at'])
+        self.assertFalse(any(c[0] == 'delete' for c in self.f.calls))
+        boatd.set_box(self.con, pending, state='ready')
+        self.clock += 1
+        self.assertIsNone(boatd.reap_stopped_box(self.con, [self.state(old)], self.clock))
+        self.assertFalse(any(c[0] == 'delete' for c in self.f.calls))
+        self.clock += 61
+        self.assertEqual(boatd.reap_stopped_box(self.con, [self.state(old)], self.clock), old)
+        self.assertEqual(len([c for c in self.f.calls if c[0] == 'delete']), 1)
+        self.assertEqual(self.state(old)['state'], 'deleted')
+        self.assertIsNone(self.con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:'+old,)).fetchone())
+
+    def test_box_yield_preserves_a_previous_uncertain_delete_fence(self):
+        self.real_incus()
+        old = self.box('bx_old00000', state='archived', running=False)
+        self.box('bx_pending0', state='resuming', running=False)
+        self.con.execute('INSERT INTO meta(k,v) VALUES (?,?)', ('delete_pending:'+old, '1'))
+        with self.assertRaises(boatd.Fail) as caught:
+            boatd.delete_box(self.con, old)
+        self.assertEqual(caught.exception.code, 'incus_busy')
+        self.assertIsNotNone(self.con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:'+old,)).fetchone())
+        self.assertFalse(any(c[0] == 'delete' for c in self.f.calls))
+
+    def test_dispatched_box_refusal_keeps_fence_and_hour_backoff(self):
+        self.real_incus()
+        self.clock = 100 * 86400
+        old = self.box('bx_old00000', state='archived', running=False,
+                       name='offbox example | repository pool')
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?', (self.clock-8*86400, old))
+
+        def refuse(argv, **kwargs):
+            if argv[0] == 'ps':
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            if argv[1] == 'delete':
+                self.f.calls.append(tuple(argv[1:]))
+                return subprocess.CompletedProcess(argv, 1, b'', b'dataset is busy')
+            return self.f.incus(*argv[1:], timeout=kwargs['timeout'], check=False)
+
+        with patch.object(boatd.subprocess, 'run', side_effect=refuse):
+            self.assertIsNone(boatd.reap_stopped_box(self.con, [self.state(old)], self.clock))
+            self.assertEqual(boatd.REAP_REFUSED[old], self.clock)
+            self.clock += 61
+            self.assertIsNone(boatd.reap_stopped_box(self.con, [self.state(old)], self.clock))
+        self.assertEqual(len([c for c in self.f.calls if c[0] == 'delete']), 1)
+        self.assertIsNotNone(self.con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:'+old,)).fetchone())
+        self.assertIsNone(self.state(old)['deleted_at'])
+
     def test_freeing_and_live_io_pressure_yield_without_delete(self):
         bid=self.box();self.install_rows(snaps(bid), {})
         for pressure in ({'freeing_bytes': 6*G}, {'io_full_avg10': 15}):
