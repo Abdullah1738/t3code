@@ -4269,9 +4269,19 @@ def main(argv=None):
                 try:
                     event = check_command(wd, os.environ.get('WATCH_RUN', ''), DATA)
                 except data_io.DataUnavailable as error:
+                    run_history.record_skip(row, error)
+                    row['exit'] = 1
                     print(f'money-cases: {error}', file=sys.stderr)
-                    rc = record_data_skip(wd, error)
-                    run_history.record_skip(row, error, rc)
+                    try:
+                        try:
+                            rc = record_data_skip(wd, error)
+                        except data_io.DataUnavailable as again:
+                            print(f'money-cases: {again}', file=sys.stderr)
+                            rc = record_data_skip(wd, again)
+                    except (CaseError, charges.Lookup) as exc:
+                        row['exit'] = 4 if isinstance(exc, charges.Lookup) else 2
+                        raise
+                    row['exit'] = rc
                     return rc
                 if event:
                     print(event)
@@ -4346,8 +4356,10 @@ def main(argv=None):
     except CheckBusy:
         return 75
     except data_io.DataUnavailable as e:
+        if args.command == 'check':
+            raise
         print(f'money-cases: {e}', file=sys.stderr)
-        return record_data_skip(wd, e) if args.command == 'check' else 75
+        return 75
     except (CaseError, charges.Lookup) as e:
         if isinstance(e, charges.Lookup):
             print(f"UNVERIFIED: source {str(e).split(':', 1)[0]} unreadable", file=sys.stderr)

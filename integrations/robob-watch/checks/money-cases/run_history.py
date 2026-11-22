@@ -15,10 +15,12 @@ import signal
 import time
 
 from charges import within
+from data_io import DataUnavailable
 
 MAX_BYTES = 2 * 1024 * 1024
 MAX_ROW_BYTES = 16 * 1024
 APPEND_BUDGET = 0.04
+APPEND_ERROR_BUDGET = 0.008
 APPEND_ERRORS = 0
 _ACTIVE = ContextVar('money_cases_run_history', default=None)
 STOP_REASONS = {'source_limit', 'follow_deadline', 'owner_budget', 'receipt_deadline',
@@ -164,14 +166,58 @@ def run_row(values):
             row[key] = values[key]
     if values.get('dataless_files', 0) is None:
         row['dataless_files'] = None
+    row.pop('dataless_error', None)
     value = values.get('dataless_error')
-    if isinstance(value, str) and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]{0,80} errno=(?:None|-?\d{1,6})', value):
+    if isinstance(value, str) and re.fullmatch(
+            r'[a-zA-Z][a-zA-Z0-9_]{0,80} errno=(?:None|-?\d{1,6})|DataUnavailable reason=(?:deadline|edeadlk)', value):
         row['dataless_error'] = value
     return row
 
 
 class AppendTimeout(Exception):
     pass
+
+
+def persisted_errors(wd):
+    try:
+        fd = os.open(Path(wd) / 'history-append-errors', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return 0
+    try:
+        info = os.fstat(fd)
+        return info.st_size if stat.S_ISREG(info.st_mode) else 0
+    finally:
+        os.close(fd)
+
+
+def append_failed(wd, values):
+    global APPEND_ERRORS
+    APPEND_ERRORS += 1
+    values['history_append_errors'] = APPEND_ERRORS
+    # Delayed delivery of the append alarm must not consume the marker's budget.
+    remaining = APPEND_ERROR_BUDGET
+    caller = signal.getitimer(signal.ITIMER_REAL)[0]
+    if caller:
+        remaining = min(remaining, caller - .001)
+    if remaining > 0:
+        try:
+            with within(time.time() + remaining, AppendTimeout('history diagnostic deadline')):
+                # One byte per failure survives CLI process exits and lock contention.
+                # The size is the counter; concurrent failed runs need no read/modify/write.
+                try:
+                    fd = os.open(Path(wd) / 'history-append-errors',
+                                 os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+                    try:
+                        if stat.S_ISREG(os.fstat(fd).st_mode):
+                            os.write(fd, b'\n')
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    pass
+                os.write(2, f'money-cases: history append errors={APPEND_ERRORS}\n'.encode())
+        except (Exception, DataUnavailable) as exc:
+            if getattr(exc, '_money_cases_timeout', False) and not isinstance(exc, AppendTimeout):
+                raise
 
 
 def repair_tail(fd, size):
@@ -190,15 +236,15 @@ def repair_tail(fd, size):
 
 
 def append(wd, values):
-    """No retries or fsync: at most 40 ms of best-effort local diagnostics."""
+    """No retries or fsync: 40 ms for the row, then 8 ms for failure accounting."""
     global APPEND_ERRORS
-    started = time.monotonic()
     try:
         # Leave enclosing deadlines to their caller, rather than swallowing them.
         remaining = signal.getitimer(signal.ITIMER_REAL)[0]
         if remaining and remaining <= APPEND_BUDGET:
             raise TimeoutError('caller deadline')
         with within(time.time() + APPEND_BUDGET, AppendTimeout('history append deadline')):
+            APPEND_ERRORS = max(APPEND_ERRORS, persisted_errors(wd))
             row = run_row(values)
             row['history_append_errors'] = APPEND_ERRORS
             payload = (json.dumps(row, ensure_ascii=True, allow_nan=False, separators=(',', ':')) + '\n').encode()
@@ -230,20 +276,10 @@ def append(wd, values):
             finally:
                 os.close(lock)
         return True
-    except Exception as exc:
+    except (Exception, DataUnavailable) as exc:
         if getattr(exc, '_money_cases_timeout', False) and not isinstance(exc, AppendTimeout):
             raise
-        APPEND_ERRORS += 1
-        values['history_append_errors'] = APPEND_ERRORS
-        # Preserve a count in runner stderr even when no history line can be written.
-        # This shares the 50 ms ceiling and never includes the exception text.
-        remaining = .048 - (time.monotonic() - started)
-        if remaining > 0 and not signal.getitimer(signal.ITIMER_REAL)[0]:
-            try:
-                with within(time.time() + remaining, TimeoutError('history diagnostic deadline')):
-                    os.write(2, f'money-cases: history append errors={APPEND_ERRORS}\n'.encode())
-            except Exception:
-                pass
+        append_failed(wd, values)
         return False
 
 
@@ -261,7 +297,9 @@ def recording(wd):
         yield row
         row.setdefault('exit', 0)
     except BaseException as exc:
-        if type(exc).__name__ == 'DataUnavailable':
+        if row.get('skipped'):
+            pass  # The CLI resolves bookkeeping retries and exit status before finalization.
+        elif type(exc).__name__ == 'DataUnavailable':
             record_skip(row, exc)
         else:
             row['stop_reason'] = 'check_busy' if type(exc).__name__ == 'CheckBusy' else 'error'
@@ -269,11 +307,16 @@ def recording(wd):
         raise
     finally:
         _ACTIVE.reset(token)
-        row.update(row.pop('stats', {}))
-        row['loadavg_end'] = loadavg()
-        receipt_coverage(row)
-        row.setdefault('total_s', round(time.monotonic() - started, 3))
-        append(wd, row)
+        try:
+            row.update(row.pop('stats', {}))
+            row['loadavg_end'] = loadavg()
+            receipt_coverage(row)
+            row.setdefault('total_s', round(time.monotonic() - started, 3))
+            append(wd, row)
+        except (Exception, DataUnavailable) as exc:
+            if getattr(exc, '_money_cases_timeout', False):
+                raise
+            append_failed(wd, row)
 
 
 def record_skip(row, error, exit_code=0):

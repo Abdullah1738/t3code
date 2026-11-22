@@ -104,6 +104,106 @@ class HistoryTests(unittest.TestCase):
                 row = history.run_row({**self.row, key: '/private/source text'})
                 self.assertNotIn(key, row)
 
+    def test_dataless_error_forms_remain_private_and_idempotent(self):
+        accepted = ('DataUnavailable reason=deadline', 'DataUnavailable reason=edeadlk',
+                    'PermissionError errno=13', 'DataUnavailable errno=None')
+        rejected = ('DataUnavailable reason=private text', 'OSError reason=deadline',
+                    'DataUnavailable reason=deadline\nprivate', 'OSError errno=1234567')
+        for value in accepted + rejected:
+            with self.subTest(value=value):
+                row = history.run_row({**self.row, 'dataless_error': value})
+                self.assertEqual(row.get('dataless_error'), value if value in accepted else None)
+                self.assertEqual(history.run_row(row), row)
+
+    def test_failed_history_survives_into_the_next_cli_process(self):
+        import data_io
+        for caller_timer in (0, 2):
+            for error in (OSError('fixture'), data_io.DataUnavailable(self.wd / 'runs.jsonl', 'deadline')):
+                signal.setitimer(signal.ITIMER_REAL, caller_timer)
+                try:
+                    with self.subTest(error=type(error).__name__, caller_timer=caller_timer), \
+                            patch.object(history, 'run_row', side_effect=error):
+                        self.assertFalse(history.append(self.wd, self.row))
+                        if caller_timer:
+                            self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], 1)
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+        script = '''import json,pathlib,sys
+sys.path.insert(0,sys.argv[1])
+import run_history as h
+wd=pathlib.Path(sys.argv[2])
+assert h.APPEND_ERRORS == 0
+assert h.append(wd, {'at':'2026-11-19T17:05:35Z','total_s':1,'exit':0})
+print(json.loads((wd/'runs.jsonl').read_text())['history_append_errors'])
+'''
+        done = subprocess.run([os.sys.executable, '-I', '-B', '-c', script,
+                               str(Path(history.__file__).parent), str(self.wd)],
+                              text=True, capture_output=True, check=True)
+        self.assertEqual(int(done.stdout), 4)
+
+    def test_finalization_alarm_cannot_fail_a_quiet_skip(self):
+        import data_io
+        error = data_io.DataUnavailable(self.wd / 'cases.json', 'deadline')
+        with patch.object(history, 'append', side_effect=data_io.DataUnavailable(self.wd / 'runs.jsonl')):
+            with history.recording(self.wd) as row:
+                history.record_skip(row, error)
+        self.assertEqual(history.persisted_errors(self.wd), 1)
+        self.assertIsNone(history.current())
+        self.assertTrue(history.append(self.wd, self.row))
+        self.assertGreaterEqual(json.loads(self.path.read_text())['history_append_errors'], 1)
+
+    def test_delayed_append_timeout_is_counted_by_a_fresh_process(self):
+        fail = '''import json,pathlib,signal,sys,time
+from unittest.mock import patch
+sys.path.insert(0,sys.argv[1])
+import run_history as h
+# Isolate late delivery from a second timeout in the marker itself. The
+# default marker budget and stalled writes are exercised separately.
+h.APPEND_ERROR_BUDGET=.2
+wd=pathlib.Path(sys.argv[2])
+write=h.os.write
+def delayed(fd,payload):
+    if payload != b'\\n' and fd != 2:
+        previous=signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
+        try:
+            time.sleep(.065)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK,previous)
+    return write(fd,payload)
+handler=signal.getsignal(signal.SIGALRM)
+signal.setitimer(signal.ITIMER_REAL,float(sys.argv[3]))
+try:
+    with patch.object(h.os,'write',side_effect=delayed):
+        assert not h.append(wd, {'at':'2026-11-19T16:48:49Z','exit':0,'skipped':True,
+                                 'skip_file':'cases.json','skip_reason':'deadline','skip_phase':'follow'})
+    assert not (wd/'runs.jsonl').read_bytes()
+    print(h.persisted_errors(wd))
+    assert signal.getsignal(signal.SIGALRM) is handler
+    remaining=signal.getitimer(signal.ITIMER_REAL)[0]
+    assert 1 < remaining < 2 if float(sys.argv[3]) else remaining == 0
+finally:
+    signal.setitimer(signal.ITIMER_REAL,0)
+'''
+        recover = '''import json,pathlib,sys
+sys.path.insert(0,sys.argv[1])
+import run_history as h
+wd=pathlib.Path(sys.argv[2])
+assert h.APPEND_ERRORS == 0
+assert h.append(wd, {'at':'2026-11-19T17:05:35Z','exit':0})
+print(json.loads((wd/'runs.jsonl').read_text())['history_append_errors'])
+'''
+        for caller_timer in (0, 2):
+            with self.subTest(caller_timer=caller_timer):
+                wd = self.wd / str(caller_timer)
+                wd.mkdir()
+                args = [str(Path(history.__file__).parent), str(wd)]
+                failed = subprocess.run([os.sys.executable, '-I', '-B', '-c', fail, *args, str(caller_timer)],
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(failed.returncode, 0, failed.stderr)
+                recovered = subprocess.run([os.sys.executable, '-I', '-B', '-c', recover, *args],
+                                           text=True, capture_output=True, check=True, timeout=5)
+                self.assertEqual(int(recovered.stdout), 1, f'persisted_errors={failed.stdout.strip()}')
+
     def test_case_error_normalization(self):
         timeout = str(subprocess.TimeoutExpired(
             ['/Users/ardud/.local/bin/msgs', 'search', '("Logic Utilities" OR "Acme Merchant")'], 2))
@@ -211,6 +311,64 @@ class HistoryTests(unittest.TestCase):
         try:
             self.assertTrue(history.append(self.wd, self.row))
             self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], .5)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
+    def test_error_accounting_has_its_own_bounded_attempt(self):
+        write = history.os.write
+        for caller_timer in (0, 2):
+            with self.subTest(caller_timer=caller_timer):
+                self.path.unlink(missing_ok=True)
+                attempted = []
+
+                def slow_marker(fd, payload):
+                    if payload == b'\n':
+                        attempted.append(signal.getitimer(signal.ITIMER_REAL)[0])
+                        time.sleep(1)
+                    return write(fd, payload)
+
+                handler = signal.getsignal(signal.SIGALRM)
+                signal.setitimer(signal.ITIMER_REAL, caller_timer)
+                try:
+                    with patch.object(history, 'run_row', side_effect=OSError('fixture')), \
+                            patch.object(history.os, 'write', side_effect=slow_marker):
+                        started = time.monotonic()
+                        self.assertFalse(history.append(self.wd, self.row))
+                        self.assertLess(time.monotonic() - started, .2)
+                    self.assertEqual(len(attempted), 1)
+                    self.assertTrue(0 < attempted[0] <= history.APPEND_ERROR_BUDGET)
+                    self.assertIs(signal.getsignal(signal.SIGALRM), handler)
+                    remaining = signal.getitimer(signal.ITIMER_REAL)[0]
+                    if caller_timer:
+                        self.assertGreater(remaining, 1)
+                    else:
+                        self.assertEqual(remaining, 0)
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+
+    def test_error_accounting_keeps_an_earlier_caller_deadline(self):
+        write = history.os.write
+        attempted = []
+
+        def marker(fd, payload):
+            if payload == b'\n':
+                attempted.append(signal.getitimer(signal.ITIMER_REAL)[0])
+            return write(fd, payload)
+
+        handler = signal.getsignal(signal.SIGALRM)
+        signal.setitimer(signal.ITIMER_REAL, .2)
+        try:
+            # Scale both budgets up so this checks their ordering without a
+            # sub-millisecond scheduling race on a busy test host.
+            with patch.object(history, 'APPEND_ERROR_BUDGET', .5), \
+                    patch.object(history, 'run_row', side_effect=OSError('fixture')), \
+                    patch.object(history.os, 'write', side_effect=marker):
+                self.assertFalse(history.append(self.wd, self.row))
+            self.assertEqual(len(attempted), 1)
+            self.assertTrue(0 < attempted[0] < .2)
+            self.assertTrue(0 < signal.getitimer(signal.ITIMER_REAL)[0] < .2)
+            self.assertIs(signal.getsignal(signal.SIGALRM), handler)
+            self.assertEqual(history.persisted_errors(self.wd), 1)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
 
