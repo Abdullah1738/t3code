@@ -6051,8 +6051,8 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
         chain('pnpm-bin-shadows-rm', setup=lambda home, helper: (helper / 'pnpm-bin/rm').write_text(''))
         chain('added-node-shadows-cp', environment={'_repo_node_added_node': '{home}/added'},
               setup=lambda home, helper: ((home / 'added').mkdir(), (home / 'added/cp').write_text('')))
-        chain('managed-dir-shadows-cat', setup=lambda home, helper: ((home / '.local/share/quint-guard/bin').mkdir(parents=True),
-                                                                      (home / '.local/share/quint-guard/bin/cat').write_text('')))
+        chain('managed-dir-shadows-cat', setup=lambda home, helper: ((home / '.config/opencode/skills/remote-compute/scripts/blockers').mkdir(parents=True),
+                                                                      (home / '.config/opencode/skills/remote-compute/scripts/blockers/cat').write_text('')))
         chain('helper-module-hijack', setup=lambda home, helper: (helper / 'json.py').write_text(''))
         chain('helper-package-hijack', setup=lambda home, helper: ((helper / 're').mkdir(), (helper / 're/__init__.py').write_text('')))
         chain('python-startup', environment={'PYTHONPATH': '/tmp'})
@@ -6122,7 +6122,7 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             ('nvm-pnpm-package-live', lambda: link(nvm / 'versions/node/v26.0.0/lib/node_modules/pnpm/package.json', marker), SCRIPT),
             ('corepack-package-live', lambda: link(corepack / 'v1/pnpm/10.0.0/package.json', marker), SCRIPT),
             ('path-pnpm-root-package-live', lambda: (regular(str(pnpm_root / 'bin/pnpm.cjs'), ''),
-                                                    link(home / '.local/share/quint-guard/bin/pnpm', pnpm_root / 'bin/pnpm.cjs'),
+                                                    link(home / '.config/opencode/skills/remote-compute/scripts/blockers/pnpm', pnpm_root / 'bin/pnpm.cjs'),
                                                     link(pnpm_root / 'package.json', marker)), SCRIPT),
             ('cwd-package-json-regular', lambda: regular('package.json'), None),
             ('cwd-package-json-plain-link', lambda: link(self.root / 'package.json', plain), None),

@@ -190,7 +190,6 @@ def select(cwd, base_path, home, helper):
     managed = [os.path.join(home, rel) for rel in [
         '.config/opencode/skills/remote-compute/scripts/blockers',
         '.local/share/harness-hooks/coord-blockers',
-        '.local/share/quint-guard/bin',
     ]]
     prefix = [entry for entry in managed if entry in paths]
     paths = prefix + [entry for entry in paths if entry not in prefix]

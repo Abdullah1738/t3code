@@ -340,7 +340,7 @@ class RelativeScriptReporterTests(unittest.TestCase):
 
     def test_create_run_and_syntax_only_shapes(self):
         rows = [
-            ('tmp/quint/3464/fix_rules.py', 'for r in []:\n pass\n', 'python3 tmp/quint/3464/fix_rules.py', 'python3'),
+            ('tmp/scripts/3464/fix_rules.py', 'for r in []:\n pass\n', 'python3 tmp/scripts/3464/fix_rules.py', 'python3'),
             ('tmp/implement.py', "text = 'node scripts/absent.mjs'\n", 'offbox run -- python3 tmp/implement.py', 'python3'),
             ('tmp/followup.cjs', "console.log('ok')\n", 'offbox run -- node ./tmp/followup.cjs', 'node'),
             ('tmp/acceptance.sh', './configure\n"$CC" $CFLAGS\nsh docker/fetch-foundationdb.sh\n', 'offbox run --bg -- bash tmp/acceptance.sh', 'bash'),
@@ -351,7 +351,7 @@ class RelativeScriptReporterTests(unittest.TestCase):
             for database in (LIVE, OPENCODE):
                 with self.subTest(name=name, invocation=invocation, database=database):
                     command = f"cat > {name} <<'EOF'\n{body}EOF\n{invocation}"
-                    expected = 'live-database-script-unresolved' if name in {'tmp/quint/3464/fix_rules.py', 'tmp/implement.py', 'tmp/followup.cjs'} else None
+                    expected = 'live-database-script-unresolved' if name in {'tmp/scripts/3464/fix_rules.py', 'tmp/implement.py', 'tmp/followup.cjs'} else None
                     self.check(self.event(command), expected)
                     if '--bg' in invocation:
                         # The box runs it whatever it reads (#221).

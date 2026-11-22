@@ -694,7 +694,7 @@ class ToolLogTests(unittest.TestCase):
                                       'props': {'decision': 'allowed', 'rule': 'classifier-unavailable', **props}}
         rows = ([failed('13', {'guard': 'rootwide-search', 'classifier': 'rootwide_search_guard', 'errorClass': 'timeout'})] * 3
                 + [failed('13', {'guard': 'rootwide-search', 'classifier': 'rootwide_search_guard', 'errorClass': 'exit:1'})]
-                + [failed('02', {'guard': 'quint-verify', 'classifier': 'quint_verify_guard', 'errorClass': 'timeout'})] * 2
+                + [failed('02', {'guard': 'shared-dependencies', 'classifier': 'shared_deps_guard', 'errorClass': 'timeout'})] * 2
                 + [failed('02', {'guard': 'phone-adb'})]
                 + [failed('02', {'guard': 'shared-dependencies', 'classifier': f'c{i}', 'errorClass': 'parse'}) for i in range(4)]
                 + [{'ts': f'{self.day}T11:59:59Z', 'error': {'tag': 'phone-adb-state'},
@@ -707,7 +707,7 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(list(result['errorTagsByHour']), ['hook.classifier_failed', 'phone-adb-state'])
         self.assertEqual(result['topClassifierFailures'], [
             {'classifier': 'rootwide_search_guard', 'count': 4, 'errorClasses': {'timeout': 3, 'exit:1': 1}},
-            {'classifier': 'quint_verify_guard', 'count': 2, 'errorClasses': {'timeout': 2}},
+            {'classifier': 'shared_deps_guard', 'count': 2, 'errorClasses': {'timeout': 2}},
             {'classifier': 'c0', 'count': 1, 'errorClasses': {'parse': 1}},
             {'classifier': 'c1', 'count': 1, 'errorClasses': {'parse': 1}},
             {'classifier': 'c2', 'count': 1, 'errorClasses': {'parse': 1}}])
