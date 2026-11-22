@@ -63,6 +63,7 @@ UNKNOWN_GIVE_UP_S = 3 * 3600
 CARD_RETRY_S = 600          # one more CARD_READY if someone still lacks the card 10 min later
 MISSES_BEFORE_UNKNOWN = 2   # a single empty poll doesn't flip a live card to "Checking"
 PREVIEW_RETRIES = 10        # checks spent re-rendering a frozen card's failed preview
+CLEANUP_DEADLINE_S = 50     # default 60s check: reserve 10s for state persistence and alerts
 UNSHARES_PER_RUN = 3        # ended rides' links taken down per check
 
 
@@ -377,7 +378,7 @@ def recently_requested(trips, rider, now, exclude):
                and now - t["card_requested"] < REBOOK_WINDOW_S for u, t in trips.items())
 
 
-def unshare_ended(now, live=None):
+def unshare_ended(now, live=None, *, deadline=None):
     """An hour after a ride ends, its public share link goes: the bridge caps live shares at 10 and
     old ride links used them all up (trip e44d36f9). Reads the share journal, so rides this state
     file no longer tracks are covered too. A bridge that fails is tried again next run. The trip Uber
@@ -385,16 +386,17 @@ def unshare_ended(now, live=None):
     and a run that can't read the bridge's share list retires nothing."""
     if not os.environ.get("RIDE_CARD_BRIDGE") and Path(WD).resolve() != LIVE_DIR.resolve():
         return  # a scratch run's journal isn't the real one: never touch real shares from it
+    deadline = time.monotonic() + CLEANUP_DEADLINE_S if deadline is None else deadline
     done, permanent = 0, None
     for p in sorted(rc.journal_dir().glob("*.json")):
-        if done >= UNSHARES_PER_RUN:
+        if done >= UNSHARES_PER_RUN or time.monotonic() >= deadline:
             return  # the rest go next run; the check has a 60s budget
         uuid = p.stem
         if uuid == live or not rc.UUID_RE.match(uuid) or rc.unshared_path(uuid).exists() \
                 or not rc.public_link(uuid) or not rc.link_done(rc.load_card(uuid), now):
             continue
         if permanent is None:  # asked once per run, and only when some link is due
-            permanent = rc.permanent_apps()
+            permanent = rc.permanent_apps(deadline=deadline)
             if permanent is None:
                 print("ride-share: bridge share list unreadable, no link retired this run", file=sys.stderr)
                 return
@@ -405,7 +407,10 @@ def unshare_ended(now, live=None):
                 if not rc.link_done(rc.load_card(uuid), now) or rc.unshared_path(uuid).exists():
                     continue
                 try:
-                    rc.unshare(uuid)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    rc.unshare(uuid, timeout=min(10, remaining))
                     done += 1
                 except Exception as e:
                     print(f"ride-share: unshare {uuid} failed: {e}"[:300], file=sys.stderr)
@@ -415,6 +420,7 @@ def unshare_ended(now, live=None):
 
 
 def main():
+    cleanup_deadline = time.monotonic() + CLEANUP_DEADLINE_S
     s = load()
     now = now_ts()
     clear_acked_fares(s["trips"])
@@ -569,7 +575,7 @@ def main():
         else:
             s["preview_retry"][uuid] = n + 1
 
-    unshare_ended(now, live=cur)
+    unshare_ended(now, live=cur, deadline=cleanup_deadline)
 
     for uuid, p in list(pending.items()):
         if now - p["since"] >= REBOOK_WINDOW_S:
