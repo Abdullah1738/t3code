@@ -366,6 +366,9 @@ def act(r):
         return rc == 0, (o + e).strip()
     if k == "expo":
         for pid in r["pids"]:
+            rows = leftover_processes.cpu_processes()
+            if pid in rows and leftover_processes.robob_ancestry(rows[pid], leftover_processes.parent_chain(rows[pid], rows)):
+                return False, "protected Robob descendant"
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -373,6 +376,9 @@ def act(r):
         time.sleep(3)
         alive = [p for p in r["pids"] if os.path.exists(f"/proc/{p}") or sh(["ps", "-p", str(p)])[0] == 0]
         for pid in alive:
+            rows = leftover_processes.cpu_processes()
+            if pid in rows and leftover_processes.robob_ancestry(rows[pid], leftover_processes.parent_chain(rows[pid], rows)):
+                return False, "protected Robob descendant"
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
