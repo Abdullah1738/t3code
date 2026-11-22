@@ -426,6 +426,9 @@ def host_fields(values, event):
 
 
 def safe_fields(values, event=None):
+    if event == 'host.spawn_sample':
+        from spawn_schema import fields
+        return fields(values)
     if event == 'host.overload':
         result = host_fields(values, 'host.families_lite')
         for key in ('phase', 'onset', 'conditions', 'durationS', 'notified'):
@@ -440,6 +443,9 @@ def safe_fields(values, event=None):
                 result[key] = value
             elif key == 'notified' and type(value) is bool:
                 result[key] = value
+        if isinstance((values or {}).get('spawn'), dict):
+            from spawn_schema import fields
+            result['spawn'] = fields(values['spawn'])
         result['peak'] = host_fields((values or {}).get('peak', {}), 'host.families_lite')
         for key in ('swapUsedBytes', 'swapTotalBytes'):
             if finite_number(result.get(key)):
@@ -770,7 +776,7 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                     'crash.unified.skip', 'crash.source', 'crash.collect') and
                     row.get('props', {}).get('skippedS', 0) > 0)
                 # Preserve the bounded host heartbeat through a noisy day's cap.
-                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload')
+                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload', 'host.spawn_sample')
                 if kind != 'error' and not coverage_gap and not host_sample:
                     return
             append(fd, row)
