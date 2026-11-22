@@ -194,7 +194,7 @@ def worker(lock_fd):
     finally:
         if dev_janitor is not None:
             dev_janitor.log_run(started, stats["found"], stats["killed"], ok,
-                                stats.get("phase_ms"), stats.get("mcp_summary"))
+                                stats.get("phase_ms"), stats.get("mcp_summary"), stats.get("mcp_orphan"))
     return 0
 
 

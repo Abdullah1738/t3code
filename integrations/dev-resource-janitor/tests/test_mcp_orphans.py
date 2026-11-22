@@ -214,6 +214,8 @@ class McpTests(JanitorTestCase):
         with patch.object(lp, 'scan_mcp_orphans', return_value=report), patch.object(lp, 'processes', side_effect=RuntimeError):
             scan = lp.scan(ROSTER)
         self.assertEqual(lp.report_summary(scan)['mcp_orphan'], report)
+        self.assertIn('mcp_summary', lp.report_summary(scan))
+        self.assertIn('mcp_orphan', scan['phase_ms'])
 
     def test_hourly_success_and_failure_counts(self):
         import janitor_watch
@@ -226,7 +228,19 @@ class McpTests(JanitorTestCase):
                 with (base / 'lock').open('a+') as lock, patch.object(janitor_watch, 'STATE_DIR', base), patch.object(dev_janitor, 'scan', return_value=scan), patch.object(dev_janitor, 'reap_mcp_candidates', side_effect=reap), patch.object(dev_janitor, 'record_report') as record, patch.object(dev_janitor, 'log_run') as log:
                     self.assertEqual(janitor_watch.worker(lock.fileno()), 0 if ok else 1)
                     self.assertEqual(record.call_args.args[0]['processes']['mcp_orphan']['actions'][0]['ok'], ok)
-                    self.assertEqual(log.call_args.args[1:], (1, int(ok), ok))
+                    self.assertEqual(log.call_args.args[1:4], (1, int(ok), ok))
+                    self.assertEqual(log.call_args.args[5], scan['processes']['mcp_summary'])
+                    self.assertIs(log.call_args.args[6], report)
+
+    def test_resource_rescans_preserve_confirmed_reap_totals_for_run_log(self):
+        report = self.detect()
+        stats = {}
+        dev_janitor.collect_scan_stats(stats, {'processes': {'mcp_orphan': report}})
+        report.update(freed_rss_kib=123, reaped_counts={'cua': 1})
+        dev_janitor.collect_scan_stats(stats, {'processes': {'mcp_orphan': self.detect(), 'mcp_summary': {'ok': True}}})
+        self.assertIs(stats['mcp_orphan'], report)
+        self.assertEqual(stats['mcp_orphan']['freed_rss_kib'], 123)
+        self.assertEqual(stats['mcp_summary'], {'ok': True})
 
     def test_shared_service_subcommand_argument_class(self):
         # Global option forms: split/equals values, short/long, repeated, flags,

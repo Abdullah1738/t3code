@@ -40,7 +40,7 @@ def log_kill(resource, ok):
         pass
 
 
-def log_run(started, found, killed, ok, phase_ms=None, mcp_summary=None):
+def log_run(started, found, killed, ok, phase_ms=None, mcp_summary=None, mcp_orphan=None):
     summary = mcp_summary if mcp_summary is not None else leftover_processes.unavailable_report(
         "process_scan_skipped")["mcp_summary"]
     try:
@@ -48,10 +48,15 @@ def log_run(started, found, killed, ok, phase_ms=None, mcp_summary=None):
              props={"mcp_summary": summary})
     except Exception:
         pass
+    props = {"found": found, "killed": killed, "phase_ms": phase_ms or {}}
+    if mcp_orphan is not None:
+        props["mcp_orphan"] = {key: mcp_orphan[key] for key in (
+            "reap_enabled", "counts", "rules", "oldest_age_s", "rss_kib", "freed_rss_kib", "reaped_counts")
+            if key in mcp_orphan}
     try:
         emit("janitor", "perf" if ok else "error", "janitor.run", ok=ok,
              duration_ms=(time.monotonic()-started)*1000,
-             props={"found": found, "killed": killed, "phase_ms": phase_ms or {}},
+             props=props,
              error_tag=None if ok else "janitor.failed")
     except Exception:
         pass
@@ -62,6 +67,10 @@ def collect_scan_stats(stats, st):
     for name, ms in st.get("phase_ms", {}).items():
         phases[name] = round(phases.get(name, 0) + ms, 1)
     stats["mcp_summary"] = st.get("processes", {}).get("mcp_summary")
+    # The initial report receives reap outcomes; later resource rescans must
+    # not replace its confirmed exits with a fresh, actionless census.
+    if stats.get("mcp_orphan") is None:
+        stats["mcp_orphan"] = st.get("processes", {}).get("mcp_orphan")
 
 
 IDLE_MIN = int(os.environ.get("DEV_JANITOR_IDLE_MIN", "60"))
@@ -444,7 +453,7 @@ def main():
     finally:
         if not (sys.argv[1:2] == ["scan"] and "--no-write" in sys.argv[2:]):
             log_run(started, stats["found"], stats["killed"], ok,
-                    stats.get("phase_ms"), stats.get("mcp_summary"))
+                    stats.get("phase_ms"), stats.get("mcp_summary"), stats.get("mcp_orphan"))
 
 
 if __name__ == "__main__":
