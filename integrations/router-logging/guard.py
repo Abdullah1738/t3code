@@ -16,7 +16,8 @@ import uuid
 
 from host import Sampler
 from toollog import directory, emit
-from observer import Timings, clock_sample, gap, job_snapshot, launchctl_cause, launchctl_print, measured, phase
+from causes import launchctl_info
+from observer import Timings, clock_sample, gap, launchctl_print, measured, phase
 
 LABEL = 'com.abdullah.9router-fork'
 FRESH_MS = 300000
@@ -67,7 +68,9 @@ class Guard:
                     state['unknownSinceMs'] = now
                     state['unknownHost'] = host
                     state['unknownHostAtMs'] = host_at_ms
-                    state['unknownCause'] = launchctl_cause(observation or {})
+                    state['unknownEvidence'] = launchctl_info(observation)
+                    state['unknownCause'] = state['unknownEvidence']['cause']
+                    props.update(state['unknownEvidence'])
                     props['unknownSince'] = iso(now)
                 self.event('listener.state_unknown', **props)
             state['jobUnknown'] = True
@@ -76,9 +79,11 @@ class Guard:
         if (job != 'unknown' or failed) and 'unknownSinceMs' in state:
             since = state.pop('unknownSinceMs')
             self.event('listener.state_resolved', unknownSince=iso(since), unknownMs=max(0, now - since),
-                       state=job, listener=listener, cause=state.pop('unknownCause', 'other'),
+                       state=job, listener=listener,
                        host=host, hostAtMs=host_at_ms, hostStart=state.pop('unknownHost', {}), hostEnd=host,
-                       hostStartAtMs=state.pop('unknownHostAtMs', since), hostEndAtMs=host_at_ms)
+                       hostStartAtMs=state.pop('unknownHostAtMs', since), hostEndAtMs=host_at_ms,
+                       **state.pop('unknownEvidence', launchctl_info(dict(cause=state.get('unknownCause')), legacy=True)))
+            state.pop('unknownCause', None)
         # A persisted window from the old guard may have no TCP evidence.
         # Close that uncertainty before starting a newly observed refusal.
         if (failed and 'downSinceMs' in state and 'downListener' not in state
@@ -353,12 +358,11 @@ def serve():
             while not stopping:
                 start = time.monotonic()
                 sampler = Sampler()
-                sample = dict(clock_sample(), **job_snapshot())
-                sample.update(host=sampler(), hostAtMs=sample['wallMs'])
-                missing = gap(guard.state.get('observerTick'), sample)
-                if missing:
-                    emit('guard', 'observer.gap', kind='perf', props=missing)
-                with Timings('guard', 'guard.tick_late', threshold_ms=120000, start=sample, sampler=sampler) as timing:
+                sample = clock_sample()
+                with Timings('guard', 'guard.tick_late', threshold_ms=30000, start=sample, sampler=sampler) as timing:
+                    missing = gap(guard.state.get('observerTick'), sample)
+                    if missing:
+                        emit('guard', 'observer.gap', kind='perf', props=missing)
                     try:
                         job, listener = runtime.observe()
                         runtime.settle(job, listener)
@@ -394,8 +398,10 @@ def serve():
                 if child is None or child.poll() is not None:
                     continue
                 child.terminate()
-                try:
-                    child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
+                with Timings('guard', 'guard.tick_late'):
+                    with phase('child_wait'):
+                        try:
+                            child.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait()

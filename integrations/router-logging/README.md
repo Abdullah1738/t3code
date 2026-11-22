@@ -20,13 +20,16 @@ restarts. The HTTP snapshot runs in a separate child every five minutes.
 Unknown transitions retain the router's `launchctlExit` (numeric, `timeout`,
 or `oserror`) and at most 240 characters of trimmed, redacted stderr.
 `listener.unknownByCause` groups their first observed outcome as
-`launchctl_unknown:<exit>`; legacy windows without that evidence use `other`.
-`observer.gap` and `guard.tick_late` describe late observer work separately.
-A `sleep_gap` needs a suspend-aware clock discrepancy, not just a wall-clock
-jump. `agent_not_running` needs a recorded stopped/absent observer.
+`launchctl_exit:<code>` or `launchctl_timeout`. Legacy windows without recorded
+outcomes use `unknown_no_data` with a named missing-evidence reason; they cannot
+be reconstructed. `observer.gap` and `guard.tick_late` describe late observer
+work separately, with the longest recorded phase and its supporting field.
+Suspend-aware clock discrepancies and guard process changes can establish
+`guard_not_scheduled`; a poll LaunchAgent's absent state alone cannot.
 
-`poll.phases` emits once per poll if an exclusive phase exceeds 30 seconds
-(or the total exceeds two minutes). Its fields split history scan/parse,
+`poll.phases` and `guard.tick_late` emit once when a tick exceeds 30 seconds,
+with wall/monotonic start/end pairs. The existing end diagnostic is timed as
+`post_end_diag` before capturing the end clocks. Their fields split history scan/parse,
 listener/pool history, report writes, state saves, NDJSON writes (`logWriteMs`),
 lock waits and HTTP work;
 nested work is not counted twice. `log.rollup` now measures only that rollup
