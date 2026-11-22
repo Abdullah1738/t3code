@@ -1362,7 +1362,9 @@ def delete_box(con, box_id: str, why: str | None = None, *, stopped_at=None) -> 
                 require_unprotected(con, box_id)
                 if stopped_at is not None:
                     row = box_row(con, box_id)
-                    if row['state'] != 'archived' or row['stopped_at'] != stopped_at or row['pinned']:
+                    saved = con.execute("SELECT 1 FROM saved WHERE source=? AND status IN ('ready','pending')",
+                                        (box_id,)).fetchone()
+                    if row['state'] != 'archived' or row['stopped_at'] != stopped_at or row['pinned'] or saved:
                         raise Fail(409, 'box_changed', f'{box_id} is no longer the stopped box that was selected')
                 con.execute('INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)', ('delete_pending:' + box_id, '1'))
                 if box_row(con, box_id)['state'] in LIVE + ('provisioning', 'resuming'):
@@ -3443,8 +3445,9 @@ def reap_stopped_box(con, stopped, t):
     free backlog: a burst of box deletes stalls Incus writes on the block-cloned home pool."""
     cleanup = (disk_state().get('cleanup') or {}) if CFG.get('state_dataset') else {}
     # Space is a reason only on a fresh, measured reading: a stale "short, none left" would delete a box a minute.
+    # Aged against the clock, not the pass start: the idle stops before this can take minutes.
     short = (bool(cleanup.get('shortfall_bytes')) and cleanup.get('snapshots_left') == 0
-             and t - cleanup.get('at', 0) <= CLEANUP_FRESH_S)
+             and now() - cleanup.get('at', 0) <= CLEANUP_FRESH_S)
 
     def retention(r):
         days = CFG.get('pool_unused_days', 7) if pool_box(r) else CFG["prune_unused_days"]

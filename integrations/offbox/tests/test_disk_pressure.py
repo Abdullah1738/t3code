@@ -725,6 +725,11 @@ class StoppedBoxFence(Base):
                     boatd.delete_box(self.con,bid,'pool short of space',stopped_at=1000)
                 self.assertIn(caught.exception.code,('box_changed','box_held'))
                 self.con.execute("UPDATE boxes SET state='archived',stopped_at=1000,pinned=0 WHERE id=?",(bid,))
+        self.con.execute("INSERT INTO saved(owner,name,source,status) VALUES('ardud','base',?,'pending')",(bid,))
+        with self.assertRaises(boatd.Fail) as caught:
+            boatd.delete_box(self.con,bid,'archived box exceeded unused retention',stopped_at=1000)
+        self.assertEqual(caught.exception.code,'box_changed','a save started after selection keeps its source')
+        self.con.execute('DELETE FROM saved')
         self.assertIsNone(self.state(bid)['deleted_at'])
         self.assertFalse(any(c[:1]==('delete',) for c in self.f.calls))
         boatd.delete_box(self.con,bid,'pool short of space',stopped_at=1000)
