@@ -26,19 +26,23 @@ test.each([
     const capture = join(home, "calls.jsonl");
     writeFileSync(stub, `import { appendFileSync } from "node:fs"; appendFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv.slice(2))+"\\n"); console.log("PRIVATE_BRIDGE_OUTPUT"); process.exit(process.argv[2] === "wake" ? ${wakeCode} : ${sendCode});`);
     const key = "PRIVATE_ESCALATION_KEY";
-    const program = `const { escalate, normalize } = await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
+    const program = `const { escalate, normalize, saveState, watcherDir } = await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
+      const {mkdirSync,writeFileSync}=await import('node:fs');
       const watcher = normalize({ id: "escalation-fixture", title: "PRIVATE_TITLE", check: "true", context: "PRIVATE_CONTEXT", mode: "wake", chat: "another-chat" });
       const state = { status: "active", fires: 0, consecutive_failures: 5, failure_alerted: true,
         failing_since: new Date(Date.now() - 16 * 60000).toISOString(), last_error: 'exit 1: source failure: {"outlook": "PRIVATE_CHECK_ERROR"}' };
+      mkdirSync(watcherDir(watcher.id),{recursive:true});
+      writeFileSync(watcherDir(watcher.id)+'/watcher.json',JSON.stringify(watcher));saveState(watcher.id,state);
       try { console.log(JSON.stringify(await escalate(watcher, state, ${JSON.stringify(key)}))); }
       catch { console.log(JSON.stringify({ error: true })); }`;
     const logs = join(home, "logs");
     const child = Bun.spawnSync([process.execPath, "-e", program], { env: {
       HOME: home, PATH: "/usr/bin:/bin", ROBOB_TEST: "1", TOOLLOG_DIR: logs,
+      ROBOB_WATCH_ROOT: join(home, 'watchers-root'),
       ROBOB_WATCH_SPECTRUM_CLI: stub, ROBOB_WATCH_BRIDGE_DB: dbPath,
     } });
     expect(child.exitCode, child.stderr.toString()).toBe(0);
-    expect(JSON.parse(child.stdout.toString())).toMatchObject(spawnFails ? { error: true } : { ok, via });
+    expect(JSON.parse(child.stdout.toString())).toMatchObject({ ok, via });
     if (!spawnFails) {
       const calls = readFileSync(capture, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
       expect(calls).toHaveLength(wakeCode ? 2 : 1);
