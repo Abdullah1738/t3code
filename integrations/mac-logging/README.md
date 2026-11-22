@@ -443,11 +443,15 @@ process/parent-1 counts, and disk0's second iostat sample. MB/GB use powers of
 1024. `top` MEM already includes compressed pages. The single-snapshot CPU column
 is omitted because it reports zero without a preceding observation; use
 `cpu.sample` for CPU usage. One full, memory-sorted top snapshot
-supplies both the first15 holders and watched PIDs, including those below15.
-ps supplies exact command names/elapsed time and matches the snapshot by PID.
+supplies growth tracking for every observed PID and the first15 logged holders,
+plus watched PIDs, including those below15.
+ps supplies command names, elapsed time and process start time and matches the snapshot by PID.
 At most512 watched PIDs are retained; excess
 is explicit in `watchedOmitted` and makes the sample partial. Each subprocess,
-including notifications, has a ten-second timeout. Failed probes are null with
+including notifications, has a ten-second timeout. If top times out, up to three
+previous holders get a five-second `footprint` probe and a bounded birth recheck;
+if the full ps scan also fails, bounded per-PID birth checks bracket each probe.
+`fallback` records these outcomes. No RSS substitution is used. Failed probes are null with
 fixed `…Error` codes; watched PID failures retain null metrics per PID.
 
 `state/memory.json` retains swap counter baselines and alert receipts under a
@@ -469,10 +473,19 @@ for three consecutive intervals spanning at least 15 minutes. A baseline plus
 three five-minute samples is required; one jump does not qualify. Samples log
 `fseventsdGrowthMbPerHour`, `fseventsdGrowthSamples`, `fseventsdGrowthPid` and
 `fseventsdGrowthWindowS`. State follows each watched PID on the same boot;
-missing measurements, elapsed-age discontinuities, a flat/falling reading or
-a gap over ten minutes reset its streak. The growth check needs no new subprocess.
-Each reason has a six-hour cooldown
-across day boundaries. Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
+elapsed-age discontinuities, a flat/falling reading or
+a gap over ten minutes reset its streak. A timed-out top or ps sample preserves unmeasured
+history as a gap for up to twenty minutes, without creating a new observation.
+The same tracker supplies `growth`: any holder at least4 GiB, growing above1 GiB/h
+over at least three consecutive intervals spanning30 minutes. That reason uses
+PID plus exact start time and boot identity. Samples include measured growth rates.
+Each reason has a six-hour cooldown across day boundaries. Footprint and growth
+can escalate earlier when a holder adds at least4 GiB since its last alert, or
+another holder qualifies. Swap can escalate after another4 GiB used; its initial
+trigger stays above16 GiB. All reasons retain a minimum30-minute alert gap.
+`memory.alert` includes the holder PID, footprint, growth rate and escalation/fallback
+flags; the two-line notification names the holder, swap and compressor sizes.
+Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
 suffix so another alert can be queued after six hours on the same day. An
 unconfirmed send retains its exact key/text for idempotent retry. For a diagnostic
 sample without notifications, run `TOOLLOG_DIR=<private-temp-dir> /usr/bin/python3

@@ -173,14 +173,23 @@ def memory_fields(values, event):
     if not isinstance(values, dict):
         return result
     if event == 'memory.alert':
-        if values.get('reason') in ('swap', 'pressure', 'footprint', 'fseventsd', 'fseventsd_growth'):
+        if values.get('reason') in ('swap', 'pressure', 'footprint', 'fseventsd', 'fseventsd_growth', 'growth'):
             result['reason'] = values['reason']
         if values.get('notifyError') is None or values.get('notifyError') in MEMORY_ERRORS:
             result['notifyError'] = values.get('notifyError')
+        for key in ('pid', 'footprintGiB', 'growthGiBHour'):
+            if values.get(key) is None or finite_number(values[key]) and values[key] >= 0:
+                result[key] = values.get(key)
+        if isinstance(values.get('command'), str):
+            result['command'] = memory_command(values['command'])
+        for key in ('escalation', 'fallback'):
+            if type(values.get(key)) is bool:
+                result[key] = values[key]
         return result
     numbers = {'pageSize', 'freePages', 'activePages', 'inactivePages', 'wiredPages',
                'speculativePages', 'purgeablePages', 'compressorPages', 'totalMb', 'usedMb',
-               'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'count', 'ppid1Count'}
+               'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'count', 'ppid1Count',
+               'growthSamples', 'growthWindowS', 'growthMbPerHour'}
 
     def numeric(value):
         return finite_number(value) and value >= 0
@@ -197,6 +206,9 @@ def memory_fields(values, event):
                 clean[key] = memory_command(item)
             elif key == 'etime' and isinstance(item, str) and re.fullmatch(r'\d+(?:-\d+)?(?::\d+){1,2}', item):
                 clean[key] = item
+            elif key == 'start' and isinstance(item, str) and re.fullmatch(
+                    r'[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d\d:\d\d:\d\d \d{4}', item):
+                clean[key] = item
             elif key == 'error' and (item is None or item in MEMORY_ERRORS):
                 clean[key] = item
         return clean
@@ -207,11 +219,17 @@ def memory_fields(values, event):
                     'vm': ('pageSize', 'freePages', 'activePages', 'inactivePages',
                            'wiredPages', 'speculativePages', 'purgeablePages', 'compressorPages')}[key]
             result[key] = None if value is None else row(value, keys)
-        elif key in ('top', 'watched', 'counts') and (value is None or isinstance(value, list)):
+        elif key in ('top', 'watched', 'counts', 'fallback', 'growth') and (value is None or isinstance(value, list)):
             keys = ('command', 'count', 'ppid1Count') if key == 'counts' else ('pid', 'command', 'memMb', 'cmprsMb')
             if key == 'watched':
                 keys += ('etime', 'error')
-            result[key] = None if value is None else [row(p, keys) for p in value[:{'top': 15, 'watched': 512, 'counts': 5}[key]]]
+            if key != 'counts':
+                keys += ('start',)
+            if key == 'fallback':
+                keys += ('error',)
+            if key == 'growth':
+                keys += ('growthSamples', 'growthWindowS', 'growthMbPerHour')
+            result[key] = None if value is None else [row(p, keys) for p in value[:{'top': 15, 'watched': 512, 'counts': 5, 'fallback': 3, 'growth': 527}[key]]]
         elif key == 'load' and (value is None or isinstance(value, list)):
             result[key] = None if value is None else [n for n in value[:3] if numeric(n)]
         elif key in ('pressure', 'pressureLevel', 'freePercent', 'boot', 'swapinsDelta', 'swapoutsDelta',
