@@ -4,6 +4,7 @@ import contextvars
 import ctypes
 import datetime as dt
 import functools
+import json
 import math
 import os
 import re
@@ -14,7 +15,7 @@ import time
 
 from host import Sampler, clean_host, poll_props
 from toollog import emit, trimmed_stderr
-from causes import PHASES, RESOURCE_FIELDS, BYTE_PHASES, BYTE_FIELDS, WAIT_FIELDS, SUBSTEPS, SUBSTEP_FIELDS, gap_info, launchctl_info, phase_cause, positive
+from causes import PHASES, RESOURCE_FIELDS, BYTE_PHASES, BYTE_FIELDS, WAIT_FIELDS, SUBSTEPS, SUBSTEP_FIELDS, TIMEOUT_FIELDS, gap_info, launchctl_info, phase_cause, positive
 
 JOB = 'com.ardud.9router-log-poll'
 FIELDS = {name: field for name, field in PHASES.items() if name != 'pool_fetch'}
@@ -54,9 +55,43 @@ def progress(name):
     descriptor = os.environ.get('ROUTER_POLL_PROGRESS_FD')
     if descriptor is not None:
         try:
-            os.write(int(descriptor), (name + '\n').encode('ascii'))
+            descriptor = int(descriptor)
+            os.set_blocking(descriptor, False)
+            os.write(descriptor, (name + '\n').encode('ascii'))
         except (OSError, ValueError):
             pass
+
+
+def progress_clock():
+    # Python 3.9's macOS monotonic() origin is process-relative. clock_gettime
+    # keeps poll-child timestamps comparable to its long-lived guard's clock.
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+def finished_progress(timing, name, step=None):
+    if 'ROUTER_POLL_PROGRESS_FD' not in os.environ:
+        return
+    # Cumulative snapshots recover earlier writes dropped by a full pipe.
+    data = dict(p=name)
+    if step is None:
+        data.update(ms=round(timing.values[name], 3), cpu=round(timing.cpu[name], 3))
+        data.update({key: timing.resources[name][suffix]
+                     for key, suffix in zip(('ib', 'mf', 'iv', 'v'), RESOURCE_FIELDS)})
+    else:
+        data.update(s=step, ms=math.floor(timing.substeps[name][step][0] * 1000) / 1000,
+                    cpu=math.floor(timing.substeps[name][step][1] * 1000) / 1000)
+    if name in timing.bytes:
+        data.update(bh=timing.bytes[name]['BytesHashed'], bp=timing.bytes[name]['BytesParsed'])
+    progress('=' + json.dumps(data, separators=(',', ':'), allow_nan=False))
+
+
+def phase_progress(name):
+    if 'ROUTER_POLL_PROGRESS_FD' not in os.environ:
+        return
+    # Timestamp and legacy name share one atomic FD write. The name stays last
+    # so an old guard still sees the current phase after ignoring the JSON line.
+    progress('=' + json.dumps(dict(p=name, at=round(progress_clock() * 1000, 3)),
+                              separators=(',', ':')) + '\n' + name)
 
 
 def iso(value):
@@ -168,6 +203,14 @@ def gap_summary(rows, day, generated):
                     if key in WAIT_FIELDS and type(value) is int and value >= 0}
         counters.update({key: value for key, value in props.items()
                          if key in SUBSTEP_FIELDS and (value == 0 or positive(value))})
+        counters.update({key: value for key, value in props.items()
+                         if key in TIMEOUT_FIELDS and type(value) in (int, float) and (value == 0 or positive(value))})
+        if row.get('name') == 'poll.timeout':
+            host = clean_host(props.get('host'))
+            if host:
+                hosts['host'] = host
+                if type(props.get('hostAtMs')) in (int, float) and positive(props['hostAtMs']):
+                    hosts['hostAtMs'] = props['hostAtMs']
         bucket.append(dict(**hosts, **counters, number=len(bucket) + 1, start=iso(start), end=iso(end),
                            **explanation, component=component, durationMs=round(overlap, 3)))
     return groups
@@ -220,7 +263,7 @@ def phase(name):
         return
     frame = [started, 0, cpu_started, 0, name, usage_started, dict.fromkeys(RESOURCE_FIELDS, 0)]
     timing.stack.append(frame)
-    progress(name)
+    phase_progress(name)
     try:
         yield
     finally:
@@ -239,11 +282,12 @@ def phase(name):
                 timing.stack[-2][1] += elapsed
                 timing.stack[-2][3] += cpu
             timing.last_phase = name
+            finished_progress(timing, name)
         except Exception:
             pass
         finally:
             timing.stack.pop()
-            progress(timing.stack[-1][4] if timing.stack else 'none')
+            phase_progress(timing.stack[-1][4] if timing.stack else 'none')
 
 
 def measured(name):
@@ -262,7 +306,7 @@ def measured(name):
 @contextlib.contextmanager
 def substep(name):
     timing = _active.get()
-    if timing is None or not timing.stack or timing.stack[-1][4] not in BYTE_PHASES:
+    if timing is None or name not in SUBSTEPS or not timing.stack or timing.stack[-1][4] not in BYTE_PHASES:
         yield
         return
     parent = timing.stack[-1]
@@ -280,6 +324,7 @@ def substep(name):
         cpu = max(0, (time.process_time() - cpu_started) * 1000 - (parent[3] - child_cpu) - frame[2])
         timing.substeps[parent[4]][name][0] += wall
         timing.substeps[parent[4]][name][1] += cpu
+        finished_progress(timing, parent[4], name)
         timing.steps.pop()
         if timing.steps and timing.steps[-1][0] is parent:
             timing.steps[-1][1] += wall + frame[1]
