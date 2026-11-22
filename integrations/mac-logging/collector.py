@@ -20,6 +20,7 @@ from rollup import rollup
 from logwindow import row_timestamp
 from status import CADENCES
 from toollog import directory, emit, private_dir, safe_fields, finite_number
+from homebrew import check as homebrew_integrity
 
 REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/DiagnosticReports/Retired'),
                Path.home() / 'Library/Logs/DiagnosticReports']
@@ -1059,6 +1060,7 @@ def disk_tooling_probe(run=subprocess.run, popen=subprocess.Popen, is_alive=aliv
 def main():
     # Check before any job can create today's file and hide its absence.
     missing_day()
+    homebrew_integrity(lambda text, key: notify(text, key, subprocess.run))
     deadline = time.monotonic()+290
     try:
         collect(deadline=deadline)
