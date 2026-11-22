@@ -309,12 +309,14 @@ class CheckTests(Base):
                     self.assertEqual(owner.refresh(self.data, since), 'ok')
                 before = (self.data / 'owner-snapshot.json').read_bytes()
                 processes = []
+                launches = []
                 def early_child(argv, **kwargs):
                     # Exit before importing owner_refresh, retaining the real inherited lock.
                     proc = popen([argv[0], '-I', '-B', '-c',
                                   'raise SystemExit(1)' if failure == 'exit' else 'import time; time.sleep(30)'],
                                  **kwargs)
                     processes.append(proc)
+                    launches.append((Path(argv[3]).name, len(kwargs.get('pass_fds', ()))))
                     return proc
                 with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
                         patch.object(owner.subprocess, 'Popen', side_effect=(
@@ -346,14 +348,21 @@ class CheckTests(Base):
                         patch.object(owner.subprocess, 'Popen', side_effect=early_child):
                     try:
                         mc.run_check(self.wd, 'retry', self.data, self.root, now, finder())
+                        self.assertEqual(launches[-2:], [('owner_refresh.py', 1), ('marketplace_worker.py', 0)])
                         self.assertEqual(owner.refresh_stats(self.data)['owner_refresh_result'], 'error')
                         persisted = json.loads((self.data / 'owner-refresh.json').read_text())
                         self.assertEqual(persisted['owner_refresh_result'], 'error')
                         report = mc.run_history.summary(self.wd, '24h')
                         self.assertEqual(report['owner']['last_refresh']['owner_refresh_result'], 'error')
                     finally:
-                        processes[-1].kill()
-                        processes[-1].wait(timeout=5)
+                        # Both launchers share subprocess; the last child is now
+                        # Marketplace, while the owner child holds its own flock.
+                        for proc in processes:
+                            if proc.poll() is None:
+                                proc.kill()
+                            proc.wait(timeout=5)
+                fd = owner.take_lock(self.data)
+                os.close(fd)
                 self.assertEqual((self.data / 'owner-snapshot.json').read_bytes(), before)
 
     def test_scratch_check_never_launches_a_refresh_even_when_globally_enabled(self):
