@@ -68,10 +68,12 @@ VALIDATE_CHECK_IDS = {
 # escaping this span (not a failing subprocess's returncode). Historical rows
 # without these fields remain valid. Exception text and traceback paths stay out.
 ERROR_SCHEMA = {'exceptionClass': 'identifier', 'exitCode': 'exit_code', 'stage': 'function'}
-ENDPOINT_SCHEMA = {'httpStatus': 'status', 'rawCount': int, 'keptCount': int, 'fetchComplete': bool,
+SYNC_PHASES = ('refreshMs', 'sleep.fetchMs', 'recovery.fetchMs', 'cycle.fetchMs', 'body.fetchMs', 'writeMs')
+ENDPOINT_SCHEMA = {'fetchMs': int, 'httpStatus': 'status', 'rawCount': int, 'keptCount': int, 'fetchComplete': bool,
                    'scoreStates': {k: int for k in ('SCORED', 'PENDING_SCORE', 'UNSCORABLE', 'OTHER')},
                    'newestRecordEnd': 'iso', 'newestScoredRecordEnd': 'iso', 'tokenExpiresInS': 'seconds'}
-AUTH_SCHEMA = {'authStage': {'token_load', 'token_refresh', 'api_fetch'},
+AUTH_SCHEMA = {'refreshRetried': bool, 'refreshOutcome': {'refreshed', 'retried_refreshed', 'reauth_needed', 'error'},
+               'authStage': {'token_load', 'token_refresh', 'api_fetch'},
                'authSource': {'keychain', 'file', 'env'}, 'refreshHttpStatus': 'status',
                'apiHttpStatus': 'status', 'oauthError': 'oauth_code', 'attempt': int, 'retried': bool}
 SCHEMAS = {
@@ -83,7 +85,9 @@ SCHEMAS = {
                 'failCount': int, 'failedCheckIds': 'check_ids',
                 'reason': CLI_EXIT_REASONS, 'candidateCount': int, 'queryLen': int,
                 'argc': int, 'rejected': 'rejected', **AUTH_SCHEMA},
-    'watcher.run': {'trigger': 'trigger'}, 'sync.run': {'trigger': 'trigger', 'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
+    'watcher.run': {'trigger': 'trigger', 'scheduledAt': 'optional_iso',
+                    'startLagMs': 'lag_ms', 'hostLoad1m': 'load'},
+    'sync.run': {'trigger': 'trigger', 'refreshMs': int, 'writeMs': int, 'hostLoad1m': 'load', 'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
         'lastScoredSleep': 'iso', 'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool, 'reason': WHOOP_AUTH_REASONS, **AUTH_SCHEMA,
         **{k: ENDPOINT_SCHEMA for k in ('sleep', 'recovery', 'cycle', 'body')}},
     'sync.gap': {'count': int, 'lastSleepEnd': 'iso', 'lastRecoveryEnd': 'iso', 'gapHours': 'seconds'},
@@ -163,6 +167,13 @@ def _fields(schema, props):
             out[key] = value
         elif spec == 'iso':
             out[key] = iso_stamp(value)
+        elif spec == 'optional_iso' and iso_stamp(value) is not None:
+            out[key] = iso_stamp(value)
+        elif spec == 'lag_ms' and (value is None or type(value) in (int, float)
+                                   and math.isfinite(value)):
+            out[key] = value
+        elif spec == 'load' and type(value) in (int, float) and math.isfinite(value) and value >= 0:
+            out[key] = round(value, 1)
         elif spec == 'oauth_code' and key in props:
             out[key] = (value if value is None or isinstance(value, str) and re.fullmatch(r'[a-z_]{1,40}', value)
                         else '<redacted>')
@@ -425,6 +436,21 @@ class Span:
     def __enter__(self):
         try:
             self.start = time.monotonic()
+            if self.name == 'watcher.run':
+                scheduled = iso_stamp(self.props.get('scheduledAt'))
+                if 'scheduledAt' not in self.props and self.props.get('trigger') in ('schedule', 'retry'):
+                    scheduled = iso_stamp(os.environ.get('HEALTH_TOOLLOG_SCHEDULED_AT'))
+                if scheduled is not None:
+                    self.props['scheduledAt'] = scheduled
+                self.props['startLagMs'] = ((utcnow() - dt.datetime.fromisoformat(
+                    scheduled.replace('Z', '+00:00'))).total_seconds() * 1000
+                    if scheduled is not None else None)
+            if self.name in ('watcher.run', 'sync.run'):
+                # Missing load support must not suppress the span or its outcome.
+                try:
+                    self.props['hostLoad1m'] = round(os.getloadavg()[0], 1)
+                except (AttributeError, OSError):
+                    pass
             if self.name == 'card.render':
                 # A render spanning midnight and all its sidecars share this obligation day.
                 self.render_at = utcnow()
@@ -711,22 +737,57 @@ def _expected_intervals():
         return {}
 
 
+def _cadence_times(runs):
+    # A partially upgraded component must not count untagged/chained runs as ticks.
+    tagged_day = any(tagged for _, tagged, _ in runs)
+    return sorted(stamp for stamp, _, value in runs
+                  if value == 'schedule' or not tagged_day)
+
+
+def _late_ticks(cadence, interval):
+    # Without a phase, only observed run-to-run gaps establish a late tick.
+    return [b for a, b in zip(cadence, cadence[1:])
+            if interval is not None and (b - a).total_seconds() > 1.25 * interval]
+
+
+def _same_time_skips(late_times):
+    ticks = sorted((stamp, component) for component, stamps in late_times.items() for stamp in stamps)
+    counts, window = Counter(), Counter()
+    left = right = 0
+    for stamp, component in ticks:
+        while right < len(ticks) and (ticks[right][0] - stamp).total_seconds() <= 120:
+            window[ticks[right][1]] += 1
+            right += 1
+        while (stamp - ticks[left][0]).total_seconds() > 120:
+            old = ticks[left][1]
+            window[old] -= 1
+            if not window[old]:
+                del window[old]
+            left += 1
+        if len(window) >= 2:
+            counts[component] += 1
+    return counts
+
+
 def _run_summary(runs, start, end, interval=None):
     timestamps = sorted(stamp for stamp, _, _ in runs)
     by_trigger = Counter(value for _, _, value in runs)
-    # A partially upgraded component must not count untagged/chained runs as ticks.
-    cadence = (sorted(stamp for stamp, _, value in runs if value == 'schedule')
-               if any(tagged for _, tagged, _ in runs) else timestamps)
+    cadence = _cadence_times(runs)
     # Day boundaries measure outages, but must not skew the observed cadence.
     observed = [(b - a).total_seconds() for a, b in zip(cadence, cadence[1:]) if b > a]
     median = statistics.median(observed) if observed else None
     threshold = 3 * interval if interval is not None else 3 * median if median is not None else None
     points = [start] + cadence + [end]
     gaps = [(a, (b - a).total_seconds()) for a, b in zip(points, points[1:])]
+    late = _late_ticks(cadence, interval)
     result = {'runs': len(timestamps), 'runsByTrigger': dict(sorted(by_trigger.items())),
               'firstRunTs': timestamps[0].isoformat().replace('+00:00', 'Z') if timestamps else None,
               'lastRunTs': timestamps[-1].isoformat().replace('+00:00', 'Z') if timestamps else None,
               'medianGapSeconds': median, 'maxGapSeconds': max(seconds for _, seconds in gaps),
+              'p95GapSeconds': _percentile(sorted(observed), .95) if observed else None,
+              'lateRuns': len(late),
+              'lateRunsByHour': dict(sorted(Counter(stamp.strftime('%H') for stamp in late).items())),
+              'sameTimeSkips': 0,
               'gapThresholdSeconds': threshold,
               'gapsOver': [{'startTs': stamp.isoformat().replace('+00:00', 'Z'), 'seconds': seconds}
                            for stamp, seconds in sorted(gaps, key=lambda gap: -gap[1])
@@ -775,6 +836,7 @@ def rollup(day=None):
         malformed = 0
         zero_sleep, last_scored = 0, None
         auth_failures, whoop_runs = Counter(), []
+        sync_phases, slow_syncs = defaultdict(list), 0
         food_errors, delivered, expected = Counter(), {}, set()
         receipt_sources = {}
         nag_latency, open_slots = [], {}
@@ -811,6 +873,14 @@ def rollup(day=None):
                             ended = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone(dubai).date() - dt.timedelta(days=1)
                             open_slots[str(ended)] = props['slotsOpen']
                     if r['name'] == 'sync.run' and component == 'whoop-sync':
+                        duration = r.get('durationMs')
+                        if type(duration) in (int, float) and math.isfinite(duration) and duration > 15000:
+                            slow_syncs += 1
+                        for phase in SYNC_PHASES:
+                            endpoint, _, field = phase.partition('.')
+                            value = props.get(endpoint, {}).get(field) if field else props.get(phase)
+                            if type(value) is int:
+                                sync_phases[phase].append(value)
                         if r.get('ok') is False and props.get('authStage') and props.get('reason') in WHOOP_AUTH_REASONS:
                             auth_failures[(props['authStage'], props['reason'])] += 1
                         stamp = iso_stamp(r.get('ts'))
@@ -867,6 +937,8 @@ def rollup(day=None):
             max_consecutive = max(max_consecutive, consecutive)
         total = sum(names.values())
         rated = sum(outcomes.values())
+        shared_skips = _same_time_skips({component: _late_ticks(_cadence_times(runs), intervals.get(component))
+                                        for component, runs in run_times.items()})
         result = {'day': day.isoformat(), 'tool': 'health', 'total': total, 'malformedCount': malformed,
                   'countsByName': dict(names), 'countsByKind': dict(kinds), 'okCount': outcomes['ok'],
                   'errorCount': outcomes['error'], 'okRate': outcomes['ok'] / rated if rated else None,
@@ -876,6 +948,11 @@ def rollup(day=None):
                   'components': {component: _run_summary(run_times[component], start, end, intervals.get(component))
                                  for component in sorted(set(run_times) | set(intervals))},
                   'whoop': {'lastScoredSleep': last_scored, 'zeroSleepRuns': zero_sleep,
+                            'syncPhaseMs': {phase: {'p50': _percentile(sorted(sync_phases[phase]), .5) if sync_phases[phase] else None,
+                                                   'p95': _percentile(sorted(sync_phases[phase]), .95) if sync_phases[phase] else None,
+                                                   'max': max(sync_phases[phase]) if sync_phases[phase] else None}
+                                            for phase in SYNC_PHASES},
+                            'slowSyncs': slow_syncs,
                             'authFailures': [{'authStage': stage, 'reason': reason, 'count': count}
                                              for (stage, reason), count in sorted(auth_failures.items())],
                             'consecutiveFailures': max_consecutive},
@@ -894,6 +971,8 @@ def rollup(day=None):
         for name, values in durations.items():
             values.sort()
             result['durationMs'][name] = {'p50': _percentile(values, .5), 'p95': _percentile(values, .95), 'max': values[-1]}
+        for component, summary in result['components'].items():
+            summary['sameTimeSkips'] = shared_skips[component]
         result['repeatBurst'] = sum(_repeat_bursts(values) for values in burst_times.values())
         result['topErrors'] = []
         for cause, count in tags.most_common(20):

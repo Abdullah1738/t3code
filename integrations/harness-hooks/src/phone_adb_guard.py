@@ -257,13 +257,13 @@ def _adb_kind(args, documents=()):
         return None
     verb, *rest = args
     if verb in {'install', 'uninstall', 'reboot'}:
-        return 'state'
+        return 'state', verb
     if verb in {'forward', 'reverse'}:
         if rest and rest[0] in {'--list', '--remove', '--remove-all'}:
             return None
         if rest[:1] == ['--no-rebind']:
             rest = rest[1:]
-        return 'forward' if len(rest) >= 2 else None
+        return ('forward', verb) if len(rest) >= 2 else None
     if verb == 'shell':
         while rest and rest[0].startswith('-'):
             flag = rest.pop(0)
@@ -272,7 +272,7 @@ def _adb_kind(args, documents=()):
             elif flag != '--' and not re.fullmatch(r'-[Ttnx]+', flag):
                 return None
         mutates = _remote_mutates([_literal(w) for w in rest], stdin_documents=documents) if rest else any(_remote_mutates([body]) for body, _ in documents)
-        return 'state' if mutates else None
+        return ('state', verb) if mutates else None
     return None
 
 
@@ -329,7 +329,7 @@ def calls(command, inherited=None, depth=0, inherited_bodies=None):
             elif tool in {'adb', '$ADB', '${ADB}'}:
                 kind = _adb_kind(args, documents)
                 if kind:
-                    found.append((kind, local))
+                    found.append((*kind, local))
         elif words and all(ASSIGN.match(w) for w in words):
             env = {key: value for key, value in local.items() if not (uncertain or control_depth) or env.get(key) == value}
         if control[:1] in [['fi'], ['done'], ['esac']]:
@@ -404,16 +404,16 @@ def classify(command, *, lock_dir=None, inherited=None):
     try:
         matches = calls(command, inherited if inherited is not None else {k: os.environ.get(k, '') for k in OWNER_KEYS})
     except (ValueError, AmbiguousScript):
-        return dict(matched=False, reason=None, rule='phone-adb-unavailable', error='phone-lock-unavailable')
+        return dict(matched=False, reason=None, rule='phone-adb-unavailable', error='phone-lock-unavailable', holder=None, adbVerb=None)
     if not matches:
-        return dict(matched=False, reason=None, rule=None, error=None)
-    kind = matches[0][0]
+        return dict(matched=False, reason=None, rule=None, error=None, holder=None, adbVerb=None)
+    kind, verb = matches[0][:2]
     rule = 'phone-adb-' + kind
     try:
         directory = Path(lock_dir or os.environ.get('PH_LOCK_DIR', '~/.local/share/phone-lock')).expanduser()
         hold = _read(directory / 'priority-hold')
         lease = None if hold is not None else _lease(directory / 'lease.json')
-        for call_kind, env in matches:
+        for call_kind, verb, env in matches:
             rule = 'phone-adb-' + call_kind
             if hold is not None:
                 allowed = bool(hold.strip()) and env.get('PHONE_HOLD_OWNER') == hold.strip()
@@ -428,10 +428,18 @@ def classify(command, *, lock_dir=None, inherited=None):
             if not allowed:
                 reason = (f"Phone is held by {owner} ({purpose}) until {until}. Yield, or run 'ph lease status'. "
                           "Prefix your adb call with PH_LEASE_OWNER=<your token> only if you hold the lease.")
-                return dict(matched=True, reason=reason, rule=rule, error=None)
-        return dict(matched=True, reason=None, rule=rule if hold is not None or lease else rule + '-unleased', error=None)
+                # An empty priority-hold matches no token, so nobody can be its holder.
+                holder = 'orphan' if hold is not None and not hold.strip() else 'other'
+                return dict(matched=True, reason=reason, rule=rule, error=None, holder=holder, adbVerb=verb)
+        if hold is not None or lease:
+            holder = 'self'
+        else:
+            # An expired lease file left behind reads as unleased; tell it apart from no lease.
+            holder = 'orphan' if (directory / 'lease.json').exists() else 'none'
+        return dict(matched=True, reason=None, rule=rule if hold is not None or lease else rule + '-unleased', error=None,
+                    holder=holder, adbVerb=verb)
     except (OSError, ValueError, TypeError, KeyError, OverflowError, RuntimeError):
-        return dict(matched=True, reason=None, rule='phone-adb-unavailable', error='phone-lock-unavailable')
+        return dict(matched=True, reason=None, rule='phone-adb-unavailable', error='phone-lock-unavailable', holder=None, adbVerb=verb)
 
 
 if __name__ == '__main__':

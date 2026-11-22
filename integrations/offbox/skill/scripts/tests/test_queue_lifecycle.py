@@ -52,11 +52,12 @@ class LifecycleTests(Isolated):
         for r in records:
             self.assertIn(json.dumps(r, separators=(',', ':')), log)
 
-    def test_sigterm_is_named_and_wait_and_logs_keep_exit_130(self):
+    def test_explicit_kill_sigterm_is_named_and_wait_and_logs_keep_exit_130(self):
         with common.file_lock('fixture-slot'):
             proc, row = self.launch()
             self.until(lambda: (Path(self.tmp.name) / 'waiting').exists(), proc)
-            os.kill(row['client_pid'], signal.SIGTERM)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(misc.kill_run(row['run_id']), 0)
             self.until(lambda: any(r['reason'] == 'atexit' for r in self.records(row['run_id'])), proc)
             for action in (lambda: misc.wait(row['run_id'], 1), lambda: misc.logs(row['run_id'], False)):
                 with contextlib.redirect_stderr(io.StringIO()) as err:

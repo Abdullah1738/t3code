@@ -478,7 +478,37 @@ unconfirmed send retains its exact key/text for idempotent retry. For a diagnost
 sample without notifications, run `TOOLLOG_DIR=<private-temp-dir> /usr/bin/python3
 integrations/mac-logging/memory.py --no-alert`.
 
+## Forensic log windows
+
+`mac-log-window --start 2026-11-16T08:22:00Z --end 2026-11-16T08:24:00Z
+--predicate 'eventMessage CONTAINS[c] "PMU"' --info --debug --out evidence.ndjson`
+reads `log show` with a deadline and keeps only parsed timestamps inside the
+requested inclusive UTC window, preserving the original row bytes and timestamp
+precision through nanoseconds. Use explicit
+UTC bounds. `--deadline` defaults to 90 seconds (maximum 600); group termination
+allows up to 3 seconds for TERM and 1 second to reap after KILL.
+`--slice 15m` divides the window and remaining budget between consecutive reads;
+a timed-out slice does not prevent later reads while budget remains. Shared
+slice edges are kept only once. Rows outside each slice are excluded even when
+they fall inside the overall window. `--keep-outside` saves them separately in
+`<out>.outside.ndjson`; they are never incident evidence.
+
+Exit codes are 0 complete, 2 partial (deadline), and 1 error (including bad args
+or a nonzero log exit). `<out>.summary.json` records arguments, UTC bounds,
+status, exit code, elapsed milliseconds, `rowsIn`, `rowsOutside`, earliest/latest
+outside timestamps (`outsideFirst`/`outsideLast`), `unparsed`, greatest kept
+`lastInWindowTs`, per-slice results and a reason. A partial result is incomplete;
+`lastInWindowTs` is an observation, not proof of coverage. Unparseable rows are
+counted and excluded. Validation errors also write a summary when `--out` is
+supplied and its parent is writable. The helper writes only the output and its
+sidecars and never requests root access.
+
 ## Source events
+
+Unified `crash.source` and completed `crash.unified.chunk` records include
+`outsideRows`, `outsideFirst`, `outsideLast` (UTC epoch seconds) and
+`unparsedRows` only when those counts are nonzero. Source records aggregate
+chunk counts; unparseable timestamps and outside rows never become observations.
 
 `disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
 counts. Each unavailable source also emits an error-kind `disk.inventory.source`
@@ -808,3 +838,29 @@ existing interlock. Notification retries preserve exact keys/text and never
 write alerts to stdout. The evaluator loads only the new probe label after
 review; the CPU job retains its original launcher. Installer tests set
 `MAC_LOG_SSD_PROBE_FILE` for fixture init/check; live reads use the fixed target.
+
+## Host telemetry
+
+`com.abdullah.mac-host` is a separate long-lived Standard job. It emits
+`host.vitals` every 30 seconds and `host.families_lite` every 60 seconds without
+starting subprocesses. Install copies its plist; the evaluator loads this new
+label separately. It does not require restarting the other logger jobs.
+
+Vitals include load, swap bytes, raw memory-pressure counter, memorystatus free
+percentage, pressure level, VM pages and counter deltas. Baseline/reset deltas
+are null. Runnable/U counts describe processes with a matching thread;
+`runnableThreads` counts threads. Permission failures and exits make state
+coverage partial. The separate state worker publishes counts with `stateAgeS`; a blocked worker
+never delays vitals. Snapshots older than32 seconds are omitted
+(`statesAvailable=false`). A two-second state walk disables further walks until restart.
+Family rows contain executable names/counts; Python argv reads retain only a
+script basename or module. Unreadable names and bounded inventory work are
+reported as partial. More than512 family rows set `partial`,
+`familiesOmitted` and `processesOmitted`. Families run on a separate thread so they cannot hold up
+vitals. A nonblocking local datagram wakes vitals immediately on `cpu.timeout`.
+
+Portable fixtures run with the suite above. The read-only Mac ABI check is:
+
+```sh
+MAC_HOST_LIVE_TEST=1 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I -m unittest discover -s integrations/mac-logging/tests -p test_host_live.py -v
+```

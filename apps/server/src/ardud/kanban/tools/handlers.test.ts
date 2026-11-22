@@ -4478,6 +4478,49 @@ const settingsFixture = Effect.fn("settingsFixture")(function* (
   });
 });
 
+it.effect.each([0, 1, 4])("board_settings_set applies criticalOverflowSlots=%s", (value) => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const { kanban, board, evaluator, card } = yield* settingsFixture({
+      label: "Crpko criticalOverflowSlots",
+      before: value === 1 ? "0" : "1",
+      after: String(value),
+    });
+    if (value === 1) yield* kanban.updateBoard(board.id, { criticalOverflowSlots: 0 });
+    const input = { card: card.id, ask: "q1", setting: "criticalOverflowSlots", value };
+    const result = yield* call(evaluator, "board_settings_set", input);
+    assert.isFalse(result.isError, result.text);
+    assert.strictEqual((yield* kanban.snapshot(board.id)).board.criticalOverflowSlots, value);
+    const retry = yield* call(evaluator, "board_settings_set", input);
+    assert.isFalse(retry.isError, retry.text);
+    assert.strictEqual(retry.structured.applied, false);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect.each([-1, 5, 1.5, "1", ["money"]])(
+  "board_settings_set rejects invalid criticalOverflowSlots=%s",
+  (value) => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, board, evaluator, card } = yield* settingsFixture({
+        label: "Crpko criticalOverflowSlots",
+        before: "1",
+        after: "2",
+      });
+      const result = yield* Effect.result(
+        call(evaluator, "board_settings_set", {
+          card: card.id,
+          ask: "q1",
+          setting: "criticalOverflowSlots",
+          value,
+        }),
+      );
+      assert.isTrue(result._tag === "Failure" || result.success.isError);
+      assert.strictEqual((yield* kanban.snapshot(board.id)).board.criticalOverflowSlots, 1);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
 it.effect.each([false, true])(
   "board_settings_set applies an approved change and retries idempotently: legacy=%s",
   (legacy) => {

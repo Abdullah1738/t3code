@@ -4,7 +4,10 @@ Versions are keys major*1e6 + minor*1e3 + patch. A range is a list of (lo, hi) w
 Mirrors the reference prototype in the offbox-node-28oct board artifact (checked against its cases in
 tests/test_node_version.py).
 """
+import hashlib
+import io
 import json
+import os
 import re
 import shlex
 from collections import Counter
@@ -65,6 +68,8 @@ fi
         '@ENTRYPOINT@', shlex.quote(NVM_ENTRYPOINT))
 
 BLOCK = r"""__offbox_want=@WANT@
+__offbox_candidates=
+__offbox_choice="box default"
 __offbox_nk() { local IFS=.; set -- ${1#v}; echo $(( 10#${1:-0} * 1000000 + 10#${2:-0} * 1000 + 10#${3:-0} )); }
 __offbox_in() { local k=$1; set -- @RANGES@; while [ $# -ge 2 ]; do [ "$k" -ge "$1" ] && [ "$k" -lt "$2" ] && return 0; shift 2; done; return 1; }
 __offbox_best=; __offbox_bk=-1; __offbox_have=
@@ -74,10 +79,14 @@ for __offbox_d in "$HOME"/.nvm/versions/node/v*; do
   [ -x "$__offbox_d/bin/node" ] || continue
   __offbox_have="$__offbox_have $__offbox_v"
   __offbox_k=$(__offbox_nk "$__offbox_v")
-  if __offbox_in "$__offbox_k" && [ "$__offbox_k" -gt "$__offbox_bk" ]; then __offbox_best=$__offbox_d; __offbox_bk=$__offbox_k; fi
+  if __offbox_in "$__offbox_k"; then
+    __offbox_candidates="$__offbox_candidates $__offbox_v"
+    if [ "$__offbox_k" -gt "$__offbox_bk" ]; then __offbox_best=$__offbox_d; __offbox_bk=$__offbox_k; fi
+  fi
 done
 __offbox_cur=$(node --version 2>/dev/null) || __offbox_cur=
 if [ -n "$__offbox_best" ]; then
+  __offbox_choice="newest nvm"
   export PATH="$__offbox_best/bin:$PATH"
 elif [ "${__offbox_require_nvm:-0}" != 1 ] && [[ "$__offbox_cur" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && __offbox_in "$(__offbox_nk "$__offbox_cur")"; then
   :
@@ -156,8 +165,7 @@ else
   __offbox_actual=$(node --version 2>/dev/null) || __offbox_actual=
   [[ "$__offbox_actual" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && __offbox_in "$(__offbox_nk "$__offbox_actual")" ||
     __offbox_stop "$__offbox_reason: installed Node did not activate"
-  echo "offbox: node $__offbox_actual (installed: $__offbox_want)" >&2
-  __offbox_installed=1
+  __offbox_choice="installed"
 fi
 __offbox_actual=$(node --version 2>/dev/null) || __offbox_stop "$__offbox_want: selected Node cannot execute"
 [[ "$__offbox_actual" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && __offbox_in "$(__offbox_nk "$__offbox_actual")" || __offbox_stop "$__offbox_want: selected Node $__offbox_actual does not match"
@@ -224,8 +232,9 @@ for __offbox_command in node npm npx corepack; do
 done
 export PATH="$__offbox_node_commands:$PATH"
 hash -r
-[ "${__offbox_installed:-}" = 1 ] || echo "offbox: node $__offbox_actual ($__offbox_want)" >&2
+@REPORT@
 unset -f __offbox_nk __offbox_in
+unset __offbox_candidates __offbox_choice
 unset __offbox_want __offbox_best __offbox_bk __offbox_have __offbox_d __offbox_v __offbox_k __offbox_cur __offbox_actual __offbox_installed __offbox_install __offbox_reason __offbox_index __offbox_rest
 unset __offbox_original_nvm_dir __offbox_nvm_dir __offbox_nvm_root __offbox_node_executable __offbox_node_dir __offbox_node_bin __offbox_node_nvm_dir __offbox_node_suffix __offbox_node_path __offbox_sep __offbox_tail __offbox_entry __offbox_command
 """.replace('@NVM_FETCH@', NVM_FETCH)
@@ -275,18 +284,267 @@ fi
 if [ -n "$__offbox_best" ]; then
   export PATH="$__offbox_best/bin:$PATH"
   hash -r 2>/dev/null || :
-  echo "offbox: node ${__offbox_best##*/} (no pin; $__offbox_choice)" >&2
+  __offbox_want="no pin; $__offbox_choice"
 else
   __offbox_cur=$(node --version 2>/dev/null) || __offbox_cur=none
   __offbox_command=$(command -v node) || __offbox_command=unavailable
   if [ "$__offbox_default" = system ]; then
-    echo "offbox: node $__offbox_cur (no pin; nvm default system $__offbox_command)" >&2
+    __offbox_want="no pin; nvm default system $__offbox_command"
   else
-    echo "offbox: node $__offbox_cur (no pin; box default $__offbox_command)" >&2
+    __offbox_want="no pin; box default $__offbox_command"
   fi
 fi
+__offbox_candidates=
+for __offbox_d in "$HOME"/.nvm/versions/node/v*; do
+  [ -x "$__offbox_d/bin/node" ] && __offbox_candidates="$__offbox_candidates ${__offbox_d##*/}"
+done
+__offbox_actual=$(node --version 2>/dev/null) || __offbox_actual=none
+__offbox_node_bin=$(dirname "$(command -v node 2>/dev/null)")
+[ -n "$__offbox_best" ] || __offbox_choice='box default'
+@REPORT@
+unset __offbox_want __offbox_candidates __offbox_actual __offbox_node_bin
 unset __offbox_default __offbox_best __offbox_bk __offbox_preferred __offbox_pk __offbox_d __offbox_v __offbox_k __offbox_choice __offbox_cur __offbox_command __offbox_path __offbox_sep __offbox_tail __offbox_entry
 """
+
+
+# One label formatter for open-range warnings and the installed-candidate explanation.
+REPORT = r"""
+import json, os, re, sys
+from pathlib import Path
+
+def selection_label(pin, choice, candidates, is_range, open_range):
+    label = ('installed: ' if choice == 'installed' else '') + pin
+    if open_range:
+        label += '; open range, newest on this box'
+    if is_range and len(candidates) > 1:
+        label += f'; newest of {len(candidates)} fitting on this box ({", ".join(candidates)})'
+    return label
+
+version, path, pin, choice, is_range, open_range, versions = sys.argv[1:]
+candidates = sorted({v for v in versions.split() if re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', v)},
+                    key=lambda v: tuple(map(int, v[1:].split('.'))), reverse=True)
+label = selection_label(pin, choice, candidates, is_range == '1', open_range == '1')
+facts = dict(version=version, path=path, pin=pin, choice=choice, candidates=candidates)
+# The ordinary log transport carries the same receipt, including on backends without artifact pulls.
+print('offbox: node ' + version + ' (' + label + ')', file=sys.stderr, flush=True)
+if version == 'none':
+    sys.exit(0)
+print('offbox-node: ' + json.dumps(dict(facts, label=label, run_id=os.environ.get('OFFBOX_RUN_ID'))), file=sys.stderr, flush=True)
+try:
+    if os.environ.get('OFFBOX_RUN_ID'):
+        receipt = Path.home() / '.offbox/exit' / (os.environ['OFFBOX_RUN_ID'] + '.node.json')
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps(facts))
+except OSError:
+    pass
+"""
+
+
+def _report(ranges):
+    is_range = bool(ranges) and not (len(ranges) == 1 and ranges[0][1] == ranges[0][0] + 1)
+    return ('python3 -c ' + shlex.quote(REPORT) +
+            ' "$__offbox_actual" "$__offbox_node_bin/node" "$__offbox_want" "$__offbox_choice" '
+            + f'{int(is_range)} {int(_open_range(ranges))} ' + '"$__offbox_candidates" || :')
+
+
+def exact_override(value):
+    if value is None:
+        return None
+    if not re.fullmatch(r'v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', value):
+        raise ValueError('OFFBOX_NODE must be an exact x.y.z version (for example OFFBOX_NODE=24.22.1)')
+    parts = list(map(int, value.lstrip('v').split('.')))
+    if any(part > 999 for part in parts):
+        raise ValueError('OFFBOX_NODE version components must be between 0 and 999')
+    key = _key(*parts)
+    return [(key, key + 1)], f'OFFBOX_NODE={value} (override)'
+
+
+def validate_override(extra):
+    value = os.environ.get('OFFBOX_NODE')
+    for spec in extra:
+        key, equals, supplied = spec.partition('=')
+        if key == 'OFFBOX_NODE':
+            value = supplied if equals else os.environ.get(key, value)
+    try:
+        exact_override(value)
+    except ValueError as error:
+        from .common import OffboxError
+        raise OffboxError(str(error), code=99) from error
+
+
+def stderr_offset(path):
+    from .common import read_json
+    try:
+        saved = read_json(path.with_suffix('.node-stream.json'), {})
+        context = read_json(path.with_suffix('.node-attempt.json'), dict(attempt=1, stderrOffset=0))
+        if saved.get('context') != context:
+            return 0
+        offset = saved.get('offset', 0)
+        return offset if type(offset) is int and offset >= 0 and path.with_suffix('.node-stderr.log').is_file() else 0
+    except Exception:
+        return 0
+
+
+def observe_attempt(path, metadata, *, until=None):
+    """Only the command API may move setup to a new stderr byte range."""
+    from .common import atomic_write_json, read_json
+    try:
+        attempt = metadata.get('attempt')
+        if type(attempt) is not int or attempt < 1:
+            return
+        setup = metadata.get('nodeSetup')
+        boundary = setup.get('stderrOffset') if isinstance(setup, dict) else None
+        if type(boundary) is not int or boundary < 0:
+            boundary = 0 if attempt == 1 else None
+        state = read_json(path.with_suffix('.state.json'), {})
+        command_id = state.get('command_id', metadata.get('commandId'))
+        if 'command_id' in state and (not command_id or metadata.get('commandId') not in (None, command_id)):
+            return False
+        context = dict(attempt=attempt, stderrOffset=boundary)
+        if command_id:
+            context['command_id'] = command_id
+        target = path.with_suffix('.node-attempt.json')
+        prior = read_json(target, {})
+        same_command = prior.get('command_id') == context.get('command_id')
+        if same_command and prior.get('attempt', 0) > attempt:
+            return False
+        if same_command and prior.get('attempt') == attempt and type(prior.get('stderrOffset')) is int:
+            if boundary is None or boundary < prior['stderrOffset']:
+                return False
+        if prior != context:
+            atomic_write_json(target, context)
+            if state.get('node') is not None:
+                from .runs import save_run_state
+                save_run_state(path.stem, node=None, until=until)
+            return True
+        return False
+    except Exception:
+        pass
+
+
+def capture_stderr(path, data, offset):
+    """Keep only the current invocation's setup; workload text never reopens it."""
+    from .common import atomic_write_json, read_json
+    from .runs import COMMAND_STARTED_MARKER
+    try:
+        progress = path.with_suffix('.node-stream.json')
+        saved = read_json(progress, {}) if offset else {}
+        if offset != saved.get('offset', 0):
+            return
+        context = read_json(path.with_suffix('.node-attempt.json'), dict(attempt=1, stderrOffset=0))
+        boundary = context.get('stderrOffset')
+        changed = saved.get('context') != context
+        target = path.with_suffix('.node-stderr.log')
+        if changed or not offset:
+            target.write_text('')
+        tail, skipping, setup = ('', False, True) if changed else (
+            saved.get('tail', ''), saved.get('skipping', False), saved.get('setup', True))
+        selected = []
+        payload = data[max(0, boundary - offset):] if type(boundary) is int else b''
+        with io.BytesIO(payload) as stream:
+            while part := stream.readline(65536):
+                line = tail + part.decode(errors='replace')
+                complete = part.endswith(b'\n')
+                if len(line) > 65536:
+                    skipping = True
+                if complete:
+                    if not skipping and setup:
+                        if line.startswith(('offbox-node: ', COMMAND_STARTED_MARKER)):
+                            selected.append(line)
+                        if line.startswith(COMMAND_STARTED_MARKER):
+                            setup = False
+                    tail, skipping = '', False
+                else:
+                    tail = '' if skipping else line
+        if selected:
+            with target.open('a') as stream:
+                stream.writelines(selected)
+        atomic_write_json(progress, dict(offset=offset + len(data), tail=tail, skipping=skipping,
+                                         setup=setup, context=context))
+    except Exception:
+        pass
+
+
+def record(run, path, *, source=None, start=0, length=None, digest=None, projected=False):
+    """Collect a receipt from a stderr source; missing diagnostics are null."""
+    from .runs import COMMAND_STARTED_MARKER, now, save_run_state
+    from .common import atomic_write_json, read_json
+    try:
+        source = source or path
+        info = source.stat()
+        end = info.st_size if length is None else start + length
+        cache_path = path.with_suffix('.node-remote-cache.json' if source != path else '.node-cache.json')
+        cache = read_json(cache_path, {})
+        context = read_json(path.with_suffix('.node-attempt.json'), dict(attempt=1, stderrOffset=0))
+        boundary = context.get('stderrOffset')
+        identity = [2, run['run_id'], str(source), info.st_dev, info.st_ino, start, length, digest, context, projected]
+        same = cache.get('identity') == identity
+        unchanged = same and cache.get('end') == end and cache.get('mtime_ns') == info.st_mtime_ns
+        offset = cache.get('offset', start)
+        facts, label = cache.get('facts'), cache.get('label')
+        setup, reset = cache.get('setup', True), cache.get('reset', False)
+        if not unchanged:
+            with source.open('rb') as stream:
+                if digest is not None:
+                    stream.seek(start)
+                    checksum, left = hashlib.sha256(), end - start
+                    while left:
+                        chunk = stream.read(min(left, 65536))
+                        if not chunk:
+                            return False
+                        checksum.update(chunk)
+                        left -= len(chunk)
+                    if checksum.hexdigest() != digest:
+                        return False
+                # Size growth does not prove an append: recovery can rewrite an earlier receipt in place.
+                setup = (type(boundary) is int and (not projected or
+                         read_json(path.with_suffix('.node-stream.json'), {}).get('context') == context))
+                offset, facts, label, reset = start, None, None, True
+                if not projected and type(boundary) is int:
+                    offset = min(end, start + boundary)
+                stream.seek(offset)
+                while stream.tell() < end:
+                    position = stream.tell()
+                    raw = stream.readline(min(end - position, 65536))
+                    if not raw.endswith(b'\n'):
+                        if len(raw) == 65536:
+                            while stream.tell() < end and not raw.endswith(b'\n'):
+                                raw = stream.readline(min(end - stream.tell(), 65536))
+                            offset = stream.tell()
+                            continue
+                        break  # A later committed chunk can complete this receipt.
+                    offset = stream.tell()
+                    line = raw.decode(errors='replace')
+                    if line.startswith(COMMAND_STARTED_MARKER):
+                        setup = False
+                    if setup and line.startswith('offbox-node: '):
+                        try:
+                            data = json.loads(line[len('offbox-node: '):])
+                        except ValueError:
+                            continue
+                        if (isinstance(data, dict) and data.get('run_id') == run['run_id'] and
+                                all(isinstance(data.get(k), str) for k in ('version', 'path', 'pin', 'choice', 'label')) and
+                                isinstance(data.get('candidates'), list) and
+                                all(isinstance(v, str) for v in data['candidates'])):
+                            facts = {k: data[k] for k in ('version', 'path', 'pin', 'choice', 'candidates')}
+                            label = f"offbox: node {data['version']} ({data['label']})"
+            atomic_write_json(cache_path, dict(identity=identity, end=end, offset=offset, mtime_ns=info.st_mtime_ns,
+                                              facts=facts, label=label, setup=setup, reset=reset))
+        # Optional receipt persistence must not extend a wait/logs deadline on a busy state writer.
+        if facts is None:
+            if reset and read_json(path.with_suffix('.state.json'), {}).get('node') is not None:
+                save_run_state(run['run_id'], node=None, until=now())
+            return reset
+        if read_json(path.with_suffix('.state.json'), {}).get('node') != facts:
+            save_run_state(run['run_id'], node=facts, until=now())
+        if label:
+            client = path.with_suffix('.client.log')
+            if not client.exists() or label not in client.read_text(errors='replace').splitlines():
+                with client.open('a') as stream:
+                    stream.write(label + '\n')
+        return True
+    except Exception:
+        return False
 
 
 def _key(ma, mi=0, pa=0):
@@ -587,13 +845,12 @@ def _open_range(ranges):
                              max(hi - 1 for _, hi in ranges) // 1_000_000)
 
 
-def _selection_label(ranges, label):
-    return label + ('; open range, newest on this box' if _open_range(ranges) else '')
-
-
-def want(root: Path, cwd: Path):
+def want(root: Path, cwd: Path, *, override=None):
     """(ranges, label) for the repo at root as seen from cwd, or None. Never raises."""
     try:
+        chosen = exact_override(override)
+        if chosen is not None:
+            return chosen
         root = Path(root)
         pin = _want(root, Path(cwd))
         if pin is None:
@@ -616,9 +873,8 @@ def want(root: Path, cwd: Path):
 def block(w, *, require_nvm=False) -> str:
     """Select or provision a matching Node, stopping before user code on failure."""
     if w is None:
-        return NO_PIN_BLOCK
+        return NO_PIN_BLOCK.replace("@REPORT@", _report(None))
     ranges, label = w
-    label = _selection_label(ranges, label)
     rng = " ".join(f"{lo} {hi}" for lo, hi in ranges)
     return toolchain.SHELL + f"__offbox_require_nvm={int(require_nvm)}\n" + (BLOCK.replace("@RANGES@", rng)
-            .replace("@WANT@", shlex.quote(label)))
+            .replace("@WANT@", shlex.quote(label)).replace("@REPORT@", _report(ranges)))

@@ -4,7 +4,10 @@ import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
-import { OrchestrationV2CancelReason } from "../orchestrationV2.ts";
+import {
+  OrchestrationV2ProviderFailureCategory,
+  OrchestrationV2CancelReason,
+} from "../orchestrationV2.ts";
 
 const Timestamp = Schema.String.check(
   Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
@@ -385,7 +388,7 @@ const GeneralEvent = Schema.Struct({
       distinctCwds: Schema.optionalKey(Measurement),
       maxPerSecond: Schema.optionalKey(Measurement),
       windowMs: Schema.optionalKey(Measurement),
-      overflow: Schema.optionalKey(Measurement),
+      overflow: Schema.optionalKey(Schema.Union([Measurement, Schema.Boolean])),
       top: Schema.optionalKey(
         Schema.Array(
           Schema.Struct({
@@ -429,6 +432,11 @@ const GeneralEvent = Schema.Struct({
       errorClass: Schema.optionalKey(Label),
       cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
       runId: Schema.optionalKey(DerivedId),
+      providerTurnId: Schema.optionalKey(DerivedId),
+      providerThreadId: Schema.optionalKey(DerivedId),
+      providerSessionId: Schema.optionalKey(DerivedId),
+      runStatus: Schema.optionalKey(Label),
+      msAfterRunEnded: Schema.optionalKey(Schema.NullOr(Measurement)),
       attemptId: Schema.optionalKey(DerivedId),
       stage: Schema.optionalKey(Label),
       outcome: Schema.optionalKey(Label),
@@ -570,6 +578,7 @@ const GeneralEvent = Schema.Struct({
       failedRunId: Schema.optionalKey(DerivedId),
       startedRunId: Schema.optionalKey(DerivedId),
       failureCode: Schema.optionalKey(Label),
+      failureCategory: Schema.optionalKey(OrchestrationV2ProviderFailureCategory),
       headRunId: Schema.optionalKey(DerivedId),
       headOrdinal: Schema.optionalKey(Measurement),
       queuedCount: Schema.optionalKey(Measurement),

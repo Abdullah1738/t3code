@@ -122,6 +122,7 @@ describe("Antigravity process environment", () => {
       }).env ?? {};
 
     const geminiKey = spawnFor({
+      ...ANTIGRAVITY_PERSONAL_AUTH,
       authMethod: "gemini-api-key",
       apiKey: "gemini-secret",
       gcpProject: "proj",
@@ -132,6 +133,7 @@ describe("Antigravity process environment", () => {
     expect(geminiKey.GOOGLE_CLOUD_PROJECT).toBeUndefined();
 
     const vertexKey = spawnFor({
+      ...ANTIGRAVITY_PERSONAL_AUTH,
       authMethod: "agent-platform",
       apiKey: "vertex-secret",
       gcpProject: "",
@@ -141,6 +143,7 @@ describe("Antigravity process environment", () => {
     expect(vertexKey.GEMINI_API_KEY).toBeUndefined();
 
     const business = spawnFor({
+      ...ANTIGRAVITY_PERSONAL_AUTH,
       authMethod: "oauth-business",
       apiKey: "ignored",
       gcpProject: "proj",
@@ -154,6 +157,7 @@ describe("Antigravity process environment", () => {
     expect(
       decodeJson(
         antigravityProfileSettings({
+          ...ANTIGRAVITY_PERSONAL_AUTH,
           authMethod: "oauth-business",
           apiKey: "never-written",
           gcpProject: "proj",
@@ -167,6 +171,62 @@ describe("Antigravity process environment", () => {
     expect(decodeJson(antigravityProfileSettings(ANTIGRAVITY_PERSONAL_AUTH))).toEqual({
       auth: { type: "oauth-personal" },
     });
+  });
+
+  it("routes the gateway method through the runtime's native gateway auth only", () => {
+    const baseEnv = {
+      PATH: "/usr/bin",
+      GEMINI_API_KEY: "ambient-gemini",
+      AGY_LLM_GATEWAY_URL: "http://ambient-gateway",
+      agy_llm_gateway_api_key: "ambient-gateway-key",
+      AGY_LLM_GATEWAY_HEADERS: "x-ambient: 1",
+      AGY_LLM_GATEWAY_MODELS: "ambient/model",
+      AGY_GATEWAY_URL: "http://legacy-gateway",
+      AGY_ACP_ENABLE_GATEWAY_AUTH: "1",
+    };
+    const gatewayAuth: AntigravityAuthConfig = {
+      ...ANTIGRAVITY_PERSONAL_AUTH,
+      authMethod: "gateway",
+      apiKey: "unused-gemini-key",
+      gatewayBaseUrl: "http://127.0.0.1:20128/",
+      gatewayApiKey: "router-secret",
+      gatewayModels: ["ag/gemini-4-neon-high", "ag/gemini-4-carbon-low"],
+    };
+    const spawnFor = (auth: AntigravityAuthConfig) =>
+      buildAntigravityAcpSpawnInput({
+        installation: { executablePath: "/release/acp", harnessPath: "/release/harness" },
+        profile,
+        cwd: "/project",
+        baseEnv,
+        auth,
+      }).env ?? {};
+
+    const gateway = spawnFor(gatewayAuth);
+    expect(gateway.AGY_ACP_ENABLE_GATEWAY_AUTH).toBe("1");
+    expect(gateway.AGY_LLM_GATEWAY_URL).toBe("http://127.0.0.1:20128");
+    expect(gateway.AGY_LLM_GATEWAY_API_KEY).toBe("router-secret");
+    expect(gateway.AGY_LLM_GATEWAY_MODELS).toBe("ag/gemini-4-neon-high,ag/gemini-4-carbon-low");
+    expect(gateway.AGY_LLM_GATEWAY_HEADERS).toBeUndefined();
+    expect(gateway.AGY_GATEWAY_URL).toBeUndefined();
+    expect(gateway.agy_llm_gateway_api_key).toBeUndefined();
+    expect(gateway.GEMINI_API_KEY).toBeUndefined();
+    expect(gateway.GOOGLE_API_KEY).toBeUndefined();
+
+    const withoutKey = spawnFor({ ...gatewayAuth, gatewayApiKey: "", gatewayModels: [] });
+    expect(withoutKey.AGY_LLM_GATEWAY_API_KEY).toBeUndefined();
+    expect(withoutKey.AGY_LLM_GATEWAY_MODELS).toBeUndefined();
+
+    // Other methods never inherit ambient gateway routing or the gateway key.
+    for (const authMethod of ["oauth-personal", "gemini-api-key"] as const) {
+      const env = spawnFor({ ...gatewayAuth, authMethod });
+      expect(Object.keys(env).filter((key) => /gateway/i.test(key))).toEqual([]);
+      expect(Object.values(env)).not.toContain("router-secret");
+    }
+
+    expect(decodeJson(antigravityProfileSettings(gatewayAuth))).toEqual({
+      auth: { type: "gateway" },
+    });
+    expect(antigravityProfileSettings(gatewayAuth)).not.toContain("router-secret");
   });
 
   it("names the missing credential for each method", () => {
@@ -188,6 +248,22 @@ describe("Antigravity process environment", () => {
         gcpProject: "proj",
         gcpLocation: "us-central1",
       }),
+    ).toBeNull();
+    const gateway = { ...ANTIGRAVITY_PERSONAL_AUTH, authMethod: "gateway" as const };
+    expect(antigravityAuthConfigIssue(gateway)).toContain("gateway URL");
+    expect(
+      antigravityAuthConfigIssue({ ...gateway, gatewayBaseUrl: "ftp://127.0.0.1:20128" }),
+    ).toContain("gateway URL");
+    for (const gatewayBaseUrl of [
+      "http://user:pw@127.0.0.1",
+      "http://127.0.0.1:20128?key=router-secret",
+      "http://127.0.0.1:20128#router-secret",
+      "not a url",
+    ]) {
+      expect(antigravityAuthConfigIssue({ ...gateway, gatewayBaseUrl })).toContain("gateway URL");
+    }
+    expect(
+      antigravityAuthConfigIssue({ ...gateway, gatewayBaseUrl: "http://127.0.0.1:20128" }),
     ).toBeNull();
   });
 
@@ -738,6 +814,7 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
       const profile = yield* prepareAntigravityProfile({
         profileDirectory: temporaryDirectory,
         auth: {
+          ...ANTIGRAVITY_PERSONAL_AUTH,
           authMethod: "agent-platform",
           apiKey: "vertex-secret",
           gcpProject: "proj",

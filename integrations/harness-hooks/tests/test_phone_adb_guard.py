@@ -159,6 +159,49 @@ class PhoneAdbTests(unittest.TestCase):
             self.assertIsNone(row['cmd'])
             self.assertEqual(len(row['cmd_hmac_sha256']), 64)
 
+    def test_holder_and_verb(self):
+        # holder says whose lock refused or admitted the call; adbVerb is the first adb word only.
+        now = dt.datetime.now(dt.timezone.utc)
+        cases = [
+            ('lease, other owner', None, self.lease, TAP, 'other', 'shell', True),
+            ('lease, own token', None, self.lease, 'PH_LEASE_OWNER=holder ' + TAP, 'self', 'shell', False),
+            ('priority hold, other', 'owner-req', None, 'adb install a.apk', 'other', 'install', True),
+            ('priority hold, own token', 'owner-req', None, 'PHONE_HOLD_OWNER=owner-req adb reboot', 'self', 'reboot', False),
+            ('empty priority hold', '', None, 'adb uninstall pkg', 'orphan', 'uninstall', True),
+            ('expired lease file', None, dict(self.lease, acquired_at=(now - dt.timedelta(hours=2)).isoformat(),
+                                              expires_at=(now - dt.timedelta(hours=1)).isoformat()),
+             'adb forward tcp:1 tcp:2', 'orphan', 'forward', False),
+            ('no lease', None, None, 'adb reverse tcp:1 tcp:2', 'none', 'reverse', False),
+        ]
+        for name, hold, lease, command, holder, verb, denied in cases:
+            with self.subTest(name):
+                (self.root / 'lease.json').unlink(missing_ok=True)
+                (self.root / 'priority-hold').unlink(missing_ok=True)
+                if hold is not None:
+                    (self.root / 'priority-hold').write_text(hold)
+                if lease is not None:
+                    (self.root / 'lease.json').write_text(json.dumps(lease))
+                verdict = guard.classify(command)
+                self.assertEqual((verdict['holder'], verdict['adbVerb'], bool(verdict['reason'])), (holder, verb, denied))
+        self.assertEqual(guard.classify('ls')['holder'], None)
+        (self.root / 'priority-hold').unlink(missing_ok=True)
+        (self.root / 'lease.json').write_text('{corrupt')
+        self.assertEqual((guard.classify(TAP)['holder'], guard.classify(TAP)['adbVerb']), (None, 'shell'))
+
+    def test_toollog_rows_carry_holder_verb_and_source(self):
+        board = Path(os.environ['TOOLLOG_ROOT']) / 'agent-tools'
+        day = board / (dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d') + '.ndjson')
+        before = len(day.read_text().splitlines()) if day.exists() else 0
+        with patch.object(engine, 'resolve_identity', return_value={}), patch.object(engine, '_classify_offbox', return_value={'heavy': False}), \
+                patch.object(engine.toollog, 'HOOK_SAMPLE_RATE', 1):
+            for command in [TAP, 'PH_LEASE_OWNER=holder adb forward tcp:1 tcp:2']:
+                engine.decide({'hook_event_name': 'PreToolUse', 'tool_name': 'Bash', 'cwd': str(self.root),
+                               'tool_input': {'command': command}}, 'claude')
+        rows = [json.loads(line) for line in day.read_text().splitlines()[before:]]
+        rows = [r['props'] for r in rows if r.get('props', {}).get('guard') == 'phone-adb']
+        self.assertEqual([(r['rule'], r['holder'], r['adbVerb'], r['source']) for r in rows],
+                         [('phone-adb-state', 'other', 'shell', 'test'), ('phone-adb-forward', 'self', 'forward', 'test')])
+
     def test_manifest_parity(self):
         manifest = json.loads((SRC.parents[1] / 'harness-homes/manifest.json').read_text())
         paths = manifest['paritySources']['phone-adb']

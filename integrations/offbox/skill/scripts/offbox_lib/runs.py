@@ -70,7 +70,7 @@ RESTART_MARKER_MAX_S = 300
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
 REFUSED_STATUSES = (400, 401, 403, 404, 409, 413, 422, 429)
 ENV_ALLOW = ("TZ", "LANG", "LC_ALL", "GOFLAGS", "GOPROXY", "GONOSUMDB", "GOPRIVATE", "GOTOOLCHAIN", "CGO_ENABLED",
-             "NODE_OPTIONS", "NODE_ENV", "JEST_WORKERS", "FORCE_COLOR", "NO_COLOR", "PYTHONUNBUFFERED", "PYTEST_ADDOPTS",
+             "OFFBOX_NODE", "NODE_OPTIONS", "NODE_ENV", "JEST_WORKERS", "FORCE_COLOR", "NO_COLOR", "PYTHONUNBUFFERED", "PYTEST_ADDOPTS",
              "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES", "RUST_BACKTRACE", "CARGO_TERM_COLOR", "TERM")
 ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "SESSION", "COOKIE", "AUTH")
 # Read from this checkout's skill root, not common.TEMPLATES_DIR: the live copy lacks the file until install.zsh runs.
@@ -1220,7 +1220,7 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
         *(["rm -f -- " + shlex.quote(script_file),
            'find "$HOME/.offbox/cmd" -name "*.sh" -mtime +2 -delete'] if script_file else []),
         'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" -o -name "*.gate" '
-        '-o -name "*.trace" -o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
+        '-o -name "*.node.json" -o -name "*.trace" -o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
     ])
     # Filesystem calls after the preamble are just as capable of wedging as restore's flock/load. The helper
     # owns no run output descriptors and is abandoned at its deadline even if its children cannot be killed.
@@ -1771,7 +1771,7 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
     # Boxes have no AWS instance metadata (169.254.169.254 is blackholed); boto3 without credentials waits ~2 s per lookup.
     env = {"CI": "1", "AWS_EC2_METADATA_DISABLED": "true"}
     for k in ENV_ALLOW:
-        if os.environ.get(k):
+        if os.environ.get(k) or (k == "OFFBOX_NODE" and k in os.environ):
             env[k] = os.environ[k]
     explicit = []
     for spec in extra:
@@ -1899,9 +1899,14 @@ def _source_present(root: Path, cwd: Path) -> None:
         raise common.SourceGone(cwd) from None
 
 
+def validate_node_override(a):
+    node_version.validate_override(getattr(a, 'env', None) or [])
+
+
 class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
+        validate_node_override(a)
         self.run_id = home.take_invocation_run() or new_id("run")
         self.protocol_nonce = secrets.token_hex(8)
         home.flush_routing(self.run_id)
@@ -2056,7 +2061,7 @@ class Runner:
                                                                  effective=size, reason=why)))
             try:
                 save_run_state(self.run_id, protocol_nonce=self.protocol_nonce, resources=resources.unavailable(
-                    'not_started' if api.BACKEND == 'server' else 'boat'),
+                    'not_started' if api.BACKEND == 'server' else 'boat'), node=None,
                     nvm_ref=node_version.command_uses_nvm(cmd_text), nvm_sh=None,
                     **offbox_disk_space.client_metadata())
             except Exception:
@@ -2090,7 +2095,7 @@ class Runner:
         claim = start_check.claim_id(con, self.run_id)
         env_file = f"/home/user/.offbox/env/{claim}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
-        w = node_version.want(self.root, self.cwd)
+        w = node_version.exact_override(env.get("OFFBOX_NODE")) or node_version.want(self.root, self.cwd)
         node_block = node_version.block(w)
         words = steps or a.cmd
         bun_choice = (bun_version.want(self.root, self.cwd, words, bun_version.mac_version(),
@@ -2707,6 +2712,9 @@ def interruption_info(status):
 
 
 def remember_interruption(run_id, status, *, until=None):
+    if run_id and isinstance(status, dict):
+        metadata = status.get('command') if isinstance(status.get('command'), dict) else status
+        node_version.observe_attempt(LOGS_DIR / f'{run_id}.log', metadata, until=until)
     info = interruption_info(status)
     if (run_id and info is not None and
             read_json(LOGS_DIR / f'{run_id}.state.json', {}).get('interruption') != info):
@@ -3020,7 +3028,10 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     # Absolute: a frame that arrives after the deadline (even an exit) is not accepted.
                     if until is not None and now() >= until:
                         raise timed_out()
-                    remember_interruption(run_id, fr, until=until)
+                    metadata_until = fr.get('_history_until', until)
+                    if until is not None and metadata_until is not None:
+                        metadata_until = min(until, metadata_until)
+                    remember_interruption(run_id, fr, until=metadata_until)
                     t = fr.get("type")
                     if t != "error" and run_id and (now() - last_home_read >= 5 or t in ("hello", "attempt", "exit") or fr.get("status") is not None):
                         from .home_run_observation import observe
@@ -3045,6 +3056,8 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                             lf.flush()
                             # Commit after the flush: a holder dying in between leaves this chunk past logBytes.
                             _commit(target, out_off, err_off, lf.tell())
+                            if t == 'stderr':
+                                node_version.capture_stderr(Path(log_path or target), b, err_off - len(b))
                             if echo:
                                 delivered = lf.tell()
                             if mf:
@@ -3629,6 +3642,7 @@ def run_remote(a, me: dict) -> int:
 
 
 def _background(a, me: dict) -> int:
+    from . import bg_cancel
     if not a.no_sync and getattr(a, "include", None):
         ssh_sync.push_filters(Path(me["repo_root"]), a.git, a.include)
     rn = Runner(a, me)
@@ -3648,7 +3662,9 @@ def _background(a, me: dict) -> int:
         ready_r, ready_w = os.pipe()
         accept_r, accept_w = os.pipe()
         import offbox_protection
+        cancel_token = bg_cancel.token()
         payload = json.dumps(dict(args=vars(a), me=me, env=dict(os.environ), backend=common.backend(),
+                                  cancel_token=cancel_token,
                                   caller=offbox_protection.caller(),
                                   home_wait_deadline=home.wait_budget_end(),
                                   ready_fd=ready_w, accept_fd=accept_r, signal_mask=list(mask))).encode()
@@ -3660,6 +3676,7 @@ def _background(a, me: dict) -> int:
                                      stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env,
                                      cwd=str(rn.log_path.parent))
         # Until this publication the original caller remains the provable owner. No payload is sent before it.
+        bg_cancel.publish(rn.run_id, child.pid, cancel_token)
         rn.record(client_pid=child.pid, start_at=now())
         os.close(ready_w)
         ready_w = None
@@ -3722,7 +3739,8 @@ def background_wait_hint(run_id: str) -> None:
 
 
 def background_queue(run_id: str, payload: dict) -> int:
-    with queue_lifecycle.client(run_id) as result:
+    from . import bg_cancel
+    with bg_cancel.client(run_id, payload.get('cancel_token')), queue_lifecycle.client(run_id) as result:
         code = _background_queue(run_id, payload)
         result['exit_code'] = code
         return code
@@ -3770,8 +3788,9 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
     from . import cli
     rid = os.environ[BACKGROUND_RUN_ENV]
     def interrupted(signum, frame):
-        queue_lifecycle.received(rid, signum)
-        raise _ClientSignal
+        from . import bg_cancel
+        if bg_cancel.interrupt(rid, signum):
+            raise _ClientSignal
     old = {s: signal.signal(s, interrupted) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     code = EXIT_LOCAL
     try:
@@ -3884,13 +3903,14 @@ def reset_disk_retry(error):
                         ('start_claim:' + error.run_id, new_id('claim')))
     save_run_state(error.run_id, status='starting', box_id=None, process_id=None, exit_code=None,
                    command_id=None, wrapper_pid=None, known_exit_code=None, end_at=None,
-                   infra_failure=None, infra_reason=None, setup_native_crash=False, disk_space={}, wrapper_exit_code=None)
+                   infra_failure=None, infra_reason=None, setup_native_crash=False, disk_space={}, wrapper_exit_code=None,
+                   node=None)
     # The public id survives, but stream offsets and disk markers belong to the old attempt.
     # Retain its output for inspection without letting it classify the replacement's exit.
     with log_lock(error.run_id):
         path = LOGS_DIR / f'{error.run_id}.log'
         archive = '.disk-full-' + new_id('attempt')
-        for old in (path, *path.parent.glob(path.name + '.*')):
+        for old in (path, *path.parent.glob(path.name + '.*'), *path.parent.glob(path.stem + '.node-*')):
             if old.is_file() and '.disk-full-' not in old.name:
                 old.rename(old.with_name(old.name + archive))
     error.disk_reset = True
@@ -4163,14 +4183,14 @@ def _run_remote(a, rn) -> int:
 
     def on_sig(signum, _frame):
         if interrupted['sig'] is None:
-            interrupted["sig"] = signum
             if os.environ.get(BACKGROUND_RUN_ENV):
-                queue_lifecycle.received(rn.run_id, signum)
+                from . import bg_cancel
+                if not bg_cancel.interrupt(rn.run_id, signum, started=rn.started):
+                    return
+            interrupted["sig"] = signum
             raise _ClientSignal
 
-    # Installed before rn.start(): a tool-call timeout's SIGTERM during the pool wait or the lease must reach
-    # run_remote's not-started finish ('killed'). With the default handler Python died there and the row stayed
-    # 'starting' with no box (31 Oct, run-1031-145121-2b9f).
+    # Foreground signals cancel preparation; detached clients require an explicit kill request before start.
     old = {s: signal.signal(s, on_sig) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
         try:
@@ -4230,6 +4250,7 @@ def _run_remote(a, rn) -> int:
             admission = follow(rn.box, rn.pid, rn.log_path, echo=False, run_id=rn.run_id,
                                until_command_started=True, admission_offsets=rn.admission_offsets)
             if admission is _COMMAND_RUNNING:
+                resources.finalize(dict(run_id=rn.run_id, mode='bg'), node_only=True)
                 print(rn.run_id)
                 background_wait_hint(rn.run_id)
                 say(f"started in background on {rn.box}")

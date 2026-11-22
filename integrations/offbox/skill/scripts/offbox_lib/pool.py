@@ -25,6 +25,8 @@ WAIT_MAX_S = 1200
 # has its own memory queue behind this one. The numbers above are for the Boat standby, where a box costs money.
 HOME_WAIT_S = 86400
 HOME_POOL_SIZE, HOME_POOL_MAX = 8, 64
+BOAT_POOL_MAX = 16              # a repo pool of runs pinned to Boat
+BOAT_PLAN_MAX_ACTIVE = 300      # the $100 plan's active-box limit, used until /limits has been read once
 PROGRESS_EVERY_S = 60
 AFFINITY_WAIT_S = 60
 LOCK_WAIT_S = 30
@@ -82,7 +84,31 @@ def pool_size() -> int:
     """Boxes one repository pool may have. More callers than that wait for one of them."""
     if at_home():
         return capacity.setting("OFFBOX_POOL_SIZE", HOME_POOL_SIZE, maximum=HOME_POOL_MAX)
-    return capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=16)
+    if home.failed_over():
+        return overflow_pool_size()
+    return capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=BOAT_POOL_MAX)
+
+
+def plan_active_limit(con=None) -> int:
+    """How many boxes Boat's plan runs at once, as last seen."""
+    try:
+        if con is None:
+            with contextlib.closing(db()) as own:
+                limit = capacity.plan(own).get("max_active")
+        else:
+            limit = capacity.plan(con).get("max_active")
+    except sqlite3.Error:
+        limit = None
+    return limit if type(limit) is int and limit > 0 else BOAT_PLAN_MAX_ACTIVE
+
+
+def overflow_pool_size() -> int:
+    """Work that left home meets no pool cap of ours on Boat, only what Boat's plan runs at once.
+
+    Boat still refuses starts past the plan's rate and active-box limits, and the spend cap still stops new
+    leases; a run that left a busy home goes back to home's queue when Boat refuses it."""
+    limit = plan_active_limit()
+    return capacity.setting("OFFBOX_POOL_SIZE", limit, maximum=limit)
 
 
 def _span(seconds: float) -> str:
@@ -149,7 +175,8 @@ def pool_cap(con, key, *, locked=False):
             else:
                 con.execute("DELETE FROM pool_cap_callers WHERE token=?", (row['token'],))
         winner = max(live, key=lambda r: r['cap']) if live else None
-        limit = HOME_POOL_MAX if at_home() else 16
+        # Only a caller that left home lifts the pool past Boat's own cap; a run pinned to Boat keeps it.
+        limit = HOME_POOL_MAX if at_home() else plan_active_limit(con) if home.failed_over() else BOAT_POOL_MAX
         cap = min(limit, winner['cap']) if winner else (HOME_POOL_SIZE if at_home() else 4)
         con.execute("INSERT OR REPLACE INTO pool_caps VALUES (?,?,?,?)",
                     (key, cap, winner['pid'] if winner else None, now()))
@@ -822,7 +849,10 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     next_home_probe = time.monotonic() + outage.PROBE_EVERY_S
     failover = home.failed_over()
     probe_every = home.failback_probe_seconds()
-    queue.setdefault("next_failback_probe", started + probe_every)
+    # A run that left a busy home gives Boat time to start it: home with one free moment is not a reason to go
+    # back to the end of home's line, where it could not leave again.
+    queue.setdefault("next_failback_probe", started + (max(probe_every, home.OVERFLOW_RETURN_S)
+                                                       if home.left_busy_home() else probe_every))
 
     def check_home(*, force=False):
         nonlocal next_home_probe
@@ -834,7 +864,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             toollog.emit("backend", "backend.failback_probe", ids={"run": run_id},
                          props={"ok": why is None, "class": (home.PROBE_FACTS.get() or {}).get("class", "hard"),
                                 "waited_s": t-started})
-            if why is None:
+            # A home that answers but has its own line would only move this run from one queue to another.
+            if why is None and not (home.PROBE_FACTS.get() or {}).get("busy"):
                 state = poll.call(lambda: queue_state(con, key, run_id, source=source, size=size, token=waiter))
                 raise home.FailbackReady(run_id, t-started, state)
         if not protected_base or (not force and time.monotonic() < next_home_probe):
@@ -845,6 +876,17 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         if why:
             raise OffboxError(f"home offbox server not reachable ({why})", outage=True, run_id=run_id)
 
+    def home_instead(error):
+        """Boat refused a run that only left home's line (no machine, start limit): home's queue is the better
+        wait than failing here. Nothing of this run has started."""
+        if (failover and home.left_busy_home() and isinstance(error, capacity.CapacityError)
+                and home.probe(timeout=min(5, home.PROBE_TIMEOUT_S), wait=False) is None):
+            state = poll.call(lambda: queue_state(con, key, run_id, source=source, size=size, token=waiter))
+            raise home.FailbackReady(run_id, time.monotonic()-started, state, why=f"Boat cannot start this run ({error})")
+        return error
+
+    # Only a plain pool run: a named base or an excluded box has its own waiting rules in the caller.
+    overflow = home.may_fail_over() and not base and not exclude
     lock_options = {'check_home': check_home} if protected_base or failover else {}
     said, last_error = queue.get('reported', False), None
     next_refresh = 0
@@ -1332,7 +1374,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         if resume_stall is not None:
                             e.args = (f"{e} Earlier cause: {resume_stall}",)
                         if not isinstance(e, (api.SupplyOut, api.BoatAtCapacity)):
-                            raise
+                            raise home_instead(e)
                         last_error = e
                         break
                     except OffboxError as e:
@@ -1372,9 +1414,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         con.execute("UPDATE pool_waiters SET reserved=0 WHERE token=?", (waiter,))
                         con.commit()
             if capacity_outage is not None:
-                raise capacity_outage
+                raise home_instead(capacity_outage)
             if start_limit is not None:
-                raise start_limit
+                raise home_instead(start_limit)
             if stopped_error is not None and not can_create:
                 raise stopped_error
             break
@@ -1382,14 +1424,22 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             continue
         t = time.monotonic()
         if last_error and not isinstance(last_error, (api.SupplyOut, api.BoatAtCapacity)):
-            raise last_error
+            raise home_instead(last_error)
         check_home(force=wait > 0 and t >= deadline)
         if t >= deadline:
             if last_error:
-                raise last_error
+                raise home_instead(last_error)
             raise _queue_timeout(con, me, started, t)
+        # Only here, where every usable box is busy and nothing of this run is in flight on any of them.
+        # The two minutes count from the first time the pool was found busy, not from earlier resume or sync work.
+        if overflow and not last_error and t >= queue.setdefault("next_overflow", t + home.overflow_pool_wait_seconds()):
+            queue["next_overflow"] = t + max(60, home.overflow_pool_wait_seconds())
+            if home.boat_can_take():
+                # cli treats an outage raised before anything started as "this run may go to Boat".
+                raise OffboxError(f"{home.BUSY}: no {key} pool box free after {int(t-started)} s",
+                                  outage=True, run_id=run_id)
         if isinstance(last_error, api.BoatAtCapacity):
-            raise last_error
+            raise home_instead(last_error)
         state = poll.call(lambda: queue_state(con, key, run_id, source=source, size=size, token=waiter))
         queue['place'] = state.get('place')
         if (not recycle_wait_said and not fresh and (template or base) and not state['serving']
@@ -1404,14 +1454,18 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                          props={"queued": True, "position": state.get("place"), "waitMs": (t-started)*1000})
             detail = _queue_line(state, source)
             if failover:
+                first = queue["next_failback_probe"] - t
+                looks = (f"checking home every {probe_every} s" if first <= probe_every else
+                         f"first look at home in {int(first)} s, then every {probe_every} s")
                 if not said:
-                    say(f"queued for a {key} pool box on Boat (home is down): {detail}; waits until a Boat box "
-                        f"frees or home is back, no time limit; checking home every {probe_every} s. "
+                    say(f"queued for a {key} pool box on Boat (home is {'busy' if home.left_busy_home() else 'down'}): "
+                        f"{detail}; waits until a Boat box "
+                        f"frees or home {'has no line' if home.left_busy_home() else 'is back'}, no time limit; "
+                        f"{looks}. "
                         "Run it with --bg or in a background shell if your tool call has a timeout")
                     said = True
                 else:
-                    say(f"still queued for a {key} pool box on Boat: waited {int(t-started)} s, {detail}"
-                        f" · checking home every {probe_every} s")
+                    say(f"still queued for a {key} pool box on Boat: waited {int(t-started)} s, {detail} · {looks}")
             elif home.unlimited_queue():
                 if not said:
                     say(f"queued for a {key} pool box on home: {detail}; no time limit; "

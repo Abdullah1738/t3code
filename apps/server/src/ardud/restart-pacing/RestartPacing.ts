@@ -46,6 +46,7 @@ type AdmissionObservation = {
   maxQueueDepth: number;
   recorded: boolean;
 };
+type Wake = "spacing_deadline" | "release" | "queue_change" | "load_clear" | "other";
 type LoadHold = {
   loadHoldMs: number;
   checkedAt: number;
@@ -115,7 +116,7 @@ const make = Effect.gen(function* () {
   const bootId = Option.isSome(startup) ? startup.value.snapshot().bootId : undefined;
   const scope = yield* Effect.scope;
   const mutex = yield* Semaphore.make(1);
-  let changed = yield* Deferred.make<void>();
+  let changed = yield* Deferred.make<Wake>();
   const settingsMutex = yield* Semaphore.make(1);
   let snapshot: { at: number; value: Settings } | undefined;
   const readSettingsSnapshot = Effect.fn("RestartPacing.settingsSnapshot")(
@@ -139,6 +140,8 @@ const make = Effect.gen(function* () {
         runId?: RunId;
         readyAt?: number;
         wakeRequested?: boolean;
+        wake?: Wake;
+        waitNote?: object;
         priority: number;
         activityAt: number;
         loadHoldMs: number;
@@ -281,7 +284,9 @@ const make = Effect.gen(function* () {
   };
   // Record readiness with the mutation that changes the head or frees a slot.
   // A late timer must expose the missed deadline instead of resetting its age.
-  const queueChanged = Effect.gen(function* () {
+  const queueChanged = Effect.fn("RestartPacing.queueChanged")(function* (
+    wake: Wake = "queue_change",
+  ) {
     const now = yield* Clock.currentTimeMillis;
     const queue = orderedQueue(now, pass?.loaded ?? false);
     if (pass !== undefined) {
@@ -299,7 +304,7 @@ const make = Effect.gen(function* () {
         head.readyAt = hold > 0 ? readyAt : Math.min(head.readyAt ?? readyAt, readyAt);
       }
     }
-    yield* Deferred.succeed(changed, undefined);
+    yield* Deferred.succeed(changed, wake);
   });
   // Keep CPU intervals short and wake load-held heads independently of durable retries.
   yield* Effect.sleep(PASS_MS).pipe(
@@ -319,7 +324,7 @@ const make = Effect.gen(function* () {
               loadScore,
               ...(loadSample === undefined ? {} : { loadSample }),
             };
-            if (loadChanged) yield* queueChanged;
+            if (loadChanged) yield* queueChanged(loaded ? "other" : "load_clear");
           }
         }),
       ),
@@ -339,7 +344,7 @@ const make = Effect.gen(function* () {
     function* (source: RestartSource) {
       releaseReservation(source, yield* Clock.currentTimeMillis, true);
     },
-    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged))),
+    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged("release")))),
   );
   const releaseRun = Effect.fn("RestartPacing.releaseRun")(
     function* (threadId: ThreadId, runId: RunId, effectId?: string, retrying = false) {
@@ -368,7 +373,7 @@ const make = Effect.gen(function* () {
         if (source === undefined || source.effectId !== effectId || !source.admitted)
           return Effect.void;
         // Re-read ownership under the mutex before changing a reservation.
-        return mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged)));
+        return mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged("release"))));
       }),
   );
   // Keep allocation/transfer and its finalizer metadata in the same mutex turn.
@@ -384,9 +389,19 @@ const make = Effect.gen(function* () {
       hold: reservation.hold,
     });
   };
+  const clearWait = Effect.fn("RestartPacing.clearWait")(function* (source: RestartSource) {
+    const entry = pending.get(key(source));
+    if (entry !== undefined) {
+      // Invalidate before releasing the thread lock, including failed clears
+      // that leave the entry queued and need a fresh waiting publication.
+      delete entry.waitNote;
+      delete entry.waitKey;
+    }
+    return yield* state.status(source, null);
+  });
   const completeRetiredNotes = Effect.fn("RestartPacing.completeRetiredNotes")(function* () {
     for (const [noteKey, source] of retiredNotes) {
-      const closed = yield* state.status(source, null).pipe(
+      const closed = yield* clearWait(source).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("restart-pacing.retired-note-cleanup-failed", {
             threadId: source.threadId,
@@ -402,7 +417,7 @@ const make = Effect.gen(function* () {
     source: RestartSource,
     retainHold = false,
   ) {
-    if (!(yield* state.status(source, null))) {
+    if (!(yield* clearWait(source))) {
       // A replacement still owns the note. Keep cleanup reachable by the next
       // admission pass without keeping this retired source in the queue.
       retiredNotes.set(key(source), source);
@@ -446,6 +461,8 @@ const make = Effect.gen(function* () {
         // next promotion owns a new effect, but retains its elapsed load hold.
         delete replacement.position;
         delete replacement.waitKey;
+        delete replacement.waitNote;
+        delete replacement.wake;
         delete replacement.orderWait;
         replacement.retryMs = RECHECK_MS;
         pending.set(key(source), replacement);
@@ -473,6 +490,8 @@ const make = Effect.gen(function* () {
         wakeRequested: false,
       };
       delete replacement.waitKey;
+      delete replacement.waitNote;
+      delete replacement.wake;
       delete replacement.orderWait;
       delete replacement.observation;
       pending.set(key(source), replacement);
@@ -510,8 +529,10 @@ const make = Effect.gen(function* () {
     });
     requeuedHolds.delete(key(source));
   });
-  const acquire = Effect.fn("RestartPacing.acquire")(
-    function* (source: RestartSource, runId?: RunId) {
+  // The public acquire operation owns the span, including semaphore wait time.
+  const acquirePass = Effect.fnUntraced(
+    function* (source: RestartSource, runId: RunId | undefined, startedAt: number) {
+      const lockedAt = yield* Clock.currentTimeMillis;
       yield* completeRetiredNotes();
       // A queued wake cannot take admission back from the actual provider start.
       if (runId === undefined && active.get(key(source))?.runId !== undefined)
@@ -519,7 +540,7 @@ const make = Effect.gen(function* () {
       // Keep the dispatch-to-provider gap reserved; a running turn needs no slot.
       if (active.has(key(source))) {
         if (runId !== undefined) ownRunReservation(source, runId);
-        yield* state.status(source, null);
+        yield* clearWait(source);
         return 0;
       }
       yield* register(source, runId);
@@ -610,6 +631,8 @@ const make = Effect.gen(function* () {
       }
       const entry = pending.get(key(source));
       if (entry === undefined) return yield* new RestartAdmissionSupersededError();
+      const wake = entry.wake ?? "other";
+      delete entry.wake;
       entry.wakeRequested = false;
       const position = queue.indexOf(entry) + 1;
       observeProgress(queue, yield* Clock.currentTimeMillis);
@@ -658,7 +681,7 @@ const make = Effect.gen(function* () {
           loaded,
           rule,
         });
-        yield* state.status(source, null);
+        yield* clearWait(source);
         pending.delete(key(source));
         // A failed expiry commit retries this effect immediately; a new resume
         // gets its own allowance instead of inheriting the retired registration.
@@ -744,55 +767,82 @@ const make = Effect.gen(function* () {
           spacing > 0,
           wait.loadHoldRemainingMs > 0,
         ].join(":");
-        if (entry.waitKey !== waitKey) {
-          yield* state.status(source, position, wait);
-          entry.position = position;
-          entry.waitKey = waitKey;
-          yield* Effect.logInfo("restart-pacing.waiting", {
-            threadId: source.threadId,
-            sourceRunId: source.sourceRunId,
-            position,
-            loaded,
-            classification: source.classification ?? "continuation",
-            priority: entry.priority,
-            queueOrder: entry.order,
-            queuedAtMs: entry.registeredAt,
-            waitedMs: now - entry.registeredAt,
-            lastAdmissionAgoMs,
-            ...(loaded ? { loadScore: pass.loadScore, loadThreshold: 1, ...pass.loadSample } : {}),
-            reasons: [
-              ...(position > 1 ? ["queue"] : []),
-              ...(active.size >= config.maxActive ? ["maxActive"] : []),
-              ...(spacing > 0 ? ["spacing"] : []),
-              ...(wait.loadHoldRemainingMs > 0 ? ["load"] : []),
-            ],
-            ...wait,
-          });
-        }
+        const loadHoldCreditSpent = entry.loadHoldMs >= MAX_LOAD_HOLD_MS;
+        const fields = {
+          threadId: source.threadId,
+          sourceRunId: source.sourceRunId,
+          position,
+          loaded,
+          classification: source.classification ?? "continuation",
+          priority: entry.priority,
+          queueOrder: entry.order,
+          queuedAtMs: entry.registeredAt,
+          waitedMs: now - entry.registeredAt,
+          lastAdmissionAgoMs,
+          ...(loaded ? { loadScore: pass.loadScore, loadThreshold: 1, ...pass.loadSample } : {}),
+          reasons: [
+            ...(position > 1 ? ["queue"] : []),
+            ...(active.size >= config.maxActive ? ["maxActive"] : []),
+            ...(spacing > 0 ? ["spacing"] : []),
+            ...(wait.loadHoldRemainingMs > 0 ? ["load"] : []),
+          ],
+          ...wait,
+          loadHoldCreditSpent,
+        };
+        const note = {};
+        const publish =
+          entry.waitKey === waitKey
+            ? Effect.void
+            : Effect.gen(function* () {
+                const isCurrent = () =>
+                  pending.get(key(source)) === entry && entry.waitNote === note;
+                yield* state.status(source, position, wait, isCurrent);
+                const emittedAt = yield* Clock.currentTimeMillis;
+                yield* Effect.logInfo("restart-pacing.waiting", {
+                  ...fields,
+                  passLatencyMs: emittedAt - startedAt,
+                  mutexWaitMs: lockedAt - startedAt,
+                  decisionToEmitGapMs: emittedAt - now,
+                });
+              }).pipe(
+                Effect.onError(() =>
+                  Effect.sync(() => {
+                    if (pending.get(key(source)) === entry && entry.waitNote === note)
+                      delete entry.waitKey;
+                  }),
+                ),
+              );
+        entry.position = position;
+        if (entry.waitKey !== waitKey) entry.waitNote = note;
+        entry.waitKey = waitKey;
         const remainingHold = MAX_LOAD_HOLD_MS - entry.loadHoldMs;
         const retryMs = Math.min(
           loaded && remainingHold > 0 ? Math.min(entry.retryMs, remainingHold) : entry.retryMs,
           admissionDeadline - now,
         );
         entry.retryMs = Math.min(MAX_RECHECK_MS, retryMs * 2);
-        return spacing > 0 &&
+        const delay =
+          spacing > 0 &&
           (!loaded || remainingHold <= 0) &&
           position === 1 &&
           active.size < config.maxActive
-          ? Math.min(retryMs, spacing)
-          : retryMs;
+            ? Math.min(retryMs, spacing)
+            : retryMs;
+        // Notes may wait on a thread lock or SQLite. Keep that I/O outside the
+        // global gate so another thread's ready head can wake and claim a slot.
+        return { delay, publish, decidedAt: now };
       }
       if (runId !== undefined) {
         // Classification is cached while waiting. Revalidate after admission
         // becomes possible so cancelled/requeued starts don't claim a slot.
         const current = yield* state.sourceForRun(source.threadId, runId);
         if (current === undefined) {
-          yield* state.status(source, null);
+          yield* clearWait(source);
           pending.delete(key(source));
           return 0;
         }
       }
-      yield* state.status(source, null);
+      yield* clearWait(source);
       // Persistence can outlast either deadline while admission holds the mutex.
       const admittedAt = yield* checkBound;
       active.set(key(source), {
@@ -838,6 +888,7 @@ const make = Effect.gen(function* () {
         maxActive: config.maxActive,
         loaded,
       });
+      const emittedAt = yield* Clock.currentTimeMillis;
       yield* Effect.logInfo("restart-pacing.admitted", {
         threadId: source.threadId,
         sourceRunId: source.sourceRunId,
@@ -849,18 +900,41 @@ const make = Effect.gen(function* () {
         priority: entry.priority,
         queueOrder: entry.order,
         classification: source.classification ?? "continuation",
+        wake,
+        passLatencyMs: emittedAt - startedAt,
+        mutexWaitMs: lockedAt - startedAt,
+        decisionToEmitGapMs: emittedAt - now,
       });
       return 0;
     },
-    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged))),
+    (effect) =>
+      mutex
+        .withPermits(1)(effect.pipe(Effect.ensuring(queueChanged())))
+        .pipe(
+          Effect.flatMap((result) =>
+            typeof result === "number"
+              ? Effect.succeed(result)
+              : result.publish.pipe(
+                  Effect.andThen(Clock.currentTimeMillis),
+                  // Zero means admitted to callers, so an elapsed retry still defers.
+                  Effect.map((at) => Math.max(1, result.delay - (at - result.decidedAt))),
+                ),
+          ),
+        ),
   );
+  const acquire = Effect.fn("RestartPacing.acquire")(function* (
+    source: RestartSource,
+    runId?: RunId,
+  ) {
+    return yield* acquirePass(source, runId, yield* Clock.currentTimeMillis);
+  });
   const dispatched = Effect.fn("RestartPacing.dispatched")(
     function* (source: RestartSource, declined = false) {
       const reservation = active.get(key(source));
       if (declined && reservation === undefined) {
         const entry = pending.get(key(source));
         if (entry !== undefined && entry.effectId !== source.effectId) return;
-        if (!(yield* state.status(source, null))) return;
+        if (!(yield* clearWait(source))) return;
         pending.delete(key(source));
         requeuedHolds.delete(key(source));
         for (const [runKey, cached] of runSources) {
@@ -884,7 +958,7 @@ const make = Effect.gen(function* () {
         releaseReservation(source, yield* Clock.currentTimeMillis);
       }
     },
-    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged))),
+    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged("release")))),
   );
   const acquireRun = Effect.fn("RestartPacing.acquireRun")(function* (
     threadId: ThreadId,
@@ -920,10 +994,14 @@ const make = Effect.gen(function* () {
   // Durable retries can already be asleep for a minute when they become head.
   // Wake only that effect; never hold a provider worker while waiting for spacing.
   const wakeHead = Effect.fn("RestartPacing.wakeHead")(
-    function* () {
-      changed = yield* Deferred.make<void>();
+    function* (wake: Wake) {
+      changed = yield* Deferred.make<Wake>();
       yield* completeRetiredNotes();
-      const next = (delay?: number) => ({ delay, signal: changed });
+      const next = (delay?: number, timerWake: Wake = "other") => ({
+        delay,
+        signal: changed,
+        timerWake,
+      });
       if (pass === undefined || pending.size === 0)
         return next(retiredNotes.size > 0 ? PASS_MS : undefined);
       const now = yield* Clock.currentTimeMillis;
@@ -946,21 +1024,23 @@ const make = Effect.gen(function* () {
         if (entry !== head || active.size >= config.maxActive) delete entry.readyAt;
       if (blocked) return next(PASS_MS);
       head.readyAt ??= Math.max(now, spacingAt);
-      if (now < spacingAt) return next(spacingAt - now);
+      if (now < spacingAt) return next(spacingAt - now, "spacing_deadline");
       if (head.wakeRequested || head.effectId === undefined) return next(PASS_MS);
       head.wakeRequested = yield* state.wake(head);
+      if (head.wakeRequested) head.wake = wake;
       // A claim may still be unwinding into its durable retry. Retry only that
       // race; sleeping heads are woken once, at their spacing deadline.
       return next(head.wakeRequested ? PASS_MS : 100);
     },
     (effect) => mutex.withPermits(1)(effect),
   );
+  let wake: Wake = "other";
   yield* Effect.gen(function* () {
-    const next = yield* wakeHead();
+    const next = yield* wakeHead(wake);
     const notified = Deferred.await(next.signal);
-    yield* next.delay === undefined
+    wake = yield* next.delay === undefined
       ? notified
-      : Effect.raceFirst(notified, Effect.sleep(next.delay));
+      : Effect.raceFirst(notified, Effect.sleep(next.delay).pipe(Effect.as(next.timerWake)));
   }).pipe(
     Effect.catchCause((cause) =>
       Effect.logWarning("restart-pacing.wake-failed", { cause }).pipe(
@@ -973,7 +1053,7 @@ const make = Effect.gen(function* () {
   return RestartPacing.of({
     settingsSnapshot,
     register: (source) =>
-      mutex.withPermits(1)(register(source).pipe(Effect.ensuring(queueChanged))),
+      mutex.withPermits(1)(register(source).pipe(Effect.ensuring(queueChanged()))),
     acquire,
     acquireRun,
     dispatched,

@@ -43,6 +43,38 @@ import {
 import { makeStreamingTimelineFixture, makeThreadProjectionFixture } from "./test-fixtures";
 import type { ChatMessage } from "./types";
 
+function makeRetryErrorItem() {
+  const now = DateTime.makeUnsafe("2026-06-20T00:00:00.000Z");
+  return {
+    id: TurnItemId.make("item-provider-retry"),
+    threadId: ThreadId.make("thread-provider-retry"),
+    runId: RunId.make("run-provider-retry"),
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: 1,
+    status: "running" as const,
+    title: "Provider retry",
+    startedAt: now,
+    completedAt: null,
+    updatedAt: now,
+    type: "error" as const,
+    failure: {
+      class: "provider_error" as const,
+      message: "Claude API overloaded.",
+      code: "api_error_529",
+      retryable: true,
+    },
+    retry: {
+      attempt: 2,
+      maxAttempts: 10,
+      retryDelayMs: 1_500,
+    },
+  } satisfies Extract<OrchestrationV2TurnItem, { readonly type: "error" }>;
+}
+
 describe("V2 session presentation", () => {
   it("uses run status as the settlement boundary", () => {
     const runId = RunId.make("run-1");
@@ -104,34 +136,7 @@ describe("V2 session presentation", () => {
 
   it("labels provider retry progress, delay, recovery, and exhaustion", () => {
     const now = DateTime.makeUnsafe("2026-06-20T00:00:00.000Z");
-    const retryItem = {
-      id: TurnItemId.make("item-provider-retry"),
-      threadId: ThreadId.make("thread-provider-retry"),
-      runId: RunId.make("run-provider-retry"),
-      nodeId: null,
-      providerThreadId: null,
-      providerTurnId: null,
-      nativeItemRef: null,
-      parentItemId: null,
-      ordinal: 1,
-      status: "running" as const,
-      title: "Provider retry",
-      startedAt: now,
-      completedAt: null,
-      updatedAt: now,
-      type: "error" as const,
-      failure: {
-        class: "provider_error" as const,
-        message: "Claude API overloaded.",
-        code: "api_error_529",
-        retryable: true,
-      },
-      retry: {
-        attempt: 2,
-        maxAttempts: 10,
-        retryDelayMs: 1_500,
-      },
-    } satisfies Extract<OrchestrationV2TurnItem, { readonly type: "error" }>;
+    const retryItem = makeRetryErrorItem();
 
     expect(
       providerErrorPresentation({
@@ -182,6 +187,45 @@ describe("V2 session presentation", () => {
       }),
     ).toMatchObject({ label: "Provider error after 10/10 retries" });
   });
+
+  it.each([
+    { category: "persistence", failureClass: "unknown", errorLabel: "Persistence error" },
+    { category: "unknown", failureClass: "usage_limit", errorLabel: "Usage limit reached" },
+    { category: "unknown", failureClass: "provider_error", errorLabel: "Provider error" },
+  ] as const)(
+    "keeps $errorLabel across terminal and retry states",
+    ({ category, failureClass, errorLabel }) => {
+      const base = makeRetryErrorItem();
+      const failure = { ...base.failure, category, class: failureClass };
+      const { retry: _retry, ...withoutRetry } = base;
+      expect(
+        providerErrorPresentation({ ...withoutRetry, failure, status: "failed", title: "" }),
+      ).toEqual({
+        label: errorLabel,
+        detail: failure.message,
+      });
+      for (const maxAttempts of [null, 1] as const) {
+        const progress = maxAttempts === null ? "1" : "1/1";
+        const states = [
+          ["running", `Retrying provider (${progress})`],
+          ["completed", `Provider recovered (${progress} retries)`],
+          ["failed", `${errorLabel} after ${progress} retries`],
+          ["interrupted", `Provider retry stopped (${progress})`],
+          ["cancelled", `Provider retry stopped (${progress})`],
+        ] as const;
+        for (const [status, label] of states) {
+          expect(
+            providerErrorPresentation({
+              ...base,
+              failure,
+              status,
+              retry: { attempt: 1, maxAttempts, retryDelayMs: null },
+            }),
+          ).toEqual({ label, detail: failure.message });
+        }
+      }
+    },
+  );
 
   it("selects the latest proposed plan for a run", () => {
     const runId = RunId.make("run-1");

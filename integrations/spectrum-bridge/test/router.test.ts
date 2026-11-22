@@ -8743,6 +8743,26 @@ test.each(["queued", "queued-stale", "preparing", "retry", "late-accepted"])("fa
   }
 });
 
+test.each([true, false])("failed receipt adoption preserves arrival order (prefix index: %s)", async indexed => {
+  const h = setup(":memory:", { notifyFailure: async () => true });
+  const route = { id: "ses_1", directory: "/Chats/old", generation: 1 };
+  h.store.set("route", route);
+  for (const id of ["z-received-first", "a-received-second"]) {
+    h.input(id, "Synthetic replay", { source: "typed" });
+    h.store.updateInbound(id, "failed");
+    h.store.set(`failed-replay-receipt:${id}`, { ...route, inboundId: id, messageId: messageId(id), phase: "failed", startedAt: Date.now() });
+  }
+  if (!indexed) {
+    h.store.db.exec("DROP INDEX kv_key_nocase");
+  }
+  h.backend.single = true;
+  await h.router.checkFailedInbound();
+  expect(h.store.get<{ inboundId: string }>("activeTurn")?.inboundId).toBe("z-received-first");
+  expect(h.store.get("failed-replay-receipt:z-received-first")).toBeNull();
+  expect(h.store.get("failed-replay-receipt:a-received-second")).not.toBeNull();
+  expect(h.backend.prompts).toHaveLength(0);
+});
+
 test.each(["none", "completed", "running"])("failed-inbound adopts acceptance after expiry without another POST (newer turn: %s)", async newer => {
   const h = setup(":memory:", { notifyFailure: async () => true });
   const receivedAt = Date.parse("2026-11-13T00:00:00Z"); setSystemTime(receivedAt + 6 * 3600_000 - 1000);

@@ -14,6 +14,7 @@ from cpu_labels import family, script_hint, command_label
 from jobs import read_state, save_state, state_path
 from toollog import emit, finite_number, cpu_fields
 from volume_crawls import volume_crawls
+from host_signal import notify_cpu_timeout
 
 # Keep comm last: Darwin truncates it when another column follows, changing
 # established CPU families and disabling interpreter hints.
@@ -583,6 +584,8 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
         props = dict(diagnostics, failure=failure)
         emit('cpu', 'error', 'cpu.sample', ok=False, duration_ms=(clock()-started)*1000,
              props=props, error_tag='cpu.'+failure)
+        if failure == 'timeout':
+            notify_cpu_timeout()
         return props
 
 

@@ -99,6 +99,7 @@ import {
   resolveProviderInstanceEnabled,
   type ProviderSessionId,
   RunId,
+  type RunAttemptId,
   RuntimeMode,
   ThreadLinkedPullRequest,
   ThreadId,
@@ -13552,6 +13553,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
+    // A missing acknowledgement cannot prove that preparation did not admit this input.
+    // Keep the claimed generation until acceptance or a definite rejection is reconciled.
+    if (deliveryRun.failure?.code?.startsWith("provider_prompt_acceptance_") === true) return;
+
     // Local registration sets startedAt before native acceptance. Explicitly
     // unsent failures also hold their replacement until an explicit Resume/send.
     const failure =
@@ -13689,6 +13694,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const delivery = cohort?.delivery;
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
+    if (message?.deliveryFailure !== undefined) {
+      const { deliveryFailure: _deliveryFailure, ...acceptedMessage } = message;
+      yield* emitEvent({
+        type: "message.updated",
+        threadId: command.threadId,
+        occurredAt: now,
+        payload: { ...acceptedMessage, updatedAt: now },
+      });
+    }
     if (
       parentRun === undefined ||
       cohort === undefined ||
@@ -14959,6 +14973,140 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
   );
 
+  const interruptLateProviderTurns = Effect.fn("Orchestrator.interruptLateProviderTurns")(
+    function* (threadId: ThreadId, attemptId: RunAttemptId | null) {
+      const projection = yield* projectionStore.getThreadRecords(
+        threadId,
+        ["runs", "attempts", "providerThreads", "providerTurns", "turnItems"],
+        {
+          turnItemTypes: ["notification", "run_interrupt_request"],
+          ...(attemptId === null ? {} : { providerTurnAttemptId: attemptId }),
+        },
+      );
+      const current = projection.runs
+        .filter(
+          (run) =>
+            run.status === "preparing" ||
+            run.status === "starting" ||
+            run.status === "running" ||
+            run.status === "waiting",
+        )
+        .reduce<OrchestrationV2Run | undefined>(
+          (latest, run) => (latest === undefined || run.ordinal > latest.ordinal ? run : latest),
+          undefined,
+        );
+      for (const turn of projection.providerTurns) {
+        if (turn.status !== "pending" && turn.status !== "running") continue;
+        const attempt = projection.attempts.find((row) => row.id === turn.runAttemptId);
+        const run = projection.runs.find((row) => row.id === attempt?.runId);
+        // Child/background turns may legitimately outlive their root run.
+        if (run === undefined || turn.nodeId !== run.rootNodeId) continue;
+        // A normally completed root can retain native background work. Only a
+        // later native start is orphaned by that completion.
+        if (
+          current === undefined &&
+          run.status === "completed" &&
+          run.completedAt !== null &&
+          turn.startedAt !== null &&
+          DateTime.toEpochMillis(turn.startedAt) <= DateTime.toEpochMillis(run.completedAt)
+        )
+          continue;
+        if (
+          current?.id === run.id &&
+          run.activeAttemptId === attempt?.id &&
+          (run.status === "starting" || run.status === "running" || run.status === "waiting")
+        )
+          continue;
+        const owner = projection.providerThreads.find((row) => row.id === turn.providerThreadId);
+        if (owner?.providerSessionId == null) continue;
+        const itemId = TurnItemId.make(`turn-item:late-start:${turn.id}`);
+        if (projection.turnItems.some((item) => item.id === itemId)) continue;
+        // A Stop that already knew this exact turn owns its cleanup effect.
+        if (
+          projection.turnItems.some(
+            (item) => item.type === "run_interrupt_request" && item.providerTurnId === turn.id,
+          )
+        )
+          continue;
+        const now = yield* DateTime.now;
+        const props = {
+          runId: run.id,
+          providerTurnId: turn.id,
+          providerSessionId: owner.providerSessionId,
+          providerThreadId: owner.id,
+          runStatus: run.status,
+          msAfterRunEnded:
+            run.completedAt === null
+              ? null
+              : Math.max(0, DateTime.toEpochMillis(now) - DateTime.toEpochMillis(run.completedAt)),
+        };
+        yield* eventSink.writeWithEffects({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({
+                threadId,
+                commandId: CommandId.make(`late-start:${turn.id}`),
+              }),
+              type: "turn-item.updated",
+              threadId,
+              runId: run.id,
+              nodeId: turn.nodeId,
+              providerInstanceId: run.providerInstanceId,
+              occurredAt: now,
+              payload: {
+                id: itemId,
+                threadId,
+                runId: run.id,
+                nodeId: turn.nodeId,
+                providerThreadId: owner.id,
+                providerTurnId: turn.id,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: yield* nextTurnItemOrdinal(projection),
+                status: "completed",
+                title: "Stop queued",
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                type: "notification",
+                source: { kind: "system" },
+                outcome: "cancelled",
+                summary: "Stopping a provider turn whose run has ended or been replaced.",
+              },
+            },
+          ],
+          effects: [
+            {
+              id: `effect:late-start:${turn.id}`,
+              commandId: CommandId.make(`late-start:${turn.id}`),
+              threadId,
+              request: {
+                type: "provider-turn.interrupt",
+                stopBackgroundWork: false,
+                providerSessionId: owner.providerSessionId,
+                providerThreadId: owner.id,
+                providerTurnId: turn.id,
+              },
+            },
+          ],
+        });
+        yield* Effect.logWarning("provider_turn.late_start_interrupt_queued", {
+          threadId,
+          ...props,
+        });
+        if (Option.isSome(analytics))
+          yield* recordServerAnalytics(analytics.value, {
+            ts: DateTime.formatIso(now),
+            surface: "server",
+            route: "orchestration",
+            kind: "provider_turn.late_start_interrupt_queued",
+            threadId,
+            props,
+          });
+      }
+    },
+  );
+
   const handleRunUpdate = Effect.fn("Orchestrator.handleRunUpdate")(
     function* (stored: OrchestrationV2StoredEvent) {
       if (stored.event.type !== "run.updated") return;
@@ -14971,6 +15119,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // child lock here would invert that order, and the keyed executor's
       // semaphores are neither reentrant nor deadlock-aware.
       if (delegatedTaskTerminalStatus(run.status) !== null) {
+        yield* threadDispatch.withLock(
+          threadId,
+          interruptLateProviderTurns(threadId, run.activeAttemptId),
+        );
         yield* threadDispatch.withLock(
           threadId,
           finalizeDelegatedCompletionDelivery(threadId, run.id),
@@ -15033,6 +15185,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   // below. Replaying the full event table on every server start delays live
   // queue promotion in proportion to the lifetime size of the database.
   const terminalEventsAfterSequence = yield* eventSink.latestSequence().pipe(Effect.orDie);
+  yield* eventSink
+    .stream({ afterSequence: terminalEventsAfterSequence, eventType: "provider-turn.updated" })
+    .pipe(
+      Stream.filter(
+        (stored) =>
+          stored.event.type === "provider-turn.updated" &&
+          (stored.event.payload.status === "pending" || stored.event.payload.status === "running"),
+      ),
+      Stream.runForEach((stored) =>
+        threadDispatch
+          .withLock(
+            stored.event.threadId,
+            interruptLateProviderTurns(
+              stored.event.threadId,
+              stored.event.type === "provider-turn.updated"
+                ? stored.event.payload.runAttemptId
+                : null,
+            ),
+          )
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Late provider start check failed", {
+                threadId: stored.event.threadId,
+                cause,
+              }),
+            ),
+          ),
+      ),
+      Effect.forkDetach,
+    );
   // Queue promotion can wait on a provider or a thread lock. Subscribe to run
   // updates before buffering so that wait never retains unrelated tool bodies.
   yield* eventSink

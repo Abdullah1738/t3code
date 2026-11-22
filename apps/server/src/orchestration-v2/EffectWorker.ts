@@ -34,6 +34,7 @@ import * as SteerDeliveryFailure from "../ardud/orchestration/SteerDeliveryFailu
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
+import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 
 export class OrchestrationEffectExecutionError extends Schema.TaggedError<OrchestrationEffectExecutionError>()(
   "OrchestrationEffectExecutionError",
@@ -374,9 +375,12 @@ export const layerExecutor: Layer.Layer<
                 providerSessionId: request.providerSessionId,
                 providerThreadId: request.providerThreadId,
                 providerTurnId: request.providerTurnId,
-                ...(request.startTimeout === true
-                  ? { stopBackgroundWork: false, confirmStopped: true }
-                  : {}),
+                ...(request.stopBackgroundWork !== undefined
+                  ? { stopBackgroundWork: request.stopBackgroundWork }
+                  : request.startTimeout === true
+                    ? { stopBackgroundWork: false }
+                    : {}),
+                ...(request.startTimeout === true ? { confirmStopped: true } : {}),
                 ...(request.startingRun === undefined ? {} : { startingRun: request.startingRun }),
                 ...(request.replacementProviderSessionId === undefined
                   ? {}
@@ -437,6 +441,7 @@ export const layerExecutor: Layer.Layer<
                 ),
                 Effect.andThen((outcome) =>
                   request.startTimeout === true ||
+                  request.stopBackgroundWork === false ||
                   (request.subagent !== undefined && outcome === undefined)
                     ? Effect.void
                     : threads.dispatch({
@@ -458,7 +463,11 @@ export const layerExecutor: Layer.Layer<
                 ),
                 Effect.tap(() =>
                   Effect.gen(function* () {
-                    if (request.stopThroughRunOrdinal === undefined) return;
+                    if (
+                      request.stopBackgroundWork === false ||
+                      request.stopThroughRunOrdinal === undefined
+                    )
+                      return;
                     yield* providerSessions.stopBackgroundWork({
                       threadId: effect.threadId,
                       throughRunOrdinal: request.stopThroughRunOrdinal,
@@ -579,7 +588,12 @@ export const layerExecutor: Layer.Layer<
                 ),
                 Effect.catch((error) =>
                   Effect.gen(function* () {
-                    if (providerAccepted) return yield* error;
+                    // Recovery reads must not replace the failure that forbids resubmission.
+                    if (
+                      providerAccepted ||
+                      makeProviderFailure({ cause: error }).retryable === false
+                    )
+                      return yield* error;
                     const sessionEnded =
                       followUpPending ||
                       ("cause" in error && isProviderSessionEndedError(error.cause)) ||
@@ -681,22 +695,29 @@ export const layerExecutor: Layer.Layer<
                       );
                   }),
                 ),
-                Effect.tapError(() =>
+                Effect.tapError((error) => {
+                  const failure = makeProviderFailure({ cause: error });
                   // Mailbox bookkeeping can fail after the provider accepted the input.
-                  willRetry || providerAccepted || followUpPending
-                    ? Effect.void
-                    : SteerDeliveryFailure.persist(effect).pipe(
-                        Effect.provideService(EventSink.EventSinkV2, eventSink),
-                        Effect.provideService(ProjectionStore.ProjectionStoreV2, projections),
-                        Effect.retry({ times: 2 }),
-                        Effect.catchCause(() =>
-                          Effect.logWarning(
-                            "orchestration-v2.effect-worker.steer-delivery-notice-failed",
-                            { effectId: effect.id, threadId: effect.threadId },
-                          ),
-                        ),
+                  if (
+                    providerAccepted ||
+                    ((willRetry || followUpPending) && failure.retryable !== false)
+                  )
+                    return Effect.void;
+                  return SteerDeliveryFailure.persist(
+                    effect,
+                    failure.retryable === false ? failure : undefined,
+                  ).pipe(
+                    Effect.provideService(EventSink.EventSinkV2, eventSink),
+                    Effect.provideService(ProjectionStore.ProjectionStoreV2, projections),
+                    Effect.retry({ times: 2 }),
+                    Effect.catchCause(() =>
+                      Effect.logWarning(
+                        "orchestration-v2.effect-worker.steer-delivery-notice-failed",
+                        { effectId: effect.id, threadId: effect.threadId },
                       ),
-                ),
+                    ),
+                  );
+                }),
                 Effect.mapError(
                   (cause) =>
                     new OrchestrationEffectExecutionError({
@@ -1404,6 +1425,10 @@ export const layerWithOptions = (
             return true;
           }
           const error = Cause.pretty(exit.cause);
+          // An unconfirmed steer may still be admitted after its HTTP request ends.
+          const uncertainSteer =
+            effect.request.type === "provider-turn.steer" &&
+            makeProviderFailure({ cause: exit.cause }).retryable === false;
           const nonRetryable =
             !(effect.request.type === "provider-turn.interrupt" && effect.request.startTimeout) &&
             isNonRetryableProviderTurnControlFailure(effect.request.type, error);
@@ -1418,10 +1443,11 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : !durableRecovery &&
-                !recoveringSteer &&
-                effect.attemptCount >=
-                  (acceptance || acceptedSteer ? maxAcceptedAttempts : maxAttempts)
+            : (!acceptance && !acceptedSteer && uncertainSteer) ||
+                (!durableRecovery &&
+                  !recoveringSteer &&
+                  effect.attemptCount >=
+                    (acceptance || acceptedSteer ? maxAcceptedAttempts : maxAttempts))
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))

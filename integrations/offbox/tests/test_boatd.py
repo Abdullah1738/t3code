@@ -873,7 +873,7 @@ class Http(Base):
         self.assertEqual(st, 200)
         self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "degraded", "disk", "disk_full", "disk_low", "host", "loops", "mdraid", "mode", "ok", "phase", "pool", "problem", "queue", "reasons",
                                      "refresh_stage", "refresh_stage_ms", "refresh_timings_ms", "restartPending", "running", "snapshot_age_s",
-                                     "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
+                                     "startedAt", "starting", "startupPhases", "up", "uptime_s", "version", "waiting"])
         self.assertNotIn("moni", json.dumps(d))
         self.assertNotIn("bx_", json.dumps(d))
 
@@ -945,6 +945,43 @@ class Http(Base):
                         self.assertEqual(data, content[offset:offset + (1 << 20)])
                         self.assertEqual(page["nextOffset"], offset + len(data))
                         self.assertEqual(page["done"], status == "exited" and page["nextOffset"] >= page["size"])
+
+    def test_node_setup_comes_from_current_host_invocation(self):
+        bid = self.box()
+        self.cmd(bid, pid=1001, status='running')
+        journal = boatd.cmd_dir(bid) / '1001.2.invocations.json'
+        self.con.execute("UPDATE commands SET attempt=2 WHERE box_id=? AND pid=1001", (bid,))
+        self.con.commit()
+        for body, expected in ((None, None), ('broken', None), ('[]', None),
+                               ('[{"stderr_offset":true}]', None),
+                               ('[{"stderr_offset":-1}]', None),
+                               ('[{"stderr_offset":12},{"stderr_offset":345}]', 345)):
+            with self.subTest(body=body):
+                if body is not None:
+                    journal.write_text(body)
+                status = boatd.cmd_status_json(self.con, bid, 1001)
+                self.assertEqual(status['nodeSetup'], dict(stderrOffset=expected))
+                st, page = self.call('ardud', 'GET',
+                    f'/sandboxes/{bid}/command-history/cmd_1001/logs?stream=stderr&offset=0')
+                self.assertEqual(st, 200)
+                self.assertEqual(page['attempt'], 2)
+                self.assertEqual(page['nodeSetup'], dict(stderrOffset=expected))
+
+    def test_attach_frames_include_current_invocation_boundary(self):
+        bid = self.box()
+        self.cmd(bid, pid=1001, status='exited')
+        self.con.execute("UPDATE commands SET attempt=2 WHERE box_id=? AND pid=1001", (bid,))
+        directory = boatd.cmd_dir(bid)
+        (directory / '1001.2.invocations.json').write_text('[{"stderr_offset":12}]')
+        (directory / '1001.err').write_bytes(b'old attempt\nnew setup\n\xff')
+        request = urllib.request.Request(self.url + f'/sandboxes/{bid}/commands/1001/stream',
+                                         headers={'Authorization': 'Bearer ' + self.tok['ardud']})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            frames = [json.loads(line) for line in response]
+        self.assertEqual([f['type'] for f in frames], ['hello', 'stderr', 'stderr', 'exit'])
+        for frame in frames[:-1]:
+            self.assertEqual((frame['attempt'], frame['nodeSetup']), (2, dict(stderrOffset=12)))
+            self.assertEqual(frame['commandId'], 'cmd_1001')
 
     def test_running_history_page_limit_preserves_utf8_and_advances_by_offset(self):
         bid = self.box()
@@ -1111,9 +1148,14 @@ unused devices: <none>
         b = self.box()
         self.cmd(b, pid=1, status="queued")
         self.cmd(b, pid=2, status="running")
+        self.con.execute("UPDATE commands SET created_at=? WHERE pid=1", (boatd.now(),))
         h = boatd.health(fresh=True)
         self.assertEqual((h["ok"], h["mode"], h["reasons"], h["pool"]), (True, "ok", [], {"name": "offbox", "state": "ONLINE"}))
         self.assertEqual((h["queue"], h["running"], h["boot_id"], h["version"]), (1, 1, "boot-2", boatd.VERSION))
+        # A run that has only just arrived is queued but not yet waiting for capacity.
+        self.assertEqual(h["waiting"], 0)
+        self.con.execute("UPDATE commands SET created_at=? WHERE pid=1", (boatd.now() - boatd.WAITING_AFTER_S - 1,))
+        self.assertEqual(boatd.health(fresh=True)["waiting"], 1)
 
     def test_pending_restarts_expose_only_count_and_utc_timestamp(self):
         record = self.tmp / "restart-pending.json"

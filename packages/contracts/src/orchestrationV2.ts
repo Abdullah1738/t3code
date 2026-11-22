@@ -1242,6 +1242,8 @@ const assistantPhaseField = Schema.optional(OrchestrationV2AssistantPhase).pipe(
 );
 
 export const OrchestrationV2ConversationMessage = Schema.Struct({
+  /** Acceptance lost during steering belongs to this input, not the active run. */
+  deliveryFailure: Schema.optional(Schema.suspend(() => OrchestrationV2ProviderFailure)),
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
   scheduledTaskId: Schema.optional(ScheduledTaskId),
@@ -1420,6 +1422,7 @@ export const OrchestrationV2ProviderFailureCategory = Schema.Literals([
   "model_invalid",
   "context_exhausted",
   "content_filter",
+  "persistence",
   "unknown",
 ]);
 export type OrchestrationV2ProviderFailureCategory =

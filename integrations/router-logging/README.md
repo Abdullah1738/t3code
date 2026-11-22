@@ -17,6 +17,25 @@ guard sends one local Telegram alert after two minutes down and a recovery note
 using the same incident key prefix. Delivery retries retain that key across guard
 restarts. The HTTP snapshot runs in a separate child every five minutes.
 
+Unknown transitions retain the router's `launchctlExit` (numeric, `timeout`,
+or `oserror`) and at most 240 characters of trimmed, redacted stderr.
+`listener.unknownByCause` groups their first observed outcome as
+`launchctl_unknown:<exit>`; legacy windows without that evidence use `other`.
+`observer.gap` and `guard.tick_late` describe late observer work separately.
+A `sleep_gap` needs a suspend-aware clock discrepancy, not just a wall-clock
+jump. `agent_not_running` needs a recorded stopped/absent observer.
+
+`poll.phases` emits once per poll if an exclusive phase exceeds 30 seconds
+(or the total exceeds two minutes). Its fields split history scan/parse,
+listener/pool history, report writes, state saves, NDJSON writes (`logWriteMs`),
+lock waits and HTTP work;
+nested work is not counted twice. `log.rollup` now measures only that rollup
+call. `pool-alerts` emits `pool.endpoint.get` for its independent fetches.
+`pollGaps`/`guardGaps` number measured spans over two minutes, clipped for daily
+duration totals. `coverage` explains threshold-only `healthByHour`, exhaustion
+episodes in `pools`, and missing legacy observer measurements.
+Finalized days are refreshed when late observer completions add a gap overlap.
+
 `~/.local/state/9router/deploy.json` coordinates the guard with the router's
 installer and release script. Only a `status: running` marker younger than five
 minutes suppresses repair; failed markers permit repair immediately. A failed

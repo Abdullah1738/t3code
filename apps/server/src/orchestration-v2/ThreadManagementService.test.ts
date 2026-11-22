@@ -2583,3 +2583,117 @@ it.effect("preserves a saved selection when the final foreground pre-check fails
     expect(call.saved).toBe("unknown");
   }).pipe(Effect.provide(harness.layerTest));
 });
+
+it.effect.each([
+  "recorded",
+  "stale-pending-native",
+  "stale-running-native",
+  "stale-idle",
+  "stale-no-probe",
+  "protocol-error",
+  "native",
+  "idle",
+  "new-run",
+] as const)("Stop without an active run handles an orphan through the adapter: %s", (kind) => {
+  const threadId = ThreadId.make(`thread:orphan:${kind}`);
+  const projectId = ProjectId.make("project:orphan");
+  const commandId = CommandId.make(`command:orphan:${kind}`);
+  const providerThreadId = ProviderThreadId.make("provider-thread:orphan");
+  const providerSessionId = ProviderSessionId.make("provider-session:orphan");
+  const turnId = ProviderTurnId.make("provider-turn:orphan");
+  const calls: string[] = [];
+  let reads = 0;
+  const layerTest = ThreadManagementService.layer.pipe(
+    Layer.provide(
+      Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+        get: () =>
+          Effect.succeed(
+            Option.some({
+              interruptTurn: ({
+                providerTurnId,
+              }: Parameters<ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"]>[0]) =>
+                Effect.gen(function* () {
+                  calls.push(providerTurnId);
+                  if (kind.startsWith("stale"))
+                    return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+                      driver: ProviderDriverKind.make("codex"),
+                      providerThreadId,
+                      providerTurnId,
+                    });
+                  if (kind === "protocol-error")
+                    return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: ProviderDriverKind.make("codex"),
+                      detail: "native transport failed",
+                    });
+                }),
+              ...(kind === "stale-no-probe"
+                ? {}
+                : {
+                    interruptOrphanedTurn: () =>
+                      Effect.sync(() => {
+                        calls.push("probe");
+                        return kind === "native" || kind.endsWith("-native");
+                      }),
+                  }),
+            } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime),
+          ),
+      }),
+    ),
+    Layer.provide(
+      Layer.mock(Orchestrator.OrchestratorV2)({
+        getThreadRecords: () =>
+          Effect.sync(() => {
+            reads++;
+            return {
+              thread: { id: threadId, projectId, deletedAt: null },
+              runs: [
+                { id: RunId.make("run:orphan"), ordinal: 1, status: "interrupted" },
+                ...(kind === "new-run" && reads > 1
+                  ? [{ id: RunId.make("run:new"), ordinal: 2, status: "running" }]
+                  : []),
+              ],
+              providerThreads: [{ id: providerThreadId, providerSessionId, ownerNodeId: null }],
+              providerTurns:
+                kind === "recorded" || kind.startsWith("stale") || kind === "protocol-error"
+                  ? [
+                      {
+                        id: turnId,
+                        providerThreadId,
+                        status: kind === "stale-pending-native" ? "pending" : "running",
+                      },
+                    ]
+                  : [],
+            } as unknown as OrchestrationV2ThreadProjection;
+          }),
+      }),
+    ),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerReceiptsTest),
+  );
+  return Effect.gen(function* () {
+    const service = yield* ThreadManagementService.ThreadManagementService;
+    const result = yield* service
+      .interruptThread({ projectId, threadId, commandId })
+      .pipe(Effect.result);
+    if (kind === "stale-no-probe" || kind === "protocol-error") {
+      expect(result._tag).toBe("Failure");
+      expect(calls).toEqual([turnId]);
+      return;
+    }
+    if (result._tag === "Failure") return expect.fail(String(result.failure));
+    expect(result.success.type).toBe(
+      kind === "recorded" || kind === "native" || kind.endsWith("-native")
+        ? "orphan_turn_interrupted"
+        : "no_active_run",
+    );
+    expect(calls).toEqual(
+      kind === "recorded"
+        ? [turnId]
+        : kind.startsWith("stale")
+          ? [turnId, "probe"]
+          : kind === "new-run"
+            ? []
+            : ["probe"],
+    );
+  }).pipe(Effect.provide(layerTest));
+});

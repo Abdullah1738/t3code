@@ -653,6 +653,7 @@ async function tickWatcher(id: string): Promise<void> {
   let slotTiming: SlotTiming | undefined;
   let probe: { pausedAt: string; attempt: number; previousNextAt: string } | undefined;
   const dueAt = probing ? Date.parse(state.failure_probe_next_at!) : triggered || finalCheck || !state.next_at || state.next_at < 0 ? t : state.next_at;
+  const scheduledAt = Number.isFinite(dueAt) && dueAt > 0 && !triggered && !finalCheck && (probing || (state.next_at ?? 0) > 0) ? iso(dueAt) : "";
   const lane = checkLane(state.last_run_ms);
   const trigger = finalCheck ? "final" : state.consecutive_failures || state.load_timeouts ? "retry" : triggered ? "trigger" : "schedule";
   let lateMs = 0, loadModeAtAdmission = false;
@@ -698,7 +699,7 @@ async function tickWatcher(id: string): Promise<void> {
     timing.startLateMs = Math.max(0, now() - dueAt);
     slotStart(current, timing, "check", runId);
     if (state.consecutive_failures || state.load_timeouts) toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id, run: runId }, props: { action: "check", attempt: state.consecutive_failures + 1 } });
-    return runCheck(current, watcherDir(id), { HEALTH_TOOLLOG_TRIGGER: state.consecutive_failures || state.load_timeouts ? "retry" : "schedule", WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
+    return runCheck(current, watcherDir(id), { HEALTH_TOOLLOG_SCHEDULED_AT: scheduledAt, HEALTH_TOOLLOG_TRIGGER: state.consecutive_failures || state.load_timeouts ? "retry" : "schedule", WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
     });
   }, { watcher: id, run: attemptId, operation: "check", intervalMs: watcher.interval_s * 1_000,
     dueAt, lane });

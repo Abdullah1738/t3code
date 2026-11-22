@@ -202,6 +202,8 @@ def _log_request(a, me):
 
 
 def cmd_run(a, me) -> int:
+    from .runs import validate_node_override
+    validate_node_override(a)
     if not getattr(a, "log_requested", False):
         _log_request(a, me)
     a.log_fallback = False
@@ -476,6 +478,9 @@ def _main(argv: list[str] | None = None) -> int:
     from .identity import whoami
     from .redact import redact_argv, warn_env_values
     try:
+        if a.sub == "run":
+            from .runs import validate_node_override
+            validate_node_override(a)
         if a.sub == "log-rollup":
             print(json.dumps(toollog.rollup(a.day, live_only=a.live_only), sort_keys=True))
             return 0

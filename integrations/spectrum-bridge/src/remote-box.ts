@@ -1,6 +1,7 @@
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { createPublicKey, createHmac } from "node:crypto";
 import { toolLog } from "./toollog.ts";
+import { traceLoopOperation } from "./loop-stall.ts";
 import { readFileSync } from "node:fs";
 import { Store } from "./store.ts";
 import { jsonBody, opaqueId, seal, tokenMatches, validId, type Fetch, type Sealed } from "./remote-protocol.ts";
@@ -12,7 +13,7 @@ import type { ChatMirror } from "./mirror.ts";
 export type RemoteBoxConfig = { kind: "remote-box"; url: string; tokenFile: string; callbackTokenFile: string;
   publicKeyFile: string; boxRouterPort?: number; macRouterPort?: number; callbackPort: number; epoch: string; boxId: string;
   noticeAfterMs?: number; outageClearMs?: number; noticeMinGapMs?: number; wakeFenceAutoFailMs?: number; mirror?: boolean };
-type Outage = { id: string; unreachableSince: number | null; reachableSince: number | null; noticeAttempted?: boolean };
+type Outage = { id: string; unreachableSince: number | null; reachableSince: number | null; noticeAttempted?: boolean; downAt?: number; failedProbes?: number };
 type Fence = { id: string; since: number; queuedBehind: number };
 type FenceAlert = { key: string; text: string };
 type WaitingNotice = { id: string; since: number; attempted?: boolean };
@@ -97,7 +98,7 @@ export class RemoteBox {
   private backendState() {
     this.nextStateLog = this.now() + 300_000;
     this.emit("moni-box-backend-state", undefined, undefined, { backend: "remote-box", active: this.io.active(), busy: this.busy,
-      queuedBehind: this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n,
+      queuedBehind: traceLoopOperation("remote.queue-depth", () => this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n),
       fenced: !!this.store.get("remoteFence"), count: this.failures });
   }
   checkUnanswered(now = this.now()): Promise<void> { return this.unanswered.check(now); }
@@ -266,8 +267,8 @@ export class RemoteBox {
     }
   }
   private waiting() {
-    return this.store.db.query<{ id: string; received_at: number }, []>(`SELECT id,received_at FROM remote_inbox
-      WHERE kind='inbound' AND finished_at IS NULL ORDER BY received_at,seq LIMIT 1`).get();
+    return traceLoopOperation("remote.unanswered", () => this.store.db.query<{ id: string; received_at: number }, []>(`SELECT id,received_at FROM remote_inbox
+      WHERE kind='inbound' AND finished_at IS NULL ORDER BY received_at,seq LIMIT 1`).get());
   }
   private finish(id: string) {
     this.store.db.transaction(() => {
@@ -319,15 +320,19 @@ export class RemoteBox {
     if (this.busy || this.now() < this.nextProbe || !this.io.active()) return;
     this.busy = true;
     let healthy = false, dependenciesReady = true;
+    let step = "lease", requestStarted = this.now(), requestEnded: number | undefined;
     try {
       const status = await this.request("/lease", { epoch: this.config.epoch, boxId: this.config.boxId });
+      requestEnded = this.now(); step = "identity";
       if (status.boxId !== this.config.boxId || status.epoch !== this.config.epoch) throw new Error("Box identity mismatch");
       dependenciesReady = status.routerReady !== false && status.callbackReady !== false;
       this.failures = 0;
-      const rows = this.store.db.query<{ id: string; seq: number; sealed: string; expires_at: number | null }, [number]>("SELECT id,seq,sealed,expires_at FROM remote_inbox WHERE sealed IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) ORDER BY seq LIMIT 50").all(this.now());
+      const rows = traceLoopOperation("remote.pending", () => this.store.db.query<{ id: string; seq: number; sealed: string; expires_at: number | null }, [number]>("SELECT id,seq,sealed,expires_at FROM remote_inbox WHERE sealed IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) ORDER BY seq LIMIT 50").all(this.now()));
       let delivered = 0;
       for (const row of rows) {
+        step = "deliver"; requestStarted = this.now(); requestEnded = undefined;
         const ack = await this.request("/deliver", { id: row.id, sealed: JSON.parse(row.sealed) as Sealed, epoch: this.config.epoch, expiresAt: row.expires_at });
+        requestEnded = this.now(); step = "ack";
         if (ack.id !== row.id || ack.accepted !== true) throw new Error("Invalid box acknowledgement");
         this.store.db.query("UPDATE remote_inbox SET sealed=NULL,delivered_at=COALESCE(delivered_at,?) WHERE id=?").run(this.now(), row.id);
         delivered++;
@@ -336,25 +341,34 @@ export class RemoteBox {
       if (outage) {
         outage.unreachableSince = null;
         outage.reachableSince ??= this.now();
-        if (this.now() - outage.reachableSince >= (this.config.outageClearMs ?? 300_000)) {
-          this.emit("moni-box-up"); this.store.set("remoteOutage", null);
+        const clearMs = this.config.outageClearMs ?? 300_000;
+        if (this.now() - outage.reachableSince >= clearMs) {
+          this.emit("moni-box-up", undefined, undefined, { clearMs,
+            ...(outage.downAt === undefined ? {} : { unreachableMs: outage.reachableSince - outage.downAt }),
+            ...(outage.failedProbes === undefined ? {} : { failedProbes: outage.failedProbes }) });
+          this.store.set("remoteOutage", null);
         } else this.store.set("remoteOutage", outage);
       }
       if (delivered) this.emit("moni-queue-delivered", `n=${delivered}`);
-      this.emit("moni-queue-depth", `n=${this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n}`);
+      this.emit("moni-queue-depth", `n=${traceLoopOperation("remote.queue-depth", () => this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n)}`);
       this.nextProbe = this.now() + 5_000;
       healthy = true;
-    } catch {
+    } catch (error) {
+      const props = { step, ...(error instanceof RemoteRequestError ? { status: error.status } : {}),
+        errorClass: error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name) ? "Timeout" : error?.constructor?.name ?? typeof error,
+        latencyMs: (requestEnded ?? this.now()) - requestStarted };
       const saved = this.store.get<Outage | null>("remoteOutage");
       // A stall notice reserves the transport outage too, even after its waiting episode ends.
       const outage: Outage = saved ?? { id: opaqueId(String(this.now())), unreachableSince: this.now(), reachableSince: null,
+        downAt: this.now(),
         noticeAttempted: this.store.get<WaitingNotice | null>("remoteWaitingNotice")?.attempted === true };
       outage.unreachableSince ??= this.now(); outage.reachableSince = null;
+      outage.failedProbes = (outage.failedProbes ?? 0) + 1;
       this.store.set("remoteOutage", outage);
-      if (!saved) this.emit("moni-box-down");
+      if (!saved) this.emit("moni-box-down", undefined, undefined, props);
       await this.noticeWaiting();
       this.nextProbe = this.now() + Math.min(60_000, 1_000 * 2 ** Math.min(++this.failures, 6));
-      this.emit("moni-runner-error", "unreachable");
+      this.emit("moni-runner-error", undefined, undefined, { code: "unreachable", ...props, failures: this.failures });
     } finally { this.busy = false; }
     // Observational requests must not hold up lease renewal, including while Telegram is stalled.
     const delivery = healthy ? this.checkDeliveries() : undefined;
@@ -374,7 +388,7 @@ export class RemoteBox {
     if (this.deliveryBusy || !this.io.active()) return;
     this.deliveryBusy = true;
     try {
-      const waiting = this.store.db.query<{ id: string; expires_at: number }, []>("SELECT id,expires_at FROM remote_inbox WHERE picked_up_at IS NULL AND expires_at IS NOT NULL AND delivery_final IS NULL ORDER BY COALESCE(delivery_checked_at,0),seq LIMIT 50").all();
+      const waiting = traceLoopOperation("remote.expiry", () => this.store.db.query<{ id: string; expires_at: number }, []>("SELECT id,expires_at FROM remote_inbox WHERE picked_up_at IS NULL AND expires_at IS NOT NULL AND delivery_final IS NULL ORDER BY COALESCE(delivery_checked_at,0),seq LIMIT 50").all());
       if (!waiting.length) return;
       const probedAt = this.now();
       const status = await this.request("/delivery-status", { ids: waiting.map(r => r.id), deadlines: waiting.map(r => ({ id: r.id, expiresAt: r.expires_at })), epoch: this.config.epoch });
@@ -414,7 +428,7 @@ export class RemoteBox {
     }
   }
   async send(id: string, text: string, mediaUrl: string | undefined, line: Line, chat: ChatKey): Promise<{ id: string; handle: string }> {
-    const row = this.store.db.query<{ at: number; state: string; handle: string }, [string]>("SELECT * FROM remote_sends WHERE id=?").get(id);
+    const row = traceLoopOperation("remote.reply", () => this.store.db.query<{ at: number; state: string; handle: string }, [string]>("SELECT * FROM remote_sends WHERE id=?").get(id));
     if (row?.state === "sent") {
       this.io.mirror?.outbound(id, text, mediaUrl, row.at);
       return { id, handle: row.handle };

@@ -671,6 +671,53 @@ class ToolLogTests(unittest.TestCase):
         path.write_text(''.join(json.dumps({**base, **row}) + '\n' for row in rows))
         return toollog.rollup('agent-tools', self.day, top_n)
 
+    def test_error_tags_by_hour_and_top_classifier_failures(self):
+        failed = lambda hour, props: {'ts': f'{self.day}T{hour}:05:00Z', 'error': {'tag': 'hook.classifier_failed'},
+                                      'props': {'decision': 'allowed', 'rule': 'classifier-unavailable', **props}}
+        rows = ([failed('13', {'guard': 'rootwide-search', 'classifier': 'rootwide_search_guard', 'errorClass': 'timeout'})] * 3
+                + [failed('13', {'guard': 'rootwide-search', 'classifier': 'rootwide_search_guard', 'errorClass': 'exit:1'})]
+                + [failed('02', {'guard': 'quint-verify', 'classifier': 'quint_verify_guard', 'errorClass': 'timeout'})] * 2
+                + [failed('02', {'guard': 'phone-adb'})]
+                + [failed('02', {'guard': 'shared-dependencies', 'classifier': f'c{i}', 'errorClass': 'parse'}) for i in range(4)]
+                + [{'ts': f'{self.day}T11:59:59Z', 'error': {'tag': 'phone-adb-state'},
+                    'props': {'decision': 'denied', 'rule': 'phone-adb-state', 'holder': 'other', 'source': 'test'}}] * 5
+                + [{'ts': 'not-a-time', 'error': {'tag': 'phone-adb-state'}, 'props': {'decision': 'denied', 'rule': 'phone-adb-state'}},
+                   {'ts': f'{self.day}T11:00:00Z', 'kind': 'perf', 'ok': True, 'props': {'decision': 'allowed', 'rule': 'x'}}])
+        result = self.hook_rollup(rows)
+        self.assertEqual(result['errorTagsByHour'], {'hook.classifier_failed': {'02': 7, '13': 4},
+                                                     'phone-adb-state': {'11': 5, '??': 1}})
+        self.assertEqual(list(result['errorTagsByHour']), ['hook.classifier_failed', 'phone-adb-state'])
+        self.assertEqual(result['topClassifierFailures'], [
+            {'classifier': 'rootwide_search_guard', 'count': 4, 'errorClasses': {'timeout': 3, 'exit:1': 1}},
+            {'classifier': 'quint_verify_guard', 'count': 2, 'errorClasses': {'timeout': 2}},
+            {'classifier': 'c0', 'count': 1, 'errorClasses': {'parse': 1}},
+            {'classifier': 'c1', 'count': 1, 'errorClasses': {'parse': 1}},
+            {'classifier': 'c2', 'count': 1, 'errorClasses': {'parse': 1}}])
+        self.assertEqual(sum(r['count'] for r in toollog.rollup('agent-tools', self.day, 20)['topClassifierFailures']), 9)
+        # Older rows without a classifier still rank under their guard.
+        only_old = self.hook_rollup([failed('05', {'guard': 'phone-adb'})])
+        self.assertEqual(only_old['topClassifierFailures'],
+                         [{'classifier': 'guard:phone-adb', 'count': 1, 'errorClasses': {'unrecorded': 1}}])
+        table = toollog.hourly_table(result).splitlines()
+        self.assertEqual(table[0].split()[:3] + table[0].split()[-2:], ['tag', '00', '01', '23', 'total'])
+        self.assertEqual(table[1].split()[0], 'hook.classifier_failed')
+        self.assertEqual(table[1].split()[-1], '11')
+        self.assertEqual(table[1].split()[1 + 2], '7')
+        self.assertEqual(table[1].split()[1 + 13], '4')
+        self.assertIn('classifier_failed rootwide_search_guard: 4 (timeout 3, exit:1 1)', table)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(toollog.main(['rollup', '--board', 'agent-tools', '--day', self.day, '--table']), 0)
+        printed = out.getvalue().splitlines()
+        self.assertTrue(printed[0].endswith('rollup-' + self.day + '.json'))
+        self.assertEqual(printed[1:], toollog.hourly_table(json.loads(Path(printed[0]).read_text())).splitlines())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            toollog.main(['rollup', '--board', 'agent-tools', '--day', self.day])
+        self.assertEqual(len(out.getvalue().splitlines()), 1)
+        orders = toollog.rollup('orders', self.day)
+        self.assertNotIn('errorTagsByHour', orders)
+
     def test_sampled_allowed_is_not_a_refusal(self):
         result = self.hook_rollup([{'kind': 'perf', 'ok': True,
             'props': {'rule': 'retry', 'decision': 'allowed', 'sampleRate': 128}}])
