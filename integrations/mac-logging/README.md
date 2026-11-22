@@ -797,11 +797,22 @@ Records retain PID, PPID, up to four ancestor PID/name pairs, cwd, elapsed
 seconds and CPU percent from matching consecutive process identities (null on
 baseline). `argv` holds executable and resolved filesystem operands only;
 patterns, find expressions and option values are omitted. Paths are retained
-without the general logger's home/secret-word replacement. A parent-visible
-project/UUID thread identifier in a recognized `t3ctl` identity operand is
-retained; shell programs and query text never supply identity. It is null
-when no such operand is visible. The checked agent
-shell had no T3/ROBOB thread-id environment key. Raw argv stays out of CPU state.
+without the general logger's home/secret-word replacement. A project/UUID thread
+identifier in a recognized `t3ctl`
+identity operand or the exact `ROBOB_THREAD_ID` environment key is retained;
+shell programs and query text never supply identity. `providerPid` and `provider`
+identify the nearest Claude, Codex or OpenCode ancestor below Robob (including
+known Node CLI entry points). `providerSessionId` accepts explicit UUID session
+arguments and OpenCode `ses_` identifiers. Codex app-server and OpenCode server
+processes have null session/thread identifiers with `providerSessionAmbiguous=true`.
+The checked live Claude processes expose `--resume=<uuid>` or
+`--session-id=<uuid>`; their named environment key was absent. `t3ctl native`
+can resolve a logged provider session ID later; the sampler makes no API calls.
+Parsed identifiers and scan operands are cached in CPU state for at most 512
+processes, keyed by PID, snapshot start time, PPID, UID and executable name.
+Each cache miss joins the existing bounded argv batch; failed reads are cached
+until identity changes or eviction. Exited processes leave the cache. Raw argv,
+prompts, settings and other environment values stay out of CPU state.
 Lines are capped at 8 KiB by dropping trailing operands with `argvOmitted`.
 Oversized cwd/thread strings become null with `stringsOmitted`; parent names
 are bounded. Unknown option arity skips classification instead of guessing
