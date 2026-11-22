@@ -735,6 +735,10 @@ def disk_maintenance(con, error=None):
             finally:
                 cleanup['last_delete_at'] = now()
                 con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk_cleanup',?)", (json.dumps(cleanup),))
+            if result.returncode == 75:
+                toollog.emit('boatd', 'snapshot.yield', ok=True, ids={'box': row['box']},
+                             props={'snapshot': row['name'], 'reason': 'incus_busy'})
+                break
             missing = result.returncode != 0 and b'not found' in result.stderr.lower()
             if missing:
                 missing_snapshots.add((row['box'], row['name']))
@@ -1026,6 +1030,8 @@ def delete_instance(box_id: str, owner: str, require_identity: bool = False) -> 
         if require_identity:
             check_instance_identity(box_id)
         deleted = incus('delete', ct(box_id), '--force', timeout=300, check=False)
+        if deleted.returncode == 75:
+            raise Fail(503, 'incus_busy', 'instance deletion deferred before dispatch')
         if deleted.returncode and not instance_missing(deleted):
             raise Fail(500, 'incus_failed', 'Incus did not confirm instance deletion')
         scratch().delete(box_id, owner)
@@ -1773,13 +1779,20 @@ def delete_box(con, box_id: str, why: str | None = None, *, stopped_at=None) -> 
                                         (box_id,)).fetchone()
                     if row['state'] != 'archived' or row['stopped_at'] != stopped_at or row['pinned'] or saved:
                         raise Fail(409, 'box_changed', f'{box_id} is no longer the stopped box that was selected')
+                already_pending = con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:' + box_id,)).fetchone()
                 con.execute('INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)', ('delete_pending:' + box_id, '1'))
                 if box_row(con, box_id)['state'] in LIVE + ('provisioning', 'resuming'):
                     set_box(con, box_id, state='stopping')
             settle_box_commands(con, box_id)
             with box_memory_lock(box_id):
                 require_unprotected(con, box_id)
-                _delete_box(con, box_id)
+                try:
+                    _delete_box(con, box_id)
+                except Fail as error:
+                    # An undispatched attempt adds no uncertainty, but cannot clear an earlier delete's fence.
+                    if error.code == 'incus_busy' and not already_pending:
+                        con.execute('DELETE FROM meta WHERE k=?', ('delete_pending:' + box_id,))
+                    raise
                 con.execute('DELETE FROM meta WHERE k=?', ('delete_pending:' + box_id,))
     finally:
         offbox_protection.CALLER.reset(token)
@@ -4048,6 +4061,10 @@ def reap_stopped_box(con, stopped, t):
         try:
             delete_box(con, bid, why, stopped_at=r["stopped_at"])
         except Exception as e:  # noqa: BLE001
+            if isinstance(e, Fail) and e.code == 'incus_busy':
+                toollog.emit('boatd', 'reaper.yield', ok=True, ids={'box': bid},
+                             props={'action': 'delete', 'reason': e.code})
+                return None
             REAP_REFUSED[bid] = t
             toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid},
                          props={"action": "delete", "reason": why, "error": str(e)[:200]}, tag="reaper_delete")
