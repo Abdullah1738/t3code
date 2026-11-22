@@ -59,7 +59,7 @@ const HookPayload = Schema.Struct({
   hook_event_name: Schema.Literal("UserPromptSubmit"),
   session_id: Schema.String,
   prompt: Schema.String,
-  cwd: Schema.String,
+  cwd: Schema.NullOr(Schema.String),
   first_prompt: Schema.Boolean,
 });
 const encodeHookPayload = Schema.encodeSync(Schema.fromJsonString(HookPayload));
@@ -74,7 +74,10 @@ export function antigravityInstructionsBlock(instructions: string): string {
 
 /** The last stdout line that decodes as a hook result carries the context. */
 export function parseHookContext(stdout: string): string | undefined {
-  const lines = stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  const lines = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const decoded = decodeHookOutput(lines[index]!);
     if (decoded._tag === "Some") {
@@ -93,12 +96,14 @@ export interface AntigravityTurnContextOptions {
   readonly baseEnv?: NodeJS.ProcessEnv;
 }
 
-const readBounded = (fileSystem: FileSystem.FileSystem, file: string, maxBytes: number) =>
-  Effect.gen(function* () {
+const readBounded = Effect.fn("AntigravityTurnContext.readBounded")(
+  function* (fileSystem: FileSystem.FileSystem, file: string, maxBytes: number) {
     const info = yield* fileSystem.stat(file);
     if (info.type !== "File" || info.size > BigInt(maxBytes)) return undefined;
     return yield* fileSystem.readFileString(file);
-  }).pipe(Effect.orElseSucceed(() => undefined));
+  },
+  Effect.orElseSucceed(() => undefined),
+);
 
 export function makeAntigravityPromptContext(options: AntigravityTurnContextOptions) {
   const loadConfig = readBounded(options.fileSystem, options.configPath, MAX_CONFIG_BYTES).pipe(
@@ -109,8 +114,8 @@ export function makeAntigravityPromptContext(options: AntigravityTurnContextOpti
     ),
   );
 
-  const runHook = (hook: typeof TurnHook.Type, payload: string) =>
-    Effect.gen(function* () {
+  const runHook = Effect.fn("AntigravityTurnContext.runHook")(
+    function* (hook: typeof TurnHook.Type, payload: string) {
       const timeoutMs = Math.min(
         Math.max(hook.timeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS, 100),
         MAX_HOOK_TIMEOUT_MS,
@@ -137,10 +142,10 @@ export function makeAntigravityPromptContext(options: AntigravityTurnContextOpti
       ).pipe(Effect.timeout(Duration.millis(timeoutMs)));
       if (Number(exitCode) !== 0 || stdout.truncated) return undefined;
       return parseHookContext(stdout.text);
-    }).pipe(
-      Effect.scoped,
-      Effect.catchCause(() => Effect.succeed(undefined)),
-    );
+    },
+    Effect.scoped,
+    Effect.catchCause(() => Effect.succeed(undefined)),
+  );
 
   return (input: AcpPromptContextInput): Effect.Effect<ReadonlyArray<string>> =>
     Effect.gen(function* () {

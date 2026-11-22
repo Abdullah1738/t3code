@@ -76,7 +76,10 @@ describe("Antigravity turn context", () => {
         },
       }));
       const first = yield* context(input());
-      assert.deepEqual(first, [antigravityInstructionsBlock("Rule one."), "<recall>first</recall>"]);
+      assert.deepEqual(first, [
+        antigravityInstructionsBlock("Rule one."),
+        "<recall>first</recall>",
+      ]);
       const later = yield* context(input({ firstPromptInSession: false }));
       assert.deepEqual(later, ["<recall>later</recall>"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
