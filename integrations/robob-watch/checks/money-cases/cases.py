@@ -3534,7 +3534,7 @@ def follow_order_charges(data, now, deadline, find=None, stats=None, end=None, r
 
 @log_scope
 @run_history.record_check
-def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
+def run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *, refresh_owner=True):
     parent = data_io.current_scope()
     stats = parent['stats'] if parent is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
     started = parent['deadline'] - CHECK_BUDGET if parent is not None else time.time()
@@ -3549,11 +3549,27 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                          skip_first_at=skip.get('first_skip_at'))
         # Discover an evicted dependency before any book or ping mutations.
         for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json',
-                     'owner-texts.json', 'msgs-searches.json', 'order-details.json', 'marketplace-placements.json'):
+                     'owner-texts.json', 'owner-snapshot.json', 'owner-refresh.json',
+                     'msgs-searches.json', 'order-details.json', 'marketplace-placements.json'):
             try:
                 data_io.read_text((data or DATA) / name)
             except FileNotFoundError:
                 pass
+        # Start before follow: its union-window read consumes only the previous
+        # complete snapshot, while this independent process warms the next run.
+        from owner_refresh import launch as launch_owner_refresh
+        owner_now = now or dt.datetime.now(TZ)
+        owner_times = []
+        for q in load_questions(data or DATA)['questions']:
+            try:
+                at = parse_time(q['at'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if q.get('kind') == 'charge' and (active(q) or
+                    (q.get('status') == 'case' and owner_now - at <= FOLLOW_CASE)):
+                owner_times.append(at)
+        if refresh_owner and owner_times and said is None:
+            launch_owner_refresh(data or DATA, min(owner_times) - charges.OWNER_AROUND, stats=stats)
         from marketplace import refresh_status
         refresh = refresh_status(data or DATA)
         result = _scoped_run_check(wd, run, data, root, now, find, said, stats, refresh, started)
@@ -3597,6 +3613,7 @@ def _scoped_run_check(wd, run, data, root, now, find, said, stats, marketplace_r
                                 'chargeCensus': diagnostic.get('charge_census', {}),
                                 'marketplace_refresh': marketplace_refresh,
                                 **{key: stats.get(key, 0) for key in (*TIMING_KEYS, *charges.OWNER_TIMING_KEYS)},
+                                **{key: stats[key] for key in charges.OWNER_LOG_KEYS if key in stats},
                                 'owner_result': stats.get('owner_result', 'ok'),
                                 **charges.receipt_timing(stats),
                                 'starved_by': stats.get('starved_by', diagnostic.get('starved_by', 'none'))})
@@ -3814,6 +3831,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                 **{f'{key}_s': round(value, 3) for key, value in phases.items()},
                 **{k: stats[k] for k in ('lookups', 'owner_queries', 'msgs_calls')},
                 **{k: stats.get(k, 0) for k in (*TIMING_KEYS, *charges.OWNER_TIMING_KEYS)},
+                **{k: stats[k] for k in charges.OWNER_LOG_KEYS if k in stats},
                 **{k: stats[k] for k in ('skip_last_file', 'skip_last_reason', 'skip_first_at') if k in stats},
                 'owner_result': stats.get('owner_result', 'ok'),
                 **charges.receipt_timing(stats),
@@ -4006,7 +4024,8 @@ def check_command(wd, run, data):
             copied = wd / 'scratch-books'
             if not copied.exists():
                 contents = {}
-                for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
+                for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json',
+                             'owner-snapshot.json', 'owner-refresh.json'):
                     try:
                         contents[name] = data_io.read_text(data / name)
                     except FileNotFoundError:
@@ -4022,7 +4041,7 @@ def check_command(wd, run, data):
             except BlockingIOError:
                 print('money-cases check already running', file=sys.stderr)
                 raise CheckBusy()
-            return run_check(wd, run, data)
+            return run_check(wd, run, data, refresh_owner=wd.resolve() == LIVE.resolve())
 
 
 @log_cli
@@ -4098,6 +4117,8 @@ def main(argv=None):
             p.add_argument('--' + field.replace('_', '-'), required=operation == 'add' and field == 'merchant')
     sub.add_parser('brief')
     sub.add_parser('check')
+    p = sub.add_parser('owner-refresh')
+    p.add_argument('--since', required=True)
     p = sub.add_parser('runs')
     p.add_argument('--since', default='24h')
     p.add_argument('--json', action='store_true')
@@ -4131,7 +4152,10 @@ def main(argv=None):
     mode.add_argument('--ask', action='store_true')
     args = parser.parse_args(argv)
     try:
-        if args.command == 'runs':
+        if args.command == 'owner-refresh':
+            from owner_refresh import refresh
+            return 0 if refresh(DATA, charges.owner_time(args.since)) in ('ok', 'busy') else 1
+        elif args.command == 'runs':
             try:
                 result = run_history.summary(Path(os.environ.get('WATCH_DIR', LIVE)), args.since)
             except BlockingIOError as exc:

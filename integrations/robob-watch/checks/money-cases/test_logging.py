@@ -63,7 +63,7 @@ class Logging(Base):
         self.assertEqual((HERE / 'toollog.py').read_bytes(), SHARED.read_bytes())
 
     def test_owner_cache_reset_diagnostics_wait_for_book_unlock(self):
-        path = self.data / 'owner-texts.json'
+        path = self.data / 'owner-snapshot.json'
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('corrupt private text')
         held, seen = [], []
