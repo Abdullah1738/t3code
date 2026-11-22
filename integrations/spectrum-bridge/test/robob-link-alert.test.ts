@@ -45,7 +45,7 @@ test("119 s is quiet; 120 s sends once with a private atomic state file", async 
   expect(readdirSync(f.root).filter(file => file.endsWith(".tmp"))).toEqual([]);
 });
 
-test.each([
+const rawSuccessCases: { name: string; props: NonNullable<LogLine["props"]>; recovered: boolean }[] = [
   { name: "legacy", props: {}, recovered: true },
   { name: "gate disabled", props: { linkGated: false }, recovered: true },
   { name: "late request, unspecified gate state", props: { linkGated: true }, recovered: false },
@@ -53,7 +53,8 @@ test.each([
   { name: "request after gate opened", props: { linkGated: true, linkGateDown: false }, recovered: true },
   { name: "probe before gate opens", props: { linkGated: true, linkProbe: true, linkGateDown: true }, recovered: true },
   { name: "probe after gate opens", props: { linkGated: true, linkProbe: true, linkGateDown: false }, recovered: true },
-])("raw success recovery respects $name", async ({ props, recovered }) => {
+];
+test.each(rawSuccessCases)("raw success recovery respects $name", async ({ props, recovered }) => {
   const f = setup(); f.alert.accept(f.down()); f.advance(120_000); await f.alert.tick();
   f.alert.accept({ ...f.success(), props }); await f.alert.tick();
   expect(f.posts).toHaveLength(recovered ? 2 : 1);
