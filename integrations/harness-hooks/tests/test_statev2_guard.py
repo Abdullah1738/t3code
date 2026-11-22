@@ -1930,6 +1930,12 @@ bash "$TASK_DIR/step5r.sh"
         self.assertIn('python: non-isolated startup', cause)
 
     def cwd_fixture(self):
+        # An inherited zsh FPATH voids every same-call writer proof; keep it out
+        # so these rows compare spellings rather than the caller's shell.
+        clean = patch.dict(os.environ)
+        clean.start()
+        self.addCleanup(clean.stop)
+        os.environ.pop('FPATH', None)
         self.write('t/a.test.mjs', "import test from 'node:test'; test('a', () => {});")
         self.write('t/b.test.mjs', "import test from 'node:test'; test('b', () => {});")
         self.write('x.mjs', 'console.log(1)')
@@ -1992,6 +1998,8 @@ bash "$TASK_DIR/step5r.sh"
                 with self.subTest(command=command):
                     rule, cause = guard.classify_detail(command, root)
                     self.assertEqual(rule, expected, cause)
+                    twin = template.replace('{p}', first).replace('{q}', second or first)
+                    self.assertEqual(rule, guard.classify(twin, root))
 
     def test_cwd_derived_live_reads_stay_reads(self):
         self.cwd_fixture()
@@ -1999,6 +2007,11 @@ bash "$TASK_DIR/step5r.sh"
         for path in self.cwd_forms(relative, str(self.root)):
             with self.subTest(path=path):
                 self.assertEqual(self.classify('sqlite3 ' + path + ' .tables'), READ)
+        for live_root in (Path.home() / '.t3/userdata', Path.home() / '.robob/userdata'):
+            for name in ('state.sqlite', 'statev2.sqlite'):
+                for path in self.cwd_forms(name, str(live_root)):
+                    with self.subTest(live_root=live_root, path=path):
+                        self.assertEqual(guard.classify('sqlite3 -readonly ' + path + ' .tables', str(live_root)), READ)
 
     @trusted_node_test
     def test_cwd_derived_paths_stay_unresolved_when_pwd_may_change(self):
@@ -2792,7 +2805,10 @@ bash "$TASK_DIR/step5r.sh"
         for path in ['state.sqlite', '$D/state.sqlite', '${D}/state.sqlite', '~/$D/state.sqlite', '~/*/state.sqlite', '$(pwd)/state.sqlite']:
             command = f'sqlite3 -readonly "{path}" "select 1"'
             with self.subTest(path=path):
-                self.assertEqual(self.classify(command), READ)
+                # $(pwd) names the tracked cwd (#235): it gets its absolute twin's decision.
+                expected = (self.classify(command.replace('$(pwd)', str(self.root))) if path.startswith('$(pwd)')
+                            else READ)
+                self.assertEqual(self.classify(command), expected)
                 script = self.write('tmp/unknown.sh', 'CLI=/Users/ardud/.local/share/tool/cli.ts\n' + command)
                 self.assertEqual(self.classify('zsh ' + shlex.quote(str(script))), SCRIPT)
         for directory in ['~/.robob/userdata', '~/.t3/userdata']:
@@ -7453,7 +7469,7 @@ class LiveDatabaseGuardTests(unittest.TestCase):
 
     def test_unresolved_cwd_denies_explicit_scripts_not_unrelated_binaries(self):
         for command in [
-            'cd "$TARGET" && python3 probe.py', 'cd "$(pwd)" && node probe.mjs',
+            'cd "$TARGET" && python3 probe.py', 'cd "$(git rev-parse --show-toplevel)" && node probe.mjs',
             "cd sub || python3 probe.py", "pushd sub; python3 probe.py",
             'bash -lc \'cd "$TARGET"; python3 probe.py\'',
             "if true; then cd sub; fi; python3 probe.py",
@@ -7463,6 +7479,11 @@ class LiveDatabaseGuardTests(unittest.TestCase):
         for command in ['cd "$TARGET" && npm test', "npm run missing-script", "missing-tool", 'cd "$TARGET" && python3 --version']:
             with self.subTest(command=command):
                 self.assertIsNone(guard.classify(command, str(self.root)))
+        # $(pwd) and $PWD are the tracked cwd (#235), so cd into them changes nothing.
+        for command in ['cd "$(pwd)" && node probe.mjs', 'cd "$PWD" && node probe.mjs']:
+            with self.subTest(command=command):
+                self.assertEqual(guard.classify(command, str(self.root)),
+                                 guard.classify(f'cd {shlex.quote(str(self.root))} && node probe.mjs', str(self.root)))
         event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "session_id": "fixture",
                  "cwd": str(self.root), "tool_input": {"command": 'cd "$TARGET" && python3 probe.py'}}
         with patch.object(engine, "resolve_identity", side_effect=AssertionError("identity called")):
