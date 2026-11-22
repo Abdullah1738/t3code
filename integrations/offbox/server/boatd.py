@@ -106,6 +106,7 @@ DEFAULTS = {
               "xlarge": {"mem": "48GiB", "prio": 7, "vcpu": 16}},
     "mem_reserve_gb": 12,             # admission: keep this much host memory free
     "default_peak_gb": 4,             # admission: predicted peak for a kind with no history
+    "usual_peak_pct": 75,             # admission: percentile of a kind's peaks held for each run (95 = worst case for all)
     "retention": dict(RETENTION),
     "zpool": "offbox",
     "scratch_disk": True,             # new boxes only; keep lifecycle handling enabled on rollback
@@ -2328,21 +2329,45 @@ def async_filter(con) -> str:
     return "sync=0 AND " if "sync" in _cols(con, "commands") else ""
 
 
-def predicted_peak(con, kind: str) -> int:
+def peak_history(con, kind: str) -> list:
     rows = [json.loads(r[0]).get("box_mem_peak") or 0 for r in con.execute(
         f"SELECT metrics FROM commands WHERE {async_filter(con)}kind=? AND metrics IS NOT NULL ORDER BY ended_at DESC LIMIT 50", (kind,))]
-    rows = sorted(x for x in rows if x)
+    return sorted(x for x in rows if x)
+
+
+def peak_at(rows: list, pct: float) -> int:
     if len(rows) < 3:
         return int(CFG["default_peak_gb"] * 2**30)
-    p95 = rows[min(len(rows) - 1, int(0.95 * len(rows)))]
-    return int(p95 * 1.25)
+    return int(rows[min(len(rows) - 1, int(pct / 100 * len(rows)))] * 1.25)
+
+
+def predicted_peak(con, kind: str) -> int:
+    """A kind's worst case. A run starts only when this much is free right now."""
+    return peak_at(peak_history(con, kind), 95)
+
+
+def usual_peak(con, kind: str) -> int:
+    """What a kind usually reaches, held for it while it runs.
+
+    Peaks of one kind spread widely (p95 is about three times the median, even for one command in one repo), so
+    holding the worst case for every run kept most of the host idle: over five days no replay of real runs under
+    that rule came within 7 GiB of the reserve. The reserve absorbs the runs that go past their usual peak."""
+    # Read per look, like the CPU limit: setting 95 after a close call must reach runs that are already queued.
+    try:
+        pct = float(json.loads((ETC / "config.json").read_text()).get("usual_peak_pct", DEFAULTS["usual_peak_pct"]))
+    except FileNotFoundError:
+        pct = DEFAULTS["usual_peak_pct"]
+    except (OSError, TypeError, ValueError, OverflowError, AttributeError):
+        pct = 95
+    rows = peak_history(con, kind)
+    return min(peak_at(rows, pct if 50 <= pct <= 95 else 95), peak_at(rows, 95))
 
 
 def admitted_bytes(con) -> int:
-    """Future anon growth for every running box; existing shmem remains charged to the host."""
+    """Expected anon growth for every running box; existing shmem remains charged to the host."""
     needs = {}
     for r in con.execute(f"SELECT box_id,kind FROM commands WHERE {async_filter(con)}status='running'"):
-        needs[r['box_id']] = max(needs.get(r['box_id'], 0), predicted_peak(con, r['kind']))
+        needs[r['box_id']] = max(needs.get(r['box_id'], 0), usual_peak(con, r['kind']))
     total = 0
     for box, need in needs.items():
         anon = boatd_memory.anon_bytes(cg_path(box))
@@ -2435,7 +2460,7 @@ def queue_head(con, box_id, pid):
 
 def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
     """Wait for this run's FIFO turn and host capacity. Returns seconds queued."""
-    need = predicted_peak(con, kind)
+    need, worst = usual_peak(con, kind), predicted_peak(con, kind)
     reserve = int(CFG["mem_reserve_gb"] * 2**30)
     t0 = now()
     last_reason, last_said = None, None
@@ -2460,8 +2485,15 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                 memory = dict(mem_available=None, shmem=None, committed_bytes=None, committed_as=None,
                               admitted_bytes=None, reserve=reserve, free_bytes=0)
             free = memory['free_bytes']
+            # Free above the reserve before the running boxes' expected growth: the head's own worst case must
+            # fit here, so one run that goes past its usual peak cannot take the reserve by itself.
+            open_now = free + (memory.get('admitted_bytes') or 0)
             mine = head is None or (head['box_id'], head['pid']) == (box_id, pid)
-            head_need = need if mine else predicted_peak(con, head['kind'])
+            head_kind = kind if mine else head['kind']
+            head_need, head_worst = usual_peak(con, head_kind), predicted_peak(con, head_kind)
+            if mine:
+                need, worst = head_need, head_worst
+            fits = free >= need and open_now >= worst
             cap = int(CFG.get("max_running") or 0)
             running = con.execute(f"SELECT COUNT(*) FROM commands WHERE {async_filter(con)}status='running'").fetchone()[0]
             room = not cap or running < cap
@@ -2473,8 +2505,8 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             cpu_room = cpu_limit == 0 or (cpu_limit is not None and cpu_known and cpu < cpu_limit and
                                         (last_start is None or now() - last_start >= 10))
             alone = running == 0
-            decision = mine and room and free >= need and (cpu_room or alone)
-            decision_state = (decision, mine, room, free >= need, cpu_room)
+            decision = mine and room and fits and (cpu_room or alone)
+            decision_state = (decision, mine, room, fits, cpu_room)
             if decision or decision_state != last_decision:
                 toollog.emit('boatd', 'admit.decision', ids={'box': box_id, 'run': current['run_id']},
                              props={**memory, 'need_bytes': need, 'decision': 'admit' if decision else 'queue',
@@ -2497,11 +2529,15 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                                 "ORDER BY created_at,box_id,pid").fetchall()
             position = next(i for i, row in enumerate(queue, 1) if (row['box_id'], row['pid']) == (box_id, pid))
             head_id = f"{head['box_id']}/{head['pid']}" if head else f"{box_id}/{pid}"
+            short = (head_need, free)   # the pair that is logged: the one that keeps the head waiting, if memory does
             if not room:
                 reason, why = 'cap', f"max_running cap {running}/{cap}"
             elif free < head_need:
                 reason = 'memory'
                 why = f"head {head_id} needs {head_need / 2**30:.2f} GiB, {max(0, free) / 2**30:.2f} GiB free above reserve and running headroom"
+            elif open_now < head_worst:
+                reason, short = 'memory', (head_worst, open_now)
+                why = f"head {head_id} can peak at {head_worst / 2**30:.2f} GiB, {max(0, open_now) / 2**30:.2f} GiB free above reserve"
             elif cpu_limit is None:
                 reason, why = 'cpu_config', "a valid CPU admission setting"
             elif not cpu_known and cpu_limit > 0:
@@ -2514,7 +2550,7 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                 reason, why = 'fifo', "the head's runner to admit"
             if not mine:
                 why = f"behind {head_id} queued {max(0, now() - head['created_at']):.0f} s; " + why
-            state = (reason, position, len(queue), head_id, head_need, cap, running if reason == 'cap' else None)
+            state = (reason, position, len(queue), head_id, short[0], cap, running if reason == 'cap' else None)
             waited = now() - t0
             if state != last_reason or last_said is None or now() - last_said >= 60:
                 write_stderr(box_id, pid, f"offbox-server: waiting; position {position} of {len(queue)}; {why}; waited {waited:.0f} s\n".encode(), errf)
@@ -2522,7 +2558,7 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                 toollog.emit('boatd', 'run.queue', ids={'box': box_id, 'run': current['run_id']},
                              props={'backend': 'home', 'queued': True, 'waitMs': waited * 1000,
                                     'reason': reason, 'position': position, 'total': len(queue),
-                                    'head': head_id, 'headNeedBytes': head_need, 'freeBytes': free,
+                                    'head': head_id, 'headNeedBytes': short[0], 'freeBytes': short[1],
                                     'running': running, 'cap': cap})
                 last_reason, last_said = state, now()
         time.sleep(2)
