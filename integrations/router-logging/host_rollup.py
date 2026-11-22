@@ -67,11 +67,11 @@ class HostLoad:
                 self.missing += not bool(clean_host(props.get('host')))
             self.sample(at, props.get('host'))
             return
-        # `host` aliases an anomaly's end snapshot. Prefer its recorded boundary
-        # over emission time so a log write delay cannot weight the sample twice.
+        # Cached host samples retain their observation time independently of the
+        # gap clocks. Older rows only carry the boundary or emission time.
         boundaries = False
-        for key, fields in (('hostStart', ('start', 'startedAtMs', 'unknownSince', 'downSince')),
-                            ('hostEnd', ('end', 'finishedAtMs'))):
+        for key, fields in (('hostStart', ('hostStartAtMs', 'start', 'startedAtMs', 'unknownSince', 'downSince')),
+                            ('hostEnd', ('hostEndAtMs', 'end', 'finishedAtMs', 'hostAtMs'))):
             boundary = next((parsed for field in fields if (parsed := timestamp(props.get(field))) is not None), None)
             if boundary is None and key == 'hostEnd':
                 boundary = at
@@ -79,7 +79,7 @@ class HostLoad:
                 self.sample(boundary, props[key])
                 boundaries = True
         if not boundaries:
-            self.sample(at, props.get('host'))
+            self.sample(timestamp(props.get('hostAtMs')) or at, props.get('host'))
 
     def summary(self):
         hourly, requests = [], []

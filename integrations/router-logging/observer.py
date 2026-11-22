@@ -149,6 +149,10 @@ def gap_summary(rows, day, generated):
         bucket = groups['guardGaps' if component == 'guard' else 'pollGaps']
         hosts = {key: clean_host(props.get(key)) for key in ('hostStart', 'hostEnd')}
         hosts = {key: value for key, value in hosts.items() if value}
+        for key in hosts.copy():
+            at = props.get(key + 'AtMs')
+            if type(at) in (int, float) and math.isfinite(at):
+                hosts[key + 'AtMs'] = at
         if 'l1' in hosts.get('hostStart', {}):
             hosts['load1Start'] = hosts['hostStart']['l1']
         bucket.append(dict(**hosts, number=len(bucket) + 1, start=iso(start), end=iso(end),
@@ -176,8 +180,13 @@ def gap(previous, current, cadence_ms=15000):
     elif current.get('pid') == previous.get('pid') and suspend > 120000:
         # A suspend-aware clock avoids calling a wall-clock adjustment sleep.
         cause = 'sleep_gap'
-    hosts = {key: value['host'] for key, value in (('hostStart', previous), ('hostEnd', current)) if value.get('host')}
-    return dict(**hosts, host=current.get('host', {}), start=iso(previous['wallMs']), end=iso(current['wallMs']), cause=cause,
+    hosts = {}
+    for key, sample in (('hostStart', previous), ('hostEnd', current)):
+        if sample.get('host'):
+            hosts[key] = sample['host']
+            hosts[key + 'AtMs'] = sample.get('hostAtMs', sample['wallMs'])
+    return dict(**hosts, host=current.get('host', {}), hostAtMs=current.get('hostAtMs', current['wallMs']),
+                start=iso(previous['wallMs']), end=iso(current['wallMs']), cause=cause,
                 wallGapMs=wall, monotonicGapMs=mono, sleepGapMs=suspend,
                 pid=current.get('pid', 0), previousPid=previous.get('pid', 0),
                 jobStateStart=previous.get('jobState', 'unknown'), jobStateEnd=current.get('jobState', 'unknown'),
@@ -224,6 +233,7 @@ class Timings:
         self.start = self.start or dict(clock_sample(), **job_snapshot())
         if not self.start.get('host'):
             self.start['host'] = self.sampler()
+        self.start.setdefault('hostAtMs', self.start['wallMs'])
         self.token = _active.set(self)
         return self
 
@@ -231,6 +241,7 @@ class Timings:
         _active.reset(self.token)
         self.end = dict(clock_sample(), **job_snapshot())
         self.end['host'] = self.start.get('host', {})
+        self.end['hostAtMs'] = self.start['hostAtMs']
         elapsed = max(0, self.end['monotonicMs'] - self.start['monotonicMs'])
         wall = self.end['wallMs'] - self.start['wallMs']
         missing = gap(self.start, self.end, cadence_ms=0)
@@ -238,7 +249,9 @@ class Timings:
         if max(self.values.values()) <= self.threshold and max(elapsed, wall) <= 120000:
             return
         self.end['host'] = self.sampler()
+        self.end['hostAtMs'] = self.end['wallMs']
         props = dict(host=self.end['host'], hostStart=self.start.get('host', {}), hostEnd=self.end['host'], start=iso(self.start['wallMs']), end=iso(self.end['wallMs']),
+                     hostAtMs=self.end['hostAtMs'], hostStartAtMs=self.start['hostAtMs'], hostEndAtMs=self.end['hostAtMs'],
                      startedAtMs=self.start['wallMs'], finishedAtMs=self.end['wallMs'],
                      monotonicStartMs=self.start['monotonicMs'], monotonicEndMs=self.end['monotonicMs'],
                      wallGapMs=wall, monotonicGapMs=elapsed,
@@ -257,7 +270,7 @@ class Timings:
 
 def poll_host():
     timing = _active.get()
-    return poll_props(timing.start.get('host', {}), timing.start['wallMs']) if timing else {}
+    return poll_props(timing.start.get('host', {}), timing.start['hostAtMs']) if timing else {}
 
 
 def observed(component='poller', name='poll.phases'):

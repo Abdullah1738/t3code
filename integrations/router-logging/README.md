@@ -39,6 +39,8 @@ Wire keys are `l1`/`l5`/`l15` (load averages), `c` (logical CPUs), `f` (free
 bytes), `a` (free plus inactive bytes, an available-memory estimate), `p`
 (macOS pressure: 1 normal, 2 warning, 4 critical), and optional `e` (failure
 enum). `hostAtMs` beside `host` retains the poll sample time across midnight.
+Anomaly `hostStartAtMs`/`hostEndAtMs` retain observation times independently
+of gap boundaries, including cached guard samples reused after a tick or restart.
 The full poll row addition, including `props` and the timestamp, stays within
 120 bytes; memory estimates and then the longer load averages may be omitted to fit
 extreme values; load1, CPU count and observed pressure/failure remain. Swap is omitted. Diagnostics share a 1.75-second command budget per

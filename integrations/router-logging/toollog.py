@@ -18,7 +18,7 @@ CAP = 200 * 1024 * 1024
 _seen = set()
 _last_report = time.monotonic()
 PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx', 'phase', 'durationMaxMs', 'omitted', 'provider', 'scope', 'cause', 'lockMs', 'until', 'previousBackoffLevel', 'backoffLevel', 'source'}
-PROPS.update({'hostAtMs', 'target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'lastTs'})
+PROPS.update({'hostAtMs', 'hostStartAtMs', 'hostEndAtMs', 'target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'lastTs'})
 CONNECTION_ERRNOS = {'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN'}
 SYSCALLS = {'connect', 'read', 'write', 'getaddrinfo', 'send', 'recv', 'shutdown'}
 IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session', 'writer'}

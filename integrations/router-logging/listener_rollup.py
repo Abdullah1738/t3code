@@ -1,6 +1,7 @@
 """Listener transitions are sparse; a recovery carries the original start time."""
 import datetime as dt
 import json
+import math
 import re
 
 from host import clean_host
@@ -83,6 +84,9 @@ def windows(day, root, generated, observations=None):
             host = clean_host(props.get(field))
             if host:
                 incident[field] = host
+                at_ms = props.get(field + 'AtMs')
+                if type(at_ms) in (int, float) and math.isfinite(at_ms):
+                    incident[field + 'AtMs'] = at_ms
         if 'l1' in incident.get('hostStart', {}):
             incident['load1Start'] = incident['hostStart']['l1']
         if confirmed:

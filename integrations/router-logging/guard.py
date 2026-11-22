@@ -50,9 +50,10 @@ class Guard:
         self.notify = notify or (lambda text, key: False)
         self.save = save or (lambda state: None)
 
-    def step(self, now, job, listener, marker=None, lock_age_ms=None, observation=None, host=None):
+    def step(self, now, job, listener, marker=None, lock_age_ms=None, observation=None, host=None, host_at_ms=None):
         state = self.state
         host = host if host is not None else Sampler()()
+        host_at_ms = now if host_at_ms is None else host_at_ms
         # Retry an undelivered recovery with the same bridge deduplication key.
         recovery = state.get('recovery')
         if recovery and self.notify(recovery['text'], recovery['key']):
@@ -60,11 +61,12 @@ class Guard:
         failed = listener in ('refused', 'unreachable')
         if job == 'unknown':
             if not state.get('jobUnknown') or (not failed and 'unknownSinceMs' not in state):
-                props = dict(state=job, listener=listener, host=host, hostStart=host)
+                props = dict(state=job, listener=listener, host=host, hostAtMs=host_at_ms, hostStart=host, hostStartAtMs=host_at_ms)
                 props.update(observation or {})
                 if not failed:
                     state['unknownSinceMs'] = now
                     state['unknownHost'] = host
+                    state['unknownHostAtMs'] = host_at_ms
                     state['unknownCause'] = launchctl_cause(observation or {})
                     props['unknownSince'] = iso(now)
                 self.event('listener.state_unknown', **props)
@@ -75,7 +77,8 @@ class Guard:
             since = state.pop('unknownSinceMs')
             self.event('listener.state_resolved', unknownSince=iso(since), unknownMs=max(0, now - since),
                        state=job, listener=listener, cause=state.pop('unknownCause', 'other'),
-                       host=host, hostStart=state.pop('unknownHost', {}), hostEnd=host)
+                       host=host, hostAtMs=host_at_ms, hostStart=state.pop('unknownHost', {}), hostEnd=host,
+                       hostStartAtMs=state.pop('unknownHostAtMs', since), hostEndAtMs=host_at_ms)
         # A persisted window from the old guard may have no TCP evidence.
         # Close that uncertainty before starting a newly observed refusal.
         if (failed and 'downSinceMs' in state and 'downListener' not in state
@@ -83,8 +86,9 @@ class Guard:
             since = state['downSinceMs']
             self.event('listener.up', downSince=iso(since), downMs=max(0, now - since),
                        cause=state['cause'], listener=listener, downListener='unknown', action=state.get('lastAction', 'none'),
-                       host=host, hostStart=state.get('downHost', {}), hostEnd=host)
-            for key in ('downSinceMs', 'downHost', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
+                       host=host, hostAtMs=host_at_ms, hostStart=state.get('downHost', {}), hostEnd=host,
+                       hostStartAtMs=state.get('downHostAtMs', since), hostEndAtMs=host_at_ms)
+            for key in ('downSinceMs', 'downHost', 'downHostAtMs', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
                 state.pop(key, None)
         if not failed:
             if 'downSinceMs' in state:
@@ -92,11 +96,12 @@ class Guard:
                 elapsed = max(0, now - since)
                 self.event('listener.up', downSince=iso(since), downMs=elapsed,
                            cause=state['cause'], listener=listener, downListener=state.get('downListener', 'unknown'),
-                           action=state.get('lastAction', 'none'), host=host, hostStart=state.get('downHost', {}), hostEnd=host)
+                           action=state.get('lastAction', 'none'), host=host, hostAtMs=host_at_ms, hostStart=state.get('downHost', {}), hostEnd=host,
+                           hostStartAtMs=state.get('downHostAtMs', since), hostEndAtMs=host_at_ms)
                 if state.get('alerted'):
                     state['recovery'] = dict(text=f'9router recovered after {round(elapsed / 1000)} s; action {state.get("lastAction", "none")}',
                                              key=f'9router-down:{iso(since)}:recovered')
-                for key in ('downSinceMs', 'downHost', 'downListener', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
+                for key in ('downSinceMs', 'downHost', 'downHostAtMs', 'downListener', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
                     state.pop(key, None)
                 self.save(state)
                 if state.get('recovery') and self.notify(state['recovery']['text'], state['recovery']['key']):
@@ -107,9 +112,10 @@ class Guard:
             cause = 'listener_' + listener
             if recent_failure(marker, now):
                 cause = 'deploy_failed'
-            state.update(downHost=host, downSinceMs=now, downListener=listener, cause=cause, alerted=False, attempts=0, nextActionMs=now)
+            state.update(downHost=host, downHostAtMs=host_at_ms, downSinceMs=now, downListener=listener, cause=cause, alerted=False, attempts=0, nextActionMs=now)
             self.save(state)
-            self.event('listener.down', downSince=iso(now), cause=cause, state=job, listener=listener, host=host, hostStart=host)
+            self.event('listener.down', downSince=iso(now), cause=cause, state=job, listener=listener,
+                       host=host, hostAtMs=host_at_ms, hostStart=host, hostStartAtMs=host_at_ms)
         if listener == 'refused':
             state.setdefault('refusedSinceMs', now)
         else:
@@ -347,7 +353,8 @@ def serve():
             while not stopping:
                 start = time.monotonic()
                 sampler = Sampler()
-                sample = dict(clock_sample(), **job_snapshot(), host=sampler())
+                sample = dict(clock_sample(), **job_snapshot())
+                sample.update(host=sampler(), hostAtMs=sample['wallMs'])
                 missing = gap(guard.state.get('observerTick'), sample)
                 if missing:
                     emit('guard', 'observer.gap', kind='perf', props=missing)
@@ -355,7 +362,7 @@ def serve():
                     try:
                         job, listener = runtime.observe()
                         runtime.settle(job, listener)
-                        guard.step(time.time() * 1000, job, listener, read_json(runtime.marker), runtime.lock_age_ms(), runtime.observation, sample['host'])
+                        guard.step(time.time() * 1000, job, listener, read_json(runtime.marker), runtime.lock_age_ms(), runtime.observation, sample['host'], sample['hostAtMs'])
                     except Exception:
                         emit('guard', 'guard.error', kind='error', error=dict(tag='tick_failed'))
                     guard.state['observerTick'] = sample
@@ -377,7 +384,10 @@ def serve():
                 while not stopping and time.monotonic() - start < 15:
                     time.sleep(max(0, min(.5, 15 - (time.monotonic() - start))))
         finally:
-            guard.state['observerTick'] = dict(clock_sample(), host=guard.state.get('observerTick', {}).get('host', {}), jobState='stopped', jobPid=os.getpid(), jobExit=0)
+            previous = guard.state.get('observerTick', {})
+            guard.state['observerTick'] = dict(clock_sample(), host=previous.get('host', {}),
+                                              hostAtMs=previous.get('hostAtMs', previous.get('wallMs')),
+                                              jobState='stopped', jobPid=os.getpid(), jobExit=0)
             with contextlib.suppress(OSError):
                 guard.save(guard.state)
             for child in (pool_alerts, poll):

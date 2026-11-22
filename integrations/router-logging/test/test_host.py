@@ -141,6 +141,8 @@ class HostTests(unittest.TestCase):
             bucket = observer.gap_summary([row], '2026-11-21', dt.datetime(2026, 11, 22, tzinfo=UTC))[('guardGaps' if component == 'guard' else 'pollGaps')]
             self.assertEqual(bucket[0]['hostStart']['l1'], 315)
             self.assertEqual(bucket[0]['hostEnd'], NORMAL)
+            self.assertEqual(bucket[0]['hostStartAtMs'], start['wallMs'])
+            self.assertEqual(bucket[0]['hostEndAtMs'], end['wallMs'])
 
     def test_rollup_hourly_overload_latency_missing_and_failed(self):
         rows = []
@@ -254,6 +256,8 @@ class HostTests(unittest.TestCase):
             props = emit.call_args.kwargs['props']
             self.assertEqual(props['hostStart'], NORMAL)
             self.assertEqual(props['hostEnd'], NORMAL)
+            self.assertEqual(props['hostStartAtMs'], props['startedAtMs'])
+            self.assertEqual(props['hostEndAtMs'], props['finishedAtMs'])
 
     def test_poll_and_phase_start_share_one_sample(self):
         cases = [dict(NORMAL, l1=100),
@@ -294,6 +298,119 @@ class HostTests(unittest.TestCase):
                         self.assertLessEqual(len(wire) - len(original), 120)
                         self.assertEqual(row['props']['host']['l1'], load)
                         self.assertEqual(row['props']['host']['c'], cpus)
+
+    def test_guard_cached_sample_keeps_observation_hour(self):
+        cases = [
+            ('2026-11-21T22:59:59Z', '2026-11-21T23:00:01Z', '2026-11-21T23:05:01Z'),
+            ('2026-11-21T23:59:59Z', '2026-11-22T00:00:01Z', '2026-11-22T00:05:01Z'),
+        ]
+        for sampled, ended, resumed in cases:
+            for restart in (False, True):
+                with self.subTest(sampled=sampled, restart=restart), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    at, end, next_at = [dt.datetime.fromisoformat(value.replace('Z', '+00:00')) for value in (sampled, ended, resumed)]
+                    start = dict(wallMs=at.timestamp() * 1000, monotonicMs=0, pid=1, host=dict(NORMAL, l1=315))
+                    end_clock = dict(wallMs=end.timestamp() * 1000, monotonicMs=2000, pid=1)
+                    with patch('observer.clock_sample', return_value=end_clock), patch('observer.job_snapshot', return_value={}):
+                        with observer.Timings('guard', start=start, sampler=lambda: NORMAL) as timing:
+                            pass
+                    previous = json.loads(json.dumps(timing.end)) if restart else timing.end
+                    current = dict(wallMs=next_at.timestamp() * 1000, monotonicMs=302000, pid=2 if restart else 1, host=dict(NORMAL, l1=1))
+                    props = observer.gap(previous, current)
+                    row = toollog.clean(dict(component='guard', name='observer.gap', kind='perf', props=props), next_at)
+                    (root / (resumed[:10] + '.ndjson')).write_text(json.dumps(row) + '\n')
+                    generated = next_at + dt.timedelta(minutes=1)
+                    before = rollup.rollup(sampled[:10], root, generated)['hostLoad']
+                    after = rollup.rollup(resumed[:10], root, generated)['hostLoad']
+                    old_hour = at.replace(minute=0, second=0).isoformat().replace('+00:00', 'Z')
+                    new_hour = next_at.replace(minute=0, second=0).isoformat().replace('+00:00', 'Z')
+                    self.assertIn(old_hour, [h['hour'] for h in before['hourly']])
+                    self.assertEqual(next(h for h in before['hourly'] if h['hour'] == old_hour)['load1'], dict(avg=315, max=315))
+                    self.assertEqual(next(h for h in after['hourly'] if h['hour'] == new_hour)['load1'], dict(avg=1, max=1))
+                    self.assertNotIn(new_hour, after['hoursWithLoadAbove2xCpu'])
+                    self.assertEqual(row['props']['hostStartAtMs'], start['wallMs'])
+                    state = {}
+                    self.assertIn(sampled[:10], poller.late_gap_days(root, [sampled[:10]], generated, state))
+                    self.assertEqual(poller.late_gap_days(root, [sampled[:10]], generated, state), set())
+
+    def test_guard_shutdown_keeps_cached_sample_time(self):
+        from unittest.mock import MagicMock
+        sampled = dt.datetime(2026, 11, 21, 23, 59, 59, tzinfo=UTC).timestamp() * 1000
+        clocks = [dict(wallMs=sampled + offset, monotonicMs=offset, pid=1) for offset in (0, 2000, 3000)]
+        handlers = {}
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = MagicMock()
+            runtime.state_file = Path(directory) / 'guard.json'
+            runtime.marker = Path(directory) / 'deploy.json'
+            runtime.lock_age_ms.return_value = None
+            def observe():
+                handlers[guard.signal.SIGTERM]()
+                return 'loaded', 'open'
+            runtime.observe.side_effect = observe
+            child = MagicMock()
+            child.poll.return_value = None
+            with patch('guard.Runtime', return_value=runtime), patch('guard.signal.signal', side_effect=lambda key, callback: handlers.update({key: callback})), patch('guard.subprocess.Popen', return_value=child), patch('guard.Sampler', return_value=lambda: NORMAL), patch('guard.job_snapshot', return_value={}), patch('observer.job_snapshot', return_value={}), patch('guard.clock_sample', side_effect=lambda: clocks.pop(0)), patch('observer.clock_sample', side_effect=lambda: clocks.pop(0)):
+                guard.serve()
+            previous = json.loads(runtime.state_file.read_text())['observerTick']
+            self.assertEqual(previous['wallMs'], sampled + 3000)
+            self.assertEqual(previous['hostAtMs'], sampled)
+            self.assertEqual(previous['jobState'], 'stopped')
+
+    def test_listener_sample_times_survive_runtime_delay_and_restart(self):
+        cases = [('unknown', 'open', 'unknownWindows'), ('loaded', 'refused', 'windows')]
+        sampled = dt.datetime(2026, 11, 21, 23, 59, 59, tzinfo=UTC)
+        for job, listener, bucket in cases:
+            with self.subTest(listener=listener), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                rows = []
+                now = sampled + dt.timedelta(seconds=2)
+                def event(name, **props):
+                    rows.append(toollog.clean(dict(component='guard', name=name, kind='event', props=props), now))
+                g = guard.Guard(event=event)
+                g.step(now.timestamp() * 1000, job, listener, host=dict(NORMAL, l1=315), host_at_ms=sampled.timestamp() * 1000)
+                state = json.loads(json.dumps(g.state))
+                now += dt.timedelta(minutes=5)
+                guard.Guard(state=state, event=event).step(now.timestamp() * 1000, 'loaded', 'open', host=dict(NORMAL, l1=1))
+                (root / '2026-11-22.ndjson').write_text('\n'.join(map(json.dumps, rows)) + '\n')
+                before = rollup.rollup('2026-11-21', root, now)['hostLoad']
+                after = rollup.rollup('2026-11-22', root, now)
+                self.assertEqual(before['hourly'][0]['load1'], dict(avg=315, max=315))
+                self.assertEqual(before['hourly'][0]['samples'], 1)
+                self.assertEqual(after['hostLoad']['hourly'][0]['load1'], dict(avg=1, max=1))
+                self.assertEqual(after['hostLoad']['hoursWithLoadAbove2xCpu'], [])
+                window = after['listener'][bucket][0]
+                self.assertEqual(window['hostStartAtMs'], sampled.timestamp() * 1000)
+                self.assertEqual(window['hostEndAtMs'], now.timestamp() * 1000)
+                self.assertEqual(poller.late_gap_days(root, ['2026-11-21'], now, {}), {'2026-11-21'})
+
+    def test_observation_times_override_boundary_and_emission_time_class(self):
+        cases = [
+            ('poller', 'poll.phases', dict(start='2026-11-22T00:00:01Z', end='2026-11-22T00:05:01Z')),
+            ('poller', 'rollup.phases', dict(startedAtMs=1795305601000, finishedAtMs=1795305901000)),
+            ('guard', 'guard.tick_late', dict(startedAtMs=1795305601000, finishedAtMs=1795305901000)),
+            ('guard', 'observer.gap', dict(start='2026-11-22T00:00:01Z', end='2026-11-22T00:05:01Z')),
+            ('pool-alerts', 'pool.endpoint.get', dict(startedAtMs=1795305601000, finishedAtMs=1795305901000)),
+            ('guard', 'listener.state_resolved', dict(unknownSince='2026-11-22T00:00:01Z')),
+            ('guard', 'listener.up', dict(downSince='2026-11-22T00:00:01Z')),
+            ('guard', 'listener.state_unknown', {}),
+        ]
+        before_at, after_at = 1795305599000, 1795305900000
+        for component, name, bounds in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                row = toollog.clean(dict(component=component, name=name, kind='perf', durationMs=300000,
+                    props=dict(bounds, host=dict(NORMAL, l1=1), hostAtMs=after_at, hostStart=dict(NORMAL, l1=315),
+                               hostStartAtMs=before_at, hostEnd=dict(NORMAL, l1=1), hostEndAtMs=after_at)),
+                    dt.datetime(2026, 11, 22, 1, tzinfo=UTC))
+                (root / '2026-11-22.ndjson').write_text(json.dumps(row))
+                generated = dt.datetime(2026, 11, 22, 2, tzinfo=UTC)
+                before = rollup.rollup('2026-11-21', root, generated)['hostLoad']
+                after = rollup.rollup('2026-11-22', root, generated)['hostLoad']
+                self.assertEqual(before['hourly'][0]['load1'], dict(avg=315, max=315))
+                self.assertEqual(after['hourly'][0]['hour'], '2026-11-22T00:00:00Z')
+                self.assertEqual(after['hourly'][0]['load1'], dict(avg=1, max=1))
+                self.assertEqual(after['hoursWithLoadAbove2xCpu'], [])
+                self.assertEqual(sum(h['samples'] for h in after['hourly']), 1)
 
 
 if __name__ == '__main__':

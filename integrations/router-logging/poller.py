@@ -67,7 +67,8 @@ class Router:
             props = dict(endpoint=route.split('?')[0], status=status, startedAtMs=wall_start, finishedAtMs=time.time() * 1000)
             if host_sampler and duration > 120000:
                 host_end = host_sampler()
-                props.update(host=host_end, hostStart=host_start, hostEnd=host_end)
+                props.update(host=host_end, hostAtMs=props['finishedAtMs'], hostStart=host_start, hostStartAtMs=wall_start,
+                             hostEnd=host_end, hostEndAtMs=props['finishedAtMs'])
             emit(self.component, self.event_name, kind='perf', ok=ok,
                  durationMs=duration, props=props,
                  **({'error': {'tag': error_tag}} if error_tag else {}))
@@ -168,7 +169,7 @@ def rollup_complete(path):
 
 def late_gap_days(root, days, now, state):
     # Only new bytes can contain late completions; keep the cursor across poll children.
-    history_names = (*GAP_NAMES, 'poll.complete')
+    history_names = (*GAP_NAMES, 'poll.complete', 'listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved')
     prior = state.get('gapSources', {})
     if not isinstance(prior, dict):
         prior = {}
@@ -207,9 +208,10 @@ def late_gap_days(root, days, now, state):
                     if recorded is not None and recorded > now.timestamp() * 1000:
                         break
                     props = row.get('props') if isinstance(row.get('props'), dict) else {}
-                    sample = host_timestamp(props.get('hostAtMs')) if row['name'] == 'poll.complete' else None
+                    samples = [sample for key in ('hostAtMs', 'hostStartAtMs', 'hostEndAtMs')
+                               if (sample := host_timestamp(props.get(key))) is not None and sample <= now]
                     for day in days:
-                        if (sample is not None and sample <= now and sample.date().isoformat() == day
+                        if (any(sample.date().isoformat() == day for sample in samples)
                                 or any(gap_summary([row], day, now).values())):
                             changed.add(day)
                             touched.add(day)
