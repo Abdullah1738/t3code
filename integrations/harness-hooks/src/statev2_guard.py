@@ -2828,7 +2828,23 @@ CWD_UNPROVED = re.compile(
     r'|(?:^|[;&|(){}\n])\s*[A-Za-z_][\w-]*\s*\(\s*\)|\(\s*\)\s*\{'
     r'|(?<![\w-])cd\s+(?:-[A-Za-z]*\s+)*-[A-Za-z]*P'
     r'|(?<![\w-])set\s+(?:[-+][A-Za-z]*\s+)*(?:-[A-Za-z]*P|[-+]o\s+physical)'
-    r'|CDPATH|(?<![\w$])PATH\+?=|(?<![\w$./-])path(?:\[[^\]]*\])?\+?=|(?<![\w$])commands\[')
+    r'|CDPATH|(?<![\w$])PATH\+?=|(?<![\w$./-])path(?:\[[^\]]*\])?\+?=|(?<![\w$])commands\['
+    # Code run later, zsh's other lookup tables, cd's physical mode and
+    # indirect expansion can also rebind PWD/PATH or shadow the commands.
+    r'|(?<![\w-])(?:trap|fc|autoload|disable|zmodload|emulate)(?![\w-])|fpath|FPATH|BASH_CMDS|BASH_ALIASES'
+    r'|(?<![\w$])(?:functions|aliases|galiases|saliases|options)\[|(?i:chase_?(?:links|dots))|\$\{!|\$\{\([^)]*P'
+    # Arithmetic evaluates a variable's value as an expression, so a value
+    # built at runtime ("P${a}D=5") assigns whatever name it spells.
+    r'|\(\(|\$\[|(?<![\w-])let(?![\w-])|\[\[[^\]]*\s-(?:eq|ne|lt|le|gt|ge)\s'
+    r'|(?<![\w$])[A-Za-z_]\w*\[[^\]]*[A-Za-z_$`]|\$\{[A-Za-z_]\w*:(?![-=+?])')
+# Builtins that bind a variable named by an operand. A name built at runtime
+# ("P${a}D", "$n") can spell PWD or PATH, so it voids the proof (review r2).
+CWD_DECLARERS = frozenset({'declare', 'typeset', 'local', 'export', 'readonly', 'integer', 'float', 'private', 'nameref'})
+CWD_NAME_BINDERS = frozenset({'set', 'read', 'mapfile', 'readarray', 'getopts', 'unset', 'vared', 'zparseopts', 'zstyle',
+                              'strftime', 'sysread', 'wait', 'coproc', 'compadd', 'zle', 'zregexparse'})
+CWD_BOUND_NAMES = frozenset({'PWD', 'OLDPWD', 'PATH', 'path', 'CDPATH', 'cdpath'})
+CWD_KEYWORDS = frozenset({'!', 'do', 'then', 'else', 'elif', 'if', 'while', 'until', 'time', 'command', 'noglob', 'nocorrect', '-', 'exec'})
+CWD_SEPARATOR = re.compile(r'[;&|()<>{}]+')
 CWD_PATH = re.compile(r'[A-Za-z0-9_./@%+=:,-]+')
 # Inside double quotes a cwd with spaces stays one word, as its literal twin does.
 CWD_QUOTED_PATH = re.compile(r'[^\0\n$`"\'\\*?\[\]{}]+')
@@ -2840,7 +2856,68 @@ CWD_SUBSTITUTION = re.compile(r'\$\{PWD\}|\$\(\s*pwd\s*\)|`\s*pwd\s*`|'
 def _cwd_unproved(command: str) -> bool:
     # Quotes and backslashes do not hide a binding from the shell (P""WD=).
     return any(CWD_UNPROVED.search(CWD_READ.sub('', text))
-               for text in (command, re.sub(r'[\'"\\]', '', command)))
+               for text in (command, re.sub(r'[\'"\\]', '', command))) or _cwd_runtime_binding(command)
+
+
+def _cwd_runtime_binding(text: str, depth: int = 0) -> bool:
+    if depth > 6:
+        return True
+    text = CWD_SUBSTITUTION.sub('', CWD_READ.sub('', text)).replace('\n', ';')
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=';&|()<>')
+    lexer.commenters, lexer.whitespace_split = '', True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        # Unbalanced quotes (a heredoc body): split the unquoted text instead.
+        tokens = re.findall(r'[;&|()<>{}]+|[^\s;&|()<>{}]+', re.sub(r'[\'"\\]', '', text))
+    dynamic = lambda token: '$' in token or '`' in token
+    segment: list[str] = []
+    for token in tokens + [';']:
+        if CWD_SEPARATOR.fullmatch(token):
+            if _cwd_segment_binds(segment, dynamic):
+                return True
+            segment = []
+            continue
+        # Payload text and quoted scripts are shell text of their own.
+        if re.search(r'[\s;&|()<>{}]', token) and _cwd_runtime_binding(token, depth + 1):
+            return True
+        segment.append(token)
+    return False
+
+
+def _cwd_segment_binds(words: list[str], dynamic) -> bool:
+    while words and (words[0] in CWD_KEYWORDS or re.fullmatch(r'[A-Za-z_]\w*\+?=.*', words[0], re.S)):
+        words = words[1:]
+    if not words:
+        return False
+    # A command word built at runtime may name a binding builtin.
+    if dynamic(words[0]) and any(dynamic(word) for word in words[1:]):
+        return True
+    for index, word in enumerate(words):
+        operands = words[index + 1:]
+        if word in CWD_DECLARERS:
+            # Namerefs and numeric types evaluate the value too.
+            if any(re.fullmatch(r'[-+][A-Za-z]*[niEF][A-Za-z]*', op) for op in operands):
+                if any(dynamic(op) for op in operands):
+                    return True
+            for op in operands:
+                if re.fullmatch(r'[-+][A-Za-z]*', op):
+                    continue
+                name = re.split(r'\+?=|\[', op, maxsplit=1)[0]
+                if dynamic(name) or name in CWD_BOUND_NAMES:
+                    return True
+        elif word in CWD_NAME_BINDERS:
+            if any(dynamic(op) or op in CWD_BOUND_NAMES for op in operands):
+                return True
+        elif word in {'printf', 'print'}:
+            if operands and (dynamic(operands[0]) or any(re.fullmatch(r'-[A-Za-z]*v.*', op, re.S) for op in operands)):
+                if any(dynamic(op) or op in CWD_BOUND_NAMES for op in operands):
+                    return True
+        elif word in {'for', 'select'}:
+            names = operands[:operands.index('in')] if 'in' in operands else operands[:1]
+            if any(name in CWD_BOUND_NAMES for name in names):
+                return True
+    return False
 
 
 def _literal_path(value: str, cwd: Path | None) -> Path | None:

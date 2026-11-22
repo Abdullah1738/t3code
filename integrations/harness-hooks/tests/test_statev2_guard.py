@@ -1983,6 +1983,8 @@ bash "$TASK_DIR/step5r.sh"
             ('offbox run --bg -- node {p}', 'live.mjs', None, root, SCRIPT),
             ('env A=1 timeout 60 node {p}', 'x.mjs', None, root, None),
             ('env A=1 timeout 60 node {p}', 'live.mjs', None, root, SCRIPT),
+            ('export A="b $USER"; node {p}', 'x.mjs', None, root, None),
+            ("printf '%s\\n' \"$USER\"; node {p}", 'x.mjs', None, root, None),
             ('d={p}; node --test "$d/a.test.mjs"', 't', None, root, None),
             ('d={p}; node "$d/live.mjs"', 'tmp/..', None, root, SCRIPT),
             ('node --test {p}', 't/*.test.mjs', None, root, None),
@@ -2035,10 +2037,28 @@ bash "$TASK_DIR/step5r.sh"
             'node "$(pwd -P)/x.mjs"', 'node "$(cat x.mjs)"', 'node "$(realpath $HOME/x.mjs)"',
             "offbox run --bg -- 'export PWD=/x; node \"$PWD/x.mjs\"'", "export PWD=/x; offbox run --bg -- 'node \"$PWD/x.mjs\"'",
             'path=(/evil $path); node "$(realpath x.mjs)"', 'commands[realpath]=/evil; node "$(realpath x.mjs)"',
+        ] + [prefix + '; node "$PWD/x.mjs"' for prefix in self.runtime_pwd_bindings('/evil')] + [
+            "offbox run --bg -- 'a=W; declare \"P${a}D=/evil\"; node \"$PWD/x.mjs\"'",
+            "offbox run --bg --step 'a=W; printf -v \"P${a}D\" %s /evil; node \"$PWD/x.mjs\"'",
+            'o=-P; cd $o sub && node "$PWD/x.mjs"', 'o=physical; set -o "$o"; cd sub && node "$PWD/x.mjs"',
+            'set -o chaselinks; cd sub && node "$PWD/x.mjs"', 'options[chaselinks]=on; cd sub && node "$PWD/x.mjs"',
         ]:
             with self.subTest(command=command):
                 self.assertIsNotNone(self.classify(command))
         self.assertIsNone(self.classify('node ' + target))
+
+    @staticmethod
+    def runtime_pwd_bindings(value):
+        # Every way bash/zsh bind PWD through a name built at runtime (review r2).
+        return [f'a=W; declare "P${{a}}D={value}"', f'a=W; printf -v "P${{a}}D" %s {value}',
+                f'a=W; typeset "P${{a}}D={value}"', f'a=W; local "P${{a}}D={value}"', f'a=W; export "P${{a}}D={value}"',
+                f'a=W; readonly "P${{a}}D={value}"', f'a=W; command declare "P${{a}}D={value}"',
+                f'a=W; read "P${{a}}D" <<< {value}', f'a=W; mapfile -t "P${{a}}D" <<< {value}', 'a=W; unset "P${a}D"',
+                'a=W; getopts x "P${a}D" -x', 'a=W; let "P${a}D=5"', 'a=W; x="P${a}D=5"; (( x ))',
+                'a=W; x="P${a}D=5"; y=$(( x ))', 'a=W; x="P${a}D=5"; arr=(1); : "${arr[x]}"',
+                'a=W; x="P${a}D=5"; [[ 1 -eq x ]]', 'a=W; typeset -i z="P${a}D=5"',
+                f'a=W; declare -n r="P${{a}}D"; r={value}', f'c=declare; a=W; $c "P${{a}}D={value}"',
+                f'a=W; n="P${{a}}D"; : "${{!n:={value}}}"', f'a=W; trap "declare P${{a}}D={value}" DEBUG']
 
     def realpath_fixture(self):
         self.cwd_fixture()
@@ -2064,6 +2084,21 @@ bash "$TASK_DIR/step5r.sh"
                 for command in commands:
                     with self.subTest(environment=environment, command=command):
                         self.assertIsNotNone(self.classify(command))
+        # PATH or the lookup tables rebound in the call, often through a
+        # name built at runtime (review r2).
+        bin_dir = f'{shadow.parent}:/bin'
+        bindings = [p.replace('P${a}D', 'P${a}TH').replace('/evil', bin_dir) for p in self.runtime_pwd_bindings('/evil')
+                    if '=5' not in p and 'unset' not in p and 'getopts' not in p]
+        bindings += [f'n=PATH; declare -x "$n={bin_dir}"', f'read PATH <<< {bin_dir}', f'declare -n r=PATH; r={bin_dir}',
+                     f'BASH_CMDS[realpath]={shadow}', "functions[realpath]='echo unsafe.sh'", 'autoload realpath',
+                     f'export "PA""TH={bin_dir}"']
+        for prefix in bindings:
+            for command in commands + [f'for PATH in {bin_dir}; do /bin/bash "$(realpath safe.sh)"; done']:
+                if command.startswith('for ') and prefix != bindings[0]:
+                    continue
+                command = command if command.startswith('for ') else prefix + '; ' + command
+                with self.subTest(binding=prefix, command=command):
+                    self.assertIsNotNone(self.classify(command))
         shadow.unlink()
         # An exported function under another name shadows neither command.
         with patch.dict(os.environ, {'BASH_FUNC_module%%': '() { :; }'}):
