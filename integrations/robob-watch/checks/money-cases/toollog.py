@@ -88,7 +88,7 @@ _NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exi
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
 _MONEY_PROPS = {
-    'marketplace.refresh': {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'result', 'snapshot_error'},
+    'marketplace.refresh': {'exitCode', 'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'result', 'snapshot_error'},
     'case.open': {'kind', 'unmatched'},
     'case.update': {'fields', 'deadlineMoved', 'answered'},
     'case.close': {'kind', 'ageDays'},
@@ -576,6 +576,30 @@ def _phases(scope, start, end):
     return {name + 'Ms': round(value, 3) for name, value in totals.items()}
 
 
+MARKETPLACE_STATUSES = {'started', 'busy', 'fresh', 'skipped', 'launch_failed',
+                        'held_data_unavailable', 'held_deadline', 'held_abort'}
+
+
+def marketplace_refresh_fields(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    if type(value.get('status')) is str and value['status'] in MARKETPLACE_STATUSES:
+        result['status'] = value['status']
+    age = value.get('snapshot_age_s')
+    result['snapshot_age_s'] = age if type(age) is int and 0 <= age <= 10**12 else None
+    outcome = value.get('last_result')
+    result['last_result'] = outcome if type(outcome) is str and outcome in _ENUMS['result'] else None
+    at = value.get('last_at')
+    result['last_at'] = None
+    if type(at) is str and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+]00:00)', at):
+        try:
+            result['last_at'] = dt.datetime.fromisoformat(at.replace('Z', '+00:00')).isoformat()
+        except ValueError:
+            pass
+    return result
+
+
 def _fields(props):
     result = {}
     for key, value in (props or {}).items():
@@ -585,6 +609,8 @@ def _fields(props):
             result[key] = value if value in _ENUMS['merchant'] else 'other'
         elif key in _ENUMS and type(value) is str and value in _ENUMS[key]:
             result[key] = value
+        elif key == 'marketplace_refresh' and isinstance(value, dict):
+            result[key] = marketplace_refresh_fields(value)
         elif key == 'trigger' and type(value) is str and value in _TRIGGERS:
             result[key] = value
         elif key in {'pagesFetched', 'rowsReturned'} and type(value) is int and 0 <= value <= 10**9:
@@ -597,7 +623,7 @@ def _fields(props):
         elif key == 'dataless_files' and value is None:
             result[key] = None
         elif key == 'dataless_error' and isinstance(value, str) \
-                and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]{0,80} errno=(?:None|-?\d{1,6})', value):
+                and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]{0,80} errno=(?:None|-?\d{1,6})|DataUnavailable reason=(?:deadline|edeadlk)', value):
             result[key] = value
         elif key == 'hours' and type(value) in (int, float) and math.isfinite(value) and 0 < value <= 24:
             result[key] = value

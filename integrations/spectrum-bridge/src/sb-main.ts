@@ -2,7 +2,7 @@ import { ProbeBudget } from "./probe-policy.ts";
 import { RemoteBox, remoteBoxConfig } from "./remote-box.ts";
 import { createChatMirror, type ChatMirror } from "./mirror.ts";
 import { readFileSync } from "node:fs";
-import { toolError, toolLog, type LogLine } from "./toollog.ts";
+import { startRobobLinkAlerts, toolError, toolLog, type LogLine } from "./toollog.ts";
 import { createLoopStallMonitor } from "./loop-stall.ts";
 import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 /**
@@ -134,6 +134,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   let api: ((request: Request) => Promise<Response>) | undefined;
   const releaseLock = acquireLock(join(stateRoot, "bridge.lock"));
   process.once("exit", releaseLock);
+  startRobobLinkAlerts(socketPost(telegramBridgeSocket, 5_000));
   const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }));
   loopStalls.start();
   process.once("exit", () => loopStalls.stop());
@@ -329,6 +330,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
         lastEventAt: seen.lastEventAt, connected: seen.synchronized, openchamberConnected: backendOk,
         uptimeSeconds: Math.floor((Date.now() - health.startedAt) / 1000),
         catchingUp: !seen.synchronized, enabled: config.enabled, paired: true, ready: ready(),
+        ...(backend instanceof RobobBackend ? { activeRoster: backend.activeRoster.status() } : {}),
         ...(appsUrl ? { appsUrl } : {}), appsRoot: config.appsRoot,
       };
     },
@@ -421,10 +423,12 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       if (ready()) void chat.parts.router?.checkFailedInbound().catch((caughtError) => { toolError("sb-main", "sb-main.catch16", caughtError); return log("failed-inbound-check-failed"); });
     }
   }, 1_000);
+  if (backend instanceof RobobBackend) backend.activeRoster.start();
   const stop = async () => {
     if (stopping) return;
     stopping = true;
     loopStalls.stop();
+    if (backend instanceof RobobBackend) backend.activeRoster.stop();
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     abort.abort();
     clearInterval(timer);

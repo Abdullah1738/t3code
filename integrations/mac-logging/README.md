@@ -1,5 +1,39 @@
 # Mac upkeep logs
 
+## Suspension leases
+
+Every upkeep SIGSTOP needs a durable deadline and a follow-up. Use an explicit
+`--deadline 10m` (recommended; required, maximum 60m) and `--then cont|kill`:
+
+```sh
+mac-suspend stop --pid 123 --deadline 10m --then cont --reason 'resource pressure' --actor 'mac worker' --card '#118'
+mac-suspend list --json
+mac-suspend resume --pid 123
+mac-suspend kill --pid 123
+mac-suspend sweep --json
+```
+
+The ledger is `~/.robob/logs/tools/mac/state/suspend-lease.json` (or beneath
+`TOOLLOG_DIR/state`), locked across each operation and fsynced before SIGSTOP.
+Every signal rechecks pid + start time and records a read-back. Resume and kill
+require an owned lease; kill sends TERM, waits five seconds if still alive,
+then sends KILL. Failed recovery retains the lease for the next sweep.
+PID reuse drops the old lease without signalling its replacement. System,
+Robob, provider and GUI processes are protected. The tool never signals
+unowned stops, including debugger stops and Ctrl-Z jobs.
+
+`com.abdullah.mac-suspend` runs a separate sweep every minute, with a 50-second
+whole-run limit and bounded ps/launchctl calls. `install.zsh` copies the helper,
+wrapper and plist; the evaluator loads the LaunchAgent after review.
+`mac-log-status` checks its launchd state and three-minute logging cadence.
+Events use toollog: `suspend.stop`, `suspend.stop_failed`, `suspend.resume`,
+`suspend.kill`, `suspend.expired`, `suspend.cleared`, `suspend.orphan`,
+`suspend.alert`, `suspend.sweep` and `suspend.error`. Orphans log at first sight
+and once after ten minutes of observation. The latter and failed kills queue
+one Telegram attention alert per pid + start; uncertain delivery retries use
+the same key and text. Agent prompts and the janitor rule are updated separately
+after owner approval.
+
 Source scripts use `toollog.py` (or the `toollog.sh` bridge) for local metadata at
 `~/.robob/logs/tools/mac/YYYY-MM-DD.ndjson`, with UTC dates. Run
 `mac-log-rollup --day YYYY-MM-DD` to write `rollup-YYYY-MM-DD.json`; with no day,
@@ -7,11 +41,16 @@ it rolls up yesterday. Quantiles use nearest rank. `okRate`/`failedRate` use
 lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
 Each hourly collector run emits `homebrew.integrity` with dangling opt links,
-missing dependencies, status and duration. The read-only `brew missing` probe
-has a 60-second timeout and disables auto-update and analytics. Broken results
-send a Telegram attention alert with a stable key for that exact set of links
-and dependencies; unchanged failures are not sent again. Probe errors are
-logged without an alert. Repairs are suggested, never run by the collector.
+missing dependencies, status and duration. Formula runtime dependencies are
+checked from linked Cellar receipts without starting Homebrew; unreadable or
+absent receipts are counted in `receiptErrors`. The read-only `brew missing`
+secondary covers casks too, runs at nice 15, has a 240-second timeout and
+disables auto-update and analytics. Broken results send a Telegram attention
+alert with a stable key for that exact set of links
+and dependencies; unchanged failures are not sent again. A secondary failure
+is logged in `brewError` and cannot suppress a finding. A completed local scan
+without findings is `ok`; `error` means no check completed. Repairs are
+suggested, never run by the collector.
 
 Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
 or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
@@ -80,6 +119,34 @@ queries within 15 minutes for the rest of the run. Each completed chunk checkpoi
 failed query retains the unfinished suffix, then continues into a fresh window
 when that suffix finishes. Each command has a 60-second cap including bounded
 process-group cleanup; the unified source shares a 135-second budget.
+Queries use UTC input as well as output. A shared boot helper reads current
+`kern.boottime` and `last -y reboot` with two-second command timeouts. Because
+`last` prints only minutes, a bounded Darwin wtmp reader refines matching
+historical boots to seconds. If a known boot cannot be refined, both readers
+skip that entire minute: `crash.source` reports `reason=bootUnresolved` and
+`skippedS`, and mac-log-window reports the same reason with `status: partial` (exit 2). Other
+intervals keep running; no query is sent into the unresolved minute.
+Chunks stop at boot seconds with no end padding across a boot. The shared
+planner also isolates the following second: macOS accepts only whole-second
+query bounds, and starting at a rounded boot second can still select the old
+epoch. The boot-second piece gets at most 10 seconds per attempt. It remains pending
+on failures one and two; failure three explicitly skips it with `crash.source`
+`reason=bootSecondUnreadable` and `skippedS`, rather than retrying indefinitely.
+The attempt count is durable. The following piece starts safely one second
+later and its completed rows are not read again. mac-log-window also caps each boot
+second at 10 seconds and labels any unfinished result partial. Failed pre-boot
+intervals remain in `unifiedBootPending` while later boot intervals can finish.
+A frozen retry ending before a newer boot is retained as a hole rather than
+blocking fresh coverage. Hole retries reserve one full call for fresh data.
+Clipping holes at the moving ceiling is checkpointed before retry I/O, with
+unreported skips retained separately. Completed unified observations are queued
+with their cursor checkpoint; a fixed log day and `observationId` make replay
+idempotent under the daily log's writer lock. Deferred gap records also keep
+a fixed identity and day until delivery is checkpointed. Writes handle short
+write counts; replay acknowledges only complete, valid matching records. The identity check reads that day's
+file in 64 KiB blocks only for these observations (no raw message storage).
+Each completed retry prefix is checkpointed; these holes obey the same moving
+90-minute ceiling and explicit skip records as the normal suffix.
 `crash.unified.chunk` records requested bounds, elapsed time and outcome;
 `crash.unified.skip` records ceiling skips before advancing the cursor. Positive
 skip records and summaries survive the daily log cap so omitted time stays explicit.
@@ -354,10 +421,11 @@ long-lived high PIDs hid a real 200-process burst after allocator wrap on this M
 The optional thread read has a two-second timeout.
 
 `userPct` excludes nice time; user + sys + nice is busy CPU. `kernelTaskPct`
-is null on normal samples. Spikes read the second frame of a bounded
-`top -l 2 -s 1 -pid 0` call, with `kernelTaskWindowS: 1` and cumulative
-`kernelTaskTime` for reference; failure sets `kernelTaskError`.
-The expensive read is limited to once per five minutes, including failed
+is null on normal samples. Spikes read the second frame of a
+`top -l 2 -s 1 -pid 0` call with a 15-second timeout, `kernelTaskWindowS: 1` and cumulative
+`kernelTaskTime` for reference; failure sets `kernelTaskError`. `kernelTaskWallMs`
+records the call's wall time rounded to the nearest millisecond, including errors.
+The expensive read is limited to once per 30 minutes, including failed
 attempts, using a wall timestamp in the existing sampler state. Skipped spikes
 report null CPU with `kernelTaskSkipped: "rate"`; quiet samples retain the
 cooldown, and a clock rollback starts a fresh cooldown.
@@ -515,7 +583,17 @@ slice edges are kept only once. Rows outside each slice are excluded even when
 they fall inside the overall window. `--keep-outside` saves them separately in
 `<out>.outside.ndjson`; they are never incident evidence.
 
-Exit codes are 0 complete, 2 partial (deadline), and 1 error (including bad args
+Every read, with or without `--slice`, also splits at known boot times. The
+shared helper refines minute-only reboot history to seconds. `<out>.summary.json`
+adds `boots` (UTC timestamps used); each slice cut by a boot has `bootSplit: true`.
+Boot discovery uses the same deadline as the reads. Slice planning is incremental;
+an unresolved minute is reported as one gap even with a tiny `--slice`.
+The boot second is isolated with at most six seconds to read plus four seconds
+for termination and reaping. Other intervals retain the remaining budget. An
+unresolved boot minute is omitted with `reason: bootUnresolved`, status `partial`
+and exit 2. `--predicate` is optional. A final log count/finished trailer is ignored.
+
+Exit codes are 0 complete, 2 partial (deadline or unresolved boot minute), and 1 error (including bad args
 or a nonzero log exit). `<out>.summary.json` records arguments, UTC bounds,
 status, exit code, elapsed milliseconds, `rowsIn`, `rowsOutside`, earliest/latest
 outside timestamps (`outsideFirst`/`outsideLast`), `unparsed`, greatest kept
@@ -608,8 +686,16 @@ results and `crash.collect` retain `windowStart`, `windowEnd` (Unix seconds),
 `windowS`, `skippedS`, `chunks` and `chunksDone`. With adaptive sizing, `chunks`
 estimates the total using the current chunk size; on completion it equals
 `chunksDone`. Chunk bounds exclude the previous cursor even when log's second
-rounding/end padding returns overlapping rows. Missing or invalid event
-timestamps fail the chunk rather than risk attributing events twice.
+rounding returns overlapping rows. Unparseable timestamps are counted and excluded.
+Unified `crash.source` results also include `partialRows` for unsuccessful reads.
+`bootUnresolvedS` records unresolved boot minutes omitted during the run;
+`bootSecondUnreadableS` records boot seconds omitted after three failures.
+All fragments of that second share the failure count; the terminal count stays
+until the second is older than the moving ceiling, preventing a fourth query.
+`partialRows` counts complete row objects received from an unsuccessful command,
+including an incomplete JSON array on timeout. They are diagnostic counts only:
+none become observations and the failed interval does not advance. A source
+summary has `partial=true` while any boot interval remains pending.
 Retry checkpoints retain unreported `skippedS`, including after the final chunk,
 so interruption before the source result cannot hide a coverage gap. Once the
 source result reports the gap, a retained suffix clears that metadata. Retries
@@ -878,7 +964,7 @@ review; the CPU job retains its original launcher. Installer tests set
 identities, runnable threads by current priority, CPU advancement and offbox
 command classes. Births are a lower bound from five-second PID/start-time
 snapshots, not a fork or exec count. `status` and rollups show the latest
-birth rate, three parents and runnable priority-4-or-lower count. Overload
+birth rate with its snapshot cadence, three parents and runnable priority-4-or-lower count. Overload
 events carry the sample as context without changing alert thresholds.
 
 Each native pass has a 1.5-second cooperative deadline and reads threads for
@@ -887,8 +973,13 @@ kernel call; the publisher reports stale/in-flight coverage instead of
 waiting. Coverage, unreadable argv/tasks and missing CPU baselines are explicit.
 Only derived labels are cached per PID/start identity; argv is never logged.
 Cost includes per-minute summed wall/CPU time, individual phase costs and guard
-decisions. Actual excess halves the thread-process cap down to one, prioritizing
-runnable hints and highest CPU gain; only then can cadence slow to 15 seconds.
+decisions. CPU above 2% of a core per minute or two consecutive ticks at the
+1.5s wall bound reduce coverage, prioritizing runnable hints and highest CPU
+gain. Summed minute wall time is data, not a cost trigger. If halving the thread
+cap does not reduce thread-read wall time, further pressure slows cadence to
+15s instead of continuing to shrink coverage. Five calm minutes (CPU below 1%,
+no tick at 1s) start recovery: restore 5s cadence first, then double the cap
+once per calm minute up to 300. Candidate selection has separate phase timing.
 A shared 75ms soft argv/CPU allocation leaves room for a 25ms thread pass every
 tick within the 1.5s overall deadline. Runnable hints with unread CPU data
 remain eligible for thread reads and carry an unknown CPU baseline.
@@ -1011,6 +1102,39 @@ response the guard looks up that ID and replays the same idempotent request,
 completing any partial thread launch. It confirms the initial safety message
 and durable run before adoption or steering. Unavailable lookups wait;
 they never authorize a second worker. These calls have a ten-second bound.
+
+Overload transitions (`host.overload`, emitted by the host sampler) also drive
+an immediate reclaim pass before the guard's fork-based probes. A fresh onset
+runs the installed janitor worker under its hourly lock (120-second timeout),
+reuses the GUI leak rule when recent footprint history is available, lowers
+eligible local builds/tests to nice 10 with `setpriority`, then starts or steers
+the existing critical worker. Offbox holders and their descendants are exempt
+from every guard action. Builds below providers, including release-build clones,
+remain eligible; the provider itself stays protected. This path never invokes
+`taskpolicy` or sends process signals of its own.
+
+Passes are limited to one per 20 minutes, persisted across restarts. A fresh
+peak can repeat the pass for the same episode after 20 minutes if the previous
+pass observed less than 1 GiB of RSS reduction. Unknown counters do not count
+as memory freed. RSS deltas are observations, not proof that the rung caused
+the decrease. No overload is inferred from raw load or missing samples.
+
+Read `guard.reclaim` rows in the mac day file and
+`~/.local/state/mac-guard/guard.log`. Each pass writes a census under the normal
+guard evidence directory, including the original overload row, families/spawn
+samples, kept identities, rung results and the never-touch list. The next
+host-vitals row after completion fills in pressure/swap after the pass;
+`after: null` means that row has not arrived. Worker delivery retries use the
+existing durable responder path, including its idempotent launch/steer IDs.
+Each rung also records the latest logged swap/pressure before and after it,
+with observation timestamps. A fresh janitor report with inventory problems
+produces `inventory-unavailable`, even if the worker exited zero; missing or
+stale reports are labelled. Priority actions retain individual command/syscall
+outcomes, bounded error reasons and known errno values. `gone` identifies an
+exited process; `partial` records a successful renice followed by a failed
+backgrounding command. Action evidence survives the day-file cap.
+Install the corresponding janitor reporter update too: its scan timestamp must
+retain fractional seconds to pass the guard's strict report-freshness check.
 
 Pause with `touch ~/.local/state/mac-guard/paused`; remove that file to resume.
 `MAC_GUARD_DRY_RUN=1` records proposed actions while sending no signals,

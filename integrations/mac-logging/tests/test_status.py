@@ -127,13 +127,15 @@ class StatusTests(unittest.TestCase):
         path = self.root / '2026-11-15.ndjson'
         path.write_text('')
         result = self.report()
-        self.assertEqual(set(result['missingJobs']), set(status.CADENCES) - {'disk.ssd_read_probe'})
+        pending = {key for key, cadence in status.CADENCES.items()
+                   if dt.date.fromisoformat(cadence['since']) > NOW.date()}
+        self.assertEqual(set(result['missingJobs']), set(status.CADENCES) - pending)
         self.assertEqual(result['missingFiles'], ['2026-11-14.ndjson'])
         path.unlink()
         result = self.report()
         self.assertEqual(result['missingFiles'], ['2026-11-14.ndjson', '2026-11-15.ndjson'])
         self.assertTrue(all(row['status'] == 'SILENT' for key, row in result['jobs'].items()
-                            if key != 'disk.ssd_read_probe'))
+                            if key not in pending))
         self.assertEqual(list(self.root.iterdir()), [])  # status never writes, even on missing inputs.
 
     def test_timestamp_forms(self):
@@ -314,6 +316,7 @@ class StatusTests(unittest.TestCase):
                         return subprocess.CompletedProcess(command, 0, 'state = not running', '')
 
                     with patch.object(status.subprocess, 'run', side_effect=runner), \
+                         patch.object(status, 'guard_worker', return_value=None), \
                          patch('sys.stdout', new_callable=io.StringIO) as output:
                         code = status.main(['--now', status.stamp(NOW), *args])
                     self.assertEqual(code, 0 if state == 'loaded' else 1)

@@ -13,6 +13,7 @@ export function dependencyBusy(code: number | null | undefined, stderr: string):
 
 // Keep these patterns and normalization in sync with helpers/toollog.py.
 const patterns = [
+  ["ride_ended", /(?:^|\n)ride-card: trip [a-f0-9-]{36} already ended \((?:done|cancelled|failed|unknown)\); not sending a new card(?:\n|$)/i],
   ["usage_error", /(?:^|\n)\s*usage:|unrecognized arguments?|unknown (?:option|argument)|invalid (?:option|choice)|argument .*required|not (?:an exact trip UUID|a bridge chat slug)|no bridge chat|unsafe display name|invalid command arguments|duplicate command option|unexpected positional arguments|--[a-z-]+ (?:is required|must be)/i],
   ["missing_file", /no such file or directory|filenotfounderror|\bENOENT\b|command not found|cannot find module|modulenotfounderror/i],
   ["permission", /permission denied|operation not permitted|permissionerror|\b(?:EACCES|EPERM)\b/i],

@@ -3582,8 +3582,8 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *, 
                 owner_times.append(at)
         if refresh_owner and owner_times and said is None:
             launch_owner_refresh(data or DATA, min(owner_times) - charges.OWNER_AROUND, stats=stats)
-        from marketplace import refresh_status
-        refresh = refresh_status(data or DATA)
+        from marketplace import refresh_status, refresh_details
+        refresh = refresh_details(data or DATA, refresh_status(data or DATA))
         result = _scoped_run_check(wd, run, data, root, now, find, said, stats, refresh, started)
         try:
             (wd / 'data-skips.json').unlink(missing_ok=True)
@@ -3610,6 +3610,29 @@ def _scoped_run_check(wd, run, data, root, now, find, said, stats, marketplace_r
                                       if key not in ('at', 'started', 'stats', 'owner_result')})
         run_history.current()['owner_result'] = stats.get('owner_result', 'not_read')
         from marketplace import launch_refresh
+        error = sys.exc_info()[1]
+        scope = data_io.current_scope()
+        data_unavailable = isinstance(error, data_io.DataUnavailable) or bool(scope and scope['failed'])
+        deadline_aborted = (diagnostic['budgetHit'] or isinstance(error, CheckTimeout)
+                            or time.time() >= started + CHECK_BUDGET)
+        if marketplace_refresh['status'] == 'started':
+            marketplace_refresh['status'] = 'skipped'
+            if data_unavailable:
+                marketplace_refresh['status'] = 'held_data_unavailable'
+            elif deadline_aborted:
+                marketplace_refresh['status'] = 'held_deadline'
+            elif error is not None:
+                marketplace_refresh['status'] = 'held_abort'
+            else:
+                try:
+                    launch_refresh(data or DATA)
+                    marketplace_refresh['status'] = 'started'
+                except data_io.DataUnavailable as exc:
+                    marketplace_refresh['status'] = 'held_deadline' if exc.reason == 'deadline' else 'held_data_unavailable'
+                except OSError:
+                    marketplace_refresh['status'] = 'launch_failed'
+                    record_event('marketplace.refresh', kind='error', ok=False, props={'result': 'launch_error'})
+        run_history.current()['marketplace_refresh'] = marketplace_refresh
         try:
             # The check owns the start and timing samples; logging adds no second timer.
             duration = diagnostic.get('total_s')
@@ -3633,11 +3656,6 @@ def _scoped_run_check(wd, run, data, root, now, find, said, stats, marketplace_r
                                 'starved_by': stats.get('starved_by', diagnostic.get('starved_by', 'none'))})
         except Exception:
             pass
-        if diagnostic['ok'] and marketplace_refresh == 'started':
-            try:
-                launch_refresh(data or DATA)
-            except OSError:
-                record_event('marketplace.refresh', kind='error', ok=False, props={'result': 'launch_error'})
 
 
 def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *, diagnostic):
@@ -4269,9 +4287,19 @@ def main(argv=None):
                 try:
                     event = check_command(wd, os.environ.get('WATCH_RUN', ''), DATA)
                 except data_io.DataUnavailable as error:
+                    run_history.record_skip(row, error)
+                    row['exit'] = 1
                     print(f'money-cases: {error}', file=sys.stderr)
-                    rc = record_data_skip(wd, error)
-                    run_history.record_skip(row, error, rc)
+                    try:
+                        try:
+                            rc = record_data_skip(wd, error)
+                        except data_io.DataUnavailable as again:
+                            print(f'money-cases: {again}', file=sys.stderr)
+                            rc = record_data_skip(wd, again)
+                    except (CaseError, charges.Lookup) as exc:
+                        row['exit'] = 4 if isinstance(exc, charges.Lookup) else 2
+                        raise
+                    row['exit'] = rc
                     return rc
                 if event:
                     print(event)
@@ -4346,8 +4374,10 @@ def main(argv=None):
     except CheckBusy:
         return 75
     except data_io.DataUnavailable as e:
+        if args.command == 'check':
+            raise
         print(f'money-cases: {e}', file=sys.stderr)
-        return record_data_skip(wd, e) if args.command == 'check' else 75
+        return 75
     except (CaseError, charges.Lookup) as e:
         if isinstance(e, charges.Lookup):
             print(f"UNVERIFIED: source {str(e).split(':', 1)[0]} unreadable", file=sys.stderr)

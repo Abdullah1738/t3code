@@ -42,7 +42,7 @@ def current_scope():
     return _SCOPE.get()
 
 
-def materialize_io(fn, path, deadline=None):
+def materialize_io(fn, path, deadline=None, *, use_alarm=True):
     state = _SCOPE.get()
     end = deadline if deadline is not None else time.time() + 40
     if state is not None:
@@ -55,7 +55,7 @@ def materialize_io(fn, path, deadline=None):
     # A tiny scheduling tolerance avoids replacing an effectively identical timer.
     caller_bounds_initial = alarm_end is not None and alarm_end <= end + 0.005
     initial_timeout = DataUnavailable(path, 'deadline')
-    initial_timer = nullcontext() if caller_bounds_initial else _within(end, initial_timeout)
+    initial_timer = nullcontext() if caller_bounds_initial or not use_alarm else _within(end, initial_timeout)
     stats = state['stats'] if state else None
     started = None
     retries = 0
@@ -95,7 +95,7 @@ def materialize_io(fn, path, deadline=None):
             end = min(end, alarm_end - 0.01)
         if time.time() >= end:
             raise DataUnavailable(path)
-        with _within(end, DataUnavailable(path)):
+        with _within(end, DataUnavailable(path)) if use_alarm else nullcontext():
             try:
                 subprocess.run(['brctl', 'download', str(path)], timeout=min(2, end - time.time()),
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -138,39 +138,60 @@ def read_text(path):
 def dataless_files(data):
     parent = _SCOPE.get()
     stats = parent['stats'] if parent else None
-    # A diagnostic census must neither spend the check's budget nor latch its
-    # failed-save guard. Nested scopes share counters but isolate that guard.
+    # A census must not install a signal handler: delivery during timer setup or
+    # teardown can escape restoration and leave its abort active in later phases.
+    # Check between metadata calls instead; one OS call can outlast this budget.
     end = min(time.time() + 0.1, parent['deadline']) if parent else time.time() + 0.1
     try:
-        with scope(end, stats), _within(end, DataUnavailable(data, 'deadline')):
-            count = _dataless_files(data)
+        with scope(end, stats):
+            count = _dataless_files(data, end)
     except (OSError, DataUnavailable) as exc:
+        if getattr(exc, '_money_cases_timeout', False):
+            raise
         if stats is not None:
             stats['dataless_files'] = None
-            stats['dataless_error'] = f'{type(exc).__name__} errno={getattr(exc, "errno", None)}'
+            detail = f'reason={exc.reason}' if isinstance(exc, DataUnavailable) else f'errno={exc.errno}'
+            stats['dataless_error'] = f'{type(exc).__name__} {detail}'
         return None
     if stats is not None:
         stats['dataless_files'] = count
     return count
 
 
-def _dataless_files(data):
+def _dataless_files(data, end):
     # Metadata only: scandir doesn't stat entries, and each entry gets exactly one stat.
+    def metadata(fn, path):
+        try:
+            value = materialize_io(fn, path, deadline=end, use_alarm=False)
+        except FileNotFoundError as exc:
+            if getattr(exc, '_money_cases_timeout', False):
+                raise
+            if time.time() >= end:
+                raise DataUnavailable(path, 'deadline')
+            raise
+        if time.time() >= end:
+            raise DataUnavailable(path, 'deadline')
+        return value
+
     count = 0
     try:
-        entries = materialize_io(lambda: list(os.scandir(data)), data)
-    except FileNotFoundError:
+        entries = metadata(lambda: list(os.scandir(data)), data)
+    except FileNotFoundError as exc:
+        if getattr(exc, '_money_cases_timeout', False):
+            raise
         return 0
     for entry in entries:
         try:
-            info = materialize_io(lambda: os.stat(entry.path, follow_symlinks=False), entry.path)
-        except FileNotFoundError:
+            info = metadata(lambda: os.stat(entry.path, follow_symlinks=False), entry.path)
+        except FileNotFoundError as exc:
+            if getattr(exc, '_money_cases_timeout', False):
+                raise
             # Atomic writers can rename their temporary entries after scandir.
             continue
         if not stat.S_ISDIR(info.st_mode):
             count += bool(getattr(info, 'st_flags', 0) & SF_DATALESS)
         else:
-            count += _dataless_files(Path(entry.path))
+            count += _dataless_files(Path(entry.path), end)
     return count
 
 

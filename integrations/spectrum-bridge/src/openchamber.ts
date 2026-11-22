@@ -352,6 +352,7 @@ export interface ChatBackend {
   steer?(id: string, directory: string, messageId: string, text: string, guidance?: string, files?: readonly FilePart[], guard?: SteerGuard): Promise<SteerDelivery>;
   abort(id: string, directory: string, cancelReason?: "user_stop" | "thread_reset"): Promise<boolean>;
   statuses(complete?: boolean): Promise<Record<string, SessionStatus>>;
+  activeStatuses?(): Record<string, SessionStatus>;
   /**
    * Whether one session is busy. Optional because `statuses()` already answers it;
    * backends whose full list is slow (Robob) implement this cheap single lookup.

@@ -20,9 +20,12 @@ LAUNCHD_LABELS = (
     'com.abdullah.mac-cpu',
     'com.abdullah.mac-ssd-read-probe',
     'com.abdullah.mac-guard',
+    'com.abdullah.mac-suspend',
 )
 # Logging shipped on 2026-11-13 UTC (#10); older days cannot prove silence.
 CADENCES = {
+    # launchd/com.abdullah.mac-suspend.plist: independent StartInterval=60.
+    'suspend.sweep': dict(name='suspend.sweep', target=None, gapHours=.05, since='2026-11-22'),
     # robob-watch/watchers/disk-space-guard/watcher.json: interval_s=1800;
     # allow two hours (four checks), as requested for the guard.
     'disk.sample': dict(name='disk.sample', target=None, gapHours=2, since='2026-11-13'),
@@ -238,7 +241,8 @@ def main(argv=None):
             spawn = result.get('spawnSample')
             if spawn:
                 parents = ', '.join('%s[%s]:%s' % (p.get('family') or p.get('parent_comm'), p.get('ppid'), p.get('births')) for p in spawn['top_spawners'])
-                print('spawn >=%s births/min; runnable pri<=4=%s; partial=%s; age=%g min; top: %s' % (spawn['births_per_min'], spawn['runnable_pri_le4'], spawn['partial'], spawn['ageMin'], parents))
+                cadence = '/'.join(str(v) for v in spawn['births_cadences_s']) or '?'
+                print('spawn >=%s births/min @%ss; runnable pri<=4=%s; partial=%s; age=%g min; top: %s' % (spawn['births_per_min'], cadence, spawn['runnable_pri_le4'], spawn['partial'], spawn['ageMin'], parents))
             for filename in result.get('missingFiles', []):
                 print('missing day file: ' + filename)
             for filename in result.get('readErrors', []):

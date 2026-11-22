@@ -7,13 +7,14 @@ import functools
 import math
 import os
 import re
+import resource
 import subprocess
 import sys
 import time
 
 from host import Sampler, clean_host, poll_props
 from toollog import emit, trimmed_stderr
-from causes import PHASES, gap_info, launchctl_info, phase_cause, positive
+from causes import PHASES, RESOURCE_FIELDS, BYTE_PHASES, BYTE_FIELDS, WAIT_FIELDS, SUBSTEPS, SUBSTEP_FIELDS, gap_info, launchctl_info, phase_cause, positive
 
 JOB = 'com.ardud.9router-log-poll'
 FIELDS = {name: field for name, field in PHASES.items() if name != 'pool_fetch'}
@@ -163,7 +164,11 @@ def gap_summary(rows, day, generated):
                 hosts[key + 'AtMs'] = at
         if 'l1' in hosts.get('hostStart', {}):
             hosts['load1Start'] = hosts['hostStart']['l1']
-        bucket.append(dict(**hosts, number=len(bucket) + 1, start=iso(start), end=iso(end),
+        counters = {key: value for key, value in props.items()
+                    if key in WAIT_FIELDS and type(value) is int and value >= 0}
+        counters.update({key: value for key, value in props.items()
+                         if key in SUBSTEP_FIELDS and (value == 0 or positive(value))})
+        bucket.append(dict(**hosts, **counters, number=len(bucket) + 1, start=iso(start), end=iso(end),
                            **explanation, component=component, durationMs=round(overlap, 3)))
     return groups
 
@@ -209,10 +214,11 @@ def phase(name):
     try:
         started = time.monotonic()
         cpu_started = time.process_time()
+        usage_started = resource.getrusage(resource.RUSAGE_SELF)
     except Exception:
         yield
         return
-    frame = [started, 0, cpu_started, 0, name]
+    frame = [started, 0, cpu_started, 0, name, usage_started, dict.fromkeys(RESOURCE_FIELDS, 0)]
     timing.stack.append(frame)
     progress(name)
     try:
@@ -221,8 +227,14 @@ def phase(name):
         try:
             elapsed = (time.monotonic() - frame[0]) * 1000
             cpu = (time.process_time() - frame[2]) * 1000
+            usage = resource.getrusage(resource.RUSAGE_SELF)
             timing.values[name] += max(0, elapsed - frame[1])
             timing.cpu[name] += max(0, cpu - frame[3])
+            for suffix, attribute in RESOURCE_FIELDS.items():
+                delta = max(0, getattr(usage, attribute) - getattr(frame[5], attribute))
+                timing.resources[name][suffix] += max(0, delta - frame[6][suffix])
+                if len(timing.stack) > 1:
+                    timing.stack[-2][6][suffix] += delta
             if len(timing.stack) > 1:
                 timing.stack[-2][1] += elapsed
                 timing.stack[-2][3] += cpu
@@ -239,9 +251,57 @@ def measured(name):
         @functools.wraps(function)
         def run(*args, **kwargs):
             with phase(name):
+                if name in BYTE_PHASES:
+                    with substep('BuildReport'):
+                        return function(*args, **kwargs)
                 return function(*args, **kwargs)
         return run
     return decorate
+
+
+@contextlib.contextmanager
+def substep(name):
+    timing = _active.get()
+    if timing is None or not timing.stack or timing.stack[-1][4] not in BYTE_PHASES:
+        yield
+        return
+    parent = timing.stack[-1]
+    started, cpu_started = time.monotonic(), time.process_time()
+    child_wall, child_cpu = parent[1], parent[3]
+    frame = [parent, 0, 0]
+    timing.steps.append(frame)
+    try:
+        yield
+    finally:
+        # Exclude both nested phases and nested substeps. A checkpoint save
+        # inside a parse loop belongs only to SaveState; listener work belongs
+        # only to its own phase, even inside history's BuildReport span.
+        wall = max(0, (time.monotonic() - started) * 1000 - (parent[1] - child_wall) - frame[1])
+        cpu = max(0, (time.process_time() - cpu_started) * 1000 - (parent[3] - child_cpu) - frame[2])
+        timing.substeps[parent[4]][name][0] += wall
+        timing.substeps[parent[4]][name][1] += cpu
+        timing.steps.pop()
+        if timing.steps and timing.steps[-1][0] is parent:
+            timing.steps[-1][1] += wall + frame[1]
+            timing.steps[-1][2] += cpu + frame[2]
+
+
+def submeasured(name):
+    def decorate(function):
+        @functools.wraps(function)
+        def run(*args, **kwargs):
+            with substep(name):
+                return function(*args, **kwargs)
+        return run
+    return decorate
+
+
+def count_bytes(suffix, count):
+    timing = _active.get()
+    if timing is not None and timing.stack:
+        name = timing.stack[-1][4]
+        if name in timing.bytes:
+            timing.bytes[name][suffix] += count
 
 
 class Timings:
@@ -252,6 +312,10 @@ class Timings:
         self.stack, self.values = [], {name: 0 for name in FIELDS}
         self.last_phase = 'none'
         self.cpu = {name: 0 for name in FIELDS}
+        self.resources = {name: dict.fromkeys(RESOURCE_FIELDS, 0) for name in FIELDS}
+        self.bytes = {name: dict.fromkeys(BYTE_FIELDS, 0) for name in BYTE_PHASES}
+        self.steps = []
+        self.substeps = {name: {step: [0, 0] for step in SUBSTEPS} for name in BYTE_PHASES}
 
     def __enter__(self):
         self.token = _active.set(self)
@@ -321,6 +385,13 @@ class Timings:
             props[key + 'End'] = self.end.get(key, 'unknown')
         props.update({field: round(self.values[name], 3) for name, field in FIELDS.items()})
         props.update({field[:-2] + 'CpuMs': round(self.cpu[name], 3) for name, field in FIELDS.items()})
+        props.update({FIELDS[name][:-2] + suffix: value
+                      for name, counters in self.resources.items() for suffix, value in counters.items()})
+        props.update({FIELDS[name][:-2] + suffix: value
+                      for name, counters in self.bytes.items() for suffix, value in counters.items()})
+        props.update({FIELDS[name][:-2] + step + suffix: math.floor(values[index] * 1000) / 1000
+                      for name, steps in self.substeps.items() for step, values in steps.items()
+                      for index, suffix in enumerate(('Ms', 'CpuMs'))})
         props.update(gap_info(props))
         emit(self.component, self.name, kind='perf', durationMs=elapsed, props=props)
 

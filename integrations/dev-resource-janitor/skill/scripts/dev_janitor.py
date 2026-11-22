@@ -289,7 +289,7 @@ def scan():
     if "mcp_summary" not in processes:
         processes = leftover_processes.unavailable_report("process_scan_skipped")
     phases.update({"processes." + name: ms for name, ms in processes.get("phase_ms", {}).items()})
-    return {"ts": int(now), "idle_min": IDLE_MIN, "running_sessions": len(running or []),
+    return {"ts": now, "idle_min": IDLE_MIN, "running_sessions": len(running or []),
             "liveness_unavailable": run_err,
             "processes": processes, "phase_ms": phases,
             "docker_up": docker_up, "resources": resources,

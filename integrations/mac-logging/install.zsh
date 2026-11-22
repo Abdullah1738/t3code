@@ -20,14 +20,15 @@ copy_file() {
     install -m "$perm" "$src" "$dst"
   fi
 }
-for file in overload.py overload_io.py overload_notify.py host.py host_native.py host_signal.py spawn_sample.py spawn_schema.py logwindow.py toollog.py toollog.sh jobs.py collector.py memory.py deep_inventory.py homebrew.py rollup.py status.py cpu.py cpu_labels.py tailnet.py u_sample.py ssd_probe.py volume_crawls.py process_argv.py disk_budgets.py disk-budgets.json disk_low.py mac_guard.py mac_guard_worker_prompt.md; do
+for file in overload.py overload_io.py overload_notify.py host.py host_native.py host_signal.py spawn_sample.py spawn_schema.py logwindow.py toollog.py toollog.sh jobs.py collector.py memory.py deep_inventory.py homebrew.py rollup.py status.py cpu.py cpu_labels.py tailnet.py u_sample.py ssd_probe.py volume_crawls.py process_argv.py disk_budgets.py disk-budgets.json disk_low.py guard_reclaim.py mac_guard.py mac_guard_worker_prompt.md suspend_lease.py; do
   copy_file "$here/$file" "$HOME/.local/lib/mac-logging/$file" 600
 done
 # A plain executable wrapper keeps imports local to the installed helper directory.
 copy_file "$here/mac-log-rollup" "$HOME/.local/bin/mac-log-rollup" 755
 copy_file "$here/mac-log-status" "$HOME/.local/bin/mac-log-status" 755
 copy_file "$here/mac-log-window" "$HOME/.local/bin/mac-log-window" 755
-for label in com.abdullah.mac-host com.abdullah.mac-log-collector com.abdullah.mac-deep-inventory com.abdullah.mac-memory com.abdullah.mac-cpu com.abdullah.mac-tailnet com.abdullah.mac-ssd-read-probe com.abdullah.mac-guard; do
+copy_file "$here/mac-suspend" "$HOME/.local/bin/mac-suspend" 755
+for label in com.abdullah.mac-host com.abdullah.mac-log-collector com.abdullah.mac-deep-inventory com.abdullah.mac-memory com.abdullah.mac-cpu com.abdullah.mac-tailnet com.abdullah.mac-ssd-read-probe com.abdullah.mac-guard com.abdullah.mac-suspend; do
 if [[ $mode == install ]]; then
   /usr/bin/python3 - "$here/launchd/$label.plist" "$HOME/Library/LaunchAgents/$label.plist" <<'PY'
 from pathlib import Path

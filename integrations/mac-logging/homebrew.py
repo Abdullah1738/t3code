@@ -39,37 +39,97 @@ def parse_missing(output):
     return [dict(formula=name, deps=sorted(deps)) for name, deps in sorted(missing.items())]
 
 
-def collect(opt_root='/opt/homebrew/opt', run=subprocess.run):
+def receipt_missing(opt_root='/opt/homebrew/opt', cellar_root='/opt/homebrew/Cellar'):
+    opt = Path(opt_root)
+    cellar = Path(cellar_root).resolve()
+    missing, errors = [], 0
+    for path in sorted(opt.iterdir()):
+        if not path.is_symlink():
+            continue
+        try:
+            target = path.resolve()
+            if not target.is_relative_to(cellar):
+                continue
+            parts = target.relative_to(cellar).parts
+            if len(parts) != 2 or parts[0] != path.name:
+                continue
+            receipt = json.loads((target/'INSTALL_RECEIPT.json').read_text(encoding='utf-8'))
+            if not isinstance(receipt, dict):
+                raise ValueError('invalid receipt')
+            dependencies = receipt.get('runtime_dependencies', [])
+            if not isinstance(dependencies, list):
+                raise ValueError('invalid receipt dependencies')
+            names = set()
+            for dependency in dependencies:
+                full_name = dependency.get('full_name') if isinstance(dependency, dict) else None
+                if not isinstance(full_name, str) or not re.fullmatch(FORMULA, full_name):
+                    raise ValueError('invalid receipt dependency name')
+                name = full_name.rsplit('/', 1)[-1]
+                if name in ('.', '..'):
+                    raise ValueError('invalid receipt dependency name')
+                if not (opt/name).exists():
+                    names.add(name)
+            if names:
+                missing.append(dict(formula=path.name, deps=sorted(names)))
+        except (OSError, ValueError, UnicodeError, RuntimeError):
+            errors += 1
+    return missing, errors
+
+
+def collect(opt_root='/opt/homebrew/opt', run=subprocess.run, *, cellar_root='/opt/homebrew/Cellar'):
     start = time.monotonic()
-    props = dict(dangling=[], missing=[], status='error')
+    props = dict(dangling=[], missing=[], receiptErrors=0)
+    checked = False
     try:
         props['dangling'] = dangling_links(opt_root)
     except OSError:
-        props['reason'] = 'opt_unavailable'
+        pass
     else:
-        try:
-            result = run(['/opt/homebrew/bin/brew', 'missing'], capture_output=True,
-                         text=True, timeout=60, env={**os.environ,
-                         'HOMEBREW_NO_AUTO_UPDATE': '1', 'HOMEBREW_NO_ANALYTICS': '1'})
-            props['exitCode'] = result.returncode
-            # brew missing exits 1 for missing dependencies as well as failures.
-            # Only parsed dependency rows make exit 1 an integrity result.
-            if result.returncode not in (0, 1):
-                props['reason'] = 'brew_exit'
+        checked = True
+    try:
+        props['missing'], props['receiptErrors'] = receipt_missing(opt_root, cellar_root)
+    except (OSError, RuntimeError):
+        pass
+    else:
+        checked = True
+    try:
+        # Ruby startup is slow under load. Formula receipts remain authoritative
+        # even if this secondary probe, which also covers casks, cannot finish.
+        result = run(['/usr/bin/nice', '-n', '15', '/opt/homebrew/bin/brew', 'missing'],
+                     capture_output=True, text=True, timeout=240, env={**os.environ,
+                     'HOMEBREW_NO_AUTO_UPDATE': '1', 'HOMEBREW_NO_ANALYTICS': '1'})
+        props['exitCode'] = result.returncode
+        if result.returncode == 127:
+            props['brewError'] = 'brew_absent'
+        elif result.returncode == 126:
+            props['brewError'] = 'brew_unavailable'
+        elif result.returncode not in (0, 1):
+            props['brewError'] = 'brew_exit'
+        else:
+            missing = parse_missing(result.stdout)
+            if result.returncode and not missing:
+                props['brewError'] = 'brew_exit'
             else:
-                props['missing'] = parse_missing(result.stdout)
-                if result.returncode and not props['missing']:
-                    props['reason'] = 'brew_exit'
-                else:
-                    props['status'] = 'broken' if props['dangling'] or props['missing'] else 'ok'
-        except FileNotFoundError:
-            props['reason'] = 'brew_absent'
-        except subprocess.TimeoutExpired:
-            props['reason'] = 'brew_timeout'
-        except OSError:
-            props['reason'] = 'brew_unavailable'
-        except (ValueError, UnicodeError):
-            props['reason'] = 'brew_parse'
+                checked = True
+                combined = {}
+                for row in props['missing']+missing:
+                    # Both sources identify the same opt entry, even when Brew
+                    # prints a tap-qualified formula or dependency name.
+                    name = row['formula'].rsplit('/', 1)[-1]
+                    combined.setdefault(name, set()).update(dep.rsplit('/', 1)[-1] for dep in row['deps'])
+                props['missing'] = [dict(formula=name, deps=sorted(deps))
+                                    for name, deps in sorted(combined.items())]
+    except FileNotFoundError:
+        props['brewError'] = 'brew_absent'
+    except subprocess.TimeoutExpired:
+        props['brewError'] = 'brew_timeout'
+    except OSError:
+        props['brewError'] = 'brew_unavailable'
+    except (ValueError, UnicodeError):
+        props['brewError'] = 'brew_parse'
+    props['status'] = 'broken' if props['dangling'] or props['missing'] else 'ok' if checked else 'error'
+    if props['status'] == 'error':
+        props['reason'] = 'opt_unavailable'
     props['durationMs'] = (time.monotonic()-start)*1000
     return props
 
@@ -99,8 +159,8 @@ def alert_content(props):
     return key, text
 
 
-def check(send, opt_root='/opt/homebrew/opt', run=subprocess.run):
-    props = collect(opt_root, run)
+def check(send, opt_root='/opt/homebrew/opt', run=subprocess.run, *, cellar_root='/opt/homebrew/Cellar'):
+    props = collect(opt_root, run, cellar_root=cellar_root)
     status = props['status']
     emit('homebrew', 'error' if status == 'error' else 'event', 'homebrew.integrity',
          ok=status == 'ok', duration_ms=props['durationMs'], props=props,

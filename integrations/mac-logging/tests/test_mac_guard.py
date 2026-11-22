@@ -77,6 +77,8 @@ class FakeHost:
 
     def soften(self, p):
         self.effects.append(('soften', p['pid']))
+        return dict(result='sent', stages=dict(renice=dict(rc=0, result='sent', stderr=''),
+                    identityRecheck=dict(same=True), taskpolicy=dict(rc=0, result='sent', stderr='')))
 
     def notify(self, key, text):
         self.effects.append(('notify', key, text))
