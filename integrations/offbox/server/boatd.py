@@ -113,7 +113,9 @@ DEFAULTS = {
     "person_owners": ["moni"],        # their boxes get hourly/daily/weekly snapshots
     "max_running": 0,                 # optional hard cap, in addition to resource admission
     "cpu_pressure_limit": 0,          # host CPU some avg10 (%); 0 = off (the default until #219)
-    "prune_unused_days": 30,          # stopped boxes untouched this long are deleted (not pinned, not saved)
+    "prune_unused_days": 7,           # stopped boxes untouched this long are deleted (not pinned, not saved)
+    "pressure_idle_s": 12 * 3600,     # pool short with no run snapshot left: stopped boxes idle this long go, oldest first
+    "unreconciled_protect_s": 86400,  # an ended command with no recorded result protects its box's snapshots this long
     "sample_s": 10, "keep_samples_days": 90,
 }
 CFG: dict = {}
@@ -163,6 +165,7 @@ CREATE TABLE IF NOT EXISTS commands (box_id TEXT, pid INTEGER, command_id TEXT, 
   queued_s REAL, kind TEXT, repo TEXT, run_id TEXT, metrics TEXT, PRIMARY KEY (box_id, pid));
 CREATE INDEX IF NOT EXISTS commands_cid ON commands(command_id);
 CREATE INDEX IF NOT EXISTS commands_kind ON commands(kind, ended_at);
+CREATE INDEX IF NOT EXISTS commands_unsettled ON commands(box_id, status, exit_code, ended_at, started_at, created_at);
 CREATE TABLE IF NOT EXISTS saved (name TEXT PRIMARY KEY, instance TEXT, source TEXT, type TEXT,
   status TEXT, error TEXT, size_bytes INTEGER, created_at REAL, snapshot_id TEXT);
 CREATE TABLE IF NOT EXISTS snaps (box_id TEXT, name TEXT, kind TEXT, created_at REAL, PRIMARY KEY (box_id, name));
@@ -546,11 +549,17 @@ def disk_admit():
 
 
 def snapshot_protected(con, pressure=True):
-    # Unknown/interrupted results stay protected too, until their owner reconciles them.
     protected = {r['id'] for r in con.execute('SELECT id,pinned,state,owner FROM boxes')
                  if r['pinned'] or (pressure and (r['state'] not in ('ready','running','archived')
                                                 or r['owner'] in (CFG.get('person_owners') or [])))}
-    protected.update(r[0] for r in con.execute("SELECT DISTINCT box_id FROM commands WHERE status IS NULL OR status NOT IN ('exited','killed') OR (status='exited' AND exit_code IS NULL)"))
+    # A live command always protects. An ended one with no recorded result protects for a bounded time only:
+    # nothing reconciles old records, and on 19-22 Nov 2026 two such rows kept a 114 GiB snapshot out of
+    # cleanup's reach while the pool sat under its floor.
+    recent = now() - CFG.get('unreconciled_protect_s', 86400)
+    protected.update(r[0] for r in con.execute(
+        "SELECT DISTINCT box_id FROM commands WHERE status IS NULL OR status IN ('queued','running') OR "
+        "((status NOT IN ('exited','killed') OR exit_code IS NULL) AND "
+        "MAX(COALESCE(ended_at,0), COALESCE(started_at,0), COALESCE(created_at,0)) > ?)", (recent,)))
     protected.update(r[0] for r in con.execute("SELECT source FROM saved WHERE status IN ('ready','pending')"))
     return protected
 
@@ -614,8 +623,16 @@ def disk_maintenance(con, error=None):
         protected = snapshot_protected(con)
         missing_snapshots = {tuple(key) for key in cleanup.get('missing_snapshots', [])}
         missing_snapshots &= live
-        eligible = [r for r in disk.candidates(snaps, protected)
-                    if (r['box'], r['name']) not in missing_snapshots]
+        # Owner rule, 22 Nov 2026: while the pool is short, waiting jobs outrank disposable history. No run
+        # restore point of an unprotected box is kept back, and they go strictly oldest first.
+        short = bool(pool and pool['free_bytes'] < cleanup.get('target_bytes', 0))
+        # A snapshot Incus refuses to delete steps aside for an hour, so it cannot hold up everything behind it.
+        refused = {tuple(key): at for key, at in cleanup.get('refused_snapshots', []) if now() - at < 3600}
+        eligible = [r for r in disk.candidates(snaps, protected, keep=0 if short else disk.KEEP_RUN)
+                    if (r['box'], r['name']) not in missing_snapshots and (r['box'], r['name']) not in refused]
+        known = {r['id'] for r in con.execute('SELECT id FROM boxes WHERE deleted_at IS NULL')}
+        # The reaper reads this: only when no run snapshot is left does it delete stopped boxes for space.
+        cleanup['snapshots_left'] = sum(1 for r in eligible if r['box'] in known) if short else 0
         # Count-retention uses the same pacing gate. Otherwise run completion or
         # personal timers could bypass sampler backpressure with a bulk delete.
         count_gone = set()
@@ -636,8 +653,11 @@ def disk_maintenance(con, error=None):
                 oversized[bid] = over
         # Tackle the boxes causing growth first, oldest history within each
         # budget tier. Small unrelated history must not consume the tick.
-        eligible.sort(key=lambda r: (0 if r['box'] in oversized else 1,
-                                     -oversized.get(r['box'], 0), r['created_at'], r['name']))
+        if short:
+            eligible.sort(key=lambda r: (r['created_at'], r['name']))
+        else:
+            eligible.sort(key=lambda r: (0 if r['box'] in oversized else 1,
+                                         -oversized.get(r['box'], 0), r['created_at'], r['name']))
         attempts = 0
         for row in eligible:
             box = con.execute('SELECT name FROM boxes WHERE id=? AND deleted_at IS NULL', (row['box'],)).fetchone()
@@ -688,6 +708,7 @@ def disk_maintenance(con, error=None):
             if missing:
                 missing_snapshots.add((row['box'], row['name']))
             if result.returncode and not missing:
+                refused[(row['box'], row['name'])] = now()
                 toollog.emit('boatd', 'snapshot.prune', kind='error', ok=False,
                              ids={'box': row['box']}, props={'snapshot': row['name'], 'reason': reason}, tag='snapshot_prune')
                 break
@@ -705,8 +726,10 @@ def disk_maintenance(con, error=None):
         cleanup['budget_shortfall_bytes'] = sum(max(0, int(u['snapshot_bytes'] - disk.SNAPSHOT_RATIO * u['live_bytes']))
             for bid, u in sizes.items() if u.get('live_bytes', 0) > 0 and con.execute(
                 "SELECT 1 FROM boxes WHERE id=? AND name LIKE '%repository pool%' AND deleted_at IS NULL", (bid,)).fetchone())
-        value['cleanup'] = {k: v for k, v in cleanup.items() if k not in ('last_delete_at', 'missing_snapshots')}
+        value['cleanup'] = {k: v for k, v in cleanup.items()
+                            if k not in ('last_delete_at', 'missing_snapshots', 'refused_snapshots')}
         cleanup['missing_snapshots'] = sorted(missing_snapshots)
+        cleanup['refused_snapshots'] = sorted([list(key), at] for key, at in refused.items())
         value['snapshot_bytes_by_kind'] = disk.kind_bytes(snaps)
         DISK.update(boxes=sizes, cleanup=value['cleanup'], snapshot_bytes_by_kind=value['snapshot_bytes_by_kind'])
         con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk_cleanup',?)", (json.dumps(cleanup),))
@@ -3333,6 +3356,7 @@ def reap_once(con) -> None:
     toollog.rollup_previous()
     toollog.rollup_today()
     t = now()
+    stopped = []
     for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall():
         bid = r["id"]
         if r['pinned'] and r['pin_until'] is not None and r['pin_until'] <= t:
@@ -3361,13 +3385,8 @@ def reap_once(con) -> None:
         elif r["state"] == "archived" and not r["pinned"] and r["owner"] not in (CFG.get("person_owners") or []):
             # A person's box is never deleted for being unused: it is where her data lives.
             used = con.execute("SELECT 1 FROM saved WHERE source=? AND status='ready'", (bid,)).fetchone()
-            if not used and t - (r["stopped_at"] or t) > CFG["prune_unused_days"] * 86400:
-                try:
-                    delete_box(con, bid, 'archived box exceeded unused retention')
-                    toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "delete"})
-                except Exception as e:  # noqa: BLE001
-                    toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
-                    log(f"prune {bid} failed: {e}")
+            if not used:
+                stopped.append(r)
         elif r["state"] == "error" and t - (r["updated_at"] or t) > 86400:
             try:
                 delete_box(con, bid, 'failed box exceeded one-day retention')
@@ -3375,6 +3394,7 @@ def reap_once(con) -> None:
             except Exception as e:  # noqa: BLE001
                 toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
                 log(f"prune {bid} failed: {e}")
+    reap_stopped_box(con, stopped, t)
     # Commands whose runner went away without recording an exit: same rules as at start-up.
     for c in [*con.execute("SELECT * FROM commands WHERE status IN ('queued','running') AND created_at < ? AND "
                           "COALESCE(interrupted_at, 0) < ?", (t - 30, t - 30)).fetchall(), *pending_kill_rows(con)]:
@@ -3383,6 +3403,62 @@ def reap_once(con) -> None:
     con.execute("DELETE FROM samples WHERE ts < ?", (t - CFG["keep_samples_days"] * 86400,))
     con.execute("DELETE FROM host_samples WHERE ts < ?", (t - CFG["keep_samples_days"] * 86400,))
     con.execute("DELETE FROM idem WHERE ts < ?", (t - 86400,))
+
+
+BOX_DELETE_GAP_S = 60
+REAP_REFUSED = {}   # box id -> time a delete was refused; it steps aside for an hour
+
+
+def reap_stopped_box(con, stopped, t):
+    """Delete at most one stopped disposable box per pass, longest-stopped first.
+
+    Past prune_unused_days a box goes regardless of space. While the pool is short and no run snapshot is left to
+    prune, pressure_idle_s is enough (owner rule, 22 Nov 2026: waiting jobs outrank old disposable state; person
+    boxes, pins and saved bases are never in `stopped`). One per pass and never into a ZFS free backlog: a burst
+    of box deletes stalls Incus writes on the block-cloned home pool."""
+    cleanup = (disk_state().get('cleanup') or {}) if CFG.get('state_dataset') else {}
+    short = bool(cleanup.get('shortfall_bytes')) and not cleanup.get('snapshots_left')
+    retention = CFG["prune_unused_days"] * 86400
+    floor = min(retention, CFG.get('pressure_idle_s', 12 * 3600)) if short else retention
+    due = sorted((r for r in stopped if t - (r["stopped_at"] or t) > floor
+                  and t - REAP_REFUSED.get(r['id'], 0) >= 3600), key=lambda r: r["stopped_at"])
+    if not due:
+        return None
+    state = con.execute("SELECT v FROM meta WHERE k='box_reap'").fetchone()
+    if t - (json.loads(state[0]).get('at', 0) if state else 0) < BOX_DELETE_GAP_S:
+        return None
+    if CFG.get('state_dataset'):
+        try:
+            if disk.yield_reason(disk.cleanup_pressure(CFG['zpool'])):
+                return None
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            return None
+    protected = snapshot_protected(con) if short else set()
+    for r in due[:8]:
+        bid = r['id']
+        expired = t - r["stopped_at"] > retention
+        if not expired:
+            # Space is the only reason here, so a box that would give none back is left alone.
+            rc, clones = _sh(['zfs', 'list', '-Hp', '-t', 'snapshot', '-o', 'clones', '-r',
+                              f"{zpool()}/containers/{ct(bid)}"])
+            if bid in protected or rc or any(line.strip() not in ('', '-') for line in clones.splitlines()):
+                continue
+        why = 'archived box exceeded unused retention' if expired else 'pool short of space: longest-stopped disposable box'
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('box_reap',?)", (json.dumps({'at': now(), 'box': bid}),))
+        try:
+            delete_box(con, bid, why)
+        except Exception as e:  # noqa: BLE001
+            REAP_REFUSED[bid] = t
+            toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid},
+                         props={"action": "delete", "reason": why, "error": str(e)[:200]}, tag="reaper_delete")
+            log(f"prune {bid} failed: {e}")
+            continue
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('box_reap',?)", (json.dumps({'at': now(), 'box': bid}),))
+        toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid},
+                     props={"action": "delete", "reason": why, "stopped_s": int(t - r["stopped_at"])})
+        log(f"box {bid} deleted ({why})")
+        return bid
+    return None
 
 
 def reap_command(con, c, t):
