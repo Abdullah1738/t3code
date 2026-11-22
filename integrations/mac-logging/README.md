@@ -889,8 +889,29 @@ A Robob process crossing the growth threshold, or the app tree totaling
 >=24 GiB, requests the overload watchdog's detached `restart` subcommand.
 Missing helpers, install holds, restart/install tmux sessions, release builds,
 server uptime under ten minutes, the SSD read-blocked interlock and a memory restart within an hour skip it
-and alert the responder. The watchdog script is an external prerequisite;
-its tracker owns it through 23 November 2026 and must keep its interface stable.
+and alert the responder. The guard calls the fork's
+`integrations/robob-overload-restart` installed copy through
+`/bin/zsh -f ~/.local/share/robob-overload-restart/launchd-entry.zsh restart <stamp>`.
+It skips with an alert while that watchdog is missing or disabled. The watchdog's
+own limits still apply, including expiry where enforced by the installed version.
+Its LaunchAgent need not be loaded for this direct call.
+
+The call runs in detached tmux session `restart/mac-guard-restart`, so it does
+not collide with the watchdog's `restart/robob-restart` exclusion. The guard
+records the attempt before launch, then reads the watchdog's stamped result
+receipt and the detached command's exit status. Success requires both a success
+receipt and a zero exit. Missing/off helpers and refusals
+consume the hourly attempt allowance and alert the responder once; they never
+select an alternate helper. Responder delivery failures retain the incident
+and retry the same request during cooldown, including status or send failures
+for an existing worker. Uncertain requests stay bound to the original worker
+and operation, even if it finishes before acknowledgment. Logs and exit status stay in the guard's evidence
+directory. `macguard.robob_restart.detail` records the refusal or install hold.
+
+On socket `qf-install`, a live pane in a session matching `^install\d*$` holds
+the restart when it runs a non-shell command or had activity within 30 minutes.
+Dead panes and older idle shells do not hold it. Failed or timed-out probes
+hold it; a confirmed absent tmux server does not.
 
 The separate runnable/idle diagnostic requires two valid minute samples of
 load >=100, host idle >=30% and process R >=64 (or >5s Robob lag). It records

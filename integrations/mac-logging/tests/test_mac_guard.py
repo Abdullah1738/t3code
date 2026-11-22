@@ -46,6 +46,7 @@ class FakeHost:
         self.worker = dict(state='running')
         self.launches = {}
         self.lookups = []
+        self.sent_requests = set()
         self.checks = dict(pid=1, started=NOW-3600, hold=None, restart=False, install=False, building=[])
         self.apps = {}
 
@@ -91,14 +92,19 @@ class FakeHost:
             raise self.checks
         return self.checks
 
-    def restart(self, log):
-        self.effects.append(('restart', str(log)))
+    def restart(self, log, stamp):
+        self.effects.append(('restart', str(log), stamp))
+
+    def restart_result(self, pending):
+        return None
 
     def worker_status(self, tid):
         return self.worker
 
-    def worker_send(self, tid, text):
-        self.effects.append(('steer', tid, text))
+    def worker_send(self, tid, text, request_id=None):
+        if request_id is None or request_id not in self.sent_requests:
+            self.effects.append(('steer', tid, text))
+            self.sent_requests.add(request_id)
 
     def worker_lookup(self, request_id):
         self.lookups.append(request_id)
@@ -232,7 +238,7 @@ class GuardTests(unittest.TestCase):
         self.tick([proc(1, ROBOB)], {1: 35})
         self.assertEqual(len(self.effects('restart')), 1)
         self.assertEqual(self.events_named('robob_restart')[-1]['reason'], 'memory_restart_cooldown')
-        self.assertEqual(len(self.effects('worker')), 1)
+        self.assertFalse(self.effects('worker'))  # the detached attempt has not reported yet
 
     def test_robob_tree_total(self):
         self.tick([proc(1, ROBOB), proc(2, '/Applications/Robob.app/Contents/Frameworks/Robob Helper (Renderer)', ppid=1)], {1: 10, 2: 15})
@@ -1144,10 +1150,14 @@ class PlumbingTests(unittest.TestCase):
         def run(argv, **kw):
             calls.append((argv, kw))
             return subprocess.CompletedProcess(argv, 0, '')
-        m.Host(run).restart(Path('/safe/restart.log'))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(m, 'OVERLOAD_SCRIPT', Path(tmp)/'robob-overload-restart.py'), patch.object(m, 'OVERLOAD_STATE', Path(tmp)/'state'):
+            m.OVERLOAD_SCRIPT.touch()
+            (m.OVERLOAD_SCRIPT.parent/'launchd-entry.zsh').touch()
+            m.Host(run).restart(Path('/safe/restart.log'), 'abc123')
+            entry = str(m.OVERLOAD_SCRIPT.parent/'launchd-entry.zsh')
         argv, kw = calls[0]
-        self.assertEqual(argv[:8], [m.TMUX, '-L', 'restart', 'new-session', '-d', '-s', 'robob-restart', argv[7]])
-        self.assertIn('/usr/bin/python3 -I '+str(m.OVERLOAD_SCRIPT)+' restart 2>&1 | /usr/bin/tee -a /safe/restart.log', argv[7])
+        self.assertEqual(argv[:7], [m.TMUX, '-L', 'restart', 'new-session', '-d', '-s', 'mac-guard-restart'])
+        self.assertIn('/bin/zsh -f '+entry+' restart abc123 > /safe/restart.log 2>&1', argv[7])
         self.assertEqual(kw['timeout'], 20)
 
     def test_identity_and_exec_reuse(self):

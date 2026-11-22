@@ -47,7 +47,8 @@ GUI_NEVER_QUIT = {
 SLOW_LEAK_GIB = 8
 SLOW_LEAK_GIB_HOUR = 1
 SLOW_LEAK_SECONDS = 1800
-OVERLOAD_SCRIPT = Path.home() / '.robob/board-artifacts/main-thread-overload-20261113/overload-restart/robob-overload-restart.py'
+OVERLOAD_SCRIPT = Path.home() / '.local/share/robob-overload-restart/robob-overload-restart.py'
+OVERLOAD_STATE = Path(os.environ.get('ROBOB_OVERLOAD_STATE', str(Path.home()/'.local/state/robob-overload-restart')))
 WORKER = ('codex', 'gpt-6.1-sol')
 STATE = Path.home() / '.local/state/mac-guard'
 EVIDENCE = Path.home() / '.robob/board-artifacts/mac-guard'
@@ -252,8 +253,47 @@ def quit_gui(pid, api=None):
                 api.AEDisposeDesc(c.byref(desc))
 
 
-def overload_checks(path=OVERLOAD_SCRIPT):
+def qf_install_hold(run=subprocess.run, now=None):
+    now = time.time() if now is None else now
+    try:
+        result = run([TMUX, '-L', 'qf-install', 'list-panes', '-a', '-F',
+                      '#{session_name} #{pane_dead} #{pane_current_command} #{session_activity}'],
+                     capture_output=True, text=True, timeout=5)
+        # tmux reports an absent server as exit 1. Other failures cannot prove safety.
+        if result.returncode == 1 and re.search(r'^(?:no server running on|error connecting to .* \(No such file or directory\))', result.stderr.strip()):
+            return None
+        if result.returncode:
+            return 'qf-install probe exit %s' % result.returncode
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            if not re.fullmatch(r'install\d*', fields[0]):
+                continue
+            if len(fields) != 4 or fields[1] not in ('0', '1'):
+                return 'qf-install unreadable pane'
+            name, dead, command, activity = fields
+            if dead == '1':
+                continue
+            if not activity.isdigit():
+                return 'qf-install unreadable activity'
+            if Path(command).name.lstrip('-') not in ('sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'tcsh', 'csh') or now-int(activity) <= 1800:
+                return 'qf-install active '+name
+        return None
+    except (OSError, subprocess.SubprocessError):
+        return 'qf-install probe failed'
+
+
+def overload_checks(path=None):
     """Called in a deadline-bounded subprocess, so imports/helpers cannot stall the loop."""
+    path = OVERLOAD_SCRIPT if path is None else Path(path)
+    if not path.is_file() or not (path.parent/'launchd-entry.zsh').is_file():
+        return dict(unavailable='installed watchdog missing')
+    if (OVERLOAD_STATE/'disabled').exists():
+        return dict(unavailable='disabled')
+    detail = qf_install_hold()
+    if detail:
+        return dict(install=True, detail=detail)
     spec = importlib.util.spec_from_file_location('mac_guard_overload', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -321,9 +361,34 @@ class Host:
     def overload(self):
         return json_object(self.cmd(['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--restart-check'], 20))
 
-    def restart(self, log):
-        cmd = '/usr/bin/python3 -I %s restart 2>&1 | /usr/bin/tee -a %s' % (shlex.quote(str(OVERLOAD_SCRIPT)), shlex.quote(str(log)))
-        self.cmd([TMUX, '-L', 'restart', 'new-session', '-d', '-s', 'robob-restart', cmd], 20)
+    def restart(self, log, stamp):
+        entry = OVERLOAD_SCRIPT.parent/'launchd-entry.zsh'
+        if not OVERLOAD_SCRIPT.is_file() or not entry.is_file() or (OVERLOAD_STATE/'disabled').exists():
+            raise ProbeError('installed watchdog missing or disabled')
+        # Use a different session: robob-restart would make limits() refuse its own caller.
+        # tmux may retain an older environment. Bind entry and receipt storage
+        # to the same installed copy that preflight checked.
+        cmd = 'export ROBOB_OVERLOAD_HOME=%s ROBOB_OVERLOAD_STATE=%s; /bin/zsh -f %s restart %s > %s 2>&1; rc=$?; /usr/bin/printf "%%s" "$rc" > %s' % (
+            shlex.quote(str(OVERLOAD_SCRIPT.parent)), shlex.quote(str(OVERLOAD_STATE)),
+            shlex.quote(str(entry)), shlex.quote(stamp), shlex.quote(str(log)), shlex.quote(str(log.with_suffix('.exit'))))
+        self.cmd([TMUX, '-L', 'restart', 'new-session', '-d', '-s', 'mac-guard-restart',
+                  '/bin/zsh -f -c '+shlex.quote(cmd)], 20)
+
+    def restart_result(self, pending):
+        receipt = read_json(OVERLOAD_STATE/('result-'+pending['stamp']+'.json'))
+        if receipt.get('ok') is False:
+            return receipt
+        try:
+            code = int(Path(pending['log']).with_suffix('.exit').read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            return dict(ok=False, reason='unreadable watchdog exit')
+        # A success receipt precedes logging and notification in the watchdog;
+        # its process can still fail after writing it.
+        if receipt.get('ok') is True:
+            return dict(ok=False, reason='watchdog exit %s after success receipt' % code) if code else receipt
+        return dict(ok=False, reason='watchdog exit %s without result' % code)
 
     def worker_status(self, tid):
         value = json_object(self.cmd([T3CTL, 'status', tid], 5))
@@ -332,8 +397,8 @@ class Host:
             raise ValueError('unreadable thread')
         return value
 
-    def worker_send(self, tid, text):
-        self.cmd([T3CTL, 'send', tid, text], 5)
+    def worker_send(self, tid, text, request_id=None):
+        self.cmd([T3CTL, 'send', tid, text]+(['--request-id', request_id] if request_id else []), 5)
 
     def worker_request(self, method, path, body=None):
         try:
@@ -828,7 +893,7 @@ class Guard:
         except (ProbeError, OSError, ValueError, KeyError):
             self.log('error', probe='worker_create', failure='unknown')
 
-    def worker_needed(self, path, summary, urgent=False):
+    def worker_needed(self, path, summary, urgent=False, delivery=None):
         if self.muted:
             self.log('worker_steered' if self.worker.get('threadId') else 'worker_spawned',
                      result='would_act', evidence=str(path), summary=summary)
@@ -864,8 +929,14 @@ class Guard:
                 if self.muted:
                     return
                 try:
-                    self.host.worker_send(tid, str(path)+'\n'+summary)
+                    if delivery is not None:
+                        delivery['threadId'] = tid
+                        self.save()
+                        self.host.worker_send(tid, str(path)+'\n'+summary, delivery['requestId'])
+                    else:
+                        self.host.worker_send(tid, str(path)+'\n'+summary)
                     self.log('worker_steered', threadId=tid, evidence=str(path))
+                    return True
                 except (ProbeError, OSError):
                     self.log('error', probe='worker_send', failure='unavailable')
                 return
@@ -882,8 +953,59 @@ class Guard:
                       options=[dict(id='reasoningEffort', value='xhigh'), dict(id='serviceTier', value='default')],
                       runtimeMode='full-access', prompt=template.replace('{{EVIDENCE}}', str(path)).replace('{{SUMMARY}}', summary))
         self.worker = dict(launchUnknown=True, launch=launch, startedAt=self.now)
+        if delivery is not None:
+            delivery.update(launch=launch, startedAt=self.now)
+            self.save()
         write_json(self.state/'worker.json', self.worker)
-        self.launch_worker(path)
+        return self.launch_worker(path)
+
+    def queue_restart_responder(self, path, reason, urgent):
+        self.saved['restartResponder'] = dict(evidence=str(path), summary='Robob restart skipped: '+reason,
+                                              urgent=urgent, requestId='mac-guard-restart-'+uuid.uuid4().hex)
+        self.save()
+
+    def deliver_restart_responder(self):
+        report = self.saved.get('restartResponder')
+        if not report or self.muted or self.now < report.get('nextAttemptAt', 0):
+            return
+        report['nextAttemptAt'] = self.now+30
+        self.save()
+        # A lost acknowledgment may belong to a worker that has since ended.
+        # Replay its original operation, without selecting a new worker.
+        try:
+            if report.get('launch'):
+                launch = report['launch']
+                adopt = (self.worker.get('launch', {}).get('clientRequestId') == launch['clientRequestId']
+                         or not self.worker.get('threadId') and not self.worker.get('launchUnknown'))
+                if adopt:
+                    self.worker = dict(launchUnknown=True, launch=launch, startedAt=report['startedAt'],
+                                       nextReconcileAt=self.now+30)
+                    write_json(self.state/'worker.json', self.worker)
+                found = self.host.worker_lookup(launch['clientRequestId'])
+                if self.muted:
+                    return
+                tid = self.host.worker_create(launch)
+                if adopt:
+                    self.worker = dict(threadId=tid, startedAt=report['startedAt'])
+                    write_json(self.state/'worker.json', self.worker)
+                self.log('worker_spawned', threadId=tid, evidence=report['evidence'],
+                         result='adopted' if found is not None else 'sent')
+                delivered = True
+            elif report.get('threadId'):
+                if self.muted:
+                    return
+                self.host.worker_send(report['threadId'], report['evidence']+'\n'+report['summary'], report['requestId'])
+                self.log('worker_steered', threadId=report['threadId'], evidence=report['evidence'])
+                delivered = True
+            else:
+                delivered = self.worker_needed(Path(report['evidence']), report['summary'], urgent=report['urgent'],
+                                               delivery=report)
+        except (ProbeError, OSError, ValueError, KeyError):
+            self.log('error', probe='restart_responder', failure='unavailable')
+            return
+        if delivered:
+            self.saved.pop('restartResponder')
+            self.save()
 
     def memory_event(self, p, kind, action):
         self.log('memory_runaway', pid=p['pid'], start=p['start'], comm=p['comm'], label=label(p, self.rows),
@@ -894,6 +1016,8 @@ class Guard:
         p = max(procs, key=lambda q: q.get('footprintGiB', 0))
         path = self.snapshot('Robob memory runaway')
         reason = 'dry_run' if self.dry else 'paused' if self.muted else None
+        detail = None
+        unavailable = False
         if not reason and self.host.ssd_blocked():
             reason = 'ssd_read_blocked'
         if not reason and self.now-self.saved.get('lastRestartAt', 0) < 3600:
@@ -901,7 +1025,10 @@ class Guard:
         if not reason:
             try:
                 checks = self.host.overload()
-                if checks.get('hold'):
+                detail = checks.get('detail')
+                if checks.get('unavailable'):
+                    reason, detail, unavailable = 'restart_unavailable', checks['unavailable'], True
+                elif checks.get('hold'):
                     reason = 'install_hold'
                 elif checks.get('restart') or checks.get('install'):
                     reason = 'tmux_session'
@@ -913,32 +1040,82 @@ class Guard:
                     reason = 'server_uptime_under_10m'
                 elif checks['pid'] not in self.rows or not self.host.identity(self.rows[checks['pid']]):
                     reason = 'server_identity_changed'
-            except (ProbeError, OSError, ValueError, TypeError, AttributeError):
-                reason = 'restart_unavailable'
-        log = OVERLOAD_SCRIPT.parent/('restart-memory-'+iso(self.now)+'.log')
+            except (ProbeError, OSError, ValueError, TypeError, AttributeError) as exc:
+                reason, detail, unavailable = 'restart_unavailable', str(exc), True
+        log = path/'restart.log'
         if not reason and self.muted:
             reason = 'dry_run' if self.dry else 'paused'
-        if not reason:
+        if unavailable or not reason:
             self.saved['lastRestartAt'] = self.now
+            self.saved.pop('lastRestartFailure', None)
+            if unavailable:
+                self.saved['lastRestartFailure'] = detail
+                self.queue_restart_responder(path, detail, urgent=True)
+            else:
+                self.save()
+        if not reason:
+            stamp = uuid.uuid4().hex
+            self.saved['restartPending'] = dict(stamp=stamp, log=str(log), evidence=str(path))
             self.save()
             try:
-                self.host.restart(log)
+                self.host.restart(log, stamp)
                 self.restore_due.append(self.now+120)
-            except (ProbeError, OSError):
-                reason = 'restart_launch_unknown'
+            except (ProbeError, OSError) as exc:
+                reason, detail = 'restart_launch_unknown', str(exc)
+                self.saved['lastRestartFailure'] = detail
+                self.saved['restartPending']['alerted'] = True
+                self.queue_restart_responder(path, detail, urgent=True)
         self.memory_event(p, 'robob', 'protected_alert' if reason else 'restart')
         self.log('robob_restart', result='skipped' if reason else 'launched', reason=reason,
                  pid=p['pid'], footprintGiB=p.get('footprintGiB'), growthGiBMin=p.get('growthGiBMin'),
-                 treeGiB=total, tmuxSession='robob-restart', log=str(log), evidence=str(path))
+                 treeGiB=total, tmuxSession='mac-guard-restart', log=str(log), evidence=str(path), detail=detail)
+        if reason == 'memory_restart_cooldown' and self.saved.get('lastRestartFailure'):
+            return
+        # The watchdog reports its result. Do not announce a restart before it
+        # has accepted the request, or alert on each cycle while it is running.
+        if not reason or reason == 'memory_restart_cooldown' and self.saved.get('restartPending'):
+            return
         hour = iso(self.now)[:11]
         self.notify('mac-guard:robob-restart:'+hour,
                     'mac-guard %s Robob: %s at %.1f GiB (tree %.1f GiB), growing %.1f GiB/min%s' %
                     ('restart skipped for' if reason else 'restarting', p['comm'], p.get('footprintGiB', 0), total,
-                     p.get('growthGiBMin', 0), '; '+reason if reason else ''))
+                     p.get('growthGiBMin', 0), '; '+reason+(': '+detail if detail else '') if reason else ''))
         if reason:
             incident = (p['pid'], p['start'], reason)
-            self.worker_needed(path, 'Robob restart skipped: '+reason, urgent=incident != self.restart_incident)
+            if unavailable or reason == 'restart_launch_unknown':
+                self.deliver_restart_responder()
+            else:
+                self.worker_needed(path, 'Robob restart skipped: '+reason, urgent=incident != self.restart_incident)
             self.restart_incident = incident
+
+    def check_restart_result(self):
+        if self.muted:
+            return
+        self.deliver_restart_responder()
+        pending = self.saved.get('restartPending')
+        if not pending:
+            return
+        try:
+            result = self.host.restart_result(pending)
+        except (ProbeError, OSError, ValueError) as exc:
+            result = dict(ok=False, reason=str(exc))
+        if result is None:
+            return
+        self.saved.pop('restartPending')
+        reason = result.get('reason') or 'watchdog refused restart'
+        if not result.get('ok'):
+            self.saved['lastRestartFailure'] = reason
+            if not pending.get('alerted'):
+                # Persist the delivery obligation with removal of restartPending.
+                self.queue_restart_responder(Path(pending['evidence']), reason, urgent=True)
+        self.save()
+        self.log('robob_restart', result='finished' if result.get('ok') else 'skipped',
+                 reason=None if result.get('ok') else 'watchdog_refused', detail=reason if not result.get('ok') else None,
+                 log=pending['log'], evidence=pending['evidence'])
+        if not result.get('ok') and not pending.get('alerted'):
+            self.notify('mac-guard:robob-restart-refused:'+iso(self.saved['lastRestartAt'])[:11],
+                        'mac-guard restart skipped for Robob: '+reason)
+            self.deliver_restart_responder()
 
     def diagnostic_trigger(self, ticks):
         # Two independent minute windows, with birth-qualified CPU deltas. No
@@ -1056,6 +1233,7 @@ class Guard:
         robob_trip = sample.get('top') is not None and (tree_total >= 24 or any(p in memory for p in robobs))
         if memory:
             signals.append(5)
+        self.check_restart_result()
         if robob_trip:
             signals.append(6)
         slow_offenders = {p['pid'] for p in slow if not protected(p, self.rows) and not gui(p)}

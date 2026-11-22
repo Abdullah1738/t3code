@@ -426,7 +426,7 @@ def host_fields(values, event):
 
 
 MACGUARD_KEYS = set("""pid start comm args action result errno actionClass owner cpuDelta footprintGiB compressedGiB growthGiBMin history at cpuS memoryClass label key threadId evidence summary probe failure cycleMs durationS signals load rCount rZeroCount lagS pressure swap usedMb totalMb largest treeGiB strain reason tmuxSession log idlePct""".split())
-MACGUARD_KEYS.update(('app', 'bundleId', 'growthGiBHour', 'footprintSeries', 'step'))
+MACGUARD_KEYS.update(('app', 'bundleId', 'growthGiBHour', 'footprintSeries', 'step', 'detail'))
 
 
 def macguard_fields(values, depth=0):
