@@ -78,6 +78,34 @@ queries within 15 minutes for the rest of the run. Each completed chunk checkpoi
 failed query retains the unfinished suffix, then continues into a fresh window
 when that suffix finishes. Each command has a 60-second cap including bounded
 process-group cleanup; the unified source shares a 135-second budget.
+Queries use UTC input as well as output. A shared boot helper reads current
+`kern.boottime` and `last -y reboot` with two-second command timeouts. Because
+`last` prints only minutes, a bounded Darwin wtmp reader refines matching
+historical boots to seconds. If a known boot cannot be refined, both readers
+skip that entire minute: `crash.source` reports `reason=bootUnresolved` and
+`skippedS`, and mac-log-window reports the same reason with `status: partial` (exit 2). Other
+intervals keep running; no query is sent into the unresolved minute.
+Chunks stop at boot seconds with no end padding across a boot. The shared
+planner also isolates the following second: macOS accepts only whole-second
+query bounds, and starting at a rounded boot second can still select the old
+epoch. The boot-second piece gets at most 10 seconds per attempt. It remains pending
+on failures one and two; failure three explicitly skips it with `crash.source`
+`reason=bootSecondUnreadable` and `skippedS`, rather than retrying indefinitely.
+The attempt count is durable. The following piece starts safely one second
+later and its completed rows are not read again. mac-log-window also caps each boot
+second at 10 seconds and labels any unfinished result partial. Failed pre-boot
+intervals remain in `unifiedBootPending` while later boot intervals can finish.
+A frozen retry ending before a newer boot is retained as a hole rather than
+blocking fresh coverage. Hole retries reserve one full call for fresh data.
+Clipping holes at the moving ceiling is checkpointed before retry I/O, with
+unreported skips retained separately. Completed unified observations are queued
+with their cursor checkpoint; a fixed log day and `observationId` make replay
+idempotent under the daily log's writer lock. Deferred gap records also keep
+a fixed identity and day until delivery is checkpointed. Writes handle short
+write counts; replay acknowledges only complete, valid matching records. The identity check reads that day's
+file in 64 KiB blocks only for these observations (no raw message storage).
+Each completed retry prefix is checkpointed; these holes obey the same moving
+90-minute ceiling and explicit skip records as the normal suffix.
 `crash.unified.chunk` records requested bounds, elapsed time and outcome;
 `crash.unified.skip` records ceiling skips before advancing the cursor. Positive
 skip records and summaries survive the daily log cap so omitted time stays explicit.
@@ -513,7 +541,17 @@ slice edges are kept only once. Rows outside each slice are excluded even when
 they fall inside the overall window. `--keep-outside` saves them separately in
 `<out>.outside.ndjson`; they are never incident evidence.
 
-Exit codes are 0 complete, 2 partial (deadline), and 1 error (including bad args
+Every read, with or without `--slice`, also splits at known boot times. The
+shared helper refines minute-only reboot history to seconds. `<out>.summary.json`
+adds `boots` (UTC timestamps used); each slice cut by a boot has `bootSplit: true`.
+Boot discovery uses the same deadline as the reads. Slice planning is incremental;
+an unresolved minute is reported as one gap even with a tiny `--slice`.
+The boot second is isolated with at most six seconds to read plus four seconds
+for termination and reaping. Other intervals retain the remaining budget. An
+unresolved boot minute is omitted with `reason: bootUnresolved`, status `partial`
+and exit 2. `--predicate` is optional. A final log count/finished trailer is ignored.
+
+Exit codes are 0 complete, 2 partial (deadline or unresolved boot minute), and 1 error (including bad args
 or a nonzero log exit). `<out>.summary.json` records arguments, UTC bounds,
 status, exit code, elapsed milliseconds, `rowsIn`, `rowsOutside`, earliest/latest
 outside timestamps (`outsideFirst`/`outsideLast`), `unparsed`, greatest kept
@@ -606,8 +644,16 @@ results and `crash.collect` retain `windowStart`, `windowEnd` (Unix seconds),
 `windowS`, `skippedS`, `chunks` and `chunksDone`. With adaptive sizing, `chunks`
 estimates the total using the current chunk size; on completion it equals
 `chunksDone`. Chunk bounds exclude the previous cursor even when log's second
-rounding/end padding returns overlapping rows. Missing or invalid event
-timestamps fail the chunk rather than risk attributing events twice.
+rounding returns overlapping rows. Unparseable timestamps are counted and excluded.
+Unified `crash.source` results also include `partialRows` for unsuccessful reads.
+`bootUnresolvedS` records unresolved boot minutes omitted during the run;
+`bootSecondUnreadableS` records boot seconds omitted after three failures.
+All fragments of that second share the failure count; the terminal count stays
+until the second is older than the moving ceiling, preventing a fourth query.
+`partialRows` counts complete row objects received from an unsuccessful command,
+including an incomplete JSON array on timeout. They are diagnostic counts only:
+none become observations and the failed interval does not advance. A source
+summary has `partial=true` while any boot interval remains pending.
 Retry checkpoints retain unreported `skippedS`, including after the final chunk,
 so interruption before the source result cannot hide a coverage gap. Once the
 source result reports the gap, a retained suffix clears that metadata. Retries

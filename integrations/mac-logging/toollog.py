@@ -24,7 +24,8 @@ NUMBERS.update(('outsideRows', 'outsideFirst', 'outsideLast', 'unparsedRows'))
 NUMBERS.update(('deltaGb', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
 NUMBERS.update(('freeGb', 'floorGb', 'lowForS'))
 NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
-                'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
+                'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt',
+                'partialRows', 'bootUnresolvedS', 'bootSecondUnreadableS'))
 NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS',
                 'backup.skipped_runs.memory', 'backup.skipped_runs.health', 'backup.skipped_runs.other',
                 'backup.ok_runs.memory', 'backup.ok_runs.health', 'backup.ok_runs.other',
@@ -66,7 +67,7 @@ NULLABLE.update(('lastGoodSnapshotAgeS', 'lockHolderCmd', 'lockHolderPpid', 'loc
 NULLABLE.update(('deltaFromTs', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
 for prefix in ('internal', 'external'):
     NULLABLE.update((prefix+'DeltaFromTs', prefix+'DeltaWindowS'))
-TEXT = set('target resourceKind process package fromVersion toVersion source operation runId threadId snapshotId resourceId'.split())
+TEXT = set('observationId target resourceKind process package fromVersion toVersion source operation runId threadId snapshotId resourceId'.split())
 for i in range(1, 6):
     TEXT.add('grower%dPath' % i)
     NUMBERS.add('grower%dDeltaGb' % i)
@@ -744,7 +745,7 @@ def safe_fields(values, event=None):
         elif event in ('crash.collect', 'crash.source', 'crash.unified.chunk') and key in ('stopReason', 'outcome') and value in (
                 'start', 'done', 'deadline', 'timeout', 'permission', 'exit', 'parse', 'error'):
             result[key] = value
-        elif event in ('crash.collect', 'crash.source', 'crash.unified.skip') and key in ('skipReason', 'reason') and value == 'lag_ceiling':
+        elif event in ('crash.collect', 'crash.source', 'crash.unified.skip') and key in ('skipReason', 'reason') and value in ('lag_ceiling', 'bootUnresolved', 'bootSecondUnreadable'):
             result[key] = value
         elif event == 'crash.unified.chunk' and key in ('chunk', 'timeoutS') and type(value) in (int, float) and math.isfinite(value) and value >= 0:
             result[key] = value
@@ -852,22 +853,68 @@ def private_dir(root):
     os.chmod(root, 0o700)
 
 
+def write_all(fd, data):
+    while data:
+        try:
+            count = os.write(fd, data)
+        except InterruptedError:
+            continue
+        if count <= 0:
+            raise OSError('log write made no progress')
+        data = data[count:]
+
+
 def append(fd, row):
-    os.write(fd, (json.dumps(row, separators=(',', ':'), allow_nan=False) + '\n').encode())
+    write_all(fd, (json.dumps(row, separators=(',', ':'), allow_nan=False) + '\n').encode())
 
 
-def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=None, error_tag=None, error_message=None, now=None):
+def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=None, error_tag=None, error_message=None, now=None, dedup_id=None):
     try:
         now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
         row = record(component, kind, name, now, duration_ms, ok, ids, props, error_tag, error_message)
+        if dedup_id is not None:
+            if not re.fullmatch(r'[a-f0-9]{32}', dedup_id) or name not in ('crash.observed', 'crash.unified.skip', 'crash.source'):
+                raise ValueError('invalid observation identity')
+            row.setdefault('props', {})['observationId'] = dedup_id
         root = directory()
         private_dir(root)
         day = now.date().isoformat()
-        fd = os.open(root / (day + '.ndjson'), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fd = os.open(root / (day + '.ndjson'), (os.O_RDWR if dedup_id else os.O_WRONLY) | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             # Never wait behind another writer, and never hold a lock across job work.
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             os.fchmod(fd, 0o600)
+            if dedup_id:
+                # The persisted outbox fixes both the identity and log day.
+                # Check and append under the same writer lock, so replay after
+                # an interruption between append and checkpoint is idempotent.
+                needle = ('"observationId":"'+dedup_id+'"').encode()
+                buffer = b''
+                matched = False
+                def matches(line):
+                    if needle not in line:
+                        return False
+                    try:
+                        old = json.loads(line)
+                        return (old.get('name') == name and
+                                old.get('props', {}).get('observationId') == dedup_id)
+                    except (ValueError, TypeError, AttributeError):
+                        return False
+                while True:
+                    block = os.read(fd, 65536)
+                    if not block:
+                        break
+                    lines = (buffer+block).split(b'\n')
+                    buffer = lines.pop()
+                    matched |= any(matches(line) for line in lines)
+                if buffer:
+                    # Finish a missing newline without deleting a torn prefix.
+                    # A complete JSON object can then be acknowledged safely;
+                    # an incomplete one never acknowledges the outbox record.
+                    write_all(fd, b'\n')
+                    matched |= matches(buffer)
+                if matched:
+                    return True
             marker = root / ('.retained-' + day)
             if not marker.exists():
                 cutoff = now.date() - dt.timedelta(days=30)
@@ -892,7 +939,7 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                     row.get('props', {}).get('skippedS', 0) > 0)
                 # Preserve the bounded host heartbeat through a noisy day's cap.
                 host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload', 'host.spawn_sample')
-                if kind != 'error' and not coverage_gap and not host_sample:
+                if kind != 'error' and not coverage_gap and not host_sample and not dedup_id:
                     return
             append(fd, row)
             return True

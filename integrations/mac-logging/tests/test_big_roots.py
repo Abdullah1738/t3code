@@ -204,4 +204,4 @@ class BigRootTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout='[]', stderr='')
         collector.unified(0, 10000, run)
         cmd = commands[0]
-        self.assertEqual(cmd[cmd.index('--start')+1], '1970-01-01 01:16:40')
+        self.assertEqual(cmd[cmd.index('--start')+1], '1970-01-01 01:16:40+0000')

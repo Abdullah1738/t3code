@@ -326,7 +326,7 @@ class CollectorWindowTests(unittest.TestCase):
                 jobs.save_state('crashes', {'unified': 100, 'rollupDay': '1969-12-31'})
                 def run(command, **kwargs):
                     def bound(flag):
-                        return dt.datetime.fromisoformat(command[command.index(flag)+1]).replace(tzinfo=dt.timezone.utc).timestamp()
+                        return float(row_timestamp(command[command.index(flag)+1]))
                     midpoint = (bound('--start')+bound('--end')-1)/2
                     rows = [dict(timestamp=dt.datetime.fromtimestamp(midpoint, dt.timezone.utc).isoformat(),
                                  eventMessage='=== system boot')]
