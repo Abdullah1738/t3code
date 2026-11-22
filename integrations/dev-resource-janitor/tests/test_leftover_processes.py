@@ -41,6 +41,24 @@ OPAQUE_RELATIVE_TOKENS = [
 
 
 class ProcessTests(JanitorTestCase):
+    def test_robob_ancestry_uses_executable_entry_not_tool_path(self):
+        renderer = dict(pid=42, ppid=30, args='/Users/test/.robob/tools/chrome-headless-shell --type=renderer', tty='??')
+        cases = [
+            ('/Applications/Robob.app/Contents/MacOS/Robob', True),
+            ('node /repo/apps/server/dist/bin.mjs --bootstrap-fd 3', True),
+            ('bun apps/server/src/bin.ts', True),
+            ('node /repo/other.js /repo/apps/server/dist/bin.mjs', False),
+            ('node -e "apps/server/dist/bin.mjs"', False),
+            ('/bin/zsh /repo/build.sh', False),
+            ('/Users/test/.robob/tools/chrome-headless-shell', False),
+        ]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                parent = dict(pid=30, ppid=1, args=args, tty='??')
+                self.assertEqual(lp.robob_ancestry(renderer, [parent]), expected)
+                reason = lp.keep_reason(renderer, [parent], {}, ())
+                self.assertEqual(reason == 'robob-descendant', expected)
+
     def test_mcp_summary_counts_rss_parent_chains_and_unknown_verdict(self):
         def row(pid, ppid, args, rss):
             return dict(pid=pid, ppid=ppid, start='old', tty='??', args=args, rss_kib=rss)

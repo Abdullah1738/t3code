@@ -217,6 +217,10 @@ def robob(p, rows):
     return False
 
 
+def robob_descendant(p, rows):
+    return any(robob(a, rows) for a in chain(p, rows))
+
+
 def label(p, rows):
     return next((q['label'] for q in [p]+chain(p, rows) if q.get('label')), None)
 
@@ -231,8 +235,9 @@ def exempt(p, rows, system_gui=False):
     return False
 
 
-def protected(p, rows):
-    return exempt(p, rows) or bool(label(p, rows)) or 'cua-driver' in p['comm']
+def protected(p, rows, *, renice=False):
+    return (exempt(p, rows) or bool(label(p, rows)) or 'cua-driver' in p['comm']
+            or not renice and robob_descendant(p, rows))
 
 
 def gui(p):
@@ -767,14 +772,17 @@ class Guard:
         gui_job = self.gui_jobs.get((p['pid'], p['start']))
         gui_ok = (cls == 'G' and gui_job and gui_job['phase'] == 'force'
                   and self.gui_force_growth(p, gui_job) and self.gui_allowed(p, gui_job))
+        ancestor = next((a for a in chain(p, self.rows) if robob(a, self.rows)), None)
         if cls == 'G':
             safe = gui_ok
         elif cls == 'D' or action == 'CONT':
             safe = not exempt(p, self.rows)
         else:
-            safe = not protected(p, self.rows)
+            safe = not protected(p, self.rows, renice=action == 'renice')
+        if ancestor and action != 'renice':
+            safe = False
         if allowed and not safe:
-            result = 'cancelled_gui_authorization' if cls == 'G' else 'cancelled_protection'
+            result = 'cancelled_gui_authorization' if cls == 'G' and not ancestor else 'cancelled_protection'
         elif not matched:
             result = 'skipped_identity'
         if (allowed and not self.muted and p['pid'] in self.rows and self.rows[p['pid']]['start'] == p['start']
@@ -813,6 +821,8 @@ class Guard:
                      action=action, result=result, errno=errno, actionClass=cls, owner=p.get('owner', {}).get('state', 'unknown'),
                      cpuDelta=p.get('cpuDelta', 0), footprintGiB=p.get('footprintGiB'), label=label(p, self.rows))
         value.update({k:details[k] for k in ('stages', 'reason') if k in details})
+        if ancestor:
+            value.update(protectedBy='robob-descendant', protectedAncestor={k: ancestor[k] for k in ('pid', 'start', 'comm')})
         if cls == 'G':
             value.update(step='force-quit', **{k: p.get(k) for k in ('app', 'bundleId', 'growthGiBHour', 'footprintSeries')})
         self.actions.append(value)
@@ -1499,7 +1509,7 @@ class Guard:
             new_incidents.add(incident)
             if robob(p, self.rows) or incident in pending_ids:
                 continue
-            kind = 'protected' if exempt(p, self.rows) else 'carve-out'
+            kind = 'protected' if exempt(p, self.rows) or robob_descendant(p, self.rows) else 'carve-out'
             self.memory_event(p, kind, 'protected_alert' if kind == 'protected' else 'TERM')
             path = self.snapshot('memory runaway pid %s' % p['pid'])
             name = label(p, self.rows) or p['comm']
@@ -1553,12 +1563,17 @@ class Guard:
         handled = {(e['proc']['pid'], e['proc']['start']) for e in self.pending}
         for p in sorted(self.rows.values(), key=lambda p: len(chain(p, self.rows))):
             ident = (p['pid'], p['start'])
-            if ident in handled or protected(p, self.rows) or p['state'].startswith('?'):
+            if ident in handled or protected(p, self.rows, renice=True) or p['state'].startswith('?'):
                 continue
             ancestors = chain(p, self.rows)
             browser = p in browsers
             job = bool(JOBS.fullmatch(Path(p['comm']).name)) or script_job(p)
             if not job and p.get('cpuDelta', 0) <= 100 and p['pid'] not in memory4 and ident not in self.hogs:
+                continue
+            if robob_descendant(p, self.rows):
+                offenders += 1
+                if ident not in self.hogs and self.action(p, 'B', 'renice'):
+                    self.hogs[ident] = dict(stage=1, at=self.now)
                 continue
             build = next((b for q in [p]+ancestors if (b := self.host.build(q, self.rows, self.now))), {}) if job else {}
             owner = self.host.ownership(p, self.rows, self.now)

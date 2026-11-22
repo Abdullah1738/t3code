@@ -47,6 +47,17 @@ def snapshot(rows, footprints=None, load=0, pressure=1, lag=0, ticks=None):
                 lag=lag, pressure=pressure, swap=dict(usedMb=39000, totalMb=40000), ticks=ticks)
 
 
+def robob_browser_tree(parent='server', cpu=0):
+    app = proc(1, ROBOB)
+    server = proc(2, 'node', ppid=1, args='node apps/server/dist/bin.mjs --bootstrap-fd 3')
+    session = proc(3, 'codex', ppid=2)
+    browser = proc(10, '/Users/test/.robob/tools/chrome-headless-shell/chrome-headless-shell',
+                   ppid=3 if parent == 'provider' else 2 if parent == 'server' else 1,
+                   args='chrome-headless-shell --headless')
+    renderer = proc(11, browser['comm'], ppid=10, cpu=cpu, args='chrome-headless-shell --type=renderer')
+    return [app, server, session, browser, renderer] if parent != 'standalone' else [browser, renderer]
+
+
 class FakeHost:
     def __init__(self):
         self.effects = []
@@ -197,7 +208,7 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(evidence['rows'][0]['label'], 'com.ardud.9router')
 
     def test_nov16_load_replay(self):
-        rows = [proc(1, ROBOB, state='R'), proc(2, 'codex', ppid=1, state='R'),
+        rows = [proc(1, '/sbin/launchd', ppid=0), proc(10, ROBOB, state='R'), proc(2, 'codex', ppid=10, state='R'),
                 proc(3, 'python3', args='python3 msgs.py', label='com.abdullah.msgs', state='R'),
                 proc(100, 'xcodebuild', state='R'), proc(101, 'SWBBuildService', ppid=100, state='R')]
         rows += [proc(110+i, 'clang', ppid=101, state='R') for i in range(9)]
@@ -212,7 +223,7 @@ class GuardTests(unittest.TestCase):
         signals = self.effects('signal')
         self.assertIn(('signal', 100, 'SIGTERM'), signals)
         self.assertIn(('signal', 100, 'SIGKILL'), signals)
-        self.assertTrue(all(p not in {1, 2, 3} for _, p, _ in signals))
+        self.assertTrue(all(p not in {1, 2, 3, 10} for _, p, _ in signals))
         self.assertEqual({p for _, p, sig in signals if 200 <= p < 242 and sig == 'SIGTERM'}, set(range(200, 242)))
         self.assertEqual(len(self.effects('worker')), 1)
         self.assertFalse(self.effects('steer'))  # no new signal after the initial launch
@@ -1128,6 +1139,49 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(self.effects('signal'))
         self.assertFalse(self.effects('soften'))
 
+    def test_robob_descendant_cpu_ladder_softens_without_signals(self):
+        for i in range(12):
+            self.tick(robob_browser_tree(cpu=i*36), load=100, lag=8)
+            self.guard.drain(self.now-20)
+        self.assertIn(('soften', 11), self.host.effects)
+        self.assertFalse(self.effects('signal'))
+        self.assertFalse(self.guard.pending)
+        self.assertFalse(self.guard.stopped)
+        self.assertTrue(m.robob_descendant(self.guard.rows[11], self.guard.rows))
+        self.assertFalse(m.robob(self.guard.rows[11], self.guard.rows))
+
+    def test_robob_descendant_signal_classes_and_provider_table(self):
+        for parent in ('server', 'provider'):
+            self.tick(robob_browser_tree(parent), load=100, lag=8)
+            self.guard.strain = True
+            for cls in ('A', 'B', 'C', 'D', 'G'):
+                for action in ('STOP', 'CONT', 'TERM', 'KILL'):
+                    with self.subTest(parent=parent, cls=cls, action=action):
+                        self.assertFalse(self.guard.action(self.guard.rows[11], cls, action))
+                        row = self.events_named('action')[-1]
+                        self.assertEqual(row['result'], 'cancelled_protection')
+                        self.assertEqual(row['protectedBy'], 'robob-descendant')
+                        self.assertIn(row['protectedAncestor']['pid'], (1, 2))
+                        self.assertFalse(self.effects('signal'))
+                        logged = toollog.record('mac-guard', 'event', 'macguard.action',
+                                                dt.datetime.now(dt.timezone.utc), props=row)
+                        self.assertEqual(logged['props']['protectedBy'], 'robob-descendant')
+                        self.assertEqual(logged['props']['protectedAncestor']['pid'], row['protectedAncestor']['pid'])
+
+    def test_same_browser_binary_without_robob_ancestry_can_be_signalled(self):
+        self.tick(robob_browser_tree('standalone'), load=100, lag=8)
+        self.guard.strain = True
+        self.assertFalse(m.robob_descendant(self.guard.rows[11], self.guard.rows))
+        self.assertTrue(self.guard.action(self.guard.rows[11], 'B', 'STOP'))
+        self.assertIn(('signal', 11, 'SIGSTOP'), self.effects('signal'))
+
+    def test_robob_descendant_memory_runaway_is_report_only(self):
+        self.tick(robob_browser_tree(), {11: 50})
+        self.guard.drain(self.now+10)
+        self.assertFalse(self.effects('signal'))
+        self.assertFalse(self.guard.pending)
+        self.assertEqual(self.events_named('memory_runaway')[0]['memoryClass'], 'protected')
+
     def test_live_agent_node_build_softened_only(self):
         self.host.owners[10] = 'live'
         for i in range(15):
@@ -1841,7 +1895,7 @@ def dry_replays():
         try:
             case.guard.dry = True
             if name == 'nov16-load':
-                rows = [proc(1, ROBOB, state='R'), proc(2, 'codex', ppid=1, state='R'),
+                rows = [proc(1, '/sbin/launchd', ppid=0), proc(10, ROBOB, state='R'), proc(2, 'codex', ppid=10, state='R'),
                         proc(3, 'python3', args='python3 msgs.py', label='com.abdullah.msgs', state='R'),
                         proc(100, 'xcodebuild', state='R'), proc(101, 'SWBBuildService', ppid=100, state='R')]
                 rows += [proc(110+i, 'clang', ppid=101, state='R') for i in range(9)]
@@ -1879,7 +1933,7 @@ class ReplayTests(unittest.TestCase):
         load = reports['nov16-load']['actions']
         self.assertTrue(any(a.get('pid') == 100 and a['action'] == 'TERM' for a in load))
         self.assertTrue(any(a.get('pid') == 101 and a['action'] == 'KILL' for a in load))
-        self.assertFalse(any(a.get('pid') in (1, 2, 3) and a.get('action') for a in load))
+        self.assertFalse(any(a.get('pid') in (1, 2, 3, 10) and a.get('action') for a in load))
         memory = reports['nov16-memory']['actions']
         self.assertEqual({a['pid'] for a in memory if a.get('actionClass') == 'D'}, {20})
         self.assertTrue(any(a.get('footprintGiB') == 23 and a.get('memoryClass') == 'carve-out' for a in memory))
