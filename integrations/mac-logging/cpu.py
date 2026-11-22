@@ -10,7 +10,7 @@ import re
 import subprocess
 import time
 
-from cpu_labels import family, script_hint, command_label
+from cpu_labels import family, script_hint, command_label, bounded_detail
 from jobs import read_state, save_state, state_path
 from toollog import emit, finite_number, cpu_fields
 from volume_crawls import volume_crawls
@@ -25,7 +25,26 @@ KERNEL_TASK_COOLDOWN_S = 1800
 
 
 class ProbeError(Exception):
-    pass
+    def __init__(self, message, *, argv=None, rc=None, stderr='', errno=None):
+        super().__init__(message)
+        self.command = os.path.basename(str(argv[0])) if argv else None
+        self.rc = rc
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode('utf-8', errors='replace')
+        self.stderr = bounded_detail(str(stderr)) if stderr else ''
+        self.errno = errno
+
+
+def failure_details(exc, operation):
+    command = getattr(exc, 'command', None) or os.path.basename(operation)
+    rc = getattr(exc, 'rc', None)
+    stderr = getattr(exc, 'stderr', '')
+    detail = getattr(exc, 'strerror', None) or str(exc) or type(exc).__name__
+    first = (stderr or detail).splitlines()[0]
+    number = getattr(exc, 'errno', None)
+    return dict(result='gone' if number == errno.ESRCH else 'error', errno=number,
+                rc=rc, stderr=bounded_detail(stderr), strerror=bounded_detail(detail),
+                reason=bounded_detail(f'{command} rc={rc}: {first}'))
 
 
 class RusageInfoV1(ctypes.Structure):
@@ -350,14 +369,14 @@ def command(argv, run, timeout=30):
     env.pop('BUN_INSPECT', None)
     try:
         result = run(argv, capture_output=True, text=True, timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        raise ProbeError('timeout')
-    except OSError:
-        raise ProbeError('unavailable')
-    except UnicodeError:
-        raise ProbeError('parse')
+    except subprocess.TimeoutExpired as exc:
+        raise ProbeError('timeout', argv=argv, stderr=exc.stderr) from None
+    except OSError as exc:
+        raise ProbeError('unavailable', argv=argv, stderr=exc.strerror, errno=exc.errno) from None
+    except UnicodeError as exc:
+        raise ProbeError('parse', argv=argv, stderr=str(exc)) from None
     if result.returncode:
-        raise ProbeError('exit')
+        raise ProbeError('exit', argv=argv, rc=result.returncode, stderr=getattr(result, 'stderr', ''))
     return result.stdout
 
 
@@ -539,6 +558,10 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
             # Apple's Python 3.9 monotonic epoch is per process, unlike Unix time.
             observed = time.time()
             previous = read_state('cpu')
+            from boot_identity import identity
+            boot_id = identity()
+            if boot_id and previous.get('bootEpoch') != boot_id['bootEpoch']:
+                previous = {}
             props, state = deltas(rows, previous, observed)
             props.update(churn(rows, previous, props))
             props.update(diagnostics)
@@ -581,6 +604,8 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
             # Reserve before emitting, under the sampler lock: a failed logger
             # write may cost a slot but cannot cause a duplicate over the cap.
             state.update(spikeDay=day, spikeCount=count+(snapshot is not None))
+            if boot_id:
+                state['bootEpoch'] = boot_id['bootEpoch']
             save_state('cpu', state)
             duration = (clock()-started)*1000
             emit('cpu', 'event', 'cpu.sample', ok=True, duration_ms=duration, props=props, now=observed_at)
@@ -598,6 +623,8 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
 
 
 def main():
+    from boot import check
+    check()
     try:
         from disk_low import check as check_disk_floor
         check_disk_floor()

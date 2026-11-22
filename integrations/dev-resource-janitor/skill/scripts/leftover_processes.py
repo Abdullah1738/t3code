@@ -569,6 +569,9 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
                     if not fresh["complete"]:
                         report["problems"].append("liveness_unavailable: " + "; ".join(fresh["problems"]))
                         reason = "liveness_unavailable"
+                    elif deadline is not None and time.monotonic() >= deadline:
+                        reason = "observation_budget_exhausted"
+                        report['budget_skipped'] += 1
                     else:
                         current = refresh(row["pid"]).get(row["pid"])
                         # RSS can change without changing process identity.
@@ -855,10 +858,11 @@ def report_summary(report):
     return result
 
 
-def scan(roster, keep=(), cursor=0):
+def scan(roster, keep=(), cursor=0, *, deadline=None, liveness=None):
     phases = {}
+    deadline = time.monotonic() + OBSERVATION_BUDGET if deadline is None else deadline
     with timed_phase(phases, "mcp_orphan"):
-        mcp_report = scan_mcp_orphans(roster, keep)
+        mcp_report = scan_mcp_orphans(roster, keep, deadline=deadline)
     try:
         with timed_phase(phases, "inventory"):
             rows = processes()
@@ -872,7 +876,9 @@ def scan(roster, keep=(), cursor=0):
         except Exception:
             hints = {}
         with timed_phase(phases, "detection"):
-            report = detect(rows, memory, labels, roster, keep, deadline=time.monotonic() + OBSERVATION_BUDGET,
+            report = detect(rows, memory, labels, roster, keep, deadline=deadline,
+                            refresh_roster=lambda: active_sessions.checked_snapshot(
+                                timeout=OWNER_CALL_TIMEOUT, max_attempts=3, deadline=deadline, stats=liveness),
                             cursor=cursor, cwd_hints=hints)
         with timed_phase(phases, "agent_browser"):
             report["agent_browser"] = scan_agent_browsers(roster, keep)

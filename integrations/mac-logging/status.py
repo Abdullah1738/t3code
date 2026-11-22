@@ -20,9 +20,12 @@ LAUNCHD_LABELS = (
     'com.abdullah.mac-cpu',
     'com.abdullah.mac-ssd-read-probe',
     'com.abdullah.mac-guard',
+    'com.abdullah.mac-suspend',
 )
 # Logging shipped on 2026-11-13 UTC (#10); older days cannot prove silence.
 CADENCES = {
+    # launchd/com.abdullah.mac-suspend.plist: independent StartInterval=60.
+    'suspend.sweep': dict(name='suspend.sweep', target=None, gapHours=.05, since='2026-11-22'),
     # robob-watch/watchers/disk-space-guard/watcher.json: interval_s=1800;
     # allow two hours (four checks), as requested for the guard.
     'disk.sample': dict(name='disk.sample', target=None, gapHours=2, since='2026-11-13'),

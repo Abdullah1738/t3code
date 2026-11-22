@@ -29,9 +29,9 @@ import datetime
 import json
 import math
 import os
-import socket
 import time
 import tempfile
+from threading import TIMEOUT_MAX
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -54,6 +54,51 @@ NATIVE_WINDOW_MS = 48 * 60 * 60 * 1000
 # The native query scans the full thread shell table server-side (7-46 s on the 26k-thread server), so it gets a
 # longer timeout than the default 20 s.
 NATIVE_TIMEOUT = 60
+RETRY_BACKOFF = (2, 5)
+
+
+def transport_failure(exc):
+    return (isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError)
+            or isinstance(exc, (TimeoutError, ConnectionError)))
+
+
+class ReadError(str):
+    """Keep the transport cause alongside the existing printable error contract."""
+
+    def __new__(cls, message, cause, phase=None):
+        value = super().__new__(cls, message)
+        value.cause = cause
+        value.phase = phase
+        return value
+
+
+def exception_chain(exc):
+    labels, seen = [], set()
+    while isinstance(exc, Exception) and id(exc) not in seen:
+        seen.add(id(exc))
+        label = type(exc).__name__
+        if isinstance(exc, OSError) and exc.errno is not None:
+            label += f' [Errno {exc.errno}] {exc.strerror}'
+        cause = (exc.reason if isinstance(exc, urllib.error.URLError) else
+                 exc.__cause__ or (exc.__context__ if not exc.__suppress_context__ else None))
+        if isinstance(cause, str):
+            label += ': ' + cause
+        labels.append(label)
+        exc = cause
+    return ' -> '.join(labels)
+
+
+def remaining_timeout(timeout, deadline=None):
+    if type(timeout) not in (int, float) or not 0 < timeout <= TIMEOUT_MAX:
+        raise ValueError('invalid timeout: must be positive, finite and within socket range')
+    if deadline is None:
+        return timeout
+    if type(deadline) not in (int, float) or not -TIMEOUT_MAX <= deadline <= TIMEOUT_MAX:
+        raise ValueError('invalid deadline: must be finite')
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ValueError('budget exhausted')
+    return min(timeout, remaining)
 
 
 class Snapshot(dict):
@@ -98,9 +143,14 @@ def _control_config():
 
 def _control_get(path, timeout=20):
     """(status, json) for a GET on the control API, or (0, error text) when it can't be reached or read."""
+    try:
+        remaining_timeout(timeout)
+    except ValueError as exc:
+        return 0, str(exc)
     cfg_path = _control_config()
     if cfg_path is None:
         return 0, "no control credential file"
+    phase = None
     try:
         if os.stat(cfg_path).st_mode & 0o077:
             return 0, f"{cfg_path} must be chmod 600"
@@ -109,14 +159,17 @@ def _control_get(path, timeout=20):
         url = cfg["url"].rstrip("/") + "/api/ardud/control" + path
         req = urllib.request.Request(url, headers={"Authorization": "Bearer " + cfg["token"]})
         with urllib.request.urlopen(req, timeout=timeout) as r:
+            # urlopen includes connect, send and header reads; only body reads
+            # have a phase we can identify without guessing from errno.
+            phase = 'read'
             return r.status, json.load(r)
     except urllib.error.HTTPError as e:
         return e.code, None
     except Exception as e:  # noqa: BLE001
-        return 0, str(e)
+        return 0, ReadError(str(e), e, phase)
 
 
-def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_TIMEOUT, stats=None):
+def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_TIMEOUT, stats=None, *, deadline=None):
     """Complete cursor walk plus one catch-up, or (None, reason); never publish a partial roster.
 
     Old servers without nextCursor retain the single-page completeness checks.
@@ -142,13 +195,15 @@ def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_
             if counts['pages'] >= CONTROL_MAX_PAGES:
                 raise ValueError(f'page cap exceeded ({CONTROL_MAX_PAGES})')
             page_path = path + '&' + urllib.parse.urlencode({'cursor': cursor}) if cursor else path
-            status, body = _control_get(page_path, timeout)
+            request_timeout = (remaining_timeout(timeout, min(deadline, started + traversal_timeout))
+                               if deadline is not None else timeout)
+            status, body = _control_get(page_path, request_timeout)
             counts['pages'] += 1
             if phase == 'catch-up':
                 counts['catch_up_pages'] += 1
-            check_deadline()
             if status == 0 and isinstance(body, str):
                 raise ValueError(body)
+            check_deadline()
             if status != 200:
                 raise ValueError(f'status {status}')
             if not isinstance(body, dict) or body.get('ok') is not True:
@@ -238,6 +293,8 @@ def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_
                 raise ValueError(f'short by {total - len(mapped)} after retry')
     except ValueError as exc:
         reason = f'control api {label}: {exc}'
+        if exc.args and isinstance(exc.args[0], ReadError):
+            reason = ReadError(reason, exc.args[0].cause, exc.args[0].phase)
         counts.update(error=reason, failure_phase=phase)
         return None, reason
     finally:
@@ -246,14 +303,14 @@ def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_
             stats.update(counts)
 
 
-def robob_active(timeout=20, now_ms=None):
+def _robob_active_once(timeout=20, now_ms=None, *, deadline=None):
     """Every active Robob thread, or (None, error). The union of two complete queries (see the module docstring).
     Either query failing or truncating makes the whole result incomplete, so a caller keeps everything."""
     # (a) Every non-idle thread. The server builds this from its live ids, so it is small. A null `now_ms` means
     # the wall clock; tests pass one so the window is exact.
     live, err = _control_threads(
         "/threads?" + urllib.parse.urlencode({"active": "true", "includeSubagents": "true", "limit": CONTROL_PAGE}),
-        timeout, "active")
+        timeout, "active", deadline=deadline)
     if err:
         return None, err
     # Native children can be runless/idle during provider work. Filter by source,
@@ -266,10 +323,54 @@ def robob_active(timeout=20, now_ms=None):
             "updatedSince": str(now - NATIVE_WINDOW_MS),
             "limit": CONTROL_PAGE,
         }),
-        NATIVE_TIMEOUT, "native")
+        NATIVE_TIMEOUT, "native", deadline=deadline)
     if err:
         return None, err
     return {**native, **live}, None
+
+
+def robob_active(timeout=20, now_ms=None, *, max_attempts=1, deadline=None, stats=None):
+    """Retry complete roster reads only for transport failures, under one deadline."""
+    started = time.monotonic()
+    attempts, last_error = 0, None
+    try:
+        if not 1 <= max_attempts <= 3:
+            raise ValueError('max_attempts must be between 1 and 3')
+        remaining_timeout(timeout, deadline)
+        for attempt in range(max_attempts):
+            remaining_timeout(timeout, deadline)
+            attempts += 1
+            rows, error = _robob_active_once(timeout, now_ms, deadline=deadline)
+            if error is None:
+                return rows, None
+            cause = error.cause if isinstance(error, ReadError) else None
+            transient = cause is not None and transport_failure(cause)
+            if max_attempts > 1:
+                label = exception_chain(cause)
+                if isinstance(error, ReadError) and error.phase is not None:
+                    label += f' (phase={error.phase})'
+                prefix = error.split(':', 1)[0]
+                detail = f'{prefix}: {label}' if transient else error
+                error = f'{detail} after {attempts} attempts, {time.monotonic() - started:.1f} s'
+            if not transient and last_error and ('budget exhausted' in error or 'deadline exceeded' in error):
+                error += f'; last transport error: {last_error}'
+            last_error = error
+            if not transient or attempts == max_attempts:
+                return None, error
+            delay = RETRY_BACKOFF[attempt]
+            if deadline is not None:
+                delay = min(delay, remaining_timeout(delay, deadline))
+            time.sleep(delay)
+        return None, last_error
+    except ValueError as exc:
+        reason = f'control api active: {exc} after {attempts} attempts, {time.monotonic() - started:.1f} s'
+        last_error = f'{reason}; last transport error: {last_error}' if last_error else reason
+        return None, last_error
+    finally:
+        if stats is not None:
+            stats['attempts'] = stats.get('attempts', 0) + attempts
+            stats['seconds'] = round(stats.get('seconds', 0) + time.monotonic() - started, 3)
+            stats['last_error'] = last_error or stats.get('last_error')
 
 
 def in_use(thread):
@@ -310,21 +411,23 @@ def workspace_of(thread, roots):
     return roots.get(thread.get("projectId"))
 
 
-def snapshot(timeout=20):
+def snapshot(timeout=20, *, max_attempts=1, deadline=None, stats=None):
     """The union of both sources, read once. `complete` is true only when every source answered in full and every
     in-use thread has a known workspace. `workspaces` maps each in-use thread to its directory, so a caller that
     needs the directories reads them from this same answer instead of reading the sources again."""
     problems = []
-    threads, err = robob_active(timeout)
+    threads, err = robob_active(timeout, max_attempts=max_attempts, deadline=deadline, stats=stats)
     if err:
         problems.append(err)
-    opencode, oc_err = opencode_active(timeout)
+        if deadline is not None:
+            return Snapshot(complete=False, threads={}, opencode=set(), workspaces={}, problems=problems)
+    opencode, oc_err = opencode_active(remaining_timeout(timeout, deadline))
     if oc_err:
         problems.append(oc_err)
     in_use_threads = [t for t in (threads or {}).values() if in_use(t)]
     roots = {}
     if any(not t.get("worktreePath") for t in in_use_threads):
-        found, roots_err = project_roots(timeout)
+        found, roots_err = project_roots(remaining_timeout(timeout, deadline))
         if roots_err:
             # A root-workspace thread's directory is unknown without the roots. The snapshot is then incomplete,
             # and the reapers keep everything rather than protect only the worktree paths they could read.
@@ -338,6 +441,8 @@ def snapshot(timeout=20):
             workspaces[t["threadId"]] = path
         else:
             problems.append(f"workspace unknown for thread {t.get('threadId')}")
+    if deadline is not None:
+        remaining_timeout(timeout, deadline)
     return Snapshot(complete=not problems, threads=threads or {}, opencode=opencode or set(),
                     workspaces=workspaces, problems=problems)
 
@@ -347,13 +452,26 @@ def active_session_ids(timeout=20):
     return opencode_active(timeout)
 
 
-def checked_snapshot(timeout=20):
+def checked_snapshot(timeout=20, *, max_attempts=1, deadline=None, stats=None):
     """Convert even unexpected client failures to an incomplete roster, never an empty live set."""
+    started = time.monotonic() if stats is not None else None
+    previous_seconds = stats.get('seconds', 0) if stats is not None else 0
     try:
-        return snapshot(timeout)
+        result = snapshot(timeout, max_attempts=max_attempts, deadline=deadline, stats=stats)
+        if not result['complete'] and stats is not None:
+            stats['last_error'] = '; '.join(result['problems'])
+        return result
     except Exception as exc:
+        reason = f'active sessions: {exc}' if isinstance(exc, ValueError) else f'active sessions: {type(exc).__name__}'
+        if stats is not None:
+            if stats.get('last_error') and isinstance(exc, ValueError):
+                reason += f"; last transport error: {stats['last_error']}"
+            stats['last_error'] = reason
         return Snapshot(complete=False, threads={}, opencode=set(), workspaces={},
-                        problems=[f"active sessions: {type(exc).__name__}"])
+                        problems=[reason])
+    finally:
+        if stats is not None:
+            stats['seconds'] = round(previous_seconds + time.monotonic() - started, 3)
 
 
 def opencode_directories(ids, timeout=20, *, overall_timeout=300, max_attempts=3, stats=None):
@@ -413,10 +531,10 @@ def opencode_directories(ids, timeout=20, *, overall_timeout=300, max_attempts=3
                         if time.monotonic() >= deadline:
                             counts['last_error'] = reason(f'overall deadline exceeded ({label})')
                             return None, counts['last_error']
-                        transient = isinstance(cause, (TimeoutError, socket.timeout, ConnectionError)) or transport_error
+                        transient = transport_failure(exc)
                         if not transient or attempts >= max_attempts:
                             return None, counts['last_error']
-                        time.sleep(min((2, 5)[attempt], max(0, deadline - time.monotonic())))
+                        time.sleep(min(RETRY_BACKOFF[attempt], max(0, deadline - time.monotonic())))
             finally:
                 counts['per_id_max_s'] = max(counts['per_id_max_s'], time.monotonic() - id_started)
         return result, None

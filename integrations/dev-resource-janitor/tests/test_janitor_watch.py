@@ -46,8 +46,10 @@ class WorkerTests(JanitorTestCase):
                     patch.object(dev_janitor, 'procs', return_value=[]), \
                     patch.object(dev_janitor, 'sh', return_value=(1, '', '')), \
                     patch.object(dev_janitor, 'keep_list', return_value=[]), \
+                    patch.object(dev_janitor.time, 'time', return_value=100.8), \
                     patch.object(lp, 'scan', **kw), patch.object(dev_janitor.time, 'monotonic', side_effect=lambda: next(clock)):
                 report = dev_janitor.scan()
+            self.assertEqual(report['ts'], 100.8)
             for phase in ('sessions', 'liveness', 'resource_processes', 'simulators', 'expo', 'docker',
                           'session_evidence', 'leftover_processes'):
                 self.assertEqual(report['phase_ms'][phase], 1.0)
@@ -159,6 +161,7 @@ class WorkerTests(JanitorTestCase):
                      "owner_calls": {"by_native": {"count": 3, "p50_ms": 10, "p95_ms": 20,
                                                    "max_ms": 20, "failures": {"404": 1}}}}
         report = {"ts": 123, "resources": [], "candidates": [], "processes": processes,
+                  "liveness": dict(attempts=3, seconds=67, last_error="control api projects: timed out"),
                   "liveness_unavailable": "control api projects: timed out"}
         with (self.state_dir / "lock").open("a+") as lock, \
                 patch.object(dev_janitor, "scan", return_value=report), \
@@ -169,6 +172,7 @@ class WorkerTests(JanitorTestCase):
         self.assertEqual(janitor_watch.read_state()['processes'], processes)
         entry = json.loads((self.root / "audit.jsonl").read_text())
         self.assertEqual(entry, {"ts": 123, "event": "report", "processes": processes,
+                                 "liveness": report['liveness'],
                                  "phase_ms": {},
                                  "liveness_unavailable": report["liveness_unavailable"]})
 

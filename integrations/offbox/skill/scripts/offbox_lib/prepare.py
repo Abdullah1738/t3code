@@ -110,7 +110,7 @@ def guard(box, end=None, seconds=None):
             with phase('bring_up', box):
                 yield budget
             budget.check()
-    except (SshHostKeyMismatch, ssh_outage.SshUnreachable):
+    except (SshHostKeyMismatch, api.BoxBootFailed, ssh_outage.SshUnreachable):
         raise
     except (Exception, _Expired) as error:
         if not isinstance(error, _Expired) and time.monotonic() < budget.end:
@@ -118,6 +118,8 @@ def guard(box, end=None, seconds=None):
         if main:
             signal.setitimer(signal.ITIMER_REAL, 0)
         if budget.resume_watch is not None:
+            # Preserve pending-peer recovery when preparation expires before the resume's own cap.
+            budget.resume_watch.check()
             budget.resume_watch.stuck(phase=budget.phase)
         else:
             log(f'resume_stuck {budget.box} {budget.phase} {time.monotonic()-budget.total_start:.1f}s')
@@ -178,6 +180,7 @@ def track_resume(watch):
     budget = _ACTIVE.get()
     if budget is not None:
         budget.resume_watch = watch
+    return budget
 
 
 @contextlib.contextmanager

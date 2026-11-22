@@ -40,7 +40,7 @@ class SlowLeakTests(unittest.TestCase):
 
     def restart(self):
         self.guard = m.Guard(self.host, self.root/'state', self.root/'evidence', dry=False,
-                             logger=lambda c, k, n, **kw: self.events.append((n, kw['props'])), clock=lambda: self.now)
+                             logger=lambda c, k, n, **kw: self.events.append((n, kw['props'])), clock=lambda: self.now, worker_submit=shared.immediate_submit)
 
     def test_nov19_replay_quit_once_near_0920(self):
         rows = [self.app()]

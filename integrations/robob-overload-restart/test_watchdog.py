@@ -78,7 +78,8 @@ else:
         Path(m.HOLD_CLI).chmod(0o700)
         Path(m.TELEGRAM).write_text(fake)
         m.processes = lambda: {999999: (1, 'captured-start', m.EXECUTABLE)}
-        m.tmux_session = lambda socket, name: False
+        self.tmux_session = m.tmux_session
+        m.tmux_session = lambda socket, name, details=None: False
         m.building = lambda: []
         self.opened = self.root / 'opened'
         self.quit = self.root / 'quit'
@@ -89,6 +90,8 @@ else:
         real_run = m.run
 
         def fake_run(args, timeout, **kw):
+            if args[0] == m.TMUX:
+                return subprocess.CompletedProcess(args, 1, '', 'no server running')
             if args[0] == '/usr/bin/osascript':
                 self.quit.write_text('quit')
                 return subprocess.CompletedProcess(args, 0, '', '')
@@ -192,7 +195,7 @@ else:
             self.assertIn(field, probes[-1])
 
     def test_f_each_standing_limit_refuses_both_entrypoints(self):
-        cases = ('disabled', 'expired', 'live-install-hold', 'install-session', 'restart-session',
+        cases = ('disabled', 'live-install-hold', 'install-session', 'restart-session',
                  'building', 'server-start-unreadable', 'server-up-under-two-hours', 'last-restart-under-two-hours')
         for name in cases:
             with self.subTest(name=name):
@@ -200,13 +203,11 @@ else:
                     if name == 'disabled':
                         (self.state / 'disabled').touch()
                         stack.callback((self.state / 'disabled').unlink)
-                    elif name == 'expired':
-                        stack.enter_context(patch.object(self.m, 'EXPIRES', '2000-01-01T00:00:00+00:00'))
                     elif name == 'live-install-hold':
                         stack.enter_context(patch.object(self.m, 'hold_live', lambda: 'other-installer'))
                     elif name.endswith('-session'):
                         socket = name.split('-')[0]
-                        stack.enter_context(patch.object(self.m, 'tmux_session', lambda s, n: s == socket))
+                        stack.enter_context(patch.object(self.m, 'tmux_session', lambda s, n, details=None: s == socket))
                     elif name == 'building':
                         stack.enter_context(patch.object(self.m, 'building', lambda: ['release-2026 fake']))
                     elif name == 'server-start-unreadable':
@@ -220,6 +221,169 @@ else:
                     self.assertFalse(self.quit.exists())
                     self.assertFalse((self.root / 'holds.ndjson').exists())
                 self.m.STATE.unlink(missing_ok=True)
+
+    def test_expiry_stops_checks_but_supervisor_and_worker_finish(self):
+        self.m.EXPIRES = '2000-01-01T00:00:00+00:00'
+        with patch.object(self.m, 'deep_health', side_effect=AssertionError('expired check ran health')):
+            self.assertEqual(self.m.check(), 0)
+        self.assertEqual([r['event'] for r in self.rows()], ['expired'])
+        self.assertFalse(self.quit.exists())
+        self.assertFalse(self.m.STATE.exists())
+        self.assertEqual(self.accepted(), [])
+        # The real worker runs under the supervisor, through fake quit/open/readiness.
+        self.assertEqual(self.m.restart('cycle'), 0)
+        self.assert_result('restart.done')
+        self.assertTrue(self.quit.exists())
+        self.assertTrue(self.opened.exists())
+
+    def test_expired_restart_still_refuses_disabled(self):
+        self.m.EXPIRES = '2000-01-01T00:00:00+00:00'
+        (self.state / 'disabled').touch()
+        self.assertEqual(self.m.restart('cycle'), 1)
+        self.assert_result('restart.failed', 'disabled')
+        self.assertEqual(self.m.restart_worker()['reason'], 'disabled')
+        self.assertFalse(self.quit.exists())
+        self.assertFalse((self.root / 'holds.ndjson').exists())
+
+    def test_status_names_check_expiry_scope(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.m.status(), 0)
+        status = json.loads(output.getvalue())
+        self.assertEqual(status['expires'], self.m.EXPIRES)
+        self.assertEqual(status['expiresScope'], 'check')
+
+    def test_qf_install_pane_matrix(self):
+        now = self.m.time.time()
+        cases = [
+            ('node-old', 'install14', '0', 'node', 7200, True),
+            ('unnumbered', 'install', '0', 'node', 7200, True),
+            ('dead', 'install14', '1', 'node', 12, False),
+            ('other-session', 'foo', '0', 'node', 12, False),
+            ('suffix', 'install14extra', '0', 'node', 12, False),
+            ('negative-number', 'install-1', '0', 'node', 12, False),
+            ('future', 'install14', '0', 'zsh', -10, True),
+        ]
+        for shell in ('zsh', '-zsh', 'bash', 'sh', 'login'):
+            for age, held in ((600, True), (1800, True), (1801, False), (7200, False)):
+                cases.append((f'{shell}-{age}', 'install14', '0', shell, age, held))
+        for label, name, dead, command, age, held in cases:
+            with self.subTest(label=label):
+                output = f'{name}\t{dead}\t{command}\t{int(now - age)}\n'
+                with patch.object(self.m, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')) as run:
+                    details = {}
+                    self.assertEqual(self.m.limits({}, details=details),
+                                     'restart-or-install-session' if held else None)
+                    args, timeout = run.call_args.args
+                    self.assertEqual(args, [self.m.TMUX, '-L', 'qf-install', 'list-panes', '-a', '-F',
+                                           '#{session_name}\t#{pane_dead}\t#{pane_current_command}\t#{session_activity}'])
+                    self.assertEqual(timeout, 10)
+                    if held:
+                        self.assertIn(f'qf-install/{name} cmd={command} idle=', details['detail'])
+                    else:
+                        self.assertEqual(details, {})
+
+    def test_qf_multiple_panes_do_not_hide_active_install(self):
+        now = int(self.m.time.time())
+        output = f'install14\t0\tzsh\t{now - 7200}\ninstall14\t0\tnode\t{now - 7200}\n'
+        with patch.object(self.m, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')):
+            details = {}
+            self.assertTrue(self.m.qf_install_active(details))
+        self.assertEqual(details['detail'], 'qf-install/install14 cmd=node idle=7200s')
+
+    def test_qf_probe_failure_matrix(self):
+        cases = [
+            (1, '', '', False),
+            (1, '', 'no server running on /tmp/qf-install', False),
+            (2, '', 'error connecting to /tmp/qf-install', False),
+            (2, 'no server running', '', False),
+            (2, '', 'permission denied', True),
+            (127, '', 'exec failed', True),
+            (0, 'install14\t0\tzsh\tinvalid\n', '', True),
+            (0, 'install14\t0\n', '', True),
+            (0, 'install14\tunknown\tnode\t0\n', '', True),
+        ]
+        for rc, stdout, stderr, held in cases:
+            with self.subTest(rc=rc, stdout=stdout, stderr=stderr):
+                with patch.object(self.m, 'run', return_value=subprocess.CompletedProcess([], rc, stdout, stderr)):
+                    details = {}
+                    self.assertEqual(self.m.qf_install_active(details), held)
+                if held:
+                    self.assertIn('probe-failed', details['detail'])
+                else:
+                    self.assertEqual(details, {})
+        for error in (subprocess.TimeoutExpired('tmux', 10), OSError('fake tmux failure')):
+            with self.subTest(error=type(error).__name__), patch.object(self.m, 'run', side_effect=error):
+                details = {}
+                self.assertEqual(self.m.limits({}, details=details), 'restart-or-install-session')
+                self.assertIn('probe-failed ' + type(error).__name__, details['detail'])
+
+    def test_qf_configuration_overrides(self):
+        spec = importlib.util.spec_from_file_location('configured_watchdog', SOURCE / 'robob-overload-restart.py')
+        configured = importlib.util.module_from_spec(spec)
+        with patch.dict(os.environ, {'ROBOB_OVERLOAD_QF_SOCKET': 'test-install',
+                                    'ROBOB_OVERLOAD_QF_SESSION_RE': r'^fixture\d*$',
+                                    'ROBOB_OVERLOAD_QF_IDLE_SEC': '42'}):
+            spec.loader.exec_module(configured)
+        now = int(time.time())
+        for age, held in ((10, True), (600, False)):
+            with self.subTest(age=age):
+                output = f'fixture2\t0\tzsh\t{now - age}\n'
+                with patch.object(configured, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')) as run:
+                    self.assertEqual(configured.qf_install_active(), held)
+                self.assertEqual(run.call_args.args[0][2], 'test-install')
+
+    def test_session_details_reach_check_and_restart_refusal(self):
+        for source in ('qf', 'install', 'restart'):
+            with self.subTest(source=source), contextlib.ExitStack() as stack:
+                self.m.LOG.unlink(missing_ok=True)
+                self.m.STATE.unlink(missing_ok=True)
+                if source == 'qf':
+                    expected = 'qf-install/install14 cmd=node idle=12s'
+                    output = f'install14\t0\tnode\t{int(self.m.time.time() - 12)}\n'
+                    stack.enter_context(patch.object(self.m, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')))
+                else:
+                    expected = f'{source}/robob-{source}'
+                    stack.enter_context(patch.object(self.m, 'tmux_session', self.tmux_session))
+                    def run(args, timeout):
+                        return subprocess.CompletedProcess(args, 0 if args[2] == source else 1, '', '')
+                    stack.enter_context(patch.object(self.m, 'run', run))
+                # Avoid the fake probe intercepting notification commands.
+                stack.enter_context(patch.object(self.m, 'notify', return_value=True))
+                self.assertEqual(self.m.check(), 0)
+                row = next(r for r in self.rows() if r['event'] == 'check')
+                self.assertEqual(row['held'], 'restart-or-install-session')
+                self.assertEqual(row['detail'], expected)
+                self.assertEqual(self.m.restart(source), 1)
+                row = next(r for r in self.rows() if r['event'] == 'restart.failed')
+                self.assertEqual(row['reason'], 'restart-or-install-session')
+                self.assertEqual(row['detail'], expected)
+                self.assertFalse(self.quit.exists())
+
+    def test_qf_worker_recheck_logs_and_returns_detail(self):
+        calls = []
+        def active(details=None):
+            calls.append(1)
+            if len(calls) == 1:
+                return False
+            details['detail'] = 'qf-install/install14 cmd=node idle=12s'
+            return True
+        with patch.object(self.m, 'qf_install_active', active):
+            self.assertEqual(self.m.restart('cycle'), 1)
+        row, _ = self.assert_result('restart.failed', 'restart-or-install-session')
+        self.assertEqual(row['detail'], 'qf-install/install14 cmd=node idle=12s')
+        held = next(r for r in self.rows() if r['event'] == 'held')
+        self.assertEqual(held['detail'], row['detail'])
+        self.assertFalse(self.quit.exists())
+
+    def test_existing_tmux_probe_failures_have_detail_and_hold(self):
+        for result in (subprocess.CompletedProcess([], 2, '', 'failure'),
+                       subprocess.TimeoutExpired('tmux', 10), OSError('failure')):
+            with self.subTest(result=type(result).__name__):
+                kwargs = {'side_effect': result} if isinstance(result, Exception) else {'return_value': result}
+                with patch.object(self.m, 'run', **kwargs):
+                    details = {}
+                    self.assertTrue(self.tmux_session('install', 'robob-install', details))
+                    self.assertIn('install/robob-install probe-failed', details['detail'])
 
     def test_g_worker_exception_releases_and_reports_once(self):
         def explode():
@@ -340,7 +504,7 @@ else:
         stamp = 'reserved'
         self.m.write_json(self.m.STATE, {'lastRestartAt': self.m.time.time(),
                                        'lastRestart': {'stamp': stamp}})
-        self.m.tmux_session = lambda socket, name: socket == 'restart'
+        self.m.tmux_session = lambda socket, name, details=None: socket == 'restart'
         self.assertEqual(self.m.restart(stamp), 0)
         self.assertTrue(self.m.read_json(self.m.STATE, {})['lastRestart']['consumed'])
         self.assertEqual(self.m.restart('differentcycle'), 1)
@@ -377,7 +541,7 @@ else:
         real_run = self.m.run
         def launch_then_timeout(args, timeout):
             nonlocal supervisor
-            if args[0] != self.m.TMUX:
+            if args[0] != self.m.TMUX or args[3] != 'new-session':
                 return real_run(args, timeout)
             stamp = self.m.read_json(self.m.STATE, {})['lastRestart']['stamp']
             supervisor = os.fork()

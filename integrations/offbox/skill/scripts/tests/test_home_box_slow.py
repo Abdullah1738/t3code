@@ -31,6 +31,8 @@ class HomeBoxSlow(unittest.TestCase):
         self.addCleanup(lambda: home.QUEUE_WAIT.reset(token))
         self.stack.enter_context(patch.object(home, "slow_read_reachable", return_value=True))
         self.stack.enter_context(patch.object(home, "say"))
+        # A long home queue is reachable only when Boat cannot take this ordinary run.
+        self.stack.enter_context(patch.object(home, "boat_can_take", return_value=False))
 
     def warm_ssh_row(self):
         self.f.box("homebox", member=True)
@@ -38,7 +40,7 @@ class HomeBoxSlow(unittest.TestCase):
         cfg.touch()
         self.stack.enter_context(patch.object(lease.ssh_sync, "cfg_path", return_value=cfg))
         self.stack.enter_context(patch.object(lease.ssh_sync, "ssh_base", return_value=["ssh"]))
-        self.stack.enter_context(patch.object(lease.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr=b"")))
+        self.stack.enter_context(patch.object(lease.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr=b"")))
         self.stack.enter_context(patch.object(lease, "ensure_ttl"))
         return self.f.con.execute("SELECT * FROM leases WHERE box_id='homebox'").fetchone()
 

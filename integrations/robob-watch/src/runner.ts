@@ -7,7 +7,7 @@ import { toolLog, toolError, logDirectory } from "./toollog.ts";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  clearFailureState, ensureFailureProbe, failureProbeDue, failureProbeDelay, pausedDuration, pauseRetryText, escalationText, escalationFallbackText,
+  clearFailureState, clearFailureEscalation, ensureFailureProbe, failureProbeDue, failureProbeDelay, pausedDuration, pauseRetryText,
   CheckShutdownError, CheckStuckError, checkGroups, withRelayLock, withRelayLockAsync, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   trackConfirmation, confirmWakes, inboundState, inQuiet, iso, installCheckShutdown, killRunningChecks, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
@@ -197,12 +197,10 @@ export async function pauseNotice(watcher: Watcher, state: State): Promise<void>
     const fresh = loadState(watcher.id);
     if (!definition || watcherInstance(watcher.id) !== instance || !fresh.failure_paused_at
       || fresh.failure_paused_at !== pausedAt) return;
-    const changed = !fresh.failure_pause_notice || !fresh.failure_pause_escalation || !fresh.failure_pause_escalation_fallback;
+    const changed = !fresh.failure_pause_notice;
     const mins = Math.round((Date.parse(pausedAt!) - Date.parse(fresh.failing_since!)) / 60_000);
     // A retry reuses the bridge key and its exact payload even after a manual pause or failed probe.
     fresh.failure_pause_notice ??= `Watcher "${definition.title}" paused after ${fresh.consecutive_failures} failures in a row (${mins} min). Last error: ${(fresh.last_error ?? "").slice(0, 300)}. ${pauseRetryText(definition, fresh)} Log: ${join(watcherDir(watcher.id), "log")}`;
-    fresh.failure_pause_escalation ??= escalationText(definition, fresh, mins);
-    fresh.failure_pause_escalation_fallback ??= escalationFallbackText(definition, fresh, mins);
     if (queueOwnerFailure(definition, fresh, "pause") || changed) saveState(watcher.id, fresh);
     return { watcher: definition, state: fresh };
   });
@@ -226,9 +224,7 @@ export async function pauseNotice(watcher: Watcher, state: State): Promise<void>
     state = fresh;
   }
   if (shouldEscalate(watcher, state)) {
-    const sent = await escalate(watcher, state, `robob-watch:${watcher.id}:escalate:${hash(state.failure_episode ?? state.failing_since ?? "").slice(0, 32)}`, !ownerFailureAlerts(watcher, state));
-    log(watcher.id, `failure escalation ok=${sent.ok} via=${sent.via}${sent.ok ? "" : ` ${sent.detail}`}`);
-    await update(fresh => { fresh.failure_escalated = sent.ok; });
+    await escalate(watcher, state, `robob-watch:${watcher.id}:escalate:${hash(state.failure_episode ?? state.failing_since ?? "").slice(0, 32)}`, !ownerFailureAlerts(watcher, state));
   }
 }
 
@@ -236,6 +232,8 @@ async function failWatcher(watcher: Watcher, fresh: State, instance: string | un
   timedOut: boolean, message: string, sources: string[] = [], detail = "", busy?: DependencyBusy): Promise<void> {
   const id = watcher.id;
   const sameInstance = () => watcherInstance(id) === instance;
+  const previousEpisode = fresh.failure_episode;
+  const firstFailure = fresh.consecutive_failures === 0;
   if (busy) {
     if (fresh.dependency_busy?.dependency !== busy.dependency) {
       fresh.dependency_busy = { dependency: busy.dependency, since: iso() };
@@ -255,6 +253,10 @@ async function failWatcher(watcher: Watcher, fresh: State, instance: string | un
   else delete fresh.last_error_sources;
   fresh.next_at = now() + backoff(fresh, watcher.interval_s, timedOut || !!busy);
   const failureKey = fresh.failure_episode ?? fresh.failing_since ?? "";
+  if (firstFailure || fresh.failure_episode !== previousEpisode) {
+    clearFailureEscalation(fresh);
+    fresh.failure_escalation_key = `robob-watch:${id}:escalate:${hash(failureKey).slice(0, 32)}:wake`;
+  }
   log(id, busy ? `check busy (${fresh.consecutive_failures}) ${busy.dependency}: ${busy.detail}`
     : `check failed (${fresh.consecutive_failures}) ${fresh.last_error}${detail}`);
   if (shouldPause(watcher, fresh, timedOut)) {
@@ -291,16 +293,13 @@ async function failWatcher(watcher: Watcher, fresh: State, instance: string | un
     toolLog({ component: "runner", kind: "event", name: "watch.failure_notice_held", ids: { watcher: id }, props: { count, threshold, timedOut } });
   }
   if (shouldEscalate(watcher, fresh)) {
-    const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(failureKey).slice(0, 32)}`, !ownerFailureAlerts(watcher, fresh));
+    await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(failureKey).slice(0, 32)}`, !ownerFailureAlerts(watcher, fresh));
     const current = loadState(id);
     if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
       log(id, "failure notice completed after resume/remove; state kept");
       return;
     }
     fresh = current;
-    fresh.failure_escalated = sent.ok;
-    saveState(id, fresh);
-    log(id, `failure escalation ok=${sent.ok} via=${sent.via}${sent.ok ? "" : ` ${sent.detail}`}`);
   }
   // Keep the retry cadence at most 5 min apart for wake watchers so escalation and recovery are not delayed
   // by a 30 min backoff.
@@ -767,7 +766,8 @@ async function tickWatcher(id: string): Promise<void> {
       if (fresh.dependency_busy) {
         delete fresh.dependency_busy;
         fresh.failure_episode = randomUUID();
-        delete fresh.failure_escalated;
+        clearFailureEscalation(fresh);
+        fresh.failure_escalation_key = `robob-watch:${id}:escalate:${hash(fresh.failure_episode).slice(0, 32)}:wake`;
       }
       fresh.load_timeouts = (fresh.load_timeouts ?? 0) + 1;
       fresh.load_timeout_since ??= iso();

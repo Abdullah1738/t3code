@@ -13,10 +13,10 @@ import threading
 from urllib.parse import urlsplit
 import volume
 from host import clean_host
-from causes import PHASES, WAIT_FIELDS, SUBSTEP_FIELDS
+from causes import PHASES, WAIT_FIELDS, SUBSTEP_FIELDS, TIMEOUT_FIELDS
 
 CAP = 200 * 1024 * 1024
-PHASE_ROWS = {('poller', 'poll.phases'), ('poller', 'rollup.phases'), ('guard', 'guard.tick_late')}
+PHASE_ROWS = {('poller', 'poll.phases'), ('poller', 'rollup.phases'), ('guard', 'guard.tick_late'), ('poller', 'poll.timeout')}
 _seen = set()
 _last_report = time.monotonic()
 PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx', 'phase', 'durationMaxMs', 'omitted', 'provider', 'scope', 'cause', 'lockMs', 'until', 'previousBackoffLevel', 'backoffLevel', 'source'}
@@ -40,6 +40,7 @@ PROPS.update({'cpuMs', 'wallMs', 'processType', 'nice', 'priority'})
 PROPS.update({field[:-2] + 'CpuMs' for field in PHASES.values()})
 PROPS.update(WAIT_FIELDS)
 PROPS.update(SUBSTEP_FIELDS)
+PROPS.update(TIMEOUT_FIELDS)
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
             'The operation was aborted due to timeout', 'The operation was aborted'}

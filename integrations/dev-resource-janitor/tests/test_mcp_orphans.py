@@ -50,6 +50,31 @@ class McpTests(JanitorTestCase):
         for args, expected in forms:
             with self.subTest(args=args): self.assertEqual(lp.mcp_helper(args), expected)
 
+    def test_expired_hourly_budget_keeps_mcp_candidate_without_resetting_the_clock(self):
+        def control(path, timeout):
+            return 200, (dict(ok=True, threads=[dict(threadId='owner', **OWNER['recovery'])])
+                         if path.startswith('/recovery/') else dict(ok=True, thread=OWNER['thread']))
+
+        for tick, expected_candidates in [(599, 1), (600, 0), (601, 0)]:
+            with self.subTest(tick=tick), \
+                    patch.object(lp.time, 'monotonic', return_value=tick), \
+                    patch.object(lp.time, 'time', return_value=self.now), \
+                    patch.object(lp, 'cpu_processes', return_value=self.rows), \
+                    patch.object(lp, 'environment_values', return_value=self.binding), \
+                    patch.object(lp.active_sessions, '_control_get', side_effect=control), \
+                    patch.object(lp, 'launch_services', return_value={}), \
+                    patch.object(lp, 'processes', return_value={}), \
+                    patch.object(lp, 'run', return_value=''), \
+                    patch.object(lp, 'parse_top', return_value={}), \
+                    patch.object(lp, 'cwd_inventory', return_value={}), \
+                    patch.object(lp, 'scan_agent_browsers', return_value={}), \
+                    patch.object(lp, 'scan_xcode_builds', return_value={}):
+                report = lp.scan(ROSTER, deadline=600)
+            self.assertEqual(len(report['mcp_orphan']['candidates']), expected_candidates)
+            if not expected_candidates:
+                self.assertEqual(report['mcp_orphan']['inventory'][0]['keep_reason'],
+                                 'observation_budget_exhausted')
+
     def test_every_helper_old_parentless_missing_or_ended_provider(self):
         for helper, args in HELPERS.items():
             for parent in [None, 'missing', 'claude', 'codex', 'opencode', '/Users/test/.robob/tools/claude']:

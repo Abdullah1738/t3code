@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/python3 -I "$HOME/.local/lib/mac-logging/suspend_lease.py" "$@"

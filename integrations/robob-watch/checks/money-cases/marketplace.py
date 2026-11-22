@@ -66,8 +66,19 @@ def lane(snapshot, cache, reason=None):
 
 
 def refresh(data, root, budget=120):
+    from state_json import write_json
     with data_io.scope(time.time() + budget):
-        return _refresh(data, root, budget)
+        stats = _refresh(data, root, budget)
+    if stats['result'] != 'busy':
+        # A cache-lock timeout exhausts the work scope. Record that outcome only
+        # after unwinding it, so diagnostics still get their own bounded budget.
+        try:
+            with data_io.scope(time.time() + .5):
+                write_json(Path(data) / 'marketplace-refresh.json', {
+                    'last_result': stats['result'], 'last_at': dt.datetime.now(dt.timezone.utc).isoformat()})
+        except (OSError, data_io.DataUnavailable):
+            pass
+    return stats
 
 
 def _refresh(data, root, budget):
@@ -189,7 +200,7 @@ def _refresh(data, root, budget):
                     snapshot['orders'] = {oid: orders[oid] for oid in seen if oid in orders}
                     snapshot['walked_at'] = walked_at
                     snapshot['complete'] = True
-                write_json(data / 'marketplace-placements.json', snapshot)
+                    write_json(data / 'marketplace-placements.json', snapshot)
         except TimeoutError:
             stats['result'] = 'cache_busy'
         except OSError:
@@ -226,9 +237,65 @@ def refresh_status(data):
         return 'skipped'
 
 
+def refresh_details(data, status):
+    from charges import toollog as orders_log
+    from order_lookup import moment
+    walked, complete, age, state = None, False, None, {}
+    # Optional diagnostics must neither spend the check budget nor latch its
+    # unavailable-data guard. A nested scope isolates that guard on failure.
+    try:
+        with data_io.scope(time.time() + .05):
+            snapshot, _ = load(data)
+            walked, complete = snapshot['walked_at'], snapshot['complete']
+            age = max(0, int(time.time() - moment(walked).timestamp())) if walked else None
+            state = json.loads(data_io.read_text(Path(data) / 'marketplace-refresh.json'))
+            if not isinstance(state, dict):
+                state = {}
+    except (OSError, ValueError, data_io.DataUnavailable):
+        state = {}
+    return orders_log.marketplace_refresh_fields({
+        'status': status, 'snapshot_age_s': age,
+        'last_result': state.get('last_result', 'end_of_history' if complete else None),
+        'last_at': state.get('last_at', walked)})
+
+
+def write_refresh_error(data, message):
+    path = Path(data) / 'marketplace-refresh.err'
+    with data_io.scope(time.time() + .5):
+        fd = data_io.materialize_io(lambda: os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), path)
+        try:
+            remaining = memoryview(message.encode()[-16 * 1024:])
+            while remaining:
+                count = data_io.materialize_io(lambda: os.write(fd, remaining), path)
+                if not count:
+                    raise OSError('short refresh diagnostic write')
+                remaining = remaining[count:]
+        finally:
+            os.close(fd)
+
+
 def launch_refresh(data):
+    with data_io.scope(time.time() + .5):
+        return _launch_refresh(data)
+
+
+def _launch_refresh(data):
     python = Path(os.environ.get('MONEY_CASES_ORDER_PYTHON', '~/.local/share/uv/tools/mitmproxy/bin/python')).expanduser()
-    subprocess.Popen([str(python), '-I', '-B', str(Path(__file__).with_name('order_lookup.py')),
-                      'refresh-marketplace', '--data', str(data)], start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     close_fds=True)
+    error_path = Path(data) / 'marketplace-refresh.err'
+    write_refresh_error(data, 'refresh supervisor starting; no result yet\n')
+    fd = data_io.materialize_io(lambda: os.open(error_path, os.O_WRONLY | os.O_APPEND), error_path)
+    with os.fdopen(fd, 'wb', buffering=0) as error:
+        try:
+            subprocess.Popen([sys.executable, '-I', '-B', str(Path(__file__).with_name('marketplace_worker.py')),
+                              str(data), str(python), '-I', '-B', str(Path(__file__).with_name('order_lookup.py')),
+                              'refresh-marketplace', '--data', str(data)], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=error,
+                             close_fds=True)
+        except OSError:
+            from state_json import write_json
+            try:
+                write_json(Path(data) / 'marketplace-refresh.json', {
+                    'last_result': 'launch_error', 'last_at': dt.datetime.now(dt.timezone.utc).isoformat()})
+            except (OSError, data_io.DataUnavailable):
+                pass
+            raise

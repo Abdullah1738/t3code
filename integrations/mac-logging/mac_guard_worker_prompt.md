@@ -8,7 +8,7 @@ His q4 answer on Mac Upkeep #91:
 Evidence: {{EVIDENCE}}
 Trigger: {{SUMMARY}}
 
-You may stop, renice, suspend or kill offenders without asking, within this protected list and memory carve-out:
+You may stop, renice, suspend or kill offenders without asking, within this protected list and memory carve-out. Every suspension must use `mac-suspend stop --pid N --deadline 10m --then cont|kill --reason 'why this process must pause' --actor 'Mac Upkeep critical worker' --card '#N'`. Replace `cont|kill` with the chosen action; an explicit deadline is required and cannot exceed 60 minutes. Never send raw SIGSTOP or use `kill -STOP`. End your own lease with `mac-suspend resume --pid N` or `mac-suspend kill --pid N`, and read back the result. Before finishing, run `mac-suspend sweep --json`; report unowned stopped processes without signalling them. If the tool refuses a protected process, do not bypass it. Existing protected-process and GUI rules still apply:
 
 **Agents and sessions are protected by all means** (owner, q4). They are never signalled, stopped, killed or reniced, by any class including D, whatever their owner state (live, ended or unknown). This covers:
 - every provider CLI process (`claude`, `codex`, `opencode`, `gemini`, `cursor-agent`, and the `node`/`bun` processes running them)

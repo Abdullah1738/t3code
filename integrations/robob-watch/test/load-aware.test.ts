@@ -89,8 +89,10 @@ test("c: a 61-minute load timeout streak enters the normal failure path", async 
 test("grace safety valve still alerts, pauses and escalates a hung wake check", async () => {
   const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9", ROBOB_WATCH_LOAD_GRACE_MS: "1" }); f.add("hung", { mode: "wake", max_consecutive_failures: 1 });
   f.save("hung", { ...f.state("hung"), consecutive_failures: 1, failing_since: new Date(Date.now() - 16 * 60_000).toISOString(), load_timeouts: 5, load_timeout_since: new Date(Date.now() - 1000).toISOString() });
-  await f.run("hung", s => !!s.failure_paused_at && s.failure_alerted && !!s.failure_escalated);
-  expect(f.state("hung").consecutive_failures).toBe(2); expect(f.calls()).toHaveLength(2);
+  await f.run("hung", s => !!s.failure_paused_at && s.failure_alerted && !!s.failure_escalated
+    && readFileSync(f.path("hung", "log"), "utf8").includes("failure escalation ok=true"));
+  expect(f.state("hung").consecutive_failures).toBe(2);
+  expect(f.calls().map(line => (JSON.parse(line) as string[])[0])).toEqual(["notify", "wake", "wake-status"]);
 });
 
 test("d: low-load timeouts count as failures", async () => {
