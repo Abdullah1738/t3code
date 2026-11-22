@@ -2058,13 +2058,18 @@ bash "$TASK_DIR/step5r.sh"
         shadow = self.write('bin/realpath', f'#!/bin/sh\necho {self.root}/unsafe.sh\n')
         shadow.chmod(0o755)
         environments = [{'PATH': os.pathsep.join((str(shadow.parent), os.environ['PATH']))},
-                        {'BASH_FUNC_realpath%%': '() { echo unsafe.sh; }'}]
+                        {'BASH_FUNC_realpath%%': '() { echo unsafe.sh; }'}, {'BASH_FUNC_pwd%%': '() { echo /; }'}]
         for environment in environments:
             with patch.dict(os.environ, environment):
                 for command in commands:
                     with self.subTest(environment=environment, command=command):
                         self.assertIsNotNone(self.classify(command))
         shadow.unlink()
+        # An exported function under another name shadows neither command.
+        with patch.dict(os.environ, {'BASH_FUNC_module%%': '() { :; }'}):
+            for command in commands + ['/bin/bash "$(pwd)/safe.sh"']:
+                with self.subTest(unrelated_function=True, command=command):
+                    self.assertIsNone(self.classify(command))
         # Same-call writes into a PATH entry ahead of /bin replace the lookup.
         with patch.dict(os.environ, {'PATH': os.pathsep.join((str(shadow.parent), os.environ['PATH']))}):
             for command in commands:

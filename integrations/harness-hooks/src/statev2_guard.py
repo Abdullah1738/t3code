@@ -4654,10 +4654,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     def resolve_cwd_substitution(literal, directory, quoted=False):
         match = CWD_SUBSTITUTION.fullmatch(literal)
         base = tracked_cwd(directory, quoted) if match else None
-        # An exported Bash function can shadow the pwd builtin or realpath.
-        if base is None or any(name.startswith('BASH_FUNC_') for name in os.environ):
+        target = match and (match[2] or match[4])
+        # An exported Bash function named pwd or realpath shadows that command.
+        if base is None or any(re.fullmatch(r'BASH_FUNC_(?:pwd|realpath)(?:%%|\(\))?', name) for name in os.environ):
             return None
-        target = match[2] or match[4]
         # Only the system realpath, found through the inherited PATH and not
         # replaced earlier in the call, is known to print the resolved path.
         if target and not (_trusted_fixture_tool('realpath', 'realpath', directory) and unchanged_tool('realpath', directory)):
