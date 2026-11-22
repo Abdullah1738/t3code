@@ -2352,6 +2352,13 @@ function rosterFixture() {
   return { client, row, server, reads, roster, backend, chats, event, advance: (ms: number) => { time += ms; } };
 }
 
+function holdRosterRead(f: ReturnType<typeof rosterFixture>) {
+  const response = Promise.withResolvers<typeof f.server>();
+  const started = Promise.withResolvers<void>();
+  f.reads.mockImplementationOnce(() => { started.resolve(); return response.promise; });
+  return { ...response, started: started.promise };
+}
+
 test("active roster shares six concurrent reads and the healthy 120-second budget across every chat", async () => {
   for (const scenario of ["idle", "active", "steer"] as const) {
     const f = rosterFixture();
@@ -2483,14 +2490,18 @@ test("healthy steer admission uses cache, a stream gap awaits one fetch, replies
   const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses(true);
   await f.backend.statuses(true); expect(f.reads).toHaveBeenCalledTimes(1);
   f.roster.streamState(false);
-  let resolve!: (value: typeof f.server) => void;
-  f.reads.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  const response = holdRosterRead(f), reconciliation = holdRosterRead(f);
   let admitted = false;
   const admission = f.backend.statuses(true).then(() => { admitted = true; });
   expect(admitted).toBe(false);
   expect(await f.chats[1]!.statuses()).toEqual({ owner: { type: "busy", root: null } });
-  f.event("owner", "needs-input"); resolve(structuredClone(f.server)); await admission;
-  expect(f.reads).toHaveBeenCalledTimes(2);
+  f.event("owner", "needs-input"); response.resolve(structuredClone(f.server));
+  await reconciliation.started;
+  expect(admitted).toBe(false);
+  expect((await f.chats[1]!.statuses()).owner?.type).toBe("busy");
+  reconciliation.resolve(structuredClone(f.server)); await admission;
+  expect(f.reads).toHaveBeenCalledTimes(3);
+  expect(f.roster.status().ambiguous).toBe(1);
   expect((await f.backend.statuses()).owner?.type).toBe("busy");
 });
 
@@ -2517,14 +2528,18 @@ test("fetch failures retain busy families, fail admission closed and back off", 
 
 test("events during a slow refresh survive its older snapshot", async () => {
   const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
-  let resolve!: (value: typeof f.server) => void;
-  f.advance(30_000); f.reads.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
-  const admission = f.backend.statuses(true);
+  const stale = structuredClone(f.server);
+  f.advance(30_000); const response = holdRosterRead(f), reconciliation = holdRosterRead(f);
+  let admitted = false;
+  const admission = f.backend.statuses(true).then(statuses => { admitted = true; return statuses; });
   f.event("owner", "idle"); expect(await f.backend.statuses()).toHaveProperty("owner");
-  resolve(structuredClone(f.server)); await admission;
+  response.resolve(stale); await reconciliation.started;
+  expect(admitted).toBe(false);
   expect(await f.backend.statuses()).toHaveProperty("owner");
-  f.roster.observe(f.server.threads[0]!);
-  expect(await f.backend.statuses()).toEqual({}); expect(f.reads).toHaveBeenCalledTimes(2);
+  reconciliation.resolve(structuredClone(f.server));
+  expect(await admission).toEqual({});
+  expect(await f.backend.statuses()).toEqual({}); expect(f.reads).toHaveBeenCalledTimes(3);
+  expect(f.roster.status().ambiguous).toBe(1);
 });
 
 test("old-run status cannot clear a newer busy foreground", async () => {
@@ -2691,13 +2706,18 @@ test.each([false, true])("an in-flight run-1 completion cannot erase a fetched b
   const f = rosterFixture();
   f.server.threads[0] = { ...f.server.threads[0]!, latestRunId: "run-1", activeRunId: active ? "run-1" : null };
   f.roster.streamState(true); await f.backend.statuses();
-  const response = Promise.withResolvers<typeof f.server>();
-  f.advance(30_000); f.reads.mockReturnValue(response.promise);
-  const admission = f.backend.statuses(true);
+  f.advance(30_000); const response = holdRosterRead(f), reconciliation = holdRosterRead(f);
+  let admitted = false;
+  const admission = f.backend.statuses(true).then(statuses => { admitted = true; return statuses; });
   rosterEvent(f.roster, { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" });
-  response.resolve({ total: 1, threads: [{ ...f.server.threads[0]!, latestRunId: "run-2", activeRunId: active ? "run-2" : null }] });
+  f.server.threads[0] = { ...f.server.threads[0]!, latestRunId: "run-2", activeRunId: active ? "run-2" : null };
+  response.resolve(structuredClone(f.server)); await reconciliation.started;
+  expect(admitted).toBe(false);
+  expect(await f.backend.statuses()).toEqual({ owner: { type: "busy", root: null } });
+  reconciliation.resolve(structuredClone(f.server));
   expect(await admission).toEqual({ owner: { type: "busy", root: null } });
-  expect(f.reads).toHaveBeenCalledTimes(2);
+  expect(f.reads).toHaveBeenCalledTimes(3);
+  expect(f.roster.status().ambiguous).toBe(1);
 });
 
 test.each(["opening", "fetched", "resolved"])("request state remains authoritative during a slow refresh: %s", async source => {
@@ -2706,24 +2726,31 @@ test.each(["opening", "fetched", "resolved"])("request state remains authoritati
   const request = { requestId: "question", kind: "question" as const, requestKind: "user_input" };
   if (source === "resolved") Object.assign(f.server.threads[0]!, { state: "needs-input", pendingRequest: request });
   f.roster.streamState(true); await f.backend.statuses();
-  const response = Promise.withResolvers<typeof f.server>();
   const stale = structuredClone(f.server);
-  f.advance(30_000); f.reads.mockReturnValueOnce(response.promise);
-  const admission = f.backend.statuses(true);
-  if (source === "opening") rosterEvent(f.roster, { type: "request.opened", threadId: "owner", ...request, status: "pending" });
+  f.advance(30_000); const response = holdRosterRead(f), reconciliation = holdRosterRead(f);
+  let admitted = false;
+  const admission = f.backend.statuses(true).then(statuses => { admitted = true; return statuses; });
+  if (source === "opening") {
+    Object.assign(f.server.threads[0]!, { state: "needs-input", pendingRequest: request });
+    rosterEvent(f.roster, { type: "request.opened", threadId: "owner", ...request, status: "pending" });
+  }
   rosterEvent(f.roster, { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" });
   if (source === "resolved") {
     f.server.threads[0] = { ...f.server.threads[0]!, state: "idle", pendingRequest: null };
     rosterEvent(f.roster, { type: "request.resolved", threadId: "owner", ...request, status: "resolved" });
   }
-  if (source === "fetched") Object.assign(stale.threads[0]!, { state: "needs-input", pendingRequest: request });
-  response.resolve(stale);
-  expect(await admission).toEqual({ owner: { type: "busy", root: null } });
-  if (source === "resolved") {
-    f.roster.observe(f.server.threads[0]!);
-    expect(await f.backend.statuses()).toEqual({});
+  if (source === "fetched") {
+    Object.assign(stale.threads[0]!, { state: "needs-input", pendingRequest: request });
+    Object.assign(f.server.threads[0]!, { state: "needs-input", pendingRequest: request });
   }
-  expect(f.reads).toHaveBeenCalledTimes(2);
+  response.resolve(stale); await reconciliation.started;
+  expect(admitted).toBe(false);
+  expect(await f.backend.statuses()).toEqual({ owner: { type: "busy", root: null } });
+  reconciliation.resolve(structuredClone(f.server));
+  expect(await admission).toEqual(source === "resolved" ? {} : { owner: { type: "busy", root: null } });
+  expect(await f.backend.statuses()).toEqual(source === "resolved" ? {} : { owner: { type: "busy", root: null } });
+  expect(f.reads).toHaveBeenCalledTimes(3);
+  expect(f.roster.status().ambiguous).toBe(1);
 });
 
 const detailRequestRaces = (["question", "approval"] as const).flatMap(kind =>
@@ -2733,33 +2760,46 @@ test.each(detailRequestRaces)("a same-run detail cannot erase a fetched pending 
   const f = rosterFixture();
   f.server.threads = [{ ...f.row("child", "running", "owner"), activeRunId: null, latestRunId: "run-1" }];
   f.roster.streamState(true); await f.backend.statuses();
-  const response = Promise.withResolvers<typeof f.server>();
-  f.advance(30_000); f.reads.mockReturnValueOnce(response.promise);
-  const admission = f.backend.statuses(true);
+  f.advance(30_000); const response = holdRosterRead(f);
+  const reconciliation = fail ? undefined : holdRosterRead(f);
+  let admitted = false;
+  const admission = f.backend.statuses(true).then(statuses => { admitted = true; return statuses; });
   f.roster.observe({ ...f.server.threads[0]!, state, status: state, pendingRequest: null, updatedAt: "2026-11-19T00:00:01Z" });
   f.server.threads[0] = { ...f.server.threads[0]!, state: "needs-input", updatedAt: "2026-11-19T00:00:02Z",
     pendingRequest: { requestId: "pending", kind, requestKind: kind === "question" ? "user_input" : "command" } };
   expect(f.roster.isBusy("child")).toBe(true);
   if (fail) response.reject(new Error("reconciliation offline"));
-  else response.resolve(structuredClone(f.server));
+  else {
+    response.resolve(structuredClone(f.server)); await reconciliation!.started;
+    expect(admitted).toBe(false);
+    expect(await f.backend.statuses()).toEqual({ child: { type: "busy", root: "owner" } });
+    reconciliation!.resolve(structuredClone(f.server));
+  }
   if (fail) await expect(admission).rejects.toThrow("reconciliation offline");
   else expect(await admission).toEqual({ child: { type: "busy", root: "owner" } });
   expect(await f.backend.statuses()).toEqual({ child: { type: "busy", root: "owner" } });
-  expect(f.reads).toHaveBeenCalledTimes(2);
+  expect(f.reads).toHaveBeenCalledTimes(fail ? 2 : 3);
+  expect(f.roster.status().ambiguous).toBe(fail ? 0 : 1);
 });
 
 test.each(["fetched-busy", "detail-busy"])("conflicting same-run aggregate details preserve busy until reconciled: %s", async order => {
   const f = rosterFixture(); f.server.threads[0]!.latestRunId = "run-1";
   if (order === "detail-busy") f.server.threads[0]!.state = "waiting";
   f.roster.streamState(true); await f.backend.statuses();
-  const response = Promise.withResolvers<typeof f.server>();
-  f.advance(30_000); f.reads.mockReturnValueOnce(response.promise);
-  const admission = f.backend.statuses(true);
+  f.advance(30_000); const response = holdRosterRead(f), reconciliation = holdRosterRead(f);
+  let admitted = false;
+  const admission = f.backend.statuses(true).then(statuses => { admitted = true; return statuses; });
   f.roster.observe({ ...f.server.threads[0]!, state: order === "detail-busy" ? "running" : "waiting" });
   expect(f.roster.isBusy("owner")).toBe(true);
   response.resolve({ total: 1, threads: [{ ...f.server.threads[0]!, state: order === "fetched-busy" ? "running" : "waiting" }] });
+  await reconciliation.started;
+  expect(admitted).toBe(false);
+  expect(await f.backend.statuses()).toEqual({ owner: { type: "busy", root: null } });
+  f.server.threads[0]!.state = "running";
+  reconciliation.resolve(structuredClone(f.server));
   expect(await admission).toEqual({ owner: { type: "busy", root: null } });
-  expect(f.reads).toHaveBeenCalledTimes(2);
+  expect(f.reads).toHaveBeenCalledTimes(3);
+  expect(f.roster.status().ambiguous).toBe(1);
 });
 
 const drainingRunEvents = [
@@ -2806,15 +2846,21 @@ test("a busy detail for a different run keeps admission blocked until the fetch 
   const f = rosterFixture();
   f.server.threads[0] = { ...f.server.threads[0]!, latestRunId: "run-1" };
   f.roster.streamState(true); await f.backend.statuses();
-  const response = Promise.withResolvers<typeof f.server>();
-  f.advance(30_000); f.reads.mockReturnValueOnce(response.promise);
-  const admission = f.backend.statuses(true);
+  f.advance(30_000); const response = holdRosterRead(f), reconciliation = holdRosterRead(f);
+  let admitted = false;
+  const admission = f.backend.statuses(true).then(statuses => { admitted = true; return statuses; });
   const next = { ...f.server.threads[0]!, latestRunId: "run-2" };
   f.roster.observe(next);
   expect(f.roster.isBusy("owner")).toBe(true);
   response.resolve({ total: 1, threads: [{ ...f.server.threads[0]!, state: "idle" }] });
+  await reconciliation.started;
+  expect(admitted).toBe(false);
+  expect(await f.backend.statuses()).toEqual({ owner: { type: "busy", root: null } });
+  f.server.threads[0] = next;
+  reconciliation.resolve(structuredClone(f.server));
   expect(await admission).toEqual({ owner: { type: "busy", root: null } });
-  expect(f.reads).toHaveBeenCalledTimes(2);
+  expect(f.reads).toHaveBeenCalledTimes(3);
+  expect(f.roster.status().ambiguous).toBe(1);
 });
 
 test("a failed request-resolution fetch retains needs-input and rejects admission", async () => {
@@ -2951,15 +2997,26 @@ test.each(["before", "during", "after"])("detail started %s the latest fetch cle
   response.resolve(structuredClone(f.server)); await refresh;
   if (order === "after") { f.roster.finish("owner", read); read = f.roster.checkpoint("owner"); }
   f.server.threads[0]!.state = "idle";
+  const reconciliation = order === "during" ? holdRosterRead(f) : undefined;
   f.roster.observe(f.server.threads[0]!, read);
   if (order === "after") expect(await f.backend.statuses()).toEqual({});
   else {
-    expect(await f.backend.statuses(true)).toHaveProperty("owner");
-    f.roster.observe(f.server.threads[0]!);
+    if (reconciliation) {
+      await reconciliation.started;
+      let admitted = false;
+      const admission = f.backend.statuses(true).then(statuses => { admitted = true; return statuses; });
+      expect(await f.backend.statuses()).toHaveProperty("owner");
+      expect(admitted).toBe(false);
+      reconciliation.resolve(structuredClone(f.server));
+      expect(await admission).toEqual({});
+    } else {
+      expect(await f.backend.statuses(true)).toHaveProperty("owner");
+      f.roster.observe(f.server.threads[0]!);
+    }
   }
   expect(await f.backend.statuses(true)).toEqual({});
-  expect(f.reads).toHaveBeenCalledTimes(2);
-  expect(f.roster.status().ambiguous).toBe(0);
+  expect(f.reads).toHaveBeenCalledTimes(order === "during" ? 3 : 2);
+  expect(f.roster.status().ambiguous).toBe(order === "during" ? 1 : 0);
 });
 
 test("real backend familyBusy stays true when a newer child run ends but older work continues", async () => {
