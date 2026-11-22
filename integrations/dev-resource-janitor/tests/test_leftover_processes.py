@@ -206,6 +206,24 @@ class ProcessTests(JanitorTestCase):
         self.assertNotIn('topsecret', json.dumps(report))
         self.assertTrue(report['report_only'])
 
+    def test_final_roster_recheck_cannot_authorize_after_observation_deadline(self):
+        clock = [0]
+        rows = lp.parse_ps(PS)
+
+        def refresh_roster():
+            clock[0] = 600
+            return ROSTER
+
+        with patch.object(lp.time, 'monotonic', side_effect=lambda: clock[0]):
+            report = lp.detect(rows, lp.parse_top(TOP), {}, ROSTER,
+                               inspect=lambda row: copy.deepcopy(DETAILS),
+                               resolve=lambda binding: copy.deepcopy(OWNER),
+                               refresh=lambda pid: {pid: rows[pid]}, refresh_roster=refresh_roster,
+                               deadline=600, now=1794787200)
+        self.assertEqual(report['candidates'], [])
+        self.assertEqual(report['budget_skipped'], 1)
+        self.assertEqual(report['inventory'][0]['keep_reason'], 'observation_budget_exhausted')
+
     def test_b_live_owner_is_kept(self):
         own = copy.deepcopy(OWNER)
         own['thread']['state'] = 'running'
