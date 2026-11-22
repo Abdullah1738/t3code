@@ -2,11 +2,11 @@
 import datetime as dt
 import json
 import math
-import re
 
 from host import clean_host
 from guard import recent_failure
-from observer import GAP_NAMES, launchctl_cause, measured
+from observer import GAP_NAMES, gap_bounds, measured
+from causes import launchctl_info, positive, unknown as unknown_cause
 
 
 def timestamp(value):
@@ -25,9 +25,12 @@ def transitions(path, observations=None):
                     continue
                 try:
                     row = json.loads(line)
-                    if (observations is not None and row.get('tool') == '9router' and row.get('name') in (*GAP_NAMES, 'poll.complete', 'listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved')
-                            and (row['name'] != 'pool.endpoint.get' or isinstance(row.get('durationMs'), (int, float)) and row['durationMs'] > 120000)):
-                        observations.append(row)
+                    if observations is not None and row.get('tool') == '9router' and row.get('name') in (*GAP_NAMES, 'poll.complete', 'listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved'):
+                        bounds = gap_bounds(row.get('props')) if row['name'] == 'pool.endpoint.get' else None
+                        if (row['name'] != 'pool.endpoint.get' or
+                                positive(row.get('durationMs')) and row['durationMs'] > 120000 or
+                                bounds is not None and bounds[1] - bounds[0] > 120000):
+                            observations.append(row)
                     if row.get('tool') == '9router' and row.get('name') in ('listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved', 'deploy.result') and timestamp(row.get('ts')) is not None:
                         yield row
                 except (ValueError, AttributeError):
@@ -75,11 +78,14 @@ def windows(day, root, generated, observations=None):
                     props.get('cause') in ('listener_refused', 'listener_unreachable'))
         key = (since, 'unknown' if unknown else 'listener')
         incident = incidents.setdefault(key, dict(start=props.get(since_key) or row['ts'], end=None,
-                                                 cause='other', confirmed=False))
+                                                 **unknown_cause('listener_probe'), confirmed=False))
         if unknown and row['name'] == 'listener.state_unknown':
-            incident['cause'] = launchctl_cause(props)
-        elif unknown and incident['cause'] == 'other' and isinstance(props.get('cause'), str) and re.fullmatch(r'launchctl_unknown:(?:-?\d+|timeout|oserror)', props['cause']):
-            incident['cause'] = props['cause']
+            incident.update(launchctl_info(props, legacy=True))
+        elif unknown and incident['cause'] == 'unknown_no_data':
+            explanation = launchctl_info(props, legacy=True)
+            if explanation['cause'] != 'unknown_no_data' or incident.get('missingEvidence') == 'listener_probe':
+                incident.pop('missingEvidence', None)
+                incident.update(explanation)
         for field in ('hostStart', 'hostEnd'):
             host = clean_host(props.get(field))
             if host:
@@ -90,6 +96,7 @@ def windows(day, root, generated, observations=None):
         if 'l1' in incident.get('hostStart', {}):
             incident['load1Start'] = incident['hostStart']['l1']
         if confirmed:
+            incident.pop('missingEvidence', None)
             incident.update(confirmed=True, cause=props.get('cause') or 'listener_' + probe)
         if row['name'] in ('listener.up', 'listener.state_resolved'):
             incident['end'] = row['ts']

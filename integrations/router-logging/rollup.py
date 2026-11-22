@@ -110,7 +110,7 @@ def rollup(day, root=None, now=None):
     unlocks = 0
     supervisor = dict(unresponsive=0, crawling=0, memoryHigh=0, killed=0,
                       starts=0, stopping=0, exits=0, reloads=0, workerForks=0, restartScheduled=0,
-                      deploy=Counter(), stopsBySignal=Counter(), stopsByInitiator=Counter(), exitCodes=Counter(),
+                      deploy=Counter(), stopsBySignal=Counter(), stopsByInitiator=Counter(), stopMarkerStates=Counter(), exitCodes=Counter(),
                       pendingWorkerOutcomes=0,
                       exitedBySignal=Counter(), exitedByCode=Counter(), killedByReason=Counter())
     heartbeat_observations = {}
@@ -173,7 +173,14 @@ def rollup(day, root=None, now=None):
                         if name == 'supervisor.stopping':
                             for field, key in (('signal', 'stopsBySignal'), ('initiator', 'stopsByInitiator')):
                                 value = props.get(field)
-                                supervisor[key][value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', value) else 'unknown'] += 1
+                                if field == 'initiator' and value in (None, 'unknown'):
+                                    value = 'unknown_no_marker'
+                                fallback = 'unknown_no_marker' if field == 'initiator' else 'unknown'
+                                supervisor[key][value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', value) else fallback] += 1
+                            marker_state = props.get('deployMarkerState')
+                            supervisor['stopMarkerStates'][marker_state if marker_state in (
+                                'active', 'missing', 'unreadable', 'invalid_json', 'invalid_shape',
+                                'inactive', 'future', 'expired') else 'legacy_no_marker_state'] += 1
                         if name == 'supervisor.exit':
                             code = props.get('code')
                             supervisor['exitCodes'][str(code) if type(code) is int else 'unknown'] += 1
@@ -474,12 +481,28 @@ def rollup(day, root=None, now=None):
         if not isinstance(row.get('ts'), str) or not row['ts'].startswith(day):
             host_load.observe(row)
     result['hostLoad'], result['proxySummary']['byHour'] = host_load.summary()
+    for key in ('guardGaps', 'pollGaps'):
+        groups = {}
+        for item in result[key]:
+            group = groups.setdefault(item['cause'], dict(cause=item['cause'], count=0, durationMs=0))
+            group['count'] += 1
+            group['durationMs'] = round(group['durationMs'] + item['durationMs'], 3)
+        result[key + 'ByCause'] = [groups[cause] for cause in sorted(groups)]
+    missing = Counter(item.get('missingEvidence', 'cause_evidence') for key in ('guardGaps', 'pollGaps')
+                      for item in result[key] if item['cause'] == 'unknown_no_data')
+    missing.update(item.get('missingEvidence', 'launchctl_outcome') for item in result['listener']['unknownWindows']
+                   if item['cause'] == 'unknown_no_data')
     result['coverage'] = dict(
         healthByHour='Threshold events only; healthy probes use supervisor.health_probe_summary.',
         healthProbeSummaryRows=counts['supervisor.health_probe_summary'],
         pools='Recorded exhaustion episodes only; empty does not mean no pools or continuous observer coverage.',
         observerGaps='Measured spans only; legacy ticks without start/end diagnostics cannot be reconstructed.',
         hostLoad='Sampled at polls and anomalies; missing legacy snapshots are unknown. See hostLoad.failedSnapshots and pollRowsWithoutHost; memory available is free plus inactive pages, an estimate. Overload hours contain a sample above 2x CPU count, not a measured duration.')
+    result['coverage']['unknownCauses'] = dict(remaining=dict(sorted(missing.items())),
+        legacyListenerWindows=sum(item.get('missingEvidence') == 'legacy_launchctl_outcome_not_recorded'
+                                  for item in result['listener']['unknownWindows']),
+        note='A phase cause requires its duration to be at least the unmeasured remainder; otherwise unknown_no_data names the missing evidence. Phase metadata and measured/unmeasured totals describe the full span before daily clipping. Legacy listener outcomes were not recorded and are excluded from new-evidence coverage; timing alone cannot distinguish child wait from host descheduling.')
+    result['coverage']['stopInitiator'] = 'Marker caller identity only; signal sender PID is unavailable to Node callbacks. Legacy null markers have no rejection state.'
     drops = Counter()
     for writer in volume_writers.values():
         drops.update(writer)

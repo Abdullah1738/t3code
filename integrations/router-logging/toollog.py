@@ -31,6 +31,9 @@ PROPS.update({'launchctlExit', 'launchctlStderr', 'jobState', 'jobPid', 'start',
               'historyScanParseMs', 'rollupWriteMs', 'stateSaveMs', 'lockWaitMs', 'listenerHistoryMs',
               'poolHistoryMs', 'historyRefreshMs', 'launchctlMs', 'tcpMs', 'providersFetchMs',
               'usageFetchMs', 'statsFetchMs', 'snapshotMs', 'logWriteMs'})
+PROPS.update({'observerSnapshotStartMs', 'postEndDiagMs', 'openPhase', 'lastPhase',
+              'causeEvidenceField', 'causeEvidenceValue', 'missingEvidence', 'childWaitMs',
+              'phaseMs', 'measuredMs', 'unmeasuredMs'})
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
             'The operation was aborted due to timeout', 'The operation was aborted'}
