@@ -26,9 +26,9 @@ test("marker roster: cached idle detail cannot overwrite newer SSE busy evidence
   const f = await fixture();
   try {
     await f.backend.beginMessageTick(["route"]);
-    expect(f.checkpoint).toHaveBeenCalledTimes(1);
     f.busy();
     expect(await f.backend.sessionBusy("route")).toBe(true);
+    expect(f.checkpoint).toHaveBeenCalledTimes(1);
     await f.backend.beginMessageTick(["route"]);
     expect(await f.backend.sessionBusy("route")).toBe(true);
     expect(f.detail).toHaveBeenCalledTimes(1);
