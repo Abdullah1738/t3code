@@ -535,7 +535,7 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
             props, state = deltas(rows, previous, observed)
             props.update(churn(rows, previous, props))
             props.update(diagnostics)
-            volume_crawls(rows, previous, observed, run)
+            state['volumeCrawlCache'] = volume_crawls(rows, previous, observed, run)
             try:
                 props['load'] = list(os.getloadavg())
             except OSError:

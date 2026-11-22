@@ -625,8 +625,17 @@ def safe_fields(values, event=None):
     if event == 'scan.volume_crawl':
         result = {}
         for key, value in (values or {}).items():
-            if key in ('pid', 'ppid', 'argvOmitted') and type(value) is int and 0 <= value <= 2147483647:
+            if key in ('pid', 'ppid', 'providerPid', 'argvOmitted') and type(value) is int and 0 <= value <= 2147483647:
                 result[key] = value
+            elif key == 'providerPid' and value is None:
+                result[key] = None
+            elif key == 'provider' and value in (None, 'claude', 'codex', 'opencode'):
+                result[key] = value
+            elif key == 'providerSessionAmbiguous' and type(value) is bool:
+                result[key] = value
+            elif key == 'providerSessionId':
+                result[key] = value if (value is None or isinstance(value, str) and
+                    re.fullmatch(r'(?:[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|ses_[A-Za-z0-9]{1,128})', value)) else None
             elif key in ('elapsedS', 'cpuPct') and (value is None or finite_number(value) and value >= 0):
                 result[key] = value
             elif key in ('cwd', 'threadId') and (value is None or isinstance(value, str)):
