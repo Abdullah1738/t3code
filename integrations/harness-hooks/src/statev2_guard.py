@@ -2828,8 +2828,10 @@ CWD_UNPROVED = re.compile(
     r'|(?:^|[;&|(){}\n])\s*[A-Za-z_][\w-]*\s*\(\s*\)|\(\s*\)\s*\{'
     r'|(?<![\w-])cd\s+(?:-[A-Za-z]*\s+)*-[A-Za-z]*P'
     r'|(?<![\w-])set\s+(?:[-+][A-Za-z]*\s+)*(?:-[A-Za-z]*P|[-+]o\s+physical)'
-    r'|CDPATH|(?<![\w$])PATH\+?=')
+    r'|CDPATH|(?<![\w$])PATH\+?=|(?<![\w$./-])path(?:\[[^\]]*\])?\+?=|(?<![\w$])commands\[')
 CWD_PATH = re.compile(r'[A-Za-z0-9_./@%+=:,-]+')
+# Inside double quotes a cwd with spaces stays one word, as its literal twin does.
+CWD_QUOTED_PATH = re.compile(r'[^\0\n$`"\'\\*?\[\]{}]+')
 CWD_SUBSTITUTION = re.compile(r'\$\{PWD\}|\$\(\s*pwd\s*\)|`\s*pwd\s*`|'
                               r'\$\(\s*realpath\s+([\'"]?)(?!-)([A-Za-z0-9_./@%+=:,-]+)\1\s*\)|'
                               r'`\s*realpath\s+([\'"]?)(?!-)([A-Za-z0-9_./@%+=:,-]+)\3\s*`')
@@ -4639,25 +4641,30 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return (preservation_tool(words, directory) and
                 _trusted_fixture_tool(words[0], 'mktemp', directory) and unchanged_tool(words[0], directory))
 
-    def tracked_cwd(directory):
+    def tracked_cwd(directory, quoted=False):
         if cwd_unproved or unsafe_bindings or directory is None or 'PWD' in shell_values or 'PWD' in script_values:
             return None
-        return str(directory) if CWD_PATH.fullmatch(str(directory)) else None
+        return str(directory) if (CWD_QUOTED_PATH if quoted else CWD_PATH).fullmatch(str(directory)) else None
 
-    def resolve_cwd_reads(text, directory):
-        # Unquoted or double-quoted $PWD; an escaped \$PWD stays literal.
-        base = tracked_cwd(directory)
+    def resolve_cwd_reads(text, directory, quoted=False):
+        # An escaped \$PWD stays literal.
+        base = tracked_cwd(directory, quoted)
         return text if base is None else re.sub(r'(?<!\\)\$(?:PWD(?!\w)|\{PWD\})', lambda _: base, text)
 
-    def resolve_cwd_substitution(literal, directory):
+    def resolve_cwd_substitution(literal, directory, quoted=False):
         match = CWD_SUBSTITUTION.fullmatch(literal)
-        base = tracked_cwd(directory) if match else None
-        if base is None:
+        base = tracked_cwd(directory, quoted) if match else None
+        # An exported Bash function can shadow the pwd builtin or realpath.
+        if base is None or any(name.startswith('BASH_FUNC_') for name in os.environ):
             return None
         target = match[2] or match[4]
+        # Only the system realpath, found through the inherited PATH and not
+        # replaced earlier in the call, is known to print the resolved path.
+        if target and not (_trusted_fixture_tool('realpath', 'realpath', directory) and unchanged_tool('realpath', directory)):
+            return None
         # realpath follows symlinks; check the path the shell would pass.
         resolved = os.path.realpath(os.path.join(base, target)) if target else base
-        return resolved if CWD_PATH.fullmatch(resolved) else None
+        return resolved if (CWD_QUOTED_PATH if quoted else CWD_PATH).fullmatch(resolved) else None
 
     def decode_word(value, directory, depth, quoted, checked, cwd_only=False, bodies=None, preserve_mktemp=False):
         nonlocal conditional, uncertain_write, last_invalidation
@@ -4669,7 +4676,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     value = value.replace(key, resolved)
                     continue
             if key in value and key.startswith('\0guard_double_'):
-                literal = resolve_cwd_reads(literal, directory)
+                literal = resolve_cwd_reads(literal, directory, quoted=True)
+                for inner in re.findall(r'\0guard_quoted_\d+__', literal):
+                    resolved = resolve_cwd_substitution(quoted.get(inner, ''), directory, quoted=True)
+                    if resolved is not None:
+                        literal = literal.replace(inner, resolved)
             if key in value and key not in checked and not key.startswith('\0guard_literal_') and literal.startswith(("${", "$(", "`")) and not cwd_only:
                 checked.add(key)
                 for substitution in _substitutions(literal, shell=True):
@@ -4868,7 +4879,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 pieces.append((text[end:], None))
                 result = {''}
                 for key, literal in pieces:
-                    cwd = resolve_cwd_substitution(literal, directory) if key.startswith('\0guard_quoted_') else None
+                    cwd = resolve_cwd_substitution(literal, directory, quoted_context) if key.startswith('\0guard_quoted_') else None
                     if cwd is not None:
                         values = {cwd}
                     elif literal is not None:

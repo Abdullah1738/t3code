@@ -1997,6 +1997,10 @@ bash "$TASK_DIR/step5r.sh"
                     continue
                 with self.subTest(command=command):
                     rule, cause = guard.classify_detail(command, root)
+                    if 'realpath' in p and '$(command -v' in template:
+                        # An earlier opaque substitution may replace realpath on PATH.
+                        self.assertIsNotNone(rule)
+                        continue
                     self.assertEqual(rule, expected, cause)
                     twin = template.replace('{p}', first).replace('{q}', second or first)
                     self.assertEqual(rule, guard.classify(twin, root))
@@ -2030,10 +2034,68 @@ bash "$TASK_DIR/step5r.sh"
             'node "$(realpath "$v")"', 'node "$(realpath -m x.mjs)"', 'node "$(realpath x.mjs y.mjs)"',
             'node "$(pwd -P)/x.mjs"', 'node "$(cat x.mjs)"', 'node "$(realpath $HOME/x.mjs)"',
             "offbox run --bg -- 'export PWD=/x; node \"$PWD/x.mjs\"'", "export PWD=/x; offbox run --bg -- 'node \"$PWD/x.mjs\"'",
+            'path=(/evil $path); node "$(realpath x.mjs)"', 'commands[realpath]=/evil; node "$(realpath x.mjs)"',
         ]:
             with self.subTest(command=command):
                 self.assertIsNotNone(self.classify(command))
         self.assertIsNone(self.classify('node ' + target))
+
+    def realpath_fixture(self):
+        self.cwd_fixture()
+        self.write('safe.sh', 'echo ok')
+        self.write('unsafe.sh', f'sqlite3 {LIVE} .tables')
+        return [template.replace('{p}', form) for form in ('"$(realpath safe.sh)"', '"`realpath safe.sh`"', '$(realpath safe.sh)')
+                for template in ('/bin/bash {p}', 'offbox run --bg -- /bin/bash {p}', "offbox run --bg -- '/bin/bash {p}'",
+                                 "offbox run --bg --step '/bin/bash {p}'")]
+
+    def test_cwd_realpath_resolves_only_through_the_system_realpath(self):
+        commands = self.realpath_fixture()
+        self.assertEqual(self.classify('/bin/bash unsafe.sh'), SCRIPT)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+        # A realpath earlier on the inherited PATH can print any path (review r1).
+        shadow = self.write('bin/realpath', f'#!/bin/sh\necho {self.root}/unsafe.sh\n')
+        shadow.chmod(0o755)
+        environments = [{'PATH': os.pathsep.join((str(shadow.parent), os.environ['PATH']))},
+                        {'BASH_FUNC_realpath%%': '() { echo unsafe.sh; }'}]
+        for environment in environments:
+            with patch.dict(os.environ, environment):
+                for command in commands:
+                    with self.subTest(environment=environment, command=command):
+                        self.assertIsNotNone(self.classify(command))
+        shadow.unlink()
+        # Same-call writes into a PATH entry ahead of /bin replace the lookup.
+        with patch.dict(os.environ, {'PATH': os.pathsep.join((str(shadow.parent), os.environ['PATH']))}):
+            for command in commands:
+                writer = f"printf '#!/bin/sh\\necho unsafe.sh\\n' > {shadow}; chmod +x {shadow}; "
+                with self.subTest(writer=True, command=command):
+                    self.assertIsNotNone(self.classify(writer + command))
+
+    @trusted_node_test
+    def test_quoted_cwd_reads_keep_parity_in_a_directory_with_spaces(self):
+        self.cwd_fixture()
+        spaced = self.root / 'project space'
+        for name in ('safe.sh', 'x.mjs'):
+            (spaced / name).parent.mkdir(exist_ok=True)
+            (spaced / name).write_text('echo ok' if name.endswith('.sh') else 'console.log(1)')
+        (spaced / 'live.mjs').write_text(f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        quoted = ['"$PWD/{p}"', '"${{PWD}}/{p}"', '"$(pwd)/{p}"', '"`pwd`/{p}"', '"$(realpath {p})"']
+        unquoted = ['$PWD/{p}', '${{PWD}}/{p}', '$(pwd)/{p}', '`pwd`/{p}', '$(realpath {p})']
+        rows = [('/bin/bash {p}', 'safe.sh', None), ('node {p}', 'x.mjs', None), ('node {p}', 'live.mjs', SCRIPT),
+                ('offbox run --bg -- node {p}', 'x.mjs', None), ('offbox run --bg -- node {p}', 'live.mjs', SCRIPT),
+                ("offbox run --bg --step 'node {p}'", 'x.mjs', None), ("offbox run --bg -- 'node {p}'", 'live.mjs', SCRIPT)]
+        for template, path, expected in rows:
+            self.assertEqual(guard.classify(template.replace('{p}', path), str(spaced)), expected)
+            for form in quoted:
+                command = template.replace('{p}', form.format(p=path))
+                with self.subTest(command=command):
+                    rule, cause = guard.classify_detail(command, str(spaced))
+                    self.assertEqual(rule, expected, cause)
+            for form in unquoted:
+                command = template.replace('{p}', form.format(p=path))
+                with self.subTest(command=command, quoted=False):
+                    self.assertIsNotNone(guard.classify(command, str(spaced)))
 
     @trusted_node_test
     def test_same_call_offbox_steps_keep_wrapper_proof(self):
