@@ -2135,7 +2135,7 @@ test.each(["idle", "active", "steer"])("marker polling: five-thread 60-second ro
   const start = Date.parse("2026-11-15T09:30:00Z"); setSystemTime(start);
   const control = fakeControl(); control.flags.markers = true;
   const backend = control.backend();
-  const chats = [];
+  const chats: Awaited<ReturnType<RobobBackend["createChat"]>>[] = [];
   for (let i = 0; i < 5; i++) {
     const chat = await backend.createChat(); chats.push(chat);
     const thread = control.threads.get(chat.id)!;
