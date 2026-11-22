@@ -21,6 +21,13 @@ from cpu_labels import command_label
 
 DEFAULT_DEADLINE = '10m'  # Recommended explicit CLI value; omission is an error.
 MAX_SECONDS = 3600
+TIMEOUTS = {'ps': 8, 'launchctl_list': 5, 'owner_list': 3, 'procinfo': 2, 'notify': 5}
+
+
+class CommandTimeout(subprocess.TimeoutExpired):
+    def __init__(self, cmd, timeout, elapsed_ms, load_avg):
+        super().__init__(cmd, timeout)
+        self.fields = dict(cmd=cmd, timeoutS=timeout, elapsedMs=elapsed_ms, loadAvg1=load_avg)
 
 
 class BudgetExceeded(BaseException):
@@ -130,8 +137,16 @@ class Host:
         self.run = run
         self.labels = None
 
+    def call(self, argv, cmd, timeout, **kwargs):
+        started = time.monotonic()
+        try:
+            return self.run(argv, timeout=timeout, **kwargs)
+        except subprocess.TimeoutExpired:
+            elapsed_ms = (time.monotonic()-started)*1000
+            raise CommandTimeout(cmd, timeout, elapsed_ms, os.getloadavg()[0]) from None
+
     def ps(self, args):
-        r = self.run(['/bin/ps', '-ww']+args, capture_output=True, text=True, timeout=2,
+        r = self.call(['/bin/ps', '-ww']+args, 'ps '+args[0], TIMEOUTS['ps'], capture_output=True, text=True,
                      env={**os.environ, 'LC_ALL': 'C'})
         if r.returncode == 1 and not r.stdout.strip() and not r.stderr.strip():
             return ''
@@ -162,12 +177,18 @@ class Host:
         return p
 
     def stopped(self):
-        return parse_stopped(self.ps(['-axo', 'pid=,stat=,lstart=,command=']))
+        args = ['-axo', 'pid=,stat=,lstart=,command=']
+        try:
+            raw = self.ps(args)
+        except subprocess.TimeoutExpired:
+            raw = self.ps(args)
+        return parse_stopped(raw)
 
     def protected(self, p):
         if protected(p):
             return True
-        r = self.run(['/bin/launchctl', 'list'], capture_output=True, text=True, timeout=2)
+        r = self.call(['/bin/launchctl', 'list'], 'launchctl list', TIMEOUTS['launchctl_list'],
+                      capture_output=True, text=True)
         if r.returncode:
             raise OSError('launchd protection lookup unavailable')
         services = {int(f[0]) for line in r.stdout.splitlines()
@@ -197,7 +218,8 @@ class Host:
         if self.labels is None:
             self.labels = {}
             try:
-                r = self.run(['/bin/launchctl', 'list'], capture_output=True, text=True, timeout=1)
+                r = self.call(['/bin/launchctl', 'list'], 'launchctl list', TIMEOUTS['owner_list'],
+                              capture_output=True, text=True)
                 for line in r.stdout.splitlines() if r.returncode == 0 else []:
                     fields = line.split()
                     if len(fields) == 3 and fields[0].isdigit():
@@ -208,8 +230,8 @@ class Host:
             return self.labels[p['pid']]
         # procinfo can require root; a bounded best-effort lookup must not sudo.
         try:
-            r = self.run(['/bin/launchctl', 'procinfo', str(p['pid'])], capture_output=True,
-                         text=True, timeout=1)
+            r = self.call(['/bin/launchctl', 'procinfo', str(p['pid'])], 'launchctl procinfo',
+                          TIMEOUTS['procinfo'], capture_output=True, text=True)
             match = re.search(r'(?m)^\s*(?:label|service|job)\s*(?:=|:)\s*([\w.-]+)', r.stdout)
             if r.returncode == 0 and match:
                 return match[1]
@@ -231,10 +253,10 @@ class Host:
     def notify(self, key, text):
         env = dict(os.environ)
         env.pop('BUN_INSPECT', None)
-        r = self.run([str(Path.home()/'.bun/bin/bun'),
+        r = self.call([str(Path.home()/'.bun/bin/bun'),
                       str(Path.home()/'.local/share/telegram-bridge/src/cli.ts'), 'notify',
                       '--source', 'Mac Upkeep', '--severity', 'attention', '--key', key,
-                      '--text', text], capture_output=True, timeout=3, env=env)
+                      '--text', text], 'bun cli.ts', TIMEOUTS['notify'], capture_output=True, env=env)
         return r.returncode == 0
 
 
@@ -288,6 +310,10 @@ class SuspendLease:
         self.logger('suspend', 'event' if ok else 'error', 'suspend.'+name,
                     ok=ok, props=redacted_record({**(lease or {}), **props}),
                     error_tag=None if ok else 'suspend.'+name)
+
+    def log_timeout(self, exc, lease=None):
+        if isinstance(exc, CommandTimeout):
+            self.log('error', lease, ok=False, result='TimeoutExpired', **exc.fields)
 
     def current(self, lease):
         p = self.host.process(lease['pid'])
@@ -364,7 +390,8 @@ class SuspendLease:
                 after = self.settle(lease, True, reads)
                 if not after or not after['stat'].startswith('T'):
                     raise RuntimeError('SIGSTOP read-back failed')
-            except Exception:
+            except Exception as exc:
+                self.log_timeout(exc, lease)
                 sent_stop = any(r['signal'] == 'SIGSTOP' and r['sent'] for r in reads)
                 recovered = not sent_stop
                 if sent_stop:
@@ -372,8 +399,8 @@ class SuspendLease:
                         self.send(lease, signal.SIGCONT, reads)
                         after = self.settle(lease, False, reads)
                         recovered = not after or not after['stat'].startswith('T')
-                    except Exception:
-                        pass
+                    except Exception as recovery_exc:
+                        self.log_timeout(recovery_exc, lease)
                 if recovered:
                     state['leases'].pop(str(pid), None)
                     self.save(state)
@@ -391,7 +418,8 @@ class SuspendLease:
         if not entry['sent']:
             try:
                 entry['sent'] = bool(self.host.notify('mac-suspend:'+key, entry['text']))
-            except Exception:
+            except Exception as exc:
+                self.log_timeout(exc, lease)
                 entry['sent'] = False
             self.save(state)
             self.log('alert', lease, ok=entry['sent'])
@@ -427,7 +455,8 @@ class SuspendLease:
                         self.host.sleep(.05)
                 ok = not after or after['stat'].startswith('Z')
                 result = 'gone' if ok else 'still_alive'
-        except Exception:
+        except Exception as exc:
+            self.log_timeout(exc, lease)
             result = 'read_or_signal_failed'
         if ok:
             state['leases'].pop(str(lease['pid']), None)
@@ -457,8 +486,11 @@ class SuspendLease:
             for lease in list(state['leases'].values()):
                 try:
                     p = self.current(lease)
-                except Exception:
-                    self.log('error', lease, ok=False, result='identity_unavailable')
+                except Exception as exc:
+                    if isinstance(exc, CommandTimeout):
+                        self.log_timeout(exc, lease)
+                    else:
+                        self.log('error', lease, ok=False, result='identity_unavailable')
                     continue
                 if not p or (not p['stat'].startswith('T') and lease.get('phase') != 'killing'):
                     state['leases'].pop(str(lease['pid']))
@@ -529,7 +561,9 @@ def main(argv=None, service=None):
                   (len(result['leases']), len(result['unowned']), len(result['actions'])))
         return 1 if isinstance(result, dict) and (result.get('ok') is False or any(not a['ok'] for a in result.get('actions', []))) else 0
     except (Exception, BudgetExceeded) as exc:
-        service.log('error', ok=False, result=type(exc).__name__)
+        service.log('error', ok=False,
+                    result='TimeoutExpired' if isinstance(exc, subprocess.TimeoutExpired) else type(exc).__name__,
+                    **(exc.fields if isinstance(exc, CommandTimeout) else {}))
         print('mac-suspend: '+str(exc), file=sys.stderr)
         return 1
 

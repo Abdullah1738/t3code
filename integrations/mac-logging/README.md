@@ -25,6 +25,7 @@ unowned stops, including debugger stops and Ctrl-Z jobs.
 `com.abdullah.mac-suspend` runs a separate sweep every minute, with a 50-second
 whole-run limit and bounded ps/launchctl calls. `install.zsh` copies the helper,
 wrapper and plist; the evaluator loads the LaunchAgent after review.
+Subprocess timeouts are centralized in `TIMEOUTS` (ps 8s, protection list 5s, owner list 3s, procinfo 2s, notify 5s), only the stopped-process listing retries once, and timed-out calls log `cmd`, `timeoutS`, `elapsedMs` and `loadAvg1` on `suspend.error`.
 `mac-log-status` checks its launchd state and three-minute logging cadence.
 Events use toollog: `suspend.stop`, `suspend.stop_failed`, `suspend.resume`,
 `suspend.kill`, `suspend.expired`, `suspend.cleared`, `suspend.orphan`,

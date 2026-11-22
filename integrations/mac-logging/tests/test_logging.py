@@ -31,6 +31,27 @@ def load(name, path):
 
 
 class LoggingTests(unittest.TestCase):
+    def test_suspend_timeout_fields_survive_logger_and_drop_unlisted_data(self):
+        fields = dict(cmd='launchctl procinfo', timeoutS=2, elapsedMs=2125.5, loadAvg1=70.25)
+        values = dict(fields, result='TimeoutExpired', argv=['launchctl', 'procinfo', '123'], stderr='private')
+        self.assertEqual(toollog.suspend_fields(values), dict(fields, result='TimeoutExpired'))
+        toollog.emit('suspend', 'error', 'suspend.error', ok=False, props=values)
+        self.assertEqual(self.rows()[0]['props'], dict(fields, result='TimeoutExpired'))
+
+    def test_suspend_cmd_uses_secret_redaction_and_printable_filter(self):
+        for cmd, expected in [('ps -axo', 'ps -axo'), ('ps\x00-axo', 'ps -axo'),
+                              ('tool password=EXAMPLE_ONLY', '[redacted]'),
+                              ('tool '+('x'*1000)+' token=EXAMPLE_ONLY', '[redacted]')]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(toollog.suspend_fields(dict(cmd=cmd)), dict(cmd=expected))
+        self.assertEqual(toollog.suspend_fields(dict(cmd=['ps', '-axo'])), {})
+
+    def test_suspend_timeout_numbers_reject_nonfinite_and_wrong_types(self):
+        for key in ('timeoutS', 'elapsedMs', 'loadAvg1'):
+            for value in (float('nan'), float('inf'), -float('inf'), True, '8', None, 10**1000):
+                with self.subTest(key=key, value=value):
+                    self.assertEqual(toollog.suspend_fields({key: value}), {})
+
     def test_janitor_summary_and_phases_survive_the_real_logger_without_free_text(self):
         scripts = REPO / 'integrations/dev-resource-janitor/skill/scripts'
         sys.path.insert(0, str(scripts))
