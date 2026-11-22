@@ -1146,7 +1146,7 @@ def generate(home_root: str | None, dry_run: bool, opencode_config: str | None =
                 writer.unlink(op[1])
             else:
                 writer.link(op[1], op[2])
-    agy_links = antigravity_links(manifest, homes["antigravity"])
+    agy_links = antigravity_links(manifest, homes["antigravity"]) if "antigravity" in homes else []
     guard_outputs([link for link, _ in agy_links])
     for link, target in agy_links:
         state = link_state(link, target)
@@ -1253,7 +1253,7 @@ def check(home_root: str | None, *, json_output: bool = False, opencode_config: 
             elif os.path.normpath(os.path.join(farm, os.readlink(link))) != path:
                 failures.append(f"{label} skills: link {name} points at the wrong directory")
 
-    for link, target in antigravity_links(manifest, homes["antigravity"]):
+    for link, target in (antigravity_links(manifest, homes["antigravity"]) if "antigravity" in homes else []):
         state = link_state(link, target)
         if state != "ok":
             failures.append(f"antigravity link {link}: {state.replace('-', ' ')} (expected -> {target})")
