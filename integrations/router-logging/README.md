@@ -16,6 +16,11 @@ with the original failure evidence. Repairs back off to five minutes. The
 guard sends one local Telegram alert after two minutes down and a recovery note
 using the same incident key prefix. Delivery retries retain that key across guard
 restarts. The HTTP snapshot runs in a separate child every five minutes.
+The observer runs at launchd `Standard` priority and records its configured
+ProcessType, nice value and scheduling priority once per supervisor start.
+The guard kills and reaps its captured poll child after four minutes, recording
+one `poll.timeout` with the active phase, wall time and child CPU time. It keeps
+the regular five-minute schedule for the next child; it never kills by pattern.
 
 Unknown transitions retain the router's `launchctlExit` (numeric, `timeout`,
 or `oserror`) and at most 240 characters of trimmed, redacted stderr.
@@ -38,6 +43,9 @@ listener/pool history, report writes, state saves, NDJSON writes (`logWriteMs`),
 lock waits and HTTP work;
 nested work is not counted twice. `log.rollup` now measures only that rollup
 call. `pool-alerts` emits `pool.endpoint.get` for its independent fetches.
+Each measured phase also has a matching `*CpuMs` field, excluding nested work.
+A phase over two minutes using less than 10% CPU is tagged
+`tick_starved:<phase>`; other slow phases retain `tick_blocked:<phase>`.
 `pollGaps`/`guardGaps` number measured spans over two minutes, clipped for daily
 duration totals. `coverage` explains threshold-only `healthByHour`, exhaustion
 episodes in `pools`, and missing legacy observer measurements.
@@ -94,7 +102,7 @@ is used. Today's cumulative per-connection cost is sampled once per UTC hour as
 `spend.snapshot`. Hourly cost buckets are unavailable (`spend.unavailable`);
 these cumulative snapshots must not be summed as hourly spend.
 
-`9router-log-rollup [--day YYYY-MM-DD]` defaults to yesterday UTC. It streams a
+`9router-log-rollup [--day YYYY-MM-DD] [--full]` defaults to yesterday UTC. It streams a
 fixture or real day file and writes a private `rollup-YYYY-MM-DD.json` with name
 and kind counts, rates, duration percentiles and top error tags. `supervisor`
 counts starts, stops, exits, reloads and deploy actions. `listener` contains
@@ -108,6 +116,17 @@ their start and end retain the actual transition timestamps. Open windows end
 at generation time or UTC midnight for duration calculation. The poller makes
 yesterday's rollup on its first successful run after 00:05 UTC. Invalid lines
 are counted and skipped.
+Per-day private aggregate state retains exact numeric samples for percentiles,
+plus an inode/device, observed size and committed byte offset. Samples grow
+linearly with the day's input (the daily log cap is soft; no approximation or
+sampling is applied). The state and sparse history caches expire with the source
+logs. Appended bytes alone update the aggregate; replacement, truncation,
+same-size rewrite or aggregate schema changes rebuild it. Rebuilds checkpoint
+atomically every 8 MiB or 30 seconds so deadline kills retain progress.
+An unfinished last line contributes provisionally to the report and is reread
+until newline termination. Listener transitions, cross-day health joins and
+pool history share a sparse append cache with the same checkpoint bounds.
+`--full` bypasses aggregate and listener caches for comparison or repair.
 `complete` means `generatedAt` is on or after the next UTC midnight; incomplete rollups are regenerated after 00:05Z, and lock `distinct` counts dedupe account/provider/model/deadline-minute while `count` keeps raw lines.
 
 `account.lock` and `account.unlock` carry hashed account IDs, scope, classifier
