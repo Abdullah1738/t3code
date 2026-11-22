@@ -5,6 +5,8 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 /** 9router serves the Antigravity account's models under this prefix. */
 export const ANTIGRAVITY_GATEWAY_MODEL_PREFIX = "ag/";
 
+const ANTIGRAVITY_GATEWAY_TIMEOUT = "10 seconds";
+
 export interface AntigravityGatewayModel {
   readonly id: string;
   readonly name: string;
@@ -58,36 +60,39 @@ export const fetchAntigravityGatewayModels = Effect.fn("fetchAntigravityGatewayM
       new AntigravityGatewayError({
         detail: `The Antigravity gateway at ${input.baseUrl} is unreachable (${reason}). Start it or fix the gateway URL in the Antigravity provider settings.`,
       });
-    const response = yield* client
-      .execute(
-        HttpClientRequest.get(url).pipe(
-          HttpClientRequest.setHeaders({
-            accept: "application/json",
-            ...(input.apiKey ? { authorization: `Bearer ${input.apiKey}` } : {}),
-          }),
-        ),
-      )
-      .pipe(
-        Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
-        Effect.timeoutOrElse({
-          duration: "10 seconds",
-          orElse: () => Effect.fail(unreachable("no answer within 10 seconds")),
-        }),
-        Effect.mapError((error) =>
-          error._tag === "AntigravityGatewayError" ? error : unreachable("connection failed"),
-        ),
+    // One deadline covers the request, the body and its decoding, so a gateway that sends
+    // headers and then stalls can't hold up provider refreshes.
+    const body = yield* Effect.gen(function* () {
+      const response = yield* client
+        .execute(
+          HttpClientRequest.get(url).pipe(
+            HttpClientRequest.setHeaders({
+              accept: "application/json",
+              ...(input.apiKey ? { authorization: `Bearer ${input.apiKey}` } : {}),
+            }),
+          ),
+        )
+        .pipe(
+          Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
+          Effect.mapError(() => unreachable("connection failed")),
+        );
+      if (response.status === 401 || response.status === 403) {
+        return yield* new AntigravityGatewayError({
+          detail: `The Antigravity gateway at ${input.baseUrl} rejected the gateway key (HTTP ${response.status}).`,
+        });
+      }
+      if (response.status < 200 || response.status >= 300) {
+        return yield* unreachable(`HTTP ${response.status}`);
+      }
+      return yield* response.json.pipe(
+        Effect.flatMap(decodeModelsResponse),
+        Effect.mapError(() => unreachable("its model list could not be read")),
       );
-    if (response.status === 401 || response.status === 403) {
-      return yield* new AntigravityGatewayError({
-        detail: `The Antigravity gateway at ${input.baseUrl} rejected the gateway key (HTTP ${response.status}).`,
-      });
-    }
-    if (response.status < 200 || response.status >= 300) {
-      return yield* unreachable(`HTTP ${response.status}`);
-    }
-    const body = yield* response.json.pipe(
-      Effect.flatMap(decodeModelsResponse),
-      Effect.mapError(() => unreachable("its model list could not be read")),
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: ANTIGRAVITY_GATEWAY_TIMEOUT,
+        orElse: () => Effect.fail(unreachable("no answer within 10 seconds")),
+      }),
     );
     const models = selectAntigravityGatewayModels(body.data);
     if (models.length === 0) {
