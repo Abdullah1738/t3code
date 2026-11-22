@@ -65,13 +65,37 @@ class Matching(unittest.TestCase):
         self.assertEqual([r['pid'] for r in tier.select(rows,{rule['label']:20},self.rules)], [20])
 
     def test_bridge_children_need_exact_live_supervisor(self):
-        parent = row(20, self.rules['roots'][3]['argv'])
-        for rule in self.rules['children']:
+        rules = dict(roots=[dict(label='supervisor', argv=['/bin/supervisor'])],
+                     children=[dict(label=label, parent='supervisor', argv=['/bin/'+label])
+                               for label in ('bridge-a', 'bridge-b')])
+        parent = row(20, rules['roots'][0]['argv'])
+        for rule in rules['children']:
             child = row(21, rule['argv'], ppid=20)
             with self.subTest(child=rule['label']):
-                self.assertEqual(len(tier.select({20: parent, 21: child}, {}, self.rules)), 2)
-                self.assertEqual(tier.select({21: child}, {}, self.rules), [])
-                self.assertEqual(len(tier.select({20: parent, 21: dict(child,ppid=22)}, {}, self.rules)), 1)
+                self.assertEqual(len(tier.select({20: parent, 21: child}, {}, rules)), 2)
+                self.assertEqual(tier.select({21: child}, {}, rules), [])
+                self.assertEqual(len(tier.select({20: parent, 21: dict(child,ppid=22)}, {}, rules)), 1)
+
+    def test_shipped_config_excludes_heavy_child_parents_and_bridges(self):
+        home = '/Users/ardud'
+        excluded = [
+            ('com.ardud.robob-watch', 'robob-watch/src/runner.ts', 1),
+            ('com.abdullah.agent-bridges', 'agent-bridges/src/supervisor.ts', 1),
+            ('spectrum-bridge', 'spectrum-bridge/src/main.ts', 21),
+            ('telegram-bridge', 'telegram-bridge/src/main.ts', 21),
+        ]
+        configured = {rule['label'] for rule in self.rules['roots'] + self.rules['children']}
+        self.assertTrue(configured.isdisjoint(label for label, _, _ in excluded))
+        for suffix in ([], ['--extra']):
+            rows = {i: row(i, [home+'/.bun/bin/bun', home+'/.local/share/'+script]+suffix, ppid=ppid)
+                    for i, (_, script, ppid) in enumerate(excluded, 20)}
+            retained = {i: row(i, rule['argv']) for i, rule in enumerate(self.rules['roots'], 30)}
+            rows.update(retained)
+            labels = {label: i for i, (label, _, _) in enumerate(excluded, 20)}
+            labels.update({rule['label']: i for i, rule in enumerate(self.rules['roots'], 30)})
+            for discovered in ({}, labels):
+                with self.subTest(suffix=suffix, labels=discovered):
+                    self.assertEqual({r['pid'] for r in tier.select(rows, discovered, self.rules)}, set(retained))
 
 
 class Adjustments(unittest.TestCase):
@@ -233,8 +257,9 @@ class Ticks(unittest.TestCase):
             root = home / '.local/state/robob-guard'
             root.mkdir(parents=True)
             rules = tier.config(home)
-            n = FakeNative([row(20,rules['roots'][2]['argv'],nice=-5)])
-            labels = Mock(return_value={'com.ardud.robob-watch':20})
+            rule = next(r for r in rules['roots'] if r['label'] == 'com.abdullah.crpko-adhoc-server')
+            n = FakeNative([row(20,rule['argv'],nice=-5)])
+            labels = Mock(return_value={rule['label']:20})
             nofork = Mock(side_effect=AssertionError('unexpected fork'))
             tier.tick(home,n,labels,nofork,nofork)
             tier.tick(home,n,labels,nofork,nofork)

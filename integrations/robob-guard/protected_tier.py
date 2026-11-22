@@ -1,4 +1,4 @@
-"""A narrow scheduling tier for critical helpers; never inherit it to descendants."""
+"""A scheduling tier for helpers whose descendants stay short and light."""
 import json
 import os
 from pathlib import Path
