@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from unittest.mock import patch
 
 from janitor_test_safety import JanitorTestCase
@@ -13,6 +14,8 @@ from janitor_test_safety import JanitorTestCase
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill/scripts'
 sys.path.insert(0, str(SCRIPTS))
 import tmpdir_prune as prune
+import tmpdir_inventory as inventory
+REAL_PROCESS_REFERENCES = prune.process_references
 
 
 class PruneTests(JanitorTestCase):
@@ -25,6 +28,18 @@ class PruneTests(JanitorTestCase):
         self.logs = self.root / 'logs'
         self.audit = self.logs / 'tmpdir-audit.jsonl'
         self.keep = self.root / 'keep.txt'
+        for name, value in [('process_references', set()), ('emit', None)]:
+            p = patch.object(prune, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.dict(os.environ, {'TMPDIR_PRUNE_DELETE': '1'})
+        p.start()
+        self.addCleanup(p.stop)
+        for module, name, value in [(prune, 'CONFIG', str(self.root/'config.json')),
+                                    (inventory, 'DISK_LOCK', str(self.root/'inventory.lock'))]:
+            p = patch.object(module, name, value)
+            p.start()
+            self.addCleanup(p.stop)
         for name, value in [('TMP', str(self.data)), ('OPENCODE', str(self.data / 'opencode')),
                             ('LOG_DIR', str(self.logs)), ('AUDIT', str(self.audit)),
                             ('KEEP_FILE', str(self.keep))]:
@@ -169,7 +184,7 @@ class PruneTests(JanitorTestCase):
         self.assertEqual((entry['removed'], entry['failed']), (1, []))
         self.assertEqual((self.open / 'file').read_text(), 'keep me')
         self.assertFalse(self.old.exists())
-        self.assertEqual(json.loads(self.audit.read_text())['removed'], 1)
+        self.assertEqual(json.loads(self.audit.read_text().splitlines()[-1])['removed'], 1)
 
     def test_unknown_keep_list_or_tree_keeps_all_candidates(self):
         self.keep.write_bytes(b'\xff')
@@ -185,7 +200,8 @@ class PruneTests(JanitorTestCase):
 
         with patch.object(prune.subprocess, 'run', return_value=self.lsof()), \
                 patch.object(prune.os, 'scandir', side_effect=scandir):
-            self.assertEqual(prune.apply()['skipped'], 'tree_unavailable')
+            result = prune.apply()
+            self.assertEqual(result['removed'], 0)
         self.assertTrue(self.old.exists())
         self.assertTrue(self.open.exists())
 
@@ -198,3 +214,233 @@ class PruneTests(JanitorTestCase):
             self.assertEqual(prune.main(), 0)
         self.assertEqual(stdout.getvalue(), '')
         self.assertEqual(json.loads(self.audit.read_text())['skipped'], 'tmpdir_unavailable')
+
+    def test_report_only_default_and_explicit_disabled_flag_delete_nothing(self):
+        for value in (None, '0', 'false', 'yes'):
+            with self.subTest(value=value), patch.dict(os.environ), \
+                    patch.object(prune, 'in_use', return_value=set()):
+                os.environ.pop('TMPDIR_PRUNE_DELETE', None)
+                if value is not None:
+                    os.environ['TMPDIR_PRUNE_DELETE'] = value
+                result = prune.apply()
+                self.assertTrue(result['report_only'])
+                self.assertEqual(result['removed'], 0)
+                self.assertTrue(self.old.exists())
+
+    def test_agent_24_hour_boundary_and_configurable_threshold(self):
+        now = 2000000
+        for offset in (-1, 0, 1):
+            path = self.tree('tmp.boundary' + str(offset))
+            for item in (path, path/'file'):
+                os.utime(item, (now-86400-offset, now-86400-offset))
+            with patch.object(prune.time, 'time', return_value=now), \
+                    patch.object(prune, 'in_use', return_value=set()):
+                paths = {c['path'] for c in prune.scan()['candidates']}
+            self.assertEqual(str(path) in paths, offset >= 0)
+        with patch.dict(os.environ, {'TMPDIR_PRUNE_IDLE_HOURS': '48'}), \
+                patch.object(prune.time, 'time', return_value=now), \
+                patch.object(prune, 'in_use', return_value=set()):
+            self.assertFalse(any('boundary' in c['path'] for c in prune.scan()['candidates']))
+
+    def test_configuration_file_is_supported_for_sanitized_watcher_environment(self):
+        with patch.dict(os.environ):
+            os.environ.pop('TMPDIR_PRUNE_DELETE', None)
+            Path(prune.CONFIG).write_text('{"delete":true,"idleHours":36}')
+            self.assertTrue(prune.deletion_enabled())
+            self.assertEqual(prune.idle_hours(), 36)
+            with patch.dict(os.environ, {'TMPDIR_PRUNE_DELETE': '0', 'TMPDIR_PRUNE_IDLE_HOURS': '24'}):
+                self.assertFalse(prune.deletion_enabled())
+                self.assertEqual(prune.idle_hours(), 24)
+
+    def test_invalid_threshold_fails_closed(self):
+        for value in ('NaN', 'inf', '0', '-1', 'bad'):
+            with self.subTest(value=value), patch.dict(os.environ, {'TMPDIR_PRUNE_IDLE_HOURS': value}), \
+                    patch.object(prune, 'in_use', return_value=set()):
+                self.assertEqual(prune.scan()['skipped'], 'config_unavailable')
+
+    def test_agent_patterns_and_explicit_exclusions(self):
+        names = ['tmp.scratch', 'harness-exit.receipt', 'chat-review-abc', 'live-db-snapshot-abc',
+                 't3-control-fixture', 't3-orchestration-v2-fixture', 'recall-toollog-test-fixture',
+                 'offbox12-review-a', 'offbox2-recheck-a', 'offbox1-integration-a', 'offbox-278-osr93_uj',
+                 'robob1937-traces.swf213x7']
+        unknown = ['com.apple.foo-review-bar', 'uv-abc.lock', 'ZqpGpiTjSMKJrZcUYPbjo',
+                   'unknown-old', 'offbox12-output', 't3-other', 'tmpscratch',
+                   'tmp.has space', 'tmp.has\nnewline', 'tmp.has\ttab']
+        for name in names + unknown:
+            path = self.tree(name)
+            self.assertEqual(prune.classify(name, str(path)), 'agent' if name in names else None, name)
+        with patch.object(prune, 'in_use', return_value=set()):
+            result = prune.apply()
+        self.assertEqual(result['removed'], 2+len(names))
+        self.assertTrue(all((self.data/n).exists() for n in unknown))
+
+    def test_young_descendant_symlink_foreign_uid_and_budget_are_kept(self):
+        path = self.tree('tmp.new-child')
+        (path/'file').touch()
+        target = self.tree('tmp.symlink')
+        (target/'link').symlink_to(self.old)
+        with patch.object(prune, 'in_use', return_value=set()):
+            paths = {c['path'] for c in prune.scan()['candidates']}
+        self.assertNotIn(str(path), paths)
+        self.assertNotIn(str(target), paths)
+        with patch.object(inventory.os, 'getuid', return_value=os.getuid()+1), self.assertRaises(prune.UsageUnavailable):
+            inventory.inspect(str(self.old))
+        with patch.object(inventory, 'MAX_NODES', 1), self.assertRaises(prune.UsageUnavailable):
+            inventory.inspect(str(self.old))
+
+    def test_fresh_use_or_new_file_after_scan_prevents_removal(self):
+        for change in ('open', 'young', 'replace'):
+            path = self.tree('tmp.race-' + change)
+            with patch.object(prune, 'in_use', return_value=set()):
+                candidate = next(c for c in prune.scan()['candidates'] if c['path'] == str(path))
+            if change == 'young':
+                (path/'file').touch()
+            elif change == 'replace':
+                path.rename(self.root/'original')
+                self.tree(path.name)
+            with patch.object(prune, 'in_use', return_value={str(path/'file')} if change == 'open' else set()), \
+                    inventory.disk_lock() as fd, self.assertRaises(prune.UsageUnavailable):
+                prune.remove_candidate(candidate, time.monotonic()+60, fd)
+            self.assertTrue(path.exists())
+
+    def make_worktree(self, name):
+        parent = self.root/name
+        parent.mkdir()
+        def git(*args):
+            return subprocess.run(['git', '-C', str(parent), *args], check=True,
+                                  capture_output=True, text=True).stdout
+        git('init')
+        git('config', 'user.email', 'test@example.invalid')
+        git('config', 'user.name', 'Test')
+        (parent/'file').write_text('tracked')
+        git('add', 'file')
+        git('-c', 'commit.gpgsign=false', 'commit', '-m', 'initial')
+        git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        path = self.data/('tmp.'+name)
+        git('worktree', 'add', '--detach', str(path), 'HEAD')
+        return path, git
+
+    def age_tree(self, path):
+        for root, dirs, files in os.walk(path):
+            for name in dirs + files:
+                os.utime(Path(root)/name, (1, 1))
+        os.utime(path, (1, 1))
+
+    def test_clean_worktree_removed_through_parent_and_registration_disappears(self):
+        path, git = self.make_worktree('clean')
+        self.age_tree(path)
+        with patch.object(prune, 'in_use', return_value=set()):
+            result = prune.apply()
+        self.assertEqual(result['failed'], [])
+        self.assertFalse(path.exists())
+        self.assertNotIn(str(path), git('worktree', 'list', '--porcelain'))
+
+    def test_standalone_repository_preserves_every_class_of_unpublished_ref(self):
+        refs = {'branch': 'refs/heads/local', 'tag': 'refs/tags/local',
+                'notes': 'refs/notes/commits', 'custom': 'refs/archive/local',
+                'reflog': None, 'stash': 'refs/stash'}
+        for kind, ref in refs.items():
+            with self.subTest(kind=kind):
+                linked, git = self.make_worktree('ref-'+kind)
+                git('worktree', 'remove', str(linked))
+                parent = self.root/('ref-'+kind)
+                if kind == 'stash':
+                    (parent/'file').write_text('unpublished stash')
+                    git('stash', 'push')
+                else:
+                    git('-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'unpublished')
+                    commit = git('rev-parse', 'HEAD').strip()
+                    git('reset', '--hard', 'HEAD^')
+                    if ref:
+                        git('update-ref', ref, commit)
+                        git('reflog', 'expire', '--expire=now', '--all')
+                self.age_tree(parent)
+                with self.assertRaises(prune.UsageUnavailable):
+                    inventory.inspect(str(parent))
+
+    def test_unpublished_dirty_untracked_orphan_and_locked_worktrees_always_kept(self):
+        for kind in ('unpublished', 'dirty', 'untracked', 'orphan', 'locked'):
+            path, git = self.make_worktree(kind)
+            if kind == 'unpublished':
+                git('-C', str(path), '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'local')
+            elif kind == 'dirty':
+                (path/'file').write_text('uncommitted')
+            elif kind == 'untracked':
+                (path/'notes').write_text('untracked')
+            elif kind == 'orphan':
+                (path/'.git').write_text('gitdir: /does/not/exist')
+            else:
+                git('worktree', 'lock', str(path))
+            self.age_tree(path)
+            with patch.object(prune, 'in_use', return_value=set()):
+                report = prune.scan()
+                self.assertNotIn(str(path), {c['path'] for c in report['candidates']}, kind)
+                self.assertTrue(any(c['path'] == str(path) for c in report['kept']), kind)
+            self.assertTrue(path.exists())
+
+    def test_process_argv_and_var_alias_protect_the_top_level_entry(self):
+        with patch.object(prune, 'TMP', '/private/var/folders/test/T'), \
+                patch.object(prune.subprocess, 'run', return_value=self.lsof(stdout='p1\nfcwd\nn/var/folders/test/T/tmp.x/file\n')):
+            self.assertEqual(prune.in_use(), {'/private/var/folders/test/T/tmp.x/file'})
+        forms = [
+            '/var/folders/test/T/tmp.owner/script.py',
+            '/private/var/folders/test/T/tmp.owner/script.py',
+            '/var/folders/test/T//tmp.owner/script.py',
+            '/private/var/folders/test/T///tmp.owner/script.py',
+            '/var//folders/test//T//tmp.owner/script.py',
+            '/var/folders/test/T/./tmp.owner/script.py',
+            '/var/folders/test/T/other/../tmp.owner/script.py',
+            '"/var/folders/test/T//tmp.owner/script.py"',
+            "'/private/var/folders/test/T//tmp.owner/script.py'",
+            '--script=/var/folders/test/T//tmp.owner/script.py',
+        ]
+        for form in forms:
+            with self.subTest(form=form), patch.object(prune, 'TMP', '/private/var/folders/test/T'), \
+                    patch.object(prune.subprocess, 'run', return_value=self.lsof(stdout='12 python ' + form + '\n')):
+                self.assertEqual(REAL_PROCESS_REFERENCES(), {'/private/var/folders/test/T/tmp.owner'})
+
+    def test_work_created_during_final_process_snapshot_is_kept(self):
+        path, git = self.make_worktree('snapshot-write')
+        self.age_tree(path)
+        with patch.object(prune, 'in_use', return_value=set()):
+            candidate = next(c for c in prune.scan()['candidates'] if c['path'] == str(path))
+        def snapshot():
+            (path/'note').write_text('work created while lsof runs')
+            return set()
+        with patch.object(prune, 'in_use', side_effect=snapshot), inventory.disk_lock() as fd, \
+                self.assertRaises(prune.UsageUnavailable):
+            prune.remove_candidate(candidate, time.monotonic()+60, fd)
+        self.assertTrue((path/'note').exists())
+        self.assertIn(str(path), git('worktree', 'list', '--porcelain'))
+
+    def test_plain_git_remove_refuses_work_created_after_last_inspection(self):
+        path, git = self.make_worktree('git-race')
+        self.age_tree(path)
+        real_git = inventory.git
+        def changed_before_remove(repo, args, deadline, lock_fd=None):
+            if args[:2] == ['worktree', 'remove']:
+                self.assertNotIn('--force', args)
+                (path/'note').write_text('new untracked work')
+            return real_git(repo, args, deadline, lock_fd)
+        with patch.object(prune, 'in_use', return_value=set()):
+            candidate = next(c for c in prune.scan()['candidates'] if c['path'] == str(path))
+            with patch.object(inventory, 'git', side_effect=changed_before_remove), \
+                    inventory.disk_lock() as fd, self.assertRaises(prune.UsageUnavailable):
+                prune.remove_candidate(candidate, time.monotonic()+60, fd)
+        self.assertTrue((path/'note').exists())
+        self.assertIn(str(path), git('worktree', 'list', '--porcelain'))
+
+    def test_lsof_cwd_file_and_sibling_prefix_matrix(self):
+        for name, source, expected in [('cwd', self.old, 1), ('file', self.old/'file', 1),
+                                       ('sibling', str(self.old)+'-other/file', 2)]:
+            with self.subTest(name=name), patch.object(prune, 'in_use', return_value={str(source)}):
+                self.assertEqual(len(prune.scan()['candidates']), expected)
+
+    def test_events_include_each_removal_and_one_run_summary(self):
+        with patch.object(prune, 'in_use', return_value=set()), patch.object(prune, 'emit') as emit:
+            result = prune.apply()
+        self.assertEqual(result['removed'], 2)
+        self.assertEqual([c.args[2] for c in emit.call_args_list],
+                         ['janitor.tmpdir_remove', 'janitor.tmpdir_remove', 'janitor.tmpdir_run'])
+        for call in emit.call_args_list[:2]:
+            self.assertEqual(set(call.kwargs['props']), {'path', 'bytes', 'ageS', 'rule'})
