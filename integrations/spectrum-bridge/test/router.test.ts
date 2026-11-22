@@ -12821,18 +12821,30 @@ test.each(acceptedRequestHolderCases)("idle holder review: child $kind handoff s
 
 
 const terminalHandoffCases = ["question", "permission"].flatMap(kind =>
-  [false, true].flatMap(beforeWatermark => [false, true].map(restart => ({ kind, beforeWatermark, restart }))));
-test.each(terminalHandoffCases)("idle holder review: terminal run without a later marker releases accepted $kind (beforeWatermark=$beforeWatermark, restart=$restart)", async ({ kind, beforeWatermark, restart }) => {
+  [false, true].flatMap(beforeWatermark => (beforeWatermark ? [false, true] : [false]).flatMap(paged => (paged ? [false, true] : [false]).flatMap(markerOnly => [false, true].map(restart => ({ kind, beforeWatermark, paged, markerOnly, restart }))))));
+test.each(terminalHandoffCases)("idle holder review: terminal run without a later marker releases accepted $kind (beforeWatermark=$beforeWatermark, paged=$paged, markerOnly=$markerOnly, restart=$restart)", async ({ kind, beforeWatermark, paged, markerOnly, restart }) => {
   const start = 10_000; setSystemTime(start);
   const h = setup(":memory:", { watchMs: 0 });
   await exchange(h, "before-empty-handoff", "Hi", "Ready");
   h.backend.states.ses_1 = { type: "busy" };
   let terminal = false;
   Object.assign(h.backend, { backgroundRun: async () => ({ runId: "run75", completionId: "idle:run75", status: terminal ? "completed" : "running", terminal,
-    ...(terminal ? { messageIds: beforeWatermark ? ["old-answer75"] : [] } : {}) }) });
+    ...(terminal && !markerOnly ? { messageIds: beforeWatermark ? ["old-answer75"] : [] } : {}) }) });
   if (beforeWatermark) h.backend.records.unshift(
     { id: "old-answer75", type: "assistant", content: [{ type: "text", text: "Already seen" }], time: { created: 0, completed: 0 } },
     { id: "idle:run75", type: "idle", outcome: "succeeded", time: { created: 0 } });
+  const pages: (string | undefined)[] = [];
+  if (paged) {
+    h.backend.records.splice(2, 0, ...Array.from({ length: 30 }, (_, i): MessageRecord => ({
+      id: `old-progress-${i}`, type: "assistant", answer: false, content: [], time: { created: 0, completed: 0 },
+    })));
+    h.backend.messagesBehavior = async opts => {
+      pages.push(opts?.until);
+      const found = h.backend.records.findIndex(record => record.id === opts?.until);
+      const newest = Math.max(0, h.backend.records.length - (opts?.limit ?? 100));
+      return h.backend.records.slice(found < 0 ? newest : Math.min(found, newest));
+    };
+  }
   await h.router.tick();
   h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
   h.backend.states.ses_child = { type: "busy" };
@@ -12863,4 +12875,45 @@ test.each(terminalHandoffCases)("idle holder review: terminal run without a late
   expect(h.store.get<string>("human-response-prompt:answer")).toEqual(prompt);
   expect(kind === "question" ? h.backend.questionReplies : h.backend.permissionReplies).toHaveLength(1);
   expect(h.backend.prompts).toHaveLength(1);
+  if (paged) expect(pages.some(id => id === "old-answer75" || id === "idle:run75")).toBe(true);
+});
+
+
+const quiescentHandoffCases = ["question", "permission"].flatMap(kind =>
+  ["final", "tool"].flatMap(replyMode => [false, true].flatMap(restart =>
+    ["cleanup", "preemption"].map(path => ({ kind, replyMode: replyMode as "final" | "tool", restart, path })))));
+test.each(quiescentHandoffCases)("idle holder review: quiescent accepted $kind releases without replay ($replyMode, restart=$restart, $path)", async ({ kind, replyMode, restart, path }) => {
+  const start = 10_000; setSystemTime(start);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { watchMs: 0, replyMode, notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  h.input("before-quiescent", "Hi"); await h.router.tick();
+  if (replyMode === "tool") agentSends(h, "ready", "Ready");
+  h.backend.final("Ready"); await h.router.tick(); deliver(h.store);
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  h.backend.states.ses_child = { type: "busy" };
+  if (kind === "question") h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  else h.backend.permissionRequests = [permission("perm_1", "ses_child")];
+  await h.router.tick(); await h.router.tick();
+  h.store.outboxState(h.controls().find(op => op.id.startsWith("request:"))!.id, "sent", "provider-request");
+  h.input("answer", kind === "question" ? "A" : "/approve perm_1 once", { source: "typed" }); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  const prompt = h.store.get<string>("human-response-prompt:answer");
+  delete h.backend.states.ses_child;
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  setSystemTime(start + 60 * 60_000);
+  if (path === "preemption") {
+    h.input("next-human", "Next work", { source: "typed" });
+    h.store.set("human-own-turn:next-human", true);
+  }
+  await router.checkUnanswered();
+  await router.tick(); await router.tick();
+  await router.checkUnanswered();
+  if (path === "cleanup") h.input("next-human", "Next work", { source: "typed" });
+  await router.tick(); await router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Hi", "Next work"]);
+  expect(kind === "question" ? h.backend.questionReplies : h.backend.permissionReplies).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  expect(h.store.get<boolean>("human-own-turn:answer")).toBe(false);
+  expect(h.store.get<string>("human-response-prompt:answer")).toEqual(prompt);
+  expect(alerts).toHaveLength(1);
 });

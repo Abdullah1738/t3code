@@ -1075,7 +1075,11 @@ export class Router {
         "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key GLOB 'batch:*' AND member.value = ? LIMIT 1",
       ).get(row.id)?.id;
       const retained = this.store.get<SteerAttempt>(`steer-attempt:${parent ?? row.id}`);
-      if (due.requeue && !retained?.response && !retained?.sameMode && !retained?.reconcileOnly) {
+      const responsePrompt = this.store.get<string>(`human-response-prompt:${parent ?? row.id}`);
+      const acceptedResponse = this.store.get(`human-response-released:${parent ?? row.id}`)
+        || active?.background && responsePrompt === active.messageId && !this.store.get(`human-own-turn:${parent ?? row.id}`);
+      if (due.requeue && !acceptedResponse
+        && !retained?.response && !retained?.sameMode && !retained?.reconcileOnly) {
         this.store.db.transaction(() => {
           // The shared own-turn marker prevents steering the retry back into a wake.
           // Only a human batch keeps its sealed members. A swallowed wake member gets its own turn.
@@ -5147,6 +5151,17 @@ export class Router {
           turn = { ...turn, holderRunId: run.runId };
           this.setTurn(turn);
         }
+        // The bound run may predate the watermark and the newest page. Do not
+        // confuse paged-out evidence with output missing from a stale snapshot.
+        if (run?.terminal && this.ownsHuman(turn)
+          && !messages.some(record => record.id === run.completionId)
+          && !run.messageIds?.every(id => messages.some(record => record.id === id))) {
+          const until = run.messageIds?.find(id => !messages.some(record => record.id === id)) ?? run.completionId;
+          if (until) {
+            messages = await this.reading(this.backend.messages(turn.id, turn.directory, { until }));
+            if (!this.current(turn) || this.store.get<Turn | null>("activeTurn")?.messageId !== turn.messageId) return;
+          }
+        }
         const start = messages.findIndex(record => record.id === turn!.messageId);
         const completion = messages.findIndex((record, index) => record.type === "idle"
           && (run?.completionId ? record.id === run.completionId : index > start));
@@ -5442,8 +5457,11 @@ export class Router {
           this.setTurn(turn);
           return;
         }
-        // An accepted answer owns the ensuing work even while only its child is busy.
-        if (this.ownsHuman(turn)) return;
+        // Accepted answers keep ownership while any discovered family work remains.
+        // Coverage history alone cannot keep a quiescent request holder alive.
+        if (this.ownsHuman(turn) && Object.entries(statuses).some(([id, status]) => id === turn!.id
+          || status.root === turn!.id || this.store.get(`child-leader:${turn!.id}:${id}`) !== undefined
+          || entries.some(entry => entry.requestSessionId === id))) return;
         // Absence is only known after discovery finishes, even if the handover grace elapsed.
         if (discoveryPending) return;
         // Only a request that is still open keeps the turn: an answer whose
@@ -5460,6 +5478,12 @@ export class Router {
         if (now - (turn.activeAt ?? turn.startedAt) < REQUEST_TURN_GRACE) return;
         this.store.db.transaction(() => {
           if (!this.current(turn!)) return;
+          // A successful response POST is not a new prompt to retry. Retain its
+          // receipt and unanswered alarm after releasing the now-idle family.
+          for (const id of new Set([...turn!.covered ?? [], ...this.store.get<string[]>(`turn-human:${turn!.messageId}`) ?? []])) {
+            if (this.store.get(`human-response-prompt:${id}`) && !this.store.get(`human-own-turn:${id}`)
+              && !this.store.get<SteerAttempt>(`steer-attempt:${id}`)?.response) this.store.set(`human-response-released:${id}`, true);
+          }
           this.logTurnEnd(turn!, turn!.earlySent ? "replied" : "no_reply");
           this.setTurn(null);
           this.store.set("pendingApprovals", null);
@@ -5853,7 +5877,10 @@ export class Router {
           const active = this.store.get<Turn | null>("activeTurn");
           const parent = active?.phase === "running" && (active.messageId === turn.messageId
             || active.origin === "request" && active.leaderId === (turn.leaderId ?? turn.inboundId));
-          if (parent) this.store.set(`human-response-prompt:${id}`, active!.steered?.at(-1) ?? active!.messageId);
+          if (parent) {
+            this.store.set(`human-response-prompt:${id}`, active!.steered?.at(-1) ?? active!.messageId);
+            if (active!.origin === "request") this.setTurn({ ...active!, activeAt: Date.now() });
+          }
           this.trackHuman(parent ? active! : turn, id);
           if (!parent && this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state === "admitted")
             this.requeueHuman(id, "turn_failed", true);
@@ -6017,7 +6044,8 @@ export class Router {
     for (const id of ids) {
       const leader = this.humanBatchLeader(id, leaders);
       const members = this.store.get<NormalizedInbound>(`batch:${leader}`)?.batchIds ?? [id];
-      if (synthetic(id) || recovered.has(id) || members.every(member => this.answered(member))) continue;
+      if (synthetic(id) || recovered.has(id) || this.store.get(`human-response-released:${leader}`)
+        || members.every(member => this.answered(member))) continue;
       // Parent completion says nothing about an unresolved response POST on a child.
       if (this.store.get<SteerAttempt>(`steer-attempt:${leader}`)?.response) continue;
       const reply = this.store.db.query(`SELECT 1 FROM outbox o WHERE json_extract(o.payload, '$.kind') = 'conversation' AND o.state IN ('pending', 'sending', 'sent', 'uncertain') AND
