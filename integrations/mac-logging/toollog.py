@@ -556,12 +556,16 @@ def janitor_mcp_fields(values):
 
 
 def suspend_fields(values):
+    from cpu_labels import command_label
+
     result = {}
     for key, value in values.items():
         if key in ('pid', 'ppid', 'createdAt', 'deadline', 'firstSeen', 'ageS', 'count', 'unownedCount') and finite_number(value):
             result[key] = value
         elif key in ('recovered', 'overdue') and type(value) is bool:
             result[key] = value
+        elif key in ('comm', 'command', 'owner') and isinstance(value, str):
+            result[key] = command_label(value) or '[redacted]'
         elif key in ('start', 'stat', 'comm', 'command', 'owner', 'reason', 'actor', 'card', 'then', 'phase', 'result') and isinstance(value, str):
             result[key] = '[redacted]' if SECRET.search(value) else ''.join(c if c.isprintable() else ' ' for c in value[:1000])
         elif key == 'readBack' and isinstance(value, list):

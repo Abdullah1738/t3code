@@ -26,6 +26,27 @@ def proc(pid=20, stat='S', start='Sun Nov 22 10:00:00 2026', comm='/bin/sleep', 
     return dict(pid=pid, ppid=1, stat=stat, start=start, comm=comm, command=command)
 
 
+CREDENTIAL_COMMANDS = [
+    ('short user', 'curl -u alice:EXAMPLE_ONLY https://example.invalid'),
+    ('joined user', 'curl -ualice:EXAMPLE_ONLY https://example.invalid'),
+    ('bundled user', 'curl -fsSLu alice:EXAMPLE_ONLY https://example.invalid'),
+    ('long user', 'curl --user alice:EXAMPLE_ONLY https://example.invalid'),
+    ('equals user', 'curl --user=alice:EXAMPLE_ONLY https://example.invalid'),
+    ('proxy user', 'curl -Ualice:EXAMPLE_ONLY https://example.invalid'),
+    ('long proxy user', 'curl --proxy-user=alice:EXAMPLE_ONLY https://example.invalid'),
+    ('Basic header', 'curl -H "Authorization: Basic EXAMPLE_ONLY" https://example.invalid'),
+    ('joined Basic header', 'curl -H"authorization:basic EXAMPLE_ONLY" https://example.invalid'),
+    ('long Basic header', 'curl --header="AUTHORIZATION: Basic EXAMPLE_ONLY" https://example.invalid'),
+    ('api-key space', 'tool --api-key EXAMPLE_ONLY'),
+    ('api-key equals', 'tool --api-key=EXAMPLE_ONLY'),
+    ('api_key', 'tool --api_key=EXAMPLE_ONLY'),
+    ('URL userinfo', 'curl https://alice:EXAMPLE_ONLY@example.invalid'),
+    ('cookie', 'curl -b sid=EXAMPLE_ONLY https://example.invalid'),
+    ('bearer', 'curl -H "Authorization: Bearer EXAMPLE_ONLY" https://example.invalid'),
+    ('after truncation', 'tool '+'x '*200+'--api-key EXAMPLE_ONLY'),
+]
+
+
 class Crash(BaseException):
     pass
 
@@ -117,6 +138,76 @@ class SuspendTests(unittest.TestCase):
         for index, effect in enumerate(self.host.effects):
             if effect[0] == 'signal':
                 self.assertEqual(self.host.effects[index+1][0], 'read')
+
+    def test_credentials_redacted_before_lease_write_log_and_every_output(self):
+        for form, command in CREDENTIAL_COMMANDS:
+            with self.subTest(form=form):
+                self.host.live = {20: proc(comm='/opt/tool', command=command)}
+                def inspect_before_signal(sig):
+                    self.assertNotIn('EXAMPLE_ONLY', self.path.read_text())
+                self.host.before_signal = inspect_before_signal
+                with patch('sys.stdout', new_callable=io.StringIO) as output:
+                    self.assertEqual(m.main(['stop', '--pid', '20', '--deadline', '1m', '--then', 'cont',
+                        '--reason', 'load', '--actor', 'test'], self.service), 0)
+                    self.assertEqual(m.main(['list', '--json'], self.service), 0)
+                    self.assertEqual(m.main(['list'], self.service), 0)
+                    self.assertEqual(m.main(['sweep', '--json'], self.service), 0)
+                exposed = json.dumps([self.events, self.service.listing()])+output.getvalue()+self.path.read_text()
+                self.assertNotIn('EXAMPLE_ONLY', exposed)
+                self.assertTrue(self.service.release(20, 'resume')['ok'])
+                # Protection compares the fresh raw process, not persisted labels.
+                self.assertEqual(self.host.live[20]['command'], command)
+
+    def test_orphan_credentials_redacted_before_storage_alert_and_logger_boundary(self):
+        self.host.owner = lambda p: p['command']
+        for index, (form, command) in enumerate(CREDENTIAL_COMMANDS):
+            with self.subTest(form=form):
+                self.host.live = {20: proc(stat='T', comm='/opt/tool', command=command,
+                    start=f'Sun Nov 22 10:00:{index:02d} 2026')}
+                result = self.service.sweep()
+                self.now += 600
+                overdue = self.service.sweep()
+                row = toollog.record('suspend', 'event', 'suspend.orphan', dt.datetime.now(dt.timezone.utc),
+                                     props=dict(command=command, owner=command, comm=command))
+                exposed = json.dumps([result, overdue, row, self.events, self.host.effects])+self.path.read_text()
+                self.assertNotIn('EXAMPLE_ONLY', exposed)
+                self.assertEqual(self.signals(), [])
+                self.host.live = {}
+                self.service.sweep()
+
+    def test_old_ledger_is_scrubbed_before_list_or_sweep(self):
+        for form, command in CREDENTIAL_COMMANDS:
+            with self.subTest(form=form):
+                p = proc(command=command)
+                lease = dict(p, createdAt=self.now, deadline=self.now+600, then='cont', reason='load', actor='test')
+                entry = dict(p, firstSeen=self.now, owner=command, overdue=False)
+                self.path.write_text(json.dumps(dict(version=1, leases={'20': lease},
+                    unowned={m.identity(p): entry}, alerts={})))
+                with patch('sys.stdout', new_callable=io.StringIO) as output:
+                    self.assertEqual(m.main(['list', '--json'], self.service), 0)
+                self.assertNotIn('EXAMPLE_ONLY', output.getvalue()+self.path.read_text())
+                self.assertEqual(self.signals(), [])
+
+    def test_missing_redactor_does_not_expose_argv(self):
+        self.host.live[20]['command'] = 'tool --api-key EXAMPLE_ONLY'
+        with patch.object(m, 'command_label', return_value=None):
+            lease = self.stop()
+            self.assertEqual(lease['command'], '[redacted]')
+            self.assertNotIn('EXAMPLE_ONLY', self.path.read_text()+json.dumps(self.events))
+        with patch('cpu_labels.command_label', return_value=None):
+            self.assertEqual(toollog.suspend_fields(dict(command='tool --api-key EXAMPLE_ONLY')),
+                             dict(command='[redacted]'))
+
+    def test_raw_argv_change_is_detected_even_if_redacted_labels_match(self):
+        self.host.live[20]['command'] = 'tool --api-key EXAMPLE_ONLY'
+        self.stop()
+        self.host.effects.clear()
+        def protection(p):
+            self.host.live[20]['command'] = 'tool --api-key SECOND_ONLY'
+            return False
+        self.host.protected = protection
+        self.assertFalse(self.service.release(20, 'resume')['ok'])
+        self.assertEqual(self.signals(), [])
 
     def fail_stop_read(self, sig):
         if sig == signal.SIGSTOP:
@@ -210,6 +301,36 @@ class SuspendTests(unittest.TestCase):
                 self.host.live = {p['pid']: p}
                 with self.assertRaisesRegex(ValueError, 'protected'):
                     self.service.stop(p['pid'], '1m', 'cont', 'load', 'test')
+        self.assertEqual(self.signals(), [])
+
+    def test_cua_driver_protection_in_stop_and_all_recovery_paths(self):
+        for comm in ('cua-driver', '/opt/homebrew/bin/cua-driver', '/opt/cua-driver-helper', '/opt/cua-driver/worker'):
+            with self.subTest(comm=comm):
+                p = proc(comm=comm, command=comm+' mcp')
+                self.host.live = {20: p}
+                self.assertTrue(m.Host(Mock()).protected(p))
+                with self.assertRaisesRegex(ValueError, 'protected'):
+                    self.stop()
+                self.assertEqual(self.signals(), [])
+                p['stat'] = 'T'
+                for action in ('resume', 'kill', 'sweep-cont', 'sweep-kill'):
+                    with self.subTest(action=action):
+                        lease = dict(p, createdAt=0, deadline=1, then='kill' if action.endswith('kill') else 'cont')
+                        with self.service.locked() as state:
+                            state['leases']['20'] = lease
+                            self.service.save(state)
+                        result = self.service.sweep()['actions'][0] if action.startswith('sweep') else self.service.release(20, action)
+                        self.assertFalse(result['ok'])
+                        self.assertEqual(self.signals(), [])
+                with self.service.locked() as state:
+                    state['leases'].clear()
+                    self.service.save(state)
+
+    def test_recovery_checks_raw_comm_even_when_saved_label_was_redacted(self):
+        self.stop('kill')
+        self.host.effects.clear()
+        self.host.live[20]['comm'] = '/Users/owner/cua-driver/worker'
+        self.assertFalse(self.service.release(20, 'kill')['ok'])
         self.assertEqual(self.signals(), [])
 
     def test_expired_cont_and_kill_grace(self):

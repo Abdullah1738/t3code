@@ -17,6 +17,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jobs import state_path
 from toollog import emit
+from cpu_labels import command_label
 
 DEFAULT_DEADLINE = '10m'  # Recommended explicit CLI value; omission is an error.
 MAX_SECONDS = 3600
@@ -31,6 +32,7 @@ PROTECTED = {
     'names': ('launchd', 'kernel_task', 'WindowServer', 'Robob', 'tailscaled', 'sshd',
               'claude', 'codex', 'opencode', 'gemini', 'cursor-agent', 'grok', 'antigravity'),
     'paths': ('/System/', '/usr/libexec/', '/usr/sbin/', '/sbin/'),
+    'comm_fragments': ('cua-driver',),
     'providers': r'(?:^|[/@])(?:claude(?:-code)?|codex|opencode|gemini(?:-cli)?|cursor-agent|grok|antigravity)(?:$|[/.-])',
     'provider_executables': ('claude', 'codex', 'opencode', 'gemini', 'cursor-agent', 'grok', 'antigravity',
                              'codex-aarch64-apple-darwin', 'codex-x86_64-apple-darwin'),
@@ -59,6 +61,7 @@ def protected(p):
     name = Path(p['comm']).name
     if (p.get('robobServer') or p['pid'] in PROTECTED['pids'] or p['pid'] == os.getpid()
             or name in PROTECTED['names'] or p['comm'].startswith(PROTECTED['paths'])
+            or any(fragment in p['comm'] for fragment in PROTECTED['comm_fragments'])
             or '.app/' in p['comm']):
         return True
     try:
@@ -78,6 +81,25 @@ def protected(p):
 
 def identity(p):
     return '%s:%s' % (p['pid'], p['start'])
+
+
+def redacted_record(record):
+    result = dict(record)
+    for key in ('command', 'comm', 'owner'):
+        if isinstance(result.get(key), str):
+            result[key] = command_label(result[key]) or '[redacted]'
+    return result
+
+
+def redact_state(state):
+    changed = False
+    for entries in (state['leases'], state['unowned']):
+        for record in entries.values():
+            clean = redacted_record(record)
+            if record != clean:
+                record.update(clean)
+                changed = True
+    return changed
 
 
 def provider_process(p):
@@ -237,9 +259,14 @@ class SuspendLease:
             if (not isinstance(state, dict) or state.get('version') != 1
                     or any(not isinstance(state.get(k), dict) for k in ('leases', 'unowned', 'alerts'))):
                 raise ValueError('invalid suspend ledger')
+            # Older ledgers may contain raw argv. Scrub before listing, logging
+            # or recovery can expose them, including read-only list commands.
+            if redact_state(state):
+                self.save(state)
             yield state
 
     def save(self, state):
+        redact_state(state)
         fd, tmp = tempfile.mkstemp(prefix='.suspend-', dir=self.path.parent)
         try:
             with os.fdopen(fd, 'w') as stream:
@@ -259,7 +286,7 @@ class SuspendLease:
 
     def log(self, name, lease=None, ok=True, **props):
         self.logger('suspend', 'event' if ok else 'error', 'suspend.'+name,
-                    ok=ok, props={**(lease or {}), **props},
+                    ok=ok, props=redacted_record({**(lease or {}), **props}),
                     error_tag=None if ok else 'suspend.'+name)
 
     def current(self, lease):
@@ -327,7 +354,8 @@ class SuspendLease:
             if p['stat'].startswith('T') or str(pid) in state['leases']:
                 raise ValueError('process already stopped or leased')
             now = self.clock()
-            lease = dict(p, createdAt=now, deadline=now+seconds, then=then, reason=reason, actor=actor, card=card)
+            lease = redacted_record(dict(p, createdAt=now, deadline=now+seconds, then=then,
+                                         reason=reason, actor=actor, card=card))
             state['leases'][str(pid)] = lease
             self.save(state)
             reads = []
@@ -448,7 +476,7 @@ class SuspendLease:
                     continue
                 entry = state['unowned'].get(key)
                 if entry is None:
-                    entry = dict(p, firstSeen=now, owner=self.host.owner(p), overdue=False)
+                    entry = redacted_record(dict(p, firstSeen=now, owner=self.host.owner(p), overdue=False))
                     unowned[key] = entry
                     state['unowned'][key] = entry
                     self.save(state)
