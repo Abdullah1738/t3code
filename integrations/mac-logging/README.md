@@ -1012,6 +1012,30 @@ completing any partial thread launch. It confirms the initial safety message
 and durable run before adoption or steering. Unavailable lookups wait;
 they never authorize a second worker. These calls have a ten-second bound.
 
+Overload transitions (`host.overload`, emitted by the host sampler) also drive
+an immediate reclaim pass before the guard's fork-based probes. A fresh onset
+runs the installed janitor worker under its hourly lock (120-second timeout),
+reuses the GUI leak rule when recent footprint history is available, lowers
+eligible local builds/tests to nice 10 with `setpriority`, then starts or steers
+the existing critical worker. Offbox holders and their descendants are exempt
+from every guard action. Builds below providers, including release-build clones,
+remain eligible; the provider itself stays protected. This path never invokes
+`taskpolicy` or sends process signals of its own.
+
+Passes are limited to one per 20 minutes, persisted across restarts. A fresh
+peak can repeat the pass for the same episode after 20 minutes if the previous
+pass observed less than 1 GiB of RSS reduction. Unknown counters do not count
+as memory freed. RSS deltas are observations, not proof that the rung caused
+the decrease. No overload is inferred from raw load or missing samples.
+
+Read `guard.reclaim` rows in the mac day file and
+`~/.local/state/mac-guard/guard.log`. Each pass writes a census under the normal
+guard evidence directory, including the original overload row, families/spawn
+samples, kept identities, rung results and the never-touch list. The next
+host-vitals row after completion fills in pressure/swap after the pass;
+`after: null` means that row has not arrived. Worker delivery retries use the
+existing durable responder path, including its idempotent launch/steer IDs.
+
 Pause with `touch ~/.local/state/mac-guard/paused`; remove that file to resume.
 `MAC_GUARD_DRY_RUN=1` records proposed actions while sending no signals,
 notifications, restarts or worker launches. Neither mode changes the separate

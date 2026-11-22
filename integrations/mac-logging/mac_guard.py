@@ -191,6 +191,8 @@ def label(p, rows):
 
 
 def exempt(p, rows, system_gui=False):
+    if any(re.search(r'(?:^|[/\s])offbox(?:\.py)?(?:\s|$)', q.get('args', '')) for q in [p]+chain(p, rows)):
+        return True
     if (label(p, rows) in MEMORY_EXEMPT['service_labels'] or p.get('sessionWrapper')
             or p['pid'] == os.getpid() or (system(p) and not system_gui) or provider(p) or robob(p, rows)):
         return True
@@ -524,7 +526,10 @@ class Host:
             ('pressure', ['/usr/sbin/sysctl', '-n', 'kern.memorystatus_vm_pressure_level'], lambda s: int(s.strip()), 2),
             ('swap', ['/usr/sbin/sysctl', '-n', 'vm.swapusage'], parse_swap, 2)):
             try:
+                observed_at = time.time()
                 snapshot[key] = parser(self.cmd(argv, timeout))
+                if key == 'top':
+                    snapshot['footprintObservedAt'] = observed_at
             except (ProbeError, MemoryError, ValueError) as exc:
                 snapshot[key] = None
                 snapshot['errors'].append(dict(probe=key, failure=str(exc)))
@@ -965,7 +970,10 @@ class Guard:
         self.save()
 
     def deliver_restart_responder(self):
-        report = self.saved.get('restartResponder')
+        return self.deliver_responder('restartResponder')
+
+    def deliver_responder(self, key):
+        report = self.saved.get(key)
         if not report or self.muted or self.now < report.get('nextAttemptAt', 0):
             return
         report['nextAttemptAt'] = self.now+30
@@ -1001,11 +1009,12 @@ class Guard:
                 delivered = self.worker_needed(Path(report['evidence']), report['summary'], urgent=report['urgent'],
                                                delivery=report)
         except (ProbeError, OSError, ValueError, KeyError):
-            self.log('error', probe='restart_responder', failure='unavailable')
+            self.log('error', probe=key, failure='unavailable')
             return
         if delivered:
-            self.saved.pop('restartResponder')
+            self.saved.pop(key)
             self.save()
+        return bool(delivered)
 
     def memory_event(self, p, kind, action):
         self.log('memory_runaway', pid=p['pid'], start=p['start'], comm=p['comm'], label=label(p, self.rows),
@@ -1183,7 +1192,8 @@ class Guard:
             p['cpuDelta'] = cpus.get(p['pid'], 0)
             footprint = top.get(p['pid'])
             if footprint:
-                p.update(footprintGiB=footprint['memMb']/1024, compressedGiB=footprint['cmprsMb']/1024)
+                p.update(footprintGiB=footprint['memMb']/1024, compressedGiB=footprint['cmprsMb']/1024,
+                         footprintObservedAt=sample.get('footprintObservedAt', now))
             p['growthGiBMin'] = 0
             # Two intervals means three observations, never a single 30s jump.
             if (len(hist) >= 2 and hist[-1]['footprintGiB'] is not None
@@ -1448,11 +1458,19 @@ def main():
             raise SystemExit(1)
         return
     guard = Guard()
+    from guard_reclaim import Reclaimer
+    reclaimer = Reclaimer(guard)
     with (guard.state/'guard.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         deadline = time.monotonic()
         while True:
             started = time.monotonic()
+            try:
+                # Consume the no-fork onset before ps/top, which can fail under load.
+                reclaimer.tick(time.time())
+            except (ProbeError, OSError, ValueError) as exc:
+                guard.now = time.time()
+                guard.log('error', probe='reclaim', failure=type(exc).__name__)
             try:
                 sample = guard.host.collect(guard.cycle)
                 sample['cycleMs'] = (time.monotonic()-started)*1000

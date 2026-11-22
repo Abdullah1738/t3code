@@ -555,6 +555,9 @@ def janitor_mcp_fields(values):
 
 
 def safe_fields(values, event=None):
+    if event == 'guard.reclaim':
+        from guard_reclaim import log_fields
+        return log_fields(values or {})
     if event and event.startswith('macguard.'):
         return macguard_fields(values or {})
     if event == 'host.spawn_sample':
@@ -954,7 +957,7 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                     'crash.unified.skip', 'crash.source', 'crash.collect') and
                     row.get('props', {}).get('skippedS', 0) > 0)
                 # Preserve the bounded host heartbeat through a noisy day's cap.
-                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload', 'host.spawn_sample')
+                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload', 'host.spawn_sample', 'guard.reclaim')
                 if kind != 'error' and not coverage_gap and not host_sample:
                     return
             append(fd, row)
