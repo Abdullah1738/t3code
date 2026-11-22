@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import guard
+from guard_test_support import GuardTestCase
 from hold import Holds
 
 SOURCE = Path(__file__).resolve().parent
@@ -184,12 +185,7 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual((statuses, action), (['hold:install'], 'none'))
         self.assertEqual(self.state['down_count'], 0)
 
-class IOTests(unittest.TestCase):
-    def setUp(self):
-        protected = patch('guard.protected_tier_tick')
-        protected.start()
-        self.addCleanup(protected.stop)
-
+class IOTests(GuardTestCase):
     def test_ssd_marker_and_probe_freshness_corpus(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
