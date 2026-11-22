@@ -101,7 +101,10 @@ test("unreachable or unsafe sockets never own attention", async () => {
   expectError("tg.router.request");
   expect(await spectrumRouterStatus("relative/path.sock")).toBeUndefined();
   expect(await spectrumRouterStatus("/bad\0path")).toBeUndefined();
+  expect(logs.entries().map(row => row.error?.tag)).toEqual(["tg.router.request", "tg.router.socket"]);
+  logs.flushErrors();
   expect(logs.entries().map(row => row.error?.tag)).toEqual(["tg.router.request", "tg.router.socket", "tg.router.socket"]);
+  expect(logs.entries().at(-1)?.props?.repeats).toBe(1);
 });
 
 test("timeouts bound the ownership check", async () => {

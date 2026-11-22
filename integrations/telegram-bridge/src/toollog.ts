@@ -1,7 +1,8 @@
+import { expandTelemetry } from "./log-format.ts";
 import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { STREAM_END_KINDS, STREAM_ERROR_CODE } from "./stream-telemetry.ts";
 
 export type LogEntry = {
@@ -11,7 +12,7 @@ export type LogEntry = {
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper", "directory"]);
-const numeric = new Set(["exitCode", "attempt", "count", "bytes", "queuedMs"]);
+const numeric = new Set(["exitCode", "attempt", "count", "bytes", "queuedMs", "repeats", "windowMs"]);
 const boolean = new Set(["deduped", "accepted"]);
 const values: Record<string, readonly string[]> = {
   severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout"],
@@ -69,10 +70,28 @@ function appendLine(file: string, line: unknown): void {
   finally { closeSync(fd); }
 }
 
-export function toolLog(entry: LogEntry): void {
+const DROP_HOUR = 3_600_000;
+let capDrops: { file: string; day: string; since: number; dropped: Record<string, number> } | undefined;
+function flushCapDrops(at: Date, force = false): void {
+  if (!capDrops || (!force && at.getTime() - capDrops.since < DROP_HOUR)) return;
+  const pending = capDrops;
+  if (Object.keys(pending.dropped).length) appendLine(pending.file, {
+    ts: new Date(Math.min(at.getTime(), Date.parse(`${pending.day}T23:59:59.999Z`))).toISOString(),
+    tool: "watchers", component: "logger", kind: "error", name: "log.capDropped",
+    props: { dropped: pending.dropped, since: new Date(pending.since).toISOString() },
+  });
+  capDrops = { ...pending, since: at.getTime(), dropped: Object.create(null) };
+}
+function countCapDrop(file: string, day: string, at: Date, entry: LogEntry): void {
+  capDrops ??= { file, day, since: at.getTime(), dropped: Object.create(null) };
+  const key = `${entry.component}:${entry.kind}:${entry.name}`;
+  const target = Object.hasOwn(capDrops.dropped, key) || Object.keys(capDrops.dropped).filter(key => key !== "other").length < 50 ? key : "other";
+  capDrops.dropped[target] = (capDrops.dropped[target] ?? 0) + 1;
+}
+
+export function toolLog(entry: LogEntry, at = new Date()): void {
   try {
     if ((process.env.ROBOB_TEST || process.env.NODE_ENV === "test" || process.env.PYTEST_CURRENT_TEST) && !process.env.TOOLLOG_DIR) return;
-    const at = new Date();
     const line = fields(entry, at);
     if (!line) return;
     const dir = logDirectory(), day = at.toISOString().slice(0, 10), file = join(dir, `${day}.ndjson`);
@@ -87,13 +106,18 @@ export function toolLog(entry: LogEntry): void {
       }
       initialized.add(identity);
     }
+    if (capDrops && capDrops.file !== file) {
+      if (dirname(capDrops.file) === dir && existsSync(capDrops.file)) flushCapDrops(at, true);
+      capDrops = undefined;
+    }
+    flushCapDrops(at);
     const size = existsSync(file) ? statSync(file).size : 0;
     if (size > CAP) {
       try {
         const marker = openSync(join(dir, `${day}.cap`), "wx", 0o600); closeSync(marker);
         appendLine(file, { ts: at.toISOString(), tool: "watchers", component: "logger", kind: "error", name: "log.cap", ok: false, error: { tag: "log.cap", message: "log.cap" } });
       } catch { /* Another component already recorded the cap. */ }
-      if (entry.kind !== "error") return;
+      if (entry.kind !== "error") { countCapDrop(file, day, at, entry); return; }
     }
     appendLine(file, line);
   } catch { /* Logging cannot affect the caller. */ }
@@ -177,8 +201,42 @@ export function errorCause(error: unknown): ErrorCause {
   return errorInfo(error).cause;
 }
 
+const ERROR_WINDOW = 60_000;
+type ErrorWindow = { component: string; tag: string; props: ErrorInfo; at: number; repeats: number; lastAt: number; dir: string };
+const errorWindows = new Map<string, ErrorWindow>();
+function flushErrorWindow(window: ErrorWindow, at: number): void {
+  if (window.repeats) toolLog({ component: window.component, kind: "error", name: `${window.component}.error`, ok: false,
+    props: { ...window.props, repeats: window.repeats, windowMs: Math.max(0, at - window.at) }, error: { tag: window.tag } }, new Date(window.lastAt));
+}
+export function flushToolErrors(at = Date.now(), force = false): void {
+  for (const [key, window] of errorWindows) {
+    if (window.dir !== logDirectory()) { errorWindows.delete(key); continue; }
+    if (force || at - window.at >= ERROR_WINDOW || Math.floor(at / 3_600_000) !== Math.floor(window.at / 3_600_000)) {
+      flushErrorWindow(window, at);
+      errorWindows.delete(key);
+    }
+  }
+}
+const errorFlushTimer = setInterval(() => { try { flushToolErrors(); flushCapDrops(new Date()); } catch { /* Best effort telemetry. */ } }, ERROR_WINDOW);
+errorFlushTimer.unref();
+process.once("exit", () => flushToolErrors(Date.now(), true));
+
 export function toolError(component: string, tag: string, ids?: Record<string, unknown>, error?: unknown): void {
-  toolLog({ component, kind: "error", name: `${component}.error`, ok: false, ids, props: errorInfo(error), error: { tag } });
+  try {
+    const at = Date.now(), props = errorInfo(error);
+    flushToolErrors(at);
+    const key = JSON.stringify([component, tag, props.cause, props.detail]);
+    const window = errorWindows.get(key);
+    if (window) { window.repeats++; window.lastAt = at; return; }
+    toolLog({ component, kind: "error", name: `${component}.error`, ok: false, ids, props, error: { tag } });
+    if (errorWindows.size < 200) errorWindows.set(key, { component, tag, props, at, repeats: 0, lastAt: at, dir: logDirectory() });
+  } catch { /* Error telemetry cannot affect its caller. */ }
+}
+
+// Summary lines represent suppressed occurrences, not an additional error.
+export function errorOccurrences(row: { kind?: unknown; props?: { repeats?: unknown } }): number {
+  const repeats = row.props?.repeats;
+  return row.kind === "error" && typeof repeats === "number" && Number.isSafeInteger(repeats) && repeats > 0 ? repeats : 1;
 }
 
 export async function rollup(day: string, dir = logDirectory()) {
@@ -200,24 +258,29 @@ export async function rollup(day: string, dir = logDirectory()) {
     }
     const lines = sourceExists ? createInterface({ input: createReadStream(source), crlfDelay: Infinity }) : [];
     for await (const line of lines) {
-      let row; try { row = JSON.parse(line); } catch { continue; }
-      if (!row || row.tool !== "watchers" || !token.test(row.name) || !["event", "perf", "error"].includes(row.kind)) continue;
-      total++; counts[row.name] = (counts[row.name] ?? 0) + 1; kinds[row.kind] = (kinds[row.kind] ?? 0) + 1;
-      if (typeof row.ok === "boolean") { withOk++; if (row.ok) ok++; else failed++; }
-      if (typeof row.durationMs === "number" && Number.isFinite(row.durationMs) && row.durationMs >= 0) (durations[row.name] ??= []).push(row.durationMs);
-      if (row.error && token.test(row.error.tag)) {
-        const tag = row.error.tag;
-        const entry = errors[tag] ??= { count: 0 };
-        entry.count++;
-        // Reuse sanitized IDs only, never text from a malformed fixture line.
-        if (row.ids && typeof row.ids === "object") for (const [key, value] of Object.entries(row.ids)) {
-          if (!idKeys.has(key) || typeof value !== "string") continue;
-          if (/^[a-f0-9]{24}$/.test(value) || ((key === "watcher" || key === "helper") && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(value) && !/\d{5}/.test(value))) {
-            entry.sampleId ??= value;
-            break;
+      let input; try { input = JSON.parse(line); } catch { continue; }
+      if (!input || typeof input !== "object") continue;
+      for (const expanded of expandTelemetry(input)) {
+        const row = expanded as LogEntry & { tool?: string };
+        if (!row || row.tool !== "watchers" || !token.test(row.name) || !["event", "perf", "error"].includes(row.kind)) continue;
+        const occurrences = errorOccurrences(row);
+        total += occurrences; counts[row.name] = (counts[row.name] ?? 0) + occurrences; kinds[row.kind] = (kinds[row.kind] ?? 0) + occurrences;
+        if (typeof row.ok === "boolean") { withOk += occurrences; if (row.ok) ok += occurrences; else failed += occurrences; }
+        if (typeof row.durationMs === "number" && Number.isFinite(row.durationMs) && row.durationMs >= 0) (durations[row.name] ??= []).push(row.durationMs);
+        if (row.error && token.test(row.error.tag)) {
+          const tag = row.error.tag;
+          const entry = errors[tag] ??= { count: 0 };
+          entry.count += occurrences;
+          // Reuse sanitized IDs only, never text from a malformed fixture line.
+          if (row.ids && typeof row.ids === "object") for (const [key, value] of Object.entries(row.ids)) {
+            if (!idKeys.has(key) || typeof value !== "string") continue;
+            if (/^[a-f0-9]{24}$/.test(value) || ((key === "watcher" || key === "helper") && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(value) && !/\d{5}/.test(value))) {
+              entry.sampleId ??= value;
+              break;
+            }
           }
         }
-      }
+    }
     }
     const timing = Object.fromEntries(Object.entries(durations).map(([name, samples]) => {
       samples.sort((a, b) => a - b);
