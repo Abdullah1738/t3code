@@ -3,6 +3,7 @@ import type { LogLine } from "./toollog.ts";
 import { callName, percentiles } from "./log-calls.ts";
 import { createRobobLinkAggregation } from "./log-robob-link.ts";
 import { createChainAggregation } from "./log-chains.ts";
+import { FETCH_CAUSES, cleanRenderCardId } from "./log-card-fetch.ts";
 
 export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>, renderLines: LogLine[] = [], requestedDay?: string) {
   const countsByName: Record<string, number> = Object.create(null);
@@ -18,6 +19,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     probeRows.set(key, rows);
   }
   const renderFailures = new Map<string, number>();
+  const renderFetchFailures = new Map<string, { failureCode: string; fetchCause: string; httpStatus?: number; count: number; cardIds: Set<string> }>();
   const represented = new Set<string>();
   const representedSingleFailures = new Set<string>();
   const individualCalls: LogLine[] = [];
@@ -105,6 +107,18 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     if (line.name === "card.render" && line.ok === false && typeof line.props?.failureCode === "string") {
       const code = line.props.failureCode;
       renderFailures.set(code, (renderFailures.get(code) ?? 0) + count);
+      if (["page_fetch", "page_http", "page_body", "page_type"].includes(code)) {
+        const cause = FETCH_CAUSES.find(cause => cause === line.props?.fetchCause) ?? "unknown";
+        const status = line.props?.httpStatus;
+        const httpStatus = typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+        const key = `${code}\0${cause}\0${httpStatus ?? ""}`;
+        const item = renderFetchFailures.get(key) ?? { failureCode: code, fetchCause: cause,
+          ...(httpStatus !== undefined ? { httpStatus } : {}), count: 0, cardIds: new Set<string>() };
+        item.count += count;
+        const cardId = line.ids?.cardId;
+        if (cleanRenderCardId(cardId)) item.cardIds.add(cardId);
+        renderFetchFailures.set(key, item);
+      }
     }
     observeError(line);
   }
@@ -178,6 +192,8 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     dedupedFailures, okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countedErrors + failedCalls) / total : 0,
     promptProbe: { ...summarizePromptProbe(promptProbe), byHour: Object.fromEntries([...probeHours].sort().map(([hour, stats]) => [hour, summarizePromptProbe(stats)])) },
     durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),
+    cardRenderFetchFailures: [...renderFetchFailures.values()].sort((a, b) => b.count - a.count || a.failureCode.localeCompare(b.failureCode) || a.fetchCause.localeCompare(b.fetchCause) || (a.httpStatus ?? 0) - (b.httpStatus ?? 0))
+      .map(item => ({ ...item, cardIds: [...item.cardIds].sort() })),
     topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20).map(item => {
       const rows = probeRows.get(`${item.tag}\0${item.causeKey}`);
       return rows ? { ...item, distinctInboundIds: rows.size, topInboundIds: [...rows].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 14).map(([inboundId, count]) => ({ inboundId, count })) } : item;

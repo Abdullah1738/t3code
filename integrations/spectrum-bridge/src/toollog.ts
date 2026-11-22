@@ -23,6 +23,7 @@ import { cleanRenders, createRenderAggregation, renderChat } from "./log-renders
 import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./log-error.ts";
 import { CONTROL_REASONS, controlFailureProps } from "./control-errors.ts";
 import { LOOP_OPERATIONS, loopOperations, traceLoopOperation } from "./loop-stall.ts";
+import { FETCH_CAUSES, cleanCardUrlClass, cleanRenderCardId, type CardFetchFailure } from "./log-card-fetch.ts";
 
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
@@ -77,6 +78,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   const ids: Record<string, string> = runId ? { runId } : {};
   for (const [key, value] of Object.entries(entry.ids ?? {})) {
     if (entry.name === "bridge-loop-stall") continue;
+    if (key === "cardId" && entry.name === "card.render" && cleanRenderCardId(value)) { ids.cardId = value; continue; }
     // Correlation ids are UUIDs; arbitrary server header text must never become a log field.
     if ((key === "requestId" || key === "serverRequestId" || key === "outageId") && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value)) continue;
     if (key === "chat" && entry.name.startsWith("card.render")) { ids.chat = renderChat(value); continue; }
@@ -86,6 +88,15 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (["fetchCause", "httpStatus", "urlClass", "bytesReceived"].includes(key)) {
+      if (entry.name === "card.render" && (
+        key === "fetchCause" && typeof value === "string" && FETCH_CAUSES.some(cause => cause === value)
+        || key === "httpStatus" && typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599
+        || key === "urlClass" && cleanCardUrlClass(value)
+        || key === "bytesReceived" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+      )) props[key] = value;
+      continue;
+    }
     if (entry.name === "bridge-loop-stall") {
       if (["stallMs", "loadAvg1", "freeMemoryBytes", "rssBytes"].includes(key)
         && typeof value === "number" && Number.isFinite(value) && value >= 0) { props[key] = value; continue; }
@@ -631,8 +642,10 @@ export function cardKind(value: string): string {
 }
 
 export function logCardRender(component: string, kind: string, durationMs: number, ok: boolean,
-  details: { chat?: string; outcome?: "ok" | "fallback" | "failed"; failureCode?: string; attempt?: number } = {}): void {
+  details: { chat?: string; outcome?: "ok" | "fallback" | "failed"; failureCode?: string; attempt?: number; cardId?: string } & Partial<CardFetchFailure> = {}): void {
   toolLog.capture(() => toolLog.write({ component, kind: "perf", name: "card.render", durationMs, ok,
-    ids: { chat: details.chat ?? "" }, props: { cardKind: kind, outcome: details.outcome ?? (ok ? "ok" : "failed"),
-      failureCode: details.failureCode ?? (ok ? "none" : "renderer_failed"), attempt: details.attempt ?? 1 } }));
+    ids: { chat: details.chat ?? "", ...(details.cardId ? { cardId: details.cardId } : {}) }, props: { cardKind: kind, outcome: details.outcome ?? (ok ? "ok" : "failed"),
+      failureCode: details.failureCode ?? (ok ? "none" : "renderer_failed"), attempt: details.attempt ?? 1,
+      ...Object.fromEntries(Object.entries({ fetchCause: details.fetchCause, httpStatus: details.httpStatus, urlClass: details.urlClass,
+        elapsedMs: details.elapsedMs, bytesReceived: details.bytesReceived }).filter((entry): entry is [string, string | number] => entry[1] !== undefined)) } }));
 }
