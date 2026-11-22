@@ -374,8 +374,10 @@ class SSDProbeTests(unittest.TestCase):
         import select
         # A real CPU entrypoint reaches inventory and never returns. The old
         # combined job would still be active here and miss its next minute.
+        # Keep auxiliary CPU checks out of the probe's log and alert fixture.
         script = ("import sys,time; sys.path.insert(0, sys.argv[1]); "
-                  "import cpu,u_sample; u_sample.sample=lambda:None; "
+                  "import cpu,u_sample,disk_low; u_sample.sample=lambda:None; "
+                  "disk_low.check=lambda:None; "
                   "cpu.sample=lambda:(print('inventory-blocked',flush=True),time.sleep(60)); "
                   "cpu.main()")
         inventory = self.popen([sys.executable, '-c', script, str(HERE)], stdout=subprocess.PIPE)
