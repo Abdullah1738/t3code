@@ -39,7 +39,7 @@ def unplaced(lane, row):
     return False
 
 
-def scan_lane(state, lane, rows, now, registered):
+def scan_lane(state, lane, rows, now, registered, *, can_fire=True):
     ids = sorted({row['order'] for row in rows})
     ignored = set(ids) - {row['order'] for row in rows if not unplaced(lane, row)}
     old = state.setdefault(lane, {'seen': ids, 'pending': {}})
@@ -52,6 +52,8 @@ def scan_lane(state, lane, rows, now, registered):
     for order, attempt in list(pending.items()):
         if order in ignored or order in gave_up or registered(order):
             del pending[order]
+            continue
+        if not can_fire:
             continue
         if isinstance(attempt, (int, float)):
             # Legacy state has no fire count; retain its retry deadline.
@@ -95,6 +97,7 @@ def main():
         events, errors = [], {}
         lanes = state.setdefault('lanes', {})
         run_lanes = {}
+        history = {}
         readers = {'minutes': lambda: core.orders('minutes', timeout=20),
                    'marketplace': lambda: core.orders('marketplace', timeout=20),
                    'food': lambda: verticals.food_orders(timeout=20),
@@ -106,14 +109,12 @@ def main():
                 result = read()
                 if result.get('partial') or not result.get('ok'):
                     raise core.NoonError('PARTIAL_HISTORY_READ')
-                events.extend(scan_lane(state, lane, result['orders'], time.time(), registered))
+                history[lane] = result['orders']
             except core.NoonError as exc:
                 errors[lane] = str(exc)
                 health.update(fail_count=health['fail_count'] + 1,
                               failing_since=health['failing_since'] or dt.datetime.now(dt.timezone.utc).isoformat(),
                               last_error=str(exc), rows=0)
-                if lane in state:
-                    events.extend(scan_lane(state, lane, [], time.time(), registered))
             else:
                 health.update(ok_at=dt.datetime.now(dt.timezone.utc).isoformat(), fail_count=0,
                               failing_since=None, last_error=None, rows=len(result['orders']))
@@ -127,6 +128,11 @@ def main():
         failed = len(errors) == len(readers) or any(
             (checked_at - dt.datetime.fromisoformat(since)).total_seconds() >= LANE_FAILURE_LIMIT_S
             for since in failing_since.values())
+        # The runner discards failed-check stdout; only deliverable events spend retries.
+        for lane in readers:
+            if lane in history or lane in state:
+                events.extend(scan_lane(state, lane, history.get(lane, []), time.time(), registered,
+                                        can_fire=not failed))
         temp = path.with_suffix('.tmp')
         temp.write_text(json.dumps(state, indent=2))
         temp.replace(path)

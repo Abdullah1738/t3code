@@ -146,6 +146,22 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(run['lanes']['food']['rows'], 2)
             self.assertFalse(run['lanes']['minutes']['ok'])
 
+    def test_transient_failed_lane_retries_pending_when_the_run_succeeds(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', WATCH_DIR=directory), \
+                patch.object(discovery.time, 'time', return_value=1000):
+            path = Path(directory)/'noon-discovery.json'
+            path.write_text(json.dumps({'food': {'seen': ['FNEW'],
+                'pending': {'FNEW': {'last_fire': 0, 'fires': 0}}, 'gave_up': []}}))
+            with self.readers({'food': discovery.core.NoonError('OFFLINE')}), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                discovery.main()
+            self.assertEqual(json.loads(out.getvalue().split(': ', 1)[1]),
+                             [{'order': 'FNEW', 'service': 'food'}])
+            saved = json.loads(path.read_text())['food']
+            self.assertEqual(saved['seen'], ['FNEW'])
+            self.assertEqual(saved['pending'], {'FNEW': {'last_fire': 1000, 'fires': 1}})
+            self.assertEqual(saved['gave_up'], [])
+
     def test_incomplete_reads_fail_only_their_lane_without_advancing_baseline(self):
         cases = [(lane, result) for lane in ('minutes', 'marketplace', 'food', 'nownow')
                  for result in ({'ok': True, 'partial': True}, {'ok': False})]
@@ -163,7 +179,7 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertEqual(state['lanes'][lane]['fail_count'], 1)
                 self.assertEqual(out.getvalue(), '')
 
-    def test_persistent_failure_is_not_masked_by_healthy_lane_event(self):
+    def test_persistent_failure_keeps_new_healthy_lane_order_pending(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', WATCH_DIR=directory):
             path = Path(directory)/'noon-discovery.json'
             since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).isoformat()
@@ -174,10 +190,86 @@ class DiscoveryTests(unittest.TestCase):
             with self.readers(results), contextlib.redirect_stdout(io.StringIO()) as out:
                 with self.assertRaises(SystemExit):
                     discovery.main()
-            self.assertIn('FNEW', out.getvalue())
+            self.assertEqual(out.getvalue(), '')
+            self.assertEqual(json.loads(path.read_text())['food']['pending'],
+                             {'FNEW': {'last_fire': 0, 'fires': 0}})
             run = json.loads((Path(directory)/'noon-discovery-runs.jsonl').read_text())
             self.assertEqual(run['exit'], 1)
-            self.assertEqual(run['events'], 1)
+            self.assertEqual(run['events'], 0)
+
+    def test_new_order_survives_seven_failed_checks_and_fires_on_recovery(self):
+        now = dt.datetime(2026, 11, 22, 12, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', WATCH_DIR=directory), \
+                patch.object(discovery.dt, 'datetime', wraps=dt.datetime) as clock, \
+                patch.object(discovery.time, 'time') as timestamp:
+            path = Path(directory)/'noon-discovery.json'
+            since = (now - dt.timedelta(hours=3)).isoformat()
+            path.write_text(json.dumps({'food': {'seen': ['FOLD'], 'pending': {}, 'gave_up': ['FPAST']},
+                'lanes': {'minutes': {'ok_at': None, 'fail_count': 5, 'failing_since': since}}}))
+            results = {'minutes': discovery.core.NoonError('OFFLINE'),
+                       'food': {'ok': True, 'orders': [{'order': 'FOLD'}, {'order': 'FNEW'}]}}
+            for attempt in range(7):
+                clock.now.return_value = now + dt.timedelta(minutes=attempt * 10)
+                timestamp.return_value = clock.now.return_value.timestamp()
+                with self.readers(results), contextlib.redirect_stdout(io.StringIO()) as out:
+                    with self.assertRaises(SystemExit):
+                        discovery.main()
+                saved = json.loads(path.read_text())
+                self.assertIn('FNEW', saved['food']['seen'])
+                self.assertEqual(saved['food']['pending'], {'FNEW': {'last_fire': 0, 'fires': 0}})
+                self.assertEqual(saved['food']['gave_up'], ['FPAST'])
+                self.assertEqual(out.getvalue(), '')
+            with self.readers(), contextlib.redirect_stdout(io.StringIO()) as out:
+                discovery.main()
+            events = json.loads(out.getvalue().split(': ', 1)[1])
+            self.assertEqual(events, [{'order': 'FNEW', 'service': 'food'}])
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved['food']['pending']['FNEW']['fires'], 1)
+            self.assertEqual(saved['food']['pending']['FNEW']['last_fire'], timestamp.return_value)
+            self.assertEqual(saved['food']['gave_up'], ['FPAST'])
+            runs = [json.loads(line) for line in (Path(directory)/'noon-discovery-runs.jsonl').read_text().splitlines()]
+            self.assertEqual([(run['exit'], run['events']) for run in runs], [(1, 0)] * 7 + [(0, 1)])
+
+    def test_existing_retry_forms_are_unchanged_on_failed_runs_then_fire_on_recovery(self):
+        now = dt.datetime(2026, 11, 22, 12, tzinfo=dt.timezone.utc)
+        forms = [('legacy', 1000.5), ('first', {'last_fire': 1000, 'fires': 0}),
+                 ('last_normal', {'last_fire': 1000, 'fires': 5}),
+                 ('persistent', {'last_fire': 1000, 'fires': 6})]
+        for failure in ('all', 'persistent_other_lane', 'persistent_and_own_lane'):
+            for label, pending in forms:
+                with self.subTest(failure=failure, pending=label), tempfile.TemporaryDirectory() as directory, \
+                        patch.dict('os.environ', WATCH_DIR=directory), \
+                        patch.object(discovery.dt, 'datetime', wraps=dt.datetime) as clock, \
+                        patch.object(discovery.time, 'time') as timestamp:
+                    clock.now.return_value = now
+                    timestamp.return_value = now.timestamp()
+                    path = Path(directory)/'noon-discovery.json'
+                    baseline = {'seen': ['FNEW'], 'pending': {'FNEW': pending}, 'gave_up': ['FPAST']}
+                    path.write_text(json.dumps({'food': baseline, 'lanes': {'minutes': {
+                        'ok_at': None, 'fail_count': 5,
+                        'failing_since': (now - dt.timedelta(hours=3)).isoformat()}}}))
+                    failed_lanes = (('minutes', 'marketplace', 'food', 'nownow') if failure == 'all'
+                                    else ('minutes', 'food') if failure == 'persistent_and_own_lane'
+                                    else ('minutes',))
+                    with self.readers({lane: discovery.core.NoonError('OFFLINE') for lane in failed_lanes}), \
+                            contextlib.redirect_stdout(io.StringIO()) as out:
+                        with self.assertRaises(SystemExit):
+                            discovery.main()
+                    self.assertEqual(json.loads(path.read_text())['food'], baseline)
+                    self.assertEqual(out.getvalue(), '')
+                    with self.readers(), contextlib.redirect_stdout(io.StringIO()) as out:
+                        discovery.main()
+                    event = {'order': 'FNEW', 'service': 'food'}
+                    if label == 'persistent':
+                        event['persistent'] = True
+                    self.assertEqual(json.loads(out.getvalue().split(': ', 1)[1]), [event])
+                    saved = json.loads(path.read_text())['food']
+                    if label == 'persistent':
+                        self.assertEqual(saved['pending'], {})
+                        self.assertEqual(saved['gave_up'], ['FPAST', 'FNEW'])
+                    else:
+                        self.assertEqual(saved['pending']['FNEW']['fires'], 6 if label == 'last_normal' else 1)
+                        self.assertEqual(saved['pending']['FNEW']['last_fire'], now.timestamp())
 
     def test_all_readers_get_twenty_second_budgets(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', WATCH_DIR=directory), \
@@ -238,7 +330,7 @@ class DiscoveryTests(unittest.TestCase):
             self.assertFalse((Path(directory)/'noon-discovery.json').exists())
             self.assertFalse((Path(directory)/'noon-discovery-runs.jsonl').exists())
 
-    def test_failed_reader_still_emits_pending_registration(self):
+    def test_all_failed_readers_keep_pending_registration_for_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/'noon-discovery.json'
             path.write_text(json.dumps({'food': {'seen': ['F1'], 'pending': {'F1': 0}}}))
@@ -250,8 +342,11 @@ class DiscoveryTests(unittest.TestCase):
                     patch.object(discovery, 'registered', return_value=False), contextlib.redirect_stdout(out):
                 with self.assertRaises(SystemExit):
                     discovery.main()
-            self.assertIn('F1', out.getvalue())
-            self.assertEqual(json.loads(path.read_text())['food']['seen'], ['F1'])
+            self.assertEqual(out.getvalue(), '')
+            state = json.loads(path.read_text())['food']
+            self.assertEqual(state['seen'], ['F1'])
+            self.assertEqual(state['pending'], {'F1': 0})
+            self.assertEqual(state['gave_up'], [])
 
     def test_baseline_retry_and_registration(self):
         state = {}
