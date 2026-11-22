@@ -51,6 +51,7 @@ const ENUMS: Record<string, readonly string[]> = {
   action: ["requeued", "in_turn"], leaderKind: ["human", "wake", "reset", "background", "none"],
   telegram: ["sent", "failed"], severity: ["warn"],
   replyMode: ["final", "tool"], reason: ["watchdog_overdue", "respond_failed", "steer_failed", "background_no_reply", "turn_failed", "background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal", "grace", "not-waiting", "already-sent", "rate-limited"],
+  attribution: ["explicit", "active_turn", "none"],
   source: ["live", "backfill", "watch", "settle_preceding"], outcome: ["replied", "failed", "refused", "no_reply", "ok", "fallback", "forwarded", "quiet", "owner_typed", "incomplete"],
   cardKind: ["quick", "delivery", "ride", "nutrition", "secure_form", "other"], phase: ["start", "stop"],
   method: ["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -80,6 +81,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (entry.name === "turn.retry_skipped" && key === "reason" && value === "reply_already_sent") { props[key] = value; continue; }
     if (WAKE_EVENTS.has(entry.name)) {
       if (key === "source" && typeof value === "string" && value.length <= 100 && !/[\x00-\x1f\x7f-\x9f]/.test(value)
         || key === "causeKey" && typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,100}$/.test(value)

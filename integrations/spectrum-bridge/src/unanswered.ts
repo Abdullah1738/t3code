@@ -179,15 +179,15 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
     });
     // A late delivery can win before dispatch starts the watchdog retry. Retire only whole,
     // still-pending batches; a retry already submitted to the backend keeps its lifecycle.
-    const queuedRetries = new Set(rows.filter(({ id, state, input }) => state === "pending"
-      && input.unanswered?.requeuedAt !== undefined && store.get(`human-own-turn:${id}`)
+    const queuedRetries = new Set(rows.filter(({ id, state }) => state === "pending"
+      && store.get(`human-own-turn:${id}`)
       && sealedBatch(store, id).members.every(member => covered.has(member))).map(row => row.id));
     for (const { id, state, input } of rows) {
       // Explicit reply coverage also settles older normalized rows without a source field.
       if (state === "cancelled" || state === "observed"
         || !humanInput(input) && !(input.source === undefined && input.id === id && Array.isArray(input.attachments))) continue;
       const retryAnswered = (state === "pending" || state === "batched") && queuedRetries.has(sealedBatch(store, id).leader);
-      const nextState = state === "admitted" || retryAnswered ? "done" : state;
+      const nextState = state === "admitted" || state === "failed" || retryAnswered ? "done" : state;
       if (input.answeredAt !== undefined) {
         if (nextState !== state) store.updateInbound(id, nextState);
         continue;

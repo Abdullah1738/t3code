@@ -1,4 +1,4 @@
-import { deliveredReplyCoverage, humanRow, markControlAcked, markAnswered, type AnsweredInput } from "./unanswered.ts";
+import { deliveredReplyCoverage, humanRow, markControlAcked, markAnswered, turnMembers, type ReplyTurn, type AnsweredInput } from "./unanswered.ts";
 import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
@@ -8,7 +8,8 @@ const steerSourceKey = (sessionId: string, generation: number, inboundId: string
   `steer-reply-source:${createHash("sha256").update(JSON.stringify([sessionId, generation, inboundId])).digest("hex")}`;
 
 export type FileAttachment = { sha256: string; name: string; mimeType: string; size: number };
-export type ReplyAttribution = { inboundId?: string; covered?: string[] };
+export type ReplyAttribution = { inboundId?: string; covered?: string[]; attribution?: "explicit" | "active_turn" | "none" };
+export const RECENT_REPLY_TURN_MS = 5 * 60_000;
 export type OutboxPoll = { title: string; options: string[] };
 export type OutboxApp = {
   url: string; caption: string; subcaption?: string; trailingCaption?: string; trailingSubcaption?: string; summary?: string;
@@ -200,11 +201,23 @@ export class Store {
   }
 
   replyAttribution(sessionId?: string, generation?: number): ReplyAttribution & { covered: string[] } {
-    const turn = this.get<{ id: string; generation: number; covered?: string[]; inboundId?: string; replyInboundId?: string } | null>("activeTurn");
-    if (!turn || turn.id !== sessionId || turn.generation !== generation) return { covered: [] };
-    const root = turn.inboundId && !/^(wake:|reset:|secret:)/.test(turn.inboundId) ? turn.inboundId : undefined;
-    const members = root ? this.get<{ batchIds?: string[] }>(`batch:${root}`)?.batchIds ?? [root] : [];
-    return { inboundId: turn.replyInboundId ?? turn.inboundId, covered: [...new Set([...members, ...turn.covered ?? []])] };
+    const active = this.get<ReplyTurn & { replyInboundId?: string } | null>("activeTurn");
+    const recent = this.get<{ turn: ReplyTurn & { replyInboundId?: string }; at: number }>("recentReplyTurn");
+    const live = active && active.id === sessionId && active.generation === generation;
+    // A restart continuation may replace the failed human turn with a background turn before its CLI reply arrives.
+    const turn = live && (active.inboundId || turnMembers(this, active).some(humanRow)) ? active
+      : recent && recent.turn.id === sessionId && recent.turn.generation === generation
+        && Date.now() >= recent.at && Date.now() - recent.at <= RECENT_REPLY_TURN_MS ? recent.turn : undefined;
+    if (!turn) return { covered: [], attribution: "none" };
+    const covered = turnMembers(this, turn).filter(id => humanRow(id) && (turn === active || !!this.db.query(`SELECT 1 FROM inbound
+      WHERE id = ? AND json_extract(payload, '$.answeredAt') IS NULL AND state NOT IN ('cancelled', 'observed')`).get(id)));
+    const source = turn.replyInboundId ?? turn.inboundId;
+    return { inboundId: turn === active ? source ?? covered[0] : source && covered.includes(source) ? source : covered[0], covered,
+      attribution: source || covered.length ? "active_turn" : "none" };
+  }
+
+  rememberReplyTurn(turn: ReplyTurn & { replyInboundId?: string }): void {
+    if (turnMembers(this, turn).some(humanRow)) this.set("recentReplyTurn", { turn, at: Date.now() });
   }
 
   enqueue(op: OutboxOperation, attribution?: ReplyAttribution): boolean {
@@ -225,18 +238,18 @@ export class Store {
       const result = this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
         ON CONFLICT(id) DO NOTHING`).run(op.id, payload);
       if (result.changes) {
+        const source = attribution ?? this.replyAttribution(op.sessionId, op.generation);
         this.set(`reply-covered:${op.id}`, (attribution?.covered ?? [...new Set([
-          ...this.replyAttribution(op.sessionId, op.generation).covered,
+          ...source.covered ?? [],
           ...(op.replyTo ? this.get<{ batchIds?: string[] }>(`batch:${op.replyTo}`)?.batchIds ?? [op.replyTo] : []),
         ])]).filter(humanRow));
         if (op.kind === "control" && !op.answersInbound) deliveredReplyCoverage(this, op);
         if (op.app?.updateOf) this.set(`app-latest:${op.app.updateOf}`, op.id);
         toolLog.capture(() => {
           this.set(`log-queued:${op.id}`, Date.now());
-          const turn = this.get<{ id: string; inboundId?: string; replyInboundId?: string } | null>("activeTurn");
           // The quote may target a later batch member; correlation follows the turn that caused the send.
-          let inboundId = attribution ? attribution.inboundId
-            : (turn && turn.id === op.sessionId ? turn.replyInboundId ?? turn.inboundId : undefined) ?? op.replyTo;
+          let inboundId = source.inboundId ?? op.replyTo;
+          this.set(`log-attribution:${op.id}`, source.inboundId ? source.attribution ?? "explicit" : op.replyTo ? "explicit" : "none");
           if (inboundId && op.sessionId && op.generation !== undefined) {
             inboundId = this.get<string>(steerSourceKey(op.sessionId, op.generation, inboundId)) ?? inboundId;
           }
