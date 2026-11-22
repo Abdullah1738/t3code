@@ -134,7 +134,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   let api: ((request: Request) => Promise<Response>) | undefined;
   const releaseLock = acquireLock(join(stateRoot, "bridge.lock"));
   process.once("exit", releaseLock);
-  startRobobLinkAlerts();
+  startRobobLinkAlerts(socketPost(telegramBridgeSocket, 5_000));
   const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }));
   loopStalls.start();
   process.once("exit", () => loopStalls.stop());

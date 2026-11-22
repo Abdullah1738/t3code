@@ -1,8 +1,7 @@
 import { RobobLinkDown } from "./robob-link-gate.ts";
 import { cleanRosterHealth, createRosterAggregation, ROSTER_ACTIONS } from "./log-active-roster.ts";
 import { homedir } from "node:os";
-import { stateRoot, telegramBridgeSocket } from "./config.ts";
-import { socketPost } from "./telegram-fallback.ts";
+import { stateRoot } from "./config.ts";
 import { createRobobLinkAlert, type LinkAlertOptions } from "./robob-link-alert.ts";
 import { probeDeferred } from "./probe-policy.ts";
 import { safeLineFailureCode, sendblueErrorKey } from "./line.ts";
@@ -585,12 +584,12 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
 
 export const toolLog = createToolLog({ defer: true });
 /** Called only by a serve loop after it holds bridge.lock; CLI log readers cannot own alert state. */
-export function startRobobLinkAlerts(): void {
+export function startRobobLinkAlerts(post: LinkAlertOptions["post"]): void {
   toolLog.capture(() => {
     logDirectory("imessage");
     // Isolated log fixtures must never read live alert state or contact Telegram.
     if (process.env.TOOLLOG_DIR) return;
-    toolLog.startLinkAlerts({ root: stateRoot, post: socketPost(telegramBridgeSocket, 5_000), holdPath: join(homedir(), ".robob/install-hold.json") });
+    toolLog.startLinkAlerts({ root: stateRoot, post, holdPath: join(homedir(), ".robob/install-hold.json") });
   });
 }
 /** Cooperative read yielding is expected control flow, not a backend failure. */
