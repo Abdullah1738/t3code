@@ -77,11 +77,15 @@ captured, with no recovery actions. Healthy ticks run no samples or log queries.
 prompts, attributed processes and launchd labels, the three largest subjects,
 request rates from sandboxd msgID deltas, bounded raw log receipts (including
 truncation flags), recovery receipts and every notification
-attempt (full text, key and exit code). Per-subject rates estimate the share of
-the msgID rate; ambiguous shared-interpreter PIDs cannot select a flood target.
-The observed subject count over 60 seconds must also exceed 50/s before recovery,
-with new request progress on consecutive ticks; sequence gaps
-alone can include unrelated services. Attribution older than the target's process
+attempt (full text, key and exit code). Raw excerpts are limited to 2 MB; analysis
+streams up to 32 MB / 32,768 requests with a separate five-second deadline.
+An exhausted analysis budget or failed query allows evidence only. Flood recovery
+requires >50/s over the full 60-second window and new progress on consecutive ticks.
+It counts observed subjects or msgID deltas between nearby requests with matching
+service, subject and PID attribution covering at least 30 distinct seconds. This tolerates
+dropped log records; unknown or mixed-service/subject/PID records break inferred
+attribution. Ambiguous shared-interpreter PIDs cannot select a flood target.
+Attribution older than the target's process
 birth is rejected, and outstanding prompts survive the 60-second log window.
 Recovery first removes leftover askers, then suspends a nonprotected flooder
 after two >50 req/s observations. Continued flooding unloads its verified

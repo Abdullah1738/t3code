@@ -422,6 +422,156 @@ class LadderTests(unittest.TestCase):
             self.assertEqual(self.recover(diag)[0], [])
 
 
+class CaptureTests(unittest.TestCase):
+    end = datetime.datetime.fromisoformat("2026-11-18T12:00:00+00:00").timestamp()
+
+    def log(self, count=3500, stride=1, drop=None, mixed=None, span=59, age=0, offsets=None):
+        base = (Path(__file__).parent / "fixtures/tccd-prompt.txt").read_text().splitlines()[:4]
+        lines = []
+        for index, sequence in enumerate(range(0, count, stride)):
+            moment = self.end + offsets[index] if offsets is not None else self.end - age - span + sequence * span / count
+            timestamp = datetime.datetime.fromtimestamp(moment,
+                                                       datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f%z")
+            for line in base:
+                if drop and index % 5 == 0 and drop in line:
+                    continue
+                line = line.split(" ", 2)[2].replace("174.190", "174.%s" % sequence)
+                line = line.replace("/Volumes/ExternalSSD/migrated/hermes/node/bin/node", "/opt/homebrew/bin/ollama")
+                line = line.replace("pid=13183", "pid=739")
+                if mixed and index % 2:
+                    if mixed == "service":
+                        line = line.replace("kTCCServiceSystemPolicyRemovableVolumes", "kTCCServiceCamera")
+                    elif mixed == "subject":
+                        line = line.replace("/opt/homebrew/bin/ollama", "/opt/another")
+                    elif mixed == "tccd":
+                        line = line.replace("tccd[432]", "tccd[999]")
+                    else:
+                        line = line.replace("pid=739", "pid=740")
+                lines.append(timestamp + " " + line + "\n")
+        return "".join(lines).encode()
+
+    def diagnose(self, raw, code=0):
+        class Child:
+            def __init__(self, argv, **kwargs):
+                kwargs["stdout"].write(raw if argv == tcc.LOG_COMMAND else b"432" if "pgrep" in argv[0] else b"")
+
+            def wait(self, timeout):
+                if code is None:
+                    raise subprocess.TimeoutExpired("fixture", timeout)
+                return code
+
+            def kill(self):
+                pass
+
+        with patch.object(tcc.subprocess, "Popen", Child), \
+                patch.object(tcc, "identity", side_effect=lambda pid: proc(432, tcc.TCCD) if pid == 432 else proc(pid)), \
+                patch.object(tcc, "ancestry", side_effect=lambda p: [p]), \
+                patch.object(tcc, "jobs", return_value={739: "sh.brew.ollama"}), \
+                patch.object(tcc, "installed", return_value={"sh.brew.ollama": "/fixture/ollama.plist"}):
+            return tcc.diagnose(Path("/synthetic"), 174, now=self.end)
+
+    def test_complete_floods_beyond_raw_excerpt_select_stop_through_real_capture(self):
+        for count in (3500, 13800):
+            with self.subTest(requests=count):
+                raw = self.log(count=count)
+                self.assertGreater(len(raw), tcc.LOG_EXCERPT_BYTES)
+                diag = self.diagnose(raw)
+                self.assertTrue(diag["logs"]["stdout_truncated"])
+                self.assertEqual(diag["logs"]["analysis_bytes"], len(raw))
+                self.assertTrue(diag["logs"]["analysis_complete"])
+                self.assertLessEqual(len(diag["logs"]["stdout"].encode()), tcc.LOG_EXCERPT_BYTES)
+                self.assertEqual(diag["log_exit_code"], 0)
+                self.assertEqual(diag["top_subjects"][0]["count"], count)
+                self.assertEqual(diag["flood"]["process"]["pid"], 739)
+                state = dict(flood_ticks=2, prompt_ticks=0)
+                with patch.object(tcc, "safe_action", return_value={"ok": True}) as action:
+                    tcc.recover(Path("/synthetic"), state, diag, self.end, Mock())
+                self.assertEqual(action.call_args.args[2], "SIGSTOP")
+
+    def test_dropped_request_and_line_input_class(self):
+        # Whole-request drops and missing individual event forms must not turn
+        # sustained, unambiguous counter progress into a low observed rate.
+        for missing in (None, "AUTHREQ_CTX", "AUTHREQ_SUBJECT", "AUTHREQ_ATTRIBUTION", "AUTHREQ_RESULT"):
+            with self.subTest(missing=missing):
+                diag = self.diagnose(self.log(count=13800, stride=10, drop=missing))
+                top = diag["top_subjects"][0]
+                self.assertLess(top["observed_rate"], 50)
+                self.assertGreater(top["recovery_rate"], 50)
+                self.assertGreaterEqual(top["sequence_coverage_seconds"], 30)
+                self.assertEqual(diag["flood"]["process"]["pid"], 739)
+
+    def test_mixed_service_subject_and_pid_break_inferred_flood_attribution(self):
+        for mixed in ("service", "subject", "pid", "tccd"):
+            with self.subTest(mixed=mixed):
+                diag = self.diagnose(self.log(count=13800, stride=10, mixed=mixed))
+                self.assertIsNone(diag["flood"])
+                self.assertLess(diag["top_subjects"][0]["recovery_rate"], 50)
+
+    def test_sparse_counter_endpoints_and_short_or_aged_bursts_do_not_infer_a_flood(self):
+        forms = (dict(count=13800, stride=13799), dict(count=13800, stride=10, span=.01),
+                 dict(count=13800, stride=10, age=40))
+        for form in forms:
+            with self.subTest(form=form):
+                diag = self.diagnose(self.log(**form))
+                self.assertIsNone(diag["flood"])
+                self.assertLess(diag["top_subjects"][0]["recovery_rate"], 50)
+
+    def test_unknown_attribution_records_break_counter_intervals(self):
+        raw = self.log(count=13800, stride=10).decode()
+        lines = []
+        for line in raw.splitlines():
+            lines.append(line)
+            if "AUTHREQ_RESULT" in line:
+                sequence = int(line.split("msgID=174.", 1)[1].split(",", 1)[0]) + 1
+                lines.append(line.split(" tccd[", 1)[0] + " tccd[432] REQUEST: msgID=174.%s" % sequence)
+        diag = self.diagnose("\n".join(lines).encode())
+        self.assertIsNone(diag["flood"])
+        self.assertEqual(diag["top_subjects"][0]["sequence_rate"], 0)
+
+    def test_timestamp_interval_input_class_counts_wall_time_once(self):
+        cases = (("repeated", [-20, -16] * 8 + [-20], 4, False),
+                 ("nested", [-20, -16, -19, -17] * 8 + [-20], 4, False),
+                 ("overlapping", [t for i in range(9) for t in (-40 + 2 * i, -36 + 2 * i)], 20, False),
+                 ("touching", list(range(-40, -7, 4)), 32, True))
+        for name, offsets, coverage, flood in cases:
+            for extra_request in (False, True):
+                times = offsets + [offsets[-1]] if extra_request else offsets
+                with self.subTest(form=name, new_progress=extra_request):
+                    diag = self.diagnose(self.log(count=len(times) * 1000, stride=1000, offsets=times))
+                    top = diag["top_subjects"][0]
+                    self.assertEqual(top["sequence_coverage_seconds"], coverage)
+                    self.assertEqual(diag["flood"] is not None, flood)
+                    if not flood:
+                        with patch.object(tcc, "safe_action") as action:
+                            self.assertEqual(tcc.recover(Path("/synthetic"), dict(flood_ticks=2, prompt_ticks=0),
+                                                         diag, self.end, Mock())[0], [])
+                        action.assert_not_called()
+
+    def test_partial_analysis_or_failed_capture_cannot_authorize_recovery(self):
+        raw = self.log()
+        for limit, value in (("LOG_ANALYSIS_BYTES", 1024), ("LOG_REQUEST_LIMIT", 3), ("LOG_LINE_BYTES", 80)):
+            with self.subTest(limit=limit), patch.object(tcc, limit, value):
+                diag = self.diagnose(raw)
+                self.assertFalse(diag["logs"]["analysis_complete"])
+                self.assertIsNone(diag["log_exit_code"])
+                with patch.object(tcc, "safe_action") as action:
+                    self.assertEqual(tcc.recover(Path("/synthetic"), dict(flood_ticks=2), diag, self.end, Mock())[0], [])
+                action.assert_not_called()
+        for code in (None, 1):
+            with self.subTest(exit_code=code):
+                diag = self.diagnose(raw, code=code)
+                with patch.object(tcc, "safe_action") as action:
+                    self.assertEqual(tcc.recover(Path("/synthetic"), dict(flood_ticks=2), diag, self.end, Mock())[0], [])
+                action.assert_not_called()
+
+    def test_analysis_deadline_is_separate_from_subprocess_timeout(self):
+        raw = self.log(count=3)
+        with patch.object(tcc.time, "monotonic", side_effect=[0, 6]):
+            diag = self.diagnose(raw)
+        self.assertFalse(diag["logs"]["analysis_complete"])
+        self.assertIsNone(diag["log_exit_code"])
+
+
 class ProcessTests(unittest.TestCase):
     def test_partial_prompt_records_keep_cached_accessing_and_responsible_roles(self):
         text = (Path(__file__).parent / "fixtures/tccd-prompt.txt").read_text()
@@ -432,7 +582,7 @@ class ProcessTests(unittest.TestCase):
             partial = "\n".join(line for line in text.splitlines() if "174.226" in line and marker in line)
             def identity(pid):
                 return proc(432, tcc.TCCD) if pid == 432 else None if pid == 25862 else proc(pid, pending[0]["path"])
-            def run(argv, timeout):
+            def run(argv, timeout, **kwargs):
                 stdout = partial if argv[0] == "/usr/bin/log" else "432" if "pgrep" in argv[0] else "CFUserNotificationReceiveResponse" if "sample" in argv[0] else ""
                 return dict(exit_code=1 if argv[:2] == ["/bin/ps", "-p"] else 0, stdout=stdout, stderr="")
             with self.subTest(form=name), patch.object(tcc, "run", side_effect=run), \
@@ -448,7 +598,7 @@ class ProcessTests(unittest.TestCase):
         attribution = next(line for line in text.splitlines() if "AUTHREQ_ATTRIBUTION" in line and "174.226" in line)
         pending = tcc.parse_log(prompt_line, 174)["prompts"]
         self.assertEqual(set(pending[0]["pids"]), {"responsible"})
-        def run(argv, timeout):
+        def run(argv, timeout, **kwargs):
             stdout = attribution if argv[0] == "/usr/bin/log" else "432" if "pgrep" in argv[0] else ""
             return dict(exit_code=0, stdout=stdout, stderr="")
         with patch.object(tcc, "run", side_effect=run), patch.object(tcc, "identity", return_value=None), \
@@ -478,7 +628,7 @@ class ProcessTests(unittest.TestCase):
                       prefix + "AUTHREQ_SUBJECT: msgID=174.%s, subject=/opt/homebrew/bin/ollama," % index]
         lines.append(prefix + "AUTHREQ_ATTRIBUTION: msgID=174.3009, attribution={accessing={pid=739, binary_path=/opt/homebrew/bin/ollama},},")
         text = "\n".join(lines)
-        def run(argv, timeout):
+        def run(argv, timeout, **kwargs):
             stdout = text if argv[0] == "/usr/bin/log" else "432" if "pgrep" in argv[0] else ""
             return dict(exit_code=0, stdout=stdout, stderr="", stdout_truncated=False)
         with patch.object(tcc, "run", side_effect=run), \
@@ -519,7 +669,7 @@ class ProcessTests(unittest.TestCase):
             if pid == 432:
                 return proc(432, tcc.TCCD)
             return proc(pid, "/opt/homebrew/Cellar/node/26.13.0_2/bin/node")
-        def run(argv, timeout):
+        def run(argv, timeout, **kwargs):
             stdout = "432" if "pgrep" in argv[0] else "CFUserNotificationReceiveResponse" if "sample" in argv[0] else ""
             return dict(exit_code=0, stdout=stdout, stderr="", stdout_truncated=False)
         with patch.object(tcc, "run", side_effect=run), patch.object(tcc, "identity", side_effect=identity), \
@@ -541,7 +691,7 @@ class ProcessTests(unittest.TestCase):
         for second, sequence in (("00", 100), ("10", 2400)):
             text += ("2026-11-18 11:10:%s+0400 tccd[432] AUTHREQ_CTX: msgID=174.%s, service=kTCCServiceSystemPolicyRemovableVolumes,\n" % (second, sequence)
                      + "2026-11-18 11:10:%s+0400 tccd[432] AUTHREQ_SUBJECT: msgID=174.%s, subject=/opt/homebrew/bin/ollama,\n" % (second, sequence))
-        def run(argv, timeout):
+        def run(argv, timeout, **kwargs):
             stdout = text if argv[0] == "/usr/bin/log" else "432" if "pgrep" in argv[0] else ""
             return dict(exit_code=0, stdout=stdout, stderr="receipt", stdout_truncated=False)
         with patch.object(tcc, "run", side_effect=run), patch.object(tcc, "identity", return_value=None), \

@@ -23,12 +23,16 @@ DENIED_LABELS = frozenset({"com.ardud.robob", "com.ardud.robob-server", "com.ard
 ARTIFACT = ".robob/board-artifacts/launchd-ssd-open-1117/actions.ndjson"
 LOG_COMMAND = ["/usr/bin/log", "show", "--last", "60s", "--style", "compact",
                "--info", "--debug", "--predicate", 'process == "tccd"']
+LOG_EXCERPT_BYTES = 2_000_000
+LOG_ANALYSIS_BYTES = 32_000_000
+LOG_REQUEST_LIMIT = 32768
+LOG_LINE_BYTES = 16384
 PROTECTED = re.compile(
     r"/Applications/|/System/|/usr/libexec/|(?:^|[/\s])(?:Robob|robob|opencode|codex|claude|cursor|grok|antigravity)(?:[/\s.\-]|$)"
     r"|apps/server/(?:dist|src)/|opencode\d*(?:/|\s)|opencode-service|provider[-_]session|\bagy\b", re.I)
 
 
-def run(argv, timeout=5, env=None):
+def run(argv, timeout=5, env=None, analyze=None):
     """No shell expansion; every process operation has its own deadline."""
     try:
         # Pipes + run(timeout) can wait forever after killing a kernel-stuck
@@ -42,11 +46,16 @@ def run(argv, timeout=5, env=None):
                 code = None
             out.seek(0)
             err.seek(0)
-            raw_out, raw_err = out.read(2_000_001), err.read(4097)
-            return dict(argv=argv, exit_code=code,
-                        stdout=raw_out[:2_000_000].decode("utf-8", "replace"),
+            analysis = analyze(iter(lambda: out.readline(LOG_LINE_BYTES + 1), b"")) if analyze else None
+            out.seek(0)
+            raw_out, raw_err = out.read(LOG_EXCERPT_BYTES + 1), err.read(4097)
+            receipt = dict(argv=argv, exit_code=code,
+                        stdout=raw_out[:LOG_EXCERPT_BYTES].decode("utf-8", "replace"),
                         stderr=raw_err[:4096].decode("utf-8", "replace") or ("timeout" if code is None else ""),
-                        stdout_truncated=len(raw_out) > 2_000_000, stderr_truncated=len(raw_err) > 4096)
+                        stdout_truncated=len(raw_out) > LOG_EXCERPT_BYTES, stderr_truncated=len(raw_err) > 4096)
+            if analyze:
+                receipt["analysis"] = analysis
+            return receipt
     except (OSError, subprocess.SubprocessError) as error:
         return dict(argv=argv, exit_code=None, stdout="", stderr=type(error).__name__)
 
@@ -118,16 +127,30 @@ def inventory():
 
 
 def parse_log(text, sandbox_pid, tccd_pid=None, window_end=None):
-    requests = {}
-    for line in text.splitlines():
+    requests, sequences, foreign = {}, set(), set()
+    complete, size = True, 0
+    deadline = time.monotonic() + 5
+    for raw_line in text.splitlines() if isinstance(text, str) else text:
+        size += len(raw_line)
+        if (size > LOG_ANALYSIS_BYTES or len(raw_line) > LOG_LINE_BYTES
+                or time.monotonic() >= deadline):
+            complete = False
+            break
+        line = raw_line.decode("utf-8", "replace") if isinstance(raw_line, bytes) else raw_line
         emitter = re.search(r"\btccd\[(\d+)(?:\]|:)", line)
-        if tccd_pid is not None and (not emitter or int(emitter[1]) != tccd_pid):
-            continue
         match = re.search(r"msgID=(\d+)\.(\d+)", line)
         if not match or int(match[1]) != sandbox_pid:
             continue
         key = match[0].split("=", 1)[1]
-        req = requests.setdefault(key, dict(msgID=key, sequence=int(match[2]), pids={}))
+        sequence = int(match[2])
+        if sequence not in sequences and len(sequences) >= LOG_REQUEST_LIMIT:
+            complete = False
+            break
+        sequences.add(sequence)
+        if tccd_pid is not None and (not emitter or int(emitter[1]) != tccd_pid):
+            foreign.add(sequence)
+            continue
+        req = requests.setdefault(key, dict(msgID=key, sequence=sequence, pids={}))
         if emitter:
             req["tccd_pid"] = int(emitter[1])
         timestamp = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)?)", line)
@@ -168,6 +191,34 @@ def parse_log(text, sandbox_pid, tccd_pid=None, window_end=None):
     timed = [r for r in requests if "time" in r]
     if window_end is None:
         window_end = max((r["time"] for r in timed), default=0)
+    # sandboxd's counter also covers requests routed to the root/other tccd.
+    # Those records, and records without timestamps, must interrupt inference.
+    own_sequences = {r["sequence"] for r in records}
+    ordered = sorted(records + [dict(sequence=n) for n in foreign - own_sequences], key=lambda r: r["sequence"])
+    deltas, coverage = collections.Counter(), collections.Counter()
+    intervals = collections.defaultdict(list)
+    for first, last in zip(ordered, ordered[1:]):
+        if not all("time" in r and window_end - 60 <= r["time"] <= window_end for r in (first, last)):
+            continue
+        path = first.get("path")
+        first_pids = {p["pid"] for p in first["pids"].values() if p["path"] == path}
+        last_pids = {p["pid"] for p in last["pids"].values() if p["path"] == path}
+        seconds = last["time"] - first["time"]
+        # Unknown/mixed-service records break attribution. Short gaps between
+        # matching, PID-attributed requests can include log drops; idle time is
+        # still charged to the full minute, never to the burst's short span.
+        if (path and last.get("path") == path and len(first_pids) == 1 and first_pids == last_pids
+                and first.get("service") == last.get("service") == "kTCCServiceSystemPolicyRemovableVolumes"
+                and 0 < seconds <= 5):
+            deltas[path] += last["sequence"] - first["sequence"]
+            intervals[path].append((first["time"], last["time"]))
+    # Delayed records can move backwards in time despite increasing msgIDs.
+    # Count covered wall time once, even when qualifying intervals overlap.
+    for path, spans in intervals.items():
+        finish = -math.inf
+        for start, end in sorted(spans):
+            coverage[path] += max(0, end - max(start, finish))
+            finish = max(finish, end)
     rate = 0
     if len(timed) >= 2:
         first, last = min(timed, key=lambda r: r["sequence"]), max(timed, key=lambda r: r["sequence"])
@@ -182,12 +233,18 @@ def parse_log(text, sandbox_pid, tccd_pid=None, window_end=None):
         # Count over the requested 60-second window, including quiet time. A
         # millisecond burst must not look sustained when replayed next tick.
         observed_rate = sum(window_end - 60 <= t <= window_end for t in times) / 60
+        sequence_rate = deltas[path] / 60
+        recovery_rate = max(observed_rate, sequence_rate if coverage[path] >= 30 else 0)
         top.append(dict(path=path, count=count, rate=rate * count / len(requests),
-                        observed_rate=observed_rate, last_time=max(times) if times else None,
+                        observed_rate=observed_rate, sequence_rate=sequence_rate,
+                        sequence_coverage_seconds=coverage[path], recovery_rate=recovery_rate,
+                        last_time=max(times) if times else None,
                         last_sequence=max(r["sequence"] for r in related),
                         pids=sorted(pids), share=count / len(requests)))
     prompts = [r for r in requests if r.get("prompting") and not r.get("result")]
-    return dict(top_subjects=top, request_rate=rate, rate_basis="sandboxd msgID delta; subject share estimated",
+    return dict(top_subjects=top, request_rate=rate,
+                rate_basis="sandboxd msgID delta; recovery uses observed count or consistently attributed deltas / 60s with >=30s coverage",
+                analysis_complete=complete, analysis_bytes=size,
                 records=records, results=results, prompts=sorted(prompts, key=lambda r: r["sequence"], reverse=True))
 
 
@@ -446,11 +503,18 @@ def recover(home, state, diagnosis, now, save):
 
 
 def diagnose(home, sandbox_pid, pending_prompts=(), now=None):
-    logs = run(LOG_COMMAND, 20)
     found = run(["/usr/bin/pgrep", "-u", USER, "-x", "tccd"], 2)
     pids = found["stdout"].split()
     pid = int(pids[0]) if found["exit_code"] == 0 and len(pids) == 1 and pids[0].isdigit() else None
-    parsed = parse_log(logs["stdout"], sandbox_pid, pid, window_end=now if now is not None else time.time())
+    end = now if now is not None else time.time()
+    # Keep a small raw receipt, but analyze beyond it: a 230/s flood produces
+    # roughly 12 MB in a minute. Parsing has separate byte/record/time bounds.
+    logs = run(LOG_COMMAND, 20, analyze=lambda lines: parse_log(lines, sandbox_pid, pid, window_end=end))
+    parsed = logs.pop("analysis", None)
+    analyzed_capture = parsed is not None
+    if parsed is None:
+        parsed = parse_log(logs["stdout"], sandbox_pid, pid, window_end=end)
+    logs.update(analysis_complete=parsed["analysis_complete"], analysis_bytes=parsed["analysis_bytes"])
     proc = identity(pid)
     sample = run(["/usr/bin/sample", str(pid), "1"], 5) if proc and not denied([proc], True) else None
     prompting = bool(sample and sample["exit_code"] == 0 and "CFUserNotificationReceiveResponse" in sample["stdout"])
@@ -473,7 +537,8 @@ def diagnose(home, sandbox_pid, pending_prompts=(), now=None):
         combined.pop(key, None)
     parsed["prompts"] = list(combined.values())
     job_list, plists = jobs(), installed(home)
-    incomplete = logs["exit_code"] != 0 or logs.get("stdout_truncated", False)
+    incomplete = (logs["exit_code"] != 0 or not parsed["analysis_complete"]
+                  or (logs.get("stdout_truncated", False) and not analyzed_capture))
     asker_unverified = incomplete or job_list is None or len(parsed["prompts"]) > 8
     candidates = []
     for req in parsed["prompts"][:8]:
@@ -491,9 +556,7 @@ def diagnose(home, sandbox_pid, pending_prompts=(), now=None):
     if parsed["top_subjects"]:
         top = parsed["top_subjects"][0]
         # Shared interpreters and mixed requesters cannot identify one offender.
-        # msgID gaps include other services and dropped records. Preserve that
-        # rate as evidence, but only observed subject throughput authorizes STOP.
-        if top["observed_rate"] > 50 and top["share"] > .5 and len(top["pids"]) == 1:
+        if top["recovery_rate"] > 50 and top["share"] > .5 and len(top["pids"]) == 1:
             flood = target(top["pids"][0], top["path"], job_list, plists, top["last_time"])
             if flood and flood not in candidates:
                 candidates.append(flood)
