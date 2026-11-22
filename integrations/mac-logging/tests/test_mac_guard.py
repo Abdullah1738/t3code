@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 import copy
 import datetime as dt
 import io
@@ -9,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +22,15 @@ import toollog
 
 NOW = 1794873600
 ROBOB = '/Applications/Robob.app/Contents/MacOS/Robob'
+
+
+def immediate_submit(fn):
+    future = Future()
+    try:
+        future.set_result(fn())
+    except BaseException as exc:
+        future.set_exception(exc)
+    return future
 
 
 def proc(pid, comm='burner', ppid=1, cpu=0, args=None, state='S', **kw):
@@ -46,6 +57,7 @@ class FakeHost:
         self.worker = dict(state='running')
         self.launches = {}
         self.lookups = []
+        self.initial_launches = {}
         self.sent_requests = set()
         self.checks = dict(pid=1, started=NOW-3600, hold=None, restart=False, install=False, building=[])
         self.apps = {}
@@ -114,10 +126,21 @@ class FakeHost:
 
     def worker_create(self, launch):
         request_id = launch['clientRequestId']
-        if request_id not in self.launches:
+        if request_id not in self.initial_launches:
             self.effects.append(('worker', launch['prompt']))
-            self.launches[request_id] = m.worker_thread_id(request_id)
+            self.initial_launches[request_id] = copy.deepcopy(launch)
+        self.launches[request_id] = m.worker_thread_id(request_id)
         return self.launches[request_id]
+
+    def worker_initial(self, launch):
+        return m.worker_thread_id(launch['clientRequestId']) if launch['clientRequestId'] in self.initial_launches else None
+
+    def worker_resume(self, launch):
+        request_id = launch['clientRequestId']
+        if request_id not in self.initial_launches:
+            self.effects.append(('safety', m.worker_thread_id(request_id), launch['prompt'], request_id))
+            self.initial_launches[request_id] = copy.deepcopy(launch)
+        return m.worker_thread_id(request_id)
 
     def diagnostic(self, path):
         self.effects.append(('diagnostic', str(path)))
@@ -132,7 +155,7 @@ class GuardTests(unittest.TestCase):
         self.events = []
         self.now = NOW
         self.guard = m.Guard(self.host, self.root/'state', self.root/'evidence', dry=False,
-                             logger=lambda c, k, n, **kw: self.events.append((n, kw['props'])), clock=lambda: self.now)
+                             logger=lambda c, k, n, **kw: self.events.append((n, kw['props'])), clock=lambda: self.now, worker_submit=immediate_submit)
 
     def tick(self, rows, footprints=None, **kw):
         rows = [dict(p) for p in rows]
@@ -456,7 +479,9 @@ class GuardTests(unittest.TestCase):
             self.tick([proc(10, 'codex')], {10: 200})
         request_id = self.guard.worker['launch']['clientRequestId']
         self.restart_guard()
-        self.tick([proc(11, 'codex')], {11: 200})
+        with patch.object(self.host, 'worker_create', side_effect=m.ProbeError('still slow')) as retry:
+            self.tick([proc(11, 'codex')], {11: 200})
+        retry.assert_not_called()
         self.assertEqual(len(self.effects('worker')), 1)
         self.assertEqual(self.guard.worker['threadId'], m.worker_thread_id(request_id))
         self.assertEqual(len(self.effects('steer')), 1)
@@ -477,49 +502,204 @@ class GuardTests(unittest.TestCase):
         self.assertIn('protected', self.effects('steer')[0][2])
         self.assertFalse(self.guard.worker.get('launchUnknown'))
 
-    def test_worker_partial_launch_replays_safety_prompt_before_steering_table(self):
-        for initial_accepted in (False, True):
-            for replay_fails in (False, True):
-                with self.subTest(initial_accepted=initial_accepted, replay_fails=replay_fails):
-                    case = GuardTests()
-                    case.setUp()
-                    try:
-                        create = case.host.worker_create
-                        def partial(launch):
-                            if initial_accepted:
-                                create(launch)
-                            else:
-                                case.host.launches[launch['clientRequestId']] = m.worker_thread_id(launch['clientRequestId'])
-                            raise m.ProbeError('partial launch')
-                        with patch.object(case.host, 'worker_create', side_effect=partial):
-                            case.tick([proc(10, 'codex')], {10: 200})
-                        launch = copy.deepcopy(case.guard.worker['launch'])
-                        case.restart_guard()
-                        case.now += 86400
-                        def replay(value):
-                            self.assertEqual(value, launch)
-                            self.assertIn('Agents and sessions are protected', value['prompt'])
-                            if replay_fails:
-                                raise m.ProbeError('initial acceptance still unknown')
-                            if not initial_accepted:
-                                case.host.effects.append(('worker', value['prompt']))
-                            return create(value)
-                        with patch.object(case.host, 'worker_create', side_effect=replay) as retry:
-                            case.tick([proc(11, 'codex')], {11: 200})
-                        retry.assert_called_once_with(launch)
-                        self.assertEqual(len(case.host.launches), 1)
-                        if replay_fails:
-                            self.assertFalse(case.effects('steer'))
-                            self.assertTrue(case.guard.worker['launchUnknown'])
-                            self.assertEqual(case.guard.worker['launch'], launch)
-                            case.restart_guard()
-                            self.assertEqual(case.guard.worker['launch'], launch)
-                        else:
-                            self.assertEqual(len(case.effects('worker')), 1)
-                            self.assertEqual(len(case.effects('steer')), 1)
-                            self.assertFalse(case.guard.worker.get('launchUnknown'))
-                    finally:
-                        case.doCleanups()
+    def test_worker_lookup_found_adopts_without_reposting(self):
+        launch = dict(clientRequestId='mac-guard-existing', prompt='original safety prompt')
+        self.guard.worker = dict(launchUnknown=True, launch=launch, startedAt=NOW)
+        self.host.launches[launch['clientRequestId']] = m.worker_thread_id(launch['clientRequestId'])
+        with patch.object(self.host, 'worker_create') as create:
+            self.tick([], load=0)
+        create.assert_not_called()
+        self.assertEqual(self.guard.worker['threadId'], m.worker_thread_id(launch['clientRequestId']))
+        self.assertEqual(self.events_named('worker_spawned')[-1]['result'], 'adopted')
+
+    def test_partial_launch_retains_safety_until_acceptance_table(self):
+        for report in (False, True):
+            for accepted in (False, True):
+                for recovery_failure in (None, 'before', 'after'):
+                    for calm in (False, True):
+                        with self.subTest(report=report, accepted=accepted, failure=recovery_failure, calm=calm):
+                            case = GuardTests()
+                            case.setUp()
+                            try:
+                                create = case.host.worker_create
+                                def partial(launch):
+                                    if accepted:
+                                        create(launch)
+                                    else:
+                                        case.host.launches[launch['clientRequestId']] = m.worker_thread_id(launch['clientRequestId'])
+                                    raise m.WorkerControlError('timeout')
+                                if report:
+                                    case.host.checks = dict(unavailable='disabled')
+                                with patch.object(case.host, 'worker_create', side_effect=partial):
+                                    case.tick([proc(1, ROBOB)] if report else [proc(10, 'codex')],
+                                              {1: 25} if report else {10: 200})
+                                launch = copy.deepcopy(case.guard.worker['launch'])
+                                case.restart_guard()
+                                method = 'worker_initial' if accepted else 'worker_resume'
+                                initial = getattr(case.host, method)
+                                def recover(value):
+                                    self.assertEqual(value, launch)
+                                    if recovery_failure != 'before':
+                                        result = initial(value)
+                                    if recovery_failure:
+                                        raise m.WorkerControlError('timeout')
+                                    return result
+                                with patch.object(case.host, 'worker_create') as repost, \
+                                     patch.object(case.host, method, side_effect=recover):
+                                    case.tick([] if calm else [proc(11, 'codex')], {} if calm else {11: 200})
+                                repost.assert_not_called()
+                                if recovery_failure:
+                                    self.assertTrue(case.guard.worker['launchUnknown'])
+                                    self.assertEqual(case.guard.worker['launch'], launch)
+                                    self.assertFalse(case.effects('steer'))
+                                    if report:
+                                        self.assertIn('restartResponder', case.guard.saved)
+                                    case.restart_guard()
+                                    case.tick([], {})
+                                self.assertEqual(case.guard.worker['threadId'], m.worker_thread_id(launch['clientRequestId']))
+                                self.assertEqual(len(case.effects('worker')), int(accepted))
+                                self.assertEqual(len(case.effects('safety')), int(not accepted))
+                                self.assertEqual(case.host.initial_launches[launch['clientRequestId']], launch)
+                                if not accepted:
+                                    self.assertEqual(case.effects('safety')[0][2], launch['prompt'])
+                                if report:
+                                    self.assertNotIn('restartResponder', case.guard.saved)
+                            finally:
+                                case.doCleanups()
+
+    def test_sampling_and_strain_ladder_continue_while_launch_pending(self):
+        jobs = []
+        def submit(fn):
+            future = Future()
+            jobs.append((fn, future))
+            return future
+        self.guard.worker_submit = submit
+        self.tick([], load=200)
+        self.tick([], load=200)
+        for i in range(4):
+            result = self.tick([proc(10, cpu=i*60)], load=200)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(len(self.events_named('sample')), 5)
+        self.assertTrue(result['strain'])
+        self.assertIn(('soften', 10), self.host.effects)
+        self.assertIn(('signal', 10, 'SIGSTOP'), self.host.effects)
+        launch = copy.deepcopy(self.guard.worker['launch'])
+        jobs[0][1].set_result(jobs[0][0]())
+        self.tick([], load=0)
+        self.assertEqual(self.guard.worker['threadId'], m.worker_thread_id(launch['clientRequestId']))
+        self.assertEqual(len(jobs), 1)
+
+    def test_pending_initial_safety_keeps_sampling_and_report(self):
+        for report in (False, True):
+            with self.subTest(report=report):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    if report:
+                        case.host.checks = dict(unavailable='disabled')
+                    def partial(launch):
+                        case.host.launches[launch['clientRequestId']] = m.worker_thread_id(launch['clientRequestId'])
+                        raise m.WorkerControlError('timeout')
+                    with patch.object(case.host, 'worker_create', side_effect=partial):
+                        case.tick([proc(1, ROBOB)] if report else [proc(10, 'codex')],
+                                  {1: 25} if report else {10: 200})
+                    launch = copy.deepcopy(case.guard.worker['launch'])
+                    jobs = []
+                    def submit(fn):
+                        future = Future()
+                        jobs.append((fn, future))
+                        return future
+                    case.guard.worker_submit = submit
+                    case.tick([], load=200)
+                    jobs[0][1].set_result(jobs[0][0]())
+                    case.tick([], load=200)
+                    self.assertEqual(case.guard.worker_job['operation'], 'worker_initial')
+                    samples = len(case.events_named('sample'))
+                    for i in range(4):
+                        result = case.tick([proc(10, cpu=i*60)], load=200)
+                    self.assertTrue(result['strain'])
+                    self.assertEqual(len(case.events_named('sample')), samples+4)
+                    self.assertIn(('signal', 10, 'SIGSTOP'), case.host.effects)
+                    self.assertEqual(len(jobs), 2)
+                    self.assertEqual(case.guard.worker['launch'], launch)
+                    self.assertFalse(case.effects('steer'))
+                    self.assertFalse(case.effects('safety'))
+                    if report:
+                        self.assertIn('restartResponder', case.guard.saved)
+                    jobs[1][1].set_result(jobs[1][0]())
+                    case.tick([], load=0)
+                    self.assertTrue(case.guard.worker['launchUnknown'])
+                    self.assertEqual(case.guard.worker_job['operation'], 'worker_resume')
+                    if report:
+                        self.assertIn('restartResponder', case.guard.saved)
+                    jobs[2][1].set_result(jobs[2][0]())
+                    case.tick([], load=0)
+                    self.assertEqual(case.guard.worker['threadId'], m.worker_thread_id(launch['clientRequestId']))
+                    self.assertEqual(case.effects('safety')[0][2], launch['prompt'])
+                    if report:
+                        self.assertNotIn('restartResponder', case.guard.saved)
+                finally:
+                    case.doCleanups()
+
+    def test_pause_during_initial_history_prevents_recovery(self):
+        launch = dict(clientRequestId='mac-guard-partial', prompt='full safety prompt')
+        self.guard.worker = dict(launchUnknown=True, launch=launch, startedAt=NOW)
+        self.host.launches[launch['clientRequestId']] = m.worker_thread_id(launch['clientRequestId'])
+        initial = self.host.worker_initial
+        def pause(launch):
+            result = initial(launch)
+            (self.guard.state/'paused').touch()
+            return result
+        with patch.object(self.host, 'worker_initial', side_effect=pause), patch.object(self.host, 'worker_resume') as resume:
+            self.tick([], load=0)
+        resume.assert_not_called()
+        self.assertTrue(self.guard.worker['launchUnknown'])
+        self.assertEqual(self.guard.worker['launch'], launch)
+        (self.guard.state/'paused').unlink()
+        self.tick([], load=0)
+        self.assertEqual(self.guard.worker['threadId'], m.worker_thread_id(launch['clientRequestId']))
+
+    def test_default_executor_does_not_block_sampling(self):
+        entered, release = threading.Event(), threading.Event()
+        self.guard = m.Guard(self.host, self.root/'state', self.root/'evidence', dry=False,
+                             logger=lambda c, k, n, **kw: self.events.append((n, kw['props'])), clock=lambda: self.now)
+        create = self.host.worker_create
+        def blocked(launch):
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError()
+            return create(launch)
+        try:
+            with patch.object(self.host, 'worker_create', side_effect=blocked):
+                self.tick([], load=200)
+                self.tick([], load=200)
+                self.assertTrue(entered.wait(5))
+                self.tick([], load=200)
+                self.assertEqual(len(self.events_named('sample')), 2)
+                self.assertTrue(self.guard.worker['launchUnknown'])
+                release.set()
+                self.guard.worker_job['future'].result(timeout=5)
+                self.tick([], load=0)
+                self.assertIn('threadId', self.guard.worker)
+        finally:
+            release.set()
+            self.guard.worker_executor.shutdown(wait=True)
+
+    def test_worker_lookup_failure_classes_and_backoff(self):
+        launch = dict(clientRequestId='mac-guard-unknown', prompt='original')
+        for failure in ('timeout', 'http_status', 'bad_response'):
+            with self.subTest(failure=failure):
+                self.guard.worker = dict(launchUnknown=True, launch=launch, startedAt=NOW)
+                with patch.object(self.host, 'worker_lookup', side_effect=m.WorkerControlError(failure, 16.6, 503)), \
+                     patch.object(self.host, 'worker_create') as create:
+                    self.tick([], load=0)
+                    self.guard.worker_needed(self.root, 'still needed', urgent=True)
+                create.assert_not_called()
+                self.assertTrue(self.guard.worker['launchUnknown'])
+                event = self.events_named('worker_lookup')[-1]
+                self.assertEqual(event['failure'], failure)
+                self.assertEqual(event['durationS'], 16.6)
+                self.assertEqual(event['errno'], 503)
 
     def test_worker_reconcile_unknown_never_creates_duplicate_then_recovers(self):
         with patch.object(self.host, 'worker_create', side_effect=m.ProbeError('timeout')):
@@ -736,7 +916,7 @@ class GuardTests(unittest.TestCase):
 
     def restart_guard(self):
         self.guard = m.Guard(self.host, self.root/'state', self.root/'evidence', dry=False,
-                             logger=lambda c, k, n, **kw: self.events.append((n, kw['props'])), clock=lambda: self.now)
+                             logger=lambda c, k, n, **kw: self.events.append((n, kw['props'])), clock=lambda: self.now, worker_submit=immediate_submit)
 
     def test_stopped_survives_restart_and_failed_resume(self):
         for i in range(3):
@@ -917,12 +1097,76 @@ class PlumbingTests(unittest.TestCase):
             self.assertEqual(m.Host(run).worker_request('POST', '/threads', {'clientRequestId': 'test'}), {'ok': True})
         argv, kw = calls[0]
         self.assertEqual(argv, ['/usr/bin/python3', '-I', str(HERE/'mac_guard.py'), '--worker-control'])
-        self.assertEqual(kw['timeout'], 10)
+        self.assertEqual(kw['timeout'], 50)
         self.assertNotIn('BUN_INSPECT', kw['env'])
         self.assertEqual(json.loads(kw['input']), dict(method='POST', path='/threads', body={'clientRequestId': 'test'}))
         for failure in (OSError(), subprocess.TimeoutExpired(argv, 10)):
             with self.subTest(failure=type(failure).__name__), self.assertRaises(m.ProbeError):
                 m.Host(lambda *a, **kw: (_ for _ in ()).throw(failure)).worker_request('GET', '/threads/test')
+
+    def test_slow_create_over_old_timeout_is_adopted(self):
+        request_id = 'mac-guard-slow'
+        tid = m.worker_thread_id(request_id)
+        launch = dict(clientRequestId=request_id, prompt='test')
+        calls = []
+        def opener(req, timeout):
+            calls.append(req.method)
+            # Model the measured API latency without making every test wait.
+            if timeout < 16.6:
+                raise TimeoutError()
+            return io.BytesIO(json.dumps(dict(threadId=tid, messageId=tid, runId='run')).encode())
+        def run(argv, **kw):
+            self.assertGreater(kw['timeout'], 45)
+            value = m.worker_control(json.loads(kw['input']), opener)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(value))
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ,
+                {'T3_CONTROL_URL': 'http://test.invalid', 'T3_CONTROL_TOKEN': 'dummy'}, clear=True):
+            guard = m.Guard(m.Host(run), Path(tmp)/'state', Path(tmp)/'evidence',
+                            dry=False, logger=lambda *a, **kw: None, worker_submit=immediate_submit)
+            guard.now = NOW
+            guard.worker = dict(launchUnknown=True, launch=launch, startedAt=NOW)
+            self.assertEqual(guard.launch_worker(Path(tmp)), tid)
+            self.assertEqual(guard.worker['threadId'], tid)
+        self.assertEqual(calls, ['POST'])
+
+    def test_http_duration_and_failure_class_table(self):
+        forms = [('timeout', lambda req: TimeoutError()),
+                 ('timeout', lambda req: m.urllib.error.URLError(TimeoutError())),
+                 ('http_status', lambda req: m.urllib.error.HTTPError(req.full_url, 503, 'test', {}, io.BytesIO(b'proxy'))),
+                 ('bad_response', lambda req: None)]
+        for failure, error in forms:
+            with self.subTest(failure=failure), patch.dict(os.environ,
+                    {'T3_CONTROL_URL': 'http://test.invalid', 'T3_CONTROL_TOKEN': 'dummy'}, clear=True):
+                times = [0]
+                def opener(req, **kw):
+                    times[0] += 16.6
+                    exc = error(req)
+                    if exc:
+                        raise exc
+                    return io.BytesIO(b'not json')
+                def run(argv, **kw):
+                    metrics = {}
+                    try:
+                        value = m.worker_control(json.loads(kw['input']), opener, metrics)
+                        return subprocess.CompletedProcess(argv, 0, json.dumps(dict(value, _durationS=metrics['durationS'])))
+                    except (OSError, ValueError, m.ProbeError) as exc:
+                        return subprocess.CompletedProcess(argv, 1, json.dumps(dict(failure=m.worker_failure(exc),
+                            status=getattr(exc, 'status', None), _durationS=metrics['durationS'])))
+                with patch.object(m.time, 'monotonic', side_effect=lambda: times[0]), \
+                     self.assertRaises(m.WorkerControlError) as caught:
+                    m.Host(run).worker_request('POST', '/threads')
+                self.assertEqual(caught.exception.failure, failure)
+                self.assertEqual(caught.exception.durationS, 16.6)
+
+    def test_worker_helper_error_protocol_preserves_failure_class(self):
+        for failure, status in [('timeout', None), ('http_status', 503), ('bad_response', None)]:
+            with self.subTest(failure=failure):
+                def run(argv, **kw):
+                    return subprocess.CompletedProcess(argv, 1, json.dumps(dict(failure=failure, status=status)))
+                with self.assertRaises(m.WorkerControlError) as caught:
+                    m.Host(run).worker_request('POST', '/threads')
+                self.assertEqual(caught.exception.failure, failure)
+                self.assertEqual(caught.exception.status, status)
 
     def test_worker_correlation_response_shape_table(self):
         host = m.Host()
@@ -953,6 +1197,70 @@ class PlumbingTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         host.worker_create(launch)
                 call.assert_called_once_with('POST', '/threads', launch)
+
+    def test_initial_message_history_acceptance_table(self):
+        host = m.Host()
+        launch = dict(clientRequestId='mac-guard-partial', prompt=' full safety prompt\n')
+        tid = m.worker_thread_id(launch['clientRequestId'])
+        good = dict(messageId=tid, role='user', text=launch['prompt'].strip(), runId='durable-run')
+        forms = [('original', dict(threadId=tid, messages=[good], total=1)),
+                 ('accepted in partial page', dict(threadId=tid, messages=[good], total=1001))]
+        for name, response in forms:
+            with self.subTest(name=name), patch.object(host, 'worker_request', return_value=response) as request:
+                self.assertEqual(host.worker_initial(launch), tid)
+                request.assert_called_once_with('GET', '/threads/'+m.urllib.parse.quote(tid, safe='')+'/messages?role=user&limit=1000')
+
+        empty = dict(threadId=tid, messages=[], total=0)
+        forms = [('wrong thread', dict(empty, threadId='other')),
+                 ('missing thread', dict(messages=[], total=0))]
+        forms += [('messages '+repr(value), dict(empty, messages=value)) for value in (None, False, '', {}, [None], [[]])]
+        forms += [('total '+repr(value), dict(empty, total=value)) for value in (None, False, '0', -1, 0.5, 1)]
+        forms += [('message '+key+' '+repr(value), dict(empty, messages=[dict(good, **{key: value})], total=1))
+                  for key, values in [('role', (None, 'assistant')), ('text', (None, 'summary only')),
+                                      ('runId', (None, '', False, []))] for value in values]
+        for name, response in forms:
+            with self.subTest(name=name), patch.object(host, 'worker_request', return_value=response) as request:
+                with self.assertRaises(ValueError):
+                    host.worker_initial(launch)
+                self.assertEqual(request.call_count, 1)  # Unknown history cannot authorize a send.
+
+    def test_initial_message_recovery_uses_original_launch_identity(self):
+        host = m.Host()
+        launch = dict(clientRequestId='mac-guard-partial', prompt=' full safety prompt\n')
+        tid = m.worker_thread_id(launch['clientRequestId'])
+        path = '/threads/'+m.urllib.parse.quote(tid, safe='')
+        good = dict(threadId=tid, messageId=tid, runId='durable-run')
+        forms = [good, dict(good, threadId='other'), dict(good, messageId=None), dict(good, messageId='other')]
+        forms += [dict(good, runId=value) for value in (None, '', False, [])]
+        for response in forms:
+            with self.subTest(response=response), patch.object(host, 'worker_request', return_value=response) as request:
+                if response == good:
+                    self.assertEqual(host.worker_resume(launch), tid)
+                else:
+                    with self.assertRaises(ValueError):
+                        host.worker_resume(launch)
+                request.assert_called_once_with('POST', path+'/resume-launch', launch)
+
+    def test_initial_message_recovery_lost_ack_with_real_template(self):
+        host = m.Host()
+        prompt = (HERE/'mac_guard_worker_prompt.md').read_text()
+        self.assertTrue(prompt.endswith('\n'))
+        launch = dict(clientRequestId='mac-guard-partial', prompt=prompt)
+        tid = m.worker_thread_id(launch['clientRequestId'])
+        messages = []
+        sends = []
+        def request(method, path, body=None):
+            if method == 'GET':
+                return dict(threadId=tid, messages=copy.deepcopy(messages), total=len(messages))
+            sends.append((path, body))
+            messages.append(dict(messageId=tid, role='user', text=body['prompt'].strip(), runId='durable-run'))
+            raise m.WorkerControlError('timeout')
+        with patch.object(host, 'worker_request', side_effect=request):
+            self.assertIsNone(host.worker_initial(launch))
+            with self.assertRaises(m.WorkerControlError):
+                host.worker_resume(launch)
+            self.assertEqual(host.worker_initial(launch), tid)
+        self.assertEqual(sends, [('/threads/'+m.urllib.parse.quote(tid, safe='')+'/resume-launch', launch)])
 
     def test_worker_control_only_authoritative_absence_allows_retry(self):
         forms = [(404, b'{"ok":false,"error":{"code":"not_found"}}', True),
@@ -999,7 +1307,7 @@ class PlumbingTests(unittest.TestCase):
                     self.assertEqual(req.full_url, 'http://'+hostname+'/api/ardud/control/threads')
                     self.assertEqual(req.get_header('Authorization'), 'Bearer '+token)
                     self.assertEqual(json.loads(req.data), body)
-                    self.assertEqual(kw['timeout'], 8)
+                    self.assertEqual(kw['timeout'], 45)
             with patch.dict(os.environ, {'T3_CONTROL_TOKEN_FILE': str(root/'missing')}, clear=True), self.assertRaises(FileNotFoundError):
                 m.worker_control(dict(method='GET', path='/threads/test'), opener)
             component.chmod(0o644)

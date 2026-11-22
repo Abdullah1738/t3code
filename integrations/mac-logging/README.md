@@ -1098,10 +1098,23 @@ recorded as unavailable evidence. Stack capture runs outside the guard loop.
 
 Worker launches persist their request ID and exact payload before using the
 control API (`t3ctl create` does not forward a request ID). After an uncertain
-response the guard looks up that ID and replays the same idempotent request,
-completing any partial thread launch. It confirms the initial safety message
-and durable run before adoption or steering. Unavailable lookups wait;
-they never authorize a second worker. These calls have a ten-second bound.
+response the guard looks up the deterministic thread ID first. A matching
+thread is adopted after its user-message history confirms acceptance of the
+full saved safety prompt with a durable run. If complete history shows that
+initial message missing, the guard resumes that same launch through
+`POST /threads/:threadId/resume-launch`. The server reuses the original
+initial-message command and receipt, so a late original dispatch cannot accept
+a second run. Both paths apply the create API's prompt trimming. Pause is
+checked between history and recovery. It retains the launch payload and any restart
+report until acceptance is confirmed, including after strain clears. Only an
+authoritative missing thread permits a re-POST of the same create payload and
+request ID. Unavailable lookups or message history wait;
+they never authorize a second worker. HTTP requests allow 45 seconds; the
+parent bounds each isolated helper's full lifetime to 50 seconds in a background
+executor, leaving sampling and the strain ladder running. Pending launches
+reconcile on later ticks even after strain clears. `macguard.worker_create`
+and `macguard.worker_lookup` record `durationS` and failures (`timeout`,
+`http_status` with the status in `errno`, `bad_response`, or `unavailable`).
 
 Overload transitions (`host.overload`, emitted by the host sampler) also drive
 an immediate reclaim pass before the guard's fork-based probes. A fresh onset

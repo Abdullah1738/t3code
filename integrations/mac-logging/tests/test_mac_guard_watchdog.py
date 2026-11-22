@@ -193,7 +193,10 @@ def building(): return []
                         case.restart_guard()
                         with patch.object(case.host, 'worker_create', wraps=create) as retry:
                             case.tick([proc(1, ROBOB)], {1: 27})
-                        retry.assert_called_once_with(launch)
+                        if accepted:
+                            retry.assert_not_called()
+                        else:
+                            retry.assert_called_once_with(launch)
                         self.assertEqual(case.host.lookups, [launch['clientRequestId']])
                         self.assertFalse(case.guard.worker.get('launchUnknown'))
                         self.assertEqual(len(case.effects('worker')), 1)
@@ -204,6 +207,39 @@ def building(): return []
                         self.assertEqual(len(case.effects('notify')), 1)
                     finally:
                         case.doCleanups()
+
+    def test_restart_responder_lookup_failure_respects_shared_backoff_table(self):
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous):
+                case = WatchdogTests()
+                case.setUp()
+                try:
+                    case.host.checks = dict(unavailable='disabled')
+                    with patch.object(case.host, 'worker_create', side_effect=m.ProbeError('timeout')):
+                        case.tick([proc(1, ROBOB)], {1: 25})
+                    launch = case.guard.worker['launch']
+                    jobs = []
+                    if asynchronous:
+                        def submit(fn):
+                            future = shared.Future()
+                            jobs.append((fn, future))
+                            return future
+                        case.guard.worker_submit = submit
+                    with patch.object(case.host, 'worker_lookup', side_effect=m.WorkerControlError('timeout')) as lookup, \
+                         patch.object(case.host, 'worker_create') as create:
+                        case.tick([], {})
+                        if asynchronous:
+                            self.assertEqual(len(jobs), 1)
+                            jobs[0][1].set_result(jobs[0][0]())
+                            case.tick([], {})
+                            self.assertEqual(len(jobs), 1)
+                        lookup.assert_called_once_with(launch['clientRequestId'])
+                        create.assert_not_called()
+                    self.assertTrue(case.guard.worker['launchUnknown'])
+                    self.assertEqual(case.guard.worker['launch'], launch)
+                    self.assertEqual(case.guard.worker['nextReconcileAt'], case.now)
+                finally:
+                    case.doCleanups()
 
     def test_receipt_and_exit_matrix(self):
         self.installed()
@@ -331,7 +367,7 @@ def building(): return []
                     case.restart_guard()
                     with patch.object(case.host, 'worker_'+operation, wraps=original) as retry:
                         case.tick([proc(1, ROBOB)], {1: 26})
-                    self.assertEqual(retry.call_args_list, [initial_call])
+                    self.assertEqual(retry.call_args_list, [] if operation == 'create' and accepted else [initial_call])
                     self.assertNotIn('restartResponder', case.guard.saved)
                     case.tick([proc(1, ROBOB)], {1: 27})
                     self.assertEqual(len(case.effects('notify')), 1)

@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import guard_reclaim as r
 import mac_guard as m
 import toollog
-from test_mac_guard import FakeHost, proc, NOW
+from test_mac_guard import FakeHost, Future, immediate_submit, proc, NOW
 
 
 def stamp(now):
@@ -63,7 +63,7 @@ class ReclaimTests(unittest.TestCase):
         self.events = []
         self.now = NOW
         self.guard = m.Guard(self.host, root/'state', root/'evidence', dry=False, clock=lambda:self.now,
-            logger=lambda c,k,n,**kw:self.events.append((n,kw['props'])))
+            logger=lambda c,k,n,**kw:self.events.append((n,kw['props'])), worker_submit=immediate_submit)
         self.janitor_calls = 0
         self.reclaim = r.Reclaimer(self.guard, root/'logs', self.native, self.janitor)
 
@@ -136,7 +136,7 @@ class ReclaimTests(unittest.TestCase):
                 root = Path(tmp)
                 calls = []
                 guard = m.Guard(FakeHost(), root/'state', root/'evidence', dry=False,
-                    clock=lambda:self.now, logger=lambda *a,**kw:None)
+                    clock=lambda:self.now, logger=lambda *a,**kw:None, worker_submit=immediate_submit)
                 janitor = lambda:calls.append(self.now) or dict(result='completed')
                 native = Native()
                 reclaim = r.Reclaimer(guard, root/'logs', native, janitor)
@@ -261,6 +261,35 @@ class ReclaimTests(unittest.TestCase):
                 row = toollog.record('mac-guard', 'event', n, dt.datetime.now(dt.timezone.utc), props=p)
                 self.assertEqual(row['props'], p)
         self.assertNotIn('shortpass', json.dumps(r.log_fields(dict(args='curl --user bob:shortpass'))))
+
+    def test_partial_worker_recovery_keeps_ladder_report_until_safety_accepted(self):
+        def partial(launch):
+            self.host.launches[launch['clientRequestId']] = m.worker_thread_id(launch['clientRequestId'])
+            raise m.WorkerControlError('timeout')
+        with patch.object(self.host, 'worker_create', side_effect=partial):
+            self.tick()
+        launch = copy.deepcopy(self.guard.worker['launch'])
+        jobs = []
+        def submit(fn):
+            future = Future()
+            jobs.append((fn, future))
+            return future
+        self.guard.worker_submit = submit
+        self.tick(NOW+30, 'end', NOW)
+        for i, operation in enumerate(('worker_lookup', 'worker_initial', 'worker_resume')):
+            self.assertEqual(self.guard.worker_job['operation'], operation)
+            self.assertEqual(self.guard.worker['launch'], launch)
+            self.assertTrue(any(k.startswith('overloadResponder:') for k in self.guard.saved))
+            self.assertFalse(any(e[0] in ('worker', 'safety', 'steer') for e in self.host.effects))
+            jobs[i][1].set_result(jobs[i][0]())
+            self.tick(NOW+60+i*30, 'end', NOW)
+        self.assertEqual(self.guard.worker['threadId'], m.worker_thread_id(launch['clientRequestId']))
+        self.assertFalse(any(k.startswith('overloadResponder:') for k in self.guard.saved))
+        self.assertEqual(self.janitor_calls, 1)
+        self.assertEqual(self.native.effects, [20])
+        self.assertEqual(len(self.host.launches), 1)
+        self.assertEqual([e[2] for e in self.host.effects if e[0] == 'safety'], [launch['prompt']])
+        self.assertTrue(self.events[-1][1]['workerDelivered'])
 
     def test_ambiguous_worker_launch_retried_without_repeating_ladder(self):
         original = self.host.worker_create

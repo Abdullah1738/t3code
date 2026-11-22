@@ -18,7 +18,7 @@ import guard_reclaim as r
 import host_native
 import mac_guard as m
 import toollog
-from test_mac_guard import FakeHost, proc, NOW
+from test_mac_guard import FakeHost, immediate_submit, proc, NOW
 from test_guard_reclaim import Native, latest, nproc, stamp
 
 
@@ -100,7 +100,7 @@ class CommandOutcomeTests(unittest.TestCase):
                 host.live[20] = p
                 host.soften = lambda p:outcome
                 guard = m.Guard(host, Path(tmp)/'state', Path(tmp)/'evidence', dry=False,
-                                clock=lambda:NOW, logger=lambda *a,**kw:None)
+                                clock=lambda:NOW, logger=lambda *a,**kw:None, worker_submit=immediate_submit)
                 guard.rows, guard.strain, guard.now = {20:p}, True, NOW
                 performed = guard.action(p, 'B', 'renice')
                 self.assertEqual(performed, rc == 0)
@@ -127,7 +127,7 @@ class CommandOutcomeTests(unittest.TestCase):
             host, p = FakeHost(), proc(20)
             host.live[20] = p
             guard = m.Guard(host, Path(tmp)/'state', Path(tmp)/'evidence', dry=False,
-                            clock=lambda:NOW, logger=lambda *a,**kw:None)
+                            clock=lambda:NOW, logger=lambda *a,**kw:None, worker_submit=immediate_submit)
             guard.rows, guard.strain, guard.now = {20:p}, True, NOW
             with patch.object(host, 'soften', side_effect=m.ProbeError('exit')):
                 self.assertFalse(guard.action(p, 'B', 'renice'))
@@ -160,7 +160,7 @@ class NativeOutcomeTests(unittest.TestCase):
                     native.row = row
                     events = []
                     guard = m.Guard(FakeHost(), Path(tmp)/'state', Path(tmp)/'evidence', dry=False,
-                        clock=lambda:NOW, logger=lambda c,k,n,**kw:events.append((n,kw['props'])))
+                        clock=lambda:NOW, logger=lambda c,k,n,**kw:events.append((n,kw['props'])), worker_submit=immediate_submit)
                     with patch.object(os, 'getpriority', side_effect=getpriority), \
                          patch.object(os, 'setpriority', side_effect=failure if stage == 'setpriority' else None) as setter:
                         r.Reclaimer(guard, Path(tmp)/'logs', native=native,
@@ -250,7 +250,7 @@ class JanitorEvidenceTests(unittest.TestCase):
                 processes=dict(problems=['process_inventory_unavailable: TimeoutExpired']))
             self.now = NOW
             guard = m.Guard(FakeHost(), root/'state', root/'evidence', dry=False,
-                clock=lambda:self.now, logger=lambda c,k,n,**kw:events.append((n,kw['props'])))
+                clock=lambda:self.now, logger=lambda c,k,n,**kw:events.append((n,kw['props'])), worker_submit=immediate_submit)
             reclaimer = r.Reclaimer(guard, root/'logs', Native(), lambda:self.run_report(root, report))
             readings = iter([(0,1554.5), (5,11144), (5,11144), (6,9927), (6,9927), (7,8835.88)])
             def read(*a):
