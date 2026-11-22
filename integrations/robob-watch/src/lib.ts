@@ -164,6 +164,13 @@ export type State = {
   failure_pause_notice?: string;
   failure_pause_escalation?: string;
   failure_pause_escalation_fallback?: string;
+  failure_escalation_key?: string;
+  failure_escalation_source?: string;
+  failure_escalation_attempts?: number;
+  failure_escalation_next_at?: string;
+  failure_escalation_notice?: string;
+  failure_escalation_notice_sent?: boolean;
+  failure_escalation_pending?: { channel: "wake" | "imessage"; key: string };
   failure_recovery_notices?: { key: string; text: string; retry_at?: number }[];
   /** Separate from Telegram flags; retained through resume until bridge acceptance. */
   owner_imessage_episodes?: OwnerAlertEpisode[];
@@ -1092,9 +1099,15 @@ function clearCreatorSend(watcher: Watcher, key: string): void {
   saveState(watcher.id, fresh);
 }
 
-export function wake(source: string, text: string, key: string, watcher?: string): Promise<{ ok: boolean; out: string }> {
+const bridgeHttpStatus = (result: { out: string }) => {
+  const match = result.out.match(/\bHTTP ([1-5][0-9]{2})\b/);
+  return match ? Number(match[1]) : undefined;
+};
+
+export async function wake(source: string, text: string, key: string, watcher?: string): Promise<{ ok: boolean; out: string; httpStatus?: number }> {
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return Promise.resolve(refused("wake"));
-  return run([BUN, spectrumCli(), "wake", `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`], undefined, undefined, { watcher });
+  const result = await run([BUN, spectrumCli(), "wake", `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`], undefined, undefined, { watcher });
+  return { ...result, httpStatus: bridgeHttpStatus(result) };
 }
 
 /**
@@ -1778,8 +1791,7 @@ export function clearFailureState(state: State): void {
   clearFailureProbe(state);
   delete state.failure_paused_at;
   delete state.failure_pause_notice;
-  delete state.failure_pause_escalation;
-  delete state.failure_pause_escalation_fallback;
+  clearFailureEscalation(state);
   delete state.trigger_error;
   delete state.load_timeouts;
   delete state.load_timeout_since;
@@ -1791,6 +1803,19 @@ export function clearFailureState(state: State): void {
   delete state.failure_episode;
   delete state.last_error;
   delete state.last_error_sources;
+}
+
+export function clearFailureEscalation(state: State): void {
+  delete state.failure_escalated;
+  delete state.failure_pause_escalation;
+  delete state.failure_pause_escalation_fallback;
+  delete state.failure_escalation_key;
+  delete state.failure_escalation_source;
+  delete state.failure_escalation_attempts;
+  delete state.failure_escalation_next_at;
+  delete state.failure_escalation_notice;
+  delete state.failure_escalation_notice_sent;
+  delete state.failure_escalation_pending;
 }
 
 export function ensureFailureProbe(watcher: Watcher, state: State): boolean {
@@ -1835,7 +1860,10 @@ export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t
 export const ESCALATE_AFTER_MS = Number(process.env.ROBOB_WATCH_ESCALATE_AFTER_MS ?? 15 * 60_000);
 
 export function shouldEscalate(watcher: Watcher, state: State, t = now()): boolean {
-  if (watcher.mode !== "wake" || state.failure_escalated || !state.failing_since) return false;
+  if (watcher.mode !== "wake" || !state.failing_since) return false;
+  if (state.failure_escalated && !state.failure_escalation_pending
+    && (!state.failure_escalation_notice || state.failure_escalation_notice_sent)) return false;
+  if (state.failure_escalation_next_at && Date.parse(state.failure_escalation_next_at) > t) return false;
   if (state.dependency_busy) return t - Date.parse(state.dependency_busy.since) >= BUSY_ALERT_AFTER_MS;
   return !!state.failure_paused_at || t - Date.parse(state.failing_since) >= ESCALATE_AFTER_MS;
 }
@@ -1893,22 +1921,139 @@ export function escalationFallbackText(watcher: Watcher, state: State, mins: num
 
 export async function escalate(watcher: Watcher, state: State, key: string, imessageFallback = true): Promise<Delivery> {
   const started = now();
+  const instance = watcherInstance(watcher.id), since = state.failing_since, episode = state.failure_episode;
+  const sameEpisode = (fresh: State) => !!loadWatcher(watcher.id) && watcherInstance(watcher.id) === instance
+    && fresh.failing_since === since && fresh.failure_episode === episode;
+  // Claim the retry window and freeze both bodies before any transport can accept them.
+  const prepared = await withRelayLockAsync(() => {
+    const fresh = loadState(watcher.id);
+    if (!sameEpisode(fresh) || !shouldEscalate(watcher, fresh)) return;
+    const mins = Math.round((Date.parse(fresh.failure_paused_at ?? iso()) - Date.parse(fresh.dependency_busy?.since ?? fresh.failing_since!)) / 60_000);
+    fresh.failure_pause_escalation ??= escalationText(watcher, fresh, mins);
+    fresh.failure_pause_escalation_fallback ??= escalationFallbackText(watcher, fresh, mins);
+    // Missing key means an episode from before this release: retain its legacy wake identity.
+    fresh.failure_escalation_key ??= key;
+    fresh.failure_escalation_source ??= `robob-watch ${watcher.id} ${fresh.dependency_busy ? "dependency busy" : "failing"}`;
+    const attempt = (fresh.failure_escalation_attempts ?? 0) + 1;
+    fresh.failure_escalation_attempts = attempt;
+    fresh.failure_escalation_next_at = iso(now() + ([1, 2, 5, 15, 30][attempt - 1] ?? 60) * 60_000);
+    saveState(watcher.id, fresh);
+    return fresh;
+  });
+  if (!prepared) return { ok: false, via: "deferred", detail: "escalation no longer due" };
+  state = prepared;
+  const wakeKey = state.failure_escalation_key!, sendKey = `${key}:imsg`;
+  const update = (change: (fresh: State) => void) => withRelayLockAsync(() => {
+    const fresh = loadState(watcher.id);
+    if (!sameEpisode(fresh) || fresh.failure_escalation_key !== wakeKey
+      || fresh.failure_escalation_attempts !== prepared.failure_escalation_attempts) return;
+    change(fresh); saveState(watcher.id, fresh); return fresh;
+  });
   let delivery: Delivery | undefined;
+  let httpStatus: number | undefined;
+  let reason: "dedupe_conflict_changed_content" | undefined;
+  const conflictReason = (out: string) => {
+    try {
+      const value: unknown = JSON.parse(out);
+      return jsonObject(value) && value.reason === "dedupe_conflict_changed_content" ? value.reason : undefined;
+    } catch { return; }
+  };
+  let exists = false;
+  let needsNotice = !!state.failure_escalation_notice;
+  const noticeText = (fresh: State) => `Watcher "${watcher.title}" is ${fresh.failure_paused_at ? "paused" : "failing"}; the agent could not be woken. Last error: ${(fresh.last_error ?? "unknown").slice(0, 500)}. Log: ${join(watcherDir(watcher.id), "log")}`;
+  // Persist acceptance before probing: a restart must only read receipts, never repost the key.
+  const markAccepted = (pending: NonNullable<State["failure_escalation_pending"]>) => update(fresh => {
+    fresh.failure_escalated = true;
+    fresh.failure_escalation_pending = pending;
+    if (exists) fresh.failure_escalation_notice ??= noticeText(fresh);
+  });
+  const attempt = async (send: () => Promise<{ ok: boolean; out: string; httpStatus?: number }>) => {
+    try { return await send(); }
+    catch (error) { return { ok: false, out: error instanceof Error ? error.message : "bridge helper failed", httpStatus: undefined }; }
+  };
+  let pending = state.failure_escalation_pending;
+  let acceptedResponse: string | undefined;
   try {
-    const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.dependency_busy?.since ?? state.failing_since!)) / 60_000);
-    const text = (state.failure_paused_at && state.failure_pause_escalation) || escalationText(watcher, state, mins);
-    const woke = await wake(`robob-watch ${watcher.id} ${state.dependency_busy ? "dependency busy" : "failing"}`, text, key, watcher.id);
-    if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
-    else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
+    if (state.failure_escalated) delivery = { ok: true, via: pending?.channel === "imessage" ? "imessage-existing" : "wake-existing", detail: "accepted key; reconciling delivery" };
     else {
-      const summary = (state.failure_paused_at && state.failure_pause_escalation_fallback) || escalationFallbackText(watcher, state, mins);
-      const sent = await imessage(summary, key, { watcher: watcher.id });
-      delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
+      const woke = await attempt(() => wake(state.failure_escalation_source!, state.failure_pause_escalation!, wakeKey, watcher.id));
+      httpStatus = woke.httpStatus;
+      if (woke.ok || httpStatus === 409) {
+        exists = httpStatus === 409;
+        if (exists) reason = conflictReason(woke.out);
+        pending = { channel: "wake", key: wakeKey };
+        delivery = { ok: true, via: exists ? "wake-existing" : "wake", detail: woke.out };
+        if (!await markAccepted(pending)) return { ok: true, via: "wake-existing", detail: "episode ended during send" };
+        if (exists) log(watcher.id, "failure escalation key already accepted (409); not resending");
+        acceptedResponse = woke.ok ? woke.out : undefined;
+      } else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
+      else {
+        // A legacy /send may already have accepted a different body under the old key.
+        // Reconcile it before using the new channel key; never duplicate it during migration.
+        if (wakeKey === key) {
+          const prior = await attempt(() => run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB,
+            `select exists(select 1 from kv where key='api:send:send:${hash(key)}')`], 10_000, undefined, { watcher: watcher.id }));
+          if (!prior.ok || prior.out.trim() !== "0") {
+            pending = { channel: "imessage", key };
+            exists = true;
+          }
+        }
+        if (!pending) {
+          const sent = await attempt(() => imessage(state.failure_pause_escalation_fallback!, sendKey, { watcher: watcher.id }));
+          if (sent.ok || bridgeHttpStatus(sent) === 409) {
+            exists = bridgeHttpStatus(sent) === 409;
+            if (exists) { httpStatus = 409; reason = conflictReason(sent.out); }
+            pending = { channel: "imessage", key: sendKey };
+            delivery = { ok: true, via: exists ? "imessage-existing" : "imessage-send", detail: sent.out };
+          } else delivery = { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
+        } else delivery = { ok: true, via: "imessage-existing", detail: "legacy send acceptance" };
+        if (pending && !await markAccepted(pending)) return { ok: true, via: "imessage-existing", detail: "episode ended during send" };
+      }
+    }
+    let confirmed = false;
+    let failed = false;
+    if (pending) {
+      if (pending.channel === "wake") {
+        const pendingKey = pending.key;
+        const receipt = await attempt(() => run([BUN, spectrumCli(), "wake-status", `--key=${pendingKey}`], undefined, 5_000, { watcher: watcher.id }));
+        const readStatus = (out: string | undefined) => {
+          try {
+            const value: unknown = JSON.parse(out ?? "");
+            return jsonObject(value) && value.id === wakeInboundId(pendingKey) && typeof value.state === "string" ? value.state : undefined;
+          } catch { return; }
+        };
+        const status = (receipt.ok ? readStatus(receipt.out) : undefined) ?? readStatus(acceptedResponse);
+        confirmed = status === "admitted";
+        failed = status === "failed";
+        delivery!.detail = `accepted wake delivery ${status ?? "unproven"}`;
+      } else {
+        const receipt = await imessageReceipt(state.failure_pause_escalation_fallback!, pending.key, watcher.id).catch(() => undefined);
+        confirmed = receipt?.ok === true;
+        failed = !!receipt && !receipt.ok && !receipt.pending;
+        delivery!.detail = receipt?.out ?? "accepted send delivery unproven";
+      }
+      needsNotice = !confirmed && (needsNotice || exists || failed || state.failure_escalation_attempts! >= 3);
+    } else needsNotice ||= !delivery!.ok && state.failure_escalation_attempts! >= 3;
+    const saved = await update(fresh => {
+      fresh.failure_escalated = delivery!.ok;
+      if (confirmed) delete fresh.failure_escalation_pending;
+      if (needsNotice) fresh.failure_escalation_notice ??= noticeText(fresh);
+      else if (!fresh.failure_escalation_notice_sent) delete fresh.failure_escalation_notice;
+    });
+    if (saved?.failure_escalation_notice && !saved.failure_escalation_notice_sent) {
+      const sent = await attempt(() => telegram(`Watcher ${watcher.id}`, saved.failure_escalation_notice!,
+        `robob-watch:${watcher.id}:escalate-undelivered:${hash(episode ?? since ?? "").slice(0, 32)}`, "attention", undefined, watcher.id));
+      await update(fresh => { fresh.failure_escalation_notice_sent = sent.ok; });
+      toolLog({ component: "wakes", kind: "error", name: "failure_escalation.undelivered", ok: sent.ok,
+        ids: { watcher: watcher.id, key: wakeInboundId(wakeKey) },
+        props: { attempt: saved.failure_escalation_attempts, httpStatus, reason, failureClass: exists ? "other" : /timed out|timeout/i.test(delivery.detail) ? "timeout" : "other" },
+        error: { tag: "wake.delivery_failed" } });
     }
     return delivery;
   } finally {
-    toolLog({ component: "wakes", kind: delivery?.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - started), ok: delivery?.ok ?? false,
-      ids: { watcher: watcher.id, chat: "owner", key: wakeInboundId(key) }, ...(delivery?.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
+    log(watcher.id, `failure escalation ok=${delivery?.ok ?? false} via=${delivery?.via ?? "none"} attempt=${state.failure_escalation_attempts} next retry=${state.failure_escalation_next_at}${delivery?.ok ? "" : ` ${delivery?.detail ?? "helper failed"}`}`);
+    toolLog({ component: "wakes", kind: httpStatus === 409 ? "event" : delivery?.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - started), ok: delivery?.ok ?? false,
+      ids: { watcher: watcher.id, chat: "owner", key: wakeInboundId(wakeKey) }, props: { httpStatus, reason, attempt: state.failure_escalation_attempts }, ...(delivery?.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
   }
 }
 

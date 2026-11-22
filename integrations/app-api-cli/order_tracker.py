@@ -474,6 +474,7 @@ def write(path, data):
 
 
 def write_order(path, cfg):
+    from amazon_checkout import preserve_links
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Registration, notice retries and retirement can hold older config snapshots.
     # Preserve claims under the same short lock used to commit a new bank match.
@@ -482,6 +483,13 @@ def write_order(path, cfg):
         current = read(path)
         if current.get('bank_msg_id'):
             cfg.update({key: current.get(key) for key in order_bank_charge.FIELDS})
+        preserve_links(cfg, current)
+        # A check may retire with the config it loaded before a silent repair.
+        if current.get('metadata_revision') and current['metadata_revision'] != cfg.get('metadata_revision'):
+            cfg.update({key: current[key] for key in
+                        ('metadata_revision', 'amount', 'total', 'currency', 'placed_items')})
+            cfg.setdefault('card_meta', {}).update({key: current['card_meta'][key]
+                                                    for key in ('items', 'total', 'currency')})
         write(path, cfg)
 
 
@@ -1581,6 +1589,9 @@ def delivery_card_result(cfg, result, state, *, persist=None):
 
 @toollog.timed('order-watch', 'track.poll')
 def _check(cfg, pending_only=False):
+    if cfg.get('terminal_import'):
+        print_terminal_snapshot(cfg)
+        return {'ok': True}
     folder = Path(os.environ['WATCH_DIR'])
     with (folder / 'order-tracker.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1825,9 +1836,31 @@ def retire(cfg, path, watcher=None):
         write_order(path, cfg)
 
 
+def print_terminal_snapshot(cfg):
+    from amazon_checkout import order_state, summary
+    state = order_state(sys.modules[__name__], cfg)
+    result = deepcopy(state.get('last_result', {}))
+    if not terminal_order(cfg, result):
+        raise ValueError('Terminal tracker has no terminal proof')
+    result['last_confirmed_status'] = result['status']
+    if cfg.get('checkout'):
+        _, projection = summary(sys.modules[__name__], cfg, result)
+        result.update(checkout=cfg['checkout'], siblings=cfg['siblings'],
+                      checkout_terminal=projection['checkout_terminal'], checkout_result=projection)
+    print(json.dumps(result, indent=2))
+
+
+def main(argv=None, _locked=False, _checkout=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] in (['import-terminal'], ['set-meta']):
+        from order_terminal import main as terminal_main
+        return terminal_main(sys.modules[__name__], argv)
+    return _main(argv, _locked=_locked, _checkout=_checkout)
+
+
 @toollog.registration
 @toollog.entrypoint('order-watch', 'status', cli=True)
-def main(argv=None, _locked=False, _checkout=None):
+def _main(argv=None, _locked=False, _checkout=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ['can-report']:
         from order_receipts import can_report
@@ -1861,7 +1894,10 @@ def main(argv=None, _locked=False, _checkout=None):
     if argv[:1] == ['aftercare']:
         import aftercare
         return aftercare.main(argv[1:], session=SESSION)
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+        'Already-delivered orders: import-terminal records Amazon delivered/cancelled proof silently; '
+        'set-meta corrects amount/items without refreshing or sending a card. '
+        'Both accept --dry-run; use COMMAND --help for options.'))
     parser.add_argument('command', choices=['status', 'add', 'check', 'check-pending', 'remove', 'reconcile'])
     parser.add_argument('--app', required=True, choices=list(PACKAGES) + list(ALIASES) + ['web'])
     parser.add_argument('--order', '--order-id', required=True, action='append')
@@ -1938,6 +1974,15 @@ def main(argv=None, _locked=False, _checkout=None):
             fcntl.flock(lock, fcntl.LOCK_EX)
             return main(argv, _locked=True, _checkout=_checkout)
     cfg = read(path)
+    if app == 'amazon' and args.command in ('status', 'check', 'check-pending'):
+        from amazon_checkout import order_state
+        saved = order_state(sys.modules[__name__], cfg)
+        scratch = os.environ.get('WATCH_DIR') and Path(os.environ['WATCH_DIR']).resolve() != (WATCHERS / wid).resolve()
+        if cfg and (cfg.get('terminal_import') or (
+                (args.command == 'status' or cfg.get('active') is False or scratch)
+                and terminal_order(cfg, saved.get('last_result', {})))):
+            print_terminal_snapshot(cfg)
+            return 0
     previous_checkout = cfg.get('checkout')
     new = not cfg
     if app == 'web' and new and args.command == 'add' and not args.merchant_name:
