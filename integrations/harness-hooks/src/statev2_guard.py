@@ -12,10 +12,17 @@ import re
 import shlex
 import shutil
 import stat
+import time
 import unicodedata
 import warnings
 from urllib.parse import unquote
 
+
+# Milliseconds this process spent scanning remote (offbox/ssh) payloads. Only the
+# outermost scan is timed, so nested payloads are not counted twice. The hook
+# engine reports the change across one call as its own phase.
+remote_scan_ms = 0.0
+_remote_scan_depth = 0
 
 REPLICA = re.compile(r"(?<![\w.-])\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?(?![\w./-])")
 LIVE = re.compile(
@@ -5031,7 +5038,18 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             fresh_variables.update(previous_fresh)
             opaque_written.clear()
 
-    def scan_remote(source, directory, depth, input_words=(), input_bodies=None, inherit_environment=False, opaque=None, preservation=True):
+    def scan_remote(*args, **kwargs):
+        global remote_scan_ms, _remote_scan_depth
+        started = time.monotonic() if _remote_scan_depth == 0 else None
+        _remote_scan_depth += 1
+        try:
+            return scan_remote_payload(*args, **kwargs)
+        finally:
+            _remote_scan_depth -= 1
+            if started is not None:
+                remote_scan_ms += (time.monotonic() - started) * 1000
+
+    def scan_remote_payload(source, directory, depth, input_words=(), input_bodies=None, inherit_environment=False, opaque=None, preservation=True):
         # Synced source evidence may be read remotely, but remote writes,
         # bindings and cwd cannot prove anything about the caller's files.
         # Only payloads offbox may run locally after an outage reach here

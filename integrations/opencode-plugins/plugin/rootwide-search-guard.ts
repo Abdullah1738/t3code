@@ -1,5 +1,5 @@
 import { hook as toolLogHook } from "../lib/toollog";
-import { failureProps, runClassifier } from "../lib/classifier";
+import { classifierPhases, failureProps, runClassifier } from "../lib/classifier";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -28,8 +28,8 @@ export function createGuardHook(directory: string, check = classify) {
     const cwd = input.workdir ?? input.cwd ?? directory;
     let verdict: Verdict;
     try { verdict = await check(command, cwd); }
-    catch (error) { toolLogHook("rootwide-search", "allowed", "classifier-unavailable", started, command, "hook.classifier_failed", {sessionId:event.sessionID}, {cwd}, failureProps(classifier, error, command, started)); return; }
-    toolLogHook("rootwide-search", verdict.root && verdict.reason ? "denied" : "allowed", "rootwide-search", started, command, undefined, {sessionId:event.sessionID}, {cwd, matchedRoot:verdict.root});
+    catch (error) { toolLogHook("rootwide-search", "allowed", "classifier-unavailable", started, command, "hook.classifier_failed", {sessionId:event.sessionID}, {cwd}, failureProps(classifier, error, command, started), classifierPhases(error)); return; }
+    toolLogHook("rootwide-search", verdict.root && verdict.reason ? "denied" : "allowed", "rootwide-search", started, command, undefined, {sessionId:event.sessionID}, {cwd, matchedRoot:verdict.root}, {}, classifierPhases(verdict));
     if (verdict.root && verdict.reason) {
       event.input = { ...input, [field]: `printf '%s\\n' ${quote(verdict.reason)} >&2; exit 3`, background: false };
     }

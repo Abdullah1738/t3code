@@ -22,6 +22,13 @@ _IMESSAGE_ERROR_NAMES = frozenset('Error TypeError RangeError ReferenceError Syn
 CAP_BYTES = 50 * 1024 * 1024
 HOOKS_CAP_BYTES = 35 * 1024 * 1024
 HOOK_SAMPLE_RATE = 128
+# Hook rows slower than this carry measured phase timings and are never sampled
+# or capped out: they are rare and they are the rows a latency card needs.
+SLOW_HOOK_MS = 2000
+# Measured spans inside one hook call. Callers time them with a monotonic clock;
+# a phase a writer cannot measure is left out, never estimated.
+HOOK_PHASES = ('identity_ms', 'lineage_ms', 'classify_ms', 'guard_ms', 'live_db_ms', 'remote_scan_ms', 'desktop_ms',
+               'lock_wait_ms', 'log_write_ms', 'mask_ms', 'spawn_ms')
 _SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _LABEL = re.compile(r"[A-Za-z0-9_.:-]{1,120}\Z")
 _ID_VALUE = re.compile(r"[A-Za-z0-9_.:%/-]{1,300}\Z")
@@ -35,7 +42,7 @@ _FIELDS = {'harness', 'guard', 'decision', 'rule', 'firstWord', 'commandLength',
            'httpMethod', 'ttfbMs', 'reason', 'identity_source', 'driver', 'route', 'httpStatus',
            'resolution', 'attempt', 'command', 'attempts', 'waitedMs',
            'classifier', 'errorClass', 'failMode', 'spawnMs', 'classifyMs', 'totalMs', 'cmdKind',
-           'holder', 'adbVerb', 'source', 'cmdShape', 'project'}
+           'holder', 'adbVerb', 'source', 'cmdShape', 'project', *HOOK_PHASES}
 _IDS = {'sessionId', 'threadId', 'nativeAgentId', 'cardNumber', 'serverId', 'home', 'sampleId'}
 _WORDS = set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split())
 
@@ -522,7 +529,8 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
                                    'kind': 'error', 'name': 'log.cap', 'ok': False,
                                    'props': {'component': scope, 'capBytes': cap},
                                    'error': {'tag': 'log.cap', 'message': 'Daily log cap reached'}})
-        if kind != 'error' and (size >= CAP_BYTES or component == 'hooks' and size >= HOOKS_CAP_BYTES):
+        if (kind != 'error' and not _slow_hook(row)
+                and (size >= CAP_BYTES or component == 'hooks' and size >= HOOKS_CAP_BYTES)):
             return
         rate = _sample_rate(row)
         if rate > 1 and random.random() >= 1 / rate:
@@ -532,13 +540,31 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
         pass
 
 
+def _is_slow(duration_ms):
+    # Compare the value emit() writes, so the writer and the cap agree at the boundary.
+    return (type(duration_ms) in (int, float) and math.isfinite(duration_ms)
+            and round(duration_ms, 3) > SLOW_HOOK_MS)
+
+
+def _slow_hook(row):
+    return row.get('name') == 'hook.decision' and _is_slow(row.get('durationMs'))
+
+
+def phase_props(duration_ms, phases):
+    """Integer phase fields for a slow hook row; nothing for a fast one."""
+    if not _is_slow(duration_ms):
+        return {}
+    return {key: int(round(value)) for key, value in (phases or {}).items()
+            if key in HOOK_PHASES and type(value) in (int, float) and math.isfinite(value) and value >= 0}
+
+
 def run_source():
     """'test' inside a test runner. Until #185 tags test runs, the environment is the only signal."""
     return 'test' if ('unittest' in sys.modules or 'pytest' in sys.modules or os.environ.get('NODE_ENV') == 'test'
                       or os.environ.get('ROBOB_TEST') or os.environ.get('PYTEST_CURRENT_TEST')) else 'real'
 
 
-def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None, identity_source=None, extra=None):
+def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None, identity_source=None, extra=None, phases=None):
     try:
         identity, source = hook_ids(harness, ids)
         command_fields = command_props(command)
@@ -555,12 +581,17 @@ def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=No
             command_fields['source'] = 'test'
         if isinstance(identity_source, str) and identity_source in {'cache', 'control', 'negative-cache'}:
             command_fields['identity_source'] = identity_source
-        emit('hooks', 'error' if decision == 'denied' or error_tag else 'perf', 'hook.decision',
-             duration_ms=duration_ms, ok=decision != 'denied' and not error_tag, ids=identity,
-             props=hook_props({**(extra or {}), 'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
+        timings = phase_props(duration_ms, phases)
+        props = hook_props({**(extra or {}), 'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
                     'threadIdSource': source, 'cwdClass': cwd_class(cwd), 'matchedRoot': matched_root(matched),
                     'repeatCount': _repeat_count(harness, identity, guard, rule, command_fields.get('firstWord', 'none')),
-                    'argv0Class': 'none', **command_fields}, error=decision == 'denied' or bool(error_tag)),
+                    'argv0Class': 'none', **command_fields}, error=decision == 'denied' or bool(error_tag))
+        if _is_slow(duration_ms):
+            # Every slow row is written, so it weighs 1 in the rollup's estimates.
+            props.pop('sampleRate', None)
+        emit('hooks', 'error' if decision == 'denied' or error_tag else 'perf', 'hook.decision',
+             duration_ms=duration_ms, ok=decision != 'denied' and not error_tag, ids=identity,
+             props={**props, **timings},
              error_tag=error_tag or (rule if decision == 'denied' else None))
     except Exception:
         pass
@@ -1117,6 +1148,7 @@ def rollup(board, day, top_n=20):
     single_failures = 0
     deduped_failures = 0
     probe_failure_kinds = {}
+    slow_hooks = []
     def observe_error(row, line_number, weight=1):
         nonlocal single_failures
         probe_id = (row.get('ids') or {}).get('inboundId', '')
@@ -1224,6 +1256,8 @@ def rollup(board, day, top_n=20):
         failed += row_failed
         errors += weight * (kind == 'error' and not already_logged)
         duration = row.get('durationMs')
+        if board == 'agent-tools' and _slow_hook(row):
+            slow_hooks.append((line_number, row))
         values = row['_rollup_histogram'] if aggregate else ([(duration, weight)]
             if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0 else [])
         if values:
@@ -1382,6 +1416,7 @@ def rollup(board, day, top_n=20):
             {'classifier': name, 'count': count,
              'errorClasses': dict(sorted(classifier_classes[name].items(), key=lambda x: (-x[1], x[0])))}
             for name, count in sorted(classifier_failures.items(), key=lambda x: (-x[1], x[0]))[:5]]
+        result['slowestPhaseByCount'] = slowest_phases(slow_hooks, day, percentiles, top_n)
     if board == 'orders':
         result['canReportByOutcome'] = can_report_outcomes
         result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
@@ -1441,6 +1476,48 @@ def rollup(board, day, top_n=20):
                 'errorRate': stats['failed'] / stats['count'] if stats['count'] else 0,
                 **({'durationMs': percentiles(stats['histogram'])} if stats['histogram'] else {})}
     return result
+
+
+def _row_phases(row):
+    """Measured phases plus the unmeasured remainder; None for rows written without phases."""
+    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+    phases = {key: props[key] for key in HOOK_PHASES
+              if type(props.get(key)) in (int, float) and math.isfinite(props[key]) and props[key] >= 0}
+    if not phases:
+        return None
+    phases['unmeasured'] = max(0, int(round(row['durationMs'] - sum(phases.values()))))
+    return phases
+
+
+def slowest_phases(rows, day, percentiles, top_n=10):
+    """Hook rows over SLOW_HOOK_MS: the largest phase per row, then count and p95 per phase per harness."""
+    harnesses, top = {}, []
+    for line_number, row in rows:
+        props = row.get('props') if isinstance(row.get('props'), dict) else {}
+        harness = props.get('harness') if isinstance(props.get('harness'), str) else 'unknown'
+        entry = harnesses.setdefault(harness, {'rows': 0, 'unphasedRows': 0, 'largest': {}, 'values': {}})
+        entry['rows'] += 1
+        phases = _row_phases(row)
+        largest = None
+        if phases is None:
+            entry['unphasedRows'] += 1
+        else:
+            largest = max(phases, key=lambda key: (phases[key], key != 'unmeasured', key))
+            entry['largest'][largest] = entry['largest'].get(largest, 0) + 1
+            for key, value in phases.items():
+                entry['values'].setdefault(key, []).append((value, 1))
+        top.append({'durationMs': row['durationMs'], 'ts': row.get('ts'), 'harness': harness,
+                    'guard': props.get('guard'), 'rule': props.get('rule'),
+                    'errorTag': (row.get('error') or {}).get('tag') if isinstance(row.get('error'), dict) else None,
+                    'largestPhase': largest, 'phases': phases,
+                    'sampleId': {'file': day + '.ndjson', 'line': line_number}})
+    return {'thresholdMs': SLOW_HOOK_MS, 'byHarness': {
+                harness: {'rows': entry['rows'], 'unphasedRows': entry['unphasedRows'],
+                          'largestPhase': dict(sorted(entry['largest'].items(), key=lambda x: (-x[1], x[0]))),
+                          'phases': {key: {'count': len(values), 'p95': percentiles(values)['p95']}
+                                     for key, values in sorted(entry['values'].items())}}
+                for harness, entry in sorted(harnesses.items())},
+            'slowestRows': sorted(top, key=lambda x: (-x['durationMs'], x['sampleId']['line']))[:top_n]}
 
 
 def hourly_table(result, limit=20):
