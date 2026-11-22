@@ -5,7 +5,9 @@ import fixture from "./fixtures/slot-replay.json";
 export type ReplayMix = { source: string; watchers: { watcher: string; intervalMs: number; checkMs: number; timeout_s?: number }[] };
 export type ReplayOptions = { mix?: ReplayMix; loads?: { at: number; load: number }[]; hysteresis?: boolean; fastSlots?: number; anchor?: boolean;
   sticky?: boolean; borrowFast?: boolean; runtime?: (watcher: ReplayMix["watchers"][number], at: number, run: number) => number;
-  freeze?: { at: number; ms: number }; existingTimeouts?: boolean; accountFrom?: number; accountUntil?: number; initialStates?: Record<string, Partial<State>> };
+  freeze?: { at: number; ms: number }; existingTimeouts?: boolean; accountFrom?: number; accountUntil?: number;
+  observedRelease?: (watcher: ReplayMix["watchers"][number], at: number, run: number) => { ms: number; timedOut: boolean };
+  releaseDelayMs?: number; failureProbes?: boolean; initialStates?: Record<string, Partial<State>> };
 export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, options: ReplayOptions = {}) {
   const mix = options.mix ?? fixture;
   let clock = 0;
@@ -25,6 +27,8 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
   let busyMs = 0;
   const borrowedNow = new Map<string, boolean>(), windowBorrowed = new Map<string, number>();
   const windowHolds = new Map<string, {slow: number; fast: number}>();
+  const hourlyHolds = Array.from({ length: hours }, () => new Map<string, {slow: number; fast: number}>());
+  const hourlySupplyMs = Array.from({ length: hours }, () => 0);
   const slots = new Slots(() => options.loads ? high ? 2 : cap : cap, { now: () => clock, emit: event => {
     if (event.name === "slot.busy") busyMs += event.durationMs;
     if (event.name === "slot.hold") {
@@ -34,6 +38,13 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
       held[event.request.lane === "fast" ? "fast" : "slow"] += ms;
       if (borrowedNow.get(event.request.watcher)) windowBorrowed.set(event.request.watcher, (windowBorrowed.get(event.request.watcher) ?? 0) + ms);
       windowHolds.set(event.request.watcher, held);
+      const lane = event.request.lane === "fast" ? "fast" : "slow";
+      for (let hour = Math.max(0, Math.floor((clock - event.durationMs) / 3600_000)); hour < hours && hour * 3600_000 < clock; hour++) {
+        const overlap = Math.max(0, Math.min(clock, (hour + 1) * 3600_000) - Math.max(clock - event.durationMs, hour * 3600_000));
+        const row = hourlyHolds[hour]!.get(event.request.watcher) ?? { slow: 0, fast: 0 };
+        row[lane] += overlap;
+        hourlyHolds[hour]!.set(event.request.watcher, row);
+      }
     }
     if (events.length < 100 && (event.name === "slot.backlog" || event.name === "slot.wait")) events.push({ at: clock, event });
   } }, options.fastSlots ?? 0, () => high && !!options.borrowFast);
@@ -43,6 +54,7 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
     while (options.loads?.[loadIndex] && options.loads[loadIndex]!.at <= clock) load = options.loads[loadIndex++]!.load;
     const wasHigh = high;
     high = options.hysteresis ? mode.sample(load, clock) : load >= 1.5;
+    if (clock < limit) hourlySupplyMs[Math.floor(clock / 3600_000)]! += ((options.loads && high ? 2 : cap) + (options.fastSlots ?? 0) + ((options.fastSlots ?? 0) > 0 ? 1 : 0)) * 1000;
     if (high !== wasHigh && clock < limit) switches++;
     const finished = timers.filter(timer => timer.at <= clock);
     for (const timer of finished) { timers.splice(timers.indexOf(timer), 1); timer.resolve(); }
@@ -50,7 +62,7 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
     slots.drain();
     if (clock < limit) for (const watcher of mix.watchers) {
       const state = states.get(watcher.watcher)!;
-      if (running.has(watcher.watcher) || (state.failure_paused_at ? Date.parse(state.failure_probe_next_at!) > clock : next.get(watcher.watcher)! > clock)) continue;
+      if ((state.failure_paused_at && options.failureProbes === false) || running.has(watcher.watcher) || (state.failure_paused_at ? Date.parse(state.failure_probe_next_at!) > clock : next.get(watcher.watcher)! > clock)) continue;
       const dueAt = state.failure_paused_at ? Date.parse(state.failure_probe_next_at!) : next.get(watcher.watcher)!;
       running.add(watcher.watcher);
       const lane = options.sticky ? checkClassification(last.get(watcher.watcher), history.get(watcher.watcher)).lane
@@ -64,11 +76,14 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
         if (probe) state.failure_probe_attempts = (state.failure_probe_attempts ?? 0) + 1;
         const started = clock, startLoad = load, run = runCounts.get(watcher.watcher) ?? 0;
         runCounts.set(watcher.watcher, run + 1);
-        const runtime = options.runtime?.(watcher, clock, run) ?? watcher.checkMs;
+        const observed = options.observedRelease?.(watcher, clock, run);
+        const runtime = observed?.ms ?? options.runtime?.(watcher, clock, run) ?? watcher.checkMs;
         let doneAt = clock + runtime;
         if (options.freeze && clock < options.freeze.at && doneAt >= options.freeze.at) doneAt += options.freeze.ms;
-        const deadline = clock + (options.existingTimeouts ? checkTimeout(definitions.get(watcher.watcher)!, load) : Infinity), timedOut = deadline < doneAt;
-        await new Promise<void>(resolve => timers.push({ at: Math.min(doneAt, deadline), resolve }));
+        const deadline = clock + (options.existingTimeouts ? checkTimeout(definitions.get(watcher.watcher)!, load) : Infinity);
+        const timedOut = observed ? observed.timedOut : deadline < doneAt;
+        const releaseAt = observed ? doneAt : timedOut ? deadline + (options.releaseDelayMs ?? 0) : doneAt;
+        await new Promise<void>(resolve => timers.push({ at: releaseAt, resolve }));
         const ms = clock - started;
         if (timedOut) {
           if (probe) state.failure_probe_next_at = new Date(clock + failureProbeDelay(state.failure_probe_attempts!)).toISOString();
@@ -114,6 +129,7 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
   });
   return { cap, watchers: mix.watchers.length, hours, assumptions: mix.source, switches,
     windowHolds: Object.fromEntries(windowHolds), windowBorrowed: Object.fromEntries(windowBorrowed),
+    hourlyHolds: hourlyHolds.map(holds => Object.fromEntries(holds)), hourlySupplyMs,
     all: waits(measured), fast: waits(measured.filter(row => row.fast)), fastFrequent: waits(measured.filter(row => row.fast && row.frequent)), slow: waits(measured.filter(row => !row.fast)),
     fastLane: waits(measured.filter(row => row.fastLane)), slowLane: waits(measured.filter(row => !row.fastLane)),
     busyMinutes: busyMs / 60_000, topHolders: [...heldMs].sort(([, a], [, b]) => b - a).slice(0, 5).map(([watcher, ms]) => ({ watcher, slotSeconds: ms / 1000 })),
