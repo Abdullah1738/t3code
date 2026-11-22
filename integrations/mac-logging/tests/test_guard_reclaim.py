@@ -118,6 +118,50 @@ class ReclaimTests(unittest.TestCase):
         self.tick(NOW+2401, 'peak', NOW-1)
         self.assertEqual(self.janitor_calls, 2)
 
+    def test_rate_limited_peak_retries_with_offset_sampler_and_guard(self):
+        cases = [
+            ('aligned', 0, 1200, False, None, 2),
+            ('before-deadline', 20, 1219, False, None, 1),
+            ('at-deadline', 20, 1220, False, None, 2),
+            ('next-tick', 20, 1230, False, None, 2),
+            ('after-restart', 20, 1230, True, None, 2),
+            ('freshness-boundary', 180, 1380, False, None, 2),
+            ('expired', 180, 1381, False, None, 1),
+            ('ended', 20, 1230, False, 'end', 1),
+            ('enough-reclaimed', 20, 1230, False, 'freed', 1),
+            ('other-episode', 20, 1230, False, 'other', 1),
+        ]
+        for name, delay, retry, restart, gate, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                calls = []
+                guard = m.Guard(FakeHost(), root/'state', root/'evidence', dry=False,
+                    clock=lambda:self.now, logger=lambda *a,**kw:None)
+                janitor = lambda:calls.append(self.now) or dict(result='completed')
+                native = Native()
+                reclaim = r.Reclaimer(guard, root/'logs', native, janitor)
+                self.now = NOW+delay
+                reclaim.tick(self.now, latest(NOW))
+                self.assertEqual(calls, [self.now])
+                if gate == 'freed':
+                    reclaim.state['freedRssMb'] = 1024
+                    reclaim.save()
+                peak = latest(NOW+1200, 'peak', NOW-1 if gate == 'other' else NOW)
+                self.now = NOW+1200
+                reclaim.tick(self.now, peak)
+                self.assertEqual(len(calls), 2 if delay == 0 else 1)
+                if restart:
+                    reclaim = r.Reclaimer(guard, reclaim.root, native, janitor)
+                if gate == 'end':
+                    self.now = NOW+1210
+                    reclaim.tick(self.now, latest(self.now, 'end', NOW))
+                self.now = NOW+retry
+                reclaim.tick(self.now, peak)
+                self.assertEqual(len(calls), expected)
+                self.now += 0.1
+                reclaim.tick(self.now, peak)
+                self.assertEqual(len(calls), expected)
+
     def test_end_stale_future_and_bad_onsets_do_nothing(self):
         for value in (event(NOW, 'end'), event(NOW-181), event(NOW+1),
                       dict(name='host.overload', ts=stamp(NOW), props=dict(phase='onset', onset='bad'))):

@@ -10,7 +10,7 @@ import re
 import subprocess
 import time
 
-from cpu_labels import family, script_hint, command_label
+from cpu_labels import family, script_hint, command_label, bounded_detail
 from jobs import read_state, save_state, state_path
 from toollog import emit, finite_number, cpu_fields
 from volume_crawls import volume_crawls
@@ -23,7 +23,26 @@ SPIKES_PER_DAY = 240
 
 
 class ProbeError(Exception):
-    pass
+    def __init__(self, message, *, argv=None, rc=None, stderr='', errno=None):
+        super().__init__(message)
+        self.command = os.path.basename(str(argv[0])) if argv else None
+        self.rc = rc
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode('utf-8', errors='replace')
+        self.stderr = bounded_detail(str(stderr)) if stderr else ''
+        self.errno = errno
+
+
+def failure_details(exc, operation):
+    command = getattr(exc, 'command', None) or os.path.basename(operation)
+    rc = getattr(exc, 'rc', None)
+    stderr = getattr(exc, 'stderr', '')
+    detail = getattr(exc, 'strerror', None) or str(exc) or type(exc).__name__
+    first = (stderr or detail).splitlines()[0]
+    number = getattr(exc, 'errno', None)
+    return dict(result='gone' if number == errno.ESRCH else 'error', errno=number,
+                rc=rc, stderr=bounded_detail(stderr), strerror=bounded_detail(detail),
+                reason=bounded_detail(f'{command} rc={rc}: {first}'))
 
 
 class RusageInfoV1(ctypes.Structure):
@@ -348,14 +367,14 @@ def command(argv, run, timeout=30):
     env.pop('BUN_INSPECT', None)
     try:
         result = run(argv, capture_output=True, text=True, timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        raise ProbeError('timeout')
-    except OSError:
-        raise ProbeError('unavailable')
-    except UnicodeError:
-        raise ProbeError('parse')
+    except subprocess.TimeoutExpired as exc:
+        raise ProbeError('timeout', argv=argv, stderr=exc.stderr) from None
+    except OSError as exc:
+        raise ProbeError('unavailable', argv=argv, stderr=exc.strerror, errno=exc.errno) from None
+    except UnicodeError as exc:
+        raise ProbeError('parse', argv=argv, stderr=str(exc)) from None
     if result.returncode:
-        raise ProbeError('exit')
+        raise ProbeError('exit', argv=argv, rc=result.returncode, stderr=getattr(result, 'stderr', ''))
     return result.stdout
 
 

@@ -12,8 +12,8 @@ import subprocess
 import time
 import uuid
 
-from cpu_labels import command_label
-from cpu import ProbeError
+from cpu_labels import command_label, bounded_detail
+from cpu import ProbeError, failure_details
 
 INTERVAL = 1200
 FRESH = 180
@@ -22,13 +22,28 @@ NEVER = ['offbox wait/_bg-queue holders and descendants', 'Robob app/server',
          'provider sessions and their wrappers', 'OpenCode service', 'macOS system processes',
          'Dia', 'Messages', 'host-vitals sampler and mac-guard', 'unknown process identity or ancestry']
 LOG_KEYS = set('cpuPct cpuBasis passId step result reason trigger phase onset ts durationS conditions evidence pid ppid start comm args family ancestors rssBeforeMb rssAfterMb freedRssMb janitor gui renice before after swapUsedBytes swapTotalBytes pressureLevel workerStarted workerDelivered threadId partial errors observedAt completedAt niceBefore niceAfter count returncode'.split())
+LOG_KEYS.update('stages stage identityRead identityRecheck getpriority setpriority readBack taskpolicy same errno rc stderr strerror'.split())
+LOG_KEYS.update(('report', 'problems', 'phaseMs'))
 
 
 def log_fields(value, depth=0):
     if depth > 8:
         return None
     if isinstance(value, dict):
-        return {k: log_fields(v, depth+1) for k, v in value.items() if k in LOG_KEYS}
+        result = {}
+        for k, v in value.items():
+            if k not in LOG_KEYS:
+                continue
+            if k == 'phaseMs':
+                from toollog import safe_fields
+                result[k] = safe_fields({'phase_ms':v}, 'janitor.run').get('phase_ms', {})
+            elif k == 'problems':
+                result[k] = [bounded_detail(str(p)) for p in v[:5]] if isinstance(v, list) else []
+            elif k in ('reason', 'stderr', 'strerror') and isinstance(v, str):
+                result[k] = bounded_detail(v)
+            else:
+                result[k] = log_fields(v, depth+1)
+        return result
     if isinstance(value, (list, tuple)):
         return [log_fields(v, depth+1) for v in value[:128]]
     if isinstance(value, str):
@@ -232,7 +247,11 @@ class Darwin:
         from host_native import BsdInfo
         bsd = self.native.info(pid, 3, BsdInfo)
         buf = c.create_string_buffer(4096)
+        c.set_errno(0)
         n = self.native.proc.proc_pidpath(pid, buf, len(buf))
+        if n <= 0:
+            number = c.get_errno()
+            raise OSError(number or None, os.strerror(number) if number else 'path unavailable')
         if bsd.pid != pid or n <= 0 or n >= len(buf):
             raise OSError('identity unavailable')
         args = shlex.join(self.native.argv(pid))
@@ -280,16 +299,63 @@ class Darwin:
         return result
 
     def soften(self, p):
-        fresh = self.row(p['pid'])
-        if any(fresh[k] != p[k] for k in ('start', 'comm', 'args', 'ppid', 'uid')):
-            return dict(result='identity-changed')
-        before = os.getpriority(os.PRIO_PROCESS, p['pid'])
-        # Absolute nice 10: repeated passes never ratchet a job to 20.
-        os.setpriority(os.PRIO_PROCESS, p['pid'], max(10, before))
-        return dict(result='sent', niceBefore=before, niceAfter=os.getpriority(os.PRIO_PROCESS, p['pid']))
+        stages = {name:dict(result='skipped', reason='prior-stage-failed')
+                  for name in ('identityRead', 'getpriority', 'setpriority', 'readBack')}
+        outcome = dict(stages=stages)
+        operations = (
+            ('identityRead', lambda:self.row(p['pid'])),
+            ('getpriority', lambda:os.getpriority(os.PRIO_PROCESS, p['pid'])),
+            # Absolute nice 10: repeated passes never ratchet a job to 20.
+            ('setpriority', lambda:os.setpriority(os.PRIO_PROCESS, p['pid'], max(10, outcome['niceBefore']))),
+            ('readBack', lambda:os.getpriority(os.PRIO_PROCESS, p['pid'])))
+        for stage, operation in operations:
+            try:
+                value = operation()
+            except (OSError, ValueError) as exc:
+                failure = failure_details(exc, stage)
+                stages[stage] = failure
+                return dict(outcome, stage=stage, **failure)
+            stages[stage] = dict(result='sent')
+            if stage == 'identityRead':
+                same = all(value[k] == p[k] for k in ('start', 'comm', 'args', 'ppid', 'uid'))
+                stages[stage]['same'] = same
+                if not same:
+                    stages[stage]['result'] = 'identity-changed'
+                    return dict(outcome, result='identity-changed')
+            elif stage == 'getpriority':
+                outcome['niceBefore'] = value
+            elif stage == 'readBack':
+                outcome['niceAfter'] = value
+        return dict(outcome, result='sent')
 
 
-def run_janitor(run=subprocess.run, home=None):
+def janitor_report(path, started):
+    try:
+        with path.open('rb') as stream:
+            raw = stream.read(1024*1024+1)
+        if len(raw) > 1024*1024:
+            return dict(report='missing')
+        report = json.loads(raw)
+        if not isinstance(report, dict):
+            return dict(report='missing')
+    except (OSError, ValueError, UnicodeError):
+        return dict(report='missing')
+    observed = report.get('ts')
+    if type(observed) not in (int, float) or not math.isfinite(observed) or observed < started:
+        return dict(report='stale')
+    processes = report.get('processes', {})
+    processes = processes if isinstance(processes, dict) else {}
+    problems = processes.get('problems', [])
+    problems = list(problems) if isinstance(problems, list) else []
+    summary = processes.get('mcp_summary', {})
+    reason = summary.get('reason') if isinstance(summary, dict) else None
+    if reason and reason not in problems:
+        problems.append(reason)
+    value = log_fields(dict(problems=problems, phaseMs=report.get('phase_ms', {})))
+    return dict(value, report='fresh', **(dict(result='inventory-unavailable') if problems else {}))
+
+
+def run_janitor(run=subprocess.run, home=None, clock=time.time):
     home = Path(home or Path.home())
     scripts = Path(os.environ.get('DEV_JANITOR_SCRIPT_DIR', str(home/'.config/opencode/skills/dev-resource-janitor/scripts')))
     log_dir = Path(os.environ.get('DEV_JANITOR_LOG_DIR', str(home/'.local/share/dev-janitor')))
@@ -306,17 +372,22 @@ def run_janitor(run=subprocess.run, home=None):
             return dict(result='already-running')
         # Use the installed normal worker and the SAME hourly lock. Calling
         # `check` would detach an unbounded worker and bypass our 120s bound.
+        started = clock()
         try:
             result = run([env.get('DEV_JANITOR_PYTHON', '/opt/homebrew/bin/python3'),
                           str(scripts/'janitor_watch.py'), 'worker', str(lock.fileno())],
                          pass_fds=(lock.fileno(),), timeout=120, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          env=env)
-            return dict(result='completed' if result.returncode == 0 else 'failed', returncode=result.returncode)
+            outcome = dict(result='completed' if result.returncode == 0 else 'failed', returncode=result.returncode)
         except subprocess.TimeoutExpired:
-            return dict(result='timeout')
+            outcome = dict(result='timeout')
         except OSError:
-            return dict(result='unavailable')
+            outcome = dict(result='unavailable')
+        report = janitor_report(log_dir/'last.json', started)
+        if outcome['result'] == 'timeout':
+            report.pop('result', None)
+        return dict(outcome, **report)
 
 
 class Reclaimer:
@@ -382,8 +453,9 @@ class Reclaimer:
             reason = 'peak-ineligible'
         if reason:
             self.log(step='decision', trigger=props, result=reason)
-            # A paused transition remains eligible until it ages out.
-            if not g.muted:
+            # A peak may arrive before 20 minutes from the guard's delayed
+            # onset pass. Keep it retryable; the sampler may emit no newer peak.
+            if not g.muted and not (phase == 'peak' and reason == 'rate-limit'):
                 self.state['seen'] = list(key)
                 self.save()
             return
@@ -420,7 +492,20 @@ class Reclaimer:
             except (OSError, ValueError):
                 census['censusErrors'].append('rss-unavailable')
                 return {}
+        vitals_row = latest.get('host.vitals', {})
+        def vitals():
+            nonlocal vitals_row
+            try:
+                current = latest_rows(self.root, g.clock()).get('host.vitals', {})
+                if timestamp(current.get('ts')) >= timestamp(vitals_row.get('ts')):
+                    vitals_row = current
+            except (OSError, ValueError):
+                census['censusErrors'].append('vitals-unavailable')
+            props = vitals_row.get('props', {})
+            return dict(observedAt=vitals_row.get('ts'),
+                        **{k:props.get(k) for k in ('swapUsedBytes', 'swapTotalBytes', 'pressureLevel')})
         def rung(step, action):
+            host_before = vitals()
             before = rss()
             try:
                 value = action()
@@ -432,7 +517,8 @@ class Reclaimer:
             evidence = [dict(pid=pid, start=rows[pid]['start'], args=command_label(rows[pid]['args']),
                              family=rows[pid]['family'], rssBeforeMb=before[pid], rssAfterMb=after[pid])
                         for pid in measured if before[pid] != after[pid]]
-            steps[step] = dict(value, freedRssMb=freed, partial=len(measured) != len(rows), processes=evidence)
+            steps[step] = dict(value, freedRssMb=freed, partial=len(measured) != len(rows), processes=evidence,
+                               before=host_before, after=vitals())
             self.log(passId=pass_id, step=step, evidence=str(path), **{k:v for k,v in steps[step].items() if k != 'processes'})
             for p in evidence:
                 self.log(passId=pass_id, step=step, result='rss-observation', **p)
@@ -470,9 +556,10 @@ class Reclaimer:
                     else:
                         try:
                             result = native.soften(p)
-                        except (OSError, ValueError):
-                            result = dict(result='identity-or-priority-unavailable')
-                        count += result['result'] == 'sent'
+                        except (OSError, ValueError) as exc:
+                            result = dict(stage='soften', **failure_details(exc, 'soften'))
+                        count += (result['result'] == 'sent'
+                                  or result.get('stages', {}).get('setpriority', {}).get('result') == 'sent')
                 after = rss({p['pid']:p}).get(p['pid']) if result.get('result') == 'sent' else p['rssMb']
                 self.log(passId=pass_id, step='renice', pid=p['pid'], start=p['start'],
                          args=p['args'], family=family, rssBeforeMb=p['rssMb'], rssAfterMb=after,

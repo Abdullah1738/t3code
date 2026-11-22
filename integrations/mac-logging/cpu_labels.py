@@ -96,6 +96,12 @@ def command_label(args):
     return ''.join(c if c.isprintable() else ' ' for c in value)[:160]
 
 
+def bounded_detail(value):
+    # Error recovery must still work when the shared redactor is unavailable.
+    label = command_label(value)
+    return label[:200] if isinstance(label, str) else '[redacted]'
+
+
 def script_hint(args):
     try:
         words = shlex.split(janitor_redact(args))

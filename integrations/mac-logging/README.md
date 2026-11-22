@@ -1035,6 +1035,15 @@ samples, kept identities, rung results and the never-touch list. The next
 host-vitals row after completion fills in pressure/swap after the pass;
 `after: null` means that row has not arrived. Worker delivery retries use the
 existing durable responder path, including its idempotent launch/steer IDs.
+Each rung also records the latest logged swap/pressure before and after it,
+with observation timestamps. A fresh janitor report with inventory problems
+produces `inventory-unavailable`, even if the worker exited zero; missing or
+stale reports are labelled. Priority actions retain individual command/syscall
+outcomes, bounded error reasons and known errno values. `gone` identifies an
+exited process; `partial` records a successful renice followed by a failed
+backgrounding command. Action evidence survives the day-file cap.
+Install the corresponding janitor reporter update too: its scan timestamp must
+retain fractional seconds to pass the guard's strict report-freshness check.
 
 Pause with `touch ~/.local/state/mac-guard/paused`; remove that file to resume.
 `MAC_GUARD_DRY_RUN=1` records proposed actions while sending no signals,
