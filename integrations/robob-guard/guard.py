@@ -22,6 +22,8 @@ EXECUTABLE = APP + "/Contents/MacOS/Robob"
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 BACKOFF = (120, 300, 600, 600)
 HOLD_MAX_AGE = 30 * 60
+SSD_PROBE_MAX_AGE = 300
+SSD_MARKER_MAX_BYTES = 64 * 1024
 HEALTH_DEADLINE = 3
 DESKTOP_STARTUP_GRACE = 180
 UNREADY_WINDOW = 180
@@ -90,7 +92,7 @@ def record_orphan_block(state, now, orphan, conflict):
 
 
 def decide(previous, *, now, up, boot_time, hold=None, hold_pid_alive=False, desktop=None,
-           orphan=None, orphan_known=True, conflict=None):
+           orphan=None, orphan_known=True, conflict=None, ssd_block=None, ssd_block_live=False):
     state = copy.deepcopy(previous)
     if (boot_time is not None and boot_time <= now and state["last_reopen"] is not None
             and state["last_reopen"] < boot_time):
@@ -106,12 +108,12 @@ def decide(previous, *, now, up, boot_time, hold=None, hold_pid_alive=False, des
         state["alerts_sent"] = [k for k in state["alerts_sent"] if k in state["pending_alerts"]
                                 or k == "robob-guard:%s:orphan-backend" % state["orphan_episode"]
                                 or k == "robob-guard:%s:check-error" % state["check_error_since"]]
-    statuses = []
-    action = "none"
     if up:
         state.update(orphan_episode=None, orphan_blocked=False, orphan_owner=None, ownership_conflict_at=now)
         state["pending_alerts"] = {k: v for k, v in state["pending_alerts"].items()
                                    if v["kind"] != "orphan-backend"}
+    statuses = []
+    action = "none"
     if hold is not None:
         by = hold.get("by", "invalid") if isinstance(hold, dict) else "invalid"
         if valid_hold(hold, now, hold_pid_alive):
@@ -120,6 +122,16 @@ def decide(previous, *, now, up, boot_time, hold=None, hold_pid_alive=False, des
             reset_unready(state)
             return state, ["hold:" + str(by)], action
         statuses.append("stale-hold:" + str(by))
+    if isinstance(ssd_block, dict):
+        if not ssd_block_live:
+            statuses.append("stale-ssd-block")
+        elif not up:
+            # Keep attempt history intact until the SSD interlock clears.
+            state = copy.deepcopy(previous)
+            state["down_count"] += 1
+            outcome = str(ssd_block.get("lastOutcome", "unknown")).encode("utf-8", "backslashreplace").decode("utf-8")
+            return state, statuses + ["down " + str(state["down_count"]),
+                                      "ssd-block:" + outcome], action
     if up:
         state.update(down_count=0, failed_reopens=0, backoff_step=0,
                      awaiting_reopen=False, next_retry=0, failure_episode=None)
@@ -222,6 +234,29 @@ def read_json(path, default):
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return copy.deepcopy(default)
+
+
+def read_ssd_block(home, now):
+    root = home / ".local/state/mac-upkeep"
+    marker_path = Path(os.environ.get("ROBOB_GUARD_SSD_BLOCK_PATH", root / "ssd-launchd-read-blocked"))
+    probe_path = Path(os.environ.get("ROBOB_GUARD_SSD_PROBE_STATE_PATH", root / "ssd-read-probe.json"))
+    try:
+        with marker_path.open("rb") as source:
+            raw = source.read(SSD_MARKER_MAX_BYTES + 1)
+        if len(raw) > SSD_MARKER_MAX_BYTES:
+            raise ValueError("oversized SSD marker")
+        marker = json.loads(raw)
+        if not isinstance(marker, dict):
+            raise ValueError("SSD marker must be an object")
+    except FileNotFoundError:
+        return None, False, []
+    except (OSError, ValueError, RecursionError):
+        return None, False, ["ssd-block-unreadable"]
+    try:
+        live = 0 <= now - probe_path.stat().st_mtime < SSD_PROBE_MAX_AGE
+    except OSError:
+        live = False
+    return marker, live, []
 
 
 def read_state(path):
@@ -657,6 +692,7 @@ def check(home):
         hold_path = home / ".robob/install-hold.json"
         previous = read_state(state_path)
         hold = read_json(hold_path, {"by": "invalid"}) if hold_path.exists() else None
+        ssd_block, ssd_block_live, ssd_statuses = read_ssd_block(home, now)
         up = None
         orphan, conflict, ownership_errors = None, None, []
         ownership_checked = False
@@ -665,15 +701,16 @@ def check(home):
         try:
             up = backend_ready(home)
             step = "desktop_snapshot"
-            desktop = None if up else desktop_snapshot()
-            if not up:
+            desktop = None if up or ssd_block_live else desktop_snapshot()
+            if not up and not ssd_block_live:
                 step = "backend_ownership"
                 orphan, conflict, ownership_errors = backend_ownership(home, previous)
                 ownership_checked = True
             step = "decide"
             state, statuses, action = decide(previous, now=now, up=up, boot_time=boot_epoch(),
                 hold=hold, hold_pid_alive=pid_alive(hold.get("pid")) if isinstance(hold, dict) else False,
-                desktop=desktop, orphan=orphan, conflict=conflict, orphan_known=not ownership_errors)
+                desktop=desktop, orphan=orphan, conflict=conflict, orphan_known=not ownership_errors,
+                ssd_block=ssd_block, ssd_block_live=ssd_block_live)
             detail = "backend-ready" if up else "backend-unready"
             if action in ("reopen", "replace"):
                 # Serialize the last hold read and open against installer hold acquisition.
@@ -688,10 +725,12 @@ def check(home):
                         step = "backend_ownership"
                         orphan, conflict, ownership_errors = backend_ownership(home, previous)
                     now = time.time()
+                    ssd_block, ssd_block_live, ssd_statuses = read_ssd_block(home, now)
                     step = "decide"
                     state, statuses, action = decide(previous, now=now, up=up, boot_time=boot_epoch(),
                         hold=latest, hold_pid_alive=pid_alive(latest.get("pid")) if isinstance(latest, dict) else False,
-                        desktop=desktop, orphan=orphan, conflict=conflict, orphan_known=not ownership_errors)
+                        desktop=desktop, orphan=orphan, conflict=conflict, orphan_known=not ownership_errors,
+                        ssd_block=ssd_block, ssd_block_live=ssd_block_live)
                     detail = "backend-ready" if up else "backend-unready"
                     if action in ("reopen", "replace"):
                         # Failed recovery operations use the same retry budget as failed opens.
@@ -713,11 +752,21 @@ def check(home):
                             # Recheck before opening into an ownership conflict.
                             step = "backend_ownership"
                             orphan, conflict, ownership_errors = backend_ownership(home, state)
-                            if orphan is not None or conflict is not None or ownership_errors:
+                            # Shutdown and ownership reads can outlast the probe's next tick.
+                            now = time.time()
+                            ssd_block, ssd_block_live, ssd_statuses = read_ssd_block(home, now)
+                            if ssd_block_live:
+                                state, statuses, action = decide(
+                                    previous, now=now, up=False, boot_time=None,
+                                    ssd_block=ssd_block, ssd_block_live=True)
+                            elif orphan is not None or conflict is not None or ownership_errors:
                                 state, statuses, action = decide(
                                     state, now=now, up=False, boot_time=None, orphan=orphan,
-                                    conflict=conflict, orphan_known=not ownership_errors)
+                                    conflict=conflict, orphan_known=not ownership_errors,
+                                    ssd_block=ssd_block, ssd_block_live=False)
                             else:
+                                if ssd_block is not None and "stale-ssd-block" not in statuses:
+                                    statuses.append("stale-ssd-block")
                                 step = "reopen"
                                 try:
                                     reopen(home)
@@ -733,7 +782,7 @@ def check(home):
             check_failed = True
             statuses, action = ["check-error:" + type(error).__name__], "none"
             detail = "step=%s errors=%s %s" % (step, state["check_error_count"], error)
-        if not ownership_checked and up is not True:
+        if not ownership_checked and up is not True and not ssd_block_live:
             orphan, conflict, ownership_errors = backend_ownership(home, state)
         if check_failed and up is not True:
             # Confirmed ownership still matters when another observation failed.
@@ -752,6 +801,10 @@ def check(home):
             detail += " ownership_conflict=" + json.dumps(conflict, separators=(",", ":"))
         if ownership_errors:
             detail += " " + " ".join(ownership_errors)
+        statuses.extend(ssd_statuses)
+        if ssd_block is not None:
+            detail += " ssd_block=" + json.dumps(
+                {key: ssd_block.get(key) for key in ("since", "lastOutcome")}, separators=(",", ":"))
         detail += " " + process_diagnostics()
         atomic_json(state_path, state)
         for key, alert in list(state["pending_alerts"].items()):
