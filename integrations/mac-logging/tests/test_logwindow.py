@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,76 @@ class TimestampTests(unittest.TestCase):
         self.assertIn('EPERM', result['reason'])
         child.stdout.close.assert_called_once()
 
+    def test_deadline_kill_is_not_repeated_before_reaping(self):
+        child = Mock(pid=123, returncode=None)
+        child.poll.return_value = None
+        signals = []
+
+        def kill_group(pid, sig):
+            signals.append(sig)
+            if signals.count(signal.SIGKILL) > 1:
+                raise PermissionError('Darwin exiting group')
+
+        def reap(timeout):
+            child.returncode = -signal.SIGKILL
+            return child.returncode
+
+        child.wait.side_effect = reap
+        selector = Mock()
+        selector.select.return_value = []
+        with patch('logwindow.subprocess.Popen', return_value=child), \
+                patch('logwindow.selectors.DefaultSelector') as factory, \
+                patch('logwindow.os.set_blocking'), \
+                patch('logwindow.os.killpg', side_effect=kill_group), \
+                patch('logwindow.time.monotonic', side_effect=[0, 0, 3, 3]):
+            factory.return_value.__enter__.return_value = selector
+            result = read_slice(['log'], row_timestamp(START), row_timestamp(END), True,
+                                0, io.BytesIO(), None)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'deadline')
+        self.assertEqual(result['exitCode'], -signal.SIGKILL)
+        self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL])
+        child.wait.assert_called_once_with(timeout=1)
+        child.stdout.close.assert_called_once()
+
+    def test_deadline_cleanup_eperm_waits_for_reap(self):
+        for reaps in (True, False):
+            with self.subTest(reaps=reaps):
+                child = Mock(pid=123, returncode=None)
+                child.poll.return_value = None
+
+                def kill_group(pid, sig):
+                    if sig == signal.SIGKILL:
+                        raise PermissionError('EPERM while exiting')
+
+                def reap(timeout):
+                    if not reaps:
+                        raise subprocess.TimeoutExpired('log', timeout)
+                    child.returncode = -signal.SIGKILL
+                    return child.returncode
+
+                child.wait.side_effect = reap
+                selector = Mock()
+                selector.select.return_value = []
+                with patch('logwindow.subprocess.Popen', return_value=child), \
+                        patch('logwindow.selectors.DefaultSelector') as factory, \
+                        patch('logwindow.os.set_blocking'), \
+                        patch('logwindow.os.killpg', side_effect=kill_group), \
+                        patch('logwindow.time.monotonic', side_effect=[0, 0, 3, 3]):
+                    factory.return_value.__enter__.return_value = selector
+                    result = read_slice(['log'], row_timestamp(START), row_timestamp(END), True,
+                                        0, io.BytesIO(), None)
+                if reaps:
+                    self.assertEqual(result['status'], 'partial')
+                    self.assertEqual(result['reason'], 'deadline')
+                    self.assertEqual(result['exitCode'], -signal.SIGKILL)
+                else:
+                    self.assertEqual(result['status'], 'error')
+                    self.assertIn('process-group cleanup failed', result['reason'])
+                    self.assertIn('EPERM', result['reason'])
+                child.wait.assert_called_once_with(timeout=1)
+                child.stdout.close.assert_called_once()
+
 
 class WindowTests(unittest.TestCase):
     def setUp(self):
@@ -89,11 +160,19 @@ class WindowTests(unittest.TestCase):
         self.fake.write_text('#!'+sys.executable+'\n'+source)
         self.fake.chmod(0o700)
 
-    def run_window(self, *extra, deadline=10):
-        return subprocess.run([sys.executable, '-I', str(BASE/'mac-log-window'),
+    def run_window(self, *extra, deadline=10, ready=None):
+        command = [sys.executable, '-I', str(BASE/'mac-log-window'),
             '--start', START, '--end', END, '--predicate', 'fixture',
-            '--deadline', str(deadline), '--out', str(self.out), *extra],
-            env=self.env, capture_output=True, timeout=deadline+5)
+            '--deadline', str(deadline), '--out', str(self.out), *extra]
+        if ready is None:
+            return subprocess.run(command, env=self.env, capture_output=True, timeout=deadline+5)
+        with subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as helper:
+            until = time.monotonic()+deadline
+            while not ready.exists() and helper.poll() is None and time.monotonic() < until:
+                time.sleep(.01)
+            self.assertTrue(ready.exists(), 'fixture did not publish its PID before the deadline')
+            stdout, stderr = helper.communicate(timeout=deadline+5)
+            return subprocess.CompletedProcess(command, helper.returncode, stdout, stderr)
 
     def summary(self):
         return json.loads(Path(str(self.out)+'.summary.json').read_text())
@@ -174,14 +253,14 @@ while True: time.sleep(60)
         self.script('''import os,signal,subprocess,sys,time
 from pathlib import Path
 child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
-Path(%r).write_text(str(child.pid))
 def stop(*args):
     child.wait(timeout=2)
     sys.exit(0)
 signal.signal(signal.SIGTERM, stop)
+Path(%r).write_text(str(child.pid))
 while True: time.sleep(60)
 ''' % str(pidfile))
-        result = self.run_window(deadline=.5)
+        result = self.run_window(deadline=5, ready=pidfile)
         self.assertEqual(result.returncode, 2, result.stderr)
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pidfile.read_text()), 0)

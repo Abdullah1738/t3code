@@ -117,7 +117,6 @@ def read_slice(command, start, end, include_end, stop, out, outside):
                     signal_group(child, signal.SIGTERM)
                     terminating = now+3
                 if terminating is not None and now >= terminating:
-                    signal_group(child, signal.SIGKILL)
                     break
                 # EOF alone does not mean log exited; it can close stdout then hang.
                 if not selector.get_map() and terminating is None:
@@ -152,15 +151,24 @@ def read_slice(command, start, end, include_end, stop, out, outside):
         result.update(status='error', reason=str(exc))
     finally:
         if child is not None:
+            cleanup_error = None
             try:
+                # Send KILL once, then reap. Darwin can reject a repeated kill
+                # while the first is still taking effect.
                 signal_group(child, signal.SIGKILL)
             except OSError as exc:
-                result.update(status='error', reason='process-group cleanup failed: '+str(exc))
+                cleanup_error = exc
             try:
                 child.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 if result['status'] != 'error':
                     result.update(status='partial', reason='deadline; child did not reap after SIGKILL')
+            else:
+                # EPERM can race with exit before poll can reap on Darwin.
+                if isinstance(cleanup_error, PermissionError):
+                    cleanup_error = None
+            if cleanup_error is not None:
+                result.update(status='error', reason='process-group cleanup failed: '+str(cleanup_error))
             child.stdout.close()
             result['exitCode'] = child.returncode
         result['elapsedMs'] = round((time.monotonic()-began)*1000)
