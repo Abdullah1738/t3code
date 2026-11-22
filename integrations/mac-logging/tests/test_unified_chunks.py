@@ -269,17 +269,23 @@ class UnifiedChunkTests(unittest.TestCase):
         self.assertEqual([r['props']['observedAt'] for r in self.rows('crash.observed')], list(self.boots))
         self.assertEqual(jobs.read_state('crashes')['unified'], 10000.125)
 
-    def test_unusable_timestamp_forms_fail_without_advancing_cursor(self):
-        for timestamp in (None, '', 'invalid', 123, [], {}):
+    def test_unusable_timestamp_forms_are_counted_without_observations(self):
+        for timestamp in (None, '', 'invalid', 123, True, 1.5, [], {},
+                          ['2026-11-16T08:22:00Z'], {'timestamp': '2026-11-16T08:22:00Z'}):
             with self.subTest(timestamp=timestamp):
+                jobs.save_state('crashes', {'unified': 6400, 'rollupDay': '1969-12-31'})
                 def run(*args, **kwargs):
                     return SimpleNamespace(returncode=0, stdout=json.dumps([
                         dict(timestamp=timestamp, eventMessage='=== system boot')]), stderr='')
                 with patch.object(collector.unified, '__defaults__',
                                   (run,)+collector.unified.__defaults__[1:]):
-                    self.assertFalse(collector.collect(10000, []))
-                self.assertEqual(jobs.read_state('crashes')['unified'], 6400)
-                self.assertEqual(self.rows('crash.source')[-1]['props']['failure'], 'parse')
+                    self.assertTrue(collector.collect(10000, []))
+                self.assertEqual(jobs.read_state('crashes')['unified'], 10000)
+                source = self.rows('crash.source')[-1]
+                self.assertTrue(source['ok'])
+                self.assertEqual(source['props']['unparsedRows'], source['props']['chunksDone'])
+                self.assertNotIn('outsideRows', source['props'])
+                self.assertEqual(self.rows('crash.observed'), [])
 
     def test_failed_second_chunk_keeps_prefix_for_all_failure_forms(self):
         failures = [subprocess.TimeoutExpired('log', 60),

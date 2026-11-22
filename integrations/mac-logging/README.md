@@ -478,7 +478,37 @@ unconfirmed send retains its exact key/text for idempotent retry. For a diagnost
 sample without notifications, run `TOOLLOG_DIR=<private-temp-dir> /usr/bin/python3
 integrations/mac-logging/memory.py --no-alert`.
 
+## Forensic log windows
+
+`mac-log-window --start 2026-11-16T08:22:00Z --end 2026-11-16T08:24:00Z
+--predicate 'eventMessage CONTAINS[c] "PMU"' --info --debug --out evidence.ndjson`
+reads `log show` with a deadline and keeps only parsed timestamps inside the
+requested inclusive UTC window, preserving the original row bytes and timestamp
+precision through nanoseconds. Use explicit
+UTC bounds. `--deadline` defaults to 90 seconds (maximum 600); group termination
+allows up to 3 seconds for TERM and 1 second to reap after KILL.
+`--slice 15m` divides the window and remaining budget between consecutive reads;
+a timed-out slice does not prevent later reads while budget remains. Shared
+slice edges are kept only once. Rows outside each slice are excluded even when
+they fall inside the overall window. `--keep-outside` saves them separately in
+`<out>.outside.ndjson`; they are never incident evidence.
+
+Exit codes are 0 complete, 2 partial (deadline), and 1 error (including bad args
+or a nonzero log exit). `<out>.summary.json` records arguments, UTC bounds,
+status, exit code, elapsed milliseconds, `rowsIn`, `rowsOutside`, earliest/latest
+outside timestamps (`outsideFirst`/`outsideLast`), `unparsed`, greatest kept
+`lastInWindowTs`, per-slice results and a reason. A partial result is incomplete;
+`lastInWindowTs` is an observation, not proof of coverage. Unparseable rows are
+counted and excluded. Validation errors also write a summary when `--out` is
+supplied and its parent is writable. The helper writes only the output and its
+sidecars and never requests root access.
+
 ## Source events
+
+Unified `crash.source` and completed `crash.unified.chunk` records include
+`outsideRows`, `outsideFirst`, `outsideLast` (UTC epoch seconds) and
+`unparsedRows` only when those counts are nonzero. Source records aggregate
+chunk counts; unparseable timestamps and outside rows never become observations.
 
 `disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
 counts. Each unavailable source also emits an error-kind `disk.inventory.source`
