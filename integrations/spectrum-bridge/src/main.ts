@@ -206,6 +206,7 @@ async function main(): Promise<void> {
       uptimeSeconds: Math.floor((Date.now() - health.startedAt) / 1000),
       lastEventAt: health.photonLastOk,
       catchingUp: !synchronized,
+      ...(backend instanceof RobobBackend ? { activeRoster: backend.activeRoster.status() } : {}),
       ...(appsUrl ? { appsUrl } : {}),
       appsRoot: config.appsRoot,
     }) });
@@ -312,10 +313,12 @@ async function main(): Promise<void> {
     }
     if (ready()) void router?.checkFailedInbound().catch((caughtError) => { toolError("main", "main.catch15", caughtError); return log("failed-inbound-check-failed"); });
   }, 1_000);
+  if (backend instanceof RobobBackend) backend.activeRoster.start();
   const stop = async () => {
     if (stopping) return;
     stopping = true;
     loopStalls.stop();
+    if (backend instanceof RobobBackend) backend.activeRoster.stop();
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     clearInterval(timer);
     clearInterval(unansweredTimer);

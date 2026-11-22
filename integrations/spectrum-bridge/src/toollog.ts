@@ -1,4 +1,5 @@
 import { RobobLinkDown } from "./robob-link-gate.ts";
+import { cleanRosterHealth, createRosterAggregation, ROSTER_ACTIONS } from "./log-active-roster.ts";
 import { probeDeferred } from "./probe-policy.ts";
 import { safeLineFailureCode, sendblueErrorKey } from "./line.ts";
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync } from "node:fs";
@@ -110,6 +111,16 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     }
     if (entry.name === "turn.end" && key === "endReason" && ["undelivered", "failed", "errored", "expired"].includes(String(value))) {
       props[key] = value; continue;
+    }
+    if (entry.component === "robob" && entry.name === "robob.active_roster") {
+      const fields = cleanRosterHealth({ [key]: value });
+      if (typeof fields?.[key] === "number") props[key] = fields[key];
+      continue;
+    }
+    if (entry.component === "robob" && entry.name === "robob.roster_action") {
+      if (key === "rosterAction" && typeof value === "string" && ROSTER_ACTIONS.includes(value as typeof ROSTER_ACTIONS[number])
+        || ["rows", "total"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
+      continue;
     }
     if (entry.component === "mirror" && ["mirror-append", "mirror-queue", "mirror-fail", "mirror-backfill"].includes(entry.name)) {
       if (key === "direction" && (value === "inbound" || value === "outbound")
@@ -240,6 +251,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   const calls = createCallAggregation(processRunId);
   const messageReads = createMessageReadAggregation();
   const promptProbes = createPromptProbeAggregation();
+  const roster = createRosterAggregation();
   const robobLink = createRobobLinkState({ root, now, checkpoint: () => {
     const day = new Date(now()).toISOString().slice(0, 10);
     const path = join(root(), `${day}.ndjson`);
@@ -279,7 +291,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.robob_calls", "robob.active_roster", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }
@@ -324,7 +336,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         saveLink();
         return;
       }
-      for (const probe of promptProbes.accept(line)) for (const messageRead of messageReads.accept(probe)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
+      for (const rosterLine of roster.accept(line)) for (const probe of promptProbes.accept(rosterLine)) for (const messageRead of messageReads.accept(probe)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
       saveLink();
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
       if (["turn.start", "reply.sent", "inbound.answered"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
@@ -426,6 +438,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   function flushAll(): boolean {
     capture(() => { for (const line of robobLink.flush(now)) enqueue(line); });
     for (const line of promptProbes.flush()) enqueue(line);
+    for (const line of roster.flush()) enqueue(line);
     for (const line of messageReads.flush()) enqueue(line);
     for (const line of renders.flush()) enqueue(line);
     for (const line of calls.flush()) enqueue(line);
@@ -513,6 +526,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   async function tick(): Promise<void> {
     try {
       const at = now();
+      for (const line of roster.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       for (const line of messageReads.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       for (const line of promptProbes.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       if (rolling) { await settled(); return; }
