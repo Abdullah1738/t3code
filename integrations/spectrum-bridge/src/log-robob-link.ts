@@ -41,11 +41,13 @@ const RETENTION_MS = 30 * 86400_000;
 const isAnswer = (line: LogLine) => line.name === "inbound.answered"
   || line.name === "reply.sent" && line.ok === true && (line.props?.kind !== "control" || line.props?.answersInbound === true);
 type JournalPosition = { day: string; offset: number };
+type LinkIdentity = Pick<RobobLink, "outageId" | "firstFailureAt"> & { snapshot?: RobobLink; recoveredAt?: string };
 export function createRobobLinkState(options: { root?: string | (() => string); now?: () => number;
-  checkpoint?: () => JournalPosition } = {}) {
+  checkpoint?: () => JournalPosition; identity?: (outageId?: string) => LinkIdentity | undefined; recovery?: () => LinkIdentity | undefined } = {}) {
   const now = options.now ?? Date.now;
   let active: Outage | undefined;
   let gatedOutage: string | undefined;
+  let lastRecoveryId: string | undefined;
   const recovered = new Map<string, Outage>();
   let loadedRoot: string | undefined;
   let resumePending = false;
@@ -85,7 +87,7 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
     const temporary = join(loadedRoot, `.robob-link-state-${randomUUID()}.tmp`);
     try {
       mkdirSync(loadedRoot, { recursive: true, mode: 0o700 });
-      writeFileSync(temporary, JSON.stringify({ version: 1, active: active ? pack(active) : null,
+      writeFileSync(temporary, JSON.stringify({ version: 1, lastRecoveryId, active: active ? pack(active) : null,
         recovered: [...recovered.values()].filter(item => item.waiting.size).map(pack),
         ...(options.checkpoint ? { journal: options.checkpoint() } : {}) }) + "\n", { mode: 0o600, flag: "wx" });
       renameSync(temporary, join(loadedRoot, "robob-link-state.json"));
@@ -97,12 +99,13 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
     const dir = root();
     if (loadedRoot === dir) return;
     if (loadedRoot) persist(true);
-    loadedRoot = dir; active = undefined; recovered.clear(); resumePending = false; lastWrite = -Infinity;
+    loadedRoot = dir; active = undefined; lastRecoveryId = undefined; recovered.clear(); resumePending = false; lastWrite = -Infinity;
     try {
       const path = join(dir, "robob-link-state.json");
       const saved = JSON.parse(readFileSync(path, "utf8"));
       chmodSync(path, 0o600);
       if (saved?.version === 1) {
+        if (typeof saved.lastRecoveryId === "string" && /^[a-f0-9-]{36}$/.test(saved.lastRecoveryId)) lastRecoveryId = saved.lastRecoveryId;
         active = restore(saved.active);
         if (active?.link.recoveredAt) active = undefined;
 
@@ -152,6 +155,7 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
                   item.waiting.delete(id); item.answered.add(id);
                 }
                 if (link.recoveredAt) {
+                  if (link.failedCalls >= 3) lastRecoveryId = link.outageId;
                   if (active?.link.outageId === link.outageId) active = undefined;
                   if (item.waiting.size) recovered.set(link.outageId, item);
                   else recovered.delete(link.outageId);
@@ -168,6 +172,30 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
   function accept(line: LogLine): { events: LogLine[]; keepDetail: boolean } {
     load();
     const events: LogLine[] = [];
+    const closed = replaying ? undefined : active ? options.identity?.(active.link.outageId) : options.recovery?.();
+    // Alert persistence precedes the journal row, so a crash can leave this checkpoint behind recovery.
+    if (closed?.recoveredAt && closed.outageId !== lastRecoveryId) {
+      const item = active ?? restore({ link: closed.snapshot, down: true });
+      if (item) {
+        item.link = { ...item.link, ...closed.snapshot, recoveredAt: closed.recoveredAt,
+          downMs: Math.max(0, Date.parse(closed.recoveredAt) - Date.parse(closed.firstFailureAt)) };
+        events.push(event("robob.link_up", item, closed.recoveredAt));
+        if (item.waiting.size) recovered.set(item.link.outageId, item);
+        lastRecoveryId = closed.outageId;
+        active = undefined; resumePending = false; stateDirty = true;
+      }
+    }
+    const identity = replaying ? undefined : options.identity?.();
+    const adopted = identity ? { outageId: identity.outageId, firstFailureAt: identity.firstFailureAt } : undefined;
+    // Alert state can outlive the log checkpoint; resume the confirmed outage before counting new failures or recovery.
+    if (!active && identity?.snapshot) {
+      active = restore({ link: { ...identity.snapshot, ...adopted }, down: true });
+      resumePending = !!active;
+      stateDirty ||= !!active;
+    }
+    if (active && identity && (active.link.outageId !== identity.outageId || active.link.firstFailureAt !== identity.firstFailureAt)) {
+      Object.assign(active.link, adopted); stateDirty = true;
+    }
     let keepDetail = true;
     // Pending reply identities have the same retention window as the day files.
     for (const [id, item] of recovered) if (Date.parse(line.ts) - Date.parse(item.link.firstFailureAt) > RETENTION_MS) { recovered.delete(id); stateDirty = true; }
@@ -213,7 +241,7 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
         || active?.link.outageId === line.ids.outageId && Number(line.props?.linkFailureCount) <= active.link.failedCalls)) return { events, keepDetail };
       // Fast successes can be sampled out; a new durable ID still proves the previous sequence ended.
       if (replaying && line.ids?.outageId && active?.link.outageId !== line.ids.outageId) active = undefined;
-      active ??= { link: { outageId: replaying && line.ids?.outageId ? line.ids.outageId : randomUUID(), firstFailureAt: line.ts, cause, route: String(line.props?.route ?? ""),
+      active ??= { link: { outageId: replaying && line.ids?.outageId ? line.ids.outageId : randomUUID(), firstFailureAt: line.ts, ...adopted, cause, route: String(line.props?.route ?? ""),
         failedCalls: 0, suppressedCalls: 0, causes: {}, inboundReceivedDuringOutage: 0, inboundAckedDuringOutage: 0, inboundAnsweredAfter: 0, inboundAnsweredDuringOutage: 0 },
         waiting: new Set(), answered: new Set(), acked: new Set(), down: false, dirty: false };
       line.ids = { ...line.ids, outageId: active.link.outageId };
@@ -243,6 +271,7 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
         active.link.recoveredAt = line.ts;
         active.link.downMs = Math.max(0, Date.parse(line.ts) - Date.parse(active.link.firstFailureAt));
         events.push(event("robob.link_up", active, line.ts));
+        if (active.link.failedCalls >= 3) lastRecoveryId = active.link.outageId;
         // The recovering call must survive the normal slow-row sampling limit.
         line.props = { ...line.props, linkRecovery: true };
         if (active.waiting.size) recovered.set(active.link.outageId, active);
