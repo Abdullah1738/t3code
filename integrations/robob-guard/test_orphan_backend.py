@@ -28,6 +28,7 @@ class OrphanTests(unittest.TestCase):
         self.runtime = dict(pid=43, port=3773, startedAt="1970-01-01T02:30:00Z")
         guard.atomic_json(self.runtime_path, self.runtime)
         for name, options in [
+            ("guard.protected_tier_tick", {}),
             ("guard.subprocess.run", dict(side_effect=self.process_run)),
             ("quit_reason.registered_desktop_pids", dict(side_effect=lambda: self.registration.copy())),
             ("guard.desktop_snapshot", dict(side_effect=lambda: self.desktop)),
