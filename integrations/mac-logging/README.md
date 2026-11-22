@@ -7,11 +7,16 @@ it rolls up yesterday. Quantiles use nearest rank. `okRate`/`failedRate` use
 lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
 Each hourly collector run emits `homebrew.integrity` with dangling opt links,
-missing dependencies, status and duration. The read-only `brew missing` probe
-has a 60-second timeout and disables auto-update and analytics. Broken results
-send a Telegram attention alert with a stable key for that exact set of links
-and dependencies; unchanged failures are not sent again. Probe errors are
-logged without an alert. Repairs are suggested, never run by the collector.
+missing dependencies, status and duration. Formula runtime dependencies are
+checked from linked Cellar receipts without starting Homebrew; unreadable or
+absent receipts are counted in `receiptErrors`. The read-only `brew missing`
+secondary covers casks too, runs at nice 15, has a 240-second timeout and
+disables auto-update and analytics. Broken results send a Telegram attention
+alert with a stable key for that exact set of links
+and dependencies; unchanged failures are not sent again. A secondary failure
+is logged in `brewError` and cannot suppress a finding. A completed local scan
+without findings is `ok`; `error` means no check completed. Repairs are
+suggested, never run by the collector.
 
 Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
 or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
