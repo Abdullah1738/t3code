@@ -136,8 +136,11 @@ class Native:
 
     def info(self, pid, flavor, layout, argument=0):
         value = layout()
-        if self.proc.proc_pidinfo(pid, flavor, argument, c.byref(value), c.sizeof(value)) != c.sizeof(value):
-            raise OSError('process info unavailable')
+        c.set_errno(0)
+        size = self.proc.proc_pidinfo(pid, flavor, argument, c.byref(value), c.sizeof(value))
+        if size != c.sizeof(value):
+            number = c.get_errno() if size <= 0 else 0
+            raise OSError(number or None, os.strerror(number) if number else 'process info unavailable')
         return value
 
     def threads(self, pid, deadline, clock=time.monotonic):

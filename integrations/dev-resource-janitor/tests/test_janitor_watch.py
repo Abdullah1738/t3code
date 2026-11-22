@@ -46,8 +46,10 @@ class WorkerTests(JanitorTestCase):
                     patch.object(dev_janitor, 'procs', return_value=[]), \
                     patch.object(dev_janitor, 'sh', return_value=(1, '', '')), \
                     patch.object(dev_janitor, 'keep_list', return_value=[]), \
+                    patch.object(dev_janitor.time, 'time', return_value=100.8), \
                     patch.object(lp, 'scan', **kw), patch.object(dev_janitor.time, 'monotonic', side_effect=lambda: next(clock)):
                 report = dev_janitor.scan()
+            self.assertEqual(report['ts'], 100.8)
             for phase in ('sessions', 'liveness', 'resource_processes', 'simulators', 'expo', 'docker',
                           'session_evidence', 'leftover_processes'):
                 self.assertEqual(report['phase_ms'][phase], 1.0)

@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter, deque
 import datetime as dt
+import errno as errno_codes
 import fcntl
 import importlib.util
 import hashlib
@@ -24,7 +25,7 @@ import uuid
 # Helper subprocesses use -I; load only the reviewed siblings beside this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cpu import PS, ProbeError, command, deltas, parse_ps, seconds, cpu_ticks, runnable_threads, spike
+from cpu import PS, ProbeError, command, failure_details, deltas, parse_ps, seconds, cpu_ticks, runnable_threads, spike
 from cpu_labels import command_label
 from memory import STATS, parse_top, parse_swap, ProbeError as MemoryError
 from toollog import emit
@@ -191,6 +192,8 @@ def label(p, rows):
 
 
 def exempt(p, rows, system_gui=False):
+    if any(re.search(r'(?:^|[/\s])offbox(?:\.py)?(?:\s|$)', q.get('args', '')) for q in [p]+chain(p, rows)):
+        return True
     if (label(p, rows) in MEMORY_EXEMPT['service_labels'] or p.get('sessionWrapper')
             or p['pid'] == os.getpid() or (system(p) and not system_gui) or provider(p) or robob(p, rows)):
         return True
@@ -312,17 +315,20 @@ class Host:
         return command(argv, self.run, timeout)
 
     def identity(self, p):
+        return self.identity_recheck(p)['same']
+
+    def identity_recheck(self, p):
         try:
             raw = self.cmd(['/bin/ps', '-ww', '-p', str(p['pid']), '-o', 'lstart=,comm='], 2).strip()
             parts = raw.split(None, 5)
             same = len(parts) == 6 and ' '.join(parts[:5]) == p['start'] and parts[5] == p['comm']
             if not same or not p.get('args'):
-                return False
+                return dict(same=False)
             args = self.cmd(['/bin/ps', '-ww', '-p', str(p['pid']), '-o', 'lstart=,args='], 2).strip().split(None, 5)
-            return (len(args) == 6 and ' '.join(args[:5]) == p['start']
-                    and hashlib.sha256(args[5].encode()).hexdigest() == p.get('argsHash', hashlib.sha256(p['args'].encode()).hexdigest()))
-        except ProbeError:
-            return False
+            return dict(same=(len(args) == 6 and ' '.join(args[:5]) == p['start']
+                    and hashlib.sha256(args[5].encode()).hexdigest() == p.get('argsHash', hashlib.sha256(p['args'].encode()).hexdigest())))
+        except (ProbeError, OSError) as exc:
+            return dict(same=False, **failure_details(exc, 'ps'))
 
     def same_birth(self, p):
         try:
@@ -335,10 +341,38 @@ class Host:
         os.kill(p['pid'], sig)
 
     def soften(self, p):
-        self.cmd(['/usr/bin/renice', '20', '-p', str(p['pid'])], 2)
-        # Revalidate between commands too.
-        if self.identity(p):
-            self.cmd(['/usr/bin/taskpolicy', '-b', '-p', str(p['pid'])], 2)
+        def send(argv):
+            try:
+                self.cmd(argv, 2)
+                return dict(rc=0, result='sent', stderr='')
+            except (ProbeError, OSError) as exc:
+                return failure_details(exc, argv[0])
+        renice = send(['/usr/bin/renice', '20', '-p', str(p['pid'])])
+        identity = self.identity_recheck(p)
+        # Text-only ESRCH reports need a failed identity check as corroboration.
+        for outcome in (renice, identity):
+            if not identity['same'] and re.search(r'no such process', outcome.get('stderr', ''), re.I):
+                outcome.update(result='gone', errno=errno_codes.ESRCH)
+        if renice['result'] != 'sent':
+            taskpolicy = dict(result='skipped', reason='renice-failed')
+        elif not identity['same']:
+            taskpolicy = dict(result='skipped', reason='identity-changed')
+        else:
+            taskpolicy = send(['/usr/bin/taskpolicy', '-b', '-p', str(p['pid'])])
+            if (taskpolicy['result'] == 'error' and re.search(r'no such process', taskpolicy.get('stderr', ''), re.I)
+                    and not self.identity(p)):
+                taskpolicy.update(result='gone', errno=errno_codes.ESRCH)
+        stages = dict(renice=renice, identityRecheck=identity, taskpolicy=taskpolicy)
+        failed = next((s for s in stages.values() if s.get('result') == 'gone'), None)
+        if failed:
+            result = 'gone'
+        elif renice['result'] != 'sent':
+            result, failed = 'error', renice
+        else:
+            failed = next((s for s in (identity, taskpolicy) if s.get('result') == 'error'), None)
+            result = 'partial' if failed else 'sent'
+        return dict(result=result, stages=stages, errno=failed.get('errno') if failed else None,
+                    **(dict(reason=failed['reason']) if failed else {}))
 
     def app_info(self, p):
         try:
@@ -524,7 +558,10 @@ class Host:
             ('pressure', ['/usr/sbin/sysctl', '-n', 'kern.memorystatus_vm_pressure_level'], lambda s: int(s.strip()), 2),
             ('swap', ['/usr/sbin/sysctl', '-n', 'vm.swapusage'], parse_swap, 2)):
             try:
+                observed_at = time.time()
                 snapshot[key] = parser(self.cmd(argv, timeout))
+                if key == 'top':
+                    snapshot['footprintObservedAt'] = observed_at
             except (ProbeError, MemoryError, ValueError) as exc:
                 snapshot[key] = None
                 snapshot['errors'].append(dict(probe=key, failure=str(exc)))
@@ -657,6 +694,7 @@ class Guard:
             p = dict(current, argsHash=p.get('argsHash', current.get('argsHash')))
         allowed = cls not in ('A', 'B', 'C') or self.strain or action == 'CONT'
         result, errno = ('cancelled_strain_clear' if not allowed else 'would_'+action if self.muted else 'skipped_identity'), None
+        details = {}
         stop_intent, prior_stage = False, None
         gui_job = self.gui_jobs.get((p['pid'], p['start']))
         gui_ok = (cls == 'G' and gui_job and gui_job['phase'] == 'force'
@@ -686,14 +724,16 @@ class Guard:
                     stop_intent = True
                     self.save()
                 if action == 'renice':
-                    self.host.soften(p)
+                    details = self.host.soften(p)
+                    result, errno = details['result'], details.get('errno')
                 else:
                     self.host.signal(p, getattr(signal, 'SIG'+action))
                     if action == 'STOP':
                         self.hogs[ident].update(confirmed=True, at=max(self.now, self.clock()))
-                result = 'sent'
+                    result = 'sent'
             except (ProbeError, OSError) as exc:
-                result, errno = 'error', getattr(exc, 'errno', None)
+                details = failure_details(exc, action)
+                result, errno = details['result'], details['errno']
                 if stop_intent:
                     self.stopped = [q for q in self.stopped if (q['pid'], q['start']) != ident]
                     if prior_stage is None:
@@ -704,11 +744,13 @@ class Guard:
         value = dict(pid=p['pid'], start=p['start'], comm=p['comm'], args=command_label(p.get('args', '')),
                      action=action, result=result, errno=errno, actionClass=cls, owner=p.get('owner', {}).get('state', 'unknown'),
                      cpuDelta=p.get('cpuDelta', 0), footprintGiB=p.get('footprintGiB'), label=label(p, self.rows))
+        value.update({k:details[k] for k in ('stages', 'reason') if k in details})
         if cls == 'G':
             value.update(step='force-quit', **{k: p.get(k) for k in ('app', 'bundleId', 'growthGiBHour', 'footprintSeries')})
         self.actions.append(value)
         self.log('action', **value)
-        performed = result == 'sent' or self.dry and allowed and safe and matched
+        performed = (result == 'sent' or details.get('stages', {}).get('renice', {}).get('result') == 'sent'
+                     or self.dry and allowed and safe and matched)
         if performed:
             if cls == 'G' and action == 'KILL' and gui_job:
                 gui_job['phase'] = 'complete'
@@ -965,7 +1007,10 @@ class Guard:
         self.save()
 
     def deliver_restart_responder(self):
-        report = self.saved.get('restartResponder')
+        return self.deliver_responder('restartResponder')
+
+    def deliver_responder(self, key):
+        report = self.saved.get(key)
         if not report or self.muted or self.now < report.get('nextAttemptAt', 0):
             return
         report['nextAttemptAt'] = self.now+30
@@ -1001,11 +1046,12 @@ class Guard:
                 delivered = self.worker_needed(Path(report['evidence']), report['summary'], urgent=report['urgent'],
                                                delivery=report)
         except (ProbeError, OSError, ValueError, KeyError):
-            self.log('error', probe='restart_responder', failure='unavailable')
+            self.log('error', probe=key, failure='unavailable')
             return
         if delivered:
-            self.saved.pop('restartResponder')
+            self.saved.pop(key)
             self.save()
+        return bool(delivered)
 
     def memory_event(self, p, kind, action):
         self.log('memory_runaway', pid=p['pid'], start=p['start'], comm=p['comm'], label=label(p, self.rows),
@@ -1183,7 +1229,8 @@ class Guard:
             p['cpuDelta'] = cpus.get(p['pid'], 0)
             footprint = top.get(p['pid'])
             if footprint:
-                p.update(footprintGiB=footprint['memMb']/1024, compressedGiB=footprint['cmprsMb']/1024)
+                p.update(footprintGiB=footprint['memMb']/1024, compressedGiB=footprint['cmprsMb']/1024,
+                         footprintObservedAt=sample.get('footprintObservedAt', now))
             p['growthGiBMin'] = 0
             # Two intervals means three observations, never a single 30s jump.
             if (len(hist) >= 2 and hist[-1]['footprintGiB'] is not None
@@ -1448,11 +1495,19 @@ def main():
             raise SystemExit(1)
         return
     guard = Guard()
+    from guard_reclaim import Reclaimer
+    reclaimer = Reclaimer(guard)
     with (guard.state/'guard.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         deadline = time.monotonic()
         while True:
             started = time.monotonic()
+            try:
+                # Consume the no-fork onset before ps/top, which can fail under load.
+                reclaimer.tick(time.time())
+            except (ProbeError, OSError, ValueError) as exc:
+                guard.now = time.time()
+                guard.log('error', probe='reclaim', failure=type(exc).__name__)
             try:
                 sample = guard.host.collect(guard.cycle)
                 sample['cycleMs'] = (time.monotonic()-started)*1000
