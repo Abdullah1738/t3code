@@ -1332,6 +1332,9 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
         receipt_result = 'out_of_time' if getattr(e, '_money_cases_timeout', False) or \
             time.time() >= receipt_end or 'out of time' in str(e) or \
             'over time' in str(e) or isinstance(e.__cause__, subprocess.TimeoutExpired) else 'error'
+        if isinstance(e, SourceLimit) or 'limit reached' in str(e):
+            from run_history import observe
+            observe(stats if stats is not None else TIMING_STATS.get(), 'budget_stop_reason', 'source_limit')
         reasons.append(e.reason if e.reason != 'other' else
                        'receipt_out_of_time' if receipt_result == 'out_of_time' else 'other')
         errors.append(f'receipt: {e}')
@@ -1344,11 +1347,16 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
         if target is not None:
             counts = target.setdefault('receipt_result', {})
             counts[receipt_result] = counts.get(receipt_result, 0) + 1
+            from run_history import observe
+            if receipt_result == 'out_of_time':
+                observe(target, 'budget_stop_reason', 'receipt_deadline')
     try:
         hit = order_receipt(charge, at, now, deadline, memo=memo, stats=stats)
         if hit:
             return {**hit, 'errors': errors}
     except SourceLimit as e:
+        from run_history import observe
+        observe(stats if stats is not None else TIMING_STATS.get(), 'budget_stop_reason', 'source_limit')
         reasons.append(e.reason)
         limits.append({'why': str(e), 'kinds': e.kinds, 'reason': e.reason})
     except Lookup as e:

@@ -139,6 +139,21 @@ Inbox triage runs every card alert it sees through the same checks before its cl
 
 ## Install or update
 
+`money-cases health` reads the current UTC day's run history without changing case
+state. Use `--day YYYY-MM-DD` for another UTC day, `--json` for JSON only, or
+`--one-line` for a compact daily result. `toollog rollup --board orders --day
+YYYY-MM-DD` includes that result and prints its one-line summary when available.
+History retention is bounded; an old day may no longer be present.
+
+Receipt coverage counts charge questions in the follow walk, excluding those
+resolved by existing order, subscription, purchase or shared evidence. Unattempted
+is eligible minus the existing receipt outcome counters. A run interrupted before
+the question census has unknown coverage; old history is also unknown. Budget stop
+reasons identify the last observed constraint, with the whole-check deadline taking
+precedence. Call counts measure merchant registry reads, bank-evidence lookups for
+registered orders, and charge-question evaluations. Load samples are the host's
+1/5/15-minute load averages; unavailable samples stay null.
+
 Marketplace coverage comes from `marketplace-placements.json`, refreshed outside the check's budget. To prime it after installation, run the installed reader with the account-reader Python:
 
 ```sh

@@ -48,6 +48,26 @@ class HistoryTests(unittest.TestCase):
             row = history.run_row({**self.row, key: 'PRIVATE TEXT'})
             self.assertNotIn(key, row)
 
+    def test_additive_schema_and_unknown_measurements(self):
+        values = {**self.row, 'receipt_eligible': 5, 'receipt_result': {'none': 2, 'error': 1},
+                  'budget_stop_reason': 'follow_deadline', 'merchants_calls': 1,
+                  'order_charges_calls': 2, 'questions_calls': 3,
+                  'loadavg_start': [1.5, 2, 3], 'loadavg_end': [2, 3, 4]}
+        history.receipt_coverage(values)
+        self.assertTrue(history.append(self.wd, values))
+        row = json.loads(self.path.read_text())
+        for key, value in self.row.items():
+            self.assertEqual(row[key], value)
+        self.assertEqual(row['receipt_unattempted'], 2)
+        for key in history.COUNTS:
+            self.assertIs(type(row[key]), int)
+        for key in (*history.COUNTS, 'loadavg_start', 'loadavg_end', 'budget_stop_reason'):
+            self.assertIsNone(history.run_row(self.row)[key])
+        self.assertEqual(history.run_row(row), row)
+        for value in ('PRIVATE', [1, 2], [1, float('nan'), 3], [-1, 2, 3]):
+            self.assertIsNone(history.run_row({**self.row, 'loadavg_start': value})['loadavg_start'])
+        self.assertIsNone(history.run_row({**self.row, 'budget_stop_reason': 'PRIVATE'})['budget_stop_reason'])
+
     def test_append_retains_counts_and_bounded_safe_errors(self):
         self.row.update(question_errors=self.row['question_errors'] * 12, text='private owner message',
                         password='test-secret', secret_detail={'text': 'private receipt'})
@@ -225,6 +245,85 @@ class HistoryTests(unittest.TestCase):
         self.assertIn('2x his threads: Robob control', text)
         self.assertIn('slowest=build_write', text)
 
+    def test_health_fixture_day_boundary_and_cli_are_read_only(self):
+        rows = [
+            {**self.row, 'at': '2026-11-15T23:59:59Z', 'total_s': 100},
+            {**self.row, 'at': '2026-11-16T00:00:00Z', 'total_s': 10, 'owner_result': 'ok',
+             'receipt_eligible': 4, 'receipt_unattempted': 1,
+             'receipt_result': {'found': 1, 'none': 1, 'out_of_time': 1, 'error': 0},
+             'budget_stop_reason': 'follow_deadline', 'loadavg_start': [1, 2, 3], 'loadavg_end': [2, 3, 4]},
+            {**self.row, 'at': '2026-11-16T23:59:59Z', 'total_s': 40, 'owner_result': 'list_failed',
+             'receipt_eligible': 6, 'receipt_unattempted': 3,
+             'receipt_result': {'found': 1, 'none': 1, 'out_of_time': 0, 'error': 1},
+             'budget_stop_reason': 'follow_deadline', 'loadavg_start': [3, 4, 5], 'loadavg_end': [4, 5, 6]},
+            {**self.row, 'at': '2026-11-17T02:00:00+04:00', 'total_s': 30},
+            {**self.row, 'at': '2026-11-17T00:00:00Z', 'total_s': 200},
+        ]
+        (self.wd / 'runs.jsonl.1').write_text('\n'.join(json.dumps(row) for row in rows[:2]) + '\n')
+        self.path.write_text('\n'.join(json.dumps(row) for row in rows[2:]) + '\n{partial\n')
+        before = {p.name: p.read_bytes() for p in self.wd.iterdir()}
+        result = history.health(self.wd, '2026-11-16')
+        self.assertEqual(result['runs'], 3)
+        self.assertEqual(result['total_s'], {'p50': 30, 'p95': 39, 'max': 40})
+        self.assertEqual(result['over_35_count'], 1)
+        self.assertEqual(result['owner_results'], {'ok': 1, 'list_failed': 1, 'incomplete': 1})
+        receipt = result['receipt']
+        self.assertEqual((receipt['known_runs'], receipt['unknown_runs'], receipt['eligible']), (2, 1, 10))
+        self.assertEqual(receipt['counts'], dict(found=2, none=2, out_of_time=1, error=1, unattempted=4))
+        self.assertEqual(receipt['share']['unattempted'], .4)
+        self.assertEqual(sum(receipt['share'].values()), 1)
+        self.assertEqual(result['top_budget_stop_reason'], 'follow_deadline')
+        self.assertEqual(result['loadavg_p95'], {'start': [2.9, 3.9, 4.9], 'end': [3.9, 4.9, 5.9]})
+        self.assertEqual(result['loadavg_samples'], dict(start=2, end=2))
+        self.assertEqual(result['invalid_lines'], 1)
+        for mode in ([], ['--json'], ['--one-line']):
+            with patch.dict(os.environ, {'WATCH_DIR': str(self.wd)}), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(cases.main(['health', '--day', '2026-11-16', *mode]), 0)
+            if mode == ['--json']:
+                self.assertEqual(json.loads(out.getvalue()), result)
+            else:
+                self.assertIn(result['one_line'], out.getvalue())
+        self.assertEqual({p.name: p.read_bytes() for p in self.wd.iterdir()}, before)
+
+    def test_health_missing_old_zero_and_invalid_days(self):
+        result = history.health(self.wd, '2026-11-16')
+        self.assertEqual(result['runs'], 0)
+        self.assertIsNone(result['receipt']['eligible'])
+        self.assertEqual(result['loadavg_p95']['end'], [None, None, None])
+        self.path.write_text(json.dumps(self.row) + '\n')
+        result = history.health(self.wd, '2026-11-16')
+        self.assertEqual(result['receipt']['unknown_runs'], 1)
+        self.assertIsNone(result['receipt']['counts']['unattempted'])
+        self.path.write_text(json.dumps({**self.row, 'receipt_eligible': 0, 'receipt_unattempted': 0}) + '\n')
+        result = history.health(self.wd, '2026-11-16')
+        self.assertEqual(result['receipt']['eligible'], 0)
+        self.assertIsNone(result['receipt']['share']['found'])
+        for day in ('2026-11-31', '2026-1-1', 'yesterday', '2026-11-16T00:00:00Z'):
+            with self.subTest(day=day), self.assertRaises(ValueError):
+                history.health(self.wd, day)
+        now = dt.datetime(2026, 11, 17, 2, tzinfo=dt.timezone(dt.timedelta(hours=4)))
+        self.assertEqual(history.health(self.wd, now=now)['day'], '2026-11-16')
+
+    def test_health_validates_raw_receipt_counter_shapes_before_projection(self):
+        forms = [
+            ('text', {'error': 'malformed'}), ('negative', {'error': -1}),
+            ('boolean', {'error': True}), ('fraction', {'error': .5}),
+            ('nonfinite', {'error': float('nan')}), ('nested', {'error': {'count': 0}}),
+            ('list-counter', {'error': []}), ('null-counter', {'error': None}),
+            ('null-container', None), ('list-container', []), ('text-container', 'malformed'),
+            ('inconsistent-total', {'none': 1}),
+        ]
+        for label, counters in forms:
+            with self.subTest(shape=label):
+                row = {**self.row, 'receipt_eligible': 1, 'receipt_unattempted': 1,
+                       'receipt_result': counters}
+                self.path.write_text(json.dumps(row) + '\n')
+                result = history.health(self.wd, '2026-11-16')
+                self.assertEqual(result['runs'], 1)
+                self.assertEqual(result['receipt']['known_runs'], 0)
+                self.assertEqual(result['receipt']['unknown_runs'], 1)
+                self.assertIsNone(result['receipt']['eligible'])
+
     def test_nonblocking_lock_prevents_interleaved_rotation(self):
         self.path.write_bytes(b'x' * (history.MAX_BYTES - 1) + b'\n')
         replace = history.os.replace
@@ -331,6 +430,51 @@ class HistoryTests(unittest.TestCase):
 
 
 class CheckHistoryTests(Base):
+    def test_loadavg_failure_still_writes_successful_check_row(self):
+        self.case()
+        with patch.object(history.os, 'getloadavg', side_effect=OSError('fixture unavailable')), \
+                patch.dict(os.environ, {'WATCH_DIR': str(self.wd), 'WATCH_RUN_ID': 'fixture'}), \
+                patch.object(cases, 'DATA', self.data), redirect_stdout(io.StringIO()):
+            self.assertEqual(cases.main(['check']), 0)
+        row = json.loads((self.wd / 'runs.jsonl').read_text())
+        self.assertEqual(row['exit'], 0)
+        self.assertIsNone(row['loadavg_start'])
+        self.assertIsNone(row['loadavg_end'])
+
+    def test_successful_load_samples_and_zero_work_counts(self):
+        with patch.object(history.os, 'getloadavg', side_effect=[(1, 2, 3), (4, 5, 6)]):
+            cases.run_check(self.wd, 'fixture', self.data, self.root,
+                            at('2026-10-25T12:00'), finder(), nobody)
+        row = json.loads((self.wd / 'runs.jsonl').read_text())
+        self.assertEqual(row['loadavg_start'], [1, 2, 3])
+        self.assertEqual(row['loadavg_end'], [4, 5, 6])
+        self.assertEqual(row['receipt_eligible'], 0)
+        self.assertEqual(row['receipt_unattempted'], 0)
+        self.assertEqual(row['questions_calls'], 0)
+        self.assertEqual(row['order_charges_calls'], 0)
+
+    def test_receipt_census_counts_questions_skipped_at_follow_deadline(self):
+        from test_cases import CheckBudget
+        now = at('2026-10-25T12:00')
+        CheckBudget.seed(self, [now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        clock = [1000.0]
+        def receipt(*args, **kwargs):
+            clock[0] += 3
+            return None
+        with history.recording(self.wd) as row, patch.object(cases.time, 'time', lambda: clock[0]), \
+                patch.object(cases, 'FOLLOW_EACH', 3), \
+                patch.object(cases.charges, 'receipt', receipt), \
+                patch.object(cases.charges, 'known', return_value=None):
+            row['stats'] = stats
+            cases.follow(self.data, now, self.root, clock[0] + 5, finder(), nobody, stats=stats)
+        row = json.loads((self.wd / 'runs.jsonl').read_text())
+        self.assertEqual(row['receipt_eligible'], 3)
+        self.assertEqual(sum(row['receipt_result'].values()), 1)
+        self.assertEqual(row['receipt_unattempted'], 2)
+        self.assertEqual(row['questions_calls'], 1)
+        self.assertEqual(row['budget_stop_reason'], 'follow_deadline')
+
     def test_final_save_skip_records_build_write_on_every_path(self):
         import data_io
         from contextlib import ExitStack

@@ -1546,6 +1546,17 @@ def main(argv=None):
             if args.top < 1:
                 raise ValueError('top must be positive')
             result = rollup(args.board, args.day, args.top)
+            if args.board == 'orders':
+                import subprocess
+                try:
+                    # Kept out of checks: the bounded history read belongs to the daily rollup.
+                    done = subprocess.run(['money-cases', 'health', '--day', args.day, '--json'],
+                                          capture_output=True, text=True, timeout=2, check=True)
+                    health = json.loads(done.stdout)
+                    if health.get('day') == args.day and isinstance(health.get('one_line'), str):
+                        result['moneyCasesHealth'] = health
+                except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+                    pass
             directory = board_dir(args.board)
             _private_dir(directory)
             path = directory / ('rollup-' + args.day + '.json')
@@ -1560,6 +1571,8 @@ def main(argv=None):
                 if os.path.exists(tmp):
                     os.unlink(tmp)
             print(path)
+            if 'moneyCasesHealth' in result:
+                print(result['moneyCasesHealth']['one_line'])
             if args.table:
                 print(hourly_table(result))
         return 0
