@@ -66,7 +66,16 @@ export function antigravityHarness(root: string, dir: string, model: string, con
     const tmp = join(root, "antigravity-tmp", randomBytes(6).toString("hex"));
     mkdirSync(tmp, { recursive: true, mode: 0o700 });
     const token = randomBytes(24).toString("hex");
-    const gate = startRouterGate(router, () => { if (!refused) log(ROUTER_KEY_ERROR); refused = true; }, { bearer: token });
+    let stopping = false;
+    // agy 1.3.0's effectively unlimited API retries ignore short reset hints. The gate owns bounded
+    // retries, and exhaustion rejects the ACP prompt before agy can start its own backoff loop.
+    const gate = startRouterGate(router, () => { if (!refused) log(ROUTER_KEY_ERROR); refused = true; }, {
+      bearer: token, retry429: {
+        signal: input.signal,
+        onRetry(count) { if (!stopping) log("router-retry", { count }); },
+        onExhausted() { if (!stopping) failure("router-retries-exhausted"); },
+      },
+    });
     const caBundle = ["/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/certs/ca-bundle.crt", "/etc/pki/tls/certs/ca-bundle.crt"].find(existsSync);
     const child = Bun.spawn([bins.executable], {
       cwd: join(root, "work"),
@@ -89,6 +98,7 @@ export function antigravityHarness(root: string, dir: string, model: string, con
       write({ jsonrpc: "2.0", id, method, params });
     });
     const permission = (message: Rpc) => {
+      if (input.signal?.aborted) return { outcome: { outcome: "cancelled" } };
       const options: PermissionOption[] = Array.isArray(message.params?.options) ? message.params.options : [];
       const allow = options.find(o => o.kind === "allow_once") ?? options.find(o => o.kind?.startsWith("allow"));
       const reject = options.find(o => o.kind === "reject_once") ?? options.find(o => o.kind?.startsWith("reject"));
@@ -138,12 +148,12 @@ export function antigravityHarness(root: string, dir: string, model: string, con
     })();
     const abort = () => {
       if (sessionId) write({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
-      setTimeout(() => { if (child.exitCode === null) child.kill("SIGTERM"); }, CANCEL_GRACE_MS).unref?.();
       failure("aborted");
     };
     input.signal?.addEventListener("abort", abort, { once: true });
     const stage = { name: "initialize" };
     try {
+      input.signal?.throwIfAborted();
       await call("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, SETUP_MS);
       const known = input.resume ? sessions.get(input.session) : undefined;
       const sessionParams = { cwd: join(root, "work"), mcpServers: [] };
@@ -151,8 +161,8 @@ export function antigravityHarness(root: string, dir: string, model: string, con
       if (known) {
         stage.name = "resume";
         try { configOptions = (await call("session/resume", { sessionId: known, ...sessionParams }, SETUP_MS))?.configOptions; sessionId = known; }
-        catch (error) { if (input.signal?.aborted || closed) throw error; log("agy-resume-failed"); }
-      } else if (input.resume) log("agy-session-new", { reason: "no-mapping" });
+        catch (error) { if (input.signal?.aborted || closed) throw error; log("agy-session-reset", { reason: "resume-failed" }); }
+      } else if (input.resume) log("agy-session-reset", { reason: "no-mapping" });
       if (!sessionId) {
         stage.name = "new";
         const created = await call("session/new", sessionParams, SETUP_MS);
@@ -185,7 +195,10 @@ export function antigravityHarness(root: string, dir: string, model: string, con
       log("harness-exit", { ...detail, stage: stage.name, error: error instanceof Error ? error.message.split(":")[0]! : "unknown" });
       throw new HarnessFailure(detail);
     } finally {
+      stopping = true;
       input.signal?.removeEventListener("abort", abort);
+      // Keep stdin open while agy handles session/cancel; EOF or SIGTERM would skip its grace period.
+      if (input.signal?.aborted) await Promise.race([child.exited, Bun.sleep(CANCEL_GRACE_MS)]);
       closed = true;
       try { child.stdin.end(); } catch { /* already closed */ }
       if (child.exitCode === null) child.kill("SIGTERM");

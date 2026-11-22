@@ -102,7 +102,7 @@ async function main(): Promise<void> {
   let paired = chatId !== undefined;
   const health = { telegramLastOk: 0, backendLastOk: 0, lastError: "", startedAt: Date.now() };
   const ready = () => config.enabled && paired;
-  api = createApi({ store, enabled: ready, chatId: () => chatId, timezone: config.timezone, health: () => ({
+  api = createApi({ store, enabled: ready, chatId: () => chatId, timezone: config.timezone, getAsk: (key, signal) => new ControlClient().getAsk(key, signal), health: () => ({
     status: Date.now() - health.telegramLastOk < 90_000 && Date.now() - health.backendLastOk < 90_000 ? "healthy" : "degraded",
     telegramConnected: Date.now() - health.telegramLastOk < 90_000,
     openchamberConnected: Date.now() - health.backendLastOk < 90_000,
@@ -120,6 +120,7 @@ async function main(): Promise<void> {
     chatId: () => chatId,
     enabled: () => ready() && !stopping,
     beforeSend: item => attention.beforeSend(item),
+    getAsk: (key, signal) => new ControlClient().getAsk(key, signal),
     askNotified: (key, at) => new ControlClient().askNotified(key, at),
     log,
   });

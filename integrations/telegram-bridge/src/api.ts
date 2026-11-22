@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { MAX_FILE_BYTES, parseCommand, validFileName, validMimeType } from "./cli.ts";
 import { redact } from "./redact.ts";
-import { enqueueNotice } from "./notification-policy.ts";
+import { classifyAsk, type AskLookup } from "./digest.ts";
+import { boardAskKey, enqueueNotice } from "./notification-policy.ts";
 import { BOARD_EVENT_KEY, BOARD_EVENT_KEY_LIMIT } from "./openchamber.ts";
 import type { ReminderRecord, Store } from "./store.ts";
 import { toolError, toolLog } from "./toollog.ts";
@@ -13,6 +14,7 @@ type Options = {
   chatId: () => number | undefined;
   timezone: string;
   health: () => Record<string, unknown>;
+  getAsk?: AskLookup;
 };
 
 const MAX_BODY = 20 * 1024;
@@ -93,7 +95,7 @@ function list(name: "reminders" | "notifications", rows: Record<string, unknown>
 }
 
 /** Fetch-compatible handler only; socket ownership and listening belong to main. */
-export function createApi({ store, enabled, chatId, timezone, health }: Options): (request: Request) => Promise<Response> {
+export function createApi({ store, enabled, chatId, timezone, health, getAsk }: Options): (request: Request) => Promise<Response> {
   return async request => {
     try {
       if (request.headers.has("origin")) throw new ApiError(403);
@@ -261,12 +263,15 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
         fields(body, ["source", "severity", "text", "dedupeKey", "askKey", "burstKey"]);
         const { source, severity, dedupeKey, askKey, burstKey } = body;
         const text = typeof body.text === "string" ? redact(body.text) : body.text;
-        if (!string(source, 40) || /[^A-Za-z0-9 ._-]/.test(source)
+        if (!string(source, 40) || /[^A-Za-z0-9 ._#-]/.test(source)
           || !string(severity, 20) || !["info", "attention", "error"].includes(severity)
           || !string(body.text, 12_000) || !string(text, 12_000) || !string(dedupeKey, 200)
           || (askKey !== undefined && !string(askKey, 200)) || (burstKey !== undefined && !string(burstKey, 200))
           || (askKey !== undefined && burstKey !== undefined)) throw new ApiError(400);
         const id = `notify:${hash(dedupeKey)}`;
+        // A retry keeps its original receipt even if the ask has changed since admission.
+        const admission = store.get(`notice-receipt:${id}`) === undefined
+          ? await classifyAsk(askKey ?? boardAskKey(source, text), getAsk) : undefined;
         const created = store.db.transaction(() => {
           const key = `api:notification:${id}`;
           const metadata = store.get<{ severity: string }>(key);
@@ -276,7 +281,7 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
             throw new ApiError(409);
           }
           const created = enqueueNotice(store, { id, source, text, severity,
-            ...(askKey === undefined ? {} : { askKey }), ...(burstKey === undefined ? {} : { burstKey }) });
+            ...(askKey === undefined ? {} : { askKey }), ...(burstKey === undefined ? {} : { burstKey }) }, Date.now(), admission);
           store.set(key, { severity });
           return created;
         }).immediate();

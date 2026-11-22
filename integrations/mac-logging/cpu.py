@@ -20,6 +20,8 @@ from host_signal import notify_cpu_timeout
 # established CPU families and disabling interpreter hints.
 PS = ['/bin/ps', '-ww', '-axo', 'pid=,ppid=,time=,rss=,state=,lstart=,etime=,uid=,comm=']
 SPIKES_PER_DAY = 240
+KERNEL_TASK_TIMEOUT_S = 15
+KERNEL_TASK_COOLDOWN_S = 1800
 
 
 class ProbeError(Exception):
@@ -437,8 +439,13 @@ def spike(props, rows, run, kernel_read=True):
     result['kernelTaskPct'] = None
     if kernel_read:
         try:
-            result.update(kernel_task(command(['/usr/bin/top', '-l', '2', '-s', '1', '-pid', '0',
-                                              '-stats', 'pid,cpu,time'], run, timeout=5)))
+            started = time.monotonic()
+            try:
+                text = command(['/usr/bin/top', '-l', '2', '-s', '1', '-pid', '0',
+                                '-stats', 'pid,cpu,time'], run, timeout=KERNEL_TASK_TIMEOUT_S)
+            finally:
+                result['kernelTaskWallMs'] = round((time.monotonic()-started)*1000)
+            result.update(kernel_task(text))
         except ProbeError as exc:
             result['kernelTaskError'] = str(exc)
     else:
@@ -564,7 +571,8 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
                 state['kernelTaskAt'] = min(last_kernel, observed)
             snapshot = None
             if props['load'] and props['load'][0] > threshold and count < SPIKES_PER_DAY:
-                take_kernel = ('kernelTaskAt' not in state or observed-state['kernelTaskAt'] >= 300)
+                take_kernel = ('kernelTaskAt' not in state or
+                               observed-state['kernelTaskAt'] >= KERNEL_TASK_COOLDOWN_S)
                 if take_kernel:
                     # Failed attempts also consume the expensive-read allowance.
                     state['kernelTaskAt'] = observed

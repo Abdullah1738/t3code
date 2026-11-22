@@ -13,7 +13,7 @@ export type LogEntry = {
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper", "meantFor"]);
-const numeric = new Set(["exitCode", "timeoutMs", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays", "slotWaitMs", "slotQueueDepth", "slotActiveAtEnqueue", "startLateMs", "intervalMs", "depth", "oldestWaitMs", "active", "cap", "dueAt", "lateMs", "load", "elapsedMs"]);
+const numeric = new Set(["exitCode", "timeoutMs", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays", "slotWaitMs", "slotQueueDepth", "slotActiveAtEnqueue", "startLateMs", "intervalMs", "depth", "oldestWaitMs", "active", "cap", "dueAt", "lateMs", "recentMinMs", "load", "elapsedMs"]);
 const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace", "loadMode", "sendDeferred"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
@@ -27,7 +27,8 @@ const values: Record<string, readonly string[]> = {
   class: ["urgent", "today", "info", "noise", "candidate", "charge", "bank", "security", "otp", "unknown", "fail_open", "deduped"],
   action: ["create", "queue", "cancel", "snooze", "sent", "retry", "check", "wake", "notify", "send", "coalesce", "conflict", "expire", "pause", "remove", "cap", "resume"],
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
-  stderrClass: ["usage_error", "missing_file", "permission", "timeout", "dependency_busy", "python_traceback", "auth", "connect", "json", "unknown"],
+  timeoutSide: ["none", "cli_process", "http"],
+  stderrClass: ["ride_ended", "usage_error", "missing_file", "permission", "timeout", "dependency_busy", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
   step: ["native", "status", "send"],
   op: ["native", "native_retry", "status", "status_retry", "send", "confirm"],
@@ -36,6 +37,7 @@ const values: Record<string, readonly string[]> = {
   confirmed: ["pending", "n/a"],
   operation: ["check", "pending"],
   lane: ["fast", "slow"],
+  lane_reason: ["fast", "fast:sticky", "fast:overdue", "slow:new", "slow:recent"],
   trigger: ["schedule", "trigger", "retry", "final"],
 };
 let testRoot: string | undefined;
