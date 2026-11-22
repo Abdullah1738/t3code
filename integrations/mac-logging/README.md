@@ -826,7 +826,10 @@ Only derived labels are cached per PID/start identity; argv is never logged.
 Cost includes per-minute summed wall/CPU time, individual phase costs and guard
 decisions. Actual excess halves the thread-process cap down to one, prioritizing
 runnable hints and highest CPU gain; only then can cadence slow to 15 seconds.
-A 50ms thread pass is attempted every tick within the 1.5s overall deadline.
+A shared 75ms soft argv/CPU allocation leaves room for a 25ms thread pass every
+tick within the 1.5s overall deadline. Runnable hints with unread CPU data
+remain eligible for thread reads and carry an unknown CPU baseline.
+Argv runs first so a slow CPU census cannot starve new parent/offbox labels.
 Thread counts are null only when no minimal pass fits or is readable, and retry
 on the next tick. Runnable counts describe the latest tick, not the sum
 of repeated censuses; offbox counts/RSS describe that same tick. CPU deltas use

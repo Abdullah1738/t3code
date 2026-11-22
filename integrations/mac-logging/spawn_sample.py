@@ -134,10 +134,49 @@ class SpawnSampler:
                 family=self.labels.get(identity(parent), {}).get('family') if parent else None))
             entry['births'] += 1
             entry['children'][child['comm']] += 1
+        # Leave time for a thread pass even when CPU/argv syscalls are slow.
+        # Identity validation may finish beyond this soft allocation, but
+        # always stays within the overall native-call deadline.
+        detail_deadline = min(deadline, self.clock()+.075)
+        # Give new identities an argv opportunity before CPU reads can consume
+        # the shared allocation. Cache only derived labels, never raw argv/env.
+        self.phase('argv')
+        argv_started = self.clock()
+        argv_reads = 0
+        parent_pids = {p['ppid'] for p in parents.values()}
+        # A busy host may never finish a cold argv census. Resolve the actors
+        # this event names before spending that budget on unrelated daemons.
+        pending = sorted(current.items(), key=lambda item:(
+            item[1]['pid'] not in parent_pids,
+            not item[1]['comm'].lower().startswith(('robob', 'codex', 'claude', 'python', 'bun', 'node')),
+            item[1]['pid']))
+        for key, row in pending:
+            if key in self.labels:
+                continue
+            if (argv_reads >= 32 or self.clock()-argv_started >= .05
+                    or self.clock() >= detail_deadline or not room('argv')):
+                break
+            argv_reads += 1
+            try:
+                argv = self.native.argv(row['pid'])
+                if not room('argv'):
+                    break
+                if identity(self.native.bsd(row['pid'])) != key:
+                    reasons.add('identity_changed')
+                    continue
+                kind, run = offbox_class(argv)
+                self.labels[key] = dict(kind=kind, run=run, family=spawn_family(argv, row['comm']))
+            except (OSError, ValueError, UnicodeError):
+                self.labels[key] = dict(kind='argv-unreadable', run=None, family=None)
+        # Discard labels only after a confirmed exit, including PID reuse.
+        self.labels = {k:v for k,v in self.labels.items() if k in retained}
         self.phase('cpu')
         metrics, candidates = {}, []
         for key, row in current.items():
             if not room('cpu_offbox'):
+                break
+            if self.clock() >= detail_deadline:
+                reasons.add('cpu_offbox_budget')
                 break
             try:
                 task = self.native.task(row['pid'])
@@ -163,36 +202,6 @@ class SpawnSampler:
             if task['running'] > 0 or (delta is not None and delta > 0):
                 candidates.append(key)
         self.tasks = {k:v for k,v in self.tasks.items() if k in retained}
-        # Cache only derived allowlisted labels. Never retain raw argv or env.
-        self.phase('argv')
-        argv_started = self.clock()
-        argv_reads = 0
-        parent_pids = {p['ppid'] for p in parents.values()}
-        # A busy host may never finish a cold argv census. Resolve the actors
-        # this event names before spending that budget on unrelated daemons.
-        pending = sorted(current.items(), key=lambda item:(
-            item[1]['pid'] not in parent_pids,
-            not item[1]['comm'].lower().startswith(('robob', 'codex', 'claude', 'python', 'bun', 'node')),
-            item[1]['pid']))
-        for key, row in pending:
-            if key in self.labels:
-                continue
-            if argv_reads >= 32 or self.clock()-argv_started >= .05 or not room('argv'):
-                break
-            argv_reads += 1
-            try:
-                argv = self.native.argv(row['pid'])
-                if not room('argv'):
-                    break
-                if identity(self.native.bsd(row['pid'])) != key:
-                    reasons.add('identity_changed')
-                    continue
-                kind, run = offbox_class(argv)
-                self.labels[key] = dict(kind=kind, run=run, family=spawn_family(argv, row['comm']))
-            except (OSError, ValueError, UnicodeError):
-                self.labels[key] = dict(kind='argv-unreadable', run=None, family=None)
-        # Discard labels only after a confirmed exit, including PID reuse.
-        self.labels = {k:v for k,v in self.labels.items() if k in retained}
         self.phase('offbox')
         classes = {k:dict(count=0, rssBytes=0, cpuDeltaNs=0, cpuUnknown=0, metricsUnreadable=0, cpuWindowMaxS=None, runs=set())
                    for k in ('wait', '_bg-queue', 'run', 'other', 'argv-unreadable', 'argv-pending')}
@@ -224,10 +233,15 @@ class SpawnSampler:
         self.phase('threads')
         # Prioritize native runnable hints, then measured CPU gain. A small
         # pass survives overload instead of permanently latching the signal off.
-        candidates.sort(key=lambda key:(metrics[key]['running'] <= 0,
-            -(metrics[key]['cpuPct'] or 0), -(metrics[key]['cpuDeltaNs'] or 0), key))
+        # Unread CPU data must not prevent a minimal thread census. BSD SRUN
+        # is a weaker hint (it includes sleepers), so try these after measured
+        # runnable/advancing tasks and expose their CPU as unknown.
+        candidates.extend(key for key,row in current.items() if key not in metrics and row['status'] == 2)
+        candidates.sort(key=lambda key:(0 if metrics.get(key, {}).get('running', 0) > 0 else
+            1 if (metrics.get(key, {}).get('cpuDeltaNs') or 0) > 0 else 2,
+            -(metrics.get(key, {}).get('cpuPct') or 0), -(metrics.get(key, {}).get('cpuDeltaNs') or 0), key))
         process_limit = min(300, self.thread_limit)
-        thread_deadline = min(deadline, self.clock()+.05)
+        thread_deadline = min(deadline, self.clock()+.025)
         for key in candidates[:process_limit]:
             if not room('threads') or self.clock() >= thread_deadline:
                 reasons.add('threads_budget')
@@ -240,7 +254,7 @@ class SpawnSampler:
                 if not rows and not complete:
                     reasons.add('threads_incomplete')
                     continue
-                # The 50ms allocation bounds thread reads. Validate any partial
+                # The soft allocation bounds thread reads. Validate any partial
                 # rows against identity while the overall 1.5s budget remains.
                 if identity(self.native.bsd(key[0])) != key:
                     reasons.add('threads_incomplete')
@@ -254,7 +268,7 @@ class SpawnSampler:
             if not complete:
                 reasons.add('threads_incomplete')
             if local:
-                pct = metrics[key]['cpuPct']
+                pct = metrics.get(key, {}).get('cpuPct')
                 unknown += pct is None
                 low += pct is not None and pct < .5
                 top.append(dict(pid=key[0], start=key[1], comm=current[key]['comm'],

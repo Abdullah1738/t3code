@@ -109,7 +109,7 @@ class SpawnTests(unittest.TestCase):
                ('sleeping',[1,2],set(),set(),set(),0),
                ('one_identity_unreadable',[1,2],{2},set(),set(),None),
                ('all_identities_unreadable',[1,2],{1,2},set(),set(),None),
-               ('one_task_unreadable',[1,2],set(),{2},set(),None),
+               ('one_task_unreadable',[1,2],set(),{2},set(),1),
                ('measured_subset',[1,2],{2},set(),{1},1)]
         for name,pids,bsd_unreadable,task_unreadable,running,expected in cases:
             with self.subTest(case=name):
@@ -130,6 +130,41 @@ class SpawnTests(unittest.TestCase):
                     self.assertEqual(result['buckets']['pri<=4'],expected)
                     self.assertIsNotNone(result['runnable_low_cpu'])
                 if bsd_unreadable or task_unreadable:self.assertTrue(r['partial'])
+    def test_slow_details_reserve_thread_pass(self):
+        for stage in ('cpu','argv'):
+            with self.subTest(stage=stage):
+                self.setUp();self.n.child(2);reads=[]
+                if stage=='cpu':
+                    def read(pid):
+                        reads.append(pid);self.now+=.08
+                        return dict(cpuNs=0,rssBytes=1,running=0)
+                    self.n.task=read
+                else:
+                    def read(pid):reads.append(pid);self.now+=.08;return ['other']
+                    self.n.argv=read
+                r=self.s.tick()
+                self.assertEqual(reads,[1]);self.assertTrue(r['partial'])
+                self.assertGreater(r['runnable']['covered'],0)
+                self.assertIsNotNone(r['runnable']['buckets'])
+                self.assertEqual(self.s.interval,5)
+                if stage=='cpu':
+                    self.assertEqual(r['runnable']['candidateCoverage'],1)
+                    self.assertEqual(r['runnable']['cpuUnknown'],1)
+                    self.assertIn('cpu_offbox_budget',r['partialReasons'])
+    def test_slow_cpu_cannot_starve_new_argv(self):
+        def task(pid):
+            self.now+=.08
+            return dict(cpuNs=0,rssBytes=1,running=1)
+        def argv(pid):
+            self.n.argv_calls.append(pid)
+            return ['codex','app-server'] if pid==1 else ['python3','/a/offbox.py','wait']
+        self.n.task=task;self.n.argv=argv
+        for i,at in enumerate((0,5,10)):
+            self.now=at;self.n.child(i+2,i+2);r=self.s.tick()
+            self.assertEqual(len(self.s.labels),len(self.n.rows))
+            self.assertEqual(self.s.labels[(1,(1,0))]['family'],'codex app-server')
+            self.assertEqual(r['offbox']['wait']['count'],i+1)
+            self.assertEqual(r['offbox']['argv-pending']['count'],0)
     def test_phase_costs_and_actual_minute_guard(self):
         original=self.n.bsd
         def bsd(pid):self.now+=.001;return original(pid)
