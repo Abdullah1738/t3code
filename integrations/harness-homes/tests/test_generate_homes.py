@@ -1099,6 +1099,26 @@ class AntigravityTests(HarnessTestCase):
                 rc = gh.main(["check", "--home-root", str(self.root), "--antigravity-links"])
             return rc, out.getvalue()
 
+    def test_a_file_written_while_linking_is_never_replaced(self) -> None:
+        # Review of 8ca5540d61: a "missing" link was created by rename, over a real file another
+        # process had just written.
+        link = self.root / "race" / "config" / "hooks.json"
+        link.parent.mkdir(parents=True)
+        real_symlink = os.symlink
+
+        def racing(target, path, *args, **kwargs):
+            if os.fspath(path) == str(link):
+                link.write_text('{"own":3}')
+            return real_symlink(target, path, *args, **kwargs)
+
+        with mock.patch.object(gh.os, "symlink", racing), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            gh.Writer(False).link_if_absent(str(link), str(self.root / "target.json"))
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(), '{"own":3}')
+        gh.Writer(False).link_if_absent(str(self.root / "race" / "config" / "mcp.json"), str(link))
+        self.assertTrue((self.root / "race" / "config" / "mcp.json").is_symlink())
+
     def test_a_scratch_home_never_touches_production_links(self) -> None:
         # Review of 3e27b87ce3: `generate --home-root <scratch>` rewired real profiles.
         profile = self.make_profile()

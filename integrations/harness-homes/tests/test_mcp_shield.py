@@ -262,6 +262,108 @@ class HttpTests(unittest.TestCase):
                 self.assertEqual(r[1]["result"]["serverInfo"]["name"], "slow-unavailable")
                 self.assertEqual(r[2]["result"]["tools"], [])
 
+    def test_slow_headers_cannot_pile_up_workers(self):
+        # Review of 8ca5540d61: a server trickling an unfinished header kept open() blocked, so
+        # the deadline had no socket to shut down and every timed-out call left a worker behind.
+        import socket as socket_module
+        sys.path.insert(0, str(SHIELD.parent))
+        import mcp_shield
+        listener = socket_module.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+
+        open_conns = []
+
+        def trickle(conn):
+            open_conns.append(conn)
+            try:
+                conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+                for _ in range(400):
+                    conn.sendall(b"x")
+                    time.sleep(0.05)
+            except OSError:
+                pass
+            finally:
+                open_conns.remove(conn)
+                conn.close()
+
+        def accept():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                threading.Thread(target=trickle, args=(conn,), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+        upstream = mcp_shield.HttpUpstream("slowhdr", f"http://127.0.0.1:{listener.getsockname()[1]}/mcp", None, 0.3)
+        for _ in range(8):
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                upstream.post(INIT, 0.3)
+            self.assertLess(time.monotonic() - started, 2)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            left = [t for t in threading.enumerate() if t.name == "mcp-shield-post-slowhdr"]
+            if not left and not open_conns:
+                break
+            time.sleep(0.05)
+        self.assertEqual(left, [])
+        self.assertEqual(open_conns, [])  # the server saw every timed-out connection close
+
+    def test_a_late_worker_cannot_replace_a_newer_session(self):
+        # Review of 8ca5540d61: a worker finishing after a re-initialize overwrote the new session.
+        sys.path.insert(0, str(SHIELD.parent))
+        import mcp_shield
+        release = threading.Event()
+
+        class Late(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                msg = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                release.wait(5)
+                data = json.dumps({"jsonrpc": "2.0", "id": msg.get("id"), "result": {}}).encode()
+                self.send_response(200)
+                self.send_header("Mcp-Session-Id", "stale")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Late)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}/mcp"
+        for abandoned in (False, True):
+            with self.subTest(abandoned=abandoned):
+                release.clear()
+                upstream = mcp_shield.HttpUpstream("late", url, None, 5)
+                upstream.session_id = "old"
+                box = {}
+
+                def call():
+                    try:
+                        box["value"] = upstream.post(LIST, 0.3 if abandoned else 5)
+                    except TimeoutError:
+                        box["timeout"] = True
+
+                caller = threading.Thread(target=call)
+                caller.start()
+                time.sleep(0.5 if abandoned else 0.2)
+                with upstream._lock:
+                    upstream.session_id = "fresh"  # a re-initialize published a new session
+                release.set()
+                caller.join(5)
+                time.sleep(0.3)
+                self.assertEqual(upstream.session_id, "fresh")
+                self.assertEqual("timeout" in box, abandoned)
+        fresh = mcp_shield.HttpUpstream("late", url, None, 5)
+        release.set()
+        fresh.post(INIT, 5)
+        self.assertEqual(fresh.session_id, "stale")  # an unchanged session still takes the reply's id
+
     def test_unauthorized_degrades(self):
         r = run_shield(["--name", "web", "--url", self.serve(401)], [INIT, LIST])
         self.assertIn("unauthorized", r[1]["result"]["instructions"])

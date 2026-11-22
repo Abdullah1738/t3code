@@ -1083,6 +1083,19 @@ class Writer:
         os.symlink(target, tmp)
         os.replace(tmp, link_path)
 
+    def link_if_absent(self, link_path: str, target: str) -> None:
+        """Create a link only where nothing exists: a file another process writes meanwhile wins."""
+        self._say("link", link_path)
+        if self.dry_run:
+            return
+        self.ensure_dir(os.path.dirname(link_path), False)
+        try:
+            os.symlink(target, link_path)
+        except FileExistsError:
+            if link_state(link_path, target) == "blocked":
+                print(f"warning: {link_path} exists and is not a link; Antigravity will not see {target}",
+                      file=sys.stderr)
+
     def unlink(self, path: str) -> None:
         self._say("unlink", path)
         if not self.dry_run:
@@ -1154,7 +1167,9 @@ def generate(home_root: str | None, dry_run: bool, opencode_config: str | None =
     guard_outputs([link for link, _ in agy_links])
     for link, target in agy_links:
         state = link_state(link, target)
-        if state in ("missing", "other-link"):
+        if state == "missing":
+            writer.link_if_absent(link, target)
+        elif state == "other-link":
             writer.link(link, target)
         elif state == "blocked":
             print(f"warning: {link} exists and is not a link; Antigravity will not see {target}", file=sys.stderr)

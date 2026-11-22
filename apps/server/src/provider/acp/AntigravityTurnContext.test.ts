@@ -225,4 +225,43 @@ describe("Antigravity turn context", () => {
       assert.deepEqual(leftovers, []);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+  it.effect("a real file written while linking is never replaced", () =>
+    Effect.gen(function* () {
+      // Review of 8ca5540d61: the absent case renamed a link over a file another process had
+      // just created.
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "agy-profile-own-" });
+      const harnessHome = antigravityHarnessHome(path, dir);
+      yield* fileSystem.makeDirectory(path.join(harnessHome, "config"), { recursive: true });
+      yield* fileSystem.writeFileString(path.join(harnessHome, "config", "hooks.json"), "{}");
+      const profileDirectory = path.join(dir, "profile");
+      const hooks = path.join(profileDirectory, "config", "hooks.json");
+      let raced = false;
+      const racing: FileSystem.FileSystem = {
+        ...fileSystem,
+        symlink: (target, link) =>
+          raced
+            ? fileSystem.symlink(target, link)
+            : Effect.sync(() => {
+                raced = true;
+              }).pipe(
+                Effect.andThen(fileSystem.writeFileString(hooks, '{"own":2}')),
+                Effect.andThen(fileSystem.symlink(target, link)),
+              ),
+      };
+      yield* linkAntigravityHarnessConfig({
+        fileSystem: racing,
+        path,
+        profileDirectory,
+        harnessHome,
+      });
+      assert.isTrue(raced);
+      assert.equal(yield* fileSystem.readFileString(hooks), '{"own":2}');
+      const leftovers = (yield* fileSystem.readDirectory(path.dirname(hooks))).filter((name) =>
+        name.includes(".robob-"),
+      );
+      assert.deepEqual(leftovers, []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 });

@@ -19,6 +19,7 @@ from the login Keychain by service name (`--bearer-keychain`).
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import socket
@@ -27,6 +28,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_PROTOCOL = "2025-06-18"
@@ -254,19 +256,16 @@ def keychain_secret(service: str) -> str | None:
     return value if out.returncode == 0 and value else None
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A redirect would carry the Keychain bearer to another origin: refuse every one."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
-        return None
-
-
 class HttpUpstream:
     def __init__(self, name: str, url: str, bearer: str | None, timeout: float):
         self.name, self.url, self.bearer, self.timeout = name, url, bearer, timeout
         self.session_id: str | None = None
         self.protocol: str | None = None
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        self._lock = threading.Lock()
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("unsupported upstream url")
+        self._parts = parts
 
     def headers(self) -> dict:
         h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
@@ -281,26 +280,32 @@ class HttpUpstream:
     def post(self, message, timeout: float) -> list:
         """One request with a hard wall-clock deadline.
 
-        Socket timeouts only bound each read, so a server trickling bytes (heartbeats, a partial
-        SSE line, a slow JSON body) could hold a call forever. The request runs on a worker; at
-        the deadline its socket is shut down and the caller gets TimeoutError. A late result from
-        the abandoned worker is discarded.
+        Socket timeouts only bound each read, so a server trickling bytes (slow headers,
+        heartbeats, a partial SSE line, a slow JSON body) could hold a call forever. The request
+        runs on a worker that registers its socket the moment it connects; at the deadline that
+        socket is shut down, which ends any blocked read (headers included) so the worker exits,
+        and the caller gets TimeoutError. Only the caller publishes a new session id, and only
+        when the session it sent is still current, so a late worker cannot undo a re-initialize.
         """
         box: dict = {}
         done = threading.Event()
+        with self._lock:
+            headers = self.headers()
+            sent = self.session_id
 
         def work():
             try:
-                box["value"] = self._post(message, timeout, box)
+                box["value"] = self._post(message, headers, timeout, box)
             except BaseException as error:  # noqa: BLE001 - re-raised in the caller
                 box["error"] = error
             finally:
                 done.set()
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, name=f"mcp-shield-post-{self.name}", daemon=True).start()
         if not done.wait(timeout):
-            box["abandoned"] = True
-            sock = box.get("socket")
+            with self._lock:
+                box["abandoned"] = True
+                sock = box.get("socket")
             if sock is not None:
                 try:
                     sock.shutdown(socket.SHUT_RDWR)
@@ -309,29 +314,52 @@ class HttpUpstream:
             raise TimeoutError("response deadline")
         if "error" in box:
             raise box["error"]
-        return box["value"]
+        values, session = box["value"]
+        if session:
+            with self._lock:
+                if self.session_id == sent:
+                    self.session_id = session
+        return values
 
-    def _post(self, message, timeout: float, box: dict) -> list:
+    def _connection(self, timeout: float, box: dict) -> http.client.HTTPConnection:
+        parts = self._parts
+        cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+        conn = cls(parts.hostname, parts.port, timeout=timeout)
+
+        def create_connection(*args, **kwargs):
+            sock = socket.create_connection(*args, **kwargs)
+            with self._lock:
+                abandoned = box.get("abandoned")
+                if not abandoned:
+                    box["socket"] = sock
+            if abandoned:
+                sock.close()
+                raise TimeoutError("response deadline")
+            return sock
+
+        conn._create_connection = create_connection  # noqa: SLF001 - see the socket before TLS and headers
+        return conn
+
+    def _post(self, message, headers: dict, timeout: float, box: dict):
         deadline = time.monotonic() + timeout
-        request = urllib.request.Request(self.url, data=json.dumps(message).encode(), headers=self.headers(),
-                                         method="POST")
-        with self.opener.open(request, timeout=timeout) as response:
-            try:
-                box["socket"] = response.fp.raw._sock  # noqa: SLF001 - only to unblock a stuck read
-            except AttributeError:
-                pass
+        parts = self._parts
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        conn = self._connection(timeout, box)
+        try:
+            # No proxy and no redirects: either would carry the Keychain bearer elsewhere.
+            conn.request("POST", path, body=json.dumps(message).encode(), headers=headers)
+            response = conn.getresponse()
             if box.get("abandoned"):
                 raise TimeoutError("response deadline")
-            if 300 <= response.status < 400:
-                raise urllib.error.HTTPError(self.url, response.status, "redirect refused", response.headers, None)
+            if response.status >= 300:
+                reason = "redirect refused" if response.status < 400 else response.reason
+                raise urllib.error.HTTPError(self.url, response.status, reason, response.headers, None)
             session = response.headers.get("Mcp-Session-Id")
-            if session and not box.get("abandoned"):
-                self.session_id = session
             kind = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if response.status == 202:
-                return []
+                return [], session
             if kind == "text/event-stream":
-                return self._read_sse(response, message, deadline)
+                return self._read_sse(response, message, deadline), session
             chunks = []
             while True:
                 if time.monotonic() > deadline:
@@ -342,10 +370,12 @@ class HttpUpstream:
                 chunks.append(chunk)
             body = b"".join(chunks)
             if not body.strip():
-                return []
+                return [], session
             value = json.loads(body)
             values = value if isinstance(value, list) else [value]
-            return [v for v in values if is_rpc(v)]
+            return [v for v in values if is_rpc(v)], session
+        finally:
+            conn.close()
 
     @staticmethod
     def _read_sse(response, message, deadline: float) -> list:

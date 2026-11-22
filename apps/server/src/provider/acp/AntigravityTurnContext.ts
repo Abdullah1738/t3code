@@ -213,26 +213,42 @@ export const linkAntigravityHarnessConfig = Effect.fn("AntigravityTurnContext.li
       const link = path.join(input.profileDirectory, "config", name);
       yield* Effect.gen(function* () {
         if (!(yield* fileSystem.exists(target))) return;
-        const existing = yield* fileSystem.readLink(link).pipe(
-          Effect.map((value): string | undefined => path.resolve(path.dirname(link), value)),
-          Effect.orElseSucceed(() => undefined),
-        );
-        if (existing === target) return;
-        if (existing === undefined && (yield* fileSystem.exists(link))) {
-          yield* Effect.logWarning("Antigravity profile config is a real file; not linked.", {
-            link,
-          });
+        yield* fileSystem.makeDirectory(path.dirname(link), { recursive: true });
+        // A few rounds: another writer may create the link (or a real file) between our checks.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const existing = yield* fileSystem.readLink(link).pipe(
+            Effect.map((value): string | undefined => path.resolve(path.dirname(link), value)),
+            Effect.orElseSucceed(() => undefined),
+          );
+          if (existing === target) return;
+          if (existing === undefined) {
+            if (yield* fileSystem.exists(link)) {
+              yield* Effect.logWarning("Antigravity profile config is a real file; not linked.", {
+                link,
+              });
+              return;
+            }
+            // Absent: create in place. symlink() fails if anything appeared meanwhile, so a
+            // file another process just wrote is never replaced; look again instead.
+            const created = yield* fileSystem.symlink(target, link).pipe(
+              Effect.as(true),
+              Effect.orElseSucceed(() => false),
+            );
+            if (created) return;
+            continue;
+          }
+          // A stale link: never unlink first, since a concurrent start (or the generator) could
+          // launch in the gap with no guards. A uniquely named link renamed over it is atomic.
+          // Only Robob and the generator replace these links, and both only replace links.
+          const nonce = yield* Random.nextInt;
+          const temporary = `${link}.robob-${process.pid}-${nonce.toString(36)}`;
+          yield* fileSystem.symlink(target, temporary);
+          yield* fileSystem
+            .rename(temporary, link)
+            .pipe(Effect.tapError(() => fileSystem.remove(temporary).pipe(Effect.ignore)));
           return;
         }
-        // Never unlink first: a concurrent start (or the generator) could launch in the gap
-        // with no guards. A uniquely named link renamed over the old one is atomic.
-        yield* fileSystem.makeDirectory(path.dirname(link), { recursive: true });
-        const nonce = yield* Random.nextInt;
-        const temporary = `${link}.robob-${process.pid}-${nonce.toString(36)}`;
-        yield* fileSystem.symlink(target, temporary);
-        yield* fileSystem
-          .rename(temporary, link)
-          .pipe(Effect.tapError(() => fileSystem.remove(temporary).pipe(Effect.ignore)));
+        yield* Effect.logWarning("Antigravity profile config kept changing; not linked.", { link });
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("Antigravity profile config is not linked.", { link, cause }),
