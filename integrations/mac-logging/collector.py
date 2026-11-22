@@ -2,6 +2,7 @@
 """Read-only Mac evidence collector with bounded disk diagnostics."""
 from collections import Counter
 import datetime as dt
+from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 import json
 import math
 import fcntl
@@ -13,11 +14,14 @@ import re
 import signal
 import subprocess
 import time
+import uuid
 from jobs import (read_state, save_state, state_path, directory_inventory,
                   SourceFailure, source_error, stderr_line, permission_denied, deadline_call)
 from rollup import rollup
+from logwindow import (row_timestamp, query_bound, boot_times, boot_boundaries, boot_skip, boot_second)
 from status import CADENCES
 from toollog import directory, emit, private_dir, safe_fields, finite_number
+from homebrew import check as homebrew_integrity
 
 REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/DiagnosticReports/Retired'),
                Path.home() / 'Library/Logs/DiagnosticReports']
@@ -57,6 +61,7 @@ UNIFIED_FIRST_CHUNK_S = 60
 UNIFIED_CALL_S = 60
 UNIFIED_TARGET_S = 10
 UNIFIED_BUDGET_S = 135
+UNIFIED_FRESH_RESERVE_S = 60
 
 
 class ReportFailure(Exception):
@@ -208,47 +213,265 @@ def next_unified_chunk(size, elapsed, model=None):
     return size_next, model
 
 
+class UnifiedCounts(Counter):
+    def __init__(self):
+        super().__init__()
+        self.stats = {}
+
+
+def unified_rows(output, partial=False):
+    if isinstance(output, bytes):
+        output = output.decode('utf-8', errors='replace')
+    if not partial:
+        rows = json.loads(output or '[]')
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('invalid log shape')
+        return rows
+    # A timed-out JSON array has no closing bracket. Decode complete objects
+    # from its prefix; the unfinished tail is never evidence.
+    decoder, rows = json.JSONDecoder(), []
+    text = (output or '').lstrip()
+    if not text.startswith('['):
+        return rows
+    text = text[1:]
+    while text:
+        text = text.lstrip(' \r\n\t,')
+        try:
+            row, end = decoder.raw_decode(text)
+        except ValueError:
+            break
+        if isinstance(row, dict):
+            rows.append(row)
+        text = text[end:]
+    return rows
+
+
+def row_stats(rows, since, until, partial=False):
+    stats = dict(partialRows=len(rows)) if partial else {}
+    for row in rows:
+        at = row_timestamp(row.get('timestamp'))
+        if at is None:
+            stats['unparsedRows'] = stats.get('unparsedRows', 0)+1
+        elif not Decimal(str(since)) < at <= Decimal(str(until)):
+            stats['outsideRows'] = stats.get('outsideRows', 0)+1
+            stats['outsideFirst'] = min(stats.get('outsideFirst', float(at)), float(at))
+            stats['outsideLast'] = max(stats.get('outsideLast', float(at)), float(at))
+    return stats
+
+
 def unified(since, until, run=unified_command, timeout=60):
     if timeout <= 0:
         raise SourceFailure('timeout', 'collector budget exhausted')
     since = max(since, until-UNIFIED_WINDOW_S)
-    def stamp(value):
-        return dt.datetime.fromtimestamp(value, dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    result = run(['/usr/bin/log', 'show', '--style', 'json', '--timezone', 'UTC',
-                  '--start', stamp(since), '--end', stamp(until+1), '--predicate',
-                  '(type == timesyncEvent AND eventMessage CONTAINS "=== system boot") OR (process == "kernel" AND eventMessage CONTAINS "PMU") OR (process == "watchdogd" AND eventMessage CONTAINS "unresponsive")'],
-                 capture_output=True, text=True, timeout=min(UNIFIED_CALL_S, timeout),
-                 env={**os.environ, 'LC_ALL': 'C'})
+    try:
+        result = run(['/usr/bin/log', 'show', '--style', 'json', '--timezone', 'UTC',
+                      '--start', query_bound(Decimal(str(since)), ROUND_FLOOR),
+                      '--end', query_bound(Decimal(str(until)), ROUND_CEILING), '--predicate',
+                      '(type == timesyncEvent AND eventMessage CONTAINS "=== system boot") OR (process == "kernel" AND eventMessage CONTAINS "PMU") OR (process == "watchdogd" AND eventMessage CONTAINS "unresponsive")'],
+                     capture_output=True, text=True, timeout=min(UNIFIED_CALL_S, timeout),
+                     env={**os.environ, 'LC_ALL': 'C', 'TZ': 'UTC'})
+    except subprocess.TimeoutExpired as exc:
+        rows = unified_rows(exc.output, partial=True)
+        exc.stats = row_stats(rows, since, until, partial=True)
+        raise
     if result.returncode:
         message = stderr_line(getattr(result, 'stderr', ''))
-        raise SourceFailure('permission' if permission_denied(message) else 'exit',
+        exc = SourceFailure('permission' if permission_denied(message) else 'exit',
                             message or 'log show exited unsuccessfully', result.returncode)
-    counts = Counter()
+        exc.stats = row_stats(unified_rows(result.stdout, partial=True), since, until, partial=True)
+        raise exc
+    counts = UnifiedCounts()
     try:
-        rows = json.loads(result.stdout or '[]')
-        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-            raise ValueError('invalid log shape')
-    except (TypeError, ValueError):
+        rows = unified_rows(result.stdout)
+        counts.stats = row_stats(rows, since, until)
+    except (AttributeError, TypeError, ValueError):
         raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
     for row in rows:
-        timestamp = row.get('timestamp')
-        try:
-            at = dt.datetime.fromisoformat(re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', timestamp.replace('Z', '+00:00')))
-        except (AttributeError, TypeError, ValueError):
-            raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
-        if at.tzinfo is None:
-            at = at.replace(tzinfo=dt.timezone.utc)
-        if not since < at.timestamp() <= until:
+        at = row_timestamp(row.get('timestamp'))
+        if at is None or not Decimal(str(since)) < at <= Decimal(str(until)):
             continue
         message = row.get('eventMessage', '')
         if not isinstance(message, str):
             raise SourceFailure('parse', 'invalid unified log data', result.returncode)
         if '=== system boot' in message:
             # Preserve boot time and collapse duplicate markers at that instant.
-            counts['restart', 'kernel', at.timestamp()] = 1
+            counts['restart', 'kernel', float(at)] = 1
         elif 'wdog' in message.lower() or 'unresponsive' in message.lower():
             counts['hang', 'system'] += 1
     return counts
+
+
+
+def merge_unified_stats(target, stats):
+    for key, value in stats.items():
+        choose = min if key == 'outsideFirst' else max if key == 'outsideLast' else lambda a,b: a+b
+        target[key] = choose(target[key], value) if key in target else value
+
+
+def queue_unified_observations(state, counts):
+    when = dt.datetime.now(dt.timezone.utc).isoformat()
+    for key, count in counts.items():
+        props = dict(resourceKind=key[0], process=key[1], count=count)
+        if len(key) == 3:
+            props['observedAt'] = key[2]
+        state.setdefault('unifiedOutbox', []).append(dict(id=uuid.uuid4().hex, at=when, props=props))
+
+
+def queue_unified_gap(state, start, end, reason):
+    state.setdefault('unifiedOutbox', []).append(dict(id=uuid.uuid4().hex,
+        at=dt.datetime.now(dt.timezone.utc).isoformat(), name='crash.source', ok=False,
+        props=dict(source='unified', windowStart=start, windowEnd=end,
+                   skippedS=end-start, partial=True, reason=reason)))
+
+
+def flush_unified_observations(state):
+    pending = list(state.get('unifiedOutbox', []))
+    for row in pending:
+        if not emit('crashes', 'event', row.get('name', 'crash.observed'), ok=row.get('ok', True), props=row['props'],
+                    now=dt.datetime.fromisoformat(row['at']), dedup_id=row['id']):
+            return False
+    if pending:
+        state.pop('unifiedOutbox', None)
+        save_state('crashes', state)
+    return True
+
+
+def failed_boot_second(state, start, end, boots, stats, failed=True):
+    boot = boot_second(start, end, boots)
+    if boot is None:
+        return False
+    attempts = state.setdefault('unifiedBootAttempts', {})
+    key = str(boot)
+    if failed:
+        attempts[key] = attempts.get(key, 0)+1
+        save_state('crashes', state)
+    if attempts.get(key, 0) < 3:
+        return False
+    # A frozen fractional end can split this second into several pending pieces.
+    # Keep its terminal count so retiring one piece cannot permit another call.
+    stats['bootSecondUnreadableS'] = stats.get('bootSecondUnreadableS', 0)+end-start
+    queue_unified_gap(state, start, end, 'bootSecondUnreadable')
+    return True
+
+
+def retry_window(cursor, window):
+    return dict(windowStart=cursor, windowEnd=window['windowEnd'], skippedS=window['skippedS'],
+                **{k: window[k] for k in ('bootUnresolvedS', 'bootSecondUnreadableS') if window.get(k)})
+
+
+def read_unified_piece(reader, deadline, start, end, timeout):
+    invoked = False
+    def read():
+        nonlocal invoked
+        invoked = True
+        return unified(start, end, timeout=timeout) if reader is None else reader(start, end)
+    try:
+        return deadline_call(deadline, read)
+    except Exception as exc:
+        exc.unified_started = invoked
+        raise
+
+
+def retry_boot_pieces(state, now, boot_info, deadline, reader, stats):
+    boots = boot_boundaries(boot_info)
+    errors, skipped = 0, 0
+    counts = Counter()
+    flush_unified_observations(state)
+    pending = []
+    deferred_skips = list(state.get('unifiedBootSkips', []))
+    for start, end in state.get('unifiedBootPending', []):
+        floor = now-UNIFIED_WINDOW_S
+        if start < floor:
+            omitted = max(0, min(floor, end)-start)
+            deferred_skips.append(dict(windowStart=start, windowEnd=start+omitted,
+                                       skippedS=omitted, reason='lag_ceiling'))
+        if max(start, floor) < end:
+            points = [max(start, floor)]+[b for b in boots if max(start, floor) < b < end]+[end]
+            pending.extend([a, b] for a, b in zip(points, points[1:]))
+    for gap in deferred_skips:
+        gap.setdefault('id', uuid.uuid4().hex)
+        gap.setdefault('at', dt.datetime.now(dt.timezone.utc).isoformat())
+    state['unifiedBootPending'] = pending
+    state['unifiedBootSkips'] = deferred_skips
+    save_state('crashes', state)
+    for gap in deferred_skips:
+        # Clipping is durable before any log command. Keep unreported skips
+        # separately so interruption during retry I/O cannot report them twice.
+        if emit('crashes', 'event', 'crash.unified.skip', ok=True,
+                props={k:v for k,v in gap.items() if k not in ('id', 'at')}, dedup_id=gap['id'],
+                now=dt.datetime.fromisoformat(gap['at'])):
+            skipped += gap['skippedS']
+            state['unifiedBootSkips'] = state['unifiedBootSkips'][1:]
+            save_state('crashes', state)
+        else:
+            break
+    index = 0
+    while index < len(pending):
+        cursor, stop = pending[index]
+        until = min(stop, cursor+UNIFIED_CHUNK_S)
+        began = time.monotonic()
+        if boot_skip(cursor, until, boot_info):
+            stats['bootUnresolvedS'] = stats.get('bootUnresolvedS', 0)+until-cursor
+            skipped += until-cursor
+            errors += 1
+            queue_unified_gap(state, cursor, until, 'bootUnresolved')
+            if until == stop:
+                pending.pop(index)
+            else:
+                pending[index][0] = until
+            if pending:
+                state['unifiedBootPending'] = pending
+            else:
+                state.pop('unifiedBootPending', None)
+            save_state('crashes', state)
+            flush_unified_observations(state)
+            continue
+        if failed_boot_second(state, cursor, until, boot_info, stats, failed=False):
+            skipped += until-cursor
+            errors += 1
+            pending.pop(index)
+            state['unifiedBootPending'] = pending
+            save_state('crashes', state)
+            flush_unified_observations(state)
+            continue
+        try:
+            remaining = min(10 if boot_second(cursor, until, boot_info) is not None else UNIFIED_CALL_S, deadline-began)
+            if remaining <= 0:
+                raise SourceFailure('timeout', 'unified log budget exhausted')
+            result = read_unified_piece(reader, deadline, cursor, until, remaining)
+        except Exception as exc:
+            merge_unified_stats(stats, getattr(exc, 'stats', {}))
+            source_error('crashes', 'crash.source', 'unified', began, exc,
+                         dict(windowStart=cursor, windowEnd=stop, partial=True,
+                              **getattr(exc, 'stats', {})))
+            errors += 1
+            if getattr(exc, 'unified_started', False) and failed_boot_second(state, cursor, until, boot_info, stats):
+                skipped += until-cursor
+                pending.pop(index)
+            else:
+                index += 1
+        else:
+            boot = boot_second(cursor, until, boot_info)
+            if boot is not None:
+                state.get('unifiedBootAttempts', {}).pop(str(boot), None)
+            merge_unified_stats(stats, getattr(result, 'stats', {}))
+            queue_unified_observations(state, result)
+            counts.update(result)
+            if until == stop:
+                pending.pop(index)
+            else:
+                pending[index][0] = until
+        if pending:
+            state['unifiedBootPending'] = pending
+        else:
+            state.pop('unifiedBootPending', None)
+        save_state('crashes', state)
+        flush_unified_observations(state)
+    if not pending:
+        state.pop('unifiedBootPending', None)
+    if not state.get('unifiedBootSkips'):
+        state.pop('unifiedBootSkips', None)
+    return counts, errors, skipped
 
 
 def crash_observations(counts):
@@ -265,6 +488,9 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
     deadline = min(started+165, deadline) if deadline is not None else started+165
     now = time.time() if now is None else now
     state = read_state('crashes')
+    if 'unifiedBootAttempts' in state:
+        state['unifiedBootAttempts'] = {key: value for key, value in state['unifiedBootAttempts'].items()
+                                        if float(key)+1 > now-UNIFIED_WINDOW_S}
     counts, errors = Counter(), 0
     report_roots = list(REPORT_DIRS if roots is None else roots)
     for i, root in enumerate(report_roots):
@@ -309,34 +535,74 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
     floor = now-UNIFIED_WINDOW_S
     if window['windowStart'] < floor:
         skipped_before = window['skippedS']
-        window = dict(windowStart=floor, windowEnd=max(floor, window['windowEnd']),
+        window = dict(window, windowStart=floor, windowEnd=max(floor, window['windowEnd']),
                       skippedS=skipped_before+floor-window['windowStart'])
     unified_deadline = min(deadline, source_started+UNIFIED_BUDGET_S)
     skipped = 0
     stop_reason = 'done'
     chunk_size = UNIFIED_FIRST_CHUNK_S
     cost_model = None
+    stats = dict(**{k:window[k] for k in ('bootUnresolvedS', 'bootSecondUnreadableS') if window.get(k)})
+    retired_boot_skips = {}
     def lag():
-        return max(0, now+time.monotonic()-started-state.get('unified', since))
+        frontier = min([state.get('unified', since)]+[a for a, _ in state.get('unifiedBootPending', [])])
+        return max(0, now+time.monotonic()-started-frontier)
 
+    cursor = window['windowStart']
     try:
+        boot_seconds = boot_times(now-UNIFIED_WINDOW_S, now, deadline=unified_deadline) if log_reader is None else []
+        boots = boot_boundaries(boot_seconds)
+        # Historical holes get at most the unreserved share. Fresh coverage
+        # must still have one full call even when several holes keep timing out.
+        retry_deadline = unified_deadline
+        if since < now:
+            retry_deadline = max(time.monotonic(), unified_deadline-UNIFIED_FRESH_RESERVE_S)
+        observed, failed, omitted = retry_boot_pieces(state, now, boot_seconds, retry_deadline, log_reader, stats)
+        counts.update(observed)
+        errors += failed
+        skipped += omitted
         while True:
             window = dict(window, windowS=window['windowEnd']-window['windowStart'])
             window.update(chunks=math.ceil(max(0, window['windowS'])/chunk_size), chunksDone=0,
-                          skipReason='lag_ceiling' if window['skippedS'] else None)
+                          skipReason='bootSecondUnreadable' if window.get('bootSecondUnreadableS') else 'bootUnresolved' if window.get('bootUnresolvedS') else 'lag_ceiling' if window['skippedS'] else None)
             cursor = window['windowStart']
             if cursor > state.get('unified', since):
                 emit('crashes', 'event', 'crash.unified.skip', ok=True,
                      props=dict(windowStart=state.get('unified', since), windowEnd=cursor,
                                 skippedS=cursor-state.get('unified', since), reason='lag_ceiling'))
                 state['unified'] = cursor
-                state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
-                                             skippedS=window['skippedS'])
+                state['unifiedRetry'] = retry_window(cursor, window)
                 save_state('crashes', state)
             while cursor < window['windowEnd']:
                 end = min(cursor+chunk_size, window['windowEnd'])
+                end = min([end]+[b for b in boots if cursor < b < end])
                 window['chunks'] = window['chunksDone']+math.ceil((window['windowEnd']-cursor)/chunk_size)
-                remaining = min(UNIFIED_CALL_S, unified_deadline-time.monotonic())
+                if boot_skip(cursor, end, boot_seconds):
+                    stats['bootUnresolvedS'] = stats.get('bootUnresolvedS', 0)+end-cursor
+                    window['skippedS'] += end-cursor
+                    window['bootUnresolvedS'] = window.get('bootUnresolvedS', 0)+end-cursor
+                    window['skipReason'] = 'bootUnresolved'
+                    errors += 1
+                    queue_unified_gap(state, cursor, end, 'bootUnresolved')
+                    cursor = end
+                    state['unified'] = cursor
+                    state['unifiedRetry'] = retry_window(cursor, window)
+                    save_state('crashes', state)
+                    flush_unified_observations(state)
+                    continue
+                if failed_boot_second(state, cursor, end, boot_seconds, stats, failed=False):
+                    errors += 1
+                    window['skippedS'] += end-cursor
+                    window['bootSecondUnreadableS'] = window.get('bootSecondUnreadableS', 0)+end-cursor
+                    window['skipReason'] = 'bootSecondUnreadable'
+                    cursor = end
+                    state['unified'] = cursor
+                    state['unifiedRetry'] = retry_window(cursor, window)
+                    save_state('crashes', state)
+                    flush_unified_observations(state)
+                    continue
+                call_cap = 10 if boot_second(cursor, end, boot_seconds) is not None else UNIFIED_CALL_S
+                remaining = min(call_cap, unified_deadline-time.monotonic())
                 if remaining <= 0:
                     stop_reason = 'deadline'
                     raise SourceFailure('timeout', 'unified log budget exhausted')
@@ -346,38 +612,65 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
                 emit('crashes', 'event', 'crash.unified.chunk', ok=None,
                      props=dict(chunk, outcome='start', elapsedMs=0))
                 try:
-                    if log_reader is None:
-                        observed = deadline_call(unified_deadline, unified, cursor, end, timeout=remaining)
-                    else:
-                        observed = deadline_call(unified_deadline, log_reader, cursor, end)
+                    observed = read_unified_piece(log_reader, unified_deadline, cursor, end, remaining)
                 except Exception as exc:
+                    merge_unified_stats(stats, getattr(exc, 'stats', {}))
                     timed_out = isinstance(exc, subprocess.TimeoutExpired) or (
                         isinstance(exc, SourceFailure) and exc.failure == 'timeout')
-                    stop_reason = ('deadline' if remaining < UNIFIED_CALL_S or time.monotonic() >= unified_deadline else 'timeout') if timed_out else (
+                    stop_reason = ('deadline' if remaining < call_cap or time.monotonic() >= unified_deadline else 'timeout') if timed_out else (
                         exc.failure if isinstance(exc, SourceFailure) else 'error')
                     emit('crashes', 'error', 'crash.unified.chunk', ok=False,
                          props=dict(chunk, outcome=stop_reason,
                                     elapsedMs=(time.monotonic()-chunk_started)*1000))
+                    if getattr(exc, 'unified_started', False) and failed_boot_second(state, cursor, end, boot_seconds, stats):
+                        errors += 1
+                        window['skippedS'] += end-cursor
+                        window['bootSecondUnreadableS'] = window.get('bootSecondUnreadableS', 0)+end-cursor
+                        window['skipReason'] = 'bootSecondUnreadable'
+                        cursor = end
+                        state['unified'] = cursor
+                        state['unifiedRetry'] = retry_window(cursor, window)
+                        save_state('crashes', state)
+                        flush_unified_observations(state)
+                        continue
+                    later_boots = [b for b in boots if cursor < b < window['windowEnd']]
+                    if not later_boots and window['windowEnd'] < now and any(window['windowEnd'] <= b <= now for b in boots):
+                        later_boots = [window['windowEnd']]
+                    if later_boots:
+                        boundary = min(later_boots)
+                        state.setdefault('unifiedBootPending', []).append([cursor, boundary])
+                        errors += 1
+                        source_error('crashes', 'crash.source', 'unified', chunk_started, exc,
+                                     dict(chunk, partial=True, **getattr(exc, 'stats', {})))
+                        cursor = boundary
+                        state['unified'] = cursor
+                        state['unifiedRetry'] = retry_window(cursor, window)
+                        save_state('crashes', state)
+                        continue
                     raise
+                boot = boot_second(cursor, end, boot_seconds)
+                if boot is not None:
+                    state.get('unifiedBootAttempts', {}).pop(str(boot), None)
+                merge_unified_stats(stats, getattr(observed, 'stats', {}))
                 elapsed = time.monotonic()-chunk_started
                 emit('crashes', 'event', 'crash.unified.chunk', ok=True,
-                     props=dict(chunk, outcome='done', elapsedMs=elapsed*1000))
+                     props=dict(chunk, outcome='done', elapsedMs=elapsed*1000, **getattr(observed, 'stats', {})))
                 chunk_size, cost_model = next_unified_chunk(end-cursor, elapsed, cost_model)
                 counts.update(observed)
-                crash_observations(observed)
+                queue_unified_observations(state, observed)
                 cursor = end
                 state['unified'] = cursor
                 window['chunksDone'] += 1
                 # Keep the gap pending until the source result reports it,
                 # including an interruption after the last chunk checkpoint.
-                state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
-                                             skippedS=window['skippedS'])
+                state['unifiedRetry'] = retry_window(cursor, window)
                 save_state('crashes', state)
+                flush_unified_observations(state)
             state['unified'] = window['windowEnd']
             state.pop('unifiedRetry', None)
             emit('crashes', 'event', 'crash.source', ok=True,
-                 props=dict(source='unified', elapsedMs=(time.monotonic()-source_started)*1000,
-                            lagS=lag(), stopReason='done', **window))
+                 props=dict({**window, **stats}, source='unified', elapsedMs=(time.monotonic()-source_started)*1000,
+                            lagS=lag(), stopReason='done', partial=bool(state.get('unifiedBootPending') or state.get('unifiedOutbox') or stats.get('bootUnresolvedS') or stats.get('bootSecondUnreadableS'))))
             skipped += window['skippedS']
             # Persist the reported gap's retirement before a fresh command can
             # be interrupted; otherwise the next run would report it again.
@@ -386,17 +679,21 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
                 break
             # A retry owns a frozen end, but finishing it must not waste the
             # rest of this run's share. Apply the cap again to the fresh window.
+            for key in ('bootUnresolvedS', 'bootSecondUnreadableS'):
+                retired_boot_skips[key] = retired_boot_skips.get(key, 0)+stats.get(key, 0)
+            stats = {}
             window = fresh_window(cursor)
     except Exception as exc:
         errors += 1
-        state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
-                                     skippedS=window['skippedS'])
+        state['unifiedRetry'] = retry_window(cursor, window)
         source_error('crashes', 'crash.source', 'unified', source_started, exc,
-                     dict(window, lagS=lag(), stopReason=stop_reason))
+                     dict({**window, **stats}, lagS=lag(), stopReason=stop_reason, partial=True))
         skipped += window['skippedS']
         state['unifiedRetry']['skippedS'] = 0
+        for key in ('bootUnresolvedS', 'bootSecondUnreadableS'):
+            state['unifiedRetry'].pop(key, None)
     window = dict(window, skippedS=skipped, lagS=lag(), stopReason=stop_reason,
-                  skipReason='lag_ceiling' if skipped else None)
+                  skipReason='bootSecondUnreadable' if stats.get('bootSecondUnreadableS') or retired_boot_skips.get('bootSecondUnreadableS') else 'bootUnresolved' if stats.get('bootUnresolvedS') or retired_boot_skips.get('bootUnresolvedS') else 'lag_ceiling' if skipped else None)
     emit('crashes', 'error' if errors else 'perf', 'crash.collect', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000,
          props={'count': sum(counts.values()), 'sourceErrors': errors, **window},
@@ -1050,6 +1347,7 @@ def disk_tooling_probe(run=subprocess.run, popen=subprocess.Popen, is_alive=aliv
 def main():
     # Check before any job can create today's file and hide its absence.
     missing_day()
+    homebrew_integrity(lambda text, key: notify(text, key, subprocess.run))
     deadline = time.monotonic()+290
     try:
         collect(deadline=deadline)

@@ -19,8 +19,9 @@ it makes are `shares` and `unshare`, an hour after a ride ended, for that ride's
 (never a stable-origin link, which stays up until someone unshares it on purpose).
 
 Env overrides (all optional):
-  WATCH_DIR          directory for rides.json and polls.jsonl (one line per poll: raw Uber status,
-                     headline, pickup ETA, car-to-pickup metres, card state; default: current dir)
+  WATCH_DIR          directory for rides.json, heals.jsonl (session recovery attempts), and
+                     polls.jsonl (one line per poll: raw Uber status, headline, pickup ETA,
+                     car-to-pickup metres, card state; default: current dir)
   RIDE_SHARE_STATE   full path of the state file
   RIDE_SHARE_HINTS   rider/booker hint directory (default ~/.local/share/rides-notify)
   RIDE_CARD_ROOT     where cards are written. Unset: the live imessage-apps folder only when WATCH_DIR
@@ -62,6 +63,7 @@ UNKNOWN_GIVE_UP_S = 3 * 3600
 CARD_RETRY_S = 600          # one more CARD_READY if someone still lacks the card 10 min later
 MISSES_BEFORE_UNKNOWN = 2   # a single empty poll doesn't flip a live card to "Checking"
 PREVIEW_RETRIES = 10        # checks spent re-rendering a frozen card's failed preview
+CLEANUP_DEADLINE_S = 50     # default 60s check: reserve 10s for state persistence and alerts
 UNSHARES_PER_RUN = 3        # ended rides' links taken down per check
 
 
@@ -119,19 +121,57 @@ def rides_status():
     d = uber("rides", "status", timeout=15)
     if stale_session(d):
         print("ride-share: stale Uber session; reopening saved profile once", file=sys.stderr)
-        browser = os.environ.get("UBER_AGENT_BROWSER") or "agent-browser"
-        profile = Path.home() / "Library/Application Support/uber/profiles/default/browser"
-        subprocess.run([browser, "--session", "uber-cli-default", "--profile", str(profile),
-                        "--headed", "open", "https://m.uber.com/go/home"],
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=15, check=True, env=ENV)
-        d = uber("rides", "status", timeout=15)
+        row = {"ts": rc.iso(now_ts()), "event": "session_heal", "reopen": "failed",
+               "reopen_ms": 0, "retry_ok": False, "error": None}
+        started = time.monotonic()
+        try:
+            try:
+                browser = os.environ.get("UBER_AGENT_BROWSER") or "agent-browser"
+                profile = Path.home() / "Library/Application Support/uber/profiles/default/browser"
+                subprocess.run([browser, "--session", "uber-cli-default", "--profile", str(profile),
+                                "--headed", "open", "https://m.uber.com/go/home"],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=15, check=True, env=ENV)
+                row["reopen"] = "ok"
+            except subprocess.TimeoutExpired:
+                row.update(reopen="timeout", error="reopen timed out")
+                raise
+            except Exception:
+                row["error"] = "reopen failed"
+                raise
+            finally:
+                row["reopen_ms"] = int((time.monotonic() - started) * 1000)
+            try:
+                d = uber("rides", "status", timeout=15)
+                row["retry_ok"] = bool(d.get("ok"))
+                if not row["retry_ok"]:
+                    row["error"] = "retry status not ok"
+            except Exception:
+                row["error"] = "retry status failed"
+                raise
+        finally:
+            log_heal(row)
     if not d.get("ok"):
         raise RuntimeError(json.dumps(d.get("error"))[:200])
     return d
 
 
 POLL_LOG_MAX = 2_000_000    # bytes; polls.jsonl keeps its newest half past this
+HEAL_LOG_MAX = 200_000
+
+
+def log_heal(row):
+    try:
+        path = Path(WD) / "heals.jsonl"
+        line = json.dumps(row) + "\n"
+        if path.exists() and path.stat().st_size > HEAL_LOG_MAX:
+            keep = path.read_bytes()[-HEAL_LOG_MAX // 2:]
+            rc.atomic_write(path, keep[keep.find(b"\n") + 1:], "wb")
+        with open(path, "a") as f:
+            f.write(line)
+    except Exception:
+        # Raw subprocess errors can contain session data; diagnostics stay generic.
+        print("ride-share: heal log failed", file=sys.stderr)
 
 
 def log_poll(trip, card, now):
@@ -338,7 +378,7 @@ def recently_requested(trips, rider, now, exclude):
                and now - t["card_requested"] < REBOOK_WINDOW_S for u, t in trips.items())
 
 
-def unshare_ended(now, live=None):
+def unshare_ended(now, live=None, *, deadline=None):
     """An hour after a ride ends, its public share link goes: the bridge caps live shares at 10 and
     old ride links used them all up (trip e44d36f9). Reads the share journal, so rides this state
     file no longer tracks are covered too. A bridge that fails is tried again next run. The trip Uber
@@ -346,16 +386,17 @@ def unshare_ended(now, live=None):
     and a run that can't read the bridge's share list retires nothing."""
     if not os.environ.get("RIDE_CARD_BRIDGE") and Path(WD).resolve() != LIVE_DIR.resolve():
         return  # a scratch run's journal isn't the real one: never touch real shares from it
+    deadline = time.monotonic() + CLEANUP_DEADLINE_S if deadline is None else deadline
     done, permanent = 0, None
     for p in sorted(rc.journal_dir().glob("*.json")):
-        if done >= UNSHARES_PER_RUN:
+        if done >= UNSHARES_PER_RUN or time.monotonic() >= deadline:
             return  # the rest go next run; the check has a 60s budget
         uuid = p.stem
         if uuid == live or not rc.UUID_RE.match(uuid) or rc.unshared_path(uuid).exists() \
                 or not rc.public_link(uuid) or not rc.link_done(rc.load_card(uuid), now):
             continue
         if permanent is None:  # asked once per run, and only when some link is due
-            permanent = rc.permanent_apps()
+            permanent = rc.permanent_apps(deadline=deadline)
             if permanent is None:
                 print("ride-share: bridge share list unreadable, no link retired this run", file=sys.stderr)
                 return
@@ -366,7 +407,10 @@ def unshare_ended(now, live=None):
                 if not rc.link_done(rc.load_card(uuid), now) or rc.unshared_path(uuid).exists():
                     continue
                 try:
-                    rc.unshare(uuid)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    rc.unshare(uuid, timeout=min(10, remaining))
                     done += 1
                 except Exception as e:
                     print(f"ride-share: unshare {uuid} failed: {e}"[:300], file=sys.stderr)
@@ -376,6 +420,7 @@ def unshare_ended(now, live=None):
 
 
 def main():
+    cleanup_deadline = time.monotonic() + CLEANUP_DEADLINE_S
     s = load()
     now = now_ts()
     clear_acked_fares(s["trips"])
@@ -530,7 +575,7 @@ def main():
         else:
             s["preview_retry"][uuid] = n + 1
 
-    unshare_ended(now, live=cur)
+    unshare_ended(now, live=cur, deadline=cleanup_deadline)
 
     for uuid, p in list(pending.items()):
         if now - p["since"] >= REBOOK_WINDOW_S:

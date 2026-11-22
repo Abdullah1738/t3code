@@ -25,6 +25,38 @@ test("history guidance appears in every foreground chat, with only permitted cro
   expect(sendblueContextPrompt(guest, false, [])).not.toContain("for a group she has written in");
 });
 
+const MONI_SCOPE = "Moni-only preferences, routines, health, work, family and documents belong to her box agent. This applies in owner, group and guest chats too. Ask her agent for task details; do not read, write or recreate a Mac personal prefs file or wiki page. Shared household, helper, pet, joint-travel, relationship and owner facts stay in their shared systems.";
+
+for (const kind of ["owner", "admin", "person", "guest", "group"] as const) {
+  for (const background of [false, true]) {
+    for (const replyMode of ["final", "tool"] as const) {
+      test(`Moni scope in ${kind}, background=${background}, reply=${replyMode}`, () => {
+        const chatKind = kind === "owner" || kind === "group" ? kind : "dm";
+        const role = kind === "person" || kind === "guest" ? kind : "admin";
+        const ctx = context(chatKind, { roleOf: () => ({ name: "Fixture", role }) });
+        const prompt = sendblueContextPrompt(ctx, false, ["fixture-sender"], background, replyMode);
+        expect(prompt.split(MONI_SCOPE).length - 1).toBe(1);
+        expect(prompt).not.toContain("moni-prefs.md");
+        expect(prompt).not.toContain("Notes and facts about her (preferences, routines, health, documents) go in the life wiki as usual.");
+        if (kind !== "owner") {
+          expect(prompt).toContain("Her box agent owns her personal rules.");
+          expect(prompt).toContain("the owner and admins (Moni) approve their own requests");
+          expect(prompt).toContain("Anything special they ask for");
+        }
+        if (kind === "group") {
+          expect(prompt).toContain("you have no private tools");
+          expect(prompt).toContain("agent-ask --to owner");
+          expect(prompt).toContain("Never post private details unless the person they belong to asked for them here.");
+        }
+        if (kind === "person" || kind === "guest") {
+          expect(prompt).not.toContain("Agent bus:");
+          expect(prompt).not.toContain("send --to");
+        }
+      });
+    }
+  }
+}
+
 type Prompt = { id: string; text: string; system?: string };
 
 class Recorder extends OpenChamber {
@@ -227,7 +259,9 @@ test("the owner's own chat keeps its text unprefixed", async () => {
 test("the admin role prompt says Moni acts like the owner; guests need ask-owner", () => {
   const admin = sendblueContextPrompt(context("dm"), false, ["+971585933213"]);
   expect(admin).toContain("Moni (admin)");
-  expect(admin).toContain("moni-prefs.md");
+  expect(admin).toContain("Her box agent owns her personal rules.");
+  expect(admin).toContain("agent-ask --to moni");
+  expect(admin).not.toContain("~/Documents/assistant/moni-prefs.md");
   expect(admin).toContain("offbox-person");
   // 24 Oct, owner: "Moni is an admin, you do not need to ask me."
   expect(admin).not.toContain("the owner is the only person who approves");
@@ -304,7 +338,8 @@ test("a wake's chat prompt drops what only typed messages need and keeps who rea
   for (const line of ["Files:", "Polls are not available", "evaluator_start", "guest-allow --address"]) expect(owner).not.toContain(line);
   expect(owner).not.toMatch(/\bmission/);
   for (const line of ["send --to <slug>", "wake --chat <slug>", "location --session", "publish --app SLUG", "never answered by you directly"]) expect(owner).toContain(line);
-  expect(owner.length).toBeLessThan(sendblueContextPrompt(context("owner"), false, []).length / 2);
+  // The data boundary is mandatory in both kinds of turn. Compare the remaining guidance.
+  expect(owner.replace(MONI_SCOPE, "").length).toBeLessThan(sendblueContextPrompt(context("owner"), false, []).replace(MONI_SCOPE, "").length / 2);
   const moni = sendblueContextPrompt(context("dm"), false, ["+971585933213"], true);
   expect(moni).toContain("Moni (admin)");
   expect(moni).toContain("including your reply after a watcher event");

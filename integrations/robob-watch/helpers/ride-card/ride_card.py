@@ -72,12 +72,16 @@ except ImportError:
         return {}
 
 
-def log_event(name, *, who=None, key=None, ack=None, command=None, error=None, exit_code=None):
-    tool_log({"component": "ride-card", "name": name, "kind": "error" if error else "event",
-              "ok": not bool(error), "ids": {"helper": "ride-card." + command if command else "ride-card", "chat": who, "key": key,
+def log_event(name, *, who=None, key=None, ack=None, command=None, error=None, exit_code=None,
+              duration_ms=None, timeout=None, timeout_side="none", attempt=1):
+    tool_log({"component": "ride-card", "name": name, "kind": "error" if error is not None else "event",
+              "ok": error is None, "ids": {"helper": "ride-card." + command if command else "ride-card", "chat": who, "key": key,
               "item": ack, "operation": command},
-              "props": {"exitCode": exit_code, **stderr_cause(error or "")},
-              **({"error": {"tag": "bridge.request_failed"}} if error else {})})
+              "durationMs": duration_ms,
+              "props": {"exitCode": exit_code, **stderr_cause(error or "", timed_out=timeout_side != "none"),
+                        **({"timeoutMs": timeout * 1000, "timeoutSide": timeout_side,
+                            "timedOut": timeout_side != "none", "attempt": attempt} if timeout is not None else {})},
+              **({"error": {"tag": "bridge.request_failed"}} if error is not None else {})})
 
 
 def root():
@@ -789,19 +793,26 @@ class BridgeError(RuntimeError):
     def __init__(self, command, error, exit_code):
         super().__init__(f"bridge {command} failed ({exit_code}): {error.strip()[:300]}")
         self.remote_chat = remote_refusal(error)
+        try:
+            self.timed_out = json.loads(error).get("error") == "Bridge request timed out"
+        except (ValueError, AttributeError):
+            self.timed_out = False
 
 
-def bridge(*args, timeout=60):
+def bridge(*args, timeout=60, attempt=1):
     # Under a test, only an injected stub bridge may run: the real one would send iMessage.
     if under_test() and not os.environ.get("RIDE_CARD_BRIDGE"):
         sys.exit(f"refused: test run; ride-card would send via the real bridge ({args[0] if args else '?'}); "
                  "set RIDE_CARD_BRIDGE to a stub")
     env = {k: v for k, v in os.environ.items() if k != "BUN_INSPECT"}
+    started = time.perf_counter()
     try:
         p = subprocess.run([*bridge_cmd(), *args], capture_output=True, text=True, timeout=timeout, env=env,
                            stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as ex:
-        log_event("bridge.error", command=args[0], error=str(ex))
+        log_event("bridge.error", command=args[0], error=(ex.stderr or "") if isinstance(ex, subprocess.TimeoutExpired) else str(ex),
+                  duration_ms=(time.perf_counter() - started) * 1000, timeout=timeout, attempt=attempt,
+                  timeout_side="cli_process" if isinstance(ex, subprocess.TimeoutExpired) else "none")
         raise
     out = p.stdout.strip()
     try:
@@ -810,8 +821,11 @@ def bridge(*args, timeout=60):
         data = {"raw": out[:300]}
     if p.returncode != 0:
         error = p.stderr or out
-        log_event("bridge.error", command=args[0], error=error, exit_code=p.returncode)
-        raise BridgeError(args[0], error, p.returncode)
+        failure = BridgeError(args[0], error, p.returncode)
+        log_event("bridge.error", command=args[0], error=error, exit_code=p.returncode,
+                  duration_ms=(time.perf_counter() - started) * 1000, timeout=timeout, attempt=attempt,
+                  timeout_side="http" if failure.timed_out else "none")
+        raise failure
     return data
 
 
@@ -859,21 +873,31 @@ def link_done(card, now, grace=UNSHARE_AFTER_S):
     return now - end >= (UNCONFIRMED_UNSHARE_AFTER_S if card.get("state") == "unknown" else grace)
 
 
-def unshare(uuid):
+def unshare(uuid, *, timeout=10):
     """Take a trip's public link down. Idempotent: the bridge answers removed:false once it's gone."""
-    res = bridge("unshare", "--app", slug(uuid), timeout=10)
+    res = bridge("unshare", "--app", slug(uuid), timeout=timeout)
     atomic_write(unshared_path(uuid), json.dumps({"at": iso(time.time()), "removed": res.get("removed")}))
     return res
 
 
-def permanent_apps():
+def permanent_apps(*, deadline=None):
     """Slugs whose public link is a stable-origin link (bridge `shares`, permanent: true). Automatic
     cleanup never retires those: the URL already sent would break, and sharing again mints a new one.
     None when the bridge's list can't be read, so the caller retires nothing."""
-    try:
-        records = bridge("shares", timeout=10).get("shares")
-    except Exception:
-        return None
+    # The CLI's HTTP deadline is 15s. Leave startup/exit headroom so it can report that
+    # deadline; retry only this read after a timeout while the bridge/host is briefly busy.
+    for attempt in (1, 2):
+        timeout = 20 if deadline is None else min(20, deadline - time.monotonic())
+        if timeout <= 0:
+            return None
+        try:
+            records = bridge("shares", timeout=timeout, attempt=attempt).get("shares")
+            break
+        except (subprocess.TimeoutExpired, BridgeError) as error:
+            if attempt == 2 or isinstance(error, BridgeError) and not error.timed_out:
+                return None
+        except Exception:
+            return None
     if not isinstance(records, list):
         return None
     return {r["app"] for r in records

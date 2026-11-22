@@ -13,20 +13,23 @@ export type LogEntry = {
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper", "meantFor"]);
-const numeric = new Set(["exitCode", "timeoutMs", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays", "slotWaitMs", "slotQueueDepth", "slotActiveAtEnqueue", "startLateMs", "intervalMs", "depth", "oldestWaitMs", "active", "cap", "dueAt", "lateMs", "load", "elapsedMs"]);
-const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace", "loadMode"]);
+const numeric = new Set(["exitCode", "httpStatus", "timeoutMs", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays", "slotWaitMs", "slotQueueDepth", "slotActiveAtEnqueue", "startLateMs", "intervalMs", "depth", "oldestWaitMs", "active", "cap", "dueAt", "lateMs", "recentMinMs", "load", "elapsedMs"]);
+const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace", "loadMode", "sendDeferred"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
   alertKind: ["pause", "failing", "recovered"],
-  severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy", "stuck_previous"],
+  reason: ["dedupe_conflict_changed_content"],
+  severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy", "stuck_previous", "accepted", "ambiguous", "deferred", "definite", "owner"],
+  failureClass: ["control_api_unavailable", "timeout", "definite", "other"],
   source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored", "logged"],
   authKind: ["otp", "signin_link"],
   senderLabel: ["Emirates NBD", "Emirates Islamic", "Mashreq", "ADCB", "Wio", "Apple", "Google", "WHOOP", "Claude", "Virgin", "e&", "du", "your bank", "an inbox sender"],
   class: ["urgent", "today", "info", "noise", "candidate", "charge", "bank", "security", "otp", "unknown", "fail_open", "deduped"],
   action: ["create", "queue", "cancel", "snooze", "sent", "retry", "check", "wake", "notify", "send", "coalesce", "conflict", "expire", "pause", "remove", "cap", "resume"],
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
-  stderrClass: ["usage_error", "missing_file", "permission", "timeout", "dependency_busy", "python_traceback", "auth", "connect", "json", "unknown"],
+  timeoutSide: ["none", "cli_process", "http"],
+  stderrClass: ["ride_ended", "usage_error", "missing_file", "permission", "timeout", "dependency_busy", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
   step: ["native", "status", "send"],
   op: ["native", "native_retry", "status", "status_retry", "send", "confirm"],
@@ -35,6 +38,7 @@ const values: Record<string, readonly string[]> = {
   confirmed: ["pending", "n/a"],
   operation: ["check", "pending"],
   lane: ["fast", "slow"],
+  lane_reason: ["fast", "fast:sticky", "fast:overdue", "slow:new", "slow:recent"],
   trigger: ["schedule", "trigger", "retry", "final"],
 };
 let testRoot: string | undefined;
@@ -114,6 +118,8 @@ function fields(entry: LogEntry, at: Date) {
       && /^(?:timeout|invalid|archived|error|exit:\d{1,3})$/.test(value)) props[key] = value;
     else if (entry.name === "wake.creator_fallback" && key === "durationMs" && typeof value === "number"
       && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if (entry.name === "wake.send_delivered_late" && ["retries", "totalDelayMs"].includes(key)
+      && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (typeof value === "string" && (key === "via" && /^thread:[A-Za-z0-9%_-]{1,8}$/.test(value)
       || key === "meant_for" && /^[A-Za-z0-9%_-]{1,8}$/.test(value))) props[key] = value;
     else if (numeric.has(key) && typeof value === "number" && Number.isFinite(value)) props[key] = value;

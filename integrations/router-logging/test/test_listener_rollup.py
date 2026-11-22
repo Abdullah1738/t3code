@@ -27,7 +27,8 @@ class ListenerRollupTests(unittest.TestCase):
         self.assertEqual(result['windows'][0]['cause'], 'deploy_failed')
         self.assertEqual(result['unknownStateMs'], 225119)
         self.assertEqual(len(result['unknownWindows']), 7)
-        self.assertEqual({w['cause'] for w in result['unknownWindows']}, {'state_unknown'})
+        self.assertEqual({w['cause'] for w in result['unknownWindows']}, {'unknown_no_data'})
+        self.assertTrue(all(w['missingEvidence'] for w in result['unknownWindows']))
 
     def test_unknown_state_open_resolved_and_day_boundaries(self):
         start = '2026-11-17T23:59:00Z'

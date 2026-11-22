@@ -16,6 +16,24 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_orders_cli_includes_health_summary_and_tolerates_failure(self):
+        import subprocess
+        health = {'day': self.day, 'runs': 2, 'one_line': 'money-cases fixture: runs=2 receipts=1/3'}
+        with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, json.dumps(health), '')) as run, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(toollog.main(['rollup', '--board', 'orders', '--day', self.day]), 0)
+        self.assertIn(health['one_line'], out.getvalue())
+        run.assert_called_once_with(['money-cases', 'health', '--day', self.day, '--json'],
+                                   capture_output=True, text=True, timeout=2, check=True)
+        path = toollog.board_dir('orders') / ('rollup-' + self.day + '.json')
+        self.assertEqual(json.loads(path.read_text())['moneyCasesHealth'], health)
+        for failure in (FileNotFoundError(), subprocess.TimeoutExpired('money-cases', 2),
+                        subprocess.CalledProcessError(1, 'money-cases')):
+            with self.subTest(failure=type(failure)), patch('subprocess.run', side_effect=failure), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(toollog.main(['rollup', '--board', 'orders', '--day', self.day]), 0)
+            self.assertNotIn('moneyCasesHealth', json.loads(path.read_text()))
+
     def test_prompt_probe_outcomes_survive_request_catch_deduplication(self):
         directory = toollog.board_dir('imessage')
         directory.mkdir(parents=True)
@@ -676,7 +694,7 @@ class ToolLogTests(unittest.TestCase):
                                       'props': {'decision': 'allowed', 'rule': 'classifier-unavailable', **props}}
         rows = ([failed('13', {'guard': 'rootwide-search', 'classifier': 'rootwide_search_guard', 'errorClass': 'timeout'})] * 3
                 + [failed('13', {'guard': 'rootwide-search', 'classifier': 'rootwide_search_guard', 'errorClass': 'exit:1'})]
-                + [failed('02', {'guard': 'quint-verify', 'classifier': 'quint_verify_guard', 'errorClass': 'timeout'})] * 2
+                + [failed('02', {'guard': 'shared-dependencies', 'classifier': 'shared_deps_guard', 'errorClass': 'timeout'})] * 2
                 + [failed('02', {'guard': 'phone-adb'})]
                 + [failed('02', {'guard': 'shared-dependencies', 'classifier': f'c{i}', 'errorClass': 'parse'}) for i in range(4)]
                 + [{'ts': f'{self.day}T11:59:59Z', 'error': {'tag': 'phone-adb-state'},
@@ -689,7 +707,7 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(list(result['errorTagsByHour']), ['hook.classifier_failed', 'phone-adb-state'])
         self.assertEqual(result['topClassifierFailures'], [
             {'classifier': 'rootwide_search_guard', 'count': 4, 'errorClasses': {'timeout': 3, 'exit:1': 1}},
-            {'classifier': 'quint_verify_guard', 'count': 2, 'errorClasses': {'timeout': 2}},
+            {'classifier': 'shared_deps_guard', 'count': 2, 'errorClasses': {'timeout': 2}},
             {'classifier': 'c0', 'count': 1, 'errorClasses': {'parse': 1}},
             {'classifier': 'c1', 'count': 1, 'errorClasses': {'parse': 1}},
             {'classifier': 'c2', 'count': 1, 'errorClasses': {'parse': 1}}])

@@ -123,6 +123,7 @@ const claudeAdapter = {
 
 interface HarnessOptions {
   readonly failFirstLaunchProjection?: boolean;
+  readonly beforeInitialMessage?: Effect.Effect<void>;
   readonly closeTerminal?: TerminalManager.TerminalManager["Service"]["close"];
   readonly adapters?: ReadonlyArray<ProviderAdapter.ProviderAdapterV2["Service"]>;
   readonly managedFolders?: Layer.Layer<ManagedProjectFolders.ManagedProjectFolders>;
@@ -154,23 +155,31 @@ function makeHarness(options: HarnessOptions = {}) {
     Layer.provide(layerServerSettings),
     Layer.provide(layerReceipts),
   );
-  const layerThreadManagement = options.failFirstLaunchProjection
-    ? Layer.effect(
-        ThreadManagement.ThreadManagementService,
-        Effect.map(ThreadManagement.ThreadManagementService, (real) => {
-          let fail = true;
-          return ThreadManagement.ThreadManagementService.of({
-            ...real,
-            getThreadProjection: (threadId) =>
-              Effect.suspend(() => {
-                if (!fail) return real.getThreadProjection(threadId);
-                fail = false;
-                return Effect.fail(new Orchestrator.OrchestratorProjectionError({ threadId }));
-              }),
-          });
-        }),
-      ).pipe(Layer.provide(layerBaseThreadManagement))
-    : layerBaseThreadManagement;
+  const layerThreadManagement =
+    options.failFirstLaunchProjection || options.beforeInitialMessage
+      ? Layer.effect(
+          ThreadManagement.ThreadManagementService,
+          Effect.map(ThreadManagement.ThreadManagementService, (real) => {
+            let fail = true;
+            return ThreadManagement.ThreadManagementService.of({
+              ...real,
+              dispatch: (command) =>
+                command.type === "message.dispatch"
+                  ? (options.beforeInitialMessage ?? Effect.void).pipe(
+                      Effect.andThen(real.dispatch(command)),
+                    )
+                  : real.dispatch(command),
+              getThreadProjection: (threadId) =>
+                Effect.suspend(() => {
+                  if (!options.failFirstLaunchProjection || !fail)
+                    return real.getThreadProjection(threadId);
+                  fail = false;
+                  return Effect.fail(new Orchestrator.OrchestratorProjectionError({ threadId }));
+                }),
+            });
+          }),
+        ).pipe(Layer.provide(layerBaseThreadManagement))
+      : layerBaseThreadManagement;
   const layerOutbox = EffectOutbox.layer.pipe(Layer.provide(layerDatabase));
   const createWorktree = vi.fn(
     options.createWorktree ??
@@ -2718,6 +2727,51 @@ it.effect("bounds concurrent first launches to one thread per command", () =>
       yield* Deferred.succeed(allowSetup, undefined);
     }).pipe(Effect.provide(harness.layer));
   }),
+);
+
+it.effect.each(["original-first", "recovery-first"] as const)(
+  "resumes a partial launch with one initial run when %s commits after the empty history snapshot",
+  (order) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let first = true;
+      const harness = makeHarness({
+        beforeInitialMessage: Effect.suspend(() => {
+          if (!first) return Effect.void;
+          first = false;
+          return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)));
+        }),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const input = launchInput({
+          command: "ardud-control:thread:partial-launch",
+          thread: "ardud-control:thread:partial-launch",
+          message: "Full safety prompt",
+        });
+        const original = yield* launches.launch(input).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        const snapshot = yield* threads.getThreadProjection(input.threadId);
+        assert.isEmpty(snapshot.messages);
+        assert.isEmpty(snapshot.runs);
+        if (order === "original-first") {
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(original);
+        }
+        // resume-launch submits the same launch input, including the initial
+        // message ID/command; it never creates an independent send command.
+        const recovered = yield* launches.launch(input);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(original);
+        const projection = yield* threads.getThreadProjection(input.threadId);
+        assert.equal(recovered.threadId, input.threadId);
+        assert.equal(projection.messages.length, 1);
+        assert.equal(projection.runs.length, 1);
+        assert.equal(projection.messages[0]?.text, input.initialMessage?.text);
+      }).pipe(Effect.provide(harness.layer));
+    }),
 );
 
 it.effect("deduplicates retried launch side effects in-process", () =>

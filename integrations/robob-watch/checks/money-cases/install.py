@@ -18,9 +18,9 @@ LIVE = Path.home() / '.local/share/robob-watch/watchers/money-cases'
 DATA = Path(os.environ.get('MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser()
 BIN = Path.home() / '.local/bin/money-cases'
 # Runtime state (including runs.jsonl and runs.jsonl.1) is never copied or removed.
-SOURCE_FILES = ('run_history.py', 'test_run_history.py', 'test_runs.fixture.jsonl', 'data_io.py', 'pin_data.py', 'test_data_io.py', 'payments.py', 'cases.py', 'charges.py', 'toollog.py', 'check.sh', 'install.py', 'test_cases.py', 'test_charges.py',
+SOURCE_FILES = ('owner_refresh.py', 'test_owner_refresh.py', 'run_history.py', 'test_run_history.py', 'test_runs.fixture.jsonl', 'data_io.py', 'pin_data.py', 'test_data_io.py', 'payments.py', 'cases.py', 'charges.py', 'toollog.py', 'check.sh', 'install.py', 'test_cases.py', 'test_charges.py',
                 'daily_legacy.fixture.json', 'test_install.py', 'test_subscriptions.py', 'test_unanswered.py', 'test_daily_list.py', 'README.md', 'settings.json',
-                'order_lookup.py', 'marketplace.py', 'state_json.py', 'test_order_lookup.py', 'test_accuracy.py', 'order_charges.py', 'test_order_charges.py')
+                'order_lookup.py', 'marketplace_worker.py', 'test_marketplace_worker.py', 'marketplace.py', 'state_json.py', 'test_order_lookup.py', 'test_accuracy.py', 'order_charges.py', 'test_order_charges.py')
 EXECUTABLE = ('cases.py', 'check.sh', 'install.py')
 
 

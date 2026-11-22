@@ -128,61 +128,7 @@ it hands it to that group (so the command can read it) and takes it back after;
 Ctrl-Z stops both. Tests:
 `/usr/bin/python3 -B -m unittest discover -s tests -p test_timeout.py`.
 
-## Quint
-
-`bin/quint` installs as `~/.local/bin/quint`. The wrapper checks `java -version` for Java 21+
-in `QUINT_JAVA_HOME` (an invalid explicit override fails), Homebrew's
-`/opt/homebrew/opt/openjdk`, `JAVA_HOME`, Linux's PATH Java, then `/usr/libexec/java_home -v '21+'`.
-Install a missing JDK with `brew install openjdk`. It finds the real CLI via
-`QUINT_BIN`, PATH (skipping itself and symlinks to itself), then
-`~/.nvm/versions/node/v26.2.0/bin/quint`; the CLI's directory supplies node
-on short agent PATHs. Missing CLI: `npm i -g @informalsystems/quint@0.33.1`.
-
-Verify without `--server-endpoint` gets a free local port. Explicit endpoints
-must name a free `localhost:<port>` or `127.0.0.1:<port>`; the wrapper starts its
-own server on IPv4 loopback there, normalizes the client endpoint to
-`127.0.0.1:<port>`, and never attaches to an existing server. Other commands pass
-through. `QUINT_APALACHE_ARCHIVE` selects the reviewed archive (default
-`~/.local/share/apalache-patched/apalache-0.62.4-grpc-1.75.0.tgz`); a missing or
-mismatched archive/JAR fails before starting Java. Each verify uses a private
-temporary distribution and `QUINT_HOME`, with a refusing fallback launcher and
-the pinned JAR available to TLC. Quint-side launch/download attempts fail even
-if Quint exits zero. The wrapper stops only its own server and CLI PIDs on
-completion or signals. Port ownership is checked with `/proc` on Linux or `lsof` on macOS; v1alpha reflection must answer before Quint runs.
-Pass each backend option once; repeated endpoint/version options, including aliases, are refused.
-
-CVE-2022-3171 is a protobuf runtime bug; the stock protobuf-java 3.25.8 runtime is patched. Its pre-22 reflection gencode warning is separate; #787 aligns gRPC to 1.75.0, generated with 3.25.8.
-The guard pins archive SHA256 `51e0e9832eb589d346370b54377850697a597e3dfc23dd49246a02df421c9174` and JAR `a90f5802b6cfdb59c548513f0be2725ebd7c53a79cb96277cb349e48ea0b8f66`, always setting `error_on_unsafe_pre22_gencode=true`; unsafe JVM overrides, Java option-file loaders (`@argfile`, `-XX:VMOptionsFile`, `-XX:Flags`), and ambiguous backslash/whitespace spellings are refused. Expand file options explicitly for guarded verify.
-The source patch binds Apalache to `127.0.0.1` only. Quint 0.33.1 requires v1alpha reflection (`dist/src/apalache.js:212,242`), so it remains registered.
-The pre-22 v1alpha gencode warning reported by Crpko #2329 can still appear outside the guarded wrapper; #54 closes that bypass. No reflection classes are regenerated here.
-`QUINT_ALLOW_VULNERABLE_APALACHE=1` explicitly bypasses this guard with a visible warning, permitting Quint's original cache/download/launch behavior; it never silences the protobuf warning.
-Upstream Apalache 0.63.0 still has no dependency fix (#787's 11 Nov check); issue filing and all installations remain owner-approved evaluator actions.
-
-Agent PATHs put `~/.local/share/quint-guard/bin` immediately after the blocker dirs, before nvm; its only tool is a symlink to `~/.local/bin/quint`.
-The shared shell fence refuses direct npm/Node/package-runner `quint verify`; use `/Users/ardud/.local/bin/quint` or explicitly set `QUINT_ALLOW_VULNERABLE_APALACHE=1`.
-Bare `quint` relies on the managed PATH when the hook cannot see the executing shell's PATH. Other subcommands pass through; the shared `~/.quint` cache is untouched.
-Offbox provisions this same wrapper ahead of repo binaries and stages the hash-checked #55 archive under `~/.offbox/quint`; use `offbox run -- quint verify …` (package runners bypass PATH).
-LISTEN alone can precede usable gRPC reflection; the wrapper probes Quint's reflection symbol within the existing 30-second startup deadline, retaining the fallback sentinel.
-Release the offbox client with `integrations/offbox/install.zsh` as well as local-helpers; existing and fresh boxes receive the assets on their next run, without changing `~/.quint`.
-
-Offbox investigation (9 Nov 2026, crpko-devops pool `bx_2vtg2veh`, three
-remote calls including one pre-command failure): Quint 0.33.1 downloads
-`https://github.com/apalache-mc/apalache/releases/download/v0.62.4/apalache.tgz`
-without checking the HTTP status before tar extraction. `curl -sSIL` and
-Node fetch both returned **504, text/html, 92 bytes**; `file` identified HTML
-starting with `<html><body><h1>504 Gateway Time-out</h1>`. This reproduces the
-invalid-archive cause: GitHub's error response is passed to tar as a tgz.
-It is independent of Java. Successful downloads on other boxes are consistent
-with an intermittent asset failure. The guarded wrapper uses the pinned archive;
-for diagnosing a fresh download use `curl --fail --location`, then `file`
-and `tar tzf` before extraction. A manual cache transfer must use the approved
-patched distribution, not an unguarded stock 0.62.4 download.
-
-The separate offbox signature `Unrecognized VM option 'G1PeriodicGCInterval'`
-indicates an older JVM (Java 11 in the reports); Apalache requires Java 21+.
-Current offbox templates include JDK 21 and select a full JDK for Java commands.
-The wrapper checks its selected JDK before launching the backend; use
-`QUINT_JAVA_HOME` to select another Java 21+ installation explicitly.
+`quint` is retired (owner rule 2026-11-21); the stub refuses with QUINT_RETIRED.
 
 Card links: the spectrum bridge serves every `share` at `https://cards.abdullah.fund/s/<token>/` from
 127.0.0.1:18793 (its config.json `shareOrigin`). `cards-tunnel` runs the named Cloudflare tunnel that forwards
@@ -218,13 +164,6 @@ runs agree even when they have different `TZ` settings.
 `ROBOB_WD_RESTARTING` and `ROBOB_WD_SLEEP` accept replacement commands;
 `ROBOB_WD_STATE` overrides the state directory. `ROBOB_WD_NOW` accepts epoch
 seconds or a command returning epoch seconds for an advancing test clock.
-
-`apalache/build-patched.sh` builds Apalache 0.62.4 (`7954daf7563a69cce9d0b89c8542e40bf46f7c6e`) with all gRPC modules at 1.75.0 and protobuf/protoc 3.25.8; ScalaPB stays at 0.11.20.
-Rebuild on Linux/JDK 21: `offbox run --remote -- 'JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 integrations/local-helpers/apalache/build-patched.sh'` (requires git, curl, Python 3 and sha256sum).
-Output: `tmp/apalache-patched-0.62.4/apalache-0.62.4-grpc-1.75.0.tgz`; SHA256 `51e0e9832eb589d346370b54377850697a597e3dfc23dd49246a02df421c9174`.
-The recipe checks resolved dependencies and reflection bytecode, records the JAR hash, and retains v1alpha reflection for quint 0.33.1; installation and wrapper selection are separate.
-Launch with `JVM_ARGS=-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=true apalache/bin/apalache-mc server --port=<n>`; the patched server binds `127.0.0.1:<n>` and keeps v1alpha reflection for Quint.
-As of 9 Nov 2026, upstream main has no dependency fix after 0.62.4; the upstream issue draft is on Robob card #787 and has not been filed.
 
 ## Repo Node and pnpm selection
 
@@ -278,6 +217,28 @@ or missing identity. `repeatCount` tracks matching session/rule/first-word retri
 until a 60-second gap; native counts are best effort when hooks overlap.
 When an error tag has no IDs, its `sampleId` gives the day file, timestamp and
 one-based physical line number so the original record can still be found.
+
+`toollog refusals --day YYYY-MM-DD [--rule R] [--top N] [--json]` prints the
+day's denied/rewritten hook decisions grouped by rule and command shape; the
+agent-tools rollup carries the same data as `refusalShapes`. Each shape has
+`count` (denied plus sampleRate-weighted rewrites, `~`/`sampled` when estimated),
+`distinctThreads`, `unattributed` (`unknown:*` rows), `retryWithin5m` (the same
+thread hit the same rule and shape again within 300 s, so it was stuck; the
+previous UTC day's last 5 minutes count as context), `harness` and `topProjects`.
+Denials rank first; past 100 shapes the rest fold into `other`. Rows marked
+`source: test` are excluded and counted in `excludedTestRows`.
+Hooks write `cmdShape` and `project` on refusals only. A shape fails closed: it
+keeps operators, env var names, one- or two-letter flags, and program names,
+subcommands, file extensions and long options from fixed vocabularies. Anything
+else (paths, quoted text, numbers, variables, attached flag values, unknown
+programs as `<cmd>`, unknown options as `--<opt>`) becomes a placeholder, e.g.
+`sqlite3 <path.sqlite> <q>`. Escaped characters stay inside their word, and a
+heredoc body is dropped; if its delimiter can't be read or its terminator never
+matches exactly, the rest of the command is dropped and the shape ends in `...`.
+No raw command is stored.
+`project` is the folder name of the git repository the command ran in (the main
+checkout for worktrees). Rows written before shapes existed group as
+`coarse:<firstWord> cwd:<cwdClass>`.
 The Python logger has one source in `libexec/toollog/`; the other integrations'
 source symlinks are materialized beside their entry points by their installers.
 

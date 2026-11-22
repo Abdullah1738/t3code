@@ -39,6 +39,12 @@ directory); it replaces the older per-bridge `com.abdullah.spectrum-bridge`
 label. Use `bun run check` and `bun test` from this directory when changing
 the supervisor.
 
+The plist sets `ProcessType` to `Interactive` because the bridge answers agents
+and the owner; at the default priority it lost CPU to agent work under load
+(22 Nov 2026, CLI timeouts). `integrations/deploy.zsh` does not install the plist:
+copy it to `~/Library/LaunchAgents/`, then run `launchctl bootout` followed by
+`launchctl bootstrap`.
+
 ## Upstream
 
 The main OpenChamber repository remains the `upstream` Git remote. This fork is

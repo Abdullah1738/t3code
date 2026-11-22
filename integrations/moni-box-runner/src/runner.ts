@@ -208,7 +208,7 @@ export class BoxRunner {
       const { row, input } = selected;
       if (this.harness.ready && !this.harness.ready()) return;
       let text: string;
-      try { text = await this.prepare(input); }
+      try { text = await this.prepare(row.id, input); }
       catch (error) {
         if (error instanceof AttachmentFailure) {
           this.db.transaction(() => {
@@ -268,15 +268,38 @@ export class BoxRunner {
       this.io.log?.("runner-error", this.now() - started);
     } finally { this.turnAbort = undefined; this.working = false; }
   }
-  private async prepare(input: Record<string, unknown>): Promise<string> {
+  private async prepare(inboxId: string, input: Record<string, unknown>): Promise<string> {
     let text = typeof input.text === "string" ? input.text : "";
-    const references = ["id", "replyTo", "threadOrigin"].filter(key => typeof input[key] === "string")
-      .map(key => `${key}: ${String(input[key])}`).join("\n");
+    const references = ["threadOrigin", "id", "replyTo"].filter(key => typeof input[key] === "string")
+      .map(key => `${key === "replyTo" ? "previousMessage" : key}: ${String(input[key])}`).join("\n");
     if (references) text = `${references}\n${text}`;
-    if (typeof input.replyTo === "string") {
-      const quoted = this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbox WHERE json_extract(payload,'$.id')=? ORDER BY seq DESC LIMIT 1").get(input.replyTo)
-        ?? this.db.query<{ payload: string }, [string]>("SELECT payload FROM actions WHERE json_extract(result,'$.handle')=? ORDER BY rowid DESC LIMIT 1").get(input.replyTo);
-      if (quoted) { const previous = JSON.parse(quoted.payload); if (typeof previous.text === "string") text += `\n[Quoted reply context]\n${previous.text.slice(0, 12000)}`; }
+    const threadOrigin = typeof input.threadOrigin === "string" && input.threadOrigin ? input.threadOrigin : undefined;
+    const hasThreadOrigin = threadOrigin !== undefined;
+    const hasReplyTo = typeof input.replyTo === "string" && input.replyTo.length > 0;
+    let source: "inbox" | "action" | "missing" | "none" = "none";
+    if (threadOrigin) {
+      // Sendblue's reply_to is the previous message; only thread_originator identifies the swipe.
+      const inbound = this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbox WHERE json_extract(payload,'$.id')=? ORDER BY seq DESC LIMIT 1").get(threadOrigin);
+      const action = inbound ? undefined : this.db.query<{ payload: string }, [string]>("SELECT payload FROM actions WHERE json_extract(result,'$.handle')=? ORDER BY rowid DESC LIMIT 1").get(threadOrigin);
+      const quoted = inbound ?? action;
+      const target: unknown = quoted ? JSON.parse(quoted.payload) : undefined;
+      let quote: string | undefined;
+      if (object(target)) {
+        if (typeof target.text === "string" && target.text.trim()) quote = target.text;
+        else if (action && typeof target.mediaUrl === "string" && target.mediaUrl) {
+          // Uploads retain the filename; the separate send action owns the message handle.
+          const name = typeof target.name === "string" && target.name.trim() ? target.name
+            : this.db.query<{ name: unknown }, [string]>("SELECT json_extract(payload,'$.name') AS name FROM actions WHERE path='/files' AND state='done' AND json_extract(result,'$.mediaUrl')=? ORDER BY rowid DESC LIMIT 1").get(target.mediaUrl)?.name;
+          if (typeof name === "string" && name.trim()) quote = `[file: ${name}]`;
+        }
+      }
+      source = quote ? inbound ? "inbox" : "action" : "missing";
+      text += quote ? `\n[Swiped reply to ${inbound ? "Moni" : "Robob"}]\n${quote.slice(0, 12000)}`
+        : "\n[Swiped reply: target not found; ask which message if it matters]";
+    }
+    if (hasThreadOrigin || hasReplyTo) {
+      this.db.query("INSERT OR IGNORE INTO actions(id,path,payload,result,state,inbox_id) VALUES (?,'/metrics',?,NULL,'pending',?)")
+        .run(opaqueId(`swipe:${inboxId}`), JSON.stringify({ kind: "swipe", source, hasThreadOrigin, hasReplyTo, durationMs: 0 }), inboxId);
     }
 
     if (Array.isArray(input.attachments)) for (const file of input.attachments) {

@@ -23,6 +23,12 @@ CHAIN = 'node --version && node --test integrations/stream-recovery/test/*.test.
 NPM_CHAIN = 'npm --prefix integrations/stream-recovery test && node --test integrations/router-logging/test/*.test.mjs'
 
 
+def remote_only(wrapper, payload):
+    # #221: offbox never runs these payloads on the Mac, so the files they
+    # execute are not scanned; payloads that may fall back keep every check.
+    return wrapper.startswith('offbox run') and ('--bg' in wrapper or any(char in payload for char in ';|&`$\n<>'))
+
+
 def write(root, name, source=SAFE):
     path = root / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,7 +153,7 @@ class NodeTestGlobTests(unittest.TestCase):
         for payload in (CHAIN, NPM_CHAIN):
             for prefix in ('', 'offbox run -- ', 'offbox run --bg -- '):
                 command = prefix + shlex.quote(payload) if prefix else payload
-                self.assert_decision(command, self.b, 'live-database-script')
+                self.assert_decision(command, self.b, None if remote_only(prefix, payload) else 'live-database-script')
         write(self.c, 'test/t35.test.mjs', BAD)
         for label, command, cwd in reporter_cases(self.a, self.b, self.c):
             if cwd == self.c:
@@ -192,7 +198,10 @@ class NodeTestGlobTests(unittest.TestCase):
                 payload = predecessor + 'node --test test/*.test.js'
                 command = prefix + shlex.quote(payload) if prefix else payload
                 with self.subTest(command=command):
-                    self.assert_decision(command, self.a, 'live-database-script-unresolved', 'written in the same call')
+                    if remote_only(prefix, payload):
+                        self.assert_decision(command, self.a)
+                    else:
+                        self.assert_decision(command, self.a, 'live-database-script-unresolved', 'written in the same call')
         for predecessor in ('mkdir outside; ', 'printf x > outside.json; ', 'cp other.mjs outside.mjs; '):
             self.assert_decision(predecessor + 'node --test test/*.test.js', self.a)
         self.assert_decision("offbox run -- 'printf x > test/z.test.js'; node --test test/*.test.js", self.a,
@@ -207,7 +216,10 @@ class NodeTestGlobTests(unittest.TestCase):
                     payload = f'{shell} {invocation} && node --test test/*.test.js'
                     command = wrapper + shlex.quote(payload) if wrapper else payload
                     with self.subTest(shell=shell, invocation=invocation, wrapper=wrapper):
-                        self.assert_decision(command, self.a, 'live-database-script-unresolved', 'written in the same call')
+                        if remote_only(wrapper, payload):
+                            self.assert_decision(command, self.a)
+                        else:
+                            self.assert_decision(command, self.a, 'live-database-script-unresolved', 'written in the same call')
         for payload in ('cat prepare.sh | bash; node --test test/*.test.js',
                         "offbox run -- bash prepare.sh; node --test test/*.test.js",
                         "offbox run -- bash < prepare.sh; node --test test/*.test.js"):
@@ -224,7 +236,8 @@ class NodeTestGlobTests(unittest.TestCase):
                         payload = invocation + 'node --test test/*.test.js'
                         command = wrapper + shlex.quote(payload) if wrapper else payload
                         with self.subTest(shell=shell, body=body, invocation=invocation, wrapper=wrapper):
-                            verdict = 'live-database-script-unresolved' if wrapper and body == ':' else expected
+                            verdict = (None if remote_only(wrapper, payload) else
+                                       'live-database-script-unresolved' if wrapper and body == ':' else expected)
                             self.assert_decision(command, self.a, verdict,
                                                  'written in the same call' if verdict else None)
 
@@ -236,7 +249,8 @@ class NodeTestGlobTests(unittest.TestCase):
                         payload = shell + ' -c ' + shlex.quote(body) + suffix + '; node --test test/*.test.js'
                         command = wrapper + shlex.quote(payload) if wrapper else payload
                         with self.subTest(shell=shell, suffix=suffix, wrapper=wrapper, body=body):
-                            verdict = 'live-database-script-unresolved' if wrapper and body == ':' else expected
+                            verdict = (None if remote_only(wrapper, payload) else
+                                       'live-database-script-unresolved' if wrapper and body == ':' else expected)
                             self.assert_decision(command, self.a, verdict,
                                                  'written in the same call' if verdict else None)
 
@@ -266,7 +280,9 @@ class NodeTestGlobTests(unittest.TestCase):
                         payload = writer + operator + ' ' + target + '; node --test test/*.test.js'
                         command = wrapper + shlex.quote(payload) if wrapper else payload
                         with self.subTest(operator=operator, writer=writer, target=target, wrapper=wrapper):
-                            if operator == '>|':
+                            if remote_only(wrapper, payload):
+                                self.assert_decision(command, self.a)
+                            elif operator == '>|':
                                 self.assert_decision(command, self.a, 'live-database-script-unresolved',
                                                      'clobber redirect unproved')
                             else:
@@ -310,7 +326,8 @@ class NodeTestGlobTests(unittest.TestCase):
             escaped = 'scripts/' + name.replace('-', '\\-')
             for wrapper in ('offbox run -- ', 'offbox run --bg -- ', 'ssh box ', 'python3 /abs/offbox.py ssh box '):
                 with self.subTest(name=name, wrapper=wrapper):
-                    self.assert_decision(wrapper + 'node ' + escaped, self.a, expected)
+                    self.assert_decision(wrapper + 'node ' + escaped, self.a,
+                                         None if remote_only(wrapper, escaped) else expected)
 
     def test_split_budgets_and_remote_merge(self):
         for i in range(36, 201):
@@ -332,9 +349,11 @@ class NodeTestGlobTests(unittest.TestCase):
     def test_other_scripts_keep_the_32_limit(self):
         files = [write(self.a, f's{i:02d}.sh', 'echo ok') for i in range(33)]
         command = '; '.join('bash ' + str(path) for path in files)
-        for shape in (command, 'offbox run -- ' + shlex.quote(command),
+        self.assert_decision(command, self.a, 'live-database-script-unresolved', 'MAX_SCRIPTS (32)')
+        # Joined with ';', these payloads can only run on the box (#221).
+        for shape in ('offbox run -- ' + shlex.quote(command),
                       'bash ' + str(files[0]) + '; offbox run -- ' + shlex.quote('; '.join('bash ' + str(path) for path in files[1:]))):
-            self.assert_decision(shape, self.a, 'live-database-script-unresolved', 'MAX_SCRIPTS (32)')
+            self.assert_decision(shape, self.a)
         preloads = ' '.join('--import ' + str(write(self.a, f'pre{i}.mjs')) for i in range(33))
         self.assert_decision('node ' + preloads + ' --test test/*.test.js', self.a,
                              'live-database-script-unresolved', 'MAX_SCRIPTS (32)')

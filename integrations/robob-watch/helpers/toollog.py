@@ -30,13 +30,15 @@ _VALUES = {
     'class': ('urgent', 'today', 'info', 'noise', 'candidate', 'charge', 'bank', 'security', 'otp', 'unknown', 'fail_open', 'deduped'),
     'action': ('create', 'queue', 'cancel', 'snooze', 'sent', 'retry', 'check', 'wake', 'notify', 'send', 'coalesce', 'conflict', 'expire', 'pause', 'remove', 'cap', 'resume'),
     'state': ('pending', 'sending', 'sent', 'uncertain', 'cancelled', 'failed', 'scheduled', 'queued', 'done', 'expired', 'paused', 'active'),
-    'stderrClass': ('usage_error', 'missing_file', 'permission', 'timeout', 'python_traceback', 'auth', 'connect', 'json', 'unknown'),
+    'timeoutSide': ('none', 'cli_process', 'http'),
+    'stderrClass': ('ride_ended', 'usage_error', 'missing_file', 'permission', 'timeout', 'python_traceback', 'auth', 'connect', 'json', 'unknown'),
     'triggerKind': ('file', 'wal'),
 }
 _initialized = set()
 
 # Same order and normalization as src/cause.ts; classification never retains text in a log.
 _PATTERNS = tuple((name, re.compile(pattern, re.I)) for name, pattern in (
+    ('ride_ended', r'(?:^|\n)ride-card: trip [a-f0-9-]{36} already ended \((?:done|cancelled|failed|unknown)\); not sending a new card(?:\n|$)'),
     ('usage_error', r'(?:^|\n)\s*usage:|unrecognized arguments?|unknown (?:option|argument)|invalid (?:option|choice)|argument .*required|not (?:an exact trip UUID|a bridge chat slug)|no bridge chat|unsafe display name|invalid command arguments|duplicate command option|unexpected positional arguments|--[a-z-]+ (?:is required|must be)'),
     ('missing_file', r'no such file or directory|filenotfounderror|\bENOENT\b|command not found|cannot find module|modulenotfounderror'),
     ('permission', r'permission denied|operation not permitted|permissionerror|\b(?:EACCES|EPERM)\b'),

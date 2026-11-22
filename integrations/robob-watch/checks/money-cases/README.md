@@ -15,7 +15,7 @@ app-api-cli deployment and the money-cases installer after approval.
 
 The check stops itself at 40 seconds, below the runner's 60-second timeout; `pings.json` records phase times, lookup and owner-query counts, msgs calls and the slowest phase in `timing`, also printed to stderr for runs over 20 seconds or when the final save times out (the previous pings file stays intact and no event is emitted). Timing in pings is sampled after the data fsync; stderr timing also includes the final timing-footer flush. The check uses null stdin for msgs and dumps a traceback and exits at 48 seconds if normal deadline handling cannot interrupt a hung C call (`MONEY_CASES_HARD_STOP` overrides this interval for subprocess tests). It reads owner messages through Robob's control API.
 
-Each check appends timing, owner-read counts/results and up to ten diagnostic errors (300 characters each) to `runs.jsonl` beside `pings.json` in the watcher directory, outside DATA. Free-form error details are omitted to keep message text and credentials out. Appends have a 40 ms budget, never fail the check, and count failures in `history_append_errors` for the process and runner stderr. A nonblocking `runs.lock` protects rotation, and the next append repairs an interrupted last line. The file rotates before exceeding 2 MiB, keeping `runs.jsonl.1`; installs preserve both. `money-cases runs --since 24h` (or `--json`, with a duration or timezone-aware ISO `--since`) reads both files and reports counts, runs over 40 seconds, p50/p95/max seconds (linearly interpolated percentiles), slowest phases, owner results and grouped errors. Corrupt lines are counted and skipped. Budget and iCloud skips are recorded; a hard stop in a hung C call cannot safely append Python diagnostics.
+Each check appends timing, owner-read counts/results and up to ten diagnostic errors (300 characters each) to `runs.jsonl` beside `pings.json` in the watcher directory, outside DATA. Free-form error details are omitted to keep message text and credentials out. Appends have a 40 ms budget and never fail the check. After a failed append, error accounting gets its own 8 ms attempt, capped by any earlier caller deadline. Failures count in `history_append_errors` across CLI processes when the local error counter can be written, and also go to runner stderr. A nonblocking `runs.lock` protects rotation, and the next append repairs an interrupted last line. The file rotates before exceeding 2 MiB, keeping `runs.jsonl.1`; installs preserve both. `money-cases runs --since 24h` (or `--json`, with a duration or timezone-aware ISO `--since`) reads both files and reports counts, runs over 40 seconds, p50/p95/max seconds (linearly interpolated percentiles), slowest phases, owner results and grouped errors. Corrupt lines are counted and skipped. Budget and iCloud skips are recorded; a hard stop in a hung C call cannot safely append Python diagnostics.
 
 ## Use
 
@@ -118,16 +118,41 @@ Owner-thread evidence comes from Robob's control API, using
 `~/.robob/ardud-control.json`. The server must supply message provenance
 (`automated` and `inboundMessageId`); an older server or a failed/timed-out
 lookup supplies no owner evidence and records a lookup error. There is no
-SQLite fallback. The per-check union-window fetch runs before receipt and order
-lookups in `follow()`, capped at ten seconds of the remaining check budget and
-three seconds per request. `timing.owner_queries` counts HTTP requests;
-`owner_result` reports complete coverage (`ok`), a partial refresh (`incomplete`),
-or a failed thread listing (`list_failed`). Partial refreshes save cache progress
-and supply no owner evidence.
+SQLite fallback. At check start a detached refresh begins with its own 90-second
+budget and a 45-second request cap. Checks read the previous complete
+`owner-snapshot.json` once for their union window. Missing, uncovered, future-dated
+or over-30-minute-old snapshots supply no owner evidence. Read-only commands and
+dry runs never launch a refresh or write a cache.
+
+The refresher lists changes since its last complete snapshot minus two minutes,
+merges thread state, reconciles known IDs without a time filter to remove archived
+or deleted threads, and revalidates changed threads. It lists the full owner
+window when no snapshot covers it. `owner-texts.json` retains per-thread warm-up
+progress; partial reads never publish a snapshot or renew its age. The persistent
+`owner-refresh.lock` uses flock, with PID/start-time diagnostics; process death
+releases it without stale-lock deletion races. `money-cases owner-refresh --since
+<ISO time>` can prime it manually. Run history records the owner source, cache age,
+list window, and last refresh's time, duration, result and timeouts; `money-cases
+runs` summarizes them alongside owner results.
 
 Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), routes expired waits to the daily list and retains asked questions as awaiting_answer without an age cutoff. Older linked money cases still accept receipt matches, closing a case nobody has touched when the receipt comes. Asked questions have no age cutoff. A receipt compatible with multiple distinct charge questions stays ambiguous; a historical receipt found later still counts when its timestamp uniquely matches the original charge window. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of the case, question and dead-card books in their own folder.
 
 ## Install or update
+
+`money-cases health` reads the current UTC day's run history without changing case
+state. Use `--day YYYY-MM-DD` for another UTC day, `--json` for JSON only, or
+`--one-line` for a compact daily result. `toollog rollup --board orders --day
+YYYY-MM-DD` includes that result and prints its one-line summary when available.
+History retention is bounded; an old day may no longer be present.
+
+Receipt coverage counts charge questions in the follow walk, excluding those
+resolved by existing order, subscription, purchase or shared evidence. Unattempted
+is eligible minus the existing receipt outcome counters. A run interrupted before
+the question census has unknown coverage; old history is also unknown. Budget stop
+reasons identify the last observed constraint, with the whole-check deadline taking
+precedence. Call counts measure merchant registry reads, bank-evidence lookups for
+registered orders, and charge-question evaluations. Load samples are the host's
+1/5/15-minute load averages; unavailable samples stay null.
 
 Marketplace coverage comes from `marketplace-placements.json`, refreshed outside the check's budget. To prime it after installation, run the installed reader with the account-reader Python:
 
@@ -212,8 +237,10 @@ streak and its last file, reason and first timestamp in timing. Each skipped run
 also leaves its exit code, file, reason and phase in `runs.jsonl`.
 Successful pings.json timing includes `edeadlk_retries`, `edeadlk_ms`,
 `eintr_retries`, and a metadata-only startup `dataless_files` count (SF_DATALESS,
-0x40000000). The census has a separate 100 ms budget; failure records a null count
-and `dataless_error` (class and errno) without aborting or skipping the check.
+0x40000000). The census checks a separate 100 ms deadline between metadata calls
+without installing an alarm; a single OS call can outlast that deadline. Failure
+records a null count and `dataless_error` (class plus a DataUnavailable reason or
+an OSError errno) without turning a census failure into a skipped check.
 Those diagnostics are allowed in check.run tool logs too.
 
 ### Keep Downloaded

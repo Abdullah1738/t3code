@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import { type CommandId, ProjectId } from "./baseSchemas.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import {
+  AntigravitySettings,
   ClientSettingsSchema,
   ClientSettingsPatch,
   ClaudeSettings,
@@ -11,6 +12,7 @@ import {
   requiredScopesForProjectMutation,
   resolveProjectProviderInstanceEnabled,
   resolveProviderInstanceEnabled,
+  secretSettingsFields,
   ServerSettings,
   ServerSettingsPatch,
 } from "./settings.ts";
@@ -1292,5 +1294,36 @@ describe("restart pacing settings", () => {
     for (const restartPacing of [{ maxActive: 0 }, { spacingMs: -1 }, { loadHigh: 0 }]) {
       expect(() => decodeServerSettingsPatch({ restartPacing })).toThrow();
     }
+  });
+});
+
+describe("Antigravity gateway sign-in", () => {
+  const decode = Schema.decodeUnknownSync(AntigravitySettings);
+  const encode = Schema.encodeSync(AntigravitySettings);
+
+  it("decodes and encodes the gateway method with its URL and key", () => {
+    const settings = decode({
+      enabled: true,
+      authMethod: "gateway",
+      gatewayBaseUrl: " http://127.0.0.1:20128 ",
+      gatewayApiKey: " router-key ",
+    });
+    expect(settings).toMatchObject({
+      authMethod: "gateway",
+      gatewayBaseUrl: "http://127.0.0.1:20128",
+      gatewayApiKey: "router-key",
+    });
+    expect(decode(encode(settings))).toEqual(settings);
+    expect(decode({})).toMatchObject({
+      authMethod: "oauth-personal",
+      gatewayBaseUrl: "",
+      gatewayApiKey: "",
+    });
+  });
+
+  it("stores the gateway key as a secret, not the URL", () => {
+    const secrets = secretSettingsFields(AntigravitySettings);
+    expect(secrets).toContain("gatewayApiKey");
+    expect(secrets).not.toContain("gatewayBaseUrl");
   });
 });

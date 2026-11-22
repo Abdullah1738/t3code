@@ -1,0 +1,8 @@
+{
+  "roots": [
+    {"label":"com.abdullah.crpko-adhoc-server","argv":["{python}","{home}/.local/share/crpko-adhoc/server.py"]},
+    {"label":"com.abdullah.crpko-ios-tunnel","argv":["/opt/homebrew/bin/cloudflared","tunnel","--no-autoupdate","--metrics","127.0.0.1:0","--protocol","http2","run","--credentials-file","{home}/.cloudflared/crpko-ios-tunnel.json","--url","http://127.0.0.1:8462","a0ea6a60-0214-4c8a-80de-fe9c71c068ad"]},
+    {"label":"com.ardud.robob-guard","argv":["{python}","{home}/.local/share/robob-guard/guard.py"]}
+  ],
+  "children": []
+}

@@ -81,7 +81,7 @@ class ArchivingSkipTests(Isolated):
             self.assertEqual(got['box_id'], 'busy')
             self.assertGreater(clock.t, 1000)
             self.assertIn('queued for a repo pool box', err.getvalue())
-            self.assertIn('skipping pool box cold', err.getvalue())
+            self.assertEqual(err.getvalue().count('cold is stopping; skipping it for now'), 1)
             self.assertEqual(self.row('cold')['state'], 'stopped')
             resume.assert_not_called()
             create.assert_not_called()

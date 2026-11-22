@@ -365,8 +365,10 @@ test("trigger failures keep the fifteen-minute wake escalation and five-minute r
   `);
   expect(result.before).toHaveLength(0);
   expect(result.escalated.failure_escalated).toBe(true);
-  expect(result.calls).toHaveLength(1);
-  expect(result.calls[0][0]).toBe("wake");
+  expect(result.calls.filter((args: string[]) => args[0] === "wake")).toHaveLength(1);
+  expect(result.calls.filter((args: string[]) => args[0] === "wake-status")).toHaveLength(2);
+  expect(result.calls.filter((args: string[]) => args[0] === "send" || args[0] === "notify")).toHaveLength(0);
+  expect(result.state.failure_escalation_pending?.channel).toBe("wake");
   expect(result.state.next_at - result.clock).toBeLessThanOrEqual(300_000);
 });
 

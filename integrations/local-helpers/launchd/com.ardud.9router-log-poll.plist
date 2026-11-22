@@ -6,5 +6,5 @@
 <key>KeepAlive</key><true/>
 <key>ThrottleInterval</key><integer>5</integer>
 <key>RunAtLoad</key><true/>
-<key>ProcessType</key><string>Background</string>
+<key>ProcessType</key><string>Standard</string>
 </dict></plist>

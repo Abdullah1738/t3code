@@ -375,9 +375,12 @@ export const layerExecutor: Layer.Layer<
                 providerSessionId: request.providerSessionId,
                 providerThreadId: request.providerThreadId,
                 providerTurnId: request.providerTurnId,
-                ...(request.startTimeout === true
-                  ? { stopBackgroundWork: false, confirmStopped: true }
-                  : {}),
+                ...(request.stopBackgroundWork !== undefined
+                  ? { stopBackgroundWork: request.stopBackgroundWork }
+                  : request.startTimeout === true
+                    ? { stopBackgroundWork: false }
+                    : {}),
+                ...(request.startTimeout === true ? { confirmStopped: true } : {}),
                 ...(request.startingRun === undefined ? {} : { startingRun: request.startingRun }),
                 ...(request.replacementProviderSessionId === undefined
                   ? {}
@@ -438,6 +441,7 @@ export const layerExecutor: Layer.Layer<
                 ),
                 Effect.andThen((outcome) =>
                   request.startTimeout === true ||
+                  request.stopBackgroundWork === false ||
                   (request.subagent !== undefined && outcome === undefined)
                     ? Effect.void
                     : threads.dispatch({
@@ -459,7 +463,11 @@ export const layerExecutor: Layer.Layer<
                 ),
                 Effect.tap(() =>
                   Effect.gen(function* () {
-                    if (request.stopThroughRunOrdinal === undefined) return;
+                    if (
+                      request.stopBackgroundWork === false ||
+                      request.stopThroughRunOrdinal === undefined
+                    )
+                      return;
                     yield* providerSessions.stopBackgroundWork({
                       threadId: effect.threadId,
                       throughRunOrdinal: request.stopThroughRunOrdinal,

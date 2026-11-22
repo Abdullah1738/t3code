@@ -102,9 +102,14 @@ function restartEffect(
   };
 }
 
-it.effect("delivers deadline cleanup to the exact turn after its start effect settled", () =>
+it.effect.each(
+  (["deadline", "late", "normal", "explicit-background"] as const).flatMap((kind) =>
+    (["stopped", "not-active"] as const).map((outcome) => ({ kind, outcome })),
+  ),
+)("interrupt $kind/$outcome preserves the intended background work", ({ kind, outcome }) =>
   Effect.gen(function* () {
     const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    let backgroundStatus = "running";
     const stopped: Array<
       Parameters<ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"]>[0]
     > = [];
@@ -113,7 +118,9 @@ it.effect("delivers deadline cleanup to the exact turn after its start effect se
       ...restartEffect(now, { type: "detach" }),
       request: {
         type: "provider-turn.interrupt",
-        startTimeout: true,
+        ...(kind === "deadline" ? { startTimeout: true } : {}),
+        ...(kind === "late" ? { stopBackgroundWork: false, stopThroughRunOrdinal: 1 } : {}),
+        ...(kind === "explicit-background" ? { stopBackgroundWork: true } : {}),
         providerSessionId: oldSessionId,
         providerThreadId,
         providerTurnId,
@@ -122,16 +129,44 @@ it.effect("delivers deadline cleanup to the exact turn after its start effect se
     const layer = layerExecutorFor({
       events,
       interrupt: (input) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
           stopped.push(input);
+          if (outcome === "not-active")
+            return yield* new ProviderTurnControlService.ProviderTurnControlError({
+              threadId,
+              operation: "interrupt",
+              providerTurnId,
+              cause: "Provider turn is not active.",
+            });
         }),
+      threads: {
+        dispatch: (command) =>
+          Effect.sync(() => {
+            assert.equal(command.type, "thread.background-work.settle");
+            backgroundStatus = "interrupted";
+            return { sequence: 1, storedEvents: [] };
+          }),
+      },
+      stopBackgroundWork: () => Effect.die("Preserved background work must not be stopped"),
     });
-    yield* (yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(Effect.provide(layer))).execute(
-      effect,
+    const result = yield* (yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+      Effect.provide(layer),
+    ))
+      .execute(effect)
+      .pipe(Effect.result);
+    assert.equal(
+      result._tag,
+      kind === "deadline" && outcome === "not-active" ? "Failure" : "Success",
     );
     assert.lengthOf(stopped, 1);
     assert.equal(stopped[0]?.providerTurnId, providerTurnId);
-    assert.isFalse(stopped[0]?.stopBackgroundWork);
+    if (kind === "deadline") assert.isTrue(stopped[0]?.confirmStopped);
+    const preserve = kind === "deadline" || kind === "late";
+    assert.equal(
+      stopped[0]?.stopBackgroundWork,
+      preserve ? false : kind === "explicit-background" ? true : undefined,
+    );
+    assert.equal(backgroundStatus, preserve ? "running" : "interrupted");
   }),
 );
 
