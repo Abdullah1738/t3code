@@ -2943,8 +2943,8 @@ test("missing until, route change, merge conflict and ten-minute redaction resyn
   } finally { setSystemTime(); }
 });
 
-test.each([100, 1_500].flatMap(historySize => ["idle", "active", "steer"].map(scenario => ({ historySize, scenario }))))(
-  "60-second router budgets preserve completion timing ($historySize rows, $scenario)", async ({ historySize, scenario }) => {
+for (const { historySize, scenario } of [100, 1_500].flatMap(historySize => ["idle", "active", "steer"].map(scenario => ({ historySize, scenario })))) {
+  test(`60-second router budgets preserve completion timing (${historySize} rows, ${scenario})`, async () => {
   const start = Date.parse("2026-11-15T09:30:00Z");
   const table: object[] = [];
   try {
@@ -3013,7 +3013,9 @@ test.each([100, 1_500].flatMap(historySize => ["idle", "active", "steer"].map(sc
     table.push({ historySize, scenario, before, after });
     console.log("message-read-budget", JSON.stringify(table));
   } finally { setSystemTime(); }
-});
+  // The legacy 1,500-row active/steer paths take about 3 s on b0; allow headroom for host load.
+}, historySize === 1_500 && scenario !== "idle" ? 15_000 : undefined);
+}
 
 test("message read modes, full reasons and returned bytes survive the minute log aggregation", async () => {
   const root = mkdtempSync(join(tmpdir(), "message-reads-log-")); dirs.push(root);
