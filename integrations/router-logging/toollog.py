@@ -13,9 +13,10 @@ import threading
 from urllib.parse import urlsplit
 import volume
 from host import clean_host
-from causes import PHASES
+from causes import PHASES, WAIT_FIELDS, SUBSTEP_FIELDS
 
 CAP = 200 * 1024 * 1024
+PHASE_ROWS = {('poller', 'poll.phases'), ('poller', 'rollup.phases'), ('guard', 'guard.tick_late')}
 _seen = set()
 _last_report = time.monotonic()
 PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx', 'phase', 'durationMaxMs', 'omitted', 'provider', 'scope', 'cause', 'lockMs', 'until', 'previousBackoffLevel', 'backoffLevel', 'source'}
@@ -37,6 +38,8 @@ PROPS.update({'observerSnapshotStartMs', 'postEndDiagMs', 'openPhase', 'lastPhas
               'phaseMs', 'measuredMs', 'unmeasuredMs'})
 PROPS.update({'cpuMs', 'wallMs', 'processType', 'nice', 'priority'})
 PROPS.update({field[:-2] + 'CpuMs' for field in PHASES.values()})
+PROPS.update(WAIT_FIELDS)
+PROPS.update(SUBSTEP_FIELDS)
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
             'The operation was aborted due to timeout', 'The operation was aborted'}
@@ -146,7 +149,10 @@ def emit(component, name, kind='event', **fields):
         if row is None:
             volume.dropped(state, 'invalid_event')
             return
-        if len((json.dumps(row, separators=(',', ':')) + '\n').encode()) > 4096:
+        # The fixed phase/resource/substep fields can exceed 4 KiB. Only these
+        # sparse diagnostics get the larger bound; ordinary events stay at 4 KiB.
+        limit = 8192 if (row['component'], row['name']) in PHASE_ROWS else 4096
+        if len((json.dumps(row, separators=(',', ':')) + '\n').encode()) > limit:
             volume.dropped(state, 'line_size')
             return
         _write(root, day, now, row, state)

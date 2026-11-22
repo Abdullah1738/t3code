@@ -7,6 +7,7 @@ import select
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -291,7 +292,8 @@ class IncrementalTests(unittest.TestCase):
                         continuousMs=wall[0] * 1000, cpuMs=cpu[0] * 1000, pid=42)
         for used, cause in ((4, 'tick_starved:history_scan_parse'), (20, 'tick_blocked:history_scan_parse')):
             wall[0], cpu[0] = 0, 0
-            with patch('observer.time.monotonic', side_effect=lambda: wall[0]), patch('observer.time.process_time', side_effect=lambda: cpu[0]), patch('observer.clock_sample', side_effect=sample), patch('observer.job_snapshot', return_value={}), patch('observer.emit') as emit:
+            usage = lambda _: SimpleNamespace(ru_inblock=0, ru_majflt=0, ru_nvcsw=0, ru_nivcsw=int(wall[0]))
+            with patch('observer.resource.getrusage', side_effect=usage), patch('observer.time.monotonic', side_effect=lambda: wall[0]), patch('observer.time.process_time', side_effect=lambda: cpu[0]), patch('observer.clock_sample', side_effect=sample), patch('observer.job_snapshot', return_value={}), patch('observer.emit') as emit:
                 with observer.Timings() as timing:
                     with observer.phase('history_scan_parse'):
                         wall[0] += 180
@@ -306,7 +308,7 @@ class IncrementalTests(unittest.TestCase):
                 event = clean(dict(component='poller', name='poll.phases', **emit.call_args.kwargs), NOW)
                 self.assertEqual(event['props']['cpuMs'], (used + 1) * 1000)
                 self.assertEqual(observer.gap_summary([event], DAY, NOW)['pollGaps'][0]['cause'], cause)
-        self.assertEqual(observer.phase_cause('tcp', 120000, 0), 'tick_blocked:tcp')
+        self.assertEqual(observer.phase_cause('tcp', 30000, 0), 'tick_blocked:tcp')
         self.assertEqual(observer.phase_cause('tcp', 120001, 12000.1), 'tick_blocked:tcp')
 
     def test_timeout_kills_only_owned_child_once_and_next_runs(self):

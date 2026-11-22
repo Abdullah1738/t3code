@@ -2712,6 +2712,269 @@ bash "$TASK_DIR/step5r.sh"
     def classify(self, command):
         return guard.classify(command, str(self.root))
 
+    def test_bun_115_subcommands(self):
+        payload = ('bun install --frozen-lockfile --cwd integrations/spectrum-bridge && '
+                   'baseline_dir=$(mktemp -d) && '
+                   'tar -xf tmp/imessage25.dT1ECD/base.tar -C "$baseline_dir" && '
+                   'ln -s "$PWD/integrations/spectrum-bridge/node_modules" '
+                   '"$baseline_dir/integrations/spectrum-bridge/node_modules" && '
+                   'cd "$baseline_dir/integrations/spectrum-bridge" && '
+                   'bun test test/robob.test.ts test/lock.test.ts')
+        commands = [
+            'offbox run --bg --include tmp/imessage25.dT1ECD/base.tar -- ' + shlex.quote(payload),
+            'd=$(mktemp -d) && cd "$d" && bun test test/a.test.ts test/b.test.ts',
+            'cd "$d" && bun test', 'cd "$d" && bun run test',
+            'cd "$d" && bun install --frozen-lockfile', 'bun --cwd pkg run test',
+            'cd "$d" && bun check', 'bun run --filter "pkg*" test',
+            'bun --cwd=pkg run --filter="pkg*" test', 'cd "$d" && bunx prettier',
+        ]
+        for subcommand in ('install', 'i', 'add', 'a', 'remove', 'rm', 'update', 'outdated',
+                           'audit', 'dedupe', 'prune', 'link', 'unlink', 'publish', 'patch',
+                           'pm', 'info', 'why', 'build', 'init', 'create', 'c', 'upgrade',
+                           'completions', 'x', 'repl'):
+            commands.append('cd "$d" && bun ' + subcommand)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+
+    def test_bun_115_test_option_values(self):
+        self.write('test/ok.test.ts', 'console.log("ok")')
+        commands = [
+            'bun test test/ok.test.ts',
+            "bun test test/ok.test.ts -t 'real bridge route cancellation.*pause'",
+            "bun test -t 'a.*b' test/ok.test.ts",
+            "bun test test/ok.test.ts --test-name-pattern 'a.*b'",
+            "bun test test/ok.test.ts --reporter junit --reporter-outfile 'out*.xml'",
+            "bun test test/ok.test.ts --timeout 5000 -t 'x|y'",
+            'env -u BUN_INSPECT ROBOB_TEST=1 bun test test/ok.test.ts --test-name-pattern '
+            "'runner SIGTERM leaves no check process.*owner=runner|checks carry environment identity'",
+            "offbox run --bg --step 'bun install --frozen-lockfile' --step "
+            + shlex.quote("bun test test/ok.test.ts --test-name-pattern 'pre-upgrade accepted steers|other name'")
+            + " --step 'bun run check'",
+        ]
+        for flag in ('-t', '--test-name-pattern', '--timeout', '--rerun-each', '--retry',
+                     '--reporter', '--reporter-outfile', '--coverage-reporter', '--coverage-dir',
+                     '--seed', '--max-concurrency', '--path-ignore-patterns', '--parallel-delay',
+                     '--shard', '--timings'):
+            for separator in (' ', '='):
+                for position in ('before', 'after'):
+                    option = flag + separator + shlex.quote('a.*b|c')
+                    args = option + ' test/ok.test.ts' if position == 'before' else 'test/ok.test.ts ' + option
+                    commands.append('bun test ' + args)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+
+    def test_bun_115_filters_and_optional_values(self):
+        self.write('test/ok.test.ts', 'console.log("ok")')
+        self.write('named-filter', 'console.log("ok")')
+        (self.root / 'directory-filter').mkdir()
+        for command in ('bun test named-filter directory-filter missing.test.ts',
+                        'bun test --bail test/ok.test.ts', 'bun test --bail 2 test/ok.test.ts',
+                        'bun test --changed test/ok.test.ts', 'bun test --changed main test/ok.test.ts',
+                        'bun test --parallel test/ok.test.ts', 'bun test --parallel 2 test/ok.test.ts'):
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+
+    def test_bun_115_package_tasks_and_preloads(self):
+        for name in ('test', 'install', 'check'):
+            self.write(name, f'require("fs").readFileSync({LIVE!r})')
+            self.assertIsNone(self.classify('bun run ' + name))
+        self.write('pkg/hook.ts', f'require("fs").readFileSync({LIVE!r})')
+        for flag in ('--preload hook.ts', '--preload=hook.ts'):
+            for args in ('--cwd pkg ' + flag + ' test', flag + ' --cwd=pkg test',
+                         '--cwd pkg test ' + flag + " -t 'a.*b'"):
+                with self.subTest(args=args):
+                    self.assertIsNotNone(self.classify('bun ' + args))
+
+    def test_bun_115_preloads_before_subcommands(self):
+        self.write('bad.ts', f'require("fs").readFileSync({LIVE!r})')
+        for subcommand in ('repl', 'install', 'x prettier', 'exec "echo ok"', 'test', 'run check'):
+            for separator in (' ', '='):
+                command = 'bun --preload' + separator + './bad.ts ' + subcommand
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_bun_115_exec_cwd(self):
+        self.write('read.js', 'console.log("ok")')
+        self.write('pkg/read.js', f'require("fs").readFileSync({LIVE!r})')
+        for cwd in ('--cwd pkg', '--cwd=pkg'):
+            for separator in (' ', ' -- '):
+                for prefix in ('bun ' + cwd + ' exec', 'bun exec ' + cwd):
+                    command = prefix + separator + "'node read.js'"
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+        for separator in (' ', ' -- '):
+            self.assertIsNone(self.classify('bun exec' + separator + "'node read.js'"))
+            self.assertEqual(self.classify('bun exec' + separator + "'node pkg/read.js'"), SCRIPT)
+
+    def test_bun_115_repeated_cwd_uses_last_value(self):
+        for directory in ('one', 'two', 'one/two', 'two/two'):
+            for name in ('safe', 'bad'):
+                content = 'console.log("ok")'
+                if (name == 'bad') == (directory == 'two'):
+                    content = f'require("fs").readFileSync({LIVE!r})'
+                self.write(f'{directory}/{name}.js', content)
+                self.write(f'{directory}/test/{name}.test.ts', content)
+        values = [('one', 'two'), ('two', 'two'),
+                  (str(self.root / 'one'), 'two'), ('one', str(self.root / 'two')),
+                  ('"$unknown"', 'two'), ('one', 'two/../two')]
+        for first, last in values:
+            for first_separator, last_separator in ((' ', ' '), ('=', '='), (' ', '='), ('=', ' ')):
+                earlier = '--cwd' + first_separator + first
+                later = '--cwd' + last_separator + last
+                for mode in ('exec', 'test', 'run', ''):
+                    for name, expected in (('safe', None), ('bad', SCRIPT)):
+                        operand = (shlex.quote('node ' + name + '.js') if mode == 'exec' else
+                                   'test/' + name + ".test.ts -t 'a.*b'" if mode == 'test' else name + '.js')
+                        for prefix in ('bun ' + earlier + ' ' + mode + ' ' + later,
+                                       'bun ' + mode + ' ' + earlier + ' ' + later):
+                            command = prefix + ' ' + operand
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_repeated_cwd_preloads_use_final_directory(self):
+        self.write('one/two/safe.js', f'require("fs").readFileSync({LIVE!r})')
+        self.write('one/two/bad.js', 'console.log("ok")')
+        self.write('two/safe.js', 'console.log("ok")')
+        self.write('two/bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for separator in (' ', '='):
+            for names in (('safe', 'safe'), ('safe', 'bad'), ('bad', 'safe')):
+                expected = SCRIPT if 'bad' in names else None
+                first = '--preload' + separator + './' + names[0] + '.js'
+                last = '--preload' + separator + './' + names[1] + '.js'
+                for mode in ('test', 'exec "echo ok"', 'run check'):
+                    command = 'bun --cwd one ' + first + ' --cwd two ' + last + ' ' + mode
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_other_path_options_preserve_cwd_and_body(self):
+        self.write('pkg/safe.js', 'console.log("ok")')
+        self.write('pkg/bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for option in ('--cpu-prof-name', '--cpu-prof-dir', '--heap-prof-name', '--heap-prof-dir',
+                       '--redirect-warnings', '--tsconfig-override', '--env-file', '--config', '-c',
+                       '--coverage-dir', '--reporter-outfile'):
+            for separator in (' ', '='):
+                values = option + separator + 'one ' + option + separator + 'two'
+                for name, expected in (('safe', None), ('bad', SCRIPT)):
+                    command = 'bun --cwd pkg test ' + values + ' ./' + name + '.js'
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+                    if option not in {'--coverage-dir', '--reporter-outfile'}:
+                        command = 'bun --cwd pkg exec ' + values + ' ' + shlex.quote('node ' + name + '.js')
+                        with self.subTest(command=command):
+                            self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_exec_options_select_shell_operand(self):
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for option in ('--silent', '--smol', '--no-clear-screen', '--silent --smol',
+                       '--filter "pkg*"', '--filter="pkg*"'):
+            for prefix in ('bun ' + option + ' exec', 'bun exec ' + option,
+                           'bun ' + option + ' exec ' + option):
+                for separator in (' ', ' -- '):
+                    for name, expected in (('safe', None), ('bad', SCRIPT)):
+                        command = prefix + separator + shlex.quote('node ' + name + '.js')
+                        with self.subTest(command=command):
+                            self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_exec_value_options_select_shell_operand(self):
+        self.write('empty.env', '')
+        self.write('empty.toml', '')
+        self.write('tsconfig.json', '{}')
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        options = {
+            '--env-file': 'empty.env', '--cwd': '.', '--config': 'empty.toml', '-c': 'empty.toml',
+            '--filter': 'pkg*', '-F': 'pkg*', '--elide-lines': '2', '--shell': 'bun',
+            '--watch-kill-signal': 'SIGTERM', '--cpu-prof-name': 'cpu', '--cpu-prof-dir': '.',
+            '--cpu-prof-interval': '1000', '--heap-prof-name': 'heap', '--heap-prof-dir': '.',
+            '--heap-prof-interval': '524288', '--install': 'fallback', '--port': '3000',
+            '--conditions': 'development', '--fetch-preconnect': 'https://example.invalid',
+            '--max-http-header-size': '16384', '--dns-result-order': 'verbatim',
+            '--redirect-warnings': 'warnings.log', '--disable-warning': 'DEP0005',
+            '--title': 'bun exec test', '--unhandled-rejections': 'strict', '--console-depth': '2',
+            '--user-agent': 'bun test', '--cron-title': 'test', '--cron-period': '1000',
+            '--main-fields': 'main', '--extension-order': '.ts,.js',
+            '--tsconfig-override': 'tsconfig.json', '--define': 'TEST:true', '-d': 'TEST:true',
+            '--drop': 'console', '--feature': 'TEST', '--loader': '.js:js', '-l': '.js:js',
+            '--jsx-factory': 'React.createElement', '--jsx-fragment': 'React.Fragment',
+            '--jsx-import-source': 'react', '--jsx-runtime': 'automatic',
+        }
+        for flag, value in options.items():
+            for operand_separator in (' ', '='):
+                option = flag + operand_separator + shlex.quote(value)
+                for prefix in ('bun ' + option + ' exec', 'bun exec ' + option,
+                               'bun ' + option + ' exec ' + option):
+                    for separator in (' ', ' -- '):
+                        for name, expected in (('safe', None), ('bad', SCRIPT)):
+                            command = prefix + separator + shlex.quote('node ' + name + '.js')
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_exec_optional_inspect_values(self):
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        # Bun only takes an inspector address when attached with '='.
+        for flag in ('--inspect', '--inspect-wait', '--inspect-brk'):
+            for suffix in ('', '=127.0.0.1:0'):
+                option = flag + suffix
+                for prefix in ('bun ' + option + ' exec', 'bun exec ' + option):
+                    for separator in (' ', ' -- '):
+                        for name, expected in (('safe', None), ('bad', SCRIPT)):
+                            command = prefix + separator + shlex.quote('node ' + name + '.js')
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_exec_delimiter_preserves_leading_dash_body(self):
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for prefix in ('bun exec', 'bun --silent exec', 'bun exec --silent',
+                       'bun --silent exec --smol'):
+            for body_prefix in ('-missing || ', '--missing; ', '-e; ', '--preload=missing || '):
+                for name, expected in (('safe', None), ('bad', SCRIPT)):
+                    command = prefix + ' -- ' + shlex.quote(body_prefix + 'node ' + name + '.js')
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_absolute_test_files_after_unknown_cwd(self):
+        good = self.write('test/ok.test.ts', 'console.log("ok")')
+        bad = self.write('test/bad.test.ts', f'require("fs").readFileSync({LIVE!r})')
+        for prefix in ('cd "$d" && bun test ', 'bun --cwd "$d" test ',
+                       'offbox run -- \'cd "$d" && bun test '):
+            # Remote-only offbox payloads are allowed per #221.
+            bad_expected = None if prefix.startswith('offbox') else SCRIPT
+            for option in ('', ' -t "a.*b"', ' --test-name-pattern="a.*b"'):
+                for path, expected in ((good, None), (bad, bad_expected)):
+                    command = prefix + str(path) + option + ("'" if prefix.startswith('offbox') else '')
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+
+        with patch.object(Path, 'home', return_value=self.root), patch.dict(os.environ, {'HOME': str(self.root)}):
+            for home in ('~', '$HOME', '${HOME}'):
+                for name, expected in (('ok', None), ('bad', SCRIPT)):
+                    command = 'cd "$d" && bun test "' + home + '/test/' + name + '.test.ts"'
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_still_refuses(self):
+        self.write('test/bad.test.ts', f'require("fs").readFileSync({LIVE!r})')
+        self.write('pkg/bad.ts', f'require("fs").readFileSync({LIVE!r})')
+        commands = [
+            'bun test test/bad.test.ts', "bun test test/bad.test.ts -t 'a.*b'",
+            "bun test -t 'a.*b' test/bad.test.ts",
+            "env -u BUN_INSPECT ROBOB_TEST=1 bun test test/bad.test.ts --test-name-pattern 'a.*b|c'",
+            'cd "$d" && bun x.ts', 'cd "$d" && bun run scripts/x.ts',
+            'bun exec ' + shlex.quote('sqlite3 ' + LIVE),
+            'bun -e ' + shlex.quote(f'require("fs").readFileSync({LIVE!r})'),
+            "bun test 'test/*.test.ts'", 'bun --cwd pkg bad.ts', 'bun --cwd=pkg run bad.ts',
+            'bun test --bail test/bad.test.ts', 'bun test --bail 2 test/bad.test.ts',
+            'bun test --parallel test/bad.test.ts', 'bun test --changed test/bad.test.ts',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.classify(command))
+
     def table(self, rows):
         for command, expected in rows:
             with self.subTest(command=command):

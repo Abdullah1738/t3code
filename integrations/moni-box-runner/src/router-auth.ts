@@ -1,5 +1,7 @@
 import { chmodSync, closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 
 export const ROUTER_KEY_ERROR = "router-key-unavailable";
 export function routerConfig(config: { boxRouterPort?: unknown; macRouterPort?: unknown; boxLivezPort?: unknown; macLivezPort?: unknown; routerKeyFile?: unknown }) {
@@ -83,12 +85,45 @@ export async function routerReady(config: ReturnType<typeof routerConfig>, track
   track(outcome);
   return outcome.reason === "ready";
 }
+async function shortResetMs(response: Response): Promise<number | undefined> {
+  const after = response.headers.get("retry-after");
+  let ms: number;
+  if (after !== null) {
+    ms = /^\d+(?:\.\d+)?$/.test(after) ? Number(after) * 1000
+      : /^[A-Za-z]{3},/.test(after) ? Math.max(0, Date.parse(after) - Date.now()) : NaN;
+  } else {
+    const reader = response.clone().body?.getReader();
+    if (!reader) return;
+    const chunks: Uint8Array[] = []; let size = 0;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if ((size += value.length) > 64 * 1024) return;
+        chunks.push(value);
+      }
+      const bytes = Buffer.concat(chunks), encoding = response.headers.get("content-encoding");
+      const text = (encoding === "gzip" ? gunzipSync(bytes, { maxOutputLength: 64 * 1024 })
+        : encoding === "deflate" ? inflateSync(bytes, { maxOutputLength: 64 * 1024 })
+        : encoding === "br" ? brotliDecompressSync(bytes, { maxOutputLength: 64 * 1024 }) : bytes).toString();
+      const hint = /reset\s+after\s+(\d+(?:\.\d+)?)\s*(ms|s)\b/i.exec(text);
+      if (!hint) return;
+      ms = Number(hint[1]) * (hint[2]!.toLowerCase() === "ms" ? 1 : 1000);
+    } catch { return; }
+    finally { void reader.cancel().catch(() => {}); reader.releaseLock(); }
+  }
+  return Number.isFinite(ms) && ms >= 0 && ms <= 10_000 ? ms : undefined;
+}
+
 /**
  * Without `bearer` the client must already send the router key as x-api-key (Claude's apiKeyHelper).
  * With `bearer` (a per-run token) the client is Antigravity: it never sees the router key, the gate
  * accepts only `Authorization: Bearer <token>` and forwards with the real key in its place.
  */
-export function startRouterGate(config: ReturnType<typeof routerConfig>, unavailable: () => void, options: { bearer?: string } = {}) {
+export function startRouterGate(config: ReturnType<typeof routerConfig>, unavailable: () => void, options: {
+  bearer?: string;
+  retry429?: { signal?: AbortSignal; onRetry: (count: number) => void; onExhausted: () => void };
+} = {}) {
   // Claude can substitute an empty header when apiKeyHelper fails. Refuse before any prompt reaches the Mac.
   return Bun.serve({ hostname: "127.0.0.1", port: 0, maxRequestBodySize: 100 * 1024 * 1024, async fetch(request) {
     let key: string;
@@ -102,11 +137,34 @@ export function startRouterGate(config: ReturnType<typeof routerConfig>, unavail
     const url = new URL(request.url), headers = new Headers(request.headers);
     headers.delete("host"); headers.delete("authorization");
     if (options.bearer !== undefined) { headers.set("x-api-key", key); headers.set("x-goog-api-key", key); }
+    const retry = options.retry429;
+    const externalSignal = retry?.signal ? AbortSignal.any([request.signal, retry.signal]) : request.signal;
+    const budget = new AbortController(), signal = AbortSignal.any([externalSignal, budget.signal]);
+    let deadline = 0, timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await fetch(`http://127.0.0.1:${config.boxRouterPort}${url.pathname}${url.search}`, {
-        method: request.method, headers, body: request.body, redirect: "error", signal: request.signal, decompress: false,
-      });
-    } catch { return Response.json({ error: "router-unavailable" }, { status: 503 }); }
+      // Only opt-in clients buffer bodies. A stream is never forwarded twice.
+      const buffered = retry && request.body ? await request.arrayBuffer() : undefined;
+      for (let attempt = 1; ; attempt++) {
+        const response = await fetch(`http://127.0.0.1:${config.boxRouterPort}${url.pathname}${url.search}`, {
+          method: request.method, headers, body: buffered ?? request.body, redirect: "error", signal, decompress: false,
+        });
+        if (!retry || response.status !== 429) return response;
+        deadline ||= performance.now() + 10_000;
+        timer ??= setTimeout(() => budget.abort(), Math.max(0, deadline - performance.now()));
+        const reset = attempt < 3 && buffered ? await shortResetMs(response) : undefined;
+        if (reset === undefined || reset >= deadline - performance.now()) {
+          retry.onExhausted();
+          void response.body?.cancel().catch(() => {});
+          return Response.json({ error: "router-retries-exhausted" }, { status: 503 });
+        }
+        retry.onRetry(attempt);
+        await response.body?.cancel();
+        await delay(reset, undefined, { signal });
+      }
+    } catch {
+      if (deadline && !externalSignal.aborted) retry?.onExhausted();
+      return Response.json({ error: "router-unavailable" }, { status: 503 });
+    } finally { clearTimeout(timer); }
   } });
 }
 const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";

@@ -387,10 +387,11 @@ long-lived high PIDs hid a real 200-process burst after allocator wrap on this M
 The optional thread read has a two-second timeout.
 
 `userPct` excludes nice time; user + sys + nice is busy CPU. `kernelTaskPct`
-is null on normal samples. Spikes read the second frame of a bounded
-`top -l 2 -s 1 -pid 0` call, with `kernelTaskWindowS: 1` and cumulative
-`kernelTaskTime` for reference; failure sets `kernelTaskError`.
-The expensive read is limited to once per five minutes, including failed
+is null on normal samples. Spikes read the second frame of a
+`top -l 2 -s 1 -pid 0` call with a 15-second timeout, `kernelTaskWindowS: 1` and cumulative
+`kernelTaskTime` for reference; failure sets `kernelTaskError`. `kernelTaskWallMs`
+records the call's wall time rounded to the nearest millisecond, including errors.
+The expensive read is limited to once per 30 minutes, including failed
 attempts, using a wall timestamp in the existing sampler state. Skipped spikes
 report null CPU with `kernelTaskSkipped: "rate"`; quiet samples retain the
 cooldown, and a clock rollback starts a fresh cooldown.
