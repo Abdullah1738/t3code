@@ -7,6 +7,7 @@ else:
 
 from contextlib import redirect_stdout
 from functools import wraps
+import hashlib
 import io
 import json
 import os
@@ -244,6 +245,63 @@ def trusted_node_test(method):
         with self.trusted_node_environment():
             return method(self)
     return run
+
+
+class RefusalGuidanceTests(unittest.TestCase):
+    def test_recall_sqlite_detail_keeps_the_approved_route(self):
+        command = ("sqlite3 -readonly 'file:/Users/ardud/.local/share/opencode/opencode.db?immutable=1' "
+                   '"SELECT type,name,sql FROM sqlite_schema WHERE name IN (...)"')
+        rule, cause = guard.classify_detail(command, '/tmp')
+        self.assertEqual(rule, READ)
+        self.assertIn('line 1 names', cause)
+        self.assert_guidance(rule, cause)
+
+    def test_inline_python_detail_keeps_the_approved_route(self):
+        source = 'import sqlite3\n' + '# context\n' * 7 + "sqlite3.connect('/Users/ardud/.local/share/opencode/opencode.db')\n"
+        rule, cause = guard.classify_detail("python3 -I - <<'EOF'\n" + source + 'EOF', '/tmp')
+        self.assertEqual(rule, READ)
+        self.assertIn('<inline script>:9 names', cause)
+        self.assert_guidance(rule, cause)
+
+    def assert_guidance(self, rule, cause):
+        reason = guard.refusal_reason(rule, cause, '/tmp')
+        tail = guard.REASON.partition('\n')[2]
+        self.assertEqual(reason, 'statev2 guard: this command was NOT run.\n' + cause + '\n' + tail)
+        self.assertIn('live-db-snapshot --card <id> --ask <id> --db <path>', reason)
+
+    def test_only_live_database_detail_rules_append_guidance(self):
+        for rule in [READ, SCRIPT]:
+            with self.subTest(rule=rule):
+                self.assert_guidance(rule, 'line 1 names opencode.db.')
+        for rule in ['live-database-snapshot', 'live-database-unavailable', 'other-rule']:
+            with self.subTest(rule=rule):
+                self.assertEqual(guard.refusal_reason(rule, 'existing detail', '/tmp'),
+                                 'statev2 guard: this command was NOT run.\nexisting detail')
+
+    def test_no_cause_policy_is_byte_identical(self):
+        self.assertEqual(hashlib.sha256(guard.REASON.encode()).hexdigest(),
+                         '1683e7c85b2292019767ab04fbf800f2aed028d62b9e74718b5adf1625de463f')
+        for rule in [READ, SCRIPT]:
+            with self.subTest(rule=rule):
+                self.assertEqual(guard.refusal_reason(rule, None, '/tmp'), guard.REASON)
+
+    def test_unresolved_messages_are_byte_identical(self):
+        snapshots = {
+            'script source changed after its heredoc write':
+                'Could not check script source changed after its heredoc write. Resolved workdir: /tmp.\n'
+                'An intervening command may replace the checked source. Split source preparation and execution into separate calls.',
+            'node: repo-node-pin invalid':
+                'Could not check node: repo-node-pin invalid. Resolved workdir: /tmp.\n'
+                'Resolve the named startup input, then retry.',
+            'python3: bare executable lookup unproved; missing pin\nAccepted: use a literal path':
+                'Could not check python3: bare executable lookup unproved; missing pin. Resolved workdir: /tmp.\n'
+                'Accepted: retry this same call with /usr/bin/python3 -I … instead of bare python3; '
+                'the executable, startup and mutation checks still apply.',
+        }
+        for cause, snapshot in snapshots.items():
+            with self.subTest(cause=cause):
+                self.assertEqual(guard.refusal_reason(UNRESOLVED, cause, '/tmp'),
+                                 'statev2 guard: this command was NOT run.\n' + snapshot)
 
 
 class GuardTests(unittest.TestCase):
