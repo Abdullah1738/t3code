@@ -250,7 +250,7 @@ def cpu_fields(values):
     numeric = {'windowS', 'cpuS', 'totalCpuPct', 'ncpu', 'processCount', 'runnable',
                'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb',
                'skippedLines', 'badLines', 'lines', 'exiting', 'systemCpuPct',
-               'userPct', 'sysPct', 'nicePct', 'idlePct', 'kernelTaskPct', 'kernelTaskWindowS',
+               'userPct', 'sysPct', 'nicePct', 'idlePct', 'kernelTaskPct', 'kernelTaskWindowS', 'kernelTaskWallMs',
                'unattributedCpuPct', 'spawned', 'exited', 'uid', 'perMinute',
                'childCpuPct', 'childReadable', 'childUnreadable', 'childUncertainParents',
                'lostParents', 'unattributedAfterChildrenPct', 'observedSpawnsLowerBound',
@@ -447,12 +447,13 @@ def host_fields(values, event):
 
 MACGUARD_KEYS = set("""pid start comm args action result errno actionClass owner cpuDelta footprintGiB compressedGiB growthGiBMin history at cpuS memoryClass label key threadId evidence summary probe failure cycleMs durationS signals load rCount rZeroCount lagS pressure swap usedMb totalMb largest treeGiB strain reason tmuxSession log idlePct""".split())
 MACGUARD_KEYS.update(('app', 'bundleId', 'growthGiBHour', 'footprintSeries', 'step', 'detail'))
+MACGUARD_KEYS.update('stages renice identityRecheck taskpolicy same rc stderr strerror'.split())
 
 
 def macguard_fields(values, depth=0):
     # Only mac-guard opts into this bounded nested schema. Shared event kinds
     # retain their existing filters; process arguments use the CPU redactor.
-    from cpu_labels import command_label
+    from cpu_labels import command_label, bounded_detail
     if depth > 5:
         return None
     if isinstance(values, dict):
@@ -460,7 +461,9 @@ def macguard_fields(values, depth=0):
         for key, value in values.items():
             if key not in MACGUARD_KEYS:
                 continue
-            if key == 'threadId' and isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9:_%./@+-]{1,1000}', value):
+            if key in ('reason', 'stderr', 'strerror') and isinstance(value, str):
+                result[key] = bounded_detail(value)
+            elif key == 'threadId' and isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9:_%./@+-]{1,1000}', value):
                 result[key] = value
             else:
                 result[key] = macguard_fields(value, depth+1)
@@ -556,6 +559,9 @@ def janitor_mcp_fields(values):
 
 
 def safe_fields(values, event=None):
+    if event == 'guard.reclaim':
+        from guard_reclaim import log_fields
+        return log_fields(values or {})
     if event and event.startswith('macguard.'):
         return macguard_fields(values or {})
     if event == 'host.spawn_sample':
@@ -1006,7 +1012,7 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                     'crash.unified.skip', 'crash.source', 'crash.collect') and
                     row.get('props', {}).get('skippedS', 0) > 0)
                 # Preserve the bounded host heartbeat through a noisy day's cap.
-                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload', 'host.spawn_sample')
+                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload', 'host.spawn_sample', 'guard.reclaim', 'macguard.action')
                 if kind != 'error' and not coverage_gap and not host_sample and not dedup_id:
                     return
             append(fd, row)

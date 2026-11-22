@@ -227,7 +227,7 @@ class LoggingTests(unittest.TestCase):
             cve.main()
         with patch.object(cve,'scan',side_effect=RuntimeError('password=secret')), patch.object(cve,'REPORTS',str(self.root/'reports')), patch.object(cve,'HOLD_FILE',str(self.root/'hold.txt')):
             with self.assertRaises(RuntimeError):
-                cve.main()
+                cve.main([])
         for ok in (True,False):
             actions=cve.FixActions(report)
             actions.append(dict(ok=ok,what='pkg 1.0 -> 1.1',did='npm install -g'))

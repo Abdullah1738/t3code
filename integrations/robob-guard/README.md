@@ -3,7 +3,7 @@
 Recovers `/Applications/Robob.app` in the background when its backend is unavailable,
 and at login. It never reads the Robob database or signals OpenCode/provider workers.
 An unready registered desktop can be terminated before reopening. Only an unexpired
-install hold with a fresh heartbeat holds off recovery. There
+install hold with a fresh heartbeat or a live SSD read block holds off recovery. There
 is no stay-quit file or mode switch.
 
 `com.ardud.robob-guard` checks every 30 seconds, including `RunAtLoad`.
@@ -89,6 +89,15 @@ and its beat is less than 90 seconds old (missing, nonnumeric and future
 timestamps are invalid). At the age limit the beater stops and the guard
 ignores the hold even if its owner and heartbeat remain alive. Stale/dead holds are logged and left in
 place, and do not prevent reopening. Install holds reset the down count.
+
+Mac Upkeep #107 owns `~/.local/state/mac-upkeep/ssd-launchd-read-blocked`.
+While Robob is down, the guard holds recovery only if that marker is a JSON object
+and `~/.local/state/mac-upkeep/ssd-read-probe.json` is less than 300 seconds old.
+It logs `ssd-block:<lastOutcome>` with `since` and `lastOutcome`, without a new alert;
+a stale probe or unreadable marker is logged and ignored. Down checks keep counting,
+so recovery can proceed on the next check after the block clears. Install holds
+take precedence. Tests can override the paths with `ROBOB_GUARD_SSD_BLOCK_PATH`
+and `ROBOB_GUARD_SSD_PROBE_STATE_PATH`.
 
 The cutover scripts source `scripts/install-hold.zsh` before their first quit.
 It shares a verified parent hold across nested scripts and uses `zshexit`,

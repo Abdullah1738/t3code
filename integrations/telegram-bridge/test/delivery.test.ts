@@ -72,13 +72,13 @@ test("reports accepted ask notifications, retaining failed receipts without send
   await delivery.tick();
   expect(receipts).toHaveLength(0);
   await delivery.tick();
-  expect(h.store.get<{ key: string; at: number }>("ask-timing-pending:ask")).toEqual({ key: "robob:1380:q1", at: now });
+  expect(h.store.get<{ key: string; at: number }>("ask-timing-pending:robob:1380:q1")).toEqual({ key: "robob:1380:q1", at: now });
   fail = false;
   await delivery.tick();
   await delivery.tick();
   expect(receipts).toEqual([{ key: "robob:1380:q1", at: now }]);
   expect(h.calls.sends).toHaveLength(1);
-  expect(h.store.get("ask-timing-pending:ask")).toBeUndefined();
+  expect(h.store.get("ask-timing-pending:robob:1380:q1")).toBeUndefined();
 });
 
 test("queued legacy up notices are cancelled and all other queued text is redacted before chunking", async () => {
