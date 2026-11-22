@@ -295,6 +295,62 @@ class OneStateReadPerProtection(Base):
         self.assertEqual(len(self.asked), few)
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM meta WHERE k LIKE 'holder_gone:%'").fetchone()[0], 30)
 
+    def test_a_box_started_after_a_stopped_reading_cannot_revive_settled_commands(self):
+        """Rows are read before the reading; a stopped box had no process then, so the later start changes nothing
+        for them. A command that is still running is held whatever the box says."""
+        self.past(4)
+        self.con.execute("INSERT INTO commands(box_id,pid,command_id,status,run_id,attempt,holder,metrics,started_at) "
+                         "VALUES (?,2000,'cmd-live','running','run-live',1,'thread:holder','{}',1)", (self.bid,))
+        answers = [b'{"status":"Stopped","pid":0}']
+        original = boatd.incus
+        def incus(*args, **kw):
+            if args[:1] == ('query',) and args[1].endswith('/state') and answers:
+                self.asked.append(args[1])
+                return subprocess.CompletedProcess(args, 0, answers.pop(), b'')
+            return original(*args, **kw)
+        with patch.object(boatd, 'incus', incus):
+            snapshot = boatd.box_protection(self.con, self.bid)
+        self.assertEqual([h['process_id'] for h in snapshot['holds']], [2000])
+        self.assertFalse(snapshot['confirmedGone'])
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM meta WHERE k LIKE 'holder_gone:%'").fetchone()[0], 4)
+
+    def test_a_box_stopped_during_the_read_is_asked_again(self):
+        self.past(3)
+        real = boatd._proc_start
+        def gone_after_first(pid, seen=[]):
+            seen.append(pid)
+            if len(seen) == 2:
+                self.state = b'{"status":"Stopped","pid":0}'
+            return real(pid) if len(seen) < 2 else None
+        with patch.object(boatd, '_proc_start', side_effect=gone_after_first):
+            snapshot = boatd.box_protection(self.con, self.bid)
+        # The first command was read from the live root and stays held; the rest saw the fresh stopped answer.
+        self.assertEqual([h['process_id'] for h in snapshot['holds']], [1003])
+
+    def test_an_incus_failure_is_not_remembered_and_never_frees_a_command(self):
+        self.past(4)
+        original = boatd.incus
+        def failing(*args, **kw):
+            if args[:1] == ('query',) and args[1].endswith('/state'):
+                self.asked.append(args[1])
+                return subprocess.CompletedProcess(args, 1, b'', b'Error: connection refused')
+            return original(*args, **kw)
+        with patch.object(boatd, 'incus', failing):
+            snapshot = boatd.box_protection(self.con, self.bid)
+        self.assertEqual((len(self.asked), len(snapshot['holds'])), (4, 4))
+        self.assertTrue(all(h['probe'] == {'reason': 'incus_unavailable'} for h in snapshot['holds']))
+
+    def test_a_failed_read_leaves_nothing_shared_behind(self):
+        self.past(2)
+        with patch.object(boatd, 'command_probe', side_effect=RuntimeError('boom')), self.assertRaises(RuntimeError):
+            boatd.box_protection(self.con, self.bid)
+        self.assertIsNone(boatd._BOX_STATE.get())
+
+    def test_an_init_name_that_is_not_text_still_reads_its_start_time(self):
+        (self.tmp/'proc'/str(self.INIT)/'stat').write_bytes(
+            b"5000 (in\xff\xfe) it) S 1 " + b' '.join([b'0']*17) + b" 4242 0 0\n")
+        self.assertEqual(boatd._proc_start(self.INIT), '4242')
+
     def test_nothing_is_shared_between_two_reads_or_two_boxes(self):
         other = self.box('bx_bbbbbbbb', port=22001)
         self.past(2)

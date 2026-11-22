@@ -1738,8 +1738,8 @@ def shared_box_state():
 
 def _proc_start(pid) -> str | None:
     try:
-        return (PROC_ROOT / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()[19]
-    except (OSError, IndexError):
+        return (PROC_ROOT / str(pid) / 'stat').read_text(errors='replace').rsplit(')', 1)[1].split()[19]
+    except (OSError, ValueError, IndexError):
         return None
 
 
@@ -1764,13 +1764,15 @@ def box_state(box_id: str) -> dict:
     """{'answer': view} when the box itself settles the probe, else {'init': host PID of its init}."""
     shared = _BOX_STATE.get()
     known = shared.get(box_id) if shared is not None else None
-    # A stopped or missing box had no process at that reading, and an unreadable one proves nothing either way.
+    # A stopped or missing box had no process at that reading. Every row of the read was fetched before it and
+    # only settled rows are retired, so a start after the reading cannot bring one of their processes back.
     # A running box's init is reused only while that PID is provably the same process: a restart is asked again.
     if known is not None and ('answer' in known or
                               (known['start'] is not None and _proc_start(known['init']) == known['start'])):
         return known
     state = _ask_box_state(box_id)
-    if shared is not None:
+    # An unreadable box or an Incus failure proves nothing and may be transient: ask again for the next command.
+    if shared is not None and (state.get('answer', {}).get('stopped') or 'init' in state):
         shared[box_id] = state
     return state
 
@@ -1780,7 +1782,7 @@ def command_probe(c) -> dict:
     try:
         state = box_state(c['box_id'])
         if 'answer' in state:
-            return dict(state['answer'])
+            return {k: list(v) if isinstance(v, list) else v for k, v in state['answer'].items()}
         init = state['init']
         root = PROC_ROOT / str(init) / 'root'
         base = root / "run/boatd" / f"{c['pid']}.{c['attempt'] or 1}"
