@@ -41,8 +41,8 @@ class UnifiedChunkTests(unittest.TestCase):
 
     def log_command(self, cmd, **kwargs):
         def value(flag):
-            return dt.datetime.fromisoformat(cmd[cmd.index(flag)+1]).replace(tzinfo=dt.timezone.utc).timestamp()
-        start, end = value('--start'), value('--end')-1
+            return dt.datetime.strptime(cmd[cmd.index(flag)+1], '%Y-%m-%d %H:%M:%S%z').replace(tzinfo=dt.timezone.utc).timestamp()
+        start, end = value('--start'), value('--end')
         self.calls.append((start, end, kwargs['timeout']))
         # Large windows reproduce the original timeout; small windows complete.
         cost = self.chunk_cost(end-start)
