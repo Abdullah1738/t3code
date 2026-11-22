@@ -2,6 +2,18 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { expandTelemetry } from "../src/log-format.ts";
+
+if (process.env.HEALTH_TIMING_CHILD !== "1") {
+  test("health timing assertions run with isolated runner imports", async () => {
+    const child = Bun.spawn([process.execPath, "test", import.meta.path], {
+      env: { ...process.env, BUN_INSPECT: undefined, HEALTH_TIMING_CHILD: "1" }, stdout: "pipe", stderr: "pipe",
+    });
+    const output = new Response(child.stdout).text(), error = new Response(child.stderr).text();
+    const [code, stdout, stderr] = await Promise.all([child.exited, output, error]);
+    expect(code, stdout + stderr).toBe(0);
+  }, 30_000);
+} else {
 
 const sandbox = mkdtempSync(join(tmpdir(), "health-timing-"));
 const runtime = resolve(process.env.HEALTH_TIMING_RUNTIME ?? join(import.meta.dir, ".."));
@@ -62,8 +74,9 @@ for (const kind of ["schedule", "retry", "missing", "zero", "negative", "trigger
       expect(row.props.startLagMs).toBeNull();
     }
     const runs = readdirSync(toolLogs).filter(name => name.endsWith(".ndjson"))
-      .flatMap(name => readFileSync(join(toolLogs, name), "utf8").trim().split("\n").map(line => JSON.parse(line)))
+      .flatMap(name => readFileSync(join(toolLogs, name), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line))))
       .filter(row => row.name === "watch.run");
-    expect(runs.at(-1).props).toMatchObject({ exitCode: 0, outcome: "no_change" });
+    expect(runs.at(-1)!.props).toMatchObject({ exitCode: 0, outcome: "no_change" });
   });
+}
 }

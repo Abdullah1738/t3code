@@ -1,3 +1,4 @@
+import { expandTelemetry } from "../src/log-volume.ts";
 import { afterAll, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,7 +36,7 @@ const rollupFor = (id: string) => {
   expect(result.exitCode).toBe(0);
   return JSON.parse(result.stdout.toString()).byWatcher[id];
 };
-const events = (name: string, watcher?: string) => readFileSync(join(sandbox, "logs", new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row.name === name && (!watcher || row.ids?.watcher === watcher));
+const events = (name: string, watcher?: string) => readFileSync(join(sandbox, "logs", new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line))).filter(row => row.name === name && (!watcher || (row.ids as Record<string, unknown> | undefined)?.watcher === watcher));
 
 async function runnerFor(ms: number) {
   const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/runner.ts")], { env, stdout: "ignore", stderr: "ignore" });
@@ -90,7 +91,7 @@ async function busyProbe(script: string) {
   const logDir = join(root, "logs");
   const logFiles = readdirSync(logDir).filter(name => name.endsWith(".ndjson")).sort();
   expect(logFiles.length).toBeGreaterThan(0);
-  const rows = logFiles.flatMap(name => readFileSync(join(logDir, name), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)));
+  const rows = logFiles.flatMap(name => readFileSync(join(logDir, name), "utf8").trim().split("\n").filter(Boolean).flatMap(line => expandTelemetry(JSON.parse(line))));
   return { root, result: JSON.parse(output.trim().split("\n").at(-1)!), rows,
     calls: existsSync(callLog) ? readFileSync(callLog,"utf8").trim().split("\n").map(line=>JSON.parse(line) as string[]) : [] };
 }
@@ -578,7 +579,7 @@ test("checks run with bounded concurrency; queue time does not count against the
     expect(state(`conc${i}`).consecutive_failures).toBe(0);
     expect(state(`conc${i}`).last_run_ms).toBeGreaterThanOrEqual(900);
   }
-  const rows = readFileSync(join(env.TOOLLOG_DIR, new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  const rows = readFileSync(join(env.TOOLLOG_DIR, new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line)));
   const admitted = rows.filter(row => row.name === "slot.start" && /^conc[1-4]$/.test(row.ids?.watcher));
   expect(admitted).toHaveLength(4);
   expect(admitted.filter(row => row.props.slotWaitMs >= 900)).toHaveLength(2);
@@ -706,7 +707,8 @@ test.each([
     await tickOne("pending-admission");
     const {rollup}=await import(${JSON.stringify(join(import.meta.dir, "../src/toollog.ts"))});
     const day=new Date().toISOString().slice(0,10);
-    const rows=readFileSync(join(process.env.TOOLLOG_DIR,day+".ndjson"),"utf8").trim().split("\\n").map(JSON.parse);
+    const {expandTelemetry}=await import(${JSON.stringify(join(import.meta.dir, "../src/log-format.ts"))});
+    const rows=readFileSync(join(process.env.TOOLLOG_DIR,day+".ndjson"),"utf8").trim().split("\\n").flatMap(line=>expandTelemetry(JSON.parse(line)));
     console.log(JSON.stringify({intercepted,ran:existsSync(marker)?readFileSync(marker,"utf8"):null,
       starts:rows.filter(row=>row.name==="slot.start" && row.props.operation==="pending"),
       watcher:(await rollup(day,process.env.TOOLLOG_DIR)).byWatcher["pending-admission"]}));

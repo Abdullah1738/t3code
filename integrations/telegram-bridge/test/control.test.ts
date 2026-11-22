@@ -126,10 +126,13 @@ test("JSON body failures preserve transport causes with signal and HTTP preceden
       }), { status: entry.status }), { preconnect: original.preconnect });
       await expect(client.request("GET", "/requests", undefined, { signal: entry.signal }))
         .rejects.toMatchObject({ status: entry.status, causeClass: entry.cause });
-      expect(logs.entries().at(-1)?.props?.cause).toBe(entry.cause);
+      expect(logs.entries().filter(row => row.props?.cause === entry.cause).map(row => row.props?.cause)).toEqual([entry.cause]);
     }
   } finally { globalThis.fetch = original; }
+  expect(logs.entries().map(row => row.props?.cause)).toEqual(["decode", "ECONNRESET", "ETIMEDOUT", "abort", "timeout", 503, "unclassified"]);
+  logs.flushErrors();
   expect(logs.entries()).toHaveLength(cases.length);
+  expect(logs.entries().at(-1)?.props).toEqual({ cause: "timeout", detail: "TimeoutError", repeats: 1, windowMs: expect.any(Number) });
   expect(logs.text()).not.toContain(secret);
   expect(logs.text()).not.toContain("PRIVATE_CODE");
   expect(logs.text()).not.toContain("test-token");

@@ -324,6 +324,62 @@ def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=No
         pass
 
 
+_WATCHER_TIMING_KEYS = ('slotWaitMs', 'slotQueueDepth', 'slotActiveAtEnqueue', 'startLateMs',
+                        'intervalMs', 'queuedMs', 'outcome', 'exitCode', 'signal', 'timedOut',
+                        'dueAt', 'lateMs', 'lane', 'loadMode', 'trigger')
+
+
+def _watcher_rows(row):
+    """Restore the logical watcher records before filtering or aggregating."""
+    name = row.get('name')
+    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+    ids = row.get('ids') if isinstance(row.get('ids'), dict) else {}
+    if row.get('v') == 1 and isinstance(name, str) and (name in {'watch.run', 'helper.run'} or name.startswith('slot.')):
+        props = dict(props)
+        timing = props.pop('timing', None)
+        if isinstance(timing, list) and timing and type(timing[0]) is int and 0 <= timing[0] < 1 << len(_WATCHER_TIMING_KEYS):
+            values = iter(timing[1:])
+            for bit, key in enumerate(_WATCHER_TIMING_KEYS):
+                if timing[0] & 1 << bit:
+                    props[key] = next(values, None)
+        ids = { {'w': 'watcher', 'r': 'run', 'h': 'helper'}.get(key, key): value for key, value in ids.items() }
+        row = {'tool': 'watchers', 'kind': 'perf', 'component': 'helpers' if name == 'helper.run' else 'runner',
+               **{key: value for key, value in row.items() if key != 'v'}, 'ids': ids, 'props': props}
+    compact = props.get('compact')
+    if name == 'helper.run' and isinstance(compact, str) and re.fullmatch(r'(?:s?t?w?|1)', compact):
+        props = {key: value for key, value in props.items() if key != 'compact'}
+        row = {**row, 'ok': True, 'ids': {**ids, **({'watcher': ids.get('helper')} if 'w' in compact else {})},
+               'props': {**props, 'exitCode': 0, **({'signal': None} if 's' in compact else {}),
+                         **({'timedOut': False} if 't' in compact else {})}}
+    def milliseconds(value):
+        return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 8.64e15
+    if name != 'watch.run' or not milliseconds(props.get('slotAt')):
+        return [row]
+    def timestamp(at):
+        return datetime.fromtimestamp(at / 1000, timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    slot = {'tool': row.get('tool'), 'component': 'runner', 'kind': 'perf', 'ids': ids}
+    slots = []
+    try:
+        if props.get('slotWritten') is not True:
+            slots.append({**slot, 'ts': timestamp(props['slotAt']), 'name': 'slot.start',
+                          'props': {**{key: props[key] for key in _WATCHER_TIMING_KEYS[:5] if key in props}, 'operation': 'check'}})
+        parts = ([[props['holdAt'], props['holdMs']]] if milliseconds(props.get('holdMs')) and milliseconds(props.get('holdAt'))
+                 else props['holdParts'][:16] if isinstance(props.get('holdParts'), list) else [])
+        for part in parts:
+            if isinstance(part, list) and len(part) >= 2 and milliseconds(part[0]) and milliseconds(part[1]):
+                slots.append({**slot, 'ts': timestamp(part[0]), 'name': 'slot.hold', 'durationMs': part[1],
+                              'props': {'operation': 'check', 'lane': props.get('lane') or 'slow'}})
+    except (ValueError, OverflowError, OSError):
+        return [row]
+    return [*slots, row]
+
+
+def _error_occurrences(row):
+    props = row.get('props')
+    repeats = props.get('repeats') if isinstance(props, dict) else None
+    return repeats if row.get('kind') == 'error' and type(repeats) is int and 1 <= repeats <= 2**53 - 1 else 1
+
+
 def _read_records(board, day):
     # Validate dates before constructing paths, including dates supplied by another board.
     if datetime.strptime(day, '%Y-%m-%d').strftime('%Y-%m-%d') != day:
@@ -337,7 +393,8 @@ def _read_records(board, day):
                 row = json.loads(line)
                 if not isinstance(row, dict):
                     continue
-                yield line_number, row
+                for expanded in _watcher_rows(row) if board == 'watchers' else [row]:
+                    yield line_number, expanded
             except (ValueError, UnicodeError):
                 continue
 
@@ -806,8 +863,9 @@ def rollup(board, day, top_n=20):
         if board == 'imessage':
             single_failures += row.get('_rollup_single_failures', 0)
         aggregate = board == 'imessage' and '_rollup_count' in row
-        weight = row['_rollup_count'] if aggregate else _sample_rate(row)
-        sampled |= weight > 1 and not aggregate
+        rate = _sample_rate(row)
+        weight = row['_rollup_count'] if aggregate else _error_occurrences(row) if board == 'watchers' and row.get('kind') == 'error' else rate
+        sampled |= rate > 1 and not aggregate
         total += weight
         if row.get('name') in {'log.cap', 'log.degraded'}:
             props = row.get('props') or {}

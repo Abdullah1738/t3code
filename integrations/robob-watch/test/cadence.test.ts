@@ -205,7 +205,8 @@ test("runner emits due/late/lane/load metadata and reclassifies a fast check's n
       await tickOne(id);
       const first=lib.loadState(id);lib.saveState(id,{...first,next_at:0});
       await tickOne(id);
-      const lines=readdirSync(process.env.TOOLLOG_DIR).filter(x=>x.endsWith(".ndjson")).flatMap(file=>readFileSync(join(process.env.TOOLLOG_DIR,file),"utf8").trim().split("\\n").map(JSON.parse));
+      const {expandTelemetry}=await import(${JSON.stringify(join(import.meta.dir, "../src/log-format.ts"))});
+      const lines=readdirSync(process.env.TOOLLOG_DIR).filter(x=>x.endsWith(".ndjson")).flatMap(file=>readFileSync(join(process.env.TOOLLOG_DIR,file),"utf8").trim().split("\\n").flatMap(line=>expandTelemetry(JSON.parse(line))));
       console.log(JSON.stringify(lines.filter(x=>x.name==="watch.run")));
     `], { env: { ...process.env, BUN_INSPECT: undefined, ROBOB_TEST: "1", ROBOB_WATCH_ROOT: join(dir, "root"), TOOLLOG_DIR: join(dir, "logs"), ROBOB_WATCH_LOAD_OVERRIDE: ".1" } });
     expect(child.stderr.toString()).toBe("");
