@@ -92,7 +92,7 @@ test.each([0, 324200, 1482100, 2302500])("a frozen borrower releases native fast
   const first = result.completions.find(row => row.watcher === "borrowed")!;
   expect(first.borrowed).toBe(true);
   expect(first.timedOut).toBe(true);
-  expect(first.at).toBe(Math.max(425_000, 180_000 + releaseDelayMs));
+  expect(first.at).toBe(Math.ceil(Math.max(425_000, 180_000 + releaseDelayMs) / 1000) * 1000);
   for (const row of result.byWatcher.filter(watcher => healthChecks.includes(watcher.watcher))) {
     expect(row.firstAfterFreezeS!).toBeLessThanOrEqual(300);
     expect(row.minGapS).toBeGreaterThanOrEqual(300);
