@@ -24,7 +24,7 @@ type Fixture = {
   requireSendJournal?: boolean;
   sendAmbiguous?: boolean;
   sendDiagnostic?: string;
-  sendDiagnosticStream?: "stdout" | "stderr";
+  sendDiagnosticStream?: "stdout" | "stderr" | "split";
   strictWakeKey?: boolean;
   wakeAmbiguousOnce?: boolean;
   sendSleep?: boolean;
@@ -74,7 +74,10 @@ if (${JSON.stringify(cli)} === 't3ctl') {
   if (args[0] === 'send' && config.sendDiagnostic) {
     const quote = ${shellQuote.toString()};
     const retry = ['t3ctl', 'send', quote(args[1]), '--request-id', quote(args[4]), '--mode', quote(args[6]), '--', quote(args[2])].join(' ');
-    console[config.sendDiagnosticStream === 'stdout' ? 'log' : 'error'](config.sendDiagnostic + '. Retry safely with: ' + retry);
+    if (config.sendDiagnosticStream === 'split') {
+      console.log('Retry safely with: ' + retry);
+      console.error(config.sendDiagnostic);
+    } else console[config.sendDiagnosticStream === 'stdout' ? 'log' : 'error'](config.sendDiagnostic + '. Retry safely with: ' + retry);
     process.exit(4);
   }
   if (args[0] === 'status' && config.sendSpawnError) unlinkSync(import.meta.path);
@@ -608,6 +611,56 @@ test.each(routeFailureWords.flatMap(word => sendPhases.map(phase => ({ word, pha
     else expect(logs.find(row => row.name === 'wake.send_retry')?.props?.outcome).toBe('definite');
   },
 );
+
+test.each(routeFailureWords.flatMap(word => sendPhases.map(phase => ({ word, phase }))))(
+  'exit-1 unavailable code overrides quoted $word message during $phase', async ({ word, phase }) => {
+    const sendFailure = `unavailable: Backend recovering for thread title '${word} event'`;
+    const { result, calls, sentLogs, logs } = await fixture(phase === 'initial' ? { sendFailure }
+      : phase === 'retry' ? { sendFailure: 'fetch failed' } : { sendAmbiguous: true }, confirmBody(phase === 'initial' ? '' : `
+      writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false },
+        sendFailure: ${JSON.stringify(sendFailure)} }));
+      ${phase === 'retry' ? 'Date.now = () => before.confirm.nextAt;' : ''}
+      await tickOne(watcher.id);
+    `));
+    expect(result.state.confirm).toMatchObject({ thread: projectThread, sendPending: true });
+    expect(result.state.confirm?.ownerFallback).not.toBe(true);
+    expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+    if (phase === 'initial') expect(sentLogs[0]?.props?.failureClass).toBe('timeout');
+    else expect(logs.find(row => row.name === 'wake.send_retry')?.props?.outcome).toBe('deferred');
+  },
+);
+
+test.each(routeFailureWords)('exit-1 status unavailable code overrides quoted %s message', async word => {
+  const { result, calls } = await fixture({ statusFailure: `unavailable: Backend recovering for thread title '${word} event'` });
+  expect(result.via).toBe('thread:abcd1234');
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+});
+
+test.each(sendPhases)('a combined retry hint before its diagnostic stays ambiguous during %s', async phase => {
+  const sendDiagnostic = 'send connection dropped; it may or may not have been delivered';
+  const { result, calls, sentLogs, logs, log } = await fixture({ watcher: { title: 'archived event' },
+    ...(phase === 'initial' ? { sendDiagnostic, sendDiagnosticStream: 'split' }
+      : phase === 'retry' ? { sendFailure: 'fetch failed' } : { sendAmbiguous: true }) }, confirmBody(phase === 'initial' ? '' : `
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false },
+      sendDiagnostic: ${JSON.stringify(sendDiagnostic)}, sendDiagnosticStream: 'split' }));
+    ${phase === 'retry' ? 'Date.now = () => before.confirm.nextAt;' : ''}
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toMatchObject({ thread: projectThread });
+  expect(result.state.confirm?.ownerFallback).not.toBe(true);
+  expect(result.state.confirm?.sendPending).toBeUndefined();
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+  const sends = calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send');
+  expect(sends).toHaveLength(phase === 'initial' ? 1 : 2);
+  expect(helperRuns(logs, 'send').at(-1)?.props?.exitCode).toBe(4);
+  if (phase === 'initial') {
+    expect(log).toContain(sendDiagnostic);
+    expect(sentLogs[0]?.props?.failureClass).toBe('control_api_unavailable');
+  } else {
+    expect(sends[1]!.args).toEqual(sends[0]!.args);
+    expect(logs.find(row => row.name === 'wake.send_retry')?.props?.outcome).toBe('ambiguous');
+  }
+});
 
 test.each([
   'fetch failed', 'ECONNREFUSED: connect failed', 'ECONNRESET', 'socket hang up', 'EPIPE',

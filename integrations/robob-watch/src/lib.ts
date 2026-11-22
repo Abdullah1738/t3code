@@ -893,7 +893,11 @@ function creatorSendTimeout(): number {
   return underTest() && process.env.ROBOB_WATCH_T3CTL && Number.isInteger(override) && override > 0 && override < 20_000 ? override : 20_000;
 }
 
-const definiteRouteFailure = (out: string) => /\b(not_found|archived|invalid[_ ](?:id|thread|session))\b/i.exec(out)?.[1]?.toLowerCase().replaceAll(" ", "_");
+const definiteRouteFailure = (out: string) => {
+  // t3ctl prints <code>: <message>; the message can quote a thread title containing route-error words.
+  const code = /^\s*([a-z][a-z0-9_]*|invalid (?:id|thread|session)):/i.exec(out)?.[1];
+  return /\b(not_found|archived|invalid[_ ](?:id|thread|session))\b/i.exec(code ?? out)?.[1]?.toLowerCase().replaceAll(" ", "_");
+};
 
 async function creatorRoute(watcher: Watcher, session: string, cli: string, diagnostics = true): Promise<CreatorRoute> {
   const routeLog = (id: string | null, message: string) => { if (diagnostics) log(id, message); };
@@ -1048,7 +1052,7 @@ const sendDiagnostic = (result: SendResult) => [result.stderr ?? "", result.out]
 const controlApiUnavailable = (diagnostic: string) => /\b(?:fetch failed|ECONNREFUSED|ECONNRESET|socket hang up|EPIPE|server_restart|HTTP\s+(?:502|503|504)|connection dropped)\b/i.test(diagnostic);
 function sendFailureClass(result: SendResult): "control_api_unavailable" | "timeout" | "definite" | "other" {
   const diagnostic = sendDiagnostic(result);
-  if (definiteRouteFailure(diagnostic)) return "definite";
+  if (!ambiguousSend(result) && definiteRouteFailure(diagnostic)) return "definite";
   if (result.signal === "SIGKILL" || /(?:^|\n)unavailable:/i.test(diagnostic)
     || /\b(?:timed? out|timeout|TimeoutError)\b/i.test(diagnostic)) return "timeout";
   return controlApiUnavailable(diagnostic) ? "control_api_unavailable" : "other";
