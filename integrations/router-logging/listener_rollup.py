@@ -5,8 +5,8 @@ import math
 
 from host import clean_host
 from guard import recent_failure
-from observer import GAP_NAMES, measured
-from causes import launchctl_info, unknown as unknown_cause
+from observer import GAP_NAMES, gap_bounds, measured
+from causes import launchctl_info, positive, unknown as unknown_cause
 
 
 def timestamp(value):
@@ -25,9 +25,12 @@ def transitions(path, observations=None):
                     continue
                 try:
                     row = json.loads(line)
-                    if (observations is not None and row.get('tool') == '9router' and row.get('name') in (*GAP_NAMES, 'poll.complete', 'listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved')
-                            and (row['name'] != 'pool.endpoint.get' or isinstance(row.get('durationMs'), (int, float)) and row['durationMs'] > 120000)):
-                        observations.append(row)
+                    if observations is not None and row.get('tool') == '9router' and row.get('name') in (*GAP_NAMES, 'poll.complete', 'listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved'):
+                        bounds = gap_bounds(row.get('props')) if row['name'] == 'pool.endpoint.get' else None
+                        if (row['name'] != 'pool.endpoint.get' or
+                                positive(row.get('durationMs')) and row['durationMs'] > 120000 or
+                                bounds is not None and bounds[1] - bounds[0] > 120000):
+                            observations.append(row)
                     if row.get('tool') == '9router' and row.get('name') in ('listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved', 'deploy.result') and timestamp(row.get('ts')) is not None:
                         yield row
                 except (ValueError, AttributeError):

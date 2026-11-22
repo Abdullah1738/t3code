@@ -13,7 +13,7 @@ import time
 
 from host import Sampler, clean_host, poll_props
 from toollog import emit, trimmed_stderr
-from causes import PHASES, evidence, gap_info, launchctl_info
+from causes import PHASES, gap_info, launchctl_info, positive
 
 JOB = 'com.ardud.9router-log-poll'
 FIELDS = {name: field for name, field in PHASES.items() if name != 'pool_fetch'}
@@ -95,6 +95,23 @@ def launchctl_cause(props):
 GAP_NAMES = {'observer.gap', 'guard.tick_late', 'poll.phases', 'rollup.phases', 'pool.endpoint.get'}
 
 
+def gap_bounds(props):
+    if not isinstance(props, dict):
+        return None
+    try:
+        start, end = props.get('startedAtMs'), props.get('finishedAtMs')
+        if start is None or end is None:
+            parsed = [dt.datetime.fromisoformat(props[key].replace('Z', '+00:00')) for key in ('start', 'end')]
+            if any(value.tzinfo is None for value in parsed):
+                return None
+            start, end = [value.timestamp() * 1000 for value in parsed]
+        if all(type(value) in (int, float) and math.isfinite(value) for value in (start, end)):
+            return start, end
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        pass
+    return None
+
+
 def gap_summary(rows, day, generated):
     floor = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc).timestamp() * 1000
     ceiling = min(floor + 86400000, generated.timestamp() * 1000)
@@ -104,24 +121,14 @@ def gap_summary(rows, day, generated):
         if row.get('name') not in GAP_NAMES or row.get('component') not in ('guard', 'poller', 'pool-alerts'):
             continue
         props = row.get('props', {})
-        if not isinstance(props, dict):
+        bounds = gap_bounds(props)
+        if bounds is None:
             continue
+        start, end = bounds
         try:
-            start = props.get('startedAtMs')
-            end = props.get('finishedAtMs')
-            if start is None or end is None:
-                parsed = [dt.datetime.fromisoformat(props[key].replace('Z', '+00:00')) for key in ('start', 'end')]
-                if any(value.tzinfo is None for value in parsed):
-                    continue
-                start, end = [value.timestamp() * 1000 for value in parsed]
-            if not all(type(value) in (int, float) and math.isfinite(value) for value in (start, end)):
-                continue
             if end - start <= 120000 or end > generated.timestamp() * 1000:
                 continue
             duration = row.get('durationMs', 0)
-            wall_gap = props.get('wallGapMs', 0)
-            if row['name'] != 'observer.gap' and not any(type(value) in (int, float) and value > 120000 for value in (duration, wall_gap)):
-                continue
             overlap = max(0, min(ceiling, end) - max(floor, start))
             if not overlap:
                 continue
@@ -132,8 +139,12 @@ def gap_summary(rows, day, generated):
         if identity in seen:
             continue
         seen.add(identity)
-        explanation = (evidence('tick_blocked:pool_fetch', 'durationMs', duration)
-                       if row.get('name') == 'pool.endpoint.get' else gap_info(props, props.get('phase')))
+        timing_props = dict(props, poolFetchMs=duration) if row.get('name') == 'pool.endpoint.get' else props
+        # Attribute the full span before clipping its duration to this UTC day.
+        elapsed = max(end - start, duration if positive(duration) else 0)
+        explanation = gap_info(timing_props, props.get('phase'), duration_ms=elapsed)
+        if explanation.get('causeEvidenceField') == 'poolFetchMs':
+            explanation['causeEvidenceField'] = 'durationMs'
         bucket = groups['guardGaps' if component == 'guard' else 'pollGaps']
         hosts = {key: clean_host(props.get(key)) for key in ('hostStart', 'hostEnd')}
         hosts = {key: value for key, value in hosts.items() if value}
@@ -268,14 +279,12 @@ class Timings:
         self.end['hostAtMs'] = self.start['hostAtMs']
         elapsed = max(0, self.end['monotonicMs'] - self.start['monotonicMs'])
         wall = self.end['wallMs'] - self.start['wallMs']
-        missing = gap(self.start, self.end, cadence_ms=0)
-        slowest = max(self.values, key=self.values.get)
         if max(elapsed, wall) <= self.threshold:
             return
         with phase('post_end_diag'):
-            self.end['host'] = self.sample_host()
-            self.end.update(clock_sample())
-            self.end['hostAtMs'] = self.end['wallMs']
+            end_host = self.sample_host()
+            self.end = dict(clock_sample(), **end_job)
+            self.end.update(host=end_host, hostAtMs=self.end['wallMs'])
         elapsed = max(0, self.end['monotonicMs'] - self.start['monotonicMs'])
         wall = self.end['wallMs'] - self.start['wallMs']
         missing = gap(self.start, self.end, cadence_ms=0)
@@ -305,7 +314,13 @@ class Timings:
 
 def poll_host():
     timing = _active.get()
-    return poll_props(timing.start.get('host', {}), timing.start['hostAtMs']) if timing else {}
+    if timing is None:
+        return {}
+    start = timing.start if isinstance(timing.start, dict) else {}
+    at_ms = start.get('hostAtMs')
+    if type(at_ms) not in (int, float) or not (at_ms == 0 or positive(at_ms)):
+        return {'host': {'e': 'error'}}
+    return poll_props(start.get('host', {}), at_ms)
 
 
 def observed(component='poller', name='poll.phases'):

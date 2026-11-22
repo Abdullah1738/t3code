@@ -56,23 +56,38 @@ def launchctl_info(props, legacy=False):
     return unknown('launchctl_outcome')
 
 
-def gap_info(props, phase=None):
+def gap_info(props, phase=None, duration_ms=None):
     props = props if isinstance(props, dict) else {}
-    if positive(props.get('sleepGapMs')) and props['sleepGapMs'] > 120000:
-        return evidence('guard_not_scheduled', 'sleepGapMs', props['sleepGapMs'])
-    recorded = props.get('cause', '')
     values = [(name, props.get(field)) for name, field in PHASES.items() if positive(props.get(field))]
+    detail = {}
     if values:
         name, duration = max(values, key=lambda item: item[1])
-        return evidence('child_wait' if name == 'child_wait' else 'tick_blocked:' + name, PHASES[name], duration)
-    if isinstance(recorded, str) and recorded.startswith('tick_blocked:'):
-        name = recorded.removeprefix('tick_blocked:')
-        if name in PHASES:
-            return evidence(recorded, 'cause', recorded)
-    if isinstance(phase, str) and phase in PHASES:
-        return evidence('child_wait' if phase == 'child_wait' else 'tick_blocked:' + phase, 'phase', phase)
+        detail.update(phase=name, phaseMs=duration)
+    totals = [value for value in (duration_ms, props.get('wallGapMs'), props.get('monotonicGapMs')) if positive(value)]
+    if any(field in props for field in PHASES.values()):
+        measured = sum(value for _, value in values)
+        detail['measuredMs'] = round(measured, 3)
+        if totals:
+            detail['unmeasuredMs'] = round(max(0, max(totals) - measured), 3)
+    if positive(props.get('sleepGapMs')) and props['sleepGapMs'] > 120000:
+        return dict(detail, **evidence('guard_not_scheduled', 'sleepGapMs', props['sleepGapMs']))
     previous, current = props.get('previousPid'), props.get('pid')
     if type(previous) is int and type(current) is int and previous > 0 and current > 0 and previous != current:
-        return evidence('guard_not_scheduled', 'previousPid', previous)
-    return unknown('tick_phase_durations' if any(field in props for field in PHASES.values())
-                   else 'inter_tick_phase_or_scheduler_state')
+        return dict(detail, **evidence('guard_not_scheduled', 'previousPid', previous))
+    if values:
+        # Uninstrumented time competes with the measured phases; a small phase
+        # cannot establish the cause of a larger unexplained stall.
+        if not totals:
+            explanation = unknown('tick_duration')
+        elif detail['unmeasuredMs'] > duration:
+            explanation = unknown('unmeasured_tick_time')
+        else:
+            explanation = evidence('child_wait' if name == 'child_wait' else 'tick_blocked:' + name, PHASES[name], duration)
+        return dict(detail, **explanation)
+    if detail.get('unmeasuredMs', 0) > 0:
+        return dict(detail, **unknown('unmeasured_tick_time'))
+    recorded = props.get('cause', '')
+    has_label = (isinstance(phase, str) and phase in PHASES or
+                 isinstance(recorded, str) and recorded.startswith('tick_blocked:'))
+    return dict(detail, **unknown('tick_phase_durations' if detail or has_label
+                                  else 'inter_tick_phase_or_scheduler_state'))

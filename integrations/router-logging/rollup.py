@@ -501,7 +501,7 @@ def rollup(day, root=None, now=None):
     result['coverage']['unknownCauses'] = dict(remaining=dict(sorted(missing.items())),
         legacyListenerWindows=sum(item.get('missingEvidence') == 'legacy_launchctl_outcome_not_recorded'
                                   for item in result['listener']['unknownWindows']),
-        note='Causes name the longest recorded phase, which may cover only part of a span. Legacy listener outcomes were not recorded and are excluded from new-evidence coverage; timing alone cannot distinguish child wait from host descheduling.')
+        note='A phase cause requires its duration to be at least the unmeasured remainder; otherwise unknown_no_data names the missing evidence. Phase metadata and measured/unmeasured totals describe the full span before daily clipping. Legacy listener outcomes were not recorded and are excluded from new-evidence coverage; timing alone cannot distinguish child wait from host descheduling.')
     result['coverage']['stopInitiator'] = 'Marker caller identity only; signal sender PID is unavailable to Node callbacks. Legacy null markers have no rejection state.'
     drops = Counter()
     for writer in volume_writers.values():

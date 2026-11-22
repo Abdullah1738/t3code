@@ -23,7 +23,11 @@ or `oserror`) and at most 240 characters of trimmed, redacted stderr.
 `launchctl_exit:<code>` or `launchctl_timeout`. Legacy windows without recorded
 outcomes use `unknown_no_data` with a named missing-evidence reason; they cannot
 be reconstructed. `observer.gap` and `guard.tick_late` describe late observer
-work separately, with the longest recorded phase and its supporting field.
+work separately, retaining the longest recorded phase and measured/unmeasured
+totals. If the unmeasured remainder exceeds that phase, the cause stays
+`unknown_no_data` with `missingEvidence=unmeasured_tick_time`; a phase label
+without duration evidence cannot establish a cause. Attribution uses the full
+span before daily clipping.
 Suspend-aware clock discrepancies and guard process changes can establish
 `guard_not_scheduled`; a poll LaunchAgent's absent state alone cannot.
 

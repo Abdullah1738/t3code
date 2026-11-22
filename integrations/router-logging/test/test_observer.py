@@ -27,6 +27,12 @@ def sample(wall=BASE, mono=1000, continuous=2000, pid=42, state='running'):
 
 
 class ObserverTests(unittest.TestCase):
+    def setUp(self):
+        for module in ('observer', 'poller', 'guard'):
+            fake = patch(module + '.Sampler', return_value=lambda: {'e': 'unsupported'})
+            fake.start()
+            self.addCleanup(fake.stop)
+
     def test_poll_refreshes_finalized_days_for_late_gap_class(self):
         cases = [('pool-alerts', 'pool.endpoint.get', 'tick_blocked:pool_fetch'),
                  ('poller', 'poll.phases', 'tick_blocked:rollup_write'),
@@ -48,7 +54,9 @@ class ObserverTests(unittest.TestCase):
                     event = dict(tool='9router', component=component, name=name, kind='perf',
                                  ts=observer.iso(ended.timestamp() * 1000), durationMs=(ended - start).total_seconds() * 1000,
                                  props=dict(start=observer.iso(start.timestamp() * 1000), end=observer.iso(ended.timestamp() * 1000),
-                                            phase='rollup_write', cause=cause))
+                                            phase='pool_fetch' if name == 'pool.endpoint.get' else 'rollup_write', cause=cause))
+                    if name != 'pool.endpoint.get':
+                        event['props']['rollupWriteMs'] = (ended - start).total_seconds() * 1000
                     if cause == 'sleep_gap':
                         event['props']['sleepGapMs'] = (ended - start).total_seconds() * 1000
                     if late_days == 1:
@@ -246,7 +254,7 @@ class ObserverTests(unittest.TestCase):
                 (subprocess.TimeoutExpired('launchctl', .5), 'timeout'),
                 (OSError('cannot execute'), 'oserror'),
                 (TypeError('bad subprocess response'), 'snapshot_error')):
-            with self.subTest(code=code), patch('observer.subprocess.run', side_effect=error), patch('observer.clock_sample', side_effect=[sample(), sample(BASE + 180000, 181000, 182000)]), patch('observer.emit') as emit, patch('guard.socket.create_connection'):
+            with self.subTest(code=code), patch('observer.subprocess.run', side_effect=error), patch('observer.clock_sample', side_effect=[sample(), sample(BASE + 180000, 181000, 182000), sample(BASE + 180000, 181000, 182000)]), patch('observer.emit') as emit, patch('guard.socket.create_connection'):
                 with observer.Timings('guard', 'guard.tick_late') as timing:
                     listener = Runtime().probe()
                 self.assertEqual(listener, 'open')
@@ -305,7 +313,7 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(next_report['pollGaps'][0]['cause'], 'tick_blocked:rollup_write')
 
     def test_sleep_during_tick_survives_into_gap_rollup(self):
-        with patch('observer.clock_sample', side_effect=[sample(), sample(BASE + 200000, 16000, 202000)]), patch('observer.job_snapshot', return_value={}), patch('observer.emit') as emit:
+        with patch('observer.clock_sample', side_effect=[sample(), sample(BASE + 200000, 16000, 202000), sample(BASE + 200000, 16000, 202000)]), patch('observer.job_snapshot', return_value={}), patch('observer.emit') as emit:
             with observer.Timings():
                 pass
         self.assertEqual(emit.call_count, 1)
