@@ -104,7 +104,7 @@ test.each([
   expect(result.code, result.err).toBe(0);
   expect(result.err).toContain("Note for route-test: could not check thread");
   expect(result.err).toContain("wakes will try it first and fall back to the owner chat");
-  expect(result.err).toContain("10 minutes without confirmation");
+  expect(result.err).toContain(session.startsWith("ses_") ? "native lookup cannot resolve a thread" : "down or slow server keeps the wake on its thread");
   expect(JSON.parse(result.out).wake_route.route).toBe("unverified");
   expect(existsSync(join(f.root, "watch/watchers/route-test/watcher.json"))).toBe(true);
   expect(routeLogs(f.logs())).toMatchObject([{ props: { route: "unverified", reason: "lookup unavailable" } }]);
