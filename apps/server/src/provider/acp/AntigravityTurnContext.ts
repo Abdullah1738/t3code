@@ -55,6 +55,14 @@ const HookOutput = Schema.Struct({
   ),
 });
 const decodeHookOutput = Schema.decodeUnknownOption(Schema.fromJsonString(HookOutput));
+const HookPayload = Schema.Struct({
+  hook_event_name: Schema.Literal("UserPromptSubmit"),
+  session_id: Schema.String,
+  prompt: Schema.String,
+  cwd: Schema.String,
+  first_prompt: Schema.Boolean,
+});
+const encodeHookPayload = Schema.encodeSync(Schema.fromJsonString(HookPayload));
 
 export function antigravityTurnContextPath(path: Path.Path, baseDir: string): string {
   return path.join(baseDir, "harness-homes", "antigravity", ANTIGRAVITY_TURN_CONTEXT_FILE);
@@ -149,7 +157,7 @@ export function makeAntigravityPromptContext(options: AntigravityTurnContextOpti
           blocks.push(antigravityInstructionsBlock(instructions));
         }
       }
-      const payload = JSON.stringify({
+      const payload = encodeHookPayload({
         hook_event_name: "UserPromptSubmit",
         session_id: input.nativeSessionId,
         prompt: input.text,
