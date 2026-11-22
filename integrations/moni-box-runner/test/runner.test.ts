@@ -64,6 +64,108 @@ test("attachment preparation can retry without repeating a harness; swipe contex
   expect(r.db.query<{ state: string }, []>("SELECT state FROM inbox").get()!.state).toBe("pending");
   available = true; await r.tick(); expect(inputs).toHaveLength(1);
   for (const value of ["raw-handle", "previous-handle", "origin-handle", "Attachment:"]) expect(inputs[0]).toContain(value);
+  expect(inputs[0]!.indexOf("threadOrigin:")).toBeLessThan(inputs[0]!.indexOf("previousMessage:"));
+  expect(r.db.query<{ n: number }, []>("SELECT count(*) n FROM actions WHERE json_extract(payload,'$.kind')='swipe'").get()!.n).toBe(1);
+});
+
+test.each([
+  { target: "action", source: "action", quote: "[Swiped reply to Robob]\nDRAFT_B" },
+  { target: "inbox", source: "inbox", quote: "[Swiped reply to Moni]\nHER_MESSAGE_B" },
+  { target: "missing", source: "missing", quote: "[Swiped reply: target not found; ask which message if it matters]" },
+  { target: "file", source: "action", quote: "[Swiped reply to Robob]\n[file: draft.pdf]" },
+  { target: "unnamed-file", source: "missing", quote: "[Swiped reply: target not found; ask which message if it matters]" },
+  { target: "empty", source: "missing", quote: "[Swiped reply: target not found; ask which message if it matters]" },
+  { target: "previous-only", source: "none", quote: undefined },
+  { target: "plain", source: undefined, quote: undefined },
+])("swipe context uses threadOrigin for $target, with metadata source $source", async ({ target, source, quote }) => {
+  const inputs: string[] = [], s = setup({ run: async ({ text }) => { inputs.push(text); return "NO_REPLY"; } });
+  const actionPayload = target === "file" ? { mediaUrl: "https://media.example/draft", name: "draft.pdf", text: "" }
+    : target === "unnamed-file" ? { mediaUrl: "https://media.example/draft" }
+      : target === "empty" ? { text: " " } : { text: "DRAFT_B" };
+  const insert = s.runner.db.query("INSERT INTO actions(id,path,payload,result,state) VALUES (?,'/send',?,?,'done')");
+  insert.run(opaqueId("previous"), JSON.stringify({ text: "WRONG_PREVIOUS_A" }), JSON.stringify({ handle: "previous-handle" }));
+  insert.run(opaqueId("draft"), JSON.stringify(actionPayload), JSON.stringify({ handle: "draft-handle" }));
+  if (target === "inbox") {
+    s.runner.enqueue(opaqueId("her-target"), { id: "draft-handle", text: "HER_MESSAGE_B" });
+    s.runner.db.query("UPDATE inbox SET state='done' WHERE id=?").run(opaqueId("her-target"));
+  }
+  const hasThreadOrigin = !["previous-only", "plain"].includes(target), hasReplyTo = target !== "plain";
+  const id = opaqueId("swipe-event");
+  s.runner.enqueue(id, { id: "raw-handle", text: "follow-up", ...(hasThreadOrigin ? { threadOrigin: target === "missing" ? "unknown-handle" : "draft-handle" } : {}),
+    ...(hasReplyTo ? { replyTo: "previous-handle" } : {}) });
+  await s.lease(); await s.runner.tick();
+  expect(inputs).toHaveLength(1); expect(inputs[0]).not.toContain("WRONG_PREVIOUS_A");
+  expect(inputs[0]).not.toContain("[Quoted reply context]"); expect(inputs[0]).not.toContain("replyTo:");
+  if (quote) expect(inputs[0]).toContain(quote); else expect(inputs[0]).not.toContain("[Swiped reply");
+  if (target === "inbox") expect(inputs[0]).not.toContain("DRAFT_B");
+  if (hasThreadOrigin) expect(inputs[0]!.indexOf("threadOrigin:")).toBeLessThan(inputs[0]!.indexOf("previousMessage:"));
+  const metric = s.runner.db.query<{ payload: string; inbox_id: string }, [string]>("SELECT payload,inbox_id FROM actions WHERE id=?").get(opaqueId(`swipe:${id}`));
+  if (source) {
+    expect(metric?.inbox_id).toBe(id);
+    expect(JSON.parse(metric!.payload)).toEqual({ kind: "swipe", source, hasThreadOrigin, hasReplyTo, durationMs: 0 });
+    const callback = s.calls.filter(c => c.path.endsWith("/metrics") && c.body.kind === "swipe");
+    expect(callback).toHaveLength(1); expect(callback[0]!.body).not.toHaveProperty("text");
+  } else expect(metric).toBeNull();
+});
+
+test.each([
+  { name: "draft.pdf", caption: "", matching: true, source: "action", quote: "[Swiped reply to Robob]\n[file: draft.pdf]" },
+  { name: "draft.pdf", caption: " ", matching: true, source: "action", quote: "[Swiped reply to Robob]\n[file: draft.pdf]" },
+  { name: "draft.pdf", caption: "DRAFT_CAPTION", matching: true, source: "action", quote: "[Swiped reply to Robob]\nDRAFT_CAPTION" },
+  { name: " ", caption: "", matching: true, source: "missing", quote: "[Swiped reply: target not found; ask which message if it matters]" },
+  { name: "unrelated.pdf", caption: "", matching: false, source: "missing", quote: "[Swiped reply: target not found; ask which message if it matters]" },
+])("file swipes follow /files to /send: %j", async ({ name, caption, matching, source, quote }) => {
+  const inputs: string[] = [], s = setup({ run: async () => "NO_REPLY" });
+  const r = new BoxRunner({ ...s.runner.config, root: join(s.root, "file-swipe") }, { run: async ({ text }) => { inputs.push(text); return "NO_REPLY"; } }, {
+    callbackReady: async () => true,
+    fetch: async (url, init) => {
+      const path = new URL(String(url)).pathname, body = JSON.parse(String(init?.body));
+      if (path === "/files") return Response.json({ mediaUrl: "https://media.example/upload" });
+      if (path === "/send") return Response.json({ handle: body.mediaUrl ? "file-handle" : "previous-handle" });
+      return Response.json({ accepted: true });
+    },
+  }); clean.push(() => r.db.close());
+  await r.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  await r.action(opaqueId("previous-file-context"), "/send", { text: "WRONG_PREVIOUS_A" });
+  const uploaded = await r.action(opaqueId("file-upload"), "/files", { name, mime: "application/pdf", data: "ZmlsZQ==" }) as { mediaUrl: string };
+  await r.action(opaqueId("file-send"), "/send", { text: caption, mediaUrl: matching ? uploaded.mediaUrl : "https://media.example/other" });
+  const id = opaqueId("uploaded-file-swipe");
+  r.enqueue(id, { text: "follow-up", threadOrigin: "file-handle", replyTo: "previous-handle" });
+  await r.tick();
+  expect(inputs).toHaveLength(1); expect(inputs[0]).toContain(quote);
+  expect(inputs[0]).not.toContain("WRONG_PREVIOUS_A"); expect(inputs[0]).not.toContain("unrelated.pdf");
+  if (caption.trim()) expect(inputs[0]).not.toContain("[file:");
+  const metric = r.db.query<{ payload: string }, [string]>("SELECT payload FROM actions WHERE id=?").get(opaqueId(`swipe:${id}`));
+  expect(JSON.parse(metric!.payload)).toEqual({ kind: "swipe", source, hasThreadOrigin: true, hasReplyTo: true, durationMs: 0 });
+});
+
+test("swiped text keeps the existing 12000 character clip", async () => {
+  const inputs: string[] = [], s = setup({ run: async ({ text }) => { inputs.push(text); return "NO_REPLY"; } });
+  s.runner.db.query("INSERT INTO actions(id,path,payload,result,state) VALUES (?,'/send',?,?,'done')")
+    .run(opaqueId("long-target"), JSON.stringify({ text: "B".repeat(12000) + "CLIPPED_TAIL" }), JSON.stringify({ handle: "long-handle" }));
+  s.runner.enqueue(opaqueId("long-swipe"), { text: "follow-up", threadOrigin: "long-handle" });
+  await s.lease(); await s.runner.tick();
+  expect(inputs[0]).toContain("[Swiped reply to Robob]\n" + "B".repeat(12000));
+  expect(inputs[0]).not.toContain("CLIPPED_TAIL");
+});
+
+test("an old Mac rejecting swipe metrics with 400 does not block sends or later turns", async () => {
+  const s = setup({ run: async () => "NO_REPLY" }), calls: { path: string; body: Record<string, unknown> }[] = [];
+  const r = new BoxRunner({ ...s.runner.config, root: join(s.root, "old-mac") }, { run: async () => "reply" }, {
+    callbackReady: async () => true,
+    fetch: async (url, init) => {
+      const path = new URL(String(url)).pathname, body = JSON.parse(String(init?.body)); calls.push({ path, body });
+      return path === "/metrics" && body.kind === "swipe" ? new Response("", { status: 400 }) : Response.json({ accepted: true });
+    },
+  }); clean.push(() => r.db.close());
+  await r.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  const id = opaqueId("old-mac-swipe");
+  r.enqueue(id, { text: "follow-up", threadOrigin: "missing" });
+  r.enqueue(opaqueId("next-turn"), { text: "next" });
+  await r.tick(); await r.tick();
+  expect(r.db.query("SELECT state FROM actions WHERE id=?").get(opaqueId(`swipe:${id}`))).toEqual({ state: "done" });
+  expect(calls.filter(c => c.path === "/send").map(c => c.body.text)).toEqual(["reply", "reply"]);
+  expect(r.db.query<{ n: number }, []>("SELECT count(*) n FROM inbox WHERE state='done'").get()!.n).toBe(2);
 });
 test("old backlog latency and failed metrics cannot block subsequent messages", async () => {
   const texts: string[] = []; const s = setup({ run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } });

@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import allocation, api, cli, common, home, lease, misc, outage, pool, runs, start_check
+from offbox_lib import allocation, api, capacity, cli, common, home, lease, misc, outage, pool, runs, start_check
 from test_capacity import Isolated
 
 
@@ -107,6 +107,135 @@ class FailbackTests(Isolated):
         back = [c for c in self.events.call_args_list if c.args[:2] == ('backend', 'backend.failback')]
         self.assertEqual(len(back), 1)
         self.assertEqual(back[0].kwargs['duration_ms'], 60000)
+
+    def test_a_home_that_answers_but_has_its_own_queue_is_not_a_reason_to_go_back(self):
+        self.full_pool()
+        self.pending()
+        self.home_paths()
+        self.stack.enter_context(patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: ''}))
+        checks = []
+        def probe(**kwargs):
+            checks.append(self.clock.t)
+            home.PROBE_FACTS.set({'class': 'good', 'busy': 'home is busy: 4 runs waiting for memory'
+                                  if self.clock.t < 1090 else None})
+            return None
+        with patch.object(home, 'probe', side_effect=probe), patch.object(os, 'execve', side_effect=SystemExit) as execute, \
+                patch.object(sys, 'argv', ['offbox.py', 'run', '--', 'true']):
+            with self.assertRaises(SystemExit):
+                self.acquire_through_cli()
+        self.assertEqual(checks, [1030, 1060, 1090])
+        self.assertEqual(execute.call_args.args[2]['OFFBOX_BACKEND'], 'server')
+
+    def test_a_run_that_left_a_busy_home_gives_boat_ten_minutes_before_it_looks_back(self):
+        self.full_pool()
+        self.pending()
+        self.home_paths()
+        self.stack.enter_context(patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: '',
+                                                       home.FAILOVER_ENV: 'home is busy: no repo pool box free after 120 s'}))
+        checks = []
+        def probe(**kwargs):
+            checks.append(self.clock.t)
+            return None
+        with patch.object(home, 'probe', side_effect=probe), patch.object(os, 'execve', side_effect=SystemExit), \
+                patch.object(sys, 'argv', ['offbox.py', 'run', '--', 'true']):
+            with self.assertRaises(SystemExit):
+                self.acquire_through_cli()
+        self.assertEqual(checks, [1000 + home.OVERFLOW_RETURN_S])
+        self.assertIn('pool box on Boat (home is busy)', self.output.getvalue())
+
+    def test_a_run_that_waited_for_a_home_pool_box_leaves_for_boat_when_boat_can_take_it(self):
+        self.full_pool()
+        self.stack.enter_context(patch.dict(os.environ))
+        os.environ.pop(home.FAILOVER_ENV)
+        can_take = []
+        def boat(*a):
+            can_take.append(self.clock.t)
+            return self.clock.t >= 1180
+        # Ten minutes already went into this allocation before the pool was first found busy (a slow resume, a
+        # retry): the two minutes still start at that first busy look.
+        with patch.object(home, 'may_fail_over', return_value=True), patch.object(home, 'boat_can_take', side_effect=boat), \
+                allocation.queue() as earlier:
+            earlier['started'] -= 600
+            with self.assertRaises(common.OffboxError) as caught:
+                pool.acquire(self.me, run_id='mine')
+        error = caught.exception
+        self.assertTrue(str(error).startswith('home is busy: no repo pool box free after '), str(error))
+        self.assertTrue(error.outage and not error.started and error.code == common.EXIT_INFRA,
+                        'the caller takes this as "nothing started, Boat may have it"')
+        # First asked after the two-minute wait; a Boat that cannot take it is asked again no sooner than that.
+        self.assertGreaterEqual(can_take[0], 1120)
+        self.assertGreaterEqual(can_take[1] - can_take[0], 120)
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_waiters').fetchone()[0], 0)
+
+    def test_runs_that_may_not_move_and_runs_avoiding_a_box_keep_waiting_for_a_pool_box(self):
+        self.full_pool()
+        self.stack.enter_context(patch.dict(os.environ))
+        os.environ.pop(home.FAILOVER_ENV)
+        def stop(seconds):
+            self.clock.t += seconds
+            if self.clock.t > self.until:
+                raise KeyboardInterrupt
+        self.clock.time.sleep = stop
+        cases = ((False, {}),                       # person, pinned or returned-home work
+                 (True, {'exclude': {'elsewhere'}}),   # a retry that avoids a suspect box has its own rules
+                 (True, {'base': 'saved'}))            # a named base may exist only at home; its caller decides
+        for movable, options in cases:
+            self.until = self.clock.t + 400
+            with self.subTest(movable=movable, options=options), patch.object(home, 'may_fail_over', return_value=movable), \
+                    patch.object(home, 'boat_can_take', side_effect=AssertionError('never asked')):
+                with self.assertRaises(KeyboardInterrupt):
+                    pool.acquire(self.me, run_id='mine', **options)
+
+    def test_a_run_that_left_a_busy_home_may_add_boat_boxes_up_to_the_plan_limit(self):
+        for n in range(16):
+            self.box(f'b{n}', member=True)
+            self.busy(f'b{n}')
+        self.con.execute("INSERT INTO pool_cap_callers(token,pool_key,pid,run_id,cap) VALUES ('mine','repo',?,NULL,300)",
+                         (os.getpid(),))
+        self.con.commit()
+        with patch.dict(os.environ, {home.FAILOVER_ENV: 'home is busy: 5 runs waiting for memory'}):
+            self.assertEqual(pool.pool_cap(self.con, 'repo'), 300)
+            self.assertTrue(pool._room(self.con, 'repo'), 'a seventeenth box may be created')
+            self.con.execute("INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)", (capacity.PLAN_KEY, json.dumps({'max_active': 16})))
+            self.con.commit()
+            self.assertFalse(pool._room(self.con, 'repo'), "the plan's own limit is the cap")
+        # Work pinned to Boat keeps Boat's pool cap even while a caller that left home is in the same pool.
+        with patch.dict(os.environ), patch.object(home, 'failed_over', return_value=False):
+            self.assertEqual(pool.pool_cap(self.con, 'repo'), 16)
+
+    def back_home_after(self, refusal):
+        self.pending()
+        self.home_paths()
+        self.stack.enter_context(patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: '',
+                                                       home.FAILOVER_ENV: 'home is busy: 5 runs waiting for memory'}))
+        def probe(**kwargs):
+            # Home still has its line: that line is where this run would have waited anyway.
+            home.PROBE_FACTS.set({'class': 'good', 'busy': 'home is busy: 5 runs waiting for memory'})
+            return None
+        with patch.object(home, 'probe', side_effect=probe), patch.object(os, 'execve', side_effect=SystemExit) as execute, \
+                patch.object(lease, 'acquire_private', side_effect=refusal), \
+                patch.object(sys, 'argv', ['offbox.py', 'run', '--', 'true']):
+            with self.assertRaises(SystemExit):
+                self.acquire_through_cli()
+        env = execute.call_args.args[2]
+        self.assertEqual(env['OFFBOX_BACKEND'], 'server')
+        self.assertTrue(env[home.RETURNED_HOME_ENV].startswith('home is busy'), 'so it cannot leave home again')
+        self.assertEqual(env[home.RUN_ID_ENV], 'mine')
+        self.assertIn('Boat cannot start this run', self.output.getvalue())
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_waiters').fetchone()[0], 0)
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_pending').fetchone()[0], 0)
+
+    def test_a_run_that_left_a_busy_home_goes_back_to_homes_queue_when_boat_has_no_machine(self):
+        self.back_home_after(api.BoatAtCapacity())
+
+    def test_a_run_that_left_a_busy_home_goes_back_to_homes_queue_at_boats_start_limit(self):
+        self.back_home_after(capacity.CapacityError('start limit reached'))
+
+    def test_a_run_that_left_a_dead_home_still_waits_out_boats_capacity(self):
+        with patch.object(home, 'probe', side_effect=AssertionError('home is not asked')), \
+                patch.object(lease, 'acquire_private', side_effect=api.BoatAtCapacity()):
+            with self.assertRaises(api.BoatAtCapacity):
+                pool.acquire(self.me, run_id='mine')
 
     def test_home_down_for_three_hours_then_boat_box(self):
         self.full_pool()

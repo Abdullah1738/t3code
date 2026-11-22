@@ -18,6 +18,7 @@ import { recordRenderCounts, renderCounts } from "./log-render-store.ts";
 import { cleanRenders, createRenderAggregation, renderChat } from "./log-renders.ts";
 import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./log-error.ts";
 import { CONTROL_REASONS, controlFailureProps } from "./control-errors.ts";
+import { LOOP_OPERATIONS, loopOperations, traceLoopOperation } from "./loop-stall.ts";
 
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
@@ -71,6 +72,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (entry.name === "bridge.catch" && entry.kind === "error" && entry.alreadyLogged === true) line.alreadyLogged = true;
   const ids: Record<string, string> = runId ? { runId } : {};
   for (const [key, value] of Object.entries(entry.ids ?? {})) {
+    if (entry.name === "bridge-loop-stall") continue;
     // Correlation ids are UUIDs; arbitrary server header text must never become a log field.
     if ((key === "requestId" || key === "serverRequestId" || key === "outageId") && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value)) continue;
     if (key === "chat" && entry.name.startsWith("card.render")) { ids.chat = renderChat(value); continue; }
@@ -80,6 +82,15 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (entry.name === "bridge-loop-stall") {
+      if (["stallMs", "loadAvg1", "freeMemoryBytes", "rssBytes"].includes(key)
+        && typeof value === "number" && Number.isFinite(value) && value >= 0) { props[key] = value; continue; }
+      if (key === "operations" && typeof value === "string" && value.length <= 500
+        && (value === "" || value.split(",").every(name => LOOP_OPERATIONS.some(allowed => allowed === name)))) {
+        props[key] = value; continue;
+      }
+      continue;
+    }
     if (WAKE_EVENTS.has(entry.name)) {
       if (key === "source" && typeof value === "string" && value.length <= 100 && !/[\x00-\x1f\x7f-\x9f]/.test(value)
         || key === "causeKey" && typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,100}$/.test(value)
@@ -111,6 +122,11 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     if (entry.name === "synthetic.carry_evicted" && key === "reason" && (value === "expired" || value === "overflow")
       || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
       props[key] = value; continue;
+    }
+    if (entry.component === "remote-box" && entry.name === "moni-swipe-resolved") {
+      if (key === "source" && typeof value === "string" && ["inbox", "action", "missing", "none"].includes(value)
+        || (key === "hasThreadOrigin" || key === "hasReplyTo") && typeof value === "boolean") props[key] = value;
+      continue;
     }
     if (entry.component === "remote-box" && entry.name === "moni-callback-ready"
       && (key === "handlerMs" || key === "loopDelayMs") && typeof value === "number" && Number.isFinite(value) && value >= 0) {
@@ -180,26 +196,32 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
 }
 
 function logSources(dir: string): Record<string, number> {
-  return Object.fromEntries(readdirSync(dir).filter(file => /^\d{4}-\d{2}-\d{2}\.ndjson$/.test(file)).sort()
-    .map(file => [file.slice(0, 10), statSync(join(dir, file)).size]));
+  const finish = loopOperations.begin("log.sources");
+  try {
+    return Object.fromEntries(readdirSync(dir).filter(file => /^\d{4}-\d{2}-\d{2}\.ndjson$/.test(file)).sort()
+      .map(file => [file.slice(0, 10), statSync(join(dir, file)).size]));
+  } finally { finish(); }
 }
 
 async function* records(dir: string, sources: Record<string, number>): AsyncGenerator<LogLine> {
-  for (const [day, bytes] of Object.entries(sources)) {
-    if (!bytes) continue;
-    // Fixed byte ranges keep appends during a build visible as a stale dependency snapshot.
-    const input = createReadStream(join(dir, `${day}.ndjson`), { encoding: "utf8", end: bytes - 1 });
-    const lines = createInterface({ input, crlfDelay: Infinity });
-    try {
-      for await (const text of lines) {
-        try {
-          const parsed = JSON.parse(text);
-          const line = clean(parsed, typeof parsed.ts === "string" ? parsed.ts : "");
-          if (line) yield line;
-        } catch { /* Interrupted or malformed row. */ }
-      }
-    } finally { lines.close(); input.destroy(); }
-  }
+  const finish = loopOperations.begin("log.scan");
+  try {
+    for (const [day, bytes] of Object.entries(sources)) {
+      if (!bytes) continue;
+      // Fixed byte ranges keep appends during a build visible as a stale dependency snapshot.
+      const input = createReadStream(join(dir, `${day}.ndjson`), { encoding: "utf8", end: bytes - 1 });
+      const lines = createInterface({ input, crlfDelay: Infinity });
+      try {
+        for await (const text of lines) {
+          try {
+            const parsed = JSON.parse(text);
+            const line = clean(parsed, typeof parsed.ts === "string" ? parsed.ts : "");
+            if (line) yield line;
+          } catch { /* Interrupted or malformed row. */ }
+        }
+      } finally { lines.close(); input.destroy(); }
+    }
+  } finally { finish(); }
 }
 
 function chainSources(sources: Record<string, number>, day: string): Record<string, number> {
@@ -226,6 +248,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   const renders = createRenderAggregation();
   let writeFailed = false;
   function append(entry: Entry, stamp?: string): void {
+    const finish = loopOperations.begin("log.append");
     let fd: number | undefined;
     try {
       const ts = stamp ?? new Date(now()).toISOString();
@@ -256,7 +279,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }
@@ -268,7 +291,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (entry.name === "card.renders") append({ component: "logger", kind: "error", name: "bridge.catch", ok: false,
         error: { tag: "render.counters.write", cause: error } }, stamp);
     }
-    finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* Best effort. */ } } }
+    finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* Best effort. */ } } finish(); }
   }
   const pending: LogLine[] = [];
   let scheduled = false;
@@ -310,7 +333,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     } catch { writeFailed = true; }
   }
   function readRenderCounts(dir: string, day: string): ReturnType<typeof renderCounts> {
-    try { return renderCounts(dir, day); }
+    try { return traceLoopOperation("log.counters", () => renderCounts(dir, day)); }
     catch (error) {
       write({ component: "logger", kind: "error", name: "bridge.catch", ok: false, error: { tag: "render.counters.read", cause: error } });
       throw error;

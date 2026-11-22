@@ -2,6 +2,7 @@
 """Read-only Mac evidence collector with bounded disk diagnostics."""
 from collections import Counter
 import datetime as dt
+from decimal import Decimal
 import json
 import math
 import fcntl
@@ -16,8 +17,10 @@ import time
 from jobs import (read_state, save_state, state_path, directory_inventory,
                   SourceFailure, source_error, stderr_line, permission_denied, deadline_call)
 from rollup import rollup
+from logwindow import row_timestamp
 from status import CADENCES
 from toollog import directory, emit, private_dir, safe_fields, finite_number
+from homebrew import check as homebrew_integrity
 
 REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/DiagnosticReports/Retired'),
                Path.home() / 'Library/Logs/DiagnosticReports']
@@ -230,22 +233,24 @@ def unified(since, until, run=unified_command, timeout=60):
             raise ValueError('invalid log shape')
     except (TypeError, ValueError):
         raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
+    counts.window_stats = {}
     for row in rows:
-        timestamp = row.get('timestamp')
-        try:
-            at = dt.datetime.fromisoformat(re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', timestamp.replace('Z', '+00:00')))
-        except (AttributeError, TypeError, ValueError):
-            raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
-        if at.tzinfo is None:
-            at = at.replace(tzinfo=dt.timezone.utc)
-        if not since < at.timestamp() <= until:
+        at = row_timestamp(row.get('timestamp'))
+        if at is None:
+            counts.window_stats['unparsedRows'] = counts.window_stats.get('unparsedRows', 0)+1
+            continue
+        if not Decimal(str(since)) < at <= Decimal(str(until)):
+            stats = counts.window_stats
+            stats['outsideRows'] = stats.get('outsideRows', 0)+1
+            stats['outsideFirst'] = min(stats.get('outsideFirst', float(at)), float(at))
+            stats['outsideLast'] = max(stats.get('outsideLast', float(at)), float(at))
             continue
         message = row.get('eventMessage', '')
         if not isinstance(message, str):
             raise SourceFailure('parse', 'invalid unified log data', result.returncode)
         if '=== system boot' in message:
             # Preserve boot time and collapse duplicate markers at that instant.
-            counts['restart', 'kernel', at.timestamp()] = 1
+            counts['restart', 'kernel', float(at)] = 1
         elif 'wdog' in message.lower() or 'unresponsive' in message.lower():
             counts['hang', 'system'] += 1
     return counts
@@ -324,6 +329,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
             window = dict(window, windowS=window['windowEnd']-window['windowStart'])
             window.update(chunks=math.ceil(max(0, window['windowS'])/chunk_size), chunksDone=0,
                           skipReason='lag_ceiling' if window['skippedS'] else None)
+            window_stats = {}
             cursor = window['windowStart']
             if cursor > state.get('unified', since):
                 emit('crashes', 'event', 'crash.unified.skip', ok=True,
@@ -359,9 +365,13 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
                          props=dict(chunk, outcome=stop_reason,
                                     elapsedMs=(time.monotonic()-chunk_started)*1000))
                     raise
+                stats = getattr(observed, 'window_stats', {})
+                for key, value in stats.items():
+                    combine = min if key == 'outsideFirst' else max if key == 'outsideLast' else lambda a, b: a+b
+                    window_stats[key] = combine(window_stats[key], value) if key in window_stats else value
                 elapsed = time.monotonic()-chunk_started
                 emit('crashes', 'event', 'crash.unified.chunk', ok=True,
-                     props=dict(chunk, outcome='done', elapsedMs=elapsed*1000))
+                     props=dict(chunk, outcome='done', elapsedMs=elapsed*1000, **stats))
                 chunk_size, cost_model = next_unified_chunk(end-cursor, elapsed, cost_model)
                 counts.update(observed)
                 crash_observations(observed)
@@ -377,7 +387,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
             state.pop('unifiedRetry', None)
             emit('crashes', 'event', 'crash.source', ok=True,
                  props=dict(source='unified', elapsedMs=(time.monotonic()-source_started)*1000,
-                            lagS=lag(), stopReason='done', **window))
+                            lagS=lag(), stopReason='done', **window, **window_stats))
             skipped += window['skippedS']
             # Persist the reported gap's retirement before a fresh command can
             # be interrupted; otherwise the next run would report it again.
@@ -392,7 +402,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
         state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
                                      skippedS=window['skippedS'])
         source_error('crashes', 'crash.source', 'unified', source_started, exc,
-                     dict(window, lagS=lag(), stopReason=stop_reason))
+                     dict(window, lagS=lag(), stopReason=stop_reason, **window_stats))
         skipped += window['skippedS']
         state['unifiedRetry']['skippedS'] = 0
     window = dict(window, skippedS=skipped, lagS=lag(), stopReason=stop_reason,
@@ -1050,6 +1060,7 @@ def disk_tooling_probe(run=subprocess.run, popen=subprocess.Popen, is_alive=aliv
 def main():
     # Check before any job can create today's file and hide its absence.
     missing_day()
+    homebrew_integrity(lambda text, key: notify(text, key, subprocess.run))
     deadline = time.monotonic()+290
     try:
         collect(deadline=deadline)

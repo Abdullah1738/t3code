@@ -8,11 +8,15 @@ import os
 import re
 from pathlib import Path
 import tempfile
+import time
 from toollog import directory, safe_target, token, CONNECTION_ERRNOS, SYSCALLS
 from volume import REASONS, integer
-from listener_rollup import windows as listener_windows
+from listener_rollup import windows as listener_windows, history_rows
 from pool_rollup import summarize as pool_summary
 from observer import gap_summary, measured, observed
+from host_rollup import HostLoad, timestamp as host_timestamp
+import append_cursor as cache
+from append_cursor import request_group, provider_group
 
 
 def percentiles(values):
@@ -77,13 +81,41 @@ def lock_identity(row, fallback):
         return fallback
 
 
+# Bump when ingestion or persisted aggregate semantics change.
+AGGREGATE_VERSION = 2
+CHECKPOINT_BYTES = 8 * 1024 * 1024
+CHECKPOINT_SECONDS = 30
+AGGREGATE_FIELDS = (
+    'counts', 'kinds', 'tags', 'pool_rows', 'times',
+    'samples', 'targets', 'target_components', 'inbound_sockets', 'inbound_components',
+    'proxy', 'models', 'clients', 'keys', 'other_products',
+    'providers', 'provider_tokens', 'model_tokens', 'upstream_codes', 'sessions',
+    'session_sources', 'attempts', 'abort_ttfb', 'locks', 'lock_accounts',
+    'distinct', 'account_distinct', 'unlocks', 'supervisor', 'heartbeat_observations',
+    'health_hours', 'health_late', 'volume_writers', 'ok', 'failed',
+    'total', 'malformed',
+    'host_state', 'host_pending',
+)
+
+
+def future_host(row, generated):
+    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+    values = [row.get('ts'), *(props.get(key) for key in (
+        'hostAtMs', 'hostStartAtMs', 'hostEndAtMs', 'start', 'end',
+        'startedAtMs', 'finishedAtMs', 'unknownSince', 'downSince'))]
+    return any(at > generated for value in values if value is not None
+               and (at := host_timestamp(value)) is not None)
+
+
 @measured('history_scan_parse')
-def rollup(day, root=None, now=None):
+def rollup(day, root=None, now=None, incremental=True):
     day = dt.date.fromisoformat(day).isoformat()
     generated = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
     next_day = dt.datetime.combine(dt.date.fromisoformat(day) + dt.timedelta(days=1), dt.time(), dt.timezone.utc)
     root = Path(root) if root is not None else directory()
     counts, kinds, tags = Counter(), Counter(), Counter()
+    host_load = HostLoad(day, generated)
+    host_state, host_pending = vars(host_load), []
     pool_rows = []
     times, samples = defaultdict(list), {}
     targets = defaultdict(Counter)
@@ -91,11 +123,11 @@ def rollup(day, root=None, now=None):
     inbound_sockets = Counter()
     inbound_components = defaultdict(Counter)
     proxy = {}
-    models = defaultdict(lambda: dict(count=0, aborted=0))
-    clients = defaultdict(lambda: dict(count=0, aborted=0))
-    keys = defaultdict(lambda: dict(count=0, aborted=0))
-    other_products = defaultdict(lambda: dict(count=0, aborted=0))
-    providers = defaultdict(lambda: dict(count=0, aborted=0, statuses=Counter()))
+    models = defaultdict(request_group)
+    clients = defaultdict(request_group)
+    keys = defaultdict(request_group)
+    other_products = defaultdict(request_group)
+    providers = defaultdict(provider_group)
     provider_tokens, model_tokens = defaultdict(Counter), defaultdict(Counter)
     upstream_codes = Counter()
 
@@ -108,7 +140,7 @@ def rollup(day, root=None, now=None):
     unlocks = 0
     supervisor = dict(unresponsive=0, crawling=0, memoryHigh=0, killed=0,
                       starts=0, stopping=0, exits=0, reloads=0, workerForks=0, restartScheduled=0,
-                      deploy=Counter(), stopsBySignal=Counter(), stopsByInitiator=Counter(), exitCodes=Counter(),
+                      deploy=Counter(), stopsBySignal=Counter(), stopsByInitiator=Counter(), stopMarkerStates=Counter(), exitCodes=Counter(),
                       pendingWorkerOutcomes=0,
                       exitedBySignal=Counter(), exitedByCode=Counter(), killedByReason=Counter())
     heartbeat_observations = {}
@@ -117,10 +149,53 @@ def rollup(day, root=None, now=None):
     day_end = day_start + 86400000
     volume_writers = {}
     ok = failed = total = malformed = 0
+    state_path = root / ('.rollup-state-' + day + '.json')
+    saved = cache.load(state_path, AGGREGATE_VERSION) if incremental else {}
     source = root / (day + '.ndjson')
     if source.exists():
-        with source.open() as lines:
-            for line in lines:
+        with source.open('rb') as lines:
+            cursor, append = cache.cursor_for(lines, saved.get('cursor', {}))
+            try:
+                aggregate = cache.decode(saved['aggregate']) if append else None
+                if aggregate is not None and set(aggregate) != set(AGGREGATE_FIELDS):
+                    raise ValueError('aggregate fields changed')
+                if aggregate is not None and (set(aggregate['host_state']) != set(host_state)
+                        or aggregate['host_state']['generated'] > generated):
+                    raise ValueError('host state needs rebuild')
+            except (ValueError, TypeError, KeyError, AttributeError):
+                aggregate, append = None, False
+            if aggregate is not None:
+                (
+                    counts, kinds, tags, pool_rows, times,
+                    samples, targets, target_components, inbound_sockets, inbound_components,
+                    proxy, models, clients, keys, other_products,
+                    providers, provider_tokens, model_tokens, upstream_codes, sessions,
+                    session_sources, attempts, abort_ttfb, locks, lock_accounts,
+                    distinct, account_distinct, unlocks, supervisor, heartbeat_observations,
+                    health_hours, health_late, volume_writers, ok, failed,
+                    total, malformed, host_state, host_pending,
+                ) = (aggregate[key] for key in AGGREGATE_FIELDS)
+                host_load.__dict__.update(host_state)
+                host_load.generated = generated
+                host_state = vars(host_load)
+                pending, host_pending = host_pending, []
+                for row in pending:
+                    if future_host(row, generated):
+                        host_pending.append(row)
+                    else:
+                        host_load.observe(row)
+            if not append:
+                cursor['offset'] = 0
+            checkpointed = False
+            checkpoint_offset, checkpoint_time = cursor['offset'], time.monotonic()
+            for line, complete in cache.lines(lines, cursor):
+                if not complete and incremental:
+                    # A tail is provisional, even if it currently parses. Persist
+                    # only newline-terminated rows so completion is counted once.
+                    values = locals()
+                    cache.save(state_path, AGGREGATE_VERSION, cursor,
+                               {key: values[key] for key in AGGREGATE_FIELDS})
+                    checkpointed = True
                 try:
                     row = json.loads(line)
                     if row.get('tool') != '9router' or row.get('kind') not in ('event', 'perf', 'error') or not isinstance(row.get('name'), str):
@@ -135,6 +210,10 @@ def rollup(day, root=None, now=None):
                         dims = tuple(props.get(k, 'unknown') for k in ('provider', 'model', 'cause'))
                         if not all(isinstance(v, str) for v in dims):
                             raise ValueError('invalid lock dimensions')
+                    if future_host(row, generated):
+                        host_pending.append(row)
+                    else:
+                        host_load.observe(row)
                     total += 1
                     counts[row['name']] += 1
                     if row['name'] in ('pool.exhausted', 'pool.recovered'):
@@ -170,7 +249,14 @@ def rollup(day, root=None, now=None):
                         if name == 'supervisor.stopping':
                             for field, key in (('signal', 'stopsBySignal'), ('initiator', 'stopsByInitiator')):
                                 value = props.get(field)
-                                supervisor[key][value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', value) else 'unknown'] += 1
+                                if field == 'initiator' and value in (None, 'unknown'):
+                                    value = 'unknown_no_marker'
+                                fallback = 'unknown_no_marker' if field == 'initiator' else 'unknown'
+                                supervisor[key][value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', value) else fallback] += 1
+                            marker_state = props.get('deployMarkerState')
+                            supervisor['stopMarkerStates'][marker_state if marker_state in (
+                                'active', 'missing', 'unreadable', 'invalid_json', 'invalid_shape',
+                                'inactive', 'future', 'expired') else 'legacy_no_marker_state'] += 1
                         if name == 'supervisor.exit':
                             code = props.get('code')
                             supervisor['exitCodes'][str(code) if type(code) is int else 'unknown'] += 1
@@ -332,8 +418,22 @@ def rollup(day, root=None, now=None):
                         if tag:
                             group['errors'][tag] += 1
                             group['samples'].setdefault(tag, row.get('ids', {}).get('req'))
-                except (ValueError, TypeError, AttributeError):
+                except (ValueError, TypeError, AttributeError, UnicodeError):
                     malformed += 1
+                if incremental and complete and (cursor['offset'] - checkpoint_offset >= CHECKPOINT_BYTES
+                                                  or time.monotonic() - checkpoint_time >= CHECKPOINT_SECONDS):
+                    values = locals()
+                    cache.save(state_path, AGGREGATE_VERSION, cursor,
+                               {key: values[key] for key in AGGREGATE_FIELDS})
+                    checkpoint_offset, checkpoint_time = cursor['offset'], time.monotonic()
+            if incremental and not checkpointed:
+                values = locals()
+                cache.save(state_path, AGGREGATE_VERSION, cursor,
+                           {key: values[key] for key in AGGREGATE_FIELDS})
+    # A future row can already expose an earlier boundary. Keep its contribution
+    # provisional until all its timestamps are visible, as with a partial line.
+    for row in host_pending:
+        host_load.observe(row)
     durations = {}
     for name, values in times.items():
         values.sort()
@@ -341,7 +441,7 @@ def rollup(day, root=None, now=None):
     measured = ok + failed
     result = dict(day=day, total=total, malformed=malformed, countsByName=dict(counts), countsByKind=dict(kinds), okRate=ok / measured if measured else None, errorRate=kinds['error'] / total if total else None, failedRate=failed / measured if measured else None, durationMs=durations, topErrors=[dict(tag=tag, count=count, sampleIds=samples[tag]) for tag, count in tags.most_common(20)])
     result.update(generatedAt=generated.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), complete=generated >= next_day)
-    result['pools'] = pool_summary(day, root, generated, pool_rows)
+    result['pools'] = pool_summary(day, root, generated, pool_rows, incremental)
     for error in result['topErrors']:
         if error['tag'] in CONNECTION_ERRNOS:
             error['byTarget'] = [dict(component=component, target=target, count=count)
@@ -426,23 +526,19 @@ def rollup(day, root=None, now=None):
     # midnight. Adjacent files contribute joins only, never this day's counts.
     for neighbor in sorted(adjacent_days):
         try:
-            with (root / (neighbor + '.ndjson')).open() as lines:
-                for line in lines:
-                    if 'health.request.late' not in line:
+            for row in history_rows(root / (neighbor + '.ndjson'), incremental):
+                try:
+                    props = row.get('props', {})
+                    probe = props.get('probe')
+                    if (row.get('tool') != '9router' or row.get('name') != 'health.request.late'
+                            or row.get('kind') != 'perf' or not isinstance(probe, str) or probe not in probe_ids
+                            or not metric(props.get('acceptToHandlerMs'))):
                         continue
-                    try:
-                        row = json.loads(line)
-                        props = row.get('props', {})
-                        probe = props.get('probe')
-                        if (row.get('tool') != '9router' or row.get('name') != 'health.request.late'
-                                or row.get('kind') != 'perf' or not isinstance(probe, str) or probe not in probe_ids
-                                or not metric(props.get('acceptToHandlerMs'))):
-                            continue
-                        at = dt.datetime.fromisoformat(row.get('ts', '').replace('Z', '+00:00'))
-                        if at.tzinfo is not None:
-                            health_late[probe].append((at.astimezone(dt.timezone.utc), props))
-                    except (ValueError, TypeError, AttributeError):
-                        continue
+                    at = dt.datetime.fromisoformat(row.get('ts', '').replace('Z', '+00:00'))
+                    if at.tzinfo is not None:
+                        health_late[probe].append((at.astimezone(dt.timezone.utc), props))
+                except (ValueError, TypeError, AttributeError):
+                    continue
         except FileNotFoundError:
             pass
     result['healthByHour'] = []
@@ -465,13 +561,34 @@ def rollup(day, root=None, now=None):
             acceptToHandlerMs=percentiles(group['late']), probesOver5s=len(probes),
             probesWithLateRow=sum(p['acceptToHandlerMs'] is not None for p in probes), probes=probes))
     observations = []
-    result['listener'] = listener_windows(day, root, generated, observations)
+    result['listener'] = listener_windows(day, root, generated, observations, incremental=incremental)
     result.update(gap_summary(observations, day, generated))
+    for row in observations:
+        if not isinstance(row.get('ts'), str) or not row['ts'].startswith(day):
+            host_load.observe(row)
+    result['hostLoad'], result['proxySummary']['byHour'] = host_load.summary()
+    for key in ('guardGaps', 'pollGaps'):
+        groups = {}
+        for item in result[key]:
+            group = groups.setdefault(item['cause'], dict(cause=item['cause'], count=0, durationMs=0))
+            group['count'] += 1
+            group['durationMs'] = round(group['durationMs'] + item['durationMs'], 3)
+        result[key + 'ByCause'] = [groups[cause] for cause in sorted(groups)]
+    missing = Counter(item.get('missingEvidence', 'cause_evidence') for key in ('guardGaps', 'pollGaps')
+                      for item in result[key] if item['cause'] == 'unknown_no_data')
+    missing.update(item.get('missingEvidence', 'launchctl_outcome') for item in result['listener']['unknownWindows']
+                   if item['cause'] == 'unknown_no_data')
     result['coverage'] = dict(
         healthByHour='Threshold events only; healthy probes use supervisor.health_probe_summary.',
         healthProbeSummaryRows=counts['supervisor.health_probe_summary'],
         pools='Recorded exhaustion episodes only; empty does not mean no pools or continuous observer coverage.',
-        observerGaps='Measured spans only; legacy ticks without start/end diagnostics cannot be reconstructed.')
+        observerGaps='Measured spans only; legacy ticks without start/end diagnostics cannot be reconstructed.',
+        hostLoad='Sampled at polls and anomalies; missing legacy snapshots are unknown. See hostLoad.failedSnapshots and pollRowsWithoutHost; memory available is free plus inactive pages, an estimate. Overload hours contain a sample above 2x CPU count, not a measured duration.')
+    result['coverage']['unknownCauses'] = dict(remaining=dict(sorted(missing.items())),
+        legacyListenerWindows=sum(item.get('missingEvidence') == 'legacy_launchctl_outcome_not_recorded'
+                                  for item in result['listener']['unknownWindows']),
+        note='A phase cause requires its duration to be at least the unmeasured remainder; otherwise unknown_no_data names the missing evidence. Phase metadata and measured/unmeasured totals describe the full span before daily clipping. Legacy listener outcomes were not recorded and are excluded from new-evidence coverage; timing alone cannot distinguish child wait from host descheduling.')
+    result['coverage']['stopInitiator'] = 'Marker caller identity only; signal sender PID is unavailable to Node callbacks. Legacy null markers have no rejection state.'
     drops = Counter()
     for writer in volume_writers.values():
         drops.update(writer)
@@ -501,8 +618,9 @@ def write_report(root, day, result):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--day', default=(dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)).isoformat())
+    p.add_argument('--full', action='store_true', help='Ignore aggregate and listener caches')
     args = p.parse_args()
-    print(json.dumps(rollup(args.day)))
+    print(json.dumps(rollup(args.day, incremental=not args.full)))
 
 if __name__ == '__main__':
     main()

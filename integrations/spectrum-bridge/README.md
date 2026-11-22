@@ -342,6 +342,7 @@ in the `x-opencode-directory` header, percent-encoded; answers come wrapped in
 The operational setup and private credential handling remain in the local
 `imessage-notifications` skill. Use `bun run check` and `bun test` from this
 directory when changing the bridge.
+The Bun version is pinned in `package.json`'s `packageManager`; bump it together with `bun.lock`.
 
 Tool-log rollups refresh at turn end, hourly, and after the UTC day changes.
 Catch rows marked `alreadyLogged: true` retain their context and request ID but count only toward row volume and `dedupedFailures`, leaving failure rates and top causes to the original request.

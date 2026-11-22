@@ -110,6 +110,7 @@ class BigRootTests(unittest.TestCase):
             return collect(10000, [], lambda a,b: collector.unified(a,b,run), **kw)
         with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]), \
              patch.object(collector, 'disk_wait'), \
+             patch.object(collector, 'homebrew_integrity'), \
              patch.object(collector, 'disk_tooling_probe', side_effect=probe), \
              patch.object(collector, 'directory_inventory', side_effect=lambda **kw: inventory([self.big]+roots, run, **kw)), \
              patch.object(collector, 'collect', side_effect=crashes):

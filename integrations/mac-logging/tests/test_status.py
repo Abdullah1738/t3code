@@ -367,7 +367,8 @@ class StatusTests(unittest.TestCase):
                    diskInventory=dict(scans=0, rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0, scanMs=0),
                    diskWait=dict(runs=0, maxStuckForS=None, latestStuckUnmountMountPoint=None,
                                  busyRuns=0, topBusyComms=[]))
-        self.assertEqual({k: v for k, v in result.items() if k not in ('jobs', 'missingJobs', 'cpuSpikes', 'diskBudgets')}, old)
+        self.assertEqual({k: v for k, v in result.items() if k not in ('jobs', 'missingJobs', 'cpuSpikes', 'diskBudgets', 'spawnSample')}, old)
+        self.assertIsNone(result['spawnSample'])
         self.assertEqual(result['diskBudgets'], dict(pathsMeasured=0, topOverBudget=[]))
         self.assertEqual(result['cpuSpikes'], dict(minutes=0, highestLoad=[]))
         health = result['jobs']['backup.run:health']
@@ -508,6 +509,7 @@ class StatusTests(unittest.TestCase):
         with patch.object(collector, 'read_state', side_effect=PermissionError):
             collector.missing_day(NOW)
         with patch.object(collector, 'missing_day') as check, \
+             patch.object(collector, 'homebrew_integrity'), \
              patch.object(collector, 'disk_tooling_probe', side_effect=lambda: self.assertTrue(check.called)), \
              patch.object(collector, 'directory_inventory'), patch.object(collector, 'collect'), \
              patch.object(collector, 'disk_wait'):

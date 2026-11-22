@@ -811,6 +811,78 @@ class WhoopAuthSchemaTests(unittest.TestCase):
             self.assertNotIn('Private', json.dumps(result))
 
 
+
+
+class WhoopPhaseSchemaTests(unittest.TestCase):
+    def test_phase_numeric_input_classes_and_secret_filter(self):
+        for value, valid in [(0, True), (123, True), (-1, False), (True, False), (1.5, False),
+                             ('PrivateToken', False), (None, False), ([], False), ({}, False),
+                             (float('nan'), False), (float('inf'), False)]:
+            with self.subTest(value=value):
+                raw = {'refreshMs': value, 'writeMs': value, 'PrivatePhase': 'PrivateToken',
+                       **{k: {'fetchMs': value, 'url': 'PrivateURL', 'headers': 'PrivateHeader', 'body': 'PrivateBody'}
+                          for k in ('sleep', 'recovery', 'cycle', 'body')}}
+                props = log._props('sync.run', raw)
+                for key in ('refreshMs', 'writeMs'):
+                    self.assertEqual(key in props, valid)
+                for key in ('sleep', 'recovery', 'cycle', 'body'):
+                    self.assertEqual('fetchMs' in props[key], valid)
+                self.assertNotIn('Private', json.dumps(props))
+        for name in ('cli.run', 'watcher.run'):
+            self.assertNotIn('refreshMs', log._props(name, {'refreshMs': 123}))
+            self.assertNotIn('writeMs', log._props(name, {'writeMs': 123}))
+
+    def test_sync_host_load_at_entry_and_missing_support(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, HEALTH_TOOLLOG_DIR=temp):
+            for value in (2.36, OSError('PrivateLoad'), AttributeError('PrivateLoad')):
+                opts = {'side_effect': value} if isinstance(value, Exception) else {'return_value': (value, 0, 0)}
+                with self.subTest(value=value), mock.patch.object(log.os, 'getloadavg', **opts) as load:
+                    with log.Span('whoop-sync', 'sync.run') as span:
+                        if not isinstance(value, Exception):
+                            self.assertEqual(span.props['hostLoad1m'], 2.4)
+                    load.assert_called_once_with()
+            rows = [json.loads(line) for p in Path(temp).glob('*.ndjson') for line in p.read_text().splitlines()]
+            self.assertEqual(rows[0]['props']['hostLoad1m'], 2.4)
+            for row in rows[1:]:
+                self.assertNotIn('hostLoad1m', row['props'])
+            self.assertTrue(all(r['ok'] for r in rows))
+            self.assertNotIn('PrivateLoad', json.dumps(rows))
+
+    def test_rollup_percentiles_and_strict_slow_boundary(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, HEALTH_TOOLLOG_DIR=temp):
+            for i, duration in enumerate((14999, 15000, 15001, 30000)):
+                props = {'refreshMs': i * 10, 'writeMs': i * 60,
+                         **{k: {'fetchMs': i * scale} for k, scale in
+                            (('sleep', 20), ('recovery', 30), ('cycle', 40), ('body', 50))}}
+                log.emit('whoop-sync', 'sync.run', duration_ms=duration, ok=i != 3,
+                         props=props, tag='timeout' if i == 3 else None)
+            log.emit('whoop-sync', 'sync.run', duration_ms=16000, ok=True)
+            for component, name in (('whoop', 'cli.run'), ('whoop', 'sync.run'), ('whoop-sync', 'watcher.run')):
+                log.emit(component, name, duration_ms=99999, ok=True, props={'refreshMs': 99999})
+            result = log.rollup(log.utcnow().date().isoformat())['whoop']
+            self.assertEqual(result['slowSyncs'], 3)
+            for phase, scale in zip(log.SYNC_PHASES, (10, 20, 30, 40, 50, 60)):
+                self.assertEqual(result['syncPhaseMs'][phase], {'p50': scale, 'p95': 3 * scale, 'max': 3 * scale})
+
+    def test_rollup_missing_partial_zero_and_invalid_samples(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, HEALTH_TOOLLOG_DIR=temp):
+            day = log.utcnow().date().isoformat()
+            empty = log.rollup(day)['whoop']
+            nulls = {'p50': None, 'p95': None, 'max': None}
+            self.assertEqual(empty['slowSyncs'], 0)
+            self.assertEqual(empty['syncPhaseMs'], dict.fromkeys(log.SYNC_PHASES, nulls))
+            log.emit('whoop-sync', 'sync.run', ok=False, props={'sleep': {'fetchMs': 0}}, tag='timeout')
+            with (Path(temp) / (day + '.ndjson')).open('a') as fh:
+                for value in (-1, True, 1.5, 'PrivateToken', None):
+                    fh.write(json.dumps({'tool': 'health', 'component': 'whoop-sync', 'name': 'sync.run',
+                        'kind': 'error', 'durationMs': value, 'props': {'refreshMs': value, 'sleep': {'fetchMs': value}}}) + '\n')
+            result = log.rollup(day)['whoop']
+            self.assertEqual(result['syncPhaseMs']['sleep.fetchMs'], {'p50': 0, 'p95': 0, 'max': 0})
+            self.assertEqual(result['syncPhaseMs']['refreshMs'], nulls)
+            self.assertEqual(result['slowSyncs'], 0)
+            self.assertNotIn('PrivateToken', json.dumps(result))
+
+
 class RefreshSchemaTests(unittest.TestCase):
     def test_outcomes_and_retry_types(self):
         for name in ('sync.run', 'cli.run'):

@@ -42,12 +42,27 @@ Choose **Sign-in method** in the Antigravity provider settings:
 | Gemini Enterprise          | Browser sign-in, GCP project, and GCP location                                               |
 | Gemini API key             | API key; choose Connect without a browser                                                    |
 | Agent Platform / Vertex AI | API key, or GCP project and location with Application Default Credentials on the environment |
+| Gateway (9router)          | Gateway URL and optional gateway key; choose Connect without a browser                       |
 
 The environment stores the Antigravity API key outside its settings file, and
 clients only see whether one is saved. The agent uses the method and credentials selected for this instance;
 ambient `GEMINI_API_KEY` and Google credential variables do not override them.
 Changing the method stops the instance's sessions. Sign out before replacing an
 account.
+
+### Gateway (9router)
+
+The gateway method sends the agent's model traffic to a Gemini-compatible gateway
+such as 9router instead of Google. Set **Gateway URL** to the gateway's root, for
+example `http://127.0.0.1:20128`, not its `/v1` or `/v1beta` path. If the gateway
+needs a key, enter it as **Gateway key**; it is sent as `Authorization: Bearer` and
+stored outside the settings file like the API key.
+
+The model list comes from the gateway's `GET /v1/models`, keeping its `ag/*` models,
+and is read again on every provider status check and session start. If the gateway
+is down, rejects the key or lists no `ag/*` models, the provider shows that error
+and subagents can't use it until it is fixed. Tools, thought signatures and
+streaming need a gateway that carries the full Gemini protocol.
 
 ## Runtime installation
 

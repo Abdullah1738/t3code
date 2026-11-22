@@ -9,6 +9,7 @@ import sys
 import threading
 
 from overload import evaluate
+from spawn_schema import fields as spawn_fields
 
 
 def save(path, value):
@@ -53,10 +54,13 @@ class Dispatcher:
         self.queue = queue.SimpleQueue()
         self.child = None
         self.latest_families = []
+        self.latest_spawn = None
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
     def tick(self, props, now):
         self.state, actions = evaluate(self.state, dict(props, families=self.latest_families), now)
+        for action in actions:
+            action['event']['spawn'] = spawn_fields(self.latest_spawn)
         self.queue.put((self.state, actions))
 
     def process(self, state, actions):

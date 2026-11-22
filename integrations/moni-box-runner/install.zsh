@@ -42,7 +42,7 @@ set -euo pipefail
 bun_bin=$1
 agent_dir=$HOME/person/agent
 [[ -x $bun_bin && -r $agent_dir/config.json ]] || { echo 'Provide box config and pinned Bun before installing' >&2; exit 1; }
-"$bun_bin" -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync(process.env.HOME+"/person/agent/config.json","utf8"));for(const k of ["tokenFile","callbackTokenFile","privateKeyFile","systemFile"])fs.accessSync(c[k]);fs.accessSync(c.claude,fs.constants.X_OK)'
+"$bun_bin" -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync(process.env.HOME+"/person/agent/config.json","utf8"));for(const k of ["tokenFile","callbackTokenFile","privateKeyFile","systemFile"])fs.accessSync(c[k]);if((c.harness??"claude")==="antigravity"){for(const f of ["agy_acp_server.par","localharness_external"])fs.accessSync(c.antigravity+"/"+f,fs.constants.X_OK)}else fs.accessSync(c.claude,fs.constants.X_OK)'
 "$bun_bin" "$agent_dir/code/integrations/moni-box-runner/src/router-auth.ts" --check-config "$agent_dir/config.json"
 # The supervisor owns separate loopback forwards: router 19465 -> 20128, livez 19466 -> 20129.
 # Validate configured overrides above; do not require tunnels before installing the paused runner.

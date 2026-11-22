@@ -6,6 +6,13 @@ Source scripts use `toollog.py` (or the `toollog.sh` bridge) for local metadata 
 it rolls up yesterday. Quantiles use nearest rank. `okRate`/`failedRate` use
 lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
+Each hourly collector run emits `homebrew.integrity` with dangling opt links,
+missing dependencies, status and duration. The read-only `brew missing` probe
+has a 60-second timeout and disables auto-update and analytics. Broken results
+send a Telegram attention alert with a stable key for that exact set of links
+and dependencies; unchanged failures are not sent again. Probe errors are
+logged without an alert. Repairs are suggested, never run by the collector.
+
 Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
 or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
 cadence clock (include `Z` or an explicit UTC offset); launchd checks always
@@ -445,11 +452,15 @@ process/parent-1 counts, and disk0's second iostat sample. MB/GB use powers of
 1024. `top` MEM already includes compressed pages. The single-snapshot CPU column
 is omitted because it reports zero without a preceding observation; use
 `cpu.sample` for CPU usage. One full, memory-sorted top snapshot
-supplies both the first15 holders and watched PIDs, including those below15.
-ps supplies exact command names/elapsed time and matches the snapshot by PID.
+supplies growth tracking for every observed PID and the first15 logged holders,
+plus watched PIDs, including those below15.
+ps supplies command names, elapsed time and process start time and matches the snapshot by PID.
 At most512 watched PIDs are retained; excess
 is explicit in `watchedOmitted` and makes the sample partial. Each subprocess,
-including notifications, has a ten-second timeout. Failed probes are null with
+including notifications, has a ten-second timeout. If top times out, up to three
+previous holders get a five-second `footprint` probe and a bounded birth recheck;
+if the full ps scan also fails, bounded per-PID birth checks bracket each probe.
+`fallback` records these outcomes. No RSS substitution is used. Failed probes are null with
 fixed `…Error` codes; watched PID failures retain null metrics per PID.
 
 `state/memory.json` retains swap counter baselines and alert receipts under a
@@ -471,16 +482,55 @@ for three consecutive intervals spanning at least 15 minutes. A baseline plus
 three five-minute samples is required; one jump does not qualify. Samples log
 `fseventsdGrowthMbPerHour`, `fseventsdGrowthSamples`, `fseventsdGrowthPid` and
 `fseventsdGrowthWindowS`. State follows each watched PID on the same boot;
-missing measurements, elapsed-age discontinuities, a flat/falling reading or
-a gap over ten minutes reset its streak. The growth check needs no new subprocess.
-Each reason has a six-hour cooldown
-across day boundaries. Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
+elapsed-age discontinuities, a flat/falling reading or
+a gap over ten minutes reset its streak. A timed-out top or ps sample preserves unmeasured
+history as a gap for up to twenty minutes, without creating a new observation.
+The same tracker supplies `growth`: any holder at least4 GiB, growing above1 GiB/h
+over at least three consecutive intervals spanning30 minutes. That reason uses
+PID plus exact start time and boot identity. Samples include measured growth rates.
+Each reason has a six-hour cooldown across day boundaries. Footprint and growth
+can escalate earlier when a holder adds at least4 GiB since its last alert, or
+another holder qualifies. Swap can escalate after another4 GiB used; its initial
+trigger stays above16 GiB. All reasons retain a minimum30-minute alert gap.
+`memory.alert` includes the holder PID, footprint, growth rate and escalation/fallback
+flags; the two-line notification names the holder, swap and compressor sizes.
+Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
 suffix so another alert can be queued after six hours on the same day. An
 unconfirmed send retains its exact key/text for idempotent retry. For a diagnostic
 sample without notifications, run `TOOLLOG_DIR=<private-temp-dir> /usr/bin/python3
 integrations/mac-logging/memory.py --no-alert`.
 
+## Forensic log windows
+
+`mac-log-window --start 2026-11-16T08:22:00Z --end 2026-11-16T08:24:00Z
+--predicate 'eventMessage CONTAINS[c] "PMU"' --info --debug --out evidence.ndjson`
+reads `log show` with a deadline and keeps only parsed timestamps inside the
+requested inclusive UTC window, preserving the original row bytes and timestamp
+precision through nanoseconds. Use explicit
+UTC bounds. `--deadline` defaults to 90 seconds (maximum 600); group termination
+allows up to 3 seconds for TERM and 1 second to reap after KILL.
+`--slice 15m` divides the window and remaining budget between consecutive reads;
+a timed-out slice does not prevent later reads while budget remains. Shared
+slice edges are kept only once. Rows outside each slice are excluded even when
+they fall inside the overall window. `--keep-outside` saves them separately in
+`<out>.outside.ndjson`; they are never incident evidence.
+
+Exit codes are 0 complete, 2 partial (deadline), and 1 error (including bad args
+or a nonzero log exit). `<out>.summary.json` records arguments, UTC bounds,
+status, exit code, elapsed milliseconds, `rowsIn`, `rowsOutside`, earliest/latest
+outside timestamps (`outsideFirst`/`outsideLast`), `unparsed`, greatest kept
+`lastInWindowTs`, per-slice results and a reason. A partial result is incomplete;
+`lastInWindowTs` is an observation, not proof of coverage. Unparseable rows are
+counted and excluded. Validation errors also write a summary when `--out` is
+supplied and its parent is writable. The helper writes only the output and its
+sidecars and never requests root access.
+
 ## Source events
+
+Unified `crash.source` and completed `crash.unified.chunk` records include
+`outsideRows`, `outsideFirst`, `outsideLast` (UTC epoch seconds) and
+`unparsedRows` only when those counts are nonzero. Source records aggregate
+chunk counts; unparseable timestamps and outside rows never become observations.
 
 `disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
 counts. Each unavailable source also emits an error-kind `disk.inventory.source`
@@ -812,6 +862,31 @@ review; the CPU job retains its original launcher. Installer tests set
 `MAC_LOG_SSD_PROBE_FILE` for fixture init/check; live reads use the fixed target.
 
 ## Host telemetry
+
+`host.spawn_sample` reports sampled births/exits once a minute, with parent
+identities, runnable threads by current priority, CPU advancement and offbox
+command classes. Births are a lower bound from five-second PID/start-time
+snapshots, not a fork or exec count. `status` and rollups show the latest
+birth rate, three parents and runnable priority-4-or-lower count. Overload
+events carry the sample as context without changing alert thresholds.
+
+Each native pass has a 1.5-second cooperative deadline and reads threads for
+at most 300 candidate processes. A separate daemon worker isolates a stuck
+kernel call; the publisher reports stale/in-flight coverage instead of
+waiting. Coverage, unreadable argv/tasks and missing CPU baselines are explicit.
+Only derived labels are cached per PID/start identity; argv is never logged.
+Cost includes per-minute summed wall/CPU time, individual phase costs and guard
+decisions. Actual excess halves the thread-process cap down to one, prioritizing
+runnable hints and highest CPU gain; only then can cadence slow to 15 seconds.
+A shared 75ms soft argv/CPU allocation leaves room for a 25ms thread pass every
+tick within the 1.5s overall deadline. Runnable hints with unread CPU data
+remain eligible for thread reads and carry an unknown CPU baseline.
+Argv runs first so a slow CPU census cannot starve new parent/offbox labels.
+Thread counts are null only when no minimal pass fits or is readable, and retry
+on the next tick. Runnable counts describe the latest tick, not the sum
+of repeated censuses; offbox counts/RSS describe that same tick. CPU deltas use
+the last readable per-identity baseline (`offboxWindowS` is the tick window,
+`cpuWindowMaxS` exposes older baselines); RSS is a sum, not unique physical memory.
 
 `com.abdullah.mac-host` is a separate long-lived Standard job. It emits
 `host.vitals` every 30 seconds and `host.families_lite` every 60 seconds without

@@ -12,12 +12,14 @@ import signal
 import threading
 from urllib.parse import urlsplit
 import volume
+from host import clean_host
+from causes import PHASES
 
 CAP = 200 * 1024 * 1024
 _seen = set()
 _last_report = time.monotonic()
 PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx', 'phase', 'durationMaxMs', 'omitted', 'provider', 'scope', 'cause', 'lockMs', 'until', 'previousBackoffLevel', 'backoffLevel', 'source'}
-PROPS.update({'target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'lastTs'})
+PROPS.update({'hostAtMs', 'hostStartAtMs', 'hostEndAtMs', 'target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'lastTs'})
 CONNECTION_ERRNOS = {'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN'}
 SYSCALLS = {'connect', 'read', 'write', 'getaddrinfo', 'send', 'recv', 'shutdown'}
 IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session', 'writer'}
@@ -30,6 +32,11 @@ PROPS.update({'launchctlExit', 'launchctlStderr', 'jobState', 'jobPid', 'start',
               'historyScanParseMs', 'rollupWriteMs', 'stateSaveMs', 'lockWaitMs', 'listenerHistoryMs',
               'poolHistoryMs', 'historyRefreshMs', 'launchctlMs', 'tcpMs', 'providersFetchMs',
               'usageFetchMs', 'statsFetchMs', 'snapshotMs', 'logWriteMs'})
+PROPS.update({'observerSnapshotStartMs', 'postEndDiagMs', 'openPhase', 'lastPhase',
+              'causeEvidenceField', 'causeEvidenceValue', 'missingEvidence', 'childWaitMs',
+              'phaseMs', 'measuredMs', 'unmeasuredMs'})
+PROPS.update({'cpuMs', 'wallMs', 'processType', 'nice', 'priority'})
+PROPS.update({field[:-2] + 'CpuMs' for field in PHASES.values()})
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
             'The operation was aborted due to timeout', 'The operation was aborted'}
@@ -103,6 +110,11 @@ def clean(event, now):
     ids = {k: hashlib.sha256(str(v).encode()).hexdigest()[:16] for k, v in event.get('ids', {}).items() if k in IDS and isinstance(v, (str, int))}
     props = {}
     for k, v in event.get('props', {}).items():
+        if k in ('host', 'hostStart', 'hostEnd'):
+            host = clean_host(v)
+            if host:
+                props[k] = host
+            continue
         if k not in PROPS:
             continue
         if k == 'launchctlStderr':
@@ -165,7 +177,7 @@ def _write_row(root, day, now, row, state):
                 os.close(fd)
                 cutoff = (now.date() - dt.timedelta(days=30)).isoformat()
                 for p in root.iterdir():
-                    m = re.fullmatch(r'(?:rollup-|\.cap-|\.retention-)?(\d{4}-\d{2}-\d{2})(?:\.ndjson|\.json)?', p.name)
+                    m = re.fullmatch(r'(?:rollup-|\.rollup-state-|\.listener-state-|\.cap-|\.retention-)?(\d{4}-\d{2}-\d{2})(?:\.ndjson|\.json)?', p.name)
                     if m and m[1] < cutoff:
                         p.unlink()
             except FileExistsError:
