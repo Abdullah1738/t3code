@@ -43,9 +43,25 @@ listener/pool history, report writes, state saves, NDJSON writes (`logWriteMs`),
 lock waits and HTTP work;
 nested work is not counted twice. `log.rollup` now measures only that rollup
 call. `pool-alerts` emits `pool.endpoint.get` for its independent fetches.
-Each measured phase also has a matching `*CpuMs` field, excluding nested work.
-A phase over two minutes using less than 10% CPU is tagged
-`tick_starved:<phase>`; other slow phases retain `tick_blocked:<phase>`.
+Each measured phase also has matching `*CpuMs`, `*InblockN`, `*MajfltN`,
+`*NivcswN` and `*NvcswN` fields, excluding nested work. History scan/parse and
+listener history additionally carry `*BytesHashed` and `*BytesParsed` (input
+bytes examined by the line reader, including filtered or unfinished lines).
+Both histories also split wall/CPU into `*LoadStateMs`/`*LoadStateCpuMs`,
+`*ValidateCursorMs`/`*ValidateCursorCpuMs`, `*ParseLinesMs`/`*ParseLinesCpuMs`,
+`*BuildReportMs`/`*BuildReportCpuMs` and `*SaveStateMs`/`*SaveStateCpuMs`.
+Substeps exclude one another and nested phases, including checkpoint saves
+inside parsing; BuildReport covers aggregate restoration and report construction.
+For phases over 30 seconds using less than 10% CPU, `tick_io:<phase>` requires
+at least 16 input operations or major faults and 16 voluntary switches, with
+voluntary switches at least four times involuntary switches. Dominant
+involuntary switches (at least 16) yield `tick_starved:<phase>`. Mixed or quiet
+counters retain `tick_blocked:<phase>`; counters are wait signals rather than
+measurements of time spent waiting. Legacy rows without counters retain the
+CPU-only inference above two minutes. These fields extend existing diagnostics
+without new rows.
+These three sparse phase rows (`poll.phases`, `rollup.phases`, `guard.tick_late`)
+have an 8 KiB serialized limit to fit the fixed fields; ordinary rows retain 4 KiB.
 Scheduling, child-wait and missing-evidence causes keep their existing rules.
 `pollGaps`/`guardGaps` number measured spans over two minutes, clipped for daily
 duration totals. `coverage` explains threshold-only `healthByHour`, exhaustion
