@@ -20,6 +20,7 @@ from data_io import DataUnavailable
 MAX_BYTES = 2 * 1024 * 1024
 MAX_ROW_BYTES = 16 * 1024
 APPEND_BUDGET = 0.04
+APPEND_ERROR_BUDGET = 0.008
 APPEND_ERRORS = 0
 _ACTIVE = ContextVar('money_cases_run_history', default=None)
 PHASES = {'reconcile', 'follow', 'attention', 'build_write', 'merchants', 'order_charges', 'payments',
@@ -132,11 +133,12 @@ def persisted_errors(wd):
         os.close(fd)
 
 
-def append_failed(wd, values, started):
+def append_failed(wd, values):
     global APPEND_ERRORS
     APPEND_ERRORS += 1
     values['history_append_errors'] = APPEND_ERRORS
-    remaining = .048 - (time.monotonic() - started)
+    # Delayed delivery of the append alarm must not consume the marker's budget.
+    remaining = APPEND_ERROR_BUDGET
     caller = signal.getitimer(signal.ITIMER_REAL)[0]
     if caller:
         remaining = min(remaining, caller - .001)
@@ -177,9 +179,8 @@ def repair_tail(fd, size):
 
 
 def append(wd, values):
-    """No retries or fsync: at most 40 ms of best-effort local diagnostics."""
+    """No retries or fsync: 40 ms for the row, then 8 ms for failure accounting."""
     global APPEND_ERRORS
-    started = time.monotonic()
     try:
         # Leave enclosing deadlines to their caller, rather than swallowing them.
         remaining = signal.getitimer(signal.ITIMER_REAL)[0]
@@ -221,7 +222,7 @@ def append(wd, values):
     except (Exception, DataUnavailable) as exc:
         if getattr(exc, '_money_cases_timeout', False) and not isinstance(exc, AppendTimeout):
             raise
-        append_failed(wd, values, started)
+        append_failed(wd, values)
         return False
 
 
@@ -248,7 +249,6 @@ def recording(wd):
         raise
     finally:
         _ACTIVE.reset(token)
-        finishing = time.monotonic()
         try:
             row.update(row.pop('stats', {}))
             row.setdefault('total_s', round(time.monotonic() - started, 3))
@@ -256,7 +256,7 @@ def recording(wd):
         except (Exception, DataUnavailable) as exc:
             if getattr(exc, '_money_cases_timeout', False):
                 raise
-            append_failed(wd, row, finishing)
+            append_failed(wd, row)
 
 
 def record_skip(row, error, exit_code=0):
