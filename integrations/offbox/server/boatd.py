@@ -227,6 +227,9 @@ def migrate(con) -> None:
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE commands ADD COLUMN {col}")
     con.execute("CREATE INDEX IF NOT EXISTS commands_cpu_start ON commands(sync, started_at)")
+    # Every waiting run reads the queue and the running rows on each look, under one lock. Without this each of
+    # those reads walks every command ever recorded, and the head's turn comes round once per (waiters x scans).
+    con.execute("CREATE INDEX IF NOT EXISTS commands_waiting ON commands(sync, status, created_at, box_id, pid)")
     if "owner" not in _cols(con, "saved"):
         # Saved states were global by name; they become per owner. The one owner so far keeps all of them.
         con.execute("BEGIN IMMEDIATE")

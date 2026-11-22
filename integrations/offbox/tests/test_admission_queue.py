@@ -264,9 +264,19 @@ class AdmissionQueue(Base):
         self.assertIn(b'position 2 of 2', err.getvalue())
         self.assertNotIn(b'cap', err.getvalue())
 
+    def test_each_look_reads_the_queue_from_an_index_not_from_every_command(self):
+        for sql in ("SELECT * FROM commands WHERE sync=0 AND status='queued' ORDER BY created_at, box_id, pid LIMIT 1",
+                    "SELECT box_id,pid FROM commands WHERE sync=0 AND status='queued' ORDER BY created_at,box_id,pid",
+                    "SELECT box_id,kind FROM commands WHERE sync=0 AND status='running'",
+                    "SELECT COUNT(*) FROM commands WHERE sync=0 AND status='running'"):
+            plan = ' '.join(r[3] for r in self.con.execute('EXPLAIN QUERY PLAN ' + sql))
+            self.assertIn('INDEX commands_waiting (sync=? AND status=?)', plan, sql)
+            self.assertNotIn('TEMP B-TREE', plan, sql)
+
     def test_admission_reads_a_legacy_schema_without_sync_or_killed(self):
         b, h, p = self.setup_queue()
         self.con.execute('DROP INDEX commands_cpu_start')
+        self.con.execute('DROP INDEX commands_waiting')
         self.con.execute('ALTER TABLE commands DROP COLUMN sync')
         self.con.execute('ALTER TABLE commands DROP COLUMN killed')
         with patch.object(boatd, '_sh', return_value=(3, 'inactive')), \
@@ -346,6 +356,7 @@ class AdmissionQueue(Base):
                 boatd.write_json(boatd.result_path(b, h), receipt)
                 if outcome == 'legacy':
                     self.con.execute('DROP INDEX commands_cpu_start')
+                    self.con.execute('DROP INDEX commands_waiting')
                     self.con.execute('ALTER TABLE commands DROP COLUMN sync')
                     self.con.execute('ALTER TABLE commands DROP COLUMN killed')
                 cleanup = dict(cleanup='unknown' if outcome == 'unknown_cleanup' else 'clean', leftover_killed=0, remaining=0)
@@ -370,6 +381,7 @@ class AdmissionQueue(Base):
 
     def test_legacy_kill_file_with_current_receipt_recovers_without_killed_column(self):
         self.con.execute('DROP INDEX commands_cpu_start')
+        self.con.execute('DROP INDEX commands_waiting')
         self.con.execute('ALTER TABLE commands DROP COLUMN sync')
         self.con.execute('ALTER TABLE commands DROP COLUMN killed')
         for outcome in ('success', 'failure', 'interrupted', 'lost', 'pending_cleanup'):
