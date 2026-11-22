@@ -555,7 +555,27 @@ def janitor_mcp_fields(values):
     return result
 
 
+def suspend_fields(values):
+    result = {}
+    for key, value in values.items():
+        if key in ('pid', 'ppid', 'createdAt', 'deadline', 'firstSeen', 'ageS', 'count', 'unownedCount') and finite_number(value):
+            result[key] = value
+        elif key in ('recovered', 'overdue') and type(value) is bool:
+            result[key] = value
+        elif key in ('start', 'stat', 'comm', 'command', 'owner', 'reason', 'actor', 'card', 'then', 'phase', 'result') and isinstance(value, str):
+            result[key] = '[redacted]' if SECRET.search(value) else ''.join(c if c.isprintable() else ' ' for c in value[:1000])
+        elif key == 'readBack' and isinstance(value, list):
+            result[key] = [{k: v for k, v in row.items()
+                            if (k in ('signal', 'stat') and isinstance(v, str)
+                                and re.fullmatch(r'[A-Za-z+<>?-]{1,32}', v))
+                            or (k == 'sent' and type(v) is bool)}
+                           for row in value[:8] if isinstance(row, dict)]
+    return result
+
+
 def safe_fields(values, event=None):
+    if event and event.startswith('suspend.'):
+        return suspend_fields(values or {})
     if event and event.startswith('macguard.'):
         return macguard_fields(values or {})
     if event == 'host.spawn_sample':
