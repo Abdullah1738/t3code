@@ -129,6 +129,84 @@ class TerminalRepairTests(unittest.TestCase):
         self.assertEqual(state['last_result']['checkout_result']['status'], 'preparing')
         self.assertTrue(tracker.read(checkout.config_path(tracker, OTHER))['active'])
 
+    def test_stale_scheduled_retirement_preserves_imported_checkout_links(self):
+        stale = self.sibling(active=True)
+        stale.pop('delivery_card')
+        config_path = checkout.config_path(tracker, OTHER)
+        tracker.write(config_path, stale)
+        self.assertEqual(self.import_order('--checkout-order', OTHER)[0], 0)
+        linked = tracker.read(config_path)
+        folder = tracker.WATCHERS / stale['watcher']
+        archived = tracker.WATCHERS.parent / 'archive' / (stale['watcher'] + '-scheduled')
+
+        def remove(args, timeout=12):
+            self.assertEqual(args, ['robob-watch', 'remove', stale['watcher']])
+            folder.rename(archived)
+            tracker.write(archived.parent / 'retired' / (stale['watcher'] + '.json'),
+                          {'archived': str(archived)})
+            return 'retired'
+
+        # The scheduled process loaded stale before import, then acquired its
+        # state lock after import committed the checkout links.
+        with patch.dict(os.environ, {'WATCH_DIR': str(folder)}), \
+                patch.object(tracker, 'bank_charge_events', return_value=[]), \
+                patch.object(tracker, 'run', side_effect=remove) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(tracker._check(stale)['ok'])
+        run.assert_called_once()
+        retired = tracker.read(config_path)
+        self.assertFalse(retired['active'])
+        for key in ('checkout', 'siblings', 'checkout_leader'):
+            self.assertEqual(retired.get(key), linked[key])
+        self.assertTrue(checkout.order_state(tracker, retired)['checkout_terminal'])
+        for oid in (OID, OTHER):
+            self.assertTrue(order_receipts.can_report(oid)['ok'])
+
+    def test_config_writes_preserve_checkout_links_and_allow_additional_members(self):
+        stale = self.sibling(active=True)
+        self.assertEqual(self.import_order('--checkout-order', OTHER)[0], 0)
+        path = checkout.config_path(tracker, OTHER)
+        linked = tracker.read(path)
+        links = {key: linked[key] for key in ('checkout', 'siblings', 'checkout_leader')}
+        cases = [({}, links),
+                 ({'checkout': 'old-group', 'siblings': [OTHER], 'checkout_leader': OTHER}, links),
+                 ({**links, 'checkout_leader': OID}, links),
+                 ({'checkout': 'conflicting-group', 'siblings': [OTHER, '408-0000000-0000001'],
+                   'checkout_leader': OTHER}, links)]
+        expanded = {**links, 'checkout': 'expanded-group', 'siblings': sorted([OID, OTHER, '408-0000000-0000001'])}
+        cases.append((expanded, expanded))
+        for incoming, expected in cases:
+            with self.subTest(incoming=incoming):
+                tracker.write(path, linked)
+                tracker.write_order(path, {**stale, **incoming, 'active': False})
+                written = tracker.read(path)
+                self.assertFalse(written['active'])
+                self.assertEqual({key: written[key] for key in links}, expected)
+
+    def test_discovery_preserves_imported_member_against_smaller_cached_checkout(self):
+        stale = self.sibling(status='preparing', active=True)
+        cfg = {**stale, 'order': OID, 'watcher': 'order-amazon-' + OID, 'active': False}
+        tracker.write(checkout.config_path(tracker, OID), cfg)
+        tracker.write(tracker.WATCHERS / cfg['watcher'] / 'order-tracker-state.json',
+                      {'status': 'delivered', 'last_result': {'status': 'delivered', 'whole_order_complete': True}})
+        group = {**self.mail['checkout'], 'leader': OTHER}
+        for oid in (OID, OTHER):
+            checkout.link_order(tracker, oid, group)
+        stale = tracker.read(checkout.config_path(tracker, OTHER))
+        folder = tracker.WATCHERS / stale['watcher']
+        tracker.write(folder / 'watcher.json', {'id': stale['watcher']})
+        imported = '408-0000000-0000001'
+        self.assertEqual(self.import_order('--checkout-order', OTHER, order=imported)[0], 0)
+        linked = tracker.read(checkout.config_path(tracker, OTHER))
+        expected = {key: linked[key] for key in ('checkout', 'siblings', 'checkout_leader')}
+        self.assertEqual(expected['siblings'], sorted([OID, OTHER, imported]))
+        with patch.dict(os.environ, {'WATCH_DIR': str(folder)}):
+            checkout.discover(tracker, stale, self.mail)
+        for oid in (OID, OTHER, imported):
+            cfg = tracker.read(checkout.config_path(tracker, oid))
+            self.assertEqual({key: cfg[key] for key in expected}, expected)
+            self.assertEqual(checkout.order_state(tracker, cfg)['siblings'], expected['siblings'])
+
     def test_missing_sibling_is_linked_but_never_invented(self):
         self.assertEqual(self.import_order('--checkout-order', OTHER)[0], 0)
         cfg = tracker.read(checkout.config_path(tracker, OID))

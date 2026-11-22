@@ -474,6 +474,7 @@ def write(path, data):
 
 
 def write_order(path, cfg):
+    from amazon_checkout import preserve_links
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Registration, notice retries and retirement can hold older config snapshots.
     # Preserve claims under the same short lock used to commit a new bank match.
@@ -482,6 +483,7 @@ def write_order(path, cfg):
         current = read(path)
         if current.get('bank_msg_id'):
             cfg.update({key: current.get(key) for key in order_bank_charge.FIELDS})
+        preserve_links(cfg, current)
         # A check may retire with the config it loaded before a silent repair.
         if current.get('metadata_revision') and current['metadata_revision'] != cfg.get('metadata_revision'):
             cfg.update({key: current[key] for key in

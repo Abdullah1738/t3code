@@ -19,6 +19,12 @@ def config_path(tracker, order):
     return tracker.ROOT / 'orders' / (order_identity.tracker_id('amazon', order) + '.json')
 
 
+def preserve_links(cfg, current):
+    # Stale configs and cached confirmations cannot shrink an established group.
+    if current.get('checkout') and not set(current.get('siblings', [])) < set(cfg.get('siblings', [])):
+        cfg.update({key: current[key] for key in ('checkout', 'siblings', 'checkout_leader')})
+
+
 def link_order(tracker, order, checkout):
     path = config_path(tracker, order)
     # Use write_order's config lock and reread inside it: a removal, notice or
@@ -27,7 +33,9 @@ def link_order(tracker, order, checkout):
         fcntl.flock(lock, fcntl.LOCK_EX)
         current = tracker.read(path)
         if current:
+            previous = current.copy()
             apply(current, checkout)
+            preserve_links(current, previous)
             tracker.write(path, current)
         return current
 
