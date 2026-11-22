@@ -160,8 +160,9 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     if (entry.component === "remote-box" && ["moni-box-down", "moni-runner-error"].includes(entry.name)) {
       if (key === "step" && typeof value === "string" && ["lease", "identity", "deliver", "ack"].includes(value)
         || key === "errorClass" && typeof value === "string" && ["RemoteRequestError", "Error", "TypeError", "SyntaxError", "Timeout", "Object", "String", "Number", "Boolean", "BigInt", "Symbol", "Function", "undefined", "object"].includes(value)
-        || ["latencyMs", "failures"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0
-        || entry.name === "moni-runner-error" && key === "code" && value === "unreachable") {
+        || key === "errorCode" && typeof value === "string" && /^[A-Za-z0-9_]{1,40}$/.test(value)
+        || ["latencyMs", "failures", "loopDelayMs"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0
+        || entry.name === "moni-runner-error" && key === "code" && (value === "unreachable" || value === "harness")) {
         props[key] = value; continue;
       }
     }
