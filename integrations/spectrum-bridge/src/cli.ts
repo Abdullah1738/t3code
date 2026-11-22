@@ -35,13 +35,18 @@ export const SEND_TIMEOUT_EXIT_CODE = 75;
 class SendTimeout extends CliError {
   constructor(readonly key: string) { super("Bridge request timed out"); }
 }
+class AgentAnswerTimeout extends CliError {
+  constructor(readonly requestId: string) { super("Bridge request timed out"); }
+}
 
 export function cliFailure(error: unknown) {
   return {
-    exitCode: error instanceof SendTimeout ? SEND_TIMEOUT_EXIT_CODE : 1,
+    exitCode: error instanceof SendTimeout || error instanceof AgentAnswerTimeout ? SEND_TIMEOUT_EXIT_CODE : 1,
     body: { error: error instanceof CliError ? error.message : "Bridge request failed",
       ...(error instanceof SendTimeout ? { outcome: "unknown", key: error.key,
-        hint: "The message may already be queued. Re-run with the same --key (it won't send twice) or check with send-status --key." } : {}) },
+        hint: "The message may already be queued. Re-run with the same --key (it won't send twice) or check with send-status --key." } : {}),
+      ...(error instanceof AgentAnswerTimeout ? { outcome: "unknown", requestId: error.requestId,
+        hint: "The answer may already be admitted. Check agent-requests --request <requestId> --session <session>, or repeat the identical agent-answer call (it won't deliver twice)." } : {}) },
   };
 }
 /** A secret value printed verbatim, with no JSON wrapping or trailing newline. */
@@ -86,7 +91,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   react: ["target", "kind"],
   send: ["text", "session", "key", "effect", "subject", "to"],
   "cancel-send": ["session", "key"],
-  "send-status": ["session", "key"],
+  "send-status": ["session", "key", "kind"],
   poll: ["title", "option", "session", "key"],
   wake: ["text", "source", "key", "chat", "session"],
   "wake-status": ["key"],
@@ -97,7 +102,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   "ask-owner": ["text", "session", "key"],
   "agent-ask": ["to", "text", "session", "key", "parent"],
   "agent-answer": ["request", "text", "session", "status"],
-  "agent-requests": ["session"],
+  "agent-requests": ["session", "request"],
   "remote-events": ["chat", "session", "after"],
   "remote-resolve": ["chat", "session", "id", "state"],
   "notify-rule": ["session", "text", "id"],
@@ -300,8 +305,10 @@ export function parseCommand(args: string[]): Command {
   switch (command) {
     case "send-status": {
       const { dedupeKey, sessionId } = session();
+      if (values.kind !== undefined && values.kind !== "send" && values.kind !== "file") throw new CliError("--kind must be send or file");
       // Even percent-encoded dot segments are removed by URL normalization.
-      return { method: "GET", path: `/send-status/?key=${encodeURIComponent(dedupeKey)}&sessionId=${encodeURIComponent(sessionId)}` };
+      return { method: "GET", path: `/send-status/?key=${encodeURIComponent(dedupeKey)}&sessionId=${encodeURIComponent(sessionId)}`
+        + (values.kind === undefined ? "" : `&kind=${values.kind}`) };
     }
     case "cancel-send":
       return { method: "POST", path: "/cancel-send", body: session() };
@@ -440,7 +447,9 @@ export function parseCommand(args: string[]): Command {
       return { method: "POST", path: "/remote-resolve", body: { chat: "moni", sessionId, id: values.id, state: values.state } };
     }
     case "agent-requests":
-      return { method: "POST", path: "/agent-requests", body: { sessionId: sessionOnly(values.session)! } };
+      if (values.request !== undefined && !validAgentRequestId(values.request)) throw new CliError("Invalid --request");
+      return { method: "POST", path: "/agent-requests", body: { sessionId: sessionOnly(values.session)!,
+        ...(values.request === undefined ? {} : { request: values.request }) } };
     case "ask-owner": {
       const text = required(values.text, "--text");
       if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
@@ -674,16 +683,17 @@ export async function sendCommand(command: Command): Promise<unknown> {
     return await new Promise<unknown>((resolve, reject) => {
       let timeoutLogged = false;
       const fail = () => {
-        if (controller.signal.aborted && command.method === "POST" && ["/send", "/files"].includes(command.path)
-          && typeof body?.dedupeKey === "string") {
+        const sendKey = ["/send", "/files"].includes(command.path) && typeof body?.dedupeKey === "string" ? body.dedupeKey : undefined;
+        const answerId = command.path === "/agent-answer" && typeof body?.request === "string" ? body.request : undefined;
+        if (controller.signal.aborted && command.method === "POST" && (sendKey !== undefined || answerId !== undefined)) {
           if (!timeoutLogged) {
             timeoutLogged = true;
-            const keyHash = createHash("sha256").update(body.dedupeKey).digest("hex");
+            const keyHash = createHash("sha256").update(sendKey ?? answerId!).digest("hex");
             toolLog.capture(() => toolLog.write({ component: "cli", kind: "event", name: "cli.send_timeout",
-              ids: { operationId: `${command.path === "/files" ? "file" : "send"}:${keyHash}` },
+              ids: { operationId: `${answerId !== undefined ? "agent-answer" : command.path === "/files" ? "file" : "send"}:${keyHash}` },
               props: { path: command.path, elapsedMs: Math.max(0, performance.now() - startedAt) } }));
           }
-          reject(new SendTimeout(body.dedupeKey));
+          reject(answerId !== undefined ? new AgentAnswerTimeout(answerId) : new SendTimeout(sendKey!));
         } else reject(new CliError(controller.signal.aborted ? "Bridge request timed out" : "Bridge request failed"));
       };
       const req = request({

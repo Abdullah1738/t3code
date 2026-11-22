@@ -1041,6 +1041,8 @@ test("bus answer acknowledgement is idempotent; owner relays refuse before writi
   expect((await scoped(s.request("/agent-answer", body))).status).toBe(202);
   // Simulate losing the first HTTP response after the owner transaction committed.
   expect((await scoped(s.request("/agent-answer", body))).status).toBe(202);
+  expect((await scoped(s.request("/agent-answer", { ...body, operationId: opaqueId("retry-answer") }))).status).toBe(202);
+  expect((await scoped(s.request("/agent-answer", { ...body, text: "change", operationId: opaqueId("changed-answer") }))).status).toBe(409);
   expect((await scoped(s.request("/agent-answer", { ...body, text: "different" }))).status).toBe(409);
   expect(ownerStore.db.query<{ n: number }, []>("SELECT count(*) n FROM inbound").get()!.n).toBe(1);
 });

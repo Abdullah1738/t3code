@@ -491,6 +491,8 @@ describe("agent bus commands", () => {
       body: { request, text: "answer", sessionId: "ses_1" } });
     for (const status of ["pending", "done", "declined"]) expect(parseCommand([...answer, "--status", status]).body?.status).toBe(status);
     expect(parseCommand(["agent-requests", "--session", "ses_1"])).toEqual({ method: "POST", path: "/agent-requests", body: { sessionId: "ses_1" } });
+    expect(parseCommand(["agent-requests", "--session=ses_1", `--request=${request}`])).toEqual({ method: "POST", path: "/agent-requests", body: { sessionId: "ses_1", request } });
+    for (const value of ["", "missing", `areq_${"g".repeat(64)}`]) expect(() => parseCommand(["agent-requests", "--session=ses_1", `--request=${value}`])).toThrow("Invalid --request");
   });
   test("requires sessions and ask keys; rejects invalid ids, status, slugs and lengths", () => {
     for (const args of [
@@ -536,6 +538,10 @@ test("send-status encodes the key and requires a session", () => {
   expect(parseCommand(["send-status", "--key=k /?%", "--session=s@2"])).toEqual({
     method: "GET", path: "/send-status/?key=k%20%2F%3F%25&sessionId=s%402" });
   expect(() => parseCommand(["send-status", "--key=k"])).toThrow("--session");
+  for (const kind of ["send", "file"]) expect(parseCommand(["send-status", "--key=k", "--session=s", `--kind=${kind}`]).path)
+    .toBe(`/send-status/?key=k&sessionId=s&kind=${kind}`);
+  for (const kind of ["", "files", "SEND", "both"]) expect(() => parseCommand(["send-status", "--key=k", "--session=s", `--kind=${kind}`]))
+    .toThrow("--kind must be send or file");
 });
 
 test.each([".", "..", "...", "%2e", "%2e%2e", "./", "../", "a/../b", "/", "\\", "?&#=+", "%", "k /?%", "مفتاح 🔑", " . ", "-k"])(
@@ -548,7 +554,7 @@ test.each([".", "..", "...", "%2e", "%2e%2e", "./", "../", "a/../b", "/", "\\", 
     expect(url.searchParams.get("sessionId")).toBe("s@2");
   });
 
-test("socket aborts distinguish send/file outcome unknown from read failures", async () => {
+test("socket aborts distinguish send/file/agent-answer outcome unknown from read failures", async () => {
   const root = await fs.mkdtemp(join(os.tmpdir(), "cli-timeout-"));
   const socket = join(root, "s.sock"), file = join(root, "fixture.txt");
   await fs.writeFile(file, "PRIVATE_CONTENT");
@@ -557,8 +563,10 @@ test("socket aborts distinguish send/file outcome unknown from read failures", a
   process.env.SPECTRUM_BRIDGE_SOCKET = socket;
   try {
     await new Promise<void>(resolve => server.listen(socket, resolve));
+    const requestId = `areq_${"a".repeat(64)}`;
     for (const args of [["send", "--text=PRIVATE_TEXT", "--session=s", "--key=private-key"],
-      ["send-file", `--file=${file}`, "--session=s", "--key=private-key"], ["health"]]) {
+      ["send-file", `--file=${file}`, "--session=s", "--key=private-key"],
+      ["agent-answer", `--request=${requestId}`, "--text=PRIVATE_TEXT", "--session=s"], ["health"]]) {
       const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: Parameters<typeof setTimeout>[0]) => {
         queueMicrotask(() => { if (typeof callback === "function") callback(); });
         return 0 as unknown as ReturnType<typeof setTimeout>;
@@ -567,7 +575,10 @@ test("socket aborts distinguish send/file outcome unknown from read failures", a
       try { await sendCommand(parseCommand(args)); }
       catch (error) { failure = cliFailure(error); }
       finally { timer.mockRestore(); }
-      expect(failure).toEqual(args[0] === "health" ? { exitCode: 1, body: { error: "Bridge request timed out" } } : {
+      expect(failure).toEqual(args[0] === "health" ? { exitCode: 1, body: { error: "Bridge request timed out" } }
+        : args[0] === "agent-answer" ? { exitCode: SEND_TIMEOUT_EXIT_CODE,
+          body: { error: "Bridge request timed out", outcome: "unknown", requestId,
+            hint: "The answer may already be admitted. Check agent-requests --request <requestId> --session <session>, or repeat the identical agent-answer call (it won't deliver twice)." } } : {
         exitCode: SEND_TIMEOUT_EXIT_CODE,
         body: { error: "Bridge request timed out", outcome: "unknown", key: "private-key",
           hint: "The message may already be queued. Re-run with the same --key (it won't send twice) or check with send-status --key." },

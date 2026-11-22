@@ -304,13 +304,13 @@ test("failed control perf rows retain safe error detail and tick/completion meas
 });
 
 
-test("CLI send timeouts survive the cap with only hashed key, path and elapsed time", () => {
+test.each(["/send", "/files", "/agent-answer"])("CLI %s timeouts survive the cap with only hashed key, path and elapsed time", path => {
   const { log, lines } = setup({ capBytes: 1 });
   log.write(entry);
   log.write({ component: "cli", kind: "event", name: "cli.send_timeout",
     ids: { operationId: `send:${"a".repeat(64)}`, key: "PRIVATE_KEY" },
-    props: { path: "/send", elapsedMs: 15_000, text: "PRIVATE_TEXT", name: "PRIVATE_FILE" } });
+    props: { path, elapsedMs: 15_000, text: "PRIVATE_TEXT", name: "PRIVATE_FILE" } });
   expect(lines().at(-1)).toMatchObject({ name: "cli.send_timeout", ids: { operationId: `send:${"a".repeat(64)}` },
-    props: { path: "/send", elapsedMs: 15_000 } });
+    props: { path, elapsedMs: 15_000 } });
   expect(JSON.stringify(lines())).not.toContain("PRIVATE");
 });

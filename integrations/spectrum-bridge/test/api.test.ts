@@ -404,6 +404,42 @@ test("send-status projects each outbox state, files and early aliases without co
   expect((await status(body.dedupeKey, "current@2")).status).toBe(409);
 });
 
+const statusStates = [["pending", "queued"], ["sending", "sending"], ["sent", "sent"], ["failed", "failed"],
+  ["cancelled", "cancelled"], ["uncertain", "unknown"]] as const;
+test.each(statusStates.flatMap(([send, sendStatus]) => statusStates.map(([file, fileStatus]) => ({ send, sendStatus, file, fileStatus })) ))(
+  "shared key selects text $send and file $file independently", async ({ send, sendStatus, file: fileState, fileStatus }) => {
+    const h = setup();
+    h.store.set("route", { id: "current", generation: 2 });
+    const sent = await h.post("/send", { text: "PRIVATE_TEXT", dedupeKey: file.dedupeKey, sessionId: "current@2" });
+    const sendId = (await sent.json() as { id: string }).id;
+    const filed = await h.post("/files", file);
+    const fileId = (await filed.json() as { id: string }).id;
+    h.store.outboxState(sendId, send);
+    h.store.outboxState(fileId, fileState);
+    const path = `/send-status/?key=${file.dedupeKey}&sessionId=current@2`;
+    const ambiguous = await h.get(path);
+    expect(ambiguous.status).toBe(409);
+    expect(await ambiguous.json()).toEqual({ error: "Key has text and file operations; use --kind send or --kind file" });
+    for (const [kind, status] of [["send", sendStatus], ["file", fileStatus]]) {
+      const command = parseCommand(["send-status", `--key=${file.dedupeKey}`, "--session=current@2", `--kind=${kind}`]);
+      const response = await h.get(command.path);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ status, kind, queuedAt: now });
+    }
+    for (const kind of ["", "files", "SEND", "both"]) expect((await h.get(`${path}&kind=${kind}`)).status).toBe(400);
+    h.store.set("route", { id: "other", generation: 2 });
+    for (const kind of ["send", "file"]) expect((await h.get(`${path.replace("current@2", "other@2")}&kind=${kind}`)).status).toBe(403);
+  });
+
+test("kind selector does not fall back to the other operation namespace", async () => {
+  const h = setup();
+  h.store.set("route", { id: "current", generation: 2 });
+  await h.post("/send", { text: "PRIVATE_TEXT", dedupeKey: "only-text", sessionId: "current@2" });
+  expect(await (await h.get("/send-status/only-text?sessionId=current@2&kind=file")).json()).toEqual({ status: "unknown", kind: "file" });
+  await h.post("/files", file);
+  expect(await (await h.get(`/send-status/${file.dedupeKey}?sessionId=current@2&kind=send`)).json()).toEqual({ status: "unknown", kind: "send" });
+});
+
 test.each([".", "..", "...", "%2e", "%2e%2e", "./", "../", "a/../b", "/", "\\", "?&#=+", "%", "k /?%", "مفتاح 🔑", " . ", "-k"])(
   "send-status resolves URL-sensitive key %j through the CLI request", async key => {
     const h = setup();

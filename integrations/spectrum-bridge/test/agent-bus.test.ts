@@ -1,4 +1,6 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import { createServer } from "node:http";
+import { cliFailure, parseCommand, sendCommand, SEND_TIMEOUT_EXIT_CODE } from "../src/cli.ts";
 import { AgentBus, agentWakeId, type AgentAnswerReceipt, type AgentBusDeps } from "../src/agent-bus.ts";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -183,7 +185,7 @@ test.each(["done", "declined"] as const)("only the target may answer and %s is f
   expect(env.answer("missing", status).status).toBe(404);
   env.time(1_250);
   expect(env.answer(id, status).status).toBe(202);
-  expect(env.answer(id).status).toBe(409);
+  expect(env.answer(id).status).toBe(status === "done" ? 202 : 409);
   expect(env.answer(id, "pending").status).toBe(409);
   expect(env.wakes).toHaveLength(2);
   expect(env.wakes[1]?.slug).toBe("owner");
@@ -193,9 +195,89 @@ test.each(["done", "declined"] as const)("only the target may answer and %s is f
 test("pending is sent once, then a final answer closes the request", () => {
   const env = setup(); const id = env.id(env.ask());
   expect(env.answer(id, "pending").status).toBe(202);
-  expect(env.answer(id, "pending").status).toBe(409);
+  expect(env.answer(id, "pending").status).toBe(202);
   expect(env.answer(id).status).toBe(202);
   expect(env.wakes).toHaveLength(3);
+});
+
+test.each((["pending", "done", "declined"] as const).flatMap(status =>
+  ["ack", "before-delivery", "after-delivery"].map(loss => ({ status, loss })) ))(
+  "$status answer recovers $loss without a second delivery", ({ status, loss }) => {
+    const env = setup(); const id = env.id(env.ask());
+    const input = { sessionId: "session-moni", request: id, text: "PRIVATE_ANSWER", status };
+    if (loss === "before-delivery") env.fail(true);
+    if (loss === "after-delivery") env.failAfter(true);
+    if (loss === "ack") expect(env.bus.answer(input).status).toBe(202);
+    else expect(() => env.bus.answer(input)).toThrow();
+    env.fail(false); env.failAfter(false);
+    const restarted = new AgentBus(env.deps);
+    const expected = { status: 202, body: { id, status } };
+    expect(restarted.answer(input)).toEqual(expected);
+    expect(restarted.answer(input)).toEqual(expected);
+    // Same length is not evidence of identical content; final statuses share one dedupe slot.
+    expect(restarted.answer({ ...input, text: "PRIVATE_CHANGED".slice(0, input.text.length) }).status).toBe(409);
+    if (status !== "pending") expect(restarted.answer({ ...input, status: status === "done" ? "declined" : "done" }).status).toBe(409);
+    expect(env.wakes.filter(wake => wake.key.startsWith(`agent-answer:${id}:`))).toHaveLength(1);
+    expect(JSON.stringify(env.bus.requests("session-moni"))).not.toContain("PRIVATE");
+    expect(JSON.stringify(env.store.db.query("SELECT * FROM agent_operations").all())).not.toContain("PRIVATE");
+  });
+
+test.each(["pending", "done", "declined"] as const)("CLI timeout after %s admission is recoverable by request ID", async status => {
+  const env = setup(); const id = env.id(env.ask());
+  const dir = mkdtempSync(join(tmpdir(), "agent-answer-timeout-")); dirs.push(dir);
+  const socket = join(dir, "s.sock");
+  const oldSocket = process.env.SPECTRUM_BRIDGE_SOCKET;
+  process.env.SPECTRUM_BRIDGE_SOCKET = socket;
+  let abort: (() => void) | undefined;
+  let loseAck = true;
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", chunk => chunks.push(chunk));
+    req.on("end", () => {
+      const result = env.bus.answer(JSON.parse(Buffer.concat(chunks).toString()));
+      if (loseAck) { loseAck = false; abort!(); }
+      else { res.writeHead(result.status, { "Content-Type": "application/json" }); res.end(JSON.stringify(result.body)); }
+    });
+  });
+  try {
+    await new Promise<void>(resolve => server.listen(socket, resolve));
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: Parameters<typeof setTimeout>[0]) => {
+      abort = () => { if (typeof callback === "function") callback(); };
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    const command = parseCommand(["agent-answer", `--request=${id}`, "--text=PRIVATE_ANSWER", "--session=session-moni", `--status=${status}`]);
+    try {
+      await expect(sendCommand(command).catch(error => { throw cliFailure(error); })).rejects.toMatchObject({
+        exitCode: SEND_TIMEOUT_EXIT_CODE, body: { outcome: "unknown", requestId: id, hint: expect.stringContaining("agent-requests --request") } });
+    } finally { timer.mockRestore(); }
+    expect(env.bus.requests("session-moni").body).toMatchObject({ requests: [{ id, status }] });
+    expect(await sendCommand(command)).toEqual({ id, status });
+    expect(env.wakes.filter(wake => wake.key.startsWith(`agent-answer:${id}:`))).toHaveLength(1);
+  } finally {
+    if (oldSocket === undefined) delete process.env.SPECTRUM_BRIDGE_SOCKET;
+    else process.env.SPECTRUM_BRIDGE_SOCKET = oldSocket;
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test("request-ID lookup reaches older answers without widening caller scope", () => {
+  const env = setup(); const id = env.id(env.ask());
+  env.answer(id);
+  for (let n = 0; n < 25; n++) env.ask("owner", "moni", `newer-${n}`);
+  expect(env.bus.requests("session-moni").body).not.toMatchObject({ requests: expect.arrayContaining([expect.objectContaining({ id })]) });
+  expect(env.bus.requests("session-moni", id).body).toMatchObject({ requests: [{ id, status: "done" }] });
+  expect(env.bus.requests("session-owner", id).body).toMatchObject({ requests: [{ id, status: "done" }] });
+  expect(env.bus.requests("session-sam", id).body).toEqual({ requests: [] });
+  expect(env.bus.requests("session-moni", "missing").body).toEqual({ requests: [] });
+});
+
+test("a legacy receipt without a content hash cannot acknowledge a changed answer", () => {
+  const env = setup(); const id = env.id(env.ask());
+  env.failAfter(true); expect(() => env.answer(id)).toThrow(); env.failAfter(false);
+  delete env.wakes.at(-1)!.receipt!.fingerprint;
+  expect(env.answer(id).status).toBe(409);
+  expect(env.bus.requests("session-moni", id).body).toMatchObject({ requests: [{ id, status: "done" }] });
+  expect(env.wakes).toHaveLength(2);
 });
 
 test.each([false, true])("timeout is sent once, late final delivered, pending first = %s", pending => {
@@ -207,10 +289,10 @@ test.each([false, true])("timeout is sent once, late final delivered, pending fi
   env.time(601_001); env.bus.sweep(); env.bus.sweep();
   expect(env.logs.filter(([event]) => event === "agent-timeout")).toEqual([["agent-timeout", id]]);
   expect(env.wakes.at(-1)?.text).toContain("no answer for 10 minutes");
-  expect(env.answer(id, "pending").status).toBe(pending ? 409 : 202);
+  expect(env.answer(id, "pending").status).toBe(202);
   env.bus.sweep();
   expect(env.answer(id)).toEqual({ status: 202, body: { id, status: "done_late" } });
-  expect(env.answer(id).status).toBe(409);
+  expect(env.answer(id).status).toBe(202);
   expect(env.logs.filter(([event]) => event === "agent-timeout")).toHaveLength(1);
 });
 
@@ -254,14 +336,14 @@ test.each(["ask", "answer", "timeout"])("failure after %s wake insertion converg
   }
   env.time(601_001);
   env.bus.sweep();
-  expect(env.answer(id).status).toBe(operation === "answer" ? 409 : 202);
+  expect(env.answer(id).status).toBe(202);
   if (operation === "answer") {
     expect(env.logs.filter(([event]) => event === "agent-timeout")).toHaveLength(0);
     const row = env.store.db.query<{ status: string }, [string]>("SELECT status FROM agent_requests WHERE id = ?").get(id);
     expect(row?.status).toBe("done");
   }
   expect(env.wakes.filter(wake => wake.key.includes(":final"))).toHaveLength(1);
-  expect(env.answer(id).status).toBe(409);
+  expect(env.answer(id).status).toBe(202);
 });
 
 test("a late answer before the sweep gets timeout and done_late", () => {
@@ -366,7 +448,7 @@ test.each([false, true])("install/download audit uses persisted pending, late = 
   if (late) env.time(601_001);
   expect(env.answer(id, "pending", "owner").status).toBe(202);
   expect(env.store.db.query<{ status: string }, [string]>("SELECT status FROM agent_requests WHERE id = ?").get(id)?.status).toBe("pending");
-  expect(env.answer(id, "pending", "owner").status).toBe(409);
+  expect(env.answer(id, "pending", "owner").status).toBe(202);
   expect(env.logs.filter(([event]) => event === "agent-needs-owner")).toEqual([["agent-needs-owner", `${id} required=true`]]);
   env.answer(id, "done", "owner");
   expect(env.logs.filter(([event]) => event === "agent-needs-owner")).toHaveLength(1);
@@ -381,7 +463,7 @@ test("a pending wake committed before rollback is audited from repaired state", 
   expect(() => env.answer(id, "pending", "owner")).toThrow();
   expect(env.logs.filter(([event]) => event === "agent-needs-owner")).toHaveLength(0);
   env.failAfter(false);
-  expect(env.answer(id, "pending", "owner").status).toBe(409);
+  expect(env.answer(id, "pending", "owner").status).toBe(202);
   expect(env.logs.filter(([event]) => event === "agent-needs-owner")).toEqual([["agent-needs-owner", `${id} required=true`]]);
 });
 

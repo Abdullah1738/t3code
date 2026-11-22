@@ -80,7 +80,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
-    if (entry.name === "cli.send_timeout" && key === "path" && ["/send", "/files"].includes(String(value))) {
+    if (entry.name === "cli.send_timeout" && key === "path" && ["/send", "/files", "/agent-answer"].includes(String(value))) {
       props[key] = value; continue;
     }
     if (WAKE_EVENTS.has(entry.name)) {

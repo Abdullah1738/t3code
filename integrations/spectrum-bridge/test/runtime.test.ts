@@ -606,6 +606,9 @@ describe("Sendblue socket API", () => {
     expect((await post("/agent-answer", { sessionId: "ses_moni@1", request, text: "stale" })).status).toBe(409);
     expect((await post("/agent-answer", { sessionId: "ses_moni@2", request, text: "waiting", status: "pending" })).status).toBe(202);
     expect((await post("/agent-answer", { sessionId: "ses_moni", request, text: "answer" })).status).toBe(202);
+    expect((await post("/agent-answer", { sessionId: "ses_moni", request, text: "answer" })).status).toBe(202);
+    expect((await post("/agent-requests", { sessionId: "ses_moni", request })).body.requests).toMatchObject([{ id: request, status: "done" }]);
+    expect((await post("/agent-requests", { sessionId: "ses_moni", request: "invalid" })).status).toBe(400);
     expect((await post("/agent-answer", { sessionId: "ses_moni", request, text: "again" })).status).toBe(409);
     expect(chats.owner.store.pendingInbound()).toHaveLength(2);
     expect((await post("/agent-requests", { sessionId: "ses_moni" })).body.requests).toEqual([
@@ -613,6 +616,7 @@ describe("Sendblue socket API", () => {
     ]);
     const stranger = chats.open(chatKey.dm("+15555550888")); stranger.store.set("route", { id: "ses_stranger", generation: 1 });
     expect((await post("/agent-requests", { sessionId: "ses_stranger" })).body.requests).toEqual([]);
+    expect((await post("/agent-requests", { sessionId: "ses_stranger", request })).body.requests).toEqual([]);
   });
 
   test.each([false, true])("a committed answer wake repairs metadata on sweep, late = %s", async late => {
@@ -637,6 +641,7 @@ describe("Sendblue socket API", () => {
         expect.objectContaining({ id: request, status: late ? "done_late" : "done",
           answeredAt: late ? 601_001 : 1_000, timedOutAt: late ? 601_001 : null }),
       ]);
+      expect((await post("/agent-answer", { sessionId: "ses_owner", request, text: "answer" })).status).toBe(202);
       expect((await post("/agent-answer", { sessionId: "ses_owner", request, text: "again" })).status).toBe(409);
       expect(moniChat.store.pendingInbound().filter(row => row.id.startsWith("wake:"))).toHaveLength(late ? 2 : 1);
     } finally { chats.wake = originalWake; setSystemTime(); }
@@ -1161,6 +1166,10 @@ test("Sendblue send-status selects the calling session store, never the owner by
   const post = await handler(new Request("http://bridge/send", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sessionId: "other-session@2", text: "PRIVATE_TEXT", dedupeKey: "k" }) }));
   expect(post.status).toBe(202);
+  for (const [kind, status] of [["send", "queued"], ["file", "unknown"]]) {
+    const response = await handler(new Request(`http://bridge/send-status/k?sessionId=other-session@2&kind=${kind}`));
+    expect(await response.json()).toMatchObject({ status, kind });
+  }
   for (const [session, status] of [["other-session@2", "queued"], ["owner-session@1", "unknown"]]) {
     for (const prefix of ["/send-status/k?", "/send-status/?key=k&"]) {
       const response = await handler(new Request(`http://bridge${prefix}sessionId=${session}`));
