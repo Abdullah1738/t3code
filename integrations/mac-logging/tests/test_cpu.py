@@ -830,5 +830,16 @@ class CpuTests(unittest.TestCase):
             self.assertIn(text, setup)
 
 
+    def test_boot_change_discards_all_cpu_baselines(self):
+        import boot_identity
+        with patch.object(boot_identity, 'identity', return_value=dict(bootEpoch=100)):
+            cpu.sample(run=self.runner(), ticks_read=lambda: [10, 10, 10, 0])
+        with patch.object(boot_identity, 'identity', return_value=dict(bootEpoch=200)):
+            props = cpu.sample(run=self.runner(), ticks_read=lambda: [20, 20, 20, 0])
+        self.assertTrue(props['baseline'])
+        self.assertIsNone(props['totalCpuPct'])
+        self.assertIsNone(props.get('systemCpuPct'))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -17,12 +17,63 @@ import logwindow as window
 
 
 class WindowTests(unittest.TestCase):
+    def test_current_boot_precision_class(self):
+        forms = [('{ sec = 100, usec = 673004 }', 100.673004),
+                 ('{ sec = 100, usec = 0 }', 100), ('{ sec = 100 }', 100)]
+        for text, expected in forms:
+            with self.subTest(text=text):
+                self.assertEqual(window.parse_boottime(text), expected)
+                def run(args, **kwargs):
+                    self.assertEqual(args, ['/usr/sbin/sysctl', '-n', 'kern.boottime'])
+                    self.assertEqual(kwargs['timeout'], 2)
+                    self.assertEqual(kwargs['env']['TZ'], 'UTC')
+                    self.assertNotIn('BUN_INSPECT', kwargs['env'])
+                    return SimpleNamespace(returncode=0, stdout=text)
+                self.assertEqual(window.current_boottime(run), expected)
+        for text in ('invalid', '{ usec = 1 }', '{ sec = 100, usec = -1 }',
+                     '{ sec = 100, usec = 1000000 }', '{ sec = 100, usec = invalid }'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                window.parse_boottime(text)
+
     def test_timestamp_input_class(self):
         for text in ('2026-11-16T08:22:07Z', '2026-11-16 08:22:07+0000',
                      '2026-11-16T08:22:07+00:00', '2026-11-16 12:22:07+0400',
                      '2026-11-16 08:22:07'):
             with self.subTest(text=text):
                 self.assertEqual(window.row_timestamp(text), 1794817327)
+
+    def test_api_keeps_rows_separate_across_reboot_slices(self):
+        def run(args, **kwargs):
+            return SimpleNamespace(returncode=0, stdout=json.dumps(dict(
+                timestamp=args[args.index('--start')+1])))
+        with patch.object(window, 'boot_times', return_value=[150]):
+            text, stats = window.read_window(100, 200, 'fixture', run=run)
+        self.assertEqual([window.row_timestamp(json.loads(line)['timestamp'])
+                          for line in text.splitlines()], [100,150,151])
+        self.assertEqual(stats['rowsIn'], 3)
+
+    def test_api_failure_class_preserves_other_slices_and_provenance(self):
+        for outcome in ('partial', 'error', 'unresolved', 'deadline'):
+            calls = []
+            def reader(command, left, right, include_end, stop, out, outside):
+                calls.append(left)
+                stats = window.counters()
+                stats['status'] = outcome if left == 150 and outcome in ('partial','error') else 'complete'
+                out.write((json.dumps(dict(timestamp=window.stamp(left)))+'\n').encode())
+                stats.update(rowsIn=1, lastInWindowTs=window.stamp(left))
+                return stats
+            boots = window.BootTimes([150], [(150,151)] if outcome == 'unresolved' else [])
+            clock = [0, 0, 0, 0, 0, 20] if outcome == 'deadline' else [0]*20
+            with self.subTest(outcome=outcome), patch.object(window, 'boot_times', return_value=boots), \
+                 patch.object(window, 'read_slice', side_effect=reader), \
+                 patch.object(window.time, 'monotonic', side_effect=clock):
+                text, stats = window.read_window(100, 200, 'fixture')
+            expected = [100,151] if outcome == 'unresolved' else [100,150] if outcome == 'deadline' else [100,150,151]
+            self.assertEqual(calls, expected)
+            self.assertEqual([window.row_timestamp(json.loads(line)['timestamp'])
+                              for line in text.splitlines()], expected)
+            self.assertEqual(stats['error'], dict(partial='partial', error='log_error',
+                unresolved='boot_unresolved', deadline='deadline')[outcome])
 
     def test_split_deduplicates_and_excludes_external_boundaries(self):
         self.assertEqual(window.split_window(100, 400, [0, 100, 200, 200, 300, 400, 500]),
