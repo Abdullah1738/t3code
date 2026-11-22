@@ -1315,12 +1315,16 @@ test("an acknowledged remote bus request with a failed Claude launch never repor
   });
   const ask = bus.ask({ sessionId: "owner-session", to: "moni", text: "PRIVATE_BUS_TEXT", dedupeKey: "launch-failure" });
   expect(ask.status).toBe(202); const id = (ask.body as { id: string }).id;
+  expect(s.store.db.query("SELECT status FROM agent_requests WHERE id=?").get(id)).toEqual({ status: "open" });
+  expect(logs.filter(line => line.startsWith("agent-deliver-pending "))).toEqual([`agent-deliver-pending ${id} moni remote=1`]);
   await s.remote.tick(); bus.sweep();
   await s.runner.tick(); s.advance(); now += 65_000; await s.remote.tick(); bus.sweep();
   expect(s.remote.delivery(agentWakeId(`agent-ask:${id}`))).toEqual({ retained: true, confirmed: true });
   expect(s.store.db.query("SELECT delivered_at FROM agent_requests WHERE id=?").get(id)).toEqual({ delivered_at: null });
   expect(logs.some(line => line.startsWith("agent-deliver "))).toBe(true);
   expect(logs.some(line => line.startsWith("agent-delivered "))).toBe(false);
+  expect(logs.some(line => line.startsWith("agent-deliver-failed "))).toBe(false);
+  expect(notices.has(`agent-undelivered:${id}`)).toBe(false);
   expect(notices.has(`agent-progress:${id}`)).toBe(false);
   now = 601_001; bus.sweep();
   expect(notices.get(`agent-timeout:${id}`)).toContain("was not delivered to a target turn");
