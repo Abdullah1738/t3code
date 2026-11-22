@@ -129,7 +129,7 @@ def diagnostics(boot, roots=REPORT_DIRS, read=None):
 
 
 def previous_samples(boot, root, previous=None):
-    last = sample = previous_epoch = None
+    last = sample = previous_epoch = sample_epoch = None
     previous_at = float('-inf')
     sources = {}
     day = dt.datetime.fromtimestamp(boot, UTC).date()
@@ -160,6 +160,7 @@ def previous_samples(boot, root, previous=None):
                             sources['lastRow'] = str(path)
                         if row.get('name') in ('cpu.sample', 'memory.sample') and (sample is None or at > sample):
                             sample = at
+                            sample_epoch = old_boot if finite_number(old_boot) and old_boot < boot else None
                             sources['lastSample'] = str(path)
                     except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
                         continue
@@ -172,9 +173,10 @@ def previous_samples(boot, root, previous=None):
             continue
         if last is not None and sample is not None and previous_epoch is not None:
             break
-    if previous and previous < boot and previous_epoch is None:
+    if previous and previous < boot and (previous_epoch is None or previous > previous_epoch):
         previous_epoch = previous
-    uptime = sample-previous_epoch if sample is not None and previous_epoch is not None and sample >= previous_epoch else None
+    sample_boot = sample_epoch if sample_epoch is not None else previous_epoch
+    uptime = sample-sample_boot if sample is not None and sample_boot is not None and sample >= sample_boot else None
     return dict(previousBootTime=iso(previous_epoch) if previous_epoch is not None else None,
                 uptimeAtPreviousSample=round(uptime, 3) if uptime is not None else None,
                 lastSampleGapS=round(boot-last, 3) if last is not None else None), sources
@@ -334,7 +336,22 @@ def observation_done(state):
     return state.get('emitted') and state.get('alerted') and state.get('rollupDone')
 
 
-def finish_observation(state, checkpoint, run, notify, now):
+def finish_observation(state, checkpoint, run, notify, now, collect_fn=None):
+    if 'props' not in state:
+        if now < state['bootEpoch']+600:
+            return
+        props = (collect_fn or collect)(state['bootEpoch'], run=run,
+                                       previous=state.get('previousBootEpoch'))
+        # These sysctls cannot be recovered from a later boot. Other evidence
+        # is collected only after the full panic-file window has closed.
+        for key, value in state.get('kernelReasons', {}).items():
+            if value is not None:
+                props[key] = value
+                props['source'][key] = dict(read='sysctl same kern.boottime', error=None)
+        props['observedAt'] = now
+        state.update(props=props,
+                     alerted=props['clean'] and not props.get('shutdownStall', {}).get('present'))
+        checkpoint()
     if not state.get('emitted'):
         path = directory()/(dt.datetime.fromtimestamp(state['eventAt'], UTC).date().isoformat()+'.ndjson')
         found = False
@@ -400,23 +417,27 @@ def observe(now=None, run=subprocess.run, boot=None, collect_fn=None, notify=Non
         except BlockingIOError:
             return
         state = read_state('boot')
-        # A panic report may arrive throughout the ten-minute evidence window.
-        # Retry older boots during the grace period, but finalize this boot only
-        # after that window closes. The unified-log query stays at three minutes.
-        ready = now >= boot+600
-        if state.get('bootEpoch') != boot and ready:
-            props = (collect_fn or collect)(boot, run=run, previous=state.get('bootEpoch'))
-            props['observedAt'] = now
+        if state.get('bootEpoch') != boot:
+            previous = state.get('bootEpoch')
             pending = state.pop('pending', [])
             if state and not observation_done(state):
                 pending.append(state)
-            state = dict(bootEpoch=boot, props=props, emitted=False,
-                         alerted=props['clean'] and not props.get('shutdownStall', {}).get('present'),
+            # Persist identity before querying evidence or waiting: this boot
+            # may reset again before its ten-minute panic window closes.
+            state = dict(bootEpoch=boot, previousBootEpoch=previous, emitted=False,
                          eventAt=boot, appendAttempted=False, pending=pending)
             save_state('boot', state)
 
         def checkpoint():
             save_state('boot', state)
+
+        if 'props' not in state and 'kernelReasons' not in state and now < boot+600:
+            from shutdown_evidence import kernel_reasons
+            try:
+                state['kernelReasons'] = kernel_reasons(boot, run)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                state['kernelReasons'] = {}
+            checkpoint()
 
         pending = state.get('pending', [])
         if pending:
@@ -424,16 +445,14 @@ def observe(now=None, run=subprocess.run, boot=None, collect_fn=None, notify=Non
             # must neither discard earlier boots nor delay today's observation.
             record = pending[0]
             try:
-                finish_observation(record, checkpoint, run, notify, now)
+                finish_observation(record, checkpoint, run, notify, now, collect_fn)
             except (OSError, SourceFailure):
                 emit('boot', 'error', 'boot.collect', ok=False, error_tag='boot.collect_failed')
             if observation_done(record):
                 pending.pop(0)
                 checkpoint()
-        if 'props' in state:
-            finish_observation(state, checkpoint, run, notify, now)
-            if state['bootEpoch'] == boot:
-                return state['props']
+        finish_observation(state, checkpoint, run, notify, now, collect_fn)
+        return state.get('props')
 
 
 def check():

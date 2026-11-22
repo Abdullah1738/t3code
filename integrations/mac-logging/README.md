@@ -72,7 +72,9 @@ backup keys are `backup.run:health` and `backup.run:memory`.
 
 Each row includes the exact `kern.boottime` epoch and UTC `bootTime` when
 available. The minute CPU sampler and hourly collector share a nonblocking boot
-lock. After the ten-minute panic-file window closes, `boot.observed` records
+lock. Each newly seen boot is saved immediately, including its kernel reason
+strings; a second reboot during the evidence wait leaves it queued for finalization.
+After the ten-minute panic-file window closes, `boot.observed` records
 the previous boot, the last prior sample's uptime, the gap from the last prior log row,
 ResetCounter faults/failure count, panic and shutdown-stall reports within ten
 minutes of boot, and Jetsam reports in the preceding two hours. Missing evidence

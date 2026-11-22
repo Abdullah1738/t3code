@@ -160,7 +160,10 @@ class BootTests(unittest.TestCase):
                 boot.observe(boot=BOOT, now=BOOT+offset)
         collect.assert_not_called()
         self.assertEqual(self.rows(), [])
-        self.assertFalse((self.root/'logs/state/boot.json').exists())
+        state = jobs.read_state('boot')
+        self.assertEqual(state['bootEpoch'], BOOT)
+        self.assertNotIn('props', state)
+        self.assertFalse(state['emitted'])
 
     def test_prior_sample_gap_and_legacy_memory_epoch(self):
         root = self.root/'logs'
@@ -446,7 +449,125 @@ class BootTests(unittest.TestCase):
         self.assertEqual(collect.call_count, 1)
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][1], 'mac-boot:%.6f' % BOOT)
-        self.assertTrue(jobs.read_state('boot')['alerted'])
+        state = jobs.read_state('boot')
+        self.assertEqual(state['bootEpoch'], BOOT+3600)
+        self.assertEqual(state['pending'], [])
+        self.assertFalse(state['emitted'])
+
+    def test_short_lived_boot_keeps_full_panic_window(self):
+        second = BOOT+300
+        sent = []
+        def collect(at, **kwargs):
+            return self.collect(at, previous=kwargs['previous'])
+        def observe(at, now):
+            return boot.observe(boot=at, now=now, run=self.runner, collect_fn=collect,
+                                notify=lambda *a, **kw: sent.append(a[1]) or True)
+        with patch.object(boot, 'parse_last', return_value=(True, None)):
+            for offset in (60, 120, 180, 240):
+                observe(BOOT, BOOT+offset)
+                state = jobs.read_state('boot')
+                self.assertEqual(state['bootEpoch'], BOOT)
+                self.assertNotIn('props', state)
+            observe(second, second+60)
+            state = jobs.read_state('boot')
+            self.assertEqual([p['bootEpoch'] for p in state['pending']], [BOOT])
+            path = self.reports/'late.panic'
+            path.write_text('panic')
+            os.utime(path, (BOOT+590, BOOT+590))
+            observe(second, BOOT+599)
+            self.assertEqual(self.rows(), [])
+            self.assertEqual(sent, [])
+            observe(second, BOOT+600)
+            rows = [r for r in self.rows() if r['name'] == 'boot.observed']
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['bootEpoch'], BOOT)
+            self.assertTrue(rows[0]['props']['panic']['present'])
+            self.assertFalse(rows[0]['props']['clean'])
+            for offset in (600, 660, 720):
+                observe(second, second+offset)
+        rows = [r for r in self.rows() if r['name'] == 'boot.observed']
+        self.assertEqual([r['bootEpoch'] for r in rows], [BOOT, second])
+        self.assertEqual(rows[1]['props']['previousBootTime'], boot.iso(BOOT))
+        self.assertEqual(sent, ['mac-boot:%.6f' % at for at in (BOOT, second)])
+        daily = rollup('2026-11-16', self.root/'logs')
+        self.assertEqual((daily['boots'], daily['uncleanBoots']), (2, 2))
+        self.assertEqual(jobs.read_state('boot')['pending'], [])
+
+    def test_multiple_short_lived_boots_survive_collector_restarts(self):
+        boots = [BOOT+offset for offset in (0, 60, 120, 180)]
+        sent, collected = [], []
+        def collect(at, **kwargs):
+            collected.append((at, kwargs['previous']))
+            return self.collect(at, previous=kwargs['previous'])
+        for at in boots:
+            boot.observe(boot=at, now=at+30, run=self.runner, collect_fn=collect)
+        state = jobs.read_state('boot')
+        self.assertEqual([p['bootEpoch'] for p in state['pending']], boots[:-1])
+        self.assertEqual(collected, [])
+        for _ in range(5):
+            boot.observe(boot=boots[-1], now=boots[-1]+700, run=self.runner,
+                         collect_fn=collect, notify=lambda *a, **kw: sent.append(a[1]) or True)
+        rows = [r for r in self.rows() if r['name'] == 'boot.observed']
+        self.assertCountEqual([r['bootEpoch'] for r in rows], boots)
+        by_boot = {r['bootEpoch']: r['props']['previousBootTime'] for r in rows}
+        self.assertEqual([by_boot[at] for at in boots], [None]+[boot.iso(at) for at in boots[:-1]])
+        self.assertCountEqual(sent, ['mac-boot:%.6f' % at for at in boots])
+        self.assertCountEqual(collected, list(zip(boots, [None]+boots[:-1])))
+        self.assertEqual(jobs.read_state('boot')['pending'], [])
+        self.assertEqual(rollup('2026-11-16', self.root/'logs')['boots'], 4)
+
+    def test_queued_predecessor_and_sample_boot_are_independent(self):
+        root = self.root/'logs'
+        root.mkdir()
+        rows = [dict(ts=boot.iso(BOOT+40), name='cpu.sample', tool='mac', bootEpoch=BOOT),
+                dict(ts=boot.iso(BOOT), name='boot.observed', tool='mac', bootEpoch=BOOT)]
+        (root/'2026-11-16.ndjson').write_text('\n'.join(map(json.dumps, rows)))
+        target = BOOT+180
+        forms = [('unknown', None, BOOT), ('older_state', BOOT-60, BOOT),
+                 ('same_boot', BOOT, BOOT), ('queued_predecessor', BOOT+120, BOOT+120),
+                 ('future_state', target+60, BOOT)]
+        for label, previous, expected in forms:
+            with self.subTest(label=label):
+                props, _ = boot.previous_samples(target, root, previous)
+                self.assertEqual(props['previousBootTime'], boot.iso(expected))
+                self.assertEqual(props['uptimeAtPreviousSample'], 40)
+                self.assertEqual(props['lastSampleGapS'], 140)
+
+    def test_early_boot_persists_before_evidence_failure(self):
+        def unavailable(at, *args, **kwargs):
+            self.assertEqual(jobs.read_state('boot')['bootEpoch'], at)
+            raise OSError('evidence unavailable')
+        with patch.object(shutdown_evidence, 'kernel_reasons', side_effect=unavailable):
+            boot.observe(boot=BOOT, now=BOOT+60)
+        with self.assertRaises(OSError):
+            boot.observe(boot=BOOT, now=BOOT+600, collect_fn=unavailable)
+        state = jobs.read_state('boot')
+        self.assertNotIn('props', state)
+        second = BOOT+300
+        boot.observe(boot=second, now=second+700,
+                     collect_fn=lambda at, **kw: self.collect(at), notify=lambda *a, **kw: True)
+        rows = [r for r in self.rows() if r['name'] == 'boot.observed']
+        self.assertEqual([r['bootEpoch'] for r in rows], [BOOT, second])
+
+    def test_queued_boot_keeps_its_own_kernel_reasons(self):
+        second = BOOT+300
+        def reasons(at, run):
+            if at == BOOT and current != BOOT:
+                raise ValueError('different boot')
+            return dict(shutdownReason=' raw shutdown %s' % at, bootReason=' raw boot %s' % at)
+        current = BOOT
+        with patch.object(shutdown_evidence, 'kernel_reasons', side_effect=reasons):
+            boot.observe(boot=BOOT, now=BOOT+60, run=self.runner)
+            current = second
+            boot.observe(boot=second, now=second+60, run=self.runner)
+            boot.observe(boot=second, now=second+700, run=self.runner,
+                         collect_fn=lambda at, **kw: self.collect(at), notify=lambda *a, **kw: True)
+        rows = [r for r in self.rows() if r['name'] == 'boot.observed']
+        self.assertEqual(len(rows), 2)
+        for row, at in zip(rows, (BOOT, second)):
+            self.assertEqual(row['props']['shutdownReason'], ' raw shutdown %s' % at)
+            self.assertEqual(row['props']['bootReason'], ' raw boot %s' % at)
+            self.assertIsNone(row['props']['source']['shutdownReason']['error'])
 
     def test_pending_append_survives_next_boot(self):
         def collect(at, **kwargs):
