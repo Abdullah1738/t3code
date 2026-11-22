@@ -294,6 +294,8 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         for name in ("9router-log-poll", "9router-log-rollup", "rclaude-key-helper"):
             self.assertTrue(os.access(self.live(".local/bin/" + name), os.X_OK))
         self.assertIn("com.ardud.9router-log-poll", os.listdir(self.loaded))
+        with open(self.live("Library/LaunchAgents/com.ardud.9router-log-poll.plist"), "rb") as source:
+            self.assertEqual(plistlib.load(source)["ProcessType"], "Standard")
 
     def test_second_run_changes_nothing_and_check_passes(self):
         self.ready()

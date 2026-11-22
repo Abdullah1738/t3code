@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from toollog import directory
+from spawn_schema import summary as spawn_summary
 
 UTC = dt.timezone.utc
 LAUNCHD_LABELS = (
@@ -132,7 +133,9 @@ def report(now=None, root=None, *, day=None):
                              lastOk=last[1].get('ok') if last else None,
                              ageMin=round(age, 3) if age is not None else None,
                              lines=recent, gapMaxMin=gap, since=cadence['since'], status=state)
+        spawn = max(((at, row) for at, row in rows if at <= now and row['name'] == 'host.spawn_sample'), key=lambda v:v[0], default=None)
         return dict(now=stamp(now), jobs=jobs,
+                    spawnSample=dict(spawn_summary(spawn[1].get('props', {})), ts=stamp(spawn[0]), ageMin=(now-spawn[0]).total_seconds()/60) if spawn else None,
                     missingJobs=[key for key, job in jobs.items() if job['status'] in ('LATE', 'SILENT')],
                     missingFiles=missing, readErrors=errors, malformed=malformed)
     except Exception:
@@ -189,6 +192,10 @@ def main(argv=None):
                 age = 'unknown' if row['ageMin'] is None else '%g min' % row['ageMin']
                 print('%-20s %-7s last=%s age=%s ok=%s' %
                       (key, row['status'], row['lastSeen'] or 'never', age, json.dumps(row['lastOk'])))
+            spawn = result.get('spawnSample')
+            if spawn:
+                parents = ', '.join('%s[%s]:%s' % (p.get('family') or p.get('parent_comm'), p.get('ppid'), p.get('births')) for p in spawn['top_spawners'])
+                print('spawn >=%s births/min; runnable pri<=4=%s; partial=%s; age=%g min; top: %s' % (spawn['births_per_min'], spawn['runnable_pri_le4'], spawn['partial'], spawn['ageMin'], parents))
             for filename in result.get('missingFiles', []):
                 print('missing day file: ' + filename)
             for filename in result.get('readErrors', []):

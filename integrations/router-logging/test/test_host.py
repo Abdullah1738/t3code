@@ -349,7 +349,7 @@ class HostTests(unittest.TestCase):
             runtime.observe.side_effect = observe
             child = MagicMock()
             child.poll.return_value = None
-            with patch('guard.Runtime', return_value=runtime), patch('guard.signal.signal', side_effect=lambda key, callback: handlers.update({key: callback})), patch('guard.subprocess.Popen', return_value=child), patch('guard.Sampler', return_value=lambda: NORMAL), patch('guard.job_snapshot', return_value={}), patch('observer.job_snapshot', return_value={}), patch('guard.clock_sample', side_effect=lambda: clocks.pop(0)), patch('observer.clock_sample', side_effect=lambda: clocks.pop(0)):
+            with patch('guard.Runtime', return_value=runtime), patch('guard.signal.signal', side_effect=lambda key, callback: handlers.update({key: callback})), patch('guard.subprocess.Popen', return_value=child), patch('guard.Sampler', return_value=lambda: NORMAL), patch('observer.job_snapshot', return_value={}), patch('guard.clock_sample', side_effect=lambda: clocks.pop(0)), patch('observer.clock_sample', side_effect=lambda: clocks.pop(0)):
                 guard.serve()
             previous = json.loads(runtime.state_file.read_text())['observerTick']
             self.assertEqual(previous['wallMs'], sampled + 3000)

@@ -6,6 +6,13 @@ Source scripts use `toollog.py` (or the `toollog.sh` bridge) for local metadata 
 it rolls up yesterday. Quantiles use nearest rank. `okRate`/`failedRate` use
 lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
+Each hourly collector run emits `homebrew.integrity` with dangling opt links,
+missing dependencies, status and duration. The read-only `brew missing` probe
+has a 60-second timeout and disables auto-update and analytics. Broken results
+send a Telegram attention alert with a stable key for that exact set of links
+and dependencies; unchanged failures are not sent again. Probe errors are
+logged without an alert. Repairs are suggested, never run by the collector.
+
 Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
 or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
 cadence clock (include `Z` or an explicit UTC offset); launchd checks always
@@ -853,6 +860,31 @@ review; the CPU job retains its original launcher. Installer tests set
 `MAC_LOG_SSD_PROBE_FILE` for fixture init/check; live reads use the fixed target.
 
 ## Host telemetry
+
+`host.spawn_sample` reports sampled births/exits once a minute, with parent
+identities, runnable threads by current priority, CPU advancement and offbox
+command classes. Births are a lower bound from five-second PID/start-time
+snapshots, not a fork or exec count. `status` and rollups show the latest
+birth rate, three parents and runnable priority-4-or-lower count. Overload
+events carry the sample as context without changing alert thresholds.
+
+Each native pass has a 1.5-second cooperative deadline and reads threads for
+at most 300 candidate processes. A separate daemon worker isolates a stuck
+kernel call; the publisher reports stale/in-flight coverage instead of
+waiting. Coverage, unreadable argv/tasks and missing CPU baselines are explicit.
+Only derived labels are cached per PID/start identity; argv is never logged.
+Cost includes per-minute summed wall/CPU time, individual phase costs and guard
+decisions. Actual excess halves the thread-process cap down to one, prioritizing
+runnable hints and highest CPU gain; only then can cadence slow to 15 seconds.
+A shared 75ms soft argv/CPU allocation leaves room for a 25ms thread pass every
+tick within the 1.5s overall deadline. Runnable hints with unread CPU data
+remain eligible for thread reads and carry an unknown CPU baseline.
+Argv runs first so a slow CPU census cannot starve new parent/offbox labels.
+Thread counts are null only when no minimal pass fits or is readable, and retry
+on the next tick. Runnable counts describe the latest tick, not the sum
+of repeated censuses; offbox counts/RSS describe that same tick. CPU deltas use
+the last readable per-identity baseline (`offboxWindowS` is the tick window,
+`cpuWindowMaxS` exposes older baselines); RSS is a sum, not unique physical memory.
 
 `com.abdullah.mac-host` is a separate long-lived Standard job. It emits
 `host.vitals` every 30 seconds and `host.families_lite` every 60 seconds without

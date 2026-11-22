@@ -19,7 +19,7 @@ type RequestRow = {
   id: string; from_slug: string; to_slug: string; parent_id: string | null; hop: number;
   status: "undelivered" | "open" | AnswerStatus | "timed_out" | "done_late";
   text_chars: number; answer_chars: number | null;
-  queued_at: number | null; delivered_at: number | null;
+  queued_at: number | null; delivered_at: number | null; delivery_pending_at: number | null;
   created_at: number; answered_at: number | null; timed_out_at: number | null;
 };
 export type AgentBusDeps = {
@@ -37,6 +37,8 @@ export type AgentBusDeps = {
 };
 const failure = (status: number, error: string): SbApiResult => ({ status, body: { error } });
 const TIMEOUT_MS = 10 * 60_000;
+// Box acks normally take 3.6–11 seconds; allow 15 seconds before reporting no_ack.
+const REMOTE_ACK_GRACE_MS = 15_000;
 
 export class AgentBus {
   private readonly now: () => number;
@@ -56,7 +58,7 @@ export class AgentBus {
     CREATE INDEX IF NOT EXISTS agent_requests_from ON agent_requests(from_slug, created_at DESC);
     CREATE INDEX IF NOT EXISTS agent_requests_to ON agent_requests(to_slug, created_at DESC);`);
     const columns = deps.db.query<{ name: string }, []>("PRAGMA table_info(agent_requests)").all();
-    for (const column of ["queued_at", "delivered_at"]) if (!columns.some(c => c.name === column)) {
+    for (const column of ["queued_at", "delivered_at", "delivery_pending_at"]) if (!columns.some(c => c.name === column)) {
       deps.db.exec(`ALTER TABLE agent_requests ADD COLUMN ${column} INTEGER`);
     }
   }
@@ -158,6 +160,14 @@ export class AgentBus {
     }
     if (!delivery?.confirmed) {
       if (row.status === "open" && row.delivered_at === null) {
+        if (reason === "no_ack" && delivery?.remote && delivery.retained && this.now() - row.created_at < REMOTE_ACK_GRACE_MS) {
+          if (row.delivery_pending_at === null) {
+            row.delivery_pending_at = this.now();
+            this.deps.db.query("UPDATE agent_requests SET delivery_pending_at=? WHERE id=?").run(row.delivery_pending_at, row.id);
+            this.deps.log("agent-deliver-pending", `${row.id} ${target.slug} remote=1`);
+          }
+          return true;
+        }
         this.deps.db.query("UPDATE agent_requests SET status='undelivered' WHERE id=?").run(row.id);
         this.deps.log("agent-deliver-failed", `${row.id} ${reason}`);
         row.status = "undelivered";

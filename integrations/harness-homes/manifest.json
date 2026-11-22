@@ -134,6 +134,7 @@
       "../harness-hooks/src/live_db_snapshot.py",
       "../harness-hooks/src/snapshot_guard.py",
       "../harness-hooks/src/statev2_guard.py",
+      "../harness-hooks/src/statev2_check.py",
       "../harness-hooks/src/engine.py",
       {
         "source": "../opencode-plugins/plugin/statev2-guard.ts",

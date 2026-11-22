@@ -9,6 +9,21 @@ SYSTEM_ROOTS = ('/System/', '/usr/libexec/', '/usr/sbin/', '/usr/bin/', '/sbin/'
 SECRET_LABEL = re.compile(r'(?i)(password|secret|credential|token[=: ]|cookie|bearer |sk-|ghp_|github_pat_|xox[baprs]-)')
 
 
+def spawn_family(argv, comm):
+    """Allowlisted family labels; raw arguments never leave the sampler."""
+    if any('agent-bridges' in a.split('/') for a in argv):
+        return 'agent-bridges'
+    if any('robob-watch' in a.split('/') for a in argv) and any('runner' in a for a in argv):
+        return 'robob-watch runner'
+    if argv and 'codex' in argv[0].lower() and 'app-server' in argv[1:]:
+        return 'codex app-server'
+    if comm.lower().startswith('claude'):
+        return 'claude provider'
+    if any('Robob.app/Contents/Resources' in a or '/robob/server/' in a for a in argv):
+        return 'Robob server'
+    return None
+
+
 class SystemFamily(str):
     # Preserve provenance until the logger: long Apple executable basenames
     # otherwise look like opaque credentials to the shared argv redactor.
