@@ -150,7 +150,7 @@ def _log(**record):
         row = {
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "event": _log_enum(record.get("event"), _LOG_EVENTS),
-            "harness": _log_enum(record.get("harness"), {"claude", "codex"}),
+            "harness": _log_enum(record.get("harness"), {"claude", "codex", "antigravity"}),
             "tool": _log_enum(record.get("tool"), _LOG_TOOLS),
             "robobThreadId_sha256": hashlib.sha256(thread_id.encode("utf-8")).hexdigest() if isinstance(thread_id, str) and thread_id else None,
             "rule": _log_enum(record.get("rule"), _LOG_RULES),
@@ -270,6 +270,10 @@ def _get_unbounded(path, deadline, *, timeout=1.2):
 def _native(event, harness):
     session = event.get("session_id")
     agent = event.get("agent_id")
+    if harness == "antigravity":
+        # hooks.json payloads carry the ACP session id as conversationId; the
+        # adapter passes it as session_id. Antigravity has no native child ids.
+        return session, None, "antigravity"
     if harness in {"codex", "codex-cu"}:
         # The hook inherits the app-server's environment, not the tool shell's.
         # Only payload IDs identify the executing agent; shim fallbacks pass
@@ -560,7 +564,7 @@ def resolve_identity(event, harness, *, fresh=False):
             if age >= 60:
                 binding.pop("model", None)
             return binding
-        fallback_cache = harness in {"claude", "codex", "codex-cu"} and valid_cache and 0 <= age < _IDENTITY_FALLBACK_TTL
+        fallback_cache = harness in {"claude", "codex", "codex-cu", "antigravity"} and valid_cache and 0 <= age < _IDENTITY_FALLBACK_TTL
         unavailable = _read_json(unavailable_file, {})
         failed_at = unavailable.get("at") if isinstance(unavailable, dict) else None
         if not fallback_cache and type(failed_at) in (int, float) and 0 <= time.time() - failed_at < _IDENTITY_UNAVAILABLE_TTL:
@@ -803,7 +807,7 @@ def decide(event, harness):
         return lineage_nodes
 
     try:
-        if not isinstance(event, dict) or harness not in {"claude", "codex"}:
+        if not isinstance(event, dict) or harness not in {"claude", "codex", "antigravity"}:
             raise ValueError("invalid-event")
         tool, cwd = event.get("tool_name", ""), event.get("cwd")
         kind = event.get("hook_event_name")

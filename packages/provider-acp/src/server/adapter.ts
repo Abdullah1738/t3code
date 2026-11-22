@@ -342,6 +342,21 @@ export interface AcpAdapterV2Flavor {
    * fail before `session/prompt`.
    */
   readonly supportsImagePrompts?: boolean;
+  /**
+   * Text blocks sent ahead of a user turn: standing rules on a session's first
+   * prompt and hook-provided context (recall notes) for harnesses whose runtime
+   * has no global rules file or prompt hooks. Must not fail; empty means none.
+   */
+  readonly promptContext?: (input: AcpPromptContextInput) => Effect.Effect<ReadonlyArray<string>>;
+}
+
+export interface AcpPromptContextInput {
+  readonly threadId: ThreadId;
+  readonly nativeSessionId: string;
+  readonly cwd: string | null;
+  readonly text: string;
+  /** First prompt this adapter sends to the native session (again after a server restart). */
+  readonly firstPromptInSession: boolean;
 }
 
 export function acpSupportsImagePrompts(input: {
@@ -1611,6 +1626,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const activeSelection = yield* Ref.make<ModelSelection | null>(null);
         const activeInteractionMode = yield* Ref.make<ProviderInteractionMode | null>(null);
         const promptInstructionStates = yield* Ref.make(new Map<string, T3AcpInstructionState>());
+        const promptContextSessions = yield* Ref.make(new Set<string>());
         const runtimeRestartRequired = yield* Ref.make(false);
         const runtimeTeardownState = yield* Ref.make<AcpRuntimeTeardownState>({ _tag: "Idle" });
         const runtimeCallbackGeneration = yield* Ref.make(0);
@@ -7201,6 +7217,22 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             resolveAttachmentPath: host.resolveAttachmentPath,
           });
           const isNativeSlashCommand = turnInput.message.text.trimStart().startsWith("/");
+          if (!isNativeSlashCommand && flavor.promptContext !== undefined) {
+            const firstPromptInSession = !(yield* Ref.get(promptContextSessions)).has(sessionId);
+            yield* Ref.update(promptContextSessions, (current) => new Set(current).add(sessionId));
+            const blocks = yield* flavor
+              .promptContext({
+                threadId: turnInput.threadId,
+                nativeSessionId: sessionId,
+                cwd: turnInput.runtimePolicy.cwd ?? null,
+                text: turnInput.message.text,
+                firstPromptInSession,
+              })
+              .pipe(Effect.catchCause(() => Effect.succeed<ReadonlyArray<string>>([])));
+            for (const block of blocks) {
+              if (block.trim().length > 0) prompt.push({ type: "text", text: block });
+            }
+          }
           const text = t3AcpPromptWithInstructions({
             prompt: messageText,
             state: instructionState,

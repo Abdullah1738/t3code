@@ -260,7 +260,7 @@ def admit(event, harness, control, state_dir=None, diagnostics=None):
         session, agent, call_id = event.get("session_id"), event.get("agent_id"), event.get("tool_use_id")
         if not valid_id(session) or not valid_id(call_id) or (agent is not None and not valid_id(agent)):
             raise ValueError("missing-desktop-identity")
-        payload = {"driver": "claudeAgent" if harness == "claude" else "codex",
+        payload = {"driver": {"claude": "claudeAgent", "antigravity": "antigravity"}.get(harness, "codex"),
                    "nativeId": agent if harness == "codex" and agent else session,
                    "toolUseId": call_id}
         if harness == "claude" and agent:
