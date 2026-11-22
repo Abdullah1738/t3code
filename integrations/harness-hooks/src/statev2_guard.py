@@ -5327,6 +5327,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             # Keep script paths unresolved even when those candidates are safe.
             pwd_values = ({str(directory)} if directory is not None else
                           {'$PWD', *(str(candidate) for candidate in unknown_directories)})
+            # The same proof as tracked_cwd: a call that may rebind PWD, even
+            # through a name built at runtime, leaves $PWD unknown (#235).
+            if cwd_unproved:
+                pwd_values = {'$PWD'}
             bindings = {'HOME': {str(Path.home())}, **({'PWD': pwd_values} if pwd_values else {}),
                         **{name: set(values) for name, values in script_values.items()}}
             # Reader evidence survives declarations that invalidate script
