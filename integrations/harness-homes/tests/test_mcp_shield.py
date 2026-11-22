@@ -6,6 +6,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +33,7 @@ FAKE_STDIO = textwrap.dedent("""
         else:
             result = {}
         print("log noise on stdout")
+        print(json.dumps({"level": "info", "message": "structured log"}))
         print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
 """)
 
@@ -39,6 +41,14 @@ INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}}
 LIST = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
 CALL = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "echo", "arguments": {"text": "hi"}}}
+
+
+def run_shield_raw(args, messages, env=None, timeout=30):
+    tmp = tempfile.mkdtemp()
+    data = "".join(json.dumps(m) + "\n" for m in messages)
+    out = subprocess.run([sys.executable, str(SHIELD), *args], input=data, capture_output=True, text=True,
+                         timeout=timeout, env={**os.environ, "MCP_SHIELD_LOG": os.path.join(tmp, "log"), **(env or {})})
+    return [json.loads(line) for line in out.stdout.splitlines()]
 
 
 def run_shield(args, messages, env=None, timeout=30):
@@ -60,6 +70,9 @@ class StdioTests(unittest.TestCase):
         self.server.write_text(FAKE_STDIO)
 
     def test_forwards_a_healthy_server_and_drops_stdout_noise(self):
+        lines = run_shield_raw(["--name", "fake", "--", sys.executable, str(self.server)], [INIT, LIST, CALL])
+        # Review of 3e27b87ce3: JSON logs are not protocol messages and must not reach the client.
+        self.assertTrue(all(m.get("jsonrpc") == "2.0" and "id" in m for m in lines), lines)
         r = run_shield(["--name", "fake", "--", sys.executable, str(self.server)], [INIT, LIST, CALL])
         self.assertEqual(r[1]["result"]["serverInfo"]["name"], "fake")
         self.assertEqual([t["name"] for t in r[2]["result"]["tools"]], ["echo"])
@@ -144,6 +157,72 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(r[1]["result"]["serverInfo"]["name"], "web")
         self.assertEqual(r[2]["result"]["tools"][0]["name"], "web_tool")
         self.assertEqual(r[3]["result"]["content"][0]["text"], "web says hi")
+
+    def test_redirects_are_refused_and_never_carry_the_bearer(self):
+        # Review of 3e27b87ce3: urllib forwarded Authorization across origins on redirect.
+        seen = []
+
+        class Catch(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(500)
+                self.end_headers()
+
+        catcher = ThreadingHTTPServer(("127.0.0.1", 0), Catch)
+        threading.Thread(target=catcher.serve_forever, daemon=True).start()
+        self.addCleanup(catcher.shutdown)
+        elsewhere = f"http://127.0.0.1:{catcher.server_address[1]}/steal"
+
+        class Redirect(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.send_response(307)
+                self.send_header("Location", elsewhere)
+                self.end_headers()
+
+        origin = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        threading.Thread(target=origin.serve_forever, daemon=True).start()
+        self.addCleanup(origin.shutdown)
+        tmp = Path(tempfile.mkdtemp())
+        fake_security = tmp / "security"
+        fake_security.write_text("#!/bin/sh\necho test-bearer-value\n")
+        fake_security.chmod(0o755)
+        r = run_shield(["--name", "web", "--url", f"http://127.0.0.1:{origin.server_address[1]}/mcp",
+                        "--bearer-keychain", "svc"], [INIT, LIST],
+                       env={"MCP_SHIELD_SECURITY": str(fake_security)})
+        self.assertEqual(r[1]["result"]["serverInfo"]["name"], "web-unavailable")
+        self.assertEqual(seen, [])
+
+    def test_heartbeats_cannot_hold_initialize_past_its_deadline(self):
+        class Heartbeat(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                try:
+                    for _ in range(100):
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        time.sleep(0.1)
+                except OSError:
+                    pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Heartbeat)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        started = time.monotonic()
+        r = run_shield(["--name", "slow", "--url", f"http://127.0.0.1:{server.server_address[1]}/mcp",
+                        "--init-timeout", "1"], [INIT, LIST])
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertEqual(r[1]["result"]["serverInfo"]["name"], "slow-unavailable")
 
     def test_unauthorized_degrades(self):
         r = run_shield(["--name", "web", "--url", self.serve(401)], [INIT, LIST])

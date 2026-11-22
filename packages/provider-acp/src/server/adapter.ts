@@ -347,7 +347,7 @@ export interface AcpAdapterV2Flavor {
    * prompt and hook-provided context (recall notes) for harnesses whose runtime
    * has no global rules file or prompt hooks. Must not fail; empty means none.
    */
-  readonly promptContext?: (input: AcpPromptContextInput) => Effect.Effect<ReadonlyArray<string>>;
+  readonly promptContext?: (input: AcpPromptContextInput) => Effect.Effect<AcpPromptContextResult>;
 }
 
 export interface AcpPromptContextInput {
@@ -355,8 +355,17 @@ export interface AcpPromptContextInput {
   readonly nativeSessionId: string;
   readonly cwd: string | null;
   readonly text: string;
-  /** First prompt this adapter sends to the native session (again after a server restart). */
+  /**
+   * The session's first-prompt context has not reached it yet through this adapter (again
+   * after a server restart). Stays true until a prompt carrying it is accepted.
+   */
   readonly firstPromptInSession: boolean;
+}
+
+export interface AcpPromptContextResult {
+  readonly blocks: ReadonlyArray<string>;
+  /** The first-prompt context is in `blocks` (or there is none to send). */
+  readonly firstPromptContextIncluded: boolean;
 }
 
 export function acpSupportsImagePrompts(input: {
@@ -7217,10 +7226,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             resolveAttachmentPath: host.resolveAttachmentPath,
           });
           const isNativeSlashCommand = turnInput.message.text.trimStart().startsWith("/");
+          let firstPromptContextSent = false;
           if (!isNativeSlashCommand && flavor.promptContext !== undefined) {
             const firstPromptInSession = !(yield* Ref.get(promptContextSessions)).has(sessionId);
-            yield* Ref.update(promptContextSessions, (current) => new Set(current).add(sessionId));
-            const blocks = yield* flavor
+            const context = yield* flavor
               .promptContext({
                 threadId: turnInput.threadId,
                 nativeSessionId: sessionId,
@@ -7228,8 +7237,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 text: turnInput.message.text,
                 firstPromptInSession,
               })
-              .pipe(Effect.catchCause(() => Effect.succeed<ReadonlyArray<string>>([])));
-            for (const block of blocks) {
+              .pipe(
+                Effect.catchCause(() =>
+                  Effect.succeed<AcpPromptContextResult>({
+                    blocks: [],
+                    firstPromptContextIncluded: false,
+                  }),
+                ),
+              );
+            firstPromptContextSent = firstPromptInSession && context.firstPromptContextIncluded;
+            for (const block of context.blocks) {
               if (block.trim().length > 0) prompt.push({ type: "text", text: block });
             }
           }
@@ -7292,7 +7309,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               }),
             });
           }
-          return { prompt, instructionState: text === messageText ? undefined : instructionState };
+          return {
+            prompt,
+            instructionState: text === messageText ? undefined : instructionState,
+            firstPromptContextSent,
+          };
         });
 
         const restartRuntimeAfterTeardownIfRequired = Effect.fnUntraced(function* (
@@ -7611,6 +7632,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   updated.set(requestedSessionId, promptParts.instructionState);
                   return updated;
                 }),
+              ),
+              // First-prompt context counts as delivered only once a prompt carrying it is accepted.
+              Effect.tap(() =>
+                promptParts?.firstPromptContextSent
+                  ? Ref.update(promptContextSessions, (current) =>
+                      new Set(current).add(requestedSessionId),
+                    )
+                  : Effect.void,
               ),
               // Wire settlement precedes the completion callback's permit request so
               // settled-soft classification can observe the native return even when

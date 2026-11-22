@@ -24,7 +24,10 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStreamText";
-import type { AcpPromptContextInput } from "@t3tools/provider-acp/server/adapter";
+import type {
+  AcpPromptContextInput,
+  AcpPromptContextResult,
+} from "@t3tools/provider-acp/server/adapter";
 
 export const ANTIGRAVITY_TURN_CONTEXT_FILE = "robob-turn-context.json";
 const MAX_CONFIG_BYTES = 256 * 1024;
@@ -147,11 +150,14 @@ export function makeAntigravityPromptContext(options: AntigravityTurnContextOpti
     Effect.catchCause(() => Effect.succeed(undefined)),
   );
 
-  return (input: AcpPromptContextInput): Effect.Effect<ReadonlyArray<string>> =>
+  const none: AcpPromptContextResult = { blocks: [], firstPromptContextIncluded: false };
+  return (input: AcpPromptContextInput): Effect.Effect<AcpPromptContextResult> =>
     Effect.gen(function* () {
       const config = yield* loadConfig;
-      if (config === undefined) return [];
+      if (config === undefined) return none;
       const blocks: Array<string> = [];
+      // Unreadable rules leave the first-prompt context pending, so the next prompt retries.
+      let firstPromptContextIncluded = config.instructionsFile === undefined;
       if (input.firstPromptInSession && config.instructionsFile !== undefined) {
         const instructions = yield* readBounded(
           options.fileSystem,
@@ -160,6 +166,7 @@ export function makeAntigravityPromptContext(options: AntigravityTurnContextOpti
         );
         if (instructions !== undefined && instructions.trim().length > 0) {
           blocks.push(antigravityInstructionsBlock(instructions));
+          firstPromptContextIncluded = true;
         }
       }
       const payload = encodeHookPayload({
@@ -176,6 +183,54 @@ export function makeAntigravityPromptContext(options: AntigravityTurnContextOpti
       for (const context of contexts) {
         if (context !== undefined) blocks.push(context);
       }
-      return blocks;
-    }).pipe(Effect.catchCause(() => Effect.succeed([])));
+      return { blocks, firstPromptContextIncluded };
+    }).pipe(Effect.catchCause(() => Effect.succeed(none)));
 }
+
+/** Generated config the profile must use (MCP servers behind the shield, guard hooks). */
+const ANTIGRAVITY_HARNESS_CONFIG_FILES = ["mcp_config.json", "hooks.json"] as const;
+
+export function antigravityHarnessHome(path: Path.Path, baseDir: string): string {
+  return path.join(baseDir, "harness-homes", "antigravity");
+}
+
+/**
+ * Point a profile's `config/{mcp_config.json,hooks.json}` at the generated harness home before
+ * its runtime starts, so a profile created after the last generator pass still runs with the
+ * guards and MCP servers. A real file is left alone; a missing generated file is skipped.
+ */
+export const linkAntigravityHarnessConfig = Effect.fn("AntigravityTurnContext.linkHarnessConfig")(
+  function* (input: {
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly path: Path.Path;
+    readonly profileDirectory: string;
+    readonly harnessHome: string;
+  }) {
+    const { fileSystem, path } = input;
+    for (const name of ANTIGRAVITY_HARNESS_CONFIG_FILES) {
+      const target = path.join(input.harnessHome, "config", name);
+      const link = path.join(input.profileDirectory, "config", name);
+      yield* Effect.gen(function* () {
+        if (!(yield* fileSystem.exists(target))) return;
+        const existing = yield* fileSystem.readLink(link).pipe(
+          Effect.map((value): string | undefined => path.resolve(path.dirname(link), value)),
+          Effect.orElseSucceed(() => undefined),
+        );
+        if (existing === target) return;
+        if (existing === undefined && (yield* fileSystem.exists(link))) {
+          yield* Effect.logWarning("Antigravity profile config is a real file; not linked.", {
+            link,
+          });
+          return;
+        }
+        if (existing !== undefined) yield* fileSystem.remove(link);
+        yield* fileSystem.makeDirectory(path.dirname(link), { recursive: true });
+        yield* fileSystem.symlink(target, link);
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Antigravity profile config is not linked.", { link, cause }),
+        ),
+      );
+    }
+  },
+);

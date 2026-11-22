@@ -21,8 +21,16 @@ this runtime and are dropped.
 import json
 import sys
 
+import re
+
 SHELL_TOOLS = {"run_command"}
 ALLOW = {"decision": "allow"}
+# Desktop calls must never pass unchecked, even when the engine cannot load
+# (same names as desktop_lease.matches, kept here so the check needs no import).
+_DESKTOP = re.compile(r"^mcp__(?:cua-driver|cua_driver)__.+$|^mcp__node_repl__js$")
+_DESKTOP_UNCHECKED = {"decision": "deny", "reason": (
+    "Desktop lease check unavailable; your lease may still be held. Retry this call once; "
+    "if it fails again, stop desktop work and report it.")}
 
 
 def _say(value):
@@ -77,14 +85,22 @@ def pre(payload):
     event = map_pre(payload)
     if event is None:
         return ALLOW
-    import engine
+    desktop = _DESKTOP.match(event.get("tool_name") or "") is not None
+    try:
+        import engine
+    except Exception:  # noqa: BLE001 - a broken install must not open the desktop
+        return _DESKTOP_UNCHECKED if desktop else ALLOW
     try:
         result = engine.decide(event, "antigravity")
-    except Exception as error:  # noqa: BLE001 - engine failures follow the native adapters
-        engine.log_event_error("antigravity", "PreToolUse", "adapter-error", type(error).__name__)
-        if engine.desktop_lease.matches(event.get("tool_name")):
-            return {"decision": "deny", "reason": engine.desktop_lease.UNAVAILABLE}
-        return ALLOW
+    except Exception as error:  # noqa: BLE001
+        # Same as claude.py/codex.py: an engine crash fails open, except desktop calls,
+        # so a broken guard install does not stop every chat. decide() itself fails closed
+        # where a rule says so (live databases, desktop lease).
+        try:
+            engine.log_event_error("antigravity", "PreToolUse", "adapter-error", type(error).__name__)
+        except Exception:  # noqa: BLE001
+            pass
+        return {"decision": "deny", "reason": engine.desktop_lease.UNAVAILABLE} if desktop else ALLOW
     if result.get("decision") == "deny":
         return {"decision": "deny", "reason": result.get("reason") or "Denied by a Robob guard."}
     return ALLOW
@@ -132,7 +148,16 @@ def main(argv=None):
     try:
         _say({"pre": pre, "post": post, "stop": stop}.get(kind, pre)(payload))
     except Exception:  # noqa: BLE001 - an exception here would deny every tool call
-        _say(ALLOW if kind == "pre" else {})
+        if kind != "pre":
+            _say({})
+            return
+        mapped = None
+        try:
+            mapped = map_pre(payload)
+        except Exception:  # noqa: BLE001
+            pass
+        desktop = mapped is not None and _DESKTOP.match(mapped.get("tool_name") or "") is not None
+        _say(_DESKTOP_UNCHECKED if desktop else ALLOW)
 
 
 if __name__ == "__main__":

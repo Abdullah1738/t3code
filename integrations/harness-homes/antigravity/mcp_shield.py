@@ -96,6 +96,15 @@ class Degraded:
             emit({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": self.note()}})
 
 
+def is_rpc(message) -> bool:
+    """A JSON-RPC 2.0 request, notification or response. Anything else is log noise."""
+    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+        return False
+    if isinstance(message.get("method"), str):
+        return True
+    return "id" in message and (("result" in message) != ("error" in message))
+
+
 def downstream_messages():
     for line in sys.stdin:
         line = line.strip()
@@ -131,7 +140,17 @@ def run_stdio(name: str, command: list[str], init_timeout: float) -> int:
                 message = json.loads(text)
             except ValueError:
                 continue  # never pass log noise to the client
-            mid = message.get("id") if isinstance(message, dict) else None
+            if not is_rpc(message):
+                # Structured logs are JSON too, but not protocol messages. A malformed reply to
+                # an open request still gets an answer, so the client never waits on it.
+                if isinstance(message, dict) and message.get("id") is not None:
+                    with pending_lock:
+                        request = pending.pop(json.dumps(message["id"]), None)
+                    if request is not None:
+                        log(name, "malformed-reply")
+                        Degraded(name, "malformed reply").answer(request)
+                continue
+            mid = message.get("id")
             if mid is not None and "method" not in message:
                 waiter = init_waiters.pop(json.dumps(mid), None)
                 if waiter is not None:
@@ -225,7 +244,7 @@ def run_stdio(name: str, command: list[str], init_timeout: float) -> int:
 
 def keychain_secret(service: str) -> str | None:
     try:
-        out = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", service,
+        out = subprocess.run([os.environ.get("MCP_SHIELD_SECURITY", "/usr/bin/security"), "find-generic-password", "-s", service,
                               "-a", os.environ.get("USER", "ardud"), "-w"],
                              capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
@@ -234,12 +253,19 @@ def keychain_secret(service: str) -> str | None:
     return value if out.returncode == 0 and value else None
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the Keychain bearer to another origin: refuse every one."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
 class HttpUpstream:
     def __init__(self, name: str, url: str, bearer: str | None, timeout: float):
         self.name, self.url, self.bearer, self.timeout = name, url, bearer, timeout
         self.session_id: str | None = None
         self.protocol: str | None = None
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     def headers(self) -> dict:
         h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
@@ -252,9 +278,13 @@ class HttpUpstream:
         return h
 
     def post(self, message, timeout: float) -> list:
+        """One request with a total deadline: heartbeats or a slow trickle cannot extend it."""
+        deadline = time.monotonic() + timeout
         request = urllib.request.Request(self.url, data=json.dumps(message).encode(), headers=self.headers(),
                                          method="POST")
         with self.opener.open(request, timeout=timeout) as response:
+            if 300 <= response.status < 400:
+                raise urllib.error.HTTPError(self.url, response.status, "redirect refused", response.headers, None)
             session = response.headers.get("Mcp-Session-Id")
             if session:
                 self.session_id = session
@@ -262,18 +292,29 @@ class HttpUpstream:
             if response.status == 202:
                 return []
             if kind == "text/event-stream":
-                return self._read_sse(response, message)
-            body = response.read()
+                return self._read_sse(response, message, deadline)
+            chunks = []
+            while True:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("response deadline")
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            body = b"".join(chunks)
             if not body.strip():
                 return []
             value = json.loads(body)
-            return value if isinstance(value, list) else [value]
+            values = value if isinstance(value, list) else [value]
+            return [v for v in values if is_rpc(v)]
 
     @staticmethod
-    def _read_sse(response, message) -> list:
+    def _read_sse(response, message, deadline: float) -> list:
         wanted = message.get("id") if isinstance(message, dict) else None
         out, data = [], []
         for raw in response:
+            if time.monotonic() > deadline:
+                raise TimeoutError("response deadline")
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             if line.startswith("data:"):
                 data.append(line[5:].lstrip())
@@ -283,7 +324,7 @@ class HttpUpstream:
                 except ValueError:
                     value = None
                 data = []
-                if value is not None:
+                if is_rpc(value):
                     out.append(value)
                     if isinstance(value, dict) and value.get("id") == wanted and "method" not in value:
                         break

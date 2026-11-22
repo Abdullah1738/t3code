@@ -85,6 +85,19 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(out["decision"], "deny")
         self.assertEqual(out["reason"], engine.desktop_lease.UNAVAILABLE)
 
+    def test_an_engine_that_cannot_load_still_denies_desktop_calls(self):
+        # Review of 3e27b87ce3: `import engine` failing allowed a mutating CUA call.
+        click = pre({"name": "click", "args": {"ServerName": "cua-driver", "ToolName": "click"}})
+        with patch.dict(sys.modules, {"engine": None}):
+            self.assertEqual(run(["--event", "pre"], click)["decision"], "deny")
+            self.assertEqual(run(["--event", "pre"], pre({"name": "run_command", "args": {"CommandLine": "ls"}})),
+                             {"decision": "allow"})
+        with patch.object(antigravity, "pre", side_effect=RuntimeError("boom")):
+            self.assertEqual(run(["--event", "pre"], click)["decision"], "deny")
+        for name in ("mcp__cua-driver__click", "mcp__cua_driver__type_text", "mcp__node_repl__js",
+                     "mcp__cua-driver__", "mcp__dia__dia_tab_create", "Bash"):
+            self.assertEqual(antigravity._DESKTOP.match(name) is not None, engine.desktop_lease.matches(name), name)
+
     def test_post_finishes_only_admitted_desktop_calls(self):
         with tempfile.TemporaryDirectory() as state, patch.dict(os.environ, {"HARNESS_HOOKS_STATE_DIR": state}):
             with patch.object(engine, "decide") as decide:

@@ -1126,7 +1126,8 @@ def logged_run(name):
 
 
 @logged_run('generate.run')
-def generate(home_root: str | None, dry_run: bool, opencode_config: str | None = None) -> int:
+def generate(home_root: str | None, dry_run: bool, opencode_config: str | None = None,
+             antigravity_links_too: bool = False) -> int:
     manifest, homes, skills, unreadable, files = plan_all(home_root)
     farms = [os.path.join(home, "skills") for home in homes.values()]
     guard_outputs([*homes.values(), *farms, *files])
@@ -1146,7 +1147,10 @@ def generate(home_root: str | None, dry_run: bool, opencode_config: str | None =
                 writer.unlink(op[1])
             else:
                 writer.link(op[1], op[2])
-    agy_links = antigravity_links(manifest, homes["antigravity"]) if "antigravity" in homes else []
+    # Profile and ~/.gemini links are production state: a --home-root run (tests, scratch)
+    # must never point them into its temporary home.
+    agy_links = (antigravity_links(manifest, homes["antigravity"])
+                 if "antigravity" in homes and (not home_root or antigravity_links_too) else [])
     guard_outputs([link for link, _ in agy_links])
     for link, target in agy_links:
         state = link_state(link, target)
@@ -1195,7 +1199,8 @@ def safe_chain_failures(homes: dict[str, str], opencode_start: Path) -> list[str
 
 
 @logged_run('generate.check')
-def check(home_root: str | None, *, json_output: bool = False, opencode_config: str | None = None) -> int:
+def check(home_root: str | None, *, json_output: bool = False, opencode_config: str | None = None,
+          antigravity_links_too: bool = False) -> int:
     manifest, homes, skills, unreadable, files = plan_all(home_root)
     guard_outputs([*homes.values(), *(os.path.join(home, "skills") for home in homes.values()), *files])
     failures: list[str] = []
@@ -1253,7 +1258,8 @@ def check(home_root: str | None, *, json_output: bool = False, opencode_config: 
             elif os.path.normpath(os.path.join(farm, os.readlink(link))) != path:
                 failures.append(f"{label} skills: link {name} points at the wrong directory")
 
-    for link, target in (antigravity_links(manifest, homes["antigravity"]) if "antigravity" in homes else []):
+    for link, target in (antigravity_links(manifest, homes["antigravity"])
+                         if "antigravity" in homes and (not home_root or antigravity_links_too) else []):
         state = link_state(link, target)
         if state != "ok":
             failures.append(f"antigravity link {link}: {state.replace('-', ' ')} (expected -> {target})")
@@ -1343,20 +1349,25 @@ def main(argv: list[str] | None = None) -> int:
     gen.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
     gen.add_argument("--dry-run", action="store_true", help="print what would change; write nothing")
     gen.add_argument("--opencode-config", help=oc_help)
+    links_help = ("with --home-root, also manage the Antigravity profile and ~/.gemini links "
+                  "(off by default so a scratch home never rewires production)")
+    gen.add_argument("--antigravity-links", action="store_true", help=links_help)
     chk = sub.add_parser("check", help="verify the homes; exit 1 on failure")
     chk.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
     chk.add_argument("--json", action="store_true", help="emit the existing check result as JSON")
     chk.add_argument("--opencode-config", help=oc_help)
+    chk.add_argument("--antigravity-links", action="store_true", help=links_help)
     diff = sub.add_parser("mcp-diff", help="compare manifest mcpServers with OpenCode's mcp config")
     diff.add_argument("--json", action="store_true", help="emit the comparison as JSON")
     diff.add_argument("--opencode-config", help="OpenCode config path (default: manifest mcpParity.opencodeConfig)")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "generate":
-            return generate(args.home_root, args.dry_run, args.opencode_config)
+            return generate(args.home_root, args.dry_run, args.opencode_config, args.antigravity_links)
         if args.cmd == "mcp-diff":
             return mcp_diff(json_output=args.json, opencode_config=args.opencode_config)
-        return check(args.home_root, json_output=args.json, opencode_config=args.opencode_config)
+        return check(args.home_root, json_output=args.json, opencode_config=args.opencode_config,
+                     antigravity_links_too=args.antigravity_links)
     except HomeError as exc:
         if args.cmd == "check" and args.json:
             print(json.dumps({"schemaVersion": 1, "ok": False, "failures": [str(exc)], "homes": []}))

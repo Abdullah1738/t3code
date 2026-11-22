@@ -1089,6 +1089,27 @@ class AntigravityTests(HarnessTestCase):
     def agy(self) -> Path:
         return self.root / "antigravity"
 
+    def run_gen(self, manifest: dict | None = None, extra: list[str] | None = None) -> str:
+        return super().run_gen(manifest, ["--antigravity-links"] + (extra or []))
+
+    def run_check(self, manifest: dict | None = None) -> tuple[int, str]:
+        with mock.patch.object(gh, "load_manifest", return_value=manifest or self.manifest()):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = gh.main(["check", "--home-root", str(self.root), "--antigravity-links"])
+            return rc, out.getvalue()
+
+    def test_a_scratch_home_never_touches_production_links(self) -> None:
+        # Review of 3e27b87ce3: `generate --home-root <scratch>` rewired real profiles.
+        profile = self.make_profile()
+        super().run_gen()
+        rc, _ = super().run_check()
+        self.assertEqual(rc, 0)
+        for rel in gh.ANTIGRAVITY_PROFILE_LINKS:
+            self.assertFalse(os.path.lexists(profile / rel))
+        self.assertFalse(os.path.lexists(self.home / ".gemini/config/skills"))
+        self.assertTrue((self.agy / "config/hooks.json").exists())
+
     def test_every_mcp_server_runs_behind_the_shield(self) -> None:
         self.run_gen()
         config = json.loads((self.agy / "config/mcp_config.json").read_text())["mcpServers"]
