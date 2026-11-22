@@ -2,6 +2,7 @@
 """Thirty-second resource backstop. All destructive decisions require birth identity."""
 import argparse
 from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import fcntl
 import importlib.util
@@ -13,6 +14,7 @@ import plistlib
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -50,6 +52,8 @@ SLOW_LEAK_SECONDS = 1800
 OVERLOAD_SCRIPT = Path.home() / '.local/share/robob-overload-restart/robob-overload-restart.py'
 OVERLOAD_STATE = Path(os.environ.get('ROBOB_OVERLOAD_STATE', str(Path.home()/'.local/state/robob-overload-restart')))
 WORKER = ('codex', 'gpt-6.1-sol')
+WORKER_HTTP_TIMEOUT = 45
+WORKER_HELPER_TIMEOUT = 50
 STATE = Path.home() / '.local/state/mac-guard'
 EVIDENCE = Path.home() / '.robob/board-artifacts/mac-guard'
 T3CTL = str(Path.home() / '.local/bin/t3ctl')
@@ -87,7 +91,23 @@ def worker_thread_id(request_id):
     return 'ardud-control:thread:'+request_id
 
 
-def worker_control(request, opener=urllib.request.urlopen):
+class WorkerControlError(ProbeError):
+    def __init__(self, failure, durationS=None, status=None):
+        super().__init__(failure)
+        self.failure, self.durationS, self.status = failure, durationS, status
+
+
+def worker_failure(exc):
+    if isinstance(exc, WorkerControlError):
+        return exc.failure
+    if isinstance(exc, (TimeoutError, socket.timeout, subprocess.TimeoutExpired)):
+        return 'timeout'
+    if isinstance(exc, urllib.error.URLError):
+        return 'timeout' if isinstance(exc.reason, (TimeoutError, socket.timeout)) else 'unavailable'
+    return 'bad_response' if isinstance(exc, (ValueError, KeyError, TypeError)) else 'unavailable'
+
+
+def worker_control(request, opener=urllib.request.urlopen, metrics=None):
     # Match t3ctl's credential precedence. The parent bounds this helper's whole
     # lifetime, including HTTP response reads, and never logs credentials.
     url, token = os.environ.get('T3_CONTROL_URL'), os.environ.get('T3_CONTROL_TOKEN')
@@ -112,17 +132,24 @@ def worker_control(request, opener=urllib.request.urlopen):
     req = urllib.request.Request(url.rstrip('/')+'/api/ardud/control'+request['path'],
               data=json.dumps(body).encode() if body is not None else None, method=request['method'],
               headers={'Authorization': 'Bearer '+token, 'Content-Type': 'application/json', 'Accept': 'application/json'})
+    started = time.monotonic()
     try:
-        with opener(req, timeout=8) as response:
+        with opener(req, timeout=WORKER_HTTP_TIMEOUT) as response:
             value = json_object(response.read(2_000_000).decode())
     except urllib.error.HTTPError as exc:
-        value = json_object(exc.read(2_000_000).decode())
+        try:
+            value = json_object(exc.read(2_000_000).decode())
+        except ValueError:
+            value = {}
         if (request['method'] == 'GET' and exc.code == 404
                 and isinstance(value.get('error'), dict) and value['error'].get('code') == 'not_found'):
             return dict(missing=True)
-        raise ProbeError('worker_control_http') from None
+        raise WorkerControlError('http_status', status=exc.code) from None
+    finally:
+        if metrics is not None:
+            metrics['durationS'] = time.monotonic()-started
     if value.get('ok') is False:
-        raise ProbeError('worker_control_response')
+        raise WorkerControlError('bad_response')
     return value
 
 
@@ -401,15 +428,18 @@ class Host:
         self.cmd([T3CTL, 'send', tid, text]+(['--request-id', request_id] if request_id else []), 5)
 
     def worker_request(self, method, path, body=None):
+        self.worker_duration = None
         try:
             result = self.run(['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--worker-control'],
                               input=json.dumps(dict(method=method, path=path, body=body)), capture_output=True,
-                              text=True, timeout=10, env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
-        except (subprocess.TimeoutExpired, OSError):
-            raise ProbeError('worker_control_unavailable') from None
+                              text=True, timeout=WORKER_HELPER_TIMEOUT, env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise WorkerControlError(worker_failure(exc)) from None
+        value = json_object(result.stdout)
+        self.worker_duration = value.pop('_durationS', None)
         if result.returncode:
-            raise ProbeError('worker_control_unavailable')
-        return json_object(result.stdout)
+            raise WorkerControlError(value.get('failure', 'unavailable'), self.worker_duration, value.get('status'))
+        return value
 
     def worker_lookup(self, request_id):
         value = self.worker_request('GET', '/threads/'+urllib.parse.quote(worker_thread_id(request_id), safe=''))
@@ -566,7 +596,7 @@ def health_lag(health):
 
 
 class Guard:
-    def __init__(self, host=None, state=STATE, evidence=EVIDENCE, dry=None, logger=emit, clock=time.time):
+    def __init__(self, host=None, state=STATE, evidence=EVIDENCE, dry=None, logger=emit, clock=time.time, worker_submit=None):
         self.host = host or Host()
         self.state, self.evidence = Path(state), Path(evidence)
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -597,6 +627,11 @@ class Guard:
         self.diag_episode = False
         self.incidents = set()
         self.restart_incident = None
+        # The executor only runs bounded helper subprocesses, never guard state
+        # changes. One in-flight request keeps reconcile and POST serialized.
+        self.worker_executor = ThreadPoolExecutor(max_workers=1) if worker_submit is None else None
+        self.worker_submit = worker_submit or self.worker_executor.submit
+        self.worker_job = None
 
     @property
     def muted(self):
@@ -879,19 +914,54 @@ class Guard:
             self.pending = remaining
             self.save()
 
-    def launch_worker(self, path, adopted=False):
+    def worker_launch_step(self, launch, path, reconcile):
         if self.muted:
             return
+        if self.worker_job is None:
+            operation = 'worker_lookup' if reconcile else 'worker_create'
+            def request():
+                started = time.monotonic()
+                try:
+                    value = (self.host.worker_lookup(launch['clientRequestId']) if reconcile
+                             else self.host.worker_create(launch))
+                    return dict(value=value, durationS=getattr(self.host, 'worker_duration', None) or time.monotonic()-started)
+                except (ProbeError, OSError, ValueError, KeyError, TypeError) as exc:
+                    return dict(failure=worker_failure(exc),
+                                durationS=getattr(exc, 'durationS', None) or getattr(self.host, 'worker_duration', None) or time.monotonic()-started,
+                                status=getattr(exc, 'status', None))
+            self.worker_job = dict(requestId=launch['clientRequestId'], operation=operation,
+                                   future=self.worker_submit(request))
+        job = self.worker_job
+        if job['requestId'] != launch['clientRequestId'] or not job['future'].done():
+            return
+        result = job['future'].result()
+        self.worker_job = None
+        failure = result.get('failure')
+        self.log(job['operation'], result='failed' if failure else 'missing' if result['value'] is None else 'found',
+                 durationS=result['durationS'], failure=failure, errno=result.get('status'))
+        if failure:
+            self.log('error', probe=job['operation'], failure=failure,
+                     durationS=result['durationS'], errno=result.get('status'))
+            return
+        if job['operation'] == 'worker_lookup' and result['value'] is None:
+            return self.worker_launch_step(launch, path, reconcile=False)
+        self.log('worker_spawned', threadId=result['value'], evidence=str(path),
+                 result='adopted' if job['operation'] == 'worker_lookup' else 'sent')
+        return result['value']
+
+    def launch_worker(self, path, reconcile=False):
+        if self.muted:
+            return
+        if self.worker_job is None and self.now < self.worker.get('nextReconcileAt', 0):
+            return
         self.worker['nextReconcileAt'] = self.now+30
+        self.worker['evidence'] = str(path)
         write_json(self.state/'worker.json', self.worker)
-        try:
-            tid = self.host.worker_create(self.worker['launch'])
+        tid = self.worker_launch_step(self.worker['launch'], path, reconcile)
+        if tid:
             self.worker = dict(threadId=tid, startedAt=self.worker['startedAt'])
             write_json(self.state/'worker.json', self.worker)
-            self.log('worker_spawned', threadId=tid, evidence=str(path), result='adopted' if adopted else 'sent')
-            return tid
-        except (ProbeError, OSError, ValueError, KeyError):
-            self.log('error', probe='worker_create', failure='unknown')
+        return tid
 
     def worker_needed(self, path, summary, urgent=False, delivery=None):
         if self.muted:
@@ -899,22 +969,7 @@ class Guard:
                      result='would_act', evidence=str(path), summary=summary)
             return
         if self.worker.get('launchUnknown'):
-            if self.now < self.worker.get('nextReconcileAt', 0):
-                return
-            self.worker['nextReconcileAt'] = self.now+30
-            write_json(self.state/'worker.json', self.worker)
-            try:
-                tid = self.host.worker_lookup(self.worker['launch']['clientRequestId'])
-            except (ProbeError, OSError, ValueError, KeyError):
-                self.log('error', probe='worker_reconcile', failure='unavailable')
-                return
-            if self.muted:
-                return
-            # Thread creation precedes initial-message acceptance. Replay the
-            # same command even for a found thread, and retain the full safety
-            # prompt until the server confirms its durable initial run. The
-            # shared command/message IDs also deduplicate a late first request.
-            if not self.launch_worker(path, adopted=tid is not None):
+            if not self.launch_worker(path, reconcile=True):
                 return
         tid = self.worker.get('threadId')
         if tid:
@@ -943,6 +998,8 @@ class Guard:
             self.worker.pop('threadId', None)
             self.worker['endedAt'] = self.now
             write_json(self.state/'worker.json', self.worker)
+        if self.worker_job is not None:
+            return
         if not urgent and self.now-self.worker.get('endedAt', 0) < 1200:
             return
         if self.muted:
@@ -975,21 +1032,21 @@ class Guard:
         try:
             if report.get('launch'):
                 launch = report['launch']
-                adopt = (self.worker.get('launch', {}).get('clientRequestId') == launch['clientRequestId']
-                         or not self.worker.get('threadId') and not self.worker.get('launchUnknown'))
-                if adopt:
-                    self.worker = dict(launchUnknown=True, launch=launch, startedAt=report['startedAt'],
-                                       nextReconcileAt=self.now+30)
-                    write_json(self.state/'worker.json', self.worker)
-                found = self.host.worker_lookup(launch['clientRequestId'])
-                if self.muted:
-                    return
-                tid = self.host.worker_create(launch)
-                if adopt:
-                    self.worker = dict(threadId=tid, startedAt=report['startedAt'])
-                    write_json(self.state/'worker.json', self.worker)
-                self.log('worker_spawned', threadId=tid, evidence=report['evidence'],
-                         result='adopted' if found is not None else 'sent')
+                if self.worker.get('threadId') != worker_thread_id(launch['clientRequestId']):
+                    adopt = (self.worker.get('launch', {}).get('clientRequestId') == launch['clientRequestId']
+                             or not self.worker.get('threadId') and not self.worker.get('launchUnknown'))
+                    if adopt:
+                        if not self.worker.get('launchUnknown'):
+                            self.worker = dict(launchUnknown=True, launch=launch, startedAt=report['startedAt'])
+                            write_json(self.state/'worker.json', self.worker)
+                        tid = self.launch_worker(Path(report['evidence']), reconcile=True)
+                    else:
+                        tid = self.worker_launch_step(launch, Path(report['evidence']), reconcile=True)
+                    if not tid:
+                        return
+                    if adopt:
+                        self.worker = dict(threadId=tid, startedAt=report['startedAt'])
+                        write_json(self.state/'worker.json', self.worker)
                 delivered = True
             elif report.get('threadId'):
                 if self.muted:
@@ -1156,6 +1213,9 @@ class Guard:
     def tick(self, sample, now):
         self.now, self.sample = now, sample
         self.cycle += 1
+        # Reconcile even after strain clears: a pending launch still owns its ID.
+        if self.worker.get('launchUnknown'):
+            self.launch_worker(Path(self.worker.get('evidence', self.evidence)), reconcile=True)
         if self.previous.get('at') and not 0 < now-self.previous['at'] <= 60:
             self.streak = self.calm = 0
         self.rows = {p['pid']: dict(p) for p in sample['rows']}
@@ -1442,9 +1502,13 @@ def main():
         capture_diagnostic(args.diagnostic)
         return
     if args.worker_control:
+        metrics = {}
         try:
-            print(json.dumps(worker_control(json_object(sys.stdin.read()))))
-        except (ProbeError, OSError, ValueError):
+            value = worker_control(json_object(sys.stdin.read()), metrics=metrics)
+            print(json.dumps(dict(value, _durationS=metrics.get('durationS'))))
+        except (ProbeError, OSError, ValueError) as exc:
+            print(json.dumps(dict(failure=worker_failure(exc), status=getattr(exc, 'status', None),
+                                  _durationS=metrics.get('durationS'))))
             raise SystemExit(1)
         return
     guard = Guard()

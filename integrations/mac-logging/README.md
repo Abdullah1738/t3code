@@ -1063,10 +1063,15 @@ recorded as unavailable evidence. Stack capture runs outside the guard loop.
 
 Worker launches persist their request ID and exact payload before using the
 control API (`t3ctl create` does not forward a request ID). After an uncertain
-response the guard looks up that ID and replays the same idempotent request,
-completing any partial thread launch. It confirms the initial safety message
-and durable run before adoption or steering. Unavailable lookups wait;
-they never authorize a second worker. These calls have a ten-second bound.
+response the guard looks up the deterministic thread ID first and adopts a
+matching thread directly. Only an authoritative missing response permits a
+re-POST of the same payload and request ID. Unavailable lookups wait;
+they never authorize a second worker. HTTP requests allow 45 seconds; the
+parent bounds each isolated helper's full lifetime to 50 seconds in a background
+executor, leaving sampling and the strain ladder running. Pending launches
+reconcile on later ticks even after strain clears. `macguard.worker_create`
+and `macguard.worker_lookup` record `durationS` and failures (`timeout`,
+`http_status` with the status in `errno`, `bad_response`, or `unavailable`).
 
 Pause with `touch ~/.local/state/mac-guard/paused`; remove that file to resume.
 `MAC_GUARD_DRY_RUN=1` records proposed actions while sending no signals,
