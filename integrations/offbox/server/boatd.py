@@ -113,8 +113,9 @@ DEFAULTS = {
     "person_owners": ["moni"],        # their boxes get hourly/daily/weekly snapshots
     "max_running": 0,                 # optional hard cap, in addition to resource admission
     "cpu_pressure_limit": 0,          # host CPU some avg10 (%); 0 = off (the default until #219)
-    "prune_unused_days": 7,           # stopped boxes untouched this long are deleted (not pinned, not saved)
-    "pressure_idle_s": 12 * 3600,     # pool short with no run snapshot left: stopped boxes idle this long go, oldest first
+    "prune_unused_days": 30,          # stopped boxes untouched this long are deleted (not pinned, not saved)
+    "pool_unused_days": 7,            # the same for repository pool boxes: warm copies a run rebuilds by itself
+    "pressure_idle_s": 12 * 3600,     # pool short with no run snapshot left: pool boxes stopped this long go, oldest first
     "unreconciled_protect_s": 86400,  # an ended command with no recorded result protects its box's snapshots this long
     "sample_s": 10, "keep_samples_days": 90,
 }
@@ -3412,15 +3413,23 @@ REAP_REFUSED = {}   # box id -> time a delete was refused; it steps aside for an
 def reap_stopped_box(con, stopped, t):
     """Delete at most one stopped disposable box per pass, longest-stopped first.
 
-    Past prune_unused_days a box goes regardless of space. While the pool is short and no run snapshot is left to
-    prune, pressure_idle_s is enough (owner rule, 22 Nov 2026: waiting jobs outrank old disposable state; person
-    boxes, pins and saved bases are never in `stopped`). One per pass and never into a ZFS free backlog: a burst
-    of box deletes stalls Incus writes on the block-cloned home pool."""
+    Past its retention a box goes regardless of space: prune_unused_days, or pool_unused_days for a repository
+    pool box. While the pool is short and no run snapshot is left to prune, a repository pool box goes after
+    pressure_idle_s (owner rule, 22 Nov 2026: waiting jobs outrank old disposable state; person boxes, pins and
+    saved bases are never in `stopped`, and templates are not pool boxes). One per pass and never into a ZFS
+    free backlog: a burst of box deletes stalls Incus writes on the block-cloned home pool."""
     cleanup = (disk_state().get('cleanup') or {}) if CFG.get('state_dataset') else {}
     short = bool(cleanup.get('shortfall_bytes')) and not cleanup.get('snapshots_left')
-    retention = CFG["prune_unused_days"] * 86400
-    floor = min(retention, CFG.get('pressure_idle_s', 12 * 3600)) if short else retention
-    due = sorted((r for r in stopped if t - (r["stopped_at"] or t) > floor
+
+    def retention(r):
+        days = CFG.get('pool_unused_days', 7) if 'repository pool' in (r['name'] or '') else CFG["prune_unused_days"]
+        return min(days, CFG["prune_unused_days"]) * 86400
+
+    def floor(r):
+        pressed = short and 'repository pool' in (r['name'] or '')
+        return min(retention(r), CFG.get('pressure_idle_s', 12 * 3600)) if pressed else retention(r)
+
+    due = sorted((r for r in stopped if t - (r["stopped_at"] or t) > floor(r)
                   and t - REAP_REFUSED.get(r['id'], 0) >= 3600), key=lambda r: r["stopped_at"])
     if not due:
         return None
@@ -3436,7 +3445,7 @@ def reap_stopped_box(con, stopped, t):
     protected = snapshot_protected(con) if short else set()
     for r in due[:8]:
         bid = r['id']
-        expired = t - r["stopped_at"] > retention
+        expired = t - r["stopped_at"] > retention(r)
         if not expired:
             # Space is the only reason here, so a box that would give none back is left alone.
             rc, clones = _sh(['zfs', 'list', '-Hp', '-t', 'snapshot', '-o', 'clones', '-r',

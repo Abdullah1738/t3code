@@ -604,6 +604,7 @@ class StoppedBoxes(Base):
         con.execute('UPDATE boxes SET deleted_at=? WHERE id=?',(self.clock,bid))
 
     def stopped(self,bid,hours,**kw):
+        kw.setdefault('name','offbox some-repo | repository pool')
         self.box(bid,state='archived',running=False,**kw)
         self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?',(self.clock-hours*3600,bid))
         return bid
@@ -655,6 +656,14 @@ class StoppedBoxes(Base):
         self.assertEqual(self.deleted,[(older,'archived box exceeded unused retention')])
         self.passes(2)
         self.assertEqual([d[0] for d in self.deleted],[older,old])
+
+    def test_templates_and_other_named_boxes_keep_the_long_retention_and_never_go_for_space(self):
+        template=self.stopped('bx_template',20*24,name='offbox template crpko-node')
+        self.passes(3)
+        self.assertEqual(self.deleted,[])
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?',(self.clock-31*86400,template))
+        self.passes()
+        self.assertEqual(self.deleted,[(template,'archived box exceeded unused retention')])
 
     def test_refused_box_steps_aside_so_the_next_one_goes(self):
         held=self.stopped('bx_held0000',50);free=self.stopped('bx_free0000',30)
