@@ -1,7 +1,7 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { createApi, MAX_FILE_BODY } from "../src/api.ts";
-import { MAX_FILE_BYTES } from "../src/cli.ts";
+import { MAX_FILE_BYTES, parseCommand } from "../src/cli.ts";
 import type { Photon } from "../src/photon.ts";
 import type { Router } from "../src/router.ts";
 import { Store } from "../src/store.ts";
@@ -366,3 +366,58 @@ test("send and wake HTTP errors include the actual message length and limit", as
   }
   expect(h.store.pendingOutbox()).toEqual([]);
 });
+
+
+test("send-status projects each outbox state, files and early aliases without content", async () => {
+  const h = setup();
+  h.store.set("route", { id: "current", generation: 2 });
+  const status = (key: string, session = "current@2") => h.get(`/send-status/${encodeURIComponent(key)}?sessionId=${encodeURIComponent(session)}`);
+  expect(await (await status("missing")).json()).toEqual({ status: "unknown", kind: null });
+  expect((await h.get("/send-status/missing")).status).toBe(400);
+  expect((await status("missing", "other")).status).toBe(409);
+  const body = { text: "PRIVATE_TEXT", dedupeKey: "key /?%", sessionId: "current@2" };
+  const first = await h.post("/send", body);
+  const { id } = await first.json() as { id: string };
+  for (const [state, expected] of [["pending", "queued"], ["sending", "sending"], ["sent", "sent"],
+    ["failed", "failed"], ["cancelled", "cancelled"], ["uncertain", "unknown"]]) {
+    h.store.outboxState(id, state!);
+    if (state === "sent") h.store.set(`sent-at:${id}`, now + 100);
+    const response = await status(body.dedupeKey);
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result).toEqual({ status: expected, kind: "send", queuedAt: now,
+      ...(["sent", "failed", "cancelled", "uncertain"].includes(state!) ? { sentAt: now + 100 } : {}) });
+    expect(JSON.stringify(result)).not.toContain("PRIVATE");
+  }
+  // Lost acknowledgement: the same request is still an idempotent replay.
+  expect(await (await h.post("/send", body)).json()).toMatchObject({ id, created: false });
+  expect(h.store.db.query("SELECT COUNT(*) AS n FROM outbox").get()).toEqual({ n: 1 });
+  h.store.set(`api:send:send:${hash("alias")}`, { operationId: id });
+  expect(await (await status("alias")).json()).toMatchObject({ status: "unknown", kind: "send" });
+  expect((await h.post("/files", file)).status).toBe(202);
+  expect(await (await status(file.dedupeKey)).json()).toEqual({ status: "queued", kind: "file", queuedAt: now });
+  // A valid new route cannot inspect an old session's operation or generation.
+  h.store.set("route", { id: "other", generation: 2 });
+  expect((await status(body.dedupeKey, "other@2")).status).toBe(403);
+  h.store.set("route", { id: "current", generation: 3 });
+  expect((await status(body.dedupeKey, "current@3")).status).toBe(403);
+  expect((await status(body.dedupeKey, "current@2")).status).toBe(409);
+});
+
+test.each([".", "..", "...", "%2e", "%2e%2e", "./", "../", "a/../b", "/", "\\", "?&#=+", "%", "k /?%", "مفتاح 🔑", " . ", "-k"])(
+  "send-status resolves URL-sensitive key %j through the CLI request", async key => {
+    const h = setup();
+    h.store.set("route", { id: "current", generation: 2 });
+    const sent = await h.post("/send", { text: "PRIVATE_TEXT", dedupeKey: key, sessionId: "current@2" });
+    expect(sent.status).toBe(202);
+    const { id } = await sent.json() as { id: string };
+    const command = parseCommand(["send-status", `--key=${key}`, "--session=current@2"]);
+    expect(await (await h.get(command.path)).json()).toEqual({ status: "queued", kind: "send", queuedAt: now });
+    h.store.outboxState(id, "sent");
+    h.store.set(`sent-at:${id}`, now + 100);
+    expect(await (await h.get(command.path)).json()).toEqual({ status: "sent", kind: "send", queuedAt: now, sentAt: now + 100 });
+    h.store.set("route", { id: "other", generation: 2 });
+    const foreign = parseCommand(["send-status", `--key=${key}`, "--session=other@2"]);
+    expect((await h.get(foreign.path)).status).toBe(403);
+    expect((await h.get("/send-status/?sessionId=other@2")).status).toBe(400);
+  });

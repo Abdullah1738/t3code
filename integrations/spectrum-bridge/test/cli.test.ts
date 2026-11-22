@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import * as os from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadCommandPayload, MAX_FILE_BYTES, parseCommand } from "../src/cli.ts";
+import { cliFailure, loadCommandPayload, MAX_FILE_BYTES, parseCommand, sendCommand, SEND_TIMEOUT_EXIT_CODE } from "../src/cli.ts";
 
 const sendFile = ["send-file", "--file", "/nonexistent/report.pdf", "--key", "file-1", "--session", "session-1"];
 
@@ -529,4 +529,54 @@ describe("notify-rule commands", () => {
       expect(() => parseCommand(["notify-rule", ...args, "--session=s"])).toThrow();
     }
   });
+});
+
+
+test("send-status encodes the key and requires a session", () => {
+  expect(parseCommand(["send-status", "--key=k /?%", "--session=s@2"])).toEqual({
+    method: "GET", path: "/send-status/?key=k%20%2F%3F%25&sessionId=s%402" });
+  expect(() => parseCommand(["send-status", "--key=k"])).toThrow("--session");
+});
+
+test.each([".", "..", "...", "%2e", "%2e%2e", "./", "../", "a/../b", "/", "\\", "?&#=+", "%", "k /?%", "مفتاح 🔑", " . ", "-k"])(
+  "send-status preserves URL-sensitive key %j", key => {
+    expect(parseCommand(["send", "--text=PRIVATE_TEXT", `--key=${key}`, "--session=s@2"]).body?.dedupeKey).toBe(key);
+    const command = parseCommand(["send-status", `--key=${key}`, "--session=s@2"]);
+    const url = new URL(command.path, "http://bridge");
+    expect(url.pathname).toBe("/send-status/");
+    expect(url.searchParams.get("key")).toBe(key);
+    expect(url.searchParams.get("sessionId")).toBe("s@2");
+  });
+
+test("socket aborts distinguish send/file outcome unknown from read failures", async () => {
+  const root = await fs.mkdtemp(join(os.tmpdir(), "cli-timeout-"));
+  const socket = join(root, "s.sock"), file = join(root, "fixture.txt");
+  await fs.writeFile(file, "PRIVATE_CONTENT");
+  const server = createServer();
+  const oldSocket = process.env.SPECTRUM_BRIDGE_SOCKET;
+  process.env.SPECTRUM_BRIDGE_SOCKET = socket;
+  try {
+    await new Promise<void>(resolve => server.listen(socket, resolve));
+    for (const args of [["send", "--text=PRIVATE_TEXT", "--session=s", "--key=private-key"],
+      ["send-file", `--file=${file}`, "--session=s", "--key=private-key"], ["health"]]) {
+      const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: Parameters<typeof setTimeout>[0]) => {
+        queueMicrotask(() => { if (typeof callback === "function") callback(); });
+        return 0 as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout);
+      let failure;
+      try { await sendCommand(parseCommand(args)); }
+      catch (error) { failure = cliFailure(error); }
+      finally { timer.mockRestore(); }
+      expect(failure).toEqual(args[0] === "health" ? { exitCode: 1, body: { error: "Bridge request timed out" } } : {
+        exitCode: SEND_TIMEOUT_EXIT_CODE,
+        body: { error: "Bridge request timed out", outcome: "unknown", key: "private-key",
+          hint: "The message may already be queued. Re-run with the same --key (it won't send twice) or check with send-status --key." },
+      });
+    }
+  } finally {
+    if (oldSocket === undefined) delete process.env.SPECTRUM_BRIDGE_SOCKET;
+    else process.env.SPECTRUM_BRIDGE_SOCKET = oldSocket;
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

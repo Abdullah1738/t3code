@@ -386,12 +386,39 @@ describe("imessage_send", () => {
         harness.reply = { stdout: "", stderr: "", exitCode: null, timedOut: true };
         const timedOut = yield* call(caller(imessageRoot), { text: "hi" });
         expect(timedOut.isError).toBe(true);
-        expect(timedOut.text).toContain("timed out after 30s");
+        expect(timedOut.text).toContain("outcome unknown");
+        expect(timedOut.text).toContain(option(harness.calls.at(-1)!, "key")!);
 
         harness.reply = { stdout: "ok", stderr: "", exitCode: 0, timedOut: false };
         const garbled = yield* call(caller(imessageRoot), { text: "hi" });
         expect(garbled.isError).toBe(true);
         expect(garbled.text).toContain("unexpected reply");
+      }),
+    );
+  });
+});
+
+describe("ambiguous send exits", () => {
+  it.effect.each([
+    { exitCode: 75, stderr: "" },
+    {
+      exitCode: 1,
+      stderr: '{"error":"Bridge request timed out","outcome":"unknown","key":"untrusted"}',
+    },
+  ])("returns the actual retry key for %j", (reply) => {
+    const harness = makeHarness();
+    harness.reply = { ...reply, stdout: "", timedOut: false };
+    return run(
+      harness,
+      Effect.gen(function* () {
+        const result = yield* call(caller(imessageRoot), { text: "PRIVATE_TEXT" });
+        expect(result.isError).toBe(true);
+        expect(result.text).toContain("outcome unknown");
+        expect(result.text).toContain(option(harness.calls[0]!, "key")!);
+        expect(result.text).toContain("Never resend with a new key");
+        expect(result.text).not.toContain("PRIVATE_TEXT");
+        expect(result.text).not.toContain("untrusted");
+        expect(harness.calls).toHaveLength(1);
       }),
     );
   });

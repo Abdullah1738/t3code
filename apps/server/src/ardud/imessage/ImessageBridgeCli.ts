@@ -13,7 +13,8 @@ import * as Schema from "effect/Schema";
 
 import * as ProcessRunner from "../../processRunner.ts";
 
-export const BRIDGE_CLI_TIMEOUT_MS = 30_000;
+// Leave time for CLI startup, file preparation and its 15s socket budget.
+export const BRIDGE_CLI_TIMEOUT_MS = 45_000;
 const MAX_OUTPUT_BYTES = 256 * 1024;
 
 export interface BridgeCliPaths {

@@ -202,6 +202,24 @@ function sendConflict(store: Store, dedupeKey: string, route: { id: string; gene
   return saved !== undefined && saved !== sendSpec(id, route, content);
 }
 
+/** Delivery metadata only; aliases can point at the turn's early acknowledgement. */
+function sendStatus(store: Store, key: string, sessionId: string) {
+  const route = liveSendRoute(store, sessionId);
+  for (const kind of ["send", "file"] as const) {
+    const id = `${kind}:${hash(key)}`;
+    const saved = store.get<{ operationId?: string; queuedAt?: number }>(`api:${kind}:${id}`);
+    const item = store.getOperation(saved?.operationId ?? id);
+    if (!item) continue;
+    if (item.sessionId !== route.id || item.generation !== route.generation) throw new ApiError(403);
+    const status = item.state === "pending" ? "queued"
+      : ["sending", "sent", "failed", "cancelled"].includes(item.state) ? item.state : "unknown";
+    const queuedAt = saved?.queuedAt ?? store.get<number>(`log-queued:${item.id}`);
+    const sentAt = store.get<number>(`sent-at:${item.id}`);
+    return { status, kind, ...(queuedAt === undefined ? {} : { queuedAt }), ...(sentAt === undefined ? {} : { sentAt }) };
+  }
+  return { status: "unknown", kind: null };
+}
+
 /** Fetch-compatible handler only; socket ownership and listening belong to main. */
 export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, foldText, log }: Options): (request: Request) => Promise<Response> {
   const pairedChat = () => {
@@ -239,6 +257,13 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
           // An absent router means nothing is owned; this route is never readiness-gated.
           const active = router();
           return json(active ? active.routerStatus() : { route: null, pending: [] });
+        }
+        if (path.startsWith("/send-status/")) {
+          const params = new URL(request.url).searchParams;
+          const key = path === "/send-status/" ? params.get("key") : decodeURIComponent(path.slice("/send-status/".length));
+          const sessionId = params.get("sessionId");
+          if (!string(key, 200) || !validSession(sessionId)) throw new ApiError(400);
+          return json(sendStatus(store, key, sessionId));
         }
         if (path.startsWith("/wake/")) {
           const status = wakeStatus(store, decodeURIComponent(path.slice("/wake/".length)));
