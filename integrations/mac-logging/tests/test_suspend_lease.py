@@ -4,6 +4,7 @@ import datetime as dt
 import fcntl
 import io
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -91,6 +92,28 @@ class FakeHost:
     def notify(self, key, text):
         self.effects.append(('notify', key, text))
         return self.notify_ok
+
+
+class FakeRun:
+    def __init__(self, live):
+        self.live = live
+        self.calls = []
+        self.timeout_calls = set()
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+        if len(self.calls) in self.timeout_calls:
+            raise subprocess.TimeoutExpired(argv, kwargs['timeout'], output='private argv', stderr='private stderr')
+        output = ''
+        if argv[0] == '/bin/ps':
+            if '-axo' in argv:
+                output = '\n'.join(f"{p['pid']} {p['stat']} {p['start']} {p['command']}" for p in self.live.values())
+            else:
+                p = self.live.get(int(argv[argv.index('-p')+1]))
+                if p:
+                    output = (f"{p['pid']} {p['ppid']} {p['stat']} {p['start']} {p['comm']}"
+                              if argv[-1].startswith('pid=') else f"{p['start']} {p['command']}")
+        return subprocess.CompletedProcess(argv, 0, output, '')
 
 
 class SuspendTests(unittest.TestCase):
@@ -584,7 +607,7 @@ class SuspendTests(unittest.TestCase):
         run = Mock(side_effect=[subprocess.CompletedProcess([], 0, '20 1 T Sun Nov 22 10:00:00 2026 /bin/sleep\n', ''),
             subprocess.CompletedProcess([], 0, 'Sun Nov 22 10:00:00 2026 /bin/sleep 600\n', '')])
         self.assertEqual(m.Host(run).process(20), proc(stat='T'))
-        self.assertTrue(all(call.kwargs['timeout'] == 2 for call in run.call_args_list))
+        self.assertTrue(all(call.kwargs['timeout'] == m.TIMEOUTS['ps'] for call in run.call_args_list))
         for rc, err, missing in [(1, '', True), (1, 'permission denied', False), (2, '', False)]:
             run = lambda *a, **kw: subprocess.CompletedProcess(a, rc, '', err)
             if missing:
@@ -592,6 +615,141 @@ class SuspendTests(unittest.TestCase):
             else:
                 with self.assertRaises(OSError):
                     m.Host(run).process(20)
+
+    def subprocess_host(self):
+        run = FakeRun(self.host.live)
+        host = m.Host(run)
+        host.signal = self.host.signal
+        self.service.host = host
+        return host, run
+
+    def cli(self, *args):
+        with patch('sys.stdout', new_callable=io.StringIO), patch('sys.stderr', new_callable=io.StringIO):
+            return m.main(list(args), self.service)
+
+    def timeout_event(self, cmd, timeout):
+        props = [kw['props'] for name, kw in self.events if name == 'suspend.error'
+                 and kw['props']['result'] == 'TimeoutExpired'][-1]
+        self.assertEqual(props['cmd'], cmd)
+        self.assertEqual(props['timeoutS'], timeout)
+        for key in ('timeoutS', 'elapsedMs', 'loadAvg1'):
+            self.assertIn(type(props[key]), (int, float))
+            self.assertTrue(math.isfinite(props[key]))
+        self.assertGreaterEqual(props['elapsedMs'], 0)
+        row = toollog.record('suspend', 'error', 'suspend.error', dt.datetime.now(dt.timezone.utc), props=props)
+        for key in ('result', 'cmd', 'timeoutS', 'elapsedMs', 'loadAvg1'):
+            self.assertEqual(row['props'][key], props[key])
+        self.assertNotIn('private', json.dumps(row))
+        return props
+
+    def test_every_subprocess_uses_central_timeouts(self):
+        host, run = self.subprocess_host()
+        self.assertEqual(host.process(20), proc())
+        self.assertEqual(host.stopped(), [])
+        self.assertFalse(host.protected(proc()))
+        self.assertEqual(host.owner(proc()), '/bin/sleep')
+        self.assertTrue(host.notify('fixture', 'fixture'))
+        self.assertEqual([kwargs['timeout'] for _, kwargs in run.calls],
+                         [m.TIMEOUTS[key] for key in
+                          ('ps', 'ps', 'ps', 'launchctl_list', 'owner_list', 'procinfo', 'notify')])
+        self.assertEqual(self.signals(), [])
+
+    def test_stopped_listing_retries_once_and_sweep_succeeds(self):
+        _, run = self.subprocess_host()
+        run.timeout_calls = {1}
+        self.assertEqual(self.cli('sweep', '--json'), 0)
+        self.assertEqual(len(run.calls), 2)
+        self.assertTrue(all('-axo' in argv for argv, _ in run.calls))
+        self.assertEqual(self.events[-1][0], 'suspend.sweep')
+        self.assertFalse([name for name, _ in self.events if name == 'suspend.error'])
+        self.assertEqual(self.signals(), [])
+
+    def test_stopped_listing_two_timeouts_fail_with_context_and_no_signals(self):
+        _, run = self.subprocess_host()
+        run.timeout_calls = {1, 2}
+        with patch.object(m.time, 'monotonic', side_effect=[10, 10.25, 11, 11.125]), \
+                patch.object(m.os, 'getloadavg', return_value=(70.5, 60, 50)):
+            self.assertEqual(self.cli('sweep', '--json'), 1)
+        self.assertEqual(len(run.calls), 2)
+        props = self.timeout_event('ps -axo', m.TIMEOUTS['ps'])
+        self.assertEqual(props['elapsedMs'], 125)
+        self.assertEqual(props['loadAvg1'], 70.5)
+        self.assertEqual(self.signals(), [])
+
+    def test_protection_list_timeout_refuses_stop_without_retry(self):
+        _, run = self.subprocess_host()
+        run.timeout_calls = {3}
+        self.assertEqual(self.cli('stop', '--pid', '20', '--deadline', '1m', '--then', 'cont',
+                                  '--reason', 'load', '--actor', 'test'), 1)
+        self.assertEqual([argv for argv, _ in run.calls if argv[0] == '/bin/launchctl'],
+                         [['/bin/launchctl', 'list']])
+        self.timeout_event('launchctl list', m.TIMEOUTS['launchctl_list'])
+        self.assertEqual(self.signals(), [])
+        self.assertFalse(self.path.exists())
+
+    def test_per_pid_ps_timeouts_do_not_retry_or_expose_pid(self):
+        for call in (1, 2):
+            with self.subTest(call=call):
+                _, run = self.subprocess_host()
+                run.timeout_calls = {call}
+                with self.assertRaises(m.CommandTimeout) as caught:
+                    self.service.host.process(20)
+                self.assertEqual(len(run.calls), call)
+                self.assertEqual(caught.exception.fields['cmd'], 'ps -p')
+                self.assertIsNone(caught.exception.output)
+                self.assertIsNone(caught.exception.stderr)
+
+    def test_owner_timeouts_remain_best_effort_without_retry(self):
+        for calls in ({1}, {2}, {1, 2}):
+            with self.subTest(calls=calls):
+                host, run = self.subprocess_host()
+                run.timeout_calls = calls
+                self.assertEqual(host.owner(proc()), '/bin/sleep')
+                self.assertEqual(len(run.calls), 2)
+                self.assertEqual([kwargs['timeout'] for _, kwargs in run.calls],
+                                 [m.TIMEOUTS['owner_list'], m.TIMEOUTS['procinfo']])
+
+    def test_listing_command_timeout_logs_context(self):
+        self.stop()
+        _, run = self.subprocess_host()
+        run.timeout_calls = {2}
+        self.assertEqual(self.cli('list', '--json'), 1)
+        self.timeout_event('ps -p', m.TIMEOUTS['ps'])
+        self.assertEqual(len(run.calls), 2)
+        self.assertIn('20', self.ledger()['leases'])
+
+    def test_sweep_identity_timeout_logs_context_and_keeps_lease(self):
+        self.stop()
+        self.host.effects.clear()
+        _, run = self.subprocess_host()
+        run.timeout_calls = {1}
+        self.service.sweep()
+        self.timeout_event('ps -p', m.TIMEOUTS['ps'])
+        self.assertIn('20', self.ledger()['leases'])
+        self.assertEqual(self.signals(), [])
+
+    def test_release_timeout_logs_context_and_keeps_lease(self):
+        self.stop()
+        self.host.effects.clear()
+        _, run = self.subprocess_host()
+        run.timeout_calls = {1}
+        self.assertEqual(self.cli('resume', '--pid', '20'), 1)
+        self.timeout_event('ps -p', m.TIMEOUTS['ps'])
+        self.assertIn('20', self.ledger()['leases'])
+        self.assertEqual(self.signals(), [])
+
+    def test_notification_timeout_logs_only_program_and_script_and_keeps_alert(self):
+        self.host.live[20]['stat'] = 'T'
+        self.service.sweep()
+        self.now += 600
+        host, run = self.subprocess_host()
+        host.stopped = self.host.stopped
+        run.timeout_calls = {1}
+        self.assertEqual(self.cli('sweep', '--json'), 0)
+        self.timeout_event('bun cli.ts', m.TIMEOUTS['notify'])
+        self.assertEqual(len(run.calls), 1)
+        self.assertFalse(next(iter(self.ledger()['alerts'].values()))['sent'])
+        self.assertEqual(self.signals(), [])
 
     def test_plist_installer_status_and_event_payload(self):
         job = plistlib.loads((HERE/'launchd/com.abdullah.mac-suspend.plist').read_bytes())
