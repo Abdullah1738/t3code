@@ -358,7 +358,8 @@ test.each([false, true])("a retired batch carries every member after its leader 
   const logs = await captureLogs(async () => { await h.router.checkInboundLatency(); });
   expect(ids.map(h.state)).toEqual(["failed", "failed", "failed"]);
   expect(h.missed().map(m => m.id)).toEqual(expired ? [] : ids);
-  expect(logs.filter(l => l.name === "synthetic.carried_from_stranded").map(l => l.ids?.inboundId)).toEqual(ids);
+  expect(logs.filter(l => l.name === "synthetic.carried_from_stranded").map(l => l.ids?.inboundId)).toEqual(expired ? [] : ids);
+  if (expired) expect(logs.filter(l => l.name === "wake.failed").map(l => l.ids?.inboundId)).toEqual(ids);
   expect(logs.filter(l => l.name === "synthetic.carry_evicted").map(l => l.ids?.inboundId)).toEqual(expired ? ids : []);
   expect(h.backend.prompts).toEqual([]);
 });

@@ -149,7 +149,7 @@
     {"cmd": "./node_modules/.bin/vitest run --config vitest.config.mjs --exclude '**/tmp/**'", "heavy": true, "rule": "js-test"},
     {"cmd": "npx vitest run src/a.test.ts --exclude '**/tmp/**' --exclude '**/dist/**'", "heavy": false},
     {"cmd": "PATH=/Users/ardud/.nvm/versions/node/v24.21.0/bin:$PATH node_modules/.bin/vp test run apps/server/src/ardud/identity/ExecutionIdentity.test.ts --dir apps/server/src/ardud/identity", "heavy": false},
-    {"cmd": "PATH=\"$PWD/node_modules/.bin:/Users/ardud/.nvm/versions/node/v24.22.2/bin:$PATH\" vp test run --dir packages/provider-core packages/provider-core/src/server/subagentProjection.test.ts", "heavy": false},
+    {"cmd": "PATH=\"$PWD/node_modules/.bin:/Users/ardud/.nvm/versions/node/v24.22.3/bin:$PATH\" vp test run --dir packages/provider-core packages/provider-core/src/server/subagentProjection.test.ts", "heavy": false},
     {"cmd": "vp test run apps/server/src/a.test.ts --root apps/server", "heavy": false},
     {"cmd": "vp test run --dir apps/server", "heavy": true, "rule": "vp-test"},
     {"cmd": "vp test run --bail 1 src/a.test.ts", "heavy": false},

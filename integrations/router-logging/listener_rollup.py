@@ -1,8 +1,10 @@
 """Listener transitions are sparse; a recovery carries the original start time."""
 import datetime as dt
 import json
+import re
 
 from guard import recent_failure
+from observer import GAP_NAMES, launchctl_cause, measured
 
 
 def timestamp(value):
@@ -13,14 +15,17 @@ def timestamp(value):
         return None
 
 
-def transitions(path):
+def transitions(path, observations=None):
     try:
         with path.open() as lines:
             for line in lines:
-                if 'listener.' not in line and 'deploy.result' not in line:
+                if 'listener.' not in line and 'deploy.result' not in line and (observations is None or not any(name in line for name in GAP_NAMES)):
                     continue
                 try:
                     row = json.loads(line)
+                    if (observations is not None and row.get('tool') == '9router' and row.get('name') in GAP_NAMES
+                            and (row['name'] != 'pool.endpoint.get' or isinstance(row.get('durationMs'), (int, float)) and row['durationMs'] > 120000)):
+                        observations.append(row)
                     if row.get('tool') == '9router' and row.get('name') in ('listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved', 'deploy.result') and timestamp(row.get('ts')) is not None:
                         yield row
                 except (ValueError, AttributeError):
@@ -29,22 +34,23 @@ def transitions(path):
         return
 
 
-def windows(day, root, generated):
+@measured('listener_history')
+def windows(day, root, generated, observations=None):
     start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc)
     floor, ceiling = start.timestamp() * 1000, min((start + dt.timedelta(days=1)).timestamp() * 1000, generated.timestamp() * 1000)
     rows = []
     # Keep the prior day's sparse transitions so recovery evidence and unknown
     # intervals beginning at the same tick both survive midnight.
     for source in sorted((p for p in root.glob('????-??-??.ndjson') if p.stem < day), reverse=True):
-        prior = list(transitions(source))
+        prior = list(transitions(source, observations))
         if any(row['name'] in ('listener.down', 'listener.up', 'listener.state_resolved') or
                row.get('props', {}).get('unknownSince') for row in prior):
             rows.extend(prior)
             break
-    rows.extend(transitions(root / (day + '.ndjson')))
+    rows.extend(transitions(root / (day + '.ndjson'), observations))
     # Recovery may follow several missing or empty days; downSince joins it back.
     for source in sorted(p for p in root.glob('????-??-??.ndjson') if day < p.stem <= generated.date().isoformat()):
-        rows.extend(transitions(source))
+        rows.extend(transitions(source, observations))
     incidents = {}
     failures = [row.get('props', {}) for row in rows if row['name'] == 'deploy.result'
                 and timestamp(row['ts']) <= generated.timestamp() * 1000]
@@ -67,7 +73,11 @@ def windows(day, root, generated):
                     props.get('cause') in ('listener_refused', 'listener_unreachable'))
         key = (since, 'unknown' if unknown else 'listener')
         incident = incidents.setdefault(key, dict(start=props.get(since_key) or row['ts'], end=None,
-                                                 cause='state_unknown', confirmed=False))
+                                                 cause='other', confirmed=False))
+        if unknown and row['name'] == 'listener.state_unknown':
+            incident['cause'] = launchctl_cause(props)
+        elif unknown and incident['cause'] == 'other' and isinstance(props.get('cause'), str) and re.fullmatch(r'launchctl_unknown:(?:-?\d+|timeout|oserror)', props['cause']):
+            incident['cause'] = props['cause']
         if confirmed:
             incident.update(confirmed=True, cause=props.get('cause') or 'listener_' + probe)
         if row['name'] in ('listener.up', 'listener.state_resolved'):
@@ -86,6 +96,13 @@ def windows(day, root, generated):
             bucket, duration = (down, 'downMs') if confirmed else (unknown, 'unknownMs')
             bucket.append(dict(**incident, **{duration: round(elapsed, 3)}))
     confirmed_ms = round(sum(row['downMs'] for row in down), 3)
+    by_cause = {}
+    for number, window in enumerate(unknown, 1):
+        window['number'] = number
+        group = by_cause.setdefault(window['cause'], dict(count=0, unknownMs=0))
+        group['count'] += 1
+        group['unknownMs'] += window['unknownMs']
     return dict(count=len(down), totalDownMs=confirmed_ms, confirmedDownMs=confirmed_ms,
                 maxDownMs=max((row['downMs'] for row in down), default=0), windows=down,
-                unknownStateMs=round(sum(row['unknownMs'] for row in unknown), 3), unknownWindows=unknown)
+                unknownStateMs=round(sum(row['unknownMs'] for row in unknown), 3), unknownWindows=unknown,
+                unknownByCause=[dict(cause=cause, **group) for cause, group in sorted(by_cause.items())])

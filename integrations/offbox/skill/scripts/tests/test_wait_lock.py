@@ -454,24 +454,30 @@ class WaitLockTests(Isolated):
                 self.assertNotIn('done exit=0', out)
 
     def test_step_completion_fetches_missing_history_before_accepting_exit(self):
+        from offbox_lib import node_version
         self.con.execute("UPDATE runs SET step_count=2,command_id='cmd-x' WHERE run_id='run-x'")
         self.con.commit()
         log = common.LOGS_DIR / 'run-x.log'
         first = b'offbox step 1 rc=0: a\n'
         last = b'offbox step 2 rc=0: b\n'
-        log.write_bytes(first)
-        runs._commit(log, 0, len(first), len(first))
         calls = []
         def history(box, command, stream, offset, **kw):
             calls.append((stream, offset))
             data = first + last if stream == 'stderr' else b''
             return dict(data=data[offset:].decode(), nextOffset=len(data), size=len(data), done=True)
-        with patch.object(api, 'history_logs', side_effect=history):
-            code = misc._finalize(misc._run_row('run-x'), 0, log)
-        self.assertEqual(code, 0)
-        self.assertIn(last, log.read_bytes())
-        self.assertIn(('stderr', len(first)), calls)
-        self.assertEqual(misc._run_row('run-x')['exit_code'], 0)
+        for metadata in (False, True):
+            with self.subTest(metadata=metadata):
+                log.write_bytes(first)
+                runs._commit(log, 0, len(first), len(first))
+                if metadata:
+                    node_version.capture_stderr(log, first, 0)
+                calls.clear()
+                with patch.object(api, 'history_logs', side_effect=history):
+                    code = misc._finalize(misc._run_row('run-x'), 0, log)
+                self.assertEqual(code, 0)
+                self.assertEqual(log.read_bytes(), first + last)
+                self.assertIn(('stderr', len(first) if metadata else 0), calls)
+                self.assertEqual(misc._run_row('run-x')['exit_code'], 0)
 
     def test_finish_never_records_done_for_missing_steps(self):
         self.con.execute("UPDATE runs SET step_count=4 WHERE run_id='run-x'")

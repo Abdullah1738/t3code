@@ -50,6 +50,7 @@ import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as PubSub from "effect/PubSub";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
@@ -747,6 +748,7 @@ function makeLocalCommandHarness(input: {
   readonly writeFailure?: unknown;
   readonly failReadsAfterRunning?: boolean;
   readonly nativeDelivery?: boolean;
+  readonly nativeEvents?: Stream.Stream<ProviderAdapter.ProviderAdapterV2Event>;
   readonly allowRecoveryHandoff?: boolean;
   readonly providerDriver?: string;
   readonly beforeHandoffWrite?: Effect.Effect<void>;
@@ -982,6 +984,7 @@ function makeLocalCommandHarness(input: {
       ),
   );
   const resumeFallbackSession = {
+    events: input.nativeEvents ?? Stream.empty,
     driver: providerThread.driver,
     providerSession: {
       id: providerSessionId,
@@ -1061,6 +1064,7 @@ function makeLocalCommandHarness(input: {
                     )
                   : input.failReadsAfterRunning === true || input.nativeDelivery === true
                     ? Effect.succeed({
+                        events: input.nativeEvents ?? Stream.empty,
                         driver: providerThread.driver,
                         providerSession: {
                           id: providerSessionId,
@@ -1383,6 +1387,19 @@ effectIt.effect.each(["interrupted", "failed", "completed", "cancelled", "rolled
             runs: current.runs.map((run) =>
               run.id === controls.run.id ? { ...run, status, completedAt } : run,
             ),
+            providerTurns: [
+              {
+                id: providerTurnId,
+                providerThreadId: controls.providerThread.id,
+                nodeId: controls.rootNode.id,
+                runAttemptId: controls.attemptId,
+                nativeTurnRef: null,
+                ordinal: 1,
+                status: "running",
+                startedAt: controls.run.requestedAt,
+                completedAt: null,
+              },
+            ],
           });
           yield* Deferred.succeed(nativeStarted, undefined);
         }),
@@ -1469,12 +1486,11 @@ effectIt.effect.each(["interrupted", "failed", "completed", "cancelled", "rolled
         ),
       );
       expect(presented).toEqual([]);
-      expect(harness.nativeInterruptTurn).toHaveBeenCalledExactlyOnceWith(
-        expect.objectContaining({
-          providerTurnId,
-          stopBackgroundWork: true,
-        }),
+      expect(harness.nativeInterruptTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ providerTurnId, stopBackgroundWork: true }),
       );
+      for (const [stop] of harness.nativeInterruptTurn.mock.calls)
+        expect(stop.providerTurnId).toBe(providerTurnId);
       expect(harness.projection().runs.find((run) => run.id === controls.run.id)?.status).toBe(
         status,
       );
@@ -4487,6 +4503,127 @@ effectIt.effect.each(["confirmed", "rejected", "unanswered"] as const)(
       expect(request?.stopBackgroundWork).toBe(false);
       expect(request?.requestRuntimeRestart).toBe(false);
     }).pipe(Effect.scoped),
+);
+
+effectIt.effect.each(["interrupted", "failed", "cancelled", "newer-run"] as const)(
+  "interrupts exactly the offered turn when ownership changes during start: %s",
+  (status) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
+      yield* harness.start;
+      const controls = harness.startRootRun.mock.calls[0]![0];
+      const turnId = ProviderTurnId.make("late-start-service-turn");
+      harness.nativeStartTurn.mockImplementation(() =>
+        Effect.sync(() => {
+          const current = harness.projection();
+          harness.setProjection({
+            ...current,
+            runs:
+              status === "newer-run"
+                ? [
+                    ...current.runs,
+                    {
+                      ...current.runs[0]!,
+                      id: RunId.make("newer-run"),
+                      ordinal: 3,
+                      status: "running",
+                    },
+                  ]
+                : current.runs.map((run) => ({ ...run, status })),
+            providerTurns: [
+              {
+                id: turnId,
+                providerThreadId: controls.providerThread.id,
+                nodeId: controls.rootNode.id,
+                runAttemptId: controls.attemptId,
+                nativeTurnRef: null,
+                ordinal: 1,
+                status: "running",
+                startedAt: controls.run.requestedAt,
+                completedAt: null,
+              },
+            ],
+          });
+        }),
+      );
+      yield* startPreparedTurn(controls);
+      expect(harness.nativeInterruptTurn).toHaveBeenCalledOnce();
+      expect(harness.nativeInterruptTurn.mock.calls[0]![0]).toMatchObject({
+        providerThread: controls.providerThread,
+        providerTurnId: turnId,
+        requestRuntimeRestart: false,
+        stopBackgroundWork: false,
+      });
+    }),
+);
+
+effectIt.effect("uses the adapter start event when cancellation beats its projection", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const events = yield* PubSub.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        nativeDelivery: true,
+        nativeEvents: Stream.fromPubSub(events),
+      });
+      yield* harness.start;
+      const controls = harness.startRootRun.mock.calls[0]![0];
+      const turnId = ProviderTurnId.make("unprojected-late-turn");
+      harness.nativeStartTurn.mockImplementation(() =>
+        Effect.gen(function* () {
+          const current = harness.projection();
+          harness.setProjection({
+            ...current,
+            runs: current.runs.map((run) => ({ ...run, status: "interrupted" })),
+          });
+          yield* PubSub.publish(events, {
+            type: "provider_turn.updated",
+            driver: controls.providerThread.driver,
+            providerTurn: {
+              id: turnId,
+              providerThreadId: controls.providerThread.id,
+              nodeId: controls.rootNode.id,
+              runAttemptId: controls.attemptId,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "running",
+              startedAt: controls.run.requestedAt,
+              completedAt: null,
+            },
+          });
+        }),
+      );
+      yield* startPreparedTurn(controls);
+      expect(harness.nativeInterruptTurn).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ providerTurnId: turnId }),
+      );
+    }),
+  ),
+);
+
+effectIt.effect("keeps a resumed lower ordinal active after a newer queued run already ended", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
+    yield* harness.start;
+    const controls = harness.startRootRun.mock.calls[0]![0];
+    const current = harness.projection();
+    harness.setProjection({
+      ...current,
+      runs: [
+        ...current.runs,
+        {
+          ...controls.run,
+          id: RunId.make("higher-ended-run"),
+          ordinal: 3,
+          status: "completed",
+          completedAt: controls.run.requestedAt,
+        },
+      ],
+    });
+    yield* startPreparedTurn(controls);
+    expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+    expect(harness.nativeInterruptTurn).not.toHaveBeenCalled();
+  }),
 );
 
 effectIt.effect.each([

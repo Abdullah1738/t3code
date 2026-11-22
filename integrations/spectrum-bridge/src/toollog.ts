@@ -38,7 +38,7 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "outboxId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId", "requestId", "serverRequestId", "outageId"]);
-const WAKE_EVENTS = new Set(["wake.accepted", "wake.turn_start", "wake.send_ambiguous", "wake.admitted", "wake.retry_scheduled", "wake.failed"]);
+const WAKE_EVENTS = new Set(["wake.accepted", "wake.turn_start", "wake.send_ambiguous", "wake.admitted", "wake.retry_scheduled", "wake.failed", "wake.waiting"]);
 const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "generation", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews", "linkFailureCount", "boundMs", "elapsedMs", "msUntilAccepted", "downMs", "skippedCalls", "failedProbes"]);
 const ENUMS: Record<string, readonly string[]> = {
   causeKind: ["timeout", "http", "transport"],
@@ -95,10 +95,21 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       if (key === "source" && typeof value === "string" && value.length <= 100 && !/[\x00-\x1f\x7f-\x9f]/.test(value)
         || key === "causeKey" && typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,100}$/.test(value)
         || key === "route" && value === "/threads/:id/send"
-        || key === "reason" && ["ambiguity_deadline", "stale", "attempts_exhausted", "route_retired"].includes(String(value))
+        || key === "reason" && ["ambiguity_deadline", "delivery_deadline", "stale", "attempts_exhausted", "route_retired", "holder", "link_down", "cooldown", "admission"].includes(String(value))
+        || key === "holderPhase" && ["submitting", "running", "unknown", "held", "failed"].includes(String(value))
+        || key === "attempt" && entry.name === "wake.failed" && value === 0
+        || key === "remainingMs" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0
         || key === "nextAt" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
         props[key] = value; continue;
       }
+    }
+    if (entry.name === "turn.hold_changed" && (key === "holderPhase" || key === "phase")
+      && ["submitting", "running", "unknown", "held", "failed", "released"].includes(String(value))
+      || entry.name === "turn.hold_changed" && key === "reason" && ["link_down", "turn_transition"].includes(String(value))) {
+      props[key] = value; continue;
+    }
+    if (entry.name === "turn.end" && key === "endReason" && ["undelivered", "failed", "errored", "expired"].includes(String(value))) {
+      props[key] = value; continue;
     }
     if (entry.component === "mirror" && ["mirror-append", "mirror-queue", "mirror-fail", "mirror-backfill"].includes(entry.name)) {
       if (key === "direction" && (value === "inbound" || value === "outbound")
@@ -263,7 +274,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }

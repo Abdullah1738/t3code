@@ -156,7 +156,8 @@ class RelativeScriptReporterTests(unittest.TestCase):
                     with self.subTest(variant=variant, shape=shape, harness=harness, tool=tool):
                         event = self.event(command, tool)
                         event['tool_input']['workdir'] = str(cwd)
-                        self.check(event, expected, harness)
+                        # A remote-only run never executes the backup copy here (#221).
+                        self.check(event, None if shape == 'offbox-options' else expected, harness)
 
     def test_fixture_and_migration_review_corpus_through_hooks(self):
         isolated_source_cases.write_migration_helpers(self.root)
@@ -170,7 +171,8 @@ class RelativeScriptReporterTests(unittest.TestCase):
             for prefix in prefixes:
                 for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:
                     with self.subTest(case=label, prefix=prefix, harness=harness, tool=tool):
-                        self.check(self.event(prefix + command, tool), expected, harness)
+                        # A remote-only run never executes the fixture here (#221).
+                        self.check(self.event(prefix + command, tool), None if '--remote' in prefix else expected, harness)
         self.write('tmp/fixture.sh', backup.read_text())
         for destination in (LIVE, '~/.t3/userdata/statev2.sqlite', '$HOME/.robob/userdata/statev2.sqlite'):
             for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:
@@ -214,6 +216,8 @@ class RelativeScriptReporterTests(unittest.TestCase):
     def test_retained_reporter_calls_through_both_adapters(self):
         cases = json.loads((FIXTURES / 'reporters.json').read_text())
         cases += json.loads((FIXTURES / 'added-reporters.json').read_text())
+        # Crpko #42, #2153 and #3029 and TorSSH #7 and #9 run their unproved script only inside a
+        # remote-only `offbox run` (#221), so they now pass.
         unresolved = {
             'toolu_019XRY6Gvz9Gtm2htPdzT6qa': 'executable provenance or mutation proof failed',
             'call_397846cad4494f52b0e9c57a3f85cd7a': 'executable provenance or mutation proof failed',
@@ -221,10 +225,8 @@ class RelativeScriptReporterTests(unittest.TestCase):
             'call_c3593fb888e64c9f8f808246c766402a': 'python: non-isolated startup',
             'call_c2ba5fc029614e1da361649017985d81': 'python: non-isolated startup',
             'call_eb023391ca2d4507b811e7a5b6519cb2': 'python: non-isolated startup',
-            'call_3c100fa581a24b9098a56b2236a87e44': 'command wrapper proof failed',
             'call_f47459aeb9274a549935ac297a7af33f': 'python: non-isolated startup',
             'call_dbaae78364c64a4cbcc003d103da0884': 'python: non-isolated startup',
-            'call_cb019549a9334bf29225f9aa9504e297': 'command wrapper proof failed',
             'call_bb309dbe7c3e4ae68be5c42f9aca3bdb': 'python: non-isolated startup',
             'call_a7f9cb33e7a3402895dd0732a98f6f41': 'python: non-isolated startup',
             'call_93af2fcd2c7141df8a27c123f19e5dbc': 'python: non-isolated startup',
@@ -237,7 +239,6 @@ class RelativeScriptReporterTests(unittest.TestCase):
             'call_582da943ca854989821aa5605fe0054b': 'python: non-isolated startup',
             'call_55c5d86ec5f44e27b37fb0ff319eac54': 'python: non-isolated startup',
             'call_52d93f07d49044ef882f9add81a10542': 'python: non-isolated startup',
-            'call_4f03bb1ff4844c5ba2df34cc593cf77a': 'command wrapper proof failed',
             'call_45eff52bf94242cd80a3025ccaca3323': 'python: non-isolated startup',
             'call_3be4afa481b74700ab1cf31ecdbc0f08': 'python: non-isolated startup',
             'call_3b7b316ae8a84badb82d8037a79f0553': 'python: non-isolated startup',
@@ -258,7 +259,6 @@ class RelativeScriptReporterTests(unittest.TestCase):
             'toolu_01EJVS24gL3YVQkyaDpezY74': '$f',
             'call_363a7f31bc384aab9c301cdb910617c2': 'python: non-isolated startup',
             # These writers follow unproved commands or unsupported brace words.
-            'call_88af2f048e124c41adcd9a9b768cddd7': 'heredoc writer',
             'call_8e1318de1e854e688a15d7312d85fcd1': 'heredoc writer',
             'call_faa5d79b00b34bacba6060455445ed12': 'heredoc writer',
             'call_cab9209449084c8e97ebeffb3b3d8fce': 'brace expansion',
@@ -266,7 +266,6 @@ class RelativeScriptReporterTests(unittest.TestCase):
             'call_68b71b26bd4040ad9f01469397760615': 'python: non-isolated startup',
             'call_d95383413b6242489793635991b4946c': 'heredoc writer',
             'call_0c02a91a69684e0787a4ed63e50287f2': 'heredoc writer',
-            'call_3eddb5bf6400468fbeec2a7cb065719a': 'heredoc writer',
             'call_9102f1f55ad34d189446c670febbd584': 'heredoc writer',
             'call_851993aaf0254922bf6070f859d45aad': 'heredoc writer',
             # Parse-only exits also require executable history. These calls
@@ -336,7 +335,8 @@ class RelativeScriptReporterTests(unittest.TestCase):
             self.write('run.sh', 'sqlite3 ' + database + ' .tables')
             for command in invocations:
                 with self.subTest(command=command, database=database):
-                    self.check(self.event(command), 'live-database-script')
+                    # --bg never runs run.sh on the Mac, so its body isn't scanned (#221).
+                    self.check(self.event(command), None if '--bg' in command else 'live-database-script')
 
     def test_create_run_and_syntax_only_shapes(self):
         rows = [
@@ -351,8 +351,12 @@ class RelativeScriptReporterTests(unittest.TestCase):
             for database in (LIVE, OPENCODE):
                 with self.subTest(name=name, invocation=invocation, database=database):
                     command = f"cat > {name} <<'EOF'\n{body}EOF\n{invocation}"
-                    expected = 'live-database-script-unresolved' if name in {'tmp/quint/3464/fix_rules.py', 'tmp/implement.py', 'tmp/followup.cjs', 'tmp/acceptance.sh'} else None
+                    expected = 'live-database-script-unresolved' if name in {'tmp/quint/3464/fix_rules.py', 'tmp/implement.py', 'tmp/followup.cjs'} else None
                     self.check(self.event(command), expected)
+                    if '--bg' in invocation:
+                        # The box runs it whatever it reads (#221).
+                        self.check(self.event(command.replace('\nEOF', '\nsqlite3 ' + database + ' .tables\nEOF', 1)))
+                        continue
                     read = f'open({database!r}).read()' if interpreter == 'python3' else f'require("fs").readFileSync({database!r})' if interpreter == 'node' else 'sqlite3 ' + database + ' .tables'
                     twin = command.replace('\nEOF', '\n' + read + '\nEOF', 1)
                     if not invocation or ' -n ' in invocation:
