@@ -1042,16 +1042,21 @@ function resolveCreator(watcher: Watcher, cli: string): Promise<CreatorRoute> {
 const ambiguousSend = (result: { code: number; signal: NodeJS.Signals | null }) => result.signal === "SIGKILL" || result.code === 4;
 
 type SendResult = { ok: boolean; code: number; signal: NodeJS.Signals | null; out: string; stderr?: string };
-const sendOutput = (result: SendResult) => `${result.stderr ?? ""}\n${result.out}`;
-const controlApiUnavailable = (result: SendResult) => /\b(?:fetch failed|ECONNREFUSED|ECONNRESET|socket hang up|EPIPE|server_restart|HTTP\s+(?:502|503|504)|connection dropped)\b/i.test(sendOutput(result));
+// t3ctl's transport retry hint echoes the full message, which may itself mention an archived or invalid thread.
+const sendDiagnostic = (result: SendResult) => [result.stderr ?? "", result.out]
+  .map(output => output.split("Retry safely with:", 1)[0]).join("\n");
+const controlApiUnavailable = (diagnostic: string) => /\b(?:fetch failed|ECONNREFUSED|ECONNRESET|socket hang up|EPIPE|server_restart|HTTP\s+(?:502|503|504)|connection dropped)\b/i.test(diagnostic);
 function sendFailureClass(result: SendResult): "control_api_unavailable" | "timeout" | "definite" | "other" {
-  if (definiteRouteFailure(sendOutput(result))) return "definite";
-  if (result.signal === "SIGKILL" || /(?:^|\n)unavailable:/i.test(sendOutput(result))
-    || /\b(?:timed? out|timeout|TimeoutError)\b/i.test(sendOutput(result))) return "timeout";
-  return controlApiUnavailable(result) ? "control_api_unavailable" : "other";
+  const diagnostic = sendDiagnostic(result);
+  if (definiteRouteFailure(diagnostic)) return "definite";
+  if (result.signal === "SIGKILL" || /(?:^|\n)unavailable:/i.test(diagnostic)
+    || /\b(?:timed? out|timeout|TimeoutError)\b/i.test(diagnostic)) return "timeout";
+  return controlApiUnavailable(diagnostic) ? "control_api_unavailable" : "other";
 }
-const transientSend = (result: SendResult) => !definiteRouteFailure(sendOutput(result))
-  && (ambiguousSend(result) || ["timeout", "control_api_unavailable"].includes(sendFailureClass(result)));
+const transientSend = (result: SendResult) => {
+  const failure = sendFailureClass(result);
+  return failure !== "definite" && (ambiguousSend(result) || ["timeout", "control_api_unavailable"].includes(failure));
+};
 const queuedThreadSend = (result: SendResult) => {
   if (!result.ok) return false;
   try { const value = JSON.parse(result.out); return value?.ok === true && value.delivery === "queued"; } catch { return false; }

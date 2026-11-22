@@ -23,6 +23,8 @@ type Fixture = {
   sendExit137?: boolean;
   requireSendJournal?: boolean;
   sendAmbiguous?: boolean;
+  sendDiagnostic?: string;
+  sendDiagnosticStream?: "stdout" | "stderr";
   strictWakeKey?: boolean;
   wakeAmbiguousOnce?: boolean;
   sendSleep?: boolean;
@@ -43,6 +45,8 @@ type Fixture = {
   sendFailure?: string;
   sendOutput?: string;
 };
+
+const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 // Each delivery runs in a fresh process: caches, bridge rows, logs and every CLI stay inside its fixture.
 async function fixture(options: Fixture = {}, body = "await deliver(watcher, 'event happened', key, state)") {
@@ -67,6 +71,12 @@ if (${JSON.stringify(cli)} === 't3ctl') {
     if (state.pending?.creatorSend?.thread !== args[1] || !(state.pending.creatorSend.sentAt <= Date.now())) process.exit(1);
   }
   if (args[0] === 'send' && config.sendAmbiguous) process.exit(4);
+  if (args[0] === 'send' && config.sendDiagnostic) {
+    const quote = ${shellQuote.toString()};
+    const retry = ['t3ctl', 'send', quote(args[1]), '--request-id', quote(args[4]), '--mode', quote(args[6]), '--', quote(args[2])].join(' ');
+    console[config.sendDiagnosticStream === 'stdout' ? 'log' : 'error'](config.sendDiagnostic + '. Retry safely with: ' + retry);
+    process.exit(4);
+  }
   if (args[0] === 'status' && config.sendSpawnError) unlinkSync(import.meta.path);
   if (config[args[0] + 'SleepOnce']) {
     delete config[args[0] + 'SleepOnce'];
@@ -526,8 +536,8 @@ for (const entry of [
   });
 }
 
-const confirmBody = (body: string) => `(async () => {
-  state.pending = { key, event: 'event happened', at: new Date().toISOString(), watcher };
+const confirmBody = (body: string, event = 'event happened') => `(async () => {
+  state.pending = { key, event: ${JSON.stringify(event)}, at: new Date().toISOString(), watcher };
   saveState(watcher.id, state);
   const { tickOne } = await import(${JSON.stringify(runnerPath)});
   await tickOne(watcher.id);
@@ -538,6 +548,66 @@ const confirmBody = (body: string) => `(async () => {
   ${body}
   return { before, state: loadState(watcher.id) };
 })()`;
+
+const routeFailureWords = ['archived', 'not_found', 'invalid id', 'invalid_id', 'invalid thread', 'invalid_thread', 'invalid session', 'invalid_session'];
+const sendPhases = ['initial', 'retry', 'escalation'] as const;
+const retryHintCases = routeFailureWords.flatMap((word, index) => sendPhases.map(phase => ({
+  word, phase,
+  transport: index % 2 ? 'timed out' : 'connection dropped',
+  stream: index % 4 < 2 ? 'stderr' as const : 'stdout' as const,
+  field: ['title', 'event', 'context'][index % 3]!,
+})));
+
+test.each(retryHintCases)('retry hint payload $word in $field stays on the thread during $phase ($transport, $stream)', async ({ word, phase, transport, stream, field }) => {
+  const payload = `watcher's ${word} event${field === 'title' ? '' : '\nfollow-up context'}`;
+  const event = field === 'event' ? payload : 'event happened';
+  const watcher = field === 'event' ? {} : { [field]: payload };
+  const sendDiagnostic = `send ${transport}; it may or may not have been delivered`;
+  const options: Fixture = { watcher, ...(phase === 'initial' ? { sendDiagnostic, sendDiagnosticStream: stream }
+    : phase === 'retry' ? { sendFailure: 'fetch failed' } : { sendAmbiguous: true }) };
+  const { result, calls, logs, sentLogs, log } = await fixture(options, confirmBody(phase === 'initial' ? '' : `
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false },
+      sendDiagnostic: ${JSON.stringify(sendDiagnostic)}, sendDiagnosticStream: ${JSON.stringify(stream)} }));
+    ${phase === 'retry' ? 'Date.now = () => before.confirm.nextAt;' : ''}
+    await tickOne(watcher.id);
+    ${phase === 'escalation' ? 'Date.now = () => at + 31_000; await tickOne(watcher.id);' : ''}
+  `, event));
+  expect(result.state.confirm).toMatchObject({ thread: projectThread });
+  expect(result.state.confirm?.ownerFallback).not.toBe(true);
+  expect(result.state.confirm?.sendPending).toBeUndefined();
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+  expect(log).not.toContain('via=wake:owner-fallback');
+  const sends = calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send');
+  expect(sends).toHaveLength(phase === 'initial' ? 1 : 2);
+  expect(sends[0]!.args[2]).toContain(payload);
+  if (phase === 'initial') {
+    expect(sentLogs[0]?.props?.via).toBe('thread:abcd1234');
+    expect(sentLogs[0]?.props?.failureClass).toBe(transport === 'timed out' ? 'timeout' : 'control_api_unavailable');
+  } else {
+    expect(sends[1]!.args).toEqual(sends[0]!.args);
+    expect(logs.find(row => row.name === 'wake.send_retry')?.props?.outcome).toBe('ambiguous');
+  }
+  if (phase === 'retry') expect(log).toContain('creator send delivered after 1 retries');
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(phase === 'escalation' ? 1 : 0);
+});
+
+test.each(routeFailureWords.flatMap(word => sendPhases.map(phase => ({ word, phase }))))(
+  'an actual $word send diagnostic still falls back during $phase', async ({ word, phase }) => {
+    const sendFailure = `${word}: thread gone after server_restart`;
+    const { result, calls, sentLogs, logs } = await fixture(phase === 'initial' ? { sendFailure }
+      : phase === 'retry' ? { sendFailure: 'fetch failed' } : { sendAmbiguous: true }, confirmBody(phase === 'initial' ? '' : `
+      writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false },
+        sendFailure: ${JSON.stringify(sendFailure)} }));
+      ${phase === 'retry' ? 'Date.now = () => before.confirm.nextAt;' : ''}
+      await tickOne(watcher.id);
+    `));
+    expect(result.state.confirm?.ownerFallback).toBe(true);
+    expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(1);
+    expect(wakeText(calls)).toStartWith('(meant for thread abcd1234, which could not be reached)\n');
+    if (phase === 'initial') expect(sentLogs[0]?.props?.failureClass).toBe('definite');
+    else expect(logs.find(row => row.name === 'wake.send_retry')?.props?.outcome).toBe('definite');
+  },
+);
 
 test.each([
   'fetch failed', 'ECONNREFUSED: connect failed', 'ECONNRESET', 'socket hang up', 'EPIPE',
