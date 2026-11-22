@@ -167,6 +167,46 @@ class BoxProtectionTests(Base):
                     self.assertEqual(not boatd.box_protection(self.con,bid)['holds'],expected)
                 self.con.execute('DELETE FROM commands WHERE box_id=?',(bid,))
 
+    def test_a_run_cancelled_while_queued_does_not_hold_its_box(self):
+        clean = {'kill': {'cleanup': 'clean', 'leftover_killed': 0, 'remaining': 0}, 'kill_synthetic': True}
+        cases = (('cancelled in the queue', clean, None, 1, 1, False, True),
+                 ('it had been admitted', clean, 10, 1, 1, False, False),
+                 ('an earlier attempt ran', clean, None, 2, 1, False, False),
+                 ('it had invoked the guest', clean, None, 1, 1, True, False),
+                 ('cleanup left a process', {**clean, 'kill': {**clean['kill'], 'remaining': 1}}, None, 1, 1, False, False),
+                 ('cleanup is unknown', {**clean, 'kill': {'cleanup': 'unknown'}}, None, 1, 1, False, False),
+                 ('a real exit replaced the kill', {**clean, 'kill_synthetic': False}, None, 1, 1, False, False),
+                 ('nobody killed it', clean, None, 1, 0, False, False))
+        for index, (name, metrics, started, attempt, killed, invoked, freed) in enumerate(cases):
+            with self.subTest(name):
+                bid = self.box(bid='bx_queuekill'+str(index))
+                self.con.execute("INSERT INTO commands(box_id,pid,command_id,status,exit_code,attempt,killed,metrics,started_at,run_id) "
+                                 "VALUES (?,1001,'cmd','exited',143,?,?,?,?,'run-q')",
+                                 (bid, attempt, killed, json.dumps(metrics), started))
+                if invoked:
+                    (boatd.cmd_dir(bid)/f'1001.{attempt}.invocations.json').write_text('[]')
+                with patch.object(boatd,'command_probe',return_value={'readable':True,'pids':None,'reason':'cgroup_unverified'}):
+                    self.assertEqual(not boatd.box_protection(self.con,bid)['holds'],freed)
+                    if freed:
+                        boatd.stop_box(self.con, bid, 'idle ttl')
+                        self.assertEqual(boatd.box_row(self.con, bid)['state'], 'archived')
+
+    def test_the_real_kill_of_a_queued_run_leaves_its_box_free_to_stop(self):
+        bid = self.box()
+        pid = self.cmd(bid, status='queued')
+        boatd.stage_kill(self.con, bid, pid, False)
+        # boatd's own settlement of a kill that arrived before the runner was admitted.
+        with patch.object(boatd, 'cleanup_run', side_effect=AssertionError('a queued run has nothing to clean up')):
+            boatd.restore_kill_result(self.con, self.status(bid, pid), {})
+        row = self.status(bid, pid)
+        self.assertEqual((row['status'], row['started_at'], row['killed']), ('exited', None, 1))
+        self.assertEqual(json.loads(row['metrics']), {'kill': dict(cleanup='clean', leftover_killed=0, remaining=0),
+                                                      'kill_synthetic': True})
+        with patch.object(boatd,'command_probe',return_value={'readable':True,'pids':None,'reason':'cgroup_unverified'}):
+            self.assertEqual(boatd.box_protection(self.con, bid)['holds'], [])
+            boatd.stop_box(self.con, bid, 'idle ttl')
+        self.assertEqual(boatd.box_row(self.con, bid)['state'], 'archived')
+
     def test_spawn_failure_needs_positive_unit_absence_before_releasing(self):
         for rc, state, expected in ((3,'inactive',True),(4,'unknown',True),(1,'bus unavailable',False)):
             with self.subTest(rc=rc):

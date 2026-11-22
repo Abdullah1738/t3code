@@ -948,6 +948,14 @@ def box_event(con, box_id, action, reason, snapshot=None, **fields):
     toollog.emit('boatd', 'box.' + action, ok=True, ids={'box': box_id, 'run': data['caller'].get('run_id')}, props=data)
 
 
+def killed_in_queue(c, metrics) -> bool:
+    """A run cancelled while it waited for admission never reached its box: nothing there can outlive it.
+    Without this its box could be neither handed out nor idle-stopped again (13 rows on 12 boxes, 19-22 Nov 2026)."""
+    kill = metrics.get('kill') or {}
+    return (bool(c['killed']) and metrics.get('kill_synthetic') is True and kill.get('cleanup') == 'clean' and
+            kill.get('remaining') == 0 and not command_was_started(c))
+
+
 def box_protection(con, box_id, *, probe=True, run_id=None):
     row = box_row(con, box_id)
     pin = bool(row['pinned']) and (row['pin_until'] is None or row['pin_until'] > now())
@@ -967,7 +975,8 @@ def box_protection(con, box_id, *, probe=True, run_id=None):
                     gone = True
                 continue
             never_dispatched = (c['status'] not in ('queued', 'running') and c['started_at'] is None and
-                                (metrics.get('not_dispatched') is True or queue_loss_json(c)['notAdmitted']))
+                                (metrics.get('not_dispatched') is True or queue_loss_json(c)['notAdmitted'] or
+                                 killed_in_queue(c, metrics)))
             proof = ({'stopped': True, 'reason': 'not_dispatched'} if never_dispatched else
                      command_probe(c) if probe and c['status'] != 'queued' else {})
             confirmed = (proof.get('stopped') is True or (proof.get('readable') is True and
