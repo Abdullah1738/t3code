@@ -31,7 +31,6 @@ import desktop_lease
 import statev2_guard
 import snapshot_guard
 import shared_deps_guard
-import quint_verify_guard
 import rootwide_search_guard
 import phone_adb_guard
 
@@ -92,7 +91,7 @@ _LOG_RULES = {
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
     "live-database-snapshot",
-    "rootwide-search", "quint-verify", "shared-dependencies", "card-mask",
+    "rootwide-search", "shared-dependencies", "card-mask",
     "phone-adb-state", "phone-adb-forward", "phone-adb-state-unleased", "phone-adb-forward-unleased", "phone-adb-unavailable",
 }
 _LOG_ERRORS = {
@@ -117,7 +116,7 @@ def _log(**record):
     try:
         rule = _log_enum(record.get("rule"), _LOG_RULES) or "no-policy"
         guard = ("statev2" if rule.startswith("live-database") else "betterstack-scope" if rule == "betterstack-scope"
-                 else "phone-adb" if rule.startswith("phone-adb") else "quint-verify" if rule == "quint-verify" else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
+                 else "phone-adb" if rule.startswith("phone-adb") else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
                      "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
                      "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
                      "docker-run", "docker-container-run", "docker-build", "docker-buildx-build", "docker-compose-up", "docker-compose-v1",
@@ -902,12 +901,6 @@ def decide(event, harness):
             if shared_reason:
                 result = {"decision": "deny", "reason": shared_reason,
                           "context": {"rule": "shared-dependencies"}}
-                return result
-            with _phase(phases, "guard_ms"):
-                quint_hit = quint_verify_guard.classify(command, command_cwd)
-            if quint_hit:
-                result = {"decision": "deny", "reason": quint_verify_guard.REASON,
-                          "context": {"rule": "quint-verify"}}
                 return result
             try:
                 with _phase(phases, "guard_ms"):

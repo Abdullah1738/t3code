@@ -1,8 +1,8 @@
 {
   "_regenerate": "bash scripts/release-gate-env.sh python3 -I integrations/opencode-plugins/test/statev2-denied-corpus.py",
   "sourceHashes": {
-    "integrations/harness-hooks/src/statev2_guard.py": "b83e16e7050ac36cd9c8e319e6b43f9f2563ea749f8fba192926ab337522abde",
-    "integrations/harness-hooks/tests/test_statev2_guard.py": "ba0d5332f4808c1e1178260d5d344f007ecbbbbf7b10b0b3579b52efa0afa651"
+    "integrations/harness-hooks/src/statev2_guard.py": "c257d3225a14ddeb4d49617012c92d86317c39589cfa71741eaf0d4fcfaa9c64",
+    "integrations/harness-hooks/tests/test_statev2_guard.py": "4ebc9800a395136a920ead758f29805850f8bdded1ca251a0cea639a9f29feb2"
   },
   "testsRun": 307,
   "skipped": 2,

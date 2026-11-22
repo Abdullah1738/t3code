@@ -86,35 +86,26 @@ class HarnessTestCase(unittest.TestCase):
             self.assertEqual(rc, 0, out.getvalue())
             return out.getvalue()
 
-    def test_quint_guard_path_in_all_generated_homes(self) -> None:
+    def test_shell_path_in_all_generated_homes(self) -> None:
         self.run_gen()
         paths = [json.loads((self.claude / "settings.json").read_text())["env"]["PATH"]]
         for harness in ["codex", "codex-cu"]:
             paths.append(tomllib.loads((self.root / harness / "config.toml").read_text())["shell_environment_policy"]["set"]["PATH"])
         expected = ":".join(self.manifest()["shellPathPrefix"] + self.manifest()["shellPath"])
         fixture = self.tmp / "path-fixture"
-        raw = fixture / ".nvm/versions/node/v26.2.0/bin/quint"
-        wrapper = fixture / ".local/bin/quint"
-        link = fixture / ".local/share/quint-guard/bin/quint"
         safe_chain = fixture / ".safe-chain/bin/safe-chain"
-        for executable in [raw, wrapper, safe_chain]:
-            write(executable, "#!/bin/sh\nexit 0\n")
-            executable.chmod(0o755)
-        link.parent.mkdir(parents=True)
-        link.symlink_to(wrapper)
+        write(safe_chain, "#!/bin/sh\nexit 0\n")
+        safe_chain.chmod(0o755)
         for path in paths:
-            self.assertEqual(shutil.which("quint", path=path.replace("/Users/ardud", str(fixture))), str(link))
+            self.assertNotIn("quint-guard", path)
             self.assertEqual(path, expected)
             entries = path.split(":")
             self.assertEqual(entries[-1], "/Users/ardud/.safe-chain/bin")
             self.assertEqual(shutil.which("safe-chain", path=entries[-1].replace("/Users/ardud", str(fixture))), str(safe_chain))
-            self.assertEqual(entries[:2], [
-                "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
-                "/Users/ardud/.local/share/quint-guard/bin",
-            ])
+            self.assertEqual(entries[0], "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers")
             for i, entry in enumerate(entries):
                 if "/.nvm/" in entry:
-                    self.assertGreater(i, 1)
+                    self.assertGreater(i, 0)
                     self.assertLess(i, entries.index("/Users/ardud/.local/bin"))
 
     def test_generated_shared_mcp_connect_headroom(self) -> None:
@@ -1106,7 +1097,7 @@ class ParityTests(HarnessTestCase):
             self.assertIn("recall", {server["id"] for server in parity["mcpServers"]})
             self.assertEqual(parity["runtimeMcpServers"], ["t3-code"])
             self.assertEqual({guard["id"] for guard in parity["guards"]},
-                             {"hook-adapters", "live-database", "rootwide-search", "phone-adb", "quint-verify", "shared-dependencies", "offbox", "betterstack-scope", "desktop-lease", "recall", "toollog"})
+                             {"hook-adapters", "live-database", "rootwide-search", "phone-adb", "shared-dependencies", "offbox", "betterstack-scope", "desktop-lease", "recall", "toollog"})
             self.assertFalse(parity["compactSkillCatalog"]["required"])
             self.assertEqual(parity["instructions"]["canonical"]["path"], str(self.canonical))
             self.assertFalse((home / "src").exists())

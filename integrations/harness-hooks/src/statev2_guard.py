@@ -648,7 +648,8 @@ REPO_NODE_PIN_HASHES = {
     'init.sh': {'d97da32ec68ee02cbf663db7675199cd12e9bd47db27cd9bb45468d133e9a4b0',
                 '90a6436ed6c5ab91b13da9fd27e57d26cdd96b6dcfe0677e591ca5f942f38327',
                 'c853ec309cdbdf38108e133875a54141bf348c6e23b6cd4e881010aa24d37aea'},
-    'select.py': {'7be0cf8c91fdb19d5ea261085f67d8fe88d9100bf39d3ebca1eec4f6d867eaa4',
+    'select.py': {'cdb4e86e5dbf41b98f26e519747f8b45bec31fb614241a06d942b1dd12c8ae24',
+                  '7be0cf8c91fdb19d5ea261085f67d8fe88d9100bf39d3ebca1eec4f6d867eaa4',
                   '1ded56be26d29b956ca8a62217e94c1ca952513f2cd96934a9680c08c045d61d'},
 }
 # @aikidosec/safe-chain 1.5.29; its only startup read is this exact script.
@@ -657,7 +658,7 @@ REPO_NODE_PIN_SAFE_CHAIN_SOURCE = b'[ ! -r "$HOME/.safe-chain/scripts/init-posix
 REPO_NODE_PIN_PYTHON = '/opt/homebrew/bin/python3'
 # select.py may move these harness guard dirs to the front of PATH.
 REPO_NODE_PIN_MANAGED = ('.config/opencode/skills/remote-compute/scripts/blockers',
-                         '.local/share/harness-hooks/coord-blockers', '.local/share/quint-guard/bin')
+                         '.local/share/harness-hooks/coord-blockers')
 REPO_NODE_PIN_INPUTS = ('package.json', '.nvmrc', '.node-version', 'pnpm-lock.yaml')
 REPO_NODE_PIN_COMMAND = re.compile(
     r'ROBOB_REPO_|_repo_node_|NVM_DIR|COREPACK_HOME|repo-node-pin|\.nvm\b|libexec|corepack|'

@@ -27,8 +27,7 @@
     "ignore": []
   },
   "shellPathPrefix": [
-    "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
-    "/Users/ardud/.local/share/quint-guard/bin"
+    "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers"
   ],
   "shellPath": ["/Users/ardud/.bun/bin", "/Users/ardud/.nvm/versions/node/v26.2.0/bin", "/Users/ardud/.cargo/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/Users/ardud/.local/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", "/Users/ardud/.safe-chain/bin"],
   "hooks": [
@@ -99,6 +98,10 @@
     ],
     "shared-dependencies": [
       "../harness-hooks/src/shared_deps_guard.py",
+      {
+        "source": "../local-helpers/libexec/repo-node-pin/select.py",
+        "installed": "~/.local/libexec/repo-node-pin/select.py"
+      },
       "../harness-hooks/src/engine.py",
       {
         "source": "../local-helpers/libexec/repo-node-pin/shared-deps.sh",
@@ -111,22 +114,6 @@
       {
         "source": "../opencode-plugins/plugin/shared-deps-guard.ts",
         "installed": "~/.config/opencode/plugin/shared-deps-guard.ts"
-      }
-    ],
-    "quint-verify": [
-      "../harness-hooks/src/quint_verify_guard.py",
-      {
-        "source": "../local-helpers/libexec/repo-node-pin/select.py",
-        "installed": "~/.local/libexec/repo-node-pin/select.py"
-      },
-      "../harness-hooks/src/engine.py",
-      {
-        "source": "../opencode-plugins/lib/classifier.ts",
-        "installed": "~/.config/opencode/lib/classifier.ts"
-      },
-      {
-        "source": "../opencode-plugins/plugin/quint-verify-guard.ts",
-        "installed": "~/.config/opencode/plugin/quint-verify-guard.ts"
       }
     ],
     "live-database": [

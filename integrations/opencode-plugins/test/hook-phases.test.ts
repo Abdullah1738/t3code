@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { HOOKS_CAP_BYTES, HOOK_PHASES, HOOK_SAMPLE_RATE, emit, hook } from "../lib/toollog";
 import { classifierPhases, runClassifier } from "../lib/classifier";
 import * as rootwide from "../plugin/rootwide-search-guard";
-import * as quint from "../plugin/quint-verify-guard";
 import * as shared from "../plugin/shared-deps-guard";
 import * as phone from "../plugin/phone-adb-guard";
 import * as statev2 from "../plugin/statev2-guard";
@@ -27,7 +26,7 @@ const messages = { timeout: "fixture classifier timed out", unavailable: "fixtur
 
 test("a classifier timeout row names spawn and classify time, measured, for every guard", async () => {
   const slow = script("slow.py", "import time; time.sleep(5)");
-  for (const [label, guard] of [["rootwide-search", rootwide], ["quint-verify", quint], ["shared-dependencies", shared], ["phone-adb", phone]] as const) {
+  for (const [label, guard] of [["rootwide-search", rootwide], ["shared-dependencies", shared], ["phone-adb", phone]] as const) {
     const run = guard.createGuardHook("/checkout", (() => runClassifier(python, slow, {}, messages)) as never);
     await run({ tool: "bash", sessionID: "fixture-session", input: { command } });
     const row = rows().at(-1);
