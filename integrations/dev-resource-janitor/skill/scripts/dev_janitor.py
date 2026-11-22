@@ -129,10 +129,16 @@ def keep_list():
         return []
 
 
-def running_sessions(snap=None):
+def running_sessions(snap=None, *, deadline=None):
     snap = active_sessions.checked_snapshot(timeout=20) if snap is None else snap
+    if not snap['complete']:
+        return None, {}, '; '.join(snap['problems']) or 'active set incomplete'
     # The hourly scan keeps its existing one-request-per-id liveness budget.
-    dirs, err = active_sessions.directories(snap, max_attempts=1)
+    try:
+        budget = active_sessions.remaining_timeout(300, deadline)
+    except ValueError as exc:
+        return None, {}, str(exc)
+    dirs, err = active_sessions.directories(snap, max_attempts=1, overall_timeout=budget)
     if err:
         return None, {}, err
     return set(snap["opencode"]), dirs, None
@@ -161,10 +167,16 @@ def process_cursor():
 def scan():
     now = time.time()
     phases = {}
+    deadline = time.monotonic() + leftover_processes.OBSERVATION_BUDGET
+    liveness = dict(attempts=0, seconds=0, last_error=None)
     with leftover_processes.timed_phase(phases, "sessions"):
-        live = active_sessions.checked_snapshot(timeout=20)
+        live = active_sessions.checked_snapshot(timeout=leftover_processes.OWNER_CALL_TIMEOUT,
+                                               max_attempts=3, deadline=deadline, stats=liveness)
     with leftover_processes.timed_phase(phases, "liveness"):
-        running, native_dirs, run_err = running_sessions(live)
+        running, native_dirs, run_err = running_sessions(live, deadline=deadline)
+        if run_err:
+            liveness['last_error'] = run_err
+    liveness['seconds'] = round(liveness['seconds'] + phases['liveness'] / 1000, 3)
     with leftover_processes.timed_phase(phases, "resource_processes"):
         ps = procs()
     by_pid = {p["pid"]: p for p in ps}
@@ -283,7 +295,8 @@ def scan():
         r["candidate"] = not reasons
     try:
         with leftover_processes.timed_phase(phases, "leftover_processes"):
-            processes = leftover_processes.scan(live, keep, cursor=process_cursor())
+            processes = leftover_processes.scan(live, keep, cursor=process_cursor(),
+                                                deadline=deadline, liveness=liveness)
     except Exception:
         processes = leftover_processes.unavailable_report("process_scan_failed")
     if "mcp_summary" not in processes:
@@ -291,6 +304,7 @@ def scan():
     phases.update({"processes." + name: ms for name, ms in processes.get("phase_ms", {}).items()})
     return {"ts": now, "idle_min": IDLE_MIN, "running_sessions": len(running or []),
             "liveness_unavailable": run_err,
+            "liveness": liveness,
             "processes": processes, "phase_ms": phases,
             "docker_up": docker_up, "resources": resources,
             "candidates": [r["id"] for r in resources if r["candidate"]]}
@@ -301,6 +315,7 @@ def record_report(st):
     with open(LAST, "w") as report:
         json.dump(st, report, indent=1)
     audit({"ts": st["ts"], "event": "report", "liveness_unavailable": st["liveness_unavailable"],
+           "liveness": st.get("liveness", dict(attempts=0, seconds=0, last_error=st['liveness_unavailable'])),
            "phase_ms": st.get("phase_ms", {}),
            "processes": leftover_processes.report_summary(st["processes"])})
 
