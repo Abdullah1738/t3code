@@ -8,11 +8,13 @@ import unittest
 from unittest.mock import patch
 
 import guard
+from guard_test_support import GuardTestCase
 notify = guard.notify
 
 
-class OrphanTests(unittest.TestCase):
+class OrphanTests(GuardTestCase):
     def setUp(self):
+        super().setUp()
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.home = Path(temp.name)
