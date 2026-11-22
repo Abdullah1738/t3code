@@ -164,7 +164,10 @@ describe("Antigravity gateway models", () => {
             controller.enqueue(new TextEncoder().encode('{"data":['));
           },
         });
-        return new Response(stalled, { status: 200, headers: { "content-type": "application/json" } });
+        return new Response(stalled, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
       });
       const input = { baseUrl: "http://127.0.0.1:20128", apiKey: "router-secret" };
       const fiber = yield* Effect.forkChild(fetchModels(input));
