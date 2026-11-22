@@ -31,6 +31,29 @@ def load(name, path):
 
 
 class LoggingTests(unittest.TestCase):
+    def test_janitor_summary_and_phases_survive_the_real_logger_without_free_text(self):
+        scripts = REPO / 'integrations/dev-resource-janitor/skill/scripts'
+        sys.path.insert(0, str(scripts))
+        import dev_janitor as janitor
+        summary = janitor.leftover_processes.unavailable_report('process_scan_failed')['mcp_summary']
+        with patch.object(janitor, 'emit', side_effect=toollog.emit):
+            janitor.log_run(time.monotonic(), 3, 0, True, {'sessions': 1.2, 'processes.owner_recovery': 45.6}, summary)
+        self.assertEqual(self.rows()[0]['props']['mcp_summary'], summary)
+        self.assertFalse(self.rows()[0]['ok'])
+        self.assertEqual(self.rows()[1]['props'], dict(found=3, killed=0,
+                         phase_ms={'sessions': 1.2, 'processes.owner_recovery': 45.6}))
+        poisoned = {**summary, 'command': 'secret-value', 'reason': 'secret-value',
+                    'keep_reasons': {'unknown_owner': 2, 'secret-value': 1},
+                    'families': {'secret-value': dict(count=1), 'cua-driver': dict(count=1, command='secret-value')},
+                    'owner_calls': {'by_native': dict(count=1, p50_ms=1, p95_ms=1, max_ms=1,
+                                                     failures={'503': 1, 'secret-value': 1})}}
+        clean = toollog.safe_fields({'mcp_summary': poisoned}, 'janitor.mcp_summary')
+        self.assertNotIn('secret-value', json.dumps(clean))
+        self.assertEqual(clean['mcp_summary']['keep_reasons'], {'unknown_owner': 2})
+        clean = toollog.safe_fields({'phase_ms': {'sessions': 1.2, 'secret-value': 1,
+                                                'docker': float('inf'), 'expo': -1}}, 'janitor.run')
+        self.assertEqual(clean, {'phase_ms': {'sessions': 1.2}})
+
     def test_inventory_summaries_preserve_only_bounded_metadata(self):
         root = '/Volumes/ExternalSSD/board-wt'
         values = {root:dict(deniedCount=2, timedOutCount=1, backedOffCount=1,
@@ -207,10 +230,10 @@ class LoggingTests(unittest.TestCase):
              patch.object(janitor,'LOG_DIR',str(state)), patch.object(janitor,'LAST',str(state/'last.json')):
             with (state/'lock').open('w') as lock:
                 self.assertEqual(watcher.worker(lock.fileno()),1)
-        self.assertEqual([r['name'] for r in self.rows()],['janitor.kill','janitor.kill','janitor.run'])
+        self.assertEqual([r['name'] for r in self.rows()],['janitor.kill','janitor.kill','janitor.mcp_summary','janitor.run'])
         self.assertEqual(self.rows()[0]['props']['resourceKind'],'metro')
         self.assertEqual(self.rows()[1]['props']['resourceKind'],'localstack')
-        self.assertEqual(self.rows()[-1]['props'],{'found':2,'killed':1})
+        self.assertEqual(self.rows()[-1]['props'],{'found':2,'killed':1,'phase_ms':{}})
         with patch.object(janitor,'run',return_value=(0,0,True)):
             janitor.main()
         self.assertTrue(self.rows()[-1]['ok'])
@@ -314,7 +337,7 @@ class LoggingTests(unittest.TestCase):
                 else:
                     with (self.root/'lock').open('w') as lock:
                         self.assertEqual(watcher.worker(lock.fileno()),1)
-                self.assertEqual(self.rows()[-1]['props'],{'found':2,'killed':1})
+                self.assertEqual(self.rows()[-1]['props'],{'found':2,'killed':1,'phase_ms':{}})
                 self.assertFalse(self.rows()[-1]['ok'])
 
     def test_cve_owner_and_browser_action_forms(self):

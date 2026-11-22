@@ -40,13 +40,28 @@ def log_kill(resource, ok):
         pass
 
 
-def log_run(started, found, killed, ok):
+def log_run(started, found, killed, ok, phase_ms=None, mcp_summary=None):
+    summary = mcp_summary if mcp_summary is not None else leftover_processes.unavailable_report(
+        "process_scan_skipped")["mcp_summary"]
+    try:
+        emit("janitor", "perf", "janitor.mcp_summary", ok=summary["ok"],
+             props={"mcp_summary": summary})
+    except Exception:
+        pass
     try:
         emit("janitor", "perf" if ok else "error", "janitor.run", ok=ok,
-             duration_ms=(time.monotonic()-started)*1000, props={"found": found, "killed": killed},
+             duration_ms=(time.monotonic()-started)*1000,
+             props={"found": found, "killed": killed, "phase_ms": phase_ms or {}},
              error_tag=None if ok else "janitor.failed")
     except Exception:
         pass
+
+
+def collect_scan_stats(stats, st):
+    phases = stats.setdefault("phase_ms", {})
+    for name, ms in st.get("phase_ms", {}).items():
+        phases[name] = round(phases.get(name, 0) + ms, 1)
+    stats["mcp_summary"] = st.get("processes", {}).get("mcp_summary")
 
 
 IDLE_MIN = int(os.environ.get("DEV_JANITOR_IDLE_MIN", "60"))
@@ -136,90 +151,98 @@ def process_cursor():
 
 def scan():
     now = time.time()
-    live = active_sessions.checked_snapshot(timeout=20)
-    running, native_dirs, run_err = running_sessions(live)
-    ps = procs()
+    phases = {}
+    with leftover_processes.timed_phase(phases, "sessions"):
+        live = active_sessions.checked_snapshot(timeout=20)
+    with leftover_processes.timed_phase(phases, "liveness"):
+        running, native_dirs, run_err = running_sessions(live)
+    with leftover_processes.timed_phase(phases, "resource_processes"):
+        ps = procs()
     by_pid = {p["pid"]: p for p in ps}
     resources = []
 
-    # iOS simulators
-    rc, out, err = sh(["xcrun", "simctl", "list", "-j", "devices", "booted"])
-    booted = []
-    if rc == 0:
-        for rt, devs in json.loads(out).get("devices", {}).items():
-            for d in devs:
-                if d.get("state") == "Booted":
-                    booted.append(d)
-    for d in booted:
-        udid = d["udid"]
-        lp = next((p for p in ps if p["cmd"].startswith("launchd_sim") and udid in p["cmd"]), None)
-        resources.append({"id": "sim:" + udid, "kind": "simulator", "name": d["name"],
-                          "age_s": lp["age_s"] if lp else None,
-                          "tokens": [udid, d["name"]]})
-    # Simulator.app left open with no booted device
-    sim_app = next((p for p in ps if p["cmd"].endswith("/Simulator.app/Contents/MacOS/Simulator")), None)
-    if rc == 0 and not booted and sim_app:
-        resources.append({"id": "simulator-app", "kind": "simulator-app", "pids": [sim_app["pid"]],
-                          "age_s": sim_app["age_s"], "rss_mb": sim_app["rss_mb"], "tokens": []})
+    with leftover_processes.timed_phase(phases, "simulators"):
+        # iOS simulators
+        rc, out, err = sh(["xcrun", "simctl", "list", "-j", "devices", "booted"])
+        booted = []
+        if rc == 0:
+            for rt, devs in json.loads(out).get("devices", {}).items():
+                for d in devs:
+                    if d.get("state") == "Booted":
+                        booted.append(d)
+        for d in booted:
+            udid = d["udid"]
+            lp = next((p for p in ps if p["cmd"].startswith("launchd_sim") and udid in p["cmd"]), None)
+            resources.append({"id": "sim:" + udid, "kind": "simulator", "name": d["name"],
+                              "age_s": lp["age_s"] if lp else None,
+                              "tokens": [udid, d["name"]]})
+        # Simulator.app left open with no booted device
+        sim_app = next((p for p in ps if p["cmd"].endswith("/Simulator.app/Contents/MacOS/Simulator")), None)
+        if rc == 0 and not booted and sim_app:
+            resources.append({"id": "simulator-app", "kind": "simulator-app", "pids": [sim_app["pid"]],
+                              "age_s": sim_app["age_s"], "rss_mb": sim_app["rss_mb"], "tokens": []})
 
-    # Expo / Metro servers
-    for p in ps:
-        c = p["cmd"]
-        if not re.search(r"(expo(/bin/cli)?|\.bin/expo)\s+start|react-native\s+start|metro\s+serve", c):
-            continue
-        if c.startswith("npm exec") or c.startswith("/bin/") or "grep" in c:
-            continue
-        port = re.search(r"--port[ =](\d+)", c)
-        port = port[1] if port else "8081"
-        cwd = cwd_of(p["pid"]) or ""
-        parent = by_pid.get(p["ppid"])
-        pgroup = [p["pid"]]
-        if parent and re.match(r"(npm exec|npx|node .*npx-cli)", parent["cmd"]):
-            pgroup.append(parent["pid"])
-        resources.append({"id": f"expo:{p['pid']}", "kind": "expo", "pid": p["pid"], "pids": pgroup,
-                          "age_s": p["age_s"], "rss_mb": p["rss_mb"], "cwd": cwd, "port": port,
-                          "cmd": leftover_processes.redact(c),
-                          "tokens": [t for t in [cwd, f"--port {port}", f":{port}"] if t]})
+    with leftover_processes.timed_phase(phases, "expo"):
+        # Expo / Metro servers
+        for p in ps:
+            c = p["cmd"]
+            if not re.search(r"(expo(/bin/cli)?|\.bin/expo)\s+start|react-native\s+start|metro\s+serve", c):
+                continue
+            if c.startswith("npm exec") or c.startswith("/bin/") or "grep" in c:
+                continue
+            port = re.search(r"--port[ =](\d+)", c)
+            port = port[1] if port else "8081"
+            cwd = cwd_of(p["pid"]) or ""
+            parent = by_pid.get(p["ppid"])
+            pgroup = [p["pid"]]
+            if parent and re.match(r"(npm exec|npx|node .*npx-cli)", parent["cmd"]):
+                pgroup.append(parent["pid"])
+            resources.append({"id": f"expo:{p['pid']}", "kind": "expo", "pid": p["pid"], "pids": pgroup,
+                              "age_s": p["age_s"], "rss_mb": p["rss_mb"], "cwd": cwd, "port": port,
+                              "cmd": leftover_processes.redact(c),
+                              "tokens": [t for t in [cwd, f"--port {port}", f":{port}"] if t]})
 
-    # Docker
-    docker_up = False
-    rc, out, err = sh([DOCKER, "info", "--format", "{{.ServerVersion}}"], timeout=20)
-    docker_up = rc == 0 and out.strip() != ""
-    vm = next((p for p in ps if "Virtualization.VirtualMachine" in p["cmd"]), None)
-    containers = []
-    if docker_up:
-        rc, out, _ = sh([DOCKER, "ps", "-q", "--no-trunc"], timeout=30)
-        ids = out.split()
-        if ids:
-            rc, out, _ = sh([DOCKER, "inspect"] + ids, timeout=60)
-            for ci in json.loads(out or "[]"):
-                name = ci["Name"].lstrip("/")
-                started = ci["State"].get("StartedAt", "")
-                try:
-                    st = calendar.timegm(time.strptime(started[:19], "%Y-%m-%dT%H:%M:%S"))
-                except Exception:  # noqa: BLE001
-                    st = now
-                labels = ci["Config"].get("Labels") or {}
-                ports = []
-                for _, binds in (ci["NetworkSettings"].get("Ports") or {}).items():
-                    for b in binds or []:
-                        if b.get("HostPort"):
-                            ports.append(b["HostPort"])
-                rc2, lo, le = sh([DOCKER, "logs", "--since", f"{IDLE_MIN}m", ci["Id"]], timeout=30)
-                lines = [l for l in (lo + le).splitlines() if l.strip() and not HEALTH_RE.search(l)]
-                wd = labels.get("com.docker.compose.project.working_dir", "")
-                toks = [name, ci["Id"][:12]] + [f":{p}" for p in sorted(set(ports))] + ([wd] if wd else [])
-                containers.append({"id": "container:" + name, "kind": "container", "name": name,
-                                   "image": ci["Config"].get("Image"), "age_s": int(now - st),
-                                   "ports": sorted(set(ports)), "compose_dir": wd,
-                                   "recent_log_lines": len(lines), "log_sample": lines[-3:],
-                                   "tokens": toks})
-        resources.extend(containers)
-        resources.append({"id": "docker-desktop", "kind": "docker-desktop",
-                          "age_s": vm["age_s"] if vm else None, "vm_rss_mb": vm["rss_mb"] if vm else None,
-                          "tokens": ["docker ", "docker\\", "docker-compose", "docker compose"]})
+    with leftover_processes.timed_phase(phases, "docker"):
+        # Docker
+        docker_up = False
+        rc, out, err = sh([DOCKER, "info", "--format", "{{.ServerVersion}}"], timeout=20)
+        docker_up = rc == 0 and out.strip() != ""
+        vm = next((p for p in ps if "Virtualization.VirtualMachine" in p["cmd"]), None)
+        containers = []
+        if docker_up:
+            rc, out, _ = sh([DOCKER, "ps", "-q", "--no-trunc"], timeout=30)
+            ids = out.split()
+            if ids:
+                rc, out, _ = sh([DOCKER, "inspect"] + ids, timeout=60)
+                for ci in json.loads(out or "[]"):
+                    name = ci["Name"].lstrip("/")
+                    started = ci["State"].get("StartedAt", "")
+                    try:
+                        st = calendar.timegm(time.strptime(started[:19], "%Y-%m-%dT%H:%M:%S"))
+                    except Exception:  # noqa: BLE001
+                        st = now
+                    labels = ci["Config"].get("Labels") or {}
+                    ports = []
+                    for _, binds in (ci["NetworkSettings"].get("Ports") or {}).items():
+                        for b in binds or []:
+                            if b.get("HostPort"):
+                                ports.append(b["HostPort"])
+                    rc2, lo, le = sh([DOCKER, "logs", "--since", f"{IDLE_MIN}m", ci["Id"]], timeout=30)
+                    lines = [l for l in (lo + le).splitlines() if l.strip() and not HEALTH_RE.search(l)]
+                    wd = labels.get("com.docker.compose.project.working_dir", "")
+                    toks = [name, ci["Id"][:12]] + [f":{p}" for p in sorted(set(ports))] + ([wd] if wd else [])
+                    containers.append({"id": "container:" + name, "kind": "container", "name": name,
+                                       "image": ci["Config"].get("Image"), "age_s": int(now - st),
+                                       "ports": sorted(set(ports)), "compose_dir": wd,
+                                       "recent_log_lines": len(lines), "log_sample": lines[-3:],
+                                       "tokens": toks})
+            resources.extend(containers)
+            resources.append({"id": "docker-desktop", "kind": "docker-desktop",
+                              "age_s": vm["age_s"] if vm else None, "vm_rss_mb": vm["rss_mb"] if vm else None,
+                              "tokens": ["docker ", "docker\\", "docker-compose", "docker compose"]})
 
-    evidence, run_dirs = session_evidence({r["id"]: r["tokens"] for r in resources}, running, native_dirs)
+    with leftover_processes.timed_phase(phases, "session_evidence"):
+        evidence, run_dirs = session_evidence({r["id"]: r["tokens"] for r in resources}, running, native_dirs)
     keep = keep_list()
     for r in resources:
         reasons = []
@@ -249,9 +272,17 @@ def scan():
                 reasons.append(f"containers_running:{len(alive)}")
         r["keep_reasons"] = reasons
         r["candidate"] = not reasons
+    try:
+        with leftover_processes.timed_phase(phases, "leftover_processes"):
+            processes = leftover_processes.scan(live, keep, cursor=process_cursor())
+    except Exception:
+        processes = leftover_processes.unavailable_report("process_scan_failed")
+    if "mcp_summary" not in processes:
+        processes = leftover_processes.unavailable_report("process_scan_skipped")
+    phases.update({"processes." + name: ms for name, ms in processes.get("phase_ms", {}).items()})
     return {"ts": int(now), "idle_min": IDLE_MIN, "running_sessions": len(running or []),
             "liveness_unavailable": run_err,
-            "processes": leftover_processes.scan(live, keep, cursor=process_cursor()),
+            "processes": processes, "phase_ms": phases,
             "docker_up": docker_up, "resources": resources,
             "candidates": [r["id"] for r in resources if r["candidate"]]}
 
@@ -261,6 +292,7 @@ def record_report(st):
     with open(LAST, "w") as report:
         json.dump(st, report, indent=1)
     audit({"ts": st["ts"], "event": "report", "liveness_unavailable": st["liveness_unavailable"],
+           "phase_ms": st.get("phase_ms", {}),
            "processes": leftover_processes.report_summary(st["processes"])})
 
 
@@ -330,6 +362,7 @@ def apply(ids, stats=None):
     done = []
     for rid in sorted(want, key=lambda x: order.get(x.split(":")[0], 9)):
         st = scan()  # re-scan before every action; state may have changed
+        collect_scan_stats(stats, st)
         r = next((x for x in st["resources"] if x["id"] == rid), None)
         if not r:
             done.append({"id": rid, "ok": True, "action": "gone"})
@@ -378,6 +411,7 @@ def run(stats=None):
     args = ap.parse_args()
     if args.cmd == "scan":
         st = scan()
+        collect_scan_stats(stats, st)
         stats["found"] = len(st["resources"])
         if not args.no_write:
             record_report(st)
@@ -397,7 +431,8 @@ def main():
         _, _, ok = run(stats)
     finally:
         if not (sys.argv[1:2] == ["scan"] and "--no-write" in sys.argv[2:]):
-            log_run(started, stats["found"], stats["killed"], ok)
+            log_run(started, stats["found"], stats["killed"], ok,
+                    stats.get("phase_ms"), stats.get("mcp_summary"))
 
 
 if __name__ == "__main__":
