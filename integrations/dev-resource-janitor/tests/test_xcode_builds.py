@@ -247,7 +247,7 @@ class XcodeTests(JanitorTestCase):
                         self.assertEqual(janitor_watch.worker(lock.fileno()), 0 if ok else 1)
                         self.assertEqual(record.call_args.args[0]['processes']['xcode_builds']['actions'][0]['ok'], ok)
                         self.assertEqual(log.call_args.args[1:4], (1, int(ok), ok))
-                        self.assertEqual(log.call_args.args[4:], ({}, old['mcp_summary']))
+                        self.assertEqual(log.call_args.args[4:], ({}, old['mcp_summary'], None))
 
     def test_final_preterm_tree_progress_matrix_keeps_resumed_builds(self):
         for mode in ['root_cpu', 'script_cpu', 'compiler_cpu', 'new_child', 'exited_child', 'reused_child', 'reparented_child']:
