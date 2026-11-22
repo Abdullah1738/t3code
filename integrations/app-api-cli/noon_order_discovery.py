@@ -15,6 +15,20 @@ import noon_http_orders as core
 import noon_vertical_reads as verticals
 
 
+LANE_FAILURE_LIMIT_S = 2 * 60 * 60
+
+
+def log_run(root, record):
+    path = root/'noon-discovery-runs.jsonl'
+    with path.open('a') as log:
+        log.write(json.dumps(record) + '\n')
+    lines = path.read_text().splitlines(keepends=True)
+    if len(lines) > 2500:
+        temp = path.with_suffix('.tmp')
+        temp.write_text(''.join(lines[-2000:]))
+        temp.replace(path)
+
+
 def unplaced(lane, row):
     raw = row.get('raw_status')
     if lane == 'food':
@@ -75,14 +89,19 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return  # Registration's prime check can overlap the runner's tick.
+        started = time.monotonic()
         path = root/'noon-discovery.json'
         state = json.loads(path.read_text()) if path.exists() else {}
         events, errors = [], {}
-        readers = {'minutes': lambda: core.orders('minutes', timeout=10),
-                   'marketplace': lambda: core.orders('marketplace', timeout=10),
-                   'food': lambda: verticals.food_orders(timeout=10),
-                   'nownow': lambda: verticals.nownow_orders(timeout=10)}
+        lanes = state.setdefault('lanes', {})
+        run_lanes = {}
+        readers = {'minutes': lambda: core.orders('minutes', timeout=20),
+                   'marketplace': lambda: core.orders('marketplace', timeout=20),
+                   'food': lambda: verticals.food_orders(timeout=20),
+                   'nownow': lambda: verticals.nownow_orders(timeout=20)}
         for lane, read in readers.items():
+            health = lanes.setdefault(lane, {'ok_at': None, 'fail_count': 0, 'failing_since': None})
+            lane_started = time.monotonic()
             try:
                 result = read()
                 if result.get('partial') or not result.get('ok'):
@@ -90,17 +109,34 @@ def main():
                 events.extend(scan_lane(state, lane, result['orders'], time.time(), registered))
             except core.NoonError as exc:
                 errors[lane] = str(exc)
+                health.update(fail_count=health['fail_count'] + 1,
+                              failing_since=health['failing_since'] or dt.datetime.now(dt.timezone.utc).isoformat(),
+                              last_error=str(exc), rows=0)
                 if lane in state:
                     events.extend(scan_lane(state, lane, [], time.time(), registered))
-        state['checked_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
+            else:
+                health.update(ok_at=dt.datetime.now(dt.timezone.utc).isoformat(), fail_count=0,
+                              failing_since=None, last_error=None, rows=len(result['orders']))
+            health['last_ms'] = round((time.monotonic() - lane_started) * 1000)
+            run_lanes[lane] = {'ok': lane not in errors, 'ms': health['last_ms'],
+                               'rows': health['rows'], 'error': health['last_error']}
+        checked_at = dt.datetime.now(dt.timezone.utc)
+        state['checked_at'] = checked_at.isoformat()
         state['errors'] = errors
+        failing_since = {lane: lanes[lane]['failing_since'] for lane in errors}
+        failed = len(errors) == len(readers) or any(
+            (checked_at - dt.datetime.fromisoformat(since)).total_seconds() >= LANE_FAILURE_LIMIT_S
+            for since in failing_since.values())
         temp = path.with_suffix('.tmp')
         temp.write_text(json.dumps(state, indent=2))
         temp.replace(path)
+        log_run(root, {'at': state['checked_at'], 'total_ms': round((time.monotonic() - started) * 1000),
+                       'lanes': run_lanes, 'events': len(events), 'exit': int(failed)})
         if events:
             print('New noon account orders (read-only discovery): ' + json.dumps(events))
-        if errors and not events:
-            raise SystemExit('Noon discovery incomplete: ' + json.dumps(errors))
+        if failed:
+            raise SystemExit('Noon discovery incomplete: ' + json.dumps(errors)
+                             + '; failing_since: ' + json.dumps(failing_since))
 
 
 if __name__ == '__main__':
