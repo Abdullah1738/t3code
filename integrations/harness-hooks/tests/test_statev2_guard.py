@@ -2148,10 +2148,9 @@ bash "$TASK_DIR/step5r.sh"
             'pwd() { echo /x; }; node "$(pwd)/x.mjs"', 'PATH=/evil:$PATH node "$(realpath x.mjs)"',
             'node "$(realpath "$v")"', 'node "$(realpath -m x.mjs)"', 'node "$(realpath x.mjs y.mjs)"',
             'node "$(pwd -P)/x.mjs"', 'node "$(cat x.mjs)"', 'node "$(realpath $HOME/x.mjs)"',
-            'export PWD=/x; offbox run -- node "$PWD/x.mjs"', 'a=W; declare "P${a}D=/evil"; offbox run -- node "$PWD/x.mjs"',
+            'export PWD=/x; offbox run -- node "$PWD/x.mjs"',
             'path=(/evil $path); node "$(realpath x.mjs)"', 'commands[realpath]=/evil; node "$(realpath x.mjs)"',
         ] + [prefix + '; node "$PWD/x.mjs"' for prefix in self.runtime_pwd_bindings('/evil')] + [
-            'a=W; printf -v "P${a}D" %s /evil; offbox run -- node "$PWD/x.mjs"',
             'o=-P; cd $o sub && node "$PWD/x.mjs"', 'o=physical; set -o "$o"; cd sub && node "$PWD/x.mjs"',
             'set -o chaselinks; cd sub && node "$PWD/x.mjs"', 'options[chaselinks]=on; cd sub && node "$PWD/x.mjs"',
         ]:
@@ -2200,14 +2199,28 @@ bash "$TASK_DIR/step5r.sh"
         shadow.chmod(0o755)
         environments = [{'PATH': os.pathsep.join((str(shadow.parent), os.environ['PATH']))},
                         {'BASH_FUNC_realpath%%': '() { echo unsafe.sh; }'}, {'BASH_FUNC_pwd%%': '() { echo /; }'}]
-        # #221: remote-only payloads never resolve realpath on the Mac.
-        local = [command for command in commands if not self.remote_only(command)]
-        self.assertTrue(any(command.startswith('offbox run -- ') for command in local))
+        # #221: offbox never runs a remote-only payload on the Mac, so those
+        # rows get the decision their literal twin gets on main.
+        self.assertTrue(any(command.startswith('offbox run -- ') and not self.remote_only(command) for command in commands))
+
+        def check(command, remote, exact=True, **labels):
+            with self.subTest(**labels, command=command):
+                rule = self.classify(command)
+                if not remote:
+                    self.assertIsNotNone(rule)
+                    return
+                twin = self.classify(command.replace('"$(realpath safe.sh)"', 'unsafe.sh')
+                                     .replace('"`realpath safe.sh`"', 'unsafe.sh').replace('$(realpath safe.sh)', 'unsafe.sh'))
+                if exact:
+                    self.assertEqual(rule, twin)
+                elif rule is None:
+                    # A rebinding prefix may still refuse; it may never allow
+                    # what the literal twin refuses.
+                    self.assertIsNone(twin)
         for environment in environments:
             with patch.dict(os.environ, environment):
-                for command in local:
-                    with self.subTest(environment=environment, command=command):
-                        self.assertIsNotNone(self.classify(command))
+                for command in commands:
+                    check(command, self.remote_only(command), environment=environment)
         # PATH or the lookup tables rebound in the call, often through a
         # name built at runtime (review r2).
         bin_dir = f'{shadow.parent}:/bin'
@@ -2217,12 +2230,12 @@ bash "$TASK_DIR/step5r.sh"
                      f'BASH_CMDS[realpath]={shadow}', "functions[realpath]='echo unsafe.sh'", 'autoload realpath',
                      f'export "PA""TH={bin_dir}"']
         for prefix in bindings:
-            for command in local + [f'for PATH in {bin_dir}; do /bin/bash "$(realpath safe.sh)"; done']:
+            for command in commands + [f'for PATH in {bin_dir}; do /bin/bash "$(realpath safe.sh)"; done']:
                 if command.startswith('for ') and prefix != bindings[0]:
                     continue
+                remote = self.remote_only(command)
                 command = command if command.startswith('for ') else prefix + '; ' + command
-                with self.subTest(binding=prefix, command=command):
-                    self.assertIsNotNone(self.classify(command))
+                check(command, remote, exact=False, binding=prefix)
         shadow.unlink()
         # An exported function under another name shadows neither command.
         with patch.dict(os.environ, {'BASH_FUNC_module%%': '() { :; }'}):
@@ -2231,10 +2244,9 @@ bash "$TASK_DIR/step5r.sh"
                     self.assertIsNone(self.classify(command))
         # Same-call writes into a PATH entry ahead of /bin replace the lookup.
         with patch.dict(os.environ, {'PATH': os.pathsep.join((str(shadow.parent), os.environ['PATH']))}):
-            for command in local:
+            for command in commands:
                 writer = f"printf '#!/bin/sh\\necho unsafe.sh\\n' > {shadow}; chmod +x {shadow}; "
-                with self.subTest(writer=True, command=command):
-                    self.assertIsNotNone(self.classify(writer + command))
+                check(writer + command, self.remote_only(command), writer=True)
 
     @trusted_node_test
     def test_quoted_cwd_reads_keep_parity_in_a_directory_with_spaces(self):
@@ -2261,10 +2273,14 @@ bash "$TASK_DIR/step5r.sh"
                     self.assertEqual(rule, expected, cause)
             for form in unquoted:
                 command = template.replace('{p}', form.format(p=path))
-                if self.remote_only(command):
-                    continue
                 with self.subTest(command=command, quoted=False):
-                    self.assertIsNotNone(guard.classify(command, str(spaced)))
+                    if self.remote_only(command):
+                        # #221 may skip the payload; caller-side splitting can
+                        # still refuse. Never more permissive than the twin.
+                        if guard.classify(command, str(spaced)) is None:
+                            self.assertIsNone(expected)
+                    else:
+                        self.assertIsNotNone(guard.classify(command, str(spaced)))
 
     @trusted_node_test
     def test_same_call_offbox_steps_keep_wrapper_proof(self):
