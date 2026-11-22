@@ -2,11 +2,15 @@
 import datetime as dt
 import json
 import math
+import time
+import append_cursor as cache
 
 from host import clean_host
 from guard import recent_failure
 from observer import GAP_NAMES, gap_bounds, measured
 from causes import launchctl_info, positive, unknown as unknown_cause
+
+HISTORY_NAMES = {'deploy.result', 'health.request.late', 'pool.exhausted', 'pool.recovered', 'poll.complete'}
 
 
 def timestamp(value):
@@ -17,45 +21,74 @@ def timestamp(value):
         return None
 
 
-def transitions(path, observations=None):
+def history_rows(path, incremental=True):
+    state_path = path.with_name('.listener-state-' + path.stem + '.json')
+    saved = cache.load(state_path, 3) if incremental else {}
     try:
-        with path.open() as lines:
-            for line in lines:
-                if 'listener.' not in line and 'deploy.result' not in line and (observations is None or not any(name in line for name in (*GAP_NAMES, 'poll.complete'))):
-                    continue
-                try:
-                    row = json.loads(line)
-                    if observations is not None and row.get('tool') == '9router' and row.get('name') in (*GAP_NAMES, 'poll.complete', 'listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved'):
-                        bounds = gap_bounds(row.get('props')) if row['name'] == 'pool.endpoint.get' else None
-                        if (row['name'] != 'pool.endpoint.get' or
-                                positive(row.get('durationMs')) and row['durationMs'] > 120000 or
-                                bounds is not None and bounds[1] - bounds[0] > 120000):
-                            observations.append(row)
-                    if row.get('tool') == '9router' and row.get('name') in ('listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved', 'deploy.result') and timestamp(row.get('ts')) is not None:
-                        yield row
-                except (ValueError, AttributeError):
-                    continue
+        with path.open('rb') as source:
+            cursor, append = cache.cursor_for(source, saved.get('cursor', {}))
+            try:
+                rows = cache.decode(saved['aggregate']) if append else []
+                if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                    raise ValueError('invalid history')
+            except (ValueError, TypeError, KeyError, AttributeError):
+                rows, append = [], False
+            if not append:
+                cursor['offset'] = 0
+            tail = []
+            checkpoint_offset, checkpoint_time = cursor["offset"], time.monotonic()
+            for line, complete in cache.lines(source, cursor):
+                if b'listener.' in line or any(name.encode() in line for name in HISTORY_NAMES | GAP_NAMES):
+                    try:
+                        row = json.loads(line)
+                        if isinstance(row, dict):
+                            (rows if complete else tail).append(row)
+                    except (ValueError, UnicodeError):
+                        pass
+                if incremental and complete and (cursor['offset'] - checkpoint_offset >= 8 * 1024 * 1024
+                                                  or time.monotonic() - checkpoint_time >= 30):
+                    cache.save(state_path, 3, cursor, rows)
+                    checkpoint_offset, checkpoint_time = cursor['offset'], time.monotonic()
+            if incremental and (not append or cursor != saved.get('cursor')):
+                cache.save(state_path, 3, cursor, rows)
+            yield from rows
+            yield from tail
     except FileNotFoundError:
         return
 
 
+def transitions(path, observations=None, incremental=True):
+    for row in history_rows(path, incremental):
+        try:
+            bounds = gap_bounds(row.get('props')) if row.get('name') == 'pool.endpoint.get' else None
+            if (observations is not None and row.get('tool') == '9router' and row.get('name') in (*GAP_NAMES, 'poll.complete', 'listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved')
+                    and (row['name'] != 'pool.endpoint.get' or
+                         positive(row.get('durationMs')) and row['durationMs'] > 120000 or
+                         bounds is not None and bounds[1] - bounds[0] > 120000)):
+                observations.append(row)
+            if row.get('tool') == '9router' and row.get('name') in ('listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved', 'deploy.result') and timestamp(row.get('ts')) is not None:
+                yield row
+        except (ValueError, AttributeError):
+            continue
+
+
 @measured('listener_history')
-def windows(day, root, generated, observations=None):
+def windows(day, root, generated, observations=None, incremental=True):
     start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc)
     floor, ceiling = start.timestamp() * 1000, min((start + dt.timedelta(days=1)).timestamp() * 1000, generated.timestamp() * 1000)
     rows = []
     # Keep the prior day's sparse transitions so recovery evidence and unknown
     # intervals beginning at the same tick both survive midnight.
     for source in sorted((p for p in root.glob('????-??-??.ndjson') if p.stem < day), reverse=True):
-        prior = list(transitions(source, observations))
+        prior = list(transitions(source, observations, incremental))
         if any(row['name'] in ('listener.down', 'listener.up', 'listener.state_resolved') or
                row.get('props', {}).get('unknownSince') for row in prior):
             rows.extend(prior)
             break
-    rows.extend(transitions(root / (day + '.ndjson'), observations))
+    rows.extend(transitions(root / (day + '.ndjson'), observations, incremental))
     # Recovery may follow several missing or empty days; downSince joins it back.
     for source in sorted(p for p in root.glob('????-??-??.ndjson') if day < p.stem <= generated.date().isoformat()):
-        rows.extend(transitions(source, observations))
+        rows.extend(transitions(source, observations, incremental))
     incidents = {}
     failures = [row.get('props', {}) for row in rows if row['name'] == 'deploy.result'
                 and timestamp(row['ts']) <= generated.timestamp() * 1000]

@@ -28,6 +28,15 @@ def unknown(reason):
     return dict(cause='unknown_no_data', missingEvidence=reason)
 
 
+def phase_cause(name, wall_ms, cpu_ms):
+    try:
+        starved = (positive(wall_ms) and wall_ms > 120000 and type(cpu_ms) in (int, float)
+                   and math.isfinite(cpu_ms) and 0 <= cpu_ms < wall_ms * .1)
+    except OverflowError:
+        starved = False
+    return ('tick_starved:' if starved else 'tick_blocked:') + name
+
+
 def launchctl_info(props, legacy=False):
     props = props if isinstance(props, dict) else {}
     value = props.get('launchctlExit')
@@ -82,12 +91,14 @@ def gap_info(props, phase=None, duration_ms=None):
         elif detail['unmeasuredMs'] > duration:
             explanation = unknown('unmeasured_tick_time')
         else:
-            explanation = evidence('child_wait' if name == 'child_wait' else 'tick_blocked:' + name, PHASES[name], duration)
+            cpu_ms = props.get(PHASES[name][:-2] + 'CpuMs')
+            explanation = evidence('child_wait' if name == 'child_wait' else phase_cause(name, duration, cpu_ms),
+                                   PHASES[name], duration)
         return dict(detail, **explanation)
     if detail.get('unmeasuredMs', 0) > 0:
         return dict(detail, **unknown('unmeasured_tick_time'))
     recorded = props.get('cause', '')
     has_label = (isinstance(phase, str) and phase in PHASES or
-                 isinstance(recorded, str) and recorded.startswith('tick_blocked:'))
+                 isinstance(recorded, str) and recorded.startswith(('tick_blocked:', 'tick_starved:')))
     return dict(detail, **unknown('tick_phase_durations' if detail or has_label
                                   else 'inter_tick_phase_or_scheduler_state'))

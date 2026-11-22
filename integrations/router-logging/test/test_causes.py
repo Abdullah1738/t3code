@@ -27,6 +27,9 @@ def clock(seconds):
 
 class CauseTests(unittest.TestCase):
     def setUp(self):
+        cpu = patch('observer.time.process_time', side_effect=lambda: observer.time.monotonic())
+        cpu.start()
+        self.addCleanup(cpu.stop)
         for module in ('observer', 'poller', 'guard'):
             fake = patch(module + '.Sampler', return_value=lambda: {'e': 'unsupported'})
             fake.start()
@@ -80,6 +83,26 @@ class CauseTests(unittest.TestCase):
                     self.assertIn('missingEvidence', result)
         for invalid in (None, [], {}, 'new_phase', 12):
             self.assertEqual(causes.gap_info({}, invalid)['cause'], 'unknown_no_data')
+
+    def test_phase_cpu_class_preserves_evidence_and_precedence(self):
+        cases = [(120000, 0, False), (120001, 0, True), (180000, 17999, True),
+                 (180000, 18000, False), (180000, 180001, False), (180000, -1, False),
+                 (180000, None, False), (180000, True, False), (180000, '0', False),
+                 (180000, float('nan'), False), (180000, float('inf'), False),
+                 (180000, 10 ** 1000, False)]
+        for name, field in causes.PHASES.items():
+            for wall, cpu, starved in cases:
+                with self.subTest(phase=name, wall=wall, cpu=cpu):
+                    props = {field: wall, field[:-2] + 'CpuMs': cpu, 'monotonicGapMs': wall}
+                    result = causes.gap_info(props)
+                    expected = 'child_wait' if name == 'child_wait' else ('tick_starved:' if starved else 'tick_blocked:') + name
+                    self.assertEqual(result['cause'], expected)
+                    self.assertEqual(result['causeEvidenceField'], field)
+                    self.assertEqual(result['causeEvidenceValue'], wall)
+            props = {field: 180000, field[:-2] + 'CpuMs': 0, 'monotonicGapMs': 180000}
+            self.assertEqual(causes.gap_info(dict(props, sleepGapMs=180000))['cause'], 'guard_not_scheduled')
+            self.assertEqual(causes.gap_info(dict(props, monotonicGapMs=600000))['cause'], 'unknown_no_data')
+        self.assertEqual(causes.gap_info(dict(cause='tick_starved:tcp'))['missingEvidence'], 'tick_phase_durations')
 
     def test_legacy_scheduling_tag_class_requires_independent_evidence(self):
         for tag in ('agent_not_running', 'sleep_gap', 'guard_not_scheduled', 'other'):
@@ -406,12 +429,13 @@ class CauseTests(unittest.TestCase):
         self.assertEqual(causes.gap_info(dict(tcpMs=.01, monotonicGapMs=.01))['cause'], 'tick_blocked:tcp')
 
     def test_diagnostic_failures_preserve_body_result_and_exception(self):
-        for failure in ('start_clock', 'end_clock', 'phase_clock', 'snapshot', 'emit'):
+        for failure in ('start_clock', 'end_clock', 'phase_clock', 'cpu_clock', 'snapshot', 'emit'):
             for body_fails in (False, True):
                 with self.subTest(failure=failure, body_fails=body_fails):
                     samples = [RuntimeError('clock'), clock(40)] if failure == 'start_clock' else [clock(0), RuntimeError('clock') if failure == 'end_clock' else clock(40), clock(40)]
                     with patch('observer.clock_sample', side_effect=samples), \
                             patch('observer.time.monotonic', side_effect=RuntimeError('phase') if failure == 'phase_clock' else None), \
+                            patch('observer.time.process_time', side_effect=RuntimeError('cpu') if failure == 'cpu_clock' else None, return_value=0), \
                             patch('observer.job_snapshot', side_effect=RuntimeError('snapshot') if failure == 'snapshot' else None, return_value={}), \
                             patch('observer.emit', side_effect=RuntimeError('emit') if failure == 'emit' else None):
                         def run():

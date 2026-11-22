@@ -13,7 +13,7 @@ import time
 
 from host import Sampler, clean_host, poll_props
 from toollog import emit, trimmed_stderr
-from causes import PHASES, gap_info, launchctl_info, positive
+from causes import PHASES, gap_info, launchctl_info, phase_cause, positive
 
 JOB = 'com.ardud.9router-log-poll'
 FIELDS = {name: field for name, field in PHASES.items() if name != 'pool_fetch'}
@@ -46,7 +46,16 @@ def clock_sample():
     except (OSError, ValueError):
         continuous = None
     return dict(wallMs=time.time() * 1000, monotonicMs=time.monotonic() * 1000,
-                continuousMs=continuous, pid=os.getpid())
+                continuousMs=continuous, cpuMs=time.process_time() * 1000, pid=os.getpid())
+
+
+def progress(name):
+    descriptor = os.environ.get('ROUTER_POLL_PROGRESS_FD')
+    if descriptor is not None:
+        try:
+            os.write(int(descriptor), (name + '\n').encode('ascii'))
+        except (OSError, ValueError):
+            pass
 
 
 def iso(value):
@@ -92,7 +101,7 @@ def launchctl_cause(props):
     return launchctl_info(props)['cause']
 
 
-GAP_NAMES = {'observer.gap', 'guard.tick_late', 'poll.phases', 'rollup.phases', 'pool.endpoint.get'}
+GAP_NAMES = {'observer.gap', 'guard.tick_late', 'poll.phases', 'rollup.phases', 'pool.endpoint.get', 'poll.timeout'}
 
 
 def gap_bounds(props):
@@ -199,24 +208,30 @@ def phase(name):
         return
     try:
         started = time.monotonic()
+        cpu_started = time.process_time()
     except Exception:
         yield
         return
-    frame = [started, 0, name]
+    frame = [started, 0, cpu_started, 0, name]
     timing.stack.append(frame)
+    progress(name)
     try:
         yield
     finally:
         try:
             elapsed = (time.monotonic() - frame[0]) * 1000
+            cpu = (time.process_time() - frame[2]) * 1000
             timing.values[name] += max(0, elapsed - frame[1])
+            timing.cpu[name] += max(0, cpu - frame[3])
             if len(timing.stack) > 1:
                 timing.stack[-2][1] += elapsed
+                timing.stack[-2][3] += cpu
             timing.last_phase = name
         except Exception:
             pass
         finally:
             timing.stack.pop()
+            progress(timing.stack[-1][4] if timing.stack else 'none')
 
 
 def measured(name):
@@ -236,10 +251,12 @@ class Timings:
         self.sampler = sampler or Sampler()
         self.stack, self.values = [], {name: 0 for name in FIELDS}
         self.last_phase = 'none'
+        self.cpu = {name: 0 for name in FIELDS}
 
     def __enter__(self):
         self.token = _active.set(self)
         try:
+            self.cpu_start = time.process_time()
             self.start = self.start or clock_sample()
         except Exception:
             self.start = {}
@@ -267,7 +284,7 @@ class Timings:
     def finish(self):
         if not self.start:
             return
-        open_phase = self.stack[-1][2] if self.stack else 'none'
+        open_phase = self.stack[-1][4] if self.stack else 'none'
         # This launchctl snapshot used to run after the recorded end clock.
         with phase('post_end_diag'):
             try:
@@ -297,11 +314,13 @@ class Timings:
                      sleepGapMs=missing['sleepGapMs'] if missing else 0,
                      phase=slowest if self.values[slowest] > 0 else 'none',
                      openPhase=open_phase, lastPhase=self.last_phase,
+                     cpuMs=max(0, (time.process_time() - self.cpu_start) * 1000),
                      pid=self.start['pid'], ppid=os.getppid())
         for key in ('jobState', 'jobPid', 'jobExit'):
             props[key + 'Start'] = self.start.get(key, 'unknown')
             props[key + 'End'] = self.end.get(key, 'unknown')
         props.update({field: round(self.values[name], 3) for name, field in FIELDS.items()})
+        props.update({field[:-2] + 'CpuMs': round(self.cpu[name], 3) for name, field in FIELDS.items()})
         props.update(gap_info(props))
         emit(self.component, self.name, kind='perf', durationMs=elapsed, props=props)
 
