@@ -354,8 +354,17 @@ export class RemoteBox {
       this.nextProbe = this.now() + 5_000;
       healthy = true;
     } catch (error) {
+      const cause = error !== null && typeof error === "object" && "cause" in error ? error.cause : undefined;
+      const errorCode = [
+        error !== null && typeof error === "object" && "code" in error ? error.code : undefined,
+        cause !== null && typeof cause === "object" && "code" in cause ? cause.code : undefined,
+        cause !== null && typeof cause === "object" && "name" in cause ? cause.name : undefined,
+      ].find((value): value is string => typeof value === "string" && /^[A-Za-z0-9_]{1,40}$/.test(value));
       const props = { step, ...(error instanceof RemoteRequestError ? { status: error.status } : {}),
         errorClass: error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name) ? "Timeout" : error?.constructor?.name ?? typeof error,
+        ...(errorCode === undefined ? {} : { errorCode }),
+        // /ready owns the reset so probe diagnostics preserve its sampling window.
+        loopDelayMs: Math.round(this.callbackLoopDelay.max / 1_000_000),
         latencyMs: (requestEnded ?? this.now()) - requestStarted };
       const saved = this.store.get<Outage | null>("remoteOutage");
       // A stall notice reserves the transport outage too, even after its waiting episode ends.
@@ -491,7 +500,7 @@ export class RemoteBox {
           this.emit("moni-swipe-resolved", undefined, undefined, { source: body.source, hasThreadOrigin: body.hasThreadOrigin, hasReplyTo: body.hasReplyTo });
           return reply(200, { accepted: true });
         }
-        if (body.status === "error") this.emit("moni-runner-error", "harness");
+        if (body.status === "error") this.emit("moni-runner-error", undefined, undefined, { code: "harness" });
         this.emit("moni-turn-latency", undefined, body.durationMs); return reply(200, { accepted: true });
       }
       if (path === "/ready") return reply(200, { epoch: this.config.epoch });

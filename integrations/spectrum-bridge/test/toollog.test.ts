@@ -26,6 +26,30 @@ test("notice suppression reasons survive structured-log redaction", () => {
   expect(lines().map(line => line.props?.reason)).toEqual(reasons);
 });
 
+test.each([undefined, 1])("remote fetch diagnostics are allowlisted with cap %s", capBytes => {
+  const { log, lines } = setup({ capBytes });
+  log.write({ component: "fixture", kind: "event", name: "fill" });
+  for (const name of ["moni-box-down", "moni-runner-error"]) {
+    for (const errorCode of ["ConnectionRefused", "E", "E".repeat(40), "ERR_SOCKET_2"]) {
+      log.write({ component: "remote-box", kind: "error", name, props: { errorCode, loopDelayMs: 123, message: "PRIVATE_MESSAGE", url: "http://x" } });
+      expect(lines().at(-1)?.props).toEqual({ errorCode, loopDelayMs: 123 });
+    }
+    for (const errorCode of ["connect http://x", "", "E".repeat(41), "ECONNRESET\n", "ERR-SOCKET", "ÉCONNRESET", 123, false]) {
+      log.write({ component: "remote-box", kind: "error", name, props: { errorCode, loopDelayMs: -1 } });
+      expect(lines().at(-1)?.props).toBeUndefined();
+    }
+    for (const loopDelayMs of [NaN, Infinity, "123", false]) {
+      log.write({ component: "remote-box", kind: "error", name, props: { loopDelayMs } });
+      expect(lines().at(-1)?.props).toBeUndefined();
+    }
+  }
+  log.write({ component: "remote-box", kind: "error", name: "unrelated", props: { errorCode: "ConnectionRefused", loopDelayMs: 123 } });
+  expect(lines().at(-1)?.props).toBeUndefined();
+  const raw = JSON.stringify(lines());
+  for (const value of ["PRIVATE_", "http"]) expect(raw).not.toContain(value);
+  if (capBytes) expect(lines().some(row => row.name === "log.degraded")).toBe(true);
+});
+
 test("wake lifecycle rows survive the log cap and keep only delivery metadata", () => {
   const { log, lines } = setup({ capBytes: 1 });
   for (const name of ["wake.accepted", "wake.turn_start", "wake.send_ambiguous", "wake.admitted", "wake.retry_scheduled", "wake.failed"]) {
