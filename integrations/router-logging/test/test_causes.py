@@ -429,12 +429,13 @@ class CauseTests(unittest.TestCase):
         self.assertEqual(causes.gap_info(dict(tcpMs=.01, monotonicGapMs=.01))['cause'], 'tick_blocked:tcp')
 
     def test_diagnostic_failures_preserve_body_result_and_exception(self):
-        for failure in ('start_clock', 'end_clock', 'phase_clock', 'snapshot', 'emit'):
+        for failure in ('start_clock', 'end_clock', 'phase_clock', 'cpu_clock', 'snapshot', 'emit'):
             for body_fails in (False, True):
                 with self.subTest(failure=failure, body_fails=body_fails):
                     samples = [RuntimeError('clock'), clock(40)] if failure == 'start_clock' else [clock(0), RuntimeError('clock') if failure == 'end_clock' else clock(40), clock(40)]
                     with patch('observer.clock_sample', side_effect=samples), \
                             patch('observer.time.monotonic', side_effect=RuntimeError('phase') if failure == 'phase_clock' else None), \
+                            patch('observer.time.process_time', side_effect=RuntimeError('cpu') if failure == 'cpu_clock' else None, return_value=0), \
                             patch('observer.job_snapshot', side_effect=RuntimeError('snapshot') if failure == 'snapshot' else None, return_value={}), \
                             patch('observer.emit', side_effect=RuntimeError('emit') if failure == 'emit' else None):
                         def run():

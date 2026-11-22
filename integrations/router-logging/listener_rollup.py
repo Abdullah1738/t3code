@@ -2,7 +2,6 @@
 import datetime as dt
 import json
 import math
-import re
 import time
 import append_cursor as cache
 

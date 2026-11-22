@@ -46,6 +46,7 @@ call. `pool-alerts` emits `pool.endpoint.get` for its independent fetches.
 Each measured phase also has a matching `*CpuMs` field, excluding nested work.
 A phase over two minutes using less than 10% CPU is tagged
 `tick_starved:<phase>`; other slow phases retain `tick_blocked:<phase>`.
+Scheduling, child-wait and missing-evidence causes keep their existing rules.
 `pollGaps`/`guardGaps` number measured spans over two minutes, clipped for daily
 duration totals. `coverage` explains threshold-only `healthByHour`, exhaustion
 episodes in `pools`, and missing legacy observer measurements.

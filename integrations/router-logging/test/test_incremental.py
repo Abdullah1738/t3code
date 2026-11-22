@@ -77,6 +77,24 @@ class IncrementalTests(unittest.TestCase):
             self.assertEqual((props['nice'], props['priority']), (0, 31))
             self.assertEqual(clean(dict(component='guard', name='observer.priority', kind='event', props=props), NOW)['props'], props)
 
+    def test_chunked_causes_keep_cpu_and_unmeasured_evidence(self):
+        start = dt.datetime(2026, 11, 21, 12, tzinfo=dt.timezone.utc).timestamp() * 1000
+        cases = [(dict(postEndDiagMs=180000, postEndDiagCpuMs=4), 'tick_starved:post_end_diag'),
+                 (dict(postEndDiagMs=180000, postEndDiagCpuMs=20000), 'tick_blocked:post_end_diag'),
+                 (dict(childWaitMs=180000, childWaitCpuMs=0), 'child_wait'),
+                 (dict(tcpMs=1, tcpCpuMs=0), 'unknown_no_data')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, (props, expected) in enumerate(cases):
+                begin = start + index * 300000
+                event = dict(row('guard.tick_late', startedAtMs=begin, finishedAtMs=begin + 180000,
+                                 monotonicGapMs=180000, **props), component='guard', durationMs=180000)
+                with (root / (DAY + '.ndjson')).open('a') as out:
+                    out.write(json.dumps(event) + '\n')
+                report = self.compare(root)
+                self.assertEqual(report['guardGaps'][-1]['cause'], expected)
+            self.assertEqual(report['coverage']['unknownCauses']['remaining'], {'unmeasured_tick_time': 1})
+
     def test_chunked_append_exact_all_fixtures(self):
         fixture = Path(__file__).with_name('fixtures')
         events = [row(status=499, provider='p', usage={'in': 12}, attempts=2, ttfbMs=200,
