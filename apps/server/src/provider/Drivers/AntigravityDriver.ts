@@ -26,6 +26,7 @@ import {
   makeAntigravityTextGeneration,
 } from "../../textGeneration/AntigravityTextGeneration.ts";
 import { makeAntigravityAuth, type AntigravityAuth } from "../AntigravityAuth.ts";
+import { fetchAntigravityGatewayModels } from "../antigravityGateway.ts";
 import * as AntigravityInstallation from "../AntigravityInstallation.ts";
 import * as AntigravityUsage from "./AntigravityUsage.ts";
 import {
@@ -120,7 +121,31 @@ export const AntigravityDriver: ProviderDriver<
       apiKey: settings.apiKey,
       gcpProject: settings.gcpProject,
       gcpLocation: settings.gcpLocation,
+      gatewayBaseUrl: settings.gatewayBaseUrl,
+      gatewayApiKey: settings.gatewayApiKey,
     };
+    const listGatewayModels = Effect.fn("AntigravityDriver.listGatewayModels")(function* (
+      operation: "configure" | "start",
+    ) {
+      return yield* fetchAntigravityGatewayModels({
+        baseUrl: auth.gatewayBaseUrl,
+        apiKey: auth.gatewayApiKey,
+      }).pipe(
+        Effect.provideService(HttpClient.HttpClient, httpClient),
+        Effect.mapError(
+          (cause) => new ProviderSetupError({ instanceId, operation, detail: cause.detail, cause }),
+        ),
+      );
+    });
+    // Every launch reads the gateway's list, so a refresh picks up models it added or dropped.
+    const resolveRuntimeAuth = Effect.fn("AntigravityDriver.resolveRuntimeAuth")(function* () {
+      if (auth.authMethod !== "gateway") return auth;
+      const models = yield* listGatewayModels("start");
+      return {
+        ...auth,
+        gatewayModels: models.map((model) => model.id),
+      } satisfies AntigravityAuthConfig;
+    });
     const authConfigIssue = antigravityAuthConfigIssue(auth);
     const processEnvironment = yield* mergeProviderInstanceEnvironment(environment);
     const userHome = resolveAntigravityUserHome(
@@ -194,10 +219,11 @@ export const AntigravityDriver: ProviderDriver<
             }),
         ),
       );
+      const runtimeAuth = yield* resolveRuntimeAuth();
       const profile = yield* prepareAntigravityProfile({
         profileDirectory,
         baseEnv: processEnvironment,
-        auth,
+        auth: runtimeAuth,
         userHome,
         tempDirectory: directories.runtimeTemp,
       }).pipe(
@@ -250,7 +276,7 @@ export const AntigravityDriver: ProviderDriver<
           profile,
           cwd: input.cwd,
           baseEnv: withAgentDeviceEnvironment(processEnvironment, input),
-          auth,
+          auth: runtimeAuth,
           runtimeTempDirectory,
         }),
       }).pipe(Effect.provideService(Crypto.Crypto, crypto));
@@ -371,7 +397,10 @@ export const AntigravityDriver: ProviderDriver<
           promptCapabilities: { image: true, audio: true, embeddedContext: true },
           sessionCapabilities: { list: {}, resume: {} },
         },
-        authMethods: [{ id: "oauth-personal", name: "Log in with Google" }],
+        authMethods:
+          auth.authMethod === "gateway"
+            ? [{ id: "gateway", name: "Gateway" }]
+            : [{ id: "oauth-personal", name: "Log in with Google" }],
         agentInfo: {
           name: "antigravity-acp",
           title: "Google Antigravity",
@@ -395,6 +424,9 @@ export const AntigravityDriver: ProviderDriver<
       probeUsage: usage.probe,
       clearUsage: usage.clear,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
+      ...(auth.authMethod === "gateway" && authConfigIssue === null
+        ? { gatewayModels: listGatewayModels("configure") }
+        : {}),
       supportsTextGeneration: isAntigravityTextGenerationAvailable(profileDirectory).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
@@ -470,7 +502,10 @@ export const AntigravityDriver: ProviderDriver<
             new ProviderDriverError({
               driver: DRIVER,
               instanceId,
-              detail: "Antigravity model refresh timed out. Try again or check Google sign-in.",
+              detail:
+                auth.authMethod === "gateway"
+                  ? "Antigravity model refresh timed out. Try again or check the gateway."
+                  : "Antigravity model refresh timed out. Try again or check Google sign-in.",
             }),
           ),
       }),

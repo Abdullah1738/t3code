@@ -118,16 +118,41 @@ Owner-thread evidence comes from Robob's control API, using
 `~/.robob/ardud-control.json`. The server must supply message provenance
 (`automated` and `inboundMessageId`); an older server or a failed/timed-out
 lookup supplies no owner evidence and records a lookup error. There is no
-SQLite fallback. The per-check union-window fetch runs before receipt and order
-lookups in `follow()`, capped at ten seconds of the remaining check budget and
-three seconds per request. `timing.owner_queries` counts HTTP requests;
-`owner_result` reports complete coverage (`ok`), a partial refresh (`incomplete`),
-or a failed thread listing (`list_failed`). Partial refreshes save cache progress
-and supply no owner evidence.
+SQLite fallback. At check start a detached refresh begins with its own 90-second
+budget and a 45-second request cap. Checks read the previous complete
+`owner-snapshot.json` once for their union window. Missing, uncovered, future-dated
+or over-30-minute-old snapshots supply no owner evidence. Read-only commands and
+dry runs never launch a refresh or write a cache.
+
+The refresher lists changes since its last complete snapshot minus two minutes,
+merges thread state, reconciles known IDs without a time filter to remove archived
+or deleted threads, and revalidates changed threads. It lists the full owner
+window when no snapshot covers it. `owner-texts.json` retains per-thread warm-up
+progress; partial reads never publish a snapshot or renew its age. The persistent
+`owner-refresh.lock` uses flock, with PID/start-time diagnostics; process death
+releases it without stale-lock deletion races. `money-cases owner-refresh --since
+<ISO time>` can prime it manually. Run history records the owner source, cache age,
+list window, and last refresh's time, duration, result and timeouts; `money-cases
+runs` summarizes them alongside owner results.
 
 Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), routes expired waits to the daily list and retains asked questions as awaiting_answer without an age cutoff. Older linked money cases still accept receipt matches, closing a case nobody has touched when the receipt comes. Asked questions have no age cutoff. A receipt compatible with multiple distinct charge questions stays ambiguous; a historical receipt found later still counts when its timestamp uniquely matches the original charge window. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of the case, question and dead-card books in their own folder.
 
 ## Install or update
+
+`money-cases health` reads the current UTC day's run history without changing case
+state. Use `--day YYYY-MM-DD` for another UTC day, `--json` for JSON only, or
+`--one-line` for a compact daily result. `toollog rollup --board orders --day
+YYYY-MM-DD` includes that result and prints its one-line summary when available.
+History retention is bounded; an old day may no longer be present.
+
+Receipt coverage counts charge questions in the follow walk, excluding those
+resolved by existing order, subscription, purchase or shared evidence. Unattempted
+is eligible minus the existing receipt outcome counters. A run interrupted before
+the question census has unknown coverage; old history is also unknown. Budget stop
+reasons identify the last observed constraint, with the whole-check deadline taking
+precedence. Call counts measure merchant registry reads, bank-evidence lookups for
+registered orders, and charge-question evaluations. Load samples are the host's
+1/5/15-minute load averages; unavailable samples stay null.
 
 Marketplace coverage comes from `marketplace-placements.json`, refreshed outside the check's budget. To prime it after installation, run the installed reader with the account-reader Python:
 

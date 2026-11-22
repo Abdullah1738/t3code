@@ -322,15 +322,20 @@ class Round2(Base):
         boatd.disk_maintenance(self.con)
         self.assertEqual([(c[2],c[3]) for c in self.deletes()], [(boatd.ct(target),'auto-0')])
 
-    def test_pressure_prioritizes_oversized_box_over_older_small_history(self):
+    def test_oversized_box_goes_first_only_while_the_pool_has_room(self):
         small=self.box('bx_small000');large=self.box('bx_large000',name='offbox repository pool')
         rows=snaps(small)+snaps(large)
         for row in rows:
             if row['box']==large:row['created_at']+=1000
         self.install_rows(rows,{small:{'snapshot_bytes':G,'live_bytes':10*G},
                                 large:{'snapshot_bytes':8*G,'live_bytes':10*G}})
+        self.free=30*G
         boatd.disk_maintenance(self.con)
         self.assertEqual([(c[2],c[3]) for c in self.deletes()],[(boatd.ct(large),'auto-0')])
+        # Short pool: strictly oldest first across boxes, whatever their budgets.
+        self.free=15*G;self.clock+=60
+        boatd.disk_maintenance(self.con)
+        self.assertEqual([(c[2],c[3]) for c in self.deletes()][1:],[(boatd.ct(small),'auto-0')])
 
     def test_byte_target_survives_warn_crossing_and_stop_snapshots_are_eligible(self):
         bid=self.box();self.install_rows(snaps(bid,kind='stop'), {})
@@ -392,17 +397,80 @@ class Round2(Base):
             boatd.disk_maintenance(self.con)
         self.assertIsNotNone(self.con.execute("SELECT * FROM snaps WHERE name='auto-new'").fetchone())
 
-    def test_protected_floor_exposes_byte_shortfall_and_skips_new_run_snapshots(self):
+    def test_short_pool_keeps_no_run_snapshot_back_and_skips_new_ones(self):
+        # 22 Nov 2026: every box sat at its newest three, cleanup had no candidate and the pool stayed full for 22 h.
         bid=self.box(name='offbox mission-control | repository pool')
         self.install_rows(snaps(bid,count=3),{bid:{'snapshot_bytes':60*G,'live_bytes':100*G}})
         value=boatd.disk_maintenance(self.con)
         self.assertEqual(value['cleanup']['shortfall_bytes'],10*G)
         self.assertEqual(value['cleanup']['budget_shortfall_bytes'],10*G)
-        self.assertEqual(value['snapshot_bytes_by_kind']['auto'],3*G)
-        self.assertEqual(self.deletes(),[])
+        self.assertEqual(value['cleanup']['snapshots_left'],3)
+        self.assertEqual([c[3] for c in self.deletes()],['auto-0'])
+        for _ in range(3):
+            self.clock+=60
+            value=boatd.disk_maintenance(self.con)
+        self.assertEqual([c[3] for c in self.deletes()],['auto-0','auto-1','auto-2'])
+        self.assertEqual(value['cleanup']['snapshots_left'],0)
         for kind in ('auto','stop'):
             self.assertIsNone(boatd.snapshot(self.con,bid,kind))
         self.assertFalse(any(c[:2]==('snapshot','create') for c in self.f.calls))
+
+    def test_pool_with_room_keeps_the_newest_three(self):
+        bid=self.box(name='offbox mission-control | repository pool')
+        self.install_rows(snaps(bid,count=3),{bid:{'snapshot_bytes':60*G,'live_bytes':100*G}})
+        self.free=30*G
+        value=boatd.disk_maintenance(self.con)
+        self.assertEqual(self.deletes(),[])
+        self.assertEqual(value['cleanup']['snapshots_left'],0)
+
+    def test_short_pool_never_takes_person_pinned_saved_busy_or_cloned_snapshots(self):
+        hers=self.box('bx_hers0000',owner='moni');pinned=self.box('bx_pinned00');base=self.box('bx_base0000')
+        busy=self.box('bx_busy0000');origin=self.box('bx_origin00');free=self.box('bx_free0000')
+        self.con.execute('UPDATE boxes SET pinned=1 WHERE id=?',(pinned,))
+        self.con.execute("INSERT INTO saved(owner,name,source,status) VALUES('ardud','base',?,'ready')",(base,))
+        self.cmd(busy,status='running',age=5*86400)
+        rows=[r for b in (hers,pinned,base,busy,origin) for r in snaps(b,count=2)]
+        for row in rows:
+            if row['box']==origin:row['clones']=True
+        later=snaps(free,count=2)
+        for row in later:row['created_at']+=1000
+        self.install_rows(rows+later,{})
+        for _ in range(4):
+            boatd.disk_maintenance(self.con);self.clock+=60
+        self.assertEqual([(c[2],c[3]) for c in self.deletes()],[(boatd.ct(free),'auto-0'),(boatd.ct(free),'auto-1')])
+
+    def test_ended_command_without_a_result_protects_for_a_day_only(self):
+        self.clock=10*86400
+        old=self.box('bx_old00000');fresh=self.box('bx_fresh000');live=self.box('bx_live0000');done=self.box('bx_done0000')
+        self.cmd(old,pid=1,status='interrupted',age=2*86400);self.cmd(old,pid=2,status='lost',age=3*86400)
+        self.cmd(old,pid=3,status='exited',age=4*86400)
+        self.cmd(fresh,status='interrupted',age=3600)
+        self.cmd(live,pid=1,status='running',age=5*86400);self.cmd(live,pid=2,status='queued',age=5*86400)
+        self.cmd(done,status='exited',age=60);self.con.execute('UPDATE commands SET exit_code=0 WHERE box_id=?',(done,))
+        self.assertEqual(boatd.snapshot_protected(self.con),{fresh,live})
+        boatd.CFG['unreconciled_protect_s']=5*86400
+        self.assertEqual(boatd.snapshot_protected(self.con),{old,fresh,live})
+
+    def test_protection_query_reads_the_index_not_the_command_rows(self):
+        plan=' '.join(r[3] for r in self.con.execute(
+            "EXPLAIN QUERY PLAN SELECT DISTINCT box_id FROM commands WHERE status IS NULL OR status IN ('queued','running') OR "
+            "((status NOT IN ('exited','killed') OR exit_code IS NULL) AND "
+            "MAX(COALESCE(ended_at,0), COALESCE(started_at,0), COALESCE(created_at,0)) > ?)",(0,)))
+        self.assertIn('COVERING INDEX commands_unsettled',plan)
+
+    def test_refused_snapshot_steps_aside_for_an_hour(self):
+        bid=self.box();self.install_rows(snaps(bid,count=3),{})
+        original=self.f.incus
+        def refuse(*a,**kw):
+            if a[:2]==('snapshot','delete') and a[3]=='auto-0':
+                self.f.calls.append(a)
+                return subprocess.CompletedProcess(a,1,b'',b'dataset is busy')
+            return original(*a,**kw)
+        with patch.object(boatd,'incus',side_effect=refuse):
+            boatd.disk_maintenance(self.con);self.clock+=60
+            boatd.disk_maintenance(self.con);self.clock+=3600
+            boatd.disk_maintenance(self.con)
+        self.assertEqual([c[3] for c in self.deletes()],['auto-0','auto-1','auto-0'])
 
     def test_count_retention_cannot_bypass_pacing_or_pressure(self):
         bid=self.box()
@@ -509,3 +577,210 @@ class CleanupMeasurements(unittest.TestCase):
         self.assertEqual(disk.yield_reason(measured),'io_pressure')
         measured['io_full_avg10']=14.9
         self.assertIsNone(disk.yield_reason(measured))
+
+
+class StoppedBoxes(Base):
+    """The reaper's deletes of stopped disposable boxes: by age always, by space only as the last resort."""
+
+    def setUp(self):
+        super().setUp()
+        boatd.CFG['state_dataset']='offbox/boatd'
+        self.stack=contextlib.ExitStack();self.addCleanup(self.stack.close)
+        self.clock=100*86400
+        self.cleanup={'shortfall_bytes':10*G,'snapshots_left':0}
+        self.pressure={'freeing_bytes':0,'io_full_avg10':0,'io_some_avg10':0}
+        self.stack.enter_context(patch.object(boatd,'now',side_effect=lambda:self.clock))
+        self.stack.enter_context(patch.object(boatd,'disk_state',side_effect=lambda *a,**k:{
+            'level':'low','disk_low':True,'disk_full':False,'filesystems':[],
+            'cleanup':{'at':self.clock-self.reading_age,**self.cleanup}}))
+        self.reading_age=5
+        self.stack.enter_context(patch.object(disk,'cleanup_pressure',side_effect=lambda *_:dict(self.pressure)))
+        self.stack.enter_context(patch.object(boatd,'delete_box',side_effect=self.delete))
+        boatd.REAP_REFUSED.clear()
+        self.deleted=[];self.refuse=set()
+
+    def delete(self,con,bid,why=None,*,stopped_at=None):
+        self.assertEqual(stopped_at,self.state(bid)['stopped_at'],'the reaper passes the moment it selected on')
+        if bid in self.refuse:
+            raise boatd.Fail(409,'box_held',f'{bid} is held')
+        self.deleted.append((bid,why))
+        con.execute('UPDATE boxes SET deleted_at=? WHERE id=?',(self.clock,bid))
+
+    def stopped(self,bid,hours,**kw):
+        kw.setdefault('name','offbox some-repo | repository pool')
+        self.box(bid,state='archived',running=False,**kw)
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?',(self.clock-hours*3600,bid))
+        return bid
+
+    def passes(self,count=1,gap=60):
+        for _ in range(count):
+            boatd.reap_once(self.con);self.clock+=gap
+
+    def test_short_pool_with_no_snapshot_left_takes_the_longest_stopped_box_one_per_pass(self):
+        a=self.stopped('bx_a0000000',30);b=self.stopped('bx_b0000000',50);self.stopped('bx_new00000',11)
+        self.passes()
+        self.assertEqual(self.deleted,[(b,'pool short of space: longest-stopped disposable box')])
+        self.passes(3)
+        self.assertEqual([d[0] for d in self.deleted],[b,a])
+
+    def test_space_alone_never_takes_person_pinned_saved_busy_or_clone_origin_boxes(self):
+        self.stopped('bx_hers0000',500,owner='moni');pinned=self.stopped('bx_pinned00',50)
+        base=self.stopped('bx_base0000',50);pending=self.stopped('bx_pending0',50)
+        recent=self.stopped('bx_recent00',50);origin=self.stopped('bx_origin00',50)
+        self.con.execute('UPDATE boxes SET pinned=1 WHERE id=?',(pinned,))
+        self.con.execute("INSERT INTO saved(owner,name,source,status) VALUES('ardud','base',?,'ready')",(base,))
+        self.con.execute("INSERT INTO saved(owner,name,source,status) VALUES('ardud','next',?,'pending')",(pending,))
+        self.cmd(recent,status='interrupted',age=3600)
+        self.clones(origin)
+        self.passes(3)
+        self.assertEqual(self.deleted,[])
+
+    def clones(self,bid):
+        self.f.sh[('zfs','list','-Hp','-t','snapshot','-o','clones','-r',f'offbox/incus/containers/{boatd.ct(bid)}')]=(0,'-\noffbox/incus/containers/bx-copy\n')
+
+    def test_boxes_that_cannot_go_do_not_block_the_one_behind_them(self):
+        for i in range(12):
+            self.clones(self.stopped(f'bx_origin{i:02d}',100+i))
+        for i in range(12):
+            self.cmd(self.stopped(f'bx_recent{i:02d}',130+i),status='interrupted',age=3600)
+        free=self.stopped('bx_free0000',30)
+        self.passes()
+        self.assertEqual([d[0] for d in self.deleted],[free])
+
+    def test_space_needs_a_fresh_measured_reading_with_zero_snapshots_left(self):
+        box=self.stopped('bx_a0000000',30)
+        for change in ({'snapshots_left':None},{'snapshots_left':2}):
+            with self.subTest(change=change):
+                saved=dict(self.cleanup);self.cleanup.update(change)
+                self.passes();self.assertEqual(self.deleted,[])
+                self.cleanup=saved
+        self.reading_age=91
+        self.passes();self.assertEqual(self.deleted,[],'a stale "short, none left" must not delete a box a minute')
+        self.reading_age=5
+        self.passes();self.assertEqual([d[0] for d in self.deleted],[box])
+
+    def test_a_saved_base_source_survives_its_retention_while_a_save_is_pending(self):
+        base=self.stopped('bx_base0000',40*24)
+        self.con.execute("INSERT INTO saved(owner,name,source,status) VALUES('ardud','base',?,'pending')",(base,))
+        self.passes(2)
+        self.assertEqual(self.deleted,[])
+
+    def test_a_thread_title_that_mentions_repository_pool_is_not_a_pool_box(self):
+        self.stopped('bx_lease000',20*24,name='offbox some-repo | fix the repository pool queue')
+        self.passes(2)
+        self.assertEqual(self.deleted,[])
+
+    def test_space_deletes_wait_for_snapshots_room_drain_and_gap(self):
+        a=self.stopped('bx_a0000000',30);b=self.stopped('bx_b0000000',50)
+        for change in ({'snapshots_left':4},{'shortfall_bytes':0}):
+            with self.subTest(change=change):
+                saved=dict(self.cleanup);self.cleanup.update(change)
+                self.passes();self.assertEqual(self.deleted,[])
+                self.cleanup=saved
+        for pressure in ({'freeing_bytes':6*G},{'io_full_avg10':15}):
+            with self.subTest(pressure=pressure):
+                self.pressure.update(pressure)
+                self.passes();self.assertEqual(self.deleted,[])
+                self.pressure.update(freeing_bytes=0,io_full_avg10=0)
+        self.passes(1,gap=15);self.passes(1,gap=15)
+        self.assertEqual([d[0] for d in self.deleted],[b],'a second delete inside the gap would be a burst')
+        self.passes(1,gap=60);self.passes()
+        self.assertEqual([d[0] for d in self.deleted],[b,a])
+
+    def test_age_alone_deletes_with_room_one_per_pass_oldest_first(self):
+        self.cleanup={'shortfall_bytes':0,'snapshots_left':0}
+        old=self.stopped('bx_old00000',9*24);older=self.stopped('bx_older000',20*24);self.stopped('bx_young000',6*24)
+        self.passes()
+        self.assertEqual(self.deleted,[(older,'archived box exceeded unused retention')])
+        self.passes(2)
+        self.assertEqual([d[0] for d in self.deleted],[older,old])
+
+    def test_templates_and_other_named_boxes_keep_the_long_retention_and_never_go_for_space(self):
+        template=self.stopped('bx_template',20*24,name='offbox template crpko-node')
+        self.passes(3)
+        self.assertEqual(self.deleted,[])
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?',(self.clock-31*86400,template))
+        self.passes()
+        self.assertEqual(self.deleted,[(template,'archived box exceeded unused retention')])
+
+    def test_refused_box_steps_aside_so_the_next_one_goes(self):
+        held=self.stopped('bx_held0000',50);free=self.stopped('bx_free0000',30)
+        self.refuse.add(held)
+        self.passes(2)
+        self.assertEqual([d[0] for d in self.deleted],[free])
+        self.refuse.clear();self.clock+=3600
+        self.passes()
+        self.assertEqual([d[0] for d in self.deleted],[free,held])
+
+
+
+class StoppedBoxFence(Base):
+    def test_selected_box_is_not_deleted_once_it_was_resumed_or_restopped(self):
+        bid=self.box(state='archived',running=False)
+        self.con.execute('UPDATE boxes SET stopped_at=1000 WHERE id=?',(bid,))
+        for change in ("state='ready'","stopped_at=2000","pinned=1"):
+            with self.subTest(change=change):
+                self.con.execute(f'UPDATE boxes SET {change} WHERE id=?',(bid,))
+                with self.assertRaises(boatd.Fail) as caught:
+                    boatd.delete_box(self.con,bid,'pool short of space',stopped_at=1000)
+                self.assertIn(caught.exception.code,('box_changed','box_held'))
+                self.con.execute("UPDATE boxes SET state='archived',stopped_at=1000,pinned=0 WHERE id=?",(bid,))
+        self.con.execute("INSERT INTO saved(owner,name,source,status) VALUES('ardud','base',?,'pending')",(bid,))
+        with self.assertRaises(boatd.Fail) as caught:
+            boatd.delete_box(self.con,bid,'archived box exceeded unused retention',stopped_at=1000)
+        self.assertEqual(caught.exception.code,'box_changed','a save started after selection keeps its source')
+        self.con.execute('DELETE FROM saved')
+        self.assertIsNone(self.state(bid)['deleted_at'])
+        self.assertFalse(any(c[:1]==('delete',) for c in self.f.calls))
+        boatd.delete_box(self.con,bid,'pool short of space',stopped_at=1000)
+        self.assertIsNone(self.con.execute('SELECT 1 FROM boxes WHERE id=? AND deleted_at IS NULL',(bid,)).fetchone())
+
+
+class PublishedCleanupDrivesTheReaper(Base):
+    """disk_maintenance publishes what the reaper acts on: nothing is mocked between the two."""
+
+    def setUp(self):
+        super().setUp()
+        boatd.CFG['state_dataset']='offbox/boatd'
+        self.stack=contextlib.ExitStack();self.addCleanup(self.stack.close)
+        self.clock=100*86400;self.free=15*G;self.sample_ok=True
+        self.stack.enter_context(patch.object(boatd,'now',side_effect=lambda:self.clock))
+        self.stack.enter_context(patch.object(disk,'cleanup_pressure',side_effect=lambda *_:{'freeing_bytes':0,'io_full_avg10':0,'io_some_avg10':0}))
+        self.stack.enter_context(patch.object(disk,'sample',side_effect=lambda *_:self.sample()))
+        self.rows=[]
+        self.stack.enter_context(patch.object(disk,'inventory',side_effect=lambda *_:({},[
+            r for r in self.rows if any(x['name']==r['name'] for x in self.f.snapshots.get(boatd.ct(r['box']),[]))])))
+        self.stack.enter_context(patch.object(boatd,'delete_box',side_effect=lambda con,bid,why=None,**kw:self.deleted.append(bid)))
+        self.f.sh[('zfs','get')]=(0,'-')
+        boatd.REAP_REFUSED.clear();boatd.DISK.clear();boatd.DISK.update(ts=0,value=None)
+        self.addCleanup(lambda:(boatd.DISK.clear(),boatd.DISK.update(ts=0,value=None)))
+        self.deleted=[]
+        self.old=self.box('bx_old00000',state='archived',running=False,name='offbox some-repo | repository pool')
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?',(self.clock-30*3600,self.old))
+
+    def sample(self):
+        if self.sample_ok:
+            return storage(self.free)
+        value=storage(self.free);value.update(filesystems=[],errors=['offbox: zpool timed out'],level='unknown')
+        return value
+
+    def tick(self):
+        boatd.disk_maintenance(self.con);boatd.reap_once(self.con);self.clock+=61
+
+    def test_boxes_go_only_after_the_last_snapshot_and_never_on_an_unmeasured_pool(self):
+        live=self.box('bx_live0000')
+        self.rows=snaps(live,count=2)
+        self.f.snapshots[boatd.ct(live)]=[{'name':r['name']} for r in self.rows]
+        self.tick();self.tick()
+        self.assertEqual([c[3] for c in self.f.calls if c[:2]==('snapshot','delete')],['auto-0','auto-1'])
+        self.assertEqual(self.deleted,[],'snapshots first')
+        self.sample_ok=False
+        self.tick()
+        self.assertEqual(self.deleted,[],'a failed pool sample is not "short with nothing left"')
+        self.sample_ok=True
+        self.tick()
+        self.assertEqual(self.deleted,[self.old])
+        self.free=30*G
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?',(self.clock-30*3600,self.old))
+        self.tick();self.tick()
+        self.assertEqual(self.deleted,[self.old],'with room again nothing more goes')

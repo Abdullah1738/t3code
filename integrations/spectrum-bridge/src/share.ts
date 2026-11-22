@@ -1,3 +1,4 @@
+import { traceLoopOperation } from "./loop-stall.ts";
 import { toolError } from "./toollog.ts";
 import { createSecretHandler, getSecretRequest, MAX_SECRET_FORM_BYTES, SECRET_PAGE_HEADERS, type SecretDeps, validToken } from "./secrets.ts";
 /**
@@ -396,9 +397,9 @@ export class Shares {
   }
 
   private records(): [string, ShareRecord][] {
-    return this.options.store.db.query<{ key: string; value: string }, []>(
+    return traceLoopOperation("share.records", () => this.options.store.db.query<{ key: string; value: string }, []>(
       `SELECT key, value FROM kv WHERE key LIKE '${KEY_PREFIX}%' ORDER BY key`,
-    ).all().map(row => [row.key.slice(KEY_PREFIX.length), JSON.parse(row.value) as ShareRecord]);
+    ).all().map(row => [row.key.slice(KEY_PREFIX.length), JSON.parse(row.value) as ShareRecord]));
   }
 
   private record(slug: string): ShareRecord | undefined {

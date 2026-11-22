@@ -1,26 +1,42 @@
 import { hook as toolLogHook } from "../lib/toollog";
-// statev2 guard (2026-11-05). Robob keeps all its state in one SQLite file
-// (~/.robob/userdata/statev2.sqlite, 226 GB on the external SSD) with a single
-// writer. Agents running their own sqlite3 / python / node reads against the
-// live file (db-measure.py for #467, analyze.py for #456, ad-hoc sqlite3
-// queries) starved that writer: every board write waited 20-70 s and returned
-// "Board busy: not written" on all boards (5 Nov, 10:09-10:37Z).
-//
-// This blocks shell commands that name the live database, and scripts that
-// open it, and tells the agent to work on a copy instead. Fails open on errors.
-// Off switch: ~/.config/opencode/statev2-guard.json {"mode":"off"} (no restart).
-import { appendFileSync, readFileSync, statSync, mkdirSync } from "node:fs"
+import { failureProps, runClassifier } from "../lib/classifier";
+// Shared Python verdict, with the previous local checks retained for classifier failure.
+import { readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, resolve, isAbsolute } from "node:path"
 
 const HOME = homedir()
 const CFG = join(HOME, ".config/opencode/statev2-guard.json")
-const LOGDIR = join(HOME, ".local/share/statev2-guard")
-const LOG = join(LOGDIR, "guard.jsonl")
 const SHELL_TOOLS = new Set(["shell", "bash"])
+const classifier = join(HOME, ".local/share/harness-hooks/src/statev2_check.py")
+type Verdict = { rule: string | null; detail: string | null }
+type Input = { command?: unknown; workdir?: string; cwd?: string; [key: string]: unknown }
+type Event = { tool: string; sessionID?: string; input?: Input }
 
-// Any reference to the live Robob state DB (both paths resolve to the same file).
-const LIVE = /(\.robob\/userdata\/statev2|robob-data\/userdata\/statev2|\.robob\/userdata\/\*\.sqlite)/
+// Readers can resolve relative paths against cwd; shell syntax can itself be
+// unprovable. Keep those paths in the superset even without a database literal.
+export function needsClassifier(command: string): boolean {
+  return /statev2|state\.sqlite|opencode\.db|\.robob|\.t3|robob-data|userdata/i.test(command)
+    || /\b(?:sqlite3?|python[\d.]*|node|bun|deno|duckdb|litecli|datasette|uv|uvx|bash|sh|zsh|dash|ksh|source|vp|npm|pnpm|yarn|offbox|ssh|env|cp|rsync|ditto|dd|cat|strings|grep|rg|jq|xxd|hexdump|tar|zip|restic|find|fd|fdfind|case)\b/.test(command)
+    || /(?:^|\s)\.(?=\s|$)/.test(command)
+    || /[$`\\<>{}();&|'"]|(?:^|\s)(?:\.{1,2}\/|[^\s;&|<>'"]+\.(?:py|mjs|cjs|js|ts|sh)\b)/.test(command)
+}
+
+export async function classify(command: string, cwd: string | null, script = classifier, python = "/opt/homebrew/bin/python3"): Promise<Verdict> {
+  const verdict = await runClassifier<unknown>(python, script, { command, cwd }, {
+    timeout: "State database classifier timed out", unavailable: "State database classifier unavailable",
+  })
+  if (!verdict || typeof verdict !== "object"
+    || !("rule" in verdict) || !("detail" in verdict)
+    || !(verdict.rule === null || typeof verdict.rule === "string" && verdict.rule.length > 0)
+    || !(verdict.detail === null || typeof verdict.detail === "string")) {
+    throw new Error("Invalid state database classifier verdict")
+  }
+  return { rule: verdict.rule, detail: verdict.detail }
+}
+
+// Failure fallback: preserve the old matcher, plus OpenCode and the legacy T3 home.
+const LIVE = /(\.robob\/userdata\/statev2|robob-data\/userdata\/statev2|\.robob\/userdata\/\*\.sqlite|opencode\.db|\.t3\/userdata\/state)/
 // A command that names the DB is only blocked when it also opens or reads it
 // (ls/stat/du/lsof on the path stay allowed).
 const READER = /(?:^|[\s;&|(`])(?:\S*\/)?(sqlite3?|python[\d.]*|node|bun|deno|duckdb|litecli|datasette|uv|cp|rsync|ditto|dd|cat|strings|grep|rg|xxd|hexdump|tar|zip|restic)(?=[\s;&|)`]|$)/
@@ -35,13 +51,6 @@ function mode(): string {
     cfgCache = { mtime: m, mode: v }
   }
   return cfgCache.mode
-}
-
-function log(o: Record<string, unknown>) {
-  try {
-    mkdirSync(LOGDIR, { recursive: true })
-    appendFileSync(LOG, JSON.stringify({ ts: new Date().toISOString(), ...o }) + "\n")
-  } catch {}
 }
 
 // Scripts the command runs (python3 x.py, node x.mjs, bun x.ts, bash x.sh, ./x.py):
@@ -73,6 +82,18 @@ function scriptTouchesLive(path: string): boolean {
   }
 }
 
+export function fallback(command: string, cwd: string | null): Verdict {
+  if (LIVE.test(command) && READER.test(command)) {
+    return { rule: "live-database-read", detail: "the command reads the live Robob database" }
+  }
+  for (const script of scriptsIn(command, cwd)) {
+    if (scriptTouchesLive(script)) {
+      return { rule: "live-database-read", detail: `the script ${script} opens the live Robob database` }
+    }
+  }
+  return { rule: null, detail: null }
+}
+
 const shq = (s: string) => `'${s.replace(/'/g, `'"'"'`)}'`
 function denial(why: string): string {
   const lines = [
@@ -88,38 +109,42 @@ function denial(why: string): string {
   return `printf '%s\\n' ${lines.map(shq).join(" ")} >&2; exit 3`
 }
 
+export function createGuardHook(directory: string | null, check = classify, getMode = mode, record = toolLogHook) {
+  return async (e: Event) => {
+    const started = performance.now()
+    let decision = "allowed", rule = "no-policy", command: unknown, errorTag: string | undefined
+    let classifierFailure: ReturnType<typeof failureProps> | undefined
+    const input = e.input
+    const cwd = input?.workdir ?? input?.cwd ?? directory
+    try {
+      if (!SHELL_TOOLS.has(e.tool)) return
+      command = input?.command
+      if (!input || typeof command !== "string" || !command) return
+      const m = getMode()
+      if (m === "off" || !needsClassifier(command)) return
+      let verdict: Verdict
+      try { verdict = await check(command, cwd) }
+      catch (error) {
+        errorTag = "hook.classifier_failed"
+        classifierFailure = failureProps(classifier, error, command, started, "fallback")
+        verdict = fallback(command, cwd)
+      }
+      if (!verdict.rule) return
+      const deny = m === "enforce"
+      decision = deny ? "denied" : "allowed"
+      rule = verdict.rule
+      if (deny) e.input = { ...input, command: denial(verdict.detail ?? "the command reads the live Robob database"), background: false }
+    } catch {
+      errorTag = "hook.error"
+    } finally {
+      if (typeof command === "string") record("statev2", decision, rule, started, command, errorTag, {sessionId:e.sessionID}, {cwd}, classifierFailure)
+    }
+  }
+}
+
 export default {
   id: "statev2-guard",
-  setup: async (ctx: any) => {
-    await ctx.tool.hook("execute.before", async (e: any) => {
-      const started = performance.now()
-      let decision = 'allowed', rule = 'no-policy', command: unknown, errorTag: string | undefined
-      try {
-        if (!SHELL_TOOLS.has(e.tool)) return
-        const input = e.input as any
-        const cmd = input?.command
-        command = cmd
-        if (typeof cmd !== "string" || !cmd) return
-        const m = mode()
-        if (m === "off") return
-        const cwd = input.workdir ?? ctx.location?.directory ?? null
-        let why: string | null = null
-        if (LIVE.test(cmd) && READER.test(cmd)) why = "the command reads the live Robob database"
-        else {
-          for (const s of scriptsIn(cmd, cwd)) {
-            if (scriptTouchesLive(s)) { why = `the script ${s} opens the live Robob database`; break }
-          }
-        }
-        if (!why) return
-        const deny = m === "enforce"
-        decision = deny ? 'denied' : 'allowed'
-        rule = 'live-database-read'
-        if (deny) e.input = { ...input, command: denial(why), background: false }
-      } catch (err) {
-        errorTag = 'hook.error'
-      } finally {
-        if (typeof command === 'string') toolLogHook('statev2', decision, rule, started, command, errorTag, {sessionId:e.sessionID}, {cwd:e.input?.workdir ?? e.input?.cwd ?? ctx.location?.directory})
-      }
-    })
+  setup: async (ctx: { location?: { directory?: string }; tool: { hook: (name: string, fn: ReturnType<typeof createGuardHook>) => Promise<unknown> } }) => {
+    await ctx.tool.hook("execute.before", createGuardHook(ctx.location?.directory ?? null))
   },
 }

@@ -246,20 +246,133 @@ def argv_snapshot(rows, run):
         return {}
 
 
+# Only parsed attribution survives the minute sampler process. Never cache argv.
+MAX_CACHE = 512
+SESSION_UUID = re.compile(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
+OPENCODE_SESSION = re.compile(r'ses_[A-Za-z0-9]{1,128}')
+
+
+def provider_name(proc, words):
+    name = proc.get('tool') or Path(proc.get('comm', '')).name
+    if name in ('claude', 'codex', 'opencode'):
+        return name
+    if name == 'node' and len(words) > 1:
+        script = words[1]
+        for provider, suffix in (('claude', '/@anthropic-ai/claude-code/cli.js'),
+                                 ('codex', '/@openai/codex/bin/codex.js'),
+                                 ('opencode', '/opencode-ai/bin/opencode')):
+            if script.endswith(suffix):
+                return provider
+    return None
+
+
+def provider_session(provider, words):
+    flags = {'claude': ('--session-id', '--resume', '-r'),
+             'codex': ('--session-id',), 'opencode': ('--session', '-s')}[provider]
+    valid = OPENCODE_SESSION if provider == 'opencode' else SESSION_UUID
+    values = []
+    # Skip option operands so prompts/settings containing flag-shaped strings
+    # cannot become a session identifier. Unknown CLI shapes fail closed.
+    takes_value = set(('--output-format --input-format --thinking --thinking-display --effort '
+                       '--model --permission-prompt-tool --allowedTools --tools --disallowedTools '
+                       '--permission-mode --add-dir --settings --mcp-config --system-prompt '
+                       '--append-system-prompt --max-turns --max-budget-usd --betas '
+                       '--agents --agent --fallback-model --setting-sources --debug-file '
+                       '--prompt --config -c --enable --disable -C --cd --sandbox --approval-mode --profile '
+                       '--provider --format --title --agent --port --hostname').split())
+    boolean = set(('--verbose --allow-dangerously-skip-permissions --dangerously-skip-permissions '
+                   '--include-partial-messages --print --continue --strict-mcp-config '
+                   '--disable-slash-commands --no-session-persistence --no-chrome '
+                   '--chrome --fork-session --json --full-auto').split())
+    if provider == 'claude':
+        boolean.add('-p')
+    else:
+        takes_value.add('-p')
+    i, command = 1, None
+    while i < len(words):
+        word = words[i]
+        # Subcommands follow global options. Flag operands with these names
+        # are skipped below, while an actual shared server always fails closed.
+        if word == '--':
+            if command is None and provider in ('codex', 'opencode') and words[i+1:i+2] in (
+                    ['app-server'], ['serve'], ['web']):
+                return None, True
+            break
+        if not word.startswith('-'):
+            if command is None and ((provider == 'codex' and word == 'app-server') or
+                                    (provider == 'opencode' and word in ('serve', 'web'))):
+                return None, True
+            if (provider == 'codex' and command is None and word == 'exec' or
+                    provider == 'opencode' and command is None and word == 'run'):
+                command = word
+                i += 1
+                continue
+            if provider == 'codex' and command in (None, 'exec') and word == 'resume':
+                i += 1
+                if i >= len(words) or not valid.fullmatch(words[i]):
+                    return None, True
+                values.append(words[i])
+                command = 'resume'
+                i += 1
+                continue
+            break
+        option, equal, value = word.partition('=')
+        if option in flags:
+            value = value if equal else words[i+1] if i+1 < len(words) else ''
+            if not valid.fullmatch(value):
+                return None, True
+            values.append(value)
+            i += 1 if equal else 2
+        elif option in takes_value:
+            i += 1 if equal else 2
+        elif option in boolean:
+            i += 1
+        elif provider == 'codex' and word.startswith('-c') and len(word) > 2:
+            i += 1
+        else:
+            return None, True
+    unique = set(values)
+    return (next(iter(unique)), False) if len(unique) == 1 else (None, len(unique) > 1)
+
+
+def process_key(proc):
+    return [proc['start'], proc['ppid'], proc['uid'], proc.get('tool') or Path(proc['comm']).name]
+
+
+def process_metadata(proc, vector):
+    words = vector.get('argv', [])
+    provider = provider_name(proc, words)
+    thread = vector.get('threadId')
+    thread = thread if isinstance(thread, str) and VOLUME_THREAD_ID.fullmatch(thread) else None
+    metadata = dict(identity=process_key(proc), threadId=thread or thread_identity(proc, words),
+                    provider=provider, providerSessionId=None, providerSessionAmbiguous=False)
+    if provider:
+        session_words = words[1:] if (proc.get('tool') or Path(proc['comm']).name) == 'node' else words
+        session, ambiguous = provider_session(provider, session_words)
+        metadata.update(providerSessionId=session, providerSessionAmbiguous=ambiguous or not words)
+    tool = proc.get('tool') or Path(proc['comm']).name
+    if tool in TOOLS and words:
+        metadata.update(executable=vector['executable'], operands=search_paths(tool, words[1:]))
+    return metadata
+
+
 def volume_crawls(rows, previous, now, run, home=None):
     home = str(Path.home()) if home is None else home
     candidates = []
     by_pid = {p['pid']: p for p in rows}
+    old_cache = previous.get('volumeCrawlCache', {})
+    old_cache = old_cache if isinstance(old_cache, dict) else {}
+    cache = {pid: value for pid, value in old_cache.items()
+             if isinstance(pid, str) and pid.isdigit() and int(pid) in by_pid and isinstance(value, dict)
+             and value.get('identity') == process_key(by_pid[int(pid)])}
     for proc in rows:
         tool = proc.get('tool') or Path(proc.get('comm', '')).name
-        # ps's exiting rows have reset counters/argv and cannot be attributed.
         if tool not in TOOLS or proc['state'].startswith('?'):
             continue
         if proc['elapsedS'] >= 30:
             candidates.append(proc)
     if not candidates:
-        return
-    # Rotate a bounded batch under a process storm so later PIDs get a turn.
+        return dict(list(cache.items())[-MAX_CACHE:])
     offset = (int(now)//60*MAX_CANDIDATES) % len(candidates)
     candidates = (candidates[offset:]+candidates[:offset])[:MAX_CANDIDATES]
     selected = {p['pid']: p for p in candidates}
@@ -270,31 +383,44 @@ def volume_crawls(rows, previous, now, run, home=None):
             if parent is None:
                 break
             selected[parent['pid']] = parent
-    vectors = argv_snapshot(list(selected.values()), run)
+            if (parent.get('tool') or Path(parent['comm']).name) == 'Robob':
+                break
+    fresh = [p for p in selected.values() if str(p['pid']) not in cache]
+    vectors = argv_snapshot(fresh, run) if fresh else {}
+    for proc in fresh:
+        cache[str(proc['pid'])] = process_metadata(proc, vectors.get(proc['pid'], {}))
+    cache = dict(list(cache.items())[-MAX_CACHE:])
     cwds = cwd_snapshot([p['pid'] for p in candidates], run)
     for proc in candidates:
-        tool = proc.get('tool') or Path(proc['comm']).name
-        if proc['pid'] not in vectors:
-            continue
-        words = vectors[proc['pid']]['argv'][1:]
-        cwd = cwds.get(proc['pid'])
-        operands = search_paths(tool, words)
+        metadata = cache.get(str(proc['pid']), {})
+        operands = metadata.get('operands')
         if operands is None:
             continue
+        cwd = cwds.get(proc['pid'])
         paths = [absolute(p, cwd, home) for p in operands]
         if not any(p is not None and broad_root(p, home) for p in paths):
             continue
         chain, seen = [], {proc['pid']}
         parent = proc
-        thread_id = None
+        thread_id = metadata.get('threadId')
+        provider = dict(providerPid=None, provider=None, providerSessionId=None,
+                        providerSessionAmbiguous=False)
         for _ in range(4):
             parent = by_pid.get(parent['ppid'])
             if parent is None or parent['pid'] in seen:
                 break
             seen.add(parent['pid'])
             chain.append(dict(pid=parent['pid'], name=parent.get('tool') or Path(parent.get('comm', '')).name))
+            if chain[-1]['name'] == 'Robob':
+                break
+            identity = cache.get(str(parent['pid']), {})
             if thread_id is None:
-                thread_id = thread_identity(parent, vectors.get(parent['pid'], {}).get('argv', []))
+                thread_id = identity.get('threadId')
+            if provider['provider'] is None and identity.get('provider'):
+                provider.update({k: identity.get(k) for k in ('provider', 'providerSessionId', 'providerSessionAmbiguous')})
+                provider['providerPid'] = parent['pid']
+        if provider['providerSessionAmbiguous']:
+            thread_id = None
         old = previous.get('processes')
         old = old if isinstance(old, dict) else {}
         prior = old.get(str(proc['pid']))
@@ -305,8 +431,7 @@ def volume_crawls(rows, previous, now, run, home=None):
         if (0 < window <= 3600 and prior.get('start') == proc['start']
                 and finite_number(prior.get('cpuS')) and 0 <= prior['cpuS'] <= proc['cpuS']):
             pct = round((proc['cpuS']-prior['cpuS'])/window*100, 3)
-        # Paths only: search patterns, inline expressions and option values are
-        # not filesystem attribution data. Paths themselves remain verbatim.
         emit('scan', 'event', 'scan.volume_crawl', props=dict(pid=proc['pid'], ppid=proc['ppid'],
-             parentChain=chain, argv=[vectors[proc['pid']]['executable'], *[p for p in paths if p is not None]],
-             cwd=cwd, elapsedS=proc['elapsedS'], cpuPct=pct, threadId=thread_id))
+             parentChain=chain, argv=[metadata['executable'], *[p for p in paths if p is not None]],
+             cwd=cwd, elapsedS=proc['elapsedS'], cpuPct=pct, threadId=thread_id, **provider))
+    return cache

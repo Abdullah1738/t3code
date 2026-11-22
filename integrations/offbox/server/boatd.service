@@ -12,6 +12,9 @@ Restart=always
 RestartSec=5
 # Commands run in their own transient units (systemd-run), so restarting boatd never kills a run.
 KillMode=process
+# Every open request holds a socket and two database files. At the default 1024 about 330 clients following
+# their runs made new requests fail with "Too many open files" (19 Nov 2026: 31,104 errors; 22 Nov: 140).
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

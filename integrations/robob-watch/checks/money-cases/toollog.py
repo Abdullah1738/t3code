@@ -68,7 +68,9 @@ _ENUMS = {
     'marketplace_refresh': {'started', 'busy', 'fresh', 'skipped'},
     'snapshot_error': {'none', 'snapshot_missing', 'snapshot_corrupt'},
     'result': {'busy', 'budget', 'list_error', 'detail_error', 'invalid_paging', 'placement_unknown', 'end_of_history', 'launch_error', 'cache_busy', 'store_error'},
-    'owner_result': {'ok', 'incomplete', 'list_failed'},
+    'owner_result': {'ok', 'incomplete', 'list_failed', 'cache_missing', 'cache_stale'},
+    'owner_source': {'live', 'incremental', 'cache'},
+    'owner_refresh_result': {'ok', 'incomplete', 'list_failed', 'error', 'not_read'},
     'slowestPhase': {'reconcile', 'follow', 'attention', 'build_write'},
     'state': {'unknown', 'placed', 'ordered', 'shipped', 'preparing', 'picked up', 'out for delivery',
               'nearby', 'delivered', 'cancelled', 'pending confirmation'},
@@ -82,7 +84,7 @@ _NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exi
             'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
             'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms',
             'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
-            'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'eintr_retries', 'dataless_files', 'edeadlk_skips_before'}
+            'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'owner_cache_age_s', 'owner_list_window_s', 'owner_refresh_ms', 'owner_refresh_at', 'owner_refresh_timeouts', 'edeadlk_retries', 'edeadlk_ms', 'eintr_retries', 'dataless_files', 'edeadlk_skips_before'}
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
 _MONEY_PROPS = {
@@ -97,7 +99,7 @@ _MONEY_PROPS = {
                   'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
                   'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by',
                   'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
-                  'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'eintr_retries', 'dataless_files', 'dataless_error', 'edeadlk_skips_before', 'owner_result'},
+                  'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'owner_cache_age_s', 'owner_list_window_s', 'owner_refresh_ms', 'owner_refresh_at', 'owner_refresh_timeouts', 'edeadlk_retries', 'edeadlk_ms', 'eintr_retries', 'dataless_files', 'dataless_error', 'edeadlk_skips_before', 'owner_result', 'owner_source', 'owner_refresh_result'},
 }
 _COMMANDS = {'test-talabat-shops', 'capabilities', 'restaurant-cart-contract', 'item-options', 'cart',
              'clear-cart', 'menu', 'choices', 'inspect', 'open-flows', 'recover-payment',
@@ -1049,6 +1051,14 @@ def rollup(day=None):
             for merchant, poll in sorted(poll_counts.items())}
         _private_directory(folder)
         target = folder / ('rollup-' + day + '.json')
+        try:
+            health = json.loads(target.read_text()).get('moneyCasesHealth')
+            # The shared nightly reader owns this extension; automatic order polls
+            # must retain it when they refresh the same day's base rollup.
+            if isinstance(health, dict) and health.get('day') == day and isinstance(health.get('one_line'), str):
+                result['moneyCasesHealth'] = health
+        except (OSError, ValueError, AttributeError):
+            pass
         fd, temporary = tempfile.mkstemp(prefix='.rollup-', dir=folder)
         try:
             with os.fdopen(fd, 'w') as out:

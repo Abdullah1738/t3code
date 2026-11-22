@@ -1,4 +1,4 @@
-"""Bounded Darwin argv reads; stdout contains argv vectors, never environment."""
+"""Bounded Darwin argv reads; stdout contains argv and only the named thread tag."""
 import ctypes as c
 import json
 import os
@@ -19,7 +19,15 @@ class BsdInfo(c.Structure):
         ('nice', c.c_int32), ('startS', c.c_uint64), ('startUs', c.c_uint64)]
 
 
+THREAD_ENV_KEY = b'ROBOB_THREAD_ID='
+
+
 def decode_args(data):
+    executable, argv, _ = decode_process(data, read_thread=False)
+    return executable, argv
+
+
+def decode_process(data, read_thread=True):
     if not 5 <= len(data) <= MAX_BYTES:
         raise ValueError('argv size')
     argc = int.from_bytes(data[:4], sys.byteorder, signed=True)
@@ -38,7 +46,18 @@ def decode_args(data):
         end = data.index(b'\0', pos)
         argv.append(os.fsdecode(data[pos:end]))
         pos = end+1
-    return executable, argv
+    thread_id = None
+    if read_thread:
+        values = []
+        while pos < len(data):
+            end = data.index(b'\0', pos)
+            # Compare names as bytes; never decode or return another env value.
+            if data.startswith(THREAD_ENV_KEY, pos, end):
+                values.append(os.fsdecode(data[pos+len(THREAD_ENV_KEY):end]))
+            pos = end+1
+        if len(values) == 1:
+            thread_id = values[0]
+    return executable, argv, thread_id
 
 
 def native_reader():
@@ -74,9 +93,9 @@ def read_process(pid, identity, read_data):
     data = read_data(pid)
     if before != identity(pid) or before[0] != pid:
         raise ValueError('process changed')
-    executable, argv = decode_args(data)
+    executable, argv, thread_id = decode_process(data)
     return dict(ppid=before[1], uid=before[2], startS=before[3],
-                executable=executable, argv=argv)
+                executable=executable, argv=argv, threadId=thread_id)
 
 
 def collect(pids, read):

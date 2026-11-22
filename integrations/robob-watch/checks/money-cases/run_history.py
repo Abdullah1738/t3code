@@ -21,6 +21,10 @@ MAX_ROW_BYTES = 16 * 1024
 APPEND_BUDGET = 0.04
 APPEND_ERRORS = 0
 _ACTIVE = ContextVar('money_cases_run_history', default=None)
+STOP_REASONS = {'source_limit', 'follow_deadline', 'owner_budget', 'receipt_deadline',
+                'order_charges_deadline', 'check_deadline'}
+COUNTS = ('receipt_eligible', 'receipt_unattempted', 'merchants_calls',
+          'order_charges_calls', 'questions_calls')
 PHASES = {'reconcile', 'follow', 'attention', 'build_write', 'merchants', 'order_charges', 'payments',
           'questions', 'refunds', 'owner_threads', 'msgs', 'history', 'receipt', 'lookups', 'order_screen',
           'census', 'loads', 'writes', 'locks', 'untimed', 'none'}
@@ -30,7 +34,7 @@ SOURCE_PREFIX = r'(?:(?:his threads|receipt|orders|merchant history|refund mail|
 ERROR = re.compile(
     SOURCE_PREFIX +
     r'(?:Robob control: (?:message provenance unavailable; server update required|credentials unavailable|'
-    r'request failed or timed out|invalid response|owner cache save failed|incomplete thread list|'
+    r'owner read stale|owner cache missing or incomplete|request failed or timed out|invalid response|owner cache save failed|incomplete thread list|'
     r'invalid thread list|invalid thread count|invalid thread|missing thread id|invalid message list|'
     r'invalid message count|incomplete message list|lookup over time|invalid message|invalid message timestamp|'
     r'message id unavailable; server update required|thread updatedAt unavailable; server update required|'
@@ -74,8 +78,57 @@ def numeric(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
+def observe(stats, key, value=None, delta=1):
+    """Diagnostics must not turn a completed lookup into a failed check."""
+    try:
+        if stats is not None:
+            stats[key] = stats.get(key, 0) + delta if value is None else value
+    except Exception as exc:
+        if getattr(exc, '_money_cases_timeout', False):
+            raise
+
+
+def loadavg():
+    try:
+        return list(os.getloadavg())
+    except Exception as exc:
+        if getattr(exc, '_money_cases_timeout', False):
+            raise
+        return None
+
+
+def receipt_coverage(row):
+    try:
+        eligible = row.get('receipt_eligible')
+        if type(eligible) is int:
+            attempted = sum(row.get('receipt_result', {}).values())
+            row['receipt_unattempted'] = max(0, eligible - attempted)
+    except Exception as exc:
+        if getattr(exc, '_money_cases_timeout', False):
+            raise
+
+
+def coverage_known(row):
+    values = [row.get('receipt_eligible'), row.get('receipt_unattempted')]
+    counts = row.get('receipt_result', {})
+    if not isinstance(counts, dict):
+        return False
+    attempted = [counts.get(key, 0) for key in ('found', 'none', 'out_of_time', 'error')]
+    return all(type(value) is int and value >= 0 for value in (*values, *attempted)) \
+        and sum(attempted) + values[1] == values[0]
+
+
 def run_row(values):
     row = {key: value for key, value in values.items() if numeric(value)}
+    for key in COUNTS:
+        value = values.get(key)
+        row[key] = value if type(value) is int and value >= 0 else None
+    reason = values.get('budget_stop_reason')
+    row['budget_stop_reason'] = reason if isinstance(reason, str) and reason in STOP_REASONS else None
+    for key in ('loadavg_start', 'loadavg_end'):
+        value = values.get(key)
+        row[key] = list(value) if isinstance(value, (list, tuple)) and len(value) == 3 \
+            and all(numeric(n) for n in value) else None
     # Numeric-only fields cannot contain message text, even when new timing
     # counters are added. Structured receipt counters are projected explicitly.
     for key in ('msgs_by_kind', 'receipt_result'):
@@ -89,7 +142,11 @@ def run_row(values):
     row['exit'] = values.get('exit') if type(values.get('exit')) is int else None
     row['slowest'] = values.get('slowest') if values.get('slowest') in PHASES else 'unknown'
     row['owner_result'] = values.get('owner_result') if values.get('owner_result') in {
-        'ok', 'incomplete', 'list_failed', 'not_read'} else 'not_read'
+        'ok', 'incomplete', 'list_failed', 'not_read', 'cache_missing', 'cache_stale'} else 'not_read'
+    for key, allowed in (('owner_source', {'live', 'incremental', 'cache'}),
+                         ('owner_refresh_result', {'ok', 'incomplete', 'list_failed', 'error', 'not_read'})):
+        if values.get(key) in allowed:
+            row[key] = values[key]
     row.setdefault('owner_timeouts', 0)
     row.setdefault('owner_threads_fetched', 0)
     row['question_errors'] = [safe_error(e) for e in values.get('question_errors', [])[:10]]
@@ -197,7 +254,8 @@ def recording(wd):
         yield active
         return
     started = time.monotonic()
-    row = {'at': dt.datetime.now(dt.timezone.utc).isoformat(), 'owner_result': 'not_read'}
+    row = {'at': dt.datetime.now(dt.timezone.utc).isoformat(), 'owner_result': 'not_read',
+           'loadavg_start': loadavg()}
     token = _ACTIVE.set(row)
     try:
         yield row
@@ -212,6 +270,8 @@ def recording(wd):
     finally:
         _ACTIVE.reset(token)
         row.update(row.pop('stats', {}))
+        row['loadavg_end'] = loadavg()
+        receipt_coverage(row)
         row.setdefault('total_s', round(time.monotonic() - started, 3))
         append(wd, row)
 
@@ -269,9 +329,7 @@ def snapshot_lock(wd):
         os.close(fd)
 
 
-def summary(wd, since='24h', now=None):
-    now = now or dt.datetime.now(dt.timezone.utc)
-    cutoff = since_time(since, now)
+def read_rows(wd, cutoff, until, inclusive=True, validate_receipts=False):
     rows, invalid = [], 0
     with snapshot_lock(wd):
         for name in ('runs.jsonl.1', 'runs.jsonl'):
@@ -285,16 +343,36 @@ def summary(wd, since='24h', now=None):
                             if at.tzinfo is None or not numeric(row.get('total_s')) or not isinstance(errors, list) \
                                     or not all(isinstance(e, str) for e in errors):
                                 raise ValueError('invalid run')
-                            if cutoff <= at <= now:
-                                rows.append(run_row(row))
+                            if cutoff <= at and (at <= until if inclusive else at < until):
+                                projected = run_row(row)
+                                # Dropping a malformed outcome must not turn it into a measured zero.
+                                if validate_receipts and not coverage_known(row):
+                                    projected.update(receipt_eligible=None, receipt_unattempted=None)
+                                rows.append(projected)
                         except (ValueError, TypeError, KeyError, AttributeError):
                             invalid += 1
             except FileNotFoundError:
                 pass
     rows.sort(key=lambda row: dt.datetime.fromisoformat(row['at'].replace('Z', '+00:00')))
+    return rows, invalid
+
+
+def summary(wd, since='24h', now=None):
+    now = now or dt.datetime.now(dt.timezone.utc)
+    cutoff = since_time(since, now)
+    rows, invalid = read_rows(wd, cutoff, now)
     totals = sorted(row['total_s'] for row in rows)
     errors = Counter(e for row in rows for e in row.get('question_errors', []))
-    return {'since': cutoff.isoformat(), 'run_count': len(rows),
+    ages = [row['owner_cache_age_s'] for row in rows if 'owner_cache_age_s' in row]
+    windows = [row['owner_list_window_s'] for row in rows if 'owner_list_window_s' in row]
+    last = next((row for row in reversed(rows) if row.get('owner_refresh_at')), {})
+    return {'owner': {'sources': dict(Counter(row.get('owner_source', 'unknown') for row in rows)),
+                      'cache_age_s_max': max(ages) if ages else None,
+                      'list_window_s_max': max(windows) if windows else None,
+                      'last_refresh': {key: last[key] for key in (
+                          'owner_refresh_at', 'owner_refresh_ms', 'owner_refresh_result', 'owner_refresh_timeouts')
+                                       if key in last}},
+            'since': cutoff.isoformat(), 'run_count': len(rows),
             'over_40_count': sum(row['total_s'] > 40 for row in rows),
             'total_s': {'p50': percentile(totals, .5), 'p95': percentile(totals, .95),
                         'max': max(totals) if totals else None},
@@ -310,8 +388,68 @@ def format_summary(result):
              f"Total seconds: p50={totals['p50']} p95={totals['p95']} max={totals['max']}",
              'Owner results: ' + (', '.join(f'{key}={n}' for key, n in result['owner_results'].items()) or 'none'),
              'Question errors: ' + ('none' if not result['question_errors'] else '')]
+    owner = result['owner']
+    lines.insert(3, f"Owner: sources={owner['sources']}; cache age max={owner['cache_age_s_max']} s; "
+                    f"list window max={owner['list_window_s_max']} s; last refresh={owner['last_refresh']}")
     lines += [f'  {n}x {error}' for error, n in result['question_errors'].items()]
     lines += [f"  {row['at']}: {row['total_s']} s, slowest={row['slowest']}" for row in result['slow_runs']]
     if result['invalid_lines']:
         lines.append(f"Invalid history lines skipped: {result['invalid_lines']}")
+    return '\n'.join(lines)
+
+
+def health(wd, day=None, now=None):
+    now = now or dt.datetime.now(dt.timezone.utc)
+    day = day if day is not None else now.astimezone(dt.timezone.utc).date().isoformat()
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', day):
+        raise ValueError('invalid UTC day')
+    start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc)
+    rows, invalid = read_rows(wd, start, start + dt.timedelta(days=1), inclusive=False, validate_receipts=True)
+    totals = sorted(row['total_s'] for row in rows)
+    known = [row for row in rows if coverage_known(row)]
+    eligible = sum(row['receipt_eligible'] for row in known) if known else None
+    counts = {key: sum(row.get('receipt_result', {}).get(key, 0) for row in known) if known else None
+              for key in ('found', 'none', 'out_of_time', 'error')}
+    counts['unattempted'] = sum(row['receipt_unattempted'] for row in known) if known else None
+    reasons = Counter(row['budget_stop_reason'] for row in rows if row['budget_stop_reason'])
+    ranked = sorted(reasons, key=lambda key: (-reasons[key], key))
+    loads = {}
+    load_samples = {}
+    for key in ('start', 'end'):
+        samples = [row['loadavg_' + key] for row in rows if row['loadavg_' + key] is not None]
+        loads[key] = [percentile(sorted(sample[i] for sample in samples), .95) for i in range(3)]
+        load_samples[key] = len(samples)
+    result = {'day': day, 'time_zone': 'UTC', 'runs': len(rows),
+              'total_s': {'p50': percentile(totals, .5), 'p95': percentile(totals, .95),
+                          'max': max(totals) if totals else None},
+              'over_35_count': sum(value > 35 for value in totals),
+              'owner_results': dict(sorted(Counter(row['owner_result'] for row in rows).items())),
+              'receipt': {'known_runs': len(known), 'unknown_runs': len(rows) - len(known),
+                          'eligible': eligible, 'counts': counts,
+                          'share': {key: value / eligible if eligible else None for key, value in counts.items()}},
+              'budget_stop_reasons': dict(sorted(reasons.items())),
+              'top_budget_stop_reason': ranked[0] if ranked else None,
+              'loadavg_p95': loads, 'loadavg_samples': load_samples, 'invalid_lines': invalid}
+    result['one_line'] = health_line(result)
+    return result
+
+
+def health_line(result):
+    receipt = result['receipt']
+    counts = receipt['counts']
+    attempted = sum(counts[key] for key in ('found', 'none', 'out_of_time', 'error')) \
+        if receipt['known_runs'] else None
+    return (f"money-cases {result['day']} UTC: runs={result['runs']} "
+            f"p50/p95/max={result['total_s']['p50']}/{result['total_s']['p95']}/{result['total_s']['max']}s "
+            f">35s={result['over_35_count']} owner={json.dumps(result['owner_results'], separators=(',', ':'))} "
+            f"receipts={attempted}/{receipt['eligible']} unattempted={counts['unattempted']} "
+            f"unknown_runs={receipt['unknown_runs']} stop={result['top_budget_stop_reason']} "
+            f"load1_p95={result['loadavg_p95']['start'][0]}/{result['loadavg_p95']['end'][0]}")
+
+
+def format_health(result):
+    lines = [result['one_line'], 'Receipt         Count    Share of eligible']
+    for key, count in result['receipt']['counts'].items():
+        share = result['receipt']['share'][key]
+        lines.append(f"{key:<16}{str(count):<9}" + (f'{share:.1%}' if share is not None else 'unknown'))
     return '\n'.join(lines)

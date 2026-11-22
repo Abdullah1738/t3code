@@ -167,6 +167,61 @@ class BoxProtectionTests(Base):
                     self.assertEqual(not boatd.box_protection(self.con,bid)['holds'],expected)
                 self.con.execute('DELETE FROM commands WHERE box_id=?',(bid,))
 
+    def test_a_run_cancelled_while_queued_does_not_hold_its_box(self):
+        clean = {'kill': {'cleanup': 'clean', 'leftover_killed': 0, 'remaining': 0}, 'kill_synthetic': True}
+        unseen = {'readable': True, 'pids': None, 'box_rc': None, 'marker': None, 'reason': 'cgroup_unverified'}
+        cases = (('cancelled in the queue', clean, None, 1, 1, unseen, True),
+                 ('it had been admitted', clean, 10, 1, 1, unseen, False),
+                 ('an earlier attempt ran', clean, None, 2, 1, unseen, False),
+                 ('cleanup left a process', {**clean, 'kill': {**clean['kill'], 'remaining': 1}}, None, 1, 1, unseen, False),
+                 ('cleanup is unknown', {**clean, 'kill': {'cleanup': 'unknown'}}, None, 1, 1, unseen, False),
+                 ('a real exit replaced the kill', {**clean, 'kill_synthetic': False}, None, 1, 1, unseen, False),
+                 ('nobody killed it', clean, None, 1, 0, unseen, False),
+                 ('the box has its start marker', clean, None, 1, 1, {**unseen, 'marker': {'pid': 9}}, False),
+                 ('the box has its exit receipt', clean, None, 1, 1, {**unseen, 'box_rc': 0}, False),
+                 ('the box has its processes', clean, None, 1, 1, {**unseen, 'pids': [31291]}, False),
+                 ('the box cannot be read', clean, None, 1, 1, {'reason': 'box_unreadable'}, False),
+                 ('Incus does not answer', clean, None, 1, 1, {'reason': 'incus_unavailable'}, False))
+        for index, (name, metrics, started, attempt, killed, view, freed) in enumerate(cases):
+            with self.subTest(name):
+                bid = self.box(bid='bx_queuekill'+str(index))
+                self.con.execute("INSERT INTO commands(box_id,pid,command_id,status,exit_code,attempt,killed,metrics,started_at,run_id) "
+                                 "VALUES (?,1001,'cmd','exited',143,?,?,?,?,'run-q')",
+                                 (bid, attempt, killed, json.dumps(metrics), started))
+                with patch.object(boatd,'command_probe',return_value=view):
+                    self.assertEqual(not boatd.box_protection(self.con,bid)['holds'],freed)
+                    # Reads that do not look at the box (events, listings) never free it.
+                    self.assertTrue(boatd.box_protection(self.con,bid,probe=False)['holds'] or freed)
+                    if freed:
+                        boatd.stop_box(self.con, bid, 'idle ttl')
+                        self.assertEqual(boatd.box_row(self.con, bid)['state'], 'archived')
+
+    def test_output_that_shows_the_guest_started_keeps_a_cancelled_run_held(self):
+        bid = self.box()
+        self.con.execute("INSERT INTO commands(box_id,pid,command_id,status,exit_code,attempt,killed,metrics,run_id,protocol_nonce) "
+                         "VALUES (?,1001,'cmd','exited',143,1,1,?,'run-q','nonce-q')",
+                         (bid, json.dumps({'kill': {'cleanup': 'clean', 'remaining': 0}, 'kill_synthetic': True})))
+        with patch.object(boatd, 'command_was_started', return_value=True), \
+                patch.object(boatd,'command_probe',return_value={'readable':True,'pids':None,'box_rc':None,'marker':None}):
+            self.assertEqual([h['process_id'] for h in boatd.box_protection(self.con, bid)['holds']], [1001])
+
+    def test_the_real_kill_of_a_queued_run_leaves_its_box_free_to_stop(self):
+        bid = self.box()
+        pid = self.cmd(bid, status='queued')
+        boatd.stage_kill(self.con, bid, pid, False)
+        # boatd's own settlement of a kill that arrived before the runner was admitted.
+        with patch.object(boatd, 'cleanup_run', side_effect=AssertionError('a queued run has nothing to clean up')):
+            boatd.restore_kill_result(self.con, self.status(bid, pid), {})
+        row = self.status(bid, pid)
+        self.assertEqual((row['status'], row['started_at'], row['killed']), ('exited', None, 1))
+        self.assertEqual(json.loads(row['metrics']), {'kill': dict(cleanup='clean', leftover_killed=0, remaining=0),
+                                                      'kill_synthetic': True})
+        with patch.object(boatd,'command_probe',return_value={'readable':True,'pids':None,'box_rc':None,'marker':None,
+                                                               'reason':'cgroup_unverified'}):
+            self.assertEqual(boatd.box_protection(self.con, bid)['holds'], [])
+            boatd.stop_box(self.con, bid, 'idle ttl')
+        self.assertEqual(boatd.box_row(self.con, bid)['state'], 'archived')
+
     def test_spawn_failure_needs_positive_unit_absence_before_releasing(self):
         for rc, state, expected in ((3,'inactive',True),(4,'unknown',True),(1,'bus unavailable',False)):
             with self.subTest(rc=rc):
@@ -203,6 +258,163 @@ class BoxProtectionTests(Base):
         workers[0]()
         self.assertEqual(boatd.box_row(self.con,bid)['state'],'archived')
         self.assertEqual(self.f.calls[calls:],[])
+
+
+class OneStateReadPerProtection(Base):
+    """A long-lived box keeps hundreds of past commands; one protection read asks Incus about the box once."""
+    INIT = 5000
+
+    def setUp(self):
+        super().setUp()
+        self.bid = self.box()
+        self.asked = []
+        self.state = b'{"status":"Running","pid":%d}' % self.INIT
+        self.root = self.tmp/'proc'/str(self.INIT)/'root/run/boatd'
+        self.root.mkdir(parents=True)
+        self.started(self.INIT, 111)
+        original = self.f.incus
+        def incus(*args, **kw):
+            if args[:1] == ('query',) and args[1].endswith('/state'):
+                self.asked.append(args[1])
+                return subprocess.CompletedProcess(args, 0, self.state, b'')
+            return original(*args, **kw)
+        for name, value in (('PROC_ROOT', self.tmp/'proc'), ('cg_path', lambda box: self.tmp/'group'/box),
+                            ('incus', incus), ('command_probe', COMMAND_PROBE)):
+            patcher = patch.object(boatd, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def started(self, pid, start):
+        stat = self.tmp/'proc'/str(pid)/'stat'
+        stat.parent.mkdir(parents=True, exist_ok=True)
+        stat.write_text(f"{pid} (systemd (init)) S 1 " + ' '.join(['0']*17) + f" {start} 0 0\n")
+
+    def past(self, n, bid=None):
+        bid = bid or self.bid
+        for pid in range(1001, 1001+n):
+            self.con.execute("INSERT INTO commands(box_id,pid,command_id,status,run_id,attempt,holder,metrics,started_at,ended_at) "
+                             "VALUES (?,?,?,'exited',?,1,'thread:holder','{}',1,2)", (bid, pid, f'cmd-{pid}', f'run-{pid}'))
+            (self.root/f'{pid}.1.rc').write_text('0')
+
+    def test_one_query_serves_every_past_command_and_changes_no_answer(self):
+        self.past(40)
+        one_by_one = [boatd.command_probe(dict(c)) for c in self.con.execute(
+            'SELECT * FROM commands WHERE box_id=? ORDER BY pid DESC', (self.bid,))]
+        self.assertEqual(len(self.asked), 40)
+        self.asked.clear()
+        snapshot = boatd.box_protection(self.con, self.bid)
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual([h['probe'] for h in snapshot['holds']], one_by_one)
+        self.assertEqual(len(snapshot['holds']), 40)
+        self.assertTrue(all(h['probe']['reason'] == 'cgroup_unverified' for h in snapshot['holds']))
+
+    def test_a_proven_exit_is_still_retired_from_the_shared_read(self):
+        self.past(3)
+        (self.root/'1002.1.started').write_text(json.dumps(dict(pid=77, attempt=1, cgroup_joined=True)))
+        group = self.tmp/'group'/self.bid/'boatd/1002'
+        group.mkdir(parents=True)
+        (group/'cgroup.procs').write_text('')
+        snapshot = boatd.box_protection(self.con, self.bid)
+        self.assertEqual(sorted(h['process_id'] for h in snapshot['holds']), [1001, 1003])
+        self.assertEqual(len(self.asked), 1)
+        self.assertTrue(self.con.execute("SELECT 1 FROM meta WHERE k=?", (f'holder_gone:{self.bid}:1002:1',)).fetchone())
+
+    def test_a_restarted_box_is_asked_again_instead_of_trusting_the_old_init(self):
+        self.past(3)
+        real = boatd._proc_start
+        seen = []
+        def restarted(pid):
+            seen.append(pid)
+            return real(pid) if len(seen) < 3 else '999'
+        with patch.object(boatd, '_proc_start', side_effect=restarted):
+            boatd.box_protection(self.con, self.bid)
+        self.assertGreater(len(self.asked), 1)
+
+    def test_an_unreadable_start_time_falls_back_to_one_query_per_command(self):
+        (self.tmp/'proc'/str(self.INIT)/'stat').unlink()
+        self.past(5)
+        boatd.box_protection(self.con, self.bid)
+        self.assertEqual(len(self.asked), 5)
+
+    def test_a_stopped_box_answers_once_and_retires_its_settled_commands(self):
+        self.state = b'{"status":"Stopped","pid":0}'
+        self.past(1)
+        self.assertEqual(boatd.box_protection(self.con, self.bid)['holds'], [])
+        few = len(self.asked)
+        self.asked.clear()
+        self.con.execute("DELETE FROM meta WHERE k LIKE 'holder_gone:%'")
+        self.con.execute('DELETE FROM commands')
+        self.past(30)
+        self.assertEqual(boatd.box_protection(self.con, self.bid)['holds'], [])
+        # The count does not grow with the number of commands (the live-command check after the loop asks once more).
+        self.assertEqual(len(self.asked), few)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM meta WHERE k LIKE 'holder_gone:%'").fetchone()[0], 30)
+
+    def test_a_box_started_after_a_stopped_reading_cannot_revive_settled_commands(self):
+        """Rows are read before the reading; a stopped box had no process then, so the later start changes nothing
+        for them. A command that is still running is held whatever the box says."""
+        self.past(4)
+        self.con.execute("INSERT INTO commands(box_id,pid,command_id,status,run_id,attempt,holder,metrics,started_at) "
+                         "VALUES (?,2000,'cmd-live','running','run-live',1,'thread:holder','{}',1)", (self.bid,))
+        answers = [b'{"status":"Stopped","pid":0}']
+        original = boatd.incus
+        def incus(*args, **kw):
+            if args[:1] == ('query',) and args[1].endswith('/state') and answers:
+                self.asked.append(args[1])
+                return subprocess.CompletedProcess(args, 0, answers.pop(), b'')
+            return original(*args, **kw)
+        with patch.object(boatd, 'incus', incus):
+            snapshot = boatd.box_protection(self.con, self.bid)
+        self.assertEqual([h['process_id'] for h in snapshot['holds']], [2000])
+        self.assertFalse(snapshot['confirmedGone'])
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM meta WHERE k LIKE 'holder_gone:%'").fetchone()[0], 4)
+
+    def test_a_box_stopped_during_the_read_is_asked_again(self):
+        self.past(3)
+        real = boatd._proc_start
+        def gone_after_first(pid, seen=[]):
+            seen.append(pid)
+            if len(seen) == 2:
+                self.state = b'{"status":"Stopped","pid":0}'
+            return real(pid) if len(seen) < 2 else None
+        with patch.object(boatd, '_proc_start', side_effect=gone_after_first):
+            snapshot = boatd.box_protection(self.con, self.bid)
+        # The first command was read from the live root and stays held; the rest saw the fresh stopped answer.
+        self.assertEqual([h['process_id'] for h in snapshot['holds']], [1003])
+
+    def test_an_incus_failure_is_not_remembered_and_never_frees_a_command(self):
+        self.past(4)
+        original = boatd.incus
+        def failing(*args, **kw):
+            if args[:1] == ('query',) and args[1].endswith('/state'):
+                self.asked.append(args[1])
+                return subprocess.CompletedProcess(args, 1, b'', b'Error: connection refused')
+            return original(*args, **kw)
+        with patch.object(boatd, 'incus', failing):
+            snapshot = boatd.box_protection(self.con, self.bid)
+        self.assertEqual((len(self.asked), len(snapshot['holds'])), (4, 4))
+        self.assertTrue(all(h['probe'] == {'reason': 'incus_unavailable'} for h in snapshot['holds']))
+
+    def test_a_failed_read_leaves_nothing_shared_behind(self):
+        self.past(2)
+        with patch.object(boatd, 'command_probe', side_effect=RuntimeError('boom')), self.assertRaises(RuntimeError):
+            boatd.box_protection(self.con, self.bid)
+        self.assertIsNone(boatd._BOX_STATE.get())
+
+    def test_an_init_name_that_is_not_text_still_reads_its_start_time(self):
+        (self.tmp/'proc'/str(self.INIT)/'stat').write_bytes(
+            b"5000 (in\xff\xfe) it) S 1 " + b' '.join([b'0']*17) + b" 4242 0 0\n")
+        self.assertEqual(boatd._proc_start(self.INIT), '4242')
+
+    def test_nothing_is_shared_between_two_reads_or_two_boxes(self):
+        other = self.box('bx_bbbbbbbb', port=22001)
+        self.past(2)
+        self.past(2, other)
+        boatd.box_protection(self.con, self.bid)
+        boatd.box_protection(self.con, other)
+        boatd.box_protection(self.con, self.bid)
+        self.assertEqual(len(self.asked), 3)
+        self.assertIsNone(boatd._BOX_STATE.get())
 
 
 class ProtectionHTTP(Base):

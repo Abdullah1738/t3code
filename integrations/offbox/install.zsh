@@ -5,6 +5,12 @@
 #   install.zsh --check             exit 1 if the live copy differs from this tree or HEAD is not on origin
 #   install.zsh --allow-unpushed    install even with uncommitted or unpushed offbox changes (testing only)
 #   install.zsh --allow-reload      allow watched writes while OpenCode sessions are busy
+#   install.zsh --since=COMMIT --only=PATH [--only=PATH ...] [--dry-run]
+#                                   install only these skill files (paths under skill/), in the order given.
+#                                   Each live file must be exactly COMMIT's version, so what goes live is
+#                                   COMMIT..HEAD for those files and nothing else: a file that is behind COMMIT
+#                                   (held changes) is refused, and no other file is touched. Use while a full
+#                                   install is on hold.
 #
 # Commit and push first: the live copy must always be a commit on origin/main.
 set -eu
@@ -30,6 +36,8 @@ mode=install
 dry=()
 allow=0
 reload_flags=()
+only=()
+since=
 for arg in "$@"; do
   case "$arg" in
     --check|--dry-run)
@@ -39,7 +47,9 @@ for arg in "$@"; do
       ;;
     --allow-unpushed) allow=1 ;;
     --allow-reload) reload_flags=(--allow-reload) ;;
-    *) print -u2 "usage: install.zsh [--dry-run | --check] [--allow-unpushed] [--allow-reload]"; exit 2 ;;
+    --only=?*) only+=("${arg#--only=}") ;;
+    --since=?*) since="${arg#--since=}" ;;
+    *) print -u2 "usage: install.zsh [--dry-run | --check] [--allow-unpushed] [--allow-reload] [--since=COMMIT --only=PATH ...]"; exit 2 ;;
   esac
 done
 
@@ -55,6 +65,52 @@ pushed() {
     return 1
   fi
 }
+
+if (( ${#only} )) || [[ -n "$since" ]]; then
+  [[ $mode != check && $allow == 0 && ${#only} -gt 0 && -n "$since" ]] || {
+    print -u2 "offbox: a selective install needs --since=COMMIT and --only=PATH, without --check or --allow-unpushed"; exit 2 }
+  pushed || { print -u2 "offbox: refusing a selective install of unpushed work"; exit 1 }
+  base="$(git -C "$repo" rev-parse --verify --quiet "$since^{commit}")" || { print -u2 "offbox: --since=$since is not a commit"; exit 1 }
+  git -C "$repo" merge-base --is-ancestor "$base" HEAD || { print -u2 "offbox: --since=$since is not an ancestor of HEAD"; exit 1 }
+  # Everything is checked before anything is written.
+  for rel in "${only[@]}"; do
+    installed="$skill/$rel"
+    # :A resolves symlinks, so a linked directory on the way cannot send the write outside the skill.
+    [[ "$rel" != /* && "$rel" != *..* && -f "$here/skill/$rel" && -f "$installed" && ! -L "$installed"
+       && "${installed:A}" == "${skill:A}/$rel" ]] || {
+      print -u2 "offbox: --only=$rel is not a skill file present here and installed"; exit 1 }
+    want="$(git -C "$repo" rev-parse --verify --quiet "$base:$prefix/skill/$rel")" || {
+      print -u2 "offbox: --only=$rel does not exist at $since"; exit 1 }
+    # A file already at this tree's version is done (a re-run, or a run resumed after a failed write).
+    cmp -s "$here/skill/$rel" "$installed" && continue
+    [[ "$(git -C "$repo" hash-object --no-filters "$installed")" == "$want" ]] || {
+      print -u2 "offbox: the installed $rel is not the $since version; a selective install would carry other changes with it. Nothing was written."; exit 1 }
+  done
+  print "offbox: selective install of ${#only} file(s), commits ${base[1,10]}..$(git -C "$repo" rev-parse --short=10 HEAD):"
+  git -C "$repo" log --format='  %h %s' "$base..HEAD" -- "${only[@]/#/$prefix/skill/}"
+  backup="$HOME/.local/share/offbox/backups/only-$(date -u +%Y%m%dT%H%M%SZ)"
+  changed=0
+  for rel in "${only[@]}"; do
+    if cmp -s "$here/skill/$rel" "$skill/$rel"; then
+      print "same $rel"
+      continue
+    fi
+    print "update $rel"
+    changed=$(( changed + 1 ))
+    (( ${#dry} )) && continue
+    mkdir -p "$backup/${rel:h}"
+    cp -p "$skill/$rel" "$backup/$rel"
+    staging=$(mktemp "$skill/$rel.XXXXXX")
+    cp -p "$here/skill/$rel" "$staging" && mv -f "$staging" "$skill/$rel" || {
+      rm -f "$staging"
+      print -u2 "offbox: could not write $rel; files listed above it were updated, run the same command again"; exit 1 }
+  done
+  (( ${#dry} || changed == 0 )) || print "offbox: previous copies are in $backup"
+  rest="$(rsync -rlp --checksum --dry-run --delete --itemize-changes "${excludes[@]}" "$here/skill/" "$skill/" | grep -c '^[<>*]' || true)"
+  (( ${#dry} )) && rest=$(( rest - changed ))
+  print "offbox: $rest other installed skill file(s) still differ from this tree and were not touched."
+  exit 0
+fi
 
 # Fail on missing late inputs before the watched batch can replace anything.
 [[ -d "$here/skill" ]] || { print -u2 "offbox: missing source directory: $here/skill"; exit 1 }

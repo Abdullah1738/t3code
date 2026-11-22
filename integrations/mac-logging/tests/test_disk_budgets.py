@@ -423,6 +423,7 @@ class BudgetTests(unittest.TestCase):
                 if failing:
                     raise OSError('inventory unavailable')
             with self.subTest(failing=failing), patch.object(collector, 'missing_day'), \
+                 patch.object(collector, 'homebrew_integrity'), \
                  patch.object(collector, 'collect'), patch.object(collector, 'disk_wait'), \
                  patch.object(collector, 'disk_tooling_probe'), \
                  patch.object(collector, 'directory_inventory', side_effect=inventory), \
@@ -431,7 +432,8 @@ class BudgetTests(unittest.TestCase):
             self.assertEqual(order, ['inventory', 'budget'])
 
     def test_real_daily_du_then_hourly_event_from_persisted_cache(self):
-        (self.path/'payload').write_bytes(b'X'*1024**2)
+        # du reports allocated bytes; repeated text compresses to a few KiB on ZFS.
+        (self.path/'payload').write_bytes(os.urandom(1024**2))
         measured = []
         def run(command, **kwargs):
             result = subprocess.run(command, **kwargs)

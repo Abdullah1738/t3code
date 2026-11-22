@@ -68,10 +68,12 @@ VALIDATE_CHECK_IDS = {
 # escaping this span (not a failing subprocess's returncode). Historical rows
 # without these fields remain valid. Exception text and traceback paths stay out.
 ERROR_SCHEMA = {'exceptionClass': 'identifier', 'exitCode': 'exit_code', 'stage': 'function'}
-ENDPOINT_SCHEMA = {'httpStatus': 'status', 'rawCount': int, 'keptCount': int, 'fetchComplete': bool,
+SYNC_PHASES = ('refreshMs', 'sleep.fetchMs', 'recovery.fetchMs', 'cycle.fetchMs', 'body.fetchMs', 'writeMs')
+ENDPOINT_SCHEMA = {'fetchMs': int, 'httpStatus': 'status', 'rawCount': int, 'keptCount': int, 'fetchComplete': bool,
                    'scoreStates': {k: int for k in ('SCORED', 'PENDING_SCORE', 'UNSCORABLE', 'OTHER')},
                    'newestRecordEnd': 'iso', 'newestScoredRecordEnd': 'iso', 'tokenExpiresInS': 'seconds'}
-AUTH_SCHEMA = {'authStage': {'token_load', 'token_refresh', 'api_fetch'},
+AUTH_SCHEMA = {'refreshRetried': bool, 'refreshOutcome': {'refreshed', 'retried_refreshed', 'reauth_needed', 'error'},
+               'authStage': {'token_load', 'token_refresh', 'api_fetch'},
                'authSource': {'keychain', 'file', 'env'}, 'refreshHttpStatus': 'status',
                'apiHttpStatus': 'status', 'oauthError': 'oauth_code', 'attempt': int, 'retried': bool}
 SCHEMAS = {
@@ -85,7 +87,7 @@ SCHEMAS = {
                 'argc': int, 'rejected': 'rejected', **AUTH_SCHEMA},
     'watcher.run': {'trigger': 'trigger', 'scheduledAt': 'optional_iso',
                     'startLagMs': 'lag_ms', 'hostLoad1m': 'load'},
-    'sync.run': {'trigger': 'trigger', 'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
+    'sync.run': {'trigger': 'trigger', 'refreshMs': int, 'writeMs': int, 'hostLoad1m': 'load', 'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
         'lastScoredSleep': 'iso', 'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool, 'reason': WHOOP_AUTH_REASONS, **AUTH_SCHEMA,
         **{k: ENDPOINT_SCHEMA for k in ('sleep', 'recovery', 'cycle', 'body')}},
     'sync.gap': {'count': int, 'lastSleepEnd': 'iso', 'lastRecoveryEnd': 'iso', 'gapHours': 'seconds'},
@@ -443,6 +445,7 @@ class Span:
                 self.props['startLagMs'] = ((utcnow() - dt.datetime.fromisoformat(
                     scheduled.replace('Z', '+00:00'))).total_seconds() * 1000
                     if scheduled is not None else None)
+            if self.name in ('watcher.run', 'sync.run'):
                 # Missing load support must not suppress the span or its outcome.
                 try:
                     self.props['hostLoad1m'] = round(os.getloadavg()[0], 1)
@@ -833,6 +836,7 @@ def rollup(day=None):
         malformed = 0
         zero_sleep, last_scored = 0, None
         auth_failures, whoop_runs = Counter(), []
+        sync_phases, slow_syncs = defaultdict(list), 0
         food_errors, delivered, expected = Counter(), {}, set()
         receipt_sources = {}
         nag_latency, open_slots = [], {}
@@ -869,6 +873,14 @@ def rollup(day=None):
                             ended = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone(dubai).date() - dt.timedelta(days=1)
                             open_slots[str(ended)] = props['slotsOpen']
                     if r['name'] == 'sync.run' and component == 'whoop-sync':
+                        duration = r.get('durationMs')
+                        if type(duration) in (int, float) and math.isfinite(duration) and duration > 15000:
+                            slow_syncs += 1
+                        for phase in SYNC_PHASES:
+                            endpoint, _, field = phase.partition('.')
+                            value = props.get(endpoint, {}).get(field) if field else props.get(phase)
+                            if type(value) is int:
+                                sync_phases[phase].append(value)
                         if r.get('ok') is False and props.get('authStage') and props.get('reason') in WHOOP_AUTH_REASONS:
                             auth_failures[(props['authStage'], props['reason'])] += 1
                         stamp = iso_stamp(r.get('ts'))
@@ -936,6 +948,11 @@ def rollup(day=None):
                   'components': {component: _run_summary(run_times[component], start, end, intervals.get(component))
                                  for component in sorted(set(run_times) | set(intervals))},
                   'whoop': {'lastScoredSleep': last_scored, 'zeroSleepRuns': zero_sleep,
+                            'syncPhaseMs': {phase: {'p50': _percentile(sorted(sync_phases[phase]), .5) if sync_phases[phase] else None,
+                                                   'p95': _percentile(sorted(sync_phases[phase]), .95) if sync_phases[phase] else None,
+                                                   'max': max(sync_phases[phase]) if sync_phases[phase] else None}
+                                            for phase in SYNC_PHASES},
+                            'slowSyncs': slow_syncs,
                             'authFailures': [{'authStage': stage, 'reason': reason, 'count': count}
                                              for (stage, reason), count in sorted(auth_failures.items())],
                             'consecutiveFailures': max_consecutive},

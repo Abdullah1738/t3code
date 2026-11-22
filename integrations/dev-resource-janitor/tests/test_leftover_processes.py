@@ -41,6 +41,153 @@ OPAQUE_RELATIVE_TOKENS = [
 
 
 class ProcessTests(JanitorTestCase):
+    def test_mcp_summary_counts_rss_parent_chains_and_unknown_verdict(self):
+        def row(pid, ppid, args, rss):
+            return dict(pid=pid, ppid=ppid, start='old', tty='??', args=args, rss_kib=rss)
+        rows = {r['pid']: r for r in (
+            row(1, 0, '/sbin/launchd', 1), row(10, 1, '/bin/codex app-server', 100),
+            row(11, 1, '/bin/claude --session-id private', 100), row(12, 1, '/bin/opencode serve', 100),
+            row(13, 10, '/bin/sh wrapper.sh', 1), row(14, 1, '/bin/unrelated', 1),
+            row(20, 13, 'cua-driver mcp --token secret-value', 1024),
+            row(21, 11, 'node /private/path/perplexity-mcp/server.js', 2048),
+            row(22, 12, 'node /private/path/dia-agent-bridge/server.js', 4096),
+            row(23, 1, 'node /private/path/other-mcp/server.js', 512),
+            row(24, 14, 'cua-driver mcp', 256))}
+        report = lp.detect(rows, {}, {}, ROSTER, inspect=lambda r: DETAILS, resolve=lambda b: None)
+        summary = report['mcp_summary']
+        self.assertEqual(summary['families'], {
+            'cua-driver': dict(count=2, rss_kib=1280, rss_unavailable=0),
+            'perplexity': dict(count=1, rss_kib=2048, rss_unavailable=0),
+            'dia-bridge': dict(count=1, rss_kib=4096, rss_unavailable=0),
+            'other-mcp': dict(count=1, rss_kib=512, rss_unavailable=0)})
+        self.assertEqual(summary['parent_kinds'], {kind: 1 for kind in
+            ('codex-app-server', 'claude-cli', 'opencode-serve', 'ppid-1', 'other')})
+        self.assertEqual(summary['keep_reasons'], {'unknown_owner': 4, 'unproven_process': 1})
+        self.assertEqual(summary['unknown_owner'], 4)
+        self.assertEqual(summary['verdict'], 'unverified')
+        self.assertTrue(summary['report_only'])
+        self.assertEqual(summary['candidates'], 0)
+        for private in ('secret-value', '/private/path', 'wrapper.sh', 'session-id', 'command'):
+            self.assertNotIn(private, json.dumps(summary))
+        print('MCP_SUMMARY_SAMPLE=' + json.dumps(summary, sort_keys=True))
+
+    def test_summary_failure_clean_budget_and_liveness_matrix(self):
+        rows = lp.parse_ps(PS)
+        rows[91129]['args'] = 'cua-driver mcp'
+        for label, kwargs, verdict, reason in (
+                ('protected', {'keep': ['cua-driver']}, 'clean', 'keep_file'),
+                ('unknown', {'resolve': lambda b: None}, 'unverified', 'unknown_owner'),
+                ('failure', {'inspect': lambda r: (_ for _ in ()).throw(RuntimeError('password=private'))},
+                 'unverified', 'observation_unavailable'),
+                ('budget', {'deadline': -1}, 'unverified', 'observation_budget_exhausted'),
+                ('liveness', {'roster': {**ROSTER, 'complete': False, 'problems': ['private']}},
+                 'unverified', 'liveness_unavailable')):
+            params = dict(rows=rows, memory={}, labels={}, roster=ROSTER,
+                          inspect=lambda r: DETAILS, resolve=lambda b: None)
+            params.update(kwargs)
+            with self.subTest(label=label):
+                report = lp.detect(**params)
+                summary = report['mcp_summary']
+                self.assertEqual(summary['verdict'], verdict)
+                self.assertEqual(summary['keep_reasons'], {reason: 1})
+                self.assertEqual(summary['observation_unavailable'], int(label == 'failure'))
+                self.assertEqual(summary['families']['cua-driver']['rss_unavailable'], 1)
+                self.assertNotIn('private', json.dumps(summary))
+        self.assertEqual(lp.detect({}, {}, {}, ROSTER)['mcp_summary']['verdict'], 'clean')
+
+    def test_summary_protected_services_and_verified_candidates_keep_existing_labels(self):
+        for command, reason, count in (
+                ('cua-driver serve --port 8800', 'shared_service', 0),
+                ('cua-driver mcp', None, 1)):
+            rows = lp.parse_ps(PS)
+            rows[91129].update(args=command, rss_kib=1024)
+            report = self.detect(rows=rows)
+            summary = report['mcp_summary']
+            self.assertEqual(summary['families']['cua-driver']['count'], 1)
+            self.assertEqual(summary['keep_reasons'], {reason: 1} if reason else {})
+            self.assertEqual(summary['candidates'], count)
+            self.assertEqual(len(report['candidates']), count)
+            self.assertEqual(summary['verdict'], 'clean')
+
+    def test_summary_family_command_forms_do_not_count_dia_guard_or_flag_mentions(self):
+        forms = [
+            ('/usr/bin/cua-driver mcp', 'cua-driver'),
+            ('cua-driver serve --port 8800', 'cua-driver'),
+            ('node /package/perplexity-mcp/dist/index.js', 'perplexity'),
+            ('node /package/@perplexity-ai/mcp-server/dist/index.js', 'perplexity'),
+            ('node --max-semi-space-size=1 /package/dia-agent-bridge/src/server.js', 'dia-bridge'),
+            ('node /package/dia-mcp/dist/index.js', 'dia-bridge'),
+            ('node /package/dia-agent-bridge/src/log-launcher.js guard', None),
+            ('node /package/dia-agent-bridge/src/guard.js', None),
+            ('node ordinary.js --name perplexity-mcp', None),
+            ('node ordinary.js --note "cua-driver mcp"', None),
+            ('node /package/other-mcp/server.js', 'other-mcp'),
+            ('npx -y @example/mcp-server', 'other-mcp'),
+            ('"unterminated', None),
+        ]
+        for command, expected in forms:
+            with self.subTest(command=command):
+                self.assertEqual(lp.mcp_family(command), expected)
+
+    def test_inventory_failure_summary_is_explicit_and_has_no_exception_text(self):
+        with patch.object(lp, 'processes', side_effect=RuntimeError('secret-value')):
+            report = lp.scan(ROSTER)
+        summary = report['mcp_summary']
+        self.assertFalse(summary['ok'])
+        self.assertTrue(summary['report_only'])
+        self.assertEqual(summary['verdict'], 'unverified')
+        self.assertEqual(summary['reason'], 'process_inventory_unavailable')
+        self.assertNotIn('secret-value', json.dumps(summary))
+        self.assertIn('inventory', report['phase_ms'])
+
+    def test_verdict_matrix_for_every_keep_reason(self):
+        clean = ['tty', 'launchd_registered', 'application', 'shared_service', 'keep_file',
+                 'owner_deleted', 'owner_has_work_or_not_ended', 'connected_client', 'idle_grace']
+        unverified = ['unknown_owner', 'observation_unavailable: RuntimeError: private',
+                      'observation_budget_exhausted', 'liveness_unavailable', 'unproven_process',
+                      'memory_unavailable', 'parent_chain_incomplete', 'changed_before_report']
+        for reasons, verdict in ((clean, 'clean'), (unverified, 'unverified')):
+            for reason in reasons:
+                with self.subTest(reason=reason):
+                    inventory = [dict(mcp_family='cua-driver', parent_kind='other', rss_kib=1024,
+                                      candidate=False, keep_reason=reason)]
+                    report = dict(inventory=inventory, problems=[], owner_calls=lp.owner_call_summary({}))
+                    summary = lp.mcp_summary(report)
+                    self.assertEqual(summary['verdict'], verdict)
+                    self.assertEqual(summary['keep_reasons'], {reason.split(':', 1)[0]: 1})
+                    self.assertNotIn('private', json.dumps(summary))
+
+    def test_incomplete_final_observations_are_unverified_in_detect(self):
+        rows = lp.parse_ps(PS)
+        rows[91129]['args'] = 'cua-driver mcp'
+        for mode in ('memory_unavailable', 'parent_chain_incomplete', 'changed_before_report'):
+            params = dict(rows=rows, memory=lp.parse_top(TOP), labels={}, roster=ROSTER,
+                          inspect=lambda row: copy.deepcopy(DETAILS), resolve=lambda b: copy.deepcopy(OWNER),
+                          refresh=lambda pid: {pid: {**rows[pid], 'start': 'changed'}},
+                          refresh_roster=lambda: ROSTER, now=1794787200)
+            if mode == 'memory_unavailable':
+                params['memory'] = {}
+            elif mode == 'parent_chain_incomplete':
+                params['rows'] = {91129: rows[91129]}
+            with self.subTest(mode=mode):
+                report = lp.detect(**params)
+                self.assertEqual(report['inventory'][0]['keep_reason'], mode)
+                self.assertEqual(report['mcp_summary']['verdict'], 'unverified')
+                self.assertEqual(report['candidates'], [])
+
+    def test_existing_ps_call_carries_rss_without_using_it_as_identity(self):
+        raw = PS.replace('?? /', '?? 4096 /')
+        with patch.object(lp, 'run', return_value=raw) as run:
+            rows = lp.processes()
+        self.assertIn('rss=', run.call_args.args[0][-1])
+        self.assertEqual(rows[91129]['rss_kib'], 4096)
+        report = lp.detect(rows, lp.parse_top(TOP), {}, ROSTER,
+                           inspect=lambda r: copy.deepcopy(DETAILS), resolve=lambda b: copy.deepcopy(OWNER),
+                           refresh=lambda pid: {pid: {**rows[pid], 'rss_kib': 8192}},
+                           refresh_roster=lambda: ROSTER, now=1794787200)
+        self.assertEqual(len(report['candidates']), 1)
+        self.assertTrue(report['report_only'])
+
     def detect(self, rows=None, roster=None, owner=None, details=None, **kwargs):
         rows = lp.parse_ps(PS) if rows is None else rows
         return lp.detect(rows, lp.parse_top(TOP), {}, ROSTER if roster is None else roster,
@@ -466,7 +613,7 @@ class ProcessTests(JanitorTestCase):
             return status, body
         rows = {pid: {'pid': pid, 'ppid': 1, 'start': 'old', 'tty': '??',
                       'args': 'python3 -m http.server'} for pid in range(20, 27)}
-        with patch.object(lp.time, 'perf_counter', side_effect=lambda: clock[0]), \
+        with patch.object(lp.time, 'monotonic', side_effect=lambda: clock[0]), \
                 patch.object(lp.active_sessions, '_control_get', side_effect=api):
             report = lp.detect(rows, {}, {}, ROSTER, keep=[DETAILS['cwd']],
                 inspect=lambda row: {**DETAILS, 'binding': {'CODEX_THREAD_ID': str(row['pid'])}})
@@ -476,6 +623,8 @@ class ProcessTests(JanitorTestCase):
             'detail': dict(count=4, p50_ms=200, p95_ms=400, max_ms=400, failures={'503': 1}),
             'recovery': dict(count=3, p50_ms=2000, p95_ms=3000, max_ms=3000, failures={'0': 1}),
         })
+        self.assertEqual(report['mcp_summary']['owner_calls'], report['owner_calls'])
+        self.assertEqual(report['phase_ms']['owner_recovery'], 6000)
         self.assertEqual(report['candidates'], [])
 
     def test_owner_call_metrics_are_per_scan_and_include_only_actual_cached_calls(self):
@@ -491,7 +640,7 @@ class ProcessTests(JanitorTestCase):
 
     def test_owner_call_exception_is_counted_as_status_zero(self):
         with patch.object(lp.active_sessions, '_control_get', side_effect=OSError('unavailable')), \
-                patch.object(lp.time, 'perf_counter', side_effect=[0, .025]):
+                patch.object(lp.time, 'monotonic', side_effect=[0, .025]):
             report = lp.detect(lp.parse_ps(PS), {}, {}, ROSTER, inspect=lambda row: DETAILS)
         self.assertEqual(report['owner_calls']['by_native'],
                          dict(count=1, p50_ms=25, p95_ms=25, max_ms=25, failures={'0': 1}))
@@ -569,17 +718,20 @@ class ProcessTests(JanitorTestCase):
             cursor = report['next_cursor']
         self.assertEqual(runs, [[20, 40], [50, 30], [20, 40], [50, 30]])
 
-    def test_signal_primitive_is_only_in_opt_in_stop_and_deletion_stays_forbidden(self):
+    def test_signal_primitive_is_only_in_guarded_reapers_and_deletion_stays_forbidden(self):
         import ast
         tree = ast.parse(Path(lp.__file__).read_text())
         forbidden = {'kill', 'killpg', 'unlink', 'remove', 'rmdir', 'rmtree'}
-        stop = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'stop_xcode_builds')
-        send_default = stop.args.kw_defaults[stop.args.kwonlyargs.index(
-            next(arg for arg in stop.args.kwonlyargs if arg.arg == 'send'))]
-        self.assertIsInstance(send_default, ast.Attribute)
-        self.assertEqual(ast.unparse(send_default), 'os.kill')
+        allowed = []
+        for name in ('stop_xcode_builds', 'reap_mcp_orphans'):
+            stop = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+            send_default = stop.args.kw_defaults[stop.args.kwonlyargs.index(
+                next(arg for arg in stop.args.kwonlyargs if arg.arg == 'send'))]
+            self.assertIsInstance(send_default, ast.Attribute)
+            self.assertEqual(ast.unparse(send_default), 'os.kill')
+            allowed.append(send_default)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute) and node is not send_default:
+            if isinstance(node, ast.Attribute) and node not in allowed:
                 self.assertNotIn(node.attr, forbidden)
 
 
