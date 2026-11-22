@@ -1541,6 +1541,7 @@ def renewal_case(data, notice, source, now=None, end=None, include_existing=Fals
 def merchant_dead():
     """Read the shared registry; a failed/old CLI must never resolve existing cases."""
     try:
+        run_history.observe(charges.TIMING_STATS.get(), 'merchants_calls')
         result = subprocess.run([os.environ.get('CARD_STATUS_CLI', 'card-status'), 'merchant', 'dead', '--json'],
                                 capture_output=True, text=True, timeout=4, check=True)
         rows = json.loads(result.stdout)
@@ -2699,6 +2700,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             # Old questions query separate windows; all windows share this cap.
             remaining = charges.OWNER_BUDGET - stats.get('owner_threads_ms', 0) / 1000
             if remaining <= 0:
+                run_history.observe(stats, 'budget_stop_reason', 'owner_budget')
                 raise charges.Lookup('Robob control: lookup over time')
             stop = time.time() + remaining
             if kwargs.get('deadline') is not None:
@@ -2717,6 +2719,8 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                 source_error = exc
             raise
     charge_times = [at for _, at, q in todo if q.get('kind') == 'charge']
+    # Candidates resolved by existing evidence below do not need a receipt lookup.
+    run_history.observe(stats, 'receipt_eligible', len(charge_times))
     owner_rows = None
     owner_error = None
     if charge_times:
@@ -2732,6 +2736,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             # These exceptions identify our owner deadline without relying on that sample.
             if isinstance(e, LookupTimeout) or str(e) == 'Robob control: lookup over time':
                 stats['starved_by'] = 'owner_threads'
+                run_history.observe(stats, 'budget_stop_reason', 'owner_budget')
             owner_error = f'his threads: {e}'
             errors.append(owner_error)
             owner_rows = []
@@ -2842,6 +2847,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                           'owner_incomplete' if owner_error else 'receipt_not_checked')
                 if hit:
                     hits[q['id']] = hit
+                    run_history.observe(stats, 'receipt_eligible', delta=-1)
             except charges.SourceLimit as exc:
                 outcome = 'limited'
                 order_limits[q['id']] = {'why': str(exc), 'kinds': exc.kinds, 'reason': exc.reason}
@@ -2871,6 +2877,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             continue
         # A shortened tail attempt can fail at the same point every cycle.
         if deadline is not None and deadline - time.time() < FOLLOW_EACH:
+            run_history.observe(stats, 'budget_stop_reason', 'follow_deadline')
             errors.append('out of time; the rest next check')
             break
         commit_end = deadline
@@ -2885,6 +2892,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         before_errors = len(errors)
         limits, reasons = [], []
         if q.get('kind') == 'charge':
+            run_history.observe(stats, 'questions_calls')
             # Start the full slice after the cursor commit. The phase deadline admits
             # work; the enclosing whole-check alarm still bounds storage and lookups.
             each = time.time() + FOLLOW_EACH
@@ -2896,6 +2904,8 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                     shared = alert_verdict(transactions, q, now)
                     hit = shared if shared and shared['verdict'] in ('receipt', 'owner', 'subscription') else None
                     hit = hit or matched or purchase_match(data, charge, at, q['id'])
+                    if hit:
+                        run_history.observe(stats, 'receipt_eligible', delta=-1)
                     receipt_ok = receipt_for_question(data, charge, q['id'], questions, at)
                     if not hit and active(q) and not q.get('case') and now - at >= UNMATCHED_AFTER \
                             and charges.card_owner(charge) == 'abdullah':
@@ -3492,11 +3502,13 @@ def follow_order_charges(data, now, deadline, find=None, stats=None, end=None, r
         if case and not active(case):
             continue
         if time.time() + 1 >= deadline:
+            run_history.observe(stats, 'budget_stop_reason', 'order_charges_deadline')
             break
         proof = None
         try:
             each = min(deadline, time.time() + 4)
             with within(each, LookupTimeout('order charge lookup out of time')):
+                run_history.observe(stats, 'order_charges_calls')
                 peers = [dict(other, bank_confirmed_at=(settled.get(key, {}).get('confirmed') or {}).get('at'))
                          for key, other in orders.items()]
                 proof = order_charges.matching_charge(cfg, now, source, reader, each, charges, peers)
@@ -3566,6 +3578,8 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
 
 
 def _scoped_run_check(wd, run, data, root, now, find, said, stats, marketplace_refresh, started):
+    for key in ('merchants_calls', 'order_charges_calls', 'questions_calls'):
+        run_history.observe(stats, key, 0)
     diagnostic = {'budgetHit': False, 'openCases': 0, 'fired': 0, 'ok': False,
                   'slowest': 'reconcile', 'started': started, 'stats': stats}
     try:
@@ -3685,6 +3699,8 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                 state.pop('question_errors', None)
             limits = stats.get('question_limits', [])
             if limits:
+                if stats.get('budget_stop_reason') is None:
+                    run_history.observe(stats, 'budget_stop_reason', 'source_limit')
                 state['question_limits'] = {'at': stamp(now), 'limits': [l['why'] for l in limits][:10]}
             else:
                 state.pop('question_limits', None)
@@ -3794,6 +3810,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
     except CheckTimeout as e:
         diagnostic['budgetHit'] = time.time() >= work_end
         if diagnostic['budgetHit']:
+            run_history.observe(stats, 'budget_stop_reason', 'check_deadline')
             stats['starved_by'] = getattr(e, '_money_cases_step', phase)
         errors = state.setdefault('question_errors', {'at': stamp(now), 'errors': []})['errors']
         errors.append(str(e))
@@ -3830,6 +3847,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
         already_expired = diagnostic['budgetHit']
         diagnostic['budgetHit'] = already_expired or time.time() >= end
         if time.time() >= end and (save_at < end or not already_expired):
+            run_history.observe(stats, 'budget_stop_reason', 'check_deadline')
             stats['starved_by'] = getattr(exc, '_money_cases_step', 'build_write')
         # The old pings file is intact; never emit an event without its committed outbox.
         event = ''
@@ -4101,6 +4119,10 @@ def main(argv=None):
     p = sub.add_parser('runs')
     p.add_argument('--since', default='24h')
     p.add_argument('--json', action='store_true')
+    p = sub.add_parser('health', help='daily check health (UTC)')
+    p.add_argument('--day', metavar='YYYY-MM-DD')
+    p.add_argument('--json', action='store_true', help='JSON only')
+    p.add_argument('--one-line', action='store_true')
     p = sub.add_parser('note-purchase')
     for field in ('merchant', 'amount', 'currency', 'card', 'asked-by', 'thread'):
         p.add_argument('--' + field, required=True)
@@ -4131,7 +4153,20 @@ def main(argv=None):
     mode.add_argument('--ask', action='store_true')
     args = parser.parse_args(argv)
     try:
-        if args.command == 'runs':
+        if args.command == 'health':
+            try:
+                result = run_history.health(Path(os.environ.get('WATCH_DIR', LIVE)), args.day)
+            except BlockingIOError as exc:
+                raise CaseError('run history busy; try again') from exc
+            except (ValueError, OverflowError) as exc:
+                raise CaseError('invalid --day: use YYYY-MM-DD (UTC)') from exc
+            if args.one_line:
+                print(result['one_line'])
+            else:
+                print(json.dumps(result, indent=2))
+                if not args.json:
+                    print(run_history.format_health(result))
+        elif args.command == 'runs':
             try:
                 result = run_history.summary(Path(os.environ.get('WATCH_DIR', LIVE)), args.since)
             except BlockingIOError as exc:

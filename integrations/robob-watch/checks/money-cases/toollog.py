@@ -1049,6 +1049,14 @@ def rollup(day=None):
             for merchant, poll in sorted(poll_counts.items())}
         _private_directory(folder)
         target = folder / ('rollup-' + day + '.json')
+        try:
+            health = json.loads(target.read_text()).get('moneyCasesHealth')
+            # The shared nightly reader owns this extension; automatic order polls
+            # must retain it when they refresh the same day's base rollup.
+            if isinstance(health, dict) and health.get('day') == day and isinstance(health.get('one_line'), str):
+                result['moneyCasesHealth'] = health
+        except (OSError, ValueError, AttributeError):
+            pass
         fd, temporary = tempfile.mkstemp(prefix='.rollup-', dir=folder)
         try:
             with os.fdopen(fd, 'w') as out:
