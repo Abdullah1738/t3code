@@ -125,6 +125,9 @@ test.each(["main.ts", "sb-main.ts"].flatMap(file => [false, true].flatMap(restar
   h.backend.messages = async () => { backendCalls++; return []; };
   const errors: unknown[] = [], checks: Promise<void>[] = [];
   const backendWork = async () => { backendCalls++; };
+  class MarkerBackend {
+    async beginMessageTick(_ids: string[]) { backendCalls++; }
+  }
   const clock = {
     checkInboundLatency: (...args: Parameters<Router["checkInboundLatency"]>) => {
       const check = router.checkInboundLatency(...args); checks.push(check); return check;
@@ -140,12 +143,12 @@ test.each(["main.ts", "sb-main.ts"].flatMap(file => [false, true].flatMap(restar
   expect(begin).toBeGreaterThan(0); expect(end).toBeGreaterThan(begin);
   let fire: (() => void) | undefined;
   const interval = new Bun.Transpiler({ loader: "ts" }).transformSync(source.slice(begin, end + "  }, 1_000);".length));
-  const install = new Function("setInterval", "ready", "router", "delivery", "replyGap", "chats", "toolError", "log",
+  const install = new Function("setInterval", "ready", "router", "delivery", "replyGap", "chats", "toolError", "log", "store", "backend", "RobobBackend",
     `let routerBusy = true;\n${interval}`);
   let ready = initiallyReady;
   install((callback: () => void, ms: number) => { expect(ms).toBe(1_000); fire = callback; }, () => ready,
-    clock, delivery, replyGap, { all: () => [{ parts: { router: clock, delivery, replyGap, busy: true } }] },
-    (...args: unknown[]) => errors.push(args), (...args: unknown[]) => errors.push(args));
+    clock, delivery, replyGap, { all: () => [{ store: h.store, parts: { router: clock, delivery, replyGap, busy: true } }] },
+    (...args: unknown[]) => errors.push(args), (...args: unknown[]) => errors.push(args), h.store, new MarkerBackend(), MarkerBackend);
   fire!(); await Promise.all(checks.splice(0));
   backendCalls = 0; ready = false;
   const logs = await captureLogs(async () => {
