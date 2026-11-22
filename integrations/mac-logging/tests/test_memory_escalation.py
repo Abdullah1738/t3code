@@ -177,12 +177,50 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual(len(self.state['alerts']['footprint']['holders']),2)
 
     def test_timeout_gap_preserves_streak_without_inventing_observation(self):
-        for i in range(6):self.observe(1000+300*i,4+i*.15)
-        p=dict(boot=1,top=None,topError='timeout',watched=[],countsError=None)
-        memory.process_growth(p,self.state,2800)
-        self.assertEqual(p['growth'],[])
-        self.assertTrue(self.state['processGrowth']['61946']['gap'])
-        self.assertEqual(len(memory.growth_candidates(self.observe(3100,5.05))),1)
+        for tracker, key in ((memory.process_growth, 'processGrowth'),
+                             (memory.fseventsd_growth, 'fseventsdGrowth')):
+            for top_error, counts_error in (('timeout', None), ('timeout', 'timeout'), (None, 'timeout')):
+                with self.subTest(tracker=key, topError=top_error, countsError=counts_error):
+                    state = {}
+                    for i in range(6):
+                        p = self.props(4+i*.15)
+                        p['top'][0]['command'] = 'fseventsd'
+                        tracker(p, state, 1000+300*i)
+                    old = dict(state[key]['61946'])
+                    p = dict(boot=1, top=None if top_error else [dict(pid=61946, command='fseventsd', memMb=5100)],
+                             topError=top_error, countsError=counts_error, watched=None)
+                    tracker(p, state, 2800)
+                    self.assertEqual(state[key]['61946'], dict(old, gap=True))
+                    self.assertEqual(memory.growth_candidates(p), [])
+                    if key == 'fseventsdGrowth':
+                        self.assertEqual(p['fseventsdGrowthSamples'], 0)
+                    p = self.props(5.05)
+                    p['top'][0]['command'] = 'fseventsd'
+                    tracker(p, state, 3100)
+                    self.assertEqual(state[key]['61946']['consecutive'], 6)
+                    self.assertEqual(state[key]['61946']['since'], 1000)
+                    self.assertFalse(state[key]['61946']['gap'])
+                    if key == 'processGrowth':
+                        self.assertEqual(len(memory.growth_candidates(p)), 1)
+
+    def test_timeout_gap_expires_and_does_not_cross_boot_or_birth(self):
+        for tracker, key in ((memory.process_growth, 'processGrowth'),
+                             (memory.fseventsd_growth, 'fseventsdGrowth')):
+            for reset in ('expired', 'boot', 'birth'):
+                with self.subTest(tracker=key, reset=reset):
+                    state = {}
+                    for i in range(6):
+                        p = self.props(4+i*.15)
+                        p['top'][0]['command'] = 'fseventsd'
+                        tracker(p, state, 1000+300*i)
+                    p = dict(boot=2 if reset=='boot' else 1, top=None, topError='timeout', countsError='timeout')
+                    tracker(p, state, 3701 if reset=='expired' else 2800)
+                    if reset != 'birth':
+                        self.assertEqual(state[key], {})
+                    p = self.props(6, start='Thu Nov 19 03:30:00 2026' if reset=='birth' else START)
+                    p['top'][0]['command'] = 'fseventsd'
+                    tracker(p, state, 4001 if reset=='expired' else 3100)
+                    self.assertEqual(state[key]['61946']['consecutive'], 0)
 
     def test_ambiguous_retry_retains_payload_and_measurement(self):
         first=[]
@@ -226,8 +264,13 @@ class EscalationTests(unittest.TestCase):
         for row in fixture['rows']:
             now=dt.datetime.fromisoformat(row['ts'].replace('Z','+00:00')).timestamp()
             p=dict(boot=row['boot'],top=[dict(row['holder'],start=START)] if row['holder'] else None,
-                   topError=row['topError'],countsError=None,swap=row['swap'],vm=row['vm'])
+                   topError=row['topError'],countsError=row['countsError'],swap=row['swap'],vm=row['vm'])
+            old = json.loads(json.dumps(self.state.get('processGrowth', {})))
             memory.process_growth(p,self.state,now)
+            if row['topError']=='timeout' and row['countsError']=='timeout' and old:
+                # The 13:58 timeout is already >20 min past the last measurement.
+                retained = {pid: dict(h, gap=True) for pid,h in old.items() if 0 < now-h['at'] <= 1200}
+                self.assertEqual(self.state['processGrowth'], retained)
             memory.alerts(p,self.state,now,self.runner)
             events.extend((now,e) for e in self.events()[len(events):])
         growth=[(at,p) for at,p in events if p['reason']=='growth']
@@ -244,6 +287,71 @@ class EscalationTests(unittest.TestCase):
 
 
 class FallbackTests(unittest.TestCase):
+    def test_dual_timeout_probes_three_holders_and_attributes_alert(self):
+        helper = legacy.MemoryTests()
+        helper.setUp()
+        self.addCleanup(helper.doCleanups)
+        base = helper.runner(fail='/usr/bin/top', swap='total = 4096M used = 100M')
+        calls = []
+        def run(argv, **kw):
+            if argv[:2] == ['/bin/ps', '-axo']:
+                raise subprocess.TimeoutExpired(argv, kw['timeout'])
+            if argv[:2] == ['/bin/ps', '-p'] or argv[0] == '/usr/bin/footprint':
+                self.assertEqual(kw['timeout'], 5)
+                self.assertNotIn('BUN_INSPECT', kw['env'])
+                calls.append(argv)
+                return SimpleNamespace(returncode=0, stdout=START+'\n' if argv[0]=='/bin/ps' else
+                                       '    phys_footprint: 13958643712 B\n')
+            return base(argv, **kw)
+        previous = dict(boot=100, holders=[dict(pid=i, start=START, command='Activity Monitor') for i in range(1, 5)])
+        p, baseline = memory.collect(run, previous, 1000)
+        self.assertEqual((p['topError'], p['countsError']), ('timeout', 'timeout'))
+        self.assertEqual([r['pid'] for r in p['fallback']], [1, 2, 3])
+        self.assertTrue(all(r['memMb']==13*1024 and r['error'] is None for r in p['fallback']))
+        self.assertEqual([a[0] for a in calls], ['/bin/ps', '/usr/bin/footprint', '/bin/ps']*3)
+        self.assertEqual(baseline['holders'], previous['holders'])
+        memory.alerts(p, {}, 1000, helper.runner())
+        alert = helper.rows('memory.alert')[-1]['props']
+        self.assertEqual((alert['reason'], alert['pid'], alert['footprintGiB'], alert['fallback']),
+                         ('footprint', 1, 13, True))
+        calls.clear()
+        memory.collect(run, dict(previous, boot=200), 1300)
+        self.assertEqual(calls, [])
+
+    def test_dual_timeout_failed_birth_or_footprint_cannot_supply_measurement(self):
+        helper = legacy.MemoryTests()
+        helper.setUp()
+        self.addCleanup(helper.doCleanups)
+        base = helper.runner(fail='/usr/bin/top')
+        for stage in ('before', 'footprint', 'after'):
+            for failure in ('timeout', 'unavailable', 'exit', 'parse', 'reuse'):
+                if stage=='footprint' and failure=='reuse':
+                    continue
+                with self.subTest(stage=stage, failure=failure):
+                    calls = []
+                    def run(argv, **kw):
+                        if argv[:2] == ['/bin/ps', '-axo']:
+                            raise subprocess.TimeoutExpired(argv, kw['timeout'])
+                        if argv[:2] == ['/bin/ps', '-p'] or argv[0] == '/usr/bin/footprint':
+                            self.assertEqual(kw['timeout'], 5)
+                            current = ('before', 'footprint', 'after')[len(calls)]
+                            calls.append(argv)
+                            if current==stage:
+                                if failure=='timeout':
+                                    raise subprocess.TimeoutExpired(argv, 5)
+                                if failure=='unavailable':
+                                    raise OSError('unavailable')
+                                return SimpleNamespace(returncode=int(failure=='exit'), stdout=
+                                    'Thu Nov 19 04:00:00 2026\n' if failure=='reuse' else 'invalid')
+                            return SimpleNamespace(returncode=0, stdout=START+'\n' if current!='footprint' else
+                                                   '    phys_footprint: 13958643712 B\n')
+                        return base(argv, **kw)
+                    p, _ = memory.collect(run, dict(boot=100, holders=[dict(pid=1, start=START, command='node')]), 1000)
+                    self.assertEqual(len(calls), ('before', 'footprint', 'after').index(stage)+1)
+                    self.assertIsNone(p['fallback'][0]['memMb'])
+                    self.assertIsNotNone(p['fallback'][0]['error'])
+                    self.assertNotIn('footprint', memory.alert_reasons(p))
+
     def test_growth_below_logged_top_list_is_tracked_from_full_snapshot(self):
         for steady_count in (1, 15, 31):
             with self.subTest(rank=steady_count+1):

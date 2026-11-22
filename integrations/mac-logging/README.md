@@ -450,6 +450,7 @@ At most512 watched PIDs are retained; excess
 is explicit in `watchedOmitted` and makes the sample partial. Each subprocess,
 including notifications, has a ten-second timeout. If top times out, up to three
 previous holders get a five-second `footprint` probe and a bounded birth recheck;
+if the full ps scan also fails, bounded per-PID birth checks bracket each probe.
 `fallback` records these outcomes. No RSS substitution is used. Failed probes are null with
 fixed `…Error` codes; watched PID failures retain null metrics per PID.
 
@@ -473,7 +474,7 @@ three five-minute samples is required; one jump does not qualify. Samples log
 `fseventsdGrowthMbPerHour`, `fseventsdGrowthSamples`, `fseventsdGrowthPid` and
 `fseventsdGrowthWindowS`. State follows each watched PID on the same boot;
 elapsed-age discontinuities, a flat/falling reading or
-a gap over ten minutes reset its streak. A timed-out top sample preserves the
+a gap over ten minutes reset its streak. A timed-out top or ps sample preserves unmeasured
 history as a gap for up to twenty minutes, without creating a new observation.
 The same tracker supplies `growth`: any holder at least4 GiB, growing above1 GiB/h
 over at least three consecutive intervals spanning30 minutes. That reason uses

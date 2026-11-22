@@ -210,12 +210,18 @@ def collect(run, previous, now):
         # Recheck birth before and after the footprint probe: a reused PID must
         # not inherit the previous holder's alarm or growth history.
         for old in (previous.get('holders') or [])[:3]:
-            p = identities.get(old.get('pid'), {})
+            p = identities.get(old.get('pid'), {}) if rows is not None else old
             if not p.get('start') or p['start'] != old.get('start'):
                 continue
-            observed = dict(pid=p['pid'], command=p['command'], start=p['start'],
-                            etime=p['etime'], memMb=None, cmprsMb=None, error=None)
+            observed = dict(pid=p['pid'], command=p.get('command', '[redacted]'), start=p['start'],
+                            memMb=None, cmprsMb=None, error=None)
+            if p.get('etime'):
+                observed['etime'] = p['etime']
             try:
+                if rows is None:
+                    birth = ' '.join(command(['/bin/ps', '-p', str(p['pid']), '-o', 'lstart='], run, 5).split())
+                    if birth != p['start']:
+                        raise ProbeError('gone')
                 text = command(['/usr/bin/footprint', '-p', str(p['pid']), '--noCategories', '-f', 'bytes'], run, 5)
                 match = re.search(r'^\s*phys_footprint:\s*(\d+)\s+B\s*$', text, re.M)
                 if not match:
@@ -282,6 +288,8 @@ def growth_history(procs, previous, boot, now, threshold, gap=False, require_sta
         old = previous.get(pid)
         old = old if isinstance(old, dict) else {}
         age = elapsed_seconds(proc['etime']) if proc.get('etime') else None
+        if not proc.get('start') and age is None:
+            continue
         interval = now-old['at'] if type(old.get('at')) in (int, float) else 0
         same_birth = (proc['start'] == old.get('start') if proc.get('start') else
                       type(age) is int and type(old.get('ageS')) is int
@@ -314,7 +322,7 @@ def holders(props):
 def fseventsd_growth(props, state, now):
     procs = [p for p in holders(props) if p['command'] == 'fseventsd']
     current, candidates = growth_history(procs, state.get('fseventsdGrowth'), props.get('boot'), now, 100,
-                                        gap=props.get('topError') == 'timeout' and not props.get('countsError'))
+                                        gap=props.get('topError') == 'timeout' or props.get('countsError') == 'timeout')
     state['fseventsdGrowth'] = current
     best = max(candidates, key=lambda p: (p['growthSamples'], p['growthMbPerHour'] or 0)) if candidates else {}
     props.update(fseventsdGrowthSamples=min(3, best.get('growthSamples', 0)), fseventsdGrowthPid=best.get('pid'),
@@ -323,7 +331,7 @@ def fseventsd_growth(props, state, now):
 
 def process_growth(props, state, now):
     current, candidates = growth_history(holders(props), state.get('processGrowth'), props.get('boot'), now, 1024,
-                                        gap=props.get('topError') == 'timeout' and not props.get('countsError'), require_start=True)
+                                        gap=props.get('topError') == 'timeout' or props.get('countsError') == 'timeout', require_start=True)
     state['processGrowth'] = current
     props['growth'] = candidates
 
