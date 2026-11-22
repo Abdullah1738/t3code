@@ -342,6 +342,7 @@ in the `x-opencode-directory` header, percent-encoded; answers come wrapped in
 The operational setup and private credential handling remain in the local
 `imessage-notifications` skill. Use `bun run check` and `bun test` from this
 directory when changing the bridge.
+The Bun version is pinned in `package.json`'s `packageManager`; bump it together with `bun.lock`.
 
 Tool-log rollups refresh at turn end, hourly, and after the UTC day changes.
 Catch rows marked `alreadyLogged: true` retain their context and request ID but count only toward row volume and `dedupedFailures`, leaving failure rates and top causes to the original request.
@@ -368,3 +369,5 @@ After 50 MB, `log.degraded` marks errors-and-turns logging for the rest of the d
 The main OpenChamber repository remains the `upstream` Git remote. This fork is
 owned by `Abdullah1738` so cumulative OpenChamber changes and the companion
 bridge can be synchronized without losing local work.
+
+The bridge alerts Telegram after its Robob link is down for two minutes, once per outage across restarts, and sends the outage duration when the link recovers.

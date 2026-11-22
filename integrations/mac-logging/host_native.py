@@ -102,10 +102,12 @@ class Native:
                     stateProcessesSkipped=skipped, stateScanPartial=partial or skipped > 0,
                     stateScanMs=(clock()-started)*1000, stateScanTimedOut=clock()-started >= budget)
 
-    def pids(self):
+    def pids(self, deadline=None, clock=time.monotonic):
         estimate = self.proc.proc_listallpids(None, 0)
         if estimate <= 0:
             raise OSError(c.get_errno(), 'process count unavailable')
+        if deadline is not None and clock() >= deadline:
+            raise TimeoutError('process inventory budget')
         capacity = estimate+256
         values = (c.c_int*capacity)()
         count = self.proc.proc_listallpids(values, c.sizeof(values))
@@ -119,6 +121,43 @@ class Native:
         if count <= 0 or count >= len(value):
             raise OSError('process name unavailable')
         return os.fsdecode(value.value)
+
+    def bsd(self, pid):
+        value = self.info(pid, 3, BsdInfo)
+        if value.pid != pid:
+            raise OSError('process identity changed')
+        return dict(pid=value.pid, ppid=value.ppid, comm=os.fsdecode(value.comm),
+                    start=(value.startSec, value.startUsec), status=value.status)
+
+    def task(self, pid):
+        value = self.info(pid, 4, TaskInfo)
+        return dict(cpuNs=value.totalUser+value.totalSystem, rssBytes=value.resident,
+                    running=value.numrunning)
+
+    def info(self, pid, flavor, layout, argument=0):
+        value = layout()
+        c.set_errno(0)
+        size = self.proc.proc_pidinfo(pid, flavor, argument, c.byref(value), c.sizeof(value))
+        if size != c.sizeof(value):
+            number = c.get_errno() if size <= 0 else 0
+            raise OSError(number or None, os.strerror(number) if number else 'process info unavailable')
+        return value
+
+    def threads(self, pid, deadline, clock=time.monotonic):
+        tids = (c.c_uint64*4096)()
+        size = self.proc.proc_pidinfo(pid, 6, 0, tids, c.sizeof(tids))
+        if size <= 0 or size >= c.sizeof(tids) or size % 8:
+            raise OSError('thread inventory incomplete')
+        rows = []
+        for tid in tids[:size//8]:
+            if clock() >= deadline:
+                return rows, False
+            try:
+                value = self.info(pid, 5, ThreadInfo, tid)
+            except OSError:
+                return rows, False
+            rows.append((value.runState, value.curpri, value.priority))
+        return rows, True
 
     def argv(self, pid):
         value, size = c.create_string_buffer(MAX_BYTES), c.c_size_t(MAX_BYTES)
@@ -134,6 +173,21 @@ class ThreadInfo(c.Structure):
     _fields_ = [('userTime', c.c_uint64), ('systemTime', c.c_uint64)]+[
         (k, c.c_int32) for k in ('cpuUsage', 'policy', 'runState', 'flags', 'sleepTime',
                                 'curpri', 'priority', 'maxpriority')]+[('name', c.c_char*64)]
+
+
+class BsdInfo(c.Structure):
+    _fields_ = [(k, c.c_uint32) for k in ('flags', 'status', 'xstatus', 'pid', 'ppid',
+        'uid', 'gid', 'ruid', 'rgid', 'svuid', 'svgid', 'reserved')]+[
+        ('comm', c.c_char*16), ('name', c.c_char*32)]+[
+        (k, c.c_uint32) for k in ('nfiles', 'pgid', 'jobc', 'tdev', 'tpgid')]+[
+        ('nice', c.c_int32), ('startSec', c.c_uint64), ('startUsec', c.c_uint64)]
+
+
+class TaskInfo(c.Structure):
+    _fields_ = [(k, c.c_uint64) for k in ('virtual', 'resident', 'totalUser', 'totalSystem',
+        'threadsUser', 'threadsSystem')]+[(k, c.c_int32) for k in ('policy', 'faults',
+        'pageins', 'cowFaults', 'messagesSent', 'messagesReceived', 'syscallsMach',
+        'syscallsUnix', 'csw', 'threadnum', 'numrunning', 'priority')]
 
 
 def vm_statistics(read, host):

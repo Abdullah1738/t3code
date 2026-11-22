@@ -110,6 +110,7 @@ class BigRootTests(unittest.TestCase):
             return collect(10000, [], lambda a,b: collector.unified(a,b,run), **kw)
         with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]), \
              patch.object(collector, 'disk_wait'), \
+             patch.object(collector, 'homebrew_integrity'), \
              patch.object(collector, 'disk_tooling_probe', side_effect=probe), \
              patch.object(collector, 'directory_inventory', side_effect=lambda **kw: inventory([self.big]+roots, run, **kw)), \
              patch.object(collector, 'collect', side_effect=crashes):
@@ -203,4 +204,4 @@ class BigRootTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout='[]', stderr='')
         collector.unified(0, 10000, run)
         cmd = commands[0]
-        self.assertEqual(cmd[cmd.index('--start')+1], '1970-01-01 01:16:40')
+        self.assertEqual(cmd[cmd.index('--start')+1], '1970-01-01 01:16:40+0000')

@@ -1,0 +1,2480 @@
+{
+  "source": "memory.sample 2026-11-19, trimmed to pid61946; start time is supplied by synthetic replay identity, not present in historical rows",
+  "rows": [
+    {
+      "ts": "2026-11-19T04:02:27.444Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 1953.0,
+        "cmprsMb": 1863.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 996817
+      }
+    },
+    {
+      "ts": "2026-11-19T04:07:32.415Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 2053.0,
+        "cmprsMb": 1965.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1084937
+      }
+    },
+    {
+      "ts": "2026-11-19T04:12:37.912Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 2148.0,
+        "cmprsMb": 2050.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 999050
+      }
+    },
+    {
+      "ts": "2026-11-19T04:17:43.864Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 2244.0,
+        "cmprsMb": 2152.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1095401
+      }
+    },
+    {
+      "ts": "2026-11-19T04:22:53.953Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 2338.0,
+        "cmprsMb": 2233.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1002211
+      }
+    },
+    {
+      "ts": "2026-11-19T04:28:10.543Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 962339
+      }
+    },
+    {
+      "ts": "2026-11-19T04:33:15.828Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 2531.0,
+        "cmprsMb": 2446.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1106406
+      }
+    },
+    {
+      "ts": "2026-11-19T04:38:21.249Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 2624.0,
+        "cmprsMb": 2527.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1065291
+      }
+    },
+    {
+      "ts": "2026-11-19T04:43:26.485Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 2718.0,
+        "cmprsMb": 2634.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1140875
+      }
+    },
+    {
+      "ts": "2026-11-19T04:48:30.717Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 2812.0,
+        "cmprsMb": 2719.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1106769
+      }
+    },
+    {
+      "ts": "2026-11-19T04:53:41.799Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 2909.0,
+        "cmprsMb": 2827.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1113651
+      }
+    },
+    {
+      "ts": "2026-11-19T04:58:47.708Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 3007.0,
+        "cmprsMb": 2914.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1115992
+      }
+    },
+    {
+      "ts": "2026-11-19T05:04:02.837Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 3108.0,
+        "cmprsMb": 3026.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1920.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1224361
+      }
+    },
+    {
+      "ts": "2026-11-19T05:09:21.529Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1912.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1463054
+      }
+    },
+    {
+      "ts": "2026-11-19T05:14:29.145Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 3312.0,
+        "cmprsMb": 3233.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1912.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1236717
+      }
+    },
+    {
+      "ts": "2026-11-19T05:19:33.907Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 3410.0,
+        "cmprsMb": 3311.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1912.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1074030
+      }
+    },
+    {
+      "ts": "2026-11-19T05:24:40.802Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 3511.0,
+        "cmprsMb": 3432.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1327591
+      }
+    },
+    {
+      "ts": "2026-11-19T05:29:45.468Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 3612.0,
+        "cmprsMb": 3529.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1245105
+      }
+    },
+    {
+      "ts": "2026-11-19T05:34:52.028Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 3712.0,
+        "cmprsMb": 3635.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1353356
+      }
+    },
+    {
+      "ts": "2026-11-19T05:39:57.372Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 3813.0,
+        "cmprsMb": 3733.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1275126
+      }
+    },
+    {
+      "ts": "2026-11-19T05:45:06.796Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 3915.0,
+        "cmprsMb": 3841.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1323268
+      }
+    },
+    {
+      "ts": "2026-11-19T05:50:12.696Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 4017.0,
+        "cmprsMb": 3939.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1370560
+      }
+    },
+    {
+      "ts": "2026-11-19T05:55:30.387Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1427417
+      }
+    },
+    {
+      "ts": "2026-11-19T06:00:35.939Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 4231.0,
+        "cmprsMb": 4155.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1435849
+      }
+    },
+    {
+      "ts": "2026-11-19T06:06:03.854Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": "timeout",
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1602337
+      }
+    },
+    {
+      "ts": "2026-11-19T06:11:16.843Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 4450.0,
+        "cmprsMb": 4375.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1475287
+      }
+    },
+    {
+      "ts": "2026-11-19T06:16:26.861Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 4555.0,
+        "cmprsMb": 4459.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1131440
+      }
+    },
+    {
+      "ts": "2026-11-19T06:21:33.336Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 4660.0,
+        "cmprsMb": 4583.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1418757
+      }
+    },
+    {
+      "ts": "2026-11-19T06:26:38.133Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 4763.0,
+        "cmprsMb": 4687.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1472977
+      }
+    },
+    {
+      "ts": "2026-11-19T06:31:46.114Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 4866.0,
+        "cmprsMb": 4791.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1484050
+      }
+    },
+    {
+      "ts": "2026-11-19T06:36:55.348Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 4968.0,
+        "cmprsMb": 4895.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1573202
+      }
+    },
+    {
+      "ts": "2026-11-19T06:42:00.482Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 5075.0,
+        "cmprsMb": 5001.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1550526
+      }
+    },
+    {
+      "ts": "2026-11-19T06:47:14.792Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 5179.0,
+        "cmprsMb": 5105.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1546125
+      }
+    },
+    {
+      "ts": "2026-11-19T06:52:20.409Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 5282.0,
+        "cmprsMb": 5206.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1563749
+      }
+    },
+    {
+      "ts": "2026-11-19T06:57:26.383Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 5384.0,
+        "cmprsMb": 5311.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1573745
+      }
+    },
+    {
+      "ts": "2026-11-19T07:02:37.932Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 5488.0,
+        "cmprsMb": 5413.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1601527
+      }
+    },
+    {
+      "ts": "2026-11-19T07:07:45.892Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 5592.0,
+        "cmprsMb": 5512.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1381385
+      }
+    },
+    {
+      "ts": "2026-11-19T07:12:51.203Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 5691.0,
+        "cmprsMb": 5614.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1515092
+      }
+    },
+    {
+      "ts": "2026-11-19T07:17:56.488Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 5793.0,
+        "cmprsMb": 5723.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1896.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1657344
+      }
+    },
+    {
+      "ts": "2026-11-19T07:23:01.966Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 5897.0,
+        "cmprsMb": 5827.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1888.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1776107
+      }
+    },
+    {
+      "ts": "2026-11-19T07:28:07.983Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 5999.0,
+        "cmprsMb": 5932.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1888.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1698725
+      }
+    },
+    {
+      "ts": "2026-11-19T07:33:12.961Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 6103.0,
+        "cmprsMb": 6031.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1888.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1684629
+      }
+    },
+    {
+      "ts": "2026-11-19T07:38:17.981Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 6203.0,
+        "cmprsMb": 6131.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1599894
+      }
+    },
+    {
+      "ts": "2026-11-19T07:43:24.646Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 6305.0,
+        "cmprsMb": 6233.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1811352
+      }
+    },
+    {
+      "ts": "2026-11-19T07:48:31.694Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 6407.0,
+        "cmprsMb": 6336.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1747459
+      }
+    },
+    {
+      "ts": "2026-11-19T07:53:41.285Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 6509.0,
+        "cmprsMb": 6437.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1738664
+      }
+    },
+    {
+      "ts": "2026-11-19T07:58:50.658Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 6611.0,
+        "cmprsMb": 6544.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1736993
+      }
+    },
+    {
+      "ts": "2026-11-19T08:03:57.285Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 6703.0,
+        "cmprsMb": 6639.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1636496
+      }
+    },
+    {
+      "ts": "2026-11-19T08:09:06.216Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 6804.0,
+        "cmprsMb": 6742.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1797148
+      }
+    },
+    {
+      "ts": "2026-11-19T08:14:11.500Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 6904.0,
+        "cmprsMb": 6842.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1733135
+      }
+    },
+    {
+      "ts": "2026-11-19T08:19:17.013Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 7003.0,
+        "cmprsMb": 6943.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1643747
+      }
+    },
+    {
+      "ts": "2026-11-19T08:24:23.446Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 7105.0,
+        "cmprsMb": 7048.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1771884
+      }
+    },
+    {
+      "ts": "2026-11-19T08:29:28.811Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 7207.0,
+        "cmprsMb": 7143.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1880.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1728771
+      }
+    },
+    {
+      "ts": "2026-11-19T08:34:34.898Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 7307.0,
+        "cmprsMb": 7245.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1872.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1837466
+      }
+    },
+    {
+      "ts": "2026-11-19T08:39:39.945Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 7407.0,
+        "cmprsMb": 7346.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1872.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1677697
+      }
+    },
+    {
+      "ts": "2026-11-19T08:44:44.830Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 7506.0,
+        "cmprsMb": 7444.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1872.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1712902
+      }
+    },
+    {
+      "ts": "2026-11-19T08:49:51.132Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 7607.0,
+        "cmprsMb": 7545.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1872.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1901447
+      }
+    },
+    {
+      "ts": "2026-11-19T08:54:56.854Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 7711.0,
+        "cmprsMb": 7653.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1872.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1917554
+      }
+    },
+    {
+      "ts": "2026-11-19T09:00:02.532Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 7814.0,
+        "cmprsMb": 7758.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1872.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1951060
+      }
+    },
+    {
+      "ts": "2026-11-19T09:05:07.805Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 7921.0,
+        "cmprsMb": 7861.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 1872.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2107207
+      }
+    },
+    {
+      "ts": "2026-11-19T09:10:13.101Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 8030.0,
+        "cmprsMb": 7968.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 2313.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1902531
+      }
+    },
+    {
+      "ts": "2026-11-19T09:15:18.585Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 8135.0,
+        "cmprsMb": 8079.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 2305.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1859546
+      }
+    },
+    {
+      "ts": "2026-11-19T09:20:23.750Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 8238.0,
+        "cmprsMb": 8181.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 2305.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1952435
+      }
+    },
+    {
+      "ts": "2026-11-19T09:25:28.674Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 8341.0,
+        "cmprsMb": 8278.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 2305.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1816160
+      }
+    },
+    {
+      "ts": "2026-11-19T09:30:33.756Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 8443.0,
+        "cmprsMb": 8389.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 2305.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1959593
+      }
+    },
+    {
+      "ts": "2026-11-19T09:35:39.244Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 8546.0,
+        "cmprsMb": 8485.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 2305.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1904437
+      }
+    },
+    {
+      "ts": "2026-11-19T09:40:46.719Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 8652.0,
+        "cmprsMb": 8591.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 2305.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2012809
+      }
+    },
+    {
+      "ts": "2026-11-19T09:45:51.961Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 8760.0,
+        "cmprsMb": 8705.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 3072.0,
+        "usedMb": 2305.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2075127
+      }
+    },
+    {
+      "ts": "2026-11-19T09:50:57.415Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 8870.0,
+        "cmprsMb": 8812.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 4096.0,
+        "usedMb": 2967.88
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1938947
+      }
+    },
+    {
+      "ts": "2026-11-19T09:56:03.659Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 8980.0,
+        "cmprsMb": 8922.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 4096.0,
+        "usedMb": 2959.88
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1989794
+      }
+    },
+    {
+      "ts": "2026-11-19T10:01:09.737Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 9087.0,
+        "cmprsMb": 9025.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 4096.0,
+        "usedMb": 2959.88
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1961084
+      }
+    },
+    {
+      "ts": "2026-11-19T10:06:29.666Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 4096.0,
+        "usedMb": 3125.25
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2146674
+      }
+    },
+    {
+      "ts": "2026-11-19T10:11:37.374Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 9308.0,
+        "cmprsMb": 9248.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 4096.0,
+        "usedMb": 3514.88
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2095473
+      }
+    },
+    {
+      "ts": "2026-11-19T10:16:44.269Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 9415.0,
+        "cmprsMb": 9361.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 5120.0,
+        "usedMb": 4333.25
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2164396
+      }
+    },
+    {
+      "ts": "2026-11-19T10:21:49.701Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 9525.0,
+        "cmprsMb": 9466.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 5120.0,
+        "usedMb": 4282.5
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2064036
+      }
+    },
+    {
+      "ts": "2026-11-19T10:26:54.989Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 9636.0,
+        "cmprsMb": 9581.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 6144.0,
+        "usedMb": 5137.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2040833
+      }
+    },
+    {
+      "ts": "2026-11-19T10:32:01.474Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 9746.0,
+        "cmprsMb": 9688.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 6144.0,
+        "usedMb": 5033.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2061931
+      }
+    },
+    {
+      "ts": "2026-11-19T10:37:06.929Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 9859.0,
+        "cmprsMb": 9802.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 7168.0,
+        "usedMb": 5722.5
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1881135
+      }
+    },
+    {
+      "ts": "2026-11-19T10:42:12.803Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 9972.0,
+        "cmprsMb": 9913.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 7168.0,
+        "usedMb": 5546.5
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2072253
+      }
+    },
+    {
+      "ts": "2026-11-19T10:47:18.077Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 10240.0,
+        "cmprsMb": 10240.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 7168.0,
+        "usedMb": 5453.44
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2056188
+      }
+    },
+    {
+      "ts": "2026-11-19T10:52:23.386Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 10240.0,
+        "cmprsMb": 10240.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 7168.0,
+        "usedMb": 5429.44
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2078555
+      }
+    },
+    {
+      "ts": "2026-11-19T10:57:28.387Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 10240.0,
+        "cmprsMb": 10240.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 7168.0,
+        "usedMb": 6345.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1933046
+      }
+    },
+    {
+      "ts": "2026-11-19T11:02:34.479Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 10240.0,
+        "cmprsMb": 10240.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 8192.0,
+        "usedMb": 7012.62
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2158647
+      }
+    },
+    {
+      "ts": "2026-11-19T11:07:39.881Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 10240.0,
+        "cmprsMb": 10240.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 9216.0,
+        "usedMb": 7699.62
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1968847
+      }
+    },
+    {
+      "ts": "2026-11-19T11:12:46.038Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 10240.0,
+        "cmprsMb": 10240.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 9216.0,
+        "usedMb": 7499.62
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2086649
+      }
+    },
+    {
+      "ts": "2026-11-19T11:17:51.618Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 11264.0,
+        "cmprsMb": 10240.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 8192.0,
+        "usedMb": 7401.25
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1989689
+      }
+    },
+    {
+      "ts": "2026-11-19T11:22:57.317Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 11264.0,
+        "cmprsMb": 11264.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 8192.0,
+        "usedMb": 7329.25
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2048042
+      }
+    },
+    {
+      "ts": "2026-11-19T11:28:03.175Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 11264.0,
+        "cmprsMb": 11264.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 8192.0,
+        "usedMb": 7305.25
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2162573
+      }
+    },
+    {
+      "ts": "2026-11-19T11:33:09.987Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 11264.0,
+        "cmprsMb": 11264.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 8192.0,
+        "usedMb": 7686.75
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2094588
+      }
+    },
+    {
+      "ts": "2026-11-19T11:38:16.233Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 11264.0,
+        "cmprsMb": 11264.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 10240.0,
+        "usedMb": 8634.44
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2126475
+      }
+    },
+    {
+      "ts": "2026-11-19T11:43:21.580Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 11264.0,
+        "cmprsMb": 11264.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 10240.0,
+        "usedMb": 8678.88
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2052059
+      }
+    },
+    {
+      "ts": "2026-11-19T11:48:26.667Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 11264.0,
+        "cmprsMb": 11264.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 10240.0,
+        "usedMb": 8566.88
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1948970
+      }
+    },
+    {
+      "ts": "2026-11-19T11:53:31.389Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 11264.0,
+        "cmprsMb": 11264.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 10240.0,
+        "usedMb": 8502.88
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2068717
+      }
+    },
+    {
+      "ts": "2026-11-19T11:58:36.446Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 11264.0,
+        "cmprsMb": 11264.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 9216.0,
+        "usedMb": 8688.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2014745
+      }
+    },
+    {
+      "ts": "2026-11-19T12:03:41.559Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 12288.0,
+        "cmprsMb": 12288.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 9216.0,
+        "usedMb": 8576.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2149733
+      }
+    },
+    {
+      "ts": "2026-11-19T12:08:47.028Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 12288.0,
+        "cmprsMb": 12288.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 10240.0,
+        "usedMb": 8905.75
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1977564
+      }
+    },
+    {
+      "ts": "2026-11-19T12:13:52.960Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 12288.0,
+        "cmprsMb": 12288.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 10240.0,
+        "usedMb": 9443.25
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2012831
+      }
+    },
+    {
+      "ts": "2026-11-19T12:19:18.876Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 10240.0,
+        "usedMb": 9593.81
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2183325
+      }
+    },
+    {
+      "ts": "2026-11-19T12:24:24.278Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 12288.0,
+        "cmprsMb": 12288.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 12391.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1496225
+      }
+    },
+    {
+      "ts": "2026-11-19T12:29:30.121Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 12288.0,
+        "cmprsMb": 12288.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 12071.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1843748
+      }
+    },
+    {
+      "ts": "2026-11-19T12:34:35.621Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 12288.0,
+        "cmprsMb": 12288.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 11895.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1790210
+      }
+    },
+    {
+      "ts": "2026-11-19T12:39:41.977Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 12288.0,
+        "cmprsMb": 12288.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 11831.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1786820
+      }
+    },
+    {
+      "ts": "2026-11-19T12:44:48.439Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 12288.0,
+        "cmprsMb": 12288.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 11799.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1848391
+      }
+    },
+    {
+      "ts": "2026-11-19T12:49:55.065Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 13312.0,
+        "cmprsMb": 13312.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 11751.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1912379
+      }
+    },
+    {
+      "ts": "2026-11-19T12:55:00.988Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 13312.0,
+        "cmprsMb": 13312.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 11711.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1939671
+      }
+    },
+    {
+      "ts": "2026-11-19T13:00:07.286Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 13312.0,
+        "cmprsMb": 13312.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 11695.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1938908
+      }
+    },
+    {
+      "ts": "2026-11-19T13:05:17.410Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 13312.0,
+        "cmprsMb": 13312.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 11647.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1810576
+      }
+    },
+    {
+      "ts": "2026-11-19T13:10:26.752Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 13312.0,
+        "cmprsMb": 13312.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 11631.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1881075
+      }
+    },
+    {
+      "ts": "2026-11-19T13:15:40.849Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 13312.0,
+        "cmprsMb": 13312.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 11607.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1923369
+      }
+    },
+    {
+      "ts": "2026-11-19T13:21:01.074Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 12288.0,
+        "usedMb": 11256.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1985921
+      }
+    },
+    {
+      "ts": "2026-11-19T13:26:18.110Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 12288.0,
+        "usedMb": 11232.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2099534
+      }
+    },
+    {
+      "ts": "2026-11-19T13:31:27.711Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 14336.0,
+        "cmprsMb": 14336.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 12288.0,
+        "usedMb": 11208.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1948645
+      }
+    },
+    {
+      "ts": "2026-11-19T13:36:43.218Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 14336.0,
+        "cmprsMb": 14336.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 12288.0,
+        "usedMb": 11072.12
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2030006
+      }
+    },
+    {
+      "ts": "2026-11-19T13:46:08.235Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 12288.0,
+        "usedMb": 11122.06
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1944440
+      }
+    },
+    {
+      "ts": "2026-11-19T13:52:12.907Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": "timeout",
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 12467.81
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2175704
+      }
+    },
+    {
+      "ts": "2026-11-19T13:58:16.015Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": "timeout",
+      "swap": {
+        "totalMb": 13312.0,
+        "usedMb": 12550.19
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2062508
+      }
+    },
+    {
+      "ts": "2026-11-19T14:03:30.404Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 14336.0,
+        "usedMb": 13094.38
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1811144
+      }
+    },
+    {
+      "ts": "2026-11-19T14:08:50.933Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 14336.0,
+        "usedMb": 13113.44
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2079702
+      }
+    },
+    {
+      "ts": "2026-11-19T14:14:07.625Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 15360.0,
+        "usedMb": 13865.69
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2137476
+      }
+    },
+    {
+      "ts": "2026-11-19T14:19:19.956Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 15360.0,
+        "usedMb": 14251.44
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1932627
+      }
+    },
+    {
+      "ts": "2026-11-19T14:24:36.767Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 15360.0,
+        "usedMb": 14141.81
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2036136
+      }
+    },
+    {
+      "ts": "2026-11-19T14:29:54.364Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 15360.0,
+        "cmprsMb": 15360.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 15360.0,
+        "usedMb": 14558.69
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2198919
+      }
+    },
+    {
+      "ts": "2026-11-19T14:35:06.340Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 15360.0,
+        "cmprsMb": 15360.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 15360.0,
+        "usedMb": 14351.69
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2151764
+      }
+    },
+    {
+      "ts": "2026-11-19T14:41:06.210Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": "timeout",
+      "swap": {
+        "totalMb": 16384.0,
+        "usedMb": 15774.88
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2084460
+      }
+    },
+    {
+      "ts": "2026-11-19T14:46:52.052Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 16384.0,
+        "usedMb": 15226.44
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2061590
+      }
+    },
+    {
+      "ts": "2026-11-19T14:51:59.471Z",
+      "boot": 1794918628,
+      "holder": {
+        "pid": 61946,
+        "command": "Activity Monitor",
+        "memMb": 16384.0,
+        "cmprsMb": 15360.0
+      },
+      "topError": null,
+      "countsError": null,
+      "swap": {
+        "totalMb": 16384.0,
+        "usedMb": 14978.44
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 1967929
+      }
+    },
+    {
+      "ts": "2026-11-19T14:58:23.941Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 16384.0,
+        "usedMb": 14678.44
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2081139
+      }
+    },
+    {
+      "ts": "2026-11-19T15:03:55.018Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": "timeout",
+      "swap": {
+        "totalMb": 16384.0,
+        "usedMb": 15090.56
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2182297
+      }
+    },
+    {
+      "ts": "2026-11-19T15:09:29.652Z",
+      "boot": 1794918628,
+      "holder": null,
+      "topError": "timeout",
+      "countsError": null,
+      "swap": {
+        "totalMb": 17408.0,
+        "usedMb": 16014.06
+      },
+      "vm": {
+        "pageSize": 16384,
+        "compressorPages": 2196454
+      }
+    }
+  ]
+}

@@ -6,6 +6,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PermissionRequest, QuestionRequest } from "./openchamber.ts";
+import { parseAskKey, validateAsk, type AskDetail } from "./digest.ts";
 import { errorInfo, toolError, type ErrorCause, type ErrorInfo } from "./toollog.ts";
 
 const COMPONENT = "telegram-bridge";
@@ -179,6 +180,23 @@ export class ControlClient {
         response.ok ? { cause: "decode", detail: "SchemaError" } : undefined);
     }
     return data as T;
+  }
+
+  async getAsk(key: string, signal?: AbortSignal): Promise<AskDetail | undefined> {
+    const identity = parseAskKey(key);
+    if (!identity) throw new ControlError(0, "ask_key");
+    try {
+      const data = await this.request<unknown>("GET",
+        `/cards/${encodeURIComponent(`${identity.board}:${identity.card}`)}/asks/${identity.ask}`,
+        undefined, { kanban: true, timeoutMs: 3_000, signal });
+      if (!data || typeof data !== "object" || !("cardId" in data) || !("ask" in data)) throw new Error("ask_shape");
+      const ask = data.ask;
+      if (!ask || typeof ask !== "object" || !("id" in ask) || ask.id !== identity.ask) throw new Error("ask_shape");
+      return validateAsk({ ...ask, cardId: data.cardId });
+    } catch (error) {
+      if (error instanceof ControlError && error.status === 404) return undefined;
+      throw error;
+    }
   }
 
   async askNotified(key: string, at: number): Promise<void> {

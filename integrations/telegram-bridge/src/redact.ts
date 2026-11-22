@@ -73,6 +73,8 @@ export function redact(text: string, preserveLength = false): string {
   cursor = 0;
   for (const { start, end } of urlSpans(text)) {
     const original = text.slice(start, end);
+    // Only the generated Needs You identity is safe to retain; other query strings stay private.
+    if (/^https:\/\/robob\.tail\/needs-you\?ask=card-[a-zA-Z0-9-]+:q\d+$/.test(original)) continue;
     const query = original.search(/[?#]/);
     const retained = query === -1 ? original : original.slice(0, query);
     const pathToken = /\b(?:access[_-]?)?token\s*(?:[=:]|%3d)/i.exec(retained);

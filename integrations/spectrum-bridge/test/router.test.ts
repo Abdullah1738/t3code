@@ -14,7 +14,7 @@ import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type P
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
-import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, OUTAGE_NOTICE_AFTER_MS, pendingOrders, READ_WAIT_MS, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance, SEND_WAIT_MS } from "../src/router.ts";
+import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, OUTAGE_NOTICE_AFTER_MS, pendingOrders, READ_WAIT_MS, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, textingStyle, wakeGuidance, SEND_WAIT_MS } from "../src/router.ts";
 import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
 import { ChatRegistry, createAgentBus, createSbApi } from "../src/runtime.ts";
@@ -3024,6 +3024,7 @@ test("first attempt landing during the retry POST still admits one prompt and se
 test("watchdog notices even when normal poll reads fail, and never retries an unreadable outcome", async () => {
   const h = setup();
   const start = Date.now();
+  setSystemTime(start);
   h.backend.promptBehavior = async () => { throw new Error("offline"); };
   h.input("first", "Question");
   await h.router.tick();
@@ -8295,6 +8296,24 @@ test("tool mode: every prompt carries the marker and the imessage_send instructi
   expect(f.backend.prompts[0]!.system).not.toContain(TOOL_MODE_MARKER);
   expect(finalSteers[0]!.guidance).toContain("your final reply still goes to the chat");
   expect(imessageGuidance()).not.toContain("imessage_send");
+});
+
+test("texting style: every iMessage prompt says to text like a person, in several short messages in tool mode", () => {
+  for (const replyMode of ["final", "tool"] as const) {
+    const style = textingStyle({ replyMode });
+    expect(style).toContain("you are texting a person, not writing a document");
+    expect(style).toContain("casual, informal and short");
+    expect(style).toContain("No headings, tables or long bullet lists");
+    expect(imessageGuidance({ replyMode })).toContain(style);
+    expect(wakeGuidance({ replyMode })).toContain(style);
+    expect(imessageGuidance({ replyMode })).not.toContain("short paragraphs");
+    expect(wakeGuidance({ replyMode })).not.toContain("Short paragraphs");
+  }
+  expect(textingStyle({ replyMode: "tool" })).toContain("Use several messages, one imessage_send call each");
+  // Final mode forwards one final reply, so it can't ask for several send calls.
+  expect(textingStyle({ replyMode: "final" })).not.toContain("imessage_send");
+  // The tool rules ride on a configured custom prompt too, so the split rule reaches it.
+  expect(toolReplyRules()).toContain("split a reply into a few short messages, one send call each");
 });
 
 test("tool mode: a configured custom prompt still carries the marker", async () => {

@@ -76,6 +76,8 @@ test.each([
 });
 
 test.each([
+  ["Robob board #582", "q2 in Needs Owner", "robob:582:q2"],
+  ["Robob board 582", "q2 in Needs Owner", "robob:582:q2"],
   ["Robob board -582", "q2 in Needs Owner", "robob:582:q2"],
   ["Robob board -582", "(Q2, open since 8 Nov)", "robob:582:q2"],
   ["Robob board", "#582 needs your OK (q2)", "robob:582:q2"],
@@ -209,3 +211,12 @@ test("a rejected summary also carries its unreported failures into a replacement
     ]);
   } finally { store.close(); }
 });
+
+
+test.each([
+  ["https://robob.tail/needs-you?ask=card-fixture:q1", "https://robob.tail/needs-you?ask=card-fixture:q1"],
+  ["https://robob.tail/needs-you?ask=card-fixture:q1&token=private", "https://robob.tail/needs-you"],
+  ["https://robob.tail/needs-you?ask=card-fixture:q1#private", "https://robob.tail/needs-you"],
+  ["https://other.tail/needs-you?ask=card-fixture:q1", "https://other.tail/needs-you"],
+  ["https://robob.tail/needs-you?ask=private", "https://robob.tail/needs-you"],
+])("retains only exact generated ask links: %s", (input, expected) => expect(redact(input)).toBe(expected));

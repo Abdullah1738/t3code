@@ -16,24 +16,77 @@ with the original failure evidence. Repairs back off to five minutes. The
 guard sends one local Telegram alert after two minutes down and a recovery note
 using the same incident key prefix. Delivery retries retain that key across guard
 restarts. The HTTP snapshot runs in a separate child every five minutes.
+The observer runs at launchd `Standard` priority and records its configured
+ProcessType, nice value and scheduling priority once per supervisor start.
+The guard kills and reaps its captured poll child after four minutes, recording
+one `poll.timeout` with the active phase, wall time and child CPU time. It keeps
+the regular five-minute schedule for the next child; it never kills by pattern.
 
 Unknown transitions retain the router's `launchctlExit` (numeric, `timeout`,
 or `oserror`) and at most 240 characters of trimmed, redacted stderr.
 `listener.unknownByCause` groups their first observed outcome as
-`launchctl_unknown:<exit>`; legacy windows without that evidence use `other`.
-`observer.gap` and `guard.tick_late` describe late observer work separately.
-A `sleep_gap` needs a suspend-aware clock discrepancy, not just a wall-clock
-jump. `agent_not_running` needs a recorded stopped/absent observer.
+`launchctl_exit:<code>` or `launchctl_timeout`. Legacy windows without recorded
+outcomes use `unknown_no_data` with a named missing-evidence reason; they cannot
+be reconstructed. `observer.gap` and `guard.tick_late` describe late observer
+work separately, retaining the longest recorded phase and measured/unmeasured
+totals. If the unmeasured remainder exceeds that phase, the cause stays
+`unknown_no_data` with `missingEvidence=unmeasured_tick_time`; a phase label
+without duration evidence cannot establish a cause. Attribution uses the full
+span before daily clipping.
+Suspend-aware clock discrepancies and guard process changes can establish
+`guard_not_scheduled`; a poll LaunchAgent's absent state alone cannot.
 
-`poll.phases` emits once per poll if an exclusive phase exceeds 30 seconds
-(or the total exceeds two minutes). Its fields split history scan/parse,
+`poll.phases` and `guard.tick_late` emit once when a tick exceeds 30 seconds,
+with wall/monotonic start/end pairs. The existing end diagnostic is timed as
+`post_end_diag` before capturing the end clocks. Their fields split history scan/parse,
 listener/pool history, report writes, state saves, NDJSON writes (`logWriteMs`),
 lock waits and HTTP work;
 nested work is not counted twice. `log.rollup` now measures only that rollup
 call. `pool-alerts` emits `pool.endpoint.get` for its independent fetches.
+Each measured phase also has matching `*CpuMs`, `*InblockN`, `*MajfltN`,
+`*NivcswN` and `*NvcswN` fields, excluding nested work. History scan/parse and
+listener history additionally carry `*BytesHashed` and `*BytesParsed` (input
+bytes examined by the line reader, including filtered or unfinished lines).
+Both histories also split wall/CPU into `*LoadStateMs`/`*LoadStateCpuMs`,
+`*ValidateCursorMs`/`*ValidateCursorCpuMs`, `*ParseLinesMs`/`*ParseLinesCpuMs`,
+`*BuildReportMs`/`*BuildReportCpuMs` and `*SaveStateMs`/`*SaveStateCpuMs`.
+Substeps exclude one another and nested phases, including checkpoint saves
+inside parsing; BuildReport covers aggregate restoration and report construction.
+For phases over 30 seconds using less than 10% CPU, `tick_io:<phase>` requires
+at least 16 input operations or major faults and 16 voluntary switches, with
+voluntary switches at least four times involuntary switches. Dominant
+involuntary switches (at least 16) yield `tick_starved:<phase>`. Mixed or quiet
+counters retain `tick_blocked:<phase>`; counters are wait signals rather than
+measurements of time spent waiting. Legacy rows without counters retain the
+CPU-only inference above two minutes. These fields extend existing diagnostics
+without new rows.
+These three sparse phase rows (`poll.phases`, `rollup.phases`, `guard.tick_late`)
+have an 8 KiB serialized limit to fit the fixed fields; ordinary rows retain 4 KiB.
+Scheduling, child-wait and missing-evidence causes keep their existing rules.
 `pollGaps`/`guardGaps` number measured spans over two minutes, clipped for daily
 duration totals. `coverage` explains threshold-only `healthByHour`, exhaustion
 episodes in `pools`, and missing legacy observer measurements.
+Every `poll.complete` carries a compact `host` object, including failed polls.
+Wire keys are `l1`/`l5`/`l15` (load averages), `c` (logical CPUs), `f` (free
+bytes), `a` (free plus inactive bytes, an available-memory estimate), `p`
+(macOS pressure: 1 normal, 2 warning, 4 critical), and optional `e` (failure
+enum). `hostAtMs` beside `host` retains the poll sample time across midnight.
+Anomaly `hostStartAtMs`/`hostEndAtMs` retain observation times independently
+of gap boundaries, including cached guard samples reused after a tick or restart.
+The full poll row addition, including `props` and the timestamp, stays within
+120 bytes; memory estimates and then the longer load averages may be omitted to fit
+extreme values; load1, CPU count and observed pressure/failure remain. Swap is omitted. Diagnostics share a 1.75-second command budget per
+tick, never retry, and add no rows. Guard state retains host observations
+between ticks and across restarts. Anomalies carry `hostStart`/`hostEnd`;
+legacy boundaries remain unknown. Rollup gap and listener windows retain
+these objects and expose `load1Start` when measured.
+
+`hostLoad.hourly` reports sampled load1 average/maximum and maximum pressure.
+`hoursWithLoadAbove2xCpu` lists hours containing an overload sample; it does
+not estimate overload duration. `proxySummary.byHour` places request p95
+beside that load. `failedSnapshots`, `pollRowsWithoutHost` and `coverage.hostLoad`
+explain missing observations; no values are inferred across sampling gaps.
+
 Finalized days are refreshed when late observer completions add a gap overlap.
 
 `~/.local/state/9router/deploy.json` coordinates the guard with the router's
@@ -66,7 +119,7 @@ is used. Today's cumulative per-connection cost is sampled once per UTC hour as
 `spend.snapshot`. Hourly cost buckets are unavailable (`spend.unavailable`);
 these cumulative snapshots must not be summed as hourly spend.
 
-`9router-log-rollup [--day YYYY-MM-DD]` defaults to yesterday UTC. It streams a
+`9router-log-rollup [--day YYYY-MM-DD] [--full]` defaults to yesterday UTC. It streams a
 fixture or real day file and writes a private `rollup-YYYY-MM-DD.json` with name
 and kind counts, rates, duration percentiles and top error tags. `supervisor`
 counts starts, stops, exits, reloads and deploy actions. `listener` contains
@@ -80,6 +133,21 @@ their start and end retain the actual transition timestamps. Open windows end
 at generation time or UTC midnight for duration calculation. The poller makes
 yesterday's rollup on its first successful run after 00:05 UTC. Invalid lines
 are counted and skipped.
+Per-day private aggregate state retains exact numeric samples for percentiles,
+plus an inode/device, observed size and committed byte offset. Samples grow
+linearly with the day's input (the daily log cap is soft; no approximation or
+sampling is applied). The state and sparse history caches expire with the source
+logs. Appended bytes alone update the aggregate; replacement, truncation,
+same-size rewrite or aggregate schema changes rebuild it. A SHA-256 witness
+validates every committed byte before cache reuse, including truncate/regrow
+and middle rewrites; validation reads raw bytes in 1 MiB chunks without JSON
+parsing. The checksum extends with new complete lines at each checkpoint.
+Rebuilds checkpoint
+atomically every 8 MiB or 30 seconds so deadline kills retain progress.
+An unfinished last line contributes provisionally to the report and is reread
+until newline termination. Listener transitions, cross-day health joins and
+pool history share a sparse append cache with the same checkpoint bounds.
+`--full` bypasses aggregate and listener caches for comparison or repair.
 `complete` means `generatedAt` is on or after the next UTC midnight; incomplete rollups are regenerated after 00:05Z, and lock `distinct` counts dedupe account/provider/model/deadline-minute while `count` keeps raw lines.
 
 `account.lock` and `account.unlock` carry hashed account IDs, scope, classifier

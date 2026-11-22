@@ -2505,3 +2505,123 @@ class RenderLogTest(unittest.TestCase):
             rc.log_render(time.monotonic(), False, chat=private, failure_code=private)
             self.assertNotIn('PRIVATE', str(child.call_args))
             self.assertNotIn('971501234567', str(child.call_args))
+
+
+class BridgeListDeadlineTest(Base):
+    def rows(self):
+        from pathlib import Path
+        return [json.loads(line) for p in Path(self.env["TOOLLOG_DIR"]).glob("*.ndjson")
+                for line in p.read_text().splitlines()]
+
+    def setUp(self):
+        super().setUp()
+        self.env["TOOLLOG_DIR"] = os.path.join(self.dir, "logs")
+
+    def test_shares_survives_old_deadline_and_keeps_permanent_links(self):
+        rc = self.rc()
+        def slow_list(*args, **kwargs):
+            if kwargs["timeout"] < 12:
+                raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+            return subprocess.CompletedProcess(args[0], 0, json.dumps({"shares": [
+                {"app": "keep", "permanent": True}, {"app": "retire", "permanent": False}]}), "")
+        with unittest.mock.patch.dict(os.environ, self.env), unittest.mock.patch.object(rc.subprocess, "run", side_effect=slow_list):
+            self.assertEqual(rc.permanent_apps(), {"keep"})
+
+    def test_retries_only_list_timeouts_once(self):
+        rc = self.rc()
+        cases = [
+            (subprocess.TimeoutExpired(["PRIVATE"], 20, stderr=b"PRIVATE"), True),
+            (subprocess.CompletedProcess([], 1, "", '{"error":"Bridge request timed out"}'), True),
+            (subprocess.CompletedProcess([], 1, "", '{"error":"Bridge request failed (HTTP 403)"}'), False),
+            (FileNotFoundError(2, "No such file or directory", "PRIVATE"), False),
+            (subprocess.CompletedProcess([], 0, '{"shares":null}', ""), False),
+        ]
+        good = subprocess.CompletedProcess([], 0, '{"shares":[]}', "")
+        for first, retry in cases:
+            with self.subTest(first=type(first).__name__, retry=retry), unittest.mock.patch.dict(os.environ, self.env), unittest.mock.patch.object(rc.subprocess, "run", side_effect=[first, good]) as run:
+                self.assertEqual(rc.permanent_apps(), set() if retry else None)
+                self.assertEqual(run.call_count, 2 if retry else 1)
+        with unittest.mock.patch.dict(os.environ, self.env), unittest.mock.patch.object(rc.subprocess, "run", side_effect=subprocess.TimeoutExpired([], 20)) as run:
+            self.assertIsNone(rc.permanent_apps())
+            self.assertEqual(run.call_count, 2)
+        for command in ("app", "send", "share", "unshare"):
+            with self.subTest(command=command), unittest.mock.patch.dict(os.environ, self.env), unittest.mock.patch.object(rc.subprocess, "run", side_effect=subprocess.TimeoutExpired([], 20)) as run:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    rc.bridge(command)
+                self.assertEqual(run.call_count, 1)
+
+    def test_error_fields_distinguish_process_and_http_deadlines(self):
+        rc = self.rc()
+        cases = [
+            (subprocess.TimeoutExpired(["PRIVATE"], 20, stderr=b"PRIVATE"), "cli_process", True, "timeout"),
+            (subprocess.CompletedProcess([], 1, "", '{"error":"Bridge request timed out"}'), "http", True, "timeout"),
+            (subprocess.CompletedProcess([], 1, "", "PRIVATE Permission denied"), "none", False, "permission"),
+            (FileNotFoundError(2, "No such file or directory", "PRIVATE"), "none", False, "missing_file"),
+        ]
+        for result, side, timed_out, cause in cases:
+            with self.subTest(side=side, cause=cause), unittest.mock.patch.dict(os.environ, self.env), unittest.mock.patch.object(rc.subprocess, "run", side_effect=[result]), unittest.mock.patch.object(rc.time, "perf_counter", side_effect=[1, 1.25]):
+                with self.assertRaises(Exception):
+                    rc.bridge("shares", timeout=20, attempt=2)
+                row = self.rows()[-1]
+                self.assertEqual(row["durationMs"], 250)
+                self.assertEqual(row["props"]["timeoutMs"], 20000)
+                self.assertEqual(row["props"]["attempt"], 2)
+                self.assertEqual(row["props"]["timeoutSide"], side)
+                self.assertEqual(row["props"]["timedOut"], timed_out)
+                self.assertEqual(row["props"]["stderrClass"], cause)
+                self.assertNotIn("PRIVATE", json.dumps(row))
+
+    def test_ended_ride_failure_has_safe_classification(self):
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("refresh", "--trip", A)
+        with unittest.mock.patch.dict(os.environ, self.env):
+            card = self.rc().load_card(A)
+            self.rc().write_card(dict(card, terminal=True, state="done"))
+        result = self.card_cli("send", "--trip", A, "--session", "thread-1@3", ok=False)
+        self.assertEqual(result.returncode, 1)
+        row = next(r for r in self.rows() if r["name"] == "helper.run" and not r["ok"])
+        self.assertEqual(row["props"]["stderrClass"], "ride_ended")
+        self.assertNotIn(A, json.dumps(row))
+
+
+    def test_cleanup_budget_leaves_time_to_save_and_emit_alerts(self):
+        import contextlib
+        import importlib.util
+        import io
+        from pathlib import Path
+        rc = self.rc()
+        for prior_work in (0, 12, 49, 55):
+            with self.subTest(prior_work=prior_work), unittest.mock.patch.dict(os.environ, dict(self.env, WATCH_RUN="")):
+                spec = importlib.util.spec_from_file_location("ride_cleanup_budget", HELPER)
+                checker = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(checker)
+                clock, shares, unshares = [0], [], []
+                paths = [Path(self.journal) / (u + ".json") for u in (A, B, "cccccccc-0000-4000-8000-000000000003")]
+                state = {"trips": {}, "active": None, "fail_since": None, "ending": {},
+                         "pending_cancel": {A: {"since": 0, "rider": "abdullah"}}, "preview_retry": {}}
+                def status():
+                    clock[0] += prior_work
+                    return {"ok": True, "result": {"trip": None}}
+                def bridge_run(args, **kwargs):
+                    command, timeout = args[-1], kwargs["timeout"]
+                    if command == "shares":
+                        shares.append(timeout)
+                        elapsed = 20 if len(shares) == 1 else 19
+                        out = '{"shares":[]}'
+                    else:
+                        self.assertIn("unshare", args)
+                        unshares.append(timeout)
+                        elapsed, out = 9, '{"removed":true}'
+                    clock[0] += min(elapsed, timeout)
+                    if timeout <= elapsed:
+                        raise subprocess.TimeoutExpired(args, timeout)
+                    return subprocess.CompletedProcess(args, 0, out, "")
+                output = io.StringIO()
+                with unittest.mock.patch.object(checker, "load", return_value=state), unittest.mock.patch.object(checker, "now_ts", return_value=5000), unittest.mock.patch.object(checker, "rides_status", side_effect=status), unittest.mock.patch.object(rc.time, "monotonic", side_effect=lambda: clock[0]), unittest.mock.patch.object(Path, "glob", return_value=paths), unittest.mock.patch.object(rc, "public_link", return_value=True), unittest.mock.patch.object(rc, "load_card", return_value={"terminal": True, "state": "done", "ended_at": rc.iso(0)}), unittest.mock.patch.object(rc, "unshared_path", side_effect=lambda u: Path(self.journal) / (".budget-" + str(prior_work) + "-" + u)), unittest.mock.patch.object(rc.subprocess, "run", side_effect=bridge_run), contextlib.redirect_stdout(output):
+                    checker.main()
+                self.assertLessEqual(clock[0], max(50, prior_work))
+                self.assertEqual(shares, {0: [20, 20], 12: [20, 18], 49: [1], 55: []}[prior_work])
+                self.assertEqual(unshares, [10, 2] if prior_work == 0 else [])
+                self.assertIn("CANCELED", output.getvalue())
+                with open(self.state) as saved:
+                    self.assertEqual(json.load(saved)["pending_cancel"], {})

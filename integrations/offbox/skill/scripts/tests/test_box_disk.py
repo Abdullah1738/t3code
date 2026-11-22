@@ -878,6 +878,7 @@ class BoxDiskTests(Isolated):
         self.assertTrue(self.row('bad')['note'].startswith(box_disk.NOTE))
 
     def test_retired_resume_http_observations_have_usable_budgets_on_both_backends(self):
+        import offbox_protection
         from offbox_lib import allocation
         from test_pool_affinity import Clock
         # Real parent-process inspection would run subprocess waits against this test's fake clock.
@@ -890,6 +891,11 @@ class BoxDiskTests(Isolated):
                 with self.subTest(backend=backend, latency=latency), contextlib.ExitStack() as stack:
                     clock = Clock()
                     clock.t = common.now()
+                    stack.callback(allocation.clear_resume, self.con, 'bad')
+                    # Caller attribution is process I/O, outside this synthetic HTTP clock. In particular,
+                    # Linux subprocess.wait sleeps must not spend the simulated observation budget.
+                    token = offbox_protection.CALLER.set({'actor':'fixture', 'parent_argv':[]})
+                    stack.callback(offbox_protection.CALLER.reset, token)
                     self.con.execute("INSERT INTO kv VALUES ('resume_unanswered:bad','',?)", (clock.t-121,))
                     self.con.execute("INSERT INTO kv VALUES ('resume_sender:bad','',?)", (clock.t-121,))
                     self.con.commit()
@@ -926,6 +932,36 @@ class BoxDiskTests(Isolated):
                     self.assertTrue(self.row('bad')['note'].startswith(box_disk.NOTE))
                     send.assert_not_called()
                     prepare.assert_not_called()
+
+    def test_retired_resume_http_fixture_excludes_parent_process_waits(self):
+        import offbox_protection
+        def parent_lookup(*args, **kwargs):
+            # POSIX subprocess.wait can repeatedly sleep while ps is exiting. With the fixture's
+            # global clock those real scheduling waits would consume the entire HTTP budget.
+            time.sleep(11)
+            return subprocess.CompletedProcess(args[0], 0, stdout='fixture-parent', stderr='')
+        token = offbox_protection.CALLER.set(None)
+        try:
+            with patch.object(offbox_protection.subprocess, 'run', side_effect=parent_lookup) as lookup:
+                self.test_retired_resume_http_observations_have_usable_budgets_on_both_backends()
+            lookup.assert_not_called()
+        finally:
+            offbox_protection.CALLER.reset(token)
+
+    def test_retired_resume_http_fixture_cleans_failed_rows(self):
+        original = reap.reap
+        def fail_first(*args, **kwargs):
+            if observed.call_count == 1:
+                raise AssertionError('injected first-row failure')
+            return original(*args, **kwargs)
+        case = BoxDiskTests('test_retired_resume_http_observations_have_usable_budgets_on_both_backends')
+        result = unittest.TestResult()
+        with patch.object(reap, 'reap', side_effect=fail_first) as observed:
+            case.run(result)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(observed.call_count, 18)
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn('injected first-row failure', result.failures[0][1])
 
     def test_retired_reaper_skips_busy_allocation_lock_with_production_pool_wait(self):
         from test_pool_affinity import Clock

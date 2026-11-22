@@ -24,7 +24,8 @@ NUMBERS.update(('outsideRows', 'outsideFirst', 'outsideLast', 'unparsedRows'))
 NUMBERS.update(('deltaGb', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
 NUMBERS.update(('freeGb', 'floorGb', 'lowForS'))
 NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
-                'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
+                'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt',
+                'partialRows', 'bootUnresolvedS', 'bootSecondUnreadableS'))
 NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS',
                 'backup.skipped_runs.memory', 'backup.skipped_runs.health', 'backup.skipped_runs.other',
                 'backup.ok_runs.memory', 'backup.ok_runs.health', 'backup.ok_runs.other',
@@ -66,7 +67,7 @@ NULLABLE.update(('lastGoodSnapshotAgeS', 'lockHolderCmd', 'lockHolderPpid', 'loc
 NULLABLE.update(('deltaFromTs', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
 for prefix in ('internal', 'external'):
     NULLABLE.update((prefix+'DeltaFromTs', prefix+'DeltaWindowS'))
-TEXT = set('target resourceKind process package fromVersion toVersion source operation runId threadId snapshotId resourceId'.split())
+TEXT = set('observationId target resourceKind process package fromVersion toVersion source operation runId threadId snapshotId resourceId'.split())
 for i in range(1, 6):
     TEXT.add('grower%dPath' % i)
     NUMBERS.add('grower%dDeltaGb' % i)
@@ -173,14 +174,23 @@ def memory_fields(values, event):
     if not isinstance(values, dict):
         return result
     if event == 'memory.alert':
-        if values.get('reason') in ('swap', 'pressure', 'footprint', 'fseventsd', 'fseventsd_growth'):
+        if values.get('reason') in ('swap', 'pressure', 'footprint', 'fseventsd', 'fseventsd_growth', 'growth'):
             result['reason'] = values['reason']
         if values.get('notifyError') is None or values.get('notifyError') in MEMORY_ERRORS:
             result['notifyError'] = values.get('notifyError')
+        for key in ('pid', 'footprintGiB', 'growthGiBHour'):
+            if values.get(key) is None or finite_number(values[key]) and values[key] >= 0:
+                result[key] = values.get(key)
+        if isinstance(values.get('command'), str):
+            result['command'] = memory_command(values['command'])
+        for key in ('escalation', 'fallback'):
+            if type(values.get(key)) is bool:
+                result[key] = values[key]
         return result
     numbers = {'pageSize', 'freePages', 'activePages', 'inactivePages', 'wiredPages',
                'speculativePages', 'purgeablePages', 'compressorPages', 'totalMb', 'usedMb',
-               'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'count', 'ppid1Count'}
+               'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'count', 'ppid1Count',
+               'growthSamples', 'growthWindowS', 'growthMbPerHour'}
 
     def numeric(value):
         return finite_number(value) and value >= 0
@@ -197,6 +207,9 @@ def memory_fields(values, event):
                 clean[key] = memory_command(item)
             elif key == 'etime' and isinstance(item, str) and re.fullmatch(r'\d+(?:-\d+)?(?::\d+){1,2}', item):
                 clean[key] = item
+            elif key == 'start' and isinstance(item, str) and re.fullmatch(
+                    r'[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d\d:\d\d:\d\d \d{4}', item):
+                clean[key] = item
             elif key == 'error' and (item is None or item in MEMORY_ERRORS):
                 clean[key] = item
         return clean
@@ -207,11 +220,17 @@ def memory_fields(values, event):
                     'vm': ('pageSize', 'freePages', 'activePages', 'inactivePages',
                            'wiredPages', 'speculativePages', 'purgeablePages', 'compressorPages')}[key]
             result[key] = None if value is None else row(value, keys)
-        elif key in ('top', 'watched', 'counts') and (value is None or isinstance(value, list)):
+        elif key in ('top', 'watched', 'counts', 'fallback', 'growth') and (value is None or isinstance(value, list)):
             keys = ('command', 'count', 'ppid1Count') if key == 'counts' else ('pid', 'command', 'memMb', 'cmprsMb')
             if key == 'watched':
                 keys += ('etime', 'error')
-            result[key] = None if value is None else [row(p, keys) for p in value[:{'top': 15, 'watched': 512, 'counts': 5}[key]]]
+            if key != 'counts':
+                keys += ('start',)
+            if key == 'fallback':
+                keys += ('error',)
+            if key == 'growth':
+                keys += ('growthSamples', 'growthWindowS', 'growthMbPerHour')
+            result[key] = None if value is None else [row(p, keys) for p in value[:{'top': 15, 'watched': 512, 'counts': 5, 'fallback': 3, 'growth': 527}[key]]]
         elif key == 'load' and (value is None or isinstance(value, list)):
             result[key] = None if value is None else [n for n in value[:3] if numeric(n)]
         elif key in ('pressure', 'pressureLevel', 'freePercent', 'boot', 'swapinsDelta', 'swapoutsDelta',
@@ -231,7 +250,7 @@ def cpu_fields(values):
     numeric = {'windowS', 'cpuS', 'totalCpuPct', 'ncpu', 'processCount', 'runnable',
                'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb',
                'skippedLines', 'badLines', 'lines', 'exiting', 'systemCpuPct',
-               'userPct', 'sysPct', 'nicePct', 'idlePct', 'kernelTaskPct', 'kernelTaskWindowS',
+               'userPct', 'sysPct', 'nicePct', 'idlePct', 'kernelTaskPct', 'kernelTaskWindowS', 'kernelTaskWallMs',
                'unattributedCpuPct', 'spawned', 'exited', 'uid', 'perMinute',
                'childCpuPct', 'childReadable', 'childUnreadable', 'childUncertainParents',
                'lostParents', 'unattributedAfterChildrenPct', 'observedSpawnsLowerBound',
@@ -426,7 +445,195 @@ def host_fields(values, event):
     return result
 
 
+MACGUARD_KEYS = set("""pid start comm args action result errno actionClass owner cpuDelta footprintGiB compressedGiB growthGiBMin history at cpuS memoryClass label key threadId evidence summary probe failure cycleMs durationS signals load rCount rZeroCount lagS pressure swap usedMb totalMb largest treeGiB strain reason tmuxSession log idlePct""".split())
+MACGUARD_KEYS.update(('app', 'bundleId', 'growthGiBHour', 'footprintSeries', 'step', 'detail'))
+MACGUARD_KEYS.update('stages renice identityRecheck taskpolicy same rc stderr strerror'.split())
+
+
+def macguard_fields(values, depth=0):
+    # Only mac-guard opts into this bounded nested schema. Shared event kinds
+    # retain their existing filters; process arguments use the CPU redactor.
+    from cpu_labels import command_label, bounded_detail
+    if depth > 5:
+        return None
+    if isinstance(values, dict):
+        result = {}
+        for key, value in values.items():
+            if key not in MACGUARD_KEYS:
+                continue
+            if key in ('reason', 'stderr', 'strerror') and isinstance(value, str):
+                result[key] = bounded_detail(value)
+            elif key == 'threadId' and isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9:_%./@+-]{1,1000}', value):
+                result[key] = value
+            else:
+                result[key] = macguard_fields(value, depth+1)
+        return result
+    if isinstance(values, list):
+        return [macguard_fields(value, depth+1) for value in values[:241]]
+    if isinstance(values, str):
+        return command_label(values)
+    if values is None or type(values) is bool or finite_number(values):
+        return values
+    return None
+
+
+JANITOR_PHASES = {'sessions', 'liveness', 'resource_processes', 'simulators', 'expo', 'docker',
+                 'session_evidence', 'leftover_processes'} | {
+    'processes.' + name for name in ('inventory', 'launch_services', 'memory', 'cwd_inventory',
+                                   'detection', 'agent_browser', 'xcode_builds', 'mcp_orphan',
+                                   'owner_by_native', 'owner_detail', 'owner_recovery')}
+JANITOR_KEEP_REASONS = {'tty', 'launchd_registered', 'application', 'shared_service', 'keep_file',
+                        'liveness_unavailable', 'observation_budget_exhausted', 'unproven_process',
+                        'unknown_owner', 'owner_deleted', 'owner_has_work_or_not_ended',
+                        'connected_client', 'idle_grace', 'memory_unavailable',
+                        'parent_chain_incomplete', 'changed_before_report', 'observation_unavailable'}
+
+
+def janitor_orphan_fields(values):
+    if not isinstance(values, dict):
+        return {}
+    result = {}
+    if type(values.get('reap_enabled')) is bool:
+        result['reap_enabled'] = values['reap_enabled']
+    for key in ('oldest_age_s', 'rss_kib', 'freed_rss_kib'):
+        value = values.get(key)
+        if key == 'oldest_age_s' and key in values and value is None:
+            result[key] = None
+        elif finite_number(value) and value >= 0:
+            result[key] = value
+    for key, names in (('counts', ('cua', 'perplexity', 'dia')),
+                       ('reaped_counts', ('cua', 'perplexity', 'dia')),
+                       ('rules', ('a', 'b'))):
+        if isinstance(values.get(key), dict):
+            result[key] = {name: value for name, value in values[key].items()
+                           if name in names and type(value) is int and value >= 0}
+    return result
+
+
+def janitor_mcp_fields(values):
+    if not isinstance(values, dict):
+        return {}
+    result = {}
+    for key in ('report_only', 'ok'):
+        if type(values.get(key)) is bool:
+            result[key] = values[key]
+    for key in ('candidates', 'unknown_owner', 'observation_unavailable'):
+        if type(values.get(key)) is int and values[key] >= 0:
+            result[key] = values[key]
+    if values.get('verdict') in ('clean', 'unverified'):
+        result['verdict'] = values['verdict']
+    if values.get('reason') in ('process_scan_failed', 'process_scan_skipped',
+                               'process_scan_incomplete', 'process_inventory_unavailable'):
+        result['reason'] = values['reason']
+    for key, names in (
+            ('families', ('cua-driver', 'perplexity', 'dia-bridge', 'other-mcp')),
+            ('parent_kinds', ('codex-app-server', 'claude-cli', 'opencode-serve', 'ppid-1', 'other')),
+            ('keep_reasons', JANITOR_KEEP_REASONS)):
+        source = values.get(key)
+        if not isinstance(source, dict):
+            continue
+        result[key] = {}
+        for name in names:
+            value = source.get(name)
+            if key == 'families' and isinstance(value, dict):
+                result[key][name] = {k: v for k, v in value.items()
+                                     if k in ('count', 'rss_kib', 'rss_unavailable') and type(v) is int and v >= 0}
+            elif type(value) is int and value >= 0:
+                result[key][name] = value
+    calls = values.get('owner_calls')
+    if isinstance(calls, dict):
+        result['owner_calls'] = {}
+        for kind in ('by_native', 'detail', 'recovery'):
+            value = calls.get(kind)
+            if not isinstance(value, dict):
+                continue
+            clean = {k: v for k, v in value.items()
+                     if k in ('count', 'p50_ms', 'p95_ms', 'max_ms') and
+                     (v is None or finite_number(v) and v >= 0)}
+            if isinstance(value.get('failures'), dict):
+                clean['failures'] = {k: v for k, v in value['failures'].items()
+                                     if isinstance(k, str) and re.fullmatch(r'\d{1,3}', k)
+                                     and type(v) is int and v >= 0}
+            result['owner_calls'][kind] = clean
+    return result
+
+
+def suspend_fields(values):
+    from cpu_labels import command_label
+
+    result = {}
+    for key, value in values.items():
+        if key in ('pid', 'ppid', 'createdAt', 'deadline', 'firstSeen', 'ageS', 'count', 'unownedCount') and finite_number(value):
+            result[key] = value
+        elif key in ('recovered', 'overdue') and type(value) is bool:
+            result[key] = value
+        elif key in ('comm', 'command', 'owner') and isinstance(value, str):
+            result[key] = command_label(value) or '[redacted]'
+        elif key in ('start', 'stat', 'comm', 'command', 'owner', 'reason', 'actor', 'card', 'then', 'phase', 'result') and isinstance(value, str):
+            result[key] = '[redacted]' if SECRET.search(value) else ''.join(c if c.isprintable() else ' ' for c in value[:1000])
+        elif key == 'readBack' and isinstance(value, list):
+            result[key] = [{k: v for k, v in row.items()
+                            if (k in ('signal', 'stat') and isinstance(v, str)
+                                and re.fullmatch(r'[A-Za-z+<>?-]{1,32}', v))
+                            or (k == 'sent' and type(v) is bool)}
+                           for row in value[:8] if isinstance(row, dict)]
+    return result
+
+
 def safe_fields(values, event=None):
+    if event == 'guard.reclaim':
+        from guard_reclaim import log_fields
+        return log_fields(values or {})
+    if event and event.startswith('suspend.'):
+        return suspend_fields(values or {})
+    if event and event.startswith('macguard.'):
+        return macguard_fields(values or {})
+    if event == 'host.spawn_sample':
+        from spawn_schema import fields
+        return fields(values)
+    if event == 'homebrew.integrity':
+        result = {}
+        for key, value in (values or {}).items():
+            if key == 'status' and value in ('ok', 'broken', 'error'):
+                result[key] = value
+            elif key == 'reason' and value in ('opt_unavailable', 'brew_absent', 'brew_timeout',
+                                               'brew_exit', 'brew_unavailable', 'brew_parse'):
+                result[key] = value
+            elif key == 'brewError' and value in ('brew_absent', 'brew_timeout', 'brew_exit',
+                                                  'brew_unavailable', 'brew_parse'):
+                result[key] = value
+            elif key == 'receiptErrors' and type(value) is int and value >= 0:
+                result[key] = value
+            elif key in ('durationMs', 'exitCode') and finite_number(value):
+                result[key] = value
+            elif key in ('dangling', 'missing') and isinstance(value, list):
+                result[key] = []
+                for row in value:
+                    fields = ('name', 'target') if key == 'dangling' else ('formula', 'deps')
+                    if not isinstance(row, dict) or any(field not in row for field in fields):
+                        continue
+                    clean = {}
+                    for field in fields:
+                        items = row[field] if field == 'deps' else [row[field]]
+                        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+                            break
+                        texts = ['[redacted]' if SECRET.search(item) else ''.join(
+                            c if c.isprintable() else ' ' for c in item[:4096]) for item in items]
+                        clean[field] = texts if field == 'deps' else texts[0]
+                    else:
+                        result[key].append(clean)
+        return result
+    if event == 'janitor.mcp_summary':
+        return {'mcp_summary': janitor_mcp_fields((values or {}).get('mcp_summary'))}
+    if event == 'janitor.run':
+        result = {k: v for k, v in (values or {}).items() if k in ('found', 'killed') and finite_number(v)}
+        if 'mcp_orphan' in (values or {}):
+            result['mcp_orphan'] = janitor_orphan_fields(values['mcp_orphan'])
+        phases = (values or {}).get('phase_ms')
+        if isinstance(phases, dict):
+            result['phase_ms'] = {k: v for k, v in phases.items()
+                                  if k in JANITOR_PHASES and finite_number(v) and v >= 0}
+        return result
     if event == 'host.overload':
         result = host_fields(values, 'host.families_lite')
         for key in ('phase', 'onset', 'conditions', 'durationS', 'notified'):
@@ -441,6 +648,9 @@ def safe_fields(values, event=None):
                 result[key] = value
             elif key == 'notified' and type(value) is bool:
                 result[key] = value
+        if isinstance((values or {}).get('spawn'), dict):
+            from spawn_schema import fields
+            result['spawn'] = fields(values['spawn'])
         result['peak'] = host_fields((values or {}).get('peak', {}), 'host.families_lite')
         for key in ('swapUsedBytes', 'swapTotalBytes'):
             if finite_number(result.get(key)):
@@ -451,8 +661,17 @@ def safe_fields(values, event=None):
     if event == 'scan.volume_crawl':
         result = {}
         for key, value in (values or {}).items():
-            if key in ('pid', 'ppid', 'argvOmitted') and type(value) is int and 0 <= value <= 2147483647:
+            if key in ('pid', 'ppid', 'providerPid', 'argvOmitted') and type(value) is int and 0 <= value <= 2147483647:
                 result[key] = value
+            elif key == 'providerPid' and value is None:
+                result[key] = None
+            elif key == 'provider' and value in (None, 'claude', 'codex', 'opencode'):
+                result[key] = value
+            elif key == 'providerSessionAmbiguous' and type(value) is bool:
+                result[key] = value
+            elif key == 'providerSessionId':
+                result[key] = value if (value is None or isinstance(value, str) and
+                    re.fullmatch(r'(?:[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|ses_[A-Za-z0-9]{1,128})', value)) else None
             elif key in ('elapsedS', 'cpuPct') and (value is None or finite_number(value) and value >= 0):
                 result[key] = value
             elif key in ('cwd', 'threadId') and (value is None or isinstance(value, str)):
@@ -624,7 +843,7 @@ def safe_fields(values, event=None):
         elif event in ('crash.collect', 'crash.source', 'crash.unified.chunk') and key in ('stopReason', 'outcome') and value in (
                 'start', 'done', 'deadline', 'timeout', 'permission', 'exit', 'parse', 'error'):
             result[key] = value
-        elif event in ('crash.collect', 'crash.source', 'crash.unified.skip') and key in ('skipReason', 'reason') and value == 'lag_ceiling':
+        elif event in ('crash.collect', 'crash.source', 'crash.unified.skip') and key in ('skipReason', 'reason') and value in ('lag_ceiling', 'bootUnresolved', 'bootSecondUnreadable'):
             result[key] = value
         elif event == 'crash.unified.chunk' and key in ('chunk', 'timeoutS') and type(value) in (int, float) and math.isfinite(value) and value >= 0:
             result[key] = value
@@ -732,22 +951,68 @@ def private_dir(root):
     os.chmod(root, 0o700)
 
 
+def write_all(fd, data):
+    while data:
+        try:
+            count = os.write(fd, data)
+        except InterruptedError:
+            continue
+        if count <= 0:
+            raise OSError('log write made no progress')
+        data = data[count:]
+
+
 def append(fd, row):
-    os.write(fd, (json.dumps(row, separators=(',', ':'), allow_nan=False) + '\n').encode())
+    write_all(fd, (json.dumps(row, separators=(',', ':'), allow_nan=False) + '\n').encode())
 
 
-def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=None, error_tag=None, error_message=None, now=None):
+def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=None, error_tag=None, error_message=None, now=None, dedup_id=None):
     try:
         now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
         row = record(component, kind, name, now, duration_ms, ok, ids, props, error_tag, error_message)
+        if dedup_id is not None:
+            if not re.fullmatch(r'[a-f0-9]{32}', dedup_id) or name not in ('crash.observed', 'crash.unified.skip', 'crash.source'):
+                raise ValueError('invalid observation identity')
+            row.setdefault('props', {})['observationId'] = dedup_id
         root = directory()
         private_dir(root)
         day = now.date().isoformat()
-        fd = os.open(root / (day + '.ndjson'), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fd = os.open(root / (day + '.ndjson'), (os.O_RDWR if dedup_id else os.O_WRONLY) | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             # Never wait behind another writer, and never hold a lock across job work.
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             os.fchmod(fd, 0o600)
+            if dedup_id:
+                # The persisted outbox fixes both the identity and log day.
+                # Check and append under the same writer lock, so replay after
+                # an interruption between append and checkpoint is idempotent.
+                needle = ('"observationId":"'+dedup_id+'"').encode()
+                buffer = b''
+                matched = False
+                def matches(line):
+                    if needle not in line:
+                        return False
+                    try:
+                        old = json.loads(line)
+                        return (old.get('name') == name and
+                                old.get('props', {}).get('observationId') == dedup_id)
+                    except (ValueError, TypeError, AttributeError):
+                        return False
+                while True:
+                    block = os.read(fd, 65536)
+                    if not block:
+                        break
+                    lines = (buffer+block).split(b'\n')
+                    buffer = lines.pop()
+                    matched |= any(matches(line) for line in lines)
+                if buffer:
+                    # Finish a missing newline without deleting a torn prefix.
+                    # A complete JSON object can then be acknowledged safely;
+                    # an incomplete one never acknowledges the outbox record.
+                    write_all(fd, b'\n')
+                    matched |= matches(buffer)
+                if matched:
+                    return True
             marker = root / ('.retained-' + day)
             if not marker.exists():
                 cutoff = now.date() - dt.timedelta(days=30)
@@ -771,8 +1036,8 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                     'crash.unified.skip', 'crash.source', 'crash.collect') and
                     row.get('props', {}).get('skippedS', 0) > 0)
                 # Preserve the bounded host heartbeat through a noisy day's cap.
-                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload')
-                if kind != 'error' and not coverage_gap and not host_sample:
+                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload', 'host.spawn_sample', 'guard.reclaim', 'macguard.action')
+                if kind != 'error' and not coverage_gap and not host_sample and not dedup_id:
                     return
             append(fd, row)
             return True

@@ -7,20 +7,17 @@ import functools
 import math
 import os
 import re
+import resource
 import subprocess
 import sys
 import time
 
+from host import Sampler, clean_host, poll_props
 from toollog import emit, trimmed_stderr
+from causes import PHASES, RESOURCE_FIELDS, BYTE_PHASES, BYTE_FIELDS, WAIT_FIELDS, SUBSTEPS, SUBSTEP_FIELDS, gap_info, launchctl_info, phase_cause, positive
 
 JOB = 'com.ardud.9router-log-poll'
-FIELDS = {'history_scan_parse': 'historyScanParseMs', 'rollup_write': 'rollupWriteMs',
-          'state_save': 'stateSaveMs', 'lock_wait': 'lockWaitMs',
-          'listener_history': 'listenerHistoryMs', 'pool_history': 'poolHistoryMs',
-          'history_refresh': 'historyRefreshMs', 'launchctl': 'launchctlMs',
-          'tcp': 'tcpMs', 'providers_fetch': 'providersFetchMs',
-          'usage_fetch': 'usageFetchMs', 'stats_fetch': 'statsFetchMs',
-          'snapshot': 'snapshotMs', 'log_write': 'logWriteMs'}
+FIELDS = {name: field for name, field in PHASES.items() if name != 'pool_fetch'}
 _active = contextvars.ContextVar('observer_timing', default=None)
 
 
@@ -50,7 +47,16 @@ def clock_sample():
     except (OSError, ValueError):
         continuous = None
     return dict(wallMs=time.time() * 1000, monotonicMs=time.monotonic() * 1000,
-                continuousMs=continuous, pid=os.getpid())
+                continuousMs=continuous, cpuMs=time.process_time() * 1000, pid=os.getpid())
+
+
+def progress(name):
+    descriptor = os.environ.get('ROUTER_POLL_PROGRESS_FD')
+    if descriptor is not None:
+        try:
+            os.write(int(descriptor), (name + '\n').encode('ascii'))
+        except (OSError, ValueError):
+            pass
 
 
 def iso(value):
@@ -93,13 +99,27 @@ def job_snapshot():
 
 
 def launchctl_cause(props):
-    value = props.get('launchctlExit')
-    if type(value) is int or value in ('timeout', 'oserror'):
-        return 'launchctl_unknown:' + str(value)
-    return 'other'
+    return launchctl_info(props)['cause']
 
 
-GAP_NAMES = {'observer.gap', 'guard.tick_late', 'poll.phases', 'rollup.phases', 'pool.endpoint.get'}
+GAP_NAMES = {'observer.gap', 'guard.tick_late', 'poll.phases', 'rollup.phases', 'pool.endpoint.get', 'poll.timeout'}
+
+
+def gap_bounds(props):
+    if not isinstance(props, dict):
+        return None
+    try:
+        start, end = props.get('startedAtMs'), props.get('finishedAtMs')
+        if start is None or end is None:
+            parsed = [dt.datetime.fromisoformat(props[key].replace('Z', '+00:00')) for key in ('start', 'end')]
+            if any(value.tzinfo is None for value in parsed):
+                return None
+            start, end = [value.timestamp() * 1000 for value in parsed]
+        if all(type(value) in (int, float) and math.isfinite(value) for value in (start, end)):
+            return start, end
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        pass
+    return None
 
 
 def gap_summary(rows, day, generated):
@@ -111,24 +131,14 @@ def gap_summary(rows, day, generated):
         if row.get('name') not in GAP_NAMES or row.get('component') not in ('guard', 'poller', 'pool-alerts'):
             continue
         props = row.get('props', {})
-        if not isinstance(props, dict):
+        bounds = gap_bounds(props)
+        if bounds is None:
             continue
+        start, end = bounds
         try:
-            start = props.get('startedAtMs')
-            end = props.get('finishedAtMs')
-            if start is None or end is None:
-                parsed = [dt.datetime.fromisoformat(props[key].replace('Z', '+00:00')) for key in ('start', 'end')]
-                if any(value.tzinfo is None for value in parsed):
-                    continue
-                start, end = [value.timestamp() * 1000 for value in parsed]
-            if not all(type(value) in (int, float) and math.isfinite(value) for value in (start, end)):
-                continue
             if end - start <= 120000 or end > generated.timestamp() * 1000:
                 continue
             duration = row.get('durationMs', 0)
-            wall_gap = props.get('wallGapMs', 0)
-            if row['name'] != 'observer.gap' and not any(type(value) in (int, float) and value > 120000 for value in (duration, wall_gap)):
-                continue
             overlap = max(0, min(ceiling, end) - max(floor, start))
             if not overlap:
                 continue
@@ -139,15 +149,27 @@ def gap_summary(rows, day, generated):
         if identity in seen:
             continue
         seen.add(identity)
-        phase_name = props.get('phase')
-        if row.get('name') == 'pool.endpoint.get':
-            phase_name = 'pool_fetch'
-        cause = props.get('cause')
-        if cause not in ('sleep_gap', 'agent_not_running', 'other'):
-            cause = 'tick_blocked:' + phase_name if phase_name in (*FIELDS, 'pool_fetch') else 'other'
+        timing_props = dict(props, poolFetchMs=duration) if row.get('name') == 'pool.endpoint.get' else props
+        # Attribute the full span before clipping its duration to this UTC day.
+        elapsed = max(end - start, duration if positive(duration) else 0)
+        explanation = gap_info(timing_props, props.get('phase'), duration_ms=elapsed)
+        if explanation.get('causeEvidenceField') == 'poolFetchMs':
+            explanation['causeEvidenceField'] = 'durationMs'
         bucket = groups['guardGaps' if component == 'guard' else 'pollGaps']
-        bucket.append(dict(number=len(bucket) + 1, start=iso(start), end=iso(end),
-                           cause=cause, component=component, durationMs=round(overlap, 3)))
+        hosts = {key: clean_host(props.get(key)) for key in ('hostStart', 'hostEnd')}
+        hosts = {key: value for key, value in hosts.items() if value}
+        for key in hosts.copy():
+            at = props.get(key + 'AtMs')
+            if type(at) in (int, float) and math.isfinite(at):
+                hosts[key + 'AtMs'] = at
+        if 'l1' in hosts.get('hostStart', {}):
+            hosts['load1Start'] = hosts['hostStart']['l1']
+        counters = {key: value for key, value in props.items()
+                    if key in WAIT_FIELDS and type(value) is int and value >= 0}
+        counters.update({key: value for key, value in props.items()
+                         if key in SUBSTEP_FIELDS and (value == 0 or positive(value))})
+        bucket.append(dict(**hosts, **counters, number=len(bucket) + 1, start=iso(start), end=iso(end),
+                           **explanation, component=component, durationMs=round(overlap, 3)))
     return groups
 
 
@@ -165,36 +187,63 @@ def gap(previous, current, cadence_ms=15000):
     before, after = previous.get('continuousMs'), current.get('continuousMs')
     if all(type(value) in (int, float) and math.isfinite(value) for value in (before, after)) and mono >= 0:
         suspend = max(0, after - before - mono)
-    cause = 'other'
-    if previous.get('jobState') in ('stopped', 'absent'):
-        cause = 'agent_not_running'
-    elif current.get('pid') == previous.get('pid') and suspend > 120000:
-        # A suspend-aware clock avoids calling a wall-clock adjustment sleep.
-        cause = 'sleep_gap'
-    return dict(start=iso(previous['wallMs']), end=iso(current['wallMs']), cause=cause,
+    # Continuous and monotonic clocks are comparable only within the same guard.
+    if current.get('pid') != previous.get('pid'):
+        suspend = 0
+    hosts = {}
+    for key, sample in (('hostStart', previous), ('hostEnd', current)):
+        if sample.get('host'):
+            hosts[key] = sample['host']
+            hosts[key + 'AtMs'] = sample.get('hostAtMs', sample['wallMs'])
+    result = dict(**hosts, host=current.get('host', {}), hostAtMs=current.get('hostAtMs', current['wallMs']),
+                start=iso(previous['wallMs']), end=iso(current['wallMs']),
                 wallGapMs=wall, monotonicGapMs=mono, sleepGapMs=suspend,
                 pid=current.get('pid', 0), previousPid=previous.get('pid', 0),
                 jobStateStart=previous.get('jobState', 'unknown'), jobStateEnd=current.get('jobState', 'unknown'),
                 jobPidStart=previous.get('jobPid', 0), jobPidEnd=current.get('jobPid', 0),
                 jobExitStart=previous.get('jobExit', 'unknown'), jobExitEnd=current.get('jobExit', 'unknown'))
+    return dict(result, **gap_info(result))
 
 
 @contextlib.contextmanager
 def phase(name):
     timing = _active.get()
-    if timing is None:
+    if timing is None or name not in timing.values:
         yield
         return
-    frame = [time.monotonic(), 0]
+    try:
+        started = time.monotonic()
+        cpu_started = time.process_time()
+        usage_started = resource.getrusage(resource.RUSAGE_SELF)
+    except Exception:
+        yield
+        return
+    frame = [started, 0, cpu_started, 0, name, usage_started, dict.fromkeys(RESOURCE_FIELDS, 0)]
     timing.stack.append(frame)
+    progress(name)
     try:
         yield
     finally:
-        elapsed = (time.monotonic() - frame[0]) * 1000
-        timing.values[name] += max(0, elapsed - frame[1])
-        timing.stack.pop()
-        if timing.stack:
-            timing.stack[-1][1] += elapsed
+        try:
+            elapsed = (time.monotonic() - frame[0]) * 1000
+            cpu = (time.process_time() - frame[2]) * 1000
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            timing.values[name] += max(0, elapsed - frame[1])
+            timing.cpu[name] += max(0, cpu - frame[3])
+            for suffix, attribute in RESOURCE_FIELDS.items():
+                delta = max(0, getattr(usage, attribute) - getattr(frame[5], attribute))
+                timing.resources[name][suffix] += max(0, delta - frame[6][suffix])
+                if len(timing.stack) > 1:
+                    timing.stack[-2][6][suffix] += delta
+            if len(timing.stack) > 1:
+                timing.stack[-2][1] += elapsed
+                timing.stack[-2][3] += cpu
+            timing.last_phase = name
+        except Exception:
+            pass
+        finally:
+            timing.stack.pop()
+            progress(timing.stack[-1][4] if timing.stack else 'none')
 
 
 def measured(name):
@@ -202,46 +251,166 @@ def measured(name):
         @functools.wraps(function)
         def run(*args, **kwargs):
             with phase(name):
+                if name in BYTE_PHASES:
+                    with substep('BuildReport'):
+                        return function(*args, **kwargs)
                 return function(*args, **kwargs)
         return run
     return decorate
 
 
+@contextlib.contextmanager
+def substep(name):
+    timing = _active.get()
+    if timing is None or not timing.stack or timing.stack[-1][4] not in BYTE_PHASES:
+        yield
+        return
+    parent = timing.stack[-1]
+    started, cpu_started = time.monotonic(), time.process_time()
+    child_wall, child_cpu = parent[1], parent[3]
+    frame = [parent, 0, 0]
+    timing.steps.append(frame)
+    try:
+        yield
+    finally:
+        # Exclude both nested phases and nested substeps. A checkpoint save
+        # inside a parse loop belongs only to SaveState; listener work belongs
+        # only to its own phase, even inside history's BuildReport span.
+        wall = max(0, (time.monotonic() - started) * 1000 - (parent[1] - child_wall) - frame[1])
+        cpu = max(0, (time.process_time() - cpu_started) * 1000 - (parent[3] - child_cpu) - frame[2])
+        timing.substeps[parent[4]][name][0] += wall
+        timing.substeps[parent[4]][name][1] += cpu
+        timing.steps.pop()
+        if timing.steps and timing.steps[-1][0] is parent:
+            timing.steps[-1][1] += wall + frame[1]
+            timing.steps[-1][2] += cpu + frame[2]
+
+
+def submeasured(name):
+    def decorate(function):
+        @functools.wraps(function)
+        def run(*args, **kwargs):
+            with substep(name):
+                return function(*args, **kwargs)
+        return run
+    return decorate
+
+
+def count_bytes(suffix, count):
+    timing = _active.get()
+    if timing is not None and timing.stack:
+        name = timing.stack[-1][4]
+        if name in timing.bytes:
+            timing.bytes[name][suffix] += count
+
+
 class Timings:
-    def __init__(self, component='poller', name='poll.phases', threshold_ms=30000, start=None):
+    def __init__(self, component='poller', name='poll.phases', threshold_ms=30000, start=None, sampler=None):
         self.component, self.name, self.threshold = component, name, threshold_ms
         self.start = start
+        self.sampler = sampler or Sampler()
         self.stack, self.values = [], {name: 0 for name in FIELDS}
+        self.last_phase = 'none'
+        self.cpu = {name: 0 for name in FIELDS}
+        self.resources = {name: dict.fromkeys(RESOURCE_FIELDS, 0) for name in FIELDS}
+        self.bytes = {name: dict.fromkeys(BYTE_FIELDS, 0) for name in BYTE_PHASES}
+        self.steps = []
+        self.substeps = {name: {step: [0, 0] for step in SUBSTEPS} for name in BYTE_PHASES}
 
     def __enter__(self):
-        self.start = self.start or dict(clock_sample(), **job_snapshot())
         self.token = _active.set(self)
+        try:
+            self.cpu_start = time.process_time()
+            self.start = self.start or clock_sample()
+        except Exception:
+            self.start = {}
+            return self
+        with phase('observer_snapshot_start'):
+            if not self.start.get('host'):
+                self.start['host'] = self.sample_host()
+            self.start.setdefault('hostAtMs', self.start['wallMs'])
+            try:
+                self.start.update(job_snapshot())
+            except Exception:
+                self.start.update(jobState='unknown', jobExit='snapshot_error', jobPid=0)
         return self
 
     def __exit__(self, *_):
-        _active.reset(self.token)
-        self.end = dict(clock_sample(), **job_snapshot())
+        self.end = dict(self.start)
+        try:
+            self.finish()
+        except Exception:
+            # A diagnostic must neither break the guard nor replace its failure.
+            pass
+        finally:
+            _active.reset(self.token)
+
+    def finish(self):
+        if not self.start:
+            return
+        open_phase = self.stack[-1][4] if self.stack else 'none'
+        # This launchctl snapshot used to run after the recorded end clock.
+        with phase('post_end_diag'):
+            try:
+                end_job = job_snapshot()
+            except Exception:
+                end_job = dict(jobState='unknown', jobExit='snapshot_error', jobPid=0)
+        self.end = dict(clock_sample(), **end_job)
+        self.end['host'] = self.start.get('host', {})
+        self.end['hostAtMs'] = self.start['hostAtMs']
+        elapsed = max(0, self.end['monotonicMs'] - self.start['monotonicMs'])
+        wall = self.end['wallMs'] - self.start['wallMs']
+        if max(elapsed, wall) <= self.threshold:
+            return
+        with phase('post_end_diag'):
+            end_host = self.sample_host()
+            self.end = dict(clock_sample(), **end_job)
+            self.end.update(host=end_host, hostAtMs=self.end['wallMs'])
         elapsed = max(0, self.end['monotonicMs'] - self.start['monotonicMs'])
         wall = self.end['wallMs'] - self.start['wallMs']
         missing = gap(self.start, self.end, cadence_ms=0)
         slowest = max(self.values, key=self.values.get)
-        if max(self.values.values()) <= self.threshold and max(elapsed, wall) <= 120000:
-            return
-        props = dict(start=iso(self.start['wallMs']), end=iso(self.end['wallMs']),
+        props = dict(host=self.end['host'], hostStart=self.start.get('host', {}), hostEnd=self.end['host'], start=iso(self.start['wallMs']), end=iso(self.end['wallMs']),
+                     hostAtMs=self.end['hostAtMs'], hostStartAtMs=self.start['hostAtMs'], hostEndAtMs=self.end['hostAtMs'],
                      startedAtMs=self.start['wallMs'], finishedAtMs=self.end['wallMs'],
                      monotonicStartMs=self.start['monotonicMs'], monotonicEndMs=self.end['monotonicMs'],
                      wallGapMs=wall, monotonicGapMs=elapsed,
                      sleepGapMs=missing['sleepGapMs'] if missing else 0,
-                     phase=slowest if self.values[slowest] > self.threshold else 'other',
-                     cause='tick_blocked:' + slowest if self.values[slowest] > self.threshold else 'other',
+                     phase=slowest if self.values[slowest] > 0 else 'none',
+                     openPhase=open_phase, lastPhase=self.last_phase,
+                     cpuMs=max(0, (time.process_time() - self.cpu_start) * 1000),
                      pid=self.start['pid'], ppid=os.getppid())
-        if missing and missing['cause'] == 'sleep_gap':
-            props['cause'] = 'sleep_gap'
         for key in ('jobState', 'jobPid', 'jobExit'):
             props[key + 'Start'] = self.start.get(key, 'unknown')
             props[key + 'End'] = self.end.get(key, 'unknown')
         props.update({field: round(self.values[name], 3) for name, field in FIELDS.items()})
+        props.update({field[:-2] + 'CpuMs': round(self.cpu[name], 3) for name, field in FIELDS.items()})
+        props.update({FIELDS[name][:-2] + suffix: value
+                      for name, counters in self.resources.items() for suffix, value in counters.items()})
+        props.update({FIELDS[name][:-2] + suffix: value
+                      for name, counters in self.bytes.items() for suffix, value in counters.items()})
+        props.update({FIELDS[name][:-2] + step + suffix: math.floor(values[index] * 1000) / 1000
+                      for name, steps in self.substeps.items() for step, values in steps.items()
+                      for index, suffix in enumerate(('Ms', 'CpuMs'))})
+        props.update(gap_info(props))
         emit(self.component, self.name, kind='perf', durationMs=elapsed, props=props)
+
+    def sample_host(self):
+        try:
+            return self.sampler()
+        except Exception:
+            return {'e': 'error'}
+
+
+def poll_host():
+    timing = _active.get()
+    if timing is None:
+        return {}
+    start = timing.start if isinstance(timing.start, dict) else {}
+    at_ms = start.get('hostAtMs')
+    if type(at_ms) not in (int, float) or not (at_ms == 0 or positive(at_ms)):
+        return {'host': {'e': 'error'}}
+    return poll_props(start.get('host', {}), at_ms)
 
 
 def observed(component='poller', name='poll.phases'):
