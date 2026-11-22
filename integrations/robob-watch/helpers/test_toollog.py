@@ -40,7 +40,7 @@ class ToolLogTests(unittest.TestCase):
         log._initialized.clear()
 
     def rows(self):
-        return [json.loads(line) for path in self.directory.glob('*.ndjson') for line in path.read_text().splitlines()]
+        return [log.expand_helper(json.loads(line)) for path in self.directory.glob('*.ndjson') for line in path.read_text().splitlines()]
 
     def entry(self, **fields):
         return {'component': 'triage', 'kind': 'event', 'name': 'triage.decision', **fields}

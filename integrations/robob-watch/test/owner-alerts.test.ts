@@ -8,6 +8,7 @@ import { Delivery } from "../../spectrum-bridge/src/delivery.ts";
 import { Store } from "../../spectrum-bridge/src/store.ts";
 import { TransportError, type Photon } from "../../spectrum-bridge/src/photon.ts";
 import { BUBBLE_CHARS } from "../../spectrum-bridge/src/formatting.ts";
+import { expandTelemetry } from "../src/log-format.ts";
 
 const sandboxes: string[] = [];
 const cleanups: (() => void)[] = [];
@@ -86,7 +87,7 @@ function fixture(opted = true, extra: Record<string, unknown> = {}) {
   const calls = () => existsSync(join(root, "calls")) ? readFileSync(join(root, "calls"), "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]) : [];
   const accepted = () => existsSync(join(root, "accepted")) ? Object.values(JSON.parse(readFileSync(join(root, "accepted"), "utf8"))) as string[] : [];
   const events = () => readFileSync(join(root, "logs", new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8")
-    .trim().split("\n").map(line => JSON.parse(line));
+    .trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line)));
   const rotate = (id: string, generation: number) => {
     const db = new Database(bridgeDB);
     db.query("update kv set value=? where key='route'").run(JSON.stringify({ id, generation })); db.close();

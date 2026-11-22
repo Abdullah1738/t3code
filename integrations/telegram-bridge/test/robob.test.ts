@@ -1551,7 +1551,10 @@ test("stream throws retain toolError and aborts override thrown and error-frame 
   expect(result.control.backend.boardStatus()).toMatchObject({ streamConnects: 2,
     streamEndsByKind: { errorFrame: 0, clean: 0, thrown: 1, aborted: 1 }, lastStreamEndKind: "aborted" });
   expect(result.delays).toEqual([1000]);
+  expect(streamLogs.entries().filter(row => row.error?.tag === "tg.robob.notifications")).toHaveLength(1);
+  streamLogs.flushErrors();
   expect(streamLogs.entries().filter(row => row.error?.tag === "tg.robob.notifications")).toHaveLength(2);
+  expect(streamLogs.entries().filter(row => row.error?.tag === "tg.robob.notifications").at(-1)?.props?.repeats).toBe(1);
   expect(streamLogs.entries().filter(row => row.name === "tg.robob.streamEnd").map(row => row.props?.kind)).toEqual(["thrown", "aborted"]);
   expect(streamLogs.text()).not.toContain("PRIVATE_");
 });

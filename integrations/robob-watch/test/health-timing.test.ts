@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { expandTelemetry } from "../src/log-format.ts";
 
 const runtime = resolve(process.env.HEALTH_TIMING_RUNTIME ?? join(import.meta.dir, ".."));
 
@@ -79,9 +80,9 @@ if (process.env.HEALTH_TIMING_TEST_CHILD !== "1") {
         expect(row.props.startLagMs).toBeNull();
       }
       const runs = readdirSync(toolLogs).filter(name => name.endsWith(".ndjson"))
-        .flatMap(name => readFileSync(join(toolLogs, name), "utf8").trim().split("\n").map(line => JSON.parse(line)))
+        .flatMap(name => readFileSync(join(toolLogs, name), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line))))
         .filter(row => row.name === "watch.run");
-      expect(runs.at(-1).props).toMatchObject({ exitCode: 0, outcome: "no_change" });
+      expect(runs.at(-1)!.props).toMatchObject({ exitCode: 0, outcome: "no_change" });
     });
   }
 }

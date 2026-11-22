@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Delivery, State, Watcher } from "../src/lib.ts";
 import type { LogEntry } from "../src/toollog.ts";
+import { expandTelemetry } from "../src/log-format.ts";
 
 setDefaultTimeout(30_000);
 
@@ -153,12 +154,12 @@ console.log(JSON.stringify(await (async () => (${body}))()));`;
     const logsDir = join(dir, "logs");
     return { result: JSON.parse(lines.pop()!) as Delivery & { state: State; held: State; before: State; same: boolean; env: string; deliveries: Delivery[] },
       sentLogs: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson"))
-        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry))
+        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line)) as LogEntry[]))
         .filter(row => row.name === "wake.sent") : [],
       runnerLog: lines.join("\n"),
-      logs: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson")).flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry)) : [],
+      logs: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson")).flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line)) as LogEntry[])) : [],
       fallbacks: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson"))
-        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry))
+        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line)) as LogEntry[]))
         .filter(row => row.name === "wake.creator_fallback") : [],
       calls: existsSync(callsFile) ? readFileSync(callsFile, "utf8").trim().split("\n").map(line => JSON.parse(line) as Call) : [],
       log: existsSync(join(watcherDir, "log")) ? readFileSync(join(watcherDir, "log"), "utf8") : "" };
