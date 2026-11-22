@@ -1020,6 +1020,17 @@ def _imessage_rollup_records(board, day):
     pending = []
     for line, raw in _read_records(board, day):
         row = {key: value for key, value in raw.items() if not key.startswith('_rollup_')}
+        request_histogram = row.get('requests', {}).get('histogram') if isinstance(row.get('requests'), dict) else None
+        if row.get('component') == 'api' and row.get('name') == 'api.request.rollup' and isinstance(request_histogram, list):
+            valid = (len(request_histogram) <= 146341 and all(isinstance(p, list) and len(p) == 2
+                     and type(p[0]) is int and 0 <= p[0] <= 86400000 and type(p[1]) is int and p[1] > 0 for p in request_histogram))
+            count = sum(p[1] for p in request_histogram) if valid else 0
+            if count and count == row.get('props', {}).get('count'):
+                yield line, {**row, 'name': 'api.request', '_rollup_count': count,
+                             '_rollup_ok': count if row.get('ok') is True else 0,
+                             '_rollup_failed': count if row.get('ok') is False else 0,
+                             '_rollup_histogram': request_histogram}
+                continue
         renders = _imessage_render_stats(row)
         calls = _imessage_call_stats(row)
         if renders:
@@ -1088,6 +1099,7 @@ def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
     causes, render_failures = Counter(), Counter()
+    api_histograms, cli_failures = defaultdict(list), defaultdict(Counter)
     cause_kinds = defaultdict(Counter)
     probe_totals, probe_statuses = Counter(), Counter()
     probe_bins = defaultdict(list)
@@ -1212,6 +1224,20 @@ def rollup(board, day, top_n=20):
             else:
                 unrecognized += refusal_weight
                 unrecognized_sampled |= refusal_weight > 1
+        if board == 'imessage':
+            request_props = row.get('props') if isinstance(row.get('props'), dict) else {}
+            request_path = request_props.get('path')
+            if request_path in set("/health /send /files /file /messages /wake /wake/:id /poll /app /react /cancel-send /router /secret-request /secret-read /secret-forget /agent-ask /agent-answer /agent-requests /allow /allow-group /ask-owner /chats /guest-allow /guest-revoke /guest-send /guests /location /location-request /notify-rule /opt-in /remote-events /remote-resolve /share /share-contact /shares /unshare /unknown".split()):
+                if row.get('component') == 'api' and row.get('name') == 'api.request':
+                    ms = request_props.get('handlerMs')
+                    if aggregate:
+                        api_histograms[request_path].extend(tuple(pair) for pair in row['_rollup_histogram'])
+                    elif type(ms) in (int, float) and math.isfinite(ms) and ms >= 0:
+                        api_histograms[request_path].append((min(86400000, math.floor(ms + .5) if ms <= 60000 else math.ceil(ms / 1000) * 1000), 1))
+                if row.get('component') == 'cli' and row.get('name') == 'cli.request_failed':
+                    phase = request_props.get('phase')
+                    if phase in ('connect', 'write', 'await_headers', 'read_body'):
+                        cli_failures[request_path][phase] += 1
         row_ok = row['_rollup_ok'] if aggregate else weight * (row.get('ok') is True)
         row_failed = row['_rollup_failed'] if aggregate else weight * (row.get('ok') is False)
         already_logged = board == 'imessage' and row.get('alreadyLogged') is True
@@ -1423,6 +1449,9 @@ def rollup(board, day, top_n=20):
                 values = bins[field]
                 summary[field] = {'count': sum(n for _, n in values), **(percentiles(values) if values else {'p50': 0, 'p95': 0, 'max': 0})}
             return summary
+        result['apiRequests'] = {path: {'count': sum(n for _, n in values), 'handlerMs': percentiles(values)}
+                                 for path, values in api_histograms.items() if values}
+        result['cliRequestFailures'] = {path: dict(phases) for path, phases in cli_failures.items()}
         result['promptProbe'] = {**probe_summary(probe_totals, probe_statuses, probe_bins),
             'byHour': {hour: probe_summary(value['counts'], value['statuses'], value['bins']) for hour, value in sorted(probe_hours.items())}}
         result['dedupedFailures'] = deduped_failures
