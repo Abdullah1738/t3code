@@ -36,7 +36,12 @@ function fields(entry: LogEntry, at: Date) {
   }
   const props: Record<string, string | number | boolean | null> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
-    if (key === "exitCode" && value === null) props[key] = null;
+    if (entry.name === "tg.digest" && key === "action" && ["classifyFailed", "dropClosed", "queued", "flush"].includes(String(value))) props[key] = String(value);
+    else if (entry.name === "tg.digest" && ["slot", "items", "boards", "dropped", "promoted", "chars", "truncated"].includes(key)
+      && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if (entry.name === "tg.digest" && key === "board" && typeof value === "string" && /^[a-z0-9-]{1,80}$/.test(value)) props[key] = value;
+    else if (entry.name === "tg.digest" && key === "kind" && ["decision", "review", "notice", "task", "unknown"].includes(String(value))) props[key] = String(value);
+    else if (key === "exitCode" && value === null) props[key] = null;
     else if (entry.name === "tg.robob.streamEnd" && key === "kind" && STREAM_END_KINDS.includes(value as typeof STREAM_END_KINDS[number])) props[key] = String(value);
     else if (entry.name === "tg.robob.streamEnd" && key === "connectedMs"
       && (value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0))) props[key] = value;

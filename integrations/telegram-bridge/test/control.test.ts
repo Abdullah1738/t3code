@@ -178,3 +178,31 @@ test("control wrappers preserve bounded diagnostics for request, body, upload an
   for (const part of secret.split(" ")) expect(logs.text()).not.toContain(part);
   expect(logs.text()).not.toContain("test-token");
 });
+
+
+test("getAsk validates the actual ask detail response and treats only 404 as gone", async () => {
+  const original = globalThis.fetch;
+  const client = new ControlClient({ url: "http://127.0.0.1:1", token: "test-token" });
+  const detail = { boardId: "board-watchers", cardId: "card-fixture", cardNumber: 128, discussionId: null,
+    ask: { id: "q1", blocking: false, text: "Choose release", kind: "decision", title: "Release day", closedAt: null } };
+  const calls: { url: string; init?: RequestInit }[] = [];
+  try {
+    globalThis.fetch = Object.assign(async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init }); return Response.json(detail);
+    }, { preconnect: original.preconnect });
+    expect(await client.getAsk("watchers:128:q1")).toMatchObject({ cardId: "card-fixture", blocking: false, text: "Choose release", kind: "decision", title: "Release day", closedAt: null });
+    expect(calls[0]?.url).toBe("http://127.0.0.1:1/api/ardud/kanban/cards/watchers%3A128/asks/q1");
+    expect(calls[0]?.init?.method).toBe("GET");
+    expect(calls[0]?.init?.headers).toMatchObject({ authorization: "Bearer test-token" });
+    expect(calls[0]?.init?.signal).toBeInstanceOf(AbortSignal);
+    for (const status of [404, 500]) {
+      globalThis.fetch = Object.assign(async () => Response.json({ error: { code: "not-found" } }, { status }), { preconnect: original.preconnect });
+      if (status === 404) expect(await client.getAsk("watchers:128:q1")).toBeUndefined();
+      else await expect(client.getAsk("watchers:128:q1")).rejects.toMatchObject({ status });
+    }
+    for (const data of [{}, { ...detail, cardId: undefined }, { ...detail, ask: { ...detail.ask, blocking: "false" } }, { ...detail, ask: { ...detail.ask, id: "q2" } }]) {
+      globalThis.fetch = Object.assign(async () => Response.json(data), { preconnect: original.preconnect });
+      await expect(client.getAsk("watchers:128:q1")).rejects.toThrow("ask_shape");
+    }
+  } finally { globalThis.fetch = original; }
+});
