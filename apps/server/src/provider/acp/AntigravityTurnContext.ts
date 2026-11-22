@@ -18,6 +18,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Random from "effect/Random";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
@@ -226,7 +227,8 @@ export const linkAntigravityHarnessConfig = Effect.fn("AntigravityTurnContext.li
         // Never unlink first: a concurrent start (or the generator) could launch in the gap
         // with no guards. A uniquely named link renamed over the old one is atomic.
         yield* fileSystem.makeDirectory(path.dirname(link), { recursive: true });
-        const temporary = `${link}.robob-${process.pid}-${Math.random().toString(36).slice(2)}`;
+        const nonce = yield* Random.nextInt;
+        const temporary = `${link}.robob-${process.pid}-${nonce.toString(36)}`;
         yield* fileSystem.symlink(target, temporary);
         yield* fileSystem
           .rename(temporary, link)

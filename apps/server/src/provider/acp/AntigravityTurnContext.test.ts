@@ -213,7 +213,10 @@ describe("Antigravity turn context", () => {
           }
         });
         yield* Effect.all([...starts, probe], { concurrency: "unbounded" });
-        assert.equal(yield* fileSystem.readLink(hooks), path.join(harnessHome, "config", "hooks.json"));
+        assert.equal(
+          yield* fileSystem.readLink(hooks),
+          path.join(harnessHome, "config", "hooks.json"),
+        );
       }
       assert.equal(gaps, 0);
       const leftovers = (yield* fileSystem.readDirectory(path.dirname(hooks))).filter((name) =>
