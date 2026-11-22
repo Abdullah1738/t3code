@@ -2987,6 +2987,110 @@ def _direct_read(words, directory):
     return False
 
 
+# $PWD, ${PWD}, $(pwd) and $(realpath <literal>) name the tracked cwd only
+# while nothing in the call can rebind PWD, change cd's mode or shadow the
+# two commands. The check is textual over the whole caller command (offbox
+# payloads included) and fails closed: any match keeps the word unresolved.
+CWD_READ = re.compile(r'\$PWD(?!\w)|\$\{PWD\}')
+CWD_UNPROVED = re.compile(
+    r'(?<![\w$])PWD(?!\w)'
+    r'|(?<![\w-])(?:eval|alias|unalias|source|enable|hash|shopt|setopt|unsetopt|pushd|popd|builtin|function|chpwd)(?![\w-])'
+    r'|(?:^|[;&|(){}\n])\s*\.\s'
+    r'|(?:^|[;&|(){}\n])\s*[A-Za-z_][\w-]*\s*\(\s*\)|\(\s*\)\s*\{'
+    r'|(?<![\w-])cd\s+(?:-[A-Za-z]*\s+)*-[A-Za-z]*P'
+    r'|(?<![\w-])set\s+(?:[-+][A-Za-z]*\s+)*(?:-[A-Za-z]*P|[-+]o\s+physical)'
+    r'|CDPATH|(?<![\w$])PATH\+?=|(?<![\w$./-])path(?:\[[^\]]*\])?\+?=|(?<![\w$])commands\['
+    # Code run later, zsh's other lookup tables, cd's physical mode and
+    # indirect expansion can also rebind PWD/PATH or shadow the commands.
+    r'|(?<![\w-])(?:trap|fc|autoload|disable|zmodload|emulate)(?![\w-])|fpath|FPATH|BASH_CMDS|BASH_ALIASES'
+    r'|(?<![\w$])(?:functions|aliases|galiases|saliases|options)\[|(?i:chase_?(?:links|dots))|\$\{!|\$\{\([^)]*P'
+    # Arithmetic evaluates a variable's value as an expression, so a value
+    # built at runtime ("P${a}D=5") assigns whatever name it spells.
+    r'|\(\(|\$\[|(?<![\w-])let(?![\w-])|\[\[[^\]]*\s-(?:eq|ne|lt|le|gt|ge)\s'
+    r'|(?<![\w$])[A-Za-z_]\w*\[[^\]]*[A-Za-z_$`]|\$\{[A-Za-z_]\w*:(?![-=+?])')
+# Builtins that bind a variable named by an operand. A name built at runtime
+# ("P${a}D", "$n") can spell PWD or PATH, so it voids the proof (review r2).
+CWD_DECLARERS = frozenset({'declare', 'typeset', 'local', 'export', 'readonly', 'integer', 'float', 'private', 'nameref'})
+CWD_NAME_BINDERS = frozenset({'set', 'read', 'mapfile', 'readarray', 'getopts', 'unset', 'vared', 'zparseopts', 'zstyle',
+                              'strftime', 'sysread', 'wait', 'coproc', 'compadd', 'zle', 'zregexparse'})
+CWD_BOUND_NAMES = frozenset({'PWD', 'OLDPWD', 'PATH', 'path', 'CDPATH', 'cdpath'})
+CWD_KEYWORDS = frozenset({'!', 'do', 'then', 'else', 'elif', 'if', 'while', 'until', 'time', 'command', 'noglob', 'nocorrect', '-', 'exec'})
+CWD_SEPARATOR = re.compile(r'[;&|()<>{}]+')
+CWD_PATH = re.compile(r'[A-Za-z0-9_./@%+=:,-]+')
+# Inside double quotes a cwd with spaces stays one word, as its literal twin does.
+CWD_QUOTED_PATH = re.compile(r'[^\0\n$`"\'\\*?\[\]{}]+')
+CWD_SUBSTITUTION = re.compile(r'\$\{PWD\}|\$\(\s*pwd\s*\)|`\s*pwd\s*`|'
+                              r'\$\(\s*realpath\s+([\'"]?)(?!-)([A-Za-z0-9_./@%+=:,-]+)\1\s*\)|'
+                              r'`\s*realpath\s+([\'"]?)(?!-)([A-Za-z0-9_./@%+=:,-]+)\3\s*`')
+
+
+def _cwd_unproved(command: str) -> bool:
+    # Quotes and backslashes do not hide a binding from the shell (P""WD=).
+    return any(CWD_UNPROVED.search(CWD_READ.sub('', text))
+               for text in (command, re.sub(r'[\'"\\]', '', command))) or _cwd_runtime_binding(command)
+
+
+def _cwd_runtime_binding(text: str, depth: int = 0) -> bool:
+    if depth > 6:
+        return True
+    text = CWD_SUBSTITUTION.sub('', CWD_READ.sub('', text)).replace('\n', ';')
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=';&|()<>')
+    lexer.commenters, lexer.whitespace_split = '', True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        # Unbalanced quotes (a heredoc body): split the unquoted text instead.
+        tokens = re.findall(r'[;&|()<>{}]+|[^\s;&|()<>{}]+', re.sub(r'[\'"\\]', '', text))
+    dynamic = lambda token: '$' in token or '`' in token
+    segment: list[str] = []
+    for token in tokens + [';']:
+        if CWD_SEPARATOR.fullmatch(token):
+            if _cwd_segment_binds(segment, dynamic):
+                return True
+            segment = []
+            continue
+        # Payload text and quoted scripts are shell text of their own.
+        if re.search(r'[\s;&|()<>{}]', token) and _cwd_runtime_binding(token, depth + 1):
+            return True
+        segment.append(token)
+    return False
+
+
+def _cwd_segment_binds(words: list[str], dynamic) -> bool:
+    while words and (words[0] in CWD_KEYWORDS or re.fullmatch(r'[A-Za-z_]\w*\+?=.*', words[0], re.S)):
+        words = words[1:]
+    if not words:
+        return False
+    # A command word built at runtime may name a binding builtin.
+    if dynamic(words[0]) and any(dynamic(word) for word in words[1:]):
+        return True
+    for index, word in enumerate(words):
+        operands = words[index + 1:]
+        if word in CWD_DECLARERS:
+            # Namerefs and numeric types evaluate the value too.
+            if any(re.fullmatch(r'[-+][A-Za-z]*[niEF][A-Za-z]*', op) for op in operands):
+                if any(dynamic(op) for op in operands):
+                    return True
+            for op in operands:
+                if re.fullmatch(r'[-+][A-Za-z]*', op):
+                    continue
+                name = re.split(r'\+?=|\[', op, maxsplit=1)[0]
+                if dynamic(name) or name in CWD_BOUND_NAMES:
+                    return True
+        elif word in CWD_NAME_BINDERS:
+            if any(dynamic(op) or op in CWD_BOUND_NAMES for op in operands):
+                return True
+        elif word in {'printf', 'print'}:
+            if operands and (dynamic(operands[0]) or any(re.fullmatch(r'-[A-Za-z]*v.*', op, re.S) for op in operands)):
+                if any(dynamic(op) or op in CWD_BOUND_NAMES for op in operands):
+                    return True
+        elif word in {'for', 'select'}:
+            names = operands[:operands.index('in')] if 'in' in operands else operands[:1]
+            if any(name in CWD_BOUND_NAMES for name in names):
+                return True
+    return False
+
+
 def _literal_path(value: str, cwd: Path | None) -> Path | None:
     value = re.sub(r"^(?:~|\$HOME|\$\{HOME\})(?=/|$)", str(Path.home()), value)
     if not value or re.search(r"[$`*?\[\]]", value) or value == "-":
@@ -3603,7 +3707,7 @@ def _fixture_wrapped_invocation(command):
     return target, run
 
 
-def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None, _preservation=True, _budget=None, _glob_writes=None, _cwd_candidates=None) -> list[Path]:
+def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None, _preservation=True, _budget=None, _glob_writes=None, _cwd_candidates=None, _cwd_unproved_text=None) -> list[Path]:
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
     script_files, node_test_files = _budget if _budget is not None else (set(), set())
@@ -3631,6 +3735,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     unknown_directories = set(_cwd_candidates or ())
     conditional = 0
     inherited_values, inherited_unsafe, caller_command = _environment or ({}, False, None)
+    cwd_unproved = (_cwd_unproved_text if _cwd_unproved_text is not None else
+                    _cwd_unproved(command) or caller_command is not None and _cwd_unproved(caller_command))
     shell_values = {"HOME": str(Path.home()), **inherited_values}
     path_values = {}
     live_assignments = set()
@@ -4995,9 +5101,46 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return (preservation_tool(words, directory) and
                 _trusted_fixture_tool(words[0], 'mktemp', directory) and unchanged_tool(words[0], directory))
 
+    def tracked_cwd(directory, quoted=False):
+        if cwd_unproved or unsafe_bindings or directory is None or 'PWD' in shell_values or 'PWD' in script_values:
+            return None
+        return str(directory) if (CWD_QUOTED_PATH if quoted else CWD_PATH).fullmatch(str(directory)) else None
+
+    def resolve_cwd_reads(text, directory, quoted=False):
+        # An escaped \$PWD stays literal.
+        base = tracked_cwd(directory, quoted)
+        return text if base is None else re.sub(r'(?<!\\)\$(?:PWD(?!\w)|\{PWD\})', lambda _: base, text)
+
+    def resolve_cwd_substitution(literal, directory, quoted=False):
+        match = CWD_SUBSTITUTION.fullmatch(literal)
+        base = tracked_cwd(directory, quoted) if match else None
+        target = match and (match[2] or match[4])
+        # An exported Bash function named pwd or realpath shadows that command.
+        if base is None or any(re.fullmatch(r'BASH_FUNC_(?:pwd|realpath)(?:%%|\(\))?', name) for name in os.environ):
+            return None
+        # Only the system realpath, found through the inherited PATH and not
+        # replaced earlier in the call, is known to print the resolved path.
+        if target and not (_trusted_fixture_tool('realpath', 'realpath', directory) and unchanged_tool('realpath', directory)):
+            return None
+        # realpath follows symlinks; check the path the shell would pass.
+        resolved = os.path.realpath(os.path.join(base, target)) if target else base
+        return resolved if (CWD_QUOTED_PATH if quoted else CWD_PATH).fullmatch(resolved) else None
+
     def decode_word(value, directory, depth, quoted, checked, cwd_only=False, bodies=None, preserve_mktemp=False):
         nonlocal conditional, uncertain_write, last_invalidation
+        value = resolve_cwd_reads(value, directory)
         for key, literal in reversed(quoted.items()):
+            if key in value and key.startswith('\0guard_quoted_'):
+                resolved = resolve_cwd_substitution(literal, directory)
+                if resolved is not None:
+                    value = value.replace(key, resolved)
+                    continue
+            if key in value and key.startswith('\0guard_double_'):
+                literal = resolve_cwd_reads(literal, directory, quoted=True)
+                for inner in re.findall(r'\0guard_quoted_\d+__', literal):
+                    resolved = resolve_cwd_substitution(quoted.get(inner, ''), directory, quoted=True)
+                    if resolved is not None:
+                        literal = literal.replace(inner, resolved)
             if key in value and key not in checked and not key.startswith('\0guard_literal_') and literal.startswith(("${", "$(", "`")) and not cwd_only:
                 checked.add(key)
                 for substitution in _substitutions(literal, shell=True):
@@ -5068,7 +5211,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                   _stdin=(input_words, input_bodies or {}), _environment=environment, _opaque=opaque,
                                   _preservation=_preservation and preservation,
                                   _budget=(script_files, node_test_files), _glob_writes=glob_writes,
-                                  _cwd_candidates=unknown_directories)
+                                  _cwd_candidates=unknown_directories, _cwd_unproved_text=cwd_unproved)
         paths.extend(path for path in remote_paths if path not in paths)
         check_budget()
 
@@ -5223,7 +5366,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 pieces.append((text[end:], None))
                 result = {''}
                 for key, literal in pieces:
-                    if literal is not None:
+                    cwd = resolve_cwd_substitution(literal, directory, quoted_context) if key.startswith('\0guard_quoted_') else None
+                    if cwd is not None:
+                        values = {cwd}
+                    elif literal is not None:
                         if key.startswith('\0guard_literal_double_'):
                             values = resolve(double_text(literal), True)
                         elif key.startswith('\0guard_literal_'):

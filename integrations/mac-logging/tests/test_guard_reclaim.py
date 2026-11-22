@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import guard_reclaim as r
 import mac_guard as m
 import toollog
-from test_mac_guard import FakeHost, Future, immediate_submit, proc, NOW
+from test_mac_guard import FakeHost, Future, immediate_submit, proc, robob_browser_tree, NOW
 
 
 def stamp(now):
@@ -225,6 +225,17 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual(self.native.effects, [20])
         log = next(p for n,p in self.events if p.get('step')=='renice' and p.get('pid')==20)
         self.assertEqual(log['ancestors'][0]['pid'], 30)
+
+    def test_robob_descendant_reclaim_is_protected(self):
+        self.native.rows = {p['pid']: dict(p, uid=os.getuid()) for p in robob_browser_tree()}
+        self.native.rows[11].update(comm='/opt/clang', args='clang build.c')
+        self.guard.rows = copy.deepcopy(self.native.rows)
+        self.tick()
+        self.assertEqual(self.native.effects, [])
+        self.assertFalse(any(e[0] == 'signal' for e in self.host.effects))
+        census = json.loads(next(self.guard.evidence.glob('*/census.json')).read_text())
+        renderer = next(p for p in census['processes'] if p['pid'] == 11)
+        self.assertEqual(renderer['reason'], 'protected')
 
     def test_rss_by_rung_and_peak_threshold(self):
         def janitor():

@@ -1,10 +1,14 @@
+import { API_PATHS, REQUEST_PHASES, handlerBin } from "./request-trace.ts";
 import { emptyPromptProbe, cleanPromptProbe, mergePromptProbe, summarizePromptProbe, type PromptProbeStats } from "./log-prompt-probes.ts";
 import type { LogLine } from "./toollog.ts";
 import { callName, percentiles } from "./log-calls.ts";
 import { createRobobLinkAggregation } from "./log-robob-link.ts";
 import { createChainAggregation } from "./log-chains.ts";
+import { FETCH_CAUSES, cleanRenderCardId } from "./log-card-fetch.ts";
 
 export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>, renderLines: LogLine[] = [], requestedDay?: string) {
+  const apiHistograms = new Map<string, Map<number, number>>();
+  const cliFailures: Record<string, Record<string, number>> = Object.create(null);
   const countsByName: Record<string, number> = Object.create(null);
   const countsByKind: Record<string, number> = { event: 0, perf: 0, error: 0 };
   const durations = new Map<string, Map<number, number>>();
@@ -18,6 +22,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     probeRows.set(key, rows);
   }
   const renderFailures = new Map<string, number>();
+  const renderFetchFailures = new Map<string, { failureCode: string; fetchCause: string; httpStatus?: number; count: number; cardIds: Set<string> }>();
   const represented = new Set<string>();
   const representedSingleFailures = new Set<string>();
   const individualCalls: LogLine[] = [];
@@ -105,12 +110,40 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     if (line.name === "card.render" && line.ok === false && typeof line.props?.failureCode === "string") {
       const code = line.props.failureCode;
       renderFailures.set(code, (renderFailures.get(code) ?? 0) + count);
+      if (["page_fetch", "page_http", "page_body", "page_type"].includes(code)) {
+        const cause = FETCH_CAUSES.find(cause => cause === line.props?.fetchCause) ?? "unknown";
+        const status = line.props?.httpStatus;
+        const httpStatus = typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+        const key = `${code}\0${cause}\0${httpStatus ?? ""}`;
+        const item = renderFetchFailures.get(key) ?? { failureCode: code, fetchCause: cause,
+          ...(httpStatus !== undefined ? { httpStatus } : {}), count: 0, cardIds: new Set<string>() };
+        item.count += count;
+        const cardId = line.ids?.cardId;
+        if (cleanRenderCardId(cardId)) item.cardIds.add(cardId);
+        renderFetchFailures.set(key, item);
+      }
     }
     observeError(line);
   }
   for await (const line of lines) {
     day ??= line.ts.slice(0, 10);
     recordedRows++;
+    const path = line.props?.path;
+    if (typeof path === "string" && API_PATHS.some(value => value === path)) {
+      if (line.component === "api" && ["api.request", "api.request.rollup"].includes(line.name)) {
+        const histogram = apiHistograms.get(path) ?? new Map<number, number>();
+        if (line.name === "api.request" && typeof line.props?.handlerMs === "number" && Number.isFinite(line.props.handlerMs) && line.props.handlerMs >= 0) {
+          const bin = handlerBin(line.props.handlerMs);
+          histogram.set(bin, (histogram.get(bin) ?? 0) + 1);
+        } else if (line.requests) merge(histogram, line.requests.histogram);
+        apiHistograms.set(path, histogram);
+      }
+      if (line.component === "cli" && line.name === "cli.request_failed" && REQUEST_PHASES.some(phase => phase === line.props?.phase)) {
+        const phases = cliFailures[path] ??= Object.create(null);
+        const phase = String(line.props!.phase);
+        phases[phase] = (phases[phase] ?? 0) + 1;
+      }
+    }
     const probeRow = line.ids?.inboundId;
     if (probeRow && /^row_[a-f0-9]{16}$/.test(probeRow)) {
       if (line.name === "router.probe_backoff") {
@@ -138,7 +171,10 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     if (line.name === "inbound.answered" && line.durationMs !== undefined && ["owner", "moni"].includes(line.ids?.chat ?? "")) {
       const ms = Math.round(line.durationMs); firstReplies.set(ms, (firstReplies.get(ms) ?? 0) + 1);
     }
-    if (line.name === "card.renders" && line.renders) {
+    if (line.name === "api.request.rollup" && line.requests) {
+      const count = line.requests.histogram.reduce((sum, pair) => sum + pair[1], 0);
+      consume({ ...line, name: "api.request" }, count, line.ok ? count : 0, line.ok === false ? count : 0, line.requests.histogram);
+    } else if (line.name === "card.renders" && line.renders) {
       consume({ ...line, name: "card.render", renders: undefined }, line.renders.count, line.renders.count, 0, line.renders.histogram);
     } else if (line.name === "turn.robob_calls" && line.calls) {
       for (const [name, stats] of Object.entries(line.calls)) {
@@ -174,10 +210,15 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
       ...(stats.histogram.size ? { durationMs: percentiles(stats.histogram) } : {}),
     };
   }
-  return { robob_link: robobLink.summary(day), overdue, requeued_by_watchdog, unanswered_alerts: alerts.size, answered_late, first_reply_latency_ms: percentiles(firstReplies), total, recordedRows, countsByName, countsByKind, ok, failed,
+  const apiRequests = Object.fromEntries([...apiHistograms].map(([path, histogram]) => [path, {
+    count: [...histogram.values()].reduce((sum, n) => sum + n, 0), handlerMs: percentiles(histogram),
+  }]));
+  return { apiRequests, cliRequestFailures: cliFailures, robob_link: robobLink.summary(day), overdue, requeued_by_watchdog, unanswered_alerts: alerts.size, answered_late, first_reply_latency_ms: percentiles(firstReplies), total, recordedRows, countsByName, countsByKind, ok, failed,
     dedupedFailures, okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countedErrors + failedCalls) / total : 0,
     promptProbe: { ...summarizePromptProbe(promptProbe), byHour: Object.fromEntries([...probeHours].sort().map(([hour, stats]) => [hour, summarizePromptProbe(stats)])) },
     durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),
+    cardRenderFetchFailures: [...renderFetchFailures.values()].sort((a, b) => b.count - a.count || a.failureCode.localeCompare(b.failureCode) || a.fetchCause.localeCompare(b.fetchCause) || (a.httpStatus ?? 0) - (b.httpStatus ?? 0))
+      .map(item => ({ ...item, cardIds: [...item.cardIds].sort() })),
     topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20).map(item => {
       const rows = probeRows.get(`${item.tag}\0${item.causeKey}`);
       return rows ? { ...item, distinctInboundIds: rows.size, topInboundIds: [...rows].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 14).map(([inboundId, count]) => ({ inboundId, count })) } : item;

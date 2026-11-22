@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { requestPath, type TraceEntry } from "./request-trace.ts";
 import { readHealthSidecar } from "./health-receipts.ts";
 import { messageLengthError } from "./message-length.ts";
 import { wakeId } from "./wake-delivery.ts";
@@ -8,7 +10,7 @@ import { validId } from "./remote-protocol.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import { request } from "node:http";
-import { homedir } from "node:os";
+import { homedir, loadavg } from "node:os";
 import { basename, extname, isAbsolute, join, resolve, win32 } from "node:path";
 import { parseArgs } from "node:util";
 import { metadataWarnings, resolveAppFile, validAppSlug } from "./apps.ts";
@@ -630,111 +632,139 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
   }
 }
 
-async function sendCommand(command: Command): Promise<unknown> {
-  const socketPath = process.env.SPECTRUM_BRIDGE_SOCKET ?? join(homedir(), ".config", "spectrum-bridge", "bridge.sock");
-  let socket;
+export async function sendCommand(command: Command, options: {
+  socketPath?: string; timeoutMs?: number; httpRequest?: typeof request; emit?: (entry: TraceEntry) => void;
+} = {}): Promise<unknown> {
+  const startedAt = performance.now();
+  const requestId = randomUUID();
+  const timeoutMs = options.timeoutMs ?? (command.path === "/share" ? 60_000 : 15_000);
+  const times: { connectedAt?: number; writtenAt?: number; headersAt?: number; endedAt?: number } = {};
   try {
-    if (!isAbsolute(socketPath) || socketPath.includes("\0")) throw new Error();
-    socket = await lstat(socketPath);
-  } catch (caughtError) { toolError("cli", "cli.catch8", caughtError);
-    throw new CliError("Bridge socket is unavailable");
+    return await execute();
+  } catch (error) {
+    const endedAt = performance.now();
+    times.endedAt = endedAt;
+    const phase = times.connectedAt === undefined ? "connect" : times.writtenAt === undefined ? "write"
+      : times.headersAt === undefined ? "await_headers" : "read_body";
+    toolLog.capture(() => (options.emit ?? (entry => toolLog.write(entry)))({ component: "cli", kind: "error",
+      name: "cli.request_failed", ok: false, ids: { requestId }, props: { path: requestPath(command.path),
+        method: command.method, phase, elapsedMs: endedAt - startedAt, timeoutMs, requestId,
+        pid: process.pid, loadAvg: loadavg()[0]!, startedAt, ...times } }));
+    throw error;
   }
-  // The daemon owns the private parent directory; never follow a socket symlink.
-  if (!socket.isSocket()) throw new CliError("Bridge socket must be a Unix socket, not a file or symlink");
+  async function execute(): Promise<unknown> {
+    const socketPath = options.socketPath ?? process.env.SPECTRUM_BRIDGE_SOCKET ?? join(homedir(), ".config", "spectrum-bridge", "bridge.sock");
+    let socket;
+    try {
+      if (!isAbsolute(socketPath) || socketPath.includes("\0")) throw new Error();
+      socket = await lstat(socketPath);
+    } catch (caughtError) { toolError("cli", "cli.catch8", caughtError);
+      throw new CliError("Bridge socket is unavailable");
+    }
+    // The daemon owns the private parent directory; never follow a socket symlink.
+    if (!socket.isSocket()) throw new CliError("Bridge socket must be a Unix socket, not a file or symlink");
 
-  const body = await loadCommandPayload(command);
-  const payload = body === undefined ? undefined : JSON.stringify(body);
-  // Queued sends echo only an acknowledgement; never surface their response bodies.
-  const queued = ["/files", "/send", "/poll", "/app", "/wake"].includes(command.path);
-  const controller = new AbortController();
-  // Opening a quick tunnel waits for Cloudflare's edge, which can take a while.
-  const timer = setTimeout(() => controller.abort(), command.path === "/share" ? 60_000 : 15_000);
-  try {
-    return await new Promise<unknown>((resolve, reject) => {
-      const fail = () => reject(new CliError(controller.signal.aborted ? "Bridge request timed out" : "Bridge request failed"));
-      const req = request({
-        socketPath, method: command.method, path: command.path, agent: false,
-        signal: controller.signal, maxHeaderSize: 16 * 1024,
-        headers: {
-          Accept: "application/json",
-          ...(payload === undefined ? {} : { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }),
-        },
-      }, res => {
-        const chunks: Buffer[] = [];
-        let size = 0;
-        res.on("error", fail);
-        res.on("aborted", fail);
-        res.on("data", (chunk: Buffer) => {
-          size += chunk.length;
-          if (size > 128 * 1024) {
-            reject(new CliError("Bridge response exceeds 128 KB"));
-            req.destroy();
-            return;
-          }
-          chunks.push(chunk);
+    const body = await loadCommandPayload(command);
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    // Queued sends echo only an acknowledgement; never surface their response bodies.
+    const queued = ["/files", "/send", "/poll", "/app", "/wake"].includes(command.path);
+    const controller = new AbortController();
+    // Opening a quick tunnel waits for Cloudflare's edge, which can take a while.
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await new Promise<unknown>((resolve, reject) => {
+        const fail = () => reject(new CliError(controller.signal.aborted ? "Bridge request timed out" : "Bridge request failed"));
+        const req = (options.httpRequest ?? request)({
+          socketPath, method: command.method, path: command.path, agent: false,
+          signal: controller.signal, maxHeaderSize: 16 * 1024,
+          headers: {
+            Accept: "application/json",
+            "X-Bridge-Request-Id": requestId,
+            ...(payload === undefined ? {} : { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }),
+          },
+        }, res => {
+          times.headersAt = performance.now();
+          const chunks: Buffer[] = [];
+          let size = 0;
+          res.on("error", fail);
+          res.on("aborted", fail);
+          res.on("data", (chunk: Buffer) => {
+            size += chunk.length;
+            if (size > 128 * 1024) {
+              reject(new CliError("Bridge response exceeds 128 KB"));
+              req.destroy();
+              return;
+            }
+            chunks.push(chunk);
+          });
+          res.on("end", () => {
+            if (!res.complete || size > 128 * 1024) { fail(); return; }
+            const status = res.statusCode ?? 0;
+            const ok = status >= 200 && status < 300;
+            let data: unknown;
+            try {
+              data = JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
+            } catch (caughtError) { toolError("cli", "cli.catch9", caughtError);
+              reject(new CliError(ok ? "Bridge returned invalid JSON" : `Bridge request failed (HTTP ${status})`));
+              return;
+            }
+            if (!ok) {
+              // Only the daemon's sanitized error field may be surfaced, never the raw body. 403/404/422 carry fixed refusal reasons, never a queued body.
+              const detail = (!queued || status === 403 || status === 404 || status === 422) && data && typeof data === "object" && !Array.isArray(data) && "error" in data && typeof data.error === "string"
+                ? data.error.replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 512) : "";
+              reject(new CliError(`Bridge request failed (HTTP ${status})${detail ? `: ${detail}` : ""}`));
+              return;
+            }
+            if (queued) {
+              const prefix = command.path === "/files" ? "file" : command.path.slice(1);
+              if (!data || typeof data !== "object" || Array.isArray(data) || !("id" in data) || typeof data.id !== "string"
+                || data.id.length !== prefix.length + 65 || !new RegExp(`^${prefix}:[a-f0-9]{64}$`).test(data.id)
+                || !("created" in data) || typeof data.created !== "boolean") {
+                reject(new CliError(command.path === "/files" ? "Bridge returned an invalid file acknowledgement"
+                  : "Bridge returned an invalid acknowledgement"));
+                return;
+              }
+              const chat = "chat" in data ? data.chat : undefined;
+              if (chat !== undefined && (typeof chat !== "string" || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(chat))) {
+                reject(new CliError("Bridge returned an invalid acknowledgement"));
+                return;
+              }
+              // Queue acknowledgement only, not proof of upload or delivery. Never print echoed file contents.
+              resolve({ id: data.id, created: data.created, ...(chat === undefined ? {} : { chat }) });
+              return;
+            }
+            const record = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
+            if (command.path === "/secret-request") {
+              if (!validToken(record.token) || !validAppUrl(record.url) || typeof record.expiresAt !== "number") {
+                reject(new CliError("Bridge returned an invalid acknowledgement"));
+                return;
+              }
+              resolve({ token: record.token, url: record.url, expiresAt: record.expiresAt });
+              return;
+            }
+            if (command.path === "/secret-read") {
+              if (typeof record.value !== "string") { reject(new CliError("Bridge returned an invalid secret")); return; }
+              resolve(new RawOutput(record.value));
+              return;
+            }
+            if (command.path === "/secret-forget") {
+              resolve({ forgotten: record.forgotten === true });
+              return;
+            }
+            resolve(data);
+          });
         });
-        res.on("end", () => {
-          if (!res.complete || size > 128 * 1024) { fail(); return; }
-          const status = res.statusCode ?? 0;
-          const ok = status >= 200 && status < 300;
-          let data: unknown;
-          try {
-            data = JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
-          } catch (caughtError) { toolError("cli", "cli.catch9", caughtError);
-            reject(new CliError(ok ? "Bridge returned invalid JSON" : `Bridge request failed (HTTP ${status})`));
-            return;
-          }
-          if (!ok) {
-            // Only the daemon's sanitized error field may be surfaced, never the raw body. 403/404/422 carry fixed refusal reasons, never a queued body.
-            const detail = (!queued || status === 403 || status === 404 || status === 422) && data && typeof data === "object" && !Array.isArray(data) && "error" in data && typeof data.error === "string"
-              ? data.error.replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 512) : "";
-            reject(new CliError(`Bridge request failed (HTTP ${status})${detail ? `: ${detail}` : ""}`));
-            return;
-          }
-          if (queued) {
-            const prefix = command.path === "/files" ? "file" : command.path.slice(1);
-            if (!data || typeof data !== "object" || Array.isArray(data) || !("id" in data) || typeof data.id !== "string"
-              || data.id.length !== prefix.length + 65 || !new RegExp(`^${prefix}:[a-f0-9]{64}$`).test(data.id)
-              || !("created" in data) || typeof data.created !== "boolean") {
-              reject(new CliError(command.path === "/files" ? "Bridge returned an invalid file acknowledgement"
-                : "Bridge returned an invalid acknowledgement"));
-              return;
-            }
-            const chat = "chat" in data ? data.chat : undefined;
-            if (chat !== undefined && (typeof chat !== "string" || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(chat))) {
-              reject(new CliError("Bridge returned an invalid acknowledgement"));
-              return;
-            }
-            // Queue acknowledgement only, not proof of upload or delivery. Never print echoed file contents.
-            resolve({ id: data.id, created: data.created, ...(chat === undefined ? {} : { chat }) });
-            return;
-          }
-          const record = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
-          if (command.path === "/secret-request") {
-            if (!validToken(record.token) || !validAppUrl(record.url) || typeof record.expiresAt !== "number") {
-              reject(new CliError("Bridge returned an invalid acknowledgement"));
-              return;
-            }
-            resolve({ token: record.token, url: record.url, expiresAt: record.expiresAt });
-            return;
-          }
-          if (command.path === "/secret-read") {
-            if (typeof record.value !== "string") { reject(new CliError("Bridge returned an invalid secret")); return; }
-            resolve(new RawOutput(record.value));
-            return;
-          }
-          if (command.path === "/secret-forget") {
-            resolve({ forgotten: record.forgotten === true });
-            return;
-          }
-          resolve(data);
+        req.on("socket", socket => {
+          if (!socket.connecting) times.connectedAt = performance.now();
+          else socket.once("connect", () => { times.connectedAt = performance.now(); });
         });
+        req.once("finish", () => { times.writtenAt = performance.now(); });
+        req.on("error", fail);
+        req.end(payload);
       });
-      req.on("error", fail);
-      req.end(payload);
-    });
-  } finally {
-    clearTimeout(timer);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
 
