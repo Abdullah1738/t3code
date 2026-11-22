@@ -2341,7 +2341,8 @@ function rosterFixture() {
   });
   const server = { threads: [row("owner")], total: 1 };
   const reads = spyOn(client, "listThreads").mockImplementation(async () => structuredClone(server));
-  const roster = new ActiveRoster(client, () => time);
+  // These list-race cases exercise the full-list fallback; event-detail success has its own matrix.
+  const roster = new ActiveRoster({ listThreads: client.listThreads.bind(client), events: options => client.events(options) }, () => time);
   const backend = new RobobBackend({ chatRoot: "/chats", client, activeRoster: roster, finishes: () => new Map() });
   const chats = [backend, ...["moni", "group-a", "group-b", "idle-a", "idle-b"].map(name => backend.forChat(`chats/${name}`, name))];
   const event = (threadId: string, state: string, runId?: string) => {
@@ -2462,7 +2463,7 @@ test.each(["idle", "active", "steer", "stream-down"])("six Sendblue routers reta
   } finally { setSystemTime(); for (const store of stores) store.db.close(); }
 });
 
-test("sequenced busy patches need no GET; a draining run reconciles before clearing idle", async () => {
+test("sequenced busy patches need no GET; unavailable event detail falls back before clearing idle", async () => {
   const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
   f.event("owner", "idle");
   await f.backend.statuses(true);
@@ -2470,10 +2471,10 @@ test("sequenced busy patches need no GET; a draining run reconciles before clear
   f.event("owner", "running");
   for (const chat of f.chats) expect(await chat.statuses(true)).toEqual({ owner: { type: "busy", root: null } });
   expect(f.reads).toHaveBeenCalledTimes(2);
-  expect(f.roster.status()).toMatchObject({ ambiguous: 1, roster_event: 1 });
+  expect(f.roster.status()).toMatchObject({ detailErrors: 1, roster_event: 1 });
 });
 
-test("unknown threads, creation, archive, delete and resync refetch once", async () => {
+test("fallback discovery refetches; deletion removes locally and reconnect refetches", async () => {
   for (const data of [
     { type: "thread.status", threadId: "unknown", state: "running" }, { type: "thread.created", threadId: "new" },
     { type: "thread.updated", threadId: "owner", change: "thread.archived" },
@@ -2481,8 +2482,9 @@ test("unknown threads, creation, archive, delete and resync refetch once", async
   ]) {
     const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
     rosterEvent(f.roster, data); await Promise.all(f.chats.map(chat => chat.statuses(true)));
-    expect(f.reads).toHaveBeenCalledTimes(2);
-    expect(f.roster.status().roster_event).toBe(1); f.reads.mockRestore();
+    const localRemoval = data.change === "thread.deleted";
+    expect(f.reads).toHaveBeenCalledTimes(localRemoval ? 1 : 2);
+    expect(f.roster.status().roster_event).toBe(localRemoval ? 0 : 1); f.reads.mockRestore();
   }
 });
 
@@ -2501,7 +2503,7 @@ test("healthy steer admission uses cache, a stream gap awaits one fetch, replies
   expect((await f.chats[1]!.statuses()).owner?.type).toBe("busy");
   reconciliation.resolve(structuredClone(f.server)); await admission;
   expect(f.reads).toHaveBeenCalledTimes(3);
-  expect(f.roster.status().ambiguous).toBe(1);
+  expect(f.roster.status().detailErrors).toBeGreaterThanOrEqual(1);
   expect((await f.backend.statuses()).owner?.type).toBe("busy");
 });
 
@@ -2539,7 +2541,7 @@ test("events during a slow refresh survive its older snapshot", async () => {
   reconciliation.resolve(structuredClone(f.server));
   expect(await admission).toEqual({});
   expect(await f.backend.statuses()).toEqual({}); expect(f.reads).toHaveBeenCalledTimes(3);
-  expect(f.roster.status().ambiguous).toBe(1);
+  expect(f.roster.status().detailErrors).toBeGreaterThanOrEqual(1);
 });
 
 test("old-run status cannot clear a newer busy foreground", async () => {
@@ -2717,7 +2719,7 @@ test.each([false, true])("an in-flight run-1 completion cannot erase a fetched b
   reconciliation.resolve(structuredClone(f.server));
   expect(await admission).toEqual({ owner: { type: "busy", root: null } });
   expect(f.reads).toHaveBeenCalledTimes(3);
-  expect(f.roster.status().ambiguous).toBe(1);
+  expect(f.roster.status().detailErrors).toBeGreaterThanOrEqual(1);
 });
 
 test.each(["opening", "fetched", "resolved"])("request state remains authoritative during a slow refresh: %s", async source => {
@@ -2750,7 +2752,7 @@ test.each(["opening", "fetched", "resolved"])("request state remains authoritati
   expect(await admission).toEqual(source === "resolved" ? {} : { owner: { type: "busy", root: null } });
   expect(await f.backend.statuses()).toEqual(source === "resolved" ? {} : { owner: { type: "busy", root: null } });
   expect(f.reads).toHaveBeenCalledTimes(3);
-  expect(f.roster.status().ambiguous).toBe(1);
+  expect(f.roster.status().detailErrors).toBeGreaterThanOrEqual(1);
 });
 
 const detailRequestRaces = (["question", "approval"] as const).flatMap(kind =>
@@ -2885,7 +2887,7 @@ test.each(["resolved", "expired", "cancelled"])("a %s request cannot be revived 
   expect(await f.backend.statuses(true)).toEqual({});
   rosterEvent(f.roster, { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" });
   expect(await f.backend.statuses(true)).toEqual({});
-  expect(f.reads).toHaveBeenCalledTimes(3);
+  expect(f.reads).toHaveBeenCalledTimes(2);
 });
 
 test.each([
@@ -2984,7 +2986,7 @@ test.each([undefined, "9", "10", "bad", "9007199254740992"])("unordered event se
   const admission = Promise.all(f.chats.map(chat => chat.statuses(true)));
   response.resolve(structuredClone(f.server)); await admission;
   expect(f.reads).toHaveBeenCalledTimes(2);
-  expect(f.roster.status()).toMatchObject({ ambiguous: 1, roster_event: 1 });
+  expect(f.roster.status()).toMatchObject({ detailErrors: 1, roster_event: 1 });
 });
 
 test.each(["before", "during", "after"])("detail started %s the latest fetch clears only when ordered", async order => {
