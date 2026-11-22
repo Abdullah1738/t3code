@@ -1,5 +1,39 @@
 # Mac upkeep logs
 
+## Suspension leases
+
+Every upkeep SIGSTOP needs a durable deadline and a follow-up. Use an explicit
+`--deadline 10m` (recommended; required, maximum 60m) and `--then cont|kill`:
+
+```sh
+mac-suspend stop --pid 123 --deadline 10m --then cont --reason 'resource pressure' --actor 'mac worker' --card '#118'
+mac-suspend list --json
+mac-suspend resume --pid 123
+mac-suspend kill --pid 123
+mac-suspend sweep --json
+```
+
+The ledger is `~/.robob/logs/tools/mac/state/suspend-lease.json` (or beneath
+`TOOLLOG_DIR/state`), locked across each operation and fsynced before SIGSTOP.
+Every signal rechecks pid + start time and records a read-back. Resume and kill
+require an owned lease; kill sends TERM, waits five seconds if still alive,
+then sends KILL. Failed recovery retains the lease for the next sweep.
+PID reuse drops the old lease without signalling its replacement. System,
+Robob, provider and GUI processes are protected. The tool never signals
+unowned stops, including debugger stops and Ctrl-Z jobs.
+
+`com.abdullah.mac-suspend` runs a separate sweep every minute, with a 50-second
+whole-run limit and bounded ps/launchctl calls. `install.zsh` copies the helper,
+wrapper and plist; the evaluator loads the LaunchAgent after review.
+`mac-log-status` checks its launchd state and three-minute logging cadence.
+Events use toollog: `suspend.stop`, `suspend.stop_failed`, `suspend.resume`,
+`suspend.kill`, `suspend.expired`, `suspend.cleared`, `suspend.orphan`,
+`suspend.alert`, `suspend.sweep` and `suspend.error`. Orphans log at first sight
+and once after ten minutes of observation. The latter and failed kills queue
+one Telegram attention alert per pid + start; uncertain delivery retries use
+the same key and text. Agent prompts and the janitor rule are updated separately
+after owner approval.
+
 Source scripts use `toollog.py` (or the `toollog.sh` bridge) for local metadata at
 `~/.robob/logs/tools/mac/YYYY-MM-DD.ndjson`, with UTC dates. Run
 `mac-log-rollup --day YYYY-MM-DD` to write `rollup-YYYY-MM-DD.json`; with no day,
