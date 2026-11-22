@@ -12,12 +12,13 @@ import signal
 import threading
 from urllib.parse import urlsplit
 import volume
+from host import clean_host
 
 CAP = 200 * 1024 * 1024
 _seen = set()
 _last_report = time.monotonic()
 PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx', 'phase', 'durationMaxMs', 'omitted', 'provider', 'scope', 'cause', 'lockMs', 'until', 'previousBackoffLevel', 'backoffLevel', 'source'}
-PROPS.update({'target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'lastTs'})
+PROPS.update({'hostAtMs', 'hostStartAtMs', 'hostEndAtMs', 'target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'lastTs'})
 CONNECTION_ERRNOS = {'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN'}
 SYSCALLS = {'connect', 'read', 'write', 'getaddrinfo', 'send', 'recv', 'shutdown'}
 IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session', 'writer'}
@@ -103,6 +104,11 @@ def clean(event, now):
     ids = {k: hashlib.sha256(str(v).encode()).hexdigest()[:16] for k, v in event.get('ids', {}).items() if k in IDS and isinstance(v, (str, int))}
     props = {}
     for k, v in event.get('props', {}).items():
+        if k in ('host', 'hostStart', 'hostEnd'):
+            host = clean_host(v)
+            if host:
+                props[k] = host
+            continue
         if k not in PROPS:
             continue
         if k == 'launchctlStderr':
