@@ -811,5 +811,21 @@ class WhoopAuthSchemaTests(unittest.TestCase):
             self.assertNotIn('Private', json.dumps(result))
 
 
+class RefreshSchemaTests(unittest.TestCase):
+    def test_outcomes_and_retry_types(self):
+        for name in ('sync.run', 'cli.run'):
+            for outcome in ('refreshed', 'retried_refreshed', 'reauth_needed', 'error'):
+                for retried in (False, True):
+                    props = log._props(name, {'refreshOutcome': outcome, 'refreshRetried': retried})
+                    self.assertEqual(props['refreshOutcome'], outcome)
+                    self.assertIs(props['refreshRetried'], retried)
+            for value in ('PrivateToken', '', 1, 0, None, [], {}):
+                props = log._props(name, {'refreshOutcome': value, 'refreshRetried': value})
+                self.assertNotIn('refreshOutcome', props)
+                self.assertNotIn('refreshRetried', props)
+
+
+
+
 if __name__ == '__main__':
     unittest.main()

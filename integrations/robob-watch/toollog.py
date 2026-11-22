@@ -71,7 +71,8 @@ ERROR_SCHEMA = {'exceptionClass': 'identifier', 'exitCode': 'exit_code', 'stage'
 ENDPOINT_SCHEMA = {'httpStatus': 'status', 'rawCount': int, 'keptCount': int, 'fetchComplete': bool,
                    'scoreStates': {k: int for k in ('SCORED', 'PENDING_SCORE', 'UNSCORABLE', 'OTHER')},
                    'newestRecordEnd': 'iso', 'newestScoredRecordEnd': 'iso', 'tokenExpiresInS': 'seconds'}
-AUTH_SCHEMA = {'authStage': {'token_load', 'token_refresh', 'api_fetch'},
+AUTH_SCHEMA = {'refreshRetried': bool, 'refreshOutcome': {'refreshed', 'retried_refreshed', 'reauth_needed', 'error'},
+               'authStage': {'token_load', 'token_refresh', 'api_fetch'},
                'authSource': {'keychain', 'file', 'env'}, 'refreshHttpStatus': 'status',
                'apiHttpStatus': 'status', 'oauthError': 'oauth_code', 'attempt': int, 'retried': bool}
 SCHEMAS = {
