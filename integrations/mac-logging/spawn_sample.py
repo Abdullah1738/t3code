@@ -1,5 +1,6 @@
 """Sampled births and runnable threads. No subprocesses, argv or environment in output."""
 from collections import Counter, deque
+import heapq
 import re
 import threading
 import time
@@ -8,6 +9,7 @@ from cpu_labels import spawn_family
 
 BUCKETS = ('pri<=4', '5-19', '20-31', '32-46', '47+')
 METHOD = 'proc_listallpids+pid_start_snapshot_delta'
+CALM_MINUTES = 5
 
 
 def bucket(priority):
@@ -48,23 +50,74 @@ class SpawnSampler:
         self.interval = 5
         self.epoch = time.time() if epoch is None else epoch
         self.last_tick = None
+        self.calm_minutes = 0
+        self.blocked_ticks = 0
+        self.thread_wall = {}
+        self.thread_trial = None
+        self.halve_threads = True
+        self.guard_lock = threading.RLock()
 
     def degrade(self, reason, wall_ms, cpu_pct):
-        previous = self.thread_limit
-        if previous > 1:
-            self.thread_limit = max(1, previous//2)
-        else:
-            self.interval = 15
-        return dict(reason=reason, wallMs=wall_ms, cpuPct=cpu_pct,
-                    previousThreadLimit=previous, threadLimit=self.thread_limit,
-                    intervalS=self.interval)
+        with self.guard_lock:
+            previous, interval = self.thread_limit, self.interval
+            self.calm_minutes = 0
+            costs = self.thread_wall.get(previous, ())
+            measured = sum(costs)/len(costs) if costs else None
+            detail = dict(threadsWallMs=measured)
+            if self.thread_trial is not None:
+                limit, baseline = self.thread_trial
+                if limit == previous and measured is not None:
+                    detail['previousThreadsWallMs'] = baseline
+                    if measured >= baseline:
+                        self.halve_threads = False
+                        detail['limitNote'] = 'threads_wall_not_reduced'
+                self.thread_trial = None
+            if measured is None:
+                self.halve_threads = False
+                detail['limitNote'] = 'threads_cost_unavailable'
+            if previous > 1 and self.halve_threads:
+                self.thread_limit = max(1, previous//2)
+                self.thread_trial = (self.thread_limit, measured)
+                self.thread_wall.pop(self.thread_limit, None)
+            else:
+                self.interval = 15
+            return dict(reason=reason, wallMs=wall_ms, cpuPct=cpu_pct,
+                        previousThreadLimit=previous, threadLimit=self.thread_limit,
+                        previousIntervalS=interval, intervalS=self.interval, **detail)
 
-    def record_cost(self, wall, cpu):
-        # A descheduled tick is not a whole minute of sampling cost. Use actual
-        # minute totals, plus the hard tick bound and measured CPU share.
-        if wall >= self.budget or cpu > .02*self.interval:
-            return self.degrade('tick_wall' if wall >= self.budget else 'tick_cpu',
-                                wall*1000, cpu/self.interval*100)
+    def record_cost(self, wall, cpu, *, thread_wall_ms=None, thread_limit=None):
+        with self.guard_lock:
+            if thread_wall_ms is not None:
+                limit = self.thread_limit if thread_limit is None else thread_limit
+                self.thread_wall.setdefault(limit, deque(maxlen=12)).append(thread_wall_ms)
+            self.blocked_ticks = self.blocked_ticks+1 if wall >= self.budget else 0
+            if self.blocked_ticks >= 2:
+                self.blocked_ticks = 0
+                return self.degrade('tick_wall', wall*1000, cpu/self.interval*100)
+
+    def minute_cost(self, wall_ms, cpu_ms, span, tick_max_ms, complete):
+        with self.guard_lock:
+            cpu_pct = cpu_ms/(span*10) if span > 0 else None
+            if cpu_pct is not None and cpu_pct > 2:
+                return self.degrade('minute_cpu', wall_ms, cpu_pct)
+            calm = (complete and span >= 59 and cpu_pct is not None and cpu_pct < 1
+                    and tick_max_ms is not None and tick_max_ms < 1000)
+            self.calm_minutes = min(CALM_MINUTES, self.calm_minutes+1) if calm else 0
+            if self.calm_minutes < CALM_MINUTES or self.interval == 5 and self.thread_limit == 300:
+                return None
+            previous, interval = self.thread_limit, self.interval
+            if self.interval > 5:
+                self.interval = 5
+            else:
+                self.thread_limit = min(300, self.thread_limit*2)
+            # Recovery gives the higher coverage another measured trial if
+            # pressure returns; measurements from its old visit are stale.
+            self.thread_wall.pop(self.thread_limit, None)
+            self.thread_trial = None
+            self.halve_threads = True
+            return dict(reason='recover', wallMs=wall_ms, cpuPct=cpu_pct,
+                        previousThreadLimit=previous, threadLimit=self.thread_limit,
+                        previousIntervalS=interval, intervalS=self.interval)
 
     def phase(self, name):
         now, cpu = self.clock(), self.cpu()
@@ -73,8 +126,9 @@ class SpawnSampler:
                                                     cpuMs=(cpu-self.phase_cpu)*1000)
         self.phase_name, self.phase_wall, self.phase_cpu = name, now, cpu
 
-    def tick(self):
+    def tick(self, *, cadence_s=None):
         started, cpu_start = self.clock(), self.cpu()
+        cadence = self.interval if cadence_s is None else cadence_s
         self.phase_costs = {}
         self.phase_name = None
         self.phase('identity')
@@ -84,10 +138,13 @@ class SpawnSampler:
             result = dict(at=started, partial=True, partialReasons=['inventory_unavailable'])
         self.phase(None)
         wall, cpu = self.clock()-started, self.cpu()-cpu_start
-        action = self.record_cost(wall, cpu)
+        action = self.record_cost(wall, cpu,
+            thread_wall_ms=self.phase_costs.get('threads', {}).get('wallMs'),
+            thread_limit=(result.get('runnable') or {}).get('processLimit'))
         result.update(wallMs=wall*1000, cpuMs=cpu*1000,
                       phaseCosts=self.phase_costs, guardActions=[action] if action else [],
-                      intervalS=self.interval, threadsEnabled=True, threadLimit=self.thread_limit)
+                      intervalS=self.interval, births_cadence_s=cadence,
+                      threadsEnabled=True, threadLimit=self.thread_limit)
         return result
 
     def _tick(self):
@@ -232,19 +289,25 @@ class SpawnSampler:
             entry['distinctRunIds'] = len(entry.pop('runs'))
         counts = Counter(dict.fromkeys(BUCKETS, 0))
         top, covered, low, unknown = [], 0, 0, 0
-        self.phase('threads')
+        self.phase('thread_selection')
         # Prioritize native runnable hints, then measured CPU gain. A small
         # pass survives overload instead of permanently latching the signal off.
         # Unread CPU data must not prevent a minimal thread census. BSD SRUN
         # is a weaker hint (it includes sleepers), so try these after measured
         # runnable/advancing tasks and expose their CPU as unknown.
         candidates.extend(key for key,row in current.items() if key not in metrics and row['status'] == 2)
-        candidates.sort(key=lambda key:(0 if metrics.get(key, {}).get('running', 0) > 0 else
-            1 if (metrics.get(key, {}).get('cpuDeltaNs') or 0) > 0 else 2,
-            -(metrics.get(key, {}).get('cpuPct') or 0), -(metrics.get(key, {}).get('cpuDeltaNs') or 0), key))
         process_limit = min(300, self.thread_limit)
+        def priority(key):
+            task = metrics.get(key, {})
+            delta = task.get('cpuDeltaNs') or 0
+            return (0 if task.get('running', 0) > 0 else 1 if delta > 0 else 2,
+                    -(task.get('cpuPct') or 0), -delta, key)
+        # Only the bounded prefix is read; avoid sorting every candidate when
+        # the guard permits a tiny pass, and expose this fixed preparation cost.
+        selected = heapq.nsmallest(process_limit, candidates, key=priority)
+        self.phase('threads')
         thread_deadline = min(deadline, self.clock()+.025)
-        for key in candidates[:process_limit]:
+        for key in selected:
             if not room('threads') or self.clock() >= thread_deadline:
                 reasons.add('threads_budget')
                 break
@@ -293,24 +356,29 @@ class SpawnSampler:
 
 
 class Monitor:
-    def __init__(self, sampler, clock=time.monotonic):
-        self.sampler, self.clock = sampler, clock
+    def __init__(self, sampler, clock=time.monotonic, cpu=time.thread_time):
+        self.sampler, self.clock, self.cpu = sampler, clock, cpu
         self.results = deque(maxlen=180)
         self.started = clock()
         self.previous_report = self.started
         self.active = None
 
     def loop(self, stop):
+        cadence = self.sampler.interval
         while not stop.is_set():
             self.active = self.clock()
-            result = self.sampler.tick()
+            result = self.sampler.tick(cadence_s=cadence)
             self.results.append(result)
             self.active = None
-            stop.wait(max(0, self.sampler.interval-(self.clock()-result['at'])))
+            # A report can change interval during this sleep. The next census
+            # still follows the interval that was scheduled here.
+            cadence = self.sampler.interval
+            stop.wait(max(0, cadence-(self.clock()-result['at'])))
 
     def report(self):
-        report_started, cpu_started = self.clock(), time.thread_time()
+        report_started, cpu_started = self.clock(), self.cpu()
         now = self.clock()
+        active = self.active
         rows = []
         for _ in range(len(self.results)):
             rows.append(self.results.popleft())
@@ -324,13 +392,12 @@ class Monitor:
         age = now-good[-1]['at'] if good else None
         if not good or age > self.sampler.interval+2:
             reasons.add('stale')
-        if self.active is not None and now-self.active >= self.sampler.budget:
-            reasons.add('native_call_in_flight')
+        if active is not None:
+            reasons.add('tick_in_flight')
+            if now-active >= self.sampler.budget:
+                reasons.add('native_call_in_flight')
         wall, cpu = sum(r.get('wallMs', 0) for r in rows), sum(r.get('cpuMs', 0) for r in rows)
         actions = [a for r in rows for a in r.get('guardActions', [])]
-        if wall > 1500 or cpu > span*20:
-            actions.append(self.sampler.degrade('minute_wall' if wall > 1500 else 'minute_cpu',
-                                               wall, cpu/(span*10) if span else 0))
         phases = {}
         for r in rows:
             for name, cost in r.get('phaseCosts', {}).items():
@@ -351,17 +418,24 @@ class Monitor:
                 p['family'] = self.sampler.labels.get((p['ppid'], p['parent_start']), {}).get('family') or p['family']
         latest = good[-1] if good else {}
         births = sum(r['births'] for r in good)
+        cadences = sorted({r.get('births_cadence_s', r.get('intervalS', self.sampler.interval)) for r in good})
         wall += (self.clock()-report_started)*1000
-        cpu += (time.thread_time()-cpu_started)*1000
+        cpu += (self.cpu()-cpu_started)*1000
+        tick_max = max((r.get('wallMs', 0) for r in rows), default=None)
+        complete = active is None and bool(good) and not reasons.intersection({'stale', 'late_tick', 'inventory_unavailable'})
+        action = self.sampler.minute_cost(wall, cpu, span, tick_max, complete)
+        if action:
+            actions.append(action)
         return dict(method=METHOD, lower_bound=True, windowS=span, ticks=len(rows),
             births=births, exits=sum(r['exits'] for r in good), births_per_min=births*60/span if span else None,
+            births_cadence_s=cadences[0] if len(cadences) == 1 else None, births_cadences_s=cadences,
             baseline=any(r['baseline'] for r in good), partial=bool(reasons), partialReasons=sorted(reasons),
             top_spawners=top, runnable=latest.get('runnable'), offbox=latest.get('offbox'),
             offboxWindowS=latest.get('offboxWindowS'),
             identityCovered=latest.get('identityCovered'), identityTotal=latest.get('identityTotal'),
             sampleAgeS=age, wallMs=wall, cpuMs=cpu, cpuPct=cpu/(span*10) if span else None,
             phaseCosts=phases, guardActions=actions, threadLimit=self.sampler.thread_limit,
-            costIncomplete='native_call_in_flight' in reasons,
-            inFlightWallMs=(now-self.active)*1000 if self.active is not None else None,
+            costIncomplete=active is not None,
+            inFlightWallMs=max(0, now-active)*1000 if active is not None else None,
             intervalS=self.sampler.interval, threadsEnabled=self.sampler.threads_enabled,
-            tickWallMaxMs=max((r.get('wallMs', 0) for r in rows), default=None))
+            tickWallMaxMs=tick_max)
