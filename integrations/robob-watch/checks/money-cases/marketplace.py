@@ -66,8 +66,19 @@ def lane(snapshot, cache, reason=None):
 
 
 def refresh(data, root, budget=120):
+    from state_json import write_json
     with data_io.scope(time.time() + budget):
-        return _refresh(data, root, budget)
+        stats = _refresh(data, root, budget)
+    if stats['result'] != 'busy':
+        # A cache-lock timeout exhausts the work scope. Record that outcome only
+        # after unwinding it, so diagnostics still get their own bounded budget.
+        try:
+            with data_io.scope(time.time() + .5):
+                write_json(Path(data) / 'marketplace-refresh.json', {
+                    'last_result': stats['result'], 'last_at': dt.datetime.now(dt.timezone.utc).isoformat()})
+        except (OSError, data_io.DataUnavailable):
+            pass
+    return stats
 
 
 def _refresh(data, root, budget):
@@ -202,12 +213,6 @@ def _refresh(data, root, budget):
         stats.update(orders_total=len(seen), known=sum(oid in orders for oid in seen),
                      delivered=sum(orders[oid]['delivered'] for oid in seen if oid in orders),
                      ms=round((time.monotonic() - started) * 1000))
-        try:
-            with data_io.scope(time.time() + .5):
-                write_json(data / 'marketplace-refresh.json', {
-                    'last_result': stats['result'], 'last_at': dt.datetime.now(dt.timezone.utc).isoformat()})
-        except (OSError, data_io.DataUnavailable):
-            pass
         emit('money-cases', 'marketplace.refresh', kind='perf', duration_ms=stats['ms'],
                      ok=stats['result'] == 'end_of_history', props={**stats, 'snapshot_error': reset_reason or 'none'})
         return stats

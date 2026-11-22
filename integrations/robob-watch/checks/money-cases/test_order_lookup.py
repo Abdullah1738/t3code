@@ -640,6 +640,66 @@ def details(oid, service, timeout):
         self.assertEqual(result['result'], 'cache_busy')
         self.assertLess(time.monotonic() - start, 0.5)
 
+    def test_cache_lock_timeout_persists_latest_refresh_result(self):
+        previous_at = '2026-11-16T20:25:19+00:00'
+        snapshot = json.dumps(dict(marketplace.empty(), complete=True, walked_at=previous_at))
+        path = self.root / 'marketplace-placements.json'
+        path.write_text(snapshot)
+        (self.root / 'marketplace-refresh.json').write_text(json.dumps({
+            'last_result': 'end_of_history', 'last_at': previous_at}))
+        self.fixture(marketplace={'1': [row('N1')]}, paging=['marketplace'])
+        attempted_at = dt.datetime.now(dt.timezone.utc)
+        clock = [time.time()]
+        flock = fcntl.flock
+        def cache_busy(lock, operation):
+            if Path(lock.name).name == 'order-details.lock':
+                # Exhaust the parent deadline without racing SIGALRM delivery.
+                clock[0] += 2
+                raise TimeoutError()
+            return flock(lock, operation)
+        with patch.object(time, 'time', side_effect=lambda: clock[0]), \
+                patch.object(fcntl, 'flock', side_effect=cache_busy):
+            result = marketplace.refresh(self.root, self.root, 1)
+        self.assertEqual(result['result'], 'cache_busy')
+        details = marketplace.refresh_details(self.root, 'skipped')
+        self.assertEqual(details['last_result'], 'cache_busy')
+        self.assertGreaterEqual(dt.datetime.fromisoformat(details['last_at']), attempted_at)
+        self.assertEqual(path.read_text(), snapshot)
+
+        # cases selects watcher helpers on import; isolate that from CLI readers.
+        with patch.object(sys, 'path', sys.path[:]), patch.dict(sys.modules):
+            import cases
+            import run_history
+            wd = self.root / 'watcher'
+            wd.mkdir()
+            with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '1'}), \
+                    patch.object(cases, '_run_check', return_value='fixture_event'), \
+                    patch.object(cases, 'record_event') as emit:
+                cases.run_check(wd, 'fixture', self.root)
+            event = next(call for call in emit.call_args_list if call.args[0] == 'check.run')
+            reported = event.kwargs['props']['marketplace_refresh']
+            self.assertEqual(reported['last_result'], 'cache_busy')
+            self.assertEqual(reported['last_at'], details['last_at'])
+            summary = run_history.summary(wd)
+            self.assertEqual(summary['marketplace_refresh'], reported)
+            self.assertIn('last refresh: cache_busy', run_history.format_summary(summary))
+
+    def test_refresh_result_storage_has_its_own_bounded_budget(self):
+        self.fixture(marketplace={'1': [row('N1')]}, paging=['marketplace'])
+        state_path = self.root / 'marketplace-refresh.json'
+        state_path.write_text('{"last_result": "list_error"}')
+        replace = os.replace
+        def stalled(source, target):
+            if target == state_path:
+                time.sleep(2)
+            return replace(source, target)
+        started = time.monotonic()
+        with patch.object(os, 'replace', side_effect=stalled):
+            result = marketplace.refresh(self.root, self.root, 5)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(result['result'], 'end_of_history')
+        self.assertEqual(json.loads(state_path.read_text()), {'last_result': 'list_error'})
+
     def test_cache_cap_drops_oldest(self):
         cached = [dict(row('F'+str(i), -i), service='food', total=1, currency='AED', cached_at=AT.isoformat())
                   for i in range(1002)]
