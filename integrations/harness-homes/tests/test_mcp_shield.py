@@ -224,6 +224,44 @@ class HttpTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 6)
         self.assertEqual(r[1]["result"]["serverInfo"]["name"], "slow-unavailable")
 
+    def trickle_server(self, content_type, prefix):
+        # Review of 5a93cd767e: bytes that never finish a buffer or a line kept resetting the
+        # socket timeout, so reads blocked past the deadline.
+        class Trickle(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", "100000")
+                self.end_headers()
+                try:
+                    self.wfile.write(prefix)
+                    self.wfile.flush()
+                    for _ in range(200):
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                except OSError:
+                    pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}/mcp"
+
+    def test_a_trickled_body_or_partial_sse_line_cannot_outlive_the_deadline(self):
+        for content_type, prefix in (("application/json", b'{"jsonrpc":"2.0","id":1,"result":"'),
+                                     ("text/event-stream", b"data: {")):
+            with self.subTest(content_type=content_type):
+                started = time.monotonic()
+                r = run_shield(["--name", "slow", "--url", self.trickle_server(content_type, prefix),
+                                "--init-timeout", "1"], [INIT, LIST])
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertEqual(r[1]["result"]["serverInfo"]["name"], "slow-unavailable")
+                self.assertEqual(r[2]["result"]["tools"], [])
+
     def test_unauthorized_degrades(self):
         r = run_shield(["--name", "web", "--url", self.serve(401)], [INIT, LIST])
         self.assertIn("unauthorized", r[1]["result"]["instructions"])

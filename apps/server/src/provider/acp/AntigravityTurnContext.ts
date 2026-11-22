@@ -223,9 +223,14 @@ export const linkAntigravityHarnessConfig = Effect.fn("AntigravityTurnContext.li
           });
           return;
         }
-        if (existing !== undefined) yield* fileSystem.remove(link);
+        // Never unlink first: a concurrent start (or the generator) could launch in the gap
+        // with no guards. A uniquely named link renamed over the old one is atomic.
         yield* fileSystem.makeDirectory(path.dirname(link), { recursive: true });
-        yield* fileSystem.symlink(target, link);
+        const temporary = `${link}.robob-${process.pid}-${Math.random().toString(36).slice(2)}`;
+        yield* fileSystem.symlink(target, temporary);
+        yield* fileSystem
+          .rename(temporary, link)
+          .pipe(Effect.tapError(() => fileSystem.remove(temporary).pipe(Effect.ignore)));
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("Antigravity profile config is not linked.", { link, cause }),

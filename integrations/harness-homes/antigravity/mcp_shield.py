@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -278,15 +279,53 @@ class HttpUpstream:
         return h
 
     def post(self, message, timeout: float) -> list:
-        """One request with a total deadline: heartbeats or a slow trickle cannot extend it."""
+        """One request with a hard wall-clock deadline.
+
+        Socket timeouts only bound each read, so a server trickling bytes (heartbeats, a partial
+        SSE line, a slow JSON body) could hold a call forever. The request runs on a worker; at
+        the deadline its socket is shut down and the caller gets TimeoutError. A late result from
+        the abandoned worker is discarded.
+        """
+        box: dict = {}
+        done = threading.Event()
+
+        def work():
+            try:
+                box["value"] = self._post(message, timeout, box)
+            except BaseException as error:  # noqa: BLE001 - re-raised in the caller
+                box["error"] = error
+            finally:
+                done.set()
+
+        threading.Thread(target=work, daemon=True).start()
+        if not done.wait(timeout):
+            box["abandoned"] = True
+            sock = box.get("socket")
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            raise TimeoutError("response deadline")
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
+
+    def _post(self, message, timeout: float, box: dict) -> list:
         deadline = time.monotonic() + timeout
         request = urllib.request.Request(self.url, data=json.dumps(message).encode(), headers=self.headers(),
                                          method="POST")
         with self.opener.open(request, timeout=timeout) as response:
+            try:
+                box["socket"] = response.fp.raw._sock  # noqa: SLF001 - only to unblock a stuck read
+            except AttributeError:
+                pass
+            if box.get("abandoned"):
+                raise TimeoutError("response deadline")
             if 300 <= response.status < 400:
                 raise urllib.error.HTTPError(self.url, response.status, "redirect refused", response.headers, None)
             session = response.headers.get("Mcp-Session-Id")
-            if session:
+            if session and not box.get("abandoned"):
                 self.session_id = session
             kind = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if response.status == 202:

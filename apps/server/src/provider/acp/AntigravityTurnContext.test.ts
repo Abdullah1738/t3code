@@ -181,4 +181,45 @@ describe("Antigravity turn context", () => {
       assert.isFalse(yield* fileSystem.exists(path.join(empty, "config")));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+
+  it.effect("concurrent starts never leave a profile without its hook link", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "agy-profile-race-" });
+      const harnessHome = antigravityHarnessHome(path, dir);
+      yield* fileSystem.makeDirectory(path.join(harnessHome, "config"), { recursive: true });
+      for (const name of ["hooks.json", "mcp_config.json"]) {
+        yield* fileSystem.writeFileString(path.join(harnessHome, "config", name), "{}");
+      }
+      const profileDirectory = path.join(dir, "profile");
+      const hooks = path.join(profileDirectory, "config", "hooks.json");
+      yield* fileSystem.makeDirectory(path.dirname(hooks), { recursive: true });
+      let gaps = 0;
+      for (let round = 0; round < 5; round += 1) {
+        yield* fileSystem.remove(hooks).pipe(Effect.ignore);
+        yield* fileSystem.symlink(path.join(dir, `stale-${round}.json`), hooks);
+        const starts = Array.from({ length: 8 }, () =>
+          linkAntigravityHarnessConfig({ fileSystem, path, profileDirectory, harnessHome }),
+        );
+        const probe = Effect.gen(function* () {
+          for (let i = 0; i < 50; i += 1) {
+            const present = yield* fileSystem.readLink(hooks).pipe(
+              Effect.as(true),
+              Effect.orElseSucceed(() => false),
+            );
+            if (!present) gaps += 1;
+            yield* Effect.yieldNow;
+          }
+        });
+        yield* Effect.all([...starts, probe], { concurrency: "unbounded" });
+        assert.equal(yield* fileSystem.readLink(hooks), path.join(harnessHome, "config", "hooks.json"));
+      }
+      assert.equal(gaps, 0);
+      const leftovers = (yield* fileSystem.readDirectory(path.dirname(hooks))).filter((name) =>
+        name.includes(".robob-"),
+      );
+      assert.deepEqual(leftovers, []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 });
