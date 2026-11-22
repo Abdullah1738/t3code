@@ -632,8 +632,9 @@ def disk_maintenance(con, error=None):
         eligible = [r for r in disk.candidates(snaps, protected, keep=0 if short else disk.KEEP_RUN)
                     if (r['box'], r['name']) not in missing_snapshots and (r['box'], r['name']) not in refused]
         known = {r['id'] for r in con.execute('SELECT id FROM boxes WHERE deleted_at IS NULL')}
-        # The reaper reads this: only when no run snapshot is left does it delete stopped boxes for space.
-        cleanup['snapshots_left'] = sum(1 for r in eligible if r['box'] in known) if short else 0
+        # The reaper reads this: only at a measured 0 does it delete stopped boxes for space. An unmeasured pool
+        # is None, never 0. A snapshot Incus refuses is not counted: it must not be able to bring the outage back.
+        cleanup['snapshots_left'] = None if not pool else sum(1 for r in eligible if r['box'] in known) if short else 0
         # Count-retention uses the same pacing gate. Otherwise run completion or
         # personal timers could bypass sampler backpressure with a bulk delete.
         count_gone = set()
@@ -702,6 +703,10 @@ def disk_maintenance(con, error=None):
             con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk_cleanup',?)", (json.dumps(cleanup),))
             try:
                 result = incus('snapshot', 'delete', ct(row['box']), row['name'], timeout=120, check=False)
+            except subprocess.TimeoutExpired:
+                refused[(row['box'], row['name'])] = now()
+                cleanup['refused_snapshots'] = sorted([list(key), at] for key, at in refused.items())
+                raise
             finally:
                 cleanup['last_delete_at'] = now()
                 con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk_cleanup',?)", (json.dumps(cleanup),))
@@ -723,7 +728,12 @@ def disk_maintenance(con, error=None):
                                 'snapshot_bytes': sizes.get(row['box'], {}).get('snapshot_bytes'),
                                 'reason': 'missing' if missing else reason})
             break
-        cleanup['shortfall_bytes'] = max(0, cleanup.get('target_bytes', 0) - pool_free(value))
+        measured = any(r['filesystem'] == CFG['zpool'] for r in value['filesystems'])
+        if measured:
+            cleanup['shortfall_bytes'] = max(0, cleanup.get('target_bytes', 0) - pool_free(value))
+        else:
+            cleanup['snapshots_left'] = None
+        cleanup['at'] = now()
         cleanup['budget_shortfall_bytes'] = sum(max(0, int(u['snapshot_bytes'] - disk.SNAPSHOT_RATIO * u['live_bytes']))
             for bid, u in sizes.items() if u.get('live_bytes', 0) > 0 and con.execute(
                 "SELECT 1 FROM boxes WHERE id=? AND name LIKE '%repository pool%' AND deleted_at IS NULL", (bid,)).fetchone())
@@ -1341,13 +1351,19 @@ def _resume_box(con, box_id, body):
     threading.Thread(target=go, daemon=True).start()
 
 
-def delete_box(con, box_id: str, why: str | None = None) -> None:
+def delete_box(con, box_id: str, why: str | None = None, *, stopped_at=None) -> None:
+    """stopped_at: delete only if the box is still archived since that moment (the reaper's selection can be
+    seconds old, and a resume takes this same lifecycle lock)."""
     token = offbox_protection.CALLER.set(offbox_protection.caller(
         reason=why or offbox_protection.caller().get('reason') or 'API delete'))
     try:
         with lifecycle_lock(box_id):
             with box_memory_lock(box_id):
                 require_unprotected(con, box_id)
+                if stopped_at is not None:
+                    row = box_row(con, box_id)
+                    if row['state'] != 'archived' or row['stopped_at'] != stopped_at or row['pinned']:
+                        raise Fail(409, 'box_changed', f'{box_id} is no longer the stopped box that was selected')
                 con.execute('INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)', ('delete_pending:' + box_id, '1'))
                 if box_row(con, box_id)['state'] in LIVE + ('provisioning', 'resuming'):
                     set_box(con, box_id, state='stopping')
@@ -3385,7 +3401,7 @@ def reap_once(con) -> None:
                     log(f"idle stop {bid} failed: {e}")
         elif r["state"] == "archived" and not r["pinned"] and r["owner"] not in (CFG.get("person_owners") or []):
             # A person's box is never deleted for being unused: it is where her data lives.
-            used = con.execute("SELECT 1 FROM saved WHERE source=? AND status='ready'", (bid,)).fetchone()
+            used = con.execute("SELECT 1 FROM saved WHERE source=? AND status IN ('ready','pending')", (bid,)).fetchone()
             if not used:
                 stopped.append(r)
         elif r["state"] == "error" and t - (r["updated_at"] or t) > 86400:
@@ -3407,7 +3423,14 @@ def reap_once(con) -> None:
 
 
 BOX_DELETE_GAP_S = 60
-REAP_REFUSED = {}   # box id -> time a delete was refused; it steps aside for an hour
+CLEANUP_FRESH_S = 90
+REAP_REFUSED = {}   # box id -> time its delete was refused or could give nothing back; it steps aside for an hour
+
+
+def pool_box(row) -> bool:
+    """A repository pool box is a warm copy any run of that repository rebuilds by itself. Named leases put the
+    thread title after the bar, so only the exact suffix counts."""
+    return (row['name'] or '').endswith('| repository pool')
 
 
 def reap_stopped_box(con, stopped, t):
@@ -3419,15 +3442,16 @@ def reap_stopped_box(con, stopped, t):
     saved bases are never in `stopped`, and templates are not pool boxes). One per pass and never into a ZFS
     free backlog: a burst of box deletes stalls Incus writes on the block-cloned home pool."""
     cleanup = (disk_state().get('cleanup') or {}) if CFG.get('state_dataset') else {}
-    short = bool(cleanup.get('shortfall_bytes')) and not cleanup.get('snapshots_left')
+    # Space is a reason only on a fresh, measured reading: a stale "short, none left" would delete a box a minute.
+    short = (bool(cleanup.get('shortfall_bytes')) and cleanup.get('snapshots_left') == 0
+             and t - cleanup.get('at', 0) <= CLEANUP_FRESH_S)
 
     def retention(r):
-        days = CFG.get('pool_unused_days', 7) if 'repository pool' in (r['name'] or '') else CFG["prune_unused_days"]
+        days = CFG.get('pool_unused_days', 7) if pool_box(r) else CFG["prune_unused_days"]
         return min(days, CFG["prune_unused_days"]) * 86400
 
     def floor(r):
-        pressed = short and 'repository pool' in (r['name'] or '')
-        return min(retention(r), CFG.get('pressure_idle_s', 12 * 3600)) if pressed else retention(r)
+        return min(retention(r), CFG.get('pressure_idle_s', 12 * 3600)) if short and pool_box(r) else retention(r)
 
     due = sorted((r for r in stopped if t - (r["stopped_at"] or t) > floor(r)
                   and t - REAP_REFUSED.get(r['id'], 0) >= 3600), key=lambda r: r["stopped_at"])
@@ -3443,19 +3467,26 @@ def reap_stopped_box(con, stopped, t):
         except (OSError, ValueError, KeyError, subprocess.SubprocessError):
             return None
     protected = snapshot_protected(con) if short else set()
-    for r in due[:8]:
+    attempts = 0
+    for r in due:
         bid = r['id']
         expired = t - r["stopped_at"] > retention(r)
         if not expired:
-            # Space is the only reason here, so a box that would give none back is left alone.
+            if bid in protected:
+                continue
+            # Space is the only reason here, so a box that would give none back steps aside.
             rc, clones = _sh(['zfs', 'list', '-Hp', '-t', 'snapshot', '-o', 'clones', '-r',
                               f"{zpool()}/containers/{ct(bid)}"])
-            if bid in protected or rc or any(line.strip() not in ('', '-') for line in clones.splitlines()):
+            if rc or any(line.strip() not in ('', '-') for line in clones.splitlines()):
+                REAP_REFUSED[bid] = t
                 continue
+        attempts += 1
+        if attempts > 8:
+            break
         why = 'archived box exceeded unused retention' if expired else 'pool short of space: longest-stopped disposable box'
         con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('box_reap',?)", (json.dumps({'at': now(), 'box': bid}),))
         try:
-            delete_box(con, bid, why)
+            delete_box(con, bid, why, stopped_at=r["stopped_at"])
         except Exception as e:  # noqa: BLE001
             REAP_REFUSED[bid] = t
             toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid},
