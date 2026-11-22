@@ -27,7 +27,7 @@ HOOK_SAMPLE_RATE = 128
 SLOW_HOOK_MS = 2000
 # Measured spans inside one hook call. Callers time them with a monotonic clock;
 # a phase a writer cannot measure is left out, never estimated.
-HOOK_PHASES = ('identity_ms', 'lineage_ms', 'classify_ms', 'guard_ms', 'live_db_ms', 'desktop_ms',
+HOOK_PHASES = ('identity_ms', 'lineage_ms', 'classify_ms', 'guard_ms', 'live_db_ms', 'remote_scan_ms', 'desktop_ms',
                'lock_wait_ms', 'log_write_ms', 'mask_ms', 'spawn_ms')
 _SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _LABEL = re.compile(r"[A-Za-z0-9_.:-]{1,120}\Z")

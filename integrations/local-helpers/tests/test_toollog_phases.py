@@ -34,6 +34,7 @@ class SlowHookPhases(unittest.TestCase):
                  ('codex', 'classify_ms', {'classify_ms': 3010, 'identity_ms': 40}),
                  ('codex', 'lineage_ms', {'lineage_ms': 1500, 'identity_ms': 600}),
                  ('claude', 'live_db_ms', {'live_db_ms': 2600, 'guard_ms': 2}),
+                 ('claude', 'remote_scan_ms', {'remote_scan_ms': 2800, 'live_db_ms': 30}),
                  ('codex-cu', 'lock_wait_ms', {'lock_wait_ms': 2400, 'desktop_ms': 300}),
                  ('claude', 'log_write_ms', {'log_write_ms': 5000}),
                  ('claude', 'mask_ms', {'mask_ms': 2100.4}),
@@ -63,7 +64,8 @@ class SlowHookPhases(unittest.TestCase):
         self.assertEqual(harnesses['opencode']['largestPhase'], {'classify_ms': 2, 'spawn_ms': 1})
         self.assertEqual(harnesses['opencode']['phases']['classify_ms'], {'count': 3, 'p95': 272800})
         self.assertEqual(harnesses['claude']['largestPhase'],
-                         {'identity_ms': 1, 'live_db_ms': 1, 'log_write_ms': 1, 'mask_ms': 1, 'unmeasured': 1})
+                         {'identity_ms': 1, 'live_db_ms': 1, 'log_write_ms': 1, 'mask_ms': 1, 'remote_scan_ms': 1,
+                          'unmeasured': 1})
         self.assertEqual(harnesses['codex-cu']['phases']['lock_wait_ms'], {'count': 1, 'p95': 2400})
         self.assertEqual(table['slowestRows'][0]['phases']['classify_ms'], 272800)
 

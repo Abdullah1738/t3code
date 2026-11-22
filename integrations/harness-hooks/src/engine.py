@@ -789,6 +789,19 @@ def _phase(phases, key):
 
 
 @contextlib.contextmanager
+def _live_db_phase(phases):
+    # statev2 scans offbox/ssh payloads inside its check; report that scan on its own.
+    scanned = statev2_guard.remote_scan_ms
+    try:
+        with _phase(phases, "live_db_ms"):
+            yield
+    finally:
+        scan = statev2_guard.remote_scan_ms - scanned
+        phases["live_db_ms"] -= scan
+        phases["remote_scan_ms"] = phases.get("remote_scan_ms", 0.0) + scan
+
+
+@contextlib.contextmanager
 def _desktop_phase(phases):
     # Lock waits are reported on their own, so the two phases do not overlap.
     waited = desktop_lease.lock_wait_ms
@@ -912,8 +925,7 @@ def decide(event, harness):
             # The live DB rule is independent of native identity and offbox
             # availability, so a service outage cannot disable this local check.
             try:
-                # statev2 also scans offbox run payloads, so their time lands here.
-                with _phase(phases, "live_db_ms"):
+                with _live_db_phase(phases):
                     exact_snapshot = snapshot_guard.exact_invocation(command, command_cwd)
                     if not exact_snapshot:
                         hit, cause = statev2_guard.classify_detail(command, command_cwd)

@@ -8,7 +8,7 @@ export const HOOKS_CAP_BYTES = 35 * 1024 * 1024;
 export const HOOK_SAMPLE_RATE = 128;
 // Twin of toollog.py: hook rows slower than this carry measured phases and are never sampled or capped out.
 export const SLOW_HOOK_MS = 2000;
-export const HOOK_PHASES = ['identity_ms','lineage_ms','classify_ms','guard_ms','live_db_ms','desktop_ms',
+export const HOOK_PHASES = ['identity_ms','lineage_ms','classify_ms','guard_ms','live_db_ms','remote_scan_ms','desktop_ms',
   'lock_wait_ms','log_write_ms','mask_ms','spawn_ms'] as const;
 const label = /^[A-Za-z0-9_.:-]{1,120}$/;
 const fields = new Set(['harness','guard','decision','rule','firstWord','commandLength','filesChanged','driftFound','differingCount','platform','billedMinutes','exitCode','failingStep','count','dryRun','toolCount','operation','status','cwdClass','matchedRoot','argv0Class','repeatCount','threadIdSource','sampleRate',

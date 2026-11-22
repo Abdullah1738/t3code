@@ -118,6 +118,42 @@ class HookPhases(unittest.TestCase):
             engine.decide(self.bash(), 'claude')
         self.assert_largest(self.decision(), 'live_db_ms', 2500)
 
+    def test_offbox_payload_scan_is_split_from_the_database_check(self):
+        real = engine.statev2_guard.scripts_in
+        nested = []
+
+        def scripts_in(command, cwd, **kwargs):
+            # Only scan_remote's recursive call passes a depth; the top-level check does not.
+            if kwargs.get('_depth', 0) > 0:
+                nested.append(kwargs['_depth'])
+                self.clock.offset += 2.7
+            return real(command, cwd, **kwargs)
+        with patch.object(engine.statev2_guard, 'scripts_in', scripts_in):
+            result = engine.decide(self.bash(tool_input={'command': "offbox run --step 'echo " + SECRET + "'"}), 'claude')
+        self.assertEqual(result['decision'], 'allow')
+        self.assertTrue(nested)
+        row = self.decision()
+        self.assert_largest(row, 'remote_scan_ms', 2700)
+        self.assertLess(row['props']['live_db_ms'], 500)
+
+    def test_nested_remote_scans_are_timed_once(self):
+        real = engine.statev2_guard.scripts_in
+        depths = []
+
+        def scripts_in(command, cwd, **kwargs):
+            if kwargs.get('_depth', 0) > 0:
+                depths.append(kwargs['_depth'])
+                self.clock.offset += 1.2
+            return real(command, cwd, **kwargs)
+        command = "offbox run --step \"offbox run --step 'echo nested'\""
+        with patch.object(engine.statev2_guard, 'scripts_in', scripts_in):
+            engine.decide(self.bash(tool_input={'command': command}), 'claude')
+        self.assertGreaterEqual(len(depths), 2)
+        props = self.decision()['props']
+        # Each nested scan's time sits inside the outermost one, so the total is the clock's, not double.
+        self.assertGreaterEqual(props['remote_scan_ms'], 1200 * len(depths))
+        self.assertLess(props['remote_scan_ms'], 1200 * len(depths) + 500)
+
     def test_local_guard_parsers(self):
         with patch.object(engine.rootwide_search_guard, 'classify', self.clock.spend(2200, None)):
             engine.decide(self.bash(), 'claude')
