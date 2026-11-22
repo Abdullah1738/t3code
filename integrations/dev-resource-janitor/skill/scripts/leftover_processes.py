@@ -1,5 +1,6 @@
 """Process evidence and opt-in session cleanup. Unknown or incomplete always keeps."""
 import ctypes
+from contextlib import contextmanager
 import datetime
 import json
 import math
@@ -75,21 +76,24 @@ def run(argv, timeout=15, allow_empty=False):
     return result.stdout
 
 
-def parse_ps(raw):
+def parse_ps(raw, *, with_rss=False):
     rows = {}
     for line in raw.splitlines():
-        parts = line.split(None, 8)
-        if len(parts) != 9 or not parts[0].isdigit():
+        parts = line.split(None, 9 if with_rss else 8)
+        if len(parts) != (10 if with_rss else 9) or not parts[0].isdigit():
             raise RuntimeError("ps: malformed process inventory")
         pid = int(parts[0])
         rows[pid] = {"pid": pid, "ppid": int(parts[1]), "start": " ".join(parts[2:7]),
-                     "tty": parts[7], "args": parts[8]}
+                     "tty": parts[7], "args": parts[9 if with_rss else 8]}
+        if with_rss:
+            rows[pid]["rss_kib"] = int(parts[8])
     return rows
 
 
 def processes(pid=None, *, timeout=15):
     select = ["-p", str(pid)] if pid else ["-ax"]
-    return parse_ps(run(["/bin/ps", *select, "-o", "pid=,ppid=,lstart=,tty=,args="], timeout=timeout))
+    return parse_ps(run(["/bin/ps", *select, "-o", "pid=,ppid=,lstart=,tty=,rss=,args="], timeout=timeout),
+                    with_rss=True)
 
 
 def parse_top(raw):
@@ -230,7 +234,7 @@ def owner_call_summary(calls):
 def control(path, calls=None):
     kind = ("by_native" if path.startswith("/threads/by-native/") else
             "recovery" if path.startswith("/recovery/") else "detail")
-    started, status, failed = time.perf_counter(), 0, True
+    started, status, failed = time.monotonic(), 0, True
     try:
         status, body = active_sessions._control_get(path, timeout=OWNER_CALL_TIMEOUT)
         if status != 200 or not isinstance(body, dict) or body.get("ok") is not True:
@@ -239,7 +243,7 @@ def control(path, calls=None):
         return body
     finally:
         if calls is not None:
-            calls.setdefault(kind, []).append(((time.perf_counter() - started) * 1000,
+            calls.setdefault(kind, []).append(((time.monotonic() - started) * 1000,
                                               str(status) if failed else None))
 
 
@@ -353,6 +357,95 @@ def mcp(args):
         marker in low for marker in ("dia-mcp", "dia-agent-bridge", "perplexity-mcp", "@perplexity-ai/mcp-server", "perplexity/server"))
 
 
+def mcp_family(args):
+    try:
+        argv = shlex.split(args)
+        program = os.path.basename(argv[0]).lower()
+    except (ValueError, IndexError):
+        return None
+    if program == "cua-driver" and argv[1:2] in (["mcp"], ["serve"]):
+        return "cua-driver"
+    # Only executable/script tokens count; flags can mention arbitrary tools.
+    tokens = [argv[0].lower()]
+    if program in {"node", "bun", "npx"}:
+        tokens += [token.lower() for token in argv[1:] if not token.startswith("-")][:1]
+    if any(marker in token for token in tokens for marker in
+           ("perplexity-mcp", "@perplexity-ai/mcp-server", "perplexity/server")):
+        return "perplexity"
+    if any(marker in token for token in tokens for marker in ("dia-mcp", "dia-agent-bridge")):
+        # The same package runs a guard/log helper which is not an MCP server.
+        return "dia-bridge" if any(os.path.basename(token) in {"server.js", "server.mjs", "index.js"}
+                                   for token in tokens) else None
+    if any(re.search(r"\bmcp\b|\bmcp[-_/]server\b", token) for token in tokens):
+        return "other-mcp"
+    return None
+
+
+def mcp_parent_kind(row, chain):
+    # The nearest provider ancestor wins, even when a shell sits in between.
+    for parent in chain:
+        args = parent.get("args", "").lower()
+        if re.search(r"\bcodex\s+app-server\b", args):
+            return "codex-app-server"
+        if family({"args": args}) == "claude":
+            return "claude-cli"
+        if re.search(r"\bopencode\b.*\bserve\b", args):
+            return "opencode-serve"
+    return "ppid-1" if row["ppid"] == 1 else "other"
+
+
+def mcp_summary(report, reason=None):
+    summary = dict(report_only=True, ok=reason is None and not report["problems"],
+                   families={name: dict(count=0, rss_kib=0, rss_unavailable=0) for name in
+                             ("cua-driver", "perplexity", "dia-bridge", "other-mcp")},
+                   parent_kinds={name: 0 for name in
+                                 ("codex-app-server", "claude-cli", "opencode-serve", "ppid-1", "other")},
+                   keep_reasons={}, candidates=0, unknown_owner=0, observation_unavailable=0,
+                   owner_calls=report["owner_calls"])
+    if reason or report["problems"]:
+        summary["reason"] = reason or "process_scan_incomplete"
+    for item in report["inventory"]:
+        name = item.get("mcp_family")
+        if name is None:
+            continue
+        bucket = summary["families"][name]
+        bucket["count"] += 1
+        if item.get("rss_kib") is None:
+            bucket["rss_unavailable"] += 1
+        else:
+            bucket["rss_kib"] += item["rss_kib"]
+        summary["parent_kinds"][item["parent_kind"]] += 1
+        # Exception details stay in the redacted inventory, never in aggregate keys.
+        keep = item.get("keep_reason", "").split(":", 1)[0]
+        if keep:
+            summary["keep_reasons"][keep] = summary["keep_reasons"].get(keep, 0) + 1
+        summary["candidates"] += bool(item.get("candidate"))
+    for key in ("unknown_owner", "observation_unavailable"):
+        summary[key] = summary["keep_reasons"].get(key, 0)
+    blind = any(summary["keep_reasons"].get(key, 0) for key in
+                ("unknown_owner", "observation_unavailable", "observation_budget_exhausted",
+                 "liveness_unavailable", "unproven_process", "memory_unavailable",
+                 "parent_chain_incomplete", "changed_before_report"))
+    summary["verdict"] = "unverified" if blind or not summary["ok"] else "clean"
+    return summary
+
+
+def unavailable_report(reason, cursor=0):
+    report = dict(report_only=True, inventory=[], candidates=[], problems=[reason], checked=0,
+                  skipped=0, budget_skipped=0, next_cursor=cursor, owner_calls=owner_call_summary({}))
+    report["mcp_summary"] = mcp_summary(report, reason)
+    return report
+
+
+@contextmanager
+def timed_phase(phases, name):
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        phases[name] = round(phases.get(name, 0) + (time.monotonic() - started) * 1000, 1)
+
+
 def expired(thread, now):
     try:
         updated = datetime.datetime.fromisoformat(thread["updatedAt"].replace("Z", "+00:00")).timestamp()
@@ -418,6 +511,8 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
                     parent_chain=[{**{k: p[k] for k in ("pid", "ppid", "start") if k in p},
                                    "command": redact(p.get("args", "")), "missing": p.get("missing", False),
                                    "launch_label": labels.get(p["pid"])} for p in chain])
+        item.update(mcp_family=mcp_family(row["args"]), parent_kind=mcp_parent_kind(row, chain),
+                    rss_kib=row.get("rss_kib"))
         report["inventory"].append(item)
         reason = keep_reason(row, chain, labels, keep)
         if not reason and not roster["complete"]:
@@ -467,7 +562,8 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
                         reason = "liveness_unavailable"
                     else:
                         current = refresh(row["pid"]).get(row["pid"])
-                        again = inspect(current) if current == row else None
+                        # RSS can change without changing process identity.
+                        again = inspect(current) if process_identity(current) == process_identity(row) else None
                         current_owner = resolve(again["binding"]) if again else None
                         if again != details or current_owner != own or not owner_clear(current_owner, fresh):
                             reason = "changed_before_report"
@@ -490,6 +586,9 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
                 item.update(candidate=False, keep_reason="liveness_unavailable")
     report["skipped"] = len(report["inventory"]) - report["checked"]
     report["owner_calls"] = owner_call_summary(calls)
+    report["phase_ms"] = {"owner_" + kind: round(sum(ms for ms, _ in calls.get(kind, [])), 1)
+                          for kind in OWNER_ENDPOINTS}
+    report["mcp_summary"] = mcp_summary(report)
     return report
 
 
@@ -741,31 +840,38 @@ def reap_agent_browsers(report, *, rescan=None, close=close_agent_browser, refre
 
 def report_summary(report):
     result = {key: report[key] for key in ("candidates", "problems", "checked", "skipped", "budget_skipped", "owner_calls")}
-    for key in ("agent_browser", "xcode_builds"):
+    for key in ("agent_browser", "xcode_builds", "mcp_summary", "phase_ms"):
         if key in report:
             result[key] = report[key]
     return result
 
 
 def scan(roster, keep=(), cursor=0):
+    phases = {}
     try:
-        rows = processes()
-        labels = launch_services()
-        memory = parse_top(run(["/usr/bin/top", "-l", "1", "-stats", "pid,command,mem,cmprs"], timeout=30))
+        with timed_phase(phases, "inventory"):
+            rows = processes()
+        with timed_phase(phases, "launch_services"):
+            labels = launch_services()
+        with timed_phase(phases, "memory"):
+            memory = parse_top(run(["/usr/bin/top", "-l", "1", "-stats", "pid,command,mem,cmprs"], timeout=30))
         try:
-            hints = cwd_inventory(rows)
+            with timed_phase(phases, "cwd_inventory"):
+                hints = cwd_inventory(rows)
         except Exception:
             hints = {}
-        report = detect(rows, memory, labels, roster, keep, deadline=time.monotonic() + OBSERVATION_BUDGET,
-                        cursor=cursor, cwd_hints=hints)
-        report["agent_browser"] = scan_agent_browsers(roster, keep)
-        report["xcode_builds"] = scan_xcode_builds(roster, keep)
-        return report
+        with timed_phase(phases, "detection"):
+            report = detect(rows, memory, labels, roster, keep, deadline=time.monotonic() + OBSERVATION_BUDGET,
+                            cursor=cursor, cwd_hints=hints)
+        with timed_phase(phases, "agent_browser"):
+            report["agent_browser"] = scan_agent_browsers(roster, keep)
+        with timed_phase(phases, "xcode_builds"):
+            report["xcode_builds"] = scan_xcode_builds(roster, keep)
     except Exception as exc:
-        return {"report_only": True, "inventory": [], "candidates": [],
-                "problems": ["process_inventory_unavailable: " + type(exc).__name__],
-                "checked": 0, "skipped": 0, "budget_skipped": 0, "next_cursor": cursor,
-                "owner_calls": owner_call_summary({})}
+        report = unavailable_report("process_inventory_unavailable", cursor)
+        report["problems"] = ["process_inventory_unavailable: " + type(exc).__name__]
+    report.setdefault("phase_ms", {}).update(phases)
+    return report
 
 
 def process_identity(row):

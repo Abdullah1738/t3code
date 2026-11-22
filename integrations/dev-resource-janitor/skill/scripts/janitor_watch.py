@@ -149,6 +149,7 @@ def worker(lock_fd):
         import dev_janitor
 
         scan = dev_janitor.scan()
+        dev_janitor.collect_scan_stats(stats, scan)
         stats["found"] = len(scan["resources"])
         if "agent_browser" in scan.get("processes", {}):
             dev_janitor.close_browser_candidates(scan)
@@ -184,7 +185,8 @@ def worker(lock_fd):
         return 1
     finally:
         if dev_janitor is not None:
-            dev_janitor.log_run(started, stats["found"], stats["killed"], ok)
+            dev_janitor.log_run(started, stats["found"], stats["killed"], ok,
+                                stats.get("phase_ms"), stats.get("mcp_summary"))
     return 0
 
 
