@@ -121,7 +121,11 @@ plus an inode/device, observed size and committed byte offset. Samples grow
 linearly with the day's input (the daily log cap is soft; no approximation or
 sampling is applied). The state and sparse history caches expire with the source
 logs. Appended bytes alone update the aggregate; replacement, truncation,
-same-size rewrite or aggregate schema changes rebuild it. Rebuilds checkpoint
+same-size rewrite or aggregate schema changes rebuild it. A SHA-256 witness
+validates every committed byte before cache reuse, including truncate/regrow
+and middle rewrites; validation reads raw bytes in 1 MiB chunks without JSON
+parsing. The checksum extends with new complete lines at each checkpoint.
+Rebuilds checkpoint
 atomically every 8 MiB or 30 seconds so deadline kills retain progress.
 An unfinished last line contributes provisionally to the report and is reread
 until newline termination. Listener transitions, cross-day health joins and

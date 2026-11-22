@@ -1,6 +1,7 @@
 """Append cursors shared by aggregate and sparse-history caches."""
 import datetime as dt
 from collections import Counter, defaultdict
+import hashlib
 import json
 import os
 import tempfile
@@ -60,6 +61,7 @@ def load(path, version):
 
 def save(path, version, cursor, aggregate):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cursor['sha256'] = cursor.digest.hexdigest()
     fd, temporary = tempfile.mkstemp(prefix='.aggregate-', dir=path.parent)
     try:
         with os.fdopen(fd, 'w') as out:
@@ -70,6 +72,12 @@ def save(path, version, cursor, aggregate):
             os.unlink(temporary)
 
 
+class Cursor(dict):
+    def __init__(self, digest, **values):
+        super().__init__(values)
+        self.digest = digest
+
+
 def cursor_for(source, previous):
     previous = previous if isinstance(previous, dict) else {}
     info = os.fstat(source.fileno())
@@ -78,11 +86,29 @@ def cursor_for(source, previous):
     append = (previous.get('identity') == identity and type(offset) is int
               and type(previous.get('size')) is int and 0 <= offset <= previous['size'] <= info.st_size
               and (previous['size'] < info.st_size or previous.get('mtime') == info.st_mtime_ns))
-    return dict(identity=identity, size=info.st_size, offset=offset if append else 0,
-                mtime=info.st_mtime_ns), append
+    digest = hashlib.sha256()
+    if append:
+        # Size/inode cannot distinguish append from copytruncate followed by
+        # regrowth. Verify all committed bytes, without parsing their JSON.
+        source.seek(0)
+        remaining = offset
+        while remaining:
+            chunk = source.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        append = remaining == 0 and previous.get('sha256') == digest.hexdigest()
+    if not append:
+        digest = hashlib.sha256()
+    return Cursor(digest, identity=identity, size=info.st_size, offset=offset if append else 0,
+                  mtime=info.st_mtime_ns, sha256=digest.hexdigest()), append
 
 
 def lines(source, cursor):
+    if cursor['offset'] == 0:
+        # A caller may reject the aggregate after validating its cursor.
+        cursor.digest = hashlib.sha256()
     source.seek(cursor['offset'])
     while source.tell() < cursor['size']:
         line = source.readline(cursor['size'] - source.tell())
@@ -90,5 +116,6 @@ def lines(source, cursor):
             break
         complete = line.endswith(b'\n')
         if complete:
+            cursor.digest.update(line)
             cursor['offset'] = source.tell()
         yield line, complete

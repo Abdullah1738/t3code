@@ -81,9 +81,15 @@ class PollChild:
             return False
         # Popen owns this unreaped child; a PID from a name search is never used.
         self.process.kill()
+        # kill() polls first and can reap an exit that raced the deadline.
+        if self.process.returncode is not None:
+            self.close()
+            return True
         _, status, usage = os.wait4(self.process.pid, 0)
         self.process.returncode = os.waitstatus_to_exitcode(status)
         self.close()
+        if self.process.returncode != -signal.SIGKILL:
+            return True
         cpu_ms = (usage.ru_utime + usage.ru_stime) * 1000
         emit('poller', 'poll.timeout', kind='error', ok=False, durationMs=elapsed * 1000,
              error=dict(tag='tick_deadline'),

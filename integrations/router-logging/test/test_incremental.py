@@ -13,6 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import append_cursor
 import guard
+import listener_rollup
 import observer
 import rollup
 from toollog import clean
@@ -82,30 +83,57 @@ class IncrementalTests(unittest.TestCase):
             self.compare(root)
 
     def test_cursor_invalidation_class(self):
-        for change in ('truncate', 'replace', 'rewrite_same_size', 'schema', 'corrupt', 'delete'):
+        for change in ('truncate', 'truncate_regrow', 'replace', 'rewrite_same_size',
+                       'rewrite_middle_and_grow', 'missing_witness', 'schema', 'corrupt', 'delete'):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 source = root / (DAY + '.ndjson')
-                source.write_text((json.dumps(row()) + '\n') * 5)
+                before = [row(status=200), row('listener.down', listener='refused'), row(status=200)]
+                source.write_text(''.join(json.dumps(event) + '\n' for event in before))
                 self.compare(root)
+                self.assertEqual(list(listener_rollup.history_rows(source)),
+                                 list(listener_rollup.history_rows(source, incremental=False)))
+                states = [root / (prefix + DAY + '.json') for prefix in ('.rollup-state-', '.listener-state-')]
+                identity, size = source.stat().st_ino, source.stat().st_size
                 if change == 'truncate':
                     source.write_text(json.dumps(row(status=499)) + '\n')
+                elif change == 'truncate_regrow':
+                    after = [row(status=499), row('listener.up', listener='open'),
+                             row(status=499), row(status=499)]
+                    source.write_text(''.join(json.dumps(event) + '\n' for event in after))
+                    self.assertEqual(source.stat().st_ino, identity)
+                    self.assertGreater(source.stat().st_size, size)
                 elif change == 'replace':
                     replacement = root / 'replacement'
-                    replacement.write_text((json.dumps(row(status=499)) + '\n') * 7)
+                    replacement.write_text((json.dumps(row('listener.up', listener='open')) + '\n') * 7)
                     replacement.replace(source)
                 elif change == 'rewrite_same_size':
                     source.write_text(source.read_text().replace('123', '321'))
-                elif change == 'schema':
-                    state = root / ('.rollup-state-' + DAY + '.json')
-                    value = json.loads(state.read_text())
-                    value['version'] = -1
-                    state.write_text(json.dumps(value))
-                elif change == 'corrupt':
-                    (root / ('.rollup-state-' + DAY + '.json')).write_text('{')
+                elif change == 'rewrite_middle_and_grow':
+                    source.write_text(source.read_text().replace('listener.down', 'listener.fake')
+                                      + json.dumps(row(status=499)) + '\n')
+                    self.assertEqual(source.stat().st_ino, identity)
+                    self.assertGreater(source.stat().st_size, size)
+                elif change in ('schema', 'missing_witness', 'corrupt'):
+                    for state in states:
+                        if change == 'corrupt':
+                            state.write_text('{')
+                            continue
+                        value = json.loads(state.read_text())
+                        if change == 'schema':
+                            value['version'] = -1
+                        else:
+                            value['cursor'].pop('sha256', None)
+                        state.write_text(json.dumps(value))
                 else:
                     source.unlink()
-                self.compare(root)
+                with self.subTest(cache='aggregate'):
+                    result = self.compare(root)
+                    if change == 'truncate_regrow':
+                        self.assertEqual(result['proxySummary']['byModel'][0]['aborted'], 3)
+                with self.subTest(cache='history'):
+                    self.assertEqual(list(listener_rollup.history_rows(source)),
+                                     list(listener_rollup.history_rows(source, incremental=False)))
 
     def test_unterminated_valid_tail_and_malformed_tail(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -123,7 +151,7 @@ class IncrementalTests(unittest.TestCase):
             result = self.compare(root)
             self.assertEqual((result['total'], result['malformed']), (2, 1))
 
-    def test_only_appended_bytes_are_scanned(self):
+    def test_only_appended_bytes_are_parsed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / (DAY + '.ndjson')
@@ -140,6 +168,38 @@ class IncrementalTests(unittest.TestCase):
             with patch('append_cursor.lines', side_effect=read):
                 rollup.rollup(DAY, root, NOW)
             self.assertEqual(offsets, [len(payload) * 100] * 2)
+
+    def test_normal_exit_at_deadline_does_not_restart_guard_or_log_timeout(self):
+        script = ('import os,signal,sys,time\n'
+                  'signal.signal(signal.SIGTERM,lambda *_:sys.exit(0))\n'
+                  'os.write(int(os.environ["ROUTER_POLL_PROGRESS_FD"]),b"history_scan_parse\\n")\n'
+                  'while True: time.sleep(60)\n')
+        for stage in ('kill_reaps', 'wait4_reaps'):
+            with self.subTest(stage=stage):
+                child = guard.PollChild([sys.executable, '-I', '-c', script])
+                try:
+                    self.assertTrue(select.select([child.reader], [], [], 30)[0])
+                    child.started -= guard.POLL_DEADLINE_SECONDS + 1
+                    kill = child.process.kill
+                    def exit_during_kill():
+                        child.process.terminate()
+                        if stage == 'kill_reaps':
+                            self.assertEqual(child.process.wait(timeout=5), 0)
+                            kill()
+                    with patch.object(child.process, 'kill', side_effect=exit_during_kill), patch('guard.emit') as emit:
+                        self.assertTrue(child.check())
+                        self.assertTrue(child.check())
+                    self.assertEqual(child.process.returncode, 0)
+                    self.assertIsNone(child.reader)
+                    emit.assert_not_called()
+                    next_child = guard.PollChild([sys.executable, '-I', '-c', 'pass'])
+                    try:
+                        self.assertEqual(next_child.process.wait(timeout=5), 0)
+                        self.assertTrue(next_child.check())
+                    finally:
+                        next_child.stop()
+                finally:
+                    child.stop()
 
     def test_deadline_interrupts_cold_rebuild_twice_then_resumes_exactly(self):
         module_dir = str(Path(rollup.__file__).parent)
