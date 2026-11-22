@@ -71,8 +71,11 @@ class SSDProbeTests(unittest.TestCase):
         return json.loads((self.state_root/'ssd-read-probe.json').read_text())
 
     def event(self):
-        lines = list((self.root/'logs').glob('*.ndjson'))[0].read_text().splitlines()
-        return [json.loads(line) for line in lines]
+        # The independent CPU entrypoint also logs to this root, using today's
+        # date while probe fixtures use NOW. Inspect every probe, on every day.
+        rows = [json.loads(line) for path in sorted((self.root/'logs').glob('*.ndjson'))
+                for line in path.read_text().splitlines()]
+        return [row for row in rows if row['name'] == 'disk.ssd_read_probe']
 
     def test_ok_read_and_one_complete_event(self):
         with patch.object(ssd, 'process_type', return_value='Standard'), patch.object(ssd.os, 'nice', return_value=7):
@@ -374,8 +377,10 @@ class SSDProbeTests(unittest.TestCase):
         import select
         # A real CPU entrypoint reaches inventory and never returns. The old
         # combined job would still be active here and miss its next minute.
+        # Keep auxiliary CPU checks out of the probe's log and alert fixture.
         script = ("import sys,time; sys.path.insert(0, sys.argv[1]); "
-                  "import cpu,u_sample; u_sample.sample=lambda:None; "
+                  "import cpu,u_sample,boot,disk_low; u_sample.sample=lambda:None; "
+                  "boot.check=lambda:None; disk_low.check=lambda:None; "
                   "cpu.sample=lambda:(print('inventory-blocked',flush=True),time.sleep(60)); "
                   "cpu.main()")
         inventory = self.popen([sys.executable, '-c', script, str(HERE)], stdout=subprocess.PIPE)

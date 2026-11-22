@@ -797,9 +797,20 @@ const makeRoutes = Effect.gen(function* () {
     return { projectId: scratch.projectId, workspaceStrategy: { type: "root" as const } };
   });
 
-  const createThread = Effect.gen(function* () {
+  // HTTP instrumentation and ThreadLaunchService already provide the spans.
+  const createThread = Effect.fnUntraced(function* (existingOnly = false) {
     yield* authenticate(AuthOrchestrationOperateScope);
     const body = yield* decodeBody(decodeCreateThreadBody);
+    if (existingOnly) {
+      const threadId = yield* param("threadId");
+      if (
+        body.clientRequestId === undefined ||
+        threadId !== (yield* commandIdFor("thread", body.clientRequestId))
+      ) {
+        return yield* fail("invalid_request", "Launch request ID must match the existing thread.");
+      }
+      yield* getShell(threadId);
+    }
     const target = yield* resolveProject(body);
     const settings = yield* settingsService.getSettings.pipe(
       Effect.mapError((cause) => fail("internal", errorDetail(cause))),
@@ -2013,7 +2024,10 @@ const makeRoutes = Effect.gen(function* () {
     route("GET", `${p}/usage`, handle(listUsage)),
     route("GET", `${p}/messages`, handle(listUserMessages)),
     route("GET", `${p}/threads`, handle(listThreads)),
-    route("POST", `${p}/threads`, handle(createThread)),
+    route("POST", `${p}/threads`, handle(createThread())),
+    // Resume the original launch receipt, including its initial-message command.
+    // A separate send ID can race a late launch dispatch and accept a second run.
+    route("POST", `${p}/threads/:threadId/resume-launch`, handle(createThread(true))),
     route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
     route("GET", `${p}/identity/resolve`, handle(identityResolve), "control.identity.resolve"),
     route("GET", `${p}/recovery/snapshot`, handle(recoverySnapshot)),

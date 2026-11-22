@@ -15,6 +15,8 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -60,6 +62,7 @@ const run = Schema.decodeUnknownSync(OrchestrationV2Run)({
   contextHandoffId: null,
 });
 const makeFixture = () => {
+  const threadCommands = ThreadCommandExecutor.layer;
   let projection = decodeProjection({
     thread: {
       id: source.threadId,
@@ -120,7 +123,7 @@ const makeFixture = () => {
           cardsByThread: () => Effect.sync(() => (card === null ? [] : [card])),
           discussionByEvaluator: () => Effect.succeed(null),
         }),
-        ThreadCommandExecutor.layer,
+        threadCommands,
         Layer.mock(EventSink.EventSinkV2)({
           commitCommand: (input) =>
             Effect.sync(() => {
@@ -140,6 +143,7 @@ const makeFixture = () => {
   return {
     commits,
     layer,
+    threadCommands,
     pending: (value: boolean) => {
       continuationPending = value;
     },
@@ -495,6 +499,46 @@ it.effect.each([1, 2])(
     }).pipe(Effect.provide(f.layer));
   },
 );
+
+it.effect("a waiting snapshot rechecks freshness after acquiring the thread lock", () => {
+  const f = makeFixture();
+  f.recorded();
+  return Effect.gen(function* () {
+    const state = yield* RestartPacingState.RestartPacingState;
+    const commands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    yield* state.status(source, null);
+    let current = true;
+    let checked = false;
+    const started = yield* Deferred.make<void>();
+    const waiting = yield* commands.withLock(
+      source.threadId,
+      Effect.gen(function* () {
+        const fiber = yield* Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(
+            state.status(source, 2, undefined, () => {
+              checked = true;
+              return current;
+            }),
+          ),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(started);
+        yield* Effect.yieldNow;
+        assert.isFalse(checked);
+        current = false;
+        return fiber;
+      }),
+    );
+    yield* Fiber.join(waiting);
+    assert.isTrue(checked);
+    assert.equal(f.commits.length, 1);
+    const event = f.commits[0]?.events[0];
+    assert.equal(
+      event?.type === "turn-item.updated" ? event.payload.status : undefined,
+      "completed",
+    );
+  }).pipe(Effect.provide(Layer.merge(f.layer, f.threadCommands)));
+});
 
 it.effect.each(["user", "scheduled"] as const)(
   "%s input skips pacing despite a pending continuation",

@@ -22,6 +22,13 @@ _IMESSAGE_ERROR_NAMES = frozenset('Error TypeError RangeError ReferenceError Syn
 CAP_BYTES = 50 * 1024 * 1024
 HOOKS_CAP_BYTES = 35 * 1024 * 1024
 HOOK_SAMPLE_RATE = 128
+# Hook rows slower than this carry measured phase timings and are never sampled
+# or capped out: they are rare and they are the rows a latency card needs.
+SLOW_HOOK_MS = 2000
+# Measured spans inside one hook call. Callers time them with a monotonic clock;
+# a phase a writer cannot measure is left out, never estimated.
+HOOK_PHASES = ('identity_ms', 'lineage_ms', 'classify_ms', 'guard_ms', 'live_db_ms', 'remote_scan_ms', 'desktop_ms',
+               'lock_wait_ms', 'log_write_ms', 'mask_ms', 'spawn_ms')
 _SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _LABEL = re.compile(r"[A-Za-z0-9_.:-]{1,120}\Z")
 _ID_VALUE = re.compile(r"[A-Za-z0-9_.:%/-]{1,300}\Z")
@@ -35,7 +42,7 @@ _FIELDS = {'harness', 'guard', 'decision', 'rule', 'firstWord', 'commandLength',
            'httpMethod', 'ttfbMs', 'reason', 'identity_source', 'driver', 'route', 'httpStatus',
            'resolution', 'attempt', 'command', 'attempts', 'waitedMs',
            'classifier', 'errorClass', 'failMode', 'spawnMs', 'classifyMs', 'totalMs', 'cmdKind',
-           'holder', 'adbVerb', 'source'}
+           'holder', 'adbVerb', 'source', 'cmdShape', 'project', *HOOK_PHASES}
 _IDS = {'sessionId', 'threadId', 'nativeAgentId', 'cardNumber', 'serverId', 'home', 'sampleId'}
 _WORDS = set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split())
 
@@ -52,6 +59,192 @@ def command_props(command):
                   'build' if first in {'go', 'cargo', 'rustc', 'make'} else first if first in {
                       'git', 'docker', 'offbox', 'sqlite3'} else 'other')
     return {'firstWord': first, 'argv0Class': argv_class, 'commandLength': len(command)}
+
+
+# A command shape is a skeleton of a refused command for grouping refusals. It
+# fails closed: the only literal text it keeps is operators, env var names, one
+# or two-letter flags, and words from fixed vocabularies (programs, subcommands,
+# file extensions, --long options, long single-dash options). Everything else, including any
+# word it cannot place, becomes a placeholder. The output alphabet has no '/',
+# quotes or backslashes, and _SHAPE_TEXT rejects anything else at the log boundary.
+_SHAPE_TEXT = re.compile(r"[A-Za-z0-9 _.:=<>+|&;()$`,-]{1,240}\Z")
+# Backslash escapes stay inside their word, so `super\;secret` is one argument, not two commands.
+_SHAPE_TOKENS = re.compile(r"""'[^']*'?|"(?:\\.|[^"\\])*"?|\$\(|`|&&|\|\||<<<|<<-?|&>>?|[0-9]*>>?(?:&[0-9-]?)?|<|[|;&()]|(?:\\.|[^\s'"`|;&()<>\\])+""", re.S)
+_HEREDOC_START = re.compile(r"(?<!<)<<(?!<)(-?)")
+_HEREDOC_WORD = re.compile(r"""\s*(?:'([^']*)'|"([^"]*)"|((?:\\.|[^\s;&|<>()'"\\])+))""")
+_SHAPE_PROGRAMS = frozenset('''
+alias apw awk aws az base64 basename bash bat brew bun bunx cargo cat cd chmod chown cliq clickhouse-client cmp
+codesign column comm command cp curl cut date defaults deno df diff dig dirname docker du echo env eslint eval
+exec export expr false fd fdbcli ffmpeg file find fj gcloud gh git go gradle grep gunzip gzip head helm hlog
+hostname id jest jq kill kubectl launchctl less linctl ln ls lsof make man mdfind mkdir mktemp mv mvn mysql nc nice
+node nohup npm npx offbox open openssl osascript perl pgrep php pip pipx pkill plutil pnpm poetry popd
+prettier printenv printf ps psql pushd pwd python rclone read readlink realpath redis-cli restic rg rm rmdir
+rsync ruby rustc say scp security sed seq set sh shasum sips sleep sort source sqlite ssh stat sudo swift
+t3ctl tail tailname tailscale tar tee terraform test time timeout touch tr true tsc type uname uniq unset
+unzip uv uvx vitest vp wait wc which whoami xargs xcodebuild xcrun yarn yq zip zsh
+'''.split())
+_SHAPE_PROGRAM_VERSION = re.compile(r"([a-z][a-z-]*?)(?:[0-9]+(?:\.[0-9]+)*)?\Z")
+_SHAPE_EXTENSION = re.compile(r"\.([A-Za-z][A-Za-z0-9]{0,7})\Z")
+_SHAPE_EXTENSIONS = frozenset('''bash c cjs conf cpp css csv db env go gz h html ini java jpg js json jsonl jsx
+kt log lua md mjs ndjson patch pdf php pl png py qnt rb rs sh sql sqlite sqlite3 svg swift tar tgz toml ts tsx
+txt wal xml yaml yml zip zsh'''.split())
+# Long option names also come from a fixed list; others read --<opt> (with =<v> kept).
+_SHAPE_LONG_OPTIONS = frozenset('''all allow-empty background bg board build cached check config count cwd day db
+debug depth detach dev dir directory dry-run env exclude file files filter fix fixed-strings force format
+frozen-lockfile global glob grep help hidden home-dir host ignore-case include interactive json kind limit
+line-number list max-depth name name-only no-cache no-pager no-verify oneline only-matching out output pattern
+porcelain port prefix preload print project quiet read-only readonly recursive reporter rm root rule run save-dev
+share short silent size staged stat status step table test-name-pattern timeout top tty type verbose version
+watch word-regexp workspace write yes'''.split())
+# One or two letters (-u, -rf) or a known long single-dash option; an attached
+# value (-psecret, -usecret) is never a flag name.
+_SHAPE_SHORT_FLAG = re.compile(r"-[A-Za-z]{1,2}\Z")
+_SHAPE_DASH_WORDS = frozenset('''-name -iname -path -ipath -type -exec -execdir -print -print0 -delete -maxdepth
+-mindepth -newer -mtime -mmin -size -not -and -or -prune -empty -version -help'''.split())
+# Words after the program survive only from this fixed subcommand vocabulary, so
+# an argument (echo hunter2) can never pass as a subcommand.
+_SHAPE_VOCABULARY = frozenset('''add api apply build check checkout cherry-pick clean clone close commit compose
+config create deploy describe destroy dev diff discover down edit exec export fetch fmt format generate get
+images import info init inspect install issue kill lint list log logs ls ls-files merge mod new open plan pip
+pr preview ps pull push query read rebase release remove reset restart restore rev-parse rm run serve set show
+start stash status stop switch sync tag test tidy typecheck uninstall unittest unset up update upgrade validate
+vet view wait watch worktree pytest'''.split())
+_SHAPE_SEPARATORS = {'&&', '||', '|', ';', '&', '(', ')', '$(', '`'}
+# These run the next word as a command, so it is shaped as a program again.
+_SHAPE_WRAPPERS = frozenset('env sudo timeout nohup xargs time exec command nice'.split())
+# After `--` these run a command too (`offbox run -- vp test`); elsewhere `--` only ends options.
+_SHAPE_RUNNERS = _SHAPE_WRAPPERS | frozenset('offbox uv npx bunx pipx poetry'.split())
+_SHAPE_GLOB = re.compile(r"[*?\[]")
+_SHAPE_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
+_SHAPE_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,40}\Z")
+
+
+def _shape_program(name):
+    """The program name when it (minus a version suffix like python3.15) is a known tool, else None."""
+    if name in _SHAPE_PROGRAMS:
+        return name
+    match = _SHAPE_PROGRAM_VERSION.fullmatch(name) if len(name) <= 40 else None
+    return name if match and match[1] in _SHAPE_PROGRAMS else None
+
+
+def _shape_path(extension):
+    suffix = extension[1].lower()
+    return f'<path.{suffix}>' if suffix in _SHAPE_EXTENSIONS else '<path>'
+
+
+def _shape_word(token, slot):
+    if token[0] in '\'"':
+        return '<qvar>' if token[0] == '"' and '$' in token else '<q>'
+    if '\\' in token:
+        return '<w>'
+    if '$' in token:
+        return '<var>'
+    if _SHAPE_GLOB.search(token):
+        return '<glob>'
+    if token[0].isdigit() or token[0] == '-' and token[1:2].isdigit():
+        return '<n>'
+    if token[0] == '-' and token != '-':
+        name, equals, _ = token.partition('=')
+        if name.startswith('--'):
+            return ('--' + name[2:] if name[2:] in _SHAPE_LONG_OPTIONS else '--<opt>') + ('=<v>' if equals else '')
+        known = not equals and (_SHAPE_SHORT_FLAG.match(name) or name in _SHAPE_DASH_WORDS)
+        return name if known else '<flag>'
+    tail = token.rstrip('/').rsplit('/', 1)[-1]
+    extension = _SHAPE_EXTENSION.search(tail)
+    if '/' in token or token[0] in '~.':
+        if slot == 0 and not extension and _shape_program(tail):
+            return tail
+        return _shape_path(extension) if extension else '<path>'
+    if slot == 0:
+        return _shape_program(token) or (_shape_path(extension) if extension else '<cmd>')
+    if extension:
+        return _shape_path(extension)
+    return token if slot <= 2 and token in _SHAPE_VOCABULARY else '<w>'
+
+
+def _strip_heredoc_bodies(text):
+    """Drop heredoc bodies. A delimiter that cannot be read, or a body whose
+    terminator never appears exactly, drops everything after it."""
+    kept, pending = [], []
+    for line in text.split('\n'):
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            if delimiter is not None and (line.lstrip('\t') if strip_tabs else line) == delimiter:
+                pending.pop(0)
+            continue
+        kept.append(line)
+        for start in _HEREDOC_START.finditer(line):
+            word = _HEREDOC_WORD.match(line, start.end())
+            delimiter = None
+            # Mixed quoting (E"O"F) is not parsed; leaving it unreadable drops the rest.
+            if word and not line[word.end():word.end() + 1] in ('"', "'"):
+                delimiter = word[1] if word[1] is not None else word[2] if word[2] is not None else re.sub(r'\\(.)', r'\1', word[3])
+            pending.append((delimiter or None, bool(start[1])))
+    return ' ; '.join(line for line in kept if line.strip()), bool(pending)
+
+
+def command_shape(command):
+    """Privacy-reduced skeleton of a command for grouping refusals, or None."""
+    if not isinstance(command, str) or not command.strip():
+        return None
+    text = command[:4000].replace('\\\n', ' ')
+    truncated = len(command) > 4000
+    if '\n' in text:
+        text, unterminated = _strip_heredoc_bodies(text)
+        truncated |= unterminated
+    out = []
+    slot, program, assignments_done, target = 0, None, False, None
+    for token in _SHAPE_TOKENS.findall(text):
+        if token in _SHAPE_SEPARATORS:
+            if token == ')' and out and out[-1] == ';':
+                out.pop()
+            if not (token == ';' and (not out or out[-1] in _SHAPE_SEPARATORS)):
+                out.append(token)
+            slot, program, assignments_done, target = 0, None, False, None
+            continue
+        if token[0] in '<>&' or token[0].isdigit() and '>' in token:
+            target = 'heredoc' if token.startswith('<<') and token != '<<<' else 'redirect'
+            out.append('<<' if target == 'heredoc' else '<<<' if token == '<<<' else
+                       '<' if token == '<' else '>&' if '&' in token else '>')
+            continue
+        if target:
+            out.append('<delim>' if target == 'heredoc' else _shape_word(token, 3))
+            target = None
+            continue
+        if token == '--':
+            out.append('--')
+            if program in _SHAPE_RUNNERS:
+                slot, program, assignments_done = 0, None, False
+            continue
+        assignment = _SHAPE_ASSIGNMENT.match(token) if not assignments_done and slot == 0 else None
+        if assignment:
+            out.append(f'{assignment[1]}=<v>' if _SHAPE_ENV_NAME.match(assignment[1]) else '<assign>')
+            continue
+        assignments_done = True
+        word = _shape_word(token, slot)
+        if slot == 0 and word in _SHAPE_WRAPPERS:
+            program, assignments_done = word, False
+        elif token[0] == '-' and token != '-' and not token[1:2].isdigit():
+            pass
+        elif not (slot == 0 and word == '<n>'):
+            if slot == 0:
+                program = word
+            slot += 1
+        if word.startswith('<') and out and out[-1].rstrip('+') == word:
+            out[-1] = word + '+'
+        else:
+            out.append(word)
+        if len(out) >= 32:
+            truncated = True
+            break
+    while out and out[-1] in {';', '&'}:
+        out.pop()
+    if truncated and out:
+        out.append('...')
+    shape = ' '.join(out)
+    if len(shape) > 240:
+        shape = shape[:236].rsplit(' ', 1)[0] + ' ...'
+    return shape if shape and _SHAPE_TEXT.fullmatch(shape) else None
 
 
 def hook_props(props, *, error=False):
@@ -89,6 +282,39 @@ def _cwd_class(cwd):
         current = parent
     home = str(Path.home())
     return 'home' if path == home or path.startswith(home + os.sep) else 'other'
+
+
+def cwd_project(cwd):
+    """Folder name of the git repository holding cwd (the main checkout for a worktree), or None."""
+    return _cwd_project(cwd) if isinstance(cwd, str) and cwd else None
+
+
+@lru_cache(maxsize=256)
+def _cwd_project(cwd):
+    current = os.path.abspath(os.path.expanduser(cwd))
+    for _ in range(32):
+        git = os.path.join(current, '.git')
+        if os.path.isdir(git):
+            name = os.path.basename(current)
+            break
+        if os.path.isfile(git):
+            # Worktrees point at <repo>/.git/worktrees/<name>; report the repository, not the task branch.
+            try:
+                with open(git, encoding='utf-8') as source:
+                    pointer = source.read(4096).strip()
+            except (OSError, UnicodeError):
+                pointer = ''
+            target = pointer[8:].strip() if pointer.startswith('gitdir: ') else ''
+            repo, marker, _ = target.rpartition('/.git/worktrees/')
+            name = os.path.basename(repo) if marker else os.path.basename(current)
+            break
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+    else:
+        return None
+    return name if _LABEL.fullmatch(name or '') else None
 
 
 def matched_root(root):
@@ -219,6 +445,10 @@ def _metadata(values, keys):
     for key, value in (values or {}).items():
         if key not in keys:
             continue
+        if key in ('cmdShape', 'project') and keys is _FIELDS:
+            if isinstance(value, str) and (_SHAPE_TEXT if key == 'cmdShape' else _LABEL).fullmatch(value):
+                result[key] = value
+            continue
         if type(value) is bool or type(value) in (int, float) and math.isfinite(value):
             result[key] = value
         elif key == 'reason' and isinstance(value, str):
@@ -299,7 +529,8 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
                                    'kind': 'error', 'name': 'log.cap', 'ok': False,
                                    'props': {'component': scope, 'capBytes': cap},
                                    'error': {'tag': 'log.cap', 'message': 'Daily log cap reached'}})
-        if kind != 'error' and (size >= CAP_BYTES or component == 'hooks' and size >= HOOKS_CAP_BYTES):
+        if (kind != 'error' and not _slow_hook(row)
+                and (size >= CAP_BYTES or component == 'hooks' and size >= HOOKS_CAP_BYTES)):
             return
         rate = _sample_rate(row)
         if rate > 1 and random.random() >= 1 / rate:
@@ -309,27 +540,117 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
         pass
 
 
+def _is_slow(duration_ms):
+    # Compare the value emit() writes, so the writer and the cap agree at the boundary.
+    return (type(duration_ms) in (int, float) and math.isfinite(duration_ms)
+            and round(duration_ms, 3) > SLOW_HOOK_MS)
+
+
+def _slow_hook(row):
+    return row.get('name') == 'hook.decision' and _is_slow(row.get('durationMs'))
+
+
+def phase_props(duration_ms, phases):
+    """Integer phase fields for a slow hook row; nothing for a fast one."""
+    if not _is_slow(duration_ms):
+        return {}
+    return {key: int(round(value)) for key, value in (phases or {}).items()
+            if key in HOOK_PHASES and type(value) in (int, float) and math.isfinite(value) and value >= 0}
+
+
 def run_source():
     """'test' inside a test runner. Until #185 tags test runs, the environment is the only signal."""
     return 'test' if ('unittest' in sys.modules or 'pytest' in sys.modules or os.environ.get('NODE_ENV') == 'test'
                       or os.environ.get('ROBOB_TEST') or os.environ.get('PYTEST_CURRENT_TEST')) else 'real'
 
 
-def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None, identity_source=None, extra=None):
+def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None, identity_source=None, extra=None, phases=None):
     try:
         identity, source = hook_ids(harness, ids)
         command_fields = command_props(command)
+        if decision in ('denied', 'rewritten'):
+            shape = command_shape(command)
+            if shape:
+                command_fields['cmdShape'] = shape
+            project = cwd_project(cwd)
+            if project:
+                command_fields['project'] = project
+        if run_source() == 'test':
+            # Lets refusalShapes drop rows from hook processes a test spawned
+            # without isolating the log root (#185 owns the general fix).
+            command_fields['source'] = 'test'
         if isinstance(identity_source, str) and identity_source in {'cache', 'control', 'negative-cache'}:
             command_fields['identity_source'] = identity_source
-        emit('hooks', 'error' if decision == 'denied' or error_tag else 'perf', 'hook.decision',
-             duration_ms=duration_ms, ok=decision != 'denied' and not error_tag, ids=identity,
-             props=hook_props({**(extra or {}), 'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
+        timings = phase_props(duration_ms, phases)
+        props = hook_props({**(extra or {}), 'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,
                     'threadIdSource': source, 'cwdClass': cwd_class(cwd), 'matchedRoot': matched_root(matched),
                     'repeatCount': _repeat_count(harness, identity, guard, rule, command_fields.get('firstWord', 'none')),
-                    'argv0Class': 'none', **command_fields}, error=decision == 'denied' or bool(error_tag)),
+                    'argv0Class': 'none', **command_fields}, error=decision == 'denied' or bool(error_tag))
+        if _is_slow(duration_ms):
+            # Every slow row is written, so it weighs 1 in the rollup's estimates.
+            props.pop('sampleRate', None)
+        emit('hooks', 'error' if decision == 'denied' or error_tag else 'perf', 'hook.decision',
+             duration_ms=duration_ms, ok=decision != 'denied' and not error_tag, ids=identity,
+             props={**props, **timings},
              error_tag=error_tag or (rule if decision == 'denied' else None))
     except Exception:
         pass
+
+
+_WATCHER_TIMING_KEYS = ('slotWaitMs', 'slotQueueDepth', 'slotActiveAtEnqueue', 'startLateMs',
+                        'intervalMs', 'queuedMs', 'outcome', 'exitCode', 'signal', 'timedOut',
+                        'dueAt', 'lateMs', 'lane', 'loadMode', 'trigger')
+
+
+def _watcher_rows(row):
+    """Restore the logical watcher records before filtering or aggregating."""
+    name = row.get('name')
+    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+    ids = row.get('ids') if isinstance(row.get('ids'), dict) else {}
+    if row.get('v') == 1 and isinstance(name, str) and (name in {'watch.run', 'helper.run'} or name.startswith('slot.')):
+        props = dict(props)
+        timing = props.pop('timing', None)
+        if isinstance(timing, list) and timing and type(timing[0]) is int and 0 <= timing[0] < 1 << len(_WATCHER_TIMING_KEYS):
+            values = iter(timing[1:])
+            for bit, key in enumerate(_WATCHER_TIMING_KEYS):
+                if timing[0] & 1 << bit:
+                    props[key] = next(values, None)
+        ids = { {'w': 'watcher', 'r': 'run', 'h': 'helper'}.get(key, key): value for key, value in ids.items() }
+        row = {'tool': 'watchers', 'kind': 'perf', 'component': 'helpers' if name == 'helper.run' else 'runner',
+               **{key: value for key, value in row.items() if key != 'v'}, 'ids': ids, 'props': props}
+    compact = props.get('compact')
+    if name == 'helper.run' and isinstance(compact, str) and re.fullmatch(r'(?:s?t?w?|1)', compact):
+        props = {key: value for key, value in props.items() if key != 'compact'}
+        row = {**row, 'ok': True, 'ids': {**ids, **({'watcher': ids.get('helper')} if 'w' in compact else {})},
+               'props': {**props, 'exitCode': 0, **({'signal': None} if 's' in compact else {}),
+                         **({'timedOut': False} if 't' in compact else {})}}
+    def milliseconds(value):
+        return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 8.64e15
+    if name != 'watch.run' or not milliseconds(props.get('slotAt')):
+        return [row]
+    def timestamp(at):
+        return datetime.fromtimestamp(at / 1000, timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    slot = {'tool': row.get('tool'), 'component': 'runner', 'kind': 'perf', 'ids': ids}
+    slots = []
+    try:
+        if props.get('slotWritten') is not True:
+            slots.append({**slot, 'ts': timestamp(props['slotAt']), 'name': 'slot.start',
+                          'props': {**{key: props[key] for key in _WATCHER_TIMING_KEYS[:5] if key in props}, 'operation': 'check'}})
+        parts = ([[props['holdAt'], props['holdMs']]] if milliseconds(props.get('holdMs')) and milliseconds(props.get('holdAt'))
+                 else props['holdParts'][:16] if isinstance(props.get('holdParts'), list) else [])
+        for part in parts:
+            if isinstance(part, list) and len(part) >= 2 and milliseconds(part[0]) and milliseconds(part[1]):
+                slots.append({**slot, 'ts': timestamp(part[0]), 'name': 'slot.hold', 'durationMs': part[1],
+                              'props': {'operation': 'check', 'lane': props.get('lane') or 'slow'}})
+    except (ValueError, OverflowError, OSError):
+        return [row]
+    return [*slots, row]
+
+
+def _error_occurrences(row):
+    props = row.get('props')
+    repeats = props.get('repeats') if isinstance(props, dict) else None
+    return repeats if row.get('kind') == 'error' and type(repeats) is int and 1 <= repeats <= 2**53 - 1 else 1
 
 
 def _read_records(board, day):
@@ -345,7 +666,8 @@ def _read_records(board, day):
                 row = json.loads(line)
                 if not isinstance(row, dict):
                     continue
-                yield line_number, row
+                for expanded in _watcher_rows(row) if board == 'watchers' else [row]:
+                    yield line_number, expanded
             except (ValueError, UnicodeError):
                 continue
 
@@ -400,6 +722,136 @@ def _hook_weight(row):
 
 def _attributed_thread(thread):
     return bool(thread.startswith('native:') and thread[7:] or _ROBOB_THREAD.fullmatch(thread))
+
+
+REFUSAL_SHAPE_CAP = 100
+REFUSAL_RETRY_SECONDS = 300
+_PROJECT_THREAD = re.compile(rf'thread:project:([A-Za-z0-9_.:%-]+):{_UUID}\Z')
+
+
+def _thread_project(thread):
+    """Project label for a refusal: the folder name a Robob thread ID encodes."""
+    if thread.startswith('unknown:'):
+        return 'unattributed'
+    if thread.startswith('native:'):
+        return 'native'
+    match = _PROJECT_THREAD.fullmatch(thread)
+    if not match:
+        return 'unknown'
+    from urllib.parse import unquote
+    value = match[1]
+    for _ in range(3):
+        decoded = unquote(value)
+        if decoded == value:
+            break
+        value = decoded
+    name = value.rstrip('/').rsplit('/', 1)[-1].rsplit(':', 1)[-1]
+    return name if _LABEL.fullmatch(name) else 'other'
+
+
+def _row_shape(props):
+    shape = props.get('cmdShape')
+    if isinstance(shape, str) and _SHAPE_TEXT.fullmatch(shape):
+        return shape, 'command'
+    # Rows written before cmdShape existed still group by their fixed-vocabulary fields.
+    first = props.get('firstWord')
+    cwd = props.get('cwdClass')
+    first = first if isinstance(first, str) and _LABEL.fullmatch(first) else 'none'
+    return f"coarse:{first}" + (f" cwd:{cwd}" if isinstance(cwd, str) and _LABEL.fullmatch(cwd) else ''), 'coarse'
+
+
+class _RefusalShapes:
+    """Daily refusal counts by (rule, command shape); see refusal_shapes()."""
+
+    def __init__(self, start, rule=None):
+        from collections import defaultdict
+        self.start, self.rule = start, rule
+        self.groups = {}
+        self.times = defaultdict(list)
+        self.previous = defaultdict(list)
+        self.excluded = self.coarse = 0
+
+    def _accept(self, row, attempt):
+        return attempt and not (self.rule and attempt[1] != self.rule)
+
+    def add(self, row, attempt):
+        from collections import Counter
+        if not self._accept(row, attempt):
+            return
+        thread, rule, decision, at = attempt
+        props = row['props']
+        weight = _hook_weight(row)
+        if props.get('source') == 'test':
+            self.excluded += weight
+            return
+        shape, origin = _row_shape(props)
+        self.coarse += weight * (origin == 'coarse')
+        group = self.groups.get((rule, shape))
+        if group is None:
+            group = self.groups[(rule, shape)] = {
+                'origin': origin, 'count': 0, 'denied': 0, 'rewritten': 0, 'unattributed': 0, 'retry': 0,
+                'threads': set(), 'harness': Counter(), 'guard': Counter(), 'projects': Counter(), 'sampled': False}
+        group['count'] += weight
+        group[decision] += weight
+        harness, guard = props.get('harness'), props.get('guard')
+        group['harness'][harness if isinstance(harness, str) and _LABEL.fullmatch(harness) else 'unknown'] += weight
+        group['guard'][guard if isinstance(guard, str) and _LABEL.fullmatch(guard) else 'unknown'] += weight
+        project = props.get('project')
+        group['projects'][project if isinstance(project, str) and _LABEL.fullmatch(project) else _thread_project(thread)] += weight
+        if weight > 1:
+            group['sampled'] = True
+        if thread.startswith('unknown:'):
+            # One unknown:<harness> bucket mixes many agents: neither a thread nor a retry.
+            group['unattributed'] += weight
+            return
+        group['threads'].add(thread)
+        if weight == 1 and at is not None:
+            self.times[(thread, rule, shape)].append(at)
+
+    def add_previous(self, row, attempt):
+        """Rows from the previous UTC day supply only the retry window across midnight."""
+        if not self._accept(row, attempt) or row['props'].get('source') == 'test' or _hook_weight(row) > 1:
+            return
+        thread, rule, _, at = attempt
+        key = (thread, rule, _row_shape(row['props'])[0])
+        if key in self.times and at is not None and self.start - REFUSAL_RETRY_SECONDS <= at < self.start:
+            self.previous[key].append(at)
+
+    def result(self, cap=REFUSAL_SHAPE_CAP):
+        from collections import Counter
+        for (thread, rule, shape), current in self.times.items():
+            # A refusal repeated by the same thread within 5 minutes means the agent was stuck on it.
+            merged = sorted([(at, False) for at in self.previous.get((thread, rule, shape), ())]
+                            + [(at, True) for at in current])
+            self.groups[(rule, shape)]['retry'] += sum(
+                1 for (before, _), (at, today) in zip(merged, merged[1:])
+                if today and 0 <= at - before <= REFUSAL_RETRY_SECONDS)
+        def entry(group):
+            return {'count': group['count'], 'denied': group['denied'], 'rewritten': group['rewritten'],
+                    'distinctThreads': len(group['threads']), 'unattributed': group['unattributed'],
+                    'retryWithin5m': group['retry'], 'harness': dict(sorted(group['harness'].items())),
+                    'topProjects': [{'project': name, 'count': count} for name, count in
+                                    sorted(group['projects'].items(), key=lambda x: (-x[1], x[0]))[:5]],
+                    'sampled': group['sampled']}
+        # Denials first: sampled rewrites are estimates and would otherwise bury them.
+        ranked = sorted(self.groups.items(), key=lambda x: (-x[1]['denied'], -x[1]['count'], x[0]))
+        shapes = [{'rule': rule, 'guard': group['guard'].most_common(1)[0][0], 'shape': shape,
+                   'shapeSource': group['origin'], **entry(group)} for (rule, shape), group in ranked[:cap]]
+        other = None
+        if len(ranked) > cap:
+            folded = {'count': 0, 'denied': 0, 'rewritten': 0, 'unattributed': 0, 'retry': 0, 'threads': set(),
+                      'harness': Counter(), 'projects': Counter(), 'sampled': False}
+            for _, group in ranked[cap:]:
+                for key in ('count', 'denied', 'rewritten', 'unattributed', 'retry'):
+                    folded[key] += group[key]
+                folded['threads'] |= group['threads']
+                folded['harness'].update(group['harness'])
+                folded['projects'].update(group['projects'])
+                folded['sampled'] |= group['sampled']
+            other = {'shapes': len(ranked) - cap, **entry(folded)}
+        return {'rows': sum(group['count'] for group in self.groups.values()), 'shapeCount': len(ranked),
+                'coarseRows': self.coarse, 'excludedTestRows': self.excluded,
+                'retryWindowSeconds': REFUSAL_RETRY_SECONDS, 'cap': cap, 'shapes': shapes, 'other': other}
 
 
 def _sample_rate(row):
@@ -748,10 +1200,12 @@ def rollup(board, day, top_n=20):
     sampled = False
     day_start = datetime.strptime(day, '%Y-%m-%d').replace(tzinfo=timezone.utc)
     start = day_start.timestamp()
+    refusal_shapes_acc = _RefusalShapes(start) if board == 'agent-tools' else None
     total = oks = failed = errors = observed = 0
     single_failures = 0
     deduped_failures = 0
     probe_failure_kinds = {}
+    slow_hooks = []
     def observe_error(row, line_number, weight=1):
         nonlocal single_failures
         probe_id = (row.get('ids') or {}).get('inboundId', '')
@@ -815,8 +1269,9 @@ def rollup(board, day, top_n=20):
         if board == 'imessage':
             single_failures += row.get('_rollup_single_failures', 0)
         aggregate = board == 'imessage' and '_rollup_count' in row
-        weight = row['_rollup_count'] if aggregate else _sample_rate(row)
-        sampled |= weight > 1 and not aggregate
+        rate = _sample_rate(row)
+        weight = row['_rollup_count'] if aggregate else _error_occurrences(row) if board == 'watchers' and row.get('kind') == 'error' else rate
+        sampled |= rate > 1 and not aggregate
         total += weight
         if row.get('name') in {'log.cap', 'log.degraded'}:
             props = row.get('props') or {}
@@ -826,6 +1281,8 @@ def rollup(board, day, top_n=20):
         counts_name[name] += weight
         counts_kind[kind] += weight
         attempt = _hook_attempt(row)
+        if attempt and refusal_shapes_acc:
+            refusal_shapes_acc.add(row, attempt)
         if attempt:
             thread, rule, decision, at = attempt
             refusal_weight = _hook_weight(row)
@@ -857,6 +1314,8 @@ def rollup(board, day, top_n=20):
         failed += row_failed
         errors += weight * (kind == 'error' and not already_logged)
         duration = row.get('durationMs')
+        if board == 'agent-tools' and _slow_hook(row):
+            slow_hooks.append((line_number, row))
         values = row['_rollup_histogram'] if aggregate else ([(duration, weight)]
             if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0 else [])
         if values:
@@ -957,6 +1416,8 @@ def rollup(board, day, top_n=20):
     # supply only the rolling window; daily totals and top threads stay local.
     for _, row in _read_records(board, (day_start - timedelta(days=1)).strftime('%Y-%m-%d')):
         attempt = _hook_attempt(row)
+        if attempt and refusal_shapes_acc:
+            refusal_shapes_acc.add_previous(row, attempt)
         if attempt:
             thread, rule, decision, at = attempt
             key = (thread, rule, decision)
@@ -998,6 +1459,7 @@ def rollup(board, day, top_n=20):
                               **({'causeKinds': dict(cause_kinds[key])} if board == 'imessage' and cause_kinds[key] else {})}
                              for key, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
     if board == 'agent-tools':
+        result['refusalShapes'] = refusal_shapes_acc.result()
         result['unattributedByRule'] = {rule: [
                 {'threadId': thread, 'count': sum(counts.values()), 'attributed': False,
                  'denied': counts['denied'], 'rewritten': counts['rewritten'],
@@ -1012,6 +1474,7 @@ def rollup(board, day, top_n=20):
             {'classifier': name, 'count': count,
              'errorClasses': dict(sorted(classifier_classes[name].items(), key=lambda x: (-x[1], x[0])))}
             for name, count in sorted(classifier_failures.items(), key=lambda x: (-x[1], x[0]))[:5]]
+        result['slowestPhaseByCount'] = slowest_phases(slow_hooks, day, percentiles, top_n)
     if board == 'orders':
         result['canReportByOutcome'] = can_report_outcomes
         result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
@@ -1073,6 +1536,48 @@ def rollup(board, day, top_n=20):
     return result
 
 
+def _row_phases(row):
+    """Measured phases plus the unmeasured remainder; None for rows written without phases."""
+    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+    phases = {key: props[key] for key in HOOK_PHASES
+              if type(props.get(key)) in (int, float) and math.isfinite(props[key]) and props[key] >= 0}
+    if not phases:
+        return None
+    phases['unmeasured'] = max(0, int(round(row['durationMs'] - sum(phases.values()))))
+    return phases
+
+
+def slowest_phases(rows, day, percentiles, top_n=10):
+    """Hook rows over SLOW_HOOK_MS: the largest phase per row, then count and p95 per phase per harness."""
+    harnesses, top = {}, []
+    for line_number, row in rows:
+        props = row.get('props') if isinstance(row.get('props'), dict) else {}
+        harness = props.get('harness') if isinstance(props.get('harness'), str) else 'unknown'
+        entry = harnesses.setdefault(harness, {'rows': 0, 'unphasedRows': 0, 'largest': {}, 'values': {}})
+        entry['rows'] += 1
+        phases = _row_phases(row)
+        largest = None
+        if phases is None:
+            entry['unphasedRows'] += 1
+        else:
+            largest = max(phases, key=lambda key: (phases[key], key != 'unmeasured', key))
+            entry['largest'][largest] = entry['largest'].get(largest, 0) + 1
+            for key, value in phases.items():
+                entry['values'].setdefault(key, []).append((value, 1))
+        top.append({'durationMs': row['durationMs'], 'ts': row.get('ts'), 'harness': harness,
+                    'guard': props.get('guard'), 'rule': props.get('rule'),
+                    'errorTag': (row.get('error') or {}).get('tag') if isinstance(row.get('error'), dict) else None,
+                    'largestPhase': largest, 'phases': phases,
+                    'sampleId': {'file': day + '.ndjson', 'line': line_number}})
+    return {'thresholdMs': SLOW_HOOK_MS, 'byHarness': {
+                harness: {'rows': entry['rows'], 'unphasedRows': entry['unphasedRows'],
+                          'largestPhase': dict(sorted(entry['largest'].items(), key=lambda x: (-x[1], x[0]))),
+                          'phases': {key: {'count': len(values), 'p95': percentiles(values)['p95']}
+                                     for key, values in sorted(entry['values'].items())}}
+                for harness, entry in sorted(harnesses.items())},
+            'slowestRows': sorted(top, key=lambda x: (-x['durationMs'], x['sampleId']['line']))[:top_n]}
+
+
 def hourly_table(result, limit=20):
     """Text table of error tags by UTC hour from a rollup, busiest tags first."""
     hours = [f'{hour:02d}' for hour in range(24)]
@@ -1086,6 +1591,56 @@ def hourly_table(result, limit=20):
         classes = ', '.join(f'{name} {count}' for name, count in entry['errorClasses'].items())
         lines.append(f"classifier_failed {entry['classifier']}: {entry['count']} ({classes})")
     return '\n'.join(lines)
+
+
+def refusal_shapes(board, day, rule=None, cap=REFUSAL_SHAPE_CAP):
+    """refusalShapes for one UTC day without running the whole rollup.
+
+    Groups denied/rewritten hook.decision rows by rule and command shape. Rows
+    written before cmdShape existed group by a coarse shape (first word, cwd class).
+    """
+    if rule is not None and not _LABEL.fullmatch(rule):
+        raise ValueError('invalid rule')
+    day_start = datetime.strptime(day, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    shapes = _RefusalShapes(day_start.timestamp(), rule)
+    for _, row in _read_records(board, day):
+        attempt = _hook_attempt(row)
+        if attempt:
+            shapes.add(row, attempt)
+    for _, row in _read_records(board, (day_start - timedelta(days=1)).strftime('%Y-%m-%d')):
+        attempt = _hook_attempt(row)
+        if attempt:
+            shapes.add_previous(row, attempt)
+    return shapes.result(cap)
+
+
+def refusals_table(result, limit=30):
+    """Text table of the busiest refusal shapes from refusalShapes."""
+    def projects(entry):
+        return ', '.join(f"{item['project']} {item['count']}" for item in entry['topProjects'][:3])
+    def harness(entry):
+        return ','.join(f'{name} {count}' for name, count in entry['harness'].items())
+    rows = [(str(entry['count']) + ('~' if entry['sampled'] else ''), str(entry['denied']), str(entry['rewritten']),
+             str(entry['distinctThreads']), str(entry['retryWithin5m']), harness(entry), entry['rule'],
+             entry['shape'], projects(entry)) for entry in result['shapes'][:limit]]
+    hidden = result['shapes'][limit:]
+    other = result.get('other')
+    if hidden or other:
+        count = sum(entry['count'] for entry in hidden) + (other['count'] if other else 0)
+        denied = sum(entry['denied'] for entry in hidden) + (other['denied'] if other else 0)
+        rewritten = sum(entry['rewritten'] for entry in hidden) + (other['rewritten'] if other else 0)
+        retries = sum(entry['retryWithin5m'] for entry in hidden) + (other['retryWithin5m'] if other else 0)
+        shapes = len(hidden) + (other['shapes'] if other else 0)
+        rows.append((str(count), str(denied), str(rewritten), '', str(retries), '', '*', f'other ({shapes} shapes)', ''))
+    header = ('count', 'den', 'rew', 'thr', 'retry', 'harness', 'rule', 'shape', 'top projects')
+    widths = [max(len(row[i]) for row in rows + [header]) for i in range(len(header) - 1)]
+    def line(row):
+        cells = [cell.rjust(width) if i < 5 else cell.ljust(width) for i, (cell, width) in enumerate(zip(row, widths))]
+        return '  '.join(cells + [row[-1]]).rstrip()
+    summary = (f"{result['rows']} refusals in {result['shapeCount']} shapes; {result['coarseRows']} from rows "
+               f"without cmdShape (coarse); {result['excludedTestRows']} test rows excluded; retry = same thread, "
+               f"rule and shape again within {result['retryWindowSeconds'] // 60} min; ~ = sampled estimate")
+    return '\n'.join([summary, line(header)] + [line(row) for row in rows])
 
 
 def main(argv=None):
@@ -1103,9 +1658,20 @@ def main(argv=None):
         else:
             p.add_argument('--top', type=int, default=20)
             p.add_argument('--table', action='store_true', help='also print error tags by UTC hour after the path')
+    p = sub.add_parser('refusals', help='denied/rewritten hook refusals by rule and command shape')
+    p.add_argument('--board', default='agent-tools')
+    p.add_argument('--day', default=datetime.now(timezone.utc).strftime('%Y-%m-%d'))
+    p.add_argument('--rule')
+    p.add_argument('--top', type=int, default=30, help='table rows to print; the rest are summed as other')
+    p.add_argument('--json', action='store_true', help='print the refusalShapes JSON instead of the table')
     args = parser.parse_args(argv)
     try:
-        if args.cmd == 'read':
+        if args.cmd == 'refusals':
+            if args.top < 1:
+                raise ValueError('top must be positive')
+            result = refusal_shapes(args.board, args.day, args.rule)
+            print(json.dumps(result, indent=2) if args.json else refusals_table(result, args.top))
+        elif args.cmd == 'read':
             if args.limit < 0:
                 raise ValueError('limit must be nonnegative')
             from itertools import islice
@@ -1115,6 +1681,17 @@ def main(argv=None):
             if args.top < 1:
                 raise ValueError('top must be positive')
             result = rollup(args.board, args.day, args.top)
+            if args.board == 'orders':
+                import subprocess
+                try:
+                    # Kept out of checks: the bounded history read belongs to the daily rollup.
+                    done = subprocess.run(['money-cases', 'health', '--day', args.day, '--json'],
+                                          capture_output=True, text=True, timeout=2, check=True)
+                    health = json.loads(done.stdout)
+                    if health.get('day') == args.day and isinstance(health.get('one_line'), str):
+                        result['moneyCasesHealth'] = health
+                except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+                    pass
             directory = board_dir(args.board)
             _private_dir(directory)
             path = directory / ('rollup-' + args.day + '.json')
@@ -1129,6 +1706,8 @@ def main(argv=None):
                 if os.path.exists(tmp):
                     os.unlink(tmp)
             print(path)
+            if 'moneyCasesHealth' in result:
+                print(result['moneyCasesHealth']['one_line'])
             if args.table:
                 print(hourly_table(result))
         return 0

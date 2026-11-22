@@ -153,6 +153,7 @@ os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
     original=plist.read_text()
     rendered=plistlib.loads(original.encode())
     collector=home/'.local/lib/mac-logging/collector.py'
+    self.assertEqual((home/'.local/lib/mac-logging/homebrew.py').read_bytes(),(HERE/'homebrew.py').read_bytes())
     arguments=['/bin/zsh','-c',f'exec /usr/bin/python3 "{collector}"']
     self.assertEqual(rendered,dict(Label='com.abdullah.mac-log-collector',ProgramArguments=arguments,
                                    StartInterval=3600,RunAtLoad=True,ProcessType='Background'))

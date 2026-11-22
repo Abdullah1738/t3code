@@ -21,19 +21,23 @@ export async function stderrTail(stream: ReadableStream<Uint8Array>): Promise<Ui
     }
   } finally { reader.releaseLock(); }
 }
-if (import.meta.main) {
-  // PreToolUse persists only an attempt count, before any built-in tool can create a side effect.
-  // Hook input can include private content; it is deliberately never decoded or retained.
-  process.stdin.resume();
+/** Counts a possible side effect for a running inbox row before a tool may run; false refuses the tool. */
+export function markSideEffect(root: string, id: string): boolean {
   let db: Database | undefined;
   try {
-    const [mode, root, id] = process.argv.slice(2);
-    if (mode !== "--tool" || !root?.startsWith("/") || !validId(id)) throw new Error();
+    if (!root?.startsWith("/") || !validId(id)) return false;
     db = new Database(join(root, "agent.sqlite"), { create: false, readwrite: true });
     db.exec("PRAGMA busy_timeout=5000");
     const marked = db.query(`INSERT INTO settings(key,value) SELECT 'side-effects:' || id,'1' FROM inbox WHERE id=? AND state='running'
       ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1`).run(id);
-    if (marked.changes !== 1) throw new Error();
-  } catch { process.exitCode = 2; }
+    return marked.changes === 1;
+  } catch { return false; }
   finally { db?.close(); }
+}
+if (import.meta.main) {
+  // PreToolUse persists only an attempt count, before any built-in tool can create a side effect.
+  // Hook input can include private content; it is deliberately never decoded or retained.
+  process.stdin.resume();
+  const [mode, root, id] = process.argv.slice(2);
+  if (mode !== "--tool" || !markSideEffect(root!, id!)) process.exitCode = 2;
 }

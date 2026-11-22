@@ -17,10 +17,10 @@ Dropbox or on Boat (see "Her data stays on the box").
 
 - Any login, sign-up, account, OTP or cookie work for Moni (or any non-owner person).
 - Any code, script, project or file work done for her. It runs on her box, not the Mac.
-- Notes and documents about her (preferences, routines, health notes, ID papers, insurance,
-  form profiles) are NOT box data. They go in the life wiki on the Mac (`life-wiki` skill,
-  IDs under `documents/moni/`). Owner rule 2026-10-21. Box data is her logins, cookies,
-  accounts, mail access, working files and any database or tool built for her.
+- Her personal notes and documents (preferences, routines, health notes, ID
+  papers, insurance and form profiles) live only on her box. Her box agent
+  owns updates. Abdullah's wiki retains shared home, helpers, pets including
+  Blade, joint travel and owner facts, with personal clauses split out.
 
 ## Rules
 
@@ -110,10 +110,11 @@ Screenshots are transient: `down` deletes `$TMPDIR/offbox-person/<person>/`. Don
 
 ## On her box (Moni)
 
-- Wiki: read-only clone of the life wiki at `~/person/wiki` (GitHub deploy key
-  `moni-box-wiki-readonly`, private key `~/person/secrets/wiki_deploy`). Refresh it before
-  reading: `offbox-person run moni -- 'cd ~/person/wiki && git pull -q'`. It can't push; edit the
-  wiki on the Mac.
+- The legacy read-only clone at `~/person/wiki` is shared reference material.
+  Her personal prefs live at `/home/user/person/prefs/moni-prefs.md`, and
+  migrated wiki references at `/home/user/person/agent/memory/legacy-life-wiki/`.
+  Use her box agent for current personal facts and updates. Do not edit her
+  personal profile on the Mac or refresh a clone to restore deleted pages.
 - Her Gmail lives only on her box (moved off the Mac 2026-10-21): himalaya account `moni`
   (default), `~/person/bin/{himalaya,ortie}`, OAuth token in `~/person/secrets/ortie-moni.json`
   (ortie refreshes it itself). The owner may read her mail any time through the box:

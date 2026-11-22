@@ -27,6 +27,16 @@ def sample(wall=BASE, mono=1000, continuous=2000, pid=42, state='running'):
 
 
 class ObserverTests(unittest.TestCase):
+    def setUp(self):
+        for module in ('observer', 'poller', 'guard'):
+            fake = patch(module + '.Sampler', return_value=lambda: {'e': 'unsupported'})
+            fake.start()
+            self.addCleanup(fake.stop)
+        # These fixtures advance a synthetic clock to model active, blocked work.
+        cpu = patch('observer.time.process_time', side_effect=lambda: observer.time.monotonic())
+        cpu.start()
+        self.addCleanup(cpu.stop)
+
     def test_poll_refreshes_finalized_days_for_late_gap_class(self):
         cases = [('pool-alerts', 'pool.endpoint.get', 'tick_blocked:pool_fetch'),
                  ('poller', 'poll.phases', 'tick_blocked:rollup_write'),
@@ -48,7 +58,11 @@ class ObserverTests(unittest.TestCase):
                     event = dict(tool='9router', component=component, name=name, kind='perf',
                                  ts=observer.iso(ended.timestamp() * 1000), durationMs=(ended - start).total_seconds() * 1000,
                                  props=dict(start=observer.iso(start.timestamp() * 1000), end=observer.iso(ended.timestamp() * 1000),
-                                            phase='rollup_write', cause=cause))
+                                            phase='pool_fetch' if name == 'pool.endpoint.get' else 'rollup_write', cause=cause))
+                    if name != 'pool.endpoint.get':
+                        event['props']['rollupWriteMs'] = (ended - start).total_seconds() * 1000
+                    if cause == 'sleep_gap':
+                        event['props']['sleepGapMs'] = (ended - start).total_seconds() * 1000
                     if late_days == 1:
                         event['props'].pop('start')
                         event['props'].pop('end')
@@ -63,7 +77,7 @@ class ObserverTests(unittest.TestCase):
                     result = json.loads(report.read_text())
                     field = 'guardGaps' if component == 'guard' else 'pollGaps'
                     self.assertEqual(result[field][0]['durationMs'], 60000)
-                    self.assertEqual(result[field][0]['cause'], cause)
+                    self.assertEqual(result[field][0]['cause'], 'guard_not_scheduled' if cause == 'sleep_gap' else cause)
                     self.assertEqual(result['listener']['unknownWindows'], [])
                     with patch.object(poller, 'rollup', wraps=rollup.rollup) as build:
                         self.assertEqual(poller.poll(get, root, ended + dt.timedelta(minutes=3)), 0)
@@ -94,7 +108,7 @@ class ObserverTests(unittest.TestCase):
                     seconds[0] += 180
                     delayed.append(True)
                 return replace(source, target)
-            with patch('guard.Runtime', return_value=runtime), patch('guard.signal.signal', side_effect=lambda key, callback: handlers.update({key: callback})), patch('guard.subprocess.Popen', return_value=child), patch('guard.job_snapshot', return_value={}), patch('observer.job_snapshot', return_value={}), patch('guard.clock_sample', side_effect=clock), patch('observer.clock_sample', side_effect=clock), patch('observer.time.monotonic', side_effect=lambda: seconds[0]), patch('guard.os.replace', side_effect=slow_save), patch('observer.emit') as emit:
+            with patch('guard.Runtime', return_value=runtime), patch('guard.signal.signal', side_effect=lambda key, callback: handlers.update({key: callback})), patch('guard.subprocess.Popen', return_value=child), patch('observer.job_snapshot', return_value={}), patch('guard.clock_sample', side_effect=clock), patch('observer.clock_sample', side_effect=clock), patch('observer.time.monotonic', side_effect=lambda: seconds[0]), patch('guard.os.replace', side_effect=slow_save), patch('observer.emit') as emit:
                 guard.serve()
             self.assertEqual(len(checks), 2)
             self.assertEqual(emit.call_count, 1)
@@ -167,11 +181,11 @@ class ObserverTests(unittest.TestCase):
         before = sample()
         cases = [
             ('cadence', sample(BASE + 15000, 16000, 17000), None),
-            ('late', sample(BASE + 200000, 201000, 202000), 'other'),
-            ('sleep', sample(BASE + 200000, 16000, 202000), 'sleep_gap'),
-            ('clock_step', sample(BASE + 200000, 16000, 17000), 'other'),
-            ('no_suspend_clock', sample(BASE + 200000, 16000, None), 'other'),
-            ('restarted', sample(BASE + 200000, 16000, 202000, pid=43), 'other'),
+            ('late', sample(BASE + 200000, 201000, 202000), 'unknown_no_data'),
+            ('sleep', sample(BASE + 200000, 16000, 202000), 'guard_not_scheduled'),
+            ('clock_step', sample(BASE + 200000, 16000, 17000), 'unknown_no_data'),
+            ('no_suspend_clock', sample(BASE + 200000, 16000, None), 'unknown_no_data'),
+            ('restarted', sample(BASE + 200000, 16000, 202000, pid=43), 'guard_not_scheduled'),
             ('clock_back', sample(BASE - 200000, 201000, 202000), None),
         ]
         for name, after, cause in cases:
@@ -180,7 +194,7 @@ class ObserverTests(unittest.TestCase):
                 self.assertEqual(result['cause'] if result else None, cause)
         for state in ('stopped', 'absent'):
             result = observer.gap(sample(state=state), sample(BASE + 200000, 201000, 202000, pid=43))
-            self.assertEqual(result['cause'], 'agent_not_running')
+            self.assertEqual(result['cause'], 'guard_not_scheduled')
             self.assertEqual(result['jobStateStart'], state)
         self.assertIsNone(observer.gap({}, sample()))
         self.assertIsNone(observer.gap(None, sample()))
@@ -204,7 +218,8 @@ class ObserverTests(unittest.TestCase):
                 root = Path(directory)
                 (root / '2026-11-20.ndjson').write_text('\n'.join(map(json.dumps, events)))
                 listener = rollup.rollup('2026-11-20', root, dt.datetime(2026, 11, 21, tzinfo=UTC))['listener']
-                cause = 'launchctl_unknown:' + str(value)
+                cause = ('launchctl_timeout' if value == 'timeout' else 'unknown_no_data' if value == 'oserror'
+                         else 'launchctl_exit:' + str(value))
                 self.assertEqual(listener['unknownWindows'][0]['cause'], cause)
                 self.assertEqual(listener['unknownByCause'], [dict(cause=cause, count=1, unknownMs=60000)])
                 self.assertEqual(listener['confirmedDownMs'], 0)
@@ -243,7 +258,7 @@ class ObserverTests(unittest.TestCase):
                 (subprocess.TimeoutExpired('launchctl', .5), 'timeout'),
                 (OSError('cannot execute'), 'oserror'),
                 (TypeError('bad subprocess response'), 'snapshot_error')):
-            with self.subTest(code=code), patch('observer.subprocess.run', side_effect=error), patch('observer.clock_sample', side_effect=[sample(), sample(BASE + 180000, 181000, 182000)]), patch('observer.emit') as emit, patch('guard.socket.create_connection'):
+            with self.subTest(code=code), patch('observer.subprocess.run', side_effect=error), patch('observer.clock_sample', side_effect=[sample(), sample(BASE + 180000, 181000, 182000), sample(BASE + 180000, 181000, 182000)]), patch('observer.emit') as emit, patch('guard.socket.create_connection'):
                 with observer.Timings('guard', 'guard.tick_late') as timing:
                     listener = Runtime().probe()
                 self.assertEqual(listener, 'open')
@@ -302,26 +317,26 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(next_report['pollGaps'][0]['cause'], 'tick_blocked:rollup_write')
 
     def test_sleep_during_tick_survives_into_gap_rollup(self):
-        with patch('observer.clock_sample', side_effect=[sample(), sample(BASE + 200000, 16000, 202000)]), patch('observer.job_snapshot', return_value={}), patch('observer.emit') as emit:
+        with patch('observer.clock_sample', side_effect=[sample(), sample(BASE + 200000, 16000, 202000), sample(BASE + 200000, 16000, 202000)]), patch('observer.job_snapshot', return_value={}), patch('observer.emit') as emit:
             with observer.Timings():
                 pass
         self.assertEqual(emit.call_count, 1)
-        self.assertEqual(emit.call_args.kwargs['props']['cause'], 'sleep_gap')
+        self.assertEqual(emit.call_args.kwargs['props']['cause'], 'guard_not_scheduled')
         row = clean(dict(component='poller', name='poll.phases', **emit.call_args.kwargs), dt.datetime(2026, 11, 20, 0, 4, tzinfo=UTC))
         result = observer.gap_summary([row], '2026-11-20', dt.datetime(2026, 11, 21, tzinfo=UTC))
-        self.assertEqual(result['pollGaps'][0]['cause'], 'sleep_gap')
+        self.assertEqual(result['pollGaps'][0]['cause'], 'guard_not_scheduled')
         self.assertEqual(result['pollGaps'][0]['durationMs'], 200000)
 
     def test_gap_crosses_midnight_without_relabeling_unknown_window(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             unknown = dict(tool='9router', component='guard', name='listener.state_unknown', kind='event', ts='2026-11-20T23:58:00Z', props=dict(unknownSince='2026-11-20T23:58:00Z', listener='open', launchctlExit=5))
-            gap = dict(tool='9router', component='guard', name='observer.gap', kind='perf', ts='2026-11-21T00:03:00Z', props=dict(start='2026-11-20T23:59:00Z', end='2026-11-21T00:03:00Z', cause='sleep_gap'))
+            gap = dict(tool='9router', component='guard', name='observer.gap', kind='perf', ts='2026-11-21T00:03:00Z', props=dict(start='2026-11-20T23:59:00Z', end='2026-11-21T00:03:00Z', cause='sleep_gap', sleepGapMs=240000))
             (root / '2026-11-20.ndjson').write_text(json.dumps(unknown))
             (root / '2026-11-21.ndjson').write_text(json.dumps(gap))
             result = rollup.rollup('2026-11-20', root, dt.datetime(2026, 11, 21, 1, tzinfo=UTC))
-            self.assertEqual(result['listener']['unknownWindows'][0]['cause'], 'launchctl_unknown:5')
-            self.assertEqual(result['guardGaps'], [dict(number=1, start='2026-11-20T23:59:00.000Z', end='2026-11-21T00:03:00.000Z', cause='sleep_gap', component='guard', durationMs=60000)])
+            self.assertEqual(result['listener']['unknownWindows'][0]['cause'], 'launchctl_exit:5')
+            self.assertEqual(result['guardGaps'], [dict(number=1, start='2026-11-20T23:59:00.000Z', end='2026-11-21T00:03:00.000Z', cause='guard_not_scheduled', causeEvidenceField='sleepGapMs', causeEvidenceValue=240000, component='guard', durationMs=60000)])
             self.assertEqual(result['pollGaps'], [])
 
     def test_pool_fetch_uses_own_identity(self):

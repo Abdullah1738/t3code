@@ -86,35 +86,26 @@ class HarnessTestCase(unittest.TestCase):
             self.assertEqual(rc, 0, out.getvalue())
             return out.getvalue()
 
-    def test_quint_guard_path_in_all_generated_homes(self) -> None:
+    def test_shell_path_in_all_generated_homes(self) -> None:
         self.run_gen()
         paths = [json.loads((self.claude / "settings.json").read_text())["env"]["PATH"]]
         for harness in ["codex", "codex-cu"]:
             paths.append(tomllib.loads((self.root / harness / "config.toml").read_text())["shell_environment_policy"]["set"]["PATH"])
         expected = ":".join(self.manifest()["shellPathPrefix"] + self.manifest()["shellPath"])
         fixture = self.tmp / "path-fixture"
-        raw = fixture / ".nvm/versions/node/v26.2.0/bin/quint"
-        wrapper = fixture / ".local/bin/quint"
-        link = fixture / ".local/share/quint-guard/bin/quint"
         safe_chain = fixture / ".safe-chain/bin/safe-chain"
-        for executable in [raw, wrapper, safe_chain]:
-            write(executable, "#!/bin/sh\nexit 0\n")
-            executable.chmod(0o755)
-        link.parent.mkdir(parents=True)
-        link.symlink_to(wrapper)
+        write(safe_chain, "#!/bin/sh\nexit 0\n")
+        safe_chain.chmod(0o755)
         for path in paths:
-            self.assertEqual(shutil.which("quint", path=path.replace("/Users/ardud", str(fixture))), str(link))
+            self.assertNotIn("quint-guard", path)
             self.assertEqual(path, expected)
             entries = path.split(":")
             self.assertEqual(entries[-1], "/Users/ardud/.safe-chain/bin")
             self.assertEqual(shutil.which("safe-chain", path=entries[-1].replace("/Users/ardud", str(fixture))), str(safe_chain))
-            self.assertEqual(entries[:2], [
-                "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
-                "/Users/ardud/.local/share/quint-guard/bin",
-            ])
+            self.assertEqual(entries[0], "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers")
             for i, entry in enumerate(entries):
                 if "/.nvm/" in entry:
-                    self.assertGreater(i, 1)
+                    self.assertGreater(i, 0)
                     self.assertLess(i, entries.index("/Users/ardud/.local/bin"))
 
     def test_generated_shared_mcp_connect_headroom(self) -> None:
@@ -152,7 +143,7 @@ class HarnessTestCase(unittest.TestCase):
 class GenerateTests(HarnessTestCase):
     def test_safe_chain_check_covers_each_harness_and_service_path(self) -> None:
         self.run_gen()
-        homes = {harness: str(self.root / harness) for harness in gh.HARNESSES}
+        homes = {harness: str(self.root / harness) for harness in gh.SHELL_HARNESSES}
         executable = self.tmp / "safe-bin/safe-chain"
         write(executable, "#!/bin/sh\nexit 0\n")
         executable.chmod(0o755)
@@ -1078,6 +1069,145 @@ class GenerateTests(HarnessTestCase):
         self.assertFalse(self.root.exists())
 
 
+class AntigravityTests(HarnessTestCase):
+    def make_profile(self, name: str = "abc123") -> Path:
+        profile = self.home / ".robob/userdata/providers/antigravity" / name
+        (profile / "antigravity-acp").mkdir(parents=True)
+        (profile / "config").mkdir()
+        return profile
+
+    @property
+    def agy(self) -> Path:
+        return self.root / "antigravity"
+
+    def run_gen(self, manifest: dict | None = None, extra: list[str] | None = None) -> str:
+        return super().run_gen(manifest, ["--antigravity-links"] + (extra or []))
+
+    def run_check(self, manifest: dict | None = None) -> tuple[int, str]:
+        with mock.patch.object(gh, "load_manifest", return_value=manifest or self.manifest()):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = gh.main(["check", "--home-root", str(self.root), "--antigravity-links"])
+            return rc, out.getvalue()
+
+    def test_a_file_written_while_linking_is_never_replaced(self) -> None:
+        # Review of 8ca5540d61: a "missing" link was created by rename, over a real file another
+        # process had just written.
+        link = self.root / "race" / "config" / "hooks.json"
+        link.parent.mkdir(parents=True)
+        real_symlink = os.symlink
+
+        def racing(target, path, *args, **kwargs):
+            if os.fspath(path) == str(link):
+                link.write_text('{"own":3}')
+            return real_symlink(target, path, *args, **kwargs)
+
+        with mock.patch.object(gh.os, "symlink", racing), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            gh.Writer(False).link_if_absent(str(link), str(self.root / "target.json"))
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(), '{"own":3}')
+        gh.Writer(False).link_if_absent(str(self.root / "race" / "config" / "mcp.json"), str(link))
+        self.assertTrue((self.root / "race" / "config" / "mcp.json").is_symlink())
+
+    def test_a_scratch_home_never_touches_production_links(self) -> None:
+        # Review of 3e27b87ce3: `generate --home-root <scratch>` rewired real profiles.
+        profile = self.make_profile()
+        super().run_gen()
+        rc, _ = super().run_check()
+        self.assertEqual(rc, 0)
+        for rel in gh.ANTIGRAVITY_PROFILE_LINKS:
+            self.assertFalse(os.path.lexists(profile / rel))
+        self.assertFalse(os.path.lexists(self.home / ".gemini/config/skills"))
+        self.assertTrue((self.agy / "config/hooks.json").exists())
+
+    def test_every_mcp_server_runs_behind_the_shield(self) -> None:
+        self.run_gen()
+        config = json.loads((self.agy / "config/mcp_config.json").read_text())["mcpServers"]
+        manifest = self.manifest()
+        self.assertEqual(set(config), {s["id"] for s in manifest["mcpServers"]})
+        shield = str(self.home / ".local/share/harness-homes/antigravity/mcp_shield.py")
+        for server in manifest["mcpServers"]:
+            entry = config[server["id"]]
+            self.assertEqual(entry["command"], manifest["antigravity"]["python"])
+            self.assertEqual(entry["args"][:3], [shield, "--name", server["id"]])
+            if "url" in server:
+                self.assertIn(server["url"], entry["args"])
+                self.assertNotIn("--", entry["args"])
+            else:
+                self.assertEqual(entry["args"][entry["args"].index("--") + 1:], [server["command"], *server["args"]])
+            self.assertEqual(entry.get("env"), server.get("env") or None)
+        self.assertEqual(config["betterstack"]["args"][-2:], ["--bearer-keychain", "betterstack-mcp"])
+
+    def test_native_hooks_and_robob_turn_context(self) -> None:
+        self.run_gen()
+        hooks = json.loads((self.agy / "config/hooks.json").read_text())
+        spec = hooks["robob"]
+        self.assertTrue(spec["enabled"])
+        self.assertEqual(set(spec) - {"enabled"}, {"PreToolUse", "PostToolUse", "Stop"})
+        pre = spec["PreToolUse"][0]
+        self.assertEqual(pre["matcher"], ".*")
+        self.assertTrue(pre["hooks"][0]["command"].endswith("harness-hooks/src/antigravity.py --event pre"))
+        self.assertIn("command", spec["Stop"][0])
+        turn = json.loads((self.agy / gh.TURN_CONTEXT).read_text())
+        self.assertEqual(turn["schemaVersion"], 1)
+        self.assertEqual(turn["instructionsFile"], str(self.agy / "instructions.md"))
+        recall = turn["hooks"]["UserPromptSubmit"][0]
+        self.assertEqual(recall["args"][-2:], ["--harness", "antigravity"])
+        self.assertEqual(recall["timeoutMs"], 3000)
+        instructions = (self.agy / "instructions.md").read_bytes()
+        self.assertTrue(instructions.startswith(self.canonical.read_bytes()))
+        self.assertTrue(instructions.endswith((PKG / "overlays/antigravity.md").read_bytes()))
+
+    def test_profiles_and_user_skills_link_back_to_the_home(self) -> None:
+        profile = self.make_profile()
+        (self.home / ".robob/userdata/providers/antigravity/not-a-profile").mkdir()
+        out = self.run_gen()
+        for rel in gh.ANTIGRAVITY_PROFILE_LINKS:
+            link = profile / rel
+            self.assertTrue(link.is_symlink(), out)
+            self.assertEqual(os.readlink(link), str(self.agy / rel))
+        self.assertFalse((self.home / ".robob/userdata/providers/antigravity/not-a-profile/config").exists())
+        skills = self.home / ".gemini/config/skills"
+        self.assertEqual(os.readlink(skills), str(self.agy / "skills"))
+        self.assertEqual(sorted(os.listdir(skills)), ["alpha", "beta", "gamma"])
+        rc, output = self.run_check()
+        self.assertEqual(rc, 0, output)
+        self.assertEqual(self.run_gen(), "")  # idempotent
+
+    def test_check_reports_and_generate_repairs_profile_links(self) -> None:
+        profile = self.make_profile()
+        self.run_gen()
+        (profile / "config/hooks.json").unlink()
+        os.symlink("/elsewhere/mcp.json", profile / "config/mcp_config.json.tmp")
+        os.replace(profile / "config/mcp_config.json.tmp", profile / "config/mcp_config.json")
+        rc, output = self.run_check()
+        self.assertEqual(rc, 1)
+        self.assertIn("hooks.json: missing", output)
+        self.assertIn("mcp_config.json: other link", output)
+        self.run_gen()
+        rc, output = self.run_check()
+        self.assertEqual(rc, 0, output)
+
+    def test_a_real_file_in_a_profile_is_never_replaced(self) -> None:
+        profile = self.make_profile()
+        write(profile / "config/hooks.json", "{}\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_gen()
+        self.assertIn("is not a link", err.getvalue())
+        self.assertEqual((profile / "config/hooks.json").read_text(), "{}\n")
+        rc, output = self.run_check()
+        self.assertEqual(rc, 1)
+        self.assertIn("hooks.json: blocked", output)
+
+    def test_antigravity_hook_events_are_validated(self) -> None:
+        m = self.manifest()
+        m["hooks"].append({"harness": "antigravity", "event": "SubagentStop", "command": "/bin/true", "timeoutSec": 5})
+        with self.assertRaises(gh.HomeError):
+            gh.validate_manifest(m)
+
+
 class ParityTests(HarnessTestCase):
     def json_check(self):
         with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
@@ -1106,15 +1236,17 @@ class ParityTests(HarnessTestCase):
             self.assertIn("recall", {server["id"] for server in parity["mcpServers"]})
             self.assertEqual(parity["runtimeMcpServers"], ["t3-code"])
             self.assertEqual({guard["id"] for guard in parity["guards"]},
-                             {"hook-adapters", "live-database", "rootwide-search", "phone-adb", "quint-verify", "shared-dependencies", "offbox", "betterstack-scope", "desktop-lease", "recall", "toollog"})
+                             {"hook-adapters", "antigravity-mcp-shield", "live-database", "rootwide-search", "phone-adb", "shared-dependencies", "offbox", "betterstack-scope", "desktop-lease", "recall", "toollog"})
             self.assertFalse(parity["compactSkillCatalog"]["required"])
             self.assertEqual(parity["instructions"]["canonical"]["path"], str(self.canonical))
             self.assertFalse((home / "src").exists())
-            expected_names = {"settings.json", ".claude.json", "CLAUDE.md", "overlay.md"} if home.name == "claude" else {"config.toml", "hooks.json", "AGENTS.md", "models.json"}
+            expected_names = ({"settings.json", ".claude.json", "CLAUDE.md", "overlay.md"} if home.name == "claude"
+                              else {"mcp_config.json", "hooks.json", "instructions.md", gh.TURN_CONTEXT} if home.name == "antigravity"
+                              else {"config.toml", "hooks.json", "AGENTS.md", "models.json"})
             self.assertEqual({Path(artifact["path"]).name for artifact in parity["artifacts"]}, expected_names)
             for artifact in parity["artifacts"]:
                 self.assertTrue(Path(artifact["path"]).is_absolute())
-                self.assertEqual(Path(artifact["path"]).parent, home)
+                self.assertTrue(Path(artifact["path"]).is_relative_to(home))
                 content = Path(artifact["path"]).read_bytes()
                 if Path(artifact["path"]).name == ".claude.json":
                     self.assertEqual(artifact["format"], "claude-owned-json")

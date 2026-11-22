@@ -26,8 +26,10 @@ Stdlib only (Python 3.12, Ubuntu 24.04)."""
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import base64
+import contextvars
 import fcntl
 import hashlib
 import hmac
@@ -42,6 +44,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from contextlib import contextmanager
 from functools import wraps
@@ -105,6 +108,7 @@ DEFAULTS = {
               "xlarge": {"mem": "48GiB", "prio": 7, "vcpu": 16}},
     "mem_reserve_gb": 12,             # admission: keep this much host memory free
     "default_peak_gb": 4,             # admission: predicted peak for a kind with no history
+    "usual_peak_pct": 75,             # admission: percentile of a kind's peaks held for each run (95 = worst case for all)
     "retention": dict(RETENTION),
     "zpool": "offbox",
     "scratch_disk": True,             # new boxes only; keep lifecycle handling enabled on rollback
@@ -114,6 +118,9 @@ DEFAULTS = {
     "max_running": 0,                 # optional hard cap, in addition to resource admission
     "cpu_pressure_limit": 0,          # host CPU some avg10 (%); 0 = off (the default until #219)
     "prune_unused_days": 30,          # stopped boxes untouched this long are deleted (not pinned, not saved)
+    "pool_unused_days": 7,            # the same for repository pool boxes: warm copies a run rebuilds by itself
+    "pressure_idle_s": 12 * 3600,     # pool short with no run snapshot left: pool boxes stopped this long go, oldest first
+    "unreconciled_protect_s": 86400,  # an ended command with no recorded result protects its box's snapshots this long
     "sample_s": 10, "keep_samples_days": 90,
 }
 CFG: dict = {}
@@ -163,6 +170,7 @@ CREATE TABLE IF NOT EXISTS commands (box_id TEXT, pid INTEGER, command_id TEXT, 
   queued_s REAL, kind TEXT, repo TEXT, run_id TEXT, metrics TEXT, PRIMARY KEY (box_id, pid));
 CREATE INDEX IF NOT EXISTS commands_cid ON commands(command_id);
 CREATE INDEX IF NOT EXISTS commands_kind ON commands(kind, ended_at);
+CREATE INDEX IF NOT EXISTS commands_unsettled ON commands(box_id, status, exit_code, ended_at, started_at, created_at);
 CREATE TABLE IF NOT EXISTS saved (name TEXT PRIMARY KEY, instance TEXT, source TEXT, type TEXT,
   status TEXT, error TEXT, size_bytes INTEGER, created_at REAL, snapshot_id TEXT);
 CREATE TABLE IF NOT EXISTS snaps (box_id TEXT, name TEXT, kind TEXT, created_at REAL, PRIMARY KEY (box_id, name));
@@ -186,6 +194,8 @@ SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, admin INTEGER DEFAULT 0,
   hash TEXT UNIQUE, label TEXT, created_at REAL, last_used_at REAL, revoked_at REAL);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS incus_deletes (instance TEXT PRIMARY KEY, created_at REAL);
+CREATE TABLE IF NOT EXISTS snapshot_pending (box_id TEXT, kind TEXT, generation TEXT NOT NULL DEFAULT '', PRIMARY KEY (box_id, kind));
 """
 SAVED_V2 = """CREATE TABLE saved (owner TEXT, name TEXT, instance TEXT, source TEXT, type TEXT, status TEXT,
   error TEXT, size_bytes INTEGER, created_at REAL, snapshot_id TEXT, pending_instance TEXT,
@@ -196,9 +206,16 @@ def _cols(con, table: str) -> set:
     return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
 
 
+WAITING_AFTER_S = 20
+
+
 def migrate(con) -> None:
     """Idempotent: owner columns, per-owner saved states, run attempts, hashed tokens."""
     con.executescript(SCHEMA_V2)
+    if 'generation' not in _cols(con, 'snapshot_pending'):
+        con.execute("ALTER TABLE snapshot_pending ADD COLUMN generation TEXT NOT NULL DEFAULT ''")
+    if "start_error" not in _cols(con, "boxes"):
+        con.execute("ALTER TABLE boxes ADD COLUMN start_error TEXT")
     con.execute("CREATE TABLE IF NOT EXISTS box_events (seq INTEGER PRIMARY KEY, ts REAL, box_id TEXT, action TEXT, detail TEXT)")
     con.execute('CREATE INDEX IF NOT EXISTS box_events_box_seq ON box_events(box_id,seq)')
     for column in ('pin_until REAL', 'pin_holder TEXT'):
@@ -210,6 +227,8 @@ def migrate(con) -> None:
         con.execute("ALTER TABLE boxes ADD COLUMN mgmt_ssh_port INTEGER")
     if "provision_identity" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN provision_identity INTEGER NOT NULL DEFAULT 0")
+    if "identity_pending" not in _cols(con, "boxes"):
+        con.execute("ALTER TABLE boxes ADD COLUMN identity_pending INTEGER NOT NULL DEFAULT 0")
     owner = CFG.get("default_owner") or "ardud"
     if "owner" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN owner TEXT")
@@ -221,6 +240,9 @@ def migrate(con) -> None:
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE commands ADD COLUMN {col}")
     con.execute("CREATE INDEX IF NOT EXISTS commands_cpu_start ON commands(sync, started_at)")
+    # Every waiting run reads the queue and the running rows on each look, under one lock. Without this each of
+    # those reads walks every command ever recorded, and the head's turn comes round once per (waiters x scans).
+    con.execute("CREATE INDEX IF NOT EXISTS commands_waiting ON commands(sync, status, created_at, box_id, pid)")
     if "owner" not in _cols(con, "saved"):
         # Saved states were global by name; they become per owner. The one owner so far keeps all of them.
         con.execute("BEGIN IMMEDIATE")
@@ -320,6 +342,9 @@ def host_uptime() -> float:
 
 def _sh(args: list[str], timeout: float = 20) -> tuple[int, str]:
     try:
+        if args[:1] == ['incus']:
+            p = incus(*args[1:], timeout=timeout, check=False)
+            return p.returncode, p.stdout.decode(errors='replace').strip()
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout.strip()
     except (OSError, subprocess.SubprocessError):
@@ -479,17 +504,21 @@ def refresh_health(fresh: bool = False) -> dict:
         if vpn:
             ok = False
             reasons.append(vpn)
-        queue = running = None
+        queue = running = waiting = None
         if READY.is_set():
             try:
                 def counts():
                     con = db()
                     try:
-                        return tuple(con.execute(f"SELECT COUNT(*) FROM commands WHERE status='{status}'").fetchone()[0]
-                                     for status in ("queued", "running"))
+                        # async_filter keeps these on commands_waiting: without it each health refresh walks every row.
+                        live = f"SELECT COUNT(*) FROM commands WHERE {async_filter(con)}status=?"
+                        # Every run is queued for a moment before its runner admits it. Only one that is still
+                        # queued after WAITING_AFTER_S is waiting for capacity; clients send new work to Boat on it.
+                        return (*(con.execute(live, (status,)).fetchone()[0] for status in ("queued", "running")),
+                                con.execute(live + " AND created_at < ?", ("queued", now() - WAITING_AFTER_S)).fetchone()[0])
                     finally:
                         con.close()
-                queue, running = health_stage("sqlite", counts)
+                queue, running, waiting = health_stage("sqlite", counts)
             except sqlite3.Error:
                 ok = False
                 reasons.append("state database is not readable")
@@ -499,7 +528,7 @@ def refresh_health(fresh: bool = False) -> dict:
         if storage["disk_low"] or (storage["level"] == "unknown" and pool == 'ONLINE'):
             reasons.append("disk_" + storage["level"] + ": " + disk.description(storage))
         out = {"disk": storage, "disk_low": storage["disk_low"], "disk_full": storage["disk_full"], "ok": ok, "up": True, "mode": "ok" if not reasons else "degraded", "reasons": reasons,
-               "pool": {"name": CFG["zpool"], "state": pool}, "mdraid": md, "queue": queue, "running": running,
+               "pool": {"name": CFG["zpool"], "state": pool}, "mdraid": md, "queue": queue, "running": running, "waiting": waiting,
                "boot_id": boot_id(), "uptime_s": int(host_uptime()), "boatd_uptime_s": int(now() - STARTED),
                "restartPending": restart_pending(),
                "version": VERSION, **status, "boot": STATE.get("boot"), "startupPhases": STATE.get("phases", {})}
@@ -546,11 +575,17 @@ def disk_admit():
 
 
 def snapshot_protected(con, pressure=True):
-    # Unknown/interrupted results stay protected too, until their owner reconciles them.
     protected = {r['id'] for r in con.execute('SELECT id,pinned,state,owner FROM boxes')
                  if r['pinned'] or (pressure and (r['state'] not in ('ready','running','archived')
                                                 or r['owner'] in (CFG.get('person_owners') or [])))}
-    protected.update(r[0] for r in con.execute("SELECT DISTINCT box_id FROM commands WHERE status IS NULL OR status NOT IN ('exited','killed') OR (status='exited' AND exit_code IS NULL)"))
+    # A live command always protects. An ended one with no recorded result protects for a bounded time only:
+    # nothing reconciles old records, and on 19-22 Nov 2026 two such rows kept a 114 GiB snapshot out of
+    # cleanup's reach while the pool sat under its floor.
+    recent = now() - CFG.get('unreconciled_protect_s', 86400)
+    protected.update(r[0] for r in con.execute(
+        "SELECT DISTINCT box_id FROM commands WHERE status IS NULL OR status IN ('queued','running') OR "
+        "((status NOT IN ('exited','killed') OR exit_code IS NULL) AND "
+        "MAX(COALESCE(ended_at,0), COALESCE(started_at,0), COALESCE(created_at,0)) > ?)", (recent,)))
     protected.update(r[0] for r in con.execute("SELECT source FROM saved WHERE status IN ('ready','pending')"))
     return protected
 
@@ -614,8 +649,17 @@ def disk_maintenance(con, error=None):
         protected = snapshot_protected(con)
         missing_snapshots = {tuple(key) for key in cleanup.get('missing_snapshots', [])}
         missing_snapshots &= live
-        eligible = [r for r in disk.candidates(snaps, protected)
-                    if (r['box'], r['name']) not in missing_snapshots]
+        # Owner rule, 22 Nov 2026: while the pool is short, waiting jobs outrank disposable history. No run
+        # restore point of an unprotected box is kept back, and they go strictly oldest first.
+        short = bool(pool and pool['free_bytes'] < cleanup.get('target_bytes', 0))
+        # A snapshot Incus refuses to delete steps aside for an hour, so it cannot hold up everything behind it.
+        refused = {tuple(key): at for key, at in cleanup.get('refused_snapshots', []) if now() - at < 3600}
+        eligible = [r for r in disk.candidates(snaps, protected, keep=0 if short else disk.KEEP_RUN)
+                    if (r['box'], r['name']) not in missing_snapshots and (r['box'], r['name']) not in refused]
+        known = {r['id'] for r in con.execute('SELECT id FROM boxes WHERE deleted_at IS NULL')}
+        # The reaper reads this: only at a measured 0 does it delete stopped boxes for space. An unmeasured pool
+        # is None, never 0. A snapshot Incus refuses is not counted: it must not be able to bring the outage back.
+        cleanup['snapshots_left'] = None if not pool else sum(1 for r in eligible if r['box'] in known) if short else 0
         # Count-retention uses the same pacing gate. Otherwise run completion or
         # personal timers could bypass sampler backpressure with a bulk delete.
         count_gone = set()
@@ -636,8 +680,11 @@ def disk_maintenance(con, error=None):
                 oversized[bid] = over
         # Tackle the boxes causing growth first, oldest history within each
         # budget tier. Small unrelated history must not consume the tick.
-        eligible.sort(key=lambda r: (0 if r['box'] in oversized else 1,
-                                     -oversized.get(r['box'], 0), r['created_at'], r['name']))
+        if short:
+            eligible.sort(key=lambda r: (r['created_at'], r['name']))
+        else:
+            eligible.sort(key=lambda r: (0 if r['box'] in oversized else 1,
+                                         -oversized.get(r['box'], 0), r['created_at'], r['name']))
         attempts = 0
         for row in eligible:
             box = con.execute('SELECT name FROM boxes WHERE id=? AND deleted_at IS NULL', (row['box'],)).fetchone()
@@ -681,13 +728,22 @@ def disk_maintenance(con, error=None):
             con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk_cleanup',?)", (json.dumps(cleanup),))
             try:
                 result = incus('snapshot', 'delete', ct(row['box']), row['name'], timeout=120, check=False)
+            except subprocess.TimeoutExpired:
+                refused[(row['box'], row['name'])] = now()
+                cleanup['refused_snapshots'] = sorted([list(key), at] for key, at in refused.items())
+                raise
             finally:
                 cleanup['last_delete_at'] = now()
                 con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk_cleanup',?)", (json.dumps(cleanup),))
+            if result.returncode == 75:
+                toollog.emit('boatd', 'snapshot.yield', ok=True, ids={'box': row['box']},
+                             props={'snapshot': row['name'], 'reason': 'incus_busy'})
+                break
             missing = result.returncode != 0 and b'not found' in result.stderr.lower()
             if missing:
                 missing_snapshots.add((row['box'], row['name']))
             if result.returncode and not missing:
+                refused[(row['box'], row['name'])] = now()
                 toollog.emit('boatd', 'snapshot.prune', kind='error', ok=False,
                              ids={'box': row['box']}, props={'snapshot': row['name'], 'reason': reason}, tag='snapshot_prune')
                 break
@@ -701,12 +757,19 @@ def disk_maintenance(con, error=None):
                                 'snapshot_bytes': sizes.get(row['box'], {}).get('snapshot_bytes'),
                                 'reason': 'missing' if missing else reason})
             break
-        cleanup['shortfall_bytes'] = max(0, cleanup.get('target_bytes', 0) - pool_free(value))
+        measured = any(r['filesystem'] == CFG['zpool'] for r in value['filesystems'])
+        if measured:
+            cleanup['shortfall_bytes'] = max(0, cleanup.get('target_bytes', 0) - pool_free(value))
+        else:
+            cleanup['snapshots_left'] = None
+        cleanup['at'] = now()
         cleanup['budget_shortfall_bytes'] = sum(max(0, int(u['snapshot_bytes'] - disk.SNAPSHOT_RATIO * u['live_bytes']))
             for bid, u in sizes.items() if u.get('live_bytes', 0) > 0 and con.execute(
                 "SELECT 1 FROM boxes WHERE id=? AND name LIKE '%repository pool%' AND deleted_at IS NULL", (bid,)).fetchone())
-        value['cleanup'] = {k: v for k, v in cleanup.items() if k not in ('last_delete_at', 'missing_snapshots')}
+        value['cleanup'] = {k: v for k, v in cleanup.items()
+                            if k not in ('last_delete_at', 'missing_snapshots', 'refused_snapshots')}
         cleanup['missing_snapshots'] = sorted(missing_snapshots)
+        cleanup['refused_snapshots'] = sorted([list(key), at] for key, at in refused.items())
         value['snapshot_bytes_by_kind'] = disk.kind_bytes(snaps)
         DISK.update(boxes=sizes, cleanup=value['cleanup'], snapshot_bytes_by_kind=value['snapshot_bytes_by_kind'])
         con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk_cleanup',?)", (json.dumps(cleanup),))
@@ -758,15 +821,169 @@ class Fail(Exception):
         self.details = details or {}
 
 
-def incus(*args, input: bytes | None = None, timeout: float = 600, check: bool = True) -> subprocess.CompletedProcess:
-    if args and args[0] in ('start','init','copy'):
-        with boatd_memory.lifecycle_lock(VAR):
+_INCUS_LOCK = threading.Lock()
+_INCUS_ACTIVE = {}
+_INCUS_SLOW_UNTIL = 0.0
+_PROXY_BUDGET = threading.local()
+
+
+def incus_kind(args):
+    # Only verbs go into analytics; exec scripts, keys and config values must never do so.
+    count = 3 if args[0] == 'config' and args[1:2] == ('device',) else 2 if args[0] in ('config', 'snapshot') else 1
+    return '.'.join(args[:count])
+
+
+def maintenance_hold(exclude_box=None):
+    with _INCUS_LOCK:
+        if time.monotonic() < _INCUS_SLOW_UNTIL:
+            return 'incus_slow'
+    try:
+        if json.loads((VAR / 'incus-slow.json').read_text())['until'] > now():
+            return 'incus_slow'
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    con = db()
+    try:
+        if con.execute("SELECT 1 FROM boxes WHERE state IN ('provisioning','resuming') AND id != ? LIMIT 1",
+                       (exclude_box or '',)).fetchone():
+            return 'bring_up'
+    finally:
+        con.close()
+    return None
+
+
+def record_slow_incus(kind, elapsed):
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=VAR, prefix='.incus-slow-', delete=False) as output:
+            path = output.name
+            json.dump({'until': now() + 30, 'command_kind': kind, 'duration_ms': elapsed}, output)
+        os.replace(path, VAR / 'incus-slow.json')
+    except OSError:
+        log('incus latency cooldown could not be persisted')
+    finally:
+        if path:
+            Path(path).unlink(missing_ok=True)
+
+
+def deletion_hold():
+    con = db()
+    try:
+        row = con.execute("SELECT v FROM meta WHERE k='disk_cleanup'").fetchone()
+        state = json.loads(row[0]) if row else {}
+        if now() - state.get('last_delete_at', 0) < disk.DELETE_GAP_S:
+            return 'delete_gap'
+        try:
+            return disk.yield_reason(disk.cleanup_pressure(CFG['zpool']))
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            return 'pressure_unknown'
+    finally:
+        con.close()
+
+
+def record_delete_time():
+    con = db()
+    try:
+        row = con.execute("SELECT v FROM meta WHERE k='disk_cleanup'").fetchone()
+        state = json.loads(row[0]) if row else {}
+        state['last_delete_at'] = now()
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('disk_cleanup',?)", (json.dumps(state),))
+    finally:
+        con.close()
+
+
+def incus(*args, input: bytes | None = None, timeout: float = 600, check: bool = True,
+          before_dispatch=None) -> subprocess.CompletedProcess:
+    global _INCUS_SLOW_UNTIL
+    kind = incus_kind(args)
+    box = next(('bx_' + m[1] for x in args if (m := re.search(r'(?:^|/)bx-([a-z0-9]+)(?=$|/|\?)', x))), None)
+    housekeeping = args[0] == 'delete' or args[:2] in (('snapshot', 'create'), ('snapshot', 'delete'))
+    slot = storage_slot = None
+    exclude = box if args[0] == 'delete' else None
+    hold = maintenance_hold(exclude) if housekeeping else None
+    if housekeeping and not hold:
+        slot = open(VAR / 'incus-maintenance.lock', 'a')
+        try:
+            fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            hold = maintenance_hold(exclude)
+        except BlockingIOError:
+            hold = 'incus_busy'
+    if args[0] == 'delete' and CFG.get('state_dataset') and not hold:
+        storage_slot = open(VAR / 'disk.lock', 'a')
+        try:
+            fcntl.flock(storage_slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            hold = deletion_hold()
+            if not hold:
+                record_delete_time()
+                hold = maintenance_hold(exclude)
+        except BlockingIOError:
+            hold = 'disk_busy'
+    if not hold and before_dispatch:
+        try:
+            if not before_dispatch():
+                hold = 'incus_busy'
+        except BaseException:
+            if slot:
+                slot.close()
+            if storage_slot:
+                storage_slot.close()
+            raise
+    if hold:
+        if slot:
+            slot.close()
+        if storage_slot:
+            storage_slot.close()
+        toollog.emit('boatd', 'incus_deferred', ids={'box': box}, props={'commandKind': kind, 'reason': hold})
+        if check:
+            raise Fail(503, 'incus_busy', f'{kind} deferred: {hold}')
+        return subprocess.CompletedProcess(['incus', *args], 75, b'', f'deferred: {hold}'.encode())
+    began = time.monotonic()
+    token = object()
+    with _INCUS_LOCK:
+        _INCUS_ACTIVE[token] = {'kind': kind, 'box': box, 'since': began}
+    outcome, code = 'error', None
+    try:
+        with boatd_memory.lifecycle_lock(VAR) if args[0] in ('start', 'init', 'copy') else contextlib.nullcontext():
             p = subprocess.run(["incus", *args], input=input, capture_output=True, timeout=timeout)
-    else:
-        p = subprocess.run(["incus", *args], input=input, capture_output=True, timeout=timeout)
-    if check and p.returncode != 0:
-        raise Fail(500, "incus_failed", f"incus {' '.join(args[:3])}: {p.stderr.decode(errors='replace')[-500:]}")
-    return p
+        code, outcome = p.returncode, 'ok' if not p.returncode else 'error'
+        if check and p.returncode != 0:
+            raise Fail(500, "incus_failed", f"incus {' '.join(args[:3])}: {p.stderr.decode(errors='replace')[-500:]}")
+        return p
+    except subprocess.TimeoutExpired as e:
+        outcome = 'timeout'
+        elapsed = round((time.monotonic() - began) * 1000, 1)
+        with _INCUS_LOCK:
+            busy = [{**v, 'elapsed_ms': round((time.monotonic()-v['since'])*1000, 1)}
+                    for k, v in _INCUS_ACTIVE.items() if k is not token]
+        facts = {'command_kind': kind, 'elapsed_ms': elapsed, 'timeout_s': timeout,
+                 'busy': [{k: v for k, v in row.items() if k != 'since'} for row in busy[:8]],
+                 'psi_io': psi('io'), 'psi_cpu': psi('cpu')}
+        # Command recovery already handles TimeoutExpired, including check=False
+        # probes. Only proxy preparation turns it into a box-start API failure.
+        e.incus_details = facts
+        raise
+    finally:
+        elapsed = (time.monotonic() - began) * 1000
+        slow_mutation = args[0] not in ('query', 'list', 'exec', 'info') and (outcome == 'timeout' or elapsed >= 3000)
+        with _INCUS_LOCK:
+            _INCUS_ACTIVE.pop(token, None)
+            if slow_mutation:
+                _INCUS_SLOW_UNTIL = time.monotonic() + 30
+        if slow_mutation:
+            record_slow_incus(kind, elapsed)
+        if storage_slot:
+            try:
+                record_delete_time()
+            except sqlite3.Error:
+                log('delete completion time could not be persisted; dispatch time remains recorded')
+            finally:
+                storage_slot.close()
+        if slot:
+            slot.close()
+        toollog.emit('boatd', 'incus_call', kind='perf' if outcome == 'ok' else 'error',
+                     duration_ms=elapsed, ok=outcome == 'ok', ids={'box': box},
+                     props={'commandKind': kind, 'outcome': outcome, 'exitCode': code, 'timeoutSeconds': timeout},
+                     tag='incus_slow' if outcome == 'timeout' else None)
 
 
 def ct(box_id: str) -> str:
@@ -813,6 +1030,8 @@ def delete_instance(box_id: str, owner: str, require_identity: bool = False) -> 
         if require_identity:
             check_instance_identity(box_id)
         deleted = incus('delete', ct(box_id), '--force', timeout=300, check=False)
+        if deleted.returncode == 75:
+            raise Fail(503, 'incus_busy', 'instance deletion deferred before dispatch')
         if deleted.returncode and not instance_missing(deleted):
             raise Fail(500, 'incus_failed', 'Incus did not confirm instance deletion')
         scratch().delete(box_id, owner)
@@ -913,6 +1132,14 @@ def box_event(con, box_id, action, reason, snapshot=None, **fields):
     toollog.emit('boatd', 'box.' + action, ok=True, ids={'box': box_id, 'run': data['caller'].get('run_id')}, props=data)
 
 
+def killed_in_queue(c, metrics) -> bool:
+    """A run cancelled while it waited for admission never reached its box: nothing there can outlive it.
+    Without this its box could be neither handed out nor idle-stopped again (13 rows on 12 boxes, 19-22 Nov 2026)."""
+    kill = metrics.get('kill') or {}
+    return (bool(c['killed']) and metrics.get('kill_synthetic') is True and kill.get('cleanup') == 'clean' and
+            kill.get('remaining') == 0 and not command_was_started(c))
+
+
 def box_protection(con, box_id, *, probe=True, run_id=None):
     row = box_row(con, box_id)
     pin = bool(row['pinned']) and (row['pin_until'] is None or row['pin_until'] > now())
@@ -920,29 +1147,36 @@ def box_protection(con, box_id, *, probe=True, run_id=None):
     # An exited shell can leave children behind, including sync commands without run metadata.
     # Only a positive process probe retires an invocation from lifecycle protection.
     rows = con.execute('SELECT * FROM commands WHERE box_id=? ORDER BY pid DESC', (box_id,)).fetchall()
-    for c in rows:
-        if run_id and c['run_id'] != run_id:
-            continue
-        metrics = json.loads(c['metrics'] or '{}')
-        cache_key = f"holder_gone:{box_id}:{c['pid']}:{c['attempt'] or 1}"
-        unsettled = c['status'] in ('queued', 'running')
-        if not unsettled and con.execute('SELECT 1 FROM meta WHERE k=?', (cache_key,)).fetchone():
+    with shared_box_state():
+        for c in rows:
+            if run_id and c['run_id'] != run_id:
+                continue
+            metrics = json.loads(c['metrics'] or '{}')
+            cache_key = f"holder_gone:{box_id}:{c['pid']}:{c['attempt'] or 1}"
+            unsettled = c['status'] in ('queued', 'running')
+            if not unsettled and con.execute('SELECT 1 FROM meta WHERE k=?', (cache_key,)).fetchone():
+                if run_id:
+                    gone = True
+                continue
+            never_dispatched = (c['status'] not in ('queued', 'running') and c['started_at'] is None and
+                                (metrics.get('not_dispatched') is True or queue_loss_json(c)['notAdmitted']))
+            proof = ({'stopped': True, 'reason': 'not_dispatched'} if never_dispatched else
+                     command_probe(c) if probe and c['status'] != 'queued' else {})
+            confirmed = (proof.get('stopped') is True or (proof.get('readable') is True and
+                         proof.get('pids') == [] and (proof.get('join_verified') is True or proof.get('box_rc') is not None)))
+            # The row says it was cancelled in the queue; the box must agree that it left no trace there.
+            cancelled_unseen = (c['status'] not in ('queued', 'running') and c['started_at'] is None and
+                                killed_in_queue(c, metrics) and proof.get('readable') is True and
+                                proof.get('marker') is None and proof.get('box_rc') is None and not proof.get('pids'))
+            confirmed = confirmed or cancelled_unseen
+            never_dispatched = never_dispatched or cancelled_unseen
             if run_id:
-                gone = True
-            continue
-        never_dispatched = (c['status'] not in ('queued', 'running') and c['started_at'] is None and
-                            (metrics.get('not_dispatched') is True or queue_loss_json(c)['notAdmitted']))
-        proof = ({'stopped': True, 'reason': 'not_dispatched'} if never_dispatched else
-                 command_probe(c) if probe and c['status'] != 'queued' else {})
-        confirmed = (proof.get('stopped') is True or (proof.get('readable') is True and
-                     proof.get('pids') == [] and (proof.get('join_verified') is True or proof.get('box_rc') is not None)))
-        if run_id:
-            gone = confirmed or gone
-        if confirmed and not unsettled:
-            resolved.append((cache_key, c, never_dispatched))
-            continue
-        holds.append(dict(run_id=c['run_id'], holder=c['holder'] or row['owner'],
-                          state=c['status'], process_id=c['pid'], probe=proof))
+                gone = confirmed or gone
+            if confirmed and not unsettled:
+                resolved.append((cache_key, c, never_dispatched))
+                continue
+            holds.append(dict(run_id=c['run_id'], holder=c['holder'] or row['owner'],
+                              state=c['status'], process_id=c['pid'], probe=proof))
     # The same protection endpoint fences late guest owners and settled rows with live cgroups.
     if probe and not run_id and not holds and commands_busy(con, box_id):
         holds.append(dict(run_id=None, holder=row['owner'], state='live command'))
@@ -1008,7 +1242,8 @@ def box_json(con, r) -> dict:
         "id": r["id"], "name": r["name"], "state": state, "error": r["error"], "dataExpiredAt": None,
         'heldRuns': held_runs(con, r['id']),
         "stoppedAt": iso(r["stopped_at"]) if state == "archived" else None, "labels": json.loads(r["labels"] or "{}"),
-        "health": "ok", "type": r["type"], "vcpu": s["vcpu"], "memoryGB": int(re.sub(r"\D", "", s["mem"])),
+        "health": "unhealthy" if r['start_error'] else "ok", "startError": json.loads(r['start_error']) if r['start_error'] else None,
+        "type": r["type"], "vcpu": s["vcpu"], "memoryGB": int(re.sub(r"\D", "", s["mem"])),
         "billingMultiplier": 0, "machineProvider": "offbox-server",
         "sshEndpoint": f"{CFG['ssh_host']}:{r['ssh_port']}" if r["ssh_port"] else None,
         "owner": r["owner"],
@@ -1022,13 +1257,83 @@ def box_json(con, r) -> dict:
     }
 
 
+def _ensure_device(box_id, device, port, connect=None):
+    began = time.monotonic()
+    end = min(getattr(_PROXY_BUDGET, 'end', began + 180), began + 180)
+    desired = {'listen': f"tcp:{CFG['ssh_host']}:{port}", 'connect': connect or 'tcp:127.0.0.1:22', 'bind': 'host'}
+    slow_error = None
+    for attempt, allowance in enumerate((30, 120), 1):
+        operation = 'query'
+        try:
+            # A timed-out add may have committed in incusd after its CLI was killed.
+            # Re-read before every attempt so retries cannot duplicate the device.
+            config = json.loads(incus('query', f'/1.0/instances/{ct(box_id)}',
+                                     timeout=max(.001, min(10, end-time.monotonic()))).stdout)
+            current = config.get('devices', {}).get(device)
+            if current and current.get('type') == 'proxy' and all(current.get(k) == v for k, v in desired.items()):
+                return
+            action = 'set' if current else 'add'
+            values = [f'{k}={v}' for k, v in desired.items()]
+            args = ('config', 'device', action, ct(box_id), device)
+            if not current:
+                args += ('proxy',)
+            operation = 'config.device.' + action
+            incus(*args, *values, timeout=max(.001, min(allowance, end-time.monotonic())))
+            return
+        except (Fail, subprocess.TimeoutExpired) as caught:
+            if isinstance(caught, subprocess.TimeoutExpired):
+                facts = getattr(caught, 'incus_details', {'command_kind': operation})
+                error = Fail(503, 'incus_slow', f"{facts['command_kind']} on {box_id} exceeded {caught.timeout:g}s", facts)
+                slow_error = error
+            else:
+                error = caught
+            if error.code not in ('incus_slow', 'incus_failed'):
+                raise
+            # An earlier add can commit between our readback and the retry's add.
+            # Reconcile nonzero exits too before taking the ordinary error path.
+            try:
+                config = json.loads(incus('query', f'/1.0/instances/{ct(box_id)}',
+                                         timeout=max(.001, min(10, end-time.monotonic()))).stdout)
+                current = config.get('devices', {}).get(device, {})
+                if current.get('type') == 'proxy' and all(current.get(k) == v for k, v in desired.items()):
+                    return
+            except (Fail, subprocess.TimeoutExpired):
+                pass
+            if error.code == 'incus_failed' and slow_error is not None:
+                error = slow_error
+            if error.code != 'incus_slow':
+                raise
+            if attempt == 2 or time.monotonic() >= end:
+                error.details.update(attempts=attempt, total_ms=round((time.monotonic()-began)*1000, 1))
+                if error is caught:
+                    raise
+                raise error from caught
+            toollog.emit('boatd', 'incus_retry', ids={'box': box_id},
+                         props={'commandKind': error.details['command_kind'], 'attempt': attempt})
+
+
 def _ensure_proxy(box_id: str, port: int) -> None:
-    devs = incus("config", "device", "list", ct(box_id), timeout=30).stdout.decode().split()
-    if "ssh" in devs:
-        incus("config", "device", "set", ct(box_id), "ssh", f"listen=tcp:{CFG['ssh_host']}:{port}", timeout=30)
-    else:
-        incus("config", "device", "add", ct(box_id), "ssh", "proxy", f"listen=tcp:{CFG['ssh_host']}:{port}",
-              "connect=tcp:127.0.0.1:22", "bind=host", timeout=30)
+    _ensure_device(box_id, 'ssh', port)
+
+
+def _prepare_proxies(con, box_id):
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        port = box_row(con, box_id)['ssh_port']
+        if port is None:
+            port = next_ssh_port(con)
+            con.execute('UPDATE boxes SET ssh_port=? WHERE id=?', (port, box_id))
+        con.execute('COMMIT')
+    except Exception:
+        con.execute('ROLLBACK')
+        raise
+    # The shared ceiling leaves boot time inside the client's 300s resume wait.
+    _PROXY_BUDGET.end = time.monotonic() + 180
+    try:
+        _ensure_proxy(box_id, port)
+        _ensure_mgmt_proxy(con, box_id)
+    finally:
+        del _PROXY_BUDGET.end
 
 
 def _ensure_mgmt_proxy(con, box_id: str) -> int:
@@ -1043,14 +1348,68 @@ def _ensure_mgmt_proxy(con, box_id: str) -> int:
     except Exception:
         con.execute("ROLLBACK")
         raise
-    devs = incus("config", "device", "list", ct(box_id), timeout=30).stdout.decode().split()
-    if "offbox-mgmt-ssh" in devs:
-        incus("config", "device", "set", ct(box_id), "offbox-mgmt-ssh",
-              f"listen=tcp:{CFG['ssh_host']}:{port}", f"connect=tcp:127.0.0.1:{MGMT_PORT}", timeout=30)
-    else:
-        incus("config", "device", "add", ct(box_id), "offbox-mgmt-ssh", "proxy",
-              f"listen=tcp:{CFG['ssh_host']}:{port}", f"connect=tcp:127.0.0.1:{MGMT_PORT}", "bind=host", timeout=30)
+    _ensure_device(box_id, 'offbox-mgmt-ssh', port, f'tcp:127.0.0.1:{MGMT_PORT}')
     return port
+
+
+def failed_start(con, box_id, error, *, provision=False, record=True):
+    row = box_row(con, box_id)
+    previous = json.loads(row['start_error'] or '{}')
+    facts = {**previous, **error.details, 'class': error.code if record else previous.get('class', error.code),
+             'provision': provision or previous.get('provision', False), 'cleanup': 'unknown'}
+    changed = con.execute("UPDATE boxes SET state='stopping', stopped_at=NULL, error=?, start_error=?, updated_at=? "
+                          "WHERE id=? AND (state IN ('provisioning','resuming') OR (state='stopping' AND ?))",
+                          (str(error)[:500], json.dumps(facts), now(), box_id, provision))
+    if not changed.rowcount:
+        return
+    if record:
+        toollog.emit('boatd', 'box_start_failed', kind='error', ok=False, ids={'box': box_id},
+                     props={'class': 'incus_slow', 'commandKind': facts.get('command_kind'), 'cleanup': 'unknown'},
+                     duration_ms=facts.get('total_ms', facts.get('elapsed_ms')), tag='incus_slow')
+    continue_failed_start(con, box_id)
+
+
+def continue_failed_start(con, box_id):
+    lock = boatd_tmp.lock(box_id)
+    if not lock.acquire(blocking=False):
+        return
+    try:
+        row = con.execute('SELECT state,start_error FROM boxes WHERE id=? AND deleted_at IS NULL', (box_id,)).fetchone()
+        if not row or row['state'] != 'stopping' or not row['start_error']:
+            return
+        _failed_start(con, box_id)
+    finally:
+        lock.release()
+
+
+def _failed_start(con, box_id):
+    row = box_row(con, box_id)
+    facts, error = json.loads(row['start_error']), row['error']
+    facts['cleanup'] = 'unknown'
+    # Keep the copied disk and its identity obligation. Ports are released only
+    # after the instance is confirmed stopped and both local proxies are gone.
+    try:
+        if facts['provision']:
+            check_instance_identity(box_id)
+        incus('stop', ct(box_id), '--force', timeout=60, check=False)
+        state = json.loads(incus('query', f'/1.0/instances/{ct(box_id)}/state', timeout=10).stdout)
+        if state.get('status', '').lower() != 'stopped':
+            raise Fail(503, 'incus_slow', 'cannot confirm instance stopped')
+        config = json.loads(incus('query', f'/1.0/instances/{ct(box_id)}', timeout=10).stdout)
+        for device in ('ssh', 'offbox-mgmt-ssh'):
+            if device in config.get('devices', {}):
+                incus('config', 'device', 'remove', ct(box_id), device, timeout=30)
+        config = json.loads(incus('query', f'/1.0/instances/{ct(box_id)}', timeout=10).stdout)
+        devices = config.get('expanded_devices', config.get('devices', {}))
+        if any(device in devices for device in ('ssh', 'offbox-mgmt-ssh')):
+            raise Fail(503, 'incus_slow', 'cannot confirm proxy removal')
+        set_box(con, box_id, ssh_port=None, mgmt_ssh_port=None)
+        facts['cleanup'] = 'stopped'
+    except Exception as cleanup:
+        log(f'slow start cleanup pending {box_id}: {cleanup}')
+    set_box(con, box_id, state='archived' if facts['cleanup'] == 'stopped' else 'stopping',
+            stopped_at=now() if facts['cleanup'] == 'stopped' else None,
+            error=error, start_error=json.dumps(facts))
 
 
 def _fresh_identity(box_id: str) -> None:
@@ -1086,38 +1445,46 @@ def provision(box_id: str, source: tuple[str, str | None], t: str) -> None:
     """source: ("image", alias) | ("saved", instance) | ("box", box_id). Runs in a thread."""
     con = db()
     try:
-        # Keep the identity requirement after failed creation, later resumes and reaping.
-        set_box(con, box_id, provision_identity=1)
-        kind, ref = source
-        name = ct(box_id)
-        marker = ('-c', f'user.offbox.provision={box_id}')
-        if kind == "image":
-            incus("init", ref, name, "-p", "default", "-p", "offbox", *marker, timeout=900)
-        elif kind == "saved":
-            incus("copy", ref, name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
-        else:
-            incus("copy", ct(ref), name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
-        r = box_row(con, box_id)
-        scratch().create(box_id, r['owner'])
-        apply_size(box_id, t)
-        r = box_row(con, box_id)
-        _ensure_proxy(box_id, r["ssh_port"])
-        _ensure_mgmt_proxy(con, box_id)
-        scratch().start(box_id)
-        _wait_boot(box_id, ssh=False)
-        scratch().verify(box_id)
-        _fresh_identity(box_id)
-        _wait_boot(box_id)
-        set_box(con, box_id, state="ready", last_active=now(), error=None)
-        log(f"box {box_id} ready ({kind} {ref} {t})")
-    except Exception as e:  # noqa: BLE001
-        log(f"provision {box_id} failed: {e}")
-        try:
-            cleanup_provision(box_id, box_row(con, box_id)['owner'])
-        except Exception as cleanup:
-            log(f'provision cleanup deferred for {box_id}: {cleanup}')
-            e = RuntimeError(f'{e}; cleanup deferred: {cleanup}')
-        set_box(con, box_id, state="error", error=str(e)[:500])
+        with lifecycle_lock(box_id), boatd_tmp.lock(box_id):
+            try:
+                # Keep the identity requirement after failed creation, later resumes and reaping.
+                set_box(con, box_id, provision_identity=1, identity_pending=1)
+                kind, ref = source
+                name = ct(box_id)
+                marker = ('-c', f'user.offbox.provision={box_id}')
+                if kind == "image":
+                    incus("init", ref, name, "-p", "default", "-p", "offbox", *marker, timeout=900)
+                elif kind == "saved":
+                    incus("copy", ref, name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
+                else:
+                    incus("copy", ct(ref), name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
+                r = box_row(con, box_id)
+                scratch().create(box_id, r['owner'])
+                apply_size(box_id, t)
+                r = box_row(con, box_id)
+                _prepare_proxies(con, box_id)
+                if box_row(con, box_id)['state'] != 'provisioning':
+                    return
+                scratch().start(box_id)
+                _wait_boot(box_id, ssh=False)
+                scratch().verify(box_id)
+                _fresh_identity(box_id)
+                set_box(con, box_id, identity_pending=0)
+                _wait_boot(box_id)
+                if con.execute("UPDATE boxes SET state='ready', last_active=?, updated_at=?, error=NULL, start_error=NULL "
+                               "WHERE id=? AND state='provisioning'", (now(), now(), box_id)).rowcount:
+                    log(f"box {box_id} ready ({kind} {ref} {t})")
+            except Exception as e:  # noqa: BLE001
+                log(f"provision {box_id} failed: {e}")
+                if isinstance(e, Fail) and e.code == 'incus_slow':
+                    failed_start(con, box_id, e, provision=True)
+                    return
+                try:
+                    cleanup_provision(box_id, box_row(con, box_id)['owner'])
+                except Exception as cleanup:
+                    log(f'provision cleanup deferred for {box_id}: {cleanup}')
+                    e = RuntimeError(f'{e}; cleanup deferred: {cleanup}')
+                set_box(con, box_id, state="error", error=str(e)[:500])
     finally:
         con.close()
 
@@ -1157,7 +1524,16 @@ def create_box(con, body: dict, idem: str | None, owner: str, src_box: str | Non
     return box_json(con, box_row(con, bid))
 
 
-def snapshot(con, box_id: str, kind: str) -> str | None:
+def queue_snapshot(con, box_id, kind):
+    # Renew the request without changing its turn in the replay queue.
+    con.execute('INSERT INTO snapshot_pending(box_id,kind,generation) VALUES (?,?,?) '
+                'ON CONFLICT(box_id,kind) DO UPDATE SET generation=excluded.generation',
+                (box_id, kind, secrets.token_hex(16)))
+
+
+def snapshot(con, box_id: str, kind: str, *, before_dispatch=None) -> str | None:
+    pending = con.execute('SELECT generation FROM snapshot_pending WHERE box_id=? AND kind=?', (box_id, kind)).fetchone()
+    generation = pending[0] if pending else None
     if kind in RUN_KINDS:
         value = disk_maintenance(con)
         usage = (value.get('boxes') or DISK.get('boxes') or {}).get(box_id, {})
@@ -1167,14 +1543,39 @@ def snapshot(con, box_id: str, kind: str) -> str | None:
         if value['level'] in ('full', 'unknown') or (value.get('cleanup') or {}).get('shortfall_bytes', 0) or over_budget:
             toollog.emit('boatd', 'snapshot.skip', ok=True, ids={'box': box_id},
                          props={'snapshot': kind, 'bytes_freed': 0, 'reason': 'snapshot_budget' if over_budget else 'server_disk_low', 'disk': value})
+            con.execute('DELETE FROM snapshot_pending WHERE box_id=? AND kind=? AND generation=?', (box_id, kind, generation))
             return None
     name = f"{kind}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%f')[:-3]}"
-    p = incus("snapshot", "create", ct(box_id), name, timeout=120, check=False)
+    dispatch = {'before_dispatch': before_dispatch} if before_dispatch else {}
+    p = incus("snapshot", "create", ct(box_id), name, timeout=120, check=False, **dispatch)
+    if p.returncode == 75:
+        if not before_dispatch:
+            queue_snapshot(con, box_id, kind)
+        return None
     if p.returncode != 0:
         log(f"snapshot {box_id} {name} failed: {p.stderr.decode(errors='replace')[-300:]}")
         return None
     con.execute("INSERT OR REPLACE INTO snaps VALUES (?,?,?,?)", (box_id, name, kind, now()))
+    con.execute('DELETE FROM snapshot_pending WHERE box_id=? AND kind=? AND generation=?', (box_id, kind, generation))
     return name
+
+
+def drain_pending_snapshots(con):
+    pending = con.execute("SELECT p.rowid AS request_id, p.* FROM snapshot_pending p JOIN boxes b ON b.id=p.box_id "
+                          "WHERE b.deleted_at IS NULL AND b.state IN ('ready','running','archived') ORDER BY p.rowid LIMIT 1").fetchall()
+    for row in pending:
+        # Claim only an admitted dispatch: cooldown must preserve this turn.
+        def claim():
+            changed = con.execute('INSERT OR REPLACE INTO snapshot_pending SELECT box_id,kind,generation FROM snapshot_pending '
+                                  'WHERE rowid=? AND generation=?', (row['request_id'], row['generation'])).rowcount > 0
+            if changed:
+                con.execute("INSERT OR REPLACE INTO meta VALUES ('incus_replay_next','deletes')")
+            return changed
+        try:
+            if snapshot(con, row['box_id'], row['kind'], before_dispatch=claim):
+                prune_snaps(con, row['box_id'])
+        except Exception as error:  # noqa: BLE001
+            log(f"snapshot replay deferred for {row['box_id']}: {error}")
 
 
 RUN_KINDS = ("auto", "stop")
@@ -1227,12 +1628,25 @@ def prune_snaps(con, box_id: str) -> None:
 def stop_box(con, box_id: str, why: str) -> None:
     token = offbox_protection.CALLER.set(offbox_protection.caller(reason=why))
     try:
-        with lifecycle_lock(box_id):
+        with box_memory_lock(box_id):
+            require_unprotected(con, box_id)
+            if box_row(con, box_id)['state'] == 'archived':
+                return
+            set_box(con, box_id, state='stopping', stopped_at=None)
+        continue_stop(con, box_id, why)
+    finally:
+        offbox_protection.CALLER.reset(token)
+
+
+def continue_stop(con, box_id: str, why: str) -> None:
+    # Cancellation was already published; an old worker must not cancel a new resume.
+    token = offbox_protection.CALLER.set(offbox_protection.caller(reason=why))
+    try:
+        with lifecycle_lock(box_id), boatd_tmp.lock(box_id):
+            if box_row(con, box_id)['state'] != 'stopping':
+                return
             with box_memory_lock(box_id):
                 require_unprotected(con, box_id)
-                if box_row(con, box_id)['state'] == 'archived':
-                    return
-                set_box(con, box_id, state='stopping')
             settle_box_commands(con, box_id)
             with box_memory_lock(box_id):
                 require_unprotected(con, box_id)
@@ -1243,6 +1657,10 @@ def stop_box(con, box_id: str, why: str) -> None:
 
 def _stop_box(con, box_id: str, why: str) -> None:
     r = box_row(con, box_id)
+    if r['start_error']:
+        if r['state'] == 'stopping':
+            continue_failed_start(con, box_id)
+        return
     if r["state"] == "archived":
         return
     set_box(con, box_id, state="stopping")
@@ -1267,7 +1685,11 @@ def _stop_box(con, box_id: str, why: str) -> None:
 def resume_box(con, box_id: str, body: dict) -> None:
     with lifecycle_lock(box_id), box_memory_lock(box_id):
         check_delete_fence(con, box_id)
-        if box_row(con, box_id)['state'] == 'stopping':
+        row = box_row(con, box_id)
+        if row['state'] == 'stopping':
+            if row['start_error']:
+                failure = json.loads(row['start_error'])
+                raise Fail(503, failure.get('class', 'incus_failed'), 'failed start cleanup is still pending', failure)
             raise Fail(409, 'sandbox_unavailable', f'{box_id} is stopping')
         require_unprotected(con, box_id, reuse=True)
         _resume_box(con, box_id, body)
@@ -1276,61 +1698,101 @@ def resume_box(con, box_id: str, body: dict) -> None:
 def _resume_box(con, box_id, body):
     disk_admit()
     r = box_row(con, box_id)
+    if r['start_error'] and r['state'] == 'stopping':
+        failure = json.loads(r['start_error'])
+        raise Fail(503, failure.get('class', 'incus_failed'), 'failed start cleanup is still pending', failure)
+    if r['state'] == 'stopping':
+        raise Fail(409, 'incus_busy', 'box stop is still pending')
     if body.get("ttlSeconds"):
         set_box(con, box_id, ttl=int(body["ttlSeconds"]))
     if body.get("type") and body["type"] != r["type"]:
         t = size_of(body["type"])
         set_box(con, box_id, type=t)
-    if r["state"] in LIVE or r["state"] == "provisioning":
+    if r["state"] in LIVE + ('provisioning', 'resuming'):
         set_box(con, box_id, last_active=now())
         return
-    set_box(con, box_id, state="resuming", error=None, last_active=now())
+    if not con.execute("UPDATE boxes SET state='resuming', error=NULL, last_active=?, updated_at=? WHERE id=? AND state=?",
+                       (now(), now(), box_id, r['state'])).rowcount:
+        return
 
     context = offbox_protection.caller()
     def go():
         offbox_protection.CALLER.set(context)
         c2 = db()
+        failure = {}
+        identity_pending = False
         try:
-            with lifecycle_lock(box_id):
-                if box_row(c2, box_id)['state'] != 'resuming':
-                    return
-                check_delete_fence(c2, box_id)
-                apply_size(box_id, box_row(c2, box_id)["type"])
-                _ensure_proxy(box_id, box_row(c2, box_id)["ssh_port"])
-                _ensure_mgmt_proxy(c2, box_id)
-                if not ct_running(box_id):
-                    scratch().start(box_id)
-                _wait_boot(box_id)
-                scratch().verify(box_id)
-                with box_memory_lock(box_id):
-                    set_box(c2, box_id, state="ready", last_active=now())
-                log(f"box {box_id} resumed")
-        except Exception as e:  # noqa: BLE001
-            with lifecycle_lock(box_id), box_memory_lock(box_id):
-                if box_row(c2, box_id)['state'] != 'resuming':
-                    return
-                protected = offbox_protection.blocked(box_protection(c2, box_id, probe=False))
-                set_box(c2, box_id, state='error' if protected else 'archived', error=str(e)[:500])
-            log(f"resume {box_id} failed: {e}")
+            with lifecycle_lock(box_id), boatd_tmp.lock(box_id):
+                try:
+                    if box_row(c2, box_id)['state'] != 'resuming':
+                        return
+                    check_delete_fence(c2, box_id)
+                    row = box_row(c2, box_id)
+                    failure = json.loads(row['start_error'] or '{}')
+                    identity_pending = bool(row['identity_pending'])
+                    apply_size(box_id, box_row(c2, box_id)["type"])
+                    _prepare_proxies(c2, box_id)
+                    if box_row(c2, box_id)['state'] != 'resuming':
+                        return
+                    if not ct_running(box_id):
+                        scratch().start(box_id)
+                    if identity_pending or failure.get('provision'):
+                        _wait_boot(box_id, ssh=False)
+                        _fresh_identity(box_id)
+                        set_box(c2, box_id, identity_pending=0)
+                    _wait_boot(box_id)
+                    scratch().verify(box_id)
+                    if c2.execute("UPDATE boxes SET state='ready', last_active=?, updated_at=?, error=NULL, start_error=NULL "
+                                  "WHERE id=? AND state='resuming'", (now(), now(), box_id)).rowcount:
+                        log(f"box {box_id} resumed")
+                except Exception as e:  # noqa: BLE001
+                    if isinstance(e, Fail) and e.code == 'incus_slow':
+                        failed_start(c2, box_id, e)
+                        return
+                    if failure or identity_pending:
+                        failure_error = e if isinstance(e, Fail) else Fail(500, 'incus_failed', str(e))
+                        failed_start(c2, box_id, failure_error, provision=identity_pending, record=False)
+                        return
+                    with box_memory_lock(box_id):
+                        if box_row(c2, box_id)['state'] != 'resuming':
+                            return
+                        protected = offbox_protection.blocked(box_protection(c2, box_id, probe=False))
+                        set_box(c2, box_id, state='error' if protected else 'archived', error=str(e)[:500])
+                    log(f"resume {box_id} failed: {e}")
         finally:
             c2.close()
     threading.Thread(target=go, daemon=True).start()
 
 
-def delete_box(con, box_id: str, why: str | None = None) -> None:
+def delete_box(con, box_id: str, why: str | None = None, *, stopped_at=None) -> None:
+    """stopped_at: delete only if the box is still archived since that moment (the reaper's selection can be
+    seconds old, and a resume takes this same lifecycle lock)."""
     token = offbox_protection.CALLER.set(offbox_protection.caller(
         reason=why or offbox_protection.caller().get('reason') or 'API delete'))
     try:
         with lifecycle_lock(box_id):
             with box_memory_lock(box_id):
                 require_unprotected(con, box_id)
+                if stopped_at is not None:
+                    row = box_row(con, box_id)
+                    saved = con.execute("SELECT 1 FROM saved WHERE source=? AND status IN ('ready','pending')",
+                                        (box_id,)).fetchone()
+                    if row['state'] != 'archived' or row['stopped_at'] != stopped_at or row['pinned'] or saved:
+                        raise Fail(409, 'box_changed', f'{box_id} is no longer the stopped box that was selected')
+                already_pending = con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:' + box_id,)).fetchone()
                 con.execute('INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)', ('delete_pending:' + box_id, '1'))
                 if box_row(con, box_id)['state'] in LIVE + ('provisioning', 'resuming'):
                     set_box(con, box_id, state='stopping')
             settle_box_commands(con, box_id)
             with box_memory_lock(box_id):
                 require_unprotected(con, box_id)
-                _delete_box(con, box_id)
+                try:
+                    _delete_box(con, box_id)
+                except Fail as error:
+                    # An undispatched attempt adds no uncertainty, but cannot clear an earlier delete's fence.
+                    if error.code == 'incus_busy' and not already_pending:
+                        con.execute('DELETE FROM meta WHERE k=?', ('delete_pending:' + box_id,))
+                    raise
                 con.execute('DELETE FROM meta WHERE k=?', ('delete_pending:' + box_id,))
     finally:
         offbox_protection.CALLER.reset(token)
@@ -1343,6 +1805,7 @@ def _delete_box(con, box_id: str) -> None:
             check_instance_identity(box_id)
         delete_instance(box_id, r['owner'], require_identity=bool(r['provision_identity']))
     con.execute("DELETE FROM snaps WHERE box_id=?", (box_id,))
+    con.execute('DELETE FROM snapshot_pending WHERE box_id=?', (box_id,))
     set_box(con, box_id, state="deleted", deleted_at=now())
     log(f"box {box_id} deleted")
 
@@ -1373,6 +1836,42 @@ def saved_json(r) -> dict:
             "type": r["type"], "sizeBytes": r["size_bytes"], "createdAt": iso(r["created_at"]), "error": r["error"]}
 
 
+def queue_saved_delete(con, instance):
+    # Persist the obsolete copy before removing its last saved-state reference.
+    con.execute('INSERT OR IGNORE INTO incus_deletes VALUES (?,?)', (instance, now()))
+
+
+def drain_saved_deletes(con):
+    for row in con.execute('SELECT d.rowid AS request_id, d.instance FROM incus_deletes d WHERE NOT EXISTS '
+                           '(SELECT 1 FROM saved s WHERE s.instance=d.instance OR s.pending_instance=d.instance) '
+                           'ORDER BY d.rowid LIMIT 1').fetchall():
+        instance = row['instance']
+        if con.execute('SELECT 1 FROM saved WHERE instance=? OR pending_instance=?', (instance, instance)).fetchone():
+            continue
+        def claim():
+            changed = con.execute('INSERT OR REPLACE INTO incus_deletes SELECT instance,created_at FROM incus_deletes '
+                                  'WHERE rowid=? AND NOT EXISTS (SELECT 1 FROM saved WHERE instance=? OR pending_instance=?)',
+                                  (row['request_id'], instance, instance)).rowcount > 0
+            if changed:
+                con.execute("INSERT OR REPLACE INTO meta VALUES ('incus_replay_next','snapshots')")
+            return changed
+        try:
+            result = incus('delete', instance, '--force', timeout=300, check=False, before_dispatch=claim)
+            if result.returncode == 0 or instance_missing(result):
+                con.execute('DELETE FROM incus_deletes WHERE instance=?', (instance,))
+        except Exception as error:  # noqa: BLE001
+            log(f'saved copy deletion still pending {instance}: {error}')
+
+
+def drain_replays(con):
+    # A repeatedly failing snapshot and its cooldown must leave deletion a turn,
+    # including after restart. Deferred requests do not advance this priority.
+    row = con.execute("SELECT v FROM meta WHERE k='incus_replay_next'").fetchone()
+    drains = (drain_saved_deletes, drain_pending_snapshots) if row and row[0] == 'deletes' else (drain_pending_snapshots, drain_saved_deletes)
+    for drain in drains:
+        drain(con)
+
+
 def save_box(con, box_id: str, name: str, owner: str) -> dict:
     r = box_row(con, box_id, owner)
     inst = "sv-" + hashlib.sha1(f"{owner}:{name}:{now()}".encode()).hexdigest()[:12]
@@ -1395,17 +1894,19 @@ def save_box(con, box_id: str, name: str, owner: str) -> dict:
             scratch().detach_copy(inst)
             size = _instance_bytes(inst)
             prev = c2.execute("SELECT instance FROM saved WHERE owner=? AND name=?", key).fetchone()
+            if prev and prev['instance'] and prev['instance'] != inst:
+                queue_saved_delete(c2, prev['instance'])
             c2.execute("UPDATE saved SET instance=?, source=?, type=?, status='ready', error=NULL, size_bytes=?, "
                        "created_at=?, pending_instance=NULL WHERE owner=? AND name=?",
                        (inst, box_id, r["type"], size, now(), *key))
-            if prev and prev["instance"] and prev["instance"] != inst:
-                incus("delete", prev["instance"], "--force", timeout=300, check=False)
+            drain_saved_deletes(c2)
             log(f"saved {owner}/{name} <- {box_id} as {inst}")
         except Exception as e:  # noqa: BLE001
-            incus("delete", inst, "--force", timeout=300, check=False)
+            queue_saved_delete(c2, inst)
             st = "ready" if old and old["instance"] else "failed"
             c2.execute("UPDATE saved SET status=?, error=?, pending_instance=NULL WHERE owner=? AND name=?",
                        (st, str(e)[:500], *key))
+            drain_saved_deletes(c2)
             log(f"save {owner}/{name} failed: {e}")
         finally:
             c2.close()
@@ -1677,22 +2178,69 @@ def instance_missing(response) -> bool:
     return False
 
 
+# A protection read probes every past command of its box. The instance state is one answer for all of them,
+# so box_protection shares a single `incus query` across its loop. One query per command made a long-lived box
+# cost a second per 40 commands (bx_3uc4phe9, 22 Nov 2026: 1,049 commands, 24 s per read, under the client's pool lock).
+_BOX_STATE = contextvars.ContextVar('box_state', default=None)
+
+
+@contextmanager
+def shared_box_state():
+    token = _BOX_STATE.set({})
+    try:
+        yield
+    finally:
+        _BOX_STATE.reset(token)
+
+
+def _proc_start(pid) -> str | None:
+    try:
+        return (PROC_ROOT / str(pid) / 'stat').read_text(errors='replace').rsplit(')', 1)[1].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _ask_box_state(box_id: str) -> dict:
+    p = incus("query", f"/1.0/instances/{ct(box_id)}/state", check=False, timeout=5)
+    if p.returncode:
+        if instance_missing(p):
+            return {'answer': {"readable": True, "pids": [], "box_rc": None, "stopped": True}}
+        return {'answer': {"reason": "incus_unavailable"}}
+    state = json.loads(p.stdout)
+    if not isinstance(state, dict):
+        return {'answer': {'reason': 'box_unreadable'}}
+    if state.get("status") == "Stopped":
+        return {'answer': {"readable": True, "pids": [], "box_rc": None, "stopped": True}}
+    init = int(state.get("pid") or 0)
+    if init <= 0 or state.get("status") != "Running":
+        return {'answer': {"reason": "box_unreadable"}}
+    return {'init': init, 'start': _proc_start(init)}
+
+
+def box_state(box_id: str) -> dict:
+    """{'answer': view} when the box itself settles the probe, else {'init': host PID of its init}."""
+    shared = _BOX_STATE.get()
+    known = shared.get(box_id) if shared is not None else None
+    # A stopped or missing box had no process at that reading. Every row of the read was fetched before it and
+    # only settled rows are retired, so a start after the reading cannot bring one of their processes back.
+    # A running box's init is reused only while that PID is provably the same process: a restart is asked again.
+    if known is not None and ('answer' in known or
+                              (known['start'] is not None and _proc_start(known['init']) == known['start'])):
+        return known
+    state = _ask_box_state(box_id)
+    # An unreadable box or an Incus failure proves nothing and may be transient: ask again for the next command.
+    if shared is not None and (state.get('answer', {}).get('stopped') or 'init' in state):
+        shared[box_id] = state
+    return state
+
+
 def command_probe(c) -> dict:
     """Inspect receipts without creating another exec session in the customer's box."""
     try:
-        p = incus("query", f"/1.0/instances/{ct(c['box_id'])}/state", check=False, timeout=5)
-        if p.returncode:
-            if instance_missing(p):
-                return {"readable": True, "pids": [], "box_rc": None, "stopped": True}
-            return {"reason": "incus_unavailable"}
-        state = json.loads(p.stdout)
-        if not isinstance(state, dict):
-            return {'reason': 'box_unreadable'}
-        if state.get("status") == "Stopped":
-            return {"readable": True, "pids": [], "box_rc": None, "stopped": True}
-        init = int(state.get("pid") or 0)
-        if init <= 0 or state.get("status") != "Running":
-            return {"reason": "box_unreadable"}
+        state = box_state(c['box_id'])
+        if 'answer' in state:
+            return {k: list(v) if isinstance(v, list) else v for k, v in state['answer'].items()}
+        init = state['init']
         root = PROC_ROOT / str(init) / 'root'
         base = root / "run/boatd" / f"{c['pid']}.{c['attempt'] or 1}"
         marker = None
@@ -2223,21 +2771,45 @@ def async_filter(con) -> str:
     return "sync=0 AND " if "sync" in _cols(con, "commands") else ""
 
 
-def predicted_peak(con, kind: str) -> int:
+def peak_history(con, kind: str) -> list:
     rows = [json.loads(r[0]).get("box_mem_peak") or 0 for r in con.execute(
         f"SELECT metrics FROM commands WHERE {async_filter(con)}kind=? AND metrics IS NOT NULL ORDER BY ended_at DESC LIMIT 50", (kind,))]
-    rows = sorted(x for x in rows if x)
+    return sorted(x for x in rows if x)
+
+
+def peak_at(rows: list, pct: float) -> int:
     if len(rows) < 3:
         return int(CFG["default_peak_gb"] * 2**30)
-    p95 = rows[min(len(rows) - 1, int(0.95 * len(rows)))]
-    return int(p95 * 1.25)
+    return int(rows[min(len(rows) - 1, int(pct / 100 * len(rows)))] * 1.25)
+
+
+def predicted_peak(con, kind: str) -> int:
+    """A kind's worst case. A run starts only when this much is free right now."""
+    return peak_at(peak_history(con, kind), 95)
+
+
+def usual_peak(con, kind: str) -> int:
+    """What a kind usually reaches, held for it while it runs.
+
+    Peaks of one kind spread widely (p95 is about three times the median, even for one command in one repo), so
+    holding the worst case for every run kept most of the host idle: over five days no replay of real runs under
+    that rule came within 7 GiB of the reserve. The reserve absorbs the runs that go past their usual peak."""
+    # Read per look, like the CPU limit: setting 95 after a close call must reach runs that are already queued.
+    try:
+        pct = float(json.loads((ETC / "config.json").read_text()).get("usual_peak_pct", DEFAULTS["usual_peak_pct"]))
+    except FileNotFoundError:
+        pct = DEFAULTS["usual_peak_pct"]
+    except (OSError, TypeError, ValueError, OverflowError, AttributeError):
+        pct = 95
+    rows = peak_history(con, kind)
+    return min(peak_at(rows, pct if 50 <= pct <= 95 else 95), peak_at(rows, 95))
 
 
 def admitted_bytes(con) -> int:
-    """Future anon growth for every running box; existing shmem remains charged to the host."""
+    """Expected anon growth for every running box; existing shmem remains charged to the host."""
     needs = {}
     for r in con.execute(f"SELECT box_id,kind FROM commands WHERE {async_filter(con)}status='running'"):
-        needs[r['box_id']] = max(needs.get(r['box_id'], 0), predicted_peak(con, r['kind']))
+        needs[r['box_id']] = max(needs.get(r['box_id'], 0), usual_peak(con, r['kind']))
     total = 0
     for box, need in needs.items():
         anon = boatd_memory.anon_bytes(cg_path(box))
@@ -2330,7 +2902,7 @@ def queue_head(con, box_id, pid):
 
 def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
     """Wait for this run's FIFO turn and host capacity. Returns seconds queued."""
-    need = predicted_peak(con, kind)
+    need, worst = usual_peak(con, kind), predicted_peak(con, kind)
     reserve = int(CFG["mem_reserve_gb"] * 2**30)
     t0 = now()
     last_reason, last_said = None, None
@@ -2355,8 +2927,15 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                 memory = dict(mem_available=None, shmem=None, committed_bytes=None, committed_as=None,
                               admitted_bytes=None, reserve=reserve, free_bytes=0)
             free = memory['free_bytes']
+            # Free above the reserve before the running boxes' expected growth: the head's own worst case must
+            # fit here, so one run that goes past its usual peak cannot take the reserve by itself.
+            open_now = free + (memory.get('admitted_bytes') or 0)
             mine = head is None or (head['box_id'], head['pid']) == (box_id, pid)
-            head_need = need if mine else predicted_peak(con, head['kind'])
+            head_kind = kind if mine else head['kind']
+            head_need, head_worst = usual_peak(con, head_kind), predicted_peak(con, head_kind)
+            if mine:
+                need, worst = head_need, head_worst
+            fits = free >= need and open_now >= worst
             cap = int(CFG.get("max_running") or 0)
             running = con.execute(f"SELECT COUNT(*) FROM commands WHERE {async_filter(con)}status='running'").fetchone()[0]
             room = not cap or running < cap
@@ -2368,8 +2947,8 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             cpu_room = cpu_limit == 0 or (cpu_limit is not None and cpu_known and cpu < cpu_limit and
                                         (last_start is None or now() - last_start >= 10))
             alone = running == 0
-            decision = mine and room and free >= need and (cpu_room or alone)
-            decision_state = (decision, mine, room, free >= need, cpu_room)
+            decision = mine and room and fits and (cpu_room or alone)
+            decision_state = (decision, mine, room, fits, cpu_room)
             if decision or decision_state != last_decision:
                 toollog.emit('boatd', 'admit.decision', ids={'box': box_id, 'run': current['run_id']},
                              props={**memory, 'need_bytes': need, 'decision': 'admit' if decision else 'queue',
@@ -2392,11 +2971,15 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                                 "ORDER BY created_at,box_id,pid").fetchall()
             position = next(i for i, row in enumerate(queue, 1) if (row['box_id'], row['pid']) == (box_id, pid))
             head_id = f"{head['box_id']}/{head['pid']}" if head else f"{box_id}/{pid}"
+            short = (head_need, free)   # the pair that is logged: the one that keeps the head waiting, if memory does
             if not room:
                 reason, why = 'cap', f"max_running cap {running}/{cap}"
             elif free < head_need:
                 reason = 'memory'
                 why = f"head {head_id} needs {head_need / 2**30:.2f} GiB, {max(0, free) / 2**30:.2f} GiB free above reserve and running headroom"
+            elif open_now < head_worst:
+                reason, short = 'memory', (head_worst, open_now)
+                why = f"head {head_id} can peak at {head_worst / 2**30:.2f} GiB, {max(0, open_now) / 2**30:.2f} GiB free above reserve"
             elif cpu_limit is None:
                 reason, why = 'cpu_config', "a valid CPU admission setting"
             elif not cpu_known and cpu_limit > 0:
@@ -2409,7 +2992,7 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                 reason, why = 'fifo', "the head's runner to admit"
             if not mine:
                 why = f"behind {head_id} queued {max(0, now() - head['created_at']):.0f} s; " + why
-            state = (reason, position, len(queue), head_id, head_need, cap, running if reason == 'cap' else None)
+            state = (reason, position, len(queue), head_id, short[0], cap, running if reason == 'cap' else None)
             waited = now() - t0
             if state != last_reason or last_said is None or now() - last_said >= 60:
                 write_stderr(box_id, pid, f"offbox-server: waiting; position {position} of {len(queue)}; {why}; waited {waited:.0f} s\n".encode(), errf)
@@ -2417,7 +3000,7 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                 toollog.emit('boatd', 'run.queue', ids={'box': box_id, 'run': current['run_id']},
                              props={'backend': 'home', 'queued': True, 'waitMs': waited * 1000,
                                     'reason': reason, 'position': position, 'total': len(queue),
-                                    'head': head_id, 'headNeedBytes': head_need, 'freeBytes': free,
+                                    'head': head_id, 'headNeedBytes': short[0], 'freeBytes': short[1],
                                     'running': running, 'cap': cap})
                 last_reason, last_said = state, now()
         time.sleep(2)
@@ -2617,6 +3200,8 @@ def _run_cmd(box_id: str, pid: int) -> int:
     code, sig = None, None
     t0 = now()
     host_boxes = {"start": running_box_count(con), "end": None}
+    if host_boxes['start'] is None:
+        host_boxes['start_reason'] = 'state_unavailable'
     write_json(d / f'{pid}.context.json', {'host_boxes': host_boxes})
     dispatched = False
     try:
@@ -3068,9 +3653,12 @@ def _settle_cmd(con, c) -> str:
         res['ended_at'] = res.get('ended_at') or t
         action = record_command_result(con, c, res, m, 'finalized')
         b = con.execute("SELECT state FROM boxes WHERE id=? AND deleted_at IS NULL", (box_id,)).fetchone()
-        if action == 'finalized' and b and b["state"] in LIVE:
-            snapshot(con, box_id, "auto")
-            prune_snaps(con, box_id)
+        if action == 'finalized' and b:
+            if b['state'] == 'resuming':
+                queue_snapshot(con, box_id, 'auto')
+            elif b['state'] in LIVE:
+                snapshot(con, box_id, "auto")
+                prune_snaps(con, box_id)
         return action
     # A missing host unit says nothing about the guest. Even a queued row may have reached exec.
     guest = guest_command(c)
@@ -3114,21 +3702,35 @@ def drop_cmd(con, box_id: str, pid: int, why: str) -> None:
 def start_container(box_id: str) -> str | None:
     """Bring a box the database calls live back up (after a host restart). Returns the error text, or None."""
     c2 = db()
+    failure = {}
+    identity_pending = False
     try:
         r = box_row(c2, box_id)
+        identity_pending = bool(r['identity_pending'])
+        set_box(c2, box_id, state='resuming')
+        failure = json.loads(r['start_error'] or '{}')
         if not ct_running(box_id):
             apply_size(box_id, r["type"])
-            _ensure_proxy(box_id, r["ssh_port"])
-            _ensure_mgmt_proxy(c2, box_id)
+            _prepare_proxies(c2, box_id)
             scratch().start(box_id)
+        if identity_pending or failure.get('provision'):
+            _wait_boot(box_id, ssh=False)
+            _fresh_identity(box_id)
+            set_box(c2, box_id, identity_pending=0)
         _wait_boot(box_id)
         scratch().verify(box_id)
-        set_box(c2, box_id, state="ready", last_active=now(), error=None)
+        set_box(c2, box_id, state="ready", last_active=now(), error=None, start_error=None)
         return None
     except Exception as e:  # noqa: BLE001
-        protected = offbox_protection.blocked(box_protection(c2, box_id, probe=False))
-        set_box(c2, box_id, state='error' if protected else 'archived', stopped_at=now(),
-                error=f"did not start after a server restart: {e}"[:500])
+        if isinstance(e, Fail) and e.code == 'incus_slow':
+            failed_start(c2, box_id, e)
+        elif failure or identity_pending:
+            failure_error = e if isinstance(e, Fail) else Fail(500, 'incus_failed', str(e))
+            failed_start(c2, box_id, failure_error, provision=identity_pending, record=False)
+        else:
+            protected = offbox_protection.blocked(box_protection(c2, box_id, probe=False))
+            set_box(c2, box_id, state='error' if protected else 'archived', stopped_at=now(),
+                    error=f"did not start after a server restart: {e}"[:500])
         return str(e)
     finally:
         c2.close()
@@ -3167,6 +3769,8 @@ def reconcile(con) -> dict:
     line after a boatd restart or a host crash. Safe to run twice."""
     out = {"following": 0, "finalized": 0, "killed": 0, "requeue": 0, "retry": 0, "interrupted": 0,
            "reattached": 0, "exited-while-down": 0, "gone": 0, "boxes_started": 0, "boxes_failed": 0, "cleaned": []}
+    # Fence all restores before any startup cleanup can dispatch a deletion.
+    con.execute("UPDATE boxes SET state='resuming' WHERE deleted_at IS NULL AND state IN ('ready','running')")
     boxes = {r["id"]: r for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall()}
     # 1. A box whose creation was cut short: nothing useful is in it. Remove the half-made container; the row
     # stays as an error so the client that asked for it gets a clear answer.
@@ -3184,7 +3788,7 @@ def reconcile(con) -> dict:
     # 2. Saved states whose copy was cut short: remove exactly that copy, keep the previous one.
     for sv in con.execute("SELECT * FROM saved WHERE status='pending'").fetchall():
         if sv["pending_instance"]:
-            incus("delete", sv["pending_instance"], "--force", timeout=300, check=False)
+            queue_saved_delete(con, sv['pending_instance'])
         con.execute("UPDATE saved SET status=?, error=?, pending_instance=NULL WHERE owner=? AND name=?",
                     ("ready" if sv["instance"] else "failed", "interrupted by a server restart; save again",
                      sv["owner"], sv["name"]))
@@ -3256,7 +3860,10 @@ def reconcile(con) -> dict:
     for bid, r in boxes.items():
         if r["state"] == "stopping":
             try:
-                stop_box(con, bid, "finishing a stop cut short by a restart")
+                if r['start_error']:
+                    continue_failed_start(con, bid)
+                else:
+                    continue_stop(con, bid, "finishing a stop cut short by a restart")
             except Exception as e:  # noqa: BLE001
                 log(f"reconcile: stop {bid} failed: {e}")
             out["cleaned"].append(f"finished stop of {bid}")
@@ -3282,6 +3889,7 @@ def reconcile(con) -> dict:
         adopted, dropped = adopted + a, dropped + d
     if adopted or dropped:
         out["cleaned"].append(f"snapshot records: {adopted} adopted, {dropped} dropped")
+    drain_replays(con)
     return out
 
 
@@ -3333,8 +3941,12 @@ def reap_once(con) -> None:
     toollog.rollup_previous()
     toollog.rollup_today()
     t = now()
+    stopped = []
     for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall():
         bid = r["id"]
+        if r['state'] == 'stopping' and r['start_error']:
+            continue_failed_start(con, bid)
+            continue
         if r['pinned'] and r['pin_until'] is not None and r['pin_until'] <= t:
             with box_memory_lock(bid):
                 current = box_row(con, bid)
@@ -3360,14 +3972,9 @@ def reap_once(con) -> None:
                     log(f"idle stop {bid} failed: {e}")
         elif r["state"] == "archived" and not r["pinned"] and r["owner"] not in (CFG.get("person_owners") or []):
             # A person's box is never deleted for being unused: it is where her data lives.
-            used = con.execute("SELECT 1 FROM saved WHERE source=? AND status='ready'", (bid,)).fetchone()
-            if not used and t - (r["stopped_at"] or t) > CFG["prune_unused_days"] * 86400:
-                try:
-                    delete_box(con, bid, 'archived box exceeded unused retention')
-                    toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "delete"})
-                except Exception as e:  # noqa: BLE001
-                    toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
-                    log(f"prune {bid} failed: {e}")
+            used = con.execute("SELECT 1 FROM saved WHERE source=? AND status IN ('ready','pending')", (bid,)).fetchone()
+            if not used:
+                stopped.append(r)
         elif r["state"] == "error" and t - (r["updated_at"] or t) > 86400:
             try:
                 delete_box(con, bid, 'failed box exceeded one-day retention')
@@ -3375,6 +3982,7 @@ def reap_once(con) -> None:
             except Exception as e:  # noqa: BLE001
                 toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
                 log(f"prune {bid} failed: {e}")
+    reap_stopped_box(con, stopped, t)
     # Commands whose runner went away without recording an exit: same rules as at start-up.
     for c in [*con.execute("SELECT * FROM commands WHERE status IN ('queued','running') AND created_at < ? AND "
                           "COALESCE(interrupted_at, 0) < ?", (t - 30, t - 30)).fetchall(), *pending_kill_rows(con)]:
@@ -3383,6 +3991,91 @@ def reap_once(con) -> None:
     con.execute("DELETE FROM samples WHERE ts < ?", (t - CFG["keep_samples_days"] * 86400,))
     con.execute("DELETE FROM host_samples WHERE ts < ?", (t - CFG["keep_samples_days"] * 86400,))
     con.execute("DELETE FROM idem WHERE ts < ?", (t - 86400,))
+    drain_replays(con)
+
+
+BOX_DELETE_GAP_S = 60
+CLEANUP_FRESH_S = 90
+REAP_REFUSED = {}   # box id -> time its delete was refused or could give nothing back; it steps aside for an hour
+
+
+def pool_box(row) -> bool:
+    """A repository pool box is a warm copy any run of that repository rebuilds by itself. Named leases put the
+    thread title after the bar, so only the exact suffix counts."""
+    return (row['name'] or '').endswith('| repository pool')
+
+
+def reap_stopped_box(con, stopped, t):
+    """Delete at most one stopped disposable box per pass, longest-stopped first.
+
+    Past its retention a box goes regardless of space: prune_unused_days, or pool_unused_days for a repository
+    pool box. While the pool is short and no run snapshot is left to prune, a repository pool box goes after
+    pressure_idle_s (owner rule, 22 Nov 2026: waiting jobs outrank old disposable state; person boxes, pins and
+    saved bases are never in `stopped`, and templates are not pool boxes). One per pass and never into a ZFS
+    free backlog: a burst of box deletes stalls Incus writes on the block-cloned home pool."""
+    cleanup = (disk_state().get('cleanup') or {}) if CFG.get('state_dataset') else {}
+    # Space is a reason only on a fresh, measured reading: a stale "short, none left" would delete a box a minute.
+    # Aged against the clock, not the pass start: the idle stops before this can take minutes.
+    short = (bool(cleanup.get('shortfall_bytes')) and cleanup.get('snapshots_left') == 0
+             and now() - cleanup.get('at', 0) <= CLEANUP_FRESH_S)
+
+    def retention(r):
+        days = CFG.get('pool_unused_days', 7) if pool_box(r) else CFG["prune_unused_days"]
+        return min(days, CFG["prune_unused_days"]) * 86400
+
+    def floor(r):
+        return min(retention(r), CFG.get('pressure_idle_s', 12 * 3600)) if short and pool_box(r) else retention(r)
+
+    due = sorted((r for r in stopped if t - (r["stopped_at"] or t) > floor(r)
+                  and t - REAP_REFUSED.get(r['id'], 0) >= 3600), key=lambda r: r["stopped_at"])
+    if not due:
+        return None
+    state = con.execute("SELECT v FROM meta WHERE k='box_reap'").fetchone()
+    if t - (json.loads(state[0]).get('at', 0) if state else 0) < BOX_DELETE_GAP_S:
+        return None
+    if CFG.get('state_dataset'):
+        try:
+            if disk.yield_reason(disk.cleanup_pressure(CFG['zpool'])):
+                return None
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            return None
+    protected = snapshot_protected(con) if short else set()
+    attempts = 0
+    for r in due:
+        bid = r['id']
+        expired = t - r["stopped_at"] > retention(r)
+        if not expired:
+            if bid in protected:
+                continue
+            # Space is the only reason here, so a box that would give none back steps aside.
+            rc, clones = _sh(['zfs', 'list', '-Hp', '-t', 'snapshot', '-o', 'clones', '-r',
+                              f"{zpool()}/containers/{ct(bid)}"])
+            if rc or any(line.strip() not in ('', '-') for line in clones.splitlines()):
+                REAP_REFUSED[bid] = t
+                continue
+        attempts += 1
+        if attempts > 8:
+            break
+        why = 'archived box exceeded unused retention' if expired else 'pool short of space: longest-stopped disposable box'
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('box_reap',?)", (json.dumps({'at': now(), 'box': bid}),))
+        try:
+            delete_box(con, bid, why, stopped_at=r["stopped_at"])
+        except Exception as e:  # noqa: BLE001
+            if isinstance(e, Fail) and e.code == 'incus_busy':
+                toollog.emit('boatd', 'reaper.yield', ok=True, ids={'box': bid},
+                             props={'action': 'delete', 'reason': e.code})
+                return None
+            REAP_REFUSED[bid] = t
+            toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid},
+                         props={"action": "delete", "reason": why, "error": str(e)[:200]}, tag="reaper_delete")
+            log(f"prune {bid} failed: {e}")
+            continue
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('box_reap',?)", (json.dumps({'at': now(), 'box': bid}),))
+        toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid},
+                     props={"action": "delete", "reason": why, "stopped_s": int(t - r["stopped_at"])})
+        log(f"box {bid} deleted ({why})")
+        return bid
+    return None
 
 
 def reap_command(con, c, t):
@@ -3855,11 +4548,14 @@ class Handler(BaseHTTPRequestHandler):
         if op == "stop" and method == "POST":
             with box_memory_lock(bid):
                 require_unprotected(con, bid)
-                set_box(con, bid, state='stopping')
+                r = box_row(con, bid)
+                if r['start_error'] and r['state'] == 'archived':
+                    return {"ok": True, "sandbox": box_json(con, r)}
+                set_box(con, bid, state='stopping', stopped_at=None)
             context = offbox_protection.caller()
             def stop():
                 offbox_protection.CALLER.set(context)
-                _bg(stop_box, bid, 'api')
+                _bg(continue_stop, bid, 'api')
             threading.Thread(target=stop, daemon=True).start()
             return {"ok": True, "sandbox": box_json(con, box_row(con, bid))}
         if op == "sshkey" and method == "POST":
@@ -3927,8 +4623,9 @@ class Handler(BaseHTTPRequestHandler):
             if not r:
                 raise Fail(404, "snapshot_not_found", name)
             if r["instance"]:
-                incus("delete", r["instance"], "--force", timeout=300, check=False)
+                queue_saved_delete(con, r['instance'])
             con.execute("DELETE FROM saved WHERE owner=? AND name=?", (owner, name))
+            drain_saved_deletes(con)
             return {"ok": True}
         raise Fail(405, "method_not_allowed", method)
 

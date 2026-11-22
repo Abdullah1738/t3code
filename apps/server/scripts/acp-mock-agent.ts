@@ -538,7 +538,12 @@ const program = Effect.gen(function* () {
       if (antigravityProfile) {
         if (
           request.methodId !== "oauth-personal" &&
-          !(request.methodId === "gemini-api-key" && process.env.GEMINI_API_KEY)
+          !(request.methodId === "gemini-api-key" && process.env.GEMINI_API_KEY) &&
+          !(
+            request.methodId === "gateway" &&
+            process.env.AGY_ACP_ENABLE_GATEWAY_AUTH === "1" &&
+            process.env.AGY_LLM_GATEWAY_URL
+          )
         ) {
           return yield* AcpError.AcpRequestError.invalidParams(
             `Mock Antigravity rejected auth method ${request.methodId}.`,

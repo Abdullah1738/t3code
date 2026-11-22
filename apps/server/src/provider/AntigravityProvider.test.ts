@@ -296,6 +296,83 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
     ),
   );
 
+  it.effect("lists gateway models as a usable backend and reports an unreachable gateway", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const gateway = yield* Ref.make<
+          Effect.Effect<ReadonlyArray<{ id: string; name: string }>, ProviderSetupError>
+        >(
+          Effect.succeed([
+            { id: "ag/gemini-4-neon-high", name: "ag/gemini-4-neon-high" },
+            { id: "ag/gemini-4-carbon-low", name: "ag/gemini-4-carbon-low" },
+          ]),
+        );
+        const provider = yield* makeAntigravityProvider(
+          decodeSettings({ enabled: true, authMethod: "gateway" }),
+          {
+            stampIdentity: (snapshot) => Effect.succeed({ ...snapshot, instanceId, driver }),
+            probe: Effect.succeed(initializeResult),
+            supportsTextGeneration: Effect.succeed(true),
+            auth: { type: "gateway", label: "Gateway (9router)" },
+            gatewayModels: Ref.get(gateway).pipe(Effect.flatten),
+          },
+        );
+        const ready = yield* provider.snapshot.refresh;
+        expect(ready).toMatchObject({
+          installed: true,
+          status: "ready",
+          auth: { status: "authenticated", type: "gateway", label: "Gateway (9router)" },
+        });
+        expect(ready.message).toBeUndefined();
+        expect(ready.models.map((model) => [model.slug, model.isDefault ?? false])).toEqual([
+          ["ag/gemini-4-neon-high", true],
+          ["ag/gemini-4-carbon-low", false],
+        ]);
+
+        const unreachable = "The Antigravity gateway at http://127.0.0.1:20128 is unreachable.";
+        yield* Ref.set(
+          gateway,
+          Effect.fail(
+            new ProviderSetupError({ instanceId, operation: "configure", detail: unreachable }),
+          ),
+        );
+        const down = yield* provider.snapshot.refresh;
+        expect(down).toMatchObject({
+          installed: true,
+          status: "error",
+          message: unreachable,
+          supportsTextGeneration: false,
+        });
+        expect(down.models.map((model) => model.slug)).toEqual(
+          ready.models.map((model) => model.slug),
+        );
+
+        // A session's selection survives a health check whose list has the same ids.
+        yield* Ref.set(
+          gateway,
+          Effect.succeed([
+            { id: "ag/gemini-4-carbon-low", name: "ag/gemini-4-carbon-low" },
+            { id: "ag/gemini-4-neon-high", name: "ag/gemini-4-neon-high" },
+          ]),
+        );
+        const sessionModels = ready.models.map((model) => ({
+          ...model,
+          isDefault: model.slug === "ag/gemini-4-carbon-low",
+        }));
+        yield* provider.onConfigOptionsUpdated([
+          {
+            ...modelConfig,
+            currentValue: "ag/gemini-4-carbon-low",
+            options: sessionModels.map((model) => ({ value: model.slug, name: model.slug })),
+          },
+        ]);
+        const back = yield* provider.snapshot.refresh;
+        expect(back.status).toBe("ready");
+        expect(back.models.find((model) => model.isDefault)?.slug).toBe("ag/gemini-4-carbon-low");
+      }),
+    ),
+  );
+
   it.effect("treats initialize as installation proof, not account or model discovery", () =>
     Effect.scoped(
       Effect.gen(function* () {

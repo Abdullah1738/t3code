@@ -44,7 +44,9 @@ class Fakes:
         self.sh = {}               # argv prefix tuple -> (rc, out)
         self.sh_calls = []
 
-    def incus(self, *args, input=None, timeout=600, check=True):
+    def incus(self, *args, input=None, timeout=600, check=True, before_dispatch=None):
+        if before_dispatch and not before_dispatch():
+            return subprocess.CompletedProcess(args, 75, b'', b'claim deferred')
         self.calls.append(args)
         rc, out = 0, b""
         if args[:1] == ('query',) and args[1].endswith('/state'):
@@ -391,8 +393,14 @@ class ReconcileBoxes(Base):
                          ("ready", "sv-old", None))
         self.assertEqual(rows["first"]["status"], "failed")
         deleted = [c[1] for c in self.f.calls if c[:1] == ("delete",)]
+        pending = [r['instance'] for r in self.con.execute('SELECT instance FROM incus_deletes')]
+        self.assertEqual(sorted(deleted + pending), ['sv-first', 'sv-new'])
+        self.assertEqual(len(deleted), 1)
+        boatd.reap_once(self.con)
+        deleted = [c[1] for c in self.f.calls if c[:1] == ('delete',)]
         self.assertEqual(sorted(deleted), ["sv-first", "sv-new"])
         self.assertNotIn("sv-old", deleted)
+        self.assertEqual(self.con.execute('SELECT count(*) FROM incus_deletes').fetchone()[0], 0)
 
     def test_snapshot_records_follow_what_exists_adopt_and_drop_never_delete(self):
         b = self.box()
@@ -873,7 +881,7 @@ class Http(Base):
         self.assertEqual(st, 200)
         self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "degraded", "disk", "disk_full", "disk_low", "host", "loops", "mdraid", "mode", "ok", "phase", "pool", "problem", "queue", "reasons",
                                      "refresh_stage", "refresh_stage_ms", "refresh_timings_ms", "restartPending", "running", "snapshot_age_s",
-                                     "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
+                                     "startedAt", "starting", "startupPhases", "up", "uptime_s", "version", "waiting"])
         self.assertNotIn("moni", json.dumps(d))
         self.assertNotIn("bx_", json.dumps(d))
 
@@ -1148,9 +1156,14 @@ unused devices: <none>
         b = self.box()
         self.cmd(b, pid=1, status="queued")
         self.cmd(b, pid=2, status="running")
+        self.con.execute("UPDATE commands SET created_at=? WHERE pid=1", (boatd.now(),))
         h = boatd.health(fresh=True)
         self.assertEqual((h["ok"], h["mode"], h["reasons"], h["pool"]), (True, "ok", [], {"name": "offbox", "state": "ONLINE"}))
         self.assertEqual((h["queue"], h["running"], h["boot_id"], h["version"]), (1, 1, "boot-2", boatd.VERSION))
+        # A run that has only just arrived is queued but not yet waiting for capacity.
+        self.assertEqual(h["waiting"], 0)
+        self.con.execute("UPDATE commands SET created_at=? WHERE pid=1", (boatd.now() - boatd.WAITING_AFTER_S - 1,))
+        self.assertEqual(boatd.health(fresh=True)["waiting"], 1)
 
     def test_pending_restarts_expose_only_count_and_utc_timestamp(self):
         record = self.tmp / "restart-pending.json"

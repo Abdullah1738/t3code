@@ -10,10 +10,12 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from host import Sampler
+from host_rollup import timestamp as host_timestamp
 from rollup import rollup
 from listener_rollup import timestamp, windows as listener_windows
 from toollog import directory, emit
-from observer import GAP_NAMES, gap_summary, measured, observed, phase
+from observer import GAP_NAMES, gap_summary, measured, observed, phase, poll_host
 
 BASE = 'http://127.0.0.1:20128'
 
@@ -38,6 +40,8 @@ class Router:
             raise ValueError('route not allowed')
         start = time.monotonic()
         wall_start = time.time() * 1000
+        host_sampler = Sampler() if self.component == 'pool-alerts' else None
+        host_start = host_sampler() if host_sampler else None
         status = 0
         ok = False
         error_tag = None
@@ -59,10 +63,14 @@ class Router:
                 error_tag = 'request_failed'
             raise
         finally:
+            duration = (time.monotonic() - start) * 1000
+            props = dict(endpoint=route.split('?')[0], status=status, startedAtMs=wall_start, finishedAtMs=time.time() * 1000)
+            if host_sampler and duration > 120000:
+                host_end = host_sampler()
+                props.update(host=host_end, hostAtMs=props['finishedAtMs'], hostStart=host_start, hostStartAtMs=wall_start,
+                             hostEnd=host_end, hostEndAtMs=props['finishedAtMs'])
             emit(self.component, self.event_name, kind='perf', ok=ok,
-                 durationMs=(time.monotonic() - start) * 1000,
-                 props={'endpoint': route.split('?')[0], 'status': status,
-                        'startedAtMs': wall_start, 'finishedAtMs': time.time() * 1000},
+                 durationMs=duration, props=props,
                  **({'error': {'tag': error_tag}} if error_tag else {}))
 
 
@@ -161,6 +169,7 @@ def rollup_complete(path):
 
 def late_gap_days(root, days, now, state):
     # Only new bytes can contain late completions; keep the cursor across poll children.
+    history_names = (*GAP_NAMES, 'poll.complete', 'listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved')
     prior = state.get('gapSources', {})
     if not isinstance(prior, dict):
         prior = {}
@@ -189,17 +198,21 @@ def late_gap_days(root, days, now, state):
             while line := source.readline():
                 row = None
                 try:
-                    if not line.endswith(b'\n') or any(name.encode() in line for name in GAP_NAMES):
+                    if not line.endswith(b'\n') or any(name.encode() in line for name in history_names):
                         row = json.loads(line)
                 except (ValueError, UnicodeError):
                     if not line.endswith(b'\n'):
                         break
-                if isinstance(row, dict) and row.get('tool') == '9router' and isinstance(row.get('name'), str) and row['name'] in GAP_NAMES:
+                if isinstance(row, dict) and row.get('tool') == '9router' and isinstance(row.get('name'), str) and row['name'] in history_names:
                     recorded = timestamp(row.get('ts'))
                     if recorded is not None and recorded > now.timestamp() * 1000:
                         break
+                    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+                    samples = [sample for key in ('hostAtMs', 'hostStartAtMs', 'hostEndAtMs')
+                               if (sample := host_timestamp(props.get(key))) is not None and sample <= now]
                     for day in days:
-                        if any(gap_summary([row], day, now).values()):
+                        if (any(sample.date().isoformat() == day for sample in samples)
+                                or any(gap_summary([row], day, now).values())):
                             changed.add(day)
                             touched.add(day)
                 offset = source.tell()
@@ -287,11 +300,11 @@ def poll(get=None, root=None, now=None):
             emit('poller', 'spend.unavailable', props={'tag': 'no_hourly_cost_endpoint'})
             state['spendHour'] = hour
             save_state(state_path, state)
-        emit('poller', 'poll.complete', kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000)
+        emit('poller', 'poll.complete', props=poll_host(), kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000)
         return 0
     except Exception as error:
         tag = 'http_' + str(error.code) if isinstance(error, urllib.error.HTTPError) else 'poll_failed'
-        emit('poller', 'poll.complete', kind='error', ok=False, durationMs=(time.monotonic() - start) * 1000, error={'tag': tag})
+        emit('poller', 'poll.complete', props=poll_host(), kind='error', ok=False, durationMs=(time.monotonic() - start) * 1000, error={'tag': tag})
         return 1
 
 if __name__ == '__main__':

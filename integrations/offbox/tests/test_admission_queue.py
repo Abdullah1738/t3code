@@ -143,12 +143,83 @@ class AdmissionQueue(Base):
         self.assertEqual(len(lines), 2)
         self.assertIn('position 2 of 2', lines[0])
         self.assertIn(f'behind {b}/{h}', lines[0])
-        self.assertIn('needs 20.00 GiB, 10.00 GiB free', lines[0])
+        self.assertIn('can peak at 20.00 GiB, 10.00 GiB free above reserve', lines[0])
         self.assertIn('position 1 of 1', lines[1])
-        self.assertIn('needs 15.00 GiB, 10.00 GiB free', lines[1])
+        self.assertIn('can peak at 15.00 GiB, 10.00 GiB free above reserve', lines[1])
         self.assertNotIn('cap', err.getvalue().decode())
         self.assertEqual([(r['props']['reason'], r['props']['position']) for r in self.events('run.queue')],
                          [('memory', 2), ('memory', 1)])
+
+    def peaks(self, box, kind, gib):
+        for i, peak in enumerate(gib):
+            pid = self.cmd(box, pid=5000 + i, status='exited', age=1000 - i)
+            self.con.execute('UPDATE commands SET kind=?, metrics=? WHERE box_id=? AND pid=?',
+                             (kind, json.dumps({'box_mem_peak': int(peak * 2**30)}), box, pid))
+
+    def try_admit(self, box, pid, kind, available):
+        """One look by a queued run with this much host memory available: its status afterwards and what it said."""
+        err = io.BytesIO()
+        with patch.object(boatd, 'mem_available', return_value=int(available * 2**30)), \
+                patch.object(boatd, '_sh', return_value=(0, 'active')), \
+                patch.object(boatd.boatd_memory, 'anon_bytes', return_value=2**30), \
+                patch.object(boatd.time, 'sleep', side_effect=RuntimeError('queued')), \
+                contextlib.suppress(RuntimeError):
+            boatd.admit(self.con, box, pid, kind, err)
+        return self.status(box, pid)['status'], err.getvalue().decode()
+
+    def test_a_running_box_holds_its_usual_peak_and_a_newcomer_must_fit_at_its_worst(self):
+        gib = 2**30
+        box = self.box()
+        # 16 runs near 2 GiB and 4 near 12: usually 2.5 GiB with the margin, 15 GiB in the worst case.
+        self.peaks(box, 'build', [2.0] * 16 + [12.0] * 4)
+        self.assertEqual(boatd.usual_peak(self.con, 'build'), int(2.5 * gib))
+        self.assertEqual(boatd.predicted_peak(self.con, 'build'), 15 * gib)
+        self.assertEqual(boatd.usual_peak(self.con, 'never seen'), int(boatd.CFG['default_peak_gb'] * gib))
+        other = self.box('bx_other')
+        self.cmd(other, pid=2001, status='running')
+        self.con.execute("UPDATE commands SET kind='build', started_at=1 WHERE pid=2001")
+        # The running box is at 1 GiB: 1.5 GiB of growth is held for it, not the 14 GiB its worst case would take.
+        with patch.object(boatd.boatd_memory, 'anon_bytes', return_value=gib):
+            self.assertEqual(boatd.admitted_bytes(self.con), int(1.5 * gib))
+        waiter = self.cmd(box, pid=1001, status='queued', age=10)
+        self.con.execute("UPDATE commands SET kind='build' WHERE pid=1001")
+        reserve = boatd.CFG['mem_reserve_gb']
+        # Its worst case does not fit in what is free now: it waits and says which number is short.
+        status, said = self.try_admit(box, waiter, 'build', reserve + 14)
+        self.assertEqual(status, 'queued')
+        self.assertIn('can peak at 15.00 GiB, 14.00 GiB free above reserve', said)
+        # Its usual need must also fit beside what the running boxes are expected to grow by.
+        with patch.object(boatd, 'predicted_peak', return_value=int(2.5 * gib)):
+            status, said = self.try_admit(box, waiter, 'build', reserve + 3.5)
+        self.assertEqual(status, 'queued')
+        self.assertIn('needs 2.50 GiB, 2.00 GiB free above reserve and running headroom', said)
+        # Holding the worst case for the running box as well would have needed 14 + 15 GiB here.
+        self.assertEqual(self.try_admit(box, waiter, 'build', reserve + 15)[0], 'running')
+
+    def test_usual_peak_setting_of_95_holds_the_worst_case_for_every_run(self):
+        gib = 2**30
+        box = self.box()
+        self.peaks(box, 'build', [2.0] * 16 + [12.0] * 4)
+        config = boatd.ETC / 'config.json'
+        self.assertEqual(boatd.usual_peak(self.con, 'build'), int(2.5 * gib))
+        for text in ('{"usual_peak_pct": 95}', '{"usual_peak_pct": "nonsense"}', '{"usual_peak_pct": 10}',
+                     '{"usual_peak_pct": 400}', '{"usual_peak_pct": null}', '{"usual_peak_pct": true}',
+                     '{"usual_peak_pct": NaN}', '{"usual_peak_pct": 1' + '0' * 400 + '}', 'not json', '[]'):
+            with self.subTest(text=text[:40]):
+                config.write_text(text)
+                self.assertEqual(boatd.usual_peak(self.con, 'build'), 15 * gib)
+        config.write_text('{"usual_peak_pct": 60}')
+        self.assertEqual(boatd.usual_peak(self.con, 'build'), int(2.5 * gib))
+        other = self.box('bx_other')
+        self.cmd(other, pid=2001, status='running')
+        self.con.execute("UPDATE commands SET kind='build', started_at=1 WHERE pid=2001")
+        waiter = self.cmd(box, pid=1001, status='queued', age=10)
+        self.con.execute("UPDATE commands SET kind='build' WHERE pid=1001")
+        # A run that is already waiting follows the setting on its next look: 14 GiB held for the running box.
+        config.write_text('{"usual_peak_pct": 95}')
+        reserve = boatd.CFG['mem_reserve_gb']
+        self.assertEqual(self.try_admit(box, waiter, 'build', reserve + 28)[0], 'queued')
+        self.assertEqual(self.try_admit(box, waiter, 'build', reserve + 29)[0], 'running')
 
     def test_fifo_to_memory_reason_and_sixty_second_refresh(self):
         b, h, p = self.setup_queue()
@@ -193,9 +264,19 @@ class AdmissionQueue(Base):
         self.assertIn(b'position 2 of 2', err.getvalue())
         self.assertNotIn(b'cap', err.getvalue())
 
+    def test_each_look_reads_the_queue_from_an_index_not_from_every_command(self):
+        for sql in ("SELECT * FROM commands WHERE sync=0 AND status='queued' ORDER BY created_at, box_id, pid LIMIT 1",
+                    "SELECT box_id,pid FROM commands WHERE sync=0 AND status='queued' ORDER BY created_at,box_id,pid",
+                    "SELECT box_id,kind FROM commands WHERE sync=0 AND status='running'",
+                    "SELECT COUNT(*) FROM commands WHERE sync=0 AND status='running'"):
+            plan = ' '.join(r[3] for r in self.con.execute('EXPLAIN QUERY PLAN ' + sql))
+            self.assertIn('INDEX commands_waiting (sync=? AND status=?)', plan, sql)
+            self.assertNotIn('TEMP B-TREE', plan, sql)
+
     def test_admission_reads_a_legacy_schema_without_sync_or_killed(self):
         b, h, p = self.setup_queue()
         self.con.execute('DROP INDEX commands_cpu_start')
+        self.con.execute('DROP INDEX commands_waiting')
         self.con.execute('ALTER TABLE commands DROP COLUMN sync')
         self.con.execute('ALTER TABLE commands DROP COLUMN killed')
         with patch.object(boatd, '_sh', return_value=(3, 'inactive')), \
@@ -221,7 +302,7 @@ class AdmissionQueue(Base):
                 boatd.admit(self.con, b, h, 'huge', err)
         self.assertEqual(self.status(b, h)['status'], 'queued')
         self.assertEqual(self.status(b, p)['status'], 'queued')
-        self.assertIn(b'needs 200.00 GiB, 8.00 GiB free', err.getvalue())
+        self.assertIn(b'can peak at 200.00 GiB, 8.00 GiB free above reserve', err.getvalue())
 
     def test_empty_host_bypasses_cpu_checks_but_busy_host_keeps_them(self):
         b = self.box()
@@ -275,6 +356,7 @@ class AdmissionQueue(Base):
                 boatd.write_json(boatd.result_path(b, h), receipt)
                 if outcome == 'legacy':
                     self.con.execute('DROP INDEX commands_cpu_start')
+                    self.con.execute('DROP INDEX commands_waiting')
                     self.con.execute('ALTER TABLE commands DROP COLUMN sync')
                     self.con.execute('ALTER TABLE commands DROP COLUMN killed')
                 cleanup = dict(cleanup='unknown' if outcome == 'unknown_cleanup' else 'clean', leftover_killed=0, remaining=0)
@@ -299,6 +381,7 @@ class AdmissionQueue(Base):
 
     def test_legacy_kill_file_with_current_receipt_recovers_without_killed_column(self):
         self.con.execute('DROP INDEX commands_cpu_start')
+        self.con.execute('DROP INDEX commands_waiting')
         self.con.execute('ALTER TABLE commands DROP COLUMN sync')
         self.con.execute('ALTER TABLE commands DROP COLUMN killed')
         for outcome in ('success', 'failure', 'interrupted', 'lost', 'pending_cleanup'):

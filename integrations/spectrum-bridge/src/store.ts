@@ -2,6 +2,7 @@ import { deliveredReplyCoverage, humanRow, markControlAcked, markAnswered, turnM
 import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
+import { traceLoopOperation } from "./loop-stall.ts";
 import { createHash } from "node:crypto";
 
 const steerSourceKey = (sessionId: string, generation: number, inboundId: string) =>
@@ -92,9 +93,12 @@ export class Store {
         PRAGMA synchronous = FULL;
         PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        -- LIKE uses NOCASE; the binary primary key cannot bound its prefix scans.
+        CREATE INDEX IF NOT EXISTS kv_key_nocase ON kv(key COLLATE NOCASE);
         CREATE TABLE IF NOT EXISTS inbound (
           id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS inbound_state ON inbound(state);
         CREATE TABLE IF NOT EXISTS outbox (
           id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL,
           attempts INTEGER NOT NULL DEFAULT 0, providerId TEXT UNIQUE
@@ -166,9 +170,9 @@ export class Store {
   }
 
   pendingInbound(): InboundRecord[] {
-    return this.db.query<Omit<InboundRecord, "payload"> & { payload: string }, []>(
+    return traceLoopOperation("inbound.pending", () => this.db.query<Omit<InboundRecord, "payload"> & { payload: string }, []>(
       "SELECT id, payload, state FROM inbound WHERE state IN ('pending', 'processing') ORDER BY rowid",
-    ).all().map(row => ({ ...row, payload: JSON.parse(row.payload) }));
+    ).all().map(row => ({ ...row, payload: JSON.parse(row.payload) })));
   }
 
   updateInbound(id: string, state: string, payload?: unknown, failure?: InboundFailure): void {

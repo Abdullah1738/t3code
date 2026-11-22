@@ -7,13 +7,13 @@ import { toolLog, toolError, logDirectory } from "./toollog.ts";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  clearFailureState, ensureFailureProbe, failureProbeDue, failureProbeDelay, pausedDuration, pauseRetryText, escalationText, escalationFallbackText,
+  clearFailureState, clearFailureEscalation, ensureFailureProbe, failureProbeDue, failureProbeDelay, pausedDuration, pauseRetryText,
   CheckShutdownError, CheckStuckError, checkGroups, withRelayLock, withRelayLockAsync, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   trackConfirmation, confirmWakes, inboundState, inQuiet, iso, installCheckShutdown, killRunningChecks, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
-import { CheckSlots, checkLane, checkSlotCap, checkTimeout, hostLoad, isMounted, LoadMode, LOAD_DWELL_MS, LOAD_LOW, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH, type SlotTiming } from "./host.ts";
+import { CheckSlots, checkClassification, recentCheckRuntimes, checkSlotCap, checkTimeout, hostLoad, isMounted, LoadMode, LOAD_DWELL_MS, LOAD_LOW, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH, type SlotTiming } from "./host.ts";
 
 // A 1s tick costs a few stats and JSON reads per watcher; it lets trigger files and short intervals act fast.
 const TICK_MS = 1_000;
@@ -38,10 +38,12 @@ function sampleLoad(): number {
     toolLog({ component: "runner", kind: "event", name: "host.load_mode", props: { loadMode: high, load } });
     if (high) loadAccountedAt = at;
   }
+  const duration = loadMode.report(at);
+  if (duration !== undefined) log(null, `host load mode still on: ${load.toFixed(2)}/core for ${Math.floor(duration / 60_000)} min`);
   return load;
 }
 const slots = new CheckSlots(() => checkSlotCap(loadMode.high), { emit: event => {
-  if (event.name === "slot.overrun") log(event.request.watcher, `fast lane overrun: ${(event.elapsedMs / 1000).toFixed(1)}s; next check uses slow pool`);
+  if (event.name === "slot.overrun") log(event.request.watcher, `fast lane overrun: ${(event.elapsedMs / 1000).toFixed(1)}s`);
   if (event.name === "slot.wait" || event.name === "slot.backlog") {
     const holders = event.holders.map(holder => `${holder.watcher}:${(holder.elapsedMs / 1000).toFixed(1)}s`).join(",");
     if (event.name === "slot.wait") log(event.request.watcher, `slot wait passed 30s: slot_wait ${(event.waitMs / 1000).toFixed(1)}s, holders [${holders}]`);
@@ -52,7 +54,7 @@ const slots = new CheckSlots(() => checkSlotCap(loadMode.high), { emit: event =>
   toolLog({ component: "runner", kind: "perf", name, ...("durationMs" in data ? { durationMs: data.durationMs } : {}),
     ids: request ? { watcher: request.watcher, ...(request.run ? { run: request.run } : {}) } : undefined,
     props: { ...data, ...(request ? { operation: request.operation ?? "check", lane: request.lane ?? "slow" } : {}) } });
-} }, 2);
+} }, 2, () => loadMode.high);
 function slotStart(watcher: Watcher, timing: SlotTiming, operation: "check" | "pending", run: string): void {
   toolLog({ component: "runner", kind: "perf", name: "slot.start", ids: { watcher: watcher.id, run },
     props: { ...timing, operation, intervalMs: watcher.interval_s * 1_000 } });
@@ -109,7 +111,7 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   const delivery = await deliver(accepted, pending.event, pending.key, state);
   for (const run of pending.healthRuns ?? [pending.healthRun]) await recordHealthDelivery(watcher.id, run, delivery);
   if (watcherInstance(watcher.id) !== instance) return false;
-  log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via}${delivery.meantFor ? ` meant_for=${delivery.meantFor.split(":").at(-1)!.slice(0, 8)}` : ""} confirmed=${delivery.confirmed ?? "n/a"} ${delivery.detail}`);
+  log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via}${delivery.meantFor ? ` meant_for=${delivery.meantFor.split(":").at(-1)!.slice(0, 8)}` : ""} confirmed=${delivery.confirmed ?? "n/a"}${delivery.sendDeferred ? " send=deferred" : ""} ${delivery.detail}`);
   const definition = loadWatcher(watcher.id);
   if (!definition) return false;
   const current = loadState(watcher.id);
@@ -195,12 +197,10 @@ export async function pauseNotice(watcher: Watcher, state: State): Promise<void>
     const fresh = loadState(watcher.id);
     if (!definition || watcherInstance(watcher.id) !== instance || !fresh.failure_paused_at
       || fresh.failure_paused_at !== pausedAt) return;
-    const changed = !fresh.failure_pause_notice || !fresh.failure_pause_escalation || !fresh.failure_pause_escalation_fallback;
+    const changed = !fresh.failure_pause_notice;
     const mins = Math.round((Date.parse(pausedAt!) - Date.parse(fresh.failing_since!)) / 60_000);
     // A retry reuses the bridge key and its exact payload even after a manual pause or failed probe.
     fresh.failure_pause_notice ??= `Watcher "${definition.title}" paused after ${fresh.consecutive_failures} failures in a row (${mins} min). Last error: ${(fresh.last_error ?? "").slice(0, 300)}. ${pauseRetryText(definition, fresh)} Log: ${join(watcherDir(watcher.id), "log")}`;
-    fresh.failure_pause_escalation ??= escalationText(definition, fresh, mins);
-    fresh.failure_pause_escalation_fallback ??= escalationFallbackText(definition, fresh, mins);
     if (queueOwnerFailure(definition, fresh, "pause") || changed) saveState(watcher.id, fresh);
     return { watcher: definition, state: fresh };
   });
@@ -224,9 +224,7 @@ export async function pauseNotice(watcher: Watcher, state: State): Promise<void>
     state = fresh;
   }
   if (shouldEscalate(watcher, state)) {
-    const sent = await escalate(watcher, state, `robob-watch:${watcher.id}:escalate:${hash(state.failure_episode ?? state.failing_since ?? "").slice(0, 32)}`, !ownerFailureAlerts(watcher, state));
-    log(watcher.id, `failure escalation ok=${sent.ok} via=${sent.via}${sent.ok ? "" : ` ${sent.detail}`}`);
-    await update(fresh => { fresh.failure_escalated = sent.ok; });
+    await escalate(watcher, state, `robob-watch:${watcher.id}:escalate:${hash(state.failure_episode ?? state.failing_since ?? "").slice(0, 32)}`, !ownerFailureAlerts(watcher, state));
   }
 }
 
@@ -234,6 +232,8 @@ async function failWatcher(watcher: Watcher, fresh: State, instance: string | un
   timedOut: boolean, message: string, sources: string[] = [], detail = "", busy?: DependencyBusy): Promise<void> {
   const id = watcher.id;
   const sameInstance = () => watcherInstance(id) === instance;
+  const previousEpisode = fresh.failure_episode;
+  const firstFailure = fresh.consecutive_failures === 0;
   if (busy) {
     if (fresh.dependency_busy?.dependency !== busy.dependency) {
       fresh.dependency_busy = { dependency: busy.dependency, since: iso() };
@@ -253,6 +253,10 @@ async function failWatcher(watcher: Watcher, fresh: State, instance: string | un
   else delete fresh.last_error_sources;
   fresh.next_at = now() + backoff(fresh, watcher.interval_s, timedOut || !!busy);
   const failureKey = fresh.failure_episode ?? fresh.failing_since ?? "";
+  if (firstFailure || fresh.failure_episode !== previousEpisode) {
+    clearFailureEscalation(fresh);
+    fresh.failure_escalation_key = `robob-watch:${id}:escalate:${hash(failureKey).slice(0, 32)}:wake`;
+  }
   log(id, busy ? `check busy (${fresh.consecutive_failures}) ${busy.dependency}: ${busy.detail}`
     : `check failed (${fresh.consecutive_failures}) ${fresh.last_error}${detail}`);
   if (shouldPause(watcher, fresh, timedOut)) {
@@ -289,16 +293,13 @@ async function failWatcher(watcher: Watcher, fresh: State, instance: string | un
     toolLog({ component: "runner", kind: "event", name: "watch.failure_notice_held", ids: { watcher: id }, props: { count, threshold, timedOut } });
   }
   if (shouldEscalate(watcher, fresh)) {
-    const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(failureKey).slice(0, 32)}`, !ownerFailureAlerts(watcher, fresh));
+    await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(failureKey).slice(0, 32)}`, !ownerFailureAlerts(watcher, fresh));
     const current = loadState(id);
     if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
       log(id, "failure notice completed after resume/remove; state kept");
       return;
     }
     fresh = current;
-    fresh.failure_escalated = sent.ok;
-    saveState(id, fresh);
-    log(id, `failure escalation ok=${sent.ok} via=${sent.via}${sent.ok ? "" : ` ${sent.detail}`}`);
   }
   // Keep the retry cadence at most 5 min apart for wake watchers so escalation and recovery are not delayed
   // by a 30 min backoff.
@@ -494,6 +495,7 @@ async function failedProbe(id: string, state: State, instance: string | undefine
     const current = loadWatcher(id), fresh = loadState(id);
     if (shuttingDown || !current || current.paused || watcherInstance(id) !== instance
       || fresh.failure_paused_at !== state.failure_paused_at || fresh.failure_probe_attempts !== state.failure_probe_attempts) return;
+    fresh.recent_check_ms = recentCheckRuntimes(fresh.recent_check_ms ?? (fresh.last_run_ms === undefined ? [] : [fresh.last_run_ms]), duration);
     fresh.last_run_ms = duration;
     // Acquiring the mutex yields, so a hold may start after the check completes.
     if (held(current)) {
@@ -654,12 +656,15 @@ async function tickWatcher(id: string): Promise<void> {
   let probe: { pausedAt: string; attempt: number; previousNextAt: string } | undefined;
   const dueAt = probing ? Date.parse(state.failure_probe_next_at!) : triggered || finalCheck || !state.next_at || state.next_at < 0 ? t : state.next_at;
   const scheduledAt = Number.isFinite(dueAt) && dueAt > 0 && !triggered && !finalCheck && (probing || (state.next_at ?? 0) > 0) ? iso(dueAt) : "";
-  const lane = checkLane(state.last_run_ms);
+  const classification = checkClassification(state.last_run_ms, state.recent_check_ms);
+  let lane = classification.lane, laneReason = classification.reason;
   const trigger = finalCheck ? "final" : state.consecutive_failures || state.load_timeouts ? "retry" : triggered ? "trigger" : "schedule";
   let lateMs = 0, loadModeAtAdmission = false;
   const result = await slots.run(async timing => {
     if (shuttingDown) return;
     slotTiming = timing;
+    lane = timing.slotLane ?? lane;
+    if (lane !== classification.lane) laneReason = "fast:overdue";
     lateMs = Math.max(0, now() - dueAt);
     loadModeAtAdmission = loadMode.high;
     return withRelayLockAsync(() => {
@@ -702,11 +707,11 @@ async function tickWatcher(id: string): Promise<void> {
     return runCheck(current, watcherDir(id), { HEALTH_TOOLLOG_SCHEDULED_AT: scheduledAt, HEALTH_TOOLLOG_TRIGGER: state.consecutive_failures || state.load_timeouts ? "retry" : "schedule", WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
     });
   }, { watcher: id, run: attemptId, operation: "check", intervalMs: watcher.interval_s * 1_000,
-    dueAt, lane });
+    dueAt, lane, recentMinMs: classification.recentMinMs });
   if (!result || shuttingDown) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
   const failed = runTimedOut || result.code !== 0;
-  toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: result.busy ? "busy" : runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", ...(result.busy ? { stderrClass: "dependency_busy", dependency: result.busy.dependency } : {}), exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs: Math.max(0, now() - t - result.ms), ...slotTiming, dueAt, lateMs, lane, loadMode: loadModeAtAdmission, intervalMs: watcher.interval_s * 1_000, trigger }, ...(failed ? { error: { tag: result.busy ? "watch.dependency_busy" : runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
+  toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: result.busy ? "busy" : runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", ...(result.busy ? { stderrClass: "dependency_busy", dependency: result.busy.dependency } : {}), exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs: Math.max(0, now() - t - result.ms), ...slotTiming, dueAt, lateMs, lane, lane_reason: laneReason, recentMinMs: classification.recentMinMs, loadMode: loadModeAtAdmission, intervalMs: watcher.interval_s * 1_000, trigger }, ...(failed ? { error: { tag: result.busy ? "watch.dependency_busy" : runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
   if (!sameInstance()) return;
   const endLoad = sampleLoad();
   let fresh = loadState(id);
@@ -734,6 +739,7 @@ async function tickWatcher(id: string): Promise<void> {
     log(id, "normal check completed after removal; only the configured in-flight check may emit during grace");
     return;
   }
+  fresh.recent_check_ms = recentCheckRuntimes(fresh.recent_check_ms ?? (fresh.last_run_ms === undefined ? [] : [fresh.last_run_ms]), result.ms);
   fresh.last_run_ms = result.ms;
   const queued = now() - t - result.ms;
   if (result.ms >= SLOW_RUN_MS || queued >= 5_000) log(id, `slow run: check ${(result.ms / 1000).toFixed(1)}s, queued ${(queued / 1000).toFixed(1)}s, slot_wait ${((slotTiming?.slotWaitMs ?? 0) / 1000).toFixed(1)}s, depth ${slotTiming?.slotQueueDepth ?? 0}, active ${slotTiming?.slotActiveAtEnqueue ?? 0}`);
@@ -760,7 +766,8 @@ async function tickWatcher(id: string): Promise<void> {
       if (fresh.dependency_busy) {
         delete fresh.dependency_busy;
         fresh.failure_episode = randomUUID();
-        delete fresh.failure_escalated;
+        clearFailureEscalation(fresh);
+        fresh.failure_escalation_key = `robob-watch:${id}:escalate:${hash(fresh.failure_episode).slice(0, 32)}:wake`;
       }
       fresh.load_timeouts = (fresh.load_timeouts ?? 0) + 1;
       fresh.load_timeout_since ??= iso();

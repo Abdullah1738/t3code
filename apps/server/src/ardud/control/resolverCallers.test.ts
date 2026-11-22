@@ -138,6 +138,7 @@ const makeHarness = (
       undefined,
     );
     const startupFailure = yield* Ref.make(false);
+    const missingThread = yield* Ref.make(false);
     const requests = yield* Ref.make<ReadonlyArray<OrchestrationV2RuntimeRequest>>([]);
     const turnItems = yield* Ref.make<ReadonlyArray<OrchestrationV2TurnItem>>([]);
     const calls = yield* Ref.make<Array<{ kind: string; value: unknown }>>([]);
@@ -159,7 +160,8 @@ const makeHarness = (
                     }),
                 }),
                 Layer.mock(ThreadManagementService.ThreadManagementService)({
-                  getThreadShell: () => Effect.succeed(shell),
+                  getThreadShell: () =>
+                    Ref.get(missingThread).pipe(Effect.map((missing) => (missing ? null : shell))),
                   getThreadRecords: () =>
                     Effect.gen(function* () {
                       return {
@@ -268,6 +270,7 @@ const makeHarness = (
       shell,
       sendFailure,
       startupFailure,
+      missingThread,
       requests,
       turnItems,
       attachmentIoFailure,
@@ -285,6 +288,44 @@ const run = <A, E>(
   );
 
 describe("control resolver routes", () => {
+  it.effect(
+    "resume-launch requires the existing correlated thread and reuses the create input",
+    () =>
+      run("off", ({ request, calls, shell, missingThread }) =>
+        Effect.gen(function* () {
+          const clientRequestId = "mac-guard-partial";
+          const threadId = `ardud-control:thread:${encodeURIComponent(clientRequestId)}`;
+          const route = `/threads/${encodeURIComponent(threadId)}/resume-launch`;
+          const body = {
+            projectId: shell.projectId,
+            clientRequestId,
+            prompt: " full safety prompt\n",
+          };
+          for (const invalid of [undefined, "other", null, false, 12, []]) {
+            assert.equal(
+              (yield* request("POST", route, { ...body, clientRequestId: invalid })).status,
+              400,
+            );
+          }
+          assert.isEmpty(yield* Ref.get(calls));
+          yield* Ref.set(missingThread, true);
+          assert.equal((yield* request("POST", route, body)).status, 404);
+          assert.isEmpty(yield* Ref.get(calls));
+          yield* Ref.set(missingThread, false);
+          assert.equal((yield* request("POST", "/threads", body)).status, 201);
+          assert.equal((yield* request("POST", route, body)).status, 201);
+          const recorded = yield* Ref.get(calls);
+          assert.equal(recorded.length, 2);
+          assert.equal(recorded[0]?.kind, "launch");
+          assert.deepEqual(recorded[0], recorded[1]);
+          assert.equal(
+            (recorded[1]?.value as { initialMessage: { text: string } }).initialMessage.text,
+            "full safety prompt",
+          );
+        }),
+      ),
+  );
+
   it.effect(
     "create, send and settings infer OpenCode from a provider/model with a Claude default and no migration flag",
     () =>

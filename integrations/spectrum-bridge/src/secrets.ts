@@ -309,7 +309,7 @@ export async function forgetSecret(deps: SecretDeps, token: string): Promise<voi
 /** Expires stale requests, deletes their values, drops old records, and removes orphaned value files. */
 export async function sweepSecrets(deps: SecretDeps): Promise<void> {
   const now = deps.now?.() ?? Date.now();
-  const rows = deps.store.db.query<{ key: string }, []>("SELECT key FROM kv WHERE key LIKE 'secret-request:%'").all();
+  const rows = deps.store.db.query<{ key: string }, []>("SELECT key FROM kv WHERE key LIKE 'secret-request:%' ORDER BY key").all();
   const live = new Map<string, string>();
   for (const { key } of rows) {
     const token = key.slice("secret-request:".length);

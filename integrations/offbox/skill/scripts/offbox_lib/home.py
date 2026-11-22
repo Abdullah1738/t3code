@@ -39,6 +39,12 @@ FAILOVER_ENV = "OFFBOX_FAILOVER"      # set in the re-executed process: why this
 RETURNED_HOME_ENV = "OFFBOX_RETURNED_HOME"
 ROUTING_ENV = "OFFBOX_ROUTING_LINES"
 FAILBACK_PROBE_S = 30
+BUSY = "home is busy"                 # prefix of a failover reason: home is healthy, the run would only wait there
+OVERFLOW_QUEUE = 1                    # runs waiting for capacity on home that send new ordinary work to Boat
+OVERFLOW_POOL_WAIT_S = 120            # wait this long for a home pool box before taking the run to Boat
+OVERFLOW_RETURN_S = 600               # an overflow run stays in Boat's queue this long before it looks at home again
+BOAT_OK_FOR_S = 10                    # one answer from Boat serves the check and the move that follows it
+_BOAT_OK_AT = None
 MAX_FAILURE_LINES = 200
 RECENT_FAILURE_S = 180
 RUN_ID_ENV = "OFFBOX_PREFLIGHT_RUN"
@@ -102,6 +108,48 @@ def may_fail_over(explicit_base: str | None = None) -> bool:
     """The home server was picked automatically for ordinary work: Boat may take this run instead."""
     return (active() and common.backend_pinned() is None and common.person() is None
             and not os.environ.get(RETURNED_HOME_ENV) and not base_needs_home(explicit_base))
+
+
+def overflow_queue() -> int:
+    from . import capacity
+    return capacity.setting("OFFBOX_OVERFLOW_QUEUE", OVERFLOW_QUEUE, minimum=1, maximum=100000)
+
+
+def overflow_pool_wait_seconds() -> int:
+    from . import capacity
+    return capacity.setting("OFFBOX_OVERFLOW_POOL_WAIT_S", OVERFLOW_POOL_WAIT_S, minimum=0, maximum=86400)
+
+
+def busy_reason(data) -> str | None:
+    """Home answers and takes runs, but runs are already waiting for capacity there: a new one would join them.
+
+    Only `waiting` counts. `queue` also holds every run for the moment between its arrival and its admission."""
+    waiting = data.get("waiting") if isinstance(data, dict) else None
+    if type(waiting) is not int or waiting < overflow_queue():
+        return None
+    running = data.get("running")
+    return f"{BUSY}: {waiting} runs waiting for memory" + (f", {running} running" if type(running) is int else "")
+
+
+def left_busy_home() -> bool:
+    """This run is on Boat because home had a queue, not because home was down."""
+    return failed_over() and os.environ.get(FAILOVER_ENV, "").startswith(BUSY)
+
+
+def boat_can_take() -> bool:
+    """Boat would start a run now. A capped or silent Boat only fails the run that home would have queued and run."""
+    from . import api
+    global _BOAT_OK_AT
+    if common.read_json(common.CAP_PATH, {}).get("capped"):
+        return False
+    # The pool asks before it lets a run leave and fail_over asks again a moment later. A second request that
+    # flakes would turn a run that was only waiting into an outage.
+    if _BOAT_OK_AT is not None and time.monotonic() - _BOAT_OK_AT < BOAT_OK_FOR_S:
+        return True
+    if api.probe_backend("boat", PROBE_TIMEOUT_S) is not None:
+        return False
+    _BOAT_OK_AT = time.monotonic()
+    return True
 
 
 def health_url() -> str | None:
@@ -309,7 +357,8 @@ def _probe(timeout: float = PROBE_TIMEOUT_S, *, wait: bool = True) -> str | None
         classification = "degraded"
     elif phase:
         classification = "starting"
-    PROBE_FACTS.set({"class": classification, "tcp": reachable, "ms": round((time.monotonic()-start)*1000, 1)})
+    PROBE_FACTS.set({"class": classification, "tcp": reachable, "ms": round((time.monotonic()-start)*1000, 1),
+                     "busy": busy_reason(data) if accepting_health(data) else None})
     if wait and (phase or classification == "slow"):
         result = wait_while_starting(phase or "slow", invocation_run(),
                                     checkpoint="person" if common.person() else "probe",
@@ -494,6 +543,13 @@ def failure_class(reason):
     return "slow" if "home still slow" in reason else "starting" if "home still starting" in reason else "hard"
 
 
+def record_box_failure(error, run_id=''):
+    if not active() or getattr(error, 'api_code', None) != 'incus_slow' or getattr(error, '_home_failure_recorded', False):
+        return
+    error._home_failure_recorded = True
+    record_failure(str(error), run_id or PRE_START.get() or invocation_run(), classification='incus_slow')
+
+
 def record_failure(reason: str, run_id: str = "", *, base: str | None = None, base_kept: bool = False, classification: str | None = None) -> None:
     """One line for the health monitor: a run could not reach home before it was accepted."""
     try:
@@ -592,6 +648,10 @@ def before_run(argv: list[str], *, explicit_base: str | None = None) -> None:
         if wait_for_base:
             raise OffboxError(f"home offbox server not reachable ({why})", outage=True)
         fail_over(why, argv, invocation_run(), explicit_base=explicit_base)
+    elif may_fail_over(explicit_base):
+        busy = (PROBE_FACTS.get() or {}).get("busy")
+        if busy:
+            fail_over(busy, argv, invocation_run(), explicit_base=explicit_base)
 
 
 def person_gate() -> None:
@@ -633,11 +693,17 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
         return False
     if common.person() is not None:
         raise OffboxError("person work waits on home; nothing was sent to Boat", code=EXIT_HOME_DOWN)
-    failover_decision('boat', 'unreachable', explicit_base, run_id)
-    record_failure(reason, run_id, base=explicit_base, base_kept=explicit_base is not None)
-    if api.probe_backend("boat", PROBE_TIMEOUT_S):
-        say("Boat's API is unavailable too; keeping this run on home")
+    busy = reason.startswith(BUSY)
+    if busy and not boat_can_take():
+        say(f"{reason}, and Boat cannot take runs now; this run waits on home")
         return False
+    failover_decision('boat', 'busy' if busy else 'unreachable', explicit_base, run_id)
+    if not busy:
+        # A busy home is healthy: only a run that could not reach it is evidence for the health monitor.
+        record_failure(reason, run_id, base=explicit_base, base_kept=explicit_base is not None)
+        if api.probe_backend("boat", PROBE_TIMEOUT_S):
+            say("Boat's API is unavailable too; keeping this run on home")
+            return False
     if run_id:
         with contextlib.closing(common.db()) as con:
             con.execute("DELETE FROM prune_holds WHERE run_id=?", (run_id,))
@@ -647,7 +713,9 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
     elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
     toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
                  props={"from": "home", "to": "boat", "reason": reason, "waitMs": elapsed})
-    if 'low on disk' in reason:
+    if busy:
+        routing_line(f"{reason}; this run goes to Boat instead of waiting", run_id)
+    elif 'low on disk' in reason:
         detail = reason[reason.index('low on disk'):]
         routing_line(f"home offbox server is {detail}; this run is going to Boat", run_id)
     elif 'out of disk' in reason:
@@ -733,8 +801,8 @@ def failback_probe_seconds():
 
 class FailbackReady(BaseException):
     # Unwind every pool lock/queue scope before exec, without settling an unstarted run as a failure.
-    def __init__(self, run_id, waited, state):
-        self.run_id, self.waited, self.state = run_id, waited, state
+    def __init__(self, run_id, waited, state, why=None):
+        self.run_id, self.waited, self.state, self.why = run_id, waited, state, why
 
 
 def flush_routing(run_id):
@@ -771,7 +839,8 @@ def fail_back(ready, argv):
     run_id, waited, state = ready.run_id, ready.waited, ready.state
     reason = os.environ.get(FAILOVER_ENV, "")
     _forward_background(run_id, "boat", "server")
-    routing_line(f"home offbox server is back; this run leaves the Boat queue "
+    lead = ready.why or ("home has no runs waiting now" if reason.startswith(BUSY) else "home offbox server is back")
+    routing_line(f"{lead}; this run leaves the Boat queue "
                  f"(waited {int(waited)} s, #{state.get('place')} of {state.get('waiting')}) and goes back to home", run_id)
     toollog.emit("backend", "backend.failback", duration_ms=waited*1000, ids={"run": run_id},
                  props={"from": "boat", "to": "home", "position": state.get("place"), "reason": reason[:200]})

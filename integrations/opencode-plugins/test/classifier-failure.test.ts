@@ -5,9 +5,9 @@ import { join, resolve } from "node:path";
 import { cmdKind } from "../lib/toollog";
 import { runClassifier } from "../lib/classifier";
 import * as rootwide from "../plugin/rootwide-search-guard";
-import * as quint from "../plugin/quint-verify-guard";
 import * as shared from "../plugin/shared-deps-guard";
 import * as phone from "../plugin/phone-adb-guard";
+import * as statev2 from "../plugin/statev2-guard";
 
 const temp = mkdtempSync(join(tmpdir(), "classifier-failure-"));
 process.env.TOOLLOG_ROOT = join(temp, "logs");
@@ -29,18 +29,23 @@ const failures: [string, () => Promise<unknown>, string, string][] = [
   ["injected error", () => Promise.reject(new TypeError(secret)), "TypeError", "unclassified"],
 ];
 
-for (const [label, guard] of [["rootwide-search", rootwide], ["quint-verify", quint], ["shared-dependencies", shared], ["phone-adb", phone]] as const) {
+for (const [label, guard, classifier, failMode] of [
+  ["rootwide-search", rootwide, "rootwide_search_guard", "open"],
+  ["shared-dependencies", shared, "shared_deps_guard", "open"],
+  ["phone-adb", phone, "phone_adb_guard", "open"],
+  ["statev2", statev2, "statev2_check", "fallback"],
+] as const) {
   test(`${label}: classifier_failed rows say which classifier failed, how, and how long each phase took`, async () => {
     for (const [name, check, errorClass, errorMessage] of failures) {
-      const hook = guard.createGuardHook("/checkout", check as never);
+      const hook = label === "statev2" ? statev2.createGuardHook("/checkout", check as never, () => "enforce")
+        : guard.createGuardHook("/checkout", check as never);
       const event = { tool: "bash", sessionID: "fixture-session", input: { command } };
       await hook(event);
       expect(event.input.command).toBe(command);
       const row = rows().at(-1);
       expect(row.error.tag).toBe("hook.classifier_failed");
       expect(row.props.guard).toBe(label);
-      expect(row.props).toMatchObject({ errorClass, errorMessage, failMode: "open", cmdKind: "git", source: "test" });
-      expect(row.props.classifier).toMatch(/^[a-z_]+_guard$/);
+      expect(row.props).toMatchObject({ errorClass, errorMessage, failMode, cmdKind: "git", source: "test", classifier });
       expect(row.props.totalMs).toBeGreaterThanOrEqual(0);
       if (errorMessage !== "unclassified") {
         expect(row.props.spawnMs).toBeGreaterThanOrEqual(0);
@@ -52,6 +57,19 @@ for (const [label, guard] of [["rootwide-search", rootwide], ["quint-verify", qu
     expect(log).not.toContain("/Volumes/ExternalSSD/repo");
   }, 30000);
 }
+
+test("statev2 classifier failures log the fallback decision and keep database reads blocked", async () => {
+  for (const [, check, errorClass, errorMessage] of failures) {
+    const event = { tool: "bash", sessionID: "fallback-session", input: { command: "sqlite3 ~/.local/share/opencode/opencode.db .tables" } };
+    await statev2.createGuardHook("/checkout", check as never, () => "enforce")(event);
+    expect(event.input.command).toContain("exit 3");
+    const row = rows().at(-1);
+    expect(row.error.tag).toBe("hook.classifier_failed");
+    expect(row.ids.sessionId).toBe("fallback-session");
+    expect(row.props).toMatchObject({ guard: "statev2", classifier: "statev2_check", failMode: "fallback",
+      decision: "denied", rule: "live-database-read", cmdKind: "sqlite3", source: "test", errorClass, errorMessage });
+  }
+}, 30000);
 
 test("phone-adb decision rows carry holder, adbVerb and source", async () => {
   const hook = phone.createGuardHook("/checkout", async () => ({ matched: true, reason: "held", rule: "phone-adb-state", error: null, holder: "other", adbVerb: "shell" }));

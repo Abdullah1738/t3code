@@ -284,7 +284,7 @@ class SshBeforeStartTests(Isolated):
         for module in (lease, prepare):
             self.stack.enter_context(patch.object(module, 'time', self.clock.time))
         self.stack.enter_context(patch.object(home, 'active', return_value=True))
-        with prepare.guard('same') as budget:
+        with self.assertRaises(lease.ResumeNoProgress), prepare.guard('same') as budget:
             watch = lease._ResumeWatch(self.con, 'same')
             watch.observe({'state': 'resuming'})
             self.clock.sleep(50)
@@ -293,12 +293,12 @@ class SshBeforeStartTests(Isolated):
             with prepare.pause_for_home_start(extra_seconds=10):
                 self.clock.sleep(120)
             self.assertEqual(budget.end, end + 130)
-            self.assertEqual(watch.remaining(), 40)
-            self.clock.sleep(39)
+            self.assertEqual(watch.remaining(), 250)
+            self.clock.sleep(249)
             watch.check()
             self.clock.sleep(1)
-            with self.assertRaises(lease.ResumeNoProgress):
-                watch.check()
+            watch.check()
+        self.assertIsNone(prepare._ACTIVE.get())
 
     def test_starting_box_keeps_resume_watchdog_and_ssh_recovery_under_guard(self):
         self.clock.time.time = lambda: self.clock.t
@@ -336,7 +336,7 @@ class SshBeforeStartTests(Isolated):
                             lease._reuse(self.con, row, None)
                         self.assertEqual(raised.exception.waited_s, 125)
                     watch = bring_up.call_args.kwargs['watch']
-                    self.assertEqual(watch.remaining(), 90)
+                    self.assertEqual(watch.remaining(), 300)
                 bring_up.assert_called_once()
                 self.assertEqual(attempts, ['same', 'same'] if recover else ['same'])
                 self.assertFalse(self.con.execute("SELECT 1 FROM events WHERE kind='resume_stuck'").fetchone())
@@ -384,7 +384,7 @@ class SshBeforeStartTests(Isolated):
                             self.assertEqual(raised.exception.box, 'same')
                             self.assertEqual(raised.exception.reason, 'box_ssh_unreachable')
                             self.assertEqual(raised.exception.waited_s, 20)
-                        self.assertEqual(bring_up.call_args.kwargs['watch'].remaining(), 90)
+                        self.assertEqual(bring_up.call_args.kwargs['watch'].remaining(), 5)
                     self.assertEqual(attempts, ['same', 'same'] if recover else ['same'])
                     self.assertGreater(self.probe.call_count, 0)
                     self.assertFalse(self.con.execute("SELECT 1 FROM events WHERE kind='resume_stuck'").fetchone())

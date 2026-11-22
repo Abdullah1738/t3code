@@ -141,6 +141,8 @@ export default {
     await ctx.tool.hook("execute.before", async (e: any) => {
       const started = performance.now()
       let decision = 'allowed', rule = 'no-policy', command: unknown, errorTag: string | undefined
+      // Measured spans for a slow hook.decision row; toollog keeps them only past 2 s.
+      const phases: Record<string, number> = {}
       try {
         if (!SHELL_TOOLS.has(e.tool)) return
         const input = e.input as any
@@ -150,9 +152,11 @@ export default {
         const m = mode()
         if (m === "off") { gateLog("allowed", "unknown", 0); return }
         const t0 = performance.now()
-        ensureRules()
-        const v = classify(cmd, input.workdir ?? ctx.location?.directory ?? null)
-        const ms = +(performance.now() - t0).toFixed(3)
+        let v: any
+        // The rules are the classifier's input, so loading them counts as classifying.
+        try { ensureRules(); v = classify(cmd, input.workdir ?? ctx.location?.directory ?? null) }
+        finally { phases.classify_ms = performance.now() - t0 }
+        const ms = +phases.classify_ms.toFixed(3)
         rule = v.rule ?? "no-policy"
         if (v.error) {
           errorTag = "hook.classifier_failed"
@@ -164,7 +168,9 @@ export default {
         const ids = [e.sessionID]
         let ex = exempt(ids)
         if (!ex && m === "enforce") {
+          const p0 = performance.now()
           const p = await parentOf(ctx, e.sessionID)
+          phases.lineage_ms = performance.now() - p0
           if (p) { ids.push(p); ex = exempt(ids) }
         }
         const reason = ex ? "exempt" : !offboxAvailable() ? "no-offbox" : capped() ? "capped" : null
@@ -182,7 +188,7 @@ export default {
         gateLog("allowed", "unknown", 0, true)
         log({ event: "hook-error", session: e?.sessionID, errorTag: "hook_failed" })
       } finally {
-        if (typeof command === 'string' || errorTag) toolLogHook('offbox-gate', decision, rule, started, command, errorTag, {sessionId:e?.sessionID}, {cwd:e?.input?.workdir ?? e?.input?.cwd ?? ctx.location?.directory})
+        if (typeof command === 'string' || errorTag) toolLogHook('offbox-gate', decision, rule, started, command, errorTag, {sessionId:e?.sessionID}, {cwd:e?.input?.workdir ?? e?.input?.cwd ?? ctx.location?.directory}, {}, phases)
       }
     })
 

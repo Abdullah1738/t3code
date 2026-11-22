@@ -5,6 +5,7 @@ import fcntl
 import json
 import math
 import os
+import plistlib
 from pathlib import Path
 import signal
 import socket
@@ -14,11 +15,194 @@ import tempfile
 import time
 import uuid
 
+from host import Sampler
 from toollog import directory, emit
-from observer import Timings, clock_sample, gap, job_snapshot, launchctl_cause, launchctl_print, measured, phase
+from causes import BYTE_PHASES, RESOURCE_FIELDS, SUBSTEPS, gap_info, launchctl_info
+from observer import FIELDS, Timings, clock_sample, gap, launchctl_print, measured, phase, progress_clock
 
 LABEL = 'com.abdullah.9router-fork'
 FRESH_MS = 300000
+POLL_DEADLINE_SECONDS = 240
+
+
+def scheduling_snapshot():
+    props = dict(pid=os.getpid(), processType='unknown', nice=os.getpriority(os.PRIO_PROCESS, 0))
+    try:
+        with (Path.home() / 'Library/LaunchAgents/com.ardud.9router-log-poll.plist').open('rb') as source:
+            props['processType'] = plistlib.load(source).get('ProcessType', 'Standard')
+    except (OSError, ValueError):
+        pass
+    try:
+        value = subprocess.run(['ps', '-p', str(os.getpid()), '-o', 'pri='], capture_output=True,
+                               text=True, timeout=.5).stdout.strip()
+        props['priority'] = int(value)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return props
+
+
+class PollChild:
+    def __init__(self, command=None):
+        self.started = time.monotonic()
+        self.wall_start = time.time() * 1000
+        self.phase, self.pending = 'other', b''
+        self.progress_started = self.phase_started = progress_clock()
+        self.reported_start = None
+        self.completed = {}
+        self.discarding = False
+        # Darwin may shrink pipes to 512 bytes under pressure. Buffered local
+        # datagrams preserve atomic updates between guard checks;
+        # old children still write to the inherited FD with os.write.
+        reader_socket, writer_socket = socket.socketpair(type=socket.SOCK_DGRAM)
+        try:
+            writer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            reader_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        except OSError:
+            pass
+        self.reader, writer = reader_socket.detach(), writer_socket.detach()
+        os.set_blocking(self.reader, False)
+        os.set_blocking(writer, False)
+        try:
+            self.process = subprocess.Popen(command or [sys.executable, '-I', str(Path(__file__).with_name('run.py')), 'poll'],
+                env=dict(os.environ, ROUTER_POLL_PROGRESS_FD=str(writer)), pass_fds=(writer,),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except BaseException:
+            os.close(self.reader)
+            raise
+        finally:
+            os.close(writer)
+
+    def close(self):
+        if self.reader is not None:
+            os.close(self.reader)
+            self.reader = None
+
+    def progress_line(self, line):
+        if not line.startswith(b'='):
+            name = line.decode('ascii', errors='replace')
+            self.phase = name if name in (*FIELDS, 'other') else 'other'
+            self.phase_started = (self.reported_start[1] if self.reported_start and self.reported_start[0] == name
+                                  else progress_clock())
+            self.reported_start = None
+            return
+        try:
+            data = json.loads(line[1:])
+            if not isinstance(data, dict):
+                return
+            name, step = data.get('p'), data.get('s')
+            if set(data) == {'p', 'at'}:
+                at = data['at']
+                if (isinstance(name, str) and name in (*FIELDS, 'other', 'none')
+                        and type(at) in (int, float) and 0 <= at <= 2**53 - 1
+                        and self.progress_started <= at / 1000 <= progress_clock()):
+                    self.reported_start = (name, at / 1000)
+                return
+            if not isinstance(name, str) or name not in FIELDS:
+                return
+            fields = {'ms': 'Ms', 'cpu': 'CpuMs'}
+            if step is not None:
+                if name not in BYTE_PHASES or not isinstance(step, str) or step not in SUBSTEPS:
+                    return
+            else:
+                fields.update(zip(('ib', 'mf', 'iv', 'v'), RESOURCE_FIELDS))
+            if name in BYTE_PHASES:
+                fields.update(bh='BytesHashed', bp='BytesParsed')
+            if set(data) != {'p', *fields, *({'s'} if step is not None else set())}:
+                return
+            values = {}
+            for key, suffix in fields.items():
+                value = data[key]
+                # Limit numeric width as well as retained names and pipe bytes.
+                if type(value) not in (int, float) or not 0 <= value <= 2**53 - 1:
+                    return
+                if suffix not in ('Ms', 'CpuMs') and type(value) is not int:
+                    return
+                field = FIELDS[name][:-2] + (step or '') + suffix
+                if suffix.startswith('Bytes'):
+                    field = FIELDS[name][:-2] + suffix
+                values[field] = round(value, 3) if type(value) is float else value
+            for key, value in values.items():
+                self.completed[key] = max(self.completed.get(key, 0), value)
+        except (ValueError, TypeError, RecursionError):
+            pass
+
+    def drain(self):
+        # A noisy/broken child cannot monopolize the listener guard.
+        remaining = 262144
+        while remaining:
+            try:
+                chunk = os.read(self.reader, min(remaining, 65536))
+            except OSError:
+                # Darwin datagrams report ECONNRESET once the child closes.
+                # Progress is diagnostic; a closed FD must not mask wait4.
+                return
+            if not chunk:
+                return
+            remaining -= len(chunk)
+            lines = (self.pending + chunk).split(b'\n')
+            self.pending = lines.pop()
+            for line in lines:
+                if not self.discarding and len(line) <= 1024:
+                    self.progress_line(line)
+                self.discarding = False
+            if len(self.pending) > 1024:
+                self.pending = b''
+                self.discarding = True
+
+    def timeout_props(self, usage, elapsed):
+        cpu_ms = (usage.ru_utime + usage.ru_stime) * 1000
+        props = dict(self.completed, pid=self.process.pid, phase=self.phase, wallMs=elapsed * 1000,
+                     cpuMs=cpu_ms, startedAtMs=self.wall_start, finishedAtMs=time.time() * 1000,
+                     activePhaseMs=max(0, (progress_clock() - self.phase_started) * 1000))
+        props['activePhaseCpuMs'] = max(0, cpu_ms - sum(self.completed.get(field[:-2] + 'CpuMs', 0)
+                                                       for field in FIELDS.values()))
+        for suffix, attribute in RESOURCE_FIELDS.items():
+            total = max(0, getattr(usage, attribute))
+            props['child' + suffix] = total
+            props['activePhase' + suffix] = max(0, total - sum(self.completed.get(field[:-2] + suffix, 0)
+                                                              for field in FIELDS.values()))
+        props.update(gap_info(props), phase=self.phase)
+        at_ms = time.time() * 1000
+        props.update(host=Sampler()(), hostAtMs=at_ms)
+        return props
+
+    def check(self):
+        if self.process.poll() is not None:
+            self.close()
+            return True
+        self.drain()
+        elapsed = time.monotonic() - self.started
+        if elapsed < POLL_DEADLINE_SECONDS:
+            return False
+        # Popen owns this unreaped child; a PID from a name search is never used.
+        self.process.kill()
+        # kill() polls first and can reap an exit that raced the deadline.
+        if self.process.returncode is not None:
+            self.close()
+            return True
+        _, status, usage = os.wait4(self.process.pid, 0)
+        self.process.returncode = os.waitstatus_to_exitcode(status)
+        # Include completions written between the last check and SIGKILL.
+        self.drain()
+        self.close()
+        if self.process.returncode != -signal.SIGKILL:
+            return True
+        emit('poller', 'poll.timeout', kind='error', ok=False, durationMs=elapsed * 1000,
+             error=dict(tag='tick_deadline'),
+             props=self.timeout_props(usage, elapsed))
+        return True
+
+    def stop(self):
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+        finally:
+            self.close()
 
 
 def iso(milliseconds):
@@ -49,8 +233,10 @@ class Guard:
         self.notify = notify or (lambda text, key: False)
         self.save = save or (lambda state: None)
 
-    def step(self, now, job, listener, marker=None, lock_age_ms=None, observation=None):
+    def step(self, now, job, listener, marker=None, lock_age_ms=None, observation=None, host=None, host_at_ms=None):
         state = self.state
+        host = host if host is not None else Sampler()()
+        host_at_ms = now if host_at_ms is None else host_at_ms
         # Retry an undelivered recovery with the same bridge deduplication key.
         recovery = state.get('recovery')
         if recovery and self.notify(recovery['text'], recovery['key']):
@@ -58,11 +244,15 @@ class Guard:
         failed = listener in ('refused', 'unreachable')
         if job == 'unknown':
             if not state.get('jobUnknown') or (not failed and 'unknownSinceMs' not in state):
-                props = dict(state=job, listener=listener)
+                props = dict(state=job, listener=listener, host=host, hostAtMs=host_at_ms, hostStart=host, hostStartAtMs=host_at_ms)
                 props.update(observation or {})
                 if not failed:
                     state['unknownSinceMs'] = now
-                    state['unknownCause'] = launchctl_cause(observation or {})
+                    state['unknownHost'] = host
+                    state['unknownHostAtMs'] = host_at_ms
+                    state['unknownEvidence'] = launchctl_info(observation)
+                    state['unknownCause'] = state['unknownEvidence']['cause']
+                    props.update(state['unknownEvidence'])
                     props['unknownSince'] = iso(now)
                 self.event('listener.state_unknown', **props)
             state['jobUnknown'] = True
@@ -71,15 +261,21 @@ class Guard:
         if (job != 'unknown' or failed) and 'unknownSinceMs' in state:
             since = state.pop('unknownSinceMs')
             self.event('listener.state_resolved', unknownSince=iso(since), unknownMs=max(0, now - since),
-                       state=job, listener=listener, cause=state.pop('unknownCause', 'other'))
+                       state=job, listener=listener,
+                       host=host, hostAtMs=host_at_ms, hostStart=state.pop('unknownHost', {}), hostEnd=host,
+                       hostStartAtMs=state.pop('unknownHostAtMs', since), hostEndAtMs=host_at_ms,
+                       **state.pop('unknownEvidence', launchctl_info(dict(cause=state.get('unknownCause')), legacy=True)))
+            state.pop('unknownCause', None)
         # A persisted window from the old guard may have no TCP evidence.
         # Close that uncertainty before starting a newly observed refusal.
         if (failed and 'downSinceMs' in state and 'downListener' not in state
                 and state.get('cause') not in ('listener_refused', 'listener_unreachable')):
             since = state['downSinceMs']
             self.event('listener.up', downSince=iso(since), downMs=max(0, now - since),
-                       cause=state['cause'], listener=listener, downListener='unknown', action=state.get('lastAction', 'none'))
-            for key in ('downSinceMs', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
+                       cause=state['cause'], listener=listener, downListener='unknown', action=state.get('lastAction', 'none'),
+                       host=host, hostAtMs=host_at_ms, hostStart=state.get('downHost', {}), hostEnd=host,
+                       hostStartAtMs=state.get('downHostAtMs', since), hostEndAtMs=host_at_ms)
+            for key in ('downSinceMs', 'downHost', 'downHostAtMs', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
                 state.pop(key, None)
         if not failed:
             if 'downSinceMs' in state:
@@ -87,11 +283,12 @@ class Guard:
                 elapsed = max(0, now - since)
                 self.event('listener.up', downSince=iso(since), downMs=elapsed,
                            cause=state['cause'], listener=listener, downListener=state.get('downListener', 'unknown'),
-                           action=state.get('lastAction', 'none'))
+                           action=state.get('lastAction', 'none'), host=host, hostAtMs=host_at_ms, hostStart=state.get('downHost', {}), hostEnd=host,
+                           hostStartAtMs=state.get('downHostAtMs', since), hostEndAtMs=host_at_ms)
                 if state.get('alerted'):
                     state['recovery'] = dict(text=f'9router recovered after {round(elapsed / 1000)} s; action {state.get("lastAction", "none")}',
                                              key=f'9router-down:{iso(since)}:recovered')
-                for key in ('downSinceMs', 'downListener', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
+                for key in ('downSinceMs', 'downHost', 'downHostAtMs', 'downListener', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
                     state.pop(key, None)
                 self.save(state)
                 if state.get('recovery') and self.notify(state['recovery']['text'], state['recovery']['key']):
@@ -102,9 +299,10 @@ class Guard:
             cause = 'listener_' + listener
             if recent_failure(marker, now):
                 cause = 'deploy_failed'
-            state.update(downSinceMs=now, downListener=listener, cause=cause, alerted=False, attempts=0, nextActionMs=now)
+            state.update(downHost=host, downHostAtMs=host_at_ms, downSinceMs=now, downListener=listener, cause=cause, alerted=False, attempts=0, nextActionMs=now)
             self.save(state)
-            self.event('listener.down', downSince=iso(now), cause=cause, state=job, listener=listener)
+            self.event('listener.down', downSince=iso(now), cause=cause, state=job, listener=listener,
+                       host=host, hostAtMs=host_at_ms, hostStart=host, hostStartAtMs=host_at_ms)
         if listener == 'refused':
             state.setdefault('refusedSinceMs', now)
         else:
@@ -327,6 +525,7 @@ def serve():
         except BlockingIOError:
             return
         os.chmod(lock.name, 0o600)
+        emit('guard', 'observer.priority', props=scheduling_snapshot())
         guard = Guard(state=read_json(runtime.state_file), action=runtime.act, notify=runtime.notify,
                       save=lambda state: write_json(runtime.state_file, state))
         stopping = False
@@ -341,15 +540,18 @@ def serve():
         try:
             while not stopping:
                 start = time.monotonic()
-                sample = dict(clock_sample(), **job_snapshot())
-                missing = gap(guard.state.get('observerTick'), sample)
-                if missing:
-                    emit('guard', 'observer.gap', kind='perf', props=missing)
-                with Timings('guard', 'guard.tick_late', threshold_ms=120000, start=sample) as timing:
+                if poll is not None and poll.check():
+                    poll = None
+                sampler = Sampler()
+                sample = clock_sample()
+                with Timings('guard', 'guard.tick_late', threshold_ms=30000, start=sample, sampler=sampler) as timing:
+                    missing = gap(guard.state.get('observerTick'), sample)
+                    if missing:
+                        emit('guard', 'observer.gap', kind='perf', props=missing)
                     try:
                         job, listener = runtime.observe()
                         runtime.settle(job, listener)
-                        guard.step(time.time() * 1000, job, listener, read_json(runtime.marker), runtime.lock_age_ms(), runtime.observation)
+                        guard.step(time.time() * 1000, job, listener, read_json(runtime.marker), runtime.lock_age_ms(), runtime.observation, sample['host'], sample['hostAtMs'])
                     except Exception:
                         emit('guard', 'guard.error', kind='error', error=dict(tag='tick_failed'))
                     guard.state['observerTick'] = sample
@@ -361,25 +563,29 @@ def serve():
                     # Its own process keeps listener repair on the 15 s cadence.
                     pool_alerts = subprocess.Popen([sys.executable, '-I', str(Path(__file__).with_name('run.py')), 'pool-alerts'],
                                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if poll is not None and poll.poll() is not None:
-                    poll = None
                 if start >= next_poll and poll is None:
                     # HTTP snapshots and rollups can take longer than the listener cadence.
-                    poll = subprocess.Popen([sys.executable, '-I', str(Path(__file__).with_name('run.py')), 'poll'],
-                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    poll = PollChild()
                     next_poll = start + 300
                 while not stopping and time.monotonic() - start < 15:
                     time.sleep(max(0, min(.5, 15 - (time.monotonic() - start))))
         finally:
-            guard.state['observerTick'] = dict(clock_sample(), jobState='stopped', jobPid=os.getpid(), jobExit=0)
+            previous = guard.state.get('observerTick', {})
+            guard.state['observerTick'] = dict(clock_sample(), host=previous.get('host', {}),
+                                              hostAtMs=previous.get('hostAtMs', previous.get('wallMs')),
+                                              jobState='stopped', jobPid=os.getpid(), jobExit=0)
             with contextlib.suppress(OSError):
                 guard.save(guard.state)
-            for child in (pool_alerts, poll):
+            if poll is not None:
+                poll.stop()
+            for child in (pool_alerts,):
                 if child is None or child.poll() is not None:
                     continue
                 child.terminate()
-                try:
-                    child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
+                with Timings('guard', 'guard.tick_late'):
+                    with phase('child_wait'):
+                        try:
+                            child.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait()
