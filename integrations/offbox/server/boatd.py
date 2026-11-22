@@ -202,6 +202,9 @@ def _cols(con, table: str) -> set:
     return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
 
 
+WAITING_AFTER_S = 20
+
+
 def migrate(con) -> None:
     """Idempotent: owner columns, per-owner saved states, run attempts, hashed tokens."""
     con.executescript(SCHEMA_V2)
@@ -488,17 +491,21 @@ def refresh_health(fresh: bool = False) -> dict:
         if vpn:
             ok = False
             reasons.append(vpn)
-        queue = running = None
+        queue = running = waiting = None
         if READY.is_set():
             try:
                 def counts():
                     con = db()
                     try:
-                        return tuple(con.execute(f"SELECT COUNT(*) FROM commands WHERE status='{status}'").fetchone()[0]
-                                     for status in ("queued", "running"))
+                        # async_filter keeps these on commands_waiting: without it each health refresh walks every row.
+                        live = f"SELECT COUNT(*) FROM commands WHERE {async_filter(con)}status=?"
+                        # Every run is queued for a moment before its runner admits it. Only one that is still
+                        # queued after WAITING_AFTER_S is waiting for capacity; clients send new work to Boat on it.
+                        return (*(con.execute(live, (status,)).fetchone()[0] for status in ("queued", "running")),
+                                con.execute(live + " AND created_at < ?", ("queued", now() - WAITING_AFTER_S)).fetchone()[0])
                     finally:
                         con.close()
-                queue, running = health_stage("sqlite", counts)
+                queue, running, waiting = health_stage("sqlite", counts)
             except sqlite3.Error:
                 ok = False
                 reasons.append("state database is not readable")
@@ -508,7 +515,7 @@ def refresh_health(fresh: bool = False) -> dict:
         if storage["disk_low"] or (storage["level"] == "unknown" and pool == 'ONLINE'):
             reasons.append("disk_" + storage["level"] + ": " + disk.description(storage))
         out = {"disk": storage, "disk_low": storage["disk_low"], "disk_full": storage["disk_full"], "ok": ok, "up": True, "mode": "ok" if not reasons else "degraded", "reasons": reasons,
-               "pool": {"name": CFG["zpool"], "state": pool}, "mdraid": md, "queue": queue, "running": running,
+               "pool": {"name": CFG["zpool"], "state": pool}, "mdraid": md, "queue": queue, "running": running, "waiting": waiting,
                "boot_id": boot_id(), "uptime_s": int(host_uptime()), "boatd_uptime_s": int(now() - STARTED),
                "restartPending": restart_pending(),
                "version": VERSION, **status, "boot": STATE.get("boot"), "startupPhases": STATE.get("phases", {})}
