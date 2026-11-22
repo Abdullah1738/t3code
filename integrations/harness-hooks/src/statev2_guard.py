@@ -109,8 +109,8 @@ BUN_TEST_VALUE_OPTIONS = {
     '--coverage-reporter', '--coverage-dir', '--reporter', '--reporter-outfile',
     '--max-concurrency', '--path-ignore-patterns', '--parallel-delay', '--shard', '--timings',
 }
-REASON = (
-    "statev2 guard: this command was NOT run (owner incident 2026-11-05).\n"
+REASON_HEADER = "statev2 guard: this command was NOT run (owner incident 2026-11-05).\n"
+REASON_GUIDANCE = (
     "Shell reads of Robob's live statev2.sqlite and OpenCode's live opencode.db are blocked, "
     "including sqlite3/python/node scripts and read-only SQL. They contend with the live writers.\n"
     "Use Robob tools/APIs (board_*/card_*, t3ctl, /api/ardud/control/*), recall for past sessions, "
@@ -119,6 +119,7 @@ REASON = (
     "`live-db-snapshot --card <id> --ask <id> --db <path>` once he approves.\n"
     "If only the database can answer, report the exact queries and stop."
 )
+REASON = REASON_HEADER + REASON_GUIDANCE
 
 
 def protected_databases():
@@ -2527,7 +2528,8 @@ def refusal_reason(rule, cause, cwd):
         return ("statev2 guard: this command was NOT run.\n"
                 f"Could not check {cause or 'the script path'}. Resolved workdir: {cwd}.\n{fix}")
     if cause:
-        return "statev2 guard: this command was NOT run.\n" + cause
+        guidance = "\n" + REASON_GUIDANCE if rule in {"live-database-read", "live-database-script"} else ""
+        return "statev2 guard: this command was NOT run.\n" + cause + guidance
     return REASON
 
 
