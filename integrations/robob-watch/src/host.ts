@@ -153,11 +153,12 @@ export class CheckSlots {
     }
     for (;;) {
       let index = this.waiters.findIndex(waiter => waiter.lane === "fast" ? this.fastActive < this.fastCap : this.active < cap);
-      if (index < 0 && this.borrowFast() && !this.borrowedFast && !this.overrunActive && this.fastActive < this.fastCap) {
+      if (index < 0 && this.borrowFast() && !this.borrowedFast && !this.overrunActive && this.fastActive === 0 && this.fastCap > 0) {
         // Preserve slow FIFO admissions and genuine fast work. Only otherwise
         // idle reserved capacity serves overdue 5–10 minute checks.
         // Require runtimes well beyond the fast threshold, leaving brief overruns
         // to sticky classification. Old state can qualify from last_run_ms.
+        // An older fast holder must retain access to overflow at its own deadline.
         let deadline = Infinity;
         for (let i = 0; i < this.waiters.length; i++) {
           const request = this.waiters[i]!.request;

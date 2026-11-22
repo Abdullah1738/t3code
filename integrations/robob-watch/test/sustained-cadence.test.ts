@@ -69,11 +69,12 @@ test.each([
   expect(started).toBe(true);
 });
 
-test("a borrowed overrun keeps its overflow reservation and releases fast capacity at ten seconds", async () => {
+test.each([0, 1, 9000])("a borrower ahead of a native holder by %i ms releases fast capacity at ten seconds", async nativeAt => {
   let clock = 0, releaseNative!: () => void, releaseBorrowed!: () => void;
   const slots = new CheckSlots(() => 0, { now: () => clock }, 2, () => true);
-  const native = slots.run(() => new Promise<void>(resolve => { releaseNative = resolve; }), { watcher: "native", lane: "fast" });
   const borrowed = slots.run(() => new Promise<void>(resolve => { releaseBorrowed = resolve; }), { watcher: "borrowed", lane: "slow", operation: "check", intervalMs: 300_000, dueAt: 0, recentMinMs: 60_000 });
+  clock = nativeAt;
+  const native = slots.run(() => new Promise<void>(resolve => { releaseNative = resolve; }), { watcher: "native", lane: "fast" });
   await flush();
   let cheapStarted = false, anotherStarted = false;
   const cheap = slots.run(async () => { cheapStarted = true; }, { watcher: "cheap", lane: "fast" });
@@ -84,6 +85,35 @@ test("a borrowed overrun keeps its overflow reservation and releases fast capaci
   releaseBorrowed(); await borrowed; await flush();
   expect(anotherStarted).toBe(false);
   releaseNative(); await native; await another;
+});
+
+test.each([0, 1, 1000, 5000, 9000, 9999, 10000, 10001])("a loan at %i ms cannot delay an older native fast holder", async loanAt => {
+  const run = async (borrowing: boolean) => {
+    let clock = 0;
+    const releases: (() => void)[] = [];
+    const slots = new CheckSlots(() => 2, { now: () => clock }, 2, () => borrowing);
+    const hold = (watcher: string, lane: "fast" | "slow", loan = false) => slots.run(() => new Promise<void>(resolve => {
+      releases.push(resolve);
+    }), { watcher, lane, ...(loan ? { operation: "check" as const, intervalMs: 300_000, dueAt: 0, recentMinMs: 60_000 } : {}) });
+    const holders = [hold("slow-a", "slow"), hold("slow-b", "slow"), hold("older-native", "fast")];
+    await flush();
+    clock = loanAt;
+    const borrower = hold("borrower", "slow", true);
+    await flush();
+    clock = Math.max(10_000, loanAt);
+    let started: number | undefined;
+    const fast = slots.run(async () => { started = clock; }, { watcher: "native-fast", lane: "fast", dueAt: clock });
+    await flush();
+    clock = loanAt + 10_000;
+    slots.drain(); await flush();
+    const admittedAt = started;
+    for (let i = 0; i < 3; i++) { for (const release of releases.splice(0)) release(); await flush(); }
+    await Promise.all([...holders, borrower, fast]);
+    return admittedAt;
+  };
+  const before = await run(false), after = await run(true);
+  expect(after).toBe(before);
+  expect(after).toBe(Math.max(10_000, loanAt));
 });
 
 test("occupied overflow leaves native fast capacity ahead of two long borrowers", async () => {
