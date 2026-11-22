@@ -215,7 +215,7 @@ class GuardTests(unittest.TestCase):
         self.assertTrue(all(p not in {1, 2, 3} for _, p, _ in signals))
         self.assertEqual({p for _, p, sig in signals if 200 <= p < 242 and sig == 'SIGTERM'}, set(range(200, 242)))
         self.assertEqual(len(self.effects('worker')), 1)
-        self.assertGreaterEqual(len(self.effects('steer')), 1)
+        self.assertFalse(self.effects('steer'))  # no new signal after the initial launch
 
     def test_memory_edges(self):
         for _ in range(5):
@@ -427,6 +427,320 @@ class GuardTests(unittest.TestCase):
             self.assertTrue(self.tick([proc(10)])['strain'])
         self.assertFalse(self.tick([proc(10)])['strain'])
 
+    def test_calm_countdown_never_requests_worker(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        self.tick([], lag=8)
+        self.tick([], lag=8)
+        self.host.effects.clear()
+        with patch.object(self.guard, 'worker_needed') as needed:
+            for _ in range(9):
+                self.assertTrue(self.tick([])['strain'])
+            needed.assert_not_called()
+        self.assertFalse(self.effects('steer'))
+        self.assertEqual(self.events_named('worker_skipped')[0]['reason'], 'empty_signals')
+
+    def test_strain_steers_on_gain_or_ten_minute_ongoing(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        self.tick([], load=100)
+        self.tick([], load=100)
+        self.assertEqual(len(self.effects('steer')), 1)
+        for _ in range(19):
+            self.tick([], load=100)
+        self.assertEqual(len(self.effects('steer')), 1)
+        self.tick([], load=100)
+        self.assertEqual(len(self.effects('steer')), 2)
+        self.assertIn('still ongoing', self.effects('steer')[-1][2])
+        self.assertIn('100', self.effects('steer')[-1][2])
+        self.tick([], load=100, lag=8)
+        self.assertEqual(len(self.effects('steer')), 3)
+        self.tick([], load=100)
+        self.assertEqual(len(self.effects('steer')), 3)
+        skipped = self.events_named('worker_skipped')
+        self.assertTrue(skipped)
+        self.assertLessEqual(len(skipped), 11)
+
+    def test_strain_clear_sends_one_final_without_launching(self):
+        self.tick([], lag=8)
+        self.tick([], lag=8)
+        for _ in range(10):
+            self.tick([])
+        self.assertEqual(len(self.effects('worker')), 1)
+        self.assertEqual(len(self.effects('steer')), 1)
+        self.assertIn('strain ended', self.effects('steer')[0][2])
+        self.assertIn('300', self.effects('steer')[0][2])
+        self.tick([])
+        self.restart_guard()
+        self.tick([])
+        self.assertEqual(len(self.effects('steer')), 1)
+
+    def test_strain_clear_does_not_launch_for_absent_or_ended_worker(self):
+        for worker in ({}, dict(threadId='ended', startedAt=NOW)):
+            with self.subTest(worker=worker):
+                self.guard.strain, self.guard.since, self.guard.calm = True, self.now-300, 9
+                self.guard.worker = worker
+                self.host.worker = dict(state='idle', status='completed')
+                self.tick([])
+                self.assertFalse(self.effects('worker'))
+                self.assertFalse(self.effects('steer'))
+
+    def test_load_only_waits_ten_continuous_minutes(self):
+        self.tick([], load=100)
+        self.tick([], load=100)
+        for _ in range(19):
+            self.tick([], load=100)
+        self.assertFalse(self.effects('worker'))
+        self.tick([], load=100)
+        self.assertEqual(len(self.effects('worker')), 1)
+        self.tick([], load=100)
+        self.assertFalse(self.effects('steer'))
+        self.assertEqual(self.events_named('worker_skipped')[0]['reason'], 'load_only_wait')
+
+    def test_load_only_additional_signal_launches_at_once(self):
+        for _ in range(4):
+            self.tick([], load=100)
+        self.assertFalse(self.effects('worker'))
+        self.tick([], load=100, lag=8)
+        self.assertEqual(len(self.effects('worker')), 1)
+
+    def test_load_only_calm_or_sampling_gap_restarts_wait(self):
+        for gap in ('calm', 'missing'):
+            with self.subTest(gap=gap):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    for _ in range(10):
+                        case.tick([], load=100)
+                    if gap == 'calm':
+                        case.tick([])
+                    else:
+                        case.now += 600
+                    for _ in range(20):
+                        case.tick([], load=100)
+                    self.assertFalse(case.effects('worker'))
+                    case.tick([], load=100)
+                    self.assertEqual(len(case.effects('worker')), 1)
+                finally:
+                    case.doCleanups()
+
+    def test_strain_dedupe_and_load_wait_survive_restart(self):
+        for _ in range(10):
+            self.tick([], load=100)
+        self.restart_guard()
+        for _ in range(11):
+            self.tick([], load=100)
+        self.assertFalse(self.effects('worker'))
+        self.tick([], load=100)
+        self.assertEqual(len(self.effects('worker')), 1)
+        record = copy.deepcopy(self.guard.saved['strainWorker'])
+        self.restart_guard()
+        self.tick([], load=100)
+        self.assertFalse(self.effects('steer'))
+        self.assertEqual(self.guard.saved['strainWorker'], record)
+        self.assertEqual(record['signals'], [1])
+        self.assertTrue(Path(record['evidence']).exists())
+
+    def test_urgent_incidents_bypass_strain_dedupe(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        self.tick([], load=100)
+        self.tick([], load=100)
+        self.tick([proc(10, 'codex')], {10: 200}, load=100)
+        self.assertEqual(len(self.effects('steer')), 2)
+        self.assertIn('memory runaway', self.effects('steer')[-1][2])
+        self.host.checks['hold'] = 'installer'
+        self.tick([proc(1, ROBOB)], {1: 25}, load=100)
+        self.assertEqual(len(self.effects('steer')), 3)
+        self.assertIn('Robob restart skipped', self.effects('steer')[-1][2])
+
+    def test_empty_signals_never_launch_in_calm_countdown(self):
+        self.tick([], load=100)
+        self.tick([], load=100)
+        for _ in range(10):
+            self.tick([])
+        self.assertFalse(self.effects('worker'))
+        self.assertFalse(self.effects('steer'))
+
+    def test_running_worker_dedupe_survives_restart(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        m.write_json(self.guard.state/'worker.json', self.guard.worker)
+        self.tick([], lag=8)
+        self.tick([], lag=8)
+        self.restart_guard()
+        for _ in range(19):
+            self.tick([], lag=8)
+        self.assertEqual(len(self.effects('steer')), 1)
+        self.tick([], lag=8)
+        self.assertEqual(len(self.effects('steer')), 2)
+
+    def test_ambiguous_strain_send_reserved_before_restart(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        m.write_json(self.guard.state/'worker.json', self.guard.worker)
+        send = self.host.worker_send
+        def lost_ack(*args):
+            send(*args)
+            raise m.ProbeError('timeout after delivery')
+        with patch.object(self.host, 'worker_send', side_effect=lost_ack):
+            self.tick([], lag=8)
+            self.tick([], lag=8)
+        self.restart_guard()
+        self.tick([], lag=8)
+        self.assertEqual(len(self.effects('steer')), 1)
+
+    def test_load_only_gate_bypassed_by_offender_or_unknown_health(self):
+        for mode in ('offender', 'lag_unknown', 'pressure_unknown'):
+            with self.subTest(mode=mode):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    for _ in range(2):
+                        case.tick([], load=100, lag=None if mode == 'lag_unknown' else 0,
+                                  pressure=None if mode == 'pressure_unknown' else 1)
+                    if mode == 'offender':
+                        case.guard.first_action = case.now-180
+                        with patch.object(case.guard, 'cpu_actions', return_value=1):
+                            case.tick([], load=100)
+                    self.assertEqual(len(case.effects('worker')), 1)
+                finally:
+                    case.doCleanups()
+
+    def test_load_only_gap_with_intermediate_save_restarts_wait(self):
+        for save_path in ('restart_result', 'drain', 'restart'):
+            with self.subTest(save_path=save_path):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    for _ in range(10):
+                        case.tick([], load=100)
+                    case.now += 600
+                    if save_path == 'restart_result':
+                        case.guard.saved['restartPending'] = dict(log='unused', evidence=str(case.root))
+                        case.host.restart_result = lambda pending: dict(ok=True)
+                    elif save_path == 'drain':
+                        case.guard.drain(case.now)
+                    else:
+                        case.guard.drain(case.now)
+                        case.restart_guard()
+                    for _ in range(20):
+                        case.tick([], load=100)
+                    self.assertFalse(case.effects('worker'))
+                    case.tick([], load=100)
+                    self.assertEqual(len(case.effects('worker')), 1)
+                finally:
+                    case.doCleanups()
+
+    def test_load_only_interrupted_tick_restarts_wait_table(self):
+        for restart in (False, True):
+            for phase, gap in [('check_restart_result', 0), ('check_restart_result', 600),
+                               ('cpu_actions', 0), ('cpu_actions', 600)]:
+                with self.subTest(restart=restart, phase=phase, gap=gap):
+                    case = GuardTests()
+                    case.setUp()
+                    try:
+                        for _ in range(10):
+                            case.tick([], load=100)
+                        case.now += gap
+                        case.guard.saved['restartPending'] = dict(log='unused', evidence=str(case.root))
+                        case.host.restart_result = lambda pending: dict(ok=True)
+                        original = getattr(case.guard, phase)
+                        def interrupted(*args):
+                            original(*args)
+                            raise RuntimeError('tick interrupted after saved restart result')
+                        with patch.object(case.guard, phase, side_effect=interrupted):
+                            with self.assertRaises(RuntimeError):
+                                case.tick([], load=100)
+                        case.now += 30
+                        if restart:
+                            case.restart_guard()
+                        for _ in range(20):
+                            case.tick([], load=100)
+                        self.assertEqual(len(case.effects('worker')), 0)
+                        case.tick([], load=100)
+                        self.assertEqual(len(case.effects('worker')), 1)
+                    finally:
+                        case.doCleanups()
+
+    def test_strain_clear_delivery_failure_table(self):
+        for failure in ('status', 'before_send', 'lost_ack', 'paused'):
+            with self.subTest(failure=failure):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    case.tick([], lag=8)
+                    case.tick([], lag=8)
+                    for _ in range(9):
+                        case.tick([])
+                    send = case.host.worker_send
+                    requests = []
+                    def deliver(tid, text, request_id=None):
+                        requests.append(request_id)
+                        if failure == 'lost_ack' or len(requests) > 1:
+                            send(tid, text, request_id)
+                        if len(requests) == 1:
+                            raise m.ProbeError('send unavailable')
+                    status_result = dict(side_effect=m.ProbeError('unavailable')) if failure == 'status' else dict(return_value=case.host.worker)
+                    with patch.object(case.host, 'worker_send', side_effect=deliver), \
+                         patch.object(case.host, 'worker_status', **status_result):
+                        if failure == 'paused':
+                            (case.guard.state/'paused').touch()
+                        case.tick([])
+                    case.restart_guard()
+                    if failure == 'paused':
+                        (case.guard.state/'paused').unlink()
+                    # The successful retry uses the same identity after a lost ack.
+                    def retry(tid, text, request_id=None):
+                        requests.append(request_id)
+                        send(tid, text, request_id)
+                    with patch.object(case.host, 'worker_send', side_effect=retry):
+                        case.tick([])
+                        case.tick([])
+                    self.assertEqual(len(case.effects('worker')), 1)
+                    self.assertEqual(len(case.effects('steer')), 1)
+                    self.assertIn('strain ended', case.effects('steer')[0][2])
+                    self.assertTrue(requests[0])
+                    self.assertEqual(len(set(requests)), 1)
+                    case.restart_guard()
+                    case.tick([])
+                    self.assertEqual(len(case.effects('steer')), 1)
+                finally:
+                    case.doCleanups()
+
+    def test_strain_clear_keeps_original_worker_after_replacement(self):
+        self.tick([], lag=8)
+        self.tick([], lag=8)
+        tid = self.guard.worker['threadId']
+        for _ in range(9):
+            self.tick([])
+        with patch.object(self.host, 'worker_status', side_effect=m.ProbeError('unavailable')):
+            self.tick([])
+        self.guard.worker = dict(threadId='replacement', startedAt=self.now)
+        self.tick([])
+        self.assertEqual(len(self.effects('steer')), 1)
+        self.assertEqual(self.effects('steer')[0][1], tid)
+        self.assertEqual(len(self.effects('worker')), 1)
+
+    def test_strain_clear_waits_for_pending_initial_safety(self):
+        self.tick([], lag=8)
+        self.tick([], lag=8)
+        tid = self.guard.worker['threadId']
+        launch = copy.deepcopy(next(iter(self.host.initial_launches.values())))
+        self.guard.worker = dict(launchUnknown=True, launch=launch, startedAt=NOW)
+        jobs = []
+        def submit(fn):
+            future = Future()
+            jobs.append((fn, future))
+            return future
+        self.guard.worker_submit = submit
+        for _ in range(10):
+            self.tick([])
+        self.assertFalse(self.effects('steer'))
+        self.assertTrue(any(k.startswith('strainClearResponder:') for k in self.guard.saved))
+        self.guard.worker_submit = immediate_submit
+        jobs[0][1].set_result(jobs[0][0]())
+        self.tick([])
+        self.assertEqual(self.guard.worker['threadId'], tid)
+        self.assertEqual(len(self.effects('worker')), 1)
+        self.assertEqual(len(self.effects('steer')), 1)
+        self.assertIn('strain ended', self.effects('steer')[0][2])
+
     def test_signal_four_nonprotected_growth(self):
         self.tick([proc(10)], {10: 5}, pressure=2)
         result = self.tick([proc(10)], {10: 6}, pressure=2)
@@ -574,8 +888,8 @@ class GuardTests(unittest.TestCase):
             jobs.append((fn, future))
             return future
         self.guard.worker_submit = submit
-        self.tick([], load=200)
-        self.tick([], load=200)
+        self.tick([], load=200, lag=8)
+        self.tick([], load=200, lag=8)
         for i in range(4):
             result = self.tick([proc(10, cpu=i*60)], load=200)
         self.assertEqual(len(jobs), 1)
@@ -671,8 +985,8 @@ class GuardTests(unittest.TestCase):
             return create(launch)
         try:
             with patch.object(self.host, 'worker_create', side_effect=blocked):
-                self.tick([], load=200)
-                self.tick([], load=200)
+                self.tick([], load=200, lag=8)
+                self.tick([], load=200, lag=8)
                 self.assertTrue(entered.wait(5))
                 self.tick([], load=200)
                 self.assertEqual(len(self.events_named('sample')), 2)
