@@ -23,6 +23,7 @@ import http.client
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -256,8 +257,52 @@ def keychain_secret(service: str) -> str | None:
     return value if out.returncode == 0 and value else None
 
 
+class _Resolver:
+    """Name lookups for one upstream: at most one in flight, each caller waits only to its deadline.
+
+    getaddrinfo cannot be cancelled or given a timeout, so a blocked resolver would otherwise strand
+    one worker per call. A good answer is reused for a minute.
+    """
+
+    TTL = 60.0
+
+    def __init__(self, name: str, host: str, port: int):
+        self.name, self.host, self.port = name, host, port
+        self._lock = threading.Lock()
+        self._pending: dict | None = None
+        self._cached: tuple[float, list] | None = None
+
+    def _lookup(self, holder: dict) -> None:
+        try:
+            holder["value"] = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)
+            with self._lock:
+                self._cached = (time.monotonic(), holder["value"])
+        except OSError as error:
+            holder["error"] = error
+        finally:
+            with self._lock:
+                self._pending = None
+            holder["done"].set()
+
+    def addresses(self, deadline: float) -> list:
+        with self._lock:
+            if self._cached is not None and time.monotonic() - self._cached[0] < self.TTL:
+                return self._cached[1]
+            holder = self._pending
+            if holder is None:
+                holder = self._pending = {"done": threading.Event()}
+                threading.Thread(target=self._lookup, args=(holder,), name=f"mcp-shield-dns-{self.name}",
+                                 daemon=True).start()
+        if not holder["done"].wait(max(0.0, deadline - time.monotonic())):
+            raise TimeoutError("name lookup deadline")
+        if "error" in holder:
+            raise holder["error"]
+        return holder["value"]
+
+
 class HttpUpstream:
-    def __init__(self, name: str, url: str, bearer: str | None, timeout: float):
+    def __init__(self, name: str, url: str, bearer: str | None, timeout: float,
+                 ssl_context: ssl.SSLContext | None = None):
         self.name, self.url, self.bearer, self.timeout = name, url, bearer, timeout
         self.session_id: str | None = None
         self.protocol: str | None = None
@@ -266,6 +311,8 @@ class HttpUpstream:
         if parts.scheme not in ("http", "https") or not parts.hostname:
             raise ValueError("unsupported upstream url")
         self._parts = parts
+        self._ssl_context = ssl_context
+        self._resolver = _Resolver(name, parts.hostname, parts.port or (443 if parts.scheme == "https" else 80))
 
     def headers(self) -> dict:
         h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
@@ -282,8 +329,9 @@ class HttpUpstream:
 
         Socket timeouts only bound each read, so a server trickling bytes (slow headers,
         heartbeats, a partial SSE line, a slow JSON body) could hold a call forever. The request
-        runs on a worker that registers its socket the moment it connects; at the deadline that
-        socket is shut down, which ends any blocked read (headers included) so the worker exits,
+        runs on a worker that registers a handle to its socket before connecting (name lookups and
+        connects share the call's deadline); at the deadline that handle is shut down, which ends
+        a blocked connect, TLS handshake or read (headers included) so the worker exits,
         and the caller gets TimeoutError. Only the caller publishes a new session id, and only
         when the session it sent is still current, so a late worker cannot undo a re-initialize.
         """
@@ -321,30 +369,55 @@ class HttpUpstream:
                     self.session_id = session
         return values
 
-    def _connection(self, timeout: float, box: dict) -> http.client.HTTPConnection:
-        parts = self._parts
-        cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-        conn = cls(parts.hostname, parts.port, timeout=timeout)
+    def _open_socket(self, timeout: float, deadline: float, box: dict) -> socket.socket:
+        """Connect within the call's own deadline, one budget across every resolved address.
 
-        def create_connection(*args, **kwargs):
-            sock = socket.create_connection(*args, **kwargs)
+        Each attempt registers a duplicate of its socket before connecting. The duplicate shares
+        the connection but keeps its own descriptor, so TLS wrapping (which detaches the original)
+        cannot take it away: shutting it down at the deadline ends a stuck handshake or read.
+        """
+        last: OSError | None = None
+        for family, kind, proto, _, address in self._resolver.addresses(deadline):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock = socket.socket(family, kind, proto)
+            handle = sock.dup()
             with self._lock:
                 abandoned = box.get("abandoned")
                 if not abandoned:
-                    box["socket"] = sock
+                    box["socket"] = handle
+                    box.setdefault("handles", []).append(handle)
             if abandoned:
                 sock.close()
+                handle.close()
                 raise TimeoutError("response deadline")
-            return sock
+            try:
+                sock.settimeout(remaining)
+                sock.connect(address)
+                sock.settimeout(timeout)
+                return sock
+            except OSError as error:
+                last = error
+                sock.close()
+        raise last if last is not None else TimeoutError("connect deadline")
 
-        conn._create_connection = create_connection  # noqa: SLF001 - see the socket before TLS and headers
+    def _connection(self, timeout: float, deadline: float, box: dict) -> http.client.HTTPConnection:
+        parts = self._parts
+        if parts.scheme == "https":
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout,
+                                               context=self._ssl_context)
+        else:
+            conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
+        # noqa: SLF001 - http.client calls this before TLS and headers; we connect ourselves.
+        conn._create_connection = lambda *args, **kwargs: self._open_socket(timeout, deadline, box)
         return conn
 
     def _post(self, message, headers: dict, timeout: float, box: dict):
         deadline = time.monotonic() + timeout
         parts = self._parts
         path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
-        conn = self._connection(timeout, box)
+        conn = self._connection(timeout, deadline, box)
         try:
             # No proxy and no redirects: either would carry the Keychain bearer elsewhere.
             conn.request("POST", path, body=json.dumps(message).encode(), headers=headers)
@@ -376,6 +449,11 @@ class HttpUpstream:
             return [v for v in values if is_rpc(v)], session
         finally:
             conn.close()
+            with self._lock:
+                handles = box.pop("handles", [])
+                box.pop("socket", None)
+            for handle in handles:
+                handle.close()
 
     @staticmethod
     def _read_sse(response, message, deadline: float) -> list:

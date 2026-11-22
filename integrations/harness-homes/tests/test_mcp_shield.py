@@ -311,6 +311,126 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(left, [])
         self.assertEqual(open_conns, [])  # the server saw every timed-out connection close
 
+    def _tls_listener(self, payload_head: bytes, header_only: bool):
+        """A TLS server that answers with a head and then trickles bytes; returns (url, ctx, conns)."""
+        import shutil
+        import socket as socket_module
+        import ssl
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            self.skipTest("openssl not installed")
+        certs = tempfile.mkdtemp()
+        cert, key = os.path.join(certs, "c.pem"), os.path.join(certs, "k.pem")
+        subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                        "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"],
+                       check=True, capture_output=True)
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(cert, key)
+        client_ctx = ssl.create_default_context(cafile=cert)
+        listener = socket_module.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+        open_conns = []
+
+        def serve(raw):
+            open_conns.append(raw)
+            try:
+                conn = server_ctx.wrap_socket(raw, server_side=True)
+                conn.recv(65536)
+                conn.sendall(payload_head)
+                for _ in range(400):
+                    conn.sendall(b"x")
+                    time.sleep(0.05)
+            except OSError:
+                pass
+            finally:
+                open_conns.remove(raw)
+                raw.close()
+
+        def accept():
+            while True:
+                try:
+                    raw, _ = listener.accept()
+                except OSError:
+                    return
+                threading.Thread(target=serve, args=(raw,), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+        return f"https://localhost:{listener.getsockname()[1]}/mcp", client_ctx, open_conns
+
+    def test_https_timeouts_reclaim_workers_and_connections(self):
+        # Review of 285ee43955: TLS wrapping detached the recorded socket, so the deadline's
+        # shutdown failed and HTTPS calls stayed blocked forever.
+        sys.path.insert(0, str(SHIELD.parent))
+        import mcp_shield
+        heads = {
+            "header": b"HTTP/1.1 200 OK\r\nX-Slow: ",
+            "json": b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{",
+            "sse": b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\ndata: {",
+        }
+        for kind, head in heads.items():
+            with self.subTest(kind=kind):
+                url, ctx, open_conns = self._tls_listener(head, kind == "header")
+                name = f"tls{kind}"
+                upstream = mcp_shield.HttpUpstream(name, url, None, 0.5, ssl_context=ctx)
+                for _ in range(3):
+                    started = time.monotonic()
+                    with self.assertRaises(TimeoutError):
+                        upstream.post(INIT, 0.5)
+                    self.assertLess(time.monotonic() - started, 2)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    left = [t for t in threading.enumerate() if t.name == f"mcp-shield-post-{name}"]
+                    if not left and not open_conns:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(left, [])
+                self.assertEqual(open_conns, [])
+
+    def test_blocked_name_lookups_and_slow_connects_stay_inside_the_deadline(self):
+        # Review of 285ee43955: getaddrinfo has no timeout, and every resolved address got the
+        # full timeout again, so workers outlived their calls.
+        import socket as socket_module
+        from unittest.mock import patch
+        sys.path.insert(0, str(SHIELD.parent))
+        import mcp_shield
+        release = threading.Event()
+        lookups = []
+
+        def blocked(*args, **kwargs):
+            lookups.append(args)
+            release.wait(10)
+            raise socket_module.gaierror("released")
+
+        with patch.object(mcp_shield.socket, "getaddrinfo", blocked):
+            upstream = mcp_shield.HttpUpstream("dnsblock", "http://blocked.invalid/mcp", None, 0.3)
+            for _ in range(3):
+                with self.assertRaises(TimeoutError):
+                    upstream.post(INIT, 0.3)
+            time.sleep(0.2)
+            self.assertEqual(len(lookups), 1)  # one lookup in flight, not one per call
+            self.assertEqual([t for t in threading.enumerate() if t.name == "mcp-shield-post-dnsblock"], [])
+            release.set()
+
+        attempts = []
+
+        class Slow(socket_module.socket):
+            def connect(self, address):
+                attempts.append(address)
+                time.sleep(self.gettimeout() or 0)
+                raise TimeoutError("timed out")
+
+        five = [(socket_module.AF_INET, socket_module.SOCK_STREAM, 6, "", ("127.0.0.1", 9 + i)) for i in range(5)]
+        with patch.object(mcp_shield.socket, "getaddrinfo", return_value=five), \
+                patch.object(mcp_shield.socket, "socket", Slow):
+            upstream = mcp_shield.HttpUpstream("fiveaddr", "http://five.invalid/mcp", None, 0.4)
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                upstream.post(INIT, 0.4)
+            self.assertLess(time.monotonic() - started, 1.5)
+            time.sleep(0.6)
+        self.assertEqual(len(attempts), 1)  # the budget is spent, no second address is tried
+        self.assertEqual([t for t in threading.enumerate() if t.name == "mcp-shield-post-fiveaddr"], [])
+
     def test_a_late_worker_cannot_replace_a_newer_session(self):
         # Review of 8ca5540d61: a worker finishing after a re-initialize overwrote the new session.
         sys.path.insert(0, str(SHIELD.parent))
