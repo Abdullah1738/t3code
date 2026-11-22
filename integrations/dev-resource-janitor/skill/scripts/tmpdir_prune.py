@@ -1,29 +1,52 @@
 #!/opt/homebrew/bin/python3
-"""Prune agent and test leftovers from $TMPDIR (internal SSD, wiped at boot).
+"""Bounded TMPDIR reports; apply only deletes when TMPDIR_PRUNE_DELETE=1.
 
-  tmpdir_prune.py scan             read-only; JSON summary of what apply would remove
-  tmpdir_prune.py scan --list      ...plus every candidate path
-  tmpdir_prune.py apply            re-scans, removes candidates, appends to the audit log
-
-Why: macOS wipes $TMPDIR on every boot, and a ~280 GB wipe is the likely cause of
-the 2026-10-16 boot hangs. Two test leaks refill it between boots:
-  - vitest <5.0.3 (vite-plus <1.1.0) never removes its root temp dir: one
-    $TMPDIR/<21-char nanoid>/ssr/ of ~20 MB per run.
-  - crpko-devops guard tests mkdtemp a dir per case and never remove it
-    (tens of thousands of tiny dirs a day).
-Agent scratch in $TMPDIR/opencode is only reported, never removed here: Crpko
-review checkouts live there, so deleting it stays a manual call (owner, 22 Oct).
-
-Removed by apply (older than TEST_IDLE_HOURS by newest mtime, deep):
-  vitest   $TMPDIR/<nanoid21> holding only ssr/
-  guard    $TMPDIR/<known crpko test prefix>*
-Reported only (opencode_stale): $TMPDIR/opencode/<entry> unchanged for
-OPENCODE_IDLE_DAYS, minus entries holding a registered git worktree (kept_worktrees).
-Never touched: anything a process uses (cwd or open file), symlinks are not followed,
-and entries listed in ~/.config/opencode/dev-janitor-keep.txt (one path per line).
-Stdlib only.
+TMPDIR_PRUNE_IDLE_HOURS sets the agent idle threshold (24 hours by default).
+Reports and pre-removal rechecks share tmpdir_inventory.inspect. Existing test
+patterns use TMPDIR_PRUNE_TEST_HOURS; opencode remains report-only.
 """
-import argparse, fcntl, json, os, re, shutil, subprocess, sys, time
+import argparse, fcntl, json, math, os, re, shutil, subprocess, sys, time
+from tmpdir_inventory import UsageUnavailable, disk_lock, inspect
+sys.path.insert(0, os.path.expanduser("~/.local/lib/mac-logging"))
+try:
+    from toollog import emit
+except ImportError:
+    def emit(*args, **kwargs):
+        pass
+
+RUN_SECONDS = 600
+
+
+CONFIG = os.path.expanduser('~/.config/opencode/tmpdir-prune.json')
+
+
+def configuration():
+    try:
+        with open(CONFIG) as f:
+            config = json.load(f)
+        if not isinstance(config, dict) or type(config.get('delete', False)) is not bool:
+            raise ValueError('invalid configuration')
+        return config
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as err:
+        raise UsageUnavailable('config_unavailable', 'unreadable configuration') from err
+
+
+def idle_hours():
+    try:
+        value = float(os.environ.get('TMPDIR_PRUNE_IDLE_HOURS', configuration().get('idleHours', 24)))
+    except (ValueError, TypeError) as err:
+        raise UsageUnavailable('config_unavailable', 'invalid idle threshold') from err
+    if not math.isfinite(value) or value <= 0:
+        raise UsageUnavailable('config_unavailable', 'invalid idle threshold')
+    return value
+
+
+def deletion_enabled():
+    value = os.environ.get('TMPDIR_PRUNE_DELETE')
+    return configuration().get('delete', False) if value is None else value == '1'
+
 
 def user_tmp():
     # robob-watch runs checks with only HOME/PATH/LANG, so TMPDIR is often unset.
@@ -51,40 +74,34 @@ GUARD_PREFIXES = (
 )
 
 
-class UsageUnavailable(Exception):
-    def __init__(self, skipped, reason):
-        self.skipped, self.reason = skipped, reason
-
-
 def walk(path):
-    """(newest mtime, bytes on disk, files) for a tree, without following symlinks."""
+    info = inspect(path)
+    return info['newest_mtime'], info['bytes'], info['files']
+
+
+def process_references():
     try:
-        st = os.lstat(path)
-    except OSError as err:
-        raise UsageUnavailable("tree_unavailable", type(err).__name__) from err
-    newest, size, files = st.st_mtime, st.st_blocks * 512, 0
-    stack = [path] if os.path.isdir(path) and not os.path.islink(path) else []
-    if not stack:
-        return newest, size, 1
-    while stack:
-        d = stack.pop()
-        try:
-            it = os.scandir(d)
-        except OSError as err:
-            raise UsageUnavailable("tree_unavailable", type(err).__name__) from err
-        with it:
-            for e in it:
-                try:
-                    s = e.stat(follow_symlinks=False)
-                except OSError as err:
-                    raise UsageUnavailable("tree_unavailable", type(err).__name__) from err
-                newest = max(newest, s.st_mtime)
-                size += s.st_blocks * 512
-                if e.is_dir(follow_symlinks=False):
-                    stack.append(e.path)
-                else:
-                    files += 1
-    return newest, size, files
+        result = subprocess.run(['/bin/ps', '-axo', 'pid=,command='],
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode or result.stderr or not result.stdout.strip():
+            raise UsageUnavailable('ps_unavailable', 'incomplete process snapshot')
+        used = set()
+        for line in result.stdout.splitlines():
+            fields = line.strip().split(None, 1)
+            if not fields or not fields[0].isdigit():
+                raise UsageUnavailable('ps_unavailable', 'malformed process snapshot')
+            if len(fields) < 2:
+                continue  # Exiting processes can have an empty argv.
+            # TMPDIR commonly ends in '/', so "$TMPDIR/script" has a doubled separator.
+            # Normalize the complete path before comparing either macOS /var spelling.
+            for match in re.finditer(r'/[^\s\'";]+', fields[1]):
+                path = os.path.normpath(match.group())
+                for prefix in {TMP, TMP.replace('/private/var/', '/var/')}:
+                    if path.startswith(prefix + os.sep):
+                        used.add(os.path.join(TMP, path[len(prefix)+1:].split(os.sep)[0]))
+        return used
+    except (OSError, subprocess.SubprocessError, UnicodeError) as err:
+        raise UsageUnavailable('ps_unavailable', type(err).__name__) from err
 
 
 def in_use():
@@ -122,10 +139,13 @@ def in_use():
             named = True
         else:
             raise UsageUnavailable("lsof_unavailable", "unreadable output")
-        if line.startswith("n") and TMP in line:
+        if line.startswith("n"):
             p = line[1:]
-            p = p[p.index(TMP):] if TMP in p else p
-            used.add(p)
+            # lsof emits both /var and /private/var spellings on macOS.
+            if TMP.startswith('/private/var/') and p.startswith('/var/'):
+                p = '/private' + p
+            if p == TMP or p.startswith(TMP + os.sep):
+                used.add(p)
     if not named:
         raise UsageUnavailable("lsof_unavailable", "incomplete final record")
     return used
@@ -147,26 +167,17 @@ def keep_list():
         raise UsageUnavailable("keep_list_unavailable", type(err).__name__) from err
 
 
-def linked_worktree(path, depth=4):
-    """True when a registered git worktree (.git file) sits under path; removing it
-    would leave a stale registration (and a locked branch) in its main repo."""
-    stack = [(path, 0)]
-    while stack:
-        d, n = stack.pop()
-        try:
-            it = os.scandir(d)
-        except OSError:
-            continue
-        with it:
-            for e in it:
-                if e.name == ".git" and e.is_file(follow_symlinks=False):
-                    return True
-                if n < depth and e.is_dir(follow_symlinks=False) and e.name != "node_modules":
-                    stack.append((e.path, n + 1))
-    return False
-
-
 def classify(name, path):
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', name):
+        return None
+    if name.startswith('com.apple.') or re.fullmatch(r'uv-.*\.lock', name):
+        return None
+    if (name.startswith(('tmp.', 'harness-exit.', 'live-db-snapshot-', 't3-control-',
+                         't3-orchestration-v2-', 'recall-toollog-test-'))
+            or re.fullmatch(r'.+-review-.+', name)
+            or re.fullmatch(r'offbox.*-(?:review|recheck|integration|osr).*', name)
+            or re.fullmatch(r'robob[0-9]+-traces\..+', name)):
+        return 'agent'
     if NANOID.match(name) and os.path.isdir(path) and not os.path.islink(path):
         try:
             if set(os.listdir(path)) == {"ssr"}:
@@ -180,52 +191,73 @@ def classify(name, path):
 
 def scan():
     try:
-        return scan_available()
+        with disk_lock() as fd:
+            return scan_available(fd)
     except UsageUnavailable as err:
         return {"skipped": err.skipped, "reason": err.reason}
     except OSError as err:
         return {"skipped": "tree_unavailable", "reason": type(err).__name__}
 
 
-def scan_available():
-    now = time.time()
-    used, keep = in_use(), keep_list()
+def protected(path, keep, used):
+    path = os.path.realpath(path)
+    keep = {os.path.realpath(p) for p in keep}
+    used = {os.path.realpath(p) for p in used}
+    return (used_under(path, used) or any(
+        path == k or path.startswith(k + os.sep) or k.startswith(path + os.sep) for k in keep))
+
+
+def scan_available(lock_fd=None):
+    now, deadline = time.time(), time.monotonic() + RUN_SECONDS
+    threshold = idle_hours()
+    used, keep = in_use() | process_references(), keep_list()
     out = {"tmpdir": TMP, "classes": {}, "candidates": [], "kept_in_use": 0, "kept_young": 0,
-           "kept_worktrees": [], "opencode_stale": {"entries": 0, "bytes": 0, "top": []}}
+           "kept_worktrees": [], "kept": [], "report_only": not deletion_enabled(), "idle_hours": threshold,
+           "opencode_stale": {"entries": 0, "bytes": 0, "top": []}}
 
     def consider(cls, path, idle_s):
-        if path in keep or used_under(path, used):
+        if protected(path, keep, used):
             out["kept_in_use"] += 1
             return
-        newest, size, files = walk(path)
+        try:
+            info = inspect(path, deadline, lock_fd)
+        except (UsageUnavailable, OSError) as err:
+            out['kept'].append({'path': path, 'reason': getattr(err, 'skipped', 'tree_unavailable'),
+                                'detail': getattr(err, 'reason', type(err).__name__)})
+            return
+        newest, size, files = info['newest_mtime'], info['bytes'], info['files']
         if now - newest < idle_s:
             out["kept_young"] += 1
             return
+        candidate = {"class": cls, "path": path, "bytes": size, "age_s": now - newest,
+                     "idle_h": round((now - newest) / 3600, 1), "idle_s": idle_s, **info}
         if cls == "opencode":
-            if linked_worktree(path):
-                out["kept_worktrees"].append({"path": path, "bytes": size})
-                return
             stale = out["opencode_stale"]
             stale["entries"] += 1
             stale["bytes"] += size
-            stale["top"].append({"path": path, "bytes": size,
-                                 "idle_h": round((now - newest) / 3600, 1)})
+            stale["top"].append(candidate)
             return
         c = out["classes"].setdefault(cls, {"entries": 0, "bytes": 0, "files": 0})
         c["entries"] += 1
         c["bytes"] += size
         c["files"] += files
-        out["candidates"].append({"class": cls, "path": path, "bytes": size,
-                                  "idle_h": round((now - newest) / 3600, 1)})
+        out["candidates"].append(candidate)
 
     with os.scandir(TMP) as it:
         for e in it:
+            if time.monotonic() >= deadline:
+                out['partial'] = True
+                break
             cls = classify(e.name, e.path)
             if cls:
-                consider(cls, e.path, TEST_IDLE_HOURS * 3600)
+                consider(cls, e.path, (threshold if cls == 'agent' else TEST_IDLE_HOURS) * 3600)
+    # The historical opencode inventory remains report-only and shares the run budget.
     if os.path.isdir(OPENCODE) and not os.path.islink(OPENCODE):
         with os.scandir(OPENCODE) as it:
             for e in it:
+                if time.monotonic() >= deadline:
+                    out['partial'] = True
+                    break
                 consider("opencode", e.path, OPENCODE_IDLE_DAYS * 86400)
     out["opencode_stale"]["top"].sort(key=lambda x: -x["bytes"])
     return out
@@ -241,36 +273,96 @@ def apply():
         return apply_locked()
 
 
+def remove_candidate(candidate, deadline, lock_fd):
+    path = candidate['path']
+    if os.path.dirname(path) != TMP or classify(os.path.basename(path), path) is None:
+        raise UsageUnavailable('tree_kept', 'not an approved direct child')
+    fresh = inspect(path, deadline, lock_fd)
+    if (fresh['device'], fresh['inode']) != (candidate['device'], candidate['inode']):
+        raise UsageUnavailable('tree_kept', 'entry identity changed')
+    if time.time() - fresh['newest_mtime'] < candidate['idle_s']:
+        raise UsageUnavailable('tree_kept', 'recent activity')
+    # A fresh process/keep snapshot is taken after the walk and Git checks, for every removal.
+    if protected(path, keep_list(), in_use() | process_references()):
+        raise UsageUnavailable('tree_kept', 'in use or kept')
+    # lsof can take seconds. Work written during that snapshot must keep the whole candidate.
+    fresh = inspect(path, deadline, lock_fd)
+    if ((fresh['device'], fresh['inode']) != (candidate['device'], candidate['inode'])
+            or time.time() - fresh['newest_mtime'] < candidate['idle_s']):
+        raise UsageUnavailable('tree_kept', 'entry changed during process snapshot')
+    if time.monotonic() >= deadline:
+        raise UsageUnavailable('tree_kept', 'run deadline')
+    for repo in sorted(fresh['repos'], key=lambda r: len(r['path']), reverse=True):
+        if repo['linked']:
+            # A successful worktree remove drops exactly this registration; never globally prune others.
+            from tmpdir_inventory import git
+            git(repo['parent_repo'], ['worktree', 'remove', repo['path']], deadline, lock_fd)
+    if os.path.lexists(path):
+        delete_path(path, fresh, deadline, lock_fd)
+    return fresh
+
+
+def delete_path(path, info, deadline, lock_fd):
+    # Bound the destructive walk too. rmtree's fd-based implementation rejects symlink substitution.
+    code = ('import os,stat,shutil,sys; p=sys.argv[1]; s=os.lstat(p); '
+            'assert (s.st_dev,s.st_ino,s.st_uid)==tuple(map(int,sys.argv[2:])); '
+            'assert not stat.S_ISLNK(s.st_mode); '
+            'shutil.rmtree(p) if stat.S_ISDIR(s.st_mode) else os.remove(p)')
+    with subprocess.Popen([sys.executable, '-I', '-c', code, path, str(info['device']),
+                           str(info['inode']), str(info['uid'])], pass_fds=(lock_fd,),
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as child:
+        try:
+            rc = child.wait(timeout=max(0.01, min(60, deadline-time.monotonic())))
+        except subprocess.TimeoutExpired as err:
+            child.kill()
+            child.wait()
+            raise UsageUnavailable('remove_incomplete', 'deletion deadline; entry may be partial') from err
+    if rc:
+        raise UsageUnavailable('remove_incomplete', 'deletion failed; entry may be partial')
+
+
+def record_event(name, props, ok=True, duration_ms=None):
+    # The local audit remains useful when the central logger is unavailable.
+    with open(AUDIT, 'a') as f:
+        f.write(json.dumps({'event': name, **props}) + '\n')
+    emit('janitor', 'event' if ok else 'error', name, ok=ok, duration_ms=duration_ms, props=props,
+         error_tag=None if ok else 'janitor.tmpdir_failed')
+
+
 def apply_locked():
+    started = time.monotonic()
     res = scan()
     if "skipped" in res:
         entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": "tmpdir_prune", **res}
-        with open(AUDIT, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        record_event('janitor.tmpdir_run', entry, ok=False)
         return entry
-    removed, failed, freed = 0, [], 0
-    for c in res["candidates"]:
-        p = c["path"]
-        # Re-check right before removal: the scan can take minutes.
-        if not os.path.realpath(p).startswith(TMP + os.sep) or os.path.islink(p):
-            failed.append({"path": p, "error": "outside $TMPDIR or symlink"})
-            continue
-        try:
-            if os.path.isdir(p):
-                shutil.rmtree(p)
-            else:
-                os.remove(p)
-            removed += 1
-            freed += c["bytes"]
-        except OSError as err:
-            failed.append({"path": p, "error": str(err)})
-    stale = res["opencode_stale"]
-    entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "removed": removed,
-             "freed_bytes": freed, "classes": res["classes"], "failed": failed[:20],
-             "opencode_stale": {"entries": stale["entries"], "bytes": stale["bytes"],
-                                "top": stale["top"][:10]}}
-    with open(AUDIT, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    removed, failed, size = 0, [], 0
+    deadline = time.monotonic() + RUN_SECONDS
+    report_only = res['report_only']
+    if not report_only:
+        for c in res['candidates']:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                if not deletion_enabled():
+                    break
+                with disk_lock() as fd:
+                    fresh = remove_candidate(c, deadline, fd)
+                removed += 1
+                size += fresh['bytes']
+                record_event('janitor.tmpdir_remove', {'path': c['path'], 'bytes': fresh['bytes'],
+                             'ageS': time.time() - fresh['newest_mtime'], 'rule': c['class']})
+            except (OSError, UsageUnavailable) as err:
+                failed.append({'path': c['path'], 'error': getattr(err, 'skipped', type(err).__name__)})
+                record_event('janitor.tmpdir_remove', {'path': c['path'], 'bytes': c['bytes'],
+                             'ageS': c['age_s'], 'rule': c['class']}, ok=False)
+    stale = res['opencode_stale']
+    entry = {'removed': removed, 'removed_bytes': size, 'report_only': report_only,
+             'found': len(res['candidates']), 'bytes': sum(c['bytes'] for c in res['candidates']),
+             'idle_hours': res['idle_hours'], 'classes': res['classes'], 'failed': failed[:20],
+             'partial': res.get('partial', False) or time.monotonic() >= deadline,
+             'opencode_stale': {'entries': stale['entries'], 'bytes': stale['bytes'], 'top': stale['top'][:10]}}
+    record_event('janitor.tmpdir_run', entry, ok=not failed, duration_ms=(time.monotonic()-started)*1000)
     return entry
 
 
@@ -284,9 +376,8 @@ def main():
     if not TMP:
         if a.cmd == "apply":
             os.makedirs(LOG_DIR, exist_ok=True)
-            with open(AUDIT, "a") as f:
-                f.write(json.dumps({"event": "tmpdir_prune", "skipped": "tmpdir_unavailable",
-                                    "reason": "could not resolve user temp directory"}) + "\n")
+            record_event('janitor.tmpdir_run', {"event": "tmpdir_prune", "skipped": "tmpdir_unavailable",
+                         "reason": "could not resolve user temp directory"}, ok=False)
         return 0
     if not TMP.startswith("/private/var/folders/"):
         print(f"tmpdir_prune: refusing to run on {TMP or 'an unknown dir'}", file=sys.stderr)

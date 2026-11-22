@@ -582,6 +582,18 @@ def suspend_fields(values):
 
 
 def safe_fields(values, event=None):
+    if event in ('janitor.tmpdir_remove', 'janitor.tmpdir_run'):
+        result = {}
+        for key, value in (values or {}).items():
+            if key in ('bytes', 'ageS', 'found', 'removed', 'removed_bytes', 'idle_hours') and finite_number(value) and value >= 0:
+                result[key] = value
+            elif key in ('report_only', 'partial') and type(value) is bool:
+                result[key] = value
+            elif key == 'rule' and value in ('agent', 'guard', 'vitest'):
+                result[key] = value
+            elif key == 'path' and isinstance(value, str) and value.startswith('/'):
+                result[key] = '[redacted]' if SECRET.search(value) else value[:2048]
+        return result
     if event == 'guard.reclaim':
         from guard_reclaim import log_fields
         return log_fields(values or {})
