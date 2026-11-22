@@ -161,7 +161,15 @@ def worker(lock_fd):
             builds = scan["processes"]["xcode_builds"]
             stats["found"] += len(builds["candidates"])
             stats["killed"] += sum(action["ok"] for action in builds["actions"])
+        if "mcp_orphan" in scan.get("processes", {}):
+            dev_janitor.reap_mcp_candidates(scan)
+            mcp = scan["processes"]["mcp_orphan"]
+            stats["found"] += len(mcp["candidates"])
+            stats["killed"] += sum(action["ok"] for action in mcp["actions"])
         dev_janitor.record_report(scan)
+        if any(action["action"] == "reap" and not action["ok"]
+               for action in scan.get("processes", {}).get("mcp_orphan", {}).get("actions", [])):
+            raise RuntimeError("MCP orphan reap failed; see audit")
         if any(action["action"] == "close" and not action["ok"]
                for action in scan.get("processes", {}).get("agent_browser", {}).get("actions", [])):
             raise RuntimeError("agent-browser close failed; see audit")
@@ -186,7 +194,7 @@ def worker(lock_fd):
     finally:
         if dev_janitor is not None:
             dev_janitor.log_run(started, stats["found"], stats["killed"], ok,
-                                stats.get("phase_ms"), stats.get("mcp_summary"))
+                                stats.get("phase_ms"), stats.get("mcp_summary"), stats.get("mcp_orphan"))
     return 0
 
 

@@ -54,6 +54,31 @@ class LoggingTests(unittest.TestCase):
                                                 'docker': float('inf'), 'expo': -1}}, 'janitor.run')
         self.assertEqual(clean, {'phase_ms': {'sessions': 1.2}})
 
+    def test_janitor_orphan_counts_and_rss_survive_logger_without_inventory(self):
+        scripts = REPO / 'integrations/dev-resource-janitor/skill/scripts'
+        sys.path.insert(0, str(scripts))
+        import dev_janitor as janitor
+        orphan = dict(reap_enabled=True, counts={'cua': 2, 'perplexity': 1, 'dia': 1},
+                      rules={'a': 3, 'b': 1}, oldest_age_s=600, rss_kib=400,
+                      freed_rss_kib=200, reaped_counts={'cua': 2})
+        summary = janitor.leftover_processes.unavailable_report('process_scan_failed')['mcp_summary']
+        poisoned = dict(orphan, inventory=[{'args': 'secret-value'}], actions=['secret-value'])
+        with patch.object(janitor, 'emit', side_effect=toollog.emit):
+            janitor.log_run(time.monotonic(), 4, 2, True, {'processes.mcp_orphan': 12.5}, summary, poisoned)
+        self.assertEqual(self.rows()[0]['props']['mcp_summary'], summary)
+        props = self.rows()[1]['props']
+        self.assertEqual(props['mcp_orphan'], orphan)
+        self.assertEqual(props['phase_ms'], {'processes.mcp_orphan': 12.5})
+        self.assertNotIn('secret-value', json.dumps(self.rows()))
+        bad = dict(counts={'secret-value': 1, 'cua': True, 'dia': -1}, rules={'a': 1.5},
+                   reaped_counts={'perplexity': 1}, rss_kib=float('nan'), freed_rss_kib=-1,
+                   oldest_age_s=None, reap_enabled=1, inventory='secret-value')
+        self.assertEqual(toollog.safe_fields({'mcp_orphan': bad}, 'janitor.run'),
+                         {'mcp_orphan': dict(counts={}, rules={}, reaped_counts={'perplexity': 1}, oldest_age_s=None)})
+        for malformed in (None, [], 'secret-value'):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(toollog.safe_fields({'mcp_orphan': malformed}, 'janitor.run'), {'mcp_orphan': {}})
+
     def test_inventory_summaries_preserve_only_bounded_metadata(self):
         root = '/Volumes/ExternalSSD/board-wt'
         values = {root:dict(deniedCount=2, timedOutCount=1, backedOffCount=1,
@@ -223,6 +248,8 @@ class LoggingTests(unittest.TestCase):
         scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0,
                   agent_browser=dict(inventory=[],candidates=[],problems=[],actions=[],reap_enabled=False),
                   xcode_builds=dict(inventory=[],candidates=[],problems=[],actions=[],stop_enabled=False),
+                  mcp_orphan=dict(inventory=[],candidates=[],problems=[],actions=[],reap_enabled=False,counts={},rules={},
+                                  oldest_age_s=None,rss_kib=0,freed_rss_kib=0,reaped_counts={},owner_calls={}),
                   owner_calls={key: dict(count=0,p50_ms=None,p95_ms=None,max_ms=None,failures={}) for key in ('by_native','detail','recovery')}),resources=resources,candidates=[r['id'] for r in resources])
         with patch.object(watcher,'STATE_DIR',state), patch.object(janitor,'scan',return_value=scan), \
              patch.object(janitor,'act',side_effect=[(True,'done'),(False,'password=secret')]), \
@@ -233,7 +260,7 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual([r['name'] for r in self.rows()],['janitor.kill','janitor.kill','janitor.mcp_summary','janitor.run'])
         self.assertEqual(self.rows()[0]['props']['resourceKind'],'metro')
         self.assertEqual(self.rows()[1]['props']['resourceKind'],'localstack')
-        self.assertEqual(self.rows()[-1]['props'],{'found':2,'killed':1,'phase_ms':{}})
+        self.assertEqual(self.rows()[-1]['props'],{'found':2,'killed':1,'phase_ms':{},'mcp_orphan':dict(reap_enabled=False,counts={},rules={},oldest_age_s=None,rss_kib=0,freed_rss_kib=0,reaped_counts={})})
         with patch.object(janitor,'run',return_value=(0,0,True)):
             janitor.main()
         self.assertTrue(self.rows()[-1]['ok'])
@@ -325,6 +352,8 @@ class LoggingTests(unittest.TestCase):
         scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0,
                   agent_browser=dict(inventory=[],candidates=[],problems=[],actions=[],reap_enabled=False),
                   xcode_builds=dict(inventory=[],candidates=[],problems=[],actions=[],stop_enabled=False),
+                  mcp_orphan=dict(inventory=[],candidates=[],problems=[],actions=[],reap_enabled=False,counts={},rules={},
+                                  oldest_age_s=None,rss_kib=0,freed_rss_kib=0,reaped_counts={},owner_calls={}),
                   owner_calls={key: dict(count=0,p50_ms=None,p95_ms=None,max_ms=None,failures={}) for key in ('by_native','detail','recovery')}),resources=resources,candidates=['expo:1','expo:2'])
         for entry in ('cli','hourly'):
             with self.subTest(entry=entry), patch.object(janitor,'scan',return_value=scan), \
@@ -337,7 +366,7 @@ class LoggingTests(unittest.TestCase):
                 else:
                     with (self.root/'lock').open('w') as lock:
                         self.assertEqual(watcher.worker(lock.fileno()),1)
-                self.assertEqual(self.rows()[-1]['props'],{'found':2,'killed':1,'phase_ms':{}})
+                self.assertEqual(self.rows()[-1]['props'],{'found':2,'killed':1,'phase_ms':{},'mcp_orphan':dict(reap_enabled=False,counts={},rules={},oldest_age_s=None,rss_kib=0,freed_rss_kib=0,reaped_counts={})})
                 self.assertFalse(self.rows()[-1]['ok'])
 
     def test_cve_owner_and_browser_action_forms(self):

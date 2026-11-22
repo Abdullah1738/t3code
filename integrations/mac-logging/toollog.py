@@ -447,13 +447,34 @@ def host_fields(values, event):
 JANITOR_PHASES = {'sessions', 'liveness', 'resource_processes', 'simulators', 'expo', 'docker',
                  'session_evidence', 'leftover_processes'} | {
     'processes.' + name for name in ('inventory', 'launch_services', 'memory', 'cwd_inventory',
-                                   'detection', 'agent_browser', 'xcode_builds',
+                                   'detection', 'agent_browser', 'xcode_builds', 'mcp_orphan',
                                    'owner_by_native', 'owner_detail', 'owner_recovery')}
 JANITOR_KEEP_REASONS = {'tty', 'launchd_registered', 'application', 'shared_service', 'keep_file',
                         'liveness_unavailable', 'observation_budget_exhausted', 'unproven_process',
                         'unknown_owner', 'owner_deleted', 'owner_has_work_or_not_ended',
                         'connected_client', 'idle_grace', 'memory_unavailable',
                         'parent_chain_incomplete', 'changed_before_report', 'observation_unavailable'}
+
+
+def janitor_orphan_fields(values):
+    if not isinstance(values, dict):
+        return {}
+    result = {}
+    if type(values.get('reap_enabled')) is bool:
+        result['reap_enabled'] = values['reap_enabled']
+    for key in ('oldest_age_s', 'rss_kib', 'freed_rss_kib'):
+        value = values.get(key)
+        if key == 'oldest_age_s' and key in values and value is None:
+            result[key] = None
+        elif finite_number(value) and value >= 0:
+            result[key] = value
+    for key, names in (('counts', ('cua', 'perplexity', 'dia')),
+                       ('reaped_counts', ('cua', 'perplexity', 'dia')),
+                       ('rules', ('a', 'b'))):
+        if isinstance(values.get(key), dict):
+            result[key] = {name: value for name, value in values[key].items()
+                           if name in names and type(value) is int and value >= 0}
+    return result
 
 
 def janitor_mcp_fields(values):
@@ -539,6 +560,8 @@ def safe_fields(values, event=None):
         return {'mcp_summary': janitor_mcp_fields((values or {}).get('mcp_summary'))}
     if event == 'janitor.run':
         result = {k: v for k, v in (values or {}).items() if k in ('found', 'killed') and finite_number(v)}
+        if 'mcp_orphan' in (values or {}):
+            result['mcp_orphan'] = janitor_orphan_fields(values['mcp_orphan'])
         phases = (values or {}).get('phase_ms')
         if isinstance(phases, dict):
             result['phase_ms'] = {k: v for k, v in phases.items()
