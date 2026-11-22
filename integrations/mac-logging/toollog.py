@@ -569,6 +569,11 @@ def safe_fields(values, event=None):
             elif key == 'reason' and value in ('opt_unavailable', 'brew_absent', 'brew_timeout',
                                                'brew_exit', 'brew_unavailable', 'brew_parse'):
                 result[key] = value
+            elif key == 'brewError' and value in ('brew_absent', 'brew_timeout', 'brew_exit',
+                                                  'brew_unavailable', 'brew_parse'):
+                result[key] = value
+            elif key == 'receiptErrors' and type(value) is int and value >= 0:
+                result[key] = value
             elif key in ('durationMs', 'exitCode') and finite_number(value):
                 result[key] = value
             elif key in ('dangling', 'missing') and isinstance(value, list):
