@@ -5,6 +5,27 @@ import { borrowedStallOptions, cadenceSummary, flappingReplay } from "./flapping
 import { healthChecks } from "./sustained-replay.ts";
 import { DeadlineSlots } from "./deadline-slots.ts";
 
+test.each([
+  { at: 5000, ms: 420_000 },
+  { at: 5000.2, ms: 420_000.2 },
+  { at: 3595_000, ms: 20_000 },
+])("hourly capacity and holdings exclude the same frozen ticks: %j", async freeze => {
+  const result = await replaySlots(undefined, 1, 2, {
+    freeze, mix: { source: "one holder spans the freeze, including an hour boundary", watchers: [
+      { watcher: "holder", intervalMs: 86400_000, checkMs: freeze.at + 60_000 },
+    ] },
+  });
+  const end = result.completions[0]!.at;
+  const frozenFrom = Math.ceil(freeze.at / 1000) * 1000;
+  const frozenUntil = Math.ceil((freeze.at + freeze.ms) / 1000) * 1000;
+  for (let hour = 0; hour < 2; hour++) {
+    const start = hour * 3600_000, until = start + 3600_000;
+    const unavailable = Math.max(0, Math.min(until, frozenUntil) - Math.max(start, frozenFrom));
+    expect(result.hourlySupplyMs[hour]).toBe(3600_000 - unavailable);
+    expect(result.hourlyHolds[hour]!.holder?.slow ?? 0).toBe(Math.max(0, Math.min(until, end) - start) - unavailable);
+  }
+});
+
 test("deadline experiment admits the imminent cadence deadline ahead of an unaged long interval", async () => {
   let release!: () => void;
   const starts: string[] = [];

@@ -29,6 +29,9 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
   const windowHolds = new Map<string, {slow: number; fast: number}>();
   const hourlyHolds = Array.from({ length: hours }, () => new Map<string, {slow: number; fast: number}>());
   const hourlySupplyMs = Array.from({ length: hours }, () => 0);
+  // Match the one-second ticks skipped by the freeze on both sides of the service budget.
+  const frozenFrom = Math.ceil((options.freeze?.at ?? 0) / 1000) * 1000;
+  const frozenUntil = Math.ceil(((options.freeze?.at ?? 0) + (options.freeze?.ms ?? 0)) / 1000) * 1000;
   const slots = new Slots(() => options.loads ? high ? 2 : cap : cap, { now: () => clock, emit: event => {
     if (event.name === "slot.busy") busyMs += event.durationMs;
     if (event.name === "slot.hold") {
@@ -40,7 +43,10 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
       windowHolds.set(event.request.watcher, held);
       const lane = event.request.lane === "fast" ? "fast" : "slow";
       for (let hour = Math.max(0, Math.floor((clock - event.durationMs) / 3600_000)); hour < hours && hour * 3600_000 < clock; hour++) {
-        const overlap = Math.max(0, Math.min(clock, (hour + 1) * 3600_000) - Math.max(clock - event.durationMs, hour * 3600_000));
+        const start = Math.max(clock - event.durationMs, hour * 3600_000);
+        const end = Math.min(clock, (hour + 1) * 3600_000);
+        const frozenMs = Math.max(0, Math.min(end, frozenUntil) - Math.max(start, frozenFrom));
+        const overlap = Math.max(0, end - start - frozenMs);
         const row = hourlyHolds[hour]!.get(event.request.watcher) ?? { slow: 0, fast: 0 };
         row[lane] += overlap;
         hourlyHolds[hour]!.set(event.request.watcher, row);
