@@ -381,8 +381,16 @@ class HttpUpstream:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            sock = socket.socket(family, kind, proto)
-            handle = sock.dup()
+            sock = handle = None
+            try:
+                sock = socket.socket(family, kind, proto)
+                handle = sock.dup()
+            except OSError as error:  # e.g. no IPv6 here: try the next family
+                last = error
+                for opened in (sock, handle):
+                    if opened is not None:
+                        opened.close()
+                continue
             with self._lock:
                 abandoned = box.get("abandoned")
                 if not abandoned:
@@ -395,11 +403,19 @@ class HttpUpstream:
             try:
                 sock.settimeout(remaining)
                 sock.connect(address)
-                sock.settimeout(timeout)
-                return sock
             except OSError as error:
                 last = error
                 sock.close()
+                continue
+            # A shutdown that arrived while connecting found nothing to shut (ENOTCONN), so look
+            # again before http.client sends anything on this socket.
+            with self._lock:
+                abandoned = box.get("abandoned")
+            if abandoned or time.monotonic() >= deadline:
+                sock.close()
+                raise TimeoutError("response deadline")
+            sock.settimeout(timeout)
+            return sock
         raise last if last is not None else TimeoutError("connect deadline")
 
     def _connection(self, timeout: float, deadline: float, box: dict) -> http.client.HTTPConnection:

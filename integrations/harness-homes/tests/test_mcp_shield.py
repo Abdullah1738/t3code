@@ -431,6 +431,67 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)  # the budget is spent, no second address is tried
         self.assertEqual([t for t in threading.enumerate() if t.name == "mcp-shield-post-fiveaddr"], [])
 
+    def test_a_call_cancelled_while_connecting_never_sends_its_request(self):
+        # Review of cff50ab633: shutdown on a socket still connecting is ENOTCONN, so a worker
+        # that finished connecting after the deadline went on to send the POST.
+        import socket as socket_module
+        from unittest.mock import patch
+        sys.path.insert(0, str(SHIELD.parent))
+        import mcp_shield
+        received = []
+
+        class Count(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                received.append(self.rfile.read(int(self.headers["Content-Length"])))
+                self.send_response(202)
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Count)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        real_socket = socket_module.socket
+
+        class Late(real_socket):
+            def connect(self, address):
+                time.sleep(0.4)  # the caller gives up at 0.15 s, mid-connect
+                return super().connect(address)
+
+        with patch.object(mcp_shield.socket, "socket", Late):
+            upstream = mcp_shield.HttpUpstream("lateconn", f"http://127.0.0.1:{server.server_address[1]}/mcp",
+                                               None, 0.15)
+            with self.assertRaises(TimeoutError):
+                upstream.post(CALL, 0.15)
+            time.sleep(0.8)
+        self.assertEqual(received, [])
+        self.assertEqual([t for t in threading.enumerate() if t.name == "mcp-shield-post-lateconn"], [])
+
+    def test_an_unusable_address_family_falls_back_to_the_next(self):
+        # Review of cff50ab633: socket() raising EAFNOSUPPORT for IPv6 skipped the IPv4 address.
+        import errno as errno_module
+        import socket as socket_module
+        from unittest.mock import patch
+        sys.path.insert(0, str(SHIELD.parent))
+        import mcp_shield
+        url = self.serve()
+        port = int(url.rsplit(":", 1)[1].split("/")[0])
+        real_socket = socket_module.socket
+
+        def make(family=socket_module.AF_INET, *args, **kwargs):
+            if family == socket_module.AF_INET6:
+                raise OSError(errno_module.EAFNOSUPPORT, "Address family not supported")
+            return real_socket(family, *args, **kwargs)
+
+        both = [(socket_module.AF_INET6, socket_module.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+                (socket_module.AF_INET, socket_module.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+        with patch.object(mcp_shield.socket, "getaddrinfo", return_value=both), \
+                patch.object(mcp_shield.socket, "socket", make):
+            upstream = mcp_shield.HttpUpstream("family", url, None, 5)
+            replies = upstream.post(INIT, 5)
+        self.assertEqual(replies[0]["result"]["serverInfo"]["name"], "web")
+
     def test_a_late_worker_cannot_replace_a_newer_session(self):
         # Review of 8ca5540d61: a worker finishing after a re-initialize overwrote the new session.
         sys.path.insert(0, str(SHIELD.parent))
