@@ -24,7 +24,7 @@ def timestamp(value):
 
 def history_rows(path, incremental=True):
     state_path = path.with_name('.listener-state-' + path.stem + '.json')
-    saved = cache.load(state_path, 2) if incremental else {}
+    saved = cache.load(state_path, 3) if incremental else {}
     try:
         with path.open('rb') as source:
             cursor, append = cache.cursor_for(source, saved.get('cursor', {}))
@@ -48,10 +48,10 @@ def history_rows(path, incremental=True):
                         pass
                 if incremental and complete and (cursor['offset'] - checkpoint_offset >= 8 * 1024 * 1024
                                                   or time.monotonic() - checkpoint_time >= 30):
-                    cache.save(state_path, 2, cursor, rows)
+                    cache.save(state_path, 3, cursor, rows)
                     checkpoint_offset, checkpoint_time = cursor['offset'], time.monotonic()
             if incremental and (not append or cursor != saved.get('cursor')):
-                cache.save(state_path, 2, cursor, rows)
+                cache.save(state_path, 3, cursor, rows)
             yield from rows
             yield from tail
     except FileNotFoundError:

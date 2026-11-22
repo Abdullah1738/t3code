@@ -14,7 +14,7 @@ from volume import REASONS, integer
 from listener_rollup import windows as listener_windows, history_rows
 from pool_rollup import summarize as pool_summary
 from observer import gap_summary, measured, observed
-from host_rollup import HostLoad
+from host_rollup import HostLoad, timestamp as host_timestamp
 import append_cursor as cache
 from append_cursor import request_group, provider_group
 
@@ -82,7 +82,7 @@ def lock_identity(row, fallback):
 
 
 # Bump when ingestion or persisted aggregate semantics change.
-AGGREGATE_VERSION = 1
+AGGREGATE_VERSION = 2
 CHECKPOINT_BYTES = 8 * 1024 * 1024
 CHECKPOINT_SECONDS = 30
 AGGREGATE_FIELDS = (
@@ -94,7 +94,17 @@ AGGREGATE_FIELDS = (
     'distinct', 'account_distinct', 'unlocks', 'supervisor', 'heartbeat_observations',
     'health_hours', 'health_late', 'volume_writers', 'ok', 'failed',
     'total', 'malformed',
+    'host_state', 'host_pending',
 )
+
+
+def future_host(row, generated):
+    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+    values = [row.get('ts'), *(props.get(key) for key in (
+        'hostAtMs', 'hostStartAtMs', 'hostEndAtMs', 'start', 'end',
+        'startedAtMs', 'finishedAtMs', 'unknownSince', 'downSince'))]
+    return any(at > generated for value in values if value is not None
+               and (at := host_timestamp(value)) is not None)
 
 
 @measured('history_scan_parse')
@@ -105,6 +115,7 @@ def rollup(day, root=None, now=None, incremental=True):
     root = Path(root) if root is not None else directory()
     counts, kinds, tags = Counter(), Counter(), Counter()
     host_load = HostLoad(day, generated)
+    host_state, host_pending = vars(host_load), []
     pool_rows = []
     times, samples = defaultdict(list), {}
     targets = defaultdict(Counter)
@@ -148,6 +159,9 @@ def rollup(day, root=None, now=None, incremental=True):
                 aggregate = cache.decode(saved['aggregate']) if append else None
                 if aggregate is not None and set(aggregate) != set(AGGREGATE_FIELDS):
                     raise ValueError('aggregate fields changed')
+                if aggregate is not None and (set(aggregate['host_state']) != set(host_state)
+                        or aggregate['host_state']['generated'] > generated):
+                    raise ValueError('host state needs rebuild')
             except (ValueError, TypeError, KeyError, AttributeError):
                 aggregate, append = None, False
             if aggregate is not None:
@@ -159,8 +173,17 @@ def rollup(day, root=None, now=None, incremental=True):
                     session_sources, attempts, abort_ttfb, locks, lock_accounts,
                     distinct, account_distinct, unlocks, supervisor, heartbeat_observations,
                     health_hours, health_late, volume_writers, ok, failed,
-                    total, malformed,
+                    total, malformed, host_state, host_pending,
                 ) = (aggregate[key] for key in AGGREGATE_FIELDS)
+                host_load.__dict__.update(host_state)
+                host_load.generated = generated
+                host_state = vars(host_load)
+                pending, host_pending = host_pending, []
+                for row in pending:
+                    if future_host(row, generated):
+                        host_pending.append(row)
+                    else:
+                        host_load.observe(row)
             if not append:
                 cursor['offset'] = 0
             checkpointed = False
@@ -187,7 +210,10 @@ def rollup(day, root=None, now=None, incremental=True):
                         dims = tuple(props.get(k, 'unknown') for k in ('provider', 'model', 'cause'))
                         if not all(isinstance(v, str) for v in dims):
                             raise ValueError('invalid lock dimensions')
-                    host_load.observe(row)
+                    if future_host(row, generated):
+                        host_pending.append(row)
+                    else:
+                        host_load.observe(row)
                     total += 1
                     counts[row['name']] += 1
                     if row['name'] in ('pool.exhausted', 'pool.recovered'):
@@ -404,6 +430,10 @@ def rollup(day, root=None, now=None, incremental=True):
                 values = locals()
                 cache.save(state_path, AGGREGATE_VERSION, cursor,
                            {key: values[key] for key in AGGREGATE_FIELDS})
+    # A future row can already expose an earlier boundary. Keep its contribution
+    # provisional until all its timestamps are visible, as with a partial line.
+    for row in host_pending:
+        host_load.observe(row)
     durations = {}
     for name, values in times.items():
         values.sort()

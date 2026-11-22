@@ -29,11 +29,39 @@ def row(name='proxy.request', **props):
 
 
 class IncrementalTests(unittest.TestCase):
-    def compare(self, root):
-        incremental = rollup.rollup(DAY, root, NOW)
-        full = rollup.rollup(DAY, root, NOW, incremental=False)
+    def compare(self, root, now=NOW):
+        incremental = rollup.rollup(DAY, root, now)
+        full = rollup.rollup(DAY, root, now, incremental=False)
         self.assertEqual(json.dumps(incremental, separators=(',', ':')), json.dumps(full, separators=(',', ':')))
         return incremental
+
+    def test_host_load_survives_append_future_boundaries_and_generation_changes(self):
+        start = dt.datetime(2026, 11, 21, 12, tzinfo=dt.timezone.utc)
+        ms = start.timestamp() * 1000
+        host = dict(l1=315, c=16, p=4)
+        events = [row(status=200),
+                  row('poll.complete', host=host, hostAtMs=ms),
+                  row('listener.up', downSince=DAY + 'T11:59:00Z', listener='open',
+                      downListener='refused', hostStart=host, hostStartAtMs=ms + 60000,
+                      hostEnd=dict(l1=1, c=16, e='timeout'), hostEndAtMs=ms + 120000),
+                  dict(row('poll.complete', host=host, hostAtMs=ms + 240000), ts=DAY + 'T12:04:00Z')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / (DAY + '.ndjson')
+            for event in events:
+                with source.open('a') as out:
+                    out.write(json.dumps(event) + '\n')
+                self.compare(root, start)
+            for minutes in (1, 2, 4, 0, 4):
+                result = self.compare(root, start + dt.timedelta(minutes=minutes))
+            self.assertEqual(result['hostLoad']['pollRows'], 2)
+            self.assertEqual(result['hostLoad']['failedSnapshots'], {'timeout': 1})
+            self.assertEqual(result['proxySummary']['byHour'][0]['count'], 1)
+            next_day = root / '2026-11-22.ndjson'
+            next_day.write_text(json.dumps(dict(row('poll.complete', host=dict(l1=7, c=16),
+                hostAtMs=ms + 300000), ts='2026-11-22T00:01:00Z')) + '\n')
+            self.assertEqual(self.compare(root)['hostLoad']['pollRows'], 3)
+            self.compare(root)
 
     def test_priority_snapshot_and_plist(self):
         plist = Path(__file__).resolve().parents[2] / 'local-helpers/launchd/com.ardud.9router-log-poll.plist'
