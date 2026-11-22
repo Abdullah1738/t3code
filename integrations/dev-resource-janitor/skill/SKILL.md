@@ -28,6 +28,7 @@ Resource ids: `sim:<UDID>`, `simulator-app` (Simulator.app open with no booted d
 An Expo server is only protected by a running session whose directory is the Expo cwd or inside it. A session in a parent directory such as `~` does not count.
 Actions: `xcrun simctl shutdown` (quits Simulator.app when none are left booted),
 SIGTERM for expo + its `npm exec` parent, `docker stop -t 30`, `docker desktop stop`.
+If the janitor suspends a process under the board's standing authority, it must use `mac-suspend stop --pid N --deadline 10m --then cont|kill --reason 'why this process must pause' --actor 'dev-resource-janitor' --card '#N'`. Replace `cont|kill` with the chosen action; an explicit deadline is required and cannot exceed 60 minutes. Never send raw SIGSTOP or use `kill -STOP`. Use `mac-suspend resume --pid N` or `mac-suspend kill --pid N` for the janitor's own lease and read back the result. Run `mac-suspend sweep --json` before finishing and report unowned stopped processes without signalling them. Existing keep rules and protected-process rules still apply; a tool refusal is not permission to bypass them.
 Audit: `~/.local/share/dev-janitor/audit.jsonl`; last scan `last.json`.
 Keep list (one id, name or cwd per line): `~/.config/opencode/dev-janitor-keep.txt`.
 
