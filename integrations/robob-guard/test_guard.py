@@ -11,6 +11,21 @@ from hold import Holds
 
 SOURCE = Path(__file__).resolve().parent
 
+
+# Backend recovery simulations own their inputs; TCC behavior is tested separately.
+def setUpModule():
+    global tcc_patch, tier_patch
+    tcc_patch = patch("guard.tcc_jam_tick")
+    tcc_patch.start()
+    tier_patch = patch("guard.protected_tier_tick")
+    tier_patch.start()
+
+
+def tearDownModule():
+    tier_patch.stop()
+    tcc_patch.stop()
+
+
 class DecisionTests(unittest.TestCase):
     def setUp(self):
         self.state=guard.initial_state(); self.now=10000
@@ -463,7 +478,7 @@ class IOTests(unittest.TestCase):
                 def process(home):
                     guard.atomic_json(home/'.robob/install-hold.json',dict(by='arriving',pid=os.getpid(),startedAt=10000,beatAt=beat))
                     return False
-                with patch('guard.backend_ready',side_effect=process),patch('guard.boot_epoch',return_value=0),patch('guard.time.time',side_effect=[10000,10001]),patch('guard.reopen') as opened:
+                with patch('guard.desktop_snapshot',return_value=None),patch('guard.process_diagnostics',return_value='fixture'),patch('guard.backend_ready',side_effect=process),patch('guard.boot_epoch',return_value=0),patch('guard.time.time',side_effect=[10000,10001]),patch('guard.reopen') as opened:
                     guard.check(home);opened.assert_not_called()
                 state=guard.read_state(p)
                 self.assertEqual(state['history'],[]);self.assertFalse(state['awaiting_reopen'])
