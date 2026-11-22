@@ -1,0 +1,10 @@
+--- a/test_toollog.py
++++ b/test_toollog.py
+@@ -1378,6 +1378,7 @@
+         self.patch('read_json', return_value={'authorized_at': 'fixture'})
+         self.patch('login_pending', return_value=False)
+         self.patch('count_failure')
++        self.patch('notify_reauth', return_value=True)
+         self.patch('log')
+         self.patch('db', side_effect=AssertionError('DB must not be reached'))
+         patch = mock.patch.object(log, 'rollup_previous')

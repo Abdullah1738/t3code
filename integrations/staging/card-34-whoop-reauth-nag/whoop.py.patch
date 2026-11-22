@@ -1,0 +1,187 @@
+--- a/whoop/whoop.py
++++ b/whoop/whoop.py
+@@ -576,7 +576,7 @@
+         return res
+ 
+ 
+-    def sync(full=False, days=14, trigger=None):
++    def sync(full=False, days=14, trigger=None, reauth_handler=None):
+         global _log_refreshed, _log_expires_in
+         _log_refreshed = False
+         metrics = {'sleepCount': 0, 'recoveryCount': 0, 'cycleCount': 0, 'bodyCount': 0,
+@@ -598,12 +598,16 @@
+                     if field != 'reason':
+                         _cli_log.props.pop(field, None)
+             try:
+-                return _sync(full, days, metrics)
+-            except Exception:
++                result = _sync(full, days, metrics)
++                reset_reauth_reminder()
++                return result
++            except Exception as error:
+                 if diagnostic['reason'] in AUTH_FAILURE_REASONS:
+                     metrics.update(diagnostic)
+                     if _cli_log is not None:
+                         _cli_log.props.update(diagnostic)
++                if reauth_handler is not None and isinstance(error, (NotAuthorized, ReauthNeeded)):
++                    error.sync_exit_code = reauth_handler(error, metrics)
+                 raise
+             finally:
+                 if "refreshOutcome" in diagnostic:
+@@ -767,16 +771,92 @@
+             return False
+ 
+ 
+-    def cmd_sync(args):
+-        """Watcher entrypoint: silent on success, message + rc 1 on failure."""
+-        full = "--full" in args
+-        days = number_option(args, "--days", int, 14)
+-        try:
+-            res = sync(full=full, days=days, trigger=_tl.trigger() if _tl is not None else 'unknown')
+-            if "-v" in args:
+-                print(json.dumps(res, indent=2))
+-            return 0
+-        except NotAuthorized:
++    def parsed_time(value):
++        try:
++            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
++            return stamp.astimezone(timezone.utc) if stamp.tzinfo is not None else None
++        except (AttributeError, TypeError, ValueError):
++            return None
++
++
++    def notify_reauth(text, key):
++        # The bridge CLI only targets the paired owner; no recipient or credentials.
++        env = dict(os.environ)
++        env.pop("BUN_INSPECT", None)
++        result = subprocess.run([os.path.expanduser("~/.bun/bin/bun"),
++            os.path.expanduser("~/.local/share/telegram-bridge/src/cli.ts"), "notify",
++            "--source", "whoop-sync", "--severity", "attention", "--key", key, "--text", text],
++            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=25, env=env)
++        return result.returncode == 0  # durable queue acceptance, not a phone receipt
++
++
++    def record_reauth_reminder(pending, metrics):
++        # Caller holds TokenLock through the claim and send, across processes.
++        st = read_json(STATUS, {}) or {}
++        stamp = now()
++        last = parsed_time(st.get("last_sync_at"))
++        if metrics is not None:
++            metrics.update(reauthPending=pending, reminderSent=False,
++                           hoursSinceLastSuccess=round(max(0, (stamp - last).total_seconds()) / 3600, 2)
++                           if last else None)
++        path = os.path.join(os.path.dirname(STATUS), "reauth_reminder.json")
++        try:
++            state = read_json(path, {}) or {}
++            since = parsed_time(state.get("pending_since")) or stamp
++            if metrics is not None:
++                metrics["reauthPendingSinceDay"] = since.date().isoformat()
++            attempted = parsed_time(state.get("last_attempt_at"))
++            if attempted and (stamp - attempted).total_seconds() < 86400:
++                return
++            expired = state.get("expired_notice")
++            if not pending and expired and expired.get("accepted") is True:
++                return
++            day = last.date().isoformat() if last else "unknown"
++            if pending:
++                expiry = parsed_time((st.get("listener") or {}).get("until"))
++                text = ("WHOOP needs you to sign in again, data stopped %s, link valid until %s. %s"
++                        % (day, expiry.strftime("%Y-%m-%d %H:%M UTC") if expiry else "unknown", LOGIN_LINK))
++            else:
++                if not expired:
++                    expired = {"key": "whoop-reauth-pending:" + stamp.date().isoformat(),
++                               "text": ("WHOOP needs you to sign in again, data stopped %s. The login link expired. %s"
++                                        % (day, REAUTH_STEPS)), "accepted": False}
++                    state["expired_notice"] = expired
++                text = expired["text"]
++            # Persist before invoking the CLI: a crash/timeout may already have queued it.
++            state.update(pending_since=since.isoformat(), last_attempt_at=stamp.isoformat())
++            write_json(path, state, mode=0o600)
++            # Retry an expired notice with its original identity after uncertain sends.
++            key = "whoop-reauth-pending:" + stamp.date().isoformat() if pending else expired["key"]
++            accepted = notify_reauth(text, key)
++            if metrics is not None:
++                metrics["reminderSent"] = accepted
++            if accepted:
++                state["last_sent_at"] = stamp.isoformat()
++                if not pending:
++                    expired["accepted"] = True
++                write_json(path, state, mode=0o600)
++        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
++            # Notification failures must not turn the quiet auth wait into sync errors.
++            pass
++
++
++    def reset_reauth_reminder():
++        path = os.path.join(os.path.dirname(STATUS), "reauth_reminder.json")
++        try:
++            with TokenLock():
++                state = read_json(path, {}) or {}
++                if not state:
++                    return
++                # Keep the throttle across episodes; successful sync ends this episode.
++                clean = {key: state[key] for key in ("last_attempt_at", "last_sent_at") if key in state}
++                write_json(path, clean, mode=0o600)
++        except OSError:
++            pass
++
++
++    def handle_reauth(e, metrics=None):
++        if isinstance(e, NotAuthorized):
+             st = read_json(STATUS, {}) or {}
+             if not st.get("authorized_at"):
+                 return 0  # never connected: stay quiet
+@@ -785,14 +865,16 @@
+                     log("tokens were missing, but a login installed new ones meanwhile")
+                     return 0
+                 count_failure(state="reauth_needed", last_error="tokens missing from Keychain")
+-                if login_pending():
+-                    return 0  # login link already sent, the listener finishes the job
++                pending = login_pending()
++                record_reauth_reminder(pending, metrics)
++                if pending:
++                    return 0  # the listener finishes the job
+             log("sync failed, re-auth needed: tokens missing from Keychain")
+             # stderr: robob-watch keeps only stderr as the failure text
+             exit_detail('not_authorized', 'sync')
+             print("WHOOP tokens missing from Keychain (was authorized before). %s" % REAUTH_STEPS, file=sys.stderr)
+             return 1
+-        except ReauthNeeded as e:
++        else:
+             with TokenLock():  # the login callback installs tokens under this lock
+                 rejected = getattr(e, "rejected", None)
+                 current = load_tokens()
+@@ -801,13 +883,31 @@
+                     log("refresh of replaced tokens rejected; a newer login installed new ones")
+                     return 0
+                 count_failure(state="reauth_needed", last_error=str(e)[:300])
+-                if login_pending():
+-                    return 0  # login link already sent, the listener finishes the job
++                pending = login_pending()
++                record_reauth_reminder(pending, metrics)
++                if pending:
++                    return 0  # the listener finishes the job
+             log("sync failed, re-auth needed: %s" % e)
+             exit_detail('reauth_needed', 'sync')
+             print("WHOOP re-auth needed: refresh token rejected (%s). %s" % (str(e)[:200], REAUTH_STEPS),
+                   file=sys.stderr)
+             return 1
++
++
++    def cmd_sync(args):
++        """Watcher entrypoint: silent on success, message + rc 1 on failure."""
++        full = "--full" in args
++        days = number_option(args, "--days", int, 14)
++        try:
++            res = sync(full=full, days=days, trigger=_tl.trigger() if _tl is not None else 'unknown',
++                       reauth_handler=handle_reauth)
++            if "-v" in args:
++                print(json.dumps(res, indent=2))
++            return 0
++        except (NotAuthorized, ReauthNeeded) as e:
++            if hasattr(e, "sync_exit_code"):
++                return e.sync_exit_code
++            return handle_reauth(e)
+         except Exception as e:
+             count_failure(state="sync_error", last_error=str(e)[:300])
+             log("sync failed: %s\n%s" % (e, traceback.format_exc()))
