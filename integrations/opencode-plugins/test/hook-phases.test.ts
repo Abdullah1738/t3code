@@ -8,6 +8,7 @@ import * as rootwide from "../plugin/rootwide-search-guard";
 import * as quint from "../plugin/quint-verify-guard";
 import * as shared from "../plugin/shared-deps-guard";
 import * as phone from "../plugin/phone-adb-guard";
+import * as statev2 from "../plugin/statev2-guard";
 
 const temp = mkdtempSync(join(tmpdir(), "hook-phases-"));
 afterAll(() => rmSync(temp, { recursive: true, force: true }));
@@ -40,6 +41,22 @@ test("a classifier timeout row names spawn and classify time, measured, for ever
   }
   expect(readFileSync(logFile(), "utf8")).not.toContain(secret);
 }, 30000);
+
+test("the state database guard carries its classifier phases on timeout and on a derived verdict", async () => {
+  const slow = script("slow-db.py", "import time; time.sleep(5)");
+  const run = statev2.createGuardHook("/checkout", (() => statev2.classify(`cat ${secret}`, "/checkout", slow, python)) as never, () => "observe");
+  await run({ tool: "bash", sessionID: "fixture-session", input: { command: `cat ${secret}` } } as never);
+  const row = rows().at(-1);
+  expect(row.props.guard).toBe("statev2");
+  expect(row.durationMs).toBeGreaterThan(2000);
+  expect(phaseKeys(row.props)).toEqual(["classify_ms", "spawn_ms"]);
+  expect(row.props.classify_ms).toBeGreaterThanOrEqual(1990);
+  expect(JSON.stringify(row)).not.toContain(secret);
+  // classify() builds a new {rule, detail}; its timings must come along.
+  const verdict = await statev2.classify("cat notes", "/checkout", script("ok-db.py", 'print(\'{"rule": null, "detail": null}\')'), python);
+  expect(verdict).toEqual({ rule: null, detail: null });
+  expect(Object.keys(classifierPhases(verdict)).sort()).toEqual(["classify_ms", "spawn_ms"]);
+}, 15000);
 
 test("fast classifier rows keep sampling and carry no phase fields", async () => {
   const fast = script("fast.py", 'print(\'{"root": null, "reason": null}\')');

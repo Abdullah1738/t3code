@@ -1,5 +1,5 @@
 import { hook as toolLogHook } from "../lib/toollog";
-import { failureProps, runClassifier } from "../lib/classifier";
+import { carryTimings, classifierPhases, failureProps, runClassifier } from "../lib/classifier";
 // Shared Python verdict, with the previous local checks retained for classifier failure.
 import { readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
@@ -32,7 +32,7 @@ export async function classify(command: string, cwd: string | null, script = cla
     || !(verdict.detail === null || typeof verdict.detail === "string")) {
     throw new Error("Invalid state database classifier verdict")
   }
-  return { rule: verdict.rule, detail: verdict.detail }
+  return carryTimings(verdict, { rule: verdict.rule, detail: verdict.detail })
 }
 
 // Failure fallback: preserve the old matcher, plus OpenCode and the legacy T3 home.
@@ -114,6 +114,7 @@ export function createGuardHook(directory: string | null, check = classify, getM
     const started = performance.now()
     let decision = "allowed", rule = "no-policy", command: unknown, errorTag: string | undefined
     let classifierFailure: ReturnType<typeof failureProps> | undefined
+    let phases: Record<string, number> = {}
     const input = e.input
     const cwd = input?.workdir ?? input?.cwd ?? directory
     try {
@@ -123,10 +124,11 @@ export function createGuardHook(directory: string | null, check = classify, getM
       const m = getMode()
       if (m === "off" || !needsClassifier(command)) return
       let verdict: Verdict
-      try { verdict = await check(command, cwd) }
+      try { verdict = await check(command, cwd); phases = classifierPhases(verdict) }
       catch (error) {
         errorTag = "hook.classifier_failed"
         classifierFailure = failureProps(classifier, error, command, started, "fallback")
+        phases = classifierPhases(error)
         verdict = fallback(command, cwd)
       }
       if (!verdict.rule) return
@@ -137,7 +139,7 @@ export function createGuardHook(directory: string | null, check = classify, getM
     } catch {
       errorTag = "hook.error"
     } finally {
-      if (typeof command === "string") record("statev2", decision, rule, started, command, errorTag, {sessionId:e.sessionID}, {cwd}, classifierFailure)
+      if (typeof command === "string") record("statev2", decision, rule, started, command, errorTag, {sessionId:e.sessionID}, {cwd}, classifierFailure, phases)
     }
   }
 }

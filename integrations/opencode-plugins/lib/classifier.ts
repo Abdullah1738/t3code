@@ -21,6 +21,13 @@ const verdictTimings = new WeakMap<object, Timing>();
  * and classify (until the child's close or the 2 s timer callback ran, so a blocked event
  * loop lands here). Outcomes that did not come from runClassifier give no phases.
  */
+/** Keeps a verdict's timings on an object a guard derived from it. */
+export function carryTimings<T extends object>(from: unknown, to: T): T {
+  const timing = from !== null && typeof from === "object" ? verdictTimings.get(from) : undefined;
+  if (timing) verdictTimings.set(to, timing);
+  return to;
+}
+
 export function classifierPhases(outcome: unknown) {
   const timing = outcome instanceof ClassifierError ? outcome : outcome !== null && typeof outcome === "object" ? verdictTimings.get(outcome) : undefined;
   return timing ? { spawn_ms: timing.spawnMs, classify_ms: timing.classifyMs } : {};
