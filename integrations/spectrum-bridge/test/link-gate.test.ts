@@ -18,7 +18,7 @@ import { join } from "node:path";
 const start = Date.parse("2026-11-18T08:00:00Z");
 const stores: Store[] = [];
 afterEach(() => { stores.splice(0).forEach(s => s.close()); setSystemTime(); });
-function harness(random = 0.5, network = false, options: { storePath?: string; replies?: boolean; markers?: boolean } = {}) {
+function harness(random = 0.5, network = false, options: { storePath?: string; replies?: boolean; markers?: boolean; detailResponse?: Promise<void> } = {}) {
   let at = start, healthy = false, booting = false, healthStatus = "healthy";
   let loseReplyResponse = false, recoverBeforeLostReply = false;
   let mirrorBodyFailure: Error | undefined;
@@ -74,7 +74,10 @@ function harness(random = 0.5, network = false, options: { storePath?: string; r
       return ok({ threads: [], total: 0 });
     }
     if (options.markers && path === "/messages") return ok({ messages: [], nextCursor: null });
-    if (options.markers && /^\/threads\/[^/]+$/.test(path)) return ok({ thread: { ...thread, threadId: decodeURIComponent(path.split("/")[2]!), changeMarker: 1 } });
+    if (options.markers && /^\/threads\/[^/]+$/.test(path)) {
+      await options.detailResponse;
+      return ok({ thread: { ...thread, threadId: decodeURIComponent(path.split("/")[2]!), changeMarker: 1 } });
+    }
     if (path === "/threads/thread") return ok({ thread });
     if (path === "/threads/thread/messages") return ok({ messages });
     if (path.endsWith("/evidence")) return ok({ toolEvidence: "ran", complete: !!options.replies, status: options.replies ? "completed" : "running" });
@@ -214,6 +217,45 @@ test.each(["marker", "first page", "next page"])("a gate closing before %s count
     expect(h.calls.filter(path => path === "/threads")).toHaveLength(stage === "marker" ? 0 : 1);
     expect(h.calls.filter(path => path === "/messages")).toHaveLength(stage === "next page" ? 1 : 0);
   } finally { intercepts.forEach(intercept => intercept.mockRestore()); h.fetcher.mockRestore(); }
+});
+
+test.each(["before", "after"])("three failures %s any successful detail keep the outage and physical counts", async order => {
+  const release = Promise.withResolvers<void>();
+  const h = harness(0.5, false, { markers: true, detailResponse: release.promise });
+  const cache = new MessageCache(h.client), read = h.client.thread.bind(h.client);
+  let succeeded = false;
+  const detail = spyOn(h.client, "thread").mockImplementation(async (...args) => {
+    const response = read(...args);
+    const fail = async () => {
+      h.healthy = false;
+      for (let i = 0; i < 3; i++) await read("failed-probe").catch(() => {});
+      expect(h.gate.available).toBe(false);
+    };
+    if (order === "before") { await fail(); expect(succeeded).toBe(false); }
+    release.resolve();
+    const result = await response; succeeded = true;
+    if (order === "after") await fail();
+    expect(h.gate.available).toBe(false);
+    return result;
+  });
+  try {
+    const rows = await captureLogs(async () => {
+      h.healthy = true;
+      await cache.beginTick(["thread"]);
+      expect(succeeded).toBe(true);
+      expect(h.gate.available).toBe(false);
+      expect(await cache.prepared("thread")).toBe(false);
+      await cache.beginTick(["thread"]);
+      await expect(cache.read("thread", "fallback")).rejects.toBeInstanceOf(RobobLinkDown);
+    });
+    const reads = rows.filter(row => row.name === "robob.message_reads");
+    const sum = (field: string) => reads.reduce((total, row) => total + Number(row.props?.[field] ?? 0), 0);
+    expect(sum("markerPolls")).toBe(1);
+    expect(sum("crossThreadReads") + sum("crossThreadPages") + sum("fallbacks") + sum("fullReads") + sum("incrementalReads")).toBe(0);
+    expect(h.calls.filter(path => path === "/threads")).toHaveLength(1);
+    expect(h.calls.filter(path => path === "/messages")).toHaveLength(0);
+    expect(rows.filter(row => row.name === "robob.link_down_summary").length).toBeLessThanOrEqual(1);
+  } finally { release.resolve(); detail.mockRestore(); h.fetcher.mockRestore(); }
 });
 
 test("a gate refusal during a prepared transcript rebuild remains outage uncertainty", async () => {

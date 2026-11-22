@@ -16,6 +16,8 @@ import { Router, turnRanTools } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 import { firstTurnAlert } from "../src/telegram-fallback.ts";
 import { ProbeBudget } from "../src/probe-policy.ts";
+import { DETAIL_DEADLINE_MS } from "../src/message-cache.ts";
+import { captureLogs } from "./log-fixture.ts";
 
 const inbounds = (store: Store) => store.db.query<{ id: string; state: string }, []>("SELECT id, state FROM inbound ORDER BY rowid").all();
 const wakeBody = (title = "Daily board") => `[Watcher event from robob-watch daily-backlog, not typed by the owner. Handle it; reply only if the owner needs to know or act now, otherwise log it to the activity log and end with NO_REPLY.]\n${title}\n\nEvent:\nWORKING #5`;
@@ -1869,7 +1871,267 @@ async function markerFixture(count = 1, running = false) {
 
 const pollingCalls = (calls: Call[]) => calls.filter(call => call.method === "GET" && (call.path.startsWith("/messages?") || call.path.startsWith("/threads?ids=") || call.path.includes("/messages?")));
 
+async function withinDetailBound(work: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([work, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("detail preparation exceeded the shared deadline")), DETAIL_DEADLINE_MS + 500);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+test("bounded details: one held chat defers without delaying another beyond the shared deadline", async () => {
+  const { control, backend, chats } = await markerFixture(2, true);
+  const [slow, healthy] = chats as [typeof chats[number], typeof chats[number]];
+  const before = await backend.messages(slow.id), cache = backend["messageCache"];
+  const checkpoint = cache["entries"].get(slow.id);
+  control.reply(slow.id, "slow final", "completed"); control.reply(healthy.id, "healthy final", "completed");
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), returned = Promise.withResolvers<void>();
+  const read = backend.client.thread.bind(backend.client);
+  const detail = spyOn(backend.client, "thread").mockImplementation(async (id, options) => {
+    const result = await read(id, options);
+    if (id === slow.id) { entered.resolve(); await release.promise; returned.resolve(); }
+    return result;
+  });
+  const started = performance.now();
+  let polling: Promise<void> | undefined;
+  try {
+    const rows = await captureLogs(async () => {
+      polling = backend.beginMessageTick(chats.map(chat => chat.id));
+      await entered.promise;
+      await withinDetailBound(polling);
+      expect(performance.now() - started).toBeLessThan(DETAIL_DEADLINE_MS + 500);
+      expect(JSON.stringify(await backend.messages(healthy.id))).toContain("healthy final");
+      expect(await backend.messages(slow.id)).toEqual(before);
+      expect(await backend.messages(slow.id, slow.directory, { until: "not-in-old-cache" })).toEqual(before);
+      expect(cache["entries"].get(slow.id)).toBe(checkpoint);
+      await expect(backend.promptAccepted(slow.id, slow.directory, "unknown")).rejects.toBe(probeDeferred);
+      expect(control.calls.filter(call => call.path === `/threads/${slow.id}`)).toHaveLength(1);
+      expect(control.calls.filter(call => call.path.includes(`/threads/${slow.id}/messages`))).toHaveLength(0);
+      const page = control.calls.find(call => call.path.startsWith("/messages?"))!;
+      expect(new URL("http://test" + page.path).searchParams.get("threadIds")).toBe(healthy.id);
+      release.resolve(); await returned.promise;
+      expect(cache["entries"].get(slow.id)).toBe(checkpoint);
+      await backend.beginMessageTick(chats.map(chat => chat.id));
+      expect(JSON.stringify(await backend.messages(slow.id))).toContain("slow final");
+      expect(cache["entries"].get(slow.id)?.marker).not.toBe(checkpoint?.marker);
+      expect(control.calls.filter(call => call.path === `/threads/${slow.id}`)).toHaveLength(2);
+    });
+    expect(rows.find(row => row.name === "detail_deferred")?.props).toMatchObject({ reason: "timeout", streak: 1 });
+    expect(rows.filter(row => row.name === "robob.message_reads").reduce((sum, row) => sum + Number(row.props?.detailDeferred ?? 0), 0)).toBe(1);
+  } finally { release.resolve(); await polling; detail.mockRestore(); }
+});
+
+test("bounded details: five slow reads cost one deadline and cannot publish late", async () => {
+  const { control, backend, chats } = await markerFixture(5, true);
+  const cache = backend["messageCache"], checkpoints = chats.map(chat => cache["entries"].get(chat.id));
+  for (const chat of chats) control.reply(chat.id, "late final", "completed");
+  const release = Promise.withResolvers<void>(), reads: Promise<unknown>[] = [];
+  const read = backend.client.thread.bind(backend.client);
+  const detail = spyOn(backend.client, "thread").mockImplementation((id, options) => {
+    const result = read(id, options).then(async response => { await release.promise; return response; });
+    reads.push(result); return result;
+  });
+  const started = performance.now();
+  let polling: Promise<void> | undefined;
+  try {
+    polling = backend.beginMessageTick(chats.map(chat => chat.id));
+    await withinDetailBound(polling);
+    expect(reads).toHaveLength(5);
+    expect(performance.now() - started).toBeLessThan(DETAIL_DEADLINE_MS + 500);
+    expect(pollingCalls(control.calls)).toHaveLength(1);
+    expect(chats.map(chat => cache["entries"].get(chat.id))).toEqual(checkpoints);
+    release.resolve(); await Promise.all(reads);
+    expect(chats.map(chat => cache["entries"].get(chat.id))).toEqual(checkpoints);
+  } finally { release.resolve(); await polling; await Promise.all(reads); detail.mockRestore(); }
+});
+
+test("bounded details: first-read timeout is uncertainty without a same-tick fallback", async () => {
+  const control = fakeControl(); control.flags.markers = true;
+  const backend = control.backend(), chat = await backend.createChat();
+  await backend.prompt(chat.id, chat.directory, "original", "hello"); control.calls.length = 0;
+  const release = Promise.withResolvers<void>();
+  const read = backend.client.thread.bind(backend.client);
+  const detail = spyOn(backend.client, "thread").mockImplementation(async (id, options) => { const result = await read(id, options); await release.promise; return result; });
+  let polling: Promise<void> | undefined;
+  try {
+    polling = backend.beginMessageTick([chat.id]);
+    await withinDetailBound(polling);
+    await expect(backend.messages(chat.id)).rejects.toBe(probeDeferred);
+    await expect(backend.promptAccepted(chat.id, chat.directory, "original")).rejects.toBe(probeDeferred);
+    expect(backend["messageCache"]["entries"].has(chat.id)).toBe(false);
+    expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(1);
+    expect(pollingCalls(control.calls)).toHaveLength(1);
+    release.resolve(); detail.mockRestore();
+    await backend.beginMessageTick([chat.id]);
+    expect(await backend.promptAccepted(chat.id, chat.directory, "original")).toBe(true);
+  } finally { release.resolve(); await polling; detail.mockRestore(); }
+});
+
+test.each([new ControlError(500), new Error("failed detail")])("bounded details: failed reads keep committed pairs and log consecutive streaks (%s)", async failure => {
+  const { control, backend, chats } = await markerFixture(1, true);
+  const chat = chats[0]!, before = await backend.messages(chat.id);
+  control.threads.get(chat.id)!.pending.push({ requestId: "pending", kind: "approval", requestKind: "command" });
+  let failing = true;
+  const read = backend.client.thread.bind(backend.client);
+  const detail = spyOn(backend.client, "thread").mockImplementation((...args) => failing ? Promise.reject(failure) : read(...args));
+  try {
+    const rows = await captureLogs(async () => {
+      for (let tick = 1; tick <= 6; tick++) {
+        await backend.beginMessageTick([chat.id]);
+        expect(await backend.messages(chat.id)).toEqual(before);
+        expect(await backend.permissions(chat.id)).toEqual([]);
+      }
+      expect(detail).toHaveBeenCalledTimes(6);
+      expect(pollingCalls(control.calls)).toHaveLength(6);
+      failing = false;
+      await backend.beginMessageTick([chat.id]);
+      expect(await backend.permissions(chat.id)).toHaveLength(1);
+      control.threads.get(chat.id)!.pending.push({ requestId: "next", kind: "approval", requestKind: "command" });
+      failing = true;
+      await backend.beginMessageTick([chat.id]);
+    });
+    expect(rows.filter(row => row.name === "detail_deferred").map(row => row.props?.streak)).toEqual([1, 2, 3, 4, 5, 6, 1]);
+    expect(rows.find(row => row.name === "detail_deferred")?.props).toMatchObject({ reason: failure instanceof ControlError ? "status" : "error", elapsedMs: expect.any(Number), ...(failure instanceof ControlError ? { status: 500 } : {}) });
+    expect(rows.filter(row => row.name === "detail_deferred_streak")).toHaveLength(1);
+    expect(rows.find(row => row.name === "detail_deferred_streak")).toMatchObject({ level: "warn", props: { streak: 5 } });
+    expect(rows.filter(row => row.name === "robob.message_reads").reduce((sum, row) => sum + Number(row.props?.detailDeferred ?? 0), 0)).toBe(7);
+  } finally { detail.mockRestore(); }
+});
+
+test.each((["write", "read-version", "route"] as const).flatMap(invalidation => ["completed", "needs-input"].map(state => ({ invalidation, state }))))(
+  "bounded checkpoint: $invalidation invalidation cannot mix $state metadata into a deferred transcript", async ({ invalidation, state }) => {
+  const { control, backend, chats } = await markerFixture(1, true);
+  const chat = chats[0]!, cache = backend["messageCache"], checkpoint = cache["entries"].get(chat.id);
+  const before = await backend.messages(chat.id), thread = control.threads.get(chat.id)!;
+  if (state === "completed") control.reply(chat.id, "finished", "completed");
+  else thread.pending.push({ requestId: "pending-one", kind: "approval", requestKind: "command" });
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const read = backend.client.crossThreadMessages.bind(backend.client);
+  const page = spyOn(backend.client, "crossThreadMessages").mockImplementation(async args => {
+    const result = await read(args); entered.resolve(); await release.promise; return result;
+  });
+  const polling = backend.beginMessageTick([chat.id]);
+  try {
+    await entered.promise;
+    if (invalidation === "write") cache.afterWrite(chat.id);
+    else if (invalidation === "route") cache.routeChange(chat.id);
+    else cache["readVersions"].set(chat.id, (cache["readVersions"].get(chat.id) ?? 0) + 1);
+    release.resolve(); await polling;
+    // A metadata-only reader may cache this rejected capture for reuse, never for deferral.
+    const rejected = await cache.detail(chat.id);
+    expect(state === "completed" ? rejected.run?.status === "completed" : rejected.pendingRequests.length > 0).toBe(true);
+    thread.pending.push({ requestId: "new-request", kind: "question", requestKind: "question" });
+    const detail = spyOn(backend.client, "thread").mockRejectedValue(new ControlError(500));
+    try {
+      await backend.beginMessageTick([chat.id]);
+      if (invalidation === "route") {
+        await expect(backend.messages(chat.id)).rejects.toBe(probeDeferred);
+      } else {
+        expect(cache["entries"].get(chat.id)).toBe(checkpoint);
+        expect((await cache.detail(chat.id)).run?.status).toBe("running");
+        expect((await cache.detail(chat.id)).pendingRequests).toEqual([]);
+        expect(await backend.messages(chat.id)).toEqual(before);
+      }
+      expect(detail).toHaveBeenCalledTimes(1);
+      expect(control.calls.filter(call => call.path.includes(`/threads/${chat.id}/messages`))).toHaveLength(0);
+    } finally { detail.mockRestore(); }
+  } finally { release.resolve(); await polling; page.mockRestore(); }
+});
+
+test.each(["resync", "missing-until"] as const)("bounded checkpoint: %s rebuild retains its matching detail on deferral", async reason => {
+  const { control, backend, chats } = await markerFixture(1, true);
+  const chat = chats[0]!, cache = backend["messageCache"];
+  await backend.beginMessageTick([chat.id]);
+  control.reply(chat.id, "new partial", "running");
+  if (reason === "resync") await cache.resync(chat.id, "redaction");
+  else await cache.read(chat.id, "missing", () => false);
+  const before = await backend.messages(chat.id), checkpoint = cache["entries"].get(chat.id);
+  expect(JSON.stringify(before)).toContain("new partial");
+  control.threads.get(chat.id)!.pending.push({ requestId: "pending", kind: "approval", requestKind: "command" });
+  const detail = spyOn(backend.client, "thread").mockRejectedValue(new ControlError(500));
+  try {
+    await backend.beginMessageTick([chat.id]);
+    expect(cache["entries"].get(chat.id)).toBe(checkpoint);
+    expect(await backend.messages(chat.id)).toEqual(before);
+    expect(await backend.permissions(chat.id)).toEqual([]);
+    expect(detail).toHaveBeenCalledTimes(1);
+  } finally { detail.mockRestore(); }
+});
+
+test.each((["approval", "question", "dismiss"] as const).flatMap(kind => [false, true].map(pending => ({ kind, pending }))))(
+  "bounded reconciliation: $kind with prior pending=$pending rechecks deferral after preparation", async ({ kind, pending }) => {
+  const { control, backend, chats, tick } = await markerFixture(1, true);
+  const chat = chats[0]!, thread = control.threads.get(chat.id)!, cache = backend["messageCache"];
+  if (pending) {
+    thread.pending.push({ requestId: "target", kind: kind === "approval" ? "approval" : "question", requestKind: "command" });
+    await tick();
+    thread.pending.length = 0;
+  } else thread.pending.push({ requestId: "target", kind: kind === "approval" ? "approval" : "question", requestKind: "command" });
+  const failed = Promise.withResolvers<Awaited<ReturnType<ControlClient["thread"]>>>();
+  const started = Promise.withResolvers<void>();
+  const detail = spyOn(backend.client, "thread").mockImplementation(() => { started.resolve(); return failed.promise; });
+  const entered = Promise.withResolvers<void>(), read = cache.detail.bind(cache);
+  const reader = spyOn(cache, "detail").mockImplementation(id => { entered.resolve(); return read(id); });
+  const polling = backend.beginMessageTick([chat.id]);
+  await started.promise;
+  const resolving = backend.responseResolved(chat.id, chat.directory, "target").then(result => ({ result, error: undefined }), error => ({ result: undefined, error }));
+  try {
+    await entered.promise;
+    failed.reject(new ControlError(500));
+    await polling;
+    expect((await resolving).error).toBe(probeDeferred);
+    expect(detail).toHaveBeenCalledTimes(1);
+    expect(control.calls.filter(call => call.method === "POST" && call.path.endsWith("/respond"))).toHaveLength(0);
+  } finally { failed.reject(new ControlError(500)); await polling; await resolving; reader.mockRestore(); detail.mockRestore(); }
+  await tick();
+  expect(await backend.responseResolved(chat.id, chat.directory, "target")).toBe(pending);
+});
+
+test.each((["root", "child"] as const).flatMap(target => ["question", "permission"].map(kind => ({ target, kind }))))(
+  "marker polling: $target $kind response fences replies at its correct write boundary", async ({ target, kind }) => {
+  const { control, backend, chats, tick } = await markerFixture(2, true);
+  const parent = chats[0]!, destination = target === "root" ? parent : chats[1]!;
+  if (target === "child") control.threads.get(destination.id)!.parentThreadId = parent.id;
+  control.threads.get(destination.id)!.pending.push({ requestId: "pending-one", kind: kind === "question" ? "question" : "approval", requestKind: "command",
+    questions: [{ id: "q1", header: "Choose", question: "Which?", options: [{ label: "yes" }] }] });
+  await tick();
+  const store = new Store(":memory:"); stores.push(store);
+  const turn = { ...parent, generation: 1, phase: "running" as const, messageId: `msg_${"0".repeat(64)}`, startedAt: 0 };
+  store.set("route", { ...parent, generation: 1 }); store.set("activeTurn", turn);
+  store.acceptInbound("answer", { id: "answer", text: "yes", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() });
+  store.updateInbound("answer", "processing");
+  const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } }, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/imessage", alertSkillPath: "/test/telegram", alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent",
+  });
+  const request = kind === "question" ? (await backend.questions(destination.id))[0]! : (await backend.permissions(destination.id))[0]!;
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const respond = backend.client.respond.bind(backend.client);
+  const held = spyOn(backend.client, "respond").mockImplementation(async (...args) => { entered.resolve(); await release.promise; return respond(...args); });
+  const sending = backend.messageReadScope(() => router["postResponse"]("answer", turn, destination.id, destination.directory, request.id, {
+    request, answers: kind === "question" ? [["yes"]] : [], decision: "once", outbox: 0,
+  }));
+  try {
+    await entered.promise;
+    control.reply(parent.id, "finished while response waited", "completed");
+    await tick();
+    const records = await backend.messages(parent.id);
+    const reply = records.find(record => record.type === "assistant" && JSON.stringify(record).includes("finished while response waited"))!;
+    expect(reply).toBeDefined();
+    release.resolve(); await sending;
+    const before = store.get<string[]>("human-response-before:answer");
+    expect(before?.includes(reply.id)).toBe(target === "child");
+    expect(router["replyCoverage"](turn, records, reply.id, ["answer"], new Set())).toEqual(target === "child" ? [] : ["answer"]);
+    expect(control.calls.filter(call => call.method === "POST" && call.path.endsWith("/respond"))).toHaveLength(1);
+  } finally { release.resolve(); await sending; held.mockRestore(); }
+});
+
 test.each(["idle", "active", "steer"])("marker polling: five-thread 60-second router budget (%s)", async scenario => {
+  const measuredAt = performance.now(), timings = { markerMs: 0, completionMs: 0, routerMs: 0 };
+  const timed = async (field: keyof typeof timings, work: () => Promise<void>) => {
+    const at = performance.now();
+    try { await work(); } finally { timings[field] += performance.now() - at; }
+  };
   const start = Date.parse("2026-11-15T09:30:00Z"); setSystemTime(start);
   const control = fakeControl(); control.flags.markers = true;
   const backend = control.backend();
@@ -1911,15 +2173,15 @@ test.each(["idle", "active", "steer"])("marker polling: five-thread 60-second ro
       if (second === 50 && scenario !== "idle") control.reply(chat.id, "done", "completed");
     }
     const from = control.calls.length;
-    await backend.beginMessageTick(chats.map(chat => chat.id));
-    for (const { router } of lanes) { await router.checkCompletion(); await router.tick(); }
+    await timed("markerMs", () => backend.beginMessageTick(chats.map(chat => chat.id)));
+    for (const { router } of lanes) { await timed("completionMs", () => router.checkCompletion()); await timed("routerMs", () => router.tick()); }
     const calls = pollingCalls(control.calls.slice(from));
     expect(calls.length).toBeLessThanOrEqual(scenario === "idle" ? 1 : 2);
     if (!completionSecond && scenario !== "idle" && lanes.every(({ store }) => store.pendingOutbox().some(op => op.kind === "conversation" && op.text === "done"))) completionSecond = second;
   }
   if (scenario !== "idle") expect(completionSecond).toBe(50);
   const gets = control.calls.filter(call => call.method === "GET");
-  console.log("marker-five-thread-budget", JSON.stringify({ scenario, polling: pollingCalls(gets).length,
+  console.log("marker-five-thread-budget", JSON.stringify({ scenario, durationMs: performance.now() - measuredAt, ...timings, polling: pollingCalls(gets).length,
     markers: gets.filter(call => call.path.startsWith("/threads?ids=")).length, messages: gets.filter(call => call.path.startsWith("/messages?")).length,
     detail: gets.filter(call => /^\/threads\/[^/?]+$/.test(call.path)).length, evidence: gets.filter(call => call.path.endsWith("/evidence")).length,
     discovery: gets.filter(call => call.path.startsWith("/threads?") && !call.path.startsWith("/threads?ids=")).length, completionSecond }));

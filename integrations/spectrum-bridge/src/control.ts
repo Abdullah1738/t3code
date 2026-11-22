@@ -302,8 +302,8 @@ export class ControlClient {
     }
   }
 
-  thread(threadId: string): Promise<{ thread: ThreadDetail }> {
-    return this.request("GET", `/threads/${encodeURIComponent(threadId)}`);
+  thread(threadId: string, options?: RequestOptions): Promise<{ thread: ThreadDetail }> {
+    return this.request("GET", `/threads/${encodeURIComponent(threadId)}`, undefined, options);
   }
 
   byNative(sessionId: string): Promise<{ thread: ThreadDetail }> {

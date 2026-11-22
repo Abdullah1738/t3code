@@ -3,16 +3,18 @@ import { ControlError, type ControlClient, type ControlMessage, type ThreadDetai
 import { randomUUID } from "node:crypto";
 import { toolLog } from "./toollog.ts";
 import { RobobLinkDown } from "./robob-link-gate.ts";
+import { probeDeferred } from "./probe-policy.ts";
 
-type Snapshot = { messages: ControlMessage[]; updatedAt: number; fullAt: number; readAt: number; full: boolean; marker?: string };
+type Snapshot = { messages: ControlMessage[]; updatedAt: number; fullAt: number; readAt: number; full: boolean; marker?: string; detail?: ThreadDetail };
 type Read = { generation: number; writes: number | undefined; key: string; promise: Promise<Snapshot> };
 type FullReason = "first-read" | "route-change" | "missing-until" | "resync" | "merge-conflict" | "clock-skew";
 const RESYNC_MS = 10 * 60_000;
 const SKEW_MS = 2_000;
 const BEGINNING = -8640000000000000;
 const OVERLAP_MS = 30_000;
+export const DETAIL_DEADLINE_MS = 2000;
 type Tick = { id: string; ready: Promise<void>; messages: Map<string, Snapshot>; summaries: Map<string, ThreadSummary>;
-  details: Map<string, Promise<ThreadDetail>>; evidence: Map<string, Promise<RunEvidence>>; accepted: Set<string>; deferred: Set<string>; failed: Set<string> };
+  details: Map<string, Promise<ThreadDetail>>; evidence: Map<string, Promise<RunEvidence>>; accepted: Set<string>; deferred: Set<string>; failed: Set<string>; detailDeferred: Set<string> };
 
 /** Marker snapshots share messages and metadata; run evidence is shared for one tick only. */
 export class MessageCache {
@@ -28,6 +30,7 @@ export class MessageCache {
   private polling = false;
   private readonly details = new Map<string, ThreadDetail>();
   private readonly archived = new Map<string, ThreadDetail>();
+  private readonly detailStreaks = new Map<string, number>();
   private readonly metadataScope = new AsyncLocalStorage<Map<string, Promise<RunEvidence>>>();
 
   constructor(private readonly client: ControlClient) {}
@@ -45,7 +48,7 @@ export class MessageCache {
       this.details.delete(id);
       this.archived.delete(id);
     }
-    const tick: Tick = { id: randomUUID(), ready: Promise.resolve(), messages: new Map(), summaries: new Map(), details: new Map(), evidence: new Map(), accepted: new Set(), deferred: new Set(), failed: new Set() };
+    const tick: Tick = { id: randomUUID(), ready: Promise.resolve(), messages: new Map(), summaries: new Map(), details: new Map(), evidence: new Map(), accepted: new Set(), deferred: new Set(), failed: new Set(), detailDeferred: new Set() };
     this.tick = tick;
     for (const id of threadIds) if (this.archived.has(id) && this.entries.has(id)) {
       tick.messages.set(id, this.entries.get(id)!);
@@ -85,13 +88,11 @@ export class MessageCache {
         const chunk = ids.slice(offset, offset + 50);
         const result = await this.client.threadSummaries(chunk);
         for (const id of chunk) {
-          let summary = result.threads.find(thread => thread.threadId === id);
+          const summary = result.threads.find(thread => thread.threadId === id);
           if (!summary) {
-            const { thread } = await this.client.thread(id);
-            tick.details.set(id, Promise.resolve(thread));
-            summary = thread;
             // An omitted summary is a repair boundary, never proof that the old transcript is empty.
             missing.add(id);
+            continue;
           }
           if (!Number.isSafeInteger(summary.changeMarker) || summary.changeMarker! < 0) {
             fallbackReason = "missing-marker";
@@ -102,28 +103,38 @@ export class MessageCache {
       }
       // Like #50, capture exact run/error state before reading its messages. A terminal detail
       // fetched afterwards could otherwise seal partial text or permanently clear a first-turn check.
-      for (const id of ids) {
-        const summary = tick.summaries.get(id)!;
+      const started = performance.now(), controller = new AbortController();
+      const timeout = Symbol("detail-deadline");
+      const deadline = new Promise<never>((_, reject) => {
+        controller.signal.addEventListener("abort", () => reject(timeout), { once: true });
+      });
+      const timer = setTimeout(() => controller.abort(), DETAIL_DEADLINE_MS);
+      let missingMarker = false;
+      try { await Promise.all(ids.map(async id => {
+        const summary = tick.summaries.get(id);
         const prior = this.details.get(id);
-        let read = tick.details.get(id);
-        if (!read) {
-          read = prior && this.canReuseDetail(prior, summary) ? Promise.resolve({ ...prior, ...summary })
-            : this.client.thread(id).then(({ thread }) => thread);
-          tick.details.set(id, read);
+        const read = prior && summary && this.canReuseDetail(prior, summary) ? Promise.resolve({ ...prior, ...summary })
+          : this.client.thread(id, { signal: controller.signal }).then(({ thread }) => thread);
+        let detail: ThreadDetail;
+        try { detail = await Promise.race([read, deadline]); }
+        catch (error) {
+          this.deferDetail(tick, id, error === timeout ? "timeout" : error instanceof ControlError ? "status" : "error", performance.now() - started, error);
+          return;
         }
-        const detail = await read;
         if (!Number.isSafeInteger(detail.changeMarker) || detail.changeMarker! < 0) {
-          fallbackReason = "missing-marker";
-          throw new Error("Missing change marker");
+          missingMarker = true;
+          return;
         }
+        this.detailStreaks.delete(id);
         // Detail reads runs before its marker. Omitted summaries only have the previous poll's boundary.
-        const captured = { ...detail, changeMarker: missing.has(id) ? prior?.changeMarker : summary.changeMarker };
+        const captured = { ...detail, changeMarker: missing.has(id) ? prior?.changeMarker : summary!.changeMarker };
         details.set(id, captured);
         tick.details.set(id, Promise.resolve(captured));
         tick.summaries.set(id, captured);
-      }
+      })); } finally { clearTimeout(timer); }
+      if (missingMarker) { fallbackReason = "missing-marker"; throw new Error("Missing change marker"); }
       fallbackReason = "cross-thread-error";
-      const changed = ids.filter(id => {
+      const changed = ids.filter(id => !tick.detailDeferred.has(id)).filter(id => {
         const cached = this.entries.get(id);
         if (missing.has(id) || this.reason(cached, Date.now(), id) || tick.summaries.get(id)!.changeMarker?.toString() !== cached?.marker) return true;
         tick.messages.set(id, { ...cached!, full: false });
@@ -158,12 +169,14 @@ export class MessageCache {
       }
       // Nothing becomes a skip candidate until all pages drain. Writes/route changes during the walk invalidate it.
       for (const [id, snapshot] of tick.messages) {
+        if (tick.detailDeferred.has(id)) continue;
         if (!versions.has(id)) continue;
         if (generation !== this.generation || writes.get(id) !== this.writes.get(id) || versions.get(id) !== this.readVersions.get(id)) {
           tick.messages.delete(id);
           tick.failed.add(id);
           this.pollLog(tick, id, { fallbacks: 1, fallbackReason: "state-raced" });
         } else {
+          snapshot.detail = details.get(id)!;
           this.entries.set(id, snapshot);
           this.changedRoutes.delete(id);
           const detail = details.get(id)!;
@@ -174,13 +187,34 @@ export class MessageCache {
       }
     } catch (error) {
       const status = error instanceof ControlError ? error.status : 0;
-      tick.messages.clear();
-      tick.summaries.clear();
+      for (const id of tick.messages.keys()) if (!tick.detailDeferred.has(id)) tick.messages.delete(id);
+      for (const id of tick.summaries.keys()) if (!tick.detailDeferred.has(id)) tick.summaries.delete(id);
       for (const id of ids) {
+        if (tick.detailDeferred.has(id)) continue;
         tick.failed.add(id);
         if (!(error instanceof RobobLinkDown)) this.pollLog(tick, id, { fallbacks: 1, fallbackReason, status });
       }
     }
+  }
+
+  private deferDetail(tick: Tick, threadId: string, reason: "timeout" | "error" | "status", elapsedMs: number, error: unknown): void {
+    tick.detailDeferred.add(threadId);
+    const cached = this.entries.get(threadId), prior = cached?.detail;
+    // Expose only a committed pair. A first-read miss must never look like an empty transcript.
+    if (prior && cached) {
+      tick.details.set(threadId, Promise.resolve(prior));
+      tick.summaries.set(threadId, prior);
+      tick.messages.set(threadId, cached);
+    } else tick.summaries.delete(threadId);
+    const streak = (this.detailStreaks.get(threadId) ?? 0) + 1;
+    this.detailStreaks.set(threadId, streak);
+    this.pollLog(tick, threadId, { detailDeferred: 1 });
+    const entry = { component: "robob", kind: "event" as const, ids: { threadId, tickId: tick.id },
+      props: { reason, elapsedMs, streak, ...(error instanceof ControlError ? { status: error.status } : {}) } };
+    toolLog.capture(() => {
+      toolLog.write({ ...entry, name: "detail_deferred" });
+      if (streak === 5) toolLog.write({ ...entry, name: "detail_deferred_streak", level: "warn" });
+    });
   }
 
   private async drain(tick: Tick, ids: string[], since: number): Promise<Map<string, ControlMessage[]>> {
@@ -253,6 +287,11 @@ export class MessageCache {
   async detail(threadId: string): Promise<ThreadDetail> {
     const tick = this.tick;
     await tick?.ready;
+    if (tick?.detailDeferred.has(threadId)) {
+      const prior = tick.details.get(threadId);
+      if (!prior) throw probeDeferred;
+      return prior;
+    }
     const summary = tick?.summaries.get(threadId) ?? this.archived.get(threadId);
     const shared = tick?.details;
     if (!summary) {
@@ -293,7 +332,7 @@ export class MessageCache {
   accept(threadId: string, promptId: string): void { this.tick?.accepted.add(`${threadId}\0${promptId}`); }
   accepted(threadId: string, promptId: string): boolean { return this.tick?.accepted.has(`${threadId}\0${promptId}`) ?? false; }
   deferReconciliation(threadId: string, operationId: string): void { this.tick?.deferred.add(`${threadId}\0${operationId}`); }
-  reconciliationDeferred(threadId: string, operationId: string): boolean { return this.tick?.deferred.has(`${threadId}\0${operationId}`) ?? false; }
+  reconciliationDeferred(threadId: string, operationId: string): boolean { return this.tick?.detailDeferred.has(threadId) === true || this.tick?.deferred.has(`${threadId}\0${operationId}`) === true; }
 
   routeChange(threadId?: string): void {
     if (threadId !== undefined) {
@@ -326,6 +365,10 @@ export class MessageCache {
     const tick = this.tick;
     await tick?.ready;
     const prepared = tick?.messages.get(threadId);
+    if (tick?.detailDeferred.has(threadId)) {
+      if (!prepared) throw probeDeferred;
+      return prepared.messages;
+    }
     if (prepared && (!contains || contains(prepared.messages) || prepared.full)) {
       this.log(threadId, "cached-skip");
       return prepared.messages;
@@ -352,6 +395,7 @@ export class MessageCache {
   }
 
   async resync(threadId: string, key: string): Promise<ControlMessage[]> {
+    if (this.tick?.detailDeferred.has(threadId)) throw probeDeferred;
     if (await this.prepared(threadId)) return this.rebuild(threadId, "merge-conflict");
     const read = this.refresh(threadId, key, "merge-conflict");
     this.scope.getStore()?.set(threadId, read);
@@ -360,13 +404,15 @@ export class MessageCache {
 
   private async rebuild(threadId: string, reason: FullReason): Promise<ControlMessage[]> {
     const tick = this.tick!;
+    if (tick.detailDeferred.has(threadId)) throw probeDeferred;
     const version = this.readVersions.get(threadId);
     const writes = this.writes.get(threadId);
     try {
+      const detail = await this.detail(threadId);
       const incoming = (await this.drain(tick, [threadId], BEGINNING)).get(threadId)!;
       const messages = this.merge(undefined, incoming, true)!;
       const snapshot: Snapshot = { messages, updatedAt: this.watermark(messages), fullAt: Date.now(), readAt: Date.now(), full: true,
-        marker: tick.summaries.get(threadId)!.changeMarker?.toString() };
+        marker: tick.summaries.get(threadId)!.changeMarker?.toString(), detail };
       if (version === this.readVersions.get(threadId) && writes === this.writes.get(threadId)) {
         this.entries.set(threadId, snapshot);
         tick.messages.set(threadId, snapshot);

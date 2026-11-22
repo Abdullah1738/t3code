@@ -668,6 +668,7 @@ export class RobobBackend implements ChatBackend {
     const threadId = await this.resolve(id);
     if (this.messageCache.reconciliationDeferred(threadId, `respond:${requestId}`)) throw probeDeferred;
     const thread = await this.detail(threadId);
+    if (this.messageCache.reconciliationDeferred(threadId, `respond:${requestId}`)) throw probeDeferred;
     return !thread.pendingRequests.some(request => request.requestId === requestId);
   }
 
