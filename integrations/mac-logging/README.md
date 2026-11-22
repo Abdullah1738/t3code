@@ -861,6 +861,31 @@ review; the CPU job retains its original launcher. Installer tests set
 
 ## Host telemetry
 
+`host.spawn_sample` reports sampled births/exits once a minute, with parent
+identities, runnable threads by current priority, CPU advancement and offbox
+command classes. Births are a lower bound from five-second PID/start-time
+snapshots, not a fork or exec count. `status` and rollups show the latest
+birth rate, three parents and runnable priority-4-or-lower count. Overload
+events carry the sample as context without changing alert thresholds.
+
+Each native pass has a 1.5-second cooperative deadline and reads threads for
+at most 300 candidate processes. A separate daemon worker isolates a stuck
+kernel call; the publisher reports stale/in-flight coverage instead of
+waiting. Coverage, unreadable argv/tasks and missing CPU baselines are explicit.
+Only derived labels are cached per PID/start identity; argv is never logged.
+Cost includes per-minute summed wall/CPU time, individual phase costs and guard
+decisions. Actual excess halves the thread-process cap down to one, prioritizing
+runnable hints and highest CPU gain; only then can cadence slow to 15 seconds.
+A shared 75ms soft argv/CPU allocation leaves room for a 25ms thread pass every
+tick within the 1.5s overall deadline. Runnable hints with unread CPU data
+remain eligible for thread reads and carry an unknown CPU baseline.
+Argv runs first so a slow CPU census cannot starve new parent/offbox labels.
+Thread counts are null only when no minimal pass fits or is readable, and retry
+on the next tick. Runnable counts describe the latest tick, not the sum
+of repeated censuses; offbox counts/RSS describe that same tick. CPU deltas use
+the last readable per-identity baseline (`offboxWindowS` is the tick window,
+`cpuWindowMaxS` exposes older baselines); RSS is a sum, not unique physical memory.
+
 `com.abdullah.mac-host` is a separate long-lived Standard job. It emits
 `host.vitals` every 30 seconds and `host.families_lite` every 60 seconds without
 starting subprocesses. Install copies its plist; the evaluator loads this new
