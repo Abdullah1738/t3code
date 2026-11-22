@@ -1,0 +1,8 @@
+{
+  "name": "moni-box-runner",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "../spectrum-bridge/node_modules/.bin/tsc --noEmit"
+  }
+}

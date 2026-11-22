@@ -6,6 +6,18 @@ Source scripts use `toollog.py` (or the `toollog.sh` bridge) for local metadata 
 it rolls up yesterday. Quantiles use nearest rank. `okRate`/`failedRate` use
 lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
+Each hourly collector run emits `homebrew.integrity` with dangling opt links,
+missing dependencies, status and duration. Formula runtime dependencies are
+checked from linked Cellar receipts without starting Homebrew; unreadable or
+absent receipts are counted in `receiptErrors`. The read-only `brew missing`
+secondary covers casks too, runs at nice 15, has a 240-second timeout and
+disables auto-update and analytics. Broken results send a Telegram attention
+alert with a stable key for that exact set of links
+and dependencies; unchanged failures are not sent again. A secondary failure
+is logged in `brewError` and cannot suppress a finding. A completed local scan
+without findings is `ok`; `error` means no check completed. Repairs are
+suggested, never run by the collector.
+
 Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
 or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
 cadence clock (include `Z` or an explicit UTC offset); launchd checks always
@@ -14,16 +26,18 @@ input (including invalid timestamps) or a launchd state other than `loaded`,
 and 2 for invalid option syntax.
 JSON includes an overall `ok` boolean and `launchd`, mapping each of
 `com.abdullah.mac-log-collector`, `com.abdullah.mac-deep-inventory`,
-`com.abdullah.mac-memory` and `com.abdullah.mac-cpu` to `loaded`, `not-loaded`
+`com.abdullah.mac-memory`, `com.abdullah.mac-cpu`, `com.abdullah.mac-ssd-read-probe`
+and `com.abdullah.mac-guard` to `loaded`, `not-loaded`
 or `unknown`. Each read-only `launchctl print gui/<uid>/<label>` has a two-second
-timeout (eight seconds total for four timeouts). Only an explicit
+timeout per label. Only an explicit
 `Could not find service` error means `not-loaded`; other failures are `unknown`.
 Status never loads or restarts agents, and does not send notifications.
 It reads the UTC day files covering the last 36 hours (three files before noon
 UTC, two from noon onward). Missing and unreadable files are listed separately.
 Malformed rows, including invalid timestamps and dates that overflow when
 converted to UTC, are skipped and counted. Future timestamps are ignored.
-It makes no network calls and creates no files or locks.
+It contacts no external services and creates no files or locks. The live guard
+worker check uses one bounded local `t3ctl status` request.
 
 The single cadence table is `CADENCES` in `status.py`, with schedule sources
 beside each row. Logging applies from 13 Nov 2026 UTC. Maximum gaps are two
@@ -71,6 +85,34 @@ queries within 15 minutes for the rest of the run. Each completed chunk checkpoi
 failed query retains the unfinished suffix, then continues into a fresh window
 when that suffix finishes. Each command has a 60-second cap including bounded
 process-group cleanup; the unified source shares a 135-second budget.
+Queries use UTC input as well as output. A shared boot helper reads current
+`kern.boottime` and `last -y reboot` with two-second command timeouts. Because
+`last` prints only minutes, a bounded Darwin wtmp reader refines matching
+historical boots to seconds. If a known boot cannot be refined, both readers
+skip that entire minute: `crash.source` reports `reason=bootUnresolved` and
+`skippedS`, and mac-log-window reports the same reason with `status: partial` (exit 2). Other
+intervals keep running; no query is sent into the unresolved minute.
+Chunks stop at boot seconds with no end padding across a boot. The shared
+planner also isolates the following second: macOS accepts only whole-second
+query bounds, and starting at a rounded boot second can still select the old
+epoch. The boot-second piece gets at most 10 seconds per attempt. It remains pending
+on failures one and two; failure three explicitly skips it with `crash.source`
+`reason=bootSecondUnreadable` and `skippedS`, rather than retrying indefinitely.
+The attempt count is durable. The following piece starts safely one second
+later and its completed rows are not read again. mac-log-window also caps each boot
+second at 10 seconds and labels any unfinished result partial. Failed pre-boot
+intervals remain in `unifiedBootPending` while later boot intervals can finish.
+A frozen retry ending before a newer boot is retained as a hole rather than
+blocking fresh coverage. Hole retries reserve one full call for fresh data.
+Clipping holes at the moving ceiling is checkpointed before retry I/O, with
+unreported skips retained separately. Completed unified observations are queued
+with their cursor checkpoint; a fixed log day and `observationId` make replay
+idempotent under the daily log's writer lock. Deferred gap records also keep
+a fixed identity and day until delivery is checkpointed. Writes handle short
+write counts; replay acknowledges only complete, valid matching records. The identity check reads that day's
+file in 64 KiB blocks only for these observations (no raw message storage).
+Each completed retry prefix is checkpointed; these holes obey the same moving
+90-minute ceiling and explicit skip records as the normal suffix.
 `crash.unified.chunk` records requested bounds, elapsed time and outcome;
 `crash.unified.skip` records ceiling skips before advancing the cursor. Positive
 skip records and summaries survive the daily log cap so omitted time stays explicit.
@@ -443,11 +485,15 @@ process/parent-1 counts, and disk0's second iostat sample. MB/GB use powers of
 1024. `top` MEM already includes compressed pages. The single-snapshot CPU column
 is omitted because it reports zero without a preceding observation; use
 `cpu.sample` for CPU usage. One full, memory-sorted top snapshot
-supplies both the first15 holders and watched PIDs, including those below15.
-ps supplies exact command names/elapsed time and matches the snapshot by PID.
+supplies growth tracking for every observed PID and the first15 logged holders,
+plus watched PIDs, including those below15.
+ps supplies command names, elapsed time and process start time and matches the snapshot by PID.
 At most512 watched PIDs are retained; excess
 is explicit in `watchedOmitted` and makes the sample partial. Each subprocess,
-including notifications, has a ten-second timeout. Failed probes are null with
+including notifications, has a ten-second timeout. If top times out, up to three
+previous holders get a five-second `footprint` probe and a bounded birth recheck;
+if the full ps scan also fails, bounded per-PID birth checks bracket each probe.
+`fallback` records these outcomes. No RSS substitution is used. Failed probes are null with
 fixed `…Error` codes; watched PID failures retain null metrics per PID.
 
 `state/memory.json` retains swap counter baselines and alert receipts under a
@@ -469,10 +515,19 @@ for three consecutive intervals spanning at least 15 minutes. A baseline plus
 three five-minute samples is required; one jump does not qualify. Samples log
 `fseventsdGrowthMbPerHour`, `fseventsdGrowthSamples`, `fseventsdGrowthPid` and
 `fseventsdGrowthWindowS`. State follows each watched PID on the same boot;
-missing measurements, elapsed-age discontinuities, a flat/falling reading or
-a gap over ten minutes reset its streak. The growth check needs no new subprocess.
-Each reason has a six-hour cooldown
-across day boundaries. Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
+elapsed-age discontinuities, a flat/falling reading or
+a gap over ten minutes reset its streak. A timed-out top or ps sample preserves unmeasured
+history as a gap for up to twenty minutes, without creating a new observation.
+The same tracker supplies `growth`: any holder at least4 GiB, growing above1 GiB/h
+over at least three consecutive intervals spanning30 minutes. That reason uses
+PID plus exact start time and boot identity. Samples include measured growth rates.
+Each reason has a six-hour cooldown across day boundaries. Footprint and growth
+can escalate earlier when a holder adds at least4 GiB since its last alert, or
+another holder qualifies. Swap can escalate after another4 GiB used; its initial
+trigger stays above16 GiB. All reasons retain a minimum30-minute alert gap.
+`memory.alert` includes the holder PID, footprint, growth rate and escalation/fallback
+flags; the two-line notification names the holder, swap and compressor sizes.
+Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
 suffix so another alert can be queued after six hours on the same day. An
 unconfirmed send retains its exact key/text for idempotent retry. For a diagnostic
 sample without notifications, run `TOOLLOG_DIR=<private-temp-dir> /usr/bin/python3
@@ -493,7 +548,17 @@ slice edges are kept only once. Rows outside each slice are excluded even when
 they fall inside the overall window. `--keep-outside` saves them separately in
 `<out>.outside.ndjson`; they are never incident evidence.
 
-Exit codes are 0 complete, 2 partial (deadline), and 1 error (including bad args
+Every read, with or without `--slice`, also splits at known boot times. The
+shared helper refines minute-only reboot history to seconds. `<out>.summary.json`
+adds `boots` (UTC timestamps used); each slice cut by a boot has `bootSplit: true`.
+Boot discovery uses the same deadline as the reads. Slice planning is incremental;
+an unresolved minute is reported as one gap even with a tiny `--slice`.
+The boot second is isolated with at most six seconds to read plus four seconds
+for termination and reaping. Other intervals retain the remaining budget. An
+unresolved boot minute is omitted with `reason: bootUnresolved`, status `partial`
+and exit 2. `--predicate` is optional. A final log count/finished trailer is ignored.
+
+Exit codes are 0 complete, 2 partial (deadline or unresolved boot minute), and 1 error (including bad args
 or a nonzero log exit). `<out>.summary.json` records arguments, UTC bounds,
 status, exit code, elapsed milliseconds, `rowsIn`, `rowsOutside`, earliest/latest
 outside timestamps (`outsideFirst`/`outsideLast`), `unparsed`, greatest kept
@@ -586,8 +651,16 @@ results and `crash.collect` retain `windowStart`, `windowEnd` (Unix seconds),
 `windowS`, `skippedS`, `chunks` and `chunksDone`. With adaptive sizing, `chunks`
 estimates the total using the current chunk size; on completion it equals
 `chunksDone`. Chunk bounds exclude the previous cursor even when log's second
-rounding/end padding returns overlapping rows. Missing or invalid event
-timestamps fail the chunk rather than risk attributing events twice.
+rounding returns overlapping rows. Unparseable timestamps are counted and excluded.
+Unified `crash.source` results also include `partialRows` for unsuccessful reads.
+`bootUnresolvedS` records unresolved boot minutes omitted during the run;
+`bootSecondUnreadableS` records boot seconds omitted after three failures.
+All fragments of that second share the failure count; the terminal count stays
+until the second is older than the moving ceiling, preventing a fourth query.
+`partialRows` counts complete row objects received from an unsuccessful command,
+including an incomplete JSON array on timeout. They are diagnostic counts only:
+none become observations and the failed interval does not advance. A source
+summary has `partial=true` while any boot interval remains pending.
 Retry checkpoints retain unreported `skippedS`, including after the final chunk,
 so interruption before the source result cannot hide a coverage gap. Once the
 source result reports the gap, a retained suffix clears that metadata. Retries
@@ -777,11 +850,22 @@ Records retain PID, PPID, up to four ancestor PID/name pairs, cwd, elapsed
 seconds and CPU percent from matching consecutive process identities (null on
 baseline). `argv` holds executable and resolved filesystem operands only;
 patterns, find expressions and option values are omitted. Paths are retained
-without the general logger's home/secret-word replacement. A parent-visible
-project/UUID thread identifier in a recognized `t3ctl` identity operand is
-retained; shell programs and query text never supply identity. It is null
-when no such operand is visible. The checked agent
-shell had no T3/ROBOB thread-id environment key. Raw argv stays out of CPU state.
+without the general logger's home/secret-word replacement. A project/UUID thread
+identifier in a recognized `t3ctl`
+identity operand or the exact `ROBOB_THREAD_ID` environment key is retained;
+shell programs and query text never supply identity. `providerPid` and `provider`
+identify the nearest Claude, Codex or OpenCode ancestor below Robob (including
+known Node CLI entry points). `providerSessionId` accepts explicit UUID session
+arguments and OpenCode `ses_` identifiers. Codex app-server and OpenCode server
+processes have null session/thread identifiers with `providerSessionAmbiguous=true`.
+The checked live Claude processes expose `--resume=<uuid>` or
+`--session-id=<uuid>`; their named environment key was absent. `t3ctl native`
+can resolve a logged provider session ID later; the sampler makes no API calls.
+Parsed identifiers and scan operands are cached in CPU state for at most 512
+processes, keyed by PID, snapshot start time, PPID, UID and executable name.
+Each cache miss joins the existing bounded argv batch; failed reads are cached
+until identity changes or eviction. Exited processes leave the cache. Raw argv,
+prompts, settings and other environment values stay out of CPU state.
 Lines are capped at 8 KiB by dropping trailing operands with `argvOmitted`.
 Oversized cwd/thread strings become null with `stringsOmitted`; parent names
 are bounded. Unknown option arity skips classification instead of guessing
@@ -841,6 +925,36 @@ review; the CPU job retains its original launcher. Installer tests set
 
 ## Host telemetry
 
+`host.spawn_sample` reports sampled births/exits once a minute, with parent
+identities, runnable threads by current priority, CPU advancement and offbox
+command classes. Births are a lower bound from five-second PID/start-time
+snapshots, not a fork or exec count. `status` and rollups show the latest
+birth rate with its snapshot cadence, three parents and runnable priority-4-or-lower count. Overload
+events carry the sample as context without changing alert thresholds.
+
+Each native pass has a 1.5-second cooperative deadline and reads threads for
+at most 300 candidate processes. A separate daemon worker isolates a stuck
+kernel call; the publisher reports stale/in-flight coverage instead of
+waiting. Coverage, unreadable argv/tasks and missing CPU baselines are explicit.
+Only derived labels are cached per PID/start identity; argv is never logged.
+Cost includes per-minute summed wall/CPU time, individual phase costs and guard
+decisions. CPU above 2% of a core per minute or two consecutive ticks at the
+1.5s wall bound reduce coverage, prioritizing runnable hints and highest CPU
+gain. Summed minute wall time is data, not a cost trigger. If halving the thread
+cap does not reduce thread-read wall time, further pressure slows cadence to
+15s instead of continuing to shrink coverage. Five calm minutes (CPU below 1%,
+no tick at 1s) start recovery: restore 5s cadence first, then double the cap
+once per calm minute up to 300. Candidate selection has separate phase timing.
+A shared 75ms soft argv/CPU allocation leaves room for a 25ms thread pass every
+tick within the 1.5s overall deadline. Runnable hints with unread CPU data
+remain eligible for thread reads and carry an unknown CPU baseline.
+Argv runs first so a slow CPU census cannot starve new parent/offbox labels.
+Thread counts are null only when no minimal pass fits or is readable, and retry
+on the next tick. Runnable counts describe the latest tick, not the sum
+of repeated censuses; offbox counts/RSS describe that same tick. CPU deltas use
+the last readable per-identity baseline (`offboxWindowS` is the tick window,
+`cpuWindowMaxS` exposes older baselines); RSS is a sum, not unique physical memory.
+
 `com.abdullah.mac-host` is a separate long-lived Standard job. It emits
 `host.vitals` every 30 seconds and `host.families_lite` every 60 seconds without
 starting subprocesses. Install copies its plist; the evaluator loads this new
@@ -864,3 +978,98 @@ Portable fixtures run with the suite above. The read-only Mac ABI check is:
 ```sh
 MAC_HOST_LIVE_TEST=1 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I -m unittest discover -s integrations/mac-logging/tests -p test_host_live.py -v
 ```
+
+## Mac guard
+
+`com.abdullah.mac-guard` runs a 30-second Interactive loop, logging `macguard.*`
+to the same day files. `mac-log-status` shows its last sample, strain, actions
+and Robob memory restarts in 24 hours, and its critical worker.
+
+Under sustained strain it terminates stuck/orphaned build and tool trees,
+softens CPU hogs, then suspends and terminates persistent hogs. Live or unknown
+build owners and GUI apps get softening only. Stopped survivors resume when
+strain clears. Provider CLIs, their node/bun wrappers, OpenCode, Robob and
+macOS system processes are never signalled or reniced. Integration services
+and their children are protected from the strain ladder.
+Recovery cancels queued strain-ladder kills, including while paused and across
+daemon restarts; memory-runaway kills remain independent of strain.
+
+The memory backstop uses top's footprint (including compressed pages), never
+RSS: >=16 GiB growing >=1 GiB/min over 60 seconds, or >=48 GiB regardless of
+growth. It terminates the offending PID only, including integration workers
+and GUI apps; agents, OpenCode, Robob and macOS remain exempt. Protected
+runaways alert and call one critical responder. All signals recheck PID birth
+identity. Evidence lives in `~/.robob/board-artifacts/mac-guard/`.
+
+Signal 7 catches slow leaks without waiting for load or pressure: footprint
+over 8 GiB and growth over 1 GiB/hour across at least 30 minutes. Its bounded
+history persists by PID and birth time, retaining missing-sample gaps. Other
+processes use the strain ladder; protected holders alert the responder.
+Only eligible offenders activate signal 7 and strain. A protected slow leak
+alone cannot authorize strain-ladder actions against other processes.
+Eligible leaking GUI apps get a normal Quit AppleEvent addressed to the exact
+PID. Two minutes later, only a surviving identical app still over the slow-leak
+threshold and still growing may receive TERM, then KILL ten seconds later.
+Each step rechecks identity and bundle ID. Queued force-quits also require
+current growth and service protection after a
+pause or restart. Foreground app main executables in
+`/System/Applications` (such as Activity Monitor) qualify; system daemons,
+background apps, helpers, agents, OpenCode and Robob do not.
+Dia (`company.thebrowser.dia`), Messages (`com.apple.MobileSMS`), Robob
+(`com.ardud.robob`), Finder (`com.apple.finder`), Terminal (`com.apple.Terminal`),
+iTerm2 (`com.googlecode.iterm2`), Ghostty (`com.mitchellh.ghostty`) and Warp
+(`dev.warp.Warp-Stable`, `dev.warp.Warp`, `dev.warp.Warp-Preview`) are exempt
+from this slow GUI exception even when renamed. A failed or ambiguous Quit
+alerts the responder and never authorizes force-quit. `macguard.slow_leak`
+and `macguard.action` include bundle identity, footprint series and growth;
+the responder reports evidence and actions on the Mac board.
+The single ten-second-bounded top read includes every process so Robob's tree
+total cannot disappear below the twenty largest holders; snapshots retain the
+top twenty plus footprint history for all matched PIDs.
+
+A Robob process crossing the growth threshold, or the app tree totaling
+>=24 GiB, requests the overload watchdog's detached `restart` subcommand.
+Missing helpers, install holds, restart/install tmux sessions, release builds,
+server uptime under ten minutes, the SSD read-blocked interlock and a memory restart within an hour skip it
+and alert the responder. The guard calls the fork's
+`integrations/robob-overload-restart` installed copy through
+`/bin/zsh -f ~/.local/share/robob-overload-restart/launchd-entry.zsh restart <stamp>`.
+It skips with an alert while that watchdog is missing or disabled. The watchdog's
+own limits still apply, including expiry where enforced by the installed version.
+Its LaunchAgent need not be loaded for this direct call.
+
+The call runs in detached tmux session `restart/mac-guard-restart`, so it does
+not collide with the watchdog's `restart/robob-restart` exclusion. The guard
+records the attempt before launch, then reads the watchdog's stamped result
+receipt and the detached command's exit status. Success requires both a success
+receipt and a zero exit. Missing/off helpers and refusals
+consume the hourly attempt allowance and alert the responder once; they never
+select an alternate helper. Responder delivery failures retain the incident
+and retry the same request during cooldown, including status or send failures
+for an existing worker. Uncertain requests stay bound to the original worker
+and operation, even if it finishes before acknowledgment. Logs and exit status stay in the guard's evidence
+directory. `macguard.robob_restart.detail` records the refusal or install hold.
+
+On socket `qf-install`, a live pane in a session matching `^install\d*$` holds
+the restart when it runs a non-shell command or had activity within 30 minutes.
+Dead panes and older idle shells do not hold it. Failed or timed-out probes
+hold it; a confirmed absent tmux server does not.
+
+The separate runnable/idle diagnostic requires two valid minute samples of
+load >=100, host idle >=30% and process R >=64 (or >5s Robob lag). It records
+one thread/CPU-progress/stack/core packet per episode; it never selects a victim.
+Spindump and powermetrics are bounded, without sudo; permission failures are
+recorded as unavailable evidence. Stack capture runs outside the guard loop.
+
+Worker launches persist their request ID and exact payload before using the
+control API (`t3ctl create` does not forward a request ID). After an uncertain
+response the guard looks up that ID and replays the same idempotent request,
+completing any partial thread launch. It confirms the initial safety message
+and durable run before adoption or steering. Unavailable lookups wait;
+they never authorize a second worker. These calls have a ten-second bound.
+
+Pause with `touch ~/.local/state/mac-guard/paused`; remove that file to resume.
+`MAC_GUARD_DRY_RUN=1` records proposed actions while sending no signals,
+notifications, restarts or worker launches. Neither mode changes the separate
+Robob crash reopener. The installer copies files and plists without loading
+agents; installation and read-back belong to the evaluator after review.

@@ -14,6 +14,7 @@ import time
 from overload_io import Dispatcher
 from host_native import Native
 from host_signal import socket_path
+from spawn_sample import Monitor, SpawnSampler
 from toollog import emit, host_fields
 
 COUNTERS = ('pageins', 'pageouts', 'swapins', 'swapouts')
@@ -95,7 +96,7 @@ class Sampler:
         return props
 
 
-def python_label(argv):
+def python_label(argv, *, scripts_only=False):
     def script(value):
         name = Path(value).name
         return 'python:'+name if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}\.py', name) else 'python'
@@ -129,6 +130,8 @@ def python_label(argv):
             if option in ('m', 'W', 'X'):
                 value = options[index+1:] or next(args, '')
                 if option == 'm':
+                    if scripts_only:
+                        return 'python'
                     return 'python:'+value if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', value) else 'python'
                 if not value:
                     return 'python'
@@ -192,13 +195,20 @@ def family_loop(native, stop, interval=60, writer=write_sample, overload=None):
         stop.wait(max(0, interval-(time.monotonic()-started)))
 
 
-def serve(sampler, server, stop, interval=30, duration=None, writer=write_sample, overload=None):
+def serve(sampler, server, stop, interval=30, duration=None, writer=write_sample, overload=None, spawn=None):
     started = time.monotonic()
     next_tick = started
+    next_spawn = started+60
     end = started+duration if duration is not None else float('inf')
     trigger = None
     while not stop.is_set():
         now = time.monotonic()
+        if spawn is not None and now >= next_spawn:
+            context = spawn.report()
+            writer('host.spawn_sample', context, context['wallMs'])
+            if overload is not None:
+                overload.latest_spawn = context
+            next_spawn = now+60
         if now >= next_tick or trigger:
             before = time.monotonic()
             props = sampler.tick()
@@ -212,7 +222,7 @@ def serve(sampler, server, stop, interval=30, duration=None, writer=write_sample
             trigger = None
         if now >= end:
             return
-        ready, _, _ = select.select([server], [], [], max(0, min(next_tick, end)-time.monotonic()))
+        ready, _, _ = select.select([server], [], [], max(0, min(next_tick, next_spawn if spawn else end, end)-time.monotonic()))
         if ready:
             # Coalesce queued timeouts so a sender burst cannot starve ticks.
             for _ in range(64):
@@ -243,8 +253,10 @@ def run(duration=None):
             states = StateMonitor(Native())
             threading.Thread(target=states.loop, args=(stop,), daemon=True).start()
             threading.Thread(target=family_loop, args=(Native(), stop), kwargs=dict(overload=overload), daemon=True).start()
+            spawn = Monitor(SpawnSampler(Native()))
+            threading.Thread(target=spawn.loop, args=(stop,), daemon=True).start()
             try:
-                serve(Sampler(states=states), server, stop, duration=duration, overload=overload)
+                serve(Sampler(states=states), server, stop, duration=duration, overload=overload, spawn=spawn)
             finally:
                 stop.set()
                 path.unlink(missing_ok=True)

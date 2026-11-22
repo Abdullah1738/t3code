@@ -63,7 +63,7 @@ class Logging(Base):
         self.assertEqual((HERE / 'toollog.py').read_bytes(), SHARED.read_bytes())
 
     def test_owner_cache_reset_diagnostics_wait_for_book_unlock(self):
-        path = self.data / 'owner-texts.json'
+        path = self.data / 'owner-snapshot.json'
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('corrupt private text')
         held, seen = [], []
@@ -690,6 +690,28 @@ class Logging(Base):
         for value in ('PermissionError errno=13: PRIVATE', 'PRIVATE message', 'DataUnavailable errno=None\nPRIVATE'):
             mc.toollog.emit('money-cases', 'check.run', props={'dataless_error': value})
             self.assertEqual(self.rows('check.run')[-1]['props'], {})
+
+    def test_census_reason_forms_survive_all_projections(self):
+        import run_history
+        spec = importlib.util.spec_from_file_location('orders99_shared_toollog', SHARED)
+        shared = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shared)
+        accepted = ('DataUnavailable reason=deadline', 'DataUnavailable reason=edeadlk',
+                    'DataUnavailable errno=None', 'InterruptedError errno=4', 'OSError errno=-1')
+        rejected = ('DataUnavailable reason=unknown', 'OSError reason=deadline',
+                    'DataUnavailable reason=deadline PRIVATE', 'DataUnavailable reason=deadline\nPRIVATE',
+                    'DataUnavailable reason= deadline', 'DataUnavailable Reason=deadline',
+                    'DataUnavailable reason=DEADLINE', 'DataUnavailable reason=',
+                    'DataUnavailable errno=None\nPRIVATE', 'OSError errno=1234567', None, True,
+                    0, 1, -1, 1.5, float('nan'), float('inf'), {})
+        for value in accepted + rejected:
+            with self.subTest(value=value):
+                expected = {'dataless_error': value} if value in accepted else {}
+                for logger in (mc.toollog, shared):
+                    self.assertEqual(logger._fields({'dataless_error': value}), expected)
+                row = run_history.run_row({'at': '2026-11-19T16:48:49Z', 'dataless_error': value})
+                self.assertEqual({k: v for k, v in row.items() if k == 'dataless_error'}, expected)
+        self.assertEqual((HERE / 'toollog.py').read_bytes(), SHARED.read_bytes())
 
     def test_production_modules_never_import_test_runners(self):
         for path in HERE.glob('*.py'):

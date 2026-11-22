@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 from urllib.parse import urlsplit
+from protected_tier import tick as protected_tier_tick
 
 APP = "/Applications/Robob.app"
 EXECUTABLE = APP + "/Contents/MacOS/Robob"
@@ -652,6 +653,7 @@ def check(home):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
+        protected_tier_tick(home)
         now = time.time()
         state_path = root / "state.json"
         hold_path = home / ".robob/install-hold.json"

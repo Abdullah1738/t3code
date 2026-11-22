@@ -295,6 +295,7 @@ class InventoryProgressTests(unittest.TestCase):
                     order.append('inventory')
                     return inventory([root],du,**kw)
                 with patch.object(collector.time,'monotonic',side_effect=lambda:clock[0]), \
+                     patch.object(collector,'homebrew_integrity'), \
                      patch.object(jobs.time,'time',side_effect=lambda:now[0]), \
                      patch.object(collector,'collect',side_effect=crashes), \
                      patch.object(collector,'directory_inventory',side_effect=disk), \

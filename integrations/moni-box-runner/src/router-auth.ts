@@ -83,17 +83,25 @@ export async function routerReady(config: ReturnType<typeof routerConfig>, track
   track(outcome);
   return outcome.reason === "ready";
 }
-export function startRouterGate(config: ReturnType<typeof routerConfig>, unavailable: () => void) {
+/**
+ * Without `bearer` the client must already send the router key as x-api-key (Claude's apiKeyHelper).
+ * With `bearer` (a per-run token) the client is Antigravity: it never sees the router key, the gate
+ * accepts only `Authorization: Bearer <token>` and forwards with the real key in its place.
+ */
+export function startRouterGate(config: ReturnType<typeof routerConfig>, unavailable: () => void, options: { bearer?: string } = {}) {
   // Claude can substitute an empty header when apiKeyHelper fails. Refuse before any prompt reaches the Mac.
   return Bun.serve({ hostname: "127.0.0.1", port: 0, maxRequestBodySize: 100 * 1024 * 1024, async fetch(request) {
     let key: string;
     try { key = readRouterKey(config.routerKeyFile); }
     catch { unavailable(); return Response.json({ error: ROUTER_KEY_ERROR }, { status: 503 }); }
-    if (request.headers.get("x-api-key") !== key) {
+    if (options.bearer !== undefined) {
+      if (!options.bearer || request.headers.get("authorization") !== `Bearer ${options.bearer}`) return Response.json({ error: "gate-token" }, { status: 401 });
+    } else if (request.headers.get("x-api-key") !== key) {
       unavailable(); return Response.json({ error: ROUTER_KEY_ERROR }, { status: 401 });
     }
     const url = new URL(request.url), headers = new Headers(request.headers);
     headers.delete("host"); headers.delete("authorization");
+    if (options.bearer !== undefined) { headers.set("x-api-key", key); headers.set("x-goog-api-key", key); }
     try {
       return await fetch(`http://127.0.0.1:${config.boxRouterPort}${url.pathname}${url.search}`, {
         method: request.method, headers, body: request.body, redirect: "error", signal: request.signal, decompress: false,

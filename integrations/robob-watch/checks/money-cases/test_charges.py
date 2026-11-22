@@ -20,9 +20,8 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-spec = importlib.util.spec_from_file_location('charges', Path(__file__).with_name('charges.py'))
-ch = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ch)
+import charges as ch
+
 
 TZ = ch.TZ
 
@@ -66,7 +65,7 @@ class ReadOnlySearchCache(unittest.TestCase):
                 before = (cache.read_bytes(), cache.stat().st_mtime_ns) if cache.exists() else None
                 with patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(Path(server.tmp.name) / 'logs'),
                                              'TOOLLOG_ROOT': str(Path(server.tmp.name) / 'logs')}):
-                    rows = ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), write_cache=False)
+                    rows = ch.live_owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), write_cache=False)
                 self.assertEqual(len(rows), 1)
                 after = (cache.read_bytes(), cache.stat().st_mtime_ns) if cache.exists() else None
                 self.assertEqual(after, before)
@@ -75,7 +74,7 @@ class ReadOnlySearchCache(unittest.TestCase):
 class ControlServer:
     """Loopback-only control fixtures. Never reads credentials or state from the real home."""
     def __init__(self, rows=None, threads=None, stall=None, drip=False, page_size=500,
-                 message_delay=0, stall_cursor=None, strict_since=False):
+                 message_delay=0, stall_cursor=None, strict_since=False, list_delay=0, strict_threads=False):
         self.rows = {'a': rows or []}
         self.threads = threads if threads is not None else [{'threadId': 'a', 'title': 'iMessage test',
                            'creationSource': 'server', 'origin': 'imessage'}]
@@ -84,6 +83,7 @@ class ControlServer:
         self.stall, self.drip = stall, drip
         self.page_size, self.message_delay, self.stall_cursor = page_size, message_delay, stall_cursor
         self.strict_since = strict_since
+        self.list_delay, self.strict_threads = list_delay, strict_threads
         self.active_messages = self.max_active_messages = 0
         self.lock = threading.Lock()
         self.stop = threading.Event()
@@ -107,11 +107,17 @@ class ControlServer:
                 if owner.stall_cursor and params.get('cursor') == [owner.stall_cursor]:
                     owner.stop.wait(5)
                 if path.path.endswith('/threads'):
+                    owner.stop.wait(owner.list_delay)
                     threads = [t for t in owner.threads
                                if ('creationSource' not in params or t.get('creationSource', 'web')
                                    in params['creationSource'][0].split(','))
                                and ('origin' not in params or t.get('origin') == params['origin'][0])
                                and (params.get('includeSubagents') == ['true'] or not t.get('subagent'))]
+                    if 'ids' in params:
+                        threads = [t for t in threads if t['threadId'] in params['ids'][0].split(',')
+                                   and not t.get('archived')]
+                    if owner.strict_threads and 'updatedSince' in params:
+                        threads = [t for t in threads if ch.owner_time(t['updatedAt']) > ch.owner_time(params['updatedSince'][0])]
                     offset = int(params.get('cursor', ['0'])[0])
                     limit = min(int(params.get('limit', ['50'])[0]), owner.page_size)
                     page = threads[offset:offset + limit]
@@ -735,7 +741,7 @@ class Explain(unittest.TestCase):
     def test_a_schedule_bound_to_his_imessage_thread_is_not_his_words(self):
         rows = [summary('Check my Apple order status', automated=True, createdBy='system'), relayed('Ok')]
         with ControlServer(rows):
-            got = [t for _, t, _ in ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))]
+            got = [t for _, t, _ in ch.live_owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))]
         self.assertEqual(got, ['Ok'])
 
 
@@ -1018,7 +1024,7 @@ def relayed(text, inbound='BCA7F873-4770-43DB-8E0E-7E3294F6C71A', **extra):
 
 class OwnerTexts(unittest.TestCase):
     def read(self, **kwargs):
-        return ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), **kwargs)
+        return ch.live_owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), **kwargs)
 
     def message_calls(self, server):
         return [(path, params) for path, params, _ in server.calls if path.endswith('/messages')]
@@ -1070,9 +1076,9 @@ class OwnerTexts(unittest.TestCase):
                 stats = Counter()
                 if result == 'incomplete':
                     with self.assertRaises(ch.Lookup):
-                        ch.owner_texts(since, until, stats=stats)
+                        ch.live_owner_texts(since, until, stats=stats)
                 else:
-                    self.assertEqual(len(ch.owner_texts(since, until, stats=stats)), 95)
+                    self.assertEqual(len(ch.live_owner_texts(since, until, stats=stats)), 95)
                 self.assertEqual(stats['owner_result'], result)
                 self.assertEqual(stats['owner_list_pages'], 2)
                 self.assertEqual(stats['owner_threads_selected'], 95)
@@ -1181,15 +1187,15 @@ class OwnerTexts(unittest.TestCase):
             for n, thread in enumerate(threads):
                 server.rows[str(n)] = [summary(str(n), createdAt=thread['updatedAt'])]
             with self.assertRaisesRegex(ch.Lookup, r'incomplete \(62 of 90 threads\)'):
-                ch.owner_texts(since, until)
+                ch.live_owner_texts(since, until)
             cache = json.loads((Path(server.tmp.name) / 'owner-texts.json').read_text())
             self.assertEqual(set(cache), {str(n) for n in range(62)})
             server.calls.clear()
-            self.assertEqual(len(ch.owner_texts(since, until)), 90)
+            self.assertEqual(len(ch.live_owner_texts(since, until)), 90)
             self.assertEqual(len(self.message_calls(server)), 28)
             server.calls.clear()
             stats = Counter()
-            self.assertEqual(len(ch.owner_texts(since, until, stats=stats)), 90)
+            self.assertEqual(len(ch.live_owner_texts(since, until, stats=stats)), 90)
             self.assertEqual(self.message_calls(server), [])
             self.assertEqual(stats['owner_queries'], 2)
 
@@ -1234,7 +1240,7 @@ class OwnerTexts(unittest.TestCase):
             earlier = at('2026-10-23T03:00')
             server.calls.clear()
             server.rows['a'].append(summary('earlier', createdAt=ch.iso(earlier)))
-            self.assertEqual(len(ch.owner_texts(earlier, at('2026-10-24T05:00'))), 2)
+            self.assertEqual(len(ch.live_owner_texts(earlier, at('2026-10-24T05:00'))), 2)
             self.assertEqual(self.message_calls(server)[0][1]['since'],
                              [ch.iso(earlier - dt.timedelta(milliseconds=1))])
             server.threads[0]['updatedAt'] = '2026-10-24T01:01:00Z'
@@ -1286,7 +1292,7 @@ class OwnerTexts(unittest.TestCase):
             self.assertEqual(ch.owner_time(kept['a']['coveredFrom']), cutoff)
             # An old followed question extends retention without reading cases.json.
             path.write_text(json.dumps(cached))
-            ch.owner_texts(cutoff - dt.timedelta(days=2), until)
+            ch.live_owner_texts(cutoff - dt.timedelta(days=2), until)
             self.assertEqual(set(json.loads(path.read_text())), {'a', 'expired'})
             self.assertEqual(len(json.loads(path.read_text())['a']['texts']), 2)
 
@@ -1309,9 +1315,9 @@ class OwnerTexts(unittest.TestCase):
         since = at('2026-10-24T03:00:00.000500')
         until = at('2026-10-24T05:00')
         with ControlServer([summary('boundary', createdAt=ch.iso(since))]) as server:
-            self.assertEqual(ch.owner_texts(since, until), [])
+            self.assertEqual(ch.live_owner_texts(since, until), [])
             server.calls.clear()
-            self.assertEqual(len(ch.owner_texts(since - dt.timedelta(microseconds=500), until)), 1)
+            self.assertEqual(len(ch.live_owner_texts(since - dt.timedelta(microseconds=500), until)), 1)
             self.assertEqual(len(self.message_calls(server)), 1)
 
     def test_slow_cache_io_is_bounded_and_never_returns_success(self):
@@ -1571,7 +1577,7 @@ sys.path.insert(0, sys.argv[1])
 import charges
 now = dt.datetime.now(dt.timezone.utc)
 try:
-    charges.owner_texts(now - dt.timedelta(days=1), now, deadline=time.time() + 2.2)
+    charges.live_owner_texts(now - dt.timedelta(days=1), now, deadline=time.time() + 2.2)
 except charges.Lookup:
     pass
 else:
@@ -1596,7 +1602,7 @@ import charges
 now = dt.datetime.now(dt.timezone.utc)
 for _ in range(3):
     try:
-        charges.owner_texts(now - dt.timedelta(days=1), now, deadline=time.time() + 2)
+        charges.live_owner_texts(now - dt.timedelta(days=1), now, deadline=time.time() + 2)
     except charges.Lookup:
         pass
     else:
@@ -1618,7 +1624,7 @@ print('finished', flush=True)
         rows = [summary('I paid Apple', automated=True), relayed('I paid Apple', inbound='wake:abc')]
         apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00', pending=False)
         with ControlServer(rows):
-            result = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]))
+            result = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]), said=ch.live_owner_texts)
         self.assertEqual(result['verdict'], 'ask')
 
     def test_old_or_invalid_provenance_discards_all_evidence(self):
@@ -1648,7 +1654,7 @@ print('finished', flush=True)
         del old['automated']
         apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00', pending=False)
         with ControlServer([old]):
-            result = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]))
+            result = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]), said=ch.live_owner_texts)
         self.assertEqual(result['verdict'], 'unverified')
         self.assertIn('provenance unavailable', str(result['errors']))
 
@@ -1694,7 +1700,7 @@ print('finished', flush=True)
         apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00', pending=False)
         with ControlServer() as server:
             server.responses['/api/ardud/control/threads/a/messages'] = {'ok': True, 'total': 1, 'messages': []}
-            result = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]))
+            result = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]), said=ch.live_owner_texts)
         self.assertEqual(result['verdict'], 'unverified')
         self.assertIn('incomplete message list', str(result['errors']))
 

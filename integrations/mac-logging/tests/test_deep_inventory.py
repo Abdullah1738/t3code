@@ -425,6 +425,7 @@ class DeepInventoryTests(unittest.TestCase):
         with jobs.inventory_lock() as acquired:
             self.assertIsNot(acquired,False)
             with patch.object(collector,'collect') as crash, patch.object(collector,'disk_wait'), \
+                 patch.object(collector,'homebrew_integrity'), \
                  patch.object(collector,'disk_tooling_probe'), patch.object(jobs,'DIRECTORY_ROOTS',[root]), \
                  patch.object(jobs,'du_total',side_effect=AssertionError('locked du')):
                 collector.main()

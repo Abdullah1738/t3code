@@ -1,3 +1,4 @@
+import { ActiveRoster } from "./active-roster.ts";
 import { MessageCache } from "./message-cache.ts";
 import { toolError } from "./toollog.ts";
 import { assertPromptUnexpired, IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
@@ -125,6 +126,7 @@ function dataUrl(url: string): { mimeType: string; bytes: Uint8Array } {
 }
 
 export interface RobobBackendOptions extends ControlConfigOptions {
+  activeRoster?: ActiveRoster;
   /** Root for per-chat folders. It must be a registered Robob project root (see README). */
   chatRoot: string;
   /**
@@ -164,6 +166,7 @@ export class RobobBackend implements ChatBackend {
 
   readonly brand = { app: "Robob" };
   readonly client: ControlClient;
+  readonly activeRoster: ActiveRoster;
   private readonly chatRoot: string;
   private readonly directories: ThreadDirectories;
   private readonly native: Map<string, string>;
@@ -225,8 +228,10 @@ export class RobobBackend implements ChatBackend {
     this.native = nativeAliases.get(this.client) ?? new Map();
     nativeAliases.set(this.client, this.native);
     this.directories = new ThreadDirectories(this.client);
+    this.activeRoster = options.activeRoster ?? new ActiveRoster(this.client);
     this.messageCache = caches.get(this.client) ?? new MessageCache(this.client);
     caches.set(this.client, this.messageCache);
+    this.messageCache.observeDetails(this.activeRoster);
     this.finishes = options.finishes ?? opencodeFinishes();
     this.completedSteps = options.completedSteps ?? opencodeCompletedSteps();
     this.runEvidence = options.runEvidence ?? opencodeRunEvidence();
@@ -348,7 +353,7 @@ export class RobobBackend implements ChatBackend {
 
   /** Backend for one non-owner Sendblue chat: same server and client, its own folder and thread title. */
   forChat(subdir: string, title: string): RobobBackend {
-    return new RobobBackend({ ...this.options, client: this.client, finishes: this.finishes, completedSteps: this.completedSteps, subdir, title });
+    return new RobobBackend({ ...this.options, client: this.client, activeRoster: this.activeRoster, finishes: this.finishes, completedSteps: this.completedSteps, subdir, title });
   }
 
   chatFolder(): string {
@@ -410,6 +415,7 @@ export class RobobBackend implements ChatBackend {
 
   async children(id: string, _directory?: string, complete = false): Promise<SessionRecord[]> {
     const threadId = await this.resolve(id);
+    this.activeRoster.childrenRead();
     const { total, threads } = await this.client.listThreads({ parentThreadId: threadId, includeSubagents: true, limit: 500 });
     if (complete && total > threads.length) throw new Error("Incomplete child discovery");
     return Promise.all(threads.filter(thread => thread.parentThreadId === threadId).map(thread => this.record(thread.threadId, thread, id)));
@@ -420,7 +426,7 @@ export class RobobBackend implements ChatBackend {
     const threadId = await this.resolve(id);
     // Read messages after the run state: an earlier page must not make a just-completed
     // first turn look successful before its selected-model error text has arrived.
-    let thread = await this.messageCache.detail(threadId);
+    let thread = await this.detail(threadId);
     let messages = await this.readMessages(threadId, thread, until);
     try {
       thread = await this.restoreRunStatuses(thread, messages, until, limit);
@@ -814,25 +820,17 @@ export class RobobBackend implements ChatBackend {
 
   /** Busy threads, keyed by thread id and, for imported threads, by their `ses_` id too. */
   async statuses(complete = false): Promise<Record<string, SessionStatus>> {
-    const { total, threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
-    if (complete && total > threads.length) throw new Error("Incomplete active family discovery");
-    const alias = new Map([...this.native].map(([session, threadId]) => [threadId, session]));
-    const statuses: Record<string, SessionStatus> = {};
-    for (const thread of threads) {
-      if (!BUSY.has(thread.state)) continue;
-      // Routes may be stored under an imported `ses_` id, so name the root the way the router knows it.
-      const root = thread.parentThreadId === null ? null : alias.get(thread.rootThreadId) ?? thread.rootThreadId;
-      const busy: SessionStatus = { type: "busy", root };
-      statuses[thread.threadId] = busy;
-      if (thread.nativeSessionId) statuses[thread.nativeSessionId] = busy;
-    }
-    for (const [session, threadId] of this.native) if (statuses[threadId]) statuses[session] = statuses[threadId];
-    return statuses;
+    return this.activeRoster.read(complete, this.native);
+  }
+
+  activeStatuses(): Record<string, SessionStatus> {
+    return this.activeRoster.view(this.native);
   }
 
   /** One thread's detail answers in well under a second; the thread list behind `statuses()` takes several. */
   async sessionBusy(id: string): Promise<boolean> {
-    return BUSY.has((await this.detail(id)).state);
+    const thread = await this.detail(id);
+    return BUSY.has(thread.state) || this.activeRoster.isBusy(thread.threadId);
   }
 
   /** Busy, or waiting on background work a reset would cut off (see `resetBlocked` in openchamber.ts). */

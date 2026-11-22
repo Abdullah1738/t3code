@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { toolLog } from "./toollog.ts";
 import { RobobLinkDown } from "./robob-link-gate.ts";
 import { probeDeferred } from "./probe-policy.ts";
+import type { ActiveRoster } from "./active-roster.ts";
 
 type Snapshot = { messages: ControlMessage[]; updatedAt: number; fullAt: number; readAt: number; full: boolean; marker?: string; detail?: ThreadDetail };
 type Read = { generation: number; writes: number | undefined; key: string; promise: Promise<Snapshot> };
@@ -32,8 +33,26 @@ export class MessageCache {
   private readonly archived = new Map<string, ThreadDetail>();
   private readonly detailStreaks = new Map<string, number>();
   private readonly metadataScope = new AsyncLocalStorage<Map<string, Promise<RunEvidence>>>();
+  private readonly detailObservers = new Set<ActiveRoster>();
 
   constructor(private readonly client: ControlClient) {}
+
+  observeDetails(roster: ActiveRoster): void { this.detailObservers.add(roster); }
+
+  private async readDetail(threadId: string, signal?: AbortSignal): Promise<ThreadDetail> {
+    // Tickets order physical reads against SSE. Cached and deferred details are older facts.
+    const reads = [...this.detailObservers].map(roster => ({ roster, read: roster.checkpoint(threadId) }));
+    const finish = () => { for (const { roster, read } of reads) roster.finish(threadId, read); };
+    signal?.addEventListener("abort", finish, { once: true });
+    try {
+      const { thread } = await this.client.thread(threadId, { signal });
+      if (!signal?.aborted) for (const { roster, read } of reads) roster.observe(thread, read);
+      return thread;
+    } finally {
+      signal?.removeEventListener("abort", finish);
+      finish();
+    }
+  }
 
   withinTick<T>(body: () => Promise<T>): Promise<T> {
     return this.metadataScope.run(new Map(), () => this.scope.run(new Map(), body));
@@ -114,7 +133,7 @@ export class MessageCache {
         const summary = tick.summaries.get(id);
         const prior = this.details.get(id);
         const read = prior && summary && this.canReuseDetail(prior, summary) ? Promise.resolve({ ...prior, ...summary })
-          : this.client.thread(id, { signal: controller.signal }).then(({ thread }) => thread);
+          : this.readDetail(id, controller.signal);
         let detail: ThreadDetail;
         try { detail = await Promise.race([read, deadline]); }
         catch (error) {
@@ -296,7 +315,7 @@ export class MessageCache {
     const shared = tick?.details;
     if (!summary) {
       let read = shared?.get(threadId);
-      if (!read) { read = this.client.thread(threadId).then(({ thread }) => thread); shared?.set(threadId, read); }
+      if (!read) { read = this.readDetail(threadId); shared?.set(threadId, read); }
       return read;
     }
     let read = shared?.get(threadId);
@@ -305,7 +324,7 @@ export class MessageCache {
       // Summary-only stream changes retain the full run metadata. Transitions need exact completion/error/request details.
       if (prior && this.canReuseDetail(prior, summary)) {
         read = Promise.resolve({ ...prior, ...summary });
-      } else read = this.client.thread(threadId).then(({ thread }) => thread);
+      } else read = this.readDetail(threadId);
       shared?.set(threadId, read);
     }
     const thread = await read;

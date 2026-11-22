@@ -201,6 +201,7 @@ def rollup(day, root=None):
     end = dt.datetime.combine(date + dt.timedelta(days=1), dt.time(), dt.timezone.utc)
     cadence = report(end, root, day=date)
     result.update(jobs=cadence['jobs'], missingJobs=cadence['missingJobs'])
+    result['spawnSample'] = cadence.get('spawnSample')
     result['diskBudgets'] = budget_rollup(day, root)
     result['uEpisodes'] = [dict(start=ep['start'], end=ep['end'], lastSeen=ep['lastSeen'],
                               peakCount=ep['peakCount'], volumes=ep['volumes'], topComms=ep['topComms'])

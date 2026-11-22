@@ -31,6 +31,43 @@ class HistoryTests(unittest.TestCase):
                     'owner_list_ms': 123, 'lookups': 5, 'writes_n': 3,
                     'question_errors': ['his threads: Robob control: request failed or timed out']}
 
+    def test_owner_source_freshness_and_last_refresh_summary(self):
+        self.row.update(owner_source='cache', owner_cache_age_s=125, owner_list_window_s=86400,
+                        owner_refresh_at=1794823140, owner_refresh_ms=27001,
+                        owner_refresh_result='ok', owner_refresh_timeouts=0)
+        self.assertTrue(history.append(self.wd, self.row))
+        result = history.summary(self.wd, now=dt.datetime(2026, 11, 16, 11, tzinfo=dt.timezone.utc))
+        self.assertEqual(result['owner']['sources'], {'cache': 1})
+        self.assertEqual(result['owner']['cache_age_s_max'], 125)
+        self.assertEqual(result['owner']['list_window_s_max'], 86400)
+        self.assertEqual(result['owner']['last_refresh']['owner_refresh_ms'], 27001)
+        line = next(line for line in history.format_summary(result).splitlines() if line.startswith('Owner:'))
+        for value in ('cache', '125', '86400', '27001', 'ok', '1794823140', 'timeouts'):
+            self.assertIn(value, line)
+        for key in ('owner_source', 'owner_refresh_result'):
+            row = history.run_row({**self.row, key: 'PRIVATE TEXT'})
+            self.assertNotIn(key, row)
+
+    def test_additive_schema_and_unknown_measurements(self):
+        values = {**self.row, 'receipt_eligible': 5, 'receipt_result': {'none': 2, 'error': 1},
+                  'budget_stop_reason': 'follow_deadline', 'merchants_calls': 1,
+                  'order_charges_calls': 2, 'questions_calls': 3,
+                  'loadavg_start': [1.5, 2, 3], 'loadavg_end': [2, 3, 4]}
+        history.receipt_coverage(values)
+        self.assertTrue(history.append(self.wd, values))
+        row = json.loads(self.path.read_text())
+        for key, value in self.row.items():
+            self.assertEqual(row[key], value)
+        self.assertEqual(row['receipt_unattempted'], 2)
+        for key in history.COUNTS:
+            self.assertIs(type(row[key]), int)
+        for key in (*history.COUNTS, 'loadavg_start', 'loadavg_end', 'budget_stop_reason'):
+            self.assertIsNone(history.run_row(self.row)[key])
+        self.assertEqual(history.run_row(row), row)
+        for value in ('PRIVATE', [1, 2], [1, float('nan'), 3], [-1, 2, 3]):
+            self.assertIsNone(history.run_row({**self.row, 'loadavg_start': value})['loadavg_start'])
+        self.assertIsNone(history.run_row({**self.row, 'budget_stop_reason': 'PRIVATE'})['budget_stop_reason'])
+
     def test_append_retains_counts_and_bounded_safe_errors(self):
         self.row.update(question_errors=self.row['question_errors'] * 12, text='private owner message',
                         password='test-secret', secret_detail={'text': 'private receipt'})
@@ -66,6 +103,106 @@ class HistoryTests(unittest.TestCase):
             with self.subTest(key=key):
                 row = history.run_row({**self.row, key: '/private/source text'})
                 self.assertNotIn(key, row)
+
+    def test_dataless_error_forms_remain_private_and_idempotent(self):
+        accepted = ('DataUnavailable reason=deadline', 'DataUnavailable reason=edeadlk',
+                    'PermissionError errno=13', 'DataUnavailable errno=None')
+        rejected = ('DataUnavailable reason=private text', 'OSError reason=deadline',
+                    'DataUnavailable reason=deadline\nprivate', 'OSError errno=1234567')
+        for value in accepted + rejected:
+            with self.subTest(value=value):
+                row = history.run_row({**self.row, 'dataless_error': value})
+                self.assertEqual(row.get('dataless_error'), value if value in accepted else None)
+                self.assertEqual(history.run_row(row), row)
+
+    def test_failed_history_survives_into_the_next_cli_process(self):
+        import data_io
+        for caller_timer in (0, 2):
+            for error in (OSError('fixture'), data_io.DataUnavailable(self.wd / 'runs.jsonl', 'deadline')):
+                signal.setitimer(signal.ITIMER_REAL, caller_timer)
+                try:
+                    with self.subTest(error=type(error).__name__, caller_timer=caller_timer), \
+                            patch.object(history, 'run_row', side_effect=error):
+                        self.assertFalse(history.append(self.wd, self.row))
+                        if caller_timer:
+                            self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], 1)
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+        script = '''import json,pathlib,sys
+sys.path.insert(0,sys.argv[1])
+import run_history as h
+wd=pathlib.Path(sys.argv[2])
+assert h.APPEND_ERRORS == 0
+assert h.append(wd, {'at':'2026-11-19T17:05:35Z','total_s':1,'exit':0})
+print(json.loads((wd/'runs.jsonl').read_text())['history_append_errors'])
+'''
+        done = subprocess.run([os.sys.executable, '-I', '-B', '-c', script,
+                               str(Path(history.__file__).parent), str(self.wd)],
+                              text=True, capture_output=True, check=True)
+        self.assertEqual(int(done.stdout), 4)
+
+    def test_finalization_alarm_cannot_fail_a_quiet_skip(self):
+        import data_io
+        error = data_io.DataUnavailable(self.wd / 'cases.json', 'deadline')
+        with patch.object(history, 'append', side_effect=data_io.DataUnavailable(self.wd / 'runs.jsonl')):
+            with history.recording(self.wd) as row:
+                history.record_skip(row, error)
+        self.assertEqual(history.persisted_errors(self.wd), 1)
+        self.assertIsNone(history.current())
+        self.assertTrue(history.append(self.wd, self.row))
+        self.assertGreaterEqual(json.loads(self.path.read_text())['history_append_errors'], 1)
+
+    def test_delayed_append_timeout_is_counted_by_a_fresh_process(self):
+        fail = '''import json,pathlib,signal,sys,time
+from unittest.mock import patch
+sys.path.insert(0,sys.argv[1])
+import run_history as h
+# Isolate late delivery from a second timeout in the marker itself. The
+# default marker budget and stalled writes are exercised separately.
+h.APPEND_ERROR_BUDGET=.2
+wd=pathlib.Path(sys.argv[2])
+write=h.os.write
+def delayed(fd,payload):
+    if payload != b'\\n' and fd != 2:
+        previous=signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
+        try:
+            time.sleep(.065)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK,previous)
+    return write(fd,payload)
+handler=signal.getsignal(signal.SIGALRM)
+signal.setitimer(signal.ITIMER_REAL,float(sys.argv[3]))
+try:
+    with patch.object(h.os,'write',side_effect=delayed):
+        assert not h.append(wd, {'at':'2026-11-19T16:48:49Z','exit':0,'skipped':True,
+                                 'skip_file':'cases.json','skip_reason':'deadline','skip_phase':'follow'})
+    assert not (wd/'runs.jsonl').read_bytes()
+    print(h.persisted_errors(wd))
+    assert signal.getsignal(signal.SIGALRM) is handler
+    remaining=signal.getitimer(signal.ITIMER_REAL)[0]
+    assert 1 < remaining < 2 if float(sys.argv[3]) else remaining == 0
+finally:
+    signal.setitimer(signal.ITIMER_REAL,0)
+'''
+        recover = '''import json,pathlib,sys
+sys.path.insert(0,sys.argv[1])
+import run_history as h
+wd=pathlib.Path(sys.argv[2])
+assert h.APPEND_ERRORS == 0
+assert h.append(wd, {'at':'2026-11-19T17:05:35Z','exit':0})
+print(json.loads((wd/'runs.jsonl').read_text())['history_append_errors'])
+'''
+        for caller_timer in (0, 2):
+            with self.subTest(caller_timer=caller_timer):
+                wd = self.wd / str(caller_timer)
+                wd.mkdir()
+                args = [str(Path(history.__file__).parent), str(wd)]
+                failed = subprocess.run([os.sys.executable, '-I', '-B', '-c', fail, *args, str(caller_timer)],
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(failed.returncode, 0, failed.stderr)
+                recovered = subprocess.run([os.sys.executable, '-I', '-B', '-c', recover, *args],
+                                           text=True, capture_output=True, check=True, timeout=5)
+                self.assertEqual(int(recovered.stdout), 1, f'persisted_errors={failed.stdout.strip()}')
 
     def test_case_error_normalization(self):
         timeout = str(subprocess.TimeoutExpired(
@@ -177,6 +314,64 @@ class HistoryTests(unittest.TestCase):
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
 
+    def test_error_accounting_has_its_own_bounded_attempt(self):
+        write = history.os.write
+        for caller_timer in (0, 2):
+            with self.subTest(caller_timer=caller_timer):
+                self.path.unlink(missing_ok=True)
+                attempted = []
+
+                def slow_marker(fd, payload):
+                    if payload == b'\n':
+                        attempted.append(signal.getitimer(signal.ITIMER_REAL)[0])
+                        time.sleep(1)
+                    return write(fd, payload)
+
+                handler = signal.getsignal(signal.SIGALRM)
+                signal.setitimer(signal.ITIMER_REAL, caller_timer)
+                try:
+                    with patch.object(history, 'run_row', side_effect=OSError('fixture')), \
+                            patch.object(history.os, 'write', side_effect=slow_marker):
+                        started = time.monotonic()
+                        self.assertFalse(history.append(self.wd, self.row))
+                        self.assertLess(time.monotonic() - started, .2)
+                    self.assertEqual(len(attempted), 1)
+                    self.assertTrue(0 < attempted[0] <= history.APPEND_ERROR_BUDGET)
+                    self.assertIs(signal.getsignal(signal.SIGALRM), handler)
+                    remaining = signal.getitimer(signal.ITIMER_REAL)[0]
+                    if caller_timer:
+                        self.assertGreater(remaining, 1)
+                    else:
+                        self.assertEqual(remaining, 0)
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+
+    def test_error_accounting_keeps_an_earlier_caller_deadline(self):
+        write = history.os.write
+        attempted = []
+
+        def marker(fd, payload):
+            if payload == b'\n':
+                attempted.append(signal.getitimer(signal.ITIMER_REAL)[0])
+            return write(fd, payload)
+
+        handler = signal.getsignal(signal.SIGALRM)
+        signal.setitimer(signal.ITIMER_REAL, .2)
+        try:
+            # Scale both budgets up so this checks their ordering without a
+            # sub-millisecond scheduling race on a busy test host.
+            with patch.object(history, 'APPEND_ERROR_BUDGET', .5), \
+                    patch.object(history, 'run_row', side_effect=OSError('fixture')), \
+                    patch.object(history.os, 'write', side_effect=marker):
+                self.assertFalse(history.append(self.wd, self.row))
+            self.assertEqual(len(attempted), 1)
+            self.assertTrue(0 < attempted[0] < .2)
+            self.assertTrue(0 < signal.getitimer(signal.ITIMER_REAL)[0] < .2)
+            self.assertIs(signal.getsignal(signal.SIGALRM), handler)
+            self.assertEqual(history.persisted_errors(self.wd), 1)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
     def test_symlink_not_followed(self):
         target = self.wd / 'book'
         target.write_text('preserve')
@@ -207,6 +402,85 @@ class HistoryTests(unittest.TestCase):
         self.assertIn('over 40 s: 2', text)
         self.assertIn('2x his threads: Robob control', text)
         self.assertIn('slowest=build_write', text)
+
+    def test_health_fixture_day_boundary_and_cli_are_read_only(self):
+        rows = [
+            {**self.row, 'at': '2026-11-15T23:59:59Z', 'total_s': 100},
+            {**self.row, 'at': '2026-11-16T00:00:00Z', 'total_s': 10, 'owner_result': 'ok',
+             'receipt_eligible': 4, 'receipt_unattempted': 1,
+             'receipt_result': {'found': 1, 'none': 1, 'out_of_time': 1, 'error': 0},
+             'budget_stop_reason': 'follow_deadline', 'loadavg_start': [1, 2, 3], 'loadavg_end': [2, 3, 4]},
+            {**self.row, 'at': '2026-11-16T23:59:59Z', 'total_s': 40, 'owner_result': 'list_failed',
+             'receipt_eligible': 6, 'receipt_unattempted': 3,
+             'receipt_result': {'found': 1, 'none': 1, 'out_of_time': 0, 'error': 1},
+             'budget_stop_reason': 'follow_deadline', 'loadavg_start': [3, 4, 5], 'loadavg_end': [4, 5, 6]},
+            {**self.row, 'at': '2026-11-17T02:00:00+04:00', 'total_s': 30},
+            {**self.row, 'at': '2026-11-17T00:00:00Z', 'total_s': 200},
+        ]
+        (self.wd / 'runs.jsonl.1').write_text('\n'.join(json.dumps(row) for row in rows[:2]) + '\n')
+        self.path.write_text('\n'.join(json.dumps(row) for row in rows[2:]) + '\n{partial\n')
+        before = {p.name: p.read_bytes() for p in self.wd.iterdir()}
+        result = history.health(self.wd, '2026-11-16')
+        self.assertEqual(result['runs'], 3)
+        self.assertEqual(result['total_s'], {'p50': 30, 'p95': 39, 'max': 40})
+        self.assertEqual(result['over_35_count'], 1)
+        self.assertEqual(result['owner_results'], {'ok': 1, 'list_failed': 1, 'incomplete': 1})
+        receipt = result['receipt']
+        self.assertEqual((receipt['known_runs'], receipt['unknown_runs'], receipt['eligible']), (2, 1, 10))
+        self.assertEqual(receipt['counts'], dict(found=2, none=2, out_of_time=1, error=1, unattempted=4))
+        self.assertEqual(receipt['share']['unattempted'], .4)
+        self.assertEqual(sum(receipt['share'].values()), 1)
+        self.assertEqual(result['top_budget_stop_reason'], 'follow_deadline')
+        self.assertEqual(result['loadavg_p95'], {'start': [2.9, 3.9, 4.9], 'end': [3.9, 4.9, 5.9]})
+        self.assertEqual(result['loadavg_samples'], dict(start=2, end=2))
+        self.assertEqual(result['invalid_lines'], 1)
+        for mode in ([], ['--json'], ['--one-line']):
+            with patch.dict(os.environ, {'WATCH_DIR': str(self.wd)}), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(cases.main(['health', '--day', '2026-11-16', *mode]), 0)
+            if mode == ['--json']:
+                self.assertEqual(json.loads(out.getvalue()), result)
+            else:
+                self.assertIn(result['one_line'], out.getvalue())
+        self.assertEqual({p.name: p.read_bytes() for p in self.wd.iterdir()}, before)
+
+    def test_health_missing_old_zero_and_invalid_days(self):
+        result = history.health(self.wd, '2026-11-16')
+        self.assertEqual(result['runs'], 0)
+        self.assertIsNone(result['receipt']['eligible'])
+        self.assertEqual(result['loadavg_p95']['end'], [None, None, None])
+        self.path.write_text(json.dumps(self.row) + '\n')
+        result = history.health(self.wd, '2026-11-16')
+        self.assertEqual(result['receipt']['unknown_runs'], 1)
+        self.assertIsNone(result['receipt']['counts']['unattempted'])
+        self.path.write_text(json.dumps({**self.row, 'receipt_eligible': 0, 'receipt_unattempted': 0}) + '\n')
+        result = history.health(self.wd, '2026-11-16')
+        self.assertEqual(result['receipt']['eligible'], 0)
+        self.assertIsNone(result['receipt']['share']['found'])
+        for day in ('2026-11-31', '2026-1-1', 'yesterday', '2026-11-16T00:00:00Z'):
+            with self.subTest(day=day), self.assertRaises(ValueError):
+                history.health(self.wd, day)
+        now = dt.datetime(2026, 11, 17, 2, tzinfo=dt.timezone(dt.timedelta(hours=4)))
+        self.assertEqual(history.health(self.wd, now=now)['day'], '2026-11-16')
+
+    def test_health_validates_raw_receipt_counter_shapes_before_projection(self):
+        forms = [
+            ('text', {'error': 'malformed'}), ('negative', {'error': -1}),
+            ('boolean', {'error': True}), ('fraction', {'error': .5}),
+            ('nonfinite', {'error': float('nan')}), ('nested', {'error': {'count': 0}}),
+            ('list-counter', {'error': []}), ('null-counter', {'error': None}),
+            ('null-container', None), ('list-container', []), ('text-container', 'malformed'),
+            ('inconsistent-total', {'none': 1}),
+        ]
+        for label, counters in forms:
+            with self.subTest(shape=label):
+                row = {**self.row, 'receipt_eligible': 1, 'receipt_unattempted': 1,
+                       'receipt_result': counters}
+                self.path.write_text(json.dumps(row) + '\n')
+                result = history.health(self.wd, '2026-11-16')
+                self.assertEqual(result['runs'], 1)
+                self.assertEqual(result['receipt']['known_runs'], 0)
+                self.assertEqual(result['receipt']['unknown_runs'], 1)
+                self.assertIsNone(result['receipt']['eligible'])
 
     def test_nonblocking_lock_prevents_interleaved_rotation(self):
         self.path.write_bytes(b'x' * (history.MAX_BYTES - 1) + b'\n')
@@ -314,6 +588,51 @@ class HistoryTests(unittest.TestCase):
 
 
 class CheckHistoryTests(Base):
+    def test_loadavg_failure_still_writes_successful_check_row(self):
+        self.case()
+        with patch.object(history.os, 'getloadavg', side_effect=OSError('fixture unavailable')), \
+                patch.dict(os.environ, {'WATCH_DIR': str(self.wd), 'WATCH_RUN_ID': 'fixture'}), \
+                patch.object(cases, 'DATA', self.data), redirect_stdout(io.StringIO()):
+            self.assertEqual(cases.main(['check']), 0)
+        row = json.loads((self.wd / 'runs.jsonl').read_text())
+        self.assertEqual(row['exit'], 0)
+        self.assertIsNone(row['loadavg_start'])
+        self.assertIsNone(row['loadavg_end'])
+
+    def test_successful_load_samples_and_zero_work_counts(self):
+        with patch.object(history.os, 'getloadavg', side_effect=[(1, 2, 3), (4, 5, 6)]):
+            cases.run_check(self.wd, 'fixture', self.data, self.root,
+                            at('2026-10-25T12:00'), finder(), nobody)
+        row = json.loads((self.wd / 'runs.jsonl').read_text())
+        self.assertEqual(row['loadavg_start'], [1, 2, 3])
+        self.assertEqual(row['loadavg_end'], [4, 5, 6])
+        self.assertEqual(row['receipt_eligible'], 0)
+        self.assertEqual(row['receipt_unattempted'], 0)
+        self.assertEqual(row['questions_calls'], 0)
+        self.assertEqual(row['order_charges_calls'], 0)
+
+    def test_receipt_census_counts_questions_skipped_at_follow_deadline(self):
+        from test_cases import CheckBudget
+        now = at('2026-10-25T12:00')
+        CheckBudget.seed(self, [now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        clock = [1000.0]
+        def receipt(*args, **kwargs):
+            clock[0] += 3
+            return None
+        with history.recording(self.wd) as row, patch.object(cases.time, 'time', lambda: clock[0]), \
+                patch.object(cases, 'FOLLOW_EACH', 3), \
+                patch.object(cases.charges, 'receipt', receipt), \
+                patch.object(cases.charges, 'known', return_value=None):
+            row['stats'] = stats
+            cases.follow(self.data, now, self.root, clock[0] + 5, finder(), nobody, stats=stats)
+        row = json.loads((self.wd / 'runs.jsonl').read_text())
+        self.assertEqual(row['receipt_eligible'], 3)
+        self.assertEqual(sum(row['receipt_result'].values()), 1)
+        self.assertEqual(row['receipt_unattempted'], 2)
+        self.assertEqual(row['questions_calls'], 1)
+        self.assertEqual(row['budget_stop_reason'], 'follow_deadline')
+
     def test_final_save_skip_records_build_write_on_every_path(self):
         import data_io
         from contextlib import ExitStack

@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from toollog import directory
+from spawn_schema import summary as spawn_summary
 
 UTC = dt.timezone.utc
 LAUNCHD_LABELS = (
@@ -18,6 +19,7 @@ LAUNCHD_LABELS = (
     'com.abdullah.mac-memory',
     'com.abdullah.mac-cpu',
     'com.abdullah.mac-ssd-read-probe',
+    'com.abdullah.mac-guard',
 )
 # Logging shipped on 2026-11-13 UTC (#10); older days cannot prove silence.
 CADENCES = {
@@ -132,7 +134,17 @@ def report(now=None, root=None, *, day=None):
                              lastOk=last[1].get('ok') if last else None,
                              ageMin=round(age, 3) if age is not None else None,
                              lines=recent, gapMaxMin=gap, since=cadence['since'], status=state)
-        return dict(now=stamp(now), jobs=jobs,
+        guard_rows = [(at, row) for at, row in rows if now-dt.timedelta(hours=24) <= at <= now
+                      and row['name'].startswith('macguard.')]
+        samples = [(at, row) for at, row in guard_rows if row['name'] == 'macguard.sample']
+        last_guard = max(samples, key=lambda item: item[0], default=None)
+        guard = dict(lastSample=stamp(last_guard[0]) if last_guard else None,
+                     strain=last_guard[1].get('props', {}).get('strain') if last_guard else None,
+                     actions24h=sum(row['name'] == 'macguard.action' and row.get('props', {}).get('result') == 'sent' for _, row in guard_rows),
+                     restarts24h=sum(row['name'] == 'macguard.robob_restart' and row.get('props', {}).get('result') == 'launched' for _, row in guard_rows))
+        spawn = max(((at, row) for at, row in rows if at <= now and row['name'] == 'host.spawn_sample'), key=lambda v:v[0], default=None)
+        return dict(now=stamp(now), jobs=jobs, guard=guard,
+                    spawnSample=dict(spawn_summary(spawn[1].get('props', {})), ts=stamp(spawn[0]), ageMin=(now-spawn[0]).total_seconds()/60) if spawn else None,
                     missingJobs=[key for key, job in jobs.items() if job['status'] in ('LATE', 'SILENT')],
                     missingFiles=missing, readErrors=errors, malformed=malformed)
     except Exception:
@@ -163,10 +175,40 @@ def live_report(now=None, root=None, *, runner=None):
     # about whether a job was loaded on the day being rebuilt.
     result = report(now, root)
     result['launchd'] = launchd_status(runner)
+    result.setdefault('guard', {})['worker'] = guard_worker(runner)
     result['ok'] = (not result.get('error') and not result['missingJobs']
                     and not result.get('readErrors')
                     and all(state == 'loaded' for state in result['launchd'].values()))
     return result
+
+
+def guard_worker(runner=None):
+    try:
+        path = Path.home()/'.local/state/mac-guard/worker.json'
+        worker = json.loads(path.read_text())
+        if not isinstance(worker, dict):
+            return 'unknown'
+        tid = worker.get('threadId')
+        if not tid:
+            return 'unknown' if worker.get('launchUnknown') else None
+        run = subprocess.run if runner is None else runner
+        result = run([str(Path.home()/'.local/bin/t3ctl'), 'status', tid],
+                     capture_output=True, text=True, timeout=2)
+        if result.returncode:
+            return 'unknown: '+tid
+        body = json.loads(result.stdout)
+        if not isinstance(body, dict):
+            return 'unknown: '+tid
+        thread = body.get('thread', body)
+        if not isinstance(thread, dict):
+            return 'unknown: '+tid
+        ended = (thread.get('state') == 'idle' and thread.get('status') in ('completed', 'cancelled', 'failed', 'interrupted')
+                 and not thread.get('activeRunId') and not thread.get('pendingRequests'))
+        return None if ended else tid
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 'unknown'
 
 
 def main(argv=None):
@@ -181,6 +223,10 @@ def main(argv=None):
         if as_json:
             print(json.dumps(result, indent=2))
         else:
+            guard = result.get('guard', {})
+            print('mac-guard last=%s strain=%s actions24h=%s restarts24h=%s worker=%s' %
+                  (guard.get('lastSample') or 'never', guard.get('strain'), guard.get('actions24h', 0),
+                   guard.get('restarts24h', 0), guard.get('worker') or 'none'))
             for label, state in result['launchd'].items():
                 print('%-38s %s' % (label, state))
             if 'error' in result:
@@ -189,6 +235,11 @@ def main(argv=None):
                 age = 'unknown' if row['ageMin'] is None else '%g min' % row['ageMin']
                 print('%-20s %-7s last=%s age=%s ok=%s' %
                       (key, row['status'], row['lastSeen'] or 'never', age, json.dumps(row['lastOk'])))
+            spawn = result.get('spawnSample')
+            if spawn:
+                parents = ', '.join('%s[%s]:%s' % (p.get('family') or p.get('parent_comm'), p.get('ppid'), p.get('births')) for p in spawn['top_spawners'])
+                cadence = '/'.join(str(v) for v in spawn['births_cadences_s']) or '?'
+                print('spawn >=%s births/min @%ss; runnable pri<=4=%s; partial=%s; age=%g min; top: %s' % (spawn['births_per_min'], cadence, spawn['runnable_pri_le4'], spawn['partial'], spawn['ageMin'], parents))
             for filename in result.get('missingFiles', []):
                 print('missing day file: ' + filename)
             for filename in result.get('readErrors', []):

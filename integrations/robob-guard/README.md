@@ -7,6 +7,16 @@ install hold with a fresh heartbeat holds off recovery. There
 is no stay-quit file or mode switch.
 
 `com.ardud.robob-guard` checks every 30 seconds, including `RunAtLoad`.
+The protected tier keeps crpko-adhoc-server, crpko-ios-tunnel and robob-guard at
+nice −5 and clears background scheduling when priority drops to 4 or below.
+It matches launchd labels with exact argv checks from `protected_tier.json`.
+The children list is empty: robob-watch and the bridge supervisor are excluded
+because their long-running descendants would inherit the promoted priority.
+Changes and incomplete ticks are ndjson `protected_tier.adjust` and
+`protected_tier.tick` rows in `guard.log`. Unchanged ticks use native process reads
+and cached launchd identities without spawning commands. The guard's own plist
+starts each interval invocation as Interactive at nice −5 so it needs no self-repair.
+
 It calls the same authenticated `/api/ardud/control/health` endpoint as
 `t3ctl health`, with a three-second total HTTP deadline and no deep-health SSD
 reads. It uses a guard component credential when provisioned, otherwise the
@@ -131,6 +141,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ardud.robob-guard.pl
 Deploy copies the integration, symlinks `~/.local/bin/robob-install-hold`,
 and installs the plist; it does not load or restart it. The plist uses the
 system Python and files on the internal disk, independent of the SSD checkout.
+When updating a loaded guard, boot out and bootstrap only its LaunchAgent to apply
+new plist scheduling settings; `kickstart` alone does not reread those settings.
 Emergency stop:
 
 ```zsh

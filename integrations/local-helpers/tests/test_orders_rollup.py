@@ -32,6 +32,29 @@ READERS = (SHARED, AUTOMATIC, MONEY)
 
 
 class OrdersRollupTests(unittest.TestCase):
+    def test_automatic_refresh_preserves_same_day_money_cases_health(self):
+        import subprocess
+        health = {'day': DAY, 'runs': 2, 'one_line': 'money-cases fixture: runs=2 receipts=1/3'}
+        class Clock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 11, 13, 0, 5, tzinfo=dt.timezone.utc)
+        self.write(self.fixture())
+        for reader in (AUTOMATIC, MONEY):
+            with self.subTest(writer=reader.__name__):
+                with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, json.dumps(health), '')), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(SHARED.main(['rollup', '--board', 'orders', '--day', DAY]), 0)
+                path = self.folder / ('rollup-' + DAY + '.json')
+                self.assertEqual(json.loads(path.read_text())['moneyCasesHealth'], health)
+                with patch.object(reader.dt, 'datetime', Clock):
+                    reader.previous_day_rollup()
+                self.assertEqual(json.loads(path.read_text())['moneyCasesHealth'], health)
+                self.assertEqual(reader.rollup(DAY)['moneyCasesHealth'], health)
+                for bad in ({**health, 'day': '2026-11-11'}, {'day': DAY, 'one_line': None}, []):
+                    path.write_text(json.dumps({'moneyCasesHealth': bad}))
+                    self.assertNotIn('moneyCasesHealth', reader.rollup(DAY))
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
