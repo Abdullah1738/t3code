@@ -183,14 +183,12 @@ def previous_samples(boot, root, previous=None):
 
 
 def unified(boot, run):
-    from collector import unified_command
-    start, end = (dt.datetime.fromtimestamp(at, UTC).strftime('%Y-%m-%d %H:%M:%S')
-                  for at in (math.ceil(boot), math.floor(boot)+180))
-    text = command(['/usr/bin/log', 'show', '--style', 'ndjson', '--timezone', 'UTC',
-                    '--start', start, '--end', end, '--predicate',
-                    'eventMessage CONTAINS[c] "Previous shutdown cause" OR process == "DumpPanic"'],
-                   unified_command if run is subprocess.run else run, timeout=15)
-    cause, dump, dropped = None, None, 0
+    from logwindow import read_window
+    start = dt.datetime.fromtimestamp(math.ceil(boot), UTC).strftime('%Y-%m-%d %H:%M:%S+0000')
+    text, stats = read_window(math.ceil(boot), math.floor(boot)+180,
+                             'eventMessage CONTAINS[c] "Previous shutdown cause" OR process == "DumpPanic"',
+                             run=run, timeout=15, after_boot=boot)
+    cause, dump, dropped = None, None, stats['rowsOutside']+stats['unparsed']
     for line in text.splitlines():
         if not line.startswith('{'):
             continue
@@ -205,7 +203,8 @@ def unified(boot, run):
             cause = dict(code=int(match[1]), meaning='unmapped')
         if 'no paniclog data' in msg or 'all zeros' in msg:
             dump = 'no_paniclog_data'
-    return cause, dict(read='unified', windowStart=start, windowEnd=end, droppedRows=dropped, dumpPanic=dump)
+    return cause, dict(read='unified', windowStart=start, windowEnd=stats['windowEnd'],
+                       droppedRows=dropped, dumpPanic=dump, error=stats['error'])
 
 
 def collect(boot, roots=REPORT_DIRS, root=None, run=subprocess.run, previous=None):

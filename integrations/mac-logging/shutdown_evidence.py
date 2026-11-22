@@ -88,26 +88,26 @@ def parse_shutdown(text, boot):
 
 
 def shutdown_context(boot, run):
-    from boot import command
-    from collector import unified_command
-    start, end = (dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    from logwindow import read_window
+    start, end = (dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S+0000')
                   for at in (int(boot)-179, int(boot)))
-    text = command(['/usr/bin/log', 'show', '--style', 'ndjson', '--timezone', 'UTC',
-                    '--start', start, '--end', end, '--info', '--debug', '--predicate',
-                    'process == "loginwindow" OR process == "launchd" OR process == "sessionlogoutd" '
-                    'OR subsystem == "com.apple.sessionlogoutd" OR process == "kernel" OR process == "watchdogd"'],
-                   unified_command if run is subprocess.run else run, timeout=15)
+    text, stats = read_window(int(boot)-179, int(boot),
+                             'process == "loginwindow" OR process == "launchd" OR process == "sessionlogoutd" '
+                             'OR subsystem == "com.apple.sessionlogoutd" OR process == "kernel" OR process == "watchdogd"',
+                             run=run, timeout=15, info=True, debug=True)
     props, source = parse_shutdown(text, boot)
+    source['droppedRows'] += stats['rowsOutside']+stats['unparsed']
+    source['error'] = stats['error']
     source.update(windowStart=start, windowEnd=end)
     return props, source
 
 
 def kernel_reasons(boot, run):
     from boot import command
-    from boot_identity import parse
+    from logwindow import parse_boottime
     text = command(['/usr/sbin/sysctl', 'kern.boottime', 'kern.shutdownreason', 'kern.bootreason'], run)
     fields = dict(line.split(': ', 1) for line in text.splitlines() if ': ' in line)
-    if abs(parse(fields.get('kern.boottime', ''))['bootEpoch']-boot) > 0.000001:
+    if abs(parse_boottime(fields.get('kern.boottime', ''))-boot) > 0.000001:
         raise ValueError('kernel reasons belong to another boot')
     return dict(shutdownReason=fields.get('kern.shutdownreason'), bootReason=fields.get('kern.bootreason'))
 

@@ -98,8 +98,10 @@ to it. Decode failures preserve presence and a source error.
 #92 found no numeric shutdown cause on this Apple-silicon host; any future numeric code is retained as unmapped,
 without Intel cause tables. Filtered unified-log queries cover the three minutes
 before boot for shutdown context and the first three minutes after boot for
-shutdown cause, each with a 15-second process-group deadline and timestamp
-post-filtering. ResetCounter uses plain reads, without sudo. Observations are
+shutdown cause, using the shared `logwindow` reader with explicit UTC bounds,
+reboot splits, a 15-second process-group deadline and timestamp filtering.
+The post-boot read starts at the first whole second at or after boot.
+ResetCounter uses plain reads, without sudo. Observations are
 timestamped at boot (`observedAt` records collection time), persisted once per
 boot and survive the daily log cap. Unclean boots and orderly shutdown stalls queue one
 Telegram alert with a stable boot key; failed sends retry that same key/text,

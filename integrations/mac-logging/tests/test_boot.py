@@ -13,6 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import boot
 import boot_identity
+import logwindow
 import shutdown_evidence
 import jobs
 import toollog
@@ -33,6 +34,9 @@ class BootTests(unittest.TestCase):
         time.tzset()
         self.addCleanup(time.tzset)
         self.addCleanup(env.stop)
+        discovery = patch.object(logwindow, 'boot_times', return_value=[])
+        discovery.start()
+        self.addCleanup(discovery.stop)
 
     def runner(self, argv, **kwargs):
         self.assertNotIn('BUN_INSPECT', kwargs['env'])
@@ -44,10 +48,13 @@ class BootTests(unittest.TestCase):
             Path(argv[argv.index('-o')+1]).write_text((FIX/'stall-21nov.txt').read_text())
             return SimpleNamespace(returncode=0, stdout='')
         self.assertEqual(argv[:5], ['/usr/bin/log', 'show', '--style', 'ndjson', '--timezone'])
-        self.assertEqual(kwargs['timeout'], 15)
+        self.assertGreater(kwargs['timeout'], 0)
+        self.assertLessEqual(kwargs['timeout'], 15)
+        self.assertEqual(kwargs['env']['TZ'], 'UTC')
         start, end = (argv[argv.index(flag)+1] for flag in ('--start', '--end'))
+        self.assertTrue(start.endswith('+0000') and end.endswith('+0000'))
         window = (dt.datetime.fromisoformat(end)-dt.datetime.fromisoformat(start)).total_seconds()
-        self.assertGreaterEqual(window, 179)
+        self.assertGreaterEqual(window, 0)
         self.assertLessEqual(window, 180)
         return SimpleNamespace(returncode=0, stdout=(FIX/'shutdown-21nov.ndjson').read_text() if '--debug' in argv else '')
 
@@ -112,7 +119,7 @@ class BootTests(unittest.TestCase):
             raise subprocess.TimeoutExpired('probe', 5)
         props = boot.collect(BOOT, roots=[self.reports], root=self.root/'logs', run=fail)
         self.assertFalse(props['clean'])
-        self.assertEqual(props['source']['shutdownCause']['error'], 'unavailable')
+        self.assertEqual(props['source']['shutdownCause']['error'], 'partial')
 
     def test_restart_does_not_reemit_or_alert(self):
         self.reset()
@@ -187,6 +194,94 @@ class BootTests(unittest.TestCase):
         self.assertEqual(cause, dict(code=-128, meaning='unmapped'))
         self.assertEqual(source['droppedRows'], 2)
         self.assertEqual(source['dumpPanic'], 'no_paniclog_data')
+
+    def test_post_boot_shared_reader_utc_and_reboot_boundaries(self):
+        fake = self.root/'log'
+        queries = self.root/'queries'
+        fake.write_text('#!'+sys.executable+'''\nimport datetime as dt,json,os,sys
+from pathlib import Path
+start, end = (sys.argv[sys.argv.index(flag)+1] for flag in ('--start','--end'))
+assert start.endswith('+0000') and end.endswith('+0000')
+assert os.environ['TZ'] == 'UTC'
+assert 'BUN_INSPECT' not in os.environ
+a,b = (dt.datetime.fromisoformat(x).timestamp() for x in (start,end))
+assert not a < %r < b, 'query crosses a reboot'
+with Path(%r).open('a') as stream: stream.write(json.dumps([a,b])+'\\n')
+for at,code in ((%r,-128),(%r,5)):
+ print(json.dumps({'timestamp':dt.datetime.fromtimestamp(at,dt.timezone.utc).isoformat(),
+                   'eventMessage':'Previous shutdown cause: '+str(code)}))
+''' % (BOOT+60, str(queries), BOOT+10, BOOT+70))
+        fake.chmod(0o700)
+        for fraction in (0, .673004):
+            with self.subTest(fraction=fraction), \
+                 patch.dict(os.environ, MAC_LOG_WINDOW_LOG_BIN=str(fake)), \
+                 patch.object(logwindow, 'boot_times', return_value=logwindow.BootTimes([BOOT, BOOT+60])):
+                queries.write_text('')
+                cause, source = boot.unified(BOOT+fraction, subprocess.run)
+                self.assertEqual(cause, dict(code=-128, meaning='unmapped'))
+                self.assertGreater(source['droppedRows'], 0)
+                bounds = [json.loads(line) for line in queries.read_text().splitlines()]
+                self.assertGreaterEqual(len(bounds), 1)
+                self.assertTrue(all(BOOT+fraction <= a <= b <= BOOT+60 for a,b in bounds))
+                self.assertTrue(source['windowStart'].endswith('+0000'))
+                self.assertEqual(boot.epoch(source['windowEnd']), BOOT+60)
+
+    def test_cause_attribution_stops_before_the_next_boot(self):
+        forms = [('before', 59.999999, 9), ('at', 60, -128), ('after', 70, -128)]
+        for label, offset, expected in forms:
+            rows = [dict(timestamp=boot.iso(at), eventMessage='Previous shutdown cause: %s' % code)
+                    for at, code in [(BOOT+10, -128), (BOOT+offset, 9)]]
+            def run(args, **kwargs):
+                self.assertLessEqual(boot.epoch(args[args.index('--end')+1]), BOOT+60)
+                return SimpleNamespace(returncode=0, stdout='\n'.join(map(json.dumps, rows)))
+            with self.subTest(label=label), \
+                 patch.object(logwindow, 'boot_times', return_value=logwindow.BootTimes([BOOT,BOOT+60])):
+                cause, _ = boot.unified(BOOT, run)
+                self.assertEqual(cause['code'], expected)
+
+    def test_partial_boot_second_preserves_rows_and_reads_the_safe_tail(self):
+        calls = []
+        def reader(command, left, right, include_end, stop, out, outside):
+            calls.append(left)
+            at, code = (BOOT+.5, 9) if left == BOOT else (BOOT+10, -128)
+            out.write((json.dumps(dict(timestamp=boot.iso(at),
+                eventMessage='Previous shutdown cause: %s' % code))+'\n').encode())
+            stats = logwindow.counters()
+            stats.update(rowsIn=1, lastInWindowTs=boot.iso(at),
+                         status='partial' if left == BOOT else 'complete')
+            return stats
+        with patch.object(logwindow, 'boot_times', return_value=[BOOT]), \
+             patch.object(logwindow, 'read_slice', side_effect=reader):
+            cause, source = boot.unified(BOOT, subprocess.run)
+        self.assertEqual(calls, [BOOT, BOOT+1])
+        self.assertEqual(cause['code'], -128)
+        self.assertEqual(source['error'], 'partial')
+
+    def test_unresolved_reboot_bounds_cause_attribution(self):
+        forms = [('later_minute', 60, 120, -128, 60),
+                 ('contains_start', -30, 30, None, 0),
+                 ('ends_at_start', -60, 0, 9, 180),
+                 ('starts_at_end', 180, 240, 5, 180)]
+        for label, left, right, expected, end in forms:
+            queries = []
+            rows = [dict(timestamp=boot.iso(at), eventMessage='Previous shutdown cause: %s' % code)
+                    for at, code in [(BOOT+10, -128), (BOOT+130, 5), (BOOT+180, 9)]]
+            def run(args, **kwargs):
+                queries.append((boot.epoch(args[args.index('--start')+1]),
+                                boot.epoch(args[args.index('--end')+1])))
+                return SimpleNamespace(returncode=0, stdout='\n'.join(map(json.dumps, rows)))
+            with self.subTest(label=label), patch.object(logwindow, 'boot_times',
+                    return_value=logwindow.BootTimes([], [(BOOT+left,BOOT+right)])):
+                cause, source = boot.unified(BOOT, run)
+                self.assertEqual(cause['code'] if cause else None, expected)
+                self.assertEqual(boot.epoch(source['windowEnd']), BOOT+end)
+                self.assertTrue(all(a <= b <= BOOT+end for a,b in queries))
+                if label == 'ends_at_start':
+                    self.assertIsNone(source['error'])
+                else:
+                    self.assertIn('boot_unresolved', source['error'])
+                if label == 'contains_start':
+                    self.assertEqual(queries, [])
 
     def test_clean_boot_never_alerts(self):
         props = self.collect()
