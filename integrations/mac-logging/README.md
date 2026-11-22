@@ -823,9 +823,12 @@ at most 300 candidate processes. A separate daemon worker isolates a stuck
 kernel call; the publisher reports stale/in-flight coverage instead of
 waiting. Coverage, unreadable argv/tasks and missing CPU baselines are explicit.
 Only derived labels are cached per PID/start identity; argv is never logged.
-Cost includes per-minute summed wall/CPU time. Projected excess first disables
-thread reads, then reduces census cadence to 15 seconds until restart. Disabled
-thread counts are null. Runnable counts describe the latest tick, not the sum
+Cost includes per-minute summed wall/CPU time, individual phase costs and guard
+decisions. Actual excess halves the thread-process cap down to one, prioritizing
+runnable hints and highest CPU gain; only then can cadence slow to 15 seconds.
+A 50ms thread pass is attempted every tick within the 1.5s overall deadline.
+Thread counts are null only when no minimal pass fits or is readable, and retry
+on the next tick. Runnable counts describe the latest tick, not the sum
 of repeated censuses; offbox counts/RSS describe that same tick. CPU deltas use
 the last readable per-identity baseline (`offboxWindowS` is the tick window,
 `cpuWindowMaxS` exposes older baselines); RSS is a sum, not unique physical memory.

@@ -55,21 +55,94 @@ class SpawnTests(unittest.TestCase):
         def slow(pid):self.now+=2;return original(pid)
         self.n.bsd=slow;r=self.s.tick()
         self.assertTrue(r['partial']);self.assertIn('cpu_offbox_budget',r['partialReasons'])
-        self.assertFalse(self.s.threads_enabled);self.assertEqual(r['runnable']['covered'],0)
-        self.s.tick();self.assertEqual(self.s.interval,15)
+        self.assertTrue(self.s.threads_enabled);self.assertEqual(self.s.thread_limit,150)
+        self.assertEqual(r['runnable']['covered'],0)
+        self.s.tick();self.assertEqual(self.s.thread_limit,75);self.assertEqual(self.s.interval,5)
     def test_failed_inventory_cost_and_guard(self):
         def fail(*args):self.now+=1.6;raise OSError('unavailable')
         self.n.pids=fail
         m=Monitor(self.s,clock=lambda:self.now)
         first=self.s.tick();m.results.append(first)
         self.assertAlmostEqual(first['wallMs'],1600)
-        self.assertFalse(self.s.threads_enabled);self.assertEqual(self.s.interval,5)
+        self.assertTrue(self.s.threads_enabled);self.assertEqual(self.s.thread_limit,150)
+        self.assertEqual(self.s.interval,5)
         second=self.s.tick();m.results.append(second)
         self.assertAlmostEqual(second['wallMs'],1600)
-        self.assertEqual(self.s.interval,15)
+        self.assertEqual(self.s.thread_limit,75);self.assertEqual(self.s.interval,5)
         self.now=60;p=m.report()
         self.assertAlmostEqual(p['wallMs'],3200)
         self.assertIn('inventory_unavailable',p['partialReasons'])
+    def test_slow_tick_is_not_projected_to_whole_minute(self):
+        for wall in (.126,.378,.9):
+            self.assertIsNone(self.s.record_cost(wall,.03))
+        self.assertEqual(self.s.thread_limit,300);self.assertEqual(self.s.interval,5)
+    def test_guard_reduces_to_minimal_pass_before_cadence(self):
+        limits=[]
+        for _ in range(8):
+            self.s.record_cost(1.6,.03);limits.append(self.s.thread_limit)
+        self.assertEqual(limits,[150,75,37,18,9,4,2,1]);self.assertEqual(self.s.interval,5)
+        action=self.s.record_cost(1.6,.03)
+        self.assertEqual((self.s.thread_limit,self.s.interval),(1,15))
+        self.assertEqual(action['reason'],'tick_wall');self.assertTrue(self.s.threads_enabled)
+    def test_smaller_pass_prioritizes_runnable_then_cpu_gain(self):
+        self.n.child(2);self.n.child(3);cpu={1:0,2:0,3:0}
+        self.n.task=lambda pid:dict(cpuNs=cpu[pid],rssBytes=1,running=int(pid==2))
+        self.s.tick();self.now=5;cpu.update({1:1_000_000_000,3:2_000_000_000})
+        self.s.thread_limit=2;self.n.thread_calls=[];r=self.s.tick()
+        self.assertEqual(self.n.thread_calls,[2,3]);self.assertEqual(r['runnable']['covered'],2)
+        self.assertEqual(r['runnable']['total'],3);self.assertTrue(r['partial'])
+        self.assertEqual(r['runnable']['runnable_low_cpu'],1)
+    def test_thread_soft_budget_retains_completed_minimal_pass(self):
+        self.n.child(2)
+        def read(pid,deadline,clock):self.now+=.06;return [(1,4,4)],False
+        self.n.threads=read
+        for at in (0,5):
+            self.now=at;r=self.s.tick()
+            self.assertEqual(r['runnable']['covered'],1)
+            self.assertEqual(r['runnable']['buckets']['pri<=4'],1)
+            self.assertIsNotNone(r['runnable']['runnable_low_cpu'])
+            self.assertIn('threads_budget',r['partialReasons'])
+    def test_zero_requires_complete_identity_and_cpu_coverage(self):
+        # A partial measured pass is useful; an unmeasured remainder cannot
+        # establish that there were no runnable candidates anywhere.
+        cases=[('empty',[],set(),set(),set(),0),
+               ('sleeping',[1,2],set(),set(),set(),0),
+               ('one_identity_unreadable',[1,2],{2},set(),set(),None),
+               ('all_identities_unreadable',[1,2],{1,2},set(),set(),None),
+               ('one_task_unreadable',[1,2],set(),{2},set(),None),
+               ('measured_subset',[1,2],{2},set(),{1},1)]
+        for name,pids,bsd_unreadable,task_unreadable,running,expected in cases:
+            with self.subTest(case=name):
+                self.setUp();self.n.child(2)
+                bsd=self.n.bsd
+                self.n.pids=lambda *args:pids
+                def read_bsd(pid):
+                    if pid in bsd_unreadable:raise OSError()
+                    return bsd(pid)
+                def read_task(pid):
+                    if pid in task_unreadable:raise OSError()
+                    return dict(cpuNs=0,rssBytes=1,running=int(pid in running))
+                self.n.bsd=read_bsd;self.n.task=read_task
+                r=self.s.tick();result=r['runnable']
+                if expected is None:
+                    self.assertIsNone(result['buckets']);self.assertIsNone(result['runnable_low_cpu'])
+                else:
+                    self.assertEqual(result['buckets']['pri<=4'],expected)
+                    self.assertIsNotNone(result['runnable_low_cpu'])
+                if bsd_unreadable or task_unreadable:self.assertTrue(r['partial'])
+    def test_phase_costs_and_actual_minute_guard(self):
+        original=self.n.bsd
+        def bsd(pid):self.now+=.001;return original(pid)
+        self.n.bsd=bsd;r=self.s.tick()
+        self.assertAlmostEqual(sum(v['wallMs'] for v in r['phaseCosts'].values()),r['wallMs'])
+        self.assertGreater(r['phaseCosts']['threads']['wallMs'],0)
+        m=Monitor(self.s,clock=lambda:self.now);r['wallMs']=1600;m.results.append(r)
+        self.now=60;p=m.report()
+        self.assertEqual(p['guardActions'][-1]['reason'],'minute_wall')
+        self.assertEqual(p['threadLimit'],150);self.assertTrue(p['threadsEnabled'])
+        safe=toollog.safe_fields(p,'host.spawn_sample')
+        self.assertEqual(safe['phaseCosts'],p['phaseCosts'])
+        self.assertEqual(safe['guardActions'],p['guardActions'])
     def test_no_native_read_starts_after_deadline(self):
         for stage in ('task','argv','threads'):
             with self.subTest(stage=stage):
@@ -129,6 +202,19 @@ class SpawnTests(unittest.TestCase):
         self.n.task=lambda pid:(_ for _ in ()).throw(OSError())
         r=self.s.tick()['offbox']['argv-unreadable']
         self.assertEqual((r['count'],r['metricsUnreadable'],r['cpuUnknown']),(1,1,1))
+    def test_cold_argv_census_prioritizes_birth_parents(self):
+        for pid in range(2,102):self.n.child(pid)
+        self.n.child(9998);self.n.rows[9998]['comm']='unresolved'
+        def argv(pid):
+            return ['codex','app-server'] if pid==9998 else ['other']
+        self.n.argv=argv
+        m=Monitor(self.s,clock=lambda:self.now)
+        m.results.append(self.s.tick())
+        self.assertNotIn((9998,(2,0)),self.s.labels)
+        self.now=5;self.n.child(10001,3,9998);m.results.append(self.s.tick())
+        self.now=60;p=m.report()
+        actor=next(p for p in p['top_spawners'] if p['ppid']==9998)
+        self.assertEqual(actor['family'],'codex app-server')
     def test_offbox_forms(self):
         cases=[(['python3','/x/offbox.py','wait'],'wait'),(['python3','-Iu','/x/offbox.py','run'],'run'),(['python3','-W','ignore','/x/offbox.py','_bg-queue'],'_bg-queue'),(['python3','--','/x/offbox.py','logs'],'other'),(['python3','-c','pass','offbox.py','wait'],None),(['python3','-m','x','offbox.py','wait'],None),(['zsh','-c','offbox.py wait'],None),(['python3','/x/offbox.py.other','wait'],None),(['python3','/x/fake.py','offbox.py','wait'],None)]
         for argv,kind in cases:

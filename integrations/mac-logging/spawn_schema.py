@@ -4,8 +4,10 @@ import re
 
 NUMBERS = set('windowS ticks births exits births_per_min identityCovered identityTotal sampleAgeS wallMs cpuMs cpuPct intervalS tickWallMaxMs ppid pid covered total candidateCoverage candidateTotal runnable_low_cpu cpuUnknown count rssBytes cpuDeltaNs metricsUnreadable distinctRunIds'.split())
 NUMBERS.update(('inFlightWallMs', 'offboxWindowS', 'cpuWindowMaxS'))
+NUMBERS.update(('threadLimit', 'previousThreadLimit', 'processLimit'))
 BOOLS = {'lower_bound', 'baseline', 'partial', 'threadsEnabled', 'costIncomplete'}
 OBJECTS = {'runnable', 'offbox', 'buckets', 'wait', '_bg-queue', 'run', 'other', 'argv-unreadable', 'argv-pending'}
+OBJECTS.update(('phaseCosts', 'identity', 'parents', 'cpu', 'argv', 'offbox', 'threads'))
 REASONS = {a+b for a in ('identity', 'argv', 'cpu_offbox', 'threads') for b in ('_budget', '_unreadable', '_coverage')} | {'threads_disabled', 'threads_incomplete', 'identity_changed', 'inventory_unavailable', 'stale', 'native_call_in_flight', 'late_tick', 'task_unreadable'}
 FAMILIES = {'Robob server', 'codex app-server', 'claude provider', 'robob-watch runner', 'agent-bridges'}
 
@@ -26,14 +28,17 @@ def fields(values, depth=0):
                 result[key] = value
         elif key == 'method' and value == 'proc_listallpids+pid_start_snapshot_delta':
             result[key] = value
+        elif key == 'reason' and value in ('tick_wall', 'tick_cpu', 'minute_wall', 'minute_cpu'):
+            result[key] = value
         elif key in ('parent_comm', 'comm') and isinstance(value, str):
             result[key] = value if re.fullmatch(r'[A-Za-z0-9_.: +()-]{1,96}', value) and not SECRET.search(value) else '[redacted]'
         elif key == 'family' and (value is None or isinstance(value, str) and value in FAMILIES):
             result[key] = value
         elif key == 'partialReasons' and isinstance(value, list):
             result[key] = [v for v in value[:32] if isinstance(v, str) and v in REASONS]
-        elif key in ('top_spawners', 'top', 'child_comms_top3') and isinstance(value, list):
-            result[key] = [fields(v, depth+1) for v in value[:3 if key == 'child_comms_top3' else 10]]
+        elif key in ('top_spawners', 'top', 'child_comms_top3', 'guardActions') and isinstance(value, list):
+            limit = 3 if key == 'child_comms_top3' else 32 if key == 'guardActions' else 10
+            result[key] = [fields(v, depth+1) for v in value[:limit]]
         elif key in OBJECTS:
             result[key] = None if value is None else fields(value, depth+1)
     return result
