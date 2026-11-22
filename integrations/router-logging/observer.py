@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 
+from host import Sampler, clean_host, poll_props
 from toollog import emit, trimmed_stderr
 
 JOB = 'com.ardud.9router-log-poll'
@@ -146,7 +147,11 @@ def gap_summary(rows, day, generated):
         if cause not in ('sleep_gap', 'agent_not_running', 'other'):
             cause = 'tick_blocked:' + phase_name if phase_name in (*FIELDS, 'pool_fetch') else 'other'
         bucket = groups['guardGaps' if component == 'guard' else 'pollGaps']
-        bucket.append(dict(number=len(bucket) + 1, start=iso(start), end=iso(end),
+        hosts = {key: clean_host(props.get(key)) for key in ('hostStart', 'hostEnd')}
+        hosts = {key: value for key, value in hosts.items() if value}
+        if 'l1' in hosts.get('hostStart', {}):
+            hosts['load1Start'] = hosts['hostStart']['l1']
+        bucket.append(dict(**hosts, number=len(bucket) + 1, start=iso(start), end=iso(end),
                            cause=cause, component=component, durationMs=round(overlap, 3)))
     return groups
 
@@ -171,7 +176,8 @@ def gap(previous, current, cadence_ms=15000):
     elif current.get('pid') == previous.get('pid') and suspend > 120000:
         # A suspend-aware clock avoids calling a wall-clock adjustment sleep.
         cause = 'sleep_gap'
-    return dict(start=iso(previous['wallMs']), end=iso(current['wallMs']), cause=cause,
+    hosts = {key: value['host'] for key, value in (('hostStart', previous), ('hostEnd', current)) if value.get('host')}
+    return dict(**hosts, host=current.get('host', {}), start=iso(previous['wallMs']), end=iso(current['wallMs']), cause=cause,
                 wallGapMs=wall, monotonicGapMs=mono, sleepGapMs=suspend,
                 pid=current.get('pid', 0), previousPid=previous.get('pid', 0),
                 jobStateStart=previous.get('jobState', 'unknown'), jobStateEnd=current.get('jobState', 'unknown'),
@@ -208,26 +214,31 @@ def measured(name):
 
 
 class Timings:
-    def __init__(self, component='poller', name='poll.phases', threshold_ms=30000, start=None):
+    def __init__(self, component='poller', name='poll.phases', threshold_ms=30000, start=None, sampler=None):
         self.component, self.name, self.threshold = component, name, threshold_ms
         self.start = start
+        self.sampler = sampler or Sampler()
         self.stack, self.values = [], {name: 0 for name in FIELDS}
 
     def __enter__(self):
         self.start = self.start or dict(clock_sample(), **job_snapshot())
+        if not self.start.get('host'):
+            self.start['host'] = self.sampler()
         self.token = _active.set(self)
         return self
 
     def __exit__(self, *_):
         _active.reset(self.token)
         self.end = dict(clock_sample(), **job_snapshot())
+        self.end['host'] = self.start.get('host', {})
         elapsed = max(0, self.end['monotonicMs'] - self.start['monotonicMs'])
         wall = self.end['wallMs'] - self.start['wallMs']
         missing = gap(self.start, self.end, cadence_ms=0)
         slowest = max(self.values, key=self.values.get)
         if max(self.values.values()) <= self.threshold and max(elapsed, wall) <= 120000:
             return
-        props = dict(start=iso(self.start['wallMs']), end=iso(self.end['wallMs']),
+        self.end['host'] = self.sampler()
+        props = dict(host=self.end['host'], hostStart=self.start.get('host', {}), hostEnd=self.end['host'], start=iso(self.start['wallMs']), end=iso(self.end['wallMs']),
                      startedAtMs=self.start['wallMs'], finishedAtMs=self.end['wallMs'],
                      monotonicStartMs=self.start['monotonicMs'], monotonicEndMs=self.end['monotonicMs'],
                      wallGapMs=wall, monotonicGapMs=elapsed,
@@ -242,6 +253,11 @@ class Timings:
             props[key + 'End'] = self.end.get(key, 'unknown')
         props.update({field: round(self.values[name], 3) for name, field in FIELDS.items()})
         emit(self.component, self.name, kind='perf', durationMs=elapsed, props=props)
+
+
+def poll_host():
+    timing = _active.get()
+    return poll_props(timing.start.get('host', {}), timing.start['wallMs']) if timing else {}
 
 
 def observed(component='poller', name='poll.phases'):

@@ -34,6 +34,25 @@ call. `pool-alerts` emits `pool.endpoint.get` for its independent fetches.
 `pollGaps`/`guardGaps` number measured spans over two minutes, clipped for daily
 duration totals. `coverage` explains threshold-only `healthByHour`, exhaustion
 episodes in `pools`, and missing legacy observer measurements.
+Every `poll.complete` carries a compact `host` object, including failed polls.
+Wire keys are `l1`/`l5`/`l15` (load averages), `c` (logical CPUs), `f` (free
+bytes), `a` (free plus inactive bytes, an available-memory estimate), `p`
+(macOS pressure: 1 normal, 2 warning, 4 critical), and optional `e` (failure
+enum). `hostAtMs` beside `host` retains the poll sample time across midnight.
+The full poll row addition, including `props` and the timestamp, stays within
+120 bytes; memory estimates and then the longer load averages may be omitted to fit
+extreme values; load1, CPU count and observed pressure/failure remain. Swap is omitted. Diagnostics share a 1.75-second command budget per
+tick, never retry, and add no rows. Guard state retains host observations
+between ticks and across restarts. Anomalies carry `hostStart`/`hostEnd`;
+legacy boundaries remain unknown. Rollup gap and listener windows retain
+these objects and expose `load1Start` when measured.
+
+`hostLoad.hourly` reports sampled load1 average/maximum and maximum pressure.
+`hoursWithLoadAbove2xCpu` lists hours containing an overload sample; it does
+not estimate overload duration. `proxySummary.byHour` places request p95
+beside that load. `failedSnapshots`, `pollRowsWithoutHost` and `coverage.hostLoad`
+explain missing observations; no values are inferred across sampling gaps.
+
 Finalized days are refreshed when late observer completions add a gap overlap.
 
 `~/.local/state/9router/deploy.json` coordinates the guard with the router's

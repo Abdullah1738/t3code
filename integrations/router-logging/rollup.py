@@ -13,6 +13,7 @@ from volume import REASONS, integer
 from listener_rollup import windows as listener_windows
 from pool_rollup import summarize as pool_summary
 from observer import gap_summary, measured, observed
+from host_rollup import HostLoad
 
 
 def percentiles(values):
@@ -84,6 +85,7 @@ def rollup(day, root=None, now=None):
     next_day = dt.datetime.combine(dt.date.fromisoformat(day) + dt.timedelta(days=1), dt.time(), dt.timezone.utc)
     root = Path(root) if root is not None else directory()
     counts, kinds, tags = Counter(), Counter(), Counter()
+    host_load = HostLoad(day, generated)
     pool_rows = []
     times, samples = defaultdict(list), {}
     targets = defaultdict(Counter)
@@ -135,6 +137,7 @@ def rollup(day, root=None, now=None):
                         dims = tuple(props.get(k, 'unknown') for k in ('provider', 'model', 'cause'))
                         if not all(isinstance(v, str) for v in dims):
                             raise ValueError('invalid lock dimensions')
+                    host_load.observe(row)
                     total += 1
                     counts[row['name']] += 1
                     if row['name'] in ('pool.exhausted', 'pool.recovered'):
@@ -467,11 +470,16 @@ def rollup(day, root=None, now=None):
     observations = []
     result['listener'] = listener_windows(day, root, generated, observations)
     result.update(gap_summary(observations, day, generated))
+    for row in observations:
+        if not isinstance(row.get('ts'), str) or not row['ts'].startswith(day):
+            host_load.observe(row)
+    result['hostLoad'], result['proxySummary']['byHour'] = host_load.summary()
     result['coverage'] = dict(
         healthByHour='Threshold events only; healthy probes use supervisor.health_probe_summary.',
         healthProbeSummaryRows=counts['supervisor.health_probe_summary'],
         pools='Recorded exhaustion episodes only; empty does not mean no pools or continuous observer coverage.',
-        observerGaps='Measured spans only; legacy ticks without start/end diagnostics cannot be reconstructed.')
+        observerGaps='Measured spans only; legacy ticks without start/end diagnostics cannot be reconstructed.',
+        hostLoad='Sampled at polls and anomalies; missing legacy snapshots are unknown. See hostLoad.failedSnapshots and pollRowsWithoutHost; memory available is free plus inactive pages, an estimate. Overload hours contain a sample above 2x CPU count, not a measured duration.')
     drops = Counter()
     for writer in volume_writers.values():
         drops.update(writer)

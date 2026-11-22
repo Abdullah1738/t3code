@@ -3,6 +3,7 @@ import datetime as dt
 import json
 import re
 
+from host import clean_host
 from guard import recent_failure
 from observer import GAP_NAMES, launchctl_cause, measured
 
@@ -19,11 +20,11 @@ def transitions(path, observations=None):
     try:
         with path.open() as lines:
             for line in lines:
-                if 'listener.' not in line and 'deploy.result' not in line and (observations is None or not any(name in line for name in GAP_NAMES)):
+                if 'listener.' not in line and 'deploy.result' not in line and (observations is None or not any(name in line for name in (*GAP_NAMES, 'poll.complete'))):
                     continue
                 try:
                     row = json.loads(line)
-                    if (observations is not None and row.get('tool') == '9router' and row.get('name') in GAP_NAMES
+                    if (observations is not None and row.get('tool') == '9router' and row.get('name') in (*GAP_NAMES, 'poll.complete', 'listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved')
                             and (row['name'] != 'pool.endpoint.get' or isinstance(row.get('durationMs'), (int, float)) and row['durationMs'] > 120000)):
                         observations.append(row)
                     if row.get('tool') == '9router' and row.get('name') in ('listener.down', 'listener.up', 'listener.state_unknown', 'listener.state_resolved', 'deploy.result') and timestamp(row.get('ts')) is not None:
@@ -78,6 +79,12 @@ def windows(day, root, generated, observations=None):
             incident['cause'] = launchctl_cause(props)
         elif unknown and incident['cause'] == 'other' and isinstance(props.get('cause'), str) and re.fullmatch(r'launchctl_unknown:(?:-?\d+|timeout|oserror)', props['cause']):
             incident['cause'] = props['cause']
+        for field in ('hostStart', 'hostEnd'):
+            host = clean_host(props.get(field))
+            if host:
+                incident[field] = host
+        if 'l1' in incident.get('hostStart', {}):
+            incident['load1Start'] = incident['hostStart']['l1']
         if confirmed:
             incident.update(confirmed=True, cause=props.get('cause') or 'listener_' + probe)
         if row['name'] in ('listener.up', 'listener.state_resolved'):
