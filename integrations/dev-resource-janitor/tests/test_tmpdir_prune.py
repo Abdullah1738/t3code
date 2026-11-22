@@ -358,6 +358,51 @@ class PruneTests(JanitorTestCase):
                 with self.assertRaises(prune.UsageUnavailable):
                     inventory.inspect(str(parent))
 
+    def test_linked_worktree_preserves_unpublished_recovery_history(self):
+        refs = {'reflog': None, 'worktree': 'refs/worktree/saved',
+                'bisect': 'refs/bisect/saved', 'rewritten': 'refs/rewritten/saved'}
+        for kind, ref in refs.items():
+            with self.subTest(kind=kind):
+                path, git = self.make_worktree('linked-'+kind)
+                git('-C', str(path), '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'unpublished')
+                commit = git('-C', str(path), 'rev-parse', 'HEAD').strip()
+                git('-C', str(path), 'reset', '--hard', 'HEAD^')
+                if ref:
+                    git('-C', str(path), 'update-ref', ref, commit)
+                    git('reflog', 'expire', '--expire=now', '--all')
+                    self.assertEqual(git('-C', str(path), 'rev-list', '--count', 'HEAD', '--reflog',
+                                         '--not', '--remotes').strip(), '0')
+                self.assertEqual(git('-C', str(path), 'rev-list', '--count', 'HEAD', '--not', '--remotes').strip(), '0')
+                self.age_tree(path)
+                with self.assertRaisesRegex(prune.UsageUnavailable, 'unpublished local refs or reflogs'):
+                    inventory.inspect(str(path))
+                with patch.object(prune, 'in_use', return_value=set()):
+                    report = prune.scan()
+                    self.assertNotIn(str(path), {c['path'] for c in report['candidates']})
+                    self.assertTrue(any(c['path'] == str(path) for c in report['kept']))
+                    prune.apply()
+                self.assertTrue(path.exists())
+                self.assertIn(str(path), git('worktree', 'list', '--porcelain'))
+                if ref:
+                    self.assertEqual(git('-C', str(path), 'rev-parse', ref).strip(), commit)
+                else:
+                    self.assertIn(commit, git('-C', str(path), 'reflog', 'show', '--format=%H', 'HEAD'))
+
+    def test_published_linked_worktree_recovery_history_remains_eligible(self):
+        path, git = self.make_worktree('published-history')
+        git('-C', str(path), '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'published')
+        git('update-ref', 'refs/remotes/origin/main', git('-C', str(path), 'rev-parse', 'HEAD').strip())
+        for ref in ('refs/worktree/saved', 'refs/bisect/saved', 'refs/rewritten/saved'):
+            git('-C', str(path), 'update-ref', ref, 'HEAD')
+        git('-C', str(path), 'reset', '--hard', 'HEAD^')
+        self.age_tree(path)
+        with patch.object(prune, 'in_use', return_value=set()):
+            self.assertIn(str(path), {c['path'] for c in prune.scan()['candidates']})
+            result = prune.apply()
+        self.assertEqual(result['failed'], [])
+        self.assertFalse(path.exists())
+        self.assertNotIn(str(path), git('worktree', 'list', '--porcelain'))
+
     def test_unpublished_dirty_untracked_orphan_and_locked_worktrees_always_kept(self):
         for kind in ('unpublished', 'dirty', 'untracked', 'orphan', 'locked'):
             path, git = self.make_worktree(kind)

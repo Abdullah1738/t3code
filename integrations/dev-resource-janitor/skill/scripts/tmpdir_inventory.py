@@ -66,8 +66,9 @@ def repository(path, deadline, lock_fd=None):
         # Removing a main checkout also removes every branch, tag, stash and worktree registration.
         if len(trees) != 1 or git(path, ['stash', 'list', '--format=%H'], deadline, lock_fd):
             raise UsageUnavailable('git_kept', 'main checkout has worktrees or stashes')
-        if git(path, ['rev-list', '--count', '--all', '--reflog', '--not', '--remotes'], deadline, lock_fd).strip() != '0':
-            raise UsageUnavailable('git_kept', 'unpublished local refs')
+    # Worktree removal also discards its private refs and HEAD reflog, even after a reset.
+    if git(path, ['rev-list', '--count', '--all', '--reflog', '--not', '--remotes'], deadline, lock_fd).strip() != '0':
+        raise UsageUnavailable('git_kept', 'unpublished local refs or reflogs')
     return {'path': path, 'common_dir': common, 'parent_repo': trees[0][0], 'linked': linked}
 
 
