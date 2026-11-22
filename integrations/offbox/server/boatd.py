@@ -975,12 +975,17 @@ def box_protection(con, box_id, *, probe=True, run_id=None):
                     gone = True
                 continue
             never_dispatched = (c['status'] not in ('queued', 'running') and c['started_at'] is None and
-                                (metrics.get('not_dispatched') is True or queue_loss_json(c)['notAdmitted'] or
-                                 killed_in_queue(c, metrics)))
+                                (metrics.get('not_dispatched') is True or queue_loss_json(c)['notAdmitted']))
             proof = ({'stopped': True, 'reason': 'not_dispatched'} if never_dispatched else
                      command_probe(c) if probe and c['status'] != 'queued' else {})
             confirmed = (proof.get('stopped') is True or (proof.get('readable') is True and
                          proof.get('pids') == [] and (proof.get('join_verified') is True or proof.get('box_rc') is not None)))
+            # The row says it was cancelled in the queue; the box must agree that it left no trace there.
+            cancelled_unseen = (c['status'] not in ('queued', 'running') and c['started_at'] is None and
+                                killed_in_queue(c, metrics) and proof.get('readable') is True and
+                                proof.get('marker') is None and proof.get('box_rc') is None and not proof.get('pids'))
+            confirmed = confirmed or cancelled_unseen
+            never_dispatched = never_dispatched or cancelled_unseen
             if run_id:
                 gone = confirmed or gone
             if confirmed and not unsettled:

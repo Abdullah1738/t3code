@@ -169,27 +169,41 @@ class BoxProtectionTests(Base):
 
     def test_a_run_cancelled_while_queued_does_not_hold_its_box(self):
         clean = {'kill': {'cleanup': 'clean', 'leftover_killed': 0, 'remaining': 0}, 'kill_synthetic': True}
-        cases = (('cancelled in the queue', clean, None, 1, 1, False, True),
-                 ('it had been admitted', clean, 10, 1, 1, False, False),
-                 ('an earlier attempt ran', clean, None, 2, 1, False, False),
-                 ('it had invoked the guest', clean, None, 1, 1, True, False),
-                 ('cleanup left a process', {**clean, 'kill': {**clean['kill'], 'remaining': 1}}, None, 1, 1, False, False),
-                 ('cleanup is unknown', {**clean, 'kill': {'cleanup': 'unknown'}}, None, 1, 1, False, False),
-                 ('a real exit replaced the kill', {**clean, 'kill_synthetic': False}, None, 1, 1, False, False),
-                 ('nobody killed it', clean, None, 1, 0, False, False))
-        for index, (name, metrics, started, attempt, killed, invoked, freed) in enumerate(cases):
+        unseen = {'readable': True, 'pids': None, 'box_rc': None, 'marker': None, 'reason': 'cgroup_unverified'}
+        cases = (('cancelled in the queue', clean, None, 1, 1, unseen, True),
+                 ('it had been admitted', clean, 10, 1, 1, unseen, False),
+                 ('an earlier attempt ran', clean, None, 2, 1, unseen, False),
+                 ('cleanup left a process', {**clean, 'kill': {**clean['kill'], 'remaining': 1}}, None, 1, 1, unseen, False),
+                 ('cleanup is unknown', {**clean, 'kill': {'cleanup': 'unknown'}}, None, 1, 1, unseen, False),
+                 ('a real exit replaced the kill', {**clean, 'kill_synthetic': False}, None, 1, 1, unseen, False),
+                 ('nobody killed it', clean, None, 1, 0, unseen, False),
+                 ('the box has its start marker', clean, None, 1, 1, {**unseen, 'marker': {'pid': 9}}, False),
+                 ('the box has its exit receipt', clean, None, 1, 1, {**unseen, 'box_rc': 0}, False),
+                 ('the box has its processes', clean, None, 1, 1, {**unseen, 'pids': [31291]}, False),
+                 ('the box cannot be read', clean, None, 1, 1, {'reason': 'box_unreadable'}, False),
+                 ('Incus does not answer', clean, None, 1, 1, {'reason': 'incus_unavailable'}, False))
+        for index, (name, metrics, started, attempt, killed, view, freed) in enumerate(cases):
             with self.subTest(name):
                 bid = self.box(bid='bx_queuekill'+str(index))
                 self.con.execute("INSERT INTO commands(box_id,pid,command_id,status,exit_code,attempt,killed,metrics,started_at,run_id) "
                                  "VALUES (?,1001,'cmd','exited',143,?,?,?,?,'run-q')",
                                  (bid, attempt, killed, json.dumps(metrics), started))
-                if invoked:
-                    (boatd.cmd_dir(bid)/f'1001.{attempt}.invocations.json').write_text('[]')
-                with patch.object(boatd,'command_probe',return_value={'readable':True,'pids':None,'reason':'cgroup_unverified'}):
+                with patch.object(boatd,'command_probe',return_value=view):
                     self.assertEqual(not boatd.box_protection(self.con,bid)['holds'],freed)
+                    # Reads that do not look at the box (events, listings) never free it.
+                    self.assertTrue(boatd.box_protection(self.con,bid,probe=False)['holds'] or freed)
                     if freed:
                         boatd.stop_box(self.con, bid, 'idle ttl')
                         self.assertEqual(boatd.box_row(self.con, bid)['state'], 'archived')
+
+    def test_output_that_shows_the_guest_started_keeps_a_cancelled_run_held(self):
+        bid = self.box()
+        self.con.execute("INSERT INTO commands(box_id,pid,command_id,status,exit_code,attempt,killed,metrics,run_id,protocol_nonce) "
+                         "VALUES (?,1001,'cmd','exited',143,1,1,?,'run-q','nonce-q')",
+                         (bid, json.dumps({'kill': {'cleanup': 'clean', 'remaining': 0}, 'kill_synthetic': True})))
+        with patch.object(boatd, 'command_was_started', return_value=True), \
+                patch.object(boatd,'command_probe',return_value={'readable':True,'pids':None,'box_rc':None,'marker':None}):
+            self.assertEqual([h['process_id'] for h in boatd.box_protection(self.con, bid)['holds']], [1001])
 
     def test_the_real_kill_of_a_queued_run_leaves_its_box_free_to_stop(self):
         bid = self.box()
@@ -202,7 +216,8 @@ class BoxProtectionTests(Base):
         self.assertEqual((row['status'], row['started_at'], row['killed']), ('exited', None, 1))
         self.assertEqual(json.loads(row['metrics']), {'kill': dict(cleanup='clean', leftover_killed=0, remaining=0),
                                                       'kill_synthetic': True})
-        with patch.object(boatd,'command_probe',return_value={'readable':True,'pids':None,'reason':'cgroup_unverified'}):
+        with patch.object(boatd,'command_probe',return_value={'readable':True,'pids':None,'box_rc':None,'marker':None,
+                                                               'reason':'cgroup_unverified'}):
             self.assertEqual(boatd.box_protection(self.con, bid)['holds'], [])
             boatd.stop_box(self.con, bid, 'idle ttl')
         self.assertEqual(boatd.box_row(self.con, bid)['state'], 'archived')
