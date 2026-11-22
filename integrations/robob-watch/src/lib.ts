@@ -170,6 +170,7 @@ export type State = {
   failure_escalation_next_at?: string;
   failure_escalation_notice?: string;
   failure_escalation_notice_sent?: boolean;
+  failure_escalation_pending?: { channel: "wake" | "imessage"; key: string };
   failure_recovery_notices?: { key: string; text: string; retry_at?: number }[];
   /** Separate from Telegram flags; retained through resume until bridge acceptance. */
   owner_imessage_episodes?: OwnerAlertEpisode[];
@@ -1814,6 +1815,7 @@ export function clearFailureEscalation(state: State): void {
   delete state.failure_escalation_next_at;
   delete state.failure_escalation_notice;
   delete state.failure_escalation_notice_sent;
+  delete state.failure_escalation_pending;
 }
 
 export function ensureFailureProbe(watcher: Watcher, state: State): boolean {
@@ -1859,7 +1861,8 @@ export const ESCALATE_AFTER_MS = Number(process.env.ROBOB_WATCH_ESCALATE_AFTER_M
 
 export function shouldEscalate(watcher: Watcher, state: State, t = now()): boolean {
   if (watcher.mode !== "wake" || !state.failing_since) return false;
-  if (state.failure_escalated && (!state.failure_escalation_notice || state.failure_escalation_notice_sent)) return false;
+  if (state.failure_escalated && !state.failure_escalation_pending
+    && (!state.failure_escalation_notice || state.failure_escalation_notice_sent)) return false;
   if (state.failure_escalation_next_at && Date.parse(state.failure_escalation_next_at) > t) return false;
   if (state.dependency_busy) return t - Date.parse(state.dependency_busy.since) >= BUSY_ALERT_AFTER_MS;
   return !!state.failure_paused_at || t - Date.parse(state.failing_since) >= ESCALATE_AFTER_MS;
@@ -1948,70 +1951,94 @@ export async function escalate(watcher: Watcher, state: State, key: string, imes
   });
   let delivery: Delivery | undefined;
   let httpStatus: number | undefined;
+  let reason: "dedupe_conflict_changed_content" | undefined;
+  const conflictReason = (out: string) => {
+    try {
+      const value: unknown = JSON.parse(out);
+      return jsonObject(value) && value.reason === "dedupe_conflict_changed_content" ? value.reason : undefined;
+    } catch { return; }
+  };
   let exists = false;
   let needsNotice = !!state.failure_escalation_notice;
   const noticeText = (fresh: State) => `Watcher "${watcher.title}" is ${fresh.failure_paused_at ? "paused" : "failing"}; the agent could not be woken. Last error: ${(fresh.last_error ?? "unknown").slice(0, 500)}. Log: ${join(watcherDir(watcher.id), "log")}`;
-  // A crash during the status lookup must not reopen an already accepted channel.
-  const markExisting = () => update(fresh => {
+  // Persist acceptance before probing: a restart must only read receipts, never repost the key.
+  const markAccepted = (pending: NonNullable<State["failure_escalation_pending"]>) => update(fresh => {
     fresh.failure_escalated = true;
-    fresh.failure_escalation_notice ??= noticeText(fresh);
+    fresh.failure_escalation_pending = pending;
+    if (exists) fresh.failure_escalation_notice ??= noticeText(fresh);
   });
   const attempt = async (send: () => Promise<{ ok: boolean; out: string; httpStatus?: number }>) => {
     try { return await send(); }
     catch (error) { return { ok: false, out: error instanceof Error ? error.message : "bridge helper failed", httpStatus: undefined }; }
   };
+  let pending = state.failure_escalation_pending;
+  let acceptedResponse: string | undefined;
   try {
-    if (state.failure_escalated) delivery = { ok: true, via: "wake-existing", detail: "accepted key; retrying owner notice only" };
+    if (state.failure_escalated) delivery = { ok: true, via: pending?.channel === "imessage" ? "imessage-existing" : "wake-existing", detail: "accepted key; reconciling delivery" };
     else {
       const woke = await attempt(() => wake(state.failure_escalation_source!, state.failure_pause_escalation!, wakeKey, watcher.id));
       httpStatus = woke.httpStatus;
-      if (httpStatus === 409) {
-        exists = true;
-        if (!await markExisting()) return { ok: true, via: "wake-existing", detail: "episode ended during send" };
-        log(watcher.id, "failure escalation key already accepted (409); not resending");
-        const receipt = await attempt(() => run([BUN, spectrumCli(), "wake-status", `--key=${wakeKey}`], undefined, 5_000, { watcher: watcher.id }));
-        let admitted = false;
-        try {
-          const value = JSON.parse(receipt.out);
-          admitted = receipt.ok && value.id === wakeInboundId(wakeKey) && value.state === "admitted";
-        } catch { /* Unreadable receipts cannot prove delivery. */ }
-        needsNotice = !admitted;
-        delivery = { ok: true, via: "wake-existing", detail: admitted ? "existing wake admitted" : "existing wake delivery unproven" };
-      } else if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
-      else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
+      if (woke.ok || httpStatus === 409) {
+        exists = httpStatus === 409;
+        if (exists) reason = conflictReason(woke.out);
+        pending = { channel: "wake", key: wakeKey };
+        delivery = { ok: true, via: exists ? "wake-existing" : "wake", detail: woke.out };
+        if (!await markAccepted(pending)) return { ok: true, via: "wake-existing", detail: "episode ended during send" };
+        if (exists) log(watcher.id, "failure escalation key already accepted (409); not resending");
+        acceptedResponse = woke.ok ? woke.out : undefined;
+      } else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
       else {
         // A legacy /send may already have accepted a different body under the old key.
         // Reconcile it before using the new channel key; never duplicate it during migration.
-        let legacy: { ok: boolean; out: string } | undefined;
         if (wakeKey === key) {
           const prior = await attempt(() => run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB,
             `select exists(select 1 from kv where key='api:send:send:${hash(key)}')`], 10_000, undefined, { watcher: watcher.id }));
           if (!prior.ok || prior.out.trim() !== "0") {
-            if (!await markExisting()) return { ok: true, via: "imessage-existing", detail: "episode ended during send" };
-            legacy = await imessageReceipt(state.failure_pause_escalation_fallback!, key, watcher.id).catch(() => undefined)
-              ?? { ok: false, out: "legacy send acceptance unproven" };
-            exists = true; needsNotice = !legacy.ok;
+            pending = { channel: "imessage", key };
+            exists = true;
           }
         }
-        if (legacy) delivery = { ok: true, via: "imessage-existing", detail: legacy.out };
-        else {
+        if (!pending) {
           const sent = await attempt(() => imessage(state.failure_pause_escalation_fallback!, sendKey, { watcher: watcher.id }));
-          if (bridgeHttpStatus(sent) === 409) {
-            httpStatus = 409; exists = true;
-            if (!await markExisting()) return { ok: true, via: "imessage-existing", detail: "episode ended during send" };
-            const receipt = await imessageReceipt(state.failure_pause_escalation_fallback!, sendKey, watcher.id).catch(() => undefined);
-            needsNotice = !receipt?.ok;
-            delivery = { ok: true, via: "imessage-existing", detail: receipt?.out ?? "existing send delivery unproven" };
-          } else delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out }
-            : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
-        }
+          if (sent.ok || bridgeHttpStatus(sent) === 409) {
+            exists = bridgeHttpStatus(sent) === 409;
+            if (exists) { httpStatus = 409; reason = conflictReason(sent.out); }
+            pending = { channel: "imessage", key: sendKey };
+            delivery = { ok: true, via: exists ? "imessage-existing" : "imessage-send", detail: sent.out };
+          } else delivery = { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
+        } else delivery = { ok: true, via: "imessage-existing", detail: "legacy send acceptance" };
+        if (pending && !await markAccepted(pending)) return { ok: true, via: "imessage-existing", detail: "episode ended during send" };
       }
     }
-    needsNotice ||= !delivery.ok && state.failure_escalation_attempts! >= 3;
+    let confirmed = false;
+    let failed = false;
+    if (pending) {
+      if (pending.channel === "wake") {
+        const pendingKey = pending.key;
+        const receipt = await attempt(() => run([BUN, spectrumCli(), "wake-status", `--key=${pendingKey}`], undefined, 5_000, { watcher: watcher.id }));
+        const readStatus = (out: string | undefined) => {
+          try {
+            const value: unknown = JSON.parse(out ?? "");
+            return jsonObject(value) && value.id === wakeInboundId(pendingKey) && typeof value.state === "string" ? value.state : undefined;
+          } catch { return; }
+        };
+        const status = (receipt.ok ? readStatus(receipt.out) : undefined) ?? readStatus(acceptedResponse);
+        confirmed = status === "admitted";
+        failed = status === "failed";
+        delivery!.detail = `accepted wake delivery ${status ?? "unproven"}`;
+      } else {
+        const receipt = await imessageReceipt(state.failure_pause_escalation_fallback!, pending.key, watcher.id).catch(() => undefined);
+        confirmed = receipt?.ok === true;
+        failed = !!receipt && !receipt.ok && !receipt.pending;
+        delivery!.detail = receipt?.out ?? "accepted send delivery unproven";
+      }
+      needsNotice = !confirmed && (needsNotice || exists || failed || state.failure_escalation_attempts! >= 3);
+    } else needsNotice ||= !delivery!.ok && state.failure_escalation_attempts! >= 3;
     const saved = await update(fresh => {
       fresh.failure_escalated = delivery!.ok;
+      if (confirmed) delete fresh.failure_escalation_pending;
       if (needsNotice) fresh.failure_escalation_notice ??= noticeText(fresh);
-      else if (!state.failure_escalation_notice) delete fresh.failure_escalation_notice;
+      else if (!fresh.failure_escalation_notice_sent) delete fresh.failure_escalation_notice;
     });
     if (saved?.failure_escalation_notice && !saved.failure_escalation_notice_sent) {
       const sent = await attempt(() => telegram(`Watcher ${watcher.id}`, saved.failure_escalation_notice!,
@@ -2019,14 +2046,14 @@ export async function escalate(watcher: Watcher, state: State, key: string, imes
       await update(fresh => { fresh.failure_escalation_notice_sent = sent.ok; });
       toolLog({ component: "wakes", kind: "error", name: "failure_escalation.undelivered", ok: sent.ok,
         ids: { watcher: watcher.id, key: wakeInboundId(wakeKey) },
-        props: { attempt: saved.failure_escalation_attempts, httpStatus, failureClass: exists ? "other" : /timed out|timeout/i.test(delivery.detail) ? "timeout" : "other" },
+        props: { attempt: saved.failure_escalation_attempts, httpStatus, reason, failureClass: exists ? "other" : /timed out|timeout/i.test(delivery.detail) ? "timeout" : "other" },
         error: { tag: "wake.delivery_failed" } });
     }
     return delivery;
   } finally {
     log(watcher.id, `failure escalation ok=${delivery?.ok ?? false} via=${delivery?.via ?? "none"} attempt=${state.failure_escalation_attempts} next retry=${state.failure_escalation_next_at}${delivery?.ok ? "" : ` ${delivery?.detail ?? "helper failed"}`}`);
     toolLog({ component: "wakes", kind: httpStatus === 409 ? "event" : delivery?.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - started), ok: delivery?.ok ?? false,
-      ids: { watcher: watcher.id, chat: "owner", key: wakeInboundId(wakeKey) }, props: { httpStatus, attempt: state.failure_escalation_attempts }, ...(delivery?.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
+      ids: { watcher: watcher.id, chat: "owner", key: wakeInboundId(wakeKey) }, props: { httpStatus, reason, attempt: state.failure_escalation_attempts }, ...(delivery?.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
   }
 }
 

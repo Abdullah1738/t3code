@@ -44,7 +44,7 @@ test.each([
     expect(child.exitCode, child.stderr.toString()).toBe(0);
     expect(JSON.parse(child.stdout.toString())).toMatchObject({ ok, via });
     if (!spawnFails) {
-      const calls = readFileSync(capture, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
+      const calls = readFileSync(capture, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]).filter(args => args[0] !== "wake-status");
       expect(calls).toHaveLength(wakeCode ? 2 : 1);
       for (const args of calls) {
         const text = args.find(arg => arg.startsWith("--text="))!.slice(7);

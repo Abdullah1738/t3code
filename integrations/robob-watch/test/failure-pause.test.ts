@@ -142,12 +142,13 @@ test("c: resume clears failure state and a new streak gets a new notice key", as
   f.save("resume", { ...f.state("resume"), failure_escalated: true,
     failure_escalation_key: "old:wake", failure_escalation_source: "Watcher resume", failure_escalation_attempts: 7,
     failure_escalation_next_at: new Date(Date.now() + 60_000).toISOString(),
-    failure_escalation_notice: "undelivered", failure_escalation_notice_sent: true });
+    failure_escalation_notice: "undelivered", failure_escalation_notice_sent: true,
+    failure_escalation_pending: { channel: "wake", key: "old:wake" } });
   expect(f.cli("pause", "resume").exitCode).toBe(0); expect(f.cli("resume", "resume").exitCode).toBe(0);
   expect(f.state("resume")).toMatchObject({ consecutive_failures: 0, failure_alerted: false, next_at: 0 });
   for (const field of ["failure_paused_at", "failure_escalated", "failing_since", "last_error", "last_error_sources",
     "failure_escalation_key", "failure_escalation_source", "failure_escalation_attempts", "failure_escalation_next_at",
-    "failure_escalation_notice", "failure_escalation_notice_sent"] as const) expect(f.state("resume")[field]).toBeUndefined();
+    "failure_escalation_notice", "failure_escalation_notice_sent", "failure_escalation_pending"] as const) expect(f.state("resume")[field]).toBeUndefined();
   await f.run("resume", s => !!s.failure_paused_at && s.failure_alerted);
   expect(f.runs("resume")).toBe(2);
   const keys = f.readCalls().map(c => opt(c.args, "--key")); expect(keys).toHaveLength(2); expect(keys[0]).not.toBe(keys[1]);

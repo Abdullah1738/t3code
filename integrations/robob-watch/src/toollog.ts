@@ -19,6 +19,7 @@ const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
   alertKind: ["pause", "failing", "recovered"],
+  reason: ["dedupe_conflict_changed_content"],
   severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy", "stuck_previous", "accepted", "ambiguous", "deferred", "definite", "owner"],
   failureClass: ["control_api_unavailable", "timeout", "definite", "other"],
   source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored", "logged"],
