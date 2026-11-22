@@ -5,6 +5,7 @@ import fcntl
 import json
 import math
 import os
+import plistlib
 from pathlib import Path
 import signal
 import socket
@@ -14,10 +15,99 @@ import tempfile
 import time
 import uuid
 
+from host import Sampler
 from toollog import directory, emit
+from causes import launchctl_info
+from observer import FIELDS, Timings, clock_sample, gap, launchctl_print, measured, phase
 
 LABEL = 'com.abdullah.9router-fork'
 FRESH_MS = 300000
+POLL_DEADLINE_SECONDS = 240
+
+
+def scheduling_snapshot():
+    props = dict(pid=os.getpid(), processType='unknown', nice=os.getpriority(os.PRIO_PROCESS, 0))
+    try:
+        with (Path.home() / 'Library/LaunchAgents/com.ardud.9router-log-poll.plist').open('rb') as source:
+            props['processType'] = plistlib.load(source).get('ProcessType', 'Standard')
+    except (OSError, ValueError):
+        pass
+    try:
+        value = subprocess.run(['ps', '-p', str(os.getpid()), '-o', 'pri='], capture_output=True,
+                               text=True, timeout=.5).stdout.strip()
+        props['priority'] = int(value)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return props
+
+
+class PollChild:
+    def __init__(self, command=None):
+        self.started = time.monotonic()
+        self.wall_start = time.time() * 1000
+        self.phase, self.pending = 'other', b''
+        self.reader, writer = os.pipe()
+        os.set_blocking(self.reader, False)
+        os.set_blocking(writer, False)
+        try:
+            self.process = subprocess.Popen(command or [sys.executable, '-I', str(Path(__file__).with_name('run.py')), 'poll'],
+                env=dict(os.environ, ROUTER_POLL_PROGRESS_FD=str(writer)), pass_fds=(writer,),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except BaseException:
+            os.close(self.reader)
+            raise
+        finally:
+            os.close(writer)
+
+    def close(self):
+        if self.reader is not None:
+            os.close(self.reader)
+            self.reader = None
+
+    def check(self):
+        if self.process.poll() is not None:
+            self.close()
+            return True
+        try:
+            while chunk := os.read(self.reader, 65536):
+                self.pending += chunk
+                while b'\n' in self.pending:
+                    name, self.pending = self.pending.split(b'\n', 1)
+                    self.phase = name.decode('ascii') if name.decode('ascii') in (*FIELDS, 'other') else 'other'
+        except BlockingIOError:
+            pass
+        elapsed = time.monotonic() - self.started
+        if elapsed < POLL_DEADLINE_SECONDS:
+            return False
+        # Popen owns this unreaped child; a PID from a name search is never used.
+        self.process.kill()
+        # kill() polls first and can reap an exit that raced the deadline.
+        if self.process.returncode is not None:
+            self.close()
+            return True
+        _, status, usage = os.wait4(self.process.pid, 0)
+        self.process.returncode = os.waitstatus_to_exitcode(status)
+        self.close()
+        if self.process.returncode != -signal.SIGKILL:
+            return True
+        cpu_ms = (usage.ru_utime + usage.ru_stime) * 1000
+        emit('poller', 'poll.timeout', kind='error', ok=False, durationMs=elapsed * 1000,
+             error=dict(tag='tick_deadline'),
+             props=dict(pid=self.process.pid, phase=self.phase, wallMs=elapsed * 1000, cpuMs=cpu_ms,
+                        startedAtMs=self.wall_start, finishedAtMs=time.time() * 1000))
+        return True
+
+    def stop(self):
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+        finally:
+            self.close()
 
 
 def iso(milliseconds):
@@ -48,8 +138,10 @@ class Guard:
         self.notify = notify or (lambda text, key: False)
         self.save = save or (lambda state: None)
 
-    def step(self, now, job, listener, marker=None, lock_age_ms=None):
+    def step(self, now, job, listener, marker=None, lock_age_ms=None, observation=None, host=None, host_at_ms=None):
         state = self.state
+        host = host if host is not None else Sampler()()
+        host_at_ms = now if host_at_ms is None else host_at_ms
         # Retry an undelivered recovery with the same bridge deduplication key.
         recovery = state.get('recovery')
         if recovery and self.notify(recovery['text'], recovery['key']):
@@ -57,9 +149,15 @@ class Guard:
         failed = listener in ('refused', 'unreachable')
         if job == 'unknown':
             if not state.get('jobUnknown') or (not failed and 'unknownSinceMs' not in state):
-                props = dict(state=job, listener=listener)
+                props = dict(state=job, listener=listener, host=host, hostAtMs=host_at_ms, hostStart=host, hostStartAtMs=host_at_ms)
+                props.update(observation or {})
                 if not failed:
                     state['unknownSinceMs'] = now
+                    state['unknownHost'] = host
+                    state['unknownHostAtMs'] = host_at_ms
+                    state['unknownEvidence'] = launchctl_info(observation)
+                    state['unknownCause'] = state['unknownEvidence']['cause']
+                    props.update(state['unknownEvidence'])
                     props['unknownSince'] = iso(now)
                 self.event('listener.state_unknown', **props)
             state['jobUnknown'] = True
@@ -68,15 +166,21 @@ class Guard:
         if (job != 'unknown' or failed) and 'unknownSinceMs' in state:
             since = state.pop('unknownSinceMs')
             self.event('listener.state_resolved', unknownSince=iso(since), unknownMs=max(0, now - since),
-                       state=job, listener=listener)
+                       state=job, listener=listener,
+                       host=host, hostAtMs=host_at_ms, hostStart=state.pop('unknownHost', {}), hostEnd=host,
+                       hostStartAtMs=state.pop('unknownHostAtMs', since), hostEndAtMs=host_at_ms,
+                       **state.pop('unknownEvidence', launchctl_info(dict(cause=state.get('unknownCause')), legacy=True)))
+            state.pop('unknownCause', None)
         # A persisted window from the old guard may have no TCP evidence.
         # Close that uncertainty before starting a newly observed refusal.
         if (failed and 'downSinceMs' in state and 'downListener' not in state
                 and state.get('cause') not in ('listener_refused', 'listener_unreachable')):
             since = state['downSinceMs']
             self.event('listener.up', downSince=iso(since), downMs=max(0, now - since),
-                       cause=state['cause'], listener=listener, downListener='unknown', action=state.get('lastAction', 'none'))
-            for key in ('downSinceMs', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
+                       cause=state['cause'], listener=listener, downListener='unknown', action=state.get('lastAction', 'none'),
+                       host=host, hostAtMs=host_at_ms, hostStart=state.get('downHost', {}), hostEnd=host,
+                       hostStartAtMs=state.get('downHostAtMs', since), hostEndAtMs=host_at_ms)
+            for key in ('downSinceMs', 'downHost', 'downHostAtMs', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
                 state.pop(key, None)
         if not failed:
             if 'downSinceMs' in state:
@@ -84,11 +188,12 @@ class Guard:
                 elapsed = max(0, now - since)
                 self.event('listener.up', downSince=iso(since), downMs=elapsed,
                            cause=state['cause'], listener=listener, downListener=state.get('downListener', 'unknown'),
-                           action=state.get('lastAction', 'none'))
+                           action=state.get('lastAction', 'none'), host=host, hostAtMs=host_at_ms, hostStart=state.get('downHost', {}), hostEnd=host,
+                           hostStartAtMs=state.get('downHostAtMs', since), hostEndAtMs=host_at_ms)
                 if state.get('alerted'):
                     state['recovery'] = dict(text=f'9router recovered after {round(elapsed / 1000)} s; action {state.get("lastAction", "none")}',
                                              key=f'9router-down:{iso(since)}:recovered')
-                for key in ('downSinceMs', 'downListener', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
+                for key in ('downSinceMs', 'downHost', 'downHostAtMs', 'downListener', 'cause', 'alerted', 'refusedSinceMs', 'nextActionMs', 'attempts', 'lastAction'):
                     state.pop(key, None)
                 self.save(state)
                 if state.get('recovery') and self.notify(state['recovery']['text'], state['recovery']['key']):
@@ -99,9 +204,10 @@ class Guard:
             cause = 'listener_' + listener
             if recent_failure(marker, now):
                 cause = 'deploy_failed'
-            state.update(downSinceMs=now, downListener=listener, cause=cause, alerted=False, attempts=0, nextActionMs=now)
+            state.update(downHost=host, downHostAtMs=host_at_ms, downSinceMs=now, downListener=listener, cause=cause, alerted=False, attempts=0, nextActionMs=now)
             self.save(state)
-            self.event('listener.down', downSince=iso(now), cause=cause, state=job, listener=listener)
+            self.event('listener.down', downSince=iso(now), cause=cause, state=job, listener=listener,
+                       host=host, hostAtMs=host_at_ms, hostStart=host, hostStartAtMs=host_at_ms)
         if listener == 'refused':
             state.setdefault('refusedSinceMs', now)
         else:
@@ -134,6 +240,7 @@ def read_json(path):
         return {}
 
 
+@measured('state_save')
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(prefix='.guard-', dir=path.parent)
@@ -163,8 +270,14 @@ class Runtime:
             return -1
 
     def observe(self):
-        code = self.command(['print', self.job])
+        with phase('launchctl'):
+            self.observation = launchctl_print(self.job)
+        code = self.observation['launchctlExit']
         job = 'loaded' if code == 0 else 'absent' if code == 113 else 'unknown'
+        return job, self.probe()
+
+    @measured('tcp')
+    def probe(self):
         try:
             with socket.create_connection(('127.0.0.1', 20128), timeout=.5):
                 listener = 'open'
@@ -172,7 +285,7 @@ class Runtime:
             listener = 'refused'
         except OSError:
             listener = 'unreachable'
-        return job, listener
+        return listener
 
     def notify(self, text, key):
         env = dict(os.environ)
@@ -202,7 +315,8 @@ class Runtime:
         self.marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with Path(str(self.marker) + '.coord').open('a') as gate:
             os.chmod(gate.name, 0o600)
-            fcntl.flock(gate, fcntl.LOCK_EX)
+            with phase('lock_wait'):
+                fcntl.flock(gate, fcntl.LOCK_EX)
             yield
 
     def claim(self, lock, repair):
@@ -316,6 +430,7 @@ def serve():
         except BlockingIOError:
             return
         os.chmod(lock.name, 0o600)
+        emit('guard', 'observer.priority', props=scheduling_snapshot())
         guard = Guard(state=read_json(runtime.state_file), action=runtime.act, notify=runtime.notify,
                       save=lambda state: write_json(runtime.state_file, state))
         stopping = False
@@ -330,33 +445,52 @@ def serve():
         try:
             while not stopping:
                 start = time.monotonic()
-                try:
-                    job, listener = runtime.observe()
-                    runtime.settle(job, listener)
-                    guard.step(time.time() * 1000, job, listener, read_json(runtime.marker), runtime.lock_age_ms())
-                except Exception:
-                    emit('guard', 'guard.error', kind='error', error=dict(tag='tick_failed'))
+                if poll is not None and poll.check():
+                    poll = None
+                sampler = Sampler()
+                sample = clock_sample()
+                with Timings('guard', 'guard.tick_late', threshold_ms=30000, start=sample, sampler=sampler) as timing:
+                    missing = gap(guard.state.get('observerTick'), sample)
+                    if missing:
+                        emit('guard', 'observer.gap', kind='perf', props=missing)
+                    try:
+                        job, listener = runtime.observe()
+                        runtime.settle(job, listener)
+                        guard.step(time.time() * 1000, job, listener, read_json(runtime.marker), runtime.lock_age_ms(), runtime.observation, sample['host'], sample['hostAtMs'])
+                    except Exception:
+                        emit('guard', 'guard.error', kind='error', error=dict(tag='tick_failed'))
+                    guard.state['observerTick'] = sample
+                    with contextlib.suppress(OSError):
+                        guard.save(guard.state)
+                guard.state['observerTick'] = timing.end
                 if pool_alerts is None or pool_alerts.poll() is not None:
                     # Delivery can block on several historical bridge retries.
                     # Its own process keeps listener repair on the 15 s cadence.
                     pool_alerts = subprocess.Popen([sys.executable, '-I', str(Path(__file__).with_name('run.py')), 'pool-alerts'],
                                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if poll is not None and poll.poll() is not None:
-                    poll = None
                 if start >= next_poll and poll is None:
                     # HTTP snapshots and rollups can take longer than the listener cadence.
-                    poll = subprocess.Popen([sys.executable, '-I', str(Path(__file__).with_name('run.py')), 'poll'],
-                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    poll = PollChild()
                     next_poll = start + 300
                 while not stopping and time.monotonic() - start < 15:
                     time.sleep(max(0, min(.5, 15 - (time.monotonic() - start))))
         finally:
-            for child in (pool_alerts, poll):
+            previous = guard.state.get('observerTick', {})
+            guard.state['observerTick'] = dict(clock_sample(), host=previous.get('host', {}),
+                                              hostAtMs=previous.get('hostAtMs', previous.get('wallMs')),
+                                              jobState='stopped', jobPid=os.getpid(), jobExit=0)
+            with contextlib.suppress(OSError):
+                guard.save(guard.state)
+            if poll is not None:
+                poll.stop()
+            for child in (pool_alerts,):
                 if child is None or child.poll() is not None:
                     continue
                 child.terminate()
-                try:
-                    child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
+                with Timings('guard', 'guard.tick_late'):
+                    with phase('child_wait'):
+                        try:
+                            child.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait()

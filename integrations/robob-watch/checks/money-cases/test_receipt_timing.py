@@ -128,6 +128,8 @@ class ReceiptTiming(Base):
                     ch.found(charge, now, now, said=nobody, stats=stats)
                 self.assertEqual(ch.receipt_timing(stats)['receipt_result'],
                     {key: int(key == outcome) for key in ('found', 'none', 'out_of_time', 'error')})
+                self.assertEqual(stats.get('budget_stop_reason'),
+                                 'receipt_deadline' if outcome == 'out_of_time' else None)
 
     def test_outer_timeout_is_counted_and_propagated(self):
         charge = dict(kind='charge', merchant='Acme', amount='12.34', currency='EUR', card='1111')

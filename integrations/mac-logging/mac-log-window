@@ -1,0 +1,13 @@
+#!/usr/bin/python3 -I
+"""Read a bounded unified-log window; see --help."""
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+here = Path(__file__).resolve().parent
+sys.path.insert(0, str(here if (here / 'logwindow.py').is_file() else
+                       Path.home() / '.local/lib/mac-logging'))
+from logwindow import main
+
+if __name__ == '__main__':
+    sys.exit(main())

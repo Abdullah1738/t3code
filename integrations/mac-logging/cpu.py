@@ -14,11 +14,14 @@ from cpu_labels import family, script_hint, command_label
 from jobs import read_state, save_state, state_path
 from toollog import emit, finite_number, cpu_fields
 from volume_crawls import volume_crawls
+from host_signal import notify_cpu_timeout
 
 # Keep comm last: Darwin truncates it when another column follows, changing
 # established CPU families and disabling interpreter hints.
 PS = ['/bin/ps', '-ww', '-axo', 'pid=,ppid=,time=,rss=,state=,lstart=,etime=,uid=,comm=']
 SPIKES_PER_DAY = 240
+KERNEL_TASK_TIMEOUT_S = 15
+KERNEL_TASK_COOLDOWN_S = 1800
 
 
 class ProbeError(Exception):
@@ -358,7 +361,7 @@ def command(argv, run, timeout=30):
     return result.stdout
 
 
-def deltas(rows, previous, now):
+def deltas(rows, previous, now, top_limit=20):
     at = previous.get('at')
     window = now-at if finite_number(at) else 0
     valid = 0 < window <= 3600
@@ -394,7 +397,7 @@ def deltas(rows, previous, now):
                  processCount=len(rows), runnable=sum(p['state'].startswith('R') for p in rows),
                  uninterruptible=sum(p['state'].startswith('U') for p in rows), families=groups,
                  exiting=sum(p['state'].startswith('?') for p in rows),
-                 top=sorted(top, key=lambda p: (-p['cpuPct'], p['pid']))[:20],
+                 top=sorted(top, key=lambda p: (-p['cpuPct'], p['pid']))[:top_limit],
                  kernelTaskPct=None)
     # Exiting rows have reset CPU counters; don't seed a later delta from zero.
     state = dict(at=now, identities={str(p['pid']): p['start'] for p in rows},
@@ -436,8 +439,13 @@ def spike(props, rows, run, kernel_read=True):
     result['kernelTaskPct'] = None
     if kernel_read:
         try:
-            result.update(kernel_task(command(['/usr/bin/top', '-l', '2', '-s', '1', '-pid', '0',
-                                              '-stats', 'pid,cpu,time'], run, timeout=5)))
+            started = time.monotonic()
+            try:
+                text = command(['/usr/bin/top', '-l', '2', '-s', '1', '-pid', '0',
+                                '-stats', 'pid,cpu,time'], run, timeout=KERNEL_TASK_TIMEOUT_S)
+            finally:
+                result['kernelTaskWallMs'] = round((time.monotonic()-started)*1000)
+            result.update(kernel_task(text))
         except ProbeError as exc:
             result['kernelTaskError'] = str(exc)
     else:
@@ -534,7 +542,7 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
             props, state = deltas(rows, previous, observed)
             props.update(churn(rows, previous, props))
             props.update(diagnostics)
-            volume_crawls(rows, previous, observed, run)
+            state['volumeCrawlCache'] = volume_crawls(rows, previous, observed, run)
             try:
                 props['load'] = list(os.getloadavg())
             except OSError:
@@ -563,7 +571,8 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
                 state['kernelTaskAt'] = min(last_kernel, observed)
             snapshot = None
             if props['load'] and props['load'][0] > threshold and count < SPIKES_PER_DAY:
-                take_kernel = ('kernelTaskAt' not in state or observed-state['kernelTaskAt'] >= 300)
+                take_kernel = ('kernelTaskAt' not in state or
+                               observed-state['kernelTaskAt'] >= KERNEL_TASK_COOLDOWN_S)
                 if take_kernel:
                     # Failed attempts also consume the expensive-read allowance.
                     state['kernelTaskAt'] = observed
@@ -583,6 +592,8 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
         props = dict(diagnostics, failure=failure)
         emit('cpu', 'error', 'cpu.sample', ok=False, duration_ms=(clock()-started)*1000,
              props=props, error_tag='cpu.'+failure)
+        if failure == 'timeout':
+            notify_cpu_timeout()
         return props
 
 

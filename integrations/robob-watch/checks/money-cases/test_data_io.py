@@ -134,7 +134,7 @@ class MaterializeTests(unittest.TestCase):
                     self.assertFalse(data_io.current_scope()['failed'])
                     cases.write_json(self.wd / 'saved.json', {'ok': True})
                 self.assertIsNone(stats['dataless_files'])
-                self.assertRegex(stats['dataless_error'], r'^\w+ errno=(None|\d+)$')
+                self.assertRegex(stats['dataless_error'], r'^\w+ (errno=\d+|reason=(deadline|edeadlk))$')
                 self.assertTrue(json.loads((self.wd / 'saved.json').read_text())['ok'])
 
     def test_dataless_stat_failure_returns_unknown(self):
@@ -158,15 +158,165 @@ class MaterializeTests(unittest.TestCase):
             self.assertIsNone(data_io.dataless_files(self.data))
             self.assertFalse(data_io.current_scope()['failed'])
         self.assertEqual(stats['dataless_error'], 'PermissionError errno=13')
-        def stalled(_):
-            time.sleep(1)
+        def stalled(path):
+            time.sleep(.12)
+            return real(path)
         started = time.monotonic()
         with data_io.scope(time.time() + 2, stats), patch.object(os, 'scandir', stalled):
             self.assertIsNone(data_io.dataless_files(self.data))
             self.assertFalse(data_io.current_scope()['failed'])
             self.assertEqual(data_io.read_text(self.book), self.book.read_text())
         self.assertLess(time.monotonic() - started, 0.5)
-        self.assertEqual(stats['dataless_error'], 'DataUnavailable errno=None')
+        self.assertEqual(stats['dataless_error'], 'DataUnavailable reason=deadline')
+
+    def test_census_timeout_never_installs_or_rearms_an_alarm(self):
+        original_handler = signal.getsignal(signal.SIGALRM)
+        previous = signal.getitimer(signal.ITIMER_REAL)
+        real_scan = os.scandir
+        clock = [time.time()]
+        stats = {}
+
+        def slow_scan(path):
+            clock[0] += .2
+            return real_scan(path)
+
+        def pending_at_arm(which, delay, interval=0):
+            # Replay delivery before _within reaches its try/finally.
+            if delay:
+                signal.getsignal(signal.SIGALRM)(signal.SIGALRM, None)
+            return (0., 0.)
+
+        signal.setitimer(signal.ITIMER_REAL, 2)
+        started = time.monotonic()
+        try:
+            with data_io.scope(clock[0] + 40, stats):
+                with patch.object(os, 'scandir', slow_scan), \
+                        patch.object(data_io.time, 'time', side_effect=lambda: clock[0]), \
+                        patch.object(signal, 'setitimer', side_effect=pending_at_arm) as timer:
+                    self.assertIsNone(data_io.dataless_files(self.data))
+                self.assertIs(signal.getsignal(signal.SIGALRM), original_handler)
+                timer.assert_not_called()
+                remaining = signal.getitimer(signal.ITIMER_REAL)[0]
+                self.assertAlmostEqual(remaining, 2 - (time.monotonic() - started), delta=.02)
+                self.assertFalse(data_io.current_scope()['failed'])
+                self.assertEqual(data_io.read_text(self.book), self.book.read_text())
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, original_handler)
+            if previous[0]:
+                signal.setitimer(signal.ITIMER_REAL, previous[0], previous[1])
+        self.assertEqual(stats['dataless_error'], 'DataUnavailable reason=deadline')
+
+    def test_census_stops_after_slow_stat_and_check_still_saves(self):
+        real = os.stat
+        clock = [time.time()]
+
+        def slow_stat(path, **kwargs):
+            if str(path) == str(self.book) and kwargs.get('follow_symlinks') is False:
+                clock[0] += .2
+            return real(path, **kwargs)
+
+        with patch.object(os, 'stat', slow_stat), \
+                patch.object(data_io.time, 'time', side_effect=lambda: clock[0]), \
+                patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '1'}):
+            cases.run_check(self.wd, 'slow-census', self.data,
+                            now=cases.dt.datetime(2026, 11, 16, 2, tzinfo=cases.TZ),
+                            find=lambda *a, **k: [], said=lambda *a, **k: [])
+        row = json.loads((self.wd / 'runs.jsonl').read_text())
+        timing = json.loads((self.wd / 'pings.json').read_text())['timing']
+        for values in (row, timing):
+            self.assertIsNone(values['dataless_files'])
+            self.assertEqual(values['dataless_error'], 'DataUnavailable reason=deadline')
+        self.assertEqual(row['exit'], 0)
+        self.assertFalse(row.get('skipped'))
+        self.assertFalse((self.wd / 'data-skips.json').exists())
+
+    def test_directory_deadline_can_come_from_book_lock_without_a_census(self):
+        with data_io.scope(time.time() - 1), \
+                patch.object(os, 'scandir') as scan, self.assertRaises(data_io.DataUnavailable) as caught:
+            with cases.Locked(self.data):
+                self.fail('expired data scope entered a book lock')
+        self.assertEqual(caught.exception.path, self.data)
+        self.assertEqual(caught.exception.reason, 'deadline')
+        scan.assert_not_called()
+
+    def test_census_error_paths_leave_the_caller_alarm_untouched(self):
+        forms = (InterruptedError(errno.EINTR, 'fixture'), OSError(errno.EDEADLK, 'fixture'),
+                 PermissionError(errno.EACCES, 'fixture'), FileNotFoundError(errno.ENOENT, 'fixture'))
+        for error in forms:
+            with self.subTest(error=type(error).__name__), data_io.scope(time.time() + 40, {}), \
+                    patch.object(os, 'scandir', side_effect=error), \
+                    patch.object(signal, 'setitimer', side_effect=AssertionError('census touched alarm')), \
+                    patch.object(signal, 'signal', side_effect=AssertionError('census changed handler')):
+                result = data_io.dataless_files(self.data)
+                self.assertEqual(result, 0 if isinstance(error, FileNotFoundError) else None)
+                self.assertFalse(data_io.current_scope()['failed'])
+
+    def test_census_never_replaces_an_external_timeout_after_its_deadline(self):
+        for error in (cases.CheckTimeout('caller'), cases.charges.Lookup('caller'), OSError('caller'),
+                      FileNotFoundError('caller'), data_io.DataUnavailable(self.book, 'deadline')):
+            for overdue in (False, True):
+                with self.subTest(error=type(error).__name__, overdue=overdue):
+                    clock = [time.time()]
+                    error._money_cases_timeout = True
+
+                    def interrupted(_):
+                        if overdue:
+                            clock[0] += .2
+                        raise error
+
+                    with data_io.scope(clock[0] + 40, {}), \
+                            patch.object(data_io.time, 'time', side_effect=lambda: clock[0]), \
+                            patch.object(os, 'scandir', interrupted), \
+                            self.assertRaises(type(error)) as caught:
+                        data_io.dataless_files(self.data)
+                    self.assertIs(caught.exception, error)
+
+    def test_skip_bookkeeping_outcomes_match_the_single_history_row(self):
+        original = data_io.DataUnavailable(self.book, 'deadline')
+        again = data_io.DataUnavailable(self.wd / 'data-skips.json', 'deadline')
+        forms = (
+            ('retry_quiet', [again, 0], 0, None),
+            ('retry_backstop', [again, 1], 1, None),
+            ('retry_fails', [again, again], 1, data_io.DataUnavailable),
+            ('os_error', [OSError('fixture')], 1, OSError),
+            ('case_error', [cases.CaseError('fixture')], 2, None),
+            ('lookup_error', [cases.charges.Lookup('fixture')], 4, None),
+        )
+        for index, (name, outcomes, expected, raised) in enumerate(forms, 1):
+            with self.subTest(name=name), \
+                    patch.object(cases, 'check_command', side_effect=original), \
+                    patch.object(cases, 'record_data_skip', side_effect=outcomes) as bookkeeping, \
+                    patch.dict(os.environ, {'WATCH_DIR': str(self.wd)}), \
+                    patch.object(cases.faulthandler, 'enable'), patch.object(cases.faulthandler, 'dump_traceback_later'), \
+                    redirect_stderr(io.StringIO()):
+                if raised:
+                    with self.assertRaises(raised):
+                        cases.main(['check'])
+                else:
+                    self.assertEqual(cases.main(['check']), expected)
+                self.assertEqual(bookkeeping.call_count, len(outcomes))
+            rows = [json.loads(line) for line in (self.wd / 'runs.jsonl').read_text().splitlines()]
+            self.assertEqual(len(rows), index)
+            self.assertTrue(rows[-1]['skipped'])
+            self.assertEqual(rows[-1]['skip_file'], 'cases.json')
+            self.assertEqual(rows[-1]['skip_reason'], 'deadline')
+            self.assertEqual(rows[-1]['exit'], expected)
+
+    def test_skip_state_failure_keeps_original_skip_in_history(self):
+        error = data_io.DataUnavailable(self.book, 'deadline')
+        with patch.object(cases, 'check_command', side_effect=error), \
+                patch.object(cases, 'record_data_skip', side_effect=OSError('fixture state failure')), \
+                patch.dict(os.environ, {'WATCH_DIR': str(self.wd)}), \
+                patch.object(cases.faulthandler, 'enable'), patch.object(cases.faulthandler, 'dump_traceback_later'), \
+                redirect_stderr(io.StringIO()), self.assertRaises(OSError):
+            cases.main(['check'])
+        row = json.loads((self.wd / 'runs.jsonl').read_text())
+        self.assertTrue(row['skipped'])
+        self.assertEqual(row['skip_file'], 'cases.json')
+        self.assertEqual(row['skip_reason'], 'deadline')
+        self.assertEqual(row['skip_phase'], 'loads')
+        self.assertEqual(row['exit'], 1)
 
     def test_check_saves_normally_when_scandir_is_interrupted(self):
         with patch.object(os, 'scandir', side_effect=InterruptedError(errno.EINTR, 'interrupted')), \

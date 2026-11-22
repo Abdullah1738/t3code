@@ -11,6 +11,7 @@
   <key>WorkingDirectory</key><string>/Users/ardud/.local/share/agent-bridges</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>ExitTimeOut</key><integer>15</integer>
   <key>Umask</key><integer>63</integer>

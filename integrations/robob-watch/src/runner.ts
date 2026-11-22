@@ -13,7 +13,7 @@ import {
   heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
-import { CheckSlots, checkLane, checkSlotCap, checkTimeout, hostLoad, isMounted, LoadMode, LOAD_DWELL_MS, LOAD_LOW, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH, type SlotTiming } from "./host.ts";
+import { CheckSlots, checkClassification, recentCheckRuntimes, checkSlotCap, checkTimeout, hostLoad, isMounted, LoadMode, LOAD_DWELL_MS, LOAD_LOW, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH, type SlotTiming } from "./host.ts";
 
 // A 1s tick costs a few stats and JSON reads per watcher; it lets trigger files and short intervals act fast.
 const TICK_MS = 1_000;
@@ -38,10 +38,12 @@ function sampleLoad(): number {
     toolLog({ component: "runner", kind: "event", name: "host.load_mode", props: { loadMode: high, load } });
     if (high) loadAccountedAt = at;
   }
+  const duration = loadMode.report(at);
+  if (duration !== undefined) log(null, `host load mode still on: ${load.toFixed(2)}/core for ${Math.floor(duration / 60_000)} min`);
   return load;
 }
 const slots = new CheckSlots(() => checkSlotCap(loadMode.high), { emit: event => {
-  if (event.name === "slot.overrun") log(event.request.watcher, `fast lane overrun: ${(event.elapsedMs / 1000).toFixed(1)}s; next check uses slow pool`);
+  if (event.name === "slot.overrun") log(event.request.watcher, `fast lane overrun: ${(event.elapsedMs / 1000).toFixed(1)}s`);
   if (event.name === "slot.wait" || event.name === "slot.backlog") {
     const holders = event.holders.map(holder => `${holder.watcher}:${(holder.elapsedMs / 1000).toFixed(1)}s`).join(",");
     if (event.name === "slot.wait") log(event.request.watcher, `slot wait passed 30s: slot_wait ${(event.waitMs / 1000).toFixed(1)}s, holders [${holders}]`);
@@ -52,7 +54,7 @@ const slots = new CheckSlots(() => checkSlotCap(loadMode.high), { emit: event =>
   toolLog({ component: "runner", kind: "perf", name, ...("durationMs" in data ? { durationMs: data.durationMs } : {}),
     ids: request ? { watcher: request.watcher, ...(request.run ? { run: request.run } : {}) } : undefined,
     props: { ...data, ...(request ? { operation: request.operation ?? "check", lane: request.lane ?? "slow" } : {}) } });
-} }, 2);
+} }, 2, () => loadMode.high);
 function slotStart(watcher: Watcher, timing: SlotTiming, operation: "check" | "pending", run: string): void {
   toolLog({ component: "runner", kind: "perf", name: "slot.start", ids: { watcher: watcher.id, run },
     props: { ...timing, operation, intervalMs: watcher.interval_s * 1_000 } });
@@ -109,7 +111,7 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   const delivery = await deliver(accepted, pending.event, pending.key, state);
   for (const run of pending.healthRuns ?? [pending.healthRun]) await recordHealthDelivery(watcher.id, run, delivery);
   if (watcherInstance(watcher.id) !== instance) return false;
-  log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via}${delivery.meantFor ? ` meant_for=${delivery.meantFor.split(":").at(-1)!.slice(0, 8)}` : ""} confirmed=${delivery.confirmed ?? "n/a"} ${delivery.detail}`);
+  log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via}${delivery.meantFor ? ` meant_for=${delivery.meantFor.split(":").at(-1)!.slice(0, 8)}` : ""} confirmed=${delivery.confirmed ?? "n/a"}${delivery.sendDeferred ? " send=deferred" : ""} ${delivery.detail}`);
   const definition = loadWatcher(watcher.id);
   if (!definition) return false;
   const current = loadState(watcher.id);
@@ -494,6 +496,7 @@ async function failedProbe(id: string, state: State, instance: string | undefine
     const current = loadWatcher(id), fresh = loadState(id);
     if (shuttingDown || !current || current.paused || watcherInstance(id) !== instance
       || fresh.failure_paused_at !== state.failure_paused_at || fresh.failure_probe_attempts !== state.failure_probe_attempts) return;
+    fresh.recent_check_ms = recentCheckRuntimes(fresh.recent_check_ms ?? (fresh.last_run_ms === undefined ? [] : [fresh.last_run_ms]), duration);
     fresh.last_run_ms = duration;
     // Acquiring the mutex yields, so a hold may start after the check completes.
     if (held(current)) {
@@ -654,12 +657,15 @@ async function tickWatcher(id: string): Promise<void> {
   let probe: { pausedAt: string; attempt: number; previousNextAt: string } | undefined;
   const dueAt = probing ? Date.parse(state.failure_probe_next_at!) : triggered || finalCheck || !state.next_at || state.next_at < 0 ? t : state.next_at;
   const scheduledAt = Number.isFinite(dueAt) && dueAt > 0 && !triggered && !finalCheck && (probing || (state.next_at ?? 0) > 0) ? iso(dueAt) : "";
-  const lane = checkLane(state.last_run_ms);
+  const classification = checkClassification(state.last_run_ms, state.recent_check_ms);
+  let lane = classification.lane, laneReason = classification.reason;
   const trigger = finalCheck ? "final" : state.consecutive_failures || state.load_timeouts ? "retry" : triggered ? "trigger" : "schedule";
   let lateMs = 0, loadModeAtAdmission = false;
   const result = await slots.run(async timing => {
     if (shuttingDown) return;
     slotTiming = timing;
+    lane = timing.slotLane ?? lane;
+    if (lane !== classification.lane) laneReason = "fast:overdue";
     lateMs = Math.max(0, now() - dueAt);
     loadModeAtAdmission = loadMode.high;
     return withRelayLockAsync(() => {
@@ -702,11 +708,11 @@ async function tickWatcher(id: string): Promise<void> {
     return runCheck(current, watcherDir(id), { HEALTH_TOOLLOG_SCHEDULED_AT: scheduledAt, HEALTH_TOOLLOG_TRIGGER: state.consecutive_failures || state.load_timeouts ? "retry" : "schedule", WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
     });
   }, { watcher: id, run: attemptId, operation: "check", intervalMs: watcher.interval_s * 1_000,
-    dueAt, lane });
+    dueAt, lane, recentMinMs: classification.recentMinMs });
   if (!result || shuttingDown) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
   const failed = runTimedOut || result.code !== 0;
-  toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: result.busy ? "busy" : runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", ...(result.busy ? { stderrClass: "dependency_busy", dependency: result.busy.dependency } : {}), exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs: Math.max(0, now() - t - result.ms), ...slotTiming, dueAt, lateMs, lane, loadMode: loadModeAtAdmission, intervalMs: watcher.interval_s * 1_000, trigger }, ...(failed ? { error: { tag: result.busy ? "watch.dependency_busy" : runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
+  toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: result.busy ? "busy" : runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", ...(result.busy ? { stderrClass: "dependency_busy", dependency: result.busy.dependency } : {}), exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs: Math.max(0, now() - t - result.ms), ...slotTiming, dueAt, lateMs, lane, lane_reason: laneReason, recentMinMs: classification.recentMinMs, loadMode: loadModeAtAdmission, intervalMs: watcher.interval_s * 1_000, trigger }, ...(failed ? { error: { tag: result.busy ? "watch.dependency_busy" : runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
   if (!sameInstance()) return;
   const endLoad = sampleLoad();
   let fresh = loadState(id);
@@ -734,6 +740,7 @@ async function tickWatcher(id: string): Promise<void> {
     log(id, "normal check completed after removal; only the configured in-flight check may emit during grace");
     return;
   }
+  fresh.recent_check_ms = recentCheckRuntimes(fresh.recent_check_ms ?? (fresh.last_run_ms === undefined ? [] : [fresh.last_run_ms]), result.ms);
   fresh.last_run_ms = result.ms;
   const queued = now() - t - result.ms;
   if (result.ms >= SLOW_RUN_MS || queued >= 5_000) log(id, `slow run: check ${(result.ms / 1000).toFixed(1)}s, queued ${(queued / 1000).toFixed(1)}s, slot_wait ${((slotTiming?.slotWaitMs ?? 0) / 1000).toFixed(1)}s, depth ${slotTiming?.slotQueueDepth ?? 0}, active ${slotTiming?.slotActiveAtEnqueue ?? 0}`);

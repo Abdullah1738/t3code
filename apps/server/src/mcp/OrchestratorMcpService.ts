@@ -2531,6 +2531,7 @@ const make = Effect.gen(function* () {
                 message: stalledSummary(stall, null).slice(0, 2_000),
                 retryable: null,
               };
+    yield* McpCallAnalytics.setTaskFailure(taskFailure);
     onProgress?.({ status, ...(taskFailure === undefined ? {} : { failure: taskFailure }) });
     const resultTransfer = taskResultTransfer(parentProjection, childControls, task) ?? null;
     const summaryRun =
@@ -5265,11 +5266,11 @@ const make = Effect.gen(function* () {
                 ),
           ),
         );
-      if (result.type === "no_active_run") {
+      if (result.type === "no_active_run" || result.type === "orphan_turn_interrupted") {
         return {
           threadId: input.threadId,
           runId: null,
-          status: "no_active_run",
+          status: result.type,
         } satisfies OrchestratorMcpThreadInterruptResult;
       }
       const committedRun = yield* loadProjection(input.threadId, ["runs"], {

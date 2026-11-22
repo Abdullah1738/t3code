@@ -2,33 +2,29 @@ import datetime as dt
 import json
 import hashlib
 from collections import defaultdict
-from listener_rollup import timestamp
+from listener_rollup import timestamp, history_rows
 from pool_alerts import valid
 from guard import write_json
+from observer import measured
 
 
-def transitions(path):
+def transitions(path, incremental=True):
     try:
-        with path.open() as lines:
-            for line in lines:
-                if 'pool.exhausted' not in line and 'pool.recovered' not in line:
-                    continue
-                try:
-                    row = json.loads(line)
-                    if row.get('tool') == '9router' and row.get('name') in ('pool.exhausted', 'pool.recovered'):
-                        yield row
-                except (ValueError, AttributeError):
-                    pass
+        for row in history_rows(path, incremental):
+            if row.get('tool') == '9router' and row.get('name') in ('pool.exhausted', 'pool.recovered'):
+                yield row
     except FileNotFoundError:
         pass
 
 
-def historical_transitions(root, paths):
+def historical_transitions(root, paths, incremental=True):
     index_path = root / '.pool-transitions.json'
     try:
         index = json.loads(index_path.read_text())
         index = index['files'] if index.get('version') == 1 and isinstance(index.get('files'), dict) else {}
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        index = {}
+    if not incremental:
         index = {}
     updated, rows = {}, []
     for path in paths:
@@ -40,12 +36,12 @@ def historical_transitions(root, paths):
         entry = index.get(path.name)
         if not (isinstance(entry, dict) and entry.get('signature') == signature
                 and isinstance(entry.get('rows'), list) and all(isinstance(row, dict) for row in entry['rows'])):
-            entry = dict(signature=signature, rows=list(transitions(path)))
+            entry = dict(signature=signature, rows=list(transitions(path, incremental)))
         updated[path.name] = entry
         rows.extend(entry['rows'])
     # Index actual source files rather than assuming the bounded API cache is
     # complete. Unchanged historical files need only a stat on later rollups.
-    if updated != index:
+    if incremental and updated != index:
         try:
             write_json(index_path, dict(version=1, files=updated))
         except OSError:
@@ -53,7 +49,8 @@ def historical_transitions(root, paths):
     return rows
 
 
-def summarize(day, root, generated, rows):
+@measured('pool_history')
+def summarize(day, root, generated, rows, incremental=True):
     floor = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc).timestamp() * 1000
     ceiling = min(floor + 86400000, generated.timestamp() * 1000)
     episodes = {}
@@ -65,7 +62,7 @@ def summarize(day, root, generated, rows):
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass
     neighbors = historical_transitions(root, sorted(path for path in root.glob('????-??-??.ndjson')
-        if path.stem != day and path.stem <= generated.date().isoformat()))
+        if path.stem != day and path.stem <= generated.date().isoformat()), incremental)
     for row in sorted([*neighbors, *rows], key=lambda row: timestamp(row.get('ts')) or 0):
         props = row.get('props', {})
         provider = props.get('provider')

@@ -283,6 +283,9 @@ export function layerWithRegistry<Error>(
     readonly beforeEventWrite?: (
       input: Parameters<EventSink.EventSinkV2Shape["write"]>[0],
     ) => Effect.Effect<void>;
+    readonly beforeCommandCommit?: (
+      input: Parameters<EventSink.EventSinkV2Shape["commitCommand"]>[0],
+    ) => Effect.Effect<void>;
     readonly runEffectWorker?: boolean;
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
@@ -346,7 +349,7 @@ export function layerWithRegistry<Error>(
     Layer.provide(Layer.mergeAll(layerStores, layerDatabase)),
   );
   const layerEventSinkProvided =
-    options.beforeEventWrite === undefined
+    options.beforeEventWrite === undefined && options.beforeCommandCommit === undefined
       ? layerEventSinkBase
       : Layer.effect(
           EventSink.EventSinkV2,
@@ -355,7 +358,13 @@ export function layerWithRegistry<Error>(
             return {
               ...sink,
               write: (input: Parameters<EventSink.EventSinkV2Shape["write"]>[0]) =>
-                options.beforeEventWrite!(input).pipe(Effect.andThen(sink.write(input))),
+                (options.beforeEventWrite?.(input) ?? Effect.void).pipe(
+                  Effect.andThen(sink.write(input)),
+                ),
+              commitCommand: (input: Parameters<EventSink.EventSinkV2Shape["commitCommand"]>[0]) =>
+                (options.beforeCommandCommit?.(input) ?? Effect.void).pipe(
+                  Effect.andThen(sink.commitCommand(input)),
+                ),
             };
           }),
         ).pipe(Layer.provide(layerEventSinkBase));

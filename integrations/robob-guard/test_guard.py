@@ -143,6 +143,11 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(self.state['failed_reopens'],0);self.assertEqual(self.tick()[1],'none');self.assertEqual(self.tick()[1],'reopen')
 
 class IOTests(unittest.TestCase):
+    def setUp(self):
+        protected = patch('guard.protected_tier_tick')
+        protected.start()
+        self.addCleanup(protected.stop)
+
     def test_bounded_process_diagnostics_and_failed_reads(self):
         output = "malformed\n1 0 /sbin/launchd /sbin/launchd\n42 1 /Applications/Ro %s\n" % guard.EXECUTABLE
         output += "\n".join("%s 43 /Applications/Ro %s %s" % (pid, guard.EXECUTABLE, "x" * 300) for pid in range(43, 53))

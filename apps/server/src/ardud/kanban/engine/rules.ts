@@ -685,17 +685,25 @@ export function modelOnPool(
 
 /**
  * The model a card's new work thread starts on: of the models whose pool has
- * a free slot, the highest weight; `pick` chooses among a tie.
+ * a free slot, the highest weight; otherwise use critical overflow room.
+ * `pick` chooses among a tie.
  */
 function weightedModel(
   card: KanbanCard,
   pools: ReadonlyArray<KanbanPool>,
   free: ReadonlyMap<string, number>,
   pick: (count: number) => number,
+  overflow: number,
 ): ModelSelection | null {
-  const open = kanbanCardModels(card).filter(
-    (entry) => (free.get(poolOf(pools, entry.model)) ?? 0) > 0,
-  );
+  const models = kanbanCardModels(card);
+  const available = models.filter((entry) => (free.get(poolOf(pools, entry.model)) ?? 0) > 0);
+  const open =
+    available.length > 0
+      ? available
+      : models.filter((entry) => {
+          const pool = poolFor(pools, entry.model);
+          return pool !== undefined && pool.slots > 0 && (free.get(pool.key) ?? 0) > -overflow;
+        });
   if (open.length === 0) return null;
   const top = Math.max(...open.map((entry) => entry.weight));
   const tied = open.filter((entry) => entry.weight === top);
@@ -734,6 +742,10 @@ export interface Dispatch {
   /** Start a new thread when the old thread is busy elsewhere or its home card moved on. */
   readonly fresh: boolean;
   readonly freshReason?: string;
+  readonly overflow?: true;
+  /** Capacity and holder count immediately after an overflow take. */
+  readonly slots?: number;
+  readonly used?: number;
 }
 
 /** Most cards one work thread carries at once. */
@@ -786,6 +798,7 @@ export type QueueReason =
   | "attempted"
   | "pool_full"
   | "would_start"
+  | "critical_overflow"
   | "no_pool"
   | "joins_thread"
   | "batch_full"
@@ -873,7 +886,7 @@ export function dispatchQueue(
       priority(a) - priority(b) ||
       (a.role !== b.role ? (a.role === "review" ? -1 : 1) : pickOrder(a.card, b.card)),
   );
-  return { queue, ineligible };
+  return { queue, ineligible, ranking };
 }
 
 const queuedCard = (card: KanbanCard, role: "work" | "review", nowMs: number) => ({
@@ -901,7 +914,8 @@ const blockingNumbers = (
  * Reviews and follow-up work compete by effective urgency, reviews winning a tie.
  * Within each role, pick order uses rank, holds, then oldest first.
  * Skip blocked, settled and backlog cards. Lowering a pool below what is
- * running frees nothing; it only stops new starts, and a pool at 0 takes no
+ * running frees nothing; effective-P1 work alone may use criticalOverflowSlots
+ * extra slots. A pool at 0 takes no
  * card at all. A todo card whose work thread still holds a slot rejoins that
  * thread without taking another one. `holds` are this board's held slots.
  * A card with no work thread yet starts on its highest-weight model with a
@@ -1012,7 +1026,7 @@ function allocateDispatch(
   for (const pool of pools) free.set(pool.key, pool.slots - (holding.get(pool.key)?.size ?? 0));
   const byId = new Map(cards.map((card) => [card.id as string, card]));
   const clock = nowMs ?? kanbanBoardClock(cards);
-  const { queue, ineligible } = dispatchQueue(
+  const { queue, ineligible, ranking } = dispatchQueue(
     board,
     cards,
     clock,
@@ -1047,10 +1061,12 @@ function allocateDispatch(
 
   const plan: Array<Dispatch> = [];
   for (const { role, card } of queue) {
+    const overflow =
+      (ranking.get(card.id)?.rank ?? card.priority) === 1 ? (board.criticalOverflowSlots ?? 1) : 0;
     // An existing work thread follows the card's pinned model.
     const selected =
       role === "work" && card.workThreadId === null
-        ? weightedModel(card, pools, free, pick)
+        ? weightedModel(card, pools, free, pick, overflow)
         : nextModel(board, card);
     // A full fresh-work pool has no selected model. Activity still names its highest-weight choice.
     const model =
@@ -1112,9 +1128,10 @@ function allocateDispatch(
       report("batch_full");
       continue;
     }
+    const left = free.get(key) ?? 0;
+    const overflowStart = !joins && left <= 0;
     if (!joins) {
-      const left = free.get(key) ?? 0;
-      if (left <= 0) {
+      if (left <= -overflow) {
         report("pool_full");
         continue;
       }
@@ -1126,7 +1143,7 @@ function allocateDispatch(
       set.add(thread);
       holding.set(key, set);
     }
-    report(joins ? "joins_thread" : "would_start");
+    report(joins ? "joins_thread" : overflowStart ? "critical_overflow" : "would_start");
     plan.push({
       cardId: card.id,
       role,
@@ -1135,6 +1152,9 @@ function allocateDispatch(
       joins,
       fresh,
       ...(freshReason === undefined ? {} : { freshReason }),
+      ...(overflowStart
+        ? { overflow: true as const, slots: pool.slots, used: pool.slots - left + 1 }
+        : {}),
     });
   }
   return { plan, items };
@@ -1205,7 +1225,12 @@ export function confirmDispatch(
     ).length;
     return carrying < MAX_BATCH;
   }
-  return pool.slots - holding.size > 0;
+  const left = pool.slots - holding.size;
+  const critical = (kanbanSchedule(cards).get(card.id)?.rank ?? card.priority) === 1;
+  return (
+    left > 0 ||
+    (dispatch.overflow === true && critical && left > -(board.criticalOverflowSlots ?? 1))
+  );
 }
 
 /** What a work thread brings to a claim. */

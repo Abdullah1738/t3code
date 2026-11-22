@@ -211,6 +211,10 @@ def entry_backend(argv: list[str]) -> str:
     """The backend for one `offbox ...` call. Without a home server: boat, with no lookups at all.
     Otherwise: spend is Boat's meter and stats is the home server's; a command that names a run or a box goes to
     the backend that run or box lives on. An unpinned Boat-only base uses Boat; other runs follow default_backend()."""
+    if argv[:1] == ['run']:
+        from .cli import build_parser
+        from .node_version import validate_override
+        validate_override(build_parser().parse_args(argv).env)
     global _BACKEND_REASON
     _BACKEND_REASON = None
     pin = backend_pinned()

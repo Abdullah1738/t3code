@@ -146,6 +146,81 @@ esac
         self.assertFalse((self.root / "git-calls").exists())
         self.assertFalse((self.root / "launchctl-calls").exists())
 
+    def selective_fixture(self):
+        """An installed skill with two files; then one commit that changes both and a second that changes one."""
+        lib = self.package / "skill/scripts/lib"
+        lib.mkdir()
+        (lib / "a.py").write_text("a = 1\n")
+        (lib / "b.py").write_text("b = 1\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "two files")
+        self.git("push", "origin", "main")
+        self.assertEqual(self.install().returncode, 0)
+        base = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], env=self.env,
+                              capture_output=True, text=True).stdout.strip()
+        (lib / "b.py").write_text("b = 2  # held\n")
+        self.git("commit", "-am", "held change")
+        held = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], env=self.env,
+                              capture_output=True, text=True).stdout.strip()
+        (lib / "a.py").write_text("a = 2  # wanted\n")
+        self.git("commit", "-am", "wanted change")
+        self.git("push", "origin", "main")
+        live = self.home / ".config/opencode/skills/remote-compute/scripts/lib"
+        return base, held, live
+
+    def test_selective_install_moves_only_named_files_that_are_exactly_at_the_base(self):
+        base, held, live = self.selective_fixture()
+        dry = self.install(f"--since={held}", "--only=scripts/lib/a.py", "--dry-run")
+        self.assertEqual((dry.returncode, (live / "a.py").read_text()), (0, "a = 1\n"), dry.stderr)
+        self.assertIn("1 other installed skill file(s) still differ", dry.stdout)
+        self.assertFalse((self.home / ".local/share/offbox/backups").exists(), "a dry run keeps no copies")
+        done = self.install(f"--since={held}", "--only=scripts/lib/a.py")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(((live / "a.py").read_text(), (live / "b.py").read_text()), ("a = 2  # wanted\n", "b = 1\n"))
+        self.assertIn("wanted change", done.stdout)
+        self.assertNotIn("held change", done.stdout)
+        self.assertIn("1 other installed skill file(s) still differ", done.stdout)
+        saved = list((self.home / ".local/share/offbox/backups").glob("only-*/scripts/lib/a.py"))
+        self.assertEqual([path.read_text() for path in saved], ["a = 1\n"])
+        # The same command again (or after a write that failed halfway) finds the file done.
+        again = self.install(f"--since={held}", "--only=scripts/lib/a.py")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("same scripts/lib/a.py", again.stdout)
+        self.assertNotIn("previous copies", again.stdout)
+        self.assertEqual(len(list((self.home / ".local/share/offbox/backups").glob("only-*"))), 1)
+        self.assertEqual([path.name for path in live.iterdir() if path.name not in ("a.py", "b.py")], [])
+
+    def test_selective_install_refuses_a_file_that_would_carry_held_changes_and_writes_nothing(self):
+        base, held, live = self.selective_fixture()
+        for args, said in (((f"--since={held}", "--only=scripts/lib/a.py", "--only=scripts/lib/b.py"), "is not the"),
+                           (("--only=scripts/lib/a.py",), "needs --since"),
+                           ((f"--since={held}", "--only=../../outside"), "not a skill file"),
+                           ((f"--since={held}", "--only=scripts/lib/a.py", "--allow-unpushed"), "needs --since"),
+                           (("--since=nonsense", "--only=scripts/lib/a.py"), "is not a commit")):
+            with self.subTest(args=args):
+                result = self.install(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(said, result.stderr)
+                self.assertEqual(((live / "a.py").read_text(), (live / "b.py").read_text()), ("a = 1\n", "b = 1\n"))
+        (live / "a.py").write_bytes(b"a = 1\r\n")
+        other_bytes = self.install(f"--since={held}", "--only=scripts/lib/a.py")
+        self.assertIn("is not the", other_bytes.stderr, "byte-exact, whatever the repo's line-ending rules")
+        (live / "a.py").write_text("a = 1\n")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "a.py").write_text("a = 1\n")
+        live.rename(live.with_name("lib.real"))
+        live.symlink_to(outside)
+        linked = self.install(f"--since={held}", "--only=scripts/lib/a.py")
+        self.assertIn("not a skill file", linked.stderr)
+        self.assertEqual((outside / "a.py").read_text(), "a = 1\n")
+        live.unlink()
+        live.with_name("lib.real").rename(live)
+        (self.package / "skill/scripts/lib/a.py").write_text("a = 3  # not pushed\n")
+        unpushed = self.install(f"--since={held}", "--only=scripts/lib/a.py")
+        self.assertNotEqual(unpushed.returncode, 0)
+        self.assertEqual((live / "a.py").read_text(), "a = 1\n")
+
     def test_busy_timeout_precedes_rsync_and_every_package_write(self):
         with self.busy_service() as (env, requests):
             result = self.install(env=env)

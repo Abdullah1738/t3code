@@ -389,12 +389,18 @@ function projectedWorkEntryTone(item: OrchestrationV2TurnItem): WorkLogEntry["to
 export function providerErrorPresentation(
   item: Extract<OrchestrationV2TurnItem, { readonly type: "error" }>,
 ): { readonly label: string; readonly detail: string } {
+  const failureLabel =
+    item.failure.category === "persistence"
+      ? "Persistence error"
+      : item.failure.class === "usage_limit"
+        ? "Usage limit reached"
+        : "Provider error";
   if (item.retry === undefined) {
     return {
       label:
-        item.failure.class === "usage_limit"
-          ? "Usage limit reached"
-          : item.title?.trim() || "Provider error",
+        item.failure.category === "persistence" || item.failure.class === "usage_limit"
+          ? failureLabel
+          : item.title?.trim() || failureLabel,
       detail: item.failure.message,
     };
   }
@@ -408,7 +414,7 @@ export function providerErrorPresentation(
       : item.status === "completed"
         ? `Provider recovered (${progress} retries)`
         : item.status === "failed"
-          ? `${item.failure.class === "usage_limit" ? "Usage limit reached" : "Provider error"} after ${progress} retries`
+          ? `${failureLabel} after ${progress} retries`
           : `Provider retry stopped (${progress})`;
   const retryDelay =
     item.status === "running" && item.retry.retryDelayMs !== null && item.retry.retryDelayMs > 0

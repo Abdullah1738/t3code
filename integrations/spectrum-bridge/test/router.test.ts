@@ -3024,6 +3024,7 @@ test("first attempt landing during the retry POST still admits one prompt and se
 test("watchdog notices even when normal poll reads fail, and never retries an unreadable outcome", async () => {
   const h = setup();
   const start = Date.now();
+  setSystemTime(start);
   h.backend.promptBehavior = async () => { throw new Error("offline"); };
   h.input("first", "Question");
   await h.router.tick();
@@ -8740,6 +8741,26 @@ test.each(["queued", "queued-stale", "preparing", "retry", "late-accepted"])("fa
     await h.router.tick();
     expect(h.backend.prompts.at(-1)!.text).toContain("New instruction");
   }
+});
+
+test.each([true, false])("failed receipt adoption preserves arrival order (prefix index: %s)", async indexed => {
+  const h = setup(":memory:", { notifyFailure: async () => true });
+  const route = { id: "ses_1", directory: "/Chats/old", generation: 1 };
+  h.store.set("route", route);
+  for (const id of ["z-received-first", "a-received-second"]) {
+    h.input(id, "Synthetic replay", { source: "typed" });
+    h.store.updateInbound(id, "failed");
+    h.store.set(`failed-replay-receipt:${id}`, { ...route, inboundId: id, messageId: messageId(id), phase: "failed", startedAt: Date.now() });
+  }
+  if (!indexed) {
+    h.store.db.exec("DROP INDEX kv_key_nocase");
+  }
+  h.backend.single = true;
+  await h.router.checkFailedInbound();
+  expect(h.store.get<{ inboundId: string }>("activeTurn")?.inboundId).toBe("z-received-first");
+  expect(h.store.get("failed-replay-receipt:z-received-first")).toBeNull();
+  expect(h.store.get("failed-replay-receipt:a-received-second")).not.toBeNull();
+  expect(h.backend.prompts).toHaveLength(0);
 });
 
 test.each(["none", "completed", "running"])("failed-inbound adopts acceptance after expiry without another POST (newer turn: %s)", async newer => {

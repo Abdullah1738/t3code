@@ -1289,7 +1289,7 @@ test("normal turn and completion polling bypass an exhausted retry budget", asyn
 });
 
 
-test("repeated failed reads pause wake preparation attempts until admission can resume", async () => {
+test("repeated failed reads pause wake preparation attempts until the receipt deadline", async () => {
   const id = "wake:cooling-preparation"; const h = stalledProbe(id, 15 * 60_000);
   new WakeDelivery(h.store).accept(id);
   h.store.set(`latency-route:${id}`, h.store.get(`failed-delivery:${id}`));
@@ -1314,8 +1314,9 @@ test("repeated failed reads pause wake preparation attempts until admission can 
   }
   setSystemTime(now + 900_000); h.backend.promptAccepted = async () => false;
   await h.router.tick();
-  expect(h.backend.prompts).toEqual([hash(id)]);
-  expect(h.states()).toEqual(["done"]);
+  expect(h.backend.prompts).toEqual([]);
+  expect(h.states()).toEqual(["failed"]);
+  expect(h.store.get("preparingDelivery") ?? null).toBeNull();
 });
 
 test("a confirmed steer clears failure history before a fresh requeued admission read", async () => {

@@ -1,4 +1,5 @@
 import { RobobLinkDown } from "./robob-link-gate.ts";
+import { cleanRosterHealth, createRosterAggregation, ROSTER_ACTIONS } from "./log-active-roster.ts";
 import { probeDeferred } from "./probe-policy.ts";
 import { safeLineFailureCode, sendblueErrorKey } from "./line.ts";
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync } from "node:fs";
@@ -18,6 +19,7 @@ import { recordRenderCounts, renderCounts } from "./log-render-store.ts";
 import { cleanRenders, createRenderAggregation, renderChat } from "./log-renders.ts";
 import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./log-error.ts";
 import { CONTROL_REASONS, controlFailureProps } from "./control-errors.ts";
+import { LOOP_OPERATIONS, loopOperations, traceLoopOperation } from "./loop-stall.ts";
 
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
@@ -37,7 +39,7 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "outboxId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId", "requestId", "serverRequestId", "outageId"]);
-const WAKE_EVENTS = new Set(["wake.accepted", "wake.turn_start", "wake.send_ambiguous", "wake.admitted", "wake.retry_scheduled", "wake.failed"]);
+const WAKE_EVENTS = new Set(["wake.accepted", "wake.turn_start", "wake.send_ambiguous", "wake.admitted", "wake.retry_scheduled", "wake.failed", "wake.waiting"]);
 const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "generation", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews", "linkFailureCount", "boundMs", "elapsedMs", "msUntilAccepted", "downMs", "skippedCalls", "failedProbes"]);
 const ENUMS: Record<string, readonly string[]> = {
   causeKind: ["timeout", "http", "transport"],
@@ -71,6 +73,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (entry.name === "bridge.catch" && entry.kind === "error" && entry.alreadyLogged === true) line.alreadyLogged = true;
   const ids: Record<string, string> = runId ? { runId } : {};
   for (const [key, value] of Object.entries(entry.ids ?? {})) {
+    if (entry.name === "bridge-loop-stall") continue;
     // Correlation ids are UUIDs; arbitrary server header text must never become a log field.
     if ((key === "requestId" || key === "serverRequestId" || key === "outageId") && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value)) continue;
     if (key === "chat" && entry.name.startsWith("card.render")) { ids.chat = renderChat(value); continue; }
@@ -80,14 +83,44 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (entry.name === "bridge-loop-stall") {
+      if (["stallMs", "loadAvg1", "freeMemoryBytes", "rssBytes"].includes(key)
+        && typeof value === "number" && Number.isFinite(value) && value >= 0) { props[key] = value; continue; }
+      if (key === "operations" && typeof value === "string" && value.length <= 500
+        && (value === "" || value.split(",").every(name => LOOP_OPERATIONS.some(allowed => allowed === name)))) {
+        props[key] = value; continue;
+      }
+      continue;
+    }
     if (WAKE_EVENTS.has(entry.name)) {
       if (key === "source" && typeof value === "string" && value.length <= 100 && !/[\x00-\x1f\x7f-\x9f]/.test(value)
         || key === "causeKey" && typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,100}$/.test(value)
         || key === "route" && value === "/threads/:id/send"
-        || key === "reason" && ["ambiguity_deadline", "stale", "attempts_exhausted", "route_retired"].includes(String(value))
+        || key === "reason" && ["ambiguity_deadline", "delivery_deadline", "stale", "attempts_exhausted", "route_retired", "holder", "link_down", "cooldown", "admission"].includes(String(value))
+        || key === "holderPhase" && ["submitting", "running", "unknown", "held", "failed"].includes(String(value))
+        || key === "attempt" && entry.name === "wake.failed" && value === 0
+        || key === "remainingMs" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0
         || key === "nextAt" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
         props[key] = value; continue;
       }
+    }
+    if (entry.name === "turn.hold_changed" && (key === "holderPhase" || key === "phase")
+      && ["submitting", "running", "unknown", "held", "failed", "released"].includes(String(value))
+      || entry.name === "turn.hold_changed" && key === "reason" && ["link_down", "turn_transition"].includes(String(value))) {
+      props[key] = value; continue;
+    }
+    if (entry.name === "turn.end" && key === "endReason" && ["undelivered", "failed", "errored", "expired"].includes(String(value))) {
+      props[key] = value; continue;
+    }
+    if (entry.component === "robob" && entry.name === "robob.active_roster") {
+      const fields = cleanRosterHealth({ [key]: value });
+      if (typeof fields?.[key] === "number") props[key] = fields[key];
+      continue;
+    }
+    if (entry.component === "robob" && entry.name === "robob.roster_action") {
+      if (key === "rosterAction" && typeof value === "string" && ROSTER_ACTIONS.includes(value as typeof ROSTER_ACTIONS[number])
+        || ["rows", "total"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
+      continue;
     }
     if (entry.component === "mirror" && ["mirror-append", "mirror-queue", "mirror-fail", "mirror-backfill"].includes(entry.name)) {
       if (key === "direction" && (value === "inbound" || value === "outbound")
@@ -101,8 +134,25 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
       props[key] = value; continue;
     }
+    if (entry.component === "remote-box" && entry.name === "moni-swipe-resolved") {
+      if (key === "source" && typeof value === "string" && ["inbox", "action", "missing", "none"].includes(value)
+        || (key === "hasThreadOrigin" || key === "hasReplyTo") && typeof value === "boolean") props[key] = value;
+      continue;
+    }
     if (entry.component === "remote-box" && entry.name === "moni-callback-ready"
       && (key === "handlerMs" || key === "loopDelayMs") && typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      props[key] = value; continue;
+    }
+    if (entry.component === "remote-box" && ["moni-box-down", "moni-runner-error"].includes(entry.name)) {
+      if (key === "step" && typeof value === "string" && ["lease", "identity", "deliver", "ack"].includes(value)
+        || key === "errorClass" && typeof value === "string" && ["RemoteRequestError", "Error", "TypeError", "SyntaxError", "Timeout", "Object", "String", "Number", "Boolean", "BigInt", "Symbol", "Function", "undefined", "object"].includes(value)
+        || ["latencyMs", "failures"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0
+        || entry.name === "moni-runner-error" && key === "code" && value === "unreachable") {
+        props[key] = value; continue;
+      }
+    }
+    if (entry.component === "remote-box" && entry.name === "moni-box-up"
+      && ["unreachableMs", "failedProbes", "clearMs"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) {
       props[key] = value; continue;
     }
     if (entry.component === "remote-box" && entry.name === "moni-runner-error") {
@@ -157,26 +207,32 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
 }
 
 function logSources(dir: string): Record<string, number> {
-  return Object.fromEntries(readdirSync(dir).filter(file => /^\d{4}-\d{2}-\d{2}\.ndjson$/.test(file)).sort()
-    .map(file => [file.slice(0, 10), statSync(join(dir, file)).size]));
+  const finish = loopOperations.begin("log.sources");
+  try {
+    return Object.fromEntries(readdirSync(dir).filter(file => /^\d{4}-\d{2}-\d{2}\.ndjson$/.test(file)).sort()
+      .map(file => [file.slice(0, 10), statSync(join(dir, file)).size]));
+  } finally { finish(); }
 }
 
 async function* records(dir: string, sources: Record<string, number>): AsyncGenerator<LogLine> {
-  for (const [day, bytes] of Object.entries(sources)) {
-    if (!bytes) continue;
-    // Fixed byte ranges keep appends during a build visible as a stale dependency snapshot.
-    const input = createReadStream(join(dir, `${day}.ndjson`), { encoding: "utf8", end: bytes - 1 });
-    const lines = createInterface({ input, crlfDelay: Infinity });
-    try {
-      for await (const text of lines) {
-        try {
-          const parsed = JSON.parse(text);
-          const line = clean(parsed, typeof parsed.ts === "string" ? parsed.ts : "");
-          if (line) yield line;
-        } catch { /* Interrupted or malformed row. */ }
-      }
-    } finally { lines.close(); input.destroy(); }
-  }
+  const finish = loopOperations.begin("log.scan");
+  try {
+    for (const [day, bytes] of Object.entries(sources)) {
+      if (!bytes) continue;
+      // Fixed byte ranges keep appends during a build visible as a stale dependency snapshot.
+      const input = createReadStream(join(dir, `${day}.ndjson`), { encoding: "utf8", end: bytes - 1 });
+      const lines = createInterface({ input, crlfDelay: Infinity });
+      try {
+        for await (const text of lines) {
+          try {
+            const parsed = JSON.parse(text);
+            const line = clean(parsed, typeof parsed.ts === "string" ? parsed.ts : "");
+            if (line) yield line;
+          } catch { /* Interrupted or malformed row. */ }
+        }
+      } finally { lines.close(); input.destroy(); }
+    }
+  } finally { finish(); }
 }
 
 function chainSources(sources: Record<string, number>, day: string): Record<string, number> {
@@ -195,6 +251,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   const calls = createCallAggregation(processRunId);
   const messageReads = createMessageReadAggregation();
   const promptProbes = createPromptProbeAggregation();
+  const roster = createRosterAggregation();
   const robobLink = createRobobLinkState({ root, now, checkpoint: () => {
     const day = new Date(now()).toISOString().slice(0, 10);
     const path = join(root(), `${day}.ndjson`);
@@ -203,6 +260,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   const renders = createRenderAggregation();
   let writeFailed = false;
   function append(entry: Entry, stamp?: string): void {
+    const finish = loopOperations.begin("log.append");
     let fd: number | undefined;
     try {
       const ts = stamp ?? new Date(now()).toISOString();
@@ -233,7 +291,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.robob_calls", "robob.active_roster", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }
@@ -245,7 +303,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (entry.name === "card.renders") append({ component: "logger", kind: "error", name: "bridge.catch", ok: false,
         error: { tag: "render.counters.write", cause: error } }, stamp);
     }
-    finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* Best effort. */ } } }
+    finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* Best effort. */ } } finish(); }
   }
   const pending: LogLine[] = [];
   let scheduled = false;
@@ -278,7 +336,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         saveLink();
         return;
       }
-      for (const probe of promptProbes.accept(line)) for (const messageRead of messageReads.accept(probe)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
+      for (const rosterLine of roster.accept(line)) for (const probe of promptProbes.accept(rosterLine)) for (const messageRead of messageReads.accept(probe)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
       saveLink();
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
       if (["turn.start", "reply.sent", "inbound.answered"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
@@ -287,7 +345,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     } catch { writeFailed = true; }
   }
   function readRenderCounts(dir: string, day: string): ReturnType<typeof renderCounts> {
-    try { return renderCounts(dir, day); }
+    try { return traceLoopOperation("log.counters", () => renderCounts(dir, day)); }
     catch (error) {
       write({ component: "logger", kind: "error", name: "bridge.catch", ok: false, error: { tag: "render.counters.read", cause: error } });
       throw error;
@@ -380,6 +438,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   function flushAll(): boolean {
     capture(() => { for (const line of robobLink.flush(now)) enqueue(line); });
     for (const line of promptProbes.flush()) enqueue(line);
+    for (const line of roster.flush()) enqueue(line);
     for (const line of messageReads.flush()) enqueue(line);
     for (const line of renders.flush()) enqueue(line);
     for (const line of calls.flush()) enqueue(line);
@@ -467,6 +526,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   async function tick(): Promise<void> {
     try {
       const at = now();
+      for (const line of roster.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       for (const line of messageReads.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       for (const line of promptProbes.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       if (rolling) { await settled(); return; }

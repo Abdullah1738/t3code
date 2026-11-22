@@ -767,6 +767,8 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
                 log(f"logs_fetch {r['box_id'] or '-'} {detail}")
         except OSError:
             pass
+        from . import resources
+        resources.finalize(r, node_only=True)
 
 
 def _fetch_log(r, budget, *, locked, live, lock_wait, stats) -> str:
@@ -1144,8 +1146,10 @@ def _recover_live_suffix(r, path, ck, length, deadline, stats):
 
 
 def _catch_up_live(r, path, budget, stats, *, recovery_base=None):
-    from . import live_logs
+    from . import live_logs, node_version
     from .runs import _commit, remember_interruption
+    # Staging has its own display checkpoint, but Node provenance belongs to the run's stderr stream.
+    node_path = LOGS_DIR / f"{r['run_id']}.log"
     deadline = time.time() + (10 if budget is None else budget)
     ck = checkpoint(path)
     length = path.stat().st_size
@@ -1177,22 +1181,41 @@ def _catch_up_live(r, path, budget, stats, *, recovery_base=None):
             live_logs.note(r['run_id'], 'flush' if recovery_base is None else 'recovery_staged', bytes=len(data),
                            stdoutOffset=offsets[0], stderrOffset=offsets[1],
                            **{('logBytes' if recovery_base is None else 'staged_bytes'): dst.tell()})
-        with contextlib.closing(live_logs.pages(r['box_id'], r['command_id'], offsets, until=deadline, stats=stats)) as history:
-            for i, page, error in history:
-                attempted.add(i)
-                if error:
-                    errors.append(error)
-                    continue
-                remember_interruption(r['run_id'], page)
-                if api.BACKEND == 'server' and page.get('status'):
-                    from .home_run_observation import observe
-                    observe(r['run_id'], page['status'], status=page['status'], attempt=page.get('attempt'))
-                data = (page.get('data') or '').encode()
-                observed = int(page.get('nextOffset', offsets[i] + len(data)))
-                if data:
-                    flush(i, data)
-                behind[i] = max(0, int(page['size']) - observed) if page.get('size') is not None else 0
-        if len(attempted) < 2:
+        while True:
+            # Metadata can lag a display checkpoint written by an older client.
+            read_offsets = [offsets[0], min(offsets[1], node_version.stderr_offset(node_path))]
+            replay = False
+            with contextlib.closing(live_logs.pages(r['box_id'], r['command_id'], read_offsets,
+                                                   until=deadline, stats=stats)) as history:
+                for i, page, error in history:
+                    attempted.add(i)
+                    if error:
+                        errors.append(error)
+                        continue
+                    before_observation = time.time()
+                    remember_interruption(r['run_id'], page, until=deadline)
+                    # Keep validated pages arriving at the deadline; stop if recording metadata used the budget.
+                    if time.time() > before_observation and time.time() >= deadline:
+                        errors.append('timeout')
+                        break
+                    if i == 1 and read_offsets[i] > node_version.stderr_offset(node_path):
+                        replay = True
+                        break
+                    if api.BACKEND == 'server' and page.get('status'):
+                        from .home_run_observation import observe
+                        observe(r['run_id'], page['status'], status=page['status'], attempt=page.get('attempt'))
+                    data = (page.get('data') or '').encode()
+                    observed = int(page.get('nextOffset', read_offsets[i] + len(data)))
+                    if i == 1:
+                        node_version.capture_stderr(node_path, data, read_offsets[i])
+                    visible = data[max(0, offsets[i] - read_offsets[i]):]
+                    if visible:
+                        flush(i, visible)
+                    read_offsets[i] = observed
+                    behind[i] = max(0, int(page['size']) - observed) if page.get('size') is not None else 0
+            if not replay:
+                break
+        if len(attempted) < 2 and 'timeout' not in errors:
             errors.append('timeout')
     if errors or any(behind):
         if any(behind):
@@ -1205,6 +1228,7 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
     if live:
         return _catch_up_live(r, path, budget, stats)
     from .runs import remember_interruption
+    from . import node_version
     started = time.time()
     deadline = started + (30 if budget is None else budget)
     tmp = None
@@ -1244,6 +1268,11 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                     dst.write(chunk)
                     left -= len(chunk)
             for i, which in enumerate(('stdout', 'stderr')):
+                # An older waiter may have committed the display log without the stderr-only receipt projection.
+                # Replay that stream for metadata, retaining the existing log bytes and their delivery positions.
+                read_offset = offsets[i]
+                if i == 1:
+                    read_offset = min(read_offset, node_version.stderr_offset(path))
                 header, trimming = bytearray(), which == 'stderr'
                 snapshot = None
                 empty_pages = 0
@@ -1252,7 +1281,7 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                         return 'incomplete:timeout'
                     page_started = monotonic()
                     try:
-                        page = api.history_logs(r['box_id'], r['command_id'], which, offsets[i], deadline=deadline)
+                        page = api.history_logs(r['box_id'], r['command_id'], which, read_offset, deadline=deadline)
                     finally:
                         if stats is not None:
                             elapsed_ms = round((monotonic() - page_started) * 1000, 3)
@@ -1266,6 +1295,9 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                     if time.time() >= deadline:
                         return 'incomplete:timeout'
                     remember_interruption(r['run_id'], page, until=deadline)
+                    if i == 1 and read_offset > node_version.stderr_offset(path):
+                        read_offset = 0
+                        continue
                     if live and api.BACKEND == 'server' and page.get('status'):
                         from .home_run_observation import observe
                         observe(r['run_id'], page['status'], status=page['status'], attempt=page.get('attempt'))
@@ -1277,21 +1309,22 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                         deadline = started + min(180, 30 + sum(sizes) / 1_000_000)
                     data = (page.get('data') or '').encode()
                     nxt = page.get('nextOffset')
-                    nxt = offsets[i] + len(data) if nxt is None else int(nxt)
+                    nxt = read_offset + len(data) if nxt is None else int(nxt)
                     # Older home servers omit size; an empty live page can mean the command is quiet.
-                    if live and not data and nxt == offsets[i] and not page.get('done') and page.get('size') is None:
+                    if live and not data and nxt == read_offset and not page.get('done') and page.get('size') is None:
                         break
-                    if nxt <= offsets[i] and not page.get('done') and not (live and snapshot is not None and nxt >= snapshot):
-                        if not live and r['mode'] == 'bg' and not length and not data and nxt == offsets[i] and empty_pages < 2:
+                    if nxt <= read_offset and not page.get('done') and not (live and snapshot is not None and nxt >= snapshot):
+                        if not live and r['mode'] == 'bg' and not length and not data and nxt == read_offset and empty_pages < 2:
                             empty_pages += 1
                             continue
                         return 'incomplete:no progress'
-                    if nxt != offsets[i] + len(data):
+                    if nxt != read_offset + len(data):
                         return 'incomplete:invalid history offset'
                     if remote.get('lengths'):
                         # stdout matches its prefix; stderr also has the outer wrapper's PID diagnostic first.
+                        # Metadata replay may rewind reads; hashes retain their already consumed progress.
                         expected = remote['lengths'][i]
-                        payload = data
+                        payload = data[max(0, offsets[i] - read_offset):]
                         if trimming:
                             header.extend(payload)
                             if b'\n' not in header and len(header) <= 256:
@@ -1306,10 +1339,13 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                         chunk = payload[:max(0, expected - copied[i])]
                         digests[i].update(chunk)
                         copied[i] += len(chunk)
-                    skip = max(0, ck[which + 'Offset'] - offsets[i]) if remote else 0
+                    if i == 1:
+                        node_version.capture_stderr(path, data, read_offset)
+                    skip = max(0, max(ck[which + 'Offset'], offsets[i]) - read_offset)
                     dst.write(data[skip:])
                     empty_pages = 0
-                    offsets[i] = nxt
+                    read_offset = nxt
+                    offsets[i] = max(offsets[i], nxt)
                     if live and not remote and dst.tell() >= length:
                         # Publish each validated page before fetching more: a later failure must keep this progress.
                         dst.flush()

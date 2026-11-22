@@ -3011,6 +3011,99 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect.each(["inProgress", "completed", "empty"] as const)(
+    "interrupts an unowned native turn read from Codex: %s",
+    (status) =>
+      Effect.gen(function* () {
+        const nativeThreadId = `orphan-probe-${status}`;
+        const nativeTurnId = "unowned-native-turn";
+        const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "unused" });
+        const threadReply = preamble[4]!;
+        if (
+          threadReply.type !== "emit_inbound" ||
+          typeof threadReply.frame !== "object" ||
+          threadReply.frame === null ||
+          !("result" in threadReply.frame)
+        )
+          throw new Error("Missing thread fixture");
+        const thread = (threadReply.frame.result as { thread: Record<string, unknown> }).thread;
+        const requests: Array<string> = [];
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: `orphan-probe-${status}`,
+            entries: [
+              ...preamble.slice(0, 5),
+              {
+                type: "expect_outbound",
+                frame: {
+                  id: 3,
+                  method: "thread/read",
+                  params: { threadId: nativeThreadId, includeTurns: true },
+                },
+              },
+              {
+                type: "emit_inbound",
+                frame: {
+                  id: 3,
+                  result: {
+                    thread: {
+                      ...thread,
+                      turns:
+                        status === "empty"
+                          ? []
+                          : [
+                              {
+                                id: nativeTurnId,
+                                items: [],
+                                itemsView: "notLoaded",
+                                status,
+                                error: null,
+                                startedAt: 1782622440,
+                                completedAt: status === "completed" ? 1782622450 : null,
+                                durationMs: null,
+                              },
+                            ],
+                    },
+                  },
+                },
+              },
+              ...(status === "inProgress"
+                ? [
+                    {
+                      type: "expect_outbound" as const,
+                      frame: {
+                        id: 4,
+                        method: "turn/interrupt",
+                        params: { threadId: nativeThreadId, turnId: nativeTurnId },
+                      },
+                    },
+                    { type: "emit_inbound" as const, frame: { id: 4, result: {} } },
+                  ]
+                : []),
+            ],
+          }),
+          () => Effect.void,
+          (method) =>
+            Effect.sync(() => {
+              requests.push(method);
+            }),
+        );
+        assert.equal(
+          yield* harness.runtime.interruptOrphanedTurn!({ providerThread: harness.providerThread }),
+          status === "inProgress",
+        );
+        assert.equal(
+          requests.filter((method) => method === "turn/interrupt").length,
+          status === "inProgress" ? 1 : 0,
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
   it.effect.each(
     (["completed", "failed", "interrupted"] as const).flatMap((status) =>
       (["before-terminal", "after-terminal"] as const).map((reply) => [status, reply] as const),

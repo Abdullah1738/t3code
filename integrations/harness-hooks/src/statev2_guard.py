@@ -85,6 +85,30 @@ NODE_VALUE_OPTIONS = {
     '--trace-event-categories', '--trace-event-file-pattern', '--trace-require-module',
     '--unhandled-rejections', '--use-largepages', '--v8-pool-size', '--watch-kill-signal', '--watch-path',
 }
+BUN_SUBCOMMANDS = {
+    'test', 'install', 'i', 'add', 'a', 'remove', 'rm', 'update', 'outdated', 'audit',
+    'dedupe', 'prune', 'link', 'unlink', 'publish', 'patch', 'pm', 'info', 'why',
+    'build', 'init', 'create', 'c', 'upgrade', 'completions', 'x', 'repl', 'exec',
+}
+# Required global operands from Bun 1.4 help. Inspector addresses are '=' only;
+# preload and inline code operands stay on their content-scanning paths.
+BUN_VALUE_OPTIONS = {
+    '--cwd', '--filter', '-F', '--elide-lines', '--shell', '--watch-kill-signal',
+    '--cpu-prof-name', '--cpu-prof-dir', '--cpu-prof-interval', '--heap-prof-name',
+    '--heap-prof-dir', '--heap-prof-interval', '--install', '--port', '--conditions',
+    '--fetch-preconnect', '--max-http-header-size', '--dns-result-order',
+    '--redirect-warnings', '--disable-warning', '--title', '--unhandled-rejections',
+    '--console-depth', '--user-agent', '--cron-title', '--cron-period', '--main-fields',
+    '--extension-order', '--tsconfig-override', '--define', '-d', '--drop', '--feature',
+    '--loader', '-l', '--jsx-factory', '--jsx-fragment', '--jsx-import-source',
+    '--jsx-runtime', '--env-file', '--config', '-c',
+}
+# Bun 1.4 test options; optional numeric operands must not swallow a test file.
+BUN_TEST_VALUE_OPTIONS = {
+    '-t', '--test-name-pattern', '--timeout', '--rerun-each', '--retry', '--seed',
+    '--coverage-reporter', '--coverage-dir', '--reporter', '--reporter-outfile',
+    '--max-concurrency', '--path-ignore-patterns', '--parallel-delay', '--shard', '--timings',
+}
 REASON = (
     "statev2 guard: this command was NOT run (owner incident 2026-11-05).\n"
     "Shell reads of Robob's live statev2.sqlite and OpenCode's live opencode.db are blocked, "
@@ -2890,6 +2914,8 @@ def _interpreter_args(binary, args):
         operands |= {"-o", "+o", "-O", "+O"}
     if binary in {"node", "bun", "deno"}:
         operands |= {"--test-name-pattern", "--test-skip-pattern", "--test-reporter", "--test-reporter-destination", "--test-concurrency"}
+    if binary == 'bun':
+        operands |= BUN_VALUE_OPTIONS
     result, index = [], 0
     while index < len(args):
         flag = args[index]
@@ -2901,6 +2927,50 @@ def _interpreter_args(binary, args):
         if flag not in operands:
             result.append(flag)
     return result
+
+
+def _bun_arguments(args):
+    mode, result, directories, index, options = None, [], [], 0, True
+    explicit_run = False
+    while index < len(args):
+        arg = args[index]
+        flag, equal, value = arg.partition('=')
+        if options and flag in {'-', '-e', '--eval', '-p', '--print'}:
+            return 'script', result + args[index:], directories
+        if options and flag == '--preload':
+            result.append(arg)
+            if not equal and index + 1 < len(args):
+                index += 1
+                result.append(args[index])
+        elif options and flag in BUN_VALUE_OPTIONS | (BUN_TEST_VALUE_OPTIONS if mode == 'test' else set()):
+            if not equal:
+                index += 1
+                value = args[index] if index < len(args) else ''
+            if flag == '--cwd':
+                directories.append(value)
+        elif options and mode == 'test' and flag in {'--bail', '--parallel'}:
+            if not equal and index + 1 < len(args) and args[index + 1].isdigit():
+                index += 1
+        elif options and arg == '--':
+            options = False
+            result.append(arg)
+        elif mode is None and not explicit_run and options and arg == 'run':
+            explicit_run = True
+        elif mode is None and not explicit_run and options and arg in BUN_SUBCOMMANDS:
+            mode = arg
+            if mode not in {'test', 'exec'}:
+                return mode, result + args[index + 1:], directories
+        elif not options or not arg.startswith('-'):
+            if mode is None:
+                mode = 'script' if '/' in arg or re.search(r'\.(?:[cm]?[jt]s|[jt]sx)$', arg) else 'task'
+                return mode, result + args[index:], directories
+            if mode == 'exec':
+                return mode, result + args[index:], directories
+            result.append(arg)
+        else:
+            result.append(arg)
+        index += 1
+    return mode or 'script', result, directories
 
 
 def _node_arguments(args):
@@ -3079,6 +3149,118 @@ def _offbox_payload(words, *, known_only=True):
             # caller proof through flags that may change execution bindings.
             return words[words.index('--', index) + 1:] if not known_only and '--' in words[index:] else None
     return None
+
+
+# offbox_lib/fallback.allowed refuses a local fallback for any command string
+# containing one of these; cli.py joins several --step values with '; '.
+OFFBOX_NO_FALLBACK_CHARACTERS = frozenset(';|&`$\n<>')
+# Characters a double-quoted word keeps literally; $ and ` still expand there.
+OFFBOX_DOUBLE_QUOTED_LITERALS = frozenset(';|&\n<>')
+OFFBOX_VALUE_FLAGS = frozenset({'--include', '--size', '--template', '--base', '--pull', '--env', '--step'})
+
+
+def _offbox_certain_text(raw, quoted):
+    # Only characters offbox is sure to receive count. Caller-side expansions
+    # ($X, $(...), unquoted globs) may vanish before offbox parses its argv.
+    text = []
+    for key in re.findall(r'\0guard_[a-z_]+_\d+__', raw):
+        value = quoted.get(key, '')
+        if key.startswith(('\0guard_literal_double_', '\0guard_double_')):
+            text.append(''.join(char for char in value if char in OFFBOX_DOUBLE_QUOTED_LITERALS))
+        elif key.startswith('\0guard_literal_'):
+            text.append(value)
+    return ''.join(text)
+
+
+def _offbox_remote_only(words, raw_words, quoted):
+    """True when offbox can never run this `offbox run` on the Mac.
+
+    Mirrors offbox_lib/cli.py: --bg, --no-fallback and --remote never fall back
+    (_pre_start_wait_applies and the "--bg can't fall back" branch), several
+    --step values run as one '; '-joined string, and fallback.allowed refuses
+    any command string with OFFBOX_NO_FALLBACK_CHARACTERS. Its executable
+    allowlist is deliberately not mirrored: widening it in offbox must never
+    widen this skip. Anything unrecognised counts as able to fall back.
+    """
+    if (len(words) < 3 or len(raw_words) != len(words) or
+            os.path.basename(words[0]) != 'offbox' or words[1] != 'run'):
+        return False
+    steps, index = [], 2
+    while index < len(words):
+        word = words[index]
+        flag, equal, value = word.partition('=')
+        # argparse's REMAINDER starts the command at the first positional.
+        if word == '--' or not word.startswith('-'):
+            break
+        if flag in {'--bg', '--no-fallback', '--remote'} and not equal:
+            return True
+        if flag not in OFFBOX_VALUE_FLAGS and flag not in {'--git', '--fresh', '--no-sync', '--no-retry'}:
+            return False
+        if flag in OFFBOX_VALUE_FLAGS and not equal:
+            index += 1
+            if index >= len(words) or words[index].startswith('-'):
+                return False
+            value, raw = words[index], raw_words[index]
+        else:
+            raw = raw_words[index]
+        if flag == '--step':
+            steps.append(raw)
+        index += 1
+    command = raw_words[index + 1:] if index < len(words) and words[index] == '--' else raw_words[index:]
+    if steps and command or not steps and not command:
+        return False
+    if len(steps) > 1:
+        return True
+    return any(char in OFFBOX_NO_FALLBACK_CHARACTERS
+               for raw in steps or command for char in _offbox_certain_text(raw, quoted))
+
+
+LIVE_DIRECTORY = re.compile(
+    r"(?:\.robob|robob-data)/userdata(?![\w.-])|(?:\.local/share/opencode|opencode-data)(?![\w.-])|"
+    rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata(?![\w.-])")
+
+
+def _live_database_match(text):
+    # A remote-only payload is harmless on the box, but no real payload names a
+    # live DB or the directory holding one (cd there, glob *.sqlite, ...).
+    # Quotes and backslashes may split one path ("$HOME"/.t3/...), so the
+    # dequoted text is matched too.
+    for form in (text, re.sub(r"""["'\\]""", '', text)):
+        form = REPLICA.sub(' ', form)
+        if match := LIVE.search(form):
+            return match, True
+        if match := LIVE_DIRECTORY.search(form):
+            return match, False
+    return None, False
+
+
+def _names_live_database(text):
+    return _live_database_match(text)[0] is not None
+
+
+def _offbox_syncs_from_live_directory(cwd):
+    # Outside a git repo offbox syncs cwd itself (offbox_lib/identity.repo_root),
+    # so a run from inside or above a live DB directory copies it off the Mac.
+    if cwd is None:
+        return True
+    path = Path(os.path.realpath(cwd))
+    if LIVE_DIRECTORY.search(str(path) + '/'):
+        return True
+    return any(path == database.parent or database.parent in path.parents or path in database.parents
+               for database in protected_databases())
+
+
+def _syncs_live_database(value, cwd):
+    # --include copies a local path to the box and --pull writes one back, so
+    # both act on the Mac whether or not the payload can fall back.
+    if _names_live_database(value):
+        return True
+    path = _literal_path(value, cwd)
+    if path is None:
+        return bool(LIVE_DIRECTORY.search(value))
+    return any(path == database or path in database.parents or
+               path.parent == database.parent and path.name.startswith(database.name + '-')
+               for database in protected_databases())
 
 
 def _safe_fixture_assignment(word):
@@ -3315,7 +3497,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return binary if binary in {'node', 'bun', 'deno', 'bash', 'sh', 'zsh', 'dash', 'ksh',
                                     'cat', 'tee', 'sed', 'chmod', 'mkdir', 'ls', 'test', 'echo',
                                     'cp', 'mv', 'rsync', 'ditto', 'install', 'git', 'offbox',
-                                    'perl', 'truncate', 'true', 'printf', 'mktemp'} else 'opaque binary'
+                                    'perl', 'truncate', 'true', 'printf', 'mktemp', 'curl', 'wget', 'uv'} else 'opaque binary'
 
     def invalidate(paths, site, words=(), reason=None, destination=None):
         target = invalidated_written if destination is None else destination
@@ -4659,7 +4841,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     def scan_remote(source, directory, depth, input_words=(), input_bodies=None, inherit_environment=False, opaque=None, preservation=True):
         # Synced source evidence may be read remotely, but remote writes,
         # bindings and cwd cannot prove anything about the caller's files.
-        # offbox may fall back to running locally, so its payload keeps the
+        # Only payloads offbox may run locally after an outage reach here
+        # (remote-only ones use check_remote_only), so the payload keeps the
         # caller's startup and lookup bindings (BASH_ENV, PATH, ...), and the
         # exact-invocation proof still reads the caller's whole command.
         environment = None
@@ -4676,6 +4859,21 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                   _cwd_candidates=unknown_directories)
         paths.extend(path for path in remote_paths if path not in paths)
         check_budget()
+
+    def check_remote_only(texts, directory, inputs=()):
+        # offbox never runs this payload on the Mac (_offbox_remote_only), so
+        # the scripts and test files it executes, its writes and its mktemp
+        # paths all act on the box, which has no live database. Owner, 18 Nov
+        # (#221): skip what runs inside it. Only live-DB paths the caller
+        # spells, and stdin the caller's shell opens here, still reach the Mac.
+        for text in texts:
+            match, database = _live_database_match(text)
+            if match:
+                raise LiveRead('live-database-read', None if database else
+                               f"The offbox payload names the live database directory {_token(match[0])}.")
+        for _, target in inputs:
+            if any(direct_read(['cat', *values], directory) for values in variants([target])):
+                raise LiveRead('live-database-read')
 
     def inspect(words, directory, depth, bodies, quoted, changed_sources, cwd_only=False, binding_preflight=False):
         nonlocal unknown_cause, invocation_written, invocation_fresh, invocation_literals, invocation_reader_literals, invocation_quoted, invocation_glob_escaped, unsafe_bindings, unsafe_binding_cause, noclobber, last_invalidation, invocation_invalidation
@@ -4853,6 +5051,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         assignment_prefix = True
         while words:
             binary = os.path.basename(words[0])
+            if words[0] == 'command' and words[1:2] in (['-v'], ['-V']) and not external_lookup:
+                # The builtin only reports how a name resolves and never runs
+                # it, so `if ! command -v uv` must not void proofs as if uv ran.
+                words = ['true']
+                break
             if binary in {'command', 'exec', 'nohup', 'sudo', 'nice', 'timeout', 'env', 'uv', 'offbox'}:
                 assignment_prefix = False
                 builtin = words[0] in {'command', 'exec'} and not external_lookup
@@ -4918,13 +5121,25 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             child_directory = True
                             directory = change_directory(value, directory)
             elif binary == "offbox" and words[1:2] == ['run']:
+                # A PATH/startup binding or a spelled path may run some other
+                # local program named offbox; only the plain lookup is trusted.
+                remote_only = (not unsafe_bindings and words[0] == 'offbox' and
+                               not _offbox_syncs_from_live_directory(directory) and
+                               _offbox_remote_only(words, raw_words[len(raw_words) - len(words):], quoted))
                 options_end = words.index('--') if '--' in words else len(words)
                 for index in range(2, options_end):
                     flag, equal, value = words[index].partition('=')
+                    if flag in {'--include', '--pull'}:
+                        target = value if equal else words[index + 1] if index + 1 < options_end else ''
+                        if target and any(_syncs_live_database(values[0], directory) for values in variants([target])):
+                            raise LiveRead('live-database-read', f"offbox {flag} {_token(target)} reaches a protected live database.")
                     if flag == '--step':
                         step = value if equal else words[index + 1] if index + 1 < options_end else ''
                         if not step:
                             raise AmbiguousScript('offbox --step has no command')
+                        if remote_only:
+                            check_remote_only([step], directory)
+                            continue
                         # Steps are shell commands, never exact-invocation
                         # fixture proofs. Inspect them even beside a payload.
                         scan_remote(step, directory, depth + 1, inherit_environment=True,
@@ -4949,7 +5164,16 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 for op, target in redirects:
                     if op in {'<', '<>'}:
                         remote_input.extend([op, target])
-                if words:
+                if words and remote_only:
+                    try:
+                        texts = [argv[0] if len(argv) == 1 else shlex.join(argv) for argv in caller_argv(len(words))]
+                    except AmbiguousScript as error:
+                        word = next((word for word in words if '$' in word and word not in invocation_literals), None)
+                        raise AmbiguousScript(path_refusal(word, directory, os.path.basename(words[0]), unsafe_binding_cause or str(error)) if word else str(error)) from error
+                    texts.extend(documents)
+                    texts.extend(text for text, _ in here_strings)
+                    check_remote_only(texts, directory, [(op, target) for op, target in redirects if op in {'<', '<>'}])
+                if words and not remote_only:
                     trusted, empty, reasons = {}, set(), {}
                     payload_binary = next((os.path.basename(word) for word in words
                                            if os.path.basename(word) in {'bash', 'sh', 'zsh', 'dash', 'ksh', 'node', 'bun', 'deno'} or
@@ -4995,6 +5219,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                     remote_input, remote_bodies, inherit_environment=True,
                                     opaque=(trusted, empty, reasons) if len(words) > 1 else None,
                                     preservation=wrapper_proved)
+                if words:
                     if may_change_scripts(words, directory, documents):
                         tool_changes.add(None)
                         invalidate(written, 'offbox payload', words, destination=changed_sources)
@@ -5046,6 +5271,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 output_redirects.extend(('>', arg) for arg in args if not arg.startswith('-'))
             for op, target in output_redirects:
                 if op not in {'>', '>>', '>|', '&>', '&>>', '<>', '>&'} or op == '>&' and re.fullmatch(r'\d+|-', target):
+                    continue
+                if target == '/dev/null' and op != '<>':
+                    # Discarded output cannot replace a script; without this a
+                    # `>/dev/null` in an if-test is blamed for a later download.
                     continue
                 key = opaque_key(target, directory)
                 # A quoted, contained sibling with a distinct filesystem identity
@@ -5310,7 +5539,12 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             raise AmbiguousScript("migrate-dev-db package command not found")
         shells = {"bash", "sh", "zsh", "dash", "ksh"}
         python = bool(re.fullmatch(r"python[\d.]*", binary))
+        bun_mode = None
         if binary == 'bun':
+            bun_mode, args, bun_directories = _bun_arguments(args)
+            if bun_directories:
+                # Bun resolves only the last --cwd against the invocation directory.
+                directory = change_directory(bun_directories[-1], directory)
             remaining, index, options = [], 0, True
             while index < len(args):
                 arg = args[index]
@@ -5329,11 +5563,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     add(value, directory, 'bun')
                 else:
                     remaining.append(arg)
-                    if arg == '--' or arg not in {'test', 'run'} and not arg.startswith('-') and args[:1] != ['test']:
+                    if arg == '--' or not arg.startswith('-') and bun_mode != 'test':
                         options = False
                 index += 1
             args = remaining
-        if python or binary in shells | {"bun", "deno"}:
+        if python or binary in shells | {"deno"}:
+            args = _interpreter_args(binary, args)
+        if binary == 'bun':
             args = _interpreter_args(binary, args)
         node_test = False
         node_inputs = []
@@ -5346,9 +5582,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 if argument in invocation_literals:
                     invocation_literals.add(operand)
             args, node_inputs, node_test, node_runtime_options = _node_arguments(args)
-        if binary == 'bun' and args[:1] == ['test']:
-            node_test, args = True, args[1:]
-        if binary in {'bun', 'deno'} and args[:1] == ['run']:
+        if binary == 'deno' and args[:1] == ['run']:
             args = _interpreter_args(binary, args[1:])
         program_args = list(args)
         while (program_args and program_args[0] != '-' and
@@ -5357,6 +5591,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             if flag in {'--', '-c'} or binary not in shells and flag in {'-e', '--eval', '-p', '--print', '-m'}:
                 break
         stdin_code = not args or program_args[:1] == ['-'] or all(arg.startswith('-') for arg in args)
+        if bun_mode and bun_mode != 'script':
+            stdin_code = False
         shell_options = args[:len(args) - len(program_args)] if binary in shells else []
         shell_stdin = any(re.fullmatch(r'-[a-z]*s[a-z]*', arg) for arg in shell_options)
         shell_command = any(re.fullmatch(r'-[a-z]*c[a-z]*', arg) for arg in shell_options)
@@ -5535,6 +5771,21 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 return finish_invocation()
         if binary == "eval":
             return scan(" ".join(args), directory, depth + 1)
+        if bun_mode == 'exec':
+            if program_args:
+                scan_child(program_args[0], directory, depth + 1)
+            return finish_invocation()
+        if bun_mode == 'test':
+            # Match vp test run after a non-literal cd; filters are not scripts.
+            for target in args:
+                if target.startswith('-') or directory is None and not (os.path.isabs(target) or target.startswith(('~/', '$HOME/', '${HOME}/'))):
+                    continue
+                path = script_path(target, directory, binary)
+                if path.is_file():
+                    add(target, directory, binary, test_target=target)
+            return finish_invocation()
+        if bun_mode and bun_mode != 'script':
+            return finish_invocation()
         if binary == 'ssh':
             remote = list(args)
             while remote and remote[0].startswith('-'):

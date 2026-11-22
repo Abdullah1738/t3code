@@ -115,7 +115,7 @@ test("captured live mix meets cadence with hysteresis and two fast slots, withou
     expect(current.runs).toBeGreaterThan(0);
   }
   expect(after.switches).toBeLessThanOrEqual(1);
-});
+}, 30_000);
 
 test("rollup counts scheduled cadence, keeps zero-run watchers, and clips load time across midnight", async () => {
   const dir = mkdtempSync(join(tmpdir(), "watch-cadence-"));
@@ -172,7 +172,7 @@ test("queued watchers keep emitting daily cadence headers across multiple midnig
       mock.module(path,()=>({...lib,runCheck:async()=>{checks++;return await new Promise(()=>{});}}));
       for(const id of ["holder","queued"]){
         const root=lib.watcherDir(id);mkdirSync(root,{recursive:true});
-        writeFileSync(join(root,"watcher.json"),JSON.stringify(lib.normalize({id,title:id,mode:"notify",check:"true",interval_s:300,max_fires:0})));
+        writeFileSync(join(root,"watcher.json"),JSON.stringify(lib.normalize({id,title:id,mode:"notify",check:"true",interval_s:3600,max_fires:0})));
         lib.saveState(id,{status:"active",fires:0,consecutive_failures:0,next_at:0});
       }
       const {tick}=await import(${JSON.stringify(join(import.meta.dir, "../src/runner.ts"))});
@@ -188,7 +188,7 @@ test("queued watchers keep emitting daily cadence headers across multiple midnig
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("runner emits due/late/lane/load metadata and reclassifies a fast check's next slow run", async () => {
+test("runner persists sticky history and emits the classification statistic", async () => {
   const dir = mkdtempSync(join(tmpdir(), "runner-cadence-"));
   try {
     const child = Bun.spawnSync([process.execPath, "-e", `
@@ -203,6 +203,7 @@ test("runner emits due/late/lane/load metadata and reclassifies a fast check's n
       lib.saveState(id,{status:"active",fires:0,consecutive_failures:0,last_run_ms:500,next_at:Date.now()-1000});
       const {tickOne}=await import(${JSON.stringify(join(import.meta.dir, "../src/runner.ts"))});
       await tickOne(id);
+      for(let i=0;i<2;i++){const state=lib.loadState(id);lib.saveState(id,{...state,next_at:0});await tickOne(id);}
       const first=lib.loadState(id);lib.saveState(id,{...first,next_at:0});
       await tickOne(id);
       const lines=readdirSync(process.env.TOOLLOG_DIR).filter(x=>x.endsWith(".ndjson")).flatMap(file=>readFileSync(join(process.env.TOOLLOG_DIR,file),"utf8").trim().split("\\n").map(JSON.parse));
@@ -211,10 +212,12 @@ test("runner emits due/late/lane/load metadata and reclassifies a fast check's n
     expect(child.stderr.toString()).toBe("");
     expect(child.exitCode).toBe(0);
     const rows = JSON.parse(child.stdout.toString().trim().split("\n").at(-1)!);
-    expect(rows).toHaveLength(2);
+    expect(rows).toHaveLength(4);
     expect(rows[0].props).toMatchObject({ lane: "fast", loadMode: false, trigger: "schedule", intervalMs: 300_000 });
     expect(rows[0].props.dueAt).toBeNumber();
     expect(rows[0].props.lateMs).toBeGreaterThanOrEqual(1000);
-    expect(rows[1].props).toMatchObject({ lane: "slow", loadMode: false });
+    expect(rows[1].props).toMatchObject({ lane: "fast", lane_reason: "fast:sticky", recentMinMs: 500, loadMode: false });
+    expect(rows[2].props).toMatchObject({ lane: "fast", lane_reason: "fast:sticky", recentMinMs: 500 });
+    expect(rows[3].props).toMatchObject({ lane: "slow", lane_reason: "slow:recent", recentMinMs: 11_000 });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

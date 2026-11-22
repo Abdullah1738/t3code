@@ -46,7 +46,7 @@ class TransportTests(unittest.TestCase):
             cmd, path = runs.command_payload('echo SMALL_OK', 'run-small')
         self.assertIsNone(path)
         self.assertEqual(hashlib.sha256(cmd.encode()).hexdigest(),
-                         '5656cf0c3f32b55922ad9bc735f7bd6c8cef145b166381d7f89e209da49eddf4')
+                         '2407c2cbebeb178fd87f5c9969bfa41295b3d2ea6a60e5500721df60b6c11a5f')
 
     def test_final_bytes_include_crpko_and_node_preambles(self):
         with tempfile.TemporaryDirectory() as d, patch.object(api, 'BACKEND', 'server'):

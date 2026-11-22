@@ -68,7 +68,7 @@ class CpuTests(unittest.TestCase):
         normal = self.runner(text=text)
         def run(argv, **kwargs):
             if argv[0] == '/usr/bin/top':
-                self.assertEqual(kwargs['timeout'], 5)
+                self.assertEqual(kwargs['timeout'], 15)
                 return SimpleNamespace(returncode=0, stdout='PID %CPU TIME\n0 0.0 06:18:29\nPID %CPU TIME\n0 1.5 06:18:30\n')
             if argv[:3] == ['/bin/ps', '-ww', '-o']:
                 self.calls.append(argv)
@@ -278,6 +278,7 @@ class CpuTests(unittest.TestCase):
         self.assertLessEqual(len(encoded), 8192)
         self.assertLess(len(record['props']['top']), 15)
         self.assertIn('topOmitted', record['props'])
+        self.assertEqual(record['props']['kernelTaskWallMs'], snapshot['kernelTaskWallMs'])
 
     def test_kernel_rate_limit_persists_across_quiet_samples_and_midnight(self):
         now = 1_800_000_000
@@ -288,22 +289,23 @@ class CpuTests(unittest.TestCase):
                 top.append(argv)
             return run(argv, **kwargs)
         for offset, load, count, skipped in ((0, 40, 1, False), (60, 40, 1, True),
-                (120, 1, 1, False), (299, 40, 1, True), (300, 40, 2, False)):
+                (120, 1, 1, False), (1799, 40, 1, True), (1800, 40, 2, False)):
             with self.subTest(offset=offset), patch.object(cpu.time, 'time', return_value=now+offset), \
                     patch.object(cpu.os, 'getloadavg', return_value=(load, 1, 1)):
                 value = cpu.sample(counted, ticks_read=lambda: [1]*4)
                 self.assertEqual(len(top), count)
                 self.assertEqual(value.get('kernelTaskSkipped') == 'rate', skipped)
                 self.assertEqual(value['kernelTaskPct'], None if load == 1 or skipped else 1.5)
+                self.assertEqual('kernelTaskWallMs' in value, load != 1 and not skipped)
         state = cpu.read_state('cpu')
         state['spikeDay'] = 'previous-day'
         cpu.save_state('cpu', state)
-        with patch.object(cpu.time, 'time', return_value=now+301), \
+        with patch.object(cpu.time, 'time', return_value=now+1801), \
                 patch.object(cpu.os, 'getloadavg', return_value=(40, 1, 1)):
             cpu.sample(counted, ticks_read=lambda: [1]*4)
         self.assertEqual(len(top), 2)
         self.assertEqual(self.events()[-1]['props']['kernelTaskSkipped'], 'rate')
-        self.assertEqual(cpu.read_state('cpu')['kernelTaskAt'], now+300)
+        self.assertEqual(cpu.read_state('cpu')['kernelTaskAt'], now+1800)
 
     def test_kernel_failure_and_clock_rollback_consume_cooldown(self):
         now = 1_800_000_000
@@ -312,14 +314,43 @@ class CpuTests(unittest.TestCase):
         def failed(argv, **kwargs):
             if argv[0] == '/usr/bin/top':
                 calls.append(argv)
-                raise subprocess.TimeoutExpired(argv, 5)
+                self.assertEqual(kwargs['timeout'], 15)
+                raise subprocess.TimeoutExpired(argv, 15)
             return run(argv, **kwargs)
         with patch.object(cpu.os, 'getloadavg', return_value=(40, 1, 1)):
-            for offset in (0, 60, -60, 0, 240):
+            for offset in (0, 60, -60, 0, 1739, 1740):
                 with patch.object(cpu.time, 'time', return_value=now+offset):
                     cpu.sample(failed, ticks_read=lambda: [1]*4)
         self.assertEqual(len(calls), 2)
-        self.assertEqual(cpu.read_state('cpu')['kernelTaskAt'], now+240)
+        self.assertEqual(cpu.read_state('cpu')['kernelTaskAt'], now+1740)
+
+    def test_kernel_wall_time_logged_for_reading_timeout_and_parse_error(self):
+        run = self.spike_runner()
+        for outcome, elapsed, expected_ms in (('reading', 1.2346, 1235),
+                                             ('timeout', 15.0004, 15000),
+                                             ('parse', 1.2344, 1234)):
+            def runner(argv, **kwargs):
+                if argv[0] == '/usr/bin/top' and outcome != 'reading':
+                    self.assertEqual(kwargs['timeout'], 15)
+                    if outcome == 'timeout':
+                        raise subprocess.TimeoutExpired(argv, 15)
+                    return SimpleNamespace(returncode=0, stdout='invalid')
+                return run(argv, **kwargs)
+            with self.subTest(outcome=outcome), \
+                    patch.object(cpu.time, 'time', return_value=1_800_000_000), \
+                    patch.object(cpu.os, 'getloadavg', return_value=(40, 1, 1)), \
+                    patch.object(cpu.time, 'monotonic', side_effect=[100, 100+elapsed]):
+                cpu.save_state('cpu', {})
+                value = cpu.sample(runner, ticks_read=lambda: [1]*4)
+                self.assertEqual(value['kernelTaskWallMs'], expected_ms)
+                self.assertGreaterEqual(value['kernelTaskWallMs'], 0)
+                spike = self.events()[-1]
+                self.assertEqual(spike['name'], 'cpu.spike')
+                self.assertEqual(spike['props']['kernelTaskWallMs'], expected_ms)
+                if outcome == 'reading':
+                    self.assertEqual(spike['props']['kernelTaskPct'], 1.5)
+                else:
+                    self.assertEqual(spike['props']['kernelTaskError'], outcome)
 
     def test_rusage_reader_precedes_inventory_and_identity_failures_are_visible(self):
         import errno

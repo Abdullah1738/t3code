@@ -73,6 +73,7 @@ import {
   isTransientSqliteReadFailure,
   transientReadRetrySchedule,
 } from "../ardud/durability/transientSqliteRead.ts";
+import { runIngestionFailure } from "../ardud/durability/runPersistenceFailure.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import {
@@ -743,6 +744,7 @@ export const layer: Layer.Layer<
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
     const analyticsContext = yield* Effect.context<never>();
+    const analytics = yield* Effect.serviceOption(Analytics.Analytics);
     const startProgress = yield* Effect.serviceOption(ProviderStartProgress.ProviderStartProgress);
 
     const usageByRun = new Map<
@@ -897,11 +899,15 @@ export const layer: Layer.Layer<
         // Completion cohorts are advanced by Orchestrator while a provider
         // turn is in flight. Do not replay the run snapshot captured at start
         // over a newer acknowledgement, successor, or Stop barrier.
-        const { delegatedCompletion: _delegatedCompletion, ...runWithoutDelegatedCompletion } =
-          input.run;
+        const {
+          delegatedCompletion: _delegatedCompletion,
+          failure: _failure,
+          ...runWithoutDelegatedCompletion
+        } = input.run;
         const finalizedRun: OrchestrationV2Run = {
           ...runWithoutDelegatedCompletion,
           status: persistedStatus,
+          ...(input.terminal.status === "failed" ? { failure: input.terminal.failure } : {}),
           ...(persistedStatus === "cancelled" || persistedStatus === "interrupted"
             ? {
                 cancelReason:
@@ -2103,6 +2109,38 @@ export const layer: Layer.Layer<
               if (event.type === "turn.terminal") {
                 yield* Ref.set(rootTerminalSeen, true);
                 yield* Ref.set(terminalEvent, event);
+                // Some adapters report only the terminal control signal. Persist
+                // that confirmation before a terminal run can look like an orphan.
+                if (
+                  observedRootTurn?.id === event.providerTurnId &&
+                  (observedRootTurn.status === "pending" || observedRootTurn.status === "running")
+                ) {
+                  const ended = {
+                    ...observedRootTurn,
+                    status: event.status,
+                    completedAt: yield* DateTime.now,
+                  };
+                  yield* withIngestionStep(
+                    providerEventIngestor.ingestNormalized({
+                      analyticsContext: {
+                        modelSelection: input.modelSelection,
+                        runtimeMode: input.runtimePolicy.runtimeMode,
+                        interactionMode: input.runtimePolicy.interactionMode,
+                      },
+                      providerSessionId: input.providerSessionId,
+                      providerInstanceId: input.run.providerInstanceId,
+                      threadId: input.run.threadId,
+                      runId: input.run.id,
+                      nodeId: input.rootNode.id,
+                      event: {
+                        type: "provider_turn.updated",
+                        driver: event.driver,
+                        providerTurn: ended,
+                      },
+                    }),
+                  );
+                  observedRootTurn = ended;
+                }
               }
               let storedEventCount = 0;
               const guardRunActivity =
@@ -2111,13 +2149,12 @@ export const layer: Layer.Layer<
                 // Only our committed finalization permits trailing background output.
                 !(yield* Ref.get(rootFinalizationOwned)) &&
                 event.type !== "turn.terminal" &&
-                // Restart supersedes the attempt before interrupting it. Cleanup
-                // still needs its exact root turn's terminal projection.
+                // Identity must reach the orchestrator even after cancellation,
+                // so it can queue Stop for a native start that lost ownership.
                 !(
                   event.type === "provider_turn.updated" &&
                   event.providerTurn.id === rootTurnId &&
-                  event.providerTurn.runAttemptId === input.attempt.id &&
-                  isTerminalProviderTurnStatus(event.providerTurn.status)
+                  event.providerTurn.runAttemptId === input.attempt.id
                 );
               const deliveredEvent = filterAssistantEvent(
                 event.type === "provider_turn.updated" &&
@@ -2322,6 +2359,25 @@ export const layer: Layer.Layer<
                 });
                 if (finalized) return;
                 if (yield* Ref.get(startupFailurePending)) return;
+                const failure = runIngestionFailure(cause);
+                if (failure.category === "persistence") {
+                  if (Option.isSome(analytics)) {
+                    const now = yield* DateTime.now;
+                    yield* recordServerAnalytics(analytics.value, {
+                      ts: DateTime.formatIso(now),
+                      kind: "run.failed",
+                      surface: "server",
+                      route: "orchestrationV2",
+                      threadId: input.run.threadId,
+                      props: {
+                        runId: input.run.id,
+                        failureCategory: failure.category,
+                        failureCode: failure.code ?? "persistence_sql_error",
+                        errorMessage: failure.message.slice(0, 2000),
+                      },
+                    });
+                  }
+                }
                 const providerThread = yield* currentProviderThread;
                 const latestItemOrdinal = yield* Ref.get(latestTurnItemOrdinal);
                 const openSubagents = yield* Ref.get(openRunOwnedSubagents);
@@ -2348,10 +2404,7 @@ export const layer: Layer.Layer<
                     : { loadRunInterruptReason: input.loadRunInterruptReason }),
                   openRunOwnedSubagents: openSubagents,
                   terminal: makeFailedTerminalEvent(
-                    makeProviderFailure({
-                      cause: Cause.squash(cause),
-                      class: "unknown",
-                    }),
+                    failure,
                     latestItemOrdinal + 1,
                     input.session.backgroundTasksEndWithProcess !== true,
                   ),

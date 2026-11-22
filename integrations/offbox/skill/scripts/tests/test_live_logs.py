@@ -132,6 +132,78 @@ class LiveLogsTests(Isolated):
             self.assertEqual(runs.follow('bx', 7, self.path, echo=False, run_id='run-live'), 0)
         self.assertEqual(calls, [(0, 0), (12, len(queue))])
 
+    def test_silent_attach_history_keeps_retry_node_provenance(self):
+        from offbox_lib import node_version, resources
+        from test_node_version import node_receipt
+        _, old = node_receipt('v24.22.1', 'run-live')
+        facts, current = node_receipt('v24.22.3', 'run-live')
+        first = old + 'offbox-command-started: run-live\n'
+        last = current + 'offbox-command-started: run-live\n'
+        calls = []
+        def attach(box, pid, out, err, **kw):
+            calls.append((out, err))
+            if len(calls) == 1:
+                yield dict(type='stderr', data=first, nextOffset=len(first.encode()),
+                           attempt=1, commandId='cmd-live', nodeSetup=dict(stderrOffset=0))
+                self.clock[0] = kw['deadline']
+                raise api.StreamDeadline('silent stream after setup retry')
+            yield dict(type='exit', exitCode=0)
+        def history(box, cmd, stream, offset, **kw):
+            raw = (first + last).encode() if stream == 'stderr' else b''
+            return dict(data=raw[offset:].decode(), nextOffset=len(raw), size=len(raw),
+                        attempt=2, commandId='cmd-live', nodeSetup=dict(stderrOffset=len(first.encode())))
+        with patch.object(api, 'BACKEND', 'server'), patch.object(api, 'cmd_attach', attach), \
+                patch.object(api, 'history_logs', history):
+            self.assertEqual(runs.follow('bx', 7, self.path, echo=False, run_id='run-live'), 0)
+        resources.finalize(dict(self.row()), node_only=True)
+        self.assertEqual(common.read_json(self.path.with_suffix('.state.json'), {})['node'], facts)
+        self.assertEqual(self.path.read_text(), first + last)
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=0, stderrOffset=len((first + last).encode()),
+                                                          logBytes=len((first + last).encode())))
+        self.assertEqual(common.read_json(self.path.with_suffix('.node-attempt.json'), {})['attempt'], 2)
+        self.assertEqual(node_version.stderr_offset(self.path), len((first + last).encode()))
+
+    def test_silent_attach_empty_retry_metadata_cannot_extend_history_deadline(self):
+        from offbox_lib import node_version
+        from test_node_version import node_receipt
+        facts, _ = node_receipt('v24.22.1', 'run-live')
+        runs.save_run_state('run-live', command_id='cmd-live', node=facts)
+        runs.remember_interruption('run-live', dict(commandId='cmd-live', attempt=1,
+                                                   nodeSetup=dict(stderrOffset=0)))
+        runs.save_run_state('run-live', node=facts)
+        calls, locks = [], []
+        actual_lock = runs.file_lock
+        @contextlib.contextmanager
+        def contention(name, timeout=600):
+            if name != 'run-state-run-live':
+                with actual_lock(name, timeout=timeout) as held:
+                    yield held
+                return
+            locks.append(timeout)
+            self.clock[0] += timeout
+            raise common.OffboxError('modeled isolated state lock contention')
+            yield
+        def attach(box, pid, out, err, **kw):
+            calls.append((out, err))
+            if len(calls) == 1:
+                self.clock[0] = kw['deadline']
+                raise api.StreamDeadline('silent stream after setup retry')
+            yield dict(type='exit', exitCode=0)
+        def history(box, cmd, stream, offset, **kw):
+            return dict(data='', nextOffset=0, size=0, attempt=2,
+                        commandId='cmd-live', nodeSetup=dict(stderrOffset=0))
+        def advance(seconds):
+            self.clock[0] += seconds
+        with patch.object(api, 'BACKEND', 'server'), patch.object(api, 'cmd_attach', attach), \
+                patch.object(api, 'history_logs', history), patch.object(runs, 'file_lock', contention), \
+                patch.object(runs.time, 'sleep', side_effect=advance):
+            self.assertEqual(runs.follow('bx', 7, self.path, echo=False, run_id='run-live'), 0)
+        self.assertTrue(locks)
+        self.assertEqual(set(locks), {0})
+        self.assertLessEqual(self.clock[0], 1000 + live_logs.ATTACH_S + live_logs.HISTORY_S)
+        self.assertEqual(common.read_json(self.path.with_suffix('.node-attempt.json'), {})['attempt'], 2)
+        self.assertEqual(self.path.read_bytes(), b'')
+
     def test_successive_logs_advance_stderr_even_when_stdout_exceeds_its_page_budget(self):
         requests = []
         def history(box, cmd, stream, offset, **kw):
@@ -584,6 +656,43 @@ class LiveLogsTests(Isolated):
                         stderrOffset=size + 11 if stream == 'stderr' else 0, logBytes=len(expected)))
                     offsets = [offset for which, offset in requests if which == stream]
                     self.assertEqual(offsets, sorted(set(offsets[:-1])) + [offsets[-1]])
+
+    @both_history_orders
+    def test_staging_keeps_retry_node_capture_on_the_run_stream(self):
+        from offbox_lib import node_version, resources
+        from test_node_version import node_receipt
+        _, old = node_receipt('v24.22.1', 'run-live')
+        facts, current = node_receipt('v24.22.3', 'run-live')
+        first = (old + 'offbox-command-started: run-live\n').encode()
+        stderr = first + (current + 'offbox-command-started: run-live\n').encode() + b'e' * (4 * live_logs.PAGE_BYTES)
+        original = b'prefix\n' + stderr
+        self.path.write_bytes(original)
+        runs._commit(self.path, 7, 0, 7)
+        requests = []
+        def history(box, command, stream, offset, **kw):
+            requests.append((stream, offset))
+            raw = b'prefix\nnew output\n' if stream == 'stdout' else stderr
+            data = raw[offset:offset + kw['limit_bytes']]
+            return dict(data=data.decode(), nextOffset=offset + len(data), size=len(raw),
+                        commandId='cmd-live', attempt=2, nodeSetup=dict(stderrOffset=len(first)))
+        with patch.object(api, 'history_logs', history):
+            for _ in range(6):
+                result = misc._catch_up_log(self.row(), budget=10, live=True)
+                if result == 'caught_up':
+                    break
+                self.assertTrue(result.startswith('incomplete:'), result)
+                self.assertEqual(self.path.read_bytes(), original)
+            else:
+                self.fail('bounded staging failed to publish')
+        resources.finalize(dict(self.row()), node_only=True)
+        self.assertEqual(common.read_json(self.path.with_suffix('.state.json'), {})['node'], facts)
+        self.assertEqual(node_version.stderr_offset(self.path), len(stderr))
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=18, stderrOffset=len(stderr),
+                                                          logBytes=18 + len(stderr)))
+        self.assertEqual(self.path.read_bytes().count(b'new output\n'), 1)
+        offsets = [offset for stream, offset in requests if stream == 'stderr']
+        self.assertEqual(offsets, sorted(set(offsets)))
+        self.assertFalse(self.path.with_name(self.path.name + '.node-stream.json').exists())
 
     @both_history_orders
     def test_interleaved_frames_after_failed_checkpoints_keep_recovery_progress(self):

@@ -38,5 +38,9 @@
   {"class":"connect","stderr":"{\"error\":\"Bridge request failed\"}\n","lines":1},
   {"class":"json","stderr":"PRIVATE: JSONDecodeError\n","lines":1},
   {"class":"json","stderr":"PRIVATE: Unexpected token in JSON\n","lines":1},
-  {"class":"json","stderr":"{\"error\":\"Bridge returned invalid JSON\"}\n","lines":1}
+  {"class":"json","stderr":"{\"error\":\"Bridge returned invalid JSON\"}\n","lines":1},
+  {"class":"ride_ended","stderr":"ride-card: trip aaaaaaaa-0000-4000-8000-000000000001 already ended (done); not sending a new card\n","lines":1},
+  {"class":"ride_ended","stderr":"ride-card: trip aaaaaaaa-0000-4000-8000-000000000001 already ended (cancelled); not sending a new card\n","lines":1},
+  {"class":"ride_ended","stderr":"ride-card: trip aaaaaaaa-0000-4000-8000-000000000001 already ended (failed); not sending a new card\n","lines":1},
+  {"class":"ride_ended","stderr":"ride-card: trip aaaaaaaa-0000-4000-8000-000000000001 already ended (unknown); not sending a new card\n","lines":1}
 ]

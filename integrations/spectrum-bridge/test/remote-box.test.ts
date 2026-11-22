@@ -31,7 +31,7 @@ function setup(mirrorSink?: MirrorSink, harness?: (root: string) => Harness) {
   const logs: string[] = [], notices: string[] = [], texts: string[] = [];
   const alerts: { text: string; key: string }[] = [], requests: { path: string; body: Record<string, unknown> }[] = [];
   let eventsFail = false, routerReady = true, callbackReady = true;
-  let requestHook: ((path: string) => Promise<void>) | undefined;
+  let requestHook: ((path: string) => Promise<Response | void>) | undefined;
   let now = 1000, online = true, dropAck = false, active = true;
   let afterStatus: (()=>Promise<void>) | undefined;
   const store = new Store(join(mac, "state.sqlite")); closes.push(() => store.close());
@@ -43,7 +43,7 @@ function setup(mirrorSink?: MirrorSink, harness?: (root: string) => Harness) {
     log: (name: string, code?: string) => logs.push(`${name} ${code ?? ""}`), notice: async (id: string) => { notices.push(id); },
     fetch: (async (url, init) => { if (!online) throw new Error("private error should never be logged");
       const path = new URL(String(url)).pathname; requests.push({ path, body: JSON.parse(String(init?.body)) });
-      await requestHook?.(path);
+      const hooked = await requestHook?.(path); if (hooked) return hooked;
       if (path === "/events" && eventsFail) return Response.json({ error: "PRIVATE_EVENTS_ERROR" }, { status: 503 });
       const response = await runner.handle(new Request(String(url), init));
       if (String(url).endsWith("/delivery-status") && afterStatus) { const hook=afterStatus; afterStatus=undefined; await hook(); }
@@ -69,6 +69,175 @@ function setup(mirrorSink?: MirrorSink, harness?: (root: string) => Harness) {
   };
 }
 function files(root: string): string { return readdirSync(root, { withFileTypes: true }).map(e => e.isDirectory() ? files(join(root, e.name)) : readFileSync(join(root, e.name)).toString()).join(""); }
+
+test.each([
+  { source: "inbox", hasThreadOrigin: true, hasReplyTo: true },
+  { source: "action", hasThreadOrigin: true, hasReplyTo: false },
+  { source: "missing", hasThreadOrigin: true, hasReplyTo: true },
+  { source: "none", hasThreadOrigin: false, hasReplyTo: true },
+])("swipe metrics emit only resolution metadata for $source", async props => {
+  const s = setup(), io = { line: s.line, chat: chatKey.dm("moni"), bus: async () => Response.json({}) };
+  const rows = await captureLogs(async () => {
+    const result = await s.remote.callback(s.request("/metrics", { kind: "swipe", durationMs: 0, ...props,
+      text: "PRIVATE_SWIPE_TEXT", threadOrigin: "PRIVATE_TARGET", replyTo: "PRIVATE_PREVIOUS", status: "error" }), io);
+    expect(result.status).toBe(200); expect(await result.json()).toEqual({ accepted: true });
+  });
+  const swipes = rows.filter(row => row.name === "moni-swipe-resolved");
+  expect(swipes).toHaveLength(1); expect(swipes[0]!.props).toEqual(props);
+  expect(rows.some(row => row.name === "moni-turn-latency" || row.name === "moni-runner-error")).toBe(false);
+  expect(s.logs).toContain(`moni-swipe-resolved ${JSON.stringify(props)}`);
+  expect(JSON.stringify([s.logs, rows])).not.toContain("PRIVATE_");
+});
+
+test.each([
+  { source: "PRIVATE_INVALID" }, { source: 1 }, { source: null },
+  { hasThreadOrigin: "true" }, { hasThreadOrigin: undefined },
+  { hasReplyTo: 1 }, { hasReplyTo: undefined }, { durationMs: -1 },
+])("invalid swipe metric is refused without a resolution or latency event: %j", async patch => {
+  const s = setup();
+  const rows = await captureLogs(async () => {
+    const result = await s.remote.callback(s.request("/metrics", { kind: "swipe", durationMs: 0, source: "action", hasThreadOrigin: true, hasReplyTo: true, ...patch }),
+      { line: s.line, chat: chatKey.dm("moni"), bus: async () => Response.json({}) });
+    expect(result.status).toBe(400);
+  });
+  expect(rows.some(row => row.name === "moni-swipe-resolved" || row.name === "moni-turn-latency")).toBe(false);
+  expect(JSON.stringify([s.logs, rows])).not.toContain("PRIVATE_");
+});
+
+test("legacy runner latency metrics still emit duration and harness errors", async () => {
+  const s = setup();
+  const rows = await captureLogs(async () => {
+    expect((await s.remote.callback(s.request("/metrics", { durationMs: 125, status: "error" }),
+      { line: s.line, chat: chatKey.dm("moni"), bus: async () => Response.json({}) })).status).toBe(200);
+  });
+  expect(rows.filter(row => row.name === "moni-turn-latency").map(row => row.durationMs)).toEqual([125]);
+  expect(rows.some(row => row.name === "moni-runner-error")).toBe(true);
+  expect(rows.some(row => row.name === "moni-swipe-resolved")).toBe(false);
+});
+
+test("a single failed lease logs its cause and the recovery gap separately from the clear window, even at the cap", async () => {
+  const s = setup();
+  s.config.epoch = "PRIVATE_EPOCH_CANARY";
+  s.remote.accept("PRIVATE_HANDLE", { text: "PRIVATE_MESSAGE_TEXT" });
+  const sealed = s.store.db.query<{ sealed: string }, []>("SELECT sealed FROM remote_inbox").get()!.sealed;
+  let fail = true;
+  s.requestHook(async path => {
+    if (path === "/lease") {
+      if (fail) { fail = false; s.advance(37); return Response.json({ error: "PRIVATE_ERROR_BODY" }, { status: 502 }); }
+      return Response.json({ boxId: s.config.boxId, epoch: s.config.epoch });
+    }
+    if (path === "/deliver") return Response.json({ id: s.requests.at(-1)!.body.id, accepted: true });
+    return Response.json({ events: [] });
+  });
+  const rows = await captureLogs(async () => {
+    await s.remote.tick();
+    expect(s.store.get("remoteOutage")).toMatchObject({ downAt: 1037, failedProbes: 1, reachableSince: null });
+    s.advance(1999); await s.remote.tick(); expect(s.requests).toHaveLength(1);
+    s.advance(1); await s.remote.tick();
+    expect(s.store.get("remoteOutage")).toMatchObject({ reachableSince: 3037 });
+    s.advance(295_000); await s.remote.tick();
+    s.advance(4999); await s.remote.tick();
+    expect(s.store.get("remoteOutage")).not.toBeNull();
+    s.advance(1); await s.remote.tick(); expect(s.store.get("remoteOutage")).toBeNull();
+  });
+  const detail = { step: "lease", status: 502, errorClass: "RemoteRequestError", latencyMs: 37 };
+  const down = rows.filter(row => row.name === "moni-box-down"), errors = rows.filter(row => row.name === "moni-runner-error");
+  const up = rows.filter(row => row.name === "moni-box-up");
+  expect(down).toHaveLength(1); expect(down[0]!.kind).toBe("error"); expect(down[0]!.props).toEqual(detail);
+  expect(errors).toHaveLength(1); expect(errors[0]!.props).toEqual({ code: "unreachable", ...detail, failures: 1 });
+  expect(up).toHaveLength(1); expect(up[0]!.props).toEqual({ unreachableMs: 2000, failedProbes: 1, clearMs: 300_000 });
+  expect(s.notices).toHaveLength(0);
+  const root = join(s.root, "capped-probe"), log = createToolLog({ root, now: () => 0, capBytes: 1 });
+  log.write({ component: "fixture", kind: "event", name: "fill" });
+  for (const row of [...down, ...errors, ...up]) log.write(row);
+  const raw = readFileSync(join(root, "1970-01-01.ndjson"), "utf8");
+  const capped = raw.trim().split("\n").map(line => JSON.parse(line));
+  expect(capped.some(row => row.name === "log.degraded")).toBe(true);
+  for (const row of [...down, ...errors, ...up]) expect(capped.find(saved => saved.name === row.name)?.props).toEqual(row.props);
+  const serialized = JSON.stringify([rows, s.logs, raw]);
+  for (const secret of ["PRIVATE_", s.config.url, "http://", "https://", "a".repeat(40), "b".repeat(40), sealed, "ciphertext", "encryptedKey", "authorization"]) {
+    expect(serialized).not.toContain(secret);
+  }
+});
+
+test.each([
+  { step: "identity", status: undefined, errorClass: "Error" },
+  { step: "deliver", status: 503, errorClass: "RemoteRequestError" },
+  { step: "ack", status: undefined, errorClass: "Error" },
+])("probe failure at $step retains only the failing request's latency and safe metadata", async ({ step, status, errorClass }) => {
+  const s = setup(); s.remote.accept("pending", { text: "PRIVATE_BODY" });
+  s.requestHook(async path => {
+    if (path === "/lease") {
+      s.advance(11);
+      if (step === "identity") return Response.json({ boxId: "PRIVATE_WRONG_BOX", epoch: "PRIVATE_WRONG_EPOCH" });
+    }
+    if (path === "/deliver") {
+      s.advance(23);
+      return step === "deliver" ? Response.json({ error: "PRIVATE_BODY" }, { status: status! }) : Response.json({ id: "PRIVATE_ACK", accepted: false });
+    }
+  });
+  const rows = await captureLogs(() => s.remote.tick());
+  const detail = { step, ...(status === undefined ? {} : { status }), errorClass, latencyMs: step === "identity" ? 11 : 23 };
+  expect(rows.find(row => row.name === "moni-box-down")?.props).toEqual(detail);
+  expect(rows.find(row => row.name === "moni-runner-error")?.props).toEqual({ code: "unreachable", ...detail, failures: 1 });
+  expect(JSON.stringify([rows, s.logs])).not.toContain("PRIVATE_");
+});
+
+test.each(["AbortError", "TimeoutError"])("probe %s is logged as Timeout without the exception message", async name => {
+  const s = setup();
+  s.requestHook(async () => { s.advance(12_000); throw new DOMException("PRIVATE_TIMEOUT_URL_TOKEN", name); });
+  const rows = await captureLogs(() => s.remote.tick());
+  expect(rows.find(row => row.name === "moni-box-down")?.props).toEqual({ step: "lease", errorClass: "Timeout", latencyMs: 12_000 });
+  expect(rows.find(row => row.name === "moni-runner-error")?.props).toEqual({ code: "unreachable", step: "lease", errorClass: "Timeout", latencyMs: 12_000, failures: 1 });
+  expect(JSON.stringify([rows, s.logs])).not.toContain("PRIVATE_");
+});
+
+test.each(["lease", "deliver"])("three failed %s probes retain their count and the existing backoff through recovery", async step => {
+  const s = setup(); s.config.outageClearMs = 10_000;
+  s.remote.accept("pending", {});
+  let fail = true;
+  s.requestHook(async path => { if (fail && path === `/${step}`) return Response.json({}, { status: 502 }); });
+  const rows = await captureLogs(async () => {
+    await s.remote.tick();
+    s.advance(2000); await s.remote.tick();
+    // Successful leases keep resetting the existing backoff for delivery errors.
+    s.advance(step === "lease" ? 4000 : 2000); await s.remote.tick();
+    expect(s.store.get("remoteOutage")).toMatchObject({ failedProbes: 3 });
+    fail = false; s.advance(step === "lease" ? 8000 : 2000); await s.remote.tick();
+    s.advance(10_000); await s.remote.tick();
+  });
+  expect(rows.filter(row => row.name === "moni-box-down")).toHaveLength(1);
+  expect(rows.filter(row => row.name === "moni-runner-error").map(row => row.props?.failures)).toEqual(step === "lease" ? [1, 2, 3] : [1, 1, 1]);
+  expect(rows.filter(row => row.name === "moni-box-up").map(row => row.props)).toEqual([
+    { unreachableMs: step === "lease" ? 14_000 : 6000, failedProbes: 3, clearMs: 10_000 },
+  ]);
+});
+
+test("a failure during the clear window preserves one outage and restarts continuous recovery", async () => {
+  const s = setup(); s.config.outageClearMs = 10_000;
+  const rows = await captureLogs(async () => {
+    s.offline(); await s.remote.tick(); s.online(); s.advance(2000); await s.remote.tick();
+    s.offline(); s.advance(5000); await s.remote.tick();
+    s.online(); s.advance(2000); await s.remote.tick();
+    s.advance(5000); await s.remote.tick(); expect(s.store.get("remoteOutage")).not.toBeNull();
+    s.advance(5000); await s.remote.tick();
+  });
+  expect(rows.filter(row => row.name === "moni-box-down")).toHaveLength(1);
+  expect(rows.filter(row => row.name === "moni-box-up").map(row => row.props)).toEqual([{ unreachableMs: 9000, failedProbes: 2, clearMs: 10_000 }]);
+});
+
+test.each([false, true])("an old stored outage recovers without inventing a start time (fails again=$failsAgain)", async failsAgain => {
+  const s = setup();
+  s.store.set("remoteOutage", { id: "old-outage", unreachableSince: 1, reachableSince: null, noticeAttempted: true });
+  s.restart();
+  const rows = await captureLogs(async () => {
+    if (failsAgain) { s.offline(); await s.remote.tick(); s.online(); s.advance(2000); }
+    await s.remote.tick(); s.advance(300_000); await s.remote.tick();
+  });
+  expect(s.store.get("remoteOutage")).toBeNull();
+  expect(rows.filter(row => row.name === "moni-box-down")).toHaveLength(0);
+  expect(rows.find(row => row.name === "moni-box-up")?.props).toEqual({ clearMs: 300_000, ...(failsAgain ? { failedProbes: 1 } : {}) });
+});
 
 test.each(["ready", "invalid", "paused"])("a timing log failure preserves the %s readiness response", async state => {
   const s = setup(); s.failReadyLog();
@@ -1191,12 +1360,16 @@ test("an acknowledged remote bus request with a failed Claude launch never repor
   });
   const ask = bus.ask({ sessionId: "owner-session", to: "moni", text: "PRIVATE_BUS_TEXT", dedupeKey: "launch-failure" });
   expect(ask.status).toBe(202); const id = (ask.body as { id: string }).id;
+  expect(s.store.db.query("SELECT status FROM agent_requests WHERE id=?").get(id)).toEqual({ status: "open" });
+  expect(logs.filter(line => line.startsWith("agent-deliver-pending "))).toEqual([`agent-deliver-pending ${id} moni remote=1`]);
   await s.remote.tick(); bus.sweep();
   await s.runner.tick(); s.advance(); now += 65_000; await s.remote.tick(); bus.sweep();
   expect(s.remote.delivery(agentWakeId(`agent-ask:${id}`))).toEqual({ retained: true, confirmed: true });
   expect(s.store.db.query("SELECT delivered_at FROM agent_requests WHERE id=?").get(id)).toEqual({ delivered_at: null });
   expect(logs.some(line => line.startsWith("agent-deliver "))).toBe(true);
   expect(logs.some(line => line.startsWith("agent-delivered "))).toBe(false);
+  expect(logs.some(line => line.startsWith("agent-deliver-failed "))).toBe(false);
+  expect(notices.has(`agent-undelivered:${id}`)).toBe(false);
   expect(notices.has(`agent-progress:${id}`)).toBe(false);
   now = 601_001; bus.sweep();
   expect(notices.get(`agent-timeout:${id}`)).toContain("was not delivered to a target turn");

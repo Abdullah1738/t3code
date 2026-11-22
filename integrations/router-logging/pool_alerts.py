@@ -95,7 +95,7 @@ def serve():
         while not stopped.is_set():
             episodes = []
             try:
-                router = router or Router()
+                router = router or Router(component='pool-alerts', event_name='pool.endpoint.get')
                 episodes = router.get('/api/monitoring/pools')['episodes']
             except Exception:
                 emit('guard', 'guard.error', kind='error', error=dict(tag='pool_snapshot_failed'))

@@ -1,5 +1,6 @@
 from owner_go_support import approve_test_flows
 """NowNow active-order attribution against an isolated, real journal."""
+import os
 import tempfile
 import unittest
 import uuid
@@ -19,16 +20,23 @@ ACCOUNT = FakeAuth().revalidate('nownow').account_ref
 
 class ActiveOrderTests(unittest.TestCase):
     def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name).resolve()
+        environment = patch.dict(os.environ, {
+            'ORDERING_PAUSE_FILE': str(root / 'paused'),
+            'ROBOB_TOOL_LOG_DIR': str(root / 'logs'),
+            'TOOLLOG_ROOT': str(root / 'logs'),
+        })
+        environment.start(); self.addCleanup(environment.stop)
         approve_test_flows(self)
         import order_card
+        # The private 9546 decline permits this fallback; 9546 NowNow place has an earlier contract gate.
         for field, value in (('LAST4', '2342'), ('NETWORK', 'mastercard')):
             card = patch.object(order_card, field, value)
             card.start(); self.addCleanup(card.stop)
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        root = Path(temp.name).resolve() / 'commerce'
         for module in (j, c.receipts):
-            patched = patch.object(module, 'ROOT', root)
+            patched = patch.object(module, 'ROOT', root / 'commerce')
             patched.start()
             self.addCleanup(patched.stop)
 
