@@ -150,6 +150,7 @@ class DiskWaitTests(unittest.TestCase):
                 real_wait = collector.disk_wait
                 with patch.object(collector, 'collect') as crashes, \
                      patch.object(collector, 'disk_wait', side_effect=lambda **kw: real_wait(run, **kw)), \
+                     patch.object(collector, 'homebrew_integrity'), \
                      patch.object(collector, 'disk_tooling_probe') as disk, \
                      patch.object(collector, 'directory_inventory') as inventory:
                     collector.main()

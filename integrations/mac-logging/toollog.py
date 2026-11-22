@@ -445,6 +445,33 @@ def host_fields(values, event):
 
 
 def safe_fields(values, event=None):
+    if event == 'homebrew.integrity':
+        result = {}
+        for key, value in (values or {}).items():
+            if key == 'status' and value in ('ok', 'broken', 'error'):
+                result[key] = value
+            elif key == 'reason' and value in ('opt_unavailable', 'brew_absent', 'brew_timeout',
+                                               'brew_exit', 'brew_unavailable', 'brew_parse'):
+                result[key] = value
+            elif key in ('durationMs', 'exitCode') and finite_number(value):
+                result[key] = value
+            elif key in ('dangling', 'missing') and isinstance(value, list):
+                result[key] = []
+                for row in value:
+                    fields = ('name', 'target') if key == 'dangling' else ('formula', 'deps')
+                    if not isinstance(row, dict) or any(field not in row for field in fields):
+                        continue
+                    clean = {}
+                    for field in fields:
+                        items = row[field] if field == 'deps' else [row[field]]
+                        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+                            break
+                        texts = ['[redacted]' if SECRET.search(item) else ''.join(
+                            c if c.isprintable() else ' ' for c in item[:4096]) for item in items]
+                        clean[field] = texts if field == 'deps' else texts[0]
+                    else:
+                        result[key].append(clean)
+        return result
     if event == 'host.overload':
         result = host_fields(values, 'host.families_lite')
         for key in ('phase', 'onset', 'conditions', 'durationS', 'notified'):
