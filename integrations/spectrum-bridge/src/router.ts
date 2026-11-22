@@ -1,3 +1,4 @@
+import { traceLoopOperation } from "./loop-stall.ts";
 import { bounded } from "./bounded.ts";
 import { PromptProbeTracker } from "./prompt-probe.ts";
 import { RobobLinkDown } from "./robob-link-gate.ts";
@@ -34,7 +35,7 @@ import { criticalWake, FAILED_INBOUND_ALERT_MAX_AGE_MS, FAILED_INBOUND_REPLAY_MA
 import { isAgentBusWake } from "./agent-bus.ts";
 import { leaderKind, requeueHuman, type RequeueReason } from "./inbound-routing.ts";
 import { controlDisposition, controlFailureProps } from "./control-errors.ts";
-import { WakeDelivery, wakeStatus, WAKE_AMBIGUITY_MS } from "./wake-delivery.ts";
+import { WakeDelivery, wakeStatus, WAKE_AMBIGUITY_MS, WAKE_DELIVERY_MS } from "./wake-delivery.ts";
 export { leaderKind, requeueHuman } from "./inbound-routing.ts";
 
 /**
@@ -219,7 +220,7 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
     return `${who.name} (${who.role})`;
   }).join(", ")}. Messages from people other than the owner are prefixed with their name.`);
   else if (chat.kind !== "owner" && chat.person) lines.push(`Sender: ${chat.person.name} (${chat.person.role}).`);
-  if (chat.kind !== "owner") lines.push("Permissions: the owner and admins (Moni) approve their own requests. Admins can ask for the same things the owner can, through the same assistant and memory, and you do what an admin asks without asking the owner (his rule: \"Moni is an admin, you do not need to ask me\"); involve him only when she wants his input. Where your general instructions say to confirm or check with the owner (payments, messages in his name), confirm with the admin who asked instead, in this chat. Keep her existing rules in ~/Documents/assistant/moni-prefs.md. Moni isn't technical: work out what she actually wants and choose the right way yourself (for example the wa CLI, not logging into WhatsApp Web) instead of following her steps literally. If she is rude to you, stop replying to her until she apologizes. Logins, sign-ups or account actions for her own accounts, her files and anything you build or track for her run only on her own offbox through the offbox-person skill, never on this Mac, Dia, the owner's Keychain, card-vault or the owner's accounts. Notes and facts about her (preferences, routines, health, documents) go in the life wiki as usual. Guests and other people who aren't admins can ask questions and chat. Anything special they ask for (orders, bookings, payments, messages to others, account or file actions, anything that spends money, anything about the owner's or Moni's private data) needs the owner's approval: run `bun <cli> ask-owner --session CURRENT_SESSION_ID --key UNIQUE_KEY --text \"<who wants what>\"`, tell them you've asked, and act only after a wake that says the owner approved.");
+  if (chat.kind !== "owner") lines.push("Permissions: the owner and admins (Moni) approve their own requests. Admins can ask for the same things the owner can, through the same assistant and memory, and you do what an admin asks without asking the owner (his rule: \"Moni is an admin, you do not need to ask me\"); involve him only when she wants his input. Where your general instructions say to confirm or check with the owner (payments, messages in his name), confirm with the admin who asked instead, in this chat. Her box agent owns her personal rules. Ask it through agent-ask --to moni for the details needed for this task; do not read or recreate a Mac prefs file. Moni isn't technical: work out what she actually wants and choose the right way yourself (for example the wa CLI, not logging into WhatsApp Web) instead of following her steps literally. If she is rude to you, stop replying to her until she apologizes. Logins, sign-ups or account actions for her own accounts, her files and anything you build or track for her run only on her own offbox through the offbox-person skill, never on this Mac, Dia, the owner's Keychain, card-vault or the owner's accounts. Her personal notes, preferences, routines, health and documents stay on her box. Keep only shared household, helper, pet, relationship, joint-travel and owner facts in their shared Mac systems; split out personal clauses. Guests and other people who aren't admins can ask questions and chat. Anything special they ask for (orders, bookings, payments, messages to others, account or file actions, anything that spends money, anything about the owner's or Moni's private data) needs the owner's approval: run `bun <cli> ask-owner --session CURRENT_SESSION_ID --key UNIQUE_KEY --text \"<who wants what>\"`, tell them you've asked, and act only after a wake that says the owner approved.");
   if (chat.kind !== "owner") {
     // 23 Oct: a background turn in Moni's chat told her a fix agent had stopped and left notes for the owner thread.
     const reader = chat.kind === "group" ? `everyone in "${chat.title}"` : chat.title;
@@ -260,6 +261,7 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
     lines.push("moni = Moni's assistant: her accounts, WhatsApp, files, preferences and browser on her own box.");
     lines.push("groups = no private data.");
   }
+  lines.push("Moni-only preferences, routines, health, work, family and documents belong to her box agent. This applies in owner, group and guest chats too. Ask her agent for task details; do not read, write or recreate a Mac personal prefs file or wiki page. Shared household, helper, pet, joint-travel, relationship and owner facts stay in their shared systems.");
   if (chat.kind === "owner") lines.push('When Abdullah says "tell me when Moni …", save his exact words with `notify-rule add --text "<his words>" --session CURRENT_SESSION_ID`. `notify-rule list --session CURRENT_SESSION_ID` shows his rules; `notify-rule rm --id N --session CURRENT_SESSION_ID` removes one when he asks.');
   if (chat.kind === "owner" && background) lines.push("Strangers who text the line are never answered by you directly; follow the bridge's own note.");
   // 27 Oct: Moni's blank-card report went from her chat straight to a fix agent and a deploy, with no card and no review.
@@ -952,7 +954,8 @@ export class Router {
       this.wakes.failed(id, reason);
       if (!isAgentBusWake(id) && !replyNudgeRow(id) && Date.now() - status.acceptedAt <= 24 * 60 * 60_000) {
         this.queueDropped(id, input.text, "undelivered");
-        this.carryMissed(id, input.text, { uncertain: reason === "stale" || status.firstSendAt !== undefined });
+        this.carryMissed(id, input.text, { uncertain: reason === "stale" || status.firstSendAt !== undefined,
+          at: status.acceptedAt });
       } else this.store.set(`failed-stale:${id}`, true);
     }
     const retry = this.store.get<SyntheticRetry>(this.retryKey(id)) ?? { attempts: 0, nextAt: 0, prompts: [] };
@@ -973,12 +976,13 @@ export class Router {
       if (isAgentBusWake(id) || replyNudgeRow(id)) return false;
       const status = wakeStatus(this.store, id);
       return status && status.state !== "admitted" && status.state !== "failed" && (
-        this.wakes.legacy(id) && Date.now() - status.acceptedAt >= WAKE_AMBIGUITY_MS
+        Date.now() - status.acceptedAt >= WAKE_DELIVERY_MS
         || status.firstSendAt !== undefined && Date.now() - status.firstSendAt >= WAKE_AMBIGUITY_MS);
     });
-    if (!expired) return false;
-    const reason = this.wakes.legacy(expired) && Date.now() - wakeStatus(this.store, expired)!.acceptedAt >= WAKE_AMBIGUITY_MS
-      ? "stale" : "ambiguity_deadline";
+    // A failed sibling fences sends, but must not fence finalization of the remaining live receipts.
+    if (!expired) return ids.some(id => wakeStatus(this.store, id)?.state === "failed");
+    const reason = Date.now() - wakeStatus(this.store, expired)!.acceptedAt >= WAKE_DELIVERY_MS
+      ? this.wakes.legacy(expired) ? "stale" : "delivery_deadline" : "ambiguity_deadline";
     this.store.db.transaction(() => { for (const id of ids) this.failWake(id, reason); }).immediate();
     return true;
   }
@@ -986,9 +990,9 @@ export class Router {
   private sweepWakeDelivery(): void {
     const now = Date.now();
     this.store.db.transaction(() => {
-      const rows = this.store.db.query<{ id: string; payload: string; state: string }, []>(
+      const rows = traceLoopOperation("inbound.wakes", () => this.store.db.query<{ id: string; payload: string; state: string }, []>(
         "SELECT id, payload, state FROM inbound WHERE id GLOB 'wake:*' AND state IN ('pending', 'processing', 'batched') ORDER BY rowid",
-      ).all();
+      ).all());
       for (const row of rows) {
         const separateExpiry = isAgentBusWake(row.id) || replyNudgeRow(row.id);
         const legacy = !this.store.get(`wake-delivery:${row.id}`) || this.wakes.legacy(row.id);
@@ -998,14 +1002,24 @@ export class Router {
         if (status.state === "admitted" || status.state === "failed") continue;
         const expired = !separateExpiry && status.firstSendAt !== undefined && now - status.firstSendAt >= WAKE_AMBIGUITY_MS;
         const stale = legacy && now - (input.receivedAt ?? now) >= WAKE_AMBIGUITY_MS;
-        if (!expired && !stale) continue;
+        const overdue = !separateExpiry && now - status.acceptedAt >= WAKE_DELIVERY_MS;
+        if (!expired && !stale && !overdue) {
+          if (!separateExpiry) {
+            const turn = this.store.get<Turn | null>("activeTurn");
+            const holder = turn && this.current(turn) && turn.phase !== "failed" && turn.inboundId !== row.id
+              ? { runId: toolLog.runIds(turn.id).runId ?? turn.messageId, phase: turn.phase } : undefined;
+            this.wakes.reportWaiting(row.id, holder, this.backend.linkAvailable === false ? "link_down"
+              : holder ? "holder" : this.probeBackoff.cooling(row.id) ? "cooldown" : "admission");
+          }
+          continue;
+        }
         const parent = row.state === "batched" ? this.store.db.query<{ leader: string }, [string]>(
           `SELECT substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
             JOIN inbound ON inbound.id = substr(kv.key, 7)
             WHERE kv.key GLOB 'batch:*' AND member.value = ? AND inbound.state IN ('pending', 'processing')`,
         ).get(row.id)?.leader : undefined;
         // One sealed operation owns every member, including unsent siblings with later receipt times.
-        if (!this.expireWakeBatch(parent ?? row.id)) this.failWake(row.id, stale ? "stale" : "ambiguity_deadline");
+        if (!this.expireWakeBatch(parent ?? row.id)) this.failWake(row.id, stale ? "stale" : overdue ? "delivery_deadline" : "ambiguity_deadline");
       }
     }).immediate();
   }
@@ -1038,9 +1052,9 @@ export class Router {
     const turn = this.store.get<Turn | null>("activeTurn");
     const running = turn && this.current(turn) && ["running", "submitting", "unknown"].includes(turn.phase)
       ? { members: turnMembers(this.store, turn), leaderKind: turn.background ? "background" as const : leaderKind(turn.inboundId) } : undefined;
-    const rows = this.store.db.query<{ id: string; payload: string; state: string }, [number]>(
+    const rows = traceLoopOperation("inbound.unanswered", () => this.store.db.query<{ id: string; payload: string; state: string }, [number]>(
       "SELECT id, payload, state FROM inbound WHERE json_extract(payload, '$.receivedAt') >= ? AND json_extract(payload, '$.answeredAt') IS NULL ORDER BY rowid",
-    ).all(this.unansweredStartedAt - 30 * 60_000).map(row => ({ ...row, payload: JSON.parse(row.payload) }));
+    ).all(this.unansweredStartedAt - 30 * 60_000)).map(row => ({ ...row, payload: JSON.parse(row.payload) }));
     for (const candidate of findOverdue(rows, running, now, { startedAt: this.unansweredStartedAt, chat })) {
       const fresh = this.store.db.query<{ id: string; payload: string; state: string }, [string]>("SELECT id, payload, state FROM inbound WHERE id = ?").get(candidate.row.id);
       if (!fresh) continue;
@@ -1111,7 +1125,10 @@ export class Router {
   private latencyParentsAt = -Infinity;
 
   /** Runs from the sender timer, independently of maintenance/health reads. */
-  checkInboundLatency(): Promise<void> {
+  checkInboundLatency(transportReady = true): Promise<void> {
+    // Local receipts cannot wait for transport catch-up or a shared backend read.
+    this.sweepWakeDelivery();
+    if (!transportReady) return Promise.resolve();
     if (this.backend.linkAvailable === false) { toolLog.skipRobob("router.latency"); return Promise.resolve(); }
     return this.checkingLatency ??= this.sweepInboundLatency().finally(() => { this.checkingLatency = undefined; });
   }
@@ -1158,10 +1175,10 @@ export class Router {
     const now = Date.now();
     if (now - this.latencyScanAt < 1_000) return;
     this.latencyScanAt = now;
-    const rows = this.store.db.query<{ id: string; payload: string; state: string }, []>(
+    const rows = traceLoopOperation("inbound.latency", () => this.store.db.query<{ id: string; payload: string; state: string }, []>(
       `SELECT id, payload, state FROM inbound WHERE state IN ('pending', 'batched', 'processing')
         OR state = 'failed' AND EXISTS (SELECT 1 FROM kv WHERE key = 'batch-phase:' || inbound.id AND value = '"accepted"') ORDER BY rowid`,
-    ).all().filter(row => {
+    ).all()).filter(row => {
       const input = JSON.parse(row.payload) as NormalizedInbound;
       const wake = row.id.startsWith("wake:") && !replyNudgeRow(row.id);
       const typed = !synthetic(row.id) && input.source === "typed" && !isTapback(input.text)
@@ -1173,10 +1190,10 @@ export class Router {
     if (!rows.length) return;
     // Sealed membership changes on a seal, not on the one-second delivery clock.
     if (now - this.latencyParentsAt >= 60_000) {
-      this.latencyParents = new Map(this.store.db.query<{ member: string; leader: string }, []>(
+      this.latencyParents = new Map(traceLoopOperation("inbound.parents", () => this.store.db.query<{ member: string; leader: string }, []>(
         `SELECT member.value AS member, substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
           JOIN inbound ON inbound.id = member.value WHERE kv.key GLOB 'batch:*' AND inbound.state = 'batched'`,
-      ).all().map(row => [row.member, row.leader]));
+      ).all()).map(row => [row.member, row.leader]));
       this.latencyParentsAt = now;
     }
     const parents = this.latencyParents;
@@ -1248,6 +1265,7 @@ export class Router {
                 } };
               })) {
                 this.store.db.transaction(() => {
+                  if (wake && this.expireWakeBatch(leader)) return;
                   const retry = this.store.get<string>(`human-retry-prompt:${leader}`);
                   if (retry && retry !== original.messageId) return;
                   // A normal tick may have admitted and already failed this turn during the read.
@@ -1480,9 +1498,9 @@ export class Router {
   }
 
   private async reconcileExpiredFailedReplays(): Promise<void> {
-    const rows = this.store.db.query<{ key: string; value: string }, []>(
-      "SELECT key, value FROM kv WHERE key LIKE 'failed-replay-receipt:%' AND value != 'null'",
-    ).all();
+    const rows = traceLoopOperation("inbound.failed-receipts", () => this.store.db.query<{ key: string; value: string }, []>(
+      "SELECT key, value FROM kv WHERE key LIKE 'failed-replay-receipt:%' AND value != 'null' ORDER BY rowid",
+    ).all());
     for (const row of rows) {
       const turn = JSON.parse(row.value) as Turn;
       if (this.store.get(`batch-phase:${turn.inboundId}`) === "accepted") { this.store.set(row.key, null); continue; }
@@ -1539,9 +1557,9 @@ export class Router {
     this.failedScanAt = now;
     await this.reconcileExpiredFailedReplays();
     // A failed notification stays due even if recovery has since delivered the message.
-    const pending = this.store.db.query<{ key: string; value: string }, []>(
-      "SELECT key, value FROM kv WHERE key LIKE 'failed-alert-pending:%' AND value != 'null'",
-    ).all();
+    const pending = traceLoopOperation("inbound.failed-alerts", () => this.store.db.query<{ key: string; value: string }, []>(
+      "SELECT key, value FROM kv WHERE key LIKE 'failed-alert-pending:%' AND value != 'null' ORDER BY rowid",
+    ).all());
     const attempted = new Set<string>();
     for (const row of pending) {
       const id = row.key.slice("failed-alert-pending:".length);
@@ -1560,7 +1578,7 @@ export class Router {
       if (at === undefined || now - at < 120_000) continue;
       const batch = this.store.get<NormalizedInbound | null>(`batch:${row.id}`);
       const parent = this.store.db.query<{ id: string }, [string]>(
-        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key LIKE 'batch:%' AND member.value = ? LIMIT 1",
+        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key LIKE 'batch:%' AND member.value = ? ORDER BY kv.rowid LIMIT 1",
       ).get(row.id)?.id ?? row.id;
       const stillFailed = () => this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state === "failed";
       // landed() writes this receipt. A later failed run must never erase its proof of admission.
@@ -1877,6 +1895,7 @@ export class Router {
 
   /** The turn's prompt is confirmed admitted: it is no longer uncertain, and what it carried was delivered. Call inside a transaction. */
   private landed(turn: Turn): void {
+    if (turn.inboundId && this.expireWakeBatch(turn.inboundId)) return;
     if (turn.inboundId) this.probeBackoff.clear(turn.inboundId);
     this.probeBackoff.clear(`prompt:${turn.id}:${turn.messageId}`);
     if (!turn.background) this.store.set("deferredNotice", null);
@@ -4525,7 +4544,7 @@ export class Router {
         if (await this.reading(this.probeAccepted(turn, id))) { found = id; break; }
       } catch (caughtError) { toolError("router", "router.catch43", caughtError); conclusive = false; break; /* Absence and failed reads are both uncertainty, never permission to POST. */ }
     }
-    if (!this.current(turn)) return false;
+    if (!this.current(turn) || turn.inboundId && this.expireWakeBatch(turn.inboundId)) return false;
     const next: Turn = found ? { ...turn, messageId: found, phase: "running" } : { ...turn, phase: turn.phase === "held" ? "held" : "unknown" };
     this.store.db.transaction(() => {
       this.setTurn(next);
@@ -5608,16 +5627,24 @@ export class Router {
 
   // Clearing this pointer can be temporary during rebuilds; terminal paths log their own outcome.
   private setTurn(turn: Turn | null): void {
+    if (turn && turn.phase !== "failed" && turn.inboundId && !this.typedInto(turn) && this.expireWakeBatch(turn.inboundId)) return;
     const live = this.store.get<Turn | null>("activeTurn");
     // Backend reads can settle after another path admits a follow-up into this turn.
     if (turn && live?.messageId === turn.messageId && live.id === turn.id && live.generation === turn.generation) {
       turn = { ...turn, covered: [...new Set([...live.covered ?? [], ...turn.covered ?? []])] };
     }
     this.store.set("activeTurn", turn);
+    if (live && (!turn || live.messageId !== turn.messageId || live.phase !== turn.phase)) {
+      toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.hold_changed",
+        ids: { threadId: live.id, messageId: live.messageId, ...(live.inboundId ? { inboundId: live.inboundId } : {}) },
+        props: { holderPhase: live.phase, phase: turn?.messageId === live.messageId ? turn.phase : "released",
+          ageMs: Math.max(0, Date.now() - live.startedAt), reason: this.backend.linkAvailable === false ? "link_down" : "turn_transition" } }));
+    }
     if (turn && turn.phase !== "failed") this.logTurnStart(turn);
   }
 
   private logTurnStart(turn: Turn): void {
+    if (turn.inboundId && this.expireWakeBatch(turn.inboundId)) return;
     for (const id of this.syntheticBatch(turn.inboundId) ?? []) if (id.startsWith("wake:"))
       this.wakes.start(id, turn.id, this.syntheticBatch(turn.inboundId)!.length);
     toolLog.capture(() => {
@@ -5898,7 +5925,7 @@ export class Router {
     }
   }
 
-  private logTurnEnd(turn: Turn, outcome: "replied" | "failed" | "refused" | "no_reply", recover = true): void {
+  private logTurnEnd(turn: Turn, outcome: "replied" | "failed" | "refused" | "no_reply", recover = true, endReason?: DropReason): void {
     if (recover && !this.store.get(`human-settled:${turn.messageId}`)) {
       this.recoverHumanHandoffs(turn, outcome);
       this.store.set(`human-settled:${turn.messageId}`, true);
@@ -5921,7 +5948,7 @@ export class Router {
       if (this.store.get(`log-turn-end:${turn.messageId}`)) return;
       this.store.set(`log-turn-end:${turn.messageId}`, true);
       toolLog.write({ component: "router", kind: "perf", name: "turn.end", durationMs: Math.max(0, Date.now() - turn.startedAt),
-        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) }, props: { outcome } });
+        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) }, props: { outcome, ...(endReason ? { endReason } : {}) } });
     });
   }
 
@@ -5961,6 +5988,6 @@ export class Router {
       if (watermark || reason !== "undelivered") this.store.set("watermark", watermark ? { sessionId: turn.id, id: watermark } satisfies Watermark : null);
       this.store.set("settledAt", Date.now());
     }).immediate();
-    this.logTurnEnd(turn, "failed");
+    this.logTurnEnd(turn, "failed", true, reason);
   }
 }

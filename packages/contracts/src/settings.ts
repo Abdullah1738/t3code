@@ -713,6 +713,7 @@ export const ANTIGRAVITY_AUTH_METHODS = [
   { value: "oauth-business", label: "Gemini Enterprise" },
   { value: "gemini-api-key", label: "Gemini API key" },
   { value: "agent-platform", label: "Agent Platform (Vertex AI)" },
+  { value: "gateway", label: "Gateway (9router)" },
 ] as const satisfies ReadonlyArray<ProviderSettingsFormOption>;
 export const AntigravityAuthMethod = Schema.Literals(
   ANTIGRAVITY_AUTH_METHODS.map((method) => method.value),
@@ -768,6 +769,27 @@ export const AntigravitySettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "us-central1", clearWhenEmpty: "omit" },
       }),
     ),
+    gatewayBaseUrl: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Gateway URL",
+        description: "Root URL of a Gemini-compatible gateway such as 9router.",
+        providerSettingsForm: { placeholder: "http://127.0.0.1:20128", clearWhenEmpty: "omit" },
+      }),
+    ),
+    gatewayApiKey: TrimmedString.pipe(
+      secretSetting,
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Gateway key",
+        description: "Sent as a bearer token. Stored separately on the host.",
+        providerSettingsForm: {
+          control: "password",
+          placeholder: "Optional",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
     binaryPath: TrimmedString.pipe(
       Schema.withDecodingDefault(Effect.succeed("")),
       Schema.annotateKey({
@@ -781,7 +803,17 @@ export const AntigravitySettings = makeProviderSettingsSchema(
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
-  { order: ["authMethod", "apiKey", "gcpProject", "gcpLocation", "binaryPath"] },
+  {
+    order: [
+      "authMethod",
+      "apiKey",
+      "gcpProject",
+      "gcpLocation",
+      "gatewayBaseUrl",
+      "gatewayApiKey",
+      "binaryPath",
+    ],
+  },
 );
 export type AntigravitySettings = typeof AntigravitySettings.Type;
 

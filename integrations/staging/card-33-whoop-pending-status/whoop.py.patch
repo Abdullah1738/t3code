@@ -1,0 +1,37 @@
+--- a/whoop/whoop.py
++++ b/whoop/whoop.py
+@@ -778,21 +778,21 @@
+             return 0
+         except NotAuthorized:
+             st = read_json(STATUS, {}) or {}
+-            if not st.get("authorized_at") or login_pending():
+-                return 0  # never connected, or a login is under way: stay quiet
++            if not st.get("authorized_at"):
++                return 0  # never connected: stay quiet
+             with TokenLock():  # the login callback installs tokens under this lock
+                 if load_tokens():
+                     log("tokens were missing, but a login installed new ones meanwhile")
+                     return 0
+                 count_failure(state="reauth_needed", last_error="tokens missing from Keychain")
++                if login_pending():
++                    return 0  # login link already sent, the listener finishes the job
+             log("sync failed, re-auth needed: tokens missing from Keychain")
+             # stderr: robob-watch keeps only stderr as the failure text
+             exit_detail('not_authorized', 'sync')
+             print("WHOOP tokens missing from Keychain (was authorized before). %s" % REAUTH_STEPS, file=sys.stderr)
+             return 1
+         except ReauthNeeded as e:
+-            if login_pending():
+-                return 0  # login link already sent, the listener finishes the job
+             with TokenLock():  # the login callback installs tokens under this lock
+                 rejected = getattr(e, "rejected", None)
+                 current = load_tokens()
+@@ -801,6 +801,8 @@
+                     log("refresh of replaced tokens rejected; a newer login installed new ones")
+                     return 0
+                 count_failure(state="reauth_needed", last_error=str(e)[:300])
++                if login_pending():
++                    return 0  # login link already sent, the listener finishes the job
+             log("sync failed, re-auth needed: %s" % e)
+             exit_detail('reauth_needed', 'sync')
+             print("WHOOP re-auth needed: refresh token rejected (%s). %s" % (str(e)[:200], REAUTH_STEPS),

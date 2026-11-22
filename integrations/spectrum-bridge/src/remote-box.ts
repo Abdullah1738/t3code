@@ -1,6 +1,7 @@
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { createPublicKey, createHmac } from "node:crypto";
 import { toolLog } from "./toollog.ts";
+import { traceLoopOperation } from "./loop-stall.ts";
 import { readFileSync } from "node:fs";
 import { Store } from "./store.ts";
 import { jsonBody, opaqueId, seal, tokenMatches, validId, type Fetch, type Sealed } from "./remote-protocol.ts";
@@ -97,7 +98,7 @@ export class RemoteBox {
   private backendState() {
     this.nextStateLog = this.now() + 300_000;
     this.emit("moni-box-backend-state", undefined, undefined, { backend: "remote-box", active: this.io.active(), busy: this.busy,
-      queuedBehind: this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n,
+      queuedBehind: traceLoopOperation("remote.queue-depth", () => this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n),
       fenced: !!this.store.get("remoteFence"), count: this.failures });
   }
   checkUnanswered(now = this.now()): Promise<void> { return this.unanswered.check(now); }
@@ -266,8 +267,8 @@ export class RemoteBox {
     }
   }
   private waiting() {
-    return this.store.db.query<{ id: string; received_at: number }, []>(`SELECT id,received_at FROM remote_inbox
-      WHERE kind='inbound' AND finished_at IS NULL ORDER BY received_at,seq LIMIT 1`).get();
+    return traceLoopOperation("remote.unanswered", () => this.store.db.query<{ id: string; received_at: number }, []>(`SELECT id,received_at FROM remote_inbox
+      WHERE kind='inbound' AND finished_at IS NULL ORDER BY received_at,seq LIMIT 1`).get());
   }
   private finish(id: string) {
     this.store.db.transaction(() => {
@@ -326,7 +327,7 @@ export class RemoteBox {
       if (status.boxId !== this.config.boxId || status.epoch !== this.config.epoch) throw new Error("Box identity mismatch");
       dependenciesReady = status.routerReady !== false && status.callbackReady !== false;
       this.failures = 0;
-      const rows = this.store.db.query<{ id: string; seq: number; sealed: string; expires_at: number | null }, [number]>("SELECT id,seq,sealed,expires_at FROM remote_inbox WHERE sealed IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) ORDER BY seq LIMIT 50").all(this.now());
+      const rows = traceLoopOperation("remote.pending", () => this.store.db.query<{ id: string; seq: number; sealed: string; expires_at: number | null }, [number]>("SELECT id,seq,sealed,expires_at FROM remote_inbox WHERE sealed IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) ORDER BY seq LIMIT 50").all(this.now()));
       let delivered = 0;
       for (const row of rows) {
         step = "deliver"; requestStarted = this.now(); requestEnded = undefined;
@@ -349,7 +350,7 @@ export class RemoteBox {
         } else this.store.set("remoteOutage", outage);
       }
       if (delivered) this.emit("moni-queue-delivered", `n=${delivered}`);
-      this.emit("moni-queue-depth", `n=${this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n}`);
+      this.emit("moni-queue-depth", `n=${traceLoopOperation("remote.queue-depth", () => this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n)}`);
       this.nextProbe = this.now() + 5_000;
       healthy = true;
     } catch (error) {
@@ -387,7 +388,7 @@ export class RemoteBox {
     if (this.deliveryBusy || !this.io.active()) return;
     this.deliveryBusy = true;
     try {
-      const waiting = this.store.db.query<{ id: string; expires_at: number }, []>("SELECT id,expires_at FROM remote_inbox WHERE picked_up_at IS NULL AND expires_at IS NOT NULL AND delivery_final IS NULL ORDER BY COALESCE(delivery_checked_at,0),seq LIMIT 50").all();
+      const waiting = traceLoopOperation("remote.expiry", () => this.store.db.query<{ id: string; expires_at: number }, []>("SELECT id,expires_at FROM remote_inbox WHERE picked_up_at IS NULL AND expires_at IS NOT NULL AND delivery_final IS NULL ORDER BY COALESCE(delivery_checked_at,0),seq LIMIT 50").all());
       if (!waiting.length) return;
       const probedAt = this.now();
       const status = await this.request("/delivery-status", { ids: waiting.map(r => r.id), deadlines: waiting.map(r => ({ id: r.id, expiresAt: r.expires_at })), epoch: this.config.epoch });
@@ -427,7 +428,7 @@ export class RemoteBox {
     }
   }
   async send(id: string, text: string, mediaUrl: string | undefined, line: Line, chat: ChatKey): Promise<{ id: string; handle: string }> {
-    const row = this.store.db.query<{ at: number; state: string; handle: string }, [string]>("SELECT * FROM remote_sends WHERE id=?").get(id);
+    const row = traceLoopOperation("remote.reply", () => this.store.db.query<{ at: number; state: string; handle: string }, [string]>("SELECT * FROM remote_sends WHERE id=?").get(id));
     if (row?.state === "sent") {
       this.io.mirror?.outbound(id, text, mediaUrl, row.at);
       return { id, handle: row.handle };

@@ -20,7 +20,7 @@ export function ownedSessions(store: Store): Array<{ id: string; directory?: str
   };
   const route = store.get<{ id?: unknown; directory?: unknown } | null>("route");
   add(route?.id, route?.directory);
-  for (const row of store.db.query<{ key: string }, []>("SELECT key FROM kv WHERE key LIKE 'seed:%'").all()) {
+  for (const row of store.db.query<{ key: string }, []>("SELECT key FROM kv WHERE key LIKE 'seed:%' ORDER BY key").all()) {
     add(row.key.slice("seed:".length));
   }
   for (const row of store.db.query<{ sessionId: unknown }, []>(`SELECT DISTINCT json_extract(payload, '$.sessionId') AS sessionId

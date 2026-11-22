@@ -293,6 +293,7 @@ it.effect.each(
         assert.equal(after.runs[0]?.status, status);
         assert.equal(after.runs[0]?.cancelReason, cancelReason);
         assert.equal(interruptCount, 1);
+        assert.equal(after.providerTurns.find((turn) => turn.id === `${key}:turn`)?.status, status);
         const usage = rows.filter((row) => "runId" in row && row.kind === "run.usage");
         assert.lengthOf(usage, 1);
         const row = usage[0]!;

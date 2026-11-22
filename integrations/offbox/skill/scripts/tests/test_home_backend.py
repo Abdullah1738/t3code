@@ -488,6 +488,114 @@ class Failover(HomeFiles):
         self.assertEqual(self.execs, [])
 
 
+class Overflow(HomeFiles):
+    """A healthy home with runs already waiting for memory: new ordinary work goes to Boat instead of joining them."""
+    Exec, run_cmd, failures = Failover.Exec, Failover.run_cmd, Failover.failures
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
+        self.execs = []
+        self.stack.enter_context(patch.object(api, "probe_backend", return_value=None))
+
+        def execve(path, argv, env):
+            self.execs.append((argv, env))
+            raise self.Exec()
+        self.stack.enter_context(patch.object(os, "execve", execve))
+        self.stack.enter_context(patch.object(cli, "log"))
+        self.me = {"owner": "t", "repo_root": "/r", "repo_key": "r"}
+        self.stack.enter_context(patch.object(common, "CAP_PATH", self.dir / "cap.json"))
+        self.stack.enter_context(patch.object(home, "_BOAT_OK_AT", None))
+
+    def busy(self, waiting=5):
+        return patch.object(home, "_health", return_value={"ok": True, "queue": waiting + 2, "waiting": waiting, "running": 3})
+
+    def test_a_busy_home_sends_the_run_to_boat_without_calling_it_an_outage(self):
+        with self.busy(), patch.object(runs, "run_remote", side_effect=AssertionError("nothing may be sent home")):
+            rc, err = self.run_cmd("--", "make", "test")
+        self.assertEqual(rc, "exec")
+        argv, env = self.execs[0]
+        self.assertEqual(argv[2:], ["run", "--", "make", "test"])
+        self.assertEqual(env["OFFBOX_BACKEND"], "boat")
+        self.assertEqual(env[home.FAILOVER_ENV], "home is busy: 5 runs waiting for memory, 3 running")
+        self.assertEqual(err.count("this run goes to Boat instead of waiting"), 1)
+        self.assertEqual(self.failures(), [], "a busy home is not evidence of an outage")
+
+    def test_a_home_with_nothing_waiting_keeps_the_run(self):
+        # `queue` alone also counts runs in the moment before they are admitted: it never sends a run away.
+        for body in ({"ok": True, "queue": 6, "waiting": 0, "running": 9}, {"ok": True, "queue": 6}, {"ok": True},
+                     {"ok": True, "waiting": True}, {"ok": True, "waiting": "5"}, {"ok": True, "waiting": None}):
+            with self.subTest(body=body), patch.object(home, "_health", return_value=body), \
+                    patch.object(runs, "run_remote", return_value=0):
+                self.assertEqual(self.run_cmd("--", "make", "test")[0], 0)
+                self.assertEqual(self.execs, [])
+
+    def test_the_queue_length_that_counts_as_busy_can_be_raised(self):
+        with patch.dict(os.environ, {"OFFBOX_OVERFLOW_QUEUE": "10"}), self.busy(9), \
+                patch.object(runs, "run_remote", return_value=0):
+            self.assertEqual(self.run_cmd("--", "make", "test")[0], 0)
+        self.assertEqual(self.execs, [])
+
+    def test_a_capped_or_silent_boat_leaves_the_run_waiting_on_home(self):
+        (self.dir / "cap.json").write_text('{"capped": true}')
+        with self.busy(), patch.object(runs, "run_remote", return_value=0):
+            rc, err = self.run_cmd("--", "make", "test")
+        self.assertEqual((rc, self.execs), (0, []))
+        self.assertIn("Boat cannot take runs now; this run waits on home", err)
+        (self.dir / "cap.json").unlink()
+        silent = lambda name, timeout: "no answer" if name == "boat" else None
+        with self.busy(), patch.object(api, "probe_backend", side_effect=silent), \
+                patch.object(runs, "run_remote", return_value=0):
+            rc, err = self.run_cmd("--", "make", "test")
+        self.assertEqual((rc, self.execs), (0, []))
+        self.assertEqual(self.failures(), [])
+
+    def test_one_answer_from_boat_serves_the_check_and_the_move_that_follows(self):
+        answers = iter([None, "no answer"])
+        with patch.object(api, "probe_backend", side_effect=lambda name, timeout: next(answers)):
+            self.assertTrue(home.boat_can_take())
+            self.assertTrue(home.boat_can_take(), "the move right after the check does not ask Boat a second time")
+        with patch.object(home, "_BOAT_OK_AT", home.time.monotonic() - home.BOAT_OK_FOR_S - 1), \
+                patch.object(api, "probe_backend", return_value="no answer"):
+            self.assertFalse(home.boat_can_take())
+
+    def test_work_that_left_home_has_only_boats_own_limit_and_pinned_boat_work_keeps_four(self):
+        state = self.dir / "state"
+        state.mkdir()
+        self.stack.enter_context(patch.object(common, "STATE", state))
+        self.stack.enter_context(patch.object(common, "DB_PATH", state / "offbox.db"))
+        with patch.object(pool, "backend", return_value="boat"), patch.object(common, "_BACKEND", "boat"):
+            self.assertEqual(pool.pool_size(), 4)
+            with patch.dict(os.environ, {"OFFBOX_POOL_SIZE": "500"}):
+                self.assertEqual(pool.pool_size(), 16)
+            with patch.dict(os.environ, {home.FAILOVER_ENV: "home is busy: 5 runs waiting for memory"}):
+                self.assertTrue(home.left_busy_home())
+                self.assertEqual(pool.pool_size(), pool.BOAT_PLAN_MAX_ACTIVE, "before /limits was ever read")
+                with contextlib.closing(common.db()) as con:
+                    con.execute("INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)",
+                                (capacity.PLAN_KEY, json.dumps({"max_active": 120})))
+                    con.commit()
+                self.assertEqual(pool.pool_size(), 120)
+                with patch.dict(os.environ, {"OFFBOX_POOL_SIZE": "6"}):
+                    self.assertEqual(pool.pool_size(), 6, "a caller's own smaller pool still holds")
+                with patch.dict(os.environ, {"OFFBOX_POOL_SIZE": "500"}):
+                    self.assertEqual(pool.pool_size(), 120)
+            with patch.dict(os.environ, {home.FAILOVER_ENV: "no answer (TimeoutError)"}):
+                self.assertEqual(pool.pool_size(), 120)
+                self.assertFalse(home.left_busy_home())
+
+    def test_person_pinned_and_returned_work_never_leaves_a_busy_home(self):
+        cases = (patch.object(common, "person", return_value="moni"),
+                 patch.dict(os.environ, {"OFFBOX_BACKEND": "server"}),
+                 patch.dict(os.environ, {home.RETURNED_HOME_ENV: "home is busy: 5 runs waiting for memory"}))
+        for case in cases:
+            with self.subTest(case=case), case, self.busy(), \
+                    patch.object(home, "fail_over", side_effect=AssertionError("must stay home")):
+                home.before_run(["run", "--", "true"])
+        self.assertEqual(self.execs, [])
+
+
 class BoxReadinessFailover(Isolated):
     # This fixture exercises real failover with synthetic config and a trapped execve.
     guard_home_failover = False
@@ -1303,7 +1411,9 @@ class BoxReadinessFailover(Isolated):
                 self.con.execute("UPDATE runs SET status='done'")
                 self.con.commit()
         self.clock.on_sleep = free_after_wait
+        # Boat cannot take the run, so it keeps its place at home instead of leaving after two minutes.
         with patch.dict(os.environ, {"OFFBOX_POOL_WAIT_SECONDS": "1000"}), \
+                patch.object(home, "boat_can_take", return_value=False), \
                 patch.object(lease, "_reuse", side_effect=lambda con, row, *a, **k: dict(row)), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             got = pool.acquire(self.me)

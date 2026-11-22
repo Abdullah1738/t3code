@@ -3,6 +3,7 @@ import { RemoteBox, remoteBoxConfig } from "./remote-box.ts";
 import { createChatMirror, type ChatMirror } from "./mirror.ts";
 import { readFileSync } from "node:fs";
 import { toolError, toolLog, type LogLine } from "./toollog.ts";
+import { createLoopStallMonitor } from "./loop-stall.ts";
 import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 /**
  * Sendblue serve loop. Kept apart from main.ts so the Photon path stays exactly as it was:
@@ -133,6 +134,9 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   let api: ((request: Request) => Promise<Response>) | undefined;
   const releaseLock = acquireLock(join(stateRoot, "bridge.lock"));
   process.once("exit", releaseLock);
+  const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }));
+  loopStalls.start();
+  process.once("exit", () => loopStalls.stop());
   const socketPath = join(stateRoot, "bridge.sock");
   await io.removeStaleSocket(socketPath);
   // Bind before opening SQLite: a second process must not run crash recovery on live sends.
@@ -406,7 +410,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       void chat.parts.delivery?.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
       if (ready()) void chat.parts.router?.checkCompletion();
       if (ready()) void chat.parts.replyGap?.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });
-      if (ready()) void chat.parts.router?.checkInboundLatency().catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
+      void chat.parts.router?.checkInboundLatency(ready()).catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
       if (ready() && !chat.parts.busy) {
         chat.parts.busy = true;
         const revision = chat.revision;
@@ -420,6 +424,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    loopStalls.stop();
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     abort.abort();
     clearInterval(timer);

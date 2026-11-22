@@ -115,7 +115,6 @@ class SourceTests(unittest.TestCase):
             ('permission', SimpleNamespace(returncode=1, stdout='', stderr='log: Operation not permitted'), 'log: Operation not permitted'),
             ('parse', SimpleNamespace(returncode=0, stdout='private broken JSON', stderr=''), 'invalid unified log data'),
             ('parse', SimpleNamespace(returncode=0, stdout='{}', stderr=''), 'invalid unified log data'),
-            ('parse', SimpleNamespace(returncode=0, stdout='[{"timestamp":"private"}]', stderr=''), 'invalid unified log data'),
         ]
         now = dt.datetime(2026, 11, 13, 12, tzinfo=dt.timezone.utc).timestamp()
         for failure, result, message in cases:

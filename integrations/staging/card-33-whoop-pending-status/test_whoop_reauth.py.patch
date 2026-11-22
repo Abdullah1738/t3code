@@ -1,0 +1,170 @@
+--- a/test_whoop_reauth.py
++++ b/test_whoop_reauth.py
+@@ -201,6 +201,167 @@
+                     self.w.exchange_code('PrivateAuthorizationCode')
+                 if error == 'invalid_request':
+                     self.assertNotIsInstance(caught.exception, self.w.ReauthNeeded)
++
++
++class PendingStatusTests(unittest.TestCase):
++    patch = WhoopAuthTests.patch
++    http_error = WhoopAuthTests.http_error
++
++    def setUp(self):
++        import warnings
++        warning_context = warnings.catch_warnings()
++        warning_context.__enter__()
++        self.addCleanup(warning_context.__exit__, None, None, None)
++        warnings.simplefilter('ignore', ResourceWarning)
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        env = mock.patch.dict(os.environ, HEALTH_VAULT_TEST_COPY='1',
++                              HEALTH_TOOLLOG_DIR=str(self.root / 'logs'))
++        env.start()
++        self.addCleanup(env.stop)
++        spec = importlib.util.spec_from_file_location('whoop_pending_fixture',
++            Path(__file__).parent / 'whoop/whoop.py')
++        self.w = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(self.w)
++        for name, value in {'HERE': self.root, 'STATUS': self.root / 'status.json',
++                            'AUTH_STATE': self.root / 'auth_state.json', 'LOCK': self.root / '.lock',
++                            'STATUS_LOCK': self.root / '.status.lock', 'LOG': self.root / 'whoop.log'}.items():
++            setattr(self.w, name, str(value))
++        self.clock = self.w.datetime(2026, 11, 22, 10, tzinfo=self.w.timezone.utc)
++        self.patch('now', side_effect=lambda: self.clock)
++        self.tokens = {'refresh_token': 'PrivateRefreshToken', 'access_token': 'PrivateAccessToken', 'expires_at': 0}
++        self.patch('load_tokens', side_effect=lambda: self.tokens)
++        self.patch('kc_get', side_effect=AssertionError('real Keychain must not be reached'))
++        self.patch('kc_set', side_effect=AssertionError('real Keychain must not be reached'))
++        self.patch('client_creds', return_value=('PrivateClient', 'PrivateSecret'))
++        self.patch('db', side_effect=AssertionError('DB must not be reached'))
++        self.patch('_sync', side_effect=lambda *args: self.w.valid_access_token())
++        http = mock.patch.object(self.w.urllib.request, 'urlopen',
++                                 side_effect=lambda *args, **kw: self.http_error_raised())
++        http.start()
++        self.addCleanup(http.stop)
++        rollup = mock.patch.object(log, 'rollup_previous')
++        rollup.start()
++        self.addCleanup(rollup.stop)
++        self.patch('proc_started', return_value='synthetic listener start')
++        self.w.write_json(self.w.AUTH_STATE, {'state': 'synthetic-state'})
++        self.initial = {'state': 'sync_error', 'last_error': 'stale error', 'updated_at': '2000-01-01T00:00:00+00:00',
++                        'consecutive_failures': 7, 'authorized_at': '2000-01-01T00:00:00+00:00',
++                        'listener': {'pid': 123, 'started': 'synthetic listener start',
++                                     'until': (self.clock + self.w.timedelta(hours=1)).isoformat()}}
++        self.w.write_json(self.w.STATUS, self.initial)
++        self.detail = self.patch('exit_detail')
++        count_failure = self.w.count_failure
++        def locked_failure(**kw):
++            with open(self.w.LOCK, 'a') as probe:
++                with self.assertRaises(BlockingIOError):
++                    self.w.fcntl.flock(probe, self.w.fcntl.LOCK_EX | self.w.fcntl.LOCK_NB)
++            return count_failure(**kw)
++        self.patch('count_failure', side_effect=locked_failure)
++
++    def http_error_raised(self):
++        raise self.http_error(400, 'invalid_request')
++
++    def invoke(self):
++        import io
++        out, err = io.StringIO(), io.StringIO()
++        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
++            code = self.w.cmd_sync([])
++        return code, out.getvalue(), err.getvalue()
++
++    def status(self):
++        return json.loads(Path(self.w.STATUS).read_text())
++
++    def install_before_failure_check(self):
++        original = self.w.TokenLock
++        fixture = self
++        class LoginCompletes(original):
++            installed = False
++            def __exit__(self, *args):
++                result = super().__exit__(*args)
++                if not LoginCompletes.installed:
++                    LoginCompletes.installed = True
++                    with original():
++                        fixture.tokens = {**fixture.tokens} if fixture.tokens else {}
++                        fixture.tokens.update(refresh_token='PrivateNewToken', access_token='PrivateNewAccess')
++                        fixture.w.set_status(state='ok', last_error=None, consecutive_failures=0)
++                        fixture.login_status = Path(fixture.w.STATUS).read_bytes()
++                return result
++        self.patch('TokenLock', new=LoginCompletes)
++
++    def test_pending_rejection_updates_real_status_each_run_and_stays_quiet(self):
++        for failures in (8, 9):
++            self.assertTrue(self.w.login_pending())
++            self.clock += self.w.timedelta(seconds=1)
++            self.assertEqual(self.invoke(), (0, '', ''))
++            status = self.status()
++            self.assertEqual(status['state'], 'reauth_needed')
++            self.assertEqual(status['consecutive_failures'], failures)
++            self.assertEqual(status['last_error'], 'token endpoint HTTP 400 (invalid_request: PrivateResponseBody)')
++            self.assertEqual(status['updated_at'], self.clock.isoformat(timespec='seconds'))
++            self.assertEqual(status['listener'], self.initial['listener'])
++            self.detail.assert_not_called()
++
++    def test_pending_rejection_never_overwrites_completed_login(self):
++        self.install_before_failure_check()
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(Path(self.w.STATUS).read_bytes(), self.login_status)
++        self.assertEqual(self.status()['state'], 'ok')
++        self.w.count_failure.assert_not_called()
++        self.detail.assert_not_called()
++
++    def test_nonpending_rejection_keeps_failure_exit_and_stderr(self):
++        Path(self.w.AUTH_STATE).unlink()
++        code, out, err = self.invoke()
++        self.assertEqual((code, out), (1, ''))
++        self.assertIn('WHOOP re-auth needed: refresh token rejected', err)
++        self.assertEqual(self.status()['state'], 'reauth_needed')
++        self.assertEqual(self.status()['consecutive_failures'], 8)
++        self.detail.assert_called_once_with('reauth_needed', 'sync')
++
++    def test_pending_rejection_truncates_last_error(self):
++        error = self.w.ReauthNeeded('synthetic rejection ' + 'x' * 400)
++        error.rejected = self.tokens['refresh_token']
++        self.w._sync.side_effect = error
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(self.status()['last_error'], str(error)[:300])
++
++    def test_pending_missing_tokens_updates_status_and_stays_quiet(self):
++        self.tokens = None
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(self.status()['state'], 'reauth_needed')
++        self.assertEqual(self.status()['consecutive_failures'], 8)
++        self.assertEqual(self.status()['last_error'], 'tokens missing from Keychain')
++        self.detail.assert_not_called()
++
++    def test_pending_missing_tokens_never_overwrites_completed_login(self):
++        self.tokens = None
++        self.install_before_failure_check()
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(Path(self.w.STATUS).read_bytes(), self.login_status)
++        self.w.count_failure.assert_not_called()
++        self.detail.assert_not_called()
++
++    def test_nonpending_missing_tokens_keeps_failure_exit_and_stderr(self):
++        self.tokens = None
++        Path(self.w.AUTH_STATE).unlink()
++        code, out, err = self.invoke()
++        self.assertEqual((code, out), (1, ''))
++        self.assertIn('WHOOP tokens missing from Keychain (was authorized before).', err)
++        self.assertEqual(self.status()['state'], 'reauth_needed')
++        self.assertEqual(self.status()['consecutive_failures'], 8)
++        self.detail.assert_called_once_with('not_authorized', 'sync')
++
++    def test_never_authorized_missing_tokens_keeps_status_unchanged(self):
++        self.tokens = None
++        self.initial.pop('authorized_at')
++        self.w.write_json(self.w.STATUS, self.initial)
++        before = Path(self.w.STATUS).read_bytes()
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(Path(self.w.STATUS).read_bytes(), before)
++        self.w.count_failure.assert_not_called()
++        self.detail.assert_not_called()
+ 
+ 
+ class RefreshSchemaTests(unittest.TestCase):

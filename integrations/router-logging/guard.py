@@ -15,6 +15,7 @@ import time
 import uuid
 
 from toollog import directory, emit
+from observer import Timings, clock_sample, gap, job_snapshot, launchctl_cause, launchctl_print, measured, phase
 
 LABEL = 'com.abdullah.9router-fork'
 FRESH_MS = 300000
@@ -48,7 +49,7 @@ class Guard:
         self.notify = notify or (lambda text, key: False)
         self.save = save or (lambda state: None)
 
-    def step(self, now, job, listener, marker=None, lock_age_ms=None):
+    def step(self, now, job, listener, marker=None, lock_age_ms=None, observation=None):
         state = self.state
         # Retry an undelivered recovery with the same bridge deduplication key.
         recovery = state.get('recovery')
@@ -58,8 +59,10 @@ class Guard:
         if job == 'unknown':
             if not state.get('jobUnknown') or (not failed and 'unknownSinceMs' not in state):
                 props = dict(state=job, listener=listener)
+                props.update(observation or {})
                 if not failed:
                     state['unknownSinceMs'] = now
+                    state['unknownCause'] = launchctl_cause(observation or {})
                     props['unknownSince'] = iso(now)
                 self.event('listener.state_unknown', **props)
             state['jobUnknown'] = True
@@ -68,7 +71,7 @@ class Guard:
         if (job != 'unknown' or failed) and 'unknownSinceMs' in state:
             since = state.pop('unknownSinceMs')
             self.event('listener.state_resolved', unknownSince=iso(since), unknownMs=max(0, now - since),
-                       state=job, listener=listener)
+                       state=job, listener=listener, cause=state.pop('unknownCause', 'other'))
         # A persisted window from the old guard may have no TCP evidence.
         # Close that uncertainty before starting a newly observed refusal.
         if (failed and 'downSinceMs' in state and 'downListener' not in state
@@ -134,6 +137,7 @@ def read_json(path):
         return {}
 
 
+@measured('state_save')
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(prefix='.guard-', dir=path.parent)
@@ -163,8 +167,14 @@ class Runtime:
             return -1
 
     def observe(self):
-        code = self.command(['print', self.job])
+        with phase('launchctl'):
+            self.observation = launchctl_print(self.job)
+        code = self.observation['launchctlExit']
         job = 'loaded' if code == 0 else 'absent' if code == 113 else 'unknown'
+        return job, self.probe()
+
+    @measured('tcp')
+    def probe(self):
         try:
             with socket.create_connection(('127.0.0.1', 20128), timeout=.5):
                 listener = 'open'
@@ -172,7 +182,7 @@ class Runtime:
             listener = 'refused'
         except OSError:
             listener = 'unreachable'
-        return job, listener
+        return listener
 
     def notify(self, text, key):
         env = dict(os.environ)
@@ -202,7 +212,8 @@ class Runtime:
         self.marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with Path(str(self.marker) + '.coord').open('a') as gate:
             os.chmod(gate.name, 0o600)
-            fcntl.flock(gate, fcntl.LOCK_EX)
+            with phase('lock_wait'):
+                fcntl.flock(gate, fcntl.LOCK_EX)
             yield
 
     def claim(self, lock, repair):
@@ -330,12 +341,21 @@ def serve():
         try:
             while not stopping:
                 start = time.monotonic()
-                try:
-                    job, listener = runtime.observe()
-                    runtime.settle(job, listener)
-                    guard.step(time.time() * 1000, job, listener, read_json(runtime.marker), runtime.lock_age_ms())
-                except Exception:
-                    emit('guard', 'guard.error', kind='error', error=dict(tag='tick_failed'))
+                sample = dict(clock_sample(), **job_snapshot())
+                missing = gap(guard.state.get('observerTick'), sample)
+                if missing:
+                    emit('guard', 'observer.gap', kind='perf', props=missing)
+                with Timings('guard', 'guard.tick_late', threshold_ms=120000, start=sample) as timing:
+                    try:
+                        job, listener = runtime.observe()
+                        runtime.settle(job, listener)
+                        guard.step(time.time() * 1000, job, listener, read_json(runtime.marker), runtime.lock_age_ms(), runtime.observation)
+                    except Exception:
+                        emit('guard', 'guard.error', kind='error', error=dict(tag='tick_failed'))
+                    guard.state['observerTick'] = sample
+                    with contextlib.suppress(OSError):
+                        guard.save(guard.state)
+                guard.state['observerTick'] = timing.end
                 if pool_alerts is None or pool_alerts.poll() is not None:
                     # Delivery can block on several historical bridge retries.
                     # Its own process keeps listener repair on the 15 s cadence.
@@ -351,6 +371,9 @@ def serve():
                 while not stopping and time.monotonic() - start < 15:
                     time.sleep(max(0, min(.5, 15 - (time.monotonic() - start))))
         finally:
+            guard.state['observerTick'] = dict(clock_sample(), jobState='stopped', jobPid=os.getpid(), jobExit=0)
+            with contextlib.suppress(OSError):
+                guard.save(guard.state)
             for child in (pool_alerts, poll):
                 if child is None or child.poll() is not None:
                     continue

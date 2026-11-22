@@ -47,7 +47,7 @@ class HostMemory(Base):
         b = self.box()
         self.cmd(b, age=7200)
         cg = self.tmp/'cg';cg.mkdir();(cg/'memory.stat').write_text(f'anon {G}\nshmem {20*G}\n')
-        with patch.object(boatd, 'cg_path', return_value=cg), patch.object(boatd, 'predicted_peak', return_value=6*G):
+        with patch.object(boatd, 'cg_path', return_value=cg), patch.object(boatd, 'usual_peak', return_value=6*G):
             self.assertEqual(boatd.admitted_bytes(self.con), 5*G)
             # Two commands sharing a box don't promise its whole-box prediction twice.
             self.cmd(b, pid=1002, age=0)
