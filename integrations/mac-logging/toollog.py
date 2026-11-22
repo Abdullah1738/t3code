@@ -250,7 +250,7 @@ def cpu_fields(values):
     numeric = {'windowS', 'cpuS', 'totalCpuPct', 'ncpu', 'processCount', 'runnable',
                'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb',
                'skippedLines', 'badLines', 'lines', 'exiting', 'systemCpuPct',
-               'userPct', 'sysPct', 'nicePct', 'idlePct', 'kernelTaskPct', 'kernelTaskWindowS',
+               'userPct', 'sysPct', 'nicePct', 'idlePct', 'kernelTaskPct', 'kernelTaskWindowS', 'kernelTaskWallMs',
                'unattributedCpuPct', 'spawned', 'exited', 'uid', 'perMinute',
                'childCpuPct', 'childReadable', 'childUnreadable', 'childUncertainParents',
                'lostParents', 'unattributedAfterChildrenPct', 'observedSpawnsLowerBound',
