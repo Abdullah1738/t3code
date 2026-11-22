@@ -70,6 +70,51 @@ function setup(mirrorSink?: MirrorSink, harness?: (root: string) => Harness) {
 }
 function files(root: string): string { return readdirSync(root, { withFileTypes: true }).map(e => e.isDirectory() ? files(join(root, e.name)) : readFileSync(join(root, e.name)).toString()).join(""); }
 
+test.each([
+  { source: "inbox", hasThreadOrigin: true, hasReplyTo: true },
+  { source: "action", hasThreadOrigin: true, hasReplyTo: false },
+  { source: "missing", hasThreadOrigin: true, hasReplyTo: true },
+  { source: "none", hasThreadOrigin: false, hasReplyTo: true },
+])("swipe metrics emit only resolution metadata for $source", async props => {
+  const s = setup(), io = { line: s.line, chat: chatKey.dm("moni"), bus: async () => Response.json({}) };
+  const rows = await captureLogs(async () => {
+    const result = await s.remote.callback(s.request("/metrics", { kind: "swipe", durationMs: 0, ...props,
+      text: "PRIVATE_SWIPE_TEXT", threadOrigin: "PRIVATE_TARGET", replyTo: "PRIVATE_PREVIOUS", status: "error" }), io);
+    expect(result.status).toBe(200); expect(await result.json()).toEqual({ accepted: true });
+  });
+  const swipes = rows.filter(row => row.name === "moni-swipe-resolved");
+  expect(swipes).toHaveLength(1); expect(swipes[0]!.props).toEqual(props);
+  expect(rows.some(row => row.name === "moni-turn-latency" || row.name === "moni-runner-error")).toBe(false);
+  expect(s.logs).toContain(`moni-swipe-resolved ${JSON.stringify(props)}`);
+  expect(JSON.stringify([s.logs, rows])).not.toContain("PRIVATE_");
+});
+
+test.each([
+  { source: "PRIVATE_INVALID" }, { source: 1 }, { source: null },
+  { hasThreadOrigin: "true" }, { hasThreadOrigin: undefined },
+  { hasReplyTo: 1 }, { hasReplyTo: undefined }, { durationMs: -1 },
+])("invalid swipe metric is refused without a resolution or latency event: %j", async patch => {
+  const s = setup();
+  const rows = await captureLogs(async () => {
+    const result = await s.remote.callback(s.request("/metrics", { kind: "swipe", durationMs: 0, source: "action", hasThreadOrigin: true, hasReplyTo: true, ...patch }),
+      { line: s.line, chat: chatKey.dm("moni"), bus: async () => Response.json({}) });
+    expect(result.status).toBe(400);
+  });
+  expect(rows.some(row => row.name === "moni-swipe-resolved" || row.name === "moni-turn-latency")).toBe(false);
+  expect(JSON.stringify([s.logs, rows])).not.toContain("PRIVATE_");
+});
+
+test("legacy runner latency metrics still emit duration and harness errors", async () => {
+  const s = setup();
+  const rows = await captureLogs(async () => {
+    expect((await s.remote.callback(s.request("/metrics", { durationMs: 125, status: "error" }),
+      { line: s.line, chat: chatKey.dm("moni"), bus: async () => Response.json({}) })).status).toBe(200);
+  });
+  expect(rows.filter(row => row.name === "moni-turn-latency").map(row => row.durationMs)).toEqual([125]);
+  expect(rows.some(row => row.name === "moni-runner-error")).toBe(true);
+  expect(rows.some(row => row.name === "moni-swipe-resolved")).toBe(false);
+});
+
 test("a single failed lease logs its cause and the recovery gap separately from the clear window, even at the cap", async () => {
   const s = setup();
   s.config.epoch = "PRIVATE_EPOCH_CANARY";

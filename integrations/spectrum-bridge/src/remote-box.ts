@@ -484,6 +484,12 @@ export class RemoteBox {
       const operation = body.operationId; delete body.operationId;
       if (path === "/metrics") {
         if (typeof body.durationMs !== "number" || !Number.isFinite(body.durationMs) || body.durationMs < 0) return reply(400, { error: "Invalid metrics" });
+        if (body.kind === "swipe") {
+          if (typeof body.source !== "string" || !["inbox", "action", "missing", "none"].includes(body.source)
+            || typeof body.hasThreadOrigin !== "boolean" || typeof body.hasReplyTo !== "boolean") return reply(400, { error: "Invalid metrics" });
+          this.emit("moni-swipe-resolved", undefined, undefined, { source: body.source, hasThreadOrigin: body.hasThreadOrigin, hasReplyTo: body.hasReplyTo });
+          return reply(200, { accepted: true });
+        }
         if (body.status === "error") this.emit("moni-runner-error", "harness");
         this.emit("moni-turn-latency", undefined, body.durationMs); return reply(200, { accepted: true });
       }

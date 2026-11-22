@@ -112,6 +112,11 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
       props[key] = value; continue;
     }
+    if (entry.component === "remote-box" && entry.name === "moni-swipe-resolved") {
+      if (key === "source" && typeof value === "string" && ["inbox", "action", "missing", "none"].includes(value)
+        || (key === "hasThreadOrigin" || key === "hasReplyTo") && typeof value === "boolean") props[key] = value;
+      continue;
+    }
     if (entry.component === "remote-box" && entry.name === "moni-callback-ready"
       && (key === "handlerMs" || key === "loopDelayMs") && typeof value === "number" && Number.isFinite(value) && value >= 0) {
       props[key] = value; continue;
