@@ -51,6 +51,8 @@ type Turn = Route & {
   startedAt: number;
   phase: "submitting" | "running" | "unknown" | "held" | "failed";
   background?: boolean;
+  /** Exact backend run followed by an idle watch; unrelated queued runs cannot extend it. */
+  holderRunId?: string;
   /**
    * `"request"`: follows requests after a reply or when the idle watch finds one.
    * Nothing guarantees the root resumes afterwards (the child may be aborted,
@@ -201,6 +203,9 @@ const ROTATE_AFTER = 4 * 60 * 60_000;
 const ROTATE_AT_TOKENS = 256_000;
 const MAX_RECAP = 12_000;
 const RESET_CHAT_FOR = 8 * 60 * 60_000;
+export const BACKGROUND_HOLD_MS = 15 * 60_000;
+const HOLD_AGE_MS = 5 * 60_000;
+
 const RESET_IDLE = 10 * 60_000;
 /**
  * Sendblue mode only: who is in this chat and what each role may do. Photon
@@ -2087,7 +2092,7 @@ export class Router {
       rows = this.store.pendingInbound();
       // A failed or retired turn never blocks the conversation.
       let currentTurn = this.store.get<Turn | null>("activeTurn");
-      if (currentTurn?.origin === "request" && rows.some(row => row.state === "pending" && !synthetic(row.id)
+      if (currentTurn?.origin === "request" && !this.ownsHuman(currentTurn) && rows.some(row => row.state === "pending" && !synthetic(row.id)
         && (this.wakeLed(currentTurn) || this.store.get(`human-own-turn:${row.id}`)))) {
         this.logTurnEnd(currentTurn, "no_reply");
         this.setTurn(null);
@@ -5105,7 +5110,14 @@ export class Router {
   private async poll(): Promise<void> {
     let turn = this.store.get<Turn | null>("activeTurn");
     if (!turn || !this.current(turn) || turn.phase === "failed") return;
-    // Work has no deadline: a turn runs for as long as the agent needs.
+    // Releasing a background lease does not interrupt its run or move its reply watermark.
+    this.logHoldAge(turn);
+    if (this.idleBackground(turn)) {
+      if (Date.now() - turn.startedAt >= BACKGROUND_HOLD_MS) {
+        this.releaseBackground(turn, "hold_bound");
+        return;
+      }
+    }
     try {
       const mark = this.store.get<Watermark | null>("watermark");
       void this.checkCompletion();
@@ -5125,6 +5137,29 @@ export class Router {
         if (!accepted || accepted.phase !== "running" || !this.current(accepted)) return;
         turn = accepted;
       }
+      let awaitingRun = false;
+      // A child handoff retained after lease release has no binding to the old root run.
+      if (turn.background && turn.origin !== "request" && !turn.inboundId && this.backend.backgroundRun
+        && (turn.holderRunId || !this.ownsHuman(turn))) {
+        const run = await this.reading(this.backend.backgroundRun(turn.id, turn.directory, turn.holderRunId));
+        if (!this.current(turn) || this.store.get<Turn | null>("activeTurn")?.messageId !== turn.messageId) return;
+        if (run && !turn.holderRunId) {
+          turn = { ...turn, holderRunId: run.runId };
+          this.setTurn(turn);
+        }
+        const start = messages.findIndex(record => record.id === turn!.messageId);
+        const completion = messages.findIndex((record, index) => record.type === "idle"
+          && (run?.completionId ? record.id === run.completionId : index > start));
+        const observed = run?.messageIds?.every(id => messages.some(record => record.id === id));
+        if (this.idleBackground(turn) && run?.terminal && !(start >= 0 && completion > start)) {
+          this.releaseBackground(turn, "run_terminal", messages);
+          return;
+        }
+        // Empty terminal runs have no idle marker. Evidence also fences a stale snapshot
+        // until every bound-run assistant record is present, wherever its idle sorts.
+        awaitingRun = !!run && (!run.terminal || this.ownsHuman(turn) && completion < 0 && !observed);
+      }
+      if (turn.background) this.store.set(`holder-records:${turn.messageId}`, this.backgroundRecordsKey(messages));
       const deferredSteers = this.unresolvedSteers(turn, messages);
       const ownedPrompts = new Set([turn.messageId, ...turn.steered ?? []].filter(id => !deferredSteers.has(id)));
       let lastPrompt = -1;
@@ -5153,6 +5188,9 @@ export class Router {
         for (const id of this.synchronizeRequests(currentTurn, requests)) live.add(id);
         entries = this.pending();
       };
+      // Robob orders records by run, so a sibling's later idle cannot advance
+      // the watermark before this run's completion record arrives, even if status is terminal.
+      if (awaitingRun) { await refreshRequestsOnce(); return; }
       // A candidate completion skips child discovery unless full record coverage disproves it.
       if (!settled) await refreshRequestsOnce();
       if (!this.current(turn)) return;
@@ -5404,6 +5442,8 @@ export class Router {
           this.setTurn(turn);
           return;
         }
+        // An accepted answer owns the ensuing work even while only its child is busy.
+        if (this.ownsHuman(turn)) return;
         // Absence is only known after discovery finishes, even if the handover grace elapsed.
         if (discoveryPending) return;
         // Only a request that is still open keeps the turn: an answer whose
@@ -5428,7 +5468,7 @@ export class Router {
       }
       // Busy activity may belong to an older run whose records precede this watermark.
       // Once it stops, there is no later idle marker for this empty background turn.
-      if (turn.background && start >= 0 && !after.length && statuses[turn.id] === undefined && !live.size && !discoveryPending) {
+      if (this.idleBackground(turn) && start >= 0 && !after.length && statuses[turn.id] === undefined && !live.size && !discoveryPending) {
         this.store.db.transaction(() => {
           this.logTurnEnd(turn!, turn!.earlySent ? "replied" : "no_reply");
           this.setTurn(null);
@@ -5625,14 +5665,68 @@ export class Router {
         if (after.at(-1)?.type === "idle") this.store.set("watermark", { sessionId: route.id, id: after.at(-1)!.id } satisfies Watermark);
         return;
       }
-      this.setTurn({
+      if (!this.current(route) || this.store.get<Turn | null>("activeTurn")?.phase?.match(/^(submitting|running|unknown|held)$/)) return;
+      const released = this.store.get<{ sessionId: string; generation: number; messageId: string; recordsKey?: string; lastId?: string; runId?: string }>("releasedBackground");
+      const unchanged = released?.sessionId === route.id && released.generation === route.generation && released.messageId === mark.id
+        && (released.recordsKey ? released.recordsKey === this.backgroundRecordsKey(messages) : released.lastId === messages.at(-1)?.id);
+      if (unchanged && !released?.recordsKey) return;
+      const run = this.backend.backgroundRun ? await this.reading(this.backend.backgroundRun(route.id, route.directory)) : undefined;
+      if (unchanged && (!run || released?.runId === run.runId)) return;
+      if (!this.current(route) || this.store.get<Turn | null>("activeTurn")?.phase?.match(/^(submitting|running|unknown|held)$/)) return;
+      const adopted: Turn = {
         id: route.id, directory: route.directory, generation: route.generation,
         leaderId: this.store.get<string>(`route-leader:${route.id}:${route.generation}`),
         messageId: mark.id, startedAt: now, phase: "running", background: true,
-      } satisfies Turn);
+        ...(run ? { holderRunId: run.runId } : {}),
+      };
+      this.store.set(`holder-records:${adopted.messageId}`, this.backgroundRecordsKey(messages));
+      this.setTurn(adopted);
+      toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.hold_adopted",
+        ids: { threadId: route.id, messageId: mark.id }, props: { runStatus: run?.status ?? "unknown", ...(run ? { holderRunId: run.runId } : {}) } }));
+      if (run?.terminal && !after.some(record => record.type === "idle" && (!run.completionId || record.id === run.completionId))) this.releaseBackground(adopted, "run_terminal", messages);
     } catch (caughtError) { toolError("router", "router.catch49", caughtError);
       // Best effort; the next tick looks again.
     }
+  }
+
+  private logHoldAge(turn: Turn): void {
+    const ageMs = Math.max(0, Date.now() - turn.startedAt);
+    const key = `hold-age:${turn.messageId}:${turn.startedAt}`;
+    const last = this.store.get<number>(key) ?? turn.startedAt;
+    if (ageMs < HOLD_AGE_MS || Date.now() - last < HOLD_AGE_MS) return;
+    this.store.set(key, Date.now());
+    toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.hold_age",
+      ids: { threadId: turn.id, messageId: turn.messageId }, props: { ageMs, ...(this.idleBackground(turn) ? { boundMs: BACKGROUND_HOLD_MS } : {}) } }));
+  }
+
+  private ownsHuman(turn: Turn): boolean {
+    const live = this.store.get<Turn | null>("activeTurn");
+    return !!(turn.inboundId && !synthetic(turn.inboundId)) || !!turn.replyInboundId || !!turn.covered?.length
+      || live?.messageId === turn.messageId && !!live.covered?.length
+      || !!this.store.get<string[]>(`turn-human:${turn.messageId}`)?.length;
+  }
+
+  private idleBackground(turn: Turn): boolean {
+    return turn.background === true && turn.origin !== "request" && !turn.inboundId && !this.ownsHuman(turn);
+  }
+
+  private backgroundRecordsKey(messages: MessageRecord[]): string {
+    return hash(JSON.stringify(messages.map(record => [record.id, record.type === "assistant" ? record.time.completed : undefined])));
+  }
+
+  private releaseBackground(turn: Turn, reason: "run_terminal" | "hold_bound", messages?: MessageRecord[]): void {
+    this.store.db.transaction(() => {
+      if (!this.current(turn) || this.store.get<Turn | null>("activeTurn")?.messageId !== turn.messageId || !this.idleBackground(turn)) return;
+      this.store.set("releasedBackground", { sessionId: turn.id, generation: turn.generation, messageId: turn.messageId,
+        recordsKey: messages ? this.backgroundRecordsKey(messages) : this.store.get<string>(`holder-records:${turn.messageId}`),
+        lastId: this.store.get<Watermark>("watermark")?.id, runId: turn.holderRunId });
+      const waiting = this.pending().filter(entry => ["pending", "submitting", "unknown"].includes(entry.state));
+      this.logTurnEnd(turn, turn.earlySent ? "replied" : "no_reply", true, reason);
+      this.setTurn(waiting.length ? {
+        id: turn.id, directory: turn.directory, generation: turn.generation, leaderId: turn.leaderId,
+        messageId: turn.messageId, startedAt: Date.now(), phase: "running", background: true, origin: "request", activeAt: Date.now(),
+      } : null);
+    }).immediate();
   }
 
   // Clearing this pointer can be temporary during rebuilds; terminal paths log their own outcome.
@@ -5659,8 +5753,9 @@ export class Router {
       this.wakes.start(id, turn.id, this.syntheticBatch(turn.inboundId)!.length);
     toolLog.capture(() => {
       toolLog.beginRun(turn.id, turn.messageId);
-      if (this.store.get(`log-turn-start:${turn.messageId}`)) return;
-      this.store.set(`log-turn-start:${turn.messageId}`, true);
+      const key = `log-turn-start:${turn.messageId}${turn.background ? `:${turn.startedAt}` : ""}`;
+      if (this.store.get(key)) return;
+      this.store.set(key, true);
       const inbound = turn.inboundId ? this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(turn.inboundId) : undefined;
       const receivedAt = inbound ? (JSON.parse(inbound.payload) as { receivedAt?: number }).receivedAt : undefined;
       toolLog.write({ component: "router", kind: "event", name: "turn.start",
@@ -5935,7 +6030,7 @@ export class Router {
     }
   }
 
-  private logTurnEnd(turn: Turn, outcome: "replied" | "failed" | "refused" | "no_reply", recover = true, endReason?: DropReason): void {
+  private logTurnEnd(turn: Turn, outcome: "replied" | "failed" | "refused" | "no_reply", recover = true, endReason?: DropReason | "run_terminal" | "hold_bound"): void {
     if (recover && !this.store.get(`human-settled:${turn.messageId}`)) {
       this.recoverHumanHandoffs(turn, outcome);
       this.store.set(`human-settled:${turn.messageId}`, true);
@@ -5955,10 +6050,11 @@ export class Router {
     }
     toolLog.capture(() => {
       if (this.store.get<{ sessionId: string }>("refusedRoute")?.sessionId === turn.id) outcome = "refused";
-      if (this.store.get(`log-turn-end:${turn.messageId}`)) return;
-      this.store.set(`log-turn-end:${turn.messageId}`, true);
+      const key = `log-turn-end:${turn.messageId}${turn.background ? `:${turn.startedAt}` : ""}`;
+      if (this.store.get(key)) return;
+      this.store.set(key, true);
       toolLog.write({ component: "router", kind: "perf", name: "turn.end", durationMs: Math.max(0, Date.now() - turn.startedAt),
-        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) }, props: { outcome, ...(endReason ? { endReason } : {}) } });
+        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) }, props: { outcome, endReason: endReason ?? (outcome === "replied" || outcome === "no_reply" ? "run_completed" : outcome) } });
     });
   }
 

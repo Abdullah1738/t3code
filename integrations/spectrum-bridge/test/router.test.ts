@@ -11824,7 +11824,7 @@ test.each(["failed", "interrupted"].flatMap(outcome => ["question", "permission"
   expect(h.backend.questionReplies.length + h.backend.permissionReplies.length).toBe(1);
 });
 
-test.each((["final", "tool"] as const).flatMap(replyMode => [false, true].map(restart => ({ replyMode, restart }))))("releasing mixed watcher recovers its admitted answer ($replyMode, restart=$restart)", async ({ replyMode, restart }) => {
+test.each((["final", "tool"] as const).flatMap(replyMode => [false, true].map(restart => ({ replyMode, restart }))))("mixed watcher preserves its accepted human answer until the result ($replyMode, restart=$restart)", async ({ replyMode, restart }) => {
   const h = setup(":memory:", { replyMode, watchMs: 0 });
   const start = Date.now(); setSystemTime(start);
   h.input("wake:root", wakeBody()); await h.router.tick(); h.backend.final("NO_REPLY"); await h.router.tick();
@@ -11843,10 +11843,14 @@ test.each((["final", "tool"] as const).flatMap(replyMode => [false, true].map(re
   h.backend.questionRequests = [{ ...question({}, "q_wake"), sessionID: "ses_wake" }];
   await h.router.tick(); deliver(h.store);
   expect(h.store.get<{ leaderId: string }[]>("pendingApprovals")?.some(entry => entry.leaderId === "wake:root")).toBe(true);
+  const prompt = h.store.get<string>("human-response-prompt:answer");
   const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
   h.input("next", "Next work"); await router.tick(); await router.tick(); await router.tick();
   expect(h.backend.questionReplies).toEqual([["q_human", "/Chats/human", [["B"]]]]);
-  expect(h.backend.prompts.at(-1)!.text).toBe("B");
+  expect(h.backend.prompts.map(call => call.text)).toEqual([wakeBody(), "Ask me"]);
+  expect(inbounds(h.store).filter(row => ["answer", "next"].includes(row.id)).map(row => row.state)).toEqual(["admitted", "pending"]);
+  expect(h.store.get<boolean>("human-own-turn:answer")).toBe(false);
+  expect(h.store.get<string>("human-response-prompt:answer")).toEqual(prompt);
   h.backend.questionRequests = []; h.backend.states = {};
   if (replyMode === "tool") agentSends(h, "own-answer", "B handled");
   h.backend.final("B handled"); await router.tick();
@@ -12511,4 +12515,352 @@ test.each(["/status", "/Status", "/new", "/New"])("outage telemetry: substantive
   const payloads = inbounds(h.store).map(row => row.payload as import("../src/unanswered.ts").AnsweredInput);
   expect(payloads.find(input => input.id === "command")?.answeredAt).toBeNumber();
   expect(payloads.find(input => input.id === "earlier")?.answeredAt).toBeUndefined();
+});
+
+
+test.each([false, true].flatMap(restart => [false, true].map(legacy => ({ restart, legacy }))))("idle holder: completed run57 releases behind queued58 (restart=$restart, legacy=$legacy)", async ({ restart, legacy }) => {
+  setSystemTime(Date.parse("2026-11-22T14:20:37Z"));
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-holder", "Hi", "Ready");
+  const mark = h.backend.records.at(-1)!;
+  const run = { runId: "run57", status: "completed", terminal: true };
+  Object.assign(h.backend, { backgroundRun: async () => run });
+  // A queued sibling keeps the thread busy after the watermark's run has ended.
+  h.backend.states.ses_1 = { type: "busy" };
+  h.store.set("activeTurn", { ...h.store.get<object>("route"), messageId: mark.id,
+    startedAt: Date.now(), phase: "running", background: true, ...(legacy ? {} : { holderRunId: run.runId }) });
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  h.input("wake:holder-case", wakeBody());
+  await router.tick();
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(inbounds(h.store).find(row => row.id === "wake:holder-case")!.state).toBe("pending");
+  // Scheduler availability is independent; no wake is resent while queued work is busy.
+  delete h.backend.states.ses_1;
+  await router.tick();
+  expect(h.backend.prompts.filter(p => p.messageId === messageId("wake:holder-case"))).toHaveLength(1);
+});
+
+test("idle holder: already-terminal adoption does not hold or readopt the watermark", async () => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-adoption", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  Object.assign(h.backend, { backgroundRun: async () => ({ runId: "run57", status: "completed", terminal: true }) });
+  const logs = await captureLogs(async () => { await h.router.tick(); await h.router.tick(); });
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(logs.filter(line => line.name === "turn.hold_adopted")).toHaveLength(1);
+  expect(logs.find(line => line.name === "turn.hold_adopted")?.props?.runStatus).toBe("completed");
+  expect(logs.find(line => line.name === "turn.end")?.props?.endReason).toBe("run_terminal");
+});
+
+test("idle holder: ten-minute owner alarm is independent of the held run", async () => {
+  const start = Date.parse("2026-11-22T14:20:37Z"); setSystemTime(start);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { watchMs: 0, notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  await exchange(h, "before-alarm", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  Object.assign(h.backend, { backgroundRun: async () => ({ runId: "run59", status: "running", terminal: false }) });
+  await h.router.tick();
+  h.input("held-human", "Status?", { source: "typed" });
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "held-human")!.state).toBe("pending");
+  setSystemTime(start + 10 * 60_000); await h.router.checkUnanswered();
+  expect(alerts.map(args => args[2])).toEqual(["imessage-unanswered:held-human"]);
+});
+
+
+test.each([false, true])("idle holder: finite lease survives restart and still relays a late answer (restart=%s)", async restart => {
+  const start = Date.parse("2026-11-22T14:20:37Z"); setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-bound", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  let status = "running";
+  Object.assign(h.backend, { backgroundRun: async () => ({ runId: "run59", status, terminal: status === "completed" }) });
+  await h.router.tick();
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  const logs = await captureLogs(async () => {
+    setSystemTime(start + 5 * 60_000); await router.tick(); await router.tick();
+    setSystemTime(start + 10 * 60_000); await router.tick();
+    setSystemTime(start + 15 * 60_000); await router.tick(); await router.tick();
+  });
+  expect(logs.filter(line => line.name === "turn.hold_age")).toHaveLength(3);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(logs.filter(line => line.name === "turn.end").map(line => line.props?.endReason)).toEqual(["hold_bound"]);
+  delete h.backend.states.ses_1; status = "completed";
+  h.backend.final("Late result");
+  setSystemTime(start + 15 * 60_000 + 1);
+  const late = await captureLogs(async () => { await router.tick(); await router.tick(); await router.tick(); });
+  expect(h.conversations().map(op => op.text)).toEqual(["Late result"]);
+  expect(late.filter(line => line.name === "turn.end").map(line => line.props?.endReason)).toEqual(["run_completed"]);
+});
+
+test("idle holder: run57 terminal releases even when newer59 is waiting and older58 stays queued", async () => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-overlap", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  let terminal = false;
+  const lookups: (string | undefined)[] = [];
+  Object.assign(h.backend, { backgroundRun: async (_id: string, _directory: string, runId?: string) => {
+    lookups.push(runId);
+    return { runId: runId ?? "run57", status: terminal ? "completed" : "running", terminal };
+  } });
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ holderRunId: "run57" });
+  terminal = true;
+  await h.router.tick();
+  expect(lookups).toContain("run57");
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+
+test("idle holder: the bound releases even when run status cannot be read", async () => {
+  const start = 10_000; setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-unreadable", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  let reads = 0;
+  Object.assign(h.backend, { backgroundRun: async () => { reads++; throw new Error("Unavailable"); } });
+  h.store.set("activeTurn", { ...h.store.get<object>("route"), messageId: h.backend.records.at(-1)!.id,
+    startedAt: start, phase: "running", background: true, holderRunId: "run57" });
+  setSystemTime(start + 15 * 60_000);
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toBeNull();
+  // The bound releases before a network read, and the same watermark is suppressed.
+  expect(reads).toBe(0);
+});
+
+const holderRequestCases = ["question", "permission"].flatMap(kind =>
+  ["pending", "submitting", "unknown"].flatMap(state =>
+    ["hold_bound", "run_terminal"].flatMap(reason =>
+      [false, true].map(restart => ({ kind, state, reason, restart })))));
+test.each(holderRequestCases)("idle holder review: retains $state $kind on $reason (restart=$restart)", async ({ kind, state, reason, restart }) => {
+  const start = 10_000; setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-request", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  let terminal = false;
+  Object.assign(h.backend, { backgroundRun: async () => ({ runId: "run57", completionId: "idle:run57", status: terminal ? "completed" : "running", terminal }) });
+  await h.router.tick();
+  if (kind === "question") h.backend.questionRequests = [question()];
+  else h.backend.permissionRequests = [permission()];
+  await h.router.tick();
+  expect(h.router.routerStatus().pending).toHaveLength(1);
+  const request = h.controls().find(op => op.id.startsWith("request:"))!;
+  h.store.outboxState(request.id, "sent", "provider-request");
+  const entries = h.store.get<{ state: string; submittedAt?: number }[]>("pendingApprovals")!;
+  entries[0]!.state = state; entries[0]!.submittedAt = Date.now();
+  h.store.set("pendingApprovals", entries);
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  terminal = reason === "run_terminal";
+  setSystemTime(start + (terminal ? 1000 : 15 * 60_000));
+  await router.tick();
+  expect(router.routerStatus().pending).toHaveLength(1);
+  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request" });
+  if (state === "pending") {
+    h.input("answer", kind === "permission" ? "/approve perm_1 once" : "A");
+    await router.tick();
+    expect(kind === "permission" ? h.backend.permissionReplies : h.backend.questionReplies).toHaveLength(1);
+  }
+});
+
+test.each([false, true])("idle holder review: sibling idle cannot discard an older answer (expired=%s)", async expired => {
+  const start = 10_000; setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-sibling", "Hi", "Ready");
+  const mark = h.backend.records.at(-1)!;
+  const assistant = (id: string, runId: string, text: string): MessageRecord => ({ id, runId, type: "assistant", answer: true,
+    content: [{ type: "text", text }], time: { created: start, completed: start } });
+  const sibling = [assistant("answer59", "run59", "Sibling answer"), { id: "idle:run59", type: "idle", outcome: "succeeded", time: { created: start } } as MessageRecord];
+  h.backend.records.push(...sibling);
+  h.backend.states.ses_1 = { type: "busy" };
+  let terminal = false;
+  Object.assign(h.backend, { backgroundRun: async (_id: string, _directory: string, bound?: string) => {
+    const runId = bound ?? (terminal ? "run59" : "run57");
+    return { runId, completionId: `idle:${runId}`, status: terminal ? "completed" : "running", terminal };
+  } });
+  await h.router.tick(); await h.router.tick();
+  expect(h.store.get("watermark")).toMatchObject({ id: mark.id });
+  if (expired) { setSystemTime(start + 15 * 60_000); await h.router.tick(); }
+  terminal = true; delete h.backend.states.ses_1;
+  // Robob sorts by run ordinal: the bound run's new answer precedes the unchanged tail.
+  h.backend.records = [...h.backend.records.slice(0, -2), assistant("answer57", "run57", "Bound answer"),
+    { id: "idle:run57", type: "idle", outcome: "succeeded", time: { created: start } }, ...sibling];
+  for (let i = 0; i < 5; i++) await h.router.tick();
+  const texts = h.conversations().map(op => op.text);
+  expect(texts.filter(text => text.includes("Bound answer"))).toHaveLength(1);
+  expect(texts.filter(text => text.includes("Sibling answer"))).toHaveLength(1);
+});
+
+const acceptedHolderCases = ["question", "permission"].flatMap(kind =>
+  [false, true].flatMap(restart => [false, true].flatMap(terminalGap =>
+    (terminalGap ? [false, true] : [false]).map(sibling => ({ kind, restart, terminalGap, sibling })))));
+test.each(acceptedHolderCases)("idle holder review: accepted $kind answer keeps its ownership past the lease (restart=$restart, terminalGap=$terminalGap, sibling=$sibling)", async ({ kind, restart, terminalGap, sibling }) => {
+  const start = 10_000; setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-handoff", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  let terminal = false;
+  Object.assign(h.backend, { backgroundRun: async (_id: string, _directory: string, bound?: string) => {
+    const runId = bound ?? (sibling && terminal ? "run59" : "run57");
+    return { runId, completionId: `idle:${runId}`, status: terminal ? "completed" : "running", terminal,
+      ...(terminal ? { messageIds: [runId === "run57" ? "answer57" : "answer59"] } : {}) };
+  } });
+  await h.router.tick();
+  if (kind === "question") h.backend.questionRequests = [question()];
+  else h.backend.permissionRequests = [permission()];
+  await h.router.tick();
+  h.store.outboxState(h.controls().find(op => op.id.startsWith("request:"))!.id, "sent", "provider-request");
+  setSystemTime(start + 15 * 60_000 - 1000);
+  h.input("answer", kind === "question" ? "A" : "/approve perm_1 once");
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  const before = h.store.get<string>("human-response-prompt:answer");
+  const watermark = h.store.get<object>("watermark");
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  setSystemTime(start + 15 * 60_000);
+  // Status can finish before the completion read contains that run's idle marker.
+  terminal = terminalGap;
+  if (terminalGap) delete h.backend.states.ses_1;
+  const siblingRecords: MessageRecord[] = sibling ? [
+    { id: "answer59", runId: "run59", type: "assistant", answer: true, content: [{ type: "text", text: "Sibling answer" }], time: { created: Date.now(), completed: Date.now() } },
+    { id: "idle:run59", type: "idle", outcome: "succeeded", time: { created: Date.now() } },
+  ] : [];
+  h.backend.records.push(...siblingRecords);
+  await router.tick(); await router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  expect(h.store.get<boolean>("human-own-turn:answer")).toBe(false);
+  expect(h.store.get<object>("watermark")).toEqual(watermark);
+  expect(h.store.get<string>("human-response-prompt:answer")).toEqual(before);
+  expect(kind === "question" ? h.backend.questionReplies : h.backend.permissionReplies).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
+  if (terminalGap) {
+    if (sibling) h.backend.records.splice(-siblingRecords.length);
+    h.backend.final("Result for the accepted answer", undefined, "answer57");
+    h.backend.records.at(-1)!.id = "idle:run57";
+    h.backend.records.push(...siblingRecords);
+    for (let i = 0; i < 5; i++) await router.tick();
+    const result = h.conversations().filter(op => op.text === "Result for the accepted answer");
+    expect(result).toHaveLength(1);
+    expect(h.store.get<string[]>(`reply-covered:${result[0]!.id}`)).toContain("answer");
+    h.store.outboxState(result[0]!.id, "sent");
+    expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+    if (sibling) expect(h.conversations().filter(op => op.text === "Sibling answer")).toHaveLength(1);
+    expect(h.store.get<boolean>("human-own-turn:answer")).toBe(false);
+    expect(h.backend.prompts).toHaveLength(1);
+  }
+});
+
+test("idle holder review: a later completed run delivers after an empty bound run finishes", async () => {
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-empty-run", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  let terminal = false;
+  Object.assign(h.backend, { backgroundRun: async (_id: string, _directory: string, bound?: string) => {
+    const runId = bound ?? (terminal ? "run59" : "run57");
+    return { runId, completionId: `idle:${runId}`, status: terminal ? "completed" : "running", terminal };
+  } });
+  await h.router.tick();
+  terminal = true; delete h.backend.states.ses_1;
+  h.backend.records.push({ id: "answer59", type: "assistant", runId: "run59", answer: true,
+    content: [{ type: "text", text: "Child result" }], time: { created: Date.now(), completed: Date.now() } },
+    { id: "idle:run59", type: "idle", outcome: "succeeded", time: { created: Date.now() } });
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Child result"]);
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+
+const acceptedRequestHolderCases = ["question", "permission"].flatMap(kind =>
+  ["hold_bound", "run_terminal"].flatMap(reason => [false, true].flatMap(restart =>
+    ["cleanup", "preemption"].map(path => ({ kind, reason, restart, path })))));
+test.each(acceptedRequestHolderCases)("idle holder review: child $kind handoff survives request $path after $reason (restart=$restart)", async ({ kind, reason, restart, path }) => {
+  const start = 10_000; setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-child-handoff", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  let terminal = false;
+  Object.assign(h.backend, { backgroundRun: async () => ({ runId: "run57", completionId: "idle:run57", status: terminal ? "completed" : "running", terminal }) });
+  await h.router.tick();
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  h.backend.states.ses_child = { type: "busy" };
+  if (kind === "question") h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  else h.backend.permissionRequests = [permission("perm_1", "ses_child")];
+  await h.router.tick();
+  h.store.outboxState(h.controls().find(op => op.id.startsWith("request:"))!.id, "sent", "provider-request");
+  terminal = reason === "run_terminal";
+  setSystemTime(start + (terminal ? 1000 : 15 * 60_000));
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request" });
+  delete h.backend.states.ses_1;
+  h.input("answer", kind === "question" ? "A" : "/approve perm_1 once");
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  const prompt = h.store.get<string>("human-response-prompt:answer");
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  if (path === "preemption") {
+    h.input("next-human", "Another question", { source: "typed" });
+    h.store.set("human-own-turn:next-human", true);
+  } else setSystemTime(Date.now() + 20_000);
+  await router.tick(); await router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  expect(h.store.get<boolean>("human-own-turn:answer")).toBe(false);
+  expect(h.store.get<string>("human-response-prompt:answer")).toEqual(prompt);
+  expect(kind === "question" ? h.backend.questionReplies : h.backend.permissionReplies).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
+  delete h.backend.states.ses_child;
+  h.backend.final("Child work finished");
+  await router.tick(); await router.tick();
+  const result = h.conversations().filter(op => op.text === "Child work finished");
+  expect(result).toHaveLength(1);
+  expect(h.store.get<string[]>(`reply-covered:${result[0]!.id}`)).toContain("answer");
+  h.store.outboxState(result[0]!.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+  expect(h.store.get<boolean>("human-own-turn:answer")).toBe(false);
+});
+
+
+const terminalHandoffCases = ["question", "permission"].flatMap(kind =>
+  [false, true].flatMap(beforeWatermark => [false, true].map(restart => ({ kind, beforeWatermark, restart }))));
+test.each(terminalHandoffCases)("idle holder review: terminal run without a later marker releases accepted $kind (beforeWatermark=$beforeWatermark, restart=$restart)", async ({ kind, beforeWatermark, restart }) => {
+  const start = 10_000; setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-empty-handoff", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  let terminal = false;
+  Object.assign(h.backend, { backgroundRun: async () => ({ runId: "run75", completionId: "idle:run75", status: terminal ? "completed" : "running", terminal,
+    ...(terminal ? { messageIds: beforeWatermark ? ["old-answer75"] : [] } : {}) }) });
+  if (beforeWatermark) h.backend.records.unshift(
+    { id: "old-answer75", type: "assistant", content: [{ type: "text", text: "Already seen" }], time: { created: 0, completed: 0 } },
+    { id: "idle:run75", type: "idle", outcome: "succeeded", time: { created: 0 } });
+  await h.router.tick();
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  h.backend.states.ses_child = { type: "busy" };
+  if (kind === "question") h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  else h.backend.permissionRequests = [permission("perm_1", "ses_child")];
+  await h.router.tick();
+  h.store.outboxState(h.controls().find(op => op.id.startsWith("request:"))!.id, "sent", "provider-request");
+  h.input("answer", kind === "question" ? "A" : "/approve perm_1 once");
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  const prompt = h.store.get<string>("human-response-prompt:answer");
+  terminal = true; delete h.backend.states.ses_1;
+  setSystemTime(start + 60 * 60_000);
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  await router.tick(); await router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  expect(h.store.get<boolean>("human-own-turn:answer")).toBe(false);
+  expect(h.store.get<string>("human-response-prompt:answer")).toEqual(prompt);
+  // The bound run has no new record; the child's result resumes the root in run77.
+  h.backend.final("Result from run77");
+  for (let i = 0; i < 4; i++) await router.tick();
+  const result = h.conversations().filter(op => op.text === "Result from run77");
+  expect(result).toHaveLength(1);
+  expect(h.store.get<string[]>(`reply-covered:${result[0]!.id}`)).toContain("answer");
+  h.store.outboxState(result[0]!.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+  expect(h.store.get<boolean>("human-own-turn:answer")).toBe(false);
+  expect(h.store.get<string>("human-response-prompt:answer")).toEqual(prompt);
+  expect(kind === "question" ? h.backend.questionReplies : h.backend.permissionReplies).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
 });

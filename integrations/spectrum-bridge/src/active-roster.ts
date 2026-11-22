@@ -291,7 +291,9 @@ export class ActiveRoster {
     this.generation++;
   }
 
-  isBusy(threadId: string): boolean { return this.busy[threadId] !== undefined; }
+  isBusy(threadId: string, includeQueued = true): boolean {
+    return this.busy[threadId] !== undefined && (includeQueued || this.known.get(threadId)?.state !== "queued");
+  }
 
   private schedule(): void {
     clearTimeout(this.timer);

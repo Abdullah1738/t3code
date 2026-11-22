@@ -808,7 +808,27 @@ export class RobobBackend implements ChatBackend {
   /** One thread's detail answers in well under a second; the thread list behind `statuses()` takes several. */
   async sessionBusy(id: string): Promise<boolean> {
     const thread = await this.detail(id);
-    return BUSY.has(thread.state) || this.activeRoster.isBusy(thread.threadId);
+    // Queued work has no running reply to wait for. New input can be admitted by
+    // Robob's own queue; a stranded queued run must not hold the bridge's queue too.
+    return (thread.state !== "queued" && BUSY.has(thread.state)) || this.activeRoster.isBusy(thread.threadId, false);
+  }
+
+  async backgroundRun(id: string, _directory: string, runId?: string) {
+    const thread = await this.detail(id);
+    const runs = [...thread.recentRuns, ...(thread.run ? [thread.run] : [])];
+    const candidates = runs.filter(candidate => candidate.status !== "queued").sort((a, b) => b.ordinal - a.ordinal);
+    let run = runId ? runs.find(candidate => candidate.runId === runId)
+      : candidates.find(candidate => !TERMINAL.has(candidate.status)) ?? candidates[0];
+    let messageIds: string[] | undefined;
+    if (runId && (!run || TERMINAL.has(run.status))) {
+      const evidence = await this.client.runEvidence(thread.threadId, runId);
+      if (evidence.runId !== runId) throw new Error("Mismatched holder run evidence");
+      run = { runId, status: evidence.status, ordinal: runOrdinal(runId) };
+      // The evidence route loads every assistant message even when native tool evidence is unknown.
+      if (TERMINAL.has(evidence.status)) messageIds = evidence.messages.map(message => message.id);
+    }
+    return run ? { runId: run.runId, status: run.status, terminal: TERMINAL.has(run.status), completionId: `idle:${run.runId}`,
+      ...(messageIds !== undefined ? { messageIds } : {}) } : undefined;
   }
 
   /** Busy, or waiting on background work a reset would cut off (see `resetBlocked` in openchamber.ts). */

@@ -143,6 +143,7 @@ test.each(["running", "question"] as const)("an incomplete first list retains ea
 
 test.each(["running", "question"] as const)("a first-list removal fences an older %s detail for a known idle child", async change => {
   const f = fixture();
+  f.server.child = row("child", { state: "running", status: "running" });
   expect(await f.backend.sessionBusy("child")).toBe(true);
   f.server.child = row("child", { state: "idle", status: "idle", activeRunId: null });
   expect(await f.backend.sessionBusy("child")).toBe(false);

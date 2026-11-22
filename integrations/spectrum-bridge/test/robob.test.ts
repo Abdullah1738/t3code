@@ -3070,3 +3070,59 @@ test("Sendblue finds a newly created child's question through the shared SSE-dow
   expect(h.control.calls.filter(call => call.path.includes("active=true"))).toHaveLength(initial + 1 + counters.ambiguous);
   expect(counters.roster_event).toBe(counters.ambiguous);
 });
+
+
+test.each(["waiting", "completed", "failed", "cancelled", "interrupted", "rolled_back"])("idle holder run evidence: %s is terminal despite queued sibling", async status => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const thread = control.threads.get(id)!;
+  thread.driver = { instanceId: "antigravity", model: "ag/gemini-4-neon-high" };
+  thread.runs.push({ runId: "run57", ordinal: 57, status }, { runId: "run58", ordinal: 58, status: "queued" });
+  expect(await backend.backgroundRun(id, directory)).toEqual({ runId: "run57", completionId: "idle:run57", status, terminal: true });
+  thread.runs.push({ runId: "run59", ordinal: 59, status: "waiting" });
+  expect(await backend.backgroundRun(id, directory, "run57")).toEqual({ runId: "run57", completionId: "idle:run57", status, terminal: true, messageIds: [] });
+  expect(await backend.backgroundRun(id, directory)).toEqual({ runId: "run59", completionId: "idle:run59", status: "waiting", terminal: true });
+});
+
+test.each(["preparing", "starting", "running"])("idle holder run evidence: a %s Antigravity run remains live", async status => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  control.threads.get(id)!.runs.push({ runId: "run57", ordinal: 57, status: "completed" },
+    { runId: "run58", ordinal: 58, status: "queued" }, { runId: "run59", ordinal: 59, status });
+  expect(await backend.backgroundRun(id, directory)).toEqual({ runId: "run59", completionId: "idle:run59", status, terminal: false });
+});
+
+test("idle holder run evidence: older running work precedes a newer terminal run", async () => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  control.threads.get(id)!.runs.push({ runId: "run57", ordinal: 57, status: "running" },
+    { runId: "run58", ordinal: 58, status: "queued" }, { runId: "run59", ordinal: 59, status: "completed" });
+  expect(await backend.backgroundRun(id, directory)).toEqual({ runId: "run57", completionId: "idle:run57", status: "running", terminal: false });
+});
+
+
+test("idle holder run evidence: queued-only work does not block conversation admission", async () => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  control.threads.get(id)!.runs.push({ runId: "run57", ordinal: 57, status: "completed" },
+    { runId: "run58", ordinal: 58, status: "queued" });
+  await backend.statuses();
+  expect(await backend.sessionBusy(id)).toBe(false);
+  expect(await backend.backgroundRun(id, directory)).toMatchObject({ runId: "run57", terminal: true });
+});
+
+
+test.each([false, true].flatMap(historical => [false, true].map(answer => ({ historical, answer }))))("idle holder run evidence: terminal message identities survive empty and historical runs (historical=$historical, answer=$answer)", async ({ historical, answer }) => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const thread = control.threads.get(id)!;
+  thread.runs.push({ runId: "run75", ordinal: 75, status: "completed" }, { runId: "run77", ordinal: 77, status: "completed" });
+  if (answer) thread.messages.push({ messageId: "answer75", runId: "run75", role: "assistant", text: "Bound answer", streaming: false,
+    createdAt: "2026-11-22T14:20:00Z", updatedAt: "2026-11-22T14:20:00Z" });
+  if (historical) control.flags.recentRunsLimit = 1;
+  // Tool evidence can be unknown; the run-evidence message list is still complete.
+  expect(await backend.backgroundRun(id, directory, "run75")).toMatchObject({ terminal: true, messageIds: answer ? ["answer75"] : [] });
+  expect(control.calls.filter(call => call.path.includes("/runs/run75/evidence"))).toHaveLength(1);
+});

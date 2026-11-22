@@ -306,6 +306,12 @@ export function assertPromptUnexpired(expiresAt?: number): void {
 export type SteerDelivery = "steered" | "started" | "queued" | "refused";
 export type SteerGuard = { signal: AbortSignal; beforeSend: () => Promise<boolean>; onFailure?: (error: unknown) => void };
 
+export type BackgroundRun = {
+  runId: string; status: string; terminal: boolean; completionId?: string;
+  /** Assistant record identities read with terminal run evidence, including an empty run. */
+  messageIds?: string[];
+};
+
 /**
  * What the router and the origin backfill need from a backend. OpenChamber
  * implements it here; Robob's control API implements it in robob.ts.
@@ -358,6 +364,8 @@ export interface ChatBackend {
    * backends whose full list is slow (Robob) implement this cheap single lookup.
    */
   sessionBusy?(id: string, directory: string): Promise<boolean>;
+  /** Run ownership for an adopted holder; queued sibling runs are not execution evidence. */
+  backgroundRun?(id: string, directory: string, runId?: string): Promise<BackgroundRun | undefined>;
   /**
    * Whether a session still has work that a context reset would cut off: busy, or
    * waiting on background commands or monitors. Optional, and separate from
