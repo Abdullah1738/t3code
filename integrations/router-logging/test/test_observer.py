@@ -32,6 +32,10 @@ class ObserverTests(unittest.TestCase):
             fake = patch(module + '.Sampler', return_value=lambda: {'e': 'unsupported'})
             fake.start()
             self.addCleanup(fake.stop)
+        # These fixtures advance a synthetic clock to model active, blocked work.
+        cpu = patch('observer.time.process_time', side_effect=lambda: observer.time.monotonic())
+        cpu.start()
+        self.addCleanup(cpu.stop)
 
     def test_poll_refreshes_finalized_days_for_late_gap_class(self):
         cases = [('pool-alerts', 'pool.endpoint.get', 'tick_blocked:pool_fetch'),

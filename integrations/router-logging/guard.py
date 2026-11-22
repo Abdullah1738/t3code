@@ -5,6 +5,7 @@ import fcntl
 import json
 import math
 import os
+import plistlib
 from pathlib import Path
 import signal
 import socket
@@ -17,10 +18,96 @@ import uuid
 from host import Sampler
 from toollog import directory, emit
 from causes import launchctl_info
-from observer import Timings, clock_sample, gap, launchctl_print, measured, phase
+from observer import FIELDS, Timings, clock_sample, gap, launchctl_print, measured, phase
 
 LABEL = 'com.abdullah.9router-fork'
 FRESH_MS = 300000
+POLL_DEADLINE_SECONDS = 240
+
+
+def scheduling_snapshot():
+    props = dict(pid=os.getpid(), processType='unknown', nice=os.getpriority(os.PRIO_PROCESS, 0))
+    try:
+        with (Path.home() / 'Library/LaunchAgents/com.ardud.9router-log-poll.plist').open('rb') as source:
+            props['processType'] = plistlib.load(source).get('ProcessType', 'Standard')
+    except (OSError, ValueError):
+        pass
+    try:
+        value = subprocess.run(['ps', '-p', str(os.getpid()), '-o', 'pri='], capture_output=True,
+                               text=True, timeout=.5).stdout.strip()
+        props['priority'] = int(value)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return props
+
+
+class PollChild:
+    def __init__(self, command=None):
+        self.started = time.monotonic()
+        self.wall_start = time.time() * 1000
+        self.phase, self.pending = 'other', b''
+        self.reader, writer = os.pipe()
+        os.set_blocking(self.reader, False)
+        os.set_blocking(writer, False)
+        try:
+            self.process = subprocess.Popen(command or [sys.executable, '-I', str(Path(__file__).with_name('run.py')), 'poll'],
+                env=dict(os.environ, ROUTER_POLL_PROGRESS_FD=str(writer)), pass_fds=(writer,),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except BaseException:
+            os.close(self.reader)
+            raise
+        finally:
+            os.close(writer)
+
+    def close(self):
+        if self.reader is not None:
+            os.close(self.reader)
+            self.reader = None
+
+    def check(self):
+        if self.process.poll() is not None:
+            self.close()
+            return True
+        try:
+            while chunk := os.read(self.reader, 65536):
+                self.pending += chunk
+                while b'\n' in self.pending:
+                    name, self.pending = self.pending.split(b'\n', 1)
+                    self.phase = name.decode('ascii') if name.decode('ascii') in (*FIELDS, 'other') else 'other'
+        except BlockingIOError:
+            pass
+        elapsed = time.monotonic() - self.started
+        if elapsed < POLL_DEADLINE_SECONDS:
+            return False
+        # Popen owns this unreaped child; a PID from a name search is never used.
+        self.process.kill()
+        # kill() polls first and can reap an exit that raced the deadline.
+        if self.process.returncode is not None:
+            self.close()
+            return True
+        _, status, usage = os.wait4(self.process.pid, 0)
+        self.process.returncode = os.waitstatus_to_exitcode(status)
+        self.close()
+        if self.process.returncode != -signal.SIGKILL:
+            return True
+        cpu_ms = (usage.ru_utime + usage.ru_stime) * 1000
+        emit('poller', 'poll.timeout', kind='error', ok=False, durationMs=elapsed * 1000,
+             error=dict(tag='tick_deadline'),
+             props=dict(pid=self.process.pid, phase=self.phase, wallMs=elapsed * 1000, cpuMs=cpu_ms,
+                        startedAtMs=self.wall_start, finishedAtMs=time.time() * 1000))
+        return True
+
+    def stop(self):
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+        finally:
+            self.close()
 
 
 def iso(milliseconds):
@@ -343,6 +430,7 @@ def serve():
         except BlockingIOError:
             return
         os.chmod(lock.name, 0o600)
+        emit('guard', 'observer.priority', props=scheduling_snapshot())
         guard = Guard(state=read_json(runtime.state_file), action=runtime.act, notify=runtime.notify,
                       save=lambda state: write_json(runtime.state_file, state))
         stopping = False
@@ -357,6 +445,8 @@ def serve():
         try:
             while not stopping:
                 start = time.monotonic()
+                if poll is not None and poll.check():
+                    poll = None
                 sampler = Sampler()
                 sample = clock_sample()
                 with Timings('guard', 'guard.tick_late', threshold_ms=30000, start=sample, sampler=sampler) as timing:
@@ -378,12 +468,9 @@ def serve():
                     # Its own process keeps listener repair on the 15 s cadence.
                     pool_alerts = subprocess.Popen([sys.executable, '-I', str(Path(__file__).with_name('run.py')), 'pool-alerts'],
                                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if poll is not None and poll.poll() is not None:
-                    poll = None
                 if start >= next_poll and poll is None:
                     # HTTP snapshots and rollups can take longer than the listener cadence.
-                    poll = subprocess.Popen([sys.executable, '-I', str(Path(__file__).with_name('run.py')), 'poll'],
-                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    poll = PollChild()
                     next_poll = start + 300
                 while not stopping and time.monotonic() - start < 15:
                     time.sleep(max(0, min(.5, 15 - (time.monotonic() - start))))
@@ -394,7 +481,9 @@ def serve():
                                               jobState='stopped', jobPid=os.getpid(), jobExit=0)
             with contextlib.suppress(OSError):
                 guard.save(guard.state)
-            for child in (pool_alerts, poll):
+            if poll is not None:
+                poll.stop()
+            for child in (pool_alerts,):
                 if child is None or child.poll() is not None:
                     continue
                 child.terminate()
