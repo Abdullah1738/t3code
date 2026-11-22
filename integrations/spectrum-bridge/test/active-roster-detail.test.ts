@@ -34,8 +34,131 @@ function fixture(now: () => number = Date.now) {
   const turn = { id: "owner", directory: "/chats", generation: 1, messageId: "msg_work", startedAt: Date.now(), phase: "running" as const };
   const scan = async () => router["requests"](turn, await backend.statuses(true), true);
   const reads = () => lists.mock.calls.filter(([args]) => args?.active).length;
-  return { server, client, detail, lists, roster, backend, router, scan, reads };
+  return { server, client, detail, lists, roster, backend, router, store, turn, scan, reads };
 }
+
+const bootstrapRaces = (["startup", "retry"] as const).flatMap(stage =>
+  ([true, false] as const).flatMap(listed => (["running", "question"] as const).flatMap(change =>
+    (["detail-first", "list-first"] as const).map(order => ({ stage, listed, change, order })))));
+
+test.each(bootstrapRaces)("bootstrap Router preflight retains $change: $stage, listed=$listed, $order", async ({ stage, listed, change, order }) => {
+  let clock = 1_000;
+  const f = fixture(() => clock); f.roster.streamState(false);
+  f.server.child = row("child", { state: "waiting", status: "waiting", activeRunId: null });
+  const older = { total: listed ? 1 : 0, threads: listed ? [structuredClone(f.server.child)] : [] };
+  const snapshot = Promise.withResolvers<typeof older>(), reconciliation = Promise.withResolvers<typeof older>();
+  const reconciling = Promise.withResolvers<void>();
+  let activeReads = 0;
+  f.lists.mockImplementation(async args => {
+    if (args?.parentThreadId) return { total: 1, threads: [structuredClone(f.server.child)] };
+    activeReads++;
+    if (stage === "retry" && activeReads === 1) throw new Error("initial active-list deadline");
+    if (activeReads === (stage === "retry" ? 2 : 1)) return snapshot.promise;
+    reconciling.resolve(); return reconciliation.promise;
+  });
+  if (stage === "retry") await expect(f.backend.statuses(true)).rejects.toThrow("initial active-list deadline");
+  // In production the initial GET starts before SSE ready; a failed attempt still has no cache.
+  f.roster.event({ data: { type: "ready" } }); clock += 1_000;
+  let startupFinished = false;
+  const startup = f.backend.statuses(true).then(statuses => { startupFinished = true; return statuses; });
+  f.server.child = change === "question"
+    ? row("child", { state: "needs-input", pendingRequest: question, pendingRequests: [question] })
+    : row("child", { state: "running", status: "running", activeRunId: "run-2", latestRunId: "run-2" });
+  const detail = Promise.withResolvers<{ thread: ThreadDetail }>(), entered = Promise.withResolvers<void>();
+  const canonical = structuredClone(f.server.child);
+  f.detail.mockImplementationOnce(async () => { entered.resolve(); return detail.promise; });
+  f.store.set("route", { id: f.turn.id, directory: f.turn.directory, generation: f.turn.generation });
+  f.store.set("activeTurn", f.turn);
+  const oldQuestion = { id: "old-question", sessionID: "child", title: "Question", questions: [] };
+  f.store.set("pendingApprovals", [{ id: oldQuestion.id, sessionId: "owner", generation: 1, kind: "question",
+    signature: f.router["signature"](oldQuestion), operationId: "request:1:old-question", state: "pending",
+    requestSessionId: "child", requestDirectory: "/chats", prompt: "request:old-question" }]);
+  const preflight = f.router.beforeSend({ id: "request:old-question", kind: "control", text: "Old question", state: "pending", attempts: 0 });
+  await entered.promise;
+  if (order === "list-first") { snapshot.resolve(older); await startup; }
+  detail.resolve({ thread: canonical }); expect(await preflight).toBe("cancel");
+  expect(f.roster.isBusy("child")).toBe(true);
+  if (order === "detail-first") {
+    expect(f.roster.status().complete).toBe(false);
+    expect(startupFinished).toBe(false);
+    expect(await f.backend.statuses()).toEqual({ child: { type: "busy", root: "owner" } });
+    expect(f.roster.view(new Map([["ses_owner", "owner"], ["ses_child", "child"]]))).toEqual({
+      child: { type: "busy", root: "ses_owner" }, ses_child: { type: "busy", root: "ses_owner" },
+    });
+    snapshot.resolve(older);
+  }
+  await reconciling.promise;
+  let admitted = 0;
+  const admissions = Promise.all(Array.from({ length: 6 }, () => f.backend.statuses(true).then(statuses => { admitted++; return statuses; })));
+  expect(await f.backend.statuses()).toEqual({ child: { type: "busy", root: "owner" } });
+  expect(admitted).toBe(0);
+  if (order === "detail-first") expect(startupFinished).toBe(false);
+  reconciliation.resolve({ total: 1, threads: [canonical] }); await startup;
+  for (const statuses of await admissions) expect(statuses).toEqual({ child: { type: "busy", root: "owner" } });
+  const admissionScan = await f.scan();
+  expect(admissionScan.map(item => item.request.id)).toEqual(change === "question" ? [question.requestId] : []);
+  f.router["synchronizeRequests"](f.turn, admissionScan);
+  expect(f.store.get<{ id: string; state: string }[]>("pendingApprovals")?.find(item => item.id === oldQuestion.id)?.state).toBe("expired");
+  expect(f.roster.status()).toMatchObject({ complete: true, ambiguous: 1, errors: stage === "retry" ? 1 : 0 });
+  expect(f.reads()).toBe(stage === "retry" ? 3 : 2);
+});
+
+test.each(["running", "question"] as const)("bootstrap %s details survive list errors without claiming completeness", async change => {
+  let clock = 1_000;
+  const f = fixture(() => clock);
+  f.lists.mockRejectedValue(new Error("startup offline"));
+  await expect(f.backend.statuses(true)).rejects.toThrow("startup offline");
+  f.server.child = change === "question"
+    ? row("child", { state: "needs-input", pendingRequest: question, pendingRequests: [question] })
+    : row("child", { state: "running", status: "running" });
+  expect(await f.backend.sessionBusy("child")).toBe(true);
+  const generation = f.roster.generation;
+  for (let i = 0; i < 6; i++) {
+    expect(await f.backend.sessionBusy("child")).toBe(true);
+    expect(await f.backend.statuses()).toEqual({ child: { type: "busy", root: "owner" } });
+  }
+  expect(f.roster.generation).toBe(generation);
+  expect(f.roster.status()).toMatchObject({ complete: false, ambiguous: 0 });
+  await expect(f.backend.statuses(true)).rejects.toThrow("startup offline");
+  expect(f.reads()).toBe(1);
+  clock += 1_000;
+  await expect(f.backend.statuses(true)).rejects.toThrow("startup offline");
+  expect(await f.backend.statuses()).toEqual({ child: { type: "busy", root: "owner" } });
+  expect(f.roster.status()).toMatchObject({ complete: false, errors: 2, ambiguous: 0 });
+  expect(f.reads()).toBe(2);
+});
+
+test.each(["running", "question"] as const)("an incomplete first list retains earlier %s detail evidence", async change => {
+  const f = fixture();
+  f.server.child = change === "question"
+    ? row("child", { state: "needs-input", pendingRequest: question, pendingRequests: [question] })
+    : row("child", { state: "running", status: "running" });
+  expect(await f.backend.sessionBusy("child")).toBe(true);
+  expect(f.reads()).toBe(0);
+  f.lists.mockResolvedValue({ total: 2, threads: [row("owner", { state: "idle", parentThreadId: null })] });
+  await expect(f.backend.statuses(true)).rejects.toThrow("Incomplete active family discovery");
+  expect(await f.backend.statuses()).toEqual({ child: { type: "busy", root: "owner" } });
+  expect(f.roster.status().complete).toBe(false);
+});
+
+test.each(["running", "question"] as const)("a first-list removal fences an older %s detail for a known idle child", async change => {
+  const f = fixture();
+  expect(await f.backend.sessionBusy("child")).toBe(true);
+  f.server.child = row("child", { state: "idle", status: "idle", activeRunId: null });
+  expect(await f.backend.sessionBusy("child")).toBe(false);
+  const response = Promise.withResolvers<{ thread: ThreadDetail }>(), entered = Promise.withResolvers<void>();
+  f.detail.mockImplementationOnce(async () => { entered.resolve(); return response.promise; });
+  const olderDetail = f.backend.questions("child"); await entered.promise;
+  f.lists.mockResolvedValue({ total: 0, threads: [] });
+  expect(await f.backend.statuses(true)).toEqual({});
+  response.resolve({ thread: change === "question"
+    ? row("child", { state: "needs-input", pendingRequest: question, pendingRequests: [question] })
+    : row("child", { state: "running", status: "running" }) });
+  await olderDetail;
+  expect(await f.backend.statuses(true)).toEqual({});
+  expect(f.reads()).toBe(1);
+  expect(f.roster.status().ambiguous).toBe(0);
+});
 
 function signalDetail(backend: RobobBackend, first: "permissions" | "questions", signal: () => void) {
   if (first === "permissions") {

@@ -136,7 +136,8 @@ export class ActiveRoster {
   /** Route detail reads also reconcile state while the event stream is reconnecting. */
   observe(thread: ThreadSummary, read = this.checkpoint(thread.threadId)): void {
     this.finish(thread.threadId, read);
-    if (!this.cache || read.ticket < this.revision(thread.threadId)) return;
+    // A startup deadline cannot discard newer detail evidence; only lists establish completeness.
+    if (read.ticket < this.revision(thread.threadId)) return;
     const row: ThreadSummary = { threadId: thread.threadId, projectId: thread.projectId, title: thread.title,
       state: thread.state, status: thread.status, origin: thread.origin, nativeSessionId: thread.nativeSessionId,
       runtimeMode: thread.runtimeMode, parentThreadId: thread.parentThreadId, rootThreadId: thread.rootThreadId,
@@ -199,8 +200,8 @@ export class ActiveRoster {
       const index = this.cache.threads.findIndex(thread => thread.threadId === row.threadId);
       if (index < 0) this.cache.threads.push(row);
       else this.cache.threads[index] = row;
-      this.rebuild();
     }
+    this.rebuild();
     this.count("patches");
   }
 
@@ -286,7 +287,7 @@ export class ActiveRoster {
   }
 
   private rebuild(): void {
-    this.busy = rosterStatuses(this.cache!.threads);
+    this.busy = rosterStatuses(this.cache?.threads ?? this.known.values());
     this.generation++;
   }
 
@@ -342,11 +343,11 @@ export class ActiveRoster {
           if (reaffirmed) this.reconcile(confirmation.fetch);
         }
         const isComplete = total <= threads.length;
-        // A truncated refresh cannot erase busy families from the last good read.
-        if (!isComplete) for (const row of this.cache?.threads ?? []) {
+        // A truncated list cannot erase observed busy families, including bootstrap details.
+        if (!isComplete) for (const row of this.known.values()) {
           if (BUSY.has(row.state) && !rows.some(next => next.threadId === row.threadId)) rows.push(row);
         }
-        for (const id of new Set([...this.cache?.threads ?? [], ...rows].map(row => row.threadId))) {
+        for (const id of new Set([...this.known.keys(), ...rows.map(row => row.threadId)])) {
           if (!held.has(id)) {
             this.advance(id, ticket);
             if ((this.confirmations.get(id)?.ticket ?? 0) <= ticket) this.confirmations.delete(id);
@@ -386,15 +387,15 @@ export class ActiveRoster {
   /** Synchronous view for reply checks; refreshing never delays a route's own detail read. */
   view(native: ReadonlyMap<string, string>): Record<string, SessionStatus> {
     this.background();
-    return native.size ? rosterStatuses(this.cache?.threads ?? [], native) : { ...this.busy };
+    return native.size ? rosterStatuses(this.cache?.threads ?? this.known.values(), native) : { ...this.busy };
   }
 
   async read(complete: boolean, native: ReadonlyMap<string, string>): Promise<Record<string, SessionStatus>> {
-    if (!complete && this.cache) return this.view(native);
+    if (!complete && (this.cache || this.known.size)) return this.view(native);
     await this.refresh(complete);
     // A roster event arriving during the fetch needs one subsequent complete read.
     if (complete && (this.dirty !== this.clean || this.fetchEpoch !== this.epoch)) await this.refresh(true);
     if (complete && (!this.cache?.complete || this.dirty !== this.clean || this.fetchEpoch !== this.epoch || this.failure !== undefined)) throw new Error("Incomplete active family discovery");
-    return native.size ? rosterStatuses(this.cache?.threads ?? [], native) : { ...this.busy };
+    return native.size ? rosterStatuses(this.cache?.threads ?? this.known.values(), native) : { ...this.busy };
   }
 }
