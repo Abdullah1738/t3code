@@ -52,6 +52,10 @@ import {
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeAntigravityAdapterV2 } from "../../orchestration-v2/Adapters/AntigravityAdapterV2.ts";
+import {
+  antigravityHarnessHome,
+  linkAntigravityHarnessConfig,
+} from "../acp/AntigravityTurnContext.ts";
 import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
@@ -241,6 +245,13 @@ export const AntigravityDriver: ProviderDriver<
             : cause,
         ),
       );
+      // Robob: guards and shielded MCP servers before the runtime reads its config.
+      yield* linkAntigravityHarnessConfig({
+        fileSystem,
+        path,
+        profileDirectory,
+        harnessHome: antigravityHarnessHome(path, host.paths.baseDir),
+      });
       // Each process unpacks into its own directory that dies with the
       // runtime scope, after the child is killed. A shared directory would
       // let one session's teardown delete files a sibling still reads.

@@ -1,14 +1,16 @@
+import { expandTelemetry } from "../../robob-watch/src/log-volume.ts";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rollup, toolLog, toolError } from "../src/toollog.ts";
+import type { FixtureEntry } from "./toollog-fixture.ts";
 
 const before = process.env.TOOLLOG_DIR;
 const dirs: string[] = [];
 const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
 const day = () => new Date().toISOString().slice(0, 10);
-const rows = (dir: string) => readFileSync(join(dir, `${day()}.ndjson`), "utf8").trim().split("\n").map(line => JSON.parse(line));
+const rows = (dir: string) => readFileSync(join(dir, `${day()}.ndjson`), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line))) as FixtureEntry[];
 afterEach(() => { if (before === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = before; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 test("watcher and Telegram loggers share the same private, allowlisted format", async () => {
@@ -28,9 +30,9 @@ test("watcher and Telegram loggers share the same private, allowlisted format", 
     expect(row).toEqual({ ts: expect.any(String), tool: "watchers", component: "runner", kind: "perf", name: "watch.run", ok: true, durationMs: 2, ids: { watcher: "fixture", key: expect.stringMatching(/^[a-f0-9]{24}$/) }, props: { outcome: "fire", exitCode: 0, severity: "info" }, error: { tag: "fixture.failure", message: "fixture.failure" } });
     expect(row.ts).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
     expect(JSON.stringify(row)).not.toContain(secret);
-    expect(row.ids.password).toBeUndefined();
-    expect(row.props.subject).toBeUndefined();
-    expect(row.props.health).toBeUndefined();
+    expect(row.ids?.password).toBeUndefined();
+    expect(row.props?.subject).toBeUndefined();
+    expect(row.props?.health).toBeUndefined();
   }
   expect(statSync(dir).mode & 0o777).toBe(0o700);
   expect(statSync(join(dir, `${day()}.ndjson`)).mode & 0o777).toBe(0o600);
@@ -81,7 +83,7 @@ test("error helper emits only a stable tag for each component", () => {
   const dir = fixture();
   for (const component of ["runner", "cli", "telegram"]) toolError(component, "fixture.failed");
   expect(rows(dir).map(row => row.name)).toEqual(["runner.error", "cli.error", "telegram.error"]);
-  expect(rows(dir).every(row => row.kind === "error" && row.ok === false && row.error.message === "fixture.failed")).toBe(true);
+  expect(rows(dir).every(row => row.kind === "error" && row.ok === false && row.error?.message === "fixture.failed")).toBe(true);
   if (process.env.TOOLLOG_SAMPLES) for (const row of rows(dir)) console.log("LOG_SAMPLE " + JSON.stringify(row));
 });
 
@@ -103,11 +105,11 @@ test("cause classes never retain arbitrary codes, messages or unapproved fields"
     [undefined, "non_error"],
     [Object.defineProperty({}, "status", { get() { throw new Error(secret); } }), "unclassified"],
   ] as const;
-  for (const [error] of cases) toolError("telegram", "fixture.failed", { directory: secret }, error);
-  expect(rows(dir).map(row => row.props.cause)).toEqual(cases.map(([, cause]) => cause));
-  expect(rows(dir).every(row => /^[a-f0-9]{24}$/.test(row.ids.directory))).toBe(true);
+  for (const [i, [error]] of cases.entries()) toolError("telegram", `fixture.failed.${i}`, { directory: secret }, error);
+  expect(rows(dir).map(row => row.props?.cause)).toEqual(cases.map(([, cause]) => cause));
+  expect(rows(dir).every(row => /^[a-f0-9]{24}$/.test(row.ids?.directory ?? ""))).toBe(true);
   toolLog({ component: "telegram", kind: "error", name: "fixture.props", props: { cause: secret, path: secret, url: secret, token: secret, message: secret } });
-  expect(rows(dir).at(-1).props).toBeUndefined();
+  expect(rows(dir).at(-1)?.props).toBeUndefined();
   expect(readFileSync(join(dir, `${day()}.ndjson`), "utf8")).not.toContain(secret);
 });
 

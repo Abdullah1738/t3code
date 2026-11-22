@@ -13,6 +13,7 @@ import time
 import unittest
 import unittest.mock
 from datetime import datetime, timezone
+from helpers import toollog as helper_log
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HELPER = os.path.join(HERE, "..", "helpers", "ride-share-check.py")
@@ -2510,12 +2511,17 @@ class RenderLogTest(unittest.TestCase):
 class BridgeListDeadlineTest(Base):
     def rows(self):
         from pathlib import Path
-        return [json.loads(line) for p in Path(self.env["TOOLLOG_DIR"]).glob("*.ndjson")
+        return [helper_log.expand_helper(json.loads(line)) for p in Path(self.env["TOOLLOG_DIR"]).glob("*.ndjson")
                 for line in p.read_text().splitlines()]
 
     def setUp(self):
         super().setUp()
         self.env["TOOLLOG_DIR"] = os.path.join(self.dir, "logs")
+        # Health fixtures can cache their different toollog module before ride_card imports it.
+        logger = unittest.mock.patch.multiple(self.rc(), tool_log=helper_log.tool_log,
+                                            stderr_cause=helper_log.stderr_cause)
+        logger.start()
+        self.addCleanup(logger.stop)
 
     def test_shares_survives_old_deadline_and_keeps_permanent_links(self):
         rc = self.rc()
