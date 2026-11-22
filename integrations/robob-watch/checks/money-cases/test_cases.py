@@ -159,7 +159,9 @@ class ScreenReadOnly(unittest.TestCase):
             with self.subTest(corrupt=corrupt, locks=locks), tempfile.TemporaryDirectory() as tmp:
                 with screen_sources(Path(tmp), corrupt, locks) as (data, text, charged, now, server, orders, calls):
                     before = data_snapshot(data)
-                    result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=False)
+                    with patch('marketplace.launch_refresh') as refresh:
+                        result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=False)
+                    refresh.assert_not_called()
                     self.assertEqual(result['verdict'], 'ask', result)
                     self.assertEqual(result['errors'], [])
                     self.assertEqual(data_snapshot(data), before)
@@ -2914,9 +2916,10 @@ class CheckBudget(Base):
             launch.assert_called_once()
             self.assertTrue(launch.call_args.kwargs['start_new_session'])
             self.assertEqual(launch.call_args.kwargs['stdout'], subprocess.DEVNULL)
-            self.assertEqual(launch.call_args.kwargs['stderr'], subprocess.DEVNULL)
+            self.assertNotEqual(launch.call_args.kwargs['stderr'], subprocess.DEVNULL)
+            self.assertTrue((self.data / 'marketplace-refresh.err').exists())
             event = next(c for c in log.call_args_list if c.args[0] == 'check.run')
-            self.assertEqual(event.kwargs['props']['marketplace_refresh'], 'started')
+            self.assertEqual(event.kwargs['props']['marketplace_refresh']['status'], 'started')
             launch.reset_mock()
             write_json(self.data / 'marketplace-placements.json', dict(marketplace.empty(),
                 walked_at=dt.datetime.now(dt.timezone.utc).isoformat()))
@@ -2927,6 +2930,60 @@ class CheckBudget(Base):
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 self.check('2026-10-24T09:00')
             launch.assert_not_called()
+
+    def test_unrelated_source_failure_does_not_starve_marketplace_refresh(self):
+        import marketplace
+        self.case()
+
+        def source_failure(*args, diagnostic, **kwargs):
+            diagnostic.update(complete=False, question_errors=['Robob control: incomplete thread list'])
+            return ''
+
+        with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                patch.object(mc, '_run_check', side_effect=source_failure), \
+                patch.object(marketplace, 'launch_refresh') as launch:
+            self.check('2026-10-24T09:00')
+            launch.assert_called_once_with(self.data)
+
+    def test_marketplace_refresh_is_held_on_data_unavailable_deadline_or_abort(self):
+        import marketplace
+        self.case()
+        for form, expected in (('unavailable', 'held_data_unavailable'),
+                               ('deadline', 'held_deadline'), ('abort', 'held_abort')):
+            with self.subTest(form=form):
+                def abort(*args, diagnostic, **kwargs):
+                    if form == 'unavailable':
+                        mc.data_io.current_scope()['failed'] = True
+                        raise mc.data_io.DataUnavailable(self.data / 'questions.json')
+                    if form == 'deadline':
+                        diagnostic['budgetHit'] = True
+                        return ''
+                    raise RuntimeError('fixture abort')
+
+                with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                        patch.object(mc, '_run_check', side_effect=abort), \
+                        patch.object(marketplace, 'launch_refresh') as launch, \
+                        patch.object(mc, 'record_event') as log:
+                    if form == 'deadline':
+                        self.check('2026-10-24T09:00')
+                    else:
+                        with self.assertRaises(mc.data_io.DataUnavailable if form == 'unavailable' else RuntimeError):
+                            self.check('2026-10-24T09:00')
+                    launch.assert_not_called()
+                    event = next(c for c in log.call_args_list if c.args[0] == 'check.run')
+                    self.assertEqual(event.kwargs['props']['marketplace_refresh']['status'], expected)
+
+    def test_failed_marketplace_launch_reports_actual_status(self):
+        import marketplace
+        self.case()
+        with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                patch.object(marketplace, 'launch_refresh', side_effect=OSError('fixture')), \
+                patch.object(mc, 'record_event') as log:
+            self.check('2026-10-24T09:00')
+        event = next(c for c in log.call_args_list if c.args[0] == 'check.run')
+        self.assertEqual(event.kwargs['props']['marketplace_refresh']['status'], 'launch_failed')
+        failed = next(c for c in log.call_args_list if c.args[0] == 'marketplace.refresh')
+        self.assertFalse(failed.kwargs['ok'])
 
     def test_follow_redacts_repeated_text_once_without_batching_cursor_commits(self):
         from collections import Counter

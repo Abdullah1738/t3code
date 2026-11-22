@@ -62,6 +62,15 @@ class Logging(Base):
         self.assertNotIn('PRIVATE', json.dumps(self.rows()))
         self.assertEqual((HERE / 'toollog.py').read_bytes(), SHARED.read_bytes())
 
+    def test_structured_marketplace_refresh_metadata_survives_logging(self):
+        value = {'status': 'launch_failed', 'snapshot_age_s': 7200, 'last_result': 'launch_error',
+                 'last_at': '2026-11-20T00:00:00Z', 'order': 'PRIVATE', 'amount': 'PRIVATE'}
+        mc.toollog.emit('money-cases', 'check.run', props={'marketplace_refresh': value})
+        row, = self.rows('check.run')
+        self.assertEqual(row['props']['marketplace_refresh'], {'status': 'launch_failed',
+            'snapshot_age_s': 7200, 'last_result': 'launch_error', 'last_at': '2026-11-20T00:00:00+00:00'})
+        self.assertNotIn('PRIVATE', json.dumps(row))
+
     def test_owner_cache_reset_diagnostics_wait_for_book_unlock(self):
         path = self.data / 'owner-snapshot.json'
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -318,7 +327,7 @@ class Logging(Base):
         row, = self.rows('check.run')
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
-        self.assertEqual(row['props'], {'marketplace_refresh': 'skipped', 'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
+        self.assertEqual(row['props'], {'marketplace_refresh': {'status': 'skipped', 'snapshot_age_s': None, 'last_result': None, 'last_at': None}, 'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
             **dict.fromkeys((key for key in (*mc.TIMING_KEYS, *mc.charges.OWNER_TIMING_KEYS)
                              if key != 'dataless_error'), 0), 'owner_result': 'ok', 'follow_ms': 40000, 'questions_ms': 40000,
             'starved_by': 'questions', **mc.charges.receipt_timing({})})
