@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import datetime as dt
 import base64
+import contextvars
 import fcntl
 import hashlib
 import hmac
@@ -954,29 +955,30 @@ def box_protection(con, box_id, *, probe=True, run_id=None):
     # An exited shell can leave children behind, including sync commands without run metadata.
     # Only a positive process probe retires an invocation from lifecycle protection.
     rows = con.execute('SELECT * FROM commands WHERE box_id=? ORDER BY pid DESC', (box_id,)).fetchall()
-    for c in rows:
-        if run_id and c['run_id'] != run_id:
-            continue
-        metrics = json.loads(c['metrics'] or '{}')
-        cache_key = f"holder_gone:{box_id}:{c['pid']}:{c['attempt'] or 1}"
-        unsettled = c['status'] in ('queued', 'running')
-        if not unsettled and con.execute('SELECT 1 FROM meta WHERE k=?', (cache_key,)).fetchone():
+    with shared_box_state():
+        for c in rows:
+            if run_id and c['run_id'] != run_id:
+                continue
+            metrics = json.loads(c['metrics'] or '{}')
+            cache_key = f"holder_gone:{box_id}:{c['pid']}:{c['attempt'] or 1}"
+            unsettled = c['status'] in ('queued', 'running')
+            if not unsettled and con.execute('SELECT 1 FROM meta WHERE k=?', (cache_key,)).fetchone():
+                if run_id:
+                    gone = True
+                continue
+            never_dispatched = (c['status'] not in ('queued', 'running') and c['started_at'] is None and
+                                (metrics.get('not_dispatched') is True or queue_loss_json(c)['notAdmitted']))
+            proof = ({'stopped': True, 'reason': 'not_dispatched'} if never_dispatched else
+                     command_probe(c) if probe and c['status'] != 'queued' else {})
+            confirmed = (proof.get('stopped') is True or (proof.get('readable') is True and
+                         proof.get('pids') == [] and (proof.get('join_verified') is True or proof.get('box_rc') is not None)))
             if run_id:
-                gone = True
-            continue
-        never_dispatched = (c['status'] not in ('queued', 'running') and c['started_at'] is None and
-                            (metrics.get('not_dispatched') is True or queue_loss_json(c)['notAdmitted']))
-        proof = ({'stopped': True, 'reason': 'not_dispatched'} if never_dispatched else
-                 command_probe(c) if probe and c['status'] != 'queued' else {})
-        confirmed = (proof.get('stopped') is True or (proof.get('readable') is True and
-                     proof.get('pids') == [] and (proof.get('join_verified') is True or proof.get('box_rc') is not None)))
-        if run_id:
-            gone = confirmed or gone
-        if confirmed and not unsettled:
-            resolved.append((cache_key, c, never_dispatched))
-            continue
-        holds.append(dict(run_id=c['run_id'], holder=c['holder'] or row['owner'],
-                          state=c['status'], process_id=c['pid'], probe=proof))
+                gone = confirmed or gone
+            if confirmed and not unsettled:
+                resolved.append((cache_key, c, never_dispatched))
+                continue
+            holds.append(dict(run_id=c['run_id'], holder=c['holder'] or row['owner'],
+                              state=c['status'], process_id=c['pid'], probe=proof))
     # The same protection endpoint fences late guest owners and settled rows with live cgroups.
     if probe and not run_id and not holds and commands_busy(con, box_id):
         holds.append(dict(run_id=None, holder=row['owner'], state='live command'))
@@ -1719,22 +1721,67 @@ def instance_missing(response) -> bool:
     return False
 
 
+# A protection read probes every past command of its box. The instance state is one answer for all of them,
+# so box_protection shares a single `incus query` across its loop. One query per command made a long-lived box
+# cost a second per 40 commands (bx_3uc4phe9, 22 Nov 2026: 1,049 commands, 24 s per read, under the client's pool lock).
+_BOX_STATE = contextvars.ContextVar('box_state', default=None)
+
+
+@contextmanager
+def shared_box_state():
+    token = _BOX_STATE.set({})
+    try:
+        yield
+    finally:
+        _BOX_STATE.reset(token)
+
+
+def _proc_start(pid) -> str | None:
+    try:
+        return (PROC_ROOT / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _ask_box_state(box_id: str) -> dict:
+    p = incus("query", f"/1.0/instances/{ct(box_id)}/state", check=False, timeout=5)
+    if p.returncode:
+        if instance_missing(p):
+            return {'answer': {"readable": True, "pids": [], "box_rc": None, "stopped": True}}
+        return {'answer': {"reason": "incus_unavailable"}}
+    state = json.loads(p.stdout)
+    if not isinstance(state, dict):
+        return {'answer': {'reason': 'box_unreadable'}}
+    if state.get("status") == "Stopped":
+        return {'answer': {"readable": True, "pids": [], "box_rc": None, "stopped": True}}
+    init = int(state.get("pid") or 0)
+    if init <= 0 or state.get("status") != "Running":
+        return {'answer': {"reason": "box_unreadable"}}
+    return {'init': init, 'start': _proc_start(init)}
+
+
+def box_state(box_id: str) -> dict:
+    """{'answer': view} when the box itself settles the probe, else {'init': host PID of its init}."""
+    shared = _BOX_STATE.get()
+    known = shared.get(box_id) if shared is not None else None
+    # A stopped or missing box had no process at that reading, and an unreadable one proves nothing either way.
+    # A running box's init is reused only while that PID is provably the same process: a restart is asked again.
+    if known is not None and ('answer' in known or
+                              (known['start'] is not None and _proc_start(known['init']) == known['start'])):
+        return known
+    state = _ask_box_state(box_id)
+    if shared is not None:
+        shared[box_id] = state
+    return state
+
+
 def command_probe(c) -> dict:
     """Inspect receipts without creating another exec session in the customer's box."""
     try:
-        p = incus("query", f"/1.0/instances/{ct(c['box_id'])}/state", check=False, timeout=5)
-        if p.returncode:
-            if instance_missing(p):
-                return {"readable": True, "pids": [], "box_rc": None, "stopped": True}
-            return {"reason": "incus_unavailable"}
-        state = json.loads(p.stdout)
-        if not isinstance(state, dict):
-            return {'reason': 'box_unreadable'}
-        if state.get("status") == "Stopped":
-            return {"readable": True, "pids": [], "box_rc": None, "stopped": True}
-        init = int(state.get("pid") or 0)
-        if init <= 0 or state.get("status") != "Running":
-            return {"reason": "box_unreadable"}
+        state = box_state(c['box_id'])
+        if 'answer' in state:
+            return dict(state['answer'])
+        init = state['init']
         root = PROC_ROOT / str(init) / 'root'
         base = root / "run/boatd" / f"{c['pid']}.{c['attempt'] or 1}"
         marker = None
