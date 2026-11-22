@@ -238,7 +238,8 @@ def main(argv=None):
             spawn = result.get('spawnSample')
             if spawn:
                 parents = ', '.join('%s[%s]:%s' % (p.get('family') or p.get('parent_comm'), p.get('ppid'), p.get('births')) for p in spawn['top_spawners'])
-                print('spawn >=%s births/min; runnable pri<=4=%s; partial=%s; age=%g min; top: %s' % (spawn['births_per_min'], spawn['runnable_pri_le4'], spawn['partial'], spawn['ageMin'], parents))
+                cadence = '/'.join(str(v) for v in spawn['births_cadences_s']) or '?'
+                print('spawn >=%s births/min @%ss; runnable pri<=4=%s; partial=%s; age=%g min; top: %s' % (spawn['births_per_min'], cadence, spawn['runnable_pri_le4'], spawn['partial'], spawn['ageMin'], parents))
             for filename in result.get('missingFiles', []):
                 print('missing day file: ' + filename)
             for filename in result.get('readErrors', []):

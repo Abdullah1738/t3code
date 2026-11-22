@@ -929,7 +929,7 @@ review; the CPU job retains its original launcher. Installer tests set
 identities, runnable threads by current priority, CPU advancement and offbox
 command classes. Births are a lower bound from five-second PID/start-time
 snapshots, not a fork or exec count. `status` and rollups show the latest
-birth rate, three parents and runnable priority-4-or-lower count. Overload
+birth rate with its snapshot cadence, three parents and runnable priority-4-or-lower count. Overload
 events carry the sample as context without changing alert thresholds.
 
 Each native pass has a 1.5-second cooperative deadline and reads threads for
@@ -938,8 +938,13 @@ kernel call; the publisher reports stale/in-flight coverage instead of
 waiting. Coverage, unreadable argv/tasks and missing CPU baselines are explicit.
 Only derived labels are cached per PID/start identity; argv is never logged.
 Cost includes per-minute summed wall/CPU time, individual phase costs and guard
-decisions. Actual excess halves the thread-process cap down to one, prioritizing
-runnable hints and highest CPU gain; only then can cadence slow to 15 seconds.
+decisions. CPU above 2% of a core per minute or two consecutive ticks at the
+1.5s wall bound reduce coverage, prioritizing runnable hints and highest CPU
+gain. Summed minute wall time is data, not a cost trigger. If halving the thread
+cap does not reduce thread-read wall time, further pressure slows cadence to
+15s instead of continuing to shrink coverage. Five calm minutes (CPU below 1%,
+no tick at 1s) start recovery: restore 5s cadence first, then double the cap
+once per calm minute up to 300. Candidate selection has separate phase timing.
 A shared 75ms soft argv/CPU allocation leaves room for a 25ms thread pass every
 tick within the 1.5s overall deadline. Runnable hints with unread CPU data
 remain eligible for thread reads and carry an unknown CPU baseline.
