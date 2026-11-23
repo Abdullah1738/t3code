@@ -9,9 +9,13 @@ type Operation = { startedAt: number; endedAt: number };
 export type RuntimeSample = { loopLagMaxMs: number; loopLagP95Ms: number; cpuUserMs: number; cpuSystemMs: number; rssMb: number; loadAvg1: number };
 export type Stall = { stallMs: number; loadAvg1: number; freeMemoryBytes: number; rssBytes: number; operations: string } & StallTiming;
 /**
- * Only what the process can measure: traced operations that started and ended inside the window,
- * and main-thread CPU. Off-CPU time is scheduling delay or a blocking wait (sync I/O, a lock) the
- * process cannot tell apart.
+ * Only what the process can measure, rounded to whole milliseconds.
+ * - `measuredMaxMs` / `operationMs`: wall-clock spans of traced operations that started and ended
+ *   inside the window. An upper bound on blocking: async operations (e.g. `log.scan`) may await
+ *   I/O inside their span.
+ * - `threadCpuMs`: main-thread CPU over the window.
+ * - `offCpuMs`: `windowMs - threadCpuMs`. Includes the normal idle time before the heartbeat was
+ *   due, plus scheduling delay or a blocking wait (sync I/O, a lock) the process cannot tell apart.
  */
 type StallTiming = { windowMs?: number; measuredMaxMs?: number; operationMs?: string; threadCpuMs?: number; offCpuMs?: number };
 
@@ -117,15 +121,15 @@ export function createLoopStallMonitor(emit: (stall: Stall) => void, options: {
     }
     if (stallMs <= 1_000 || at - lastEmission < 10_000) return;
     lastEmission = at;
-    const timing: StallTiming = { windowMs: at - start };
+    const timing: StallTiming = { windowMs: Math.round(at - start) };
     if (longest.size) {
-      timing.measuredMaxMs = Math.max(...longest.values());
+      timing.measuredMaxMs = Math.round(Math.max(...longest.values()));
       timing.operationMs = [...longest].map(([name, ms]) => `${name}:${Math.round(ms)}`).join(",");
     }
     if (thread && lastThread) {
       const threadCpuMs = Math.max(0, thread.user + thread.system - lastThread.user - lastThread.system) / 1000;
-      timing.threadCpuMs = threadCpuMs;
-      timing.offCpuMs = Math.max(0, at - start - threadCpuMs);
+      timing.threadCpuMs = Math.round(threadCpuMs);
+      timing.offCpuMs = Math.round(Math.max(0, at - start - threadCpuMs));
     }
     try { emit({ ...host(), stallMs, operations: operations.during(start, at), ...timing }); }
     catch { /* Diagnostics cannot interrupt bridge work or create an error loop. */ }

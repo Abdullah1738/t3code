@@ -137,14 +137,19 @@ export class Store {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS batch_members (member TEXT NOT NULL, leader TEXT NOT NULL, PRIMARY KEY (member, leader)) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS batch_members_leader ON batch_members(leader);
-        CREATE TRIGGER IF NOT EXISTS batch_members_insert AFTER INSERT ON kv WHEN new.key GLOB 'batch:*' BEGIN
+        DROP TRIGGER IF EXISTS batch_members_insert;
+        DROP TRIGGER IF EXISTS batch_members_update;
+        DROP TRIGGER IF EXISTS batch_members_delete;
+        -- INSERT OR REPLACE deletes the old row without firing AFTER DELETE (recursive_triggers is off).
+        CREATE TRIGGER batch_members_insert AFTER INSERT ON kv WHEN new.key GLOB 'batch:*' BEGIN
+          DELETE FROM batch_members WHERE leader = substr(new.key, 7);
           INSERT OR IGNORE INTO batch_members (leader, member) ${members("new")};
         END;
-        CREATE TRIGGER IF NOT EXISTS batch_members_update AFTER UPDATE ON kv WHEN old.key GLOB 'batch:*' OR new.key GLOB 'batch:*' BEGIN
+        CREATE TRIGGER batch_members_update AFTER UPDATE ON kv WHEN old.key GLOB 'batch:*' OR new.key GLOB 'batch:*' BEGIN
           DELETE FROM batch_members WHERE old.key GLOB 'batch:*' AND leader = substr(old.key, 7);
           INSERT OR IGNORE INTO batch_members (leader, member) SELECT * FROM (${members("new")}) WHERE new.key GLOB 'batch:*';
         END;
-        CREATE TRIGGER IF NOT EXISTS batch_members_delete AFTER DELETE ON kv WHEN old.key GLOB 'batch:*' BEGIN
+        CREATE TRIGGER batch_members_delete AFTER DELETE ON kv WHEN old.key GLOB 'batch:*' BEGIN
           DELETE FROM batch_members WHERE leader = substr(old.key, 7);
         END;
       `);

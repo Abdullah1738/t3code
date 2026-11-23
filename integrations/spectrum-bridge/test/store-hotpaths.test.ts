@@ -102,7 +102,11 @@ test("batch membership index follows every kv write path, rollback and malformed
     expect(store.batchLeaders("c")).toEqual([]);
     store.db.query("UPDATE kv SET key = 'batch:back' WHERE key = 'moved:raw'").run();
     expect(store.batchLeaders("c")).toEqual(["back"]);
+    store.db.query("INSERT OR REPLACE INTO kv (key, value) VALUES ('batch:back', ?)").run(JSON.stringify({ batchIds: ["f"] }));
+    expect(store.batchLeaders("c")).toEqual([]);
+    expect(store.batchLeaders("f")).toEqual(["back"]);
     store.db.query("DELETE FROM kv WHERE key = 'batch:back'").run();
+    expect(store.batchLeaders("f")).toEqual([]);
     expect(store.batchLeaders("c")).toEqual([]);
     expect(() => store.db.transaction(() => {
       store.set("batch:rolled", { batchIds: ["d"] });
