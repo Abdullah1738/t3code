@@ -10,7 +10,7 @@ async function fixture() {
     latestRunId: null, createdAt: null, updatedAt: null, changeMarker: 1 };
   const client = new ControlClient({ url: "http://127.0.0.1:1", token: "isolated-test", linkGate: false });
   const lists = spyOn(client, "listThreads").mockResolvedValue({ total: 1, threads: [idle] });
-  const summaries = spyOn(client, "threadSummaries").mockResolvedValue({ threads: [idle] });
+  const summaries = spyOn(client, "threadSummaries").mockResolvedValue({ total: 1, threads: [idle] });
   const detail = spyOn(client, "thread").mockResolvedValue({ thread: idle });
   const pages = spyOn(client, "crossThreadMessages").mockResolvedValue({ messages: [], nextCursor: null });
   const roster = new ActiveRoster(client); roster.streamState(true);
@@ -53,7 +53,7 @@ test("marker roster: fresh batch detail reconciles busy state without a consumer
   const f = await fixture();
   try {
     const busy = { ...f.idle, state: "running" as const, status: "running", changeMarker: 2 };
-    f.summaries.mockResolvedValue({ threads: [busy] }); f.detail.mockResolvedValue({ thread: busy });
+    f.summaries.mockResolvedValue({ total: 1, threads: [busy] }); f.detail.mockResolvedValue({ thread: busy });
     await f.backend.beginMessageTick(["route"]);
     expect(f.roster.isBusy("route")).toBe(true);
     expect(f.checkpoint).toHaveBeenCalledTimes(1);
@@ -67,7 +67,7 @@ test("marker roster: deferred details release tickets and never publish a late i
     await f.backend.beginMessageTick(["route"]);
     f.busy();
     const changed = { ...f.idle, changeMarker: 2, latestRunId: "next" };
-    f.summaries.mockResolvedValue({ threads: [changed] });
+    f.summaries.mockResolvedValue({ total: 1, threads: [changed] });
     f.detail.mockImplementationOnce(async () => { entered.resolve(); return release.promise; });
     const tick = f.backend.beginMessageTick(["route"]); await entered.promise; await tick;
     expect(f.checkpoint).toHaveBeenCalledTimes(2);
