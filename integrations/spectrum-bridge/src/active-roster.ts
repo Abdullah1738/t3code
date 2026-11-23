@@ -60,6 +60,7 @@ export class ActiveRoster {
   private ambiguousRefresh = false;
   private ambiguousGeneration = -1;
   private revisions = new Map<string, number>();
+  private removed = new Set<string>();
   // One start clock also orders a list's not-yet-discovered threads; fences stay per thread.
   private ticket = 0;
   private details = new Map<string, Map<number, DetailRead>>();
@@ -213,6 +214,7 @@ export class ActiveRoster {
 
   private patch(row: ThreadSummary, ticket: number): void {
     if (ticket < this.revision(row.threadId)) return;
+    this.removed.delete(row.threadId);
     const previous = this.known.get(row.threadId);
     this.known.set(row.threadId, row);
     if (previous && sameRow(previous, row)) return;
@@ -257,7 +259,9 @@ export class ActiveRoster {
         const previous = this.known.get(threadId);
         const changedFamily = this.provisional.has(threadId) || !previous
           || previous.parentThreadId !== thread.parentThreadId || previous.rootThreadId !== thread.rootThreadId;
-        if (thread.threadId !== threadId || changedFamily && thread.parentThreadId !== null
+        // An inactive creation cannot add busy family members, even when its root is absent.
+        const inactiveCreation = trigger === "created" && !BUSY.has(thread.state) && !thread.pendingRequest;
+        if (thread.threadId !== threadId || changedFamily && !inactiveCreation && thread.parentThreadId !== null
           && (!thread.rootThreadId || !this.known.has(thread.rootThreadId))) {
           this.invalidate(trigger); return;
         }
@@ -269,6 +273,16 @@ export class ActiveRoster {
         // Unlike a run event, detail is the thread's aggregate state. Its start ticket
         // fences later events/lists; unrelated in-flight lists cannot invalidate it.
         this.provisional.delete(threadId);
+        if (inactiveCreation) {
+          // Forget idle identity so its first busy event must place the family afresh.
+          this.advance(threadId, read.ticket);
+          this.removed.add(threadId);
+          this.known.delete(threadId);
+          if (this.cache) this.cache.threads = this.cache.threads.filter(row => row.threadId !== threadId);
+          this.rebuild();
+          this.count("drops");
+          return;
+        }
         this.patch(thread, read.ticket);
       } catch (error) {
         this.count("detailErrors");
@@ -426,7 +440,8 @@ export class ActiveRoster {
       const started = this.now();
       try {
         const { total, threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
-        const rows = threads.map(thread => ({ ...thread }));
+        // Removal fences outlive known rows; an older list cannot restore their identity.
+        const rows = threads.filter(thread => !this.removed.has(thread.threadId) || ticket >= this.revision(thread.threadId)).map(thread => ({ ...thread }));
         const held = new Set<string>();
         for (const [id, previous] of this.known) {
           const index = rows.findIndex(row => row.threadId === id);
@@ -463,6 +478,7 @@ export class ActiveRoster {
           }
         }
         this.cache = { threads: rows, total, complete: isComplete, fetchedAt: this.now() };
+        for (const id of this.removed) if (ticket >= this.revision(id)) this.removed.delete(id);
         for (const row of rows) this.known.set(row.threadId, row);
         if (isComplete || this.known.size > 2_000) {
           // Rows leaving the active set must not retain an old pending request for later run events.

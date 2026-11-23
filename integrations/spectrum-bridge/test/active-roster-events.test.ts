@@ -86,6 +86,101 @@ test("top-level busy detail, idle creation and metadata avoid full lists", async
   expect(f.lists).toHaveBeenCalledTimes(1); expect(f.detail).toHaveBeenCalledTimes(2);
 });
 
+const createdFamilies = [
+  { family: "top-level", parentThreadId: null, rootThreadId: "created", missingRoot: false },
+  { family: "known-root child", parentThreadId: "owner", rootThreadId: "owner", missingRoot: false },
+  { family: "inactive-root child", parentThreadId: "inactive-parent", rootThreadId: "inactive-parent", missingRoot: true },
+  { family: "inactive-root fork", parentThreadId: "inactive-parent", rootThreadId: "inactive-root", missingRoot: true },
+  { family: "rootless child", parentThreadId: "inactive-parent", rootThreadId: "", missingRoot: true },
+];
+const createdCases = createdFamilies.flatMap(family =>
+  (["idle", "waiting", "running", "queued", "needs-input"] as const).map(state => ({ ...family, state })));
+test.each(createdCases)("state-less creation: $family, detail $state", async ({ parentThreadId, rootThreadId, missingRoot, state }) => {
+  const f = await fixture(), before = await f.view();
+  const busy = state !== "idle" && state !== "waiting";
+  const pendingRequest = state === "needs-input" ? { requestId: "created-question", kind: "question" as const, requestKind: "user_input" } : null;
+  f.server.set("created", row("created", { parentThreadId, rootThreadId, state, pendingRequest }));
+  // Creation frames supply family identity but no aggregate state.
+  f.event({ type: "thread.created", threadId: "created", parentThreadId });
+  await f.confirmed("created"); await f.roster["fetching"];
+  const statuses = await f.admission();
+  if (busy) {
+    const expected = { type: "busy", root: parentThreadId === null ? null : rootThreadId };
+    expect(statuses.created).toEqual(expected); expect(statuses.ses_created).toEqual(expected);
+  } else expect(statuses).toEqual(before);
+  expect(f.detail).toHaveBeenCalledTimes(1);
+  expect(f.lists).toHaveBeenCalledTimes(busy && missingRoot ? 2 : 1);
+  expect(f.roster.status().fetch_created).toBe(busy && missingRoot ? 1 : 0);
+});
+
+test.each(createdFamilies.filter(family => family.missingRoot))("idle creation with a pending request still discovers $family", async ({ parentThreadId, rootThreadId }) => {
+  const f = await fixture();
+  const pendingRequest = { requestId: "created-question", kind: "question" as const, requestKind: "user_input" };
+  f.server.set("created", row("created", { parentThreadId, rootThreadId, state: "needs-input", pendingRequest }));
+  f.detail.mockResolvedValueOnce({ thread: row("created", { parentThreadId, rootThreadId, state: "idle", pendingRequest }) });
+  f.event({ type: "thread.created", threadId: "created", parentThreadId });
+  await f.confirmed("created"); await f.roster["fetching"];
+  expect((await f.admission()).created).toEqual({ type: "busy", root: rootThreadId });
+  expect(f.detail).toHaveBeenCalledTimes(1); expect(f.lists).toHaveBeenCalledTimes(2);
+});
+
+const createdRequestCases = createdFamilies.flatMap(family =>
+  (["idle", "waiting"] as const).flatMap(state =>
+    ([undefined, "running"] as const).flatMap(eventState =>
+      (["question", "approval"] as const).map(kind => ({ ...family, state, eventState, kind })))));
+test.each(createdRequestCases)("inactive creation then $kind: $family, detail $state, event $eventState", async ({ parentThreadId, rootThreadId, missingRoot, state, eventState, kind }) => {
+  const f = await fixture(), before = await f.view();
+  f.server.set("created", row("created", { parentThreadId, rootThreadId, state }));
+  f.event({ type: "thread.created", threadId: "created", parentThreadId, ...(eventState ? { state: eventState } : {}) });
+  await f.confirmed("created");
+  expect(await f.admission()).toEqual(before); expect(f.lists).toHaveBeenCalledTimes(1);
+  const pendingRequest = { requestId: "later-request", kind, requestKind: kind === "question" ? "user_input" : "tool_approval" };
+  f.server.set("created", row("created", { parentThreadId, rootThreadId, state: "needs-input", pendingRequest }));
+  f.event({ type: "request.opened", threadId: "created", ...pendingRequest });
+  await f.confirmed("created"); await f.roster["fetching"];
+  const statuses = await f.admission(), expected = { type: "busy", root: parentThreadId === null ? null : rootThreadId };
+  expect(statuses.created).toEqual(expected); expect(statuses.ses_created).toEqual(expected);
+  expect(f.detail).toHaveBeenCalledTimes(2);
+  expect(f.lists).toHaveBeenCalledTimes(missingRoot ? 2 : 1);
+});
+
+test("idle creation detail cannot clear a newer busy child's provisional identity", async () => {
+  const f = await fixture(), response = Promise.withResolvers<{ thread: ThreadDetail }>();
+  f.detail.mockReturnValueOnce(response.promise);
+  f.event({ type: "thread.created", threadId: "created", parentThreadId: "inactive-parent" });
+  const pending = f.confirmed("created");
+  f.server.set("created", row("created", { parentThreadId: "owner", rootThreadId: "owner" }));
+  f.event({ type: "thread.status", threadId: "created", state: "running" });
+  expect((await f.view()).created?.type).toBe("busy");
+  response.resolve({ thread: row("created", { state: "idle", parentThreadId: "inactive-parent", rootThreadId: "inactive-parent" }) });
+  await pending; await f.roster["fetching"];
+  expect((await f.admission()).created).toEqual({ type: "busy", root: "owner" });
+  expect(f.detail).toHaveBeenCalledTimes(1); expect(f.lists).toHaveBeenCalledTimes(2);
+});
+
+const createdListCases = createdFamilies.flatMap(family =>
+  (["list-first", "detail-first"] as const).flatMap(start =>
+    (["list-first", "detail-first"] as const).map(finish => ({ ...family, start, finish }))));
+test.each(createdListCases)("creation removal and list fences: $family, start $start, finish $finish", async ({ parentThreadId, rootThreadId, start, finish }) => {
+  const f = await fixture(), before = await f.view();
+  const list = Promise.withResolvers<{ total: number; threads: ThreadSummary[] }>(), detail = Promise.withResolvers<{ thread: ThreadDetail }>();
+  f.lists.mockReturnValueOnce(list.promise); f.detail.mockReturnValueOnce(detail.promise);
+  let fetching: Promise<void> | undefined, confirming: Promise<void> | undefined;
+  const startList = () => { f.time(31_000); f.roster.view(new Map()); fetching = f.roster["fetching"]; };
+  const startDetail = () => { f.event({ type: "thread.created", threadId: "created", parentThreadId }); confirming = f.confirmed("created"); };
+  if (start === "list-first") { startList(); startDetail(); } else { startDetail(); startList(); }
+  const finishList = async () => { list.resolve({ total: 3, threads: [...f.server.values(), row("created", { parentThreadId, rootThreadId })] }); await fetching; };
+  const finishDetail = async () => { detail.resolve({ thread: row("created", { parentThreadId, rootThreadId, state: "idle" }) }); await confirming; };
+  if (finish === "list-first") { await finishList(); await finishDetail(); } else { await finishDetail(); await finishList(); }
+  const statuses = await f.admission();
+  if (start === "list-first") expect(statuses).toEqual(before);
+  else {
+    const expected = { type: "busy", root: parentThreadId === null ? null : rootThreadId };
+    expect(statuses.created).toEqual(expected); expect(statuses.ses_created).toEqual(expected);
+  }
+  expect(f.lists).toHaveBeenCalledTimes(2); expect(f.detail).toHaveBeenCalledTimes(1);
+});
+
 test("child missing its root falls back to one full list", async () => {
   const f = await fixture(); f.server.set("child", row("child", { parentThreadId: "missing", rootThreadId: "missing" }));
   f.event({ type: "thread.status", threadId: "child", state: "running" }); await f.confirmed("child"); await f.roster["fetching"];
