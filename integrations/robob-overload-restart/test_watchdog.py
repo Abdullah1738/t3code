@@ -77,7 +77,10 @@ else:
         Path(m.HOLD_CLI).write_text('#!' + sys.executable + '\n' + fake)
         Path(m.HOLD_CLI).chmod(0o700)
         Path(m.TELEGRAM).write_text(fake)
-        m.processes = lambda: {999999: (1, 'captured-start', m.EXECUTABLE)}
+        m.processes = lambda timeout=20: {999999: (1, 'captured-start', m.EXECUTABLE)}
+        self.addCleanup(patch.stopall)
+        patch.object(m.os, 'getloadavg', return_value=(0, 0, 0)).start()
+        patch.object(m.os, 'cpu_count', return_value=8).start()
         self.tmux_session = m.tmux_session
         m.tmux_session = lambda socket, name, details=None: False
         m.building = lambda: []
@@ -129,6 +132,304 @@ else:
     def fifo(self, path):
         path.unlink(missing_ok=True)
         os.mkfifo(path)
+
+    def health_report(self, stalls1s=0, stalls5s=0, worst=0, connection='ok'):
+        summary = f'stalled: {stalls1s} stalls >=1s in 10 min ({stalls5s} >=5s); round trip timeout; rss 2.09 GB'
+        return {'verdict': 'stalled', 'summary': summary,
+                'connection': {'status': connection, 'ms': 615},
+                'roundTrip': {'status': 'timeout', 'ms': 8008},
+                'lag': {'status': 'complete', 'stalls1s': stalls1s, 'stalls5s': stalls5s, 'worstMs': worst}}
+
+    def sample_checks(self, reports, dry=True):
+        self.m.DRY = dry
+        now = getattr(self, 'next_check', self.m.time.time())
+        with patch.object(self.m, 'preflight', return_value=None), \
+                patch.object(self.m, 'hold_live', return_value=None), \
+                patch.object(self.m.time, 'sleep'):
+            for i, report in enumerate(reports):
+                with patch.object(self.m.time, 'time', return_value=now + i * 300), \
+                        patch.object(self.m, 'deep_health', return_value=(
+                            report.get('verdict', 'stalled'), report.get('summary', ''), report)):
+                    self.m.check()
+        self.next_check = now + len(reports) * 300
+        return [r for r in self.rows() if r['event'] == 'check']
+
+    def triggered(self):
+        return any(r['event'] in ('dry.trigger', 'trigger') for r in self.rows())
+
+    def test_roundtrip_only_four_checks_do_not_restart(self):
+        with patch.object(self.m.os, 'getloadavg', return_value=(56.6, 0, 0)):
+            rows = self.sample_checks([self.health_report()] * 4)
+        self.assertFalse(self.triggered())
+        self.assertTrue(all(r['rawVerdict'] == 'stalled' and r['effectiveVerdict'] == 'slow-roundtrip' for r in rows))
+        self.assertTrue(all(r['evidence']['source'] == 'lag' and r['rule'] is None for r in rows))
+        self.assertTrue(all(r['stallSource'] == 'lag' for r in rows))
+        checks = self.m.read_json(self.m.STATE, {})['checks']
+        self.assertEqual([r['effectiveVerdict'] for r in checks], ['slow-roundtrip'] * 4)
+
+    def test_real_five_second_stalls_restart(self):
+        self.sample_checks([self.health_report(1, 1, 5000)] * 4)
+        self.assertTrue(self.triggered())
+
+    def test_three_one_second_stalls_count_but_do_not_outweigh_agents(self):
+        report = self.health_report(3, 0, 1000)
+        with patch.object(self.m, 'cost', return_value=dict(treeProcesses=2, agentProcesses=1,
+                                                         runningTurns=None, runningSubagents=None)):
+            rows = self.sample_checks([report] * 4)
+        self.assertEqual(rows[-1]['effectiveVerdict'], 'stalled')
+        self.assertEqual(rows[-1]['held'], 'agents running (1), stall not hard')
+
+    def test_slow_roundtrips_are_neither_healthy_nor_stalled_in_long_rule(self):
+        report = self.health_report(1, 1, 5000)
+        rows = self.sample_checks([report, self.health_report()] * 4)
+        self.assertTrue(self.triggered())
+        self.assertEqual(rows[-1]['rule'], 'at most one healthy check in 8 (4 stalled)')
+
+    def test_retry_recovery_does_not_count_as_connection_failure(self):
+        failed = self.health_report(connection='timeout')
+        with patch.object(self.m, 'preflight', return_value=None), \
+                patch.object(self.m, 'hold_live', return_value=None), patch.object(self.m.time, 'sleep'), \
+                patch.object(self.m, 'deep_health', side_effect=[('stalled', '', failed),
+                    ('stalled', self.health_report()['summary'], self.health_report())]):
+            self.m.check()
+        check = self.m.read_json(self.m.STATE, {})['checks'][-1]
+        self.assertEqual(check['effectiveVerdict'], 'slow-roundtrip')
+        self.assertFalse(check['connectionFailed'])
+
+    def test_soft_retry_does_not_make_entire_connection_run_hard(self):
+        failed = self.health_report(connection='timeout')
+        now = self.m.time.time()
+        self.m.write_json(self.m.STATE, {'checks': [dict(at=now - 300 * i, effectiveVerdict='stalled',
+                              connectionFailed=True) for i in (3, 2, 1)]})
+        with patch.object(self.m, 'preflight', return_value=None), \
+                patch.object(self.m, 'hold_live', return_value=None), patch.object(self.m.time, 'sleep'), \
+                patch.object(self.m.os, 'getloadavg', return_value=(172.6, 0, 0)), \
+                patch.object(self.m, 'deep_health', side_effect=[('stalled', '', self.health_report(1, 1, 5000)),
+                                                               ('stalled', '', failed)]):
+            self.m.check()
+        row = next(r for r in self.rows() if r['event'] == 'check')
+        self.assertFalse(row['hardStall'])
+        self.assertEqual(row['held'], 'host load 172.6 > 16')
+
+    def test_connection_timeout_four_checks_restarts_even_under_load_with_agents(self):
+        report = self.health_report(connection='timeout')
+        report.pop('lag')
+        report['summary'] = 'connection timeout'
+        with patch.object(self.m.os, 'getloadavg', return_value=(172.6, 0, 0)), \
+                patch.object(self.m, 'cost', return_value=dict(treeProcesses=710, agentProcesses=8,
+                                                            runningTurns=None, runningSubagents=None)):
+            rows = self.sample_checks([report] * 4)
+        self.assertTrue(self.triggered())
+        self.assertTrue(rows[-1]['hardStall'])
+
+    def test_high_load_holds_and_preserves_history(self):
+        with patch.object(self.m.os, 'getloadavg', return_value=(16.1, 0, 0)):
+            rows = self.sample_checks([self.health_report(1, 1, 5000)] * 4)
+        self.assertFalse(self.triggered())
+        self.assertEqual(rows[-1]['held'], 'host load 16.1 > 16')
+        self.assertTrue(rows[-1]['rule'])
+        self.assertEqual(len(self.m.read_json(self.m.STATE, {})['checks']), 4)
+        self.sample_checks([self.health_report(1, 1, 5000)])
+        self.assertTrue(self.triggered())
+
+    def test_hard_loop_stall_bypasses_load_and_agent_holds(self):
+        with patch.object(self.m.os, 'getloadavg', return_value=(172.6, 0, 0)), \
+                patch.object(self.m, 'cost', return_value=dict(treeProcesses=710, agentProcesses=8,
+                                                            runningTurns=None, runningSubagents=None)):
+            rows = self.sample_checks([self.health_report(1, 1, 30000)] * 4)
+        self.assertTrue(self.triggered())
+        self.assertTrue(rows[-1]['hardStall'])
+
+    def test_agents_running_soft_stall_holds(self):
+        with patch.object(self.m, 'cost', return_value=dict(treeProcesses=710, agentProcesses=8,
+                                                         runningTurns=None, runningSubagents=None)):
+            rows = self.sample_checks([self.health_report(1, 1, 5000)] * 4)
+        self.assertFalse(self.triggered())
+        self.assertEqual(rows[-1]['held'], 'agents running (8), stall not hard')
+
+    def test_agents_running_two_five_second_stalls_restart_and_log_cost(self):
+        table = {1: (0, 'other', '/bin/launchd'), 999999: (1, 'app', self.m.EXECUTABLE),
+                 1000000: (999999, 'agent', '/opt/bin/codex'), 1000001: (999999, 'shell', '/bin/zsh'),
+                 1000002: (1, 'unrelated-agent', '/opt/bin/claude')}
+        with patch.object(self.m, 'processes', return_value=table), \
+                patch.object(self.m, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                patch.object(self.m, 'notify', return_value=True) as notify:
+            rows = self.sample_checks([self.health_report(2, 2, 5000)] * 4, dry=False)
+        self.assertTrue(self.triggered())
+        expected = dict(treeProcesses=3, agentProcesses=1, runningTurns=None, runningSubagents=None)
+        self.assertTrue(all(r['cost'] == expected for r in rows))
+        self.assertEqual(self.m.read_json(self.m.STATE, {})['lastRestart']['cost'], expected)
+        self.assertEqual(next(r for r in self.rows() if r['event'] == 'trigger')['cost'], expected)
+        self.assertIn('would stop 1 agent processes, 3 tree processes', notify.call_args.args[1])
+
+    def test_unknown_stall_counts_do_not_count(self):
+        report = self.health_report()
+        report['lag'] = {'stalls1s': None, 'stalls5s': 'bad'}
+        rows = self.sample_checks([report] * 8)
+        self.assertFalse(self.triggered())
+        self.assertTrue(all(r['effectiveVerdict'] == 'unknown' for r in rows))
+
+    def test_missing_counts_do_not_count(self):
+        rows = self.sample_checks([{'verdict': 'stalled', 'connection': {'status': 'ok'}}] * 8)
+        self.assertFalse(self.triggered())
+        self.assertTrue(all(r['effectiveVerdict'] == 'unknown' for r in rows))
+        self.assertTrue(all(r['stallSource'] is None for r in rows))
+
+    def test_summary_fallback_is_logged_and_cannot_supply_hard_duration(self):
+        report = self.health_report(1, 1, 30000)
+        del report['lag']
+        report['summary'] = 'stalled: 1 stalls >=1s in 10 min (1 >=5s), worst 30.0s at 2026-11-21T06:47:00Z; round trip timeout'
+        with patch.object(self.m.os, 'getloadavg', return_value=(172.6, 0, 0)):
+            rows = self.sample_checks([report] * 4)
+        self.assertFalse(self.triggered())
+        self.assertFalse(rows[-1]['hardStall'])
+        self.assertTrue(all(r['stallSource'] == 'summary' for r in rows))
+
+    def test_stall_configuration_overrides(self):
+        spec = importlib.util.spec_from_file_location('configured_watchdog', SOURCE / 'robob-overload-restart.py')
+        configured = importlib.util.module_from_spec(spec)
+        with patch.dict(os.environ, {'ROBOB_OVERLOAD_STALL_5S': '2', 'ROBOB_OVERLOAD_STALL_1S': '4',
+                                    'ROBOB_OVERLOAD_LOAD_FACTOR': '3'}):
+            spec.loader.exec_module(configured)
+        self.assertEqual(configured.effective_verdict('stalled', self.health_report(1, 1, 5000)), 'slow-roundtrip')
+        self.assertEqual(configured.effective_verdict('stalled', self.health_report(2, 2, 5000)), 'stalled')
+        self.assertEqual(configured.effective_verdict('stalled', self.health_report(4, 0, 1000)), 'stalled')
+        self.assertEqual(configured.effective_verdict('stalled', self.health_report(1, 1, 30000)), 'stalled')
+        self.assertEqual(configured.LOAD_FACTOR, 3)
+
+    def test_load_at_threshold_does_not_hold(self):
+        with patch.object(self.m.os, 'getloadavg', return_value=(16, 0, 0)):
+            self.sample_checks([self.health_report(1, 1, 5000)] * 4)
+        self.assertTrue(self.triggered())
+
+    def test_unavailable_agent_inventory_holds_soft_stall(self):
+        with patch.object(self.m, 'cost', return_value=dict(treeProcesses=4, agentProcesses=None,
+                                                         runningTurns=None, runningSubagents=None)):
+            rows = self.sample_checks([self.health_report(1, 1, 5000)] * 4)
+        self.assertFalse(self.triggered())
+        self.assertEqual(rows[-1]['held'], 'agent process cost unavailable')
+
+    def test_legacy_raw_history_cannot_trigger(self):
+        now = self.m.time.time()
+        self.m.write_json(self.m.STATE, {'checks': [dict(at=now - 300 * i, verdict='stalled') for i in (3, 2, 1)]})
+        self.sample_checks([self.health_report(1, 1, 5000)])
+        self.assertFalse(self.triggered())
+
+    def test_effective_verdict_input_matrix(self):
+        cases = [(0, 0, 'slow-roundtrip'), (2, 0, 'slow-roundtrip'), (3, 0, 'stalled'),
+                 (1, 1, 'stalled'), (None, 0, 'unknown'), ('3', 0, 'unknown'),
+                 (True, 0, 'unknown'), (-1, 0, 'unknown'), (1.5, 0, 'unknown'),
+                 (float('nan'), 0, 'unknown'), (float('inf'), 0, 'unknown'), (0, 1, 'unknown')]
+        for one, five, expected in cases:
+            with self.subTest(one=one, five=five):
+                report = self.health_report(one, five)
+                self.assertEqual(self.m.effective_verdict('stalled', report), expected)
+        for status in ('error', 'failed', 'timeout'):
+            with self.subTest(status=status):
+                self.assertEqual(self.m.effective_verdict('unknown', {'connection': {'status': status}}), 'stalled')
+        for status in ('skipped', 'unknown', None):
+            self.assertEqual(self.m.effective_verdict('stalled', {'connection': {'status': status}}), 'unknown')
+        report = self.health_report(1, 1, 5000)
+        del report['lag']
+        self.assertEqual(self.m.effective_verdict('stalled', report), 'stalled')
+        self.assertEqual(self.m.stall_evidence(report)['source'], 'summary')
+        report['lag'] = {'stalls1s': 0, 'stalls5s': 0}
+        self.assertEqual(self.m.effective_verdict('stalled', report), 'slow-roundtrip')
+        report['lag'] = {'stalls1s': 1}
+        self.assertEqual(self.m.effective_verdict('stalled', report), 'unknown')
+        for summary in (None, {}, '', 'stalled: unavailable'):
+            self.assertEqual(self.m.effective_verdict('stalled', {'summary': summary}), 'unknown')
+
+    def test_node_provider_script_matrix(self):
+        for command, expected in (
+            ('/bin/node /lib/@anthropic-ai/claude-code/cli.js --print hello', True),
+            ('node /lib/@openai/codex/bin/codex.js app-server', True),
+            ('node /bin/cursor-agent --print hello', True),
+            ('node /lib/opencode-ai/bin/opencode serve', True),
+            ('node /lib/@xai-official/grok/dist/index.js', True),
+            ("node /lib/@anthropic-ai/claude-code/cli.js --print Abdullah's prompt", True),
+            ('node /lib/@openai/codex/bin/codex.js --prompt "unfinished', True),
+            ('node --no-warnings /lib/@openai/codex/bin/codex.js app-server', True),
+            ('node --enable-source-maps --inspect=127.0.0.1:9229 /bin/codex', True),
+            ('node --require /app/setup.js --import=/app/hook.mjs /bin/claude', True),
+            ('node -r /app/setup.js --conditions fixture /bin/codex', True),
+            ('node -- /bin/codex', True),
+            ('node "/path with spaces/@anthropic-ai/claude-code/cli.js" --print hello', True),
+            ('node /path with spaces/@anthropic-ai/claude-code/cli.js', None),
+            ('node --future-option /bin/codex', None),
+            ('node --require', None), ('node', None), ('node "unterminated', None),
+            ('node /app/server.js codex', False), ('node -e "codex"', None),
+            ('node --eval="require(\'codex\')"', None), ('node --print "codex"', None),
+            ('node /repo/codex/test.js', False),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.m.node_provider(command), expected)
+
+    def test_cost_counts_descendants_and_bounds_node_argv_probe(self):
+        table = {999999: (1, 'app', self.m.EXECUTABLE)}
+        for pid, command in enumerate(('claude', 'codex', 'opencode', 'cursor-agent', 'grok', 'node', 'node'), 1000000):
+            table[pid] = (999999, 'child', '/bin/' + command)
+        out = '1000005 node /lib/@openai/codex/bin/codex.js app-server\n1000006 node /app/server.js\n'
+        with patch.object(self.m, 'processes', return_value=table) as processes, \
+                patch.object(self.m, 'run', return_value=subprocess.CompletedProcess([], 0, out, '')) as run:
+            self.assertEqual(self.m.cost(), dict(treeProcesses=8, agentProcesses=6, runningTurns=None, runningSubagents=None))
+        self.assertEqual(processes.call_args.kwargs, {'timeout': 5})
+        self.assertEqual(run.call_args.args[1], 5)
+        with patch.object(self.m, 'processes', side_effect=subprocess.TimeoutExpired('ps', 5)):
+            self.assertIsNone(self.m.cost()['agentProcesses'])
+
+    def test_ambiguous_node_inventory_never_counts_as_no_agents(self):
+        table = {999999: (1, 'app', self.m.EXECUTABLE),
+                 1000000: (999999, 'node', '/bin/node')}
+        cases = ('', '1000000 node --future-option /bin/codex\n',
+                 '1000000 node "unterminated\n', '1000001 node /app/server.js\n',
+                 '1000000 node /app/server.js\n1000000 node /app/server.js\n',
+                 'garbled output\n')
+        for output in cases:
+            with self.subTest(output=output), patch.object(self.m, 'processes', return_value=table), \
+                    patch.object(self.m, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')):
+                self.assertEqual(self.m.cost()['treeProcesses'], 2)
+                self.assertIsNone(self.m.cost()['agentProcesses'])
+
+    def test_node_option_value_spaces_never_hide_providers(self):
+        script = '/lib/@anthropic-ai/claude-code/cli.js'
+        cases = (
+            ('node --require /Users/ardud/Library/Application Support/preload.js ' + script, None),
+            ('node --require=/Users/ardud/Library/Application Support/preload.js ' + script, None),
+            ('node -r /Users/ardud/Library/Application Support/preload.js ' + script, None),
+            ('node --import /path with spaces/hook.mjs ' + script, None),
+            ('node --title=App title.cjs ' + script, None),
+            ('node --title App title.cjs ' + script, None),
+            ('node --require "/Users/ardud/Library/Application Support/preload.js" ' + script, True),
+            ('node --require=/app/preload.js ' + script, True),
+            ('node --require /app/preload.js /app/server.js', None),
+            ('node --import=/app/hook.mjs /app/server.js', None),
+        )
+        table = {999999: (1, 'app', self.m.EXECUTABLE), 1000000: (999999, 'node', '/bin/node')}
+        for command, expected in cases:
+            with self.subTest(command=command):
+                self.assertEqual(self.m.node_provider(command), expected)
+                output = '1000000 ' + command + '\n'
+                with patch.object(self.m, 'processes', return_value=table), \
+                        patch.object(self.m, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')):
+                    self.assertEqual(self.m.cost()['agentProcesses'], 1 if expected else None)
+
+    def test_summary_count_token_matrix(self):
+        cases = [('0', '0', 'slow-roundtrip'), ('3', '0', 'stalled'), ('1', '1', 'stalled'),
+                 ('003', '0', 'stalled'), ('-3', '0', 'unknown'), ('+3', '0', 'unknown'),
+                 ('1.5', '0', 'unknown'), ('1e3', '0', 'unknown'), ('1,003', '0', 'unknown'),
+                 ('NaN', '0', 'unknown'), ('inf', '0', 'unknown'), ('bad3', '0', 'unknown'),
+                 ('3', '-1', 'unknown'), ('3', '+1', 'unknown'), ('3', '1.5', 'unknown'),
+                 ('3', '', 'unknown'), ('0', '1', 'unknown')]
+        for one, five, expected in cases:
+            with self.subTest(one=one, five=five):
+                summary = f'stalled: {one} stalls >=1s in 10 min ({five} >=5s); round trip timeout'
+                report = {'connection': {'status': 'ok'}, 'summary': summary}
+                self.assertEqual(self.m.effective_verdict('stalled', report), expected)
+        for suffix in ('bad', '.5', ' extra'):
+            report = {'connection': {'status': 'ok'},
+                      'summary': 'stalled: 3 stalls >=1s in 10 min (0 >=5s)' + suffix}
+            self.assertEqual(self.m.effective_verdict('stalled', report), 'unknown')
 
     def test_a_fifo_ssd_holds_check_before_health_or_quit(self):
         self.fifo(Path(self.m.SSD_PROBE))
@@ -482,10 +783,10 @@ else:
                 self.m.LOG.unlink(missing_ok=True)
                 step = 500 if name == 'gap-breaks' else 300
                 now = self.m.time.time()
-                checks = [{'at': now - step * (len(verdicts) - i - 1), 'verdict': v}
+                checks = [{'at': now - step * (len(verdicts) - i - 1), 'verdict': v, 'effectiveVerdict': v}
                           for i, v in enumerate(verdicts[:-1])]
                 self.m.write_json(self.m.STATE, {'checks': checks})
-                self.m.deep_health = lambda: (verdicts[-1], verdicts[-1], {'connection': {'status': 'ok', 'ms': 12}})
+                self.m.deep_health = lambda: (verdicts[-1], verdicts[-1], self.health_report(1, 1, 5000))
                 prior_run = self.m.run
                 def fail_tmux(args, timeout):
                     if args[0] == self.m.TMUX:
@@ -557,9 +858,11 @@ else:
             raise subprocess.TimeoutExpired(args, timeout)
         self.m.run = launch_then_timeout
         now = self.m.time.time()
-        self.m.write_json(self.m.STATE, {'checks': [{'at': now - step * 300, 'verdict': 'stalled'}
+        self.m.write_json(self.m.STATE, {'checks': [{'at': now - step * 300, 'verdict': 'stalled', 'effectiveVerdict': 'stalled'}
                                                    for step in (3, 2, 1)]})
-        self.m.deep_health = lambda: ('stalled', 'stalled', {'roundTrip': {'status': 'ok'}})
+        report = self.health_report(1, 1, 5000)
+        report['roundTrip'] = {'status': 'ok', 'ms': 12}
+        self.m.deep_health = lambda: ('stalled', 'stalled', report)
         # The check's 20-second retry is unrelated to the race; preserve actual worker waits.
         with patch.object(self.m.time, 'sleep', lambda _: None):
             self.assertEqual(self.m.check(), 1)
