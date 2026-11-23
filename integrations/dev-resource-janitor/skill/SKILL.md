@@ -82,16 +82,42 @@ The old scheduled task "Dev resource janitor (hourly)" (cron `17 * * * *`, Asia/
 
 ## $TMPDIR prune (hourly, same watcher, 2026-10-22)
 
-`janitor_watch.sh` also starts `scripts/tmpdir_prune.py apply` detached (its scan
-can run past the 60 s check timeout on a full `$TMPDIR`). It removes, when older
-than 24 h and not open by any process: vitest root dirs (`$TMPDIR/<21-char id>`
-holding only `ssr/`; vitest <5.0.3 never cleans them, ~20 MB a run) and the
-crpko-devops guard-test mkdtemp dirs (`coord-scope-*`, `crpko-fdb-plan-guard-*`,
-`crpko-fdb-targets-*`, `grow-agent-render-*`). `$TMPDIR/opencode` agent scratch is
-only reported (`opencode_stale` in `~/.local/share/dev-janitor/tmpdir-audit.jsonl`);
-deleting it stays manual because Crpko review checkouts live there. `scan --list`
-previews. Paths in `~/.config/opencode/dev-janitor-keep.txt` are never touched. A
-crashed prune raises a Telegram alert on the next hourly run.
+`janitor_watch.sh` also starts `scripts/tmpdir_prune.py apply` detached; its
+bounded scan can outlast the check deadline. All TMPDIR deletion is report-only
+by default. `scan --list` shows the proposed paths without deleting anything.
+
+Configuration: `~/.config/opencode/tmpdir-prune.json`, default
+`{"delete":false,"idleHours":24}`. Only enable `delete:true` after Abdullah approves
+a fresh report from the reviewed code. `TMPDIR_PRUNE_DELETE=1` enables deletion
+and `TMPDIR_PRUNE_DELETE=0` disables it; `TMPDIR_PRUNE_IDLE_HOURS` overrides the
+agent idle threshold. The file config works with the watcher's sanitized env.
+
+Agent rules cover direct children named `tmp.*`, `harness-exit.*`, `*-review-*`,
+`live-db-snapshot-*`, `t3-control-*`, `t3-orchestration-v2-*`,
+`recall-toollog-test-*`, `offbox*-review*`, `offbox*-recheck*`,
+`offbox*-integration*`, `offbox*-osr*`, and `robob<digits>-traces.*`.
+The default age is 24 h since the newest mtime in the tree, including directory
+changes. Existing vitest roots (21-character names holding only `ssr/`) and
+known Crpko guard-test prefixes retain `TMPDIR_PRUNE_TEST_HOURS` (24 h default).
+`com.apple.*`, `uv-*.lock`, other unknown names, and names containing whitespace
+or control characters are never selected. `$TMPDIR/opencode` stays report-only.
+
+Always keep entries with a process cwd, open file or argv reference, recent
+activity, a dirty/untracked/ignored repository, unpublished commits or local
+refs, orphan Git pointers, symlinks, another uid, an incomplete walk, or a keep
+path in `~/.config/opencode/dev-janitor-keep.txt`. All checkouts retain unpublished
+refs and reflogs; main checkouts also retain stashes and linked worktrees.
+Read-only reports and final
+removal checks share `tmpdir_inventory.py`; process and tree checks repeat
+before removal. Clean linked worktrees use plain `git worktree remove` from
+their parent repo, which removes that registration; no global prune runs.
+
+Walks are serial, throttled and bounded under the shared disk-inventory lock.
+Every removal attempt emits `janitor.tmpdir_remove` (path, allocated bytes,
+age and rule); each apply emits `janitor.tmpdir_run`. The local audit is
+`~/.local/share/dev-janitor/tmpdir-audit.jsonl`. Allocated bytes are not a claim
+of physical APFS space recovered. A crashed prune raises a Telegram alert on
+the next hourly run.
 
 Previous flow (kept for reference), run as the Robob scheduled task "Dev resource janitor (hourly)" (cron
 `17 * * * *`, Asia/Dubai), imported from OpenChamber.
