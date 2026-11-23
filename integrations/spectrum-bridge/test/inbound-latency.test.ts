@@ -380,6 +380,31 @@ test("legacy batched members are repaired without replaying their completed lead
   await h.router.checkInboundLatency(); expect(h.states()).toEqual(["done", "done"]); expect(h.backend.prompts).toEqual([]);
 });
 
+test("parent resolution stays off the loop with years of sealed batch history", async () => {
+  const h = setup();
+  const filler = "x".repeat(2_000);
+  h.store.db.transaction(() => {
+    for (let i = 0; i < 3_000; i++) {
+      h.store.acceptInbound(`old:${i}`, { id: `old:${i}`, text: filler, source: "typed", attachments: [], isAudioMessage: false, receivedAt: now - 86400_000 } satisfies NormalizedInbound);
+      h.store.updateInbound(`old:${i}`, "done");
+      h.store.set(`batch:old:${i}`, { id: `old:${i}`, text: filler, batchIds: [`old:${i}`], attachments: [], receivedAt: now - 86400_000 });
+    }
+    // Members of failed leaders stay batched across sweeps, as in production.
+    for (let i = 0; i < 150; i++) {
+      h.input(`leader:${i}`, 86400_000); h.input(`member:${i}`, 86400_000);
+      h.store.set(`batch:leader:${i}`, { batchIds: [`leader:${i}`, `member:${i}`] });
+      h.store.updateInbound(`leader:${i}`, "failed"); h.store.updateInbound(`member:${i}`, "batched");
+    }
+  })();
+  const started = performance.now();
+  const heartbeat = new Promise<number>(resolve => setTimeout(() => resolve(performance.now() - started), 0));
+  const sweep = h.router.checkInboundLatency();
+  expect(await heartbeat).toBeLessThan(250);
+  await sweep;
+  expect(h.store.db.query<{ n: number }, []>("SELECT count(*) n FROM inbound WHERE state = 'batched'").get()!.n).toBe(150);
+  expect(h.backend.prompts).toEqual([]);
+});
+
 test("batched wake is retried under its leader id once, then Telegram reports each stuck row once", async () => {
   const h = setup(); for (const id of ["wake:leader", "wake:member"]) h.input(id, 15 * 60_000);
   h.store.set("batch:wake:leader", { id: "wake:member", text: "background update", batchIds: ["wake:leader", "wake:member"], attachments: [], receivedAt: now - 15 * 60_000 });

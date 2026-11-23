@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Store } from "../src/store.ts";
 
 function plan(store: Store, sql: string) {
@@ -69,17 +72,66 @@ test("share and recovery LIKE scans skip 50 MiB of unrelated values, preserving 
   } finally { store.close(); }
 });
 
-test.each([true, false])("batch parent lookup preserves first recorded membership (prefix index: %s)", indexed => {
+test("batch parent lookup preserves first recorded membership", () => {
   const store = new Store(":memory:");
   try {
     store.set("batch:z-first", { batchIds: ["member"] });
     store.set("batch:a-second", { batchIds: ["member"] });
-    if (!indexed) {
-      store.db.exec("DROP INDEX kv_key_nocase");
-    }
     const row = store.db.query<{ id: string }, [string]>(
-      "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key LIKE 'batch:%' AND member.value = ? ORDER BY kv.rowid LIMIT 1",
+      "SELECT batch_members.leader AS id FROM batch_members JOIN kv ON kv.key = 'batch:' || batch_members.leader WHERE batch_members.member = ? ORDER BY kv.rowid LIMIT 1",
     ).get("member");
     expect(row?.id).toBe("z-first");
+    expect(store.batchLeaders("member")).toEqual(["a-second", "z-first"]);
   } finally { store.close(); }
+});
+
+test("batch membership index follows every kv write path, rollback and malformed value", () => {
+  const store = new Store(":memory:");
+  try {
+    store.set("batch:leader", { batchIds: ["leader", "a", "a", 7, null] });
+    expect(store.batchLeaders("a")).toEqual(["leader"]);
+    expect(store.batchLeaders("7")).toEqual([]);
+    store.set("batch:leader", { batchIds: ["leader", "b"] });
+    expect(store.batchLeaders("a")).toEqual([]);
+    expect(store.batchLeaders("b")).toEqual(["leader"]);
+    store.set("batch:leader", null);
+    expect(store.batchLeaders("b")).toEqual([]);
+    store.db.query("INSERT INTO kv (key, value) VALUES ('batch:raw', ?)").run(JSON.stringify({ batchIds: ["c"] }));
+    expect(store.batchLeaders("c")).toEqual(["raw"]);
+    store.db.query("UPDATE kv SET key = 'moved:raw' WHERE key = 'batch:raw'").run();
+    expect(store.batchLeaders("c")).toEqual([]);
+    store.db.query("UPDATE kv SET key = 'batch:back' WHERE key = 'moved:raw'").run();
+    expect(store.batchLeaders("c")).toEqual(["back"]);
+    store.db.query("DELETE FROM kv WHERE key = 'batch:back'").run();
+    expect(store.batchLeaders("c")).toEqual([]);
+    expect(() => store.db.transaction(() => {
+      store.set("batch:rolled", { batchIds: ["d"] });
+      expect(store.batchLeaders("d")).toEqual(["rolled"]);
+      throw new Error("synthetic rollback");
+    })()).toThrow("synthetic rollback");
+    expect(store.batchLeaders("d")).toEqual([]);
+    store.db.query("INSERT INTO kv (key, value) VALUES ('batch:broken', '{not json')").run();
+    expect(store.batchLeaders("broken")).toEqual([]);
+    store.set("batching:other", { batchIds: ["e"] });
+    expect(store.batchLeaders("e")).toEqual([]);
+    expect(plan(store, "SELECT leader FROM batch_members WHERE member = 'x' ORDER BY leader")).toContain("PRIMARY KEY");
+  } finally { store.close(); }
+});
+
+test("an existing database backfills batch membership once on open", () => {
+  const dir = mkdtempSync(join(tmpdir(), "batch-members-"));
+  const path = join(dir, "state.sqlite");
+  try {
+    const legacy = new Store(path);
+    legacy.db.exec("DROP TRIGGER batch_members_insert; DROP TRIGGER batch_members_update; DROP TRIGGER batch_members_delete; DROP TABLE batch_members");
+    legacy.set("batch:old", { batchIds: ["old", "sealed"] });
+    legacy.close();
+    const store = new Store(path);
+    try {
+      expect(store.batchLeaders("sealed")).toEqual(["old"]);
+      store.set("batch:new", { batchIds: ["sealed"] });
+    } finally { store.close(); }
+    const reopened = new Store(path);
+    try { expect(reopened.batchLeaders("sealed")).toEqual(["new", "old"]); } finally { reopened.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

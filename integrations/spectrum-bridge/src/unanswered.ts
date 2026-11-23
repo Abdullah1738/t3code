@@ -54,7 +54,7 @@ function sealedBatch(store: Store, id: string): { leader: string; members: strin
   const batch = store.get<NormalizedInbound>(`batch:${id}`);
   if (batch) return { leader: id, members: batch.batchIds ?? [id] };
   const parent = store.db.query<{ key: string; value: string }, [string]>(
-    "SELECT kv.key, kv.value FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key GLOB 'batch:*' AND member.value = ? LIMIT 1",
+    "SELECT kv.key, kv.value FROM batch_members JOIN kv ON kv.key = 'batch:' || batch_members.leader WHERE batch_members.member = ? ORDER BY batch_members.leader LIMIT 1",
   ).get(id);
   return parent ? { leader: parent.key.slice("batch:".length), members: (JSON.parse(parent.value) as NormalizedInbound).batchIds! }
     : { leader: id, members: [id] };
