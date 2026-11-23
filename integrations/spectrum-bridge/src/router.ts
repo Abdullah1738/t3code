@@ -5652,6 +5652,7 @@ export class Router {
   private setTurn(turn: Turn | null): void {
     if (turn && turn.phase !== "failed" && turn.inboundId && !this.typedInto(turn) && this.expireWakeBatch(turn.inboundId)) return;
     const live = this.store.get<Turn | null>("activeTurn");
+    if (live && live.phase !== "failed" && (!turn || turn.messageId !== live.messageId || turn.phase === "failed")) this.store.rememberReplyTurn(live);
     // Backend reads can settle after another path admits a follow-up into this turn.
     if (turn && live?.messageId === turn.messageId && live.id === turn.id && live.generation === turn.generation) {
       turn = { ...turn, covered: [...new Set([...live.covered ?? [], ...turn.covered ?? []])] };
@@ -5935,7 +5936,12 @@ export class Router {
     for (const id of ids) {
       const leader = this.humanBatchLeader(id, leaders);
       const members = this.store.get<NormalizedInbound>(`batch:${leader}`)?.batchIds ?? [id];
-      if (synthetic(id) || recovered.has(id) || members.every(member => this.answered(member))) continue;
+      if (synthetic(id) || recovered.has(id)) continue;
+      if (members.every(member => this.answered(member))) {
+        if (outcome === "failed") toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.retry_skipped",
+          ids: { inboundId: id, threadId: turn.id, chat: this.options.context?.chat.slug ?? "owner" }, props: { reason: "reply_already_sent" } }));
+        continue;
+      }
       // Parent completion says nothing about an unresolved response POST on a child.
       if (this.store.get<SteerAttempt>(`steer-attempt:${leader}`)?.response) continue;
       const reply = this.store.db.query(`SELECT 1 FROM outbox o WHERE json_extract(o.payload, '$.kind') = 'conversation' AND o.state IN ('pending', 'sending', 'sent', 'uncertain') AND
@@ -5979,13 +5985,15 @@ export class Router {
     // A steer can be confirmed while failure reads await the backend; retain that ownership across restart.
     const turn = this.typedInto(snapshot) ? { ...snapshot, typed: true } : snapshot;
     this.recoverHumanHandoffs(turn, "failed");
+    if (turn.inboundId && this.answered(turn.inboundId)) toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.retry_skipped",
+      ids: { inboundId: turn.inboundId!, threadId: turn.id, chat: this.options.context?.chat.slug ?? "owner" }, props: { reason: "reply_already_sent" } }));
     this.store.db.transaction(() => {
       const ids = turn.inboundId && !this.store.get(`human-own-turn:${turn.inboundId}`)
         ? this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId] : [];
       if (immediate) {
         // A broken new chat or model needs repair, not automatic replay of a watcher wake.
-        for (const id of ids) if (!this.store.get(`human-own-turn:${id}`)) this.failInbound(id, "execution", text, turn);
-        this.notice(turn, "failed", text);
+        for (const id of ids) if (!this.answered(id) && !this.store.get(`human-own-turn:${id}`)) this.failInbound(id, "execution", text, turn);
+        if (!ids.length || ids.some(id => !this.answered(id))) this.notice(turn, "failed", text);
       }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
       else if (this.syntheticBatch(turn.inboundId)) {
@@ -5999,9 +6007,11 @@ export class Router {
         }
       }
       else {
-        if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
-        else if (!turn.background) this.notice(turn, "failed", text);
-        for (const id of ids) if (!this.store.get(`human-own-turn:${id}`)) this.failInbound(id, reason === "undelivered" ? "dispatch" : "execution", text, turn);
+        if (!turn.background && (!ids.length || ids.some(id => !this.answered(id)))) {
+          if (reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
+          else this.notice(turn, "failed", text);
+        }
+        for (const id of ids) if (!this.answered(id) && !this.store.get(`human-own-turn:${id}`)) this.failInbound(id, reason === "undelivered" ? "dispatch" : "execution", text, turn);
       }
       this.setTurn(turn.background ? null : { ...turn, phase: "failed" });
       this.store.set("resendBody", null);

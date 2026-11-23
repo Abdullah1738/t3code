@@ -10,6 +10,64 @@ import { summarizeLog } from "../src/log-rollup.ts";
 import { createApi } from "../src/api.ts";
 import { acknowledgePhoton } from "../src/inbound-failure.ts";
 import { Delivery } from "../src/delivery.ts";
+import { RECENT_REPLY_TURN_MS } from "../src/store.ts";
+import { requeueHuman } from "../src/inbound-routing.ts";
+
+test("conversation delivery cancels duplicate queued failed-turn retries and cannot requeue an answered inbound", async () => {
+  const s = store();
+  s.acceptInbound("root", input("root")); s.acceptInbound("member", input("member"));
+  s.set("batch:root", { ...input("root"), batchIds: ["root", "member"] });
+  s.updateInbound("root", "admitted"); s.updateInbound("member", "admitted");
+  s.enqueue({ id: "late", kind: "conversation", text: "Done", replyTo: "root" });
+  const logs = await captureLogs(async () => {
+    requeueHuman(s, "root", "turn_failed", { completed: true });
+    requeueHuman(s, "root", "watchdog_overdue", { completed: true });
+    s.outboxState("late", "sent");
+    requeueHuman(s, "root", "turn_failed", { completed: true });
+  });
+  expect(s.pendingInbound()).toEqual([]);
+  expect(s.get<number>("human-retries:root")).toBe(1);
+  expect(logs.find(l => l.name === "turn.retry_skipped")?.props?.reason).toBe("reply_already_sent");
+});
+
+test.each(["idle", "expired", "generation", "session", "new-human", "answered"])("recent reply attribution excludes %s context", kind => {
+  const s = store();
+  s.acceptInbound("root", input("root"));
+  const turn = { id: "ses_1", generation: 1, messageId: "prompt", inboundId: "root", phase: "running" };
+  if (kind !== "idle") s.rememberReplyTurn(turn);
+  if (kind === "expired") s.set("recentReplyTurn", { turn, at: Date.now() - RECENT_REPLY_TURN_MS - 1 });
+  if (kind === "answered") markAnswered(s, ["root"]);
+  if (kind === "new-human") {
+    s.acceptInbound("new", input("new"));
+    s.set("activeTurn", { ...turn, inboundId: "new", messageId: "new-prompt" });
+  }
+  const result = s.replyAttribution(kind === "session" ? "other" : "ses_1", kind === "generation" ? 2 : 1);
+  expect(result.covered).toEqual(kind === "new-human" ? ["new"] : []);
+  expect(result.inboundId).toBe(kind === "new-human" ? "new" : undefined);
+});
+
+test.each(["active", "recent", "explicit", "none"])("reply.sent records %s attribution and frozen batch coverage", async kind => {
+  const s = store();
+  for (const id of ["root", "member", "steered", "later"]) s.acceptInbound(id, input(id));
+  s.set("batch:root", { ...input("root"), batchIds: ["root", "member"] });
+  const turn = { id: "ses_1", generation: 1, messageId: "prompt", inboundId: "root", covered: ["steered"], phase: "running" };
+  s.set("route", { id: turn.id, generation: turn.generation });
+  if (kind === "active") s.set("activeTurn", turn);
+  if (kind === "recent") s.rememberReplyTurn(turn);
+  const logs = await captureLogs(async () => {
+    s.enqueue({ id: "send", kind: "conversation", text: "Done", sessionId: turn.id, generation: 1,
+      ...(kind === "explicit" ? { replyTo: "root" } : {}) });
+    s.set("activeTurn", null);
+    await new Delivery(s, { sendText: async () => ({ providerId: "sent" }) }, {
+      projectScope: "test", chatGuid: () => "iMessage;-;+15555550123", enabled: () => true,
+    }).tick();
+  });
+  const event = logs.find(l => l.name === "reply.sent")!;
+  expect(event.props?.attribution).toBe(kind === "active" || kind === "recent" ? "active_turn" : kind);
+  expect(event.ids?.inboundId).toBe(kind === "none" ? undefined : "root");
+  const answered = s.db.query<{ id: string }, []>("SELECT id FROM inbound WHERE json_type(payload, '$.answeredAt') = 'integer' ORDER BY rowid").all().map(r => r.id);
+  expect(answered).toEqual(kind === "none" ? [] : kind === "explicit" ? ["root", "member"] : ["root", "member", "steered"]);
+});
 
 const at = Date.parse("2026-11-16T11:30:17Z");
 const input = (id: string, receivedAt = at): AnsweredInput => ({ id, text: "PRIVATE", source: "typed", receivedAt, attachments: [], isAudioMessage: false });
@@ -263,9 +321,23 @@ test.each(["source-only", "quote-member"])("legacy steer reply attribution also 
     .toEqual([kind === "source-only" ? legacySteerStart + 2_000 : undefined, legacySteerStart + 2_000, legacySteerStart + 2_000]);
 });
 
-test.each(["processing", "partial", "no-watchdog"])("late coverage does not retire a retry outside a fully covered pending watchdog batch: %s", kind => {
+for (const state of ["pending", "processing"] as const) test.each(["root", "member"])(`split answers preserve ${state} retry lifecycle (first=%s)`, first => {
   const s = store();
-  for (const id of ["root", "member"]) s.acceptInbound(id, { ...input(id), ...(kind === "no-watchdog" ? {} : { unanswered: { requeuedAt: at + 300_000 } }) });
+  for (const id of ["root", "member"]) s.acceptInbound(id, input(id));
+  s.set("batch:root", { ...input("root"), batchIds: ["root", "member"] });
+  s.set("human-own-turn:root", true);
+  s.updateInbound("root", state); s.updateInbound("member", "batched");
+  markAnswered(s, [first], at + 1_000);
+  const states = () => s.db.query<{ state: string }, []>("SELECT state FROM inbound ORDER BY rowid").all().map(row => row.state);
+  expect(states()).toEqual([state, "batched"]);
+  const second = first === "root" ? "member" : "root";
+  markAnswered(s, [second], at + 2_000);
+  expect(states()).toEqual(state === "pending" ? ["done", "done"] : ["processing", "batched"]);
+});
+
+test.each(["processing", "partial"])("late coverage does not retire a retry outside a fully covered pending batch: %s", kind => {
+  const s = store();
+  for (const id of ["root", "member"]) s.acceptInbound(id, { ...input(id), unanswered: { requeuedAt: at + 300_000 } });
   s.set("batch:root", { ...input("root"), batchIds: ["root", "member"] });
   s.set("human-own-turn:root", true);
   s.updateInbound("root", kind === "processing" ? "processing" : "pending"); s.updateInbound("member", "batched");

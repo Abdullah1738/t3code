@@ -59,6 +59,7 @@ const ENUMS: Record<string, readonly string[]> = {
   action: ["requeued", "in_turn"], leaderKind: ["human", "wake", "reset", "background", "none"],
   telegram: ["sent", "failed"], severity: ["warn"],
   replyMode: ["final", "tool"], reason: ["watchdog_overdue", "respond_failed", "steer_failed", "background_no_reply", "turn_failed", "background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal", "grace", "not-waiting", "already-sent", "rate-limited"],
+  attribution: ["explicit", "active_turn", "none"],
   source: ["live", "backfill", "watch", "settle_preceding"], outcome: ["replied", "failed", "refused", "no_reply", "ok", "fallback", "forwarded", "quiet", "owner_typed", "incomplete"],
   cardKind: ["quick", "delivery", "ride", "nutrition", "secure_form", "other"], phase: ["start", "stop"],
   method: ["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -90,6 +91,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (entry.name === "turn.retry_skipped" && key === "reason" && value === "reply_already_sent") { props[key] = value; continue; }
     if (["api.request", "api.request.rollup", "cli.request_failed", "runtime.sample"].includes(entry.name)) {
       if (["handlerMs", "storeMs", "bodyBytes", "loopLagMs", "timeoutMs", "pid", "loadAvg1", "loadAvg", "elapsedMs", "minute",
         "startedAt", "connectedAt", "writtenAt", "headersAt", "endedAt", "p50", "p95", "max", "status", "count",
