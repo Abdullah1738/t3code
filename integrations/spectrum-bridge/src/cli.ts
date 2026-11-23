@@ -7,6 +7,7 @@ import { cardKind, logCardRender, toolError, toolLog } from "./toollog.ts";
 import { validNotifyId, validNotifyText } from "./agent-policy.ts";
 import { validAgentRequestId, validAnswerStatus } from "./agent-bus.ts";
 import { validId } from "./remote-protocol.ts";
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import { request } from "node:http";
@@ -32,12 +33,30 @@ export type LocalCommand =
   | { command: "bans"; slug?: string };
 
 class CliError extends Error {}
+export const SEND_TIMEOUT_EXIT_CODE = 75;
+class SendTimeout extends CliError {
+  constructor(readonly key: string) { super("Bridge request timed out"); }
+}
+class AgentAnswerTimeout extends CliError {
+  constructor(readonly requestId: string) { super("Bridge request timed out"); }
+}
+
+export function cliFailure(error: unknown) {
+  return {
+    exitCode: error instanceof SendTimeout || error instanceof AgentAnswerTimeout ? SEND_TIMEOUT_EXIT_CODE : 1,
+    body: { error: error instanceof CliError ? error.message : "Bridge request failed",
+      ...(error instanceof SendTimeout ? { outcome: "unknown", key: error.key,
+        hint: "The message may already be queued. Re-run with the same --key (it won't send twice) or check with send-status --key." } : {}),
+      ...(error instanceof AgentAnswerTimeout ? { outcome: "unknown", requestId: error.requestId,
+        hint: "The answer may already be admitted. Check agent-requests --request <requestId> --session <session>, or repeat the identical agent-answer call (it won't deliver twice)." } : {}) },
+  };
+}
 /** A secret value printed verbatim, with no JSON wrapping or trailing newline. */
 class RawOutput {
   constructor(readonly value: string) {}
 }
 
-const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, wake-status, secret-request, secret, publish, unpublish, ban, unban, or bans."
+const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, send-status, poll, app, react, wake, wake-status, secret-request, secret, publish, unpublish, ban, unban, or bans."
   + " Sendblue mode adds location-request, location, messages, ask-owner, agent-ask, agent-answer, agent-requests, notify-rule, chats, allow, allow-group,"
   + " guest-allow, guest-revoke, guests, guest-send, share-contact, opt-in, remote-events, and remote-resolve."
   + " Logs: log-rollup [--day YYYY-MM-DD]."
@@ -74,6 +93,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   react: ["target", "kind"],
   send: ["text", "session", "key", "effect", "subject", "to"],
   "cancel-send": ["session", "key"],
+  "send-status": ["session", "key", "kind"],
   poll: ["title", "option", "session", "key"],
   wake: ["text", "source", "key", "chat", "session"],
   "wake-status": ["key"],
@@ -84,7 +104,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   "ask-owner": ["text", "session", "key"],
   "agent-ask": ["to", "text", "session", "key", "parent"],
   "agent-answer": ["request", "text", "session", "status"],
-  "agent-requests": ["session"],
+  "agent-requests": ["session", "request"],
   "remote-events": ["chat", "session", "after"],
   "remote-resolve": ["chat", "session", "id", "state"],
   "notify-rule": ["session", "text", "id"],
@@ -285,6 +305,13 @@ export function parseCommand(args: string[]): Command {
   }
 
   switch (command) {
+    case "send-status": {
+      const { dedupeKey, sessionId } = session();
+      if (values.kind !== undefined && values.kind !== "send" && values.kind !== "file") throw new CliError("--kind must be send or file");
+      // Even percent-encoded dot segments are removed by URL normalization.
+      return { method: "GET", path: `/send-status/?key=${encodeURIComponent(dedupeKey)}&sessionId=${encodeURIComponent(sessionId)}`
+        + (values.kind === undefined ? "" : `&kind=${values.kind}`) };
+    }
     case "cancel-send":
       return { method: "POST", path: "/cancel-send", body: session() };
     case "health":
@@ -422,7 +449,9 @@ export function parseCommand(args: string[]): Command {
       return { method: "POST", path: "/remote-resolve", body: { chat: "moni", sessionId, id: values.id, state: values.state } };
     }
     case "agent-requests":
-      return { method: "POST", path: "/agent-requests", body: { sessionId: sessionOnly(values.session)! } };
+      if (values.request !== undefined && !validAgentRequestId(values.request)) throw new CliError("Invalid --request");
+      return { method: "POST", path: "/agent-requests", body: { sessionId: sessionOnly(values.session)!,
+        ...(values.request === undefined ? {} : { request: values.request }) } };
     case "ask-owner": {
       const text = required(values.text, "--text");
       if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
@@ -669,11 +698,26 @@ export async function sendCommand(command: Command, options: {
     // Queued sends echo only an acknowledgement; never surface their response bodies.
     const queued = ["/files", "/send", "/poll", "/app", "/wake"].includes(command.path);
     const controller = new AbortController();
+    const startedAt = performance.now();
     // Opening a quick tunnel waits for Cloudflare's edge, which can take a while.
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       return await new Promise<unknown>((resolve, reject) => {
-        const fail = () => reject(new CliError(controller.signal.aborted ? "Bridge request timed out" : "Bridge request failed"));
+        let timeoutLogged = false;
+        const fail = () => {
+          const sendKey = ["/send", "/files"].includes(command.path) && typeof body?.dedupeKey === "string" ? body.dedupeKey : undefined;
+          const answerId = command.path === "/agent-answer" && typeof body?.request === "string" ? body.request : undefined;
+          if (controller.signal.aborted && command.method === "POST" && (sendKey !== undefined || answerId !== undefined)) {
+            if (!timeoutLogged) {
+              timeoutLogged = true;
+              const keyHash = createHash("sha256").update(sendKey ?? answerId!).digest("hex");
+              toolLog.capture(() => toolLog.write({ component: "cli", kind: "event", name: "cli.send_timeout",
+                ids: { operationId: `${answerId !== undefined ? "agent-answer" : command.path === "/files" ? "file" : "send"}:${keyHash}` },
+                props: { path: command.path, elapsedMs: Math.max(0, performance.now() - startedAt) } }));
+            }
+            reject(answerId !== undefined ? new AgentAnswerTimeout(answerId) : new SendTimeout(sendKey!));
+          } else reject(new CliError(controller.signal.aborted ? "Bridge request timed out" : "Bridge request failed"));
+        };
         const req = (options.httpRequest ?? request)({
           socketPath, method: command.method, path: command.path, agent: false,
           signal: controller.signal, maxHeaderSize: 16 * 1024,
@@ -775,7 +819,8 @@ if (import.meta.main) {
     if (result instanceof RawOutput) process.stdout.write(result.value);
     else console.log(JSON.stringify(result));
   } catch (error) { toolError("cli", "cli.catch10", error);
-    console.error(JSON.stringify({ error: error instanceof CliError ? error.message : "Bridge request failed" }));
-    process.exitCode = 1;
+    const failure = cliFailure(error);
+    console.error(JSON.stringify(failure.body));
+    process.exitCode = failure.exitCode;
   } finally { toolLog.flush(); }
 }

@@ -130,7 +130,7 @@ test("request rollup survives logger cleaning and agrees with Python", async () 
   const root = mkdtempSync(join(tmpdir(), "request-parity-"));
   const day = "2026-11-22";
   const log = createToolLog({ root: join(root, "imessage"), now: () => Date.parse(`${day}T12:00:00Z`) });
-  const trace = createRequestTrace(row => log.write(row));
+  const trace = createRequestTrace(row => log.write(row), { clock: () => Date.parse(`${day}T12:00:00Z`) });
   try {
     for (let i = 0; i < 125; i++) await trace.handle(new Request("http://bridge/health"), () => new Response());
     trace.flush(true);

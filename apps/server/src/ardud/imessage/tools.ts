@@ -10,7 +10,7 @@ import * as ThreadManagementService from "../../orchestration-v2/ThreadManagemen
 import * as ImessageSendService from "./ImessageSendService.ts";
 
 export const IMESSAGE_SEND_DESCRIPTION =
-  "Text the iMessage chat this thread serves (or `to` another chat, only from the owner's chat). In iMessage threads your final message is not sent: this is the only way to reply. Send whenever useful while you keep working; each call sends once. Use `file` for images or files (`text` becomes the caption). Plain text only. Refused outside iMessage chat threads.";
+  "Text the iMessage chat this thread serves (or `to` another chat, only from the owner's chat). In iMessage threads your final message is not sent: this is the only way to reply. Send whenever useful while you keep working; each call sends once. Use `file` for images or files (`text` becomes the caption). Plain text only. A timeout means outcome unknown: retry the same call/key or check send-status; never resend through the CLI with a new key. Refused outside iMessage chat threads.";
 
 const ImessageSendTool = Tool.make("imessage_send", {
   description: IMESSAGE_SEND_DESCRIPTION,

@@ -18,7 +18,13 @@ import type { McpInvocationScope } from "../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ControlStore from "../control/ControlStore.ts";
 import * as ImessageBridgeCli from "./ImessageBridgeCli.ts";
-import { bridgeCliArgs, bridgeCliError, defaultSendKey, parseBridgeAck } from "./send.ts";
+import {
+  bridgeCliArgs,
+  bridgeCliError,
+  bridgeSendOutcomeUnknown,
+  defaultSendKey,
+  parseBridgeAck,
+} from "./send.ts";
 
 export const IMESSAGE_ORIGIN = "imessage";
 export const NOT_IMESSAGE_THREAD = "imessage_send only works in iMessage chat threads.";
@@ -146,10 +152,10 @@ const make = Effect.gen(function* () {
     const result = yield* bridge
       .run(bridgeCliArgs(request))
       .pipe(Effect.mapError((error) => failure("orchestration_error", error.reason)));
-    if (result.timedOut) {
+    if (result.timedOut || bridgeSendOutcomeUnknown(result.stderr, result.exitCode)) {
       return yield* failure(
         "orchestration_error",
-        "The iMessage bridge CLI timed out after 30s; the message may still have been queued. Retrying this same call will not send it twice.",
+        `The iMessage send timed out; outcome unknown. The message may already be queued. Retry with the same key (${request.key}), or check send-status --key=${request.key} --session=${request.session}. Never resend with a new key.`,
       );
     }
     if (result.exitCode !== 0) {

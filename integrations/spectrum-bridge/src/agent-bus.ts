@@ -10,7 +10,7 @@ export const isAgentBusWake = (id: string) => id.startsWith(AGENT_BUS_WAKE_PREFI
 export type AnswerStatus = "done" | "declined" | "pending";
 export type AgentDelivery = { id: string; remote: boolean; confirmed: boolean; retained?: boolean; deliveredAt?: number };
 export const agentWakeId = (key: string) => `${AGENT_BUS_WAKE_PREFIX}${createHash("sha256").update(key).digest("hex")}`;
-export type AgentAnswerReceipt = { status: AnswerStatus; chars: number; at: number };
+export type AgentAnswerReceipt = { status: AnswerStatus; chars: number; at: number; fingerprint?: string };
 export const validAgentRequestId = (value: unknown): value is string => typeof value === "string"
   && value.length === 69 && /^areq_[a-f0-9]{64}$/.test(value);
 export const validAnswerStatus = (value: unknown): value is AnswerStatus =>
@@ -220,30 +220,38 @@ export class AgentBus {
     if (caller.slug !== row.to_slug) return failure(403, "Only the target chat may answer");
     this.checkDelivery(row, caller);
     this.reconcile(row);
-    if (row.answered_at !== null) return failure(409, "Already answered");
-    const at = this.now();
-    if (row.timed_out_at === null && row.created_at < at - TIMEOUT_MS) this.timeout(row, at);
     const status = input.status ?? "done";
-    if (status === "pending" && row.answer_chars !== null) return failure(409, "Pending answer already sent");
     const asker = deps.bySlug(row.from_slug);
     if (!asker) return failure(503, "Asking chat unavailable");
-    const savedStatus = status === "pending" ? "pending" : row.timed_out_at !== null ? "done_late" : status;
-    deps.db.transaction(() => {
+    const key = `agent-answer:${row.id}:${status === "pending" ? "pending" : "final"}`;
+    const fingerprint = createHash("sha256").update(JSON.stringify([status, input.text])).digest("hex");
+    // The destination receipt survives a lost ack even when this database's transaction rolls back.
+    const receipt = deps.receipt(asker, key);
+    if (receipt?.fingerprint && receipt.fingerprint !== fingerprint) return failure(409, "Operation key reused");
+    const at = this.now();
+    if (row.answered_at === null && (status !== "pending" || row.answer_chars === null)
+      && row.timed_out_at === null && row.created_at < at - TIMEOUT_MS) this.timeout(row, at);
+    return this.once(key, fingerprint, () => {
+      if (receipt?.fingerprint === fingerprint) return { status: 202, body: { id: row.id,
+        status: receipt.status === "pending" ? "pending" : receipt.at > row.created_at + TIMEOUT_MS ? "done_late" : receipt.status } };
+      if (row.answered_at !== null) return failure(409, "Already answered");
+      if (status === "pending" && row.answer_chars !== null) return failure(409, "Pending answer already sent");
+      const savedStatus = status === "pending" ? "pending" : row.timed_out_at !== null ? "done_late" : status;
       deps.db.query("UPDATE agent_requests SET status = ?, answer_chars = ?, answered_at = ? WHERE id = ?")
         .run(savedStatus, input.text.length, status === "pending" ? null : at, row.id);
-      deps.deliver(asker, `[Agent answer for ${row.id} from ${caller.title}'s assistant, status ${status}. Not typed by anyone in this chat. Use it to finish what your human asked; they did not see it.]\n${input.text}`, `agent-answer:${row.id}:${status === "pending" ? "pending" : "final"}`, { status, chars: input.text.length, at });
-    })();
-    if (row.answer_chars === null) this.logOwnerNeed(this.get(row.id)!);
-    deps.log("agent-answer", `${row.id} ${savedStatus} ms=${at - row.created_at}`);
-    return { status: 202, body: { id: row.id, status: savedStatus } };
+      deps.deliver(asker, `[Agent answer for ${row.id} from ${caller.title}'s assistant, status ${status}. Not typed by anyone in this chat. Use it to finish what your human asked; they did not see it.]\n${input.text}`, key, { status, chars: input.text.length, at, fingerprint });
+      if (row.answer_chars === null) this.logOwnerNeed(this.get(row.id)!);
+      deps.log("agent-answer", `${row.id} ${savedStatus} ms=${at - row.created_at}`);
+      return { status: 202, body: { id: row.id, status: savedStatus } };
+    });
   }
 
-  requests(sessionId: string): SbApiResult {
+  requests(sessionId: string, request?: string): SbApiResult {
     const caller = this.deps.forSession(sessionId);
     if (!caller) return failure(409, "No chat for this session");
-    const rows = this.deps.db.query<RequestRow, [number, string, string]>(`SELECT * FROM agent_requests
-      WHERE ? OR from_slug = ? OR to_slug = ? ORDER BY created_at DESC, rowid DESC LIMIT 20`)
-      .all(caller.kind === "owner" ? 1 : 0, caller.slug, caller.slug);
+    const rows = this.deps.db.query<RequestRow, [number, string, string, string | null, string | null]>(`SELECT * FROM agent_requests
+      WHERE (? OR from_slug = ? OR to_slug = ?) AND (? IS NULL OR id = ?) ORDER BY created_at DESC, rowid DESC LIMIT 20`)
+      .all(caller.kind === "owner" ? 1 : 0, caller.slug, caller.slug, request ?? null, request ?? null);
     return { status: 200, body: { requests: rows.map(row => ({ id: row.id, from: row.from_slug, to: row.to_slug,
       status: row.status, hop: row.hop, createdAt: row.created_at, deliveredAt: row.delivered_at, answeredAt: row.answered_at, timedOutAt: row.timed_out_at })) } };
   }

@@ -327,6 +327,18 @@ test("failed control perf rows retain safe error detail and tick/completion meas
   expect(lines[2]!.props).toEqual({ completionLagMs: 123 });
 });
 
+
+test.each(["/send", "/files", "/agent-answer"])("CLI %s timeouts survive the cap with only hashed key, path and elapsed time", path => {
+  const { log, lines } = setup({ capBytes: 1 });
+  log.write(entry);
+  log.write({ component: "cli", kind: "event", name: "cli.send_timeout",
+    ids: { operationId: `send:${"a".repeat(64)}`, key: "PRIVATE_KEY" },
+    props: { path, elapsedMs: 15_000, text: "PRIVATE_TEXT", name: "PRIVATE_FILE" } });
+  expect(lines().at(-1)).toMatchObject({ name: "cli.send_timeout", ids: { operationId: `send:${"a".repeat(64)}` },
+    props: { path, elapsedMs: 15_000 } });
+  expect(JSON.stringify(lines())).not.toContain("PRIVATE");
+});
+
 test("active roster aggregates per minute with reasons, joins, patching, children and fetch latency", async () => {
   let time = at;
   const { log, lines } = setup({ now: () => time });
