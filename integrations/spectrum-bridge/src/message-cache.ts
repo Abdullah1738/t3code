@@ -305,7 +305,8 @@ export class MessageCache {
 
   async detail(threadId: string): Promise<ThreadDetail> {
     const tick = this.tick;
-    await tick?.ready;
+    // Outside a tick, start the physical read in the caller's microtask, as main's detail() did.
+    if (tick) await tick.ready;
     if (tick?.detailDeferred.has(threadId)) {
       const prior = tick.details.get(threadId);
       if (!prior) throw probeDeferred;
