@@ -55,6 +55,9 @@ OVERLOAD_STATE = Path(os.environ.get('ROBOB_OVERLOAD_STATE', str(Path.home()/'.l
 WORKER = ('codex', 'gpt-6.1-sol')
 WORKER_HTTP_TIMEOUT = 45
 WORKER_HELPER_TIMEOUT = 50
+STRAIN_WORKER_INTERVAL = 600
+LOAD_ONLY_WORKER_DELAY = 600
+WORKER_SKIP_LOG_INTERVAL = 60
 STATE = Path.home() / '.local/state/mac-guard'
 EVIDENCE = Path.home() / '.robob/board-artifacts/mac-guard'
 T3CTL = str(Path.home() / '.local/bin/t3ctl')
@@ -214,6 +217,10 @@ def robob(p, rows):
     return False
 
 
+def robob_descendant(p, rows):
+    return any(robob(a, rows) for a in chain(p, rows))
+
+
 def label(p, rows):
     return next((q['label'] for q in [p]+chain(p, rows) if q.get('label')), None)
 
@@ -228,8 +235,9 @@ def exempt(p, rows, system_gui=False):
     return False
 
 
-def protected(p, rows):
-    return exempt(p, rows) or bool(label(p, rows)) or 'cua-driver' in p['comm']
+def protected(p, rows, *, renice=False):
+    return (exempt(p, rows) or bool(label(p, rows)) or 'cua-driver' in p['comm']
+            or not renice and robob_descendant(p, rows))
 
 
 def gui(p):
@@ -764,14 +772,17 @@ class Guard:
         gui_job = self.gui_jobs.get((p['pid'], p['start']))
         gui_ok = (cls == 'G' and gui_job and gui_job['phase'] == 'force'
                   and self.gui_force_growth(p, gui_job) and self.gui_allowed(p, gui_job))
+        ancestor = next((a for a in chain(p, self.rows) if robob(a, self.rows)), None)
         if cls == 'G':
             safe = gui_ok
         elif cls == 'D' or action == 'CONT':
             safe = not exempt(p, self.rows)
         else:
-            safe = not protected(p, self.rows)
+            safe = not protected(p, self.rows, renice=action == 'renice')
+        if ancestor and action != 'renice':
+            safe = False
         if allowed and not safe:
-            result = 'cancelled_gui_authorization' if cls == 'G' else 'cancelled_protection'
+            result = 'cancelled_gui_authorization' if cls == 'G' and not ancestor else 'cancelled_protection'
         elif not matched:
             result = 'skipped_identity'
         if (allowed and not self.muted and p['pid'] in self.rows and self.rows[p['pid']]['start'] == p['start']
@@ -810,6 +821,8 @@ class Guard:
                      action=action, result=result, errno=errno, actionClass=cls, owner=p.get('owner', {}).get('state', 'unknown'),
                      cpuDelta=p.get('cpuDelta', 0), footprintGiB=p.get('footprintGiB'), label=label(p, self.rows))
         value.update({k:details[k] for k in ('stages', 'reason') if k in details})
+        if ancestor:
+            value.update(protectedBy='robob-descendant', protectedAncestor={k: ancestor[k] for k in ('pid', 'start', 'comm')})
         if cls == 'G':
             value.update(step='force-quit', **{k: p.get(k) for k in ('app', 'bundleId', 'growthGiBHour', 'footprintSeries')})
         self.actions.append(value)
@@ -1044,7 +1057,30 @@ class Guard:
             write_json(self.state/'worker.json', self.worker)
         return tid
 
-    def worker_needed(self, path, summary, urgent=False, delivery=None):
+    def worker_skipped(self, reason, signals, path):
+        last = self.saved.get('workerSkippedAt')
+        if last is not None and 0 <= self.now-last < WORKER_SKIP_LOG_INTERVAL:
+            return
+        self.saved['workerSkippedAt'] = self.now
+        self.log('worker_skipped', reason=reason, signals=signals, evidence=str(path))
+        self.save()
+
+    def record_strain_worker(self, signals, path):
+        # Reserve before send: a timeout can still have delivered the steer.
+        self.saved['strainWorker'] = dict(signals=sorted(set(signals)), at=self.now, evidence=str(path))
+        self.save()
+
+    def worker_needed(self, path, summary, urgent=False, delivery=None, signals=None, allow_launch=True):
+        if signals is not None:
+            if not signals:
+                self.worker_skipped('empty_signals', signals, path)
+                return
+            last = self.saved.get('strainWorker')
+            if last and not set(signals)-set(last['signals']):
+                if 0 <= self.now-last['at'] < STRAIN_WORKER_INTERVAL:
+                    self.worker_skipped('unchanged', signals, path)
+                    return
+                summary += '; still ongoing'
         if self.muted:
             self.log('worker_steered' if self.worker.get('threadId') else 'worker_spawned',
                      result='would_act', evidence=str(path), summary=summary)
@@ -1064,6 +1100,8 @@ class Guard:
             if not ended:
                 if self.muted:
                     return
+                if signals is not None:
+                    self.record_strain_worker(signals, path)
                 try:
                     if delivery is not None:
                         delivery['threadId'] = tid
@@ -1079,6 +1117,10 @@ class Guard:
             self.worker.pop('threadId', None)
             self.worker['endedAt'] = self.now
             write_json(self.state/'worker.json', self.worker)
+        if not allow_launch:
+            if signals is not None:
+                self.worker_skipped('load_only_wait', signals, path)
+            return
         if self.worker_job is not None:
             return
         if not urgent and self.now-self.worker.get('endedAt', 0) < 1200:
@@ -1095,6 +1137,8 @@ class Guard:
             delivery.update(launch=launch, startedAt=self.now)
             self.save()
         write_json(self.state/'worker.json', self.worker)
+        if signals is not None:
+            self.record_strain_worker(signals, path)
         return self.launch_worker(path)
 
     def queue_restart_responder(self, path, reason, urgent):
@@ -1104,6 +1148,31 @@ class Guard:
 
     def deliver_restart_responder(self):
         return self.deliver_responder('restartResponder')
+
+    def deliver_strain_clears(self):
+        for key in [k for k in self.saved if k.startswith('strainClearResponder:')]:
+            report = self.saved[key]
+            if self.muted or self.now < report.get('nextAttemptAt', 0):
+                continue
+            if (self.worker.get('launchUnknown')
+                    and report['threadId'] == worker_thread_id(self.worker['launch']['clientRequestId'])):
+                continue  # the original safety message must be accepted first
+            try:
+                value = self.host.worker_status(report['threadId'])
+            except (ProbeError, OSError, ValueError):
+                report['nextAttemptAt'] = self.now+30
+                self.save()
+                self.log('error', probe='worker_status', failure='unavailable', threadId=report['threadId'])
+                continue
+            ended = (value.get('state') == 'idle' and value.get('status') in ('completed', 'failed', 'cancelled', 'interrupted')
+                     and not value.get('activeRunId') and not value.get('pendingRequests'))
+            if ended:
+                self.saved.pop(key)
+                self.save()
+            else:
+                # The existing responder path retries the same send identity;
+                # a lost ack never selects a different worker or creates one.
+                self.deliver_responder(key)
 
     def deliver_responder(self, key):
         report = self.saved.get(key)
@@ -1297,6 +1366,13 @@ class Guard:
 
     def tick(self, sample, now):
         self.now, self.sample = now, sample
+        last_observation = self.saved.get('lastObservationAt', self.saved.get('lastSample', now))
+        # Only a completed classification can carry continuity forward. An
+        # interrupted tick's intermediate saves leave the timer invalidated.
+        load_only_since = self.saved.pop('loadOnlySince', None)
+        if not 0 <= now-last_observation <= 60:
+            load_only_since = None
+        self.saved['lastObservationAt'] = now
         self.cycle += 1
         # Reconcile even after strain clears: a pending launch still owns its ID.
         if self.worker.get('launchUnknown'):
@@ -1387,16 +1463,31 @@ class Guard:
                        and any(self.gui_allowed(p) for p in slow if gui(p)))
         if slow_strain:
             signals.append(7)
+        self.runnable = [p for p in self.rows.values() if p['state'].startswith('R')]
+        self.r_zero = dict(Counter(p['family'] for p in self.runnable if p['cpuDelta'] == 0))
         self.streak = self.streak+1 if signals else 0
         self.calm = 0 if signals else self.calm+1
         if not self.strain and (self.streak >= 2 or memory or robob_trip or slow_strain):
             self.strain, self.since = True, now
+            self.saved.pop('strainWorker', None)
             self.log('strain_start', signals=signals)
         if self.strain and self.calm >= 10:
             self.strain = False
             self.first_action = None
             self.log('strain_clear', durationS=now-self.since, signals=[])
+            path = self.snapshot('strain ended after %.0f seconds' % (now-self.since))
+            # A clear only wraps up an existing worker; it never starts one.
+            tid = self.worker.get('threadId')
+            if not tid and self.worker.get('launchUnknown'):
+                tid = worker_thread_id(self.worker['launch']['clientRequestId'])
+            if tid:
+                request_id = 'mac-guard-strain-clear-'+uuid.uuid4().hex
+                self.saved['strainClearResponder:'+request_id] = dict(threadId=tid, evidence=str(path),
+                    summary='strain ended; duration %.0f seconds' % (now-self.since), requestId=request_id)
+            self.save()
+            self.saved.pop('strainWorker', None)
             self.hogs = {}
+        self.deliver_strain_clears()
         self.cancel_calm_kills()
         if not self.strain and self.stopped:
             remaining = []
@@ -1408,8 +1499,6 @@ class Guard:
             if not self.muted:
                 self.stopped = remaining
             self.hogs = {}
-        self.runnable = [p for p in self.rows.values() if p['state'].startswith('R')]
-        self.r_zero = dict(Counter(p['family'] for p in self.runnable if p['cpuDelta'] == 0))
         if robob_trip:
             self.robob_restart(robobs, tree_total)
         else:
@@ -1420,7 +1509,7 @@ class Guard:
             new_incidents.add(incident)
             if robob(p, self.rows) or incident in pending_ids:
                 continue
-            kind = 'protected' if exempt(p, self.rows) else 'carve-out'
+            kind = 'protected' if exempt(p, self.rows) or robob_descendant(p, self.rows) else 'carve-out'
             self.memory_event(p, kind, 'protected_alert' if kind == 'protected' else 'TERM')
             path = self.snapshot('memory runaway pid %s' % p['pid'])
             name = label(p, self.rows) or p['comm']
@@ -1439,9 +1528,19 @@ class Guard:
         if not memory and not robob_trip:
             self.slow_actions(slow)
         offenders = self.cpu_actions(memory4 | slow_offenders) if self.strain else 0
+        load_only = (self.strain and signals == [1] and self.lag is not None and self.lag <= 5
+                     and sample.get('pressure') is not None and sample['pressure'] < 4
+                     and not memory and not robob_trip and not slow_strain and not offenders)
+        if load_only:
+            self.saved['loadOnlySince'] = load_only_since if load_only_since is not None else now
         if self.strain and not memory and not robob_trip and (not offenders or now-(self.first_action if self.first_action is not None else self.since) >= 180):
             path = self.snapshot('strain persists' if offenders else 'strain without an identified offender')
-            self.worker_needed(path, 'strain: signals '+str(signals))
+            if signals:
+                summary = 'strain: signals %s; load %s; lag %s s; pressure %s' % (signals, sample['load'], self.lag, sample.get('pressure'))
+                self.worker_needed(path, summary, signals=signals,
+                                   allow_launch=not load_only or now-self.saved['loadOnlySince'] >= LOAD_ONLY_WORKER_DELAY)
+            else:
+                self.worker_skipped('empty_signals', signals, path)
         self.diagnostic_trigger(sample.get('ticks'))
         largest = max((p for p in self.rows.values() if 'footprintGiB' in p), key=lambda p: p['footprintGiB'], default={})
         summary = dict(load=sample['load'], rCount=len(self.runnable), rZeroCount=sum(self.r_zero.values()),
@@ -1464,12 +1563,17 @@ class Guard:
         handled = {(e['proc']['pid'], e['proc']['start']) for e in self.pending}
         for p in sorted(self.rows.values(), key=lambda p: len(chain(p, self.rows))):
             ident = (p['pid'], p['start'])
-            if ident in handled or protected(p, self.rows) or p['state'].startswith('?'):
+            if ident in handled or protected(p, self.rows, renice=True) or p['state'].startswith('?'):
                 continue
             ancestors = chain(p, self.rows)
             browser = p in browsers
             job = bool(JOBS.fullmatch(Path(p['comm']).name)) or script_job(p)
             if not job and p.get('cpuDelta', 0) <= 100 and p['pid'] not in memory4 and ident not in self.hogs:
+                continue
+            if robob_descendant(p, self.rows):
+                offenders += 1
+                if ident not in self.hogs and self.action(p, 'B', 'renice'):
+                    self.hogs[ident] = dict(stage=1, at=self.now)
                 continue
             build = next((b for q in [p]+ancestors if (b := self.host.build(q, self.rows, self.now))), {}) if job else {}
             owner = self.host.ownership(p, self.rows, self.now)

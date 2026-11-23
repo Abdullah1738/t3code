@@ -1,5 +1,5 @@
 #!/opt/homebrew/bin/python3
-"""Generate Robob's Claude Code, Codex and Codex CU homes from one manifest.
+"""Generate Robob's Claude Code, Codex, Codex CU and Antigravity homes from one manifest.
 
 generate  writes the homes; prints one line per file or link that changed.
 check     verifies the homes against the manifest; exit 1 lists each failure.
@@ -37,7 +37,16 @@ RESERVED_IDS = {"t3-code"}  # Robob injects this per thread
 HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart",
                "SubagentStop", "Stop", "SessionStart", "SessionEnd")
 CODEX_MODEL_KEYS = ("context_window", "max_context_window")
-HARNESSES = ("claude", "codex", "codex-cu")
+HARNESSES = ("claude", "codex", "codex-cu", "antigravity")
+# Harnesses whose shell PATH this generator writes (Antigravity shells inherit Robob's environment).
+SHELL_HARNESSES = ("claude", "codex", "codex-cu")
+HOOK_HARNESSES = ("claude", "codex", "antigravity")
+# Events the Antigravity runtime runs from hooks.json, and the ones Robob emulates per turn.
+ANTIGRAVITY_NATIVE_EVENTS = ("PreToolUse", "PostToolUse", "Stop")
+ANTIGRAVITY_ROBOB_EVENTS = ("UserPromptSubmit", "SessionStart")
+# Files each Antigravity profile ($GEMINI_HOME/config) links back to the generated home.
+ANTIGRAVITY_PROFILE_LINKS = ("config/mcp_config.json", "config/hooks.json")
+TURN_CONTEXT = "robob-turn-context.json"
 NODE_REPL = "node_repl"
 PARITY_MANIFEST = "parity-manifest.json"
 DEFAULT_OPENCODE_CONFIG = "~/.config/opencode/opencode.jsonc"
@@ -591,10 +600,12 @@ def validate_manifest(manifest: dict) -> None:
     for h in manifest["hooks"]:
         if "harnesses" in h:
             raise HomeError("hook harnesses is no longer supported; use harness")
-        if "harness" in h and h["harness"] not in ("claude", "codex"):
-            raise HomeError("hook harness must be claude or codex")
+        if "harness" in h and h["harness"] not in HOOK_HARNESSES:
+            raise HomeError("hook harness must be claude, codex or antigravity")
         if h["event"] not in HOOK_EVENTS:
             raise HomeError(f"unknown hook event {h['event']!r}")
+        if h.get("harness") == "antigravity" and h["event"] not in ANTIGRAVITY_NATIVE_EVENTS + ANTIGRAVITY_ROBOB_EVENTS:
+            raise HomeError(f"antigravity has no {h['event']} hook event")
         if h["event"] == "PostToolUseFailure" and h.get("harness") != "claude":
             raise HomeError("PostToolUseFailure is only supported by Claude")
         if not os.path.isabs(h["command"]):
@@ -784,6 +795,88 @@ def parity_applies(manifest: dict, home_root: str | None, override: str | None) 
     return "mcpParity" in manifest and not home_root
 
 
+# ---------- Antigravity ----------
+
+def antigravity_settings(manifest: dict) -> dict:
+    value = manifest.get("antigravity") or {}
+    if not isinstance(value, dict):
+        raise HomeError("antigravity must be an object")
+    return value
+
+
+def antigravity_mcp(manifest: dict) -> dict:
+    """$GEMINI_HOME/config/mcp_config.json. Every server runs behind mcp_shield.py: the
+    runtime ends the whole session when any server fails to initialize."""
+    cfg = antigravity_settings(manifest)
+    python, shield = cfg.get("python", "/opt/homebrew/bin/python3"), expand(cfg.get("shield", ""))
+    if not shield:
+        raise HomeError("antigravity.shield is required")
+    bearer = cfg.get("bearerKeychain") or {}
+    servers = {}
+    for s in manifest["mcpServers"]:
+        args = [shield, "--name", s["id"], "--init-timeout", str(s.get("startupTimeoutSec", 30)),
+                "--call-timeout", str(s["toolTimeoutSec"])]
+        if "url" in s:
+            args += ["--url", s["url"]]
+            if s["id"] in bearer:
+                args += ["--bearer-keychain", bearer[s["id"]]]
+        else:
+            args += ["--", s["command"], *s["args"]]
+        entry = {"command": python, "args": args}
+        if s.get("env"):
+            entry["env"] = dict(s["env"])
+        servers[s["id"]] = entry
+    return {"mcpServers": servers}
+
+
+def antigravity_hooks(hooks: list[dict]) -> tuple[dict, dict]:
+    """Native hooks.json (one named spec) and the events Robob runs around each turn."""
+    native: dict[str, list] = {}
+    robob: dict[str, list] = {}
+    for hook in hooks:
+        event = hook["event"]
+        if event in ANTIGRAVITY_ROBOB_EVENTS:
+            argv = shlex.split(hook["command"])
+            robob.setdefault(event, []).append(
+                {"command": argv[0], "args": argv[1:], "timeoutMs": hook["timeoutSec"] * 1000})
+            continue
+        handler = {"type": "command", "command": hook["command"], "timeout": hook["timeoutSec"]}
+        if event in ("PreToolUse", "PostToolUse"):
+            native.setdefault(event, []).append({"matcher": hook.get("matcher") or ".*", "hooks": [handler]})
+        else:
+            native.setdefault(event, []).append(handler)
+    return ({"robob": {"enabled": True, **native}} if native else {}), robob
+
+
+def antigravity_profiles(manifest: dict) -> list[str]:
+    root = antigravity_settings(manifest).get("profilesRoot")
+    if not root:
+        return []
+    root = expand(root)
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name)
+    except FileNotFoundError:
+        return []
+    return [e.path for e in entries
+            if e.is_dir(follow_symlinks=False) and os.path.isdir(os.path.join(e.path, "antigravity-acp"))]
+
+
+def antigravity_links(manifest: dict, home: str) -> list[tuple[str, str]]:
+    """(link path, target) pairs outside the home that point back into it."""
+    links = [(os.path.join(profile, rel), os.path.join(home, rel))
+             for profile in antigravity_profiles(manifest) for rel in ANTIGRAVITY_PROFILE_LINKS]
+    user_skills = antigravity_settings(manifest).get("userSkillsLink")
+    if user_skills:
+        links.append((expand(user_skills), os.path.join(home, "skills")))
+    return links
+
+
+def link_state(link: str, target: str) -> str:
+    if os.path.islink(link):
+        return "ok" if os.path.normpath(os.path.join(os.path.dirname(link), os.readlink(link))) == target else "other-link"
+    return "blocked" if os.path.lexists(link) else "missing"
+
+
 def build(manifest: dict, homes: dict[str, str]) -> dict:
     """Compute every generated file in memory. Reads only; writes nothing."""
     canonical_path = expand(manifest["instructions"]["canonical"])
@@ -839,6 +932,14 @@ def build(manifest: dict, homes: dict[str, str]) -> dict:
             PKG / manifest["codexModels"]["catalogSource"], manifest, cu=name == "codex-cu")
         hooks = hooks_for_harness(manifest["hooks"], name)
         files[os.path.join(home, "hooks.json")] = json_bytes(codex_hooks_json(hooks))
+    agy = homes["antigravity"]
+    native_hooks, robob_hooks = antigravity_hooks(hooks_for_harness(manifest["hooks"], "antigravity"))
+    instructions_path = os.path.join(agy, "instructions.md")
+    files[os.path.join(agy, "config", "mcp_config.json")] = json_bytes(antigravity_mcp(manifest))
+    files[os.path.join(agy, "config", "hooks.json")] = json_bytes(native_hooks)
+    files[instructions_path] = canonical + b"\n\n" + overlays["antigravity"]
+    files[os.path.join(agy, TURN_CONTEXT)] = json_bytes({
+        "schemaVersion": 1, "instructionsFile": instructions_path, "hooks": robob_hooks})
     return files
 
 
@@ -901,7 +1002,7 @@ def parity_files(manifest: dict, homes: dict[str, str], skills: list[tuple[str, 
             "manifestSha256": hashlib.sha256(json_bytes(manifest)).hexdigest(),
             "artifacts": [artifact_digest(path, content)
                           for path, content in sorted(expected_files.items())
-                          if os.path.dirname(path) == home],
+                          if os.path.commonpath((os.path.abspath(path), home)) == home],
             "skills": catalog,
             "mcpServers": manifest["mcpServers"],
             "runtimeMcpServers": ["t3-code"],
@@ -982,6 +1083,19 @@ class Writer:
         os.symlink(target, tmp)
         os.replace(tmp, link_path)
 
+    def link_if_absent(self, link_path: str, target: str) -> None:
+        """Create a link only where nothing exists: a file another process writes meanwhile wins."""
+        self._say("link", link_path)
+        if self.dry_run:
+            return
+        self.ensure_dir(os.path.dirname(link_path), False)
+        try:
+            os.symlink(target, link_path)
+        except FileExistsError:
+            if link_state(link_path, target) == "blocked":
+                print(f"warning: {link_path} exists and is not a link; Antigravity will not see {target}",
+                      file=sys.stderr)
+
     def unlink(self, path: str) -> None:
         self._say("unlink", path)
         if not self.dry_run:
@@ -1025,7 +1139,8 @@ def logged_run(name):
 
 
 @logged_run('generate.run')
-def generate(home_root: str | None, dry_run: bool, opencode_config: str | None = None) -> int:
+def generate(home_root: str | None, dry_run: bool, opencode_config: str | None = None,
+             antigravity_links_too: bool = False) -> int:
     manifest, homes, skills, unreadable, files = plan_all(home_root)
     farms = [os.path.join(home, "skills") for home in homes.values()]
     guard_outputs([*homes.values(), *farms, *files])
@@ -1045,6 +1160,19 @@ def generate(home_root: str | None, dry_run: bool, opencode_config: str | None =
                 writer.unlink(op[1])
             else:
                 writer.link(op[1], op[2])
+    # Profile and ~/.gemini links are production state: a --home-root run (tests, scratch)
+    # must never point them into its temporary home.
+    agy_links = (antigravity_links(manifest, homes["antigravity"])
+                 if "antigravity" in homes and (not home_root or antigravity_links_too) else [])
+    guard_outputs([link for link, _ in agy_links])
+    for link, target in agy_links:
+        state = link_state(link, target)
+        if state == "missing":
+            writer.link_if_absent(link, target)
+        elif state == "other-link":
+            writer.link(link, target)
+        elif state == "blocked":
+            print(f"warning: {link} exists and is not a link; Antigravity will not see {target}", file=sys.stderr)
     warn_mcp_parity(manifest, home_root, opencode_config)
     if _run_metrics.get() is not None:
         _run_metrics.get()["filesChanged"] = writer.changed
@@ -1058,6 +1186,8 @@ def generate(home_root: str | None, dry_run: bool, opencode_config: str | None =
 def safe_chain_failures(homes: dict[str, str], opencode_start: Path) -> list[str]:
     failures = []
     for harness, home in homes.items():
+        if harness not in SHELL_HARNESSES:
+            continue
         try:
             if harness == "claude":
                 config = json.loads((Path(home) / "settings.json").read_text(encoding="utf-8"))
@@ -1084,7 +1214,8 @@ def safe_chain_failures(homes: dict[str, str], opencode_start: Path) -> list[str
 
 
 @logged_run('generate.check')
-def check(home_root: str | None, *, json_output: bool = False, opencode_config: str | None = None) -> int:
+def check(home_root: str | None, *, json_output: bool = False, opencode_config: str | None = None,
+          antigravity_links_too: bool = False) -> int:
     manifest, homes, skills, unreadable, files = plan_all(home_root)
     guard_outputs([*homes.values(), *(os.path.join(home, "skills") for home in homes.values()), *files])
     failures: list[str] = []
@@ -1142,6 +1273,14 @@ def check(home_root: str | None, *, json_output: bool = False, opencode_config: 
             elif os.path.normpath(os.path.join(farm, os.readlink(link))) != path:
                 failures.append(f"{label} skills: link {name} points at the wrong directory")
 
+    for link, target in (antigravity_links(manifest, homes["antigravity"])
+                         if "antigravity" in homes and (not home_root or antigravity_links_too) else []):
+        state = link_state(link, target)
+        if state != "ok":
+            failures.append(f"antigravity link {link}: {state.replace('-', ' ')} (expected -> {target})")
+        elif not os.path.exists(link):
+            failures.append(f"antigravity link {link}: does not resolve")
+
     if _run_metrics.get() is not None:
         _run_metrics.get()["driftFound"] = len(failures)
     toollog.emit('harness-homes', 'event' if not failures else 'error', 'generate.drift', ok=not failures,
@@ -1197,7 +1336,7 @@ def mcp_diff(*, json_output: bool, opencode_config: str | None) -> int:
                           "ignore": ignore, "servers": rows, "failures": failures}))
         return 1 if failures else 0
     print(f"opencode: {path}")
-    print("native:   manifest.json mcpServers (claude, codex, codex-cu)")
+    print("native:   manifest.json mcpServers (claude, codex, codex-cu, antigravity via mcp_shield)")
     if ignore:
         print(f"ignore:   {', '.join(ignore)}")
     for row in rows:
@@ -1225,20 +1364,25 @@ def main(argv: list[str] | None = None) -> int:
     gen.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
     gen.add_argument("--dry-run", action="store_true", help="print what would change; write nothing")
     gen.add_argument("--opencode-config", help=oc_help)
+    links_help = ("with --home-root, also manage the Antigravity profile and ~/.gemini links "
+                  "(off by default so a scratch home never rewires production)")
+    gen.add_argument("--antigravity-links", action="store_true", help=links_help)
     chk = sub.add_parser("check", help="verify the homes; exit 1 on failure")
     chk.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
     chk.add_argument("--json", action="store_true", help="emit the existing check result as JSON")
     chk.add_argument("--opencode-config", help=oc_help)
+    chk.add_argument("--antigravity-links", action="store_true", help=links_help)
     diff = sub.add_parser("mcp-diff", help="compare manifest mcpServers with OpenCode's mcp config")
     diff.add_argument("--json", action="store_true", help="emit the comparison as JSON")
     diff.add_argument("--opencode-config", help="OpenCode config path (default: manifest mcpParity.opencodeConfig)")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "generate":
-            return generate(args.home_root, args.dry_run, args.opencode_config)
+            return generate(args.home_root, args.dry_run, args.opencode_config, args.antigravity_links)
         if args.cmd == "mcp-diff":
             return mcp_diff(json_output=args.json, opencode_config=args.opencode_config)
-        return check(args.home_root, json_output=args.json, opencode_config=args.opencode_config)
+        return check(args.home_root, json_output=args.json, opencode_config=args.opencode_config,
+                     antigravity_links_too=args.antigravity_links)
     except HomeError as exc:
         if args.cmd == "check" and args.json:
             print(json.dumps({"schemaVersion": 1, "ok": False, "failures": [str(exc)], "homes": []}))

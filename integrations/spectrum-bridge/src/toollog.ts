@@ -1,3 +1,4 @@
+import { API_PATHS, REQUEST_PHASES } from "./request-trace.ts";
 import { RobobLinkDown } from "./robob-link-gate.ts";
 import { cleanRosterHealth, createRosterAggregation, ROSTER_ACTIONS } from "./log-active-roster.ts";
 import { homedir } from "node:os";
@@ -23,6 +24,7 @@ import { cleanRenders, createRenderAggregation, renderChat } from "./log-renders
 import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./log-error.ts";
 import { CONTROL_REASONS, controlFailureProps } from "./control-errors.ts";
 import { LOOP_OPERATIONS, loopOperations, traceLoopOperation } from "./loop-stall.ts";
+import { FETCH_CAUSES, cleanCardUrlClass, cleanRenderCardId, type CardFetchFailure } from "./log-card-fetch.ts";
 
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
@@ -34,6 +36,7 @@ export type LogLine = {
   error?: { tag: string } & ErrorDetail;
   calls?: CallSummary;
   promptProbe?: PromptProbeStats;
+  requests?: { histogram: [number, number][] };
   renders?: { count: number; histogram: [number, number][] };
 };
 type Entry = Omit<LogLine, "ts" | "tool" | "error"> & { error?: { tag: string; cause?: unknown } & Partial<ErrorDetail> };
@@ -77,6 +80,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   const ids: Record<string, string> = runId ? { runId } : {};
   for (const [key, value] of Object.entries(entry.ids ?? {})) {
     if (entry.name === "bridge-loop-stall") continue;
+    if (key === "cardId" && entry.name === "card.render" && cleanRenderCardId(value)) { ids.cardId = value; continue; }
     // Correlation ids are UUIDs; arbitrary server header text must never become a log field.
     if ((key === "requestId" || key === "serverRequestId" || key === "outageId") && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value)) continue;
     if (key === "chat" && entry.name.startsWith("card.render")) { ids.chat = renderChat(value); continue; }
@@ -86,6 +90,27 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (["api.request", "api.request.rollup", "cli.request_failed", "runtime.sample"].includes(entry.name)) {
+      if (["handlerMs", "storeMs", "bodyBytes", "loopLagMs", "timeoutMs", "pid", "loadAvg1", "loadAvg", "elapsedMs", "minute",
+        "startedAt", "connectedAt", "writtenAt", "headersAt", "endedAt", "p50", "p95", "max", "status", "count",
+        "loopLagMaxMs", "loopLagP95Ms", "cpuUserMs", "cpuSystemMs", "rssMb"].includes(key)
+        && typeof value === "number" && Number.isFinite(value) && value >= 0
+        || key === "path" && API_PATHS.some(path => path === value)
+        || key === "phase" && REQUEST_PHASES.some(phase => phase === value)
+        || key === "method" && ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "OTHER"].includes(String(value))
+        || ["ok", "bodyBytesKnown"].includes(key) && typeof value === "boolean"
+        || key === "requestId" && typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value)) props[key] = value;
+      continue;
+    }
+    if (["fetchCause", "httpStatus", "urlClass", "bytesReceived"].includes(key)) {
+      if (entry.name === "card.render" && (
+        key === "fetchCause" && typeof value === "string" && FETCH_CAUSES.some(cause => cause === value)
+        || key === "httpStatus" && typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599
+        || key === "urlClass" && cleanCardUrlClass(value)
+        || key === "bytesReceived" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+      )) props[key] = value;
+      continue;
+    }
     if (entry.name === "bridge-loop-stall") {
       if (["stallMs", "loadAvg1", "freeMemoryBytes", "rssBytes"].includes(key)
         && typeof value === "number" && Number.isFinite(value) && value >= 0) { props[key] = value; continue; }
@@ -149,8 +174,9 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     if (entry.component === "remote-box" && ["moni-box-down", "moni-runner-error"].includes(entry.name)) {
       if (key === "step" && typeof value === "string" && ["lease", "identity", "deliver", "ack"].includes(value)
         || key === "errorClass" && typeof value === "string" && ["RemoteRequestError", "Error", "TypeError", "SyntaxError", "Timeout", "Object", "String", "Number", "Boolean", "BigInt", "Symbol", "Function", "undefined", "object"].includes(value)
-        || ["latencyMs", "failures"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0
-        || entry.name === "moni-runner-error" && key === "code" && value === "unreachable") {
+        || key === "errorCode" && typeof value === "string" && /^[A-Za-z0-9_]{1,40}$/.test(value)
+        || ["latencyMs", "failures", "loopDelayMs"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0
+        || entry.name === "moni-runner-error" && key === "code" && (value === "unreachable" || value === "harness")) {
         props[key] = value; continue;
       }
     }
@@ -182,6 +208,14 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     else if (key === "route" && typeof value === "string" && /^(?:\/(?:[a-z-]+|:id))*$/.test(value)) props[key] = value;
   }
   if (Object.keys(props).length) line.props = props;
+  if (entry.name === "api.request.rollup" && entry.requests && Array.isArray(entry.requests.histogram)) {
+    const histogram = entry.requests.histogram;
+    if (histogram.length <= 146_341 && histogram.every(pair => Array.isArray(pair) && pair.length === 2
+      && Number.isSafeInteger(pair[0]) && pair[0] >= 0 && pair[0] <= 86_400_000
+      && Number.isSafeInteger(pair[1]) && pair[1] > 0)
+      && histogram.reduce((sum, pair) => sum + pair[1], 0) === props.count) line.requests = { histogram };
+  }
+
   if (entry.name === "router.prompt_probes" && entry.component === "router" && entry.kind === "perf") line.promptProbe = cleanPromptProbe(entry.promptProbe);
   if (entry.component === "robob" && ["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_alert", "robob.link_reply"].includes(entry.name)) line.link = cleanRobobLink(entry.link);
   if (entry.name === "card.renders" && entry.kind === "perf") line.renders = cleanRenders(entry.renders);
@@ -308,7 +342,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.robob_calls", "robob.active_roster", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_alert", "robob.link_alert_loaded", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["api.request", "api.request.rollup", "runtime.sample", "bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.robob_calls", "robob.active_roster", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_alert", "robob.link_alert_loaded", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }
@@ -342,7 +376,11 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     try {
       if (entry.kind === "error" || entry.name === "form.fail" || entry.name === "turn.robob_call" && entry.ok === false) entry = { ...entry, site: entry.site ?? logSite() };
       if (entry.name === "form.fail" && entry.kind !== "error") entry = { ...entry, kind: "error", error: entry.error ?? { tag: "form.gone" } };
-      const line = clean(entry, new Date(now()).toISOString(), processRunId);
+      // Flood buckets can flush after midnight; keep their rows in the request day's file.
+      const minute = entry.component === "api" && entry.kind === "perf" && entry.name === "api.request.rollup" ? entry.props?.minute : undefined;
+      const stamp = typeof minute === "number" && Number.isSafeInteger(minute) && minute >= 0
+        && minute <= 8_640_000_000_000_000 && minute % 60_000 === 0 ? minute : now();
+      const line = clean(entry, new Date(stamp).toISOString(), processRunId);
       if (!line) {
         if (entry.name === "card.render" || entry.name === "card.renders") writeFailed = true;
         return;
@@ -631,8 +669,10 @@ export function cardKind(value: string): string {
 }
 
 export function logCardRender(component: string, kind: string, durationMs: number, ok: boolean,
-  details: { chat?: string; outcome?: "ok" | "fallback" | "failed"; failureCode?: string; attempt?: number } = {}): void {
+  details: { chat?: string; outcome?: "ok" | "fallback" | "failed"; failureCode?: string; attempt?: number; cardId?: string } & Partial<CardFetchFailure> = {}): void {
   toolLog.capture(() => toolLog.write({ component, kind: "perf", name: "card.render", durationMs, ok,
-    ids: { chat: details.chat ?? "" }, props: { cardKind: kind, outcome: details.outcome ?? (ok ? "ok" : "failed"),
-      failureCode: details.failureCode ?? (ok ? "none" : "renderer_failed"), attempt: details.attempt ?? 1 } }));
+    ids: { chat: details.chat ?? "", ...(details.cardId ? { cardId: details.cardId } : {}) }, props: { cardKind: kind, outcome: details.outcome ?? (ok ? "ok" : "failed"),
+      failureCode: details.failureCode ?? (ok ? "none" : "renderer_failed"), attempt: details.attempt ?? 1,
+      ...Object.fromEntries(Object.entries({ fetchCause: details.fetchCause, httpStatus: details.httpStatus, urlClass: details.urlClass,
+        elapsedMs: details.elapsedMs, bytesReceived: details.bytesReceived }).filter((entry): entry is [string, string | number] => entry[1] !== undefined)) } }));
 }

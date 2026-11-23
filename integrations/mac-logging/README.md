@@ -105,6 +105,49 @@ UTC), `lastOk`, `lines` (matching lines in that window), `ageMin`, `gapMaxMin`,
 `since`, and `status`. `missingJobs` contains the `LATE` and `SILENT` job keys;
 backup keys are `backup.run:health` and `backup.run:memory`.
 
+Each row includes the exact `kern.boottime` epoch and UTC `bootTime` when
+available. The minute CPU sampler and hourly collector share a nonblocking boot
+lock. Each newly seen boot is saved immediately, including its kernel reason
+strings; a second reboot during the evidence wait leaves it queued for finalization.
+After the ten-minute panic-file window closes, `boot.observed` records
+the previous boot, the last prior sample's uptime, the gap from the last prior log row,
+ResetCounter faults/failure count, panic and shutdown-stall reports within ten
+minutes of boot, and Jetsam reports in the preceding two hours. Missing evidence
+remains null or carries a per-field source error. The gap measures logging silence; it does
+not establish how long the Mac froze.
+
+A clean boot requires the adjacent shutdown record from `last -y reboot shutdown`
+and no positive panic/reset-fault evidence. A shutdown-stall report records a
+slow orderly shutdown; its presence alone does not make the boot unclean.
+The record includes the requested operation, loginwindow sender PID/bundle and
+confirmation time, launchd's caller chain, sessionlogoutd's non-update verdict,
+and the raw `kern.shutdownreason`/`kern.bootreason` values from that same boot.
+The sender identifies a process; the human or automation activating the request
+remains unknown. A `wdog,reset_in_1` token alone does not establish an unclean
+boot or a forced watchdog timeout; `forcedWatchdogTimeout` stays null without
+explicit timeout/check-in-failure evidence. Shutdown-stall files are decoded
+with `spindump -i` on a private copy to obtain the actual sample start/end;
+the filename timestamp (or mtime when absent) matches reports to boots. The
+native decoder appends input metadata, so the original file is never passed
+to it. Decode failures preserve presence and a source error.
+#92 found no numeric shutdown cause on this Apple-silicon host; any future numeric code is retained as unmapped,
+without Intel cause tables. Filtered unified-log queries cover the three minutes
+before boot for shutdown context and the first three minutes after boot for
+shutdown cause, using the shared `logwindow` reader with explicit UTC bounds,
+reboot splits, a 15-second process-group deadline and timestamp filtering.
+The post-boot read starts at the first whole second at or after boot.
+ResetCounter uses plain reads, without sudo. Observations are
+timestamped at boot (`observedAt` records collection time), persisted once per
+boot and survive the daily log cap. Unclean boots and orderly shutdown stalls queue one
+Telegram alert with a stable boot key; failed sends retry that same key/text,
+even across later boots. Unfinished observations remain in a persistent queue;
+each invocation retries one queued boot alongside the current boot. A late
+append to an earlier UTC day rebuilds that day's rollup and publishes updated
+`log.rollup` counts with its `day`; failed repairs remain queued. Rollup writers
+share a per-day lock so an older snapshot cannot overwrite a repair.
+CPU process, host-tick and child baselines reset on boot changes. Rollups add
+`boots` and `uncleanBoots`, also emitted in `log.rollup`.
+
 The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour. Report cursors cover since their last successful read.

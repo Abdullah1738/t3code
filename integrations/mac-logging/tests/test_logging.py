@@ -52,6 +52,17 @@ class LoggingTests(unittest.TestCase):
                 with self.subTest(key=key, value=value):
                     self.assertEqual(toollog.suspend_fields({key: value}), {})
 
+    def test_tmpdir_removal_and_summary_fields_survive_logger(self):
+        remove = {'path': '/private/var/folders/example/T/tmp.scratch', 'bytes': 4096,
+                  'ageS': 86400, 'rule': 'agent'}
+        summary = {'found': 2, 'removed': 1, 'removed_bytes': 4096, 'bytes': 8192,
+                   'idle_hours': 24, 'report_only': False, 'partial': False}
+        for name, props in [('janitor.tmpdir_remove', remove), ('janitor.tmpdir_run', summary)]:
+            toollog.emit('janitor', 'event', name, ok=True, props={**props, 'unexpected': 'secret'})
+            self.assertEqual(self.rows()[-1]['props'], props)
+        self.assertEqual(toollog.safe_fields({'path': '/tmp/password=secret'}, 'janitor.tmpdir_remove'),
+                         {'path': '[redacted]'})
+
     def test_janitor_summary_and_phases_survive_the_real_logger_without_free_text(self):
         scripts = REPO / 'integrations/dev-resource-janitor/skill/scripts'
         sys.path.insert(0, str(scripts))

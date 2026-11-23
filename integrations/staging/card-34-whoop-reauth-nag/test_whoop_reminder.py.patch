@@ -1,0 +1,409 @@
+--- /dev/null
++++ b/test_whoop_reminder.py
+@@ -0,0 +1,406 @@
++"""Synthetic owner-only CLI, file-lock and rollup regressions. No live IO."""
++import datetime as dt
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import unittest
++from unittest import mock
++import test_whoop_reauth as pending_fixture
++import test_toollog as log_fixture
++
++log = log_fixture.log
++
++
++class ReminderTests(unittest.TestCase):
++    real_notice = True
++    patch = pending_fixture.PendingStatusTests.patch
++    http_error = pending_fixture.PendingStatusTests.http_error
++    http_error_raised = pending_fixture.PendingStatusTests.http_error_raised
++    status = pending_fixture.PendingStatusTests.status
++    invoke = pending_fixture.PendingStatusTests.invoke
++
++    def setUp(self):
++        pending_fixture.PendingStatusTests.setUp(self)
++        env = mock.patch.dict(os.environ, HOME=str(self.root), BUN_INSPECT='PrivateInspector')
++        env.start()
++        self.addCleanup(env.stop)
++        bun = self.root / '.bun/bin/bun'
++        bun.parent.mkdir(parents=True)
++        bun.write_text('#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
++        bun.chmod(0o700)
++        cli = self.root / '.local/share/telegram-bridge/src/cli.ts'
++        cli.parent.mkdir(parents=True)
++        cli.write_text('''import json,os,sys
++from pathlib import Path
++assert 'BUN_INSPECT' not in os.environ
++assert sys.argv[1] == 'notify'
++args = dict(zip(sys.argv[2::2], sys.argv[3::2]))
++assert set(args) == {'--source','--severity','--key','--text'}
++assert args['--source'] == 'whoop-sync' and args['--severity'] == 'attention'
++root = Path.home()
++with (root/'notice-attempts.ndjson').open('a') as f:
++    f.write(json.dumps(args)+'\\n')
++mode_file = root/'notice-mode'
++mode = mode_file.read_text() if mode_file.exists() else 'accept'
++if mode == 'reject': raise SystemExit(1)
++notices = root/'notices.ndjson'
++prior = [json.loads(line) for line in notices.read_text().splitlines()] if notices.exists() else []
++same = [row for row in prior if row['--key'] == args['--key']]
++if same:
++    assert same == [args], 'same key requires identical text'
++else:
++    with notices.open('a') as f: f.write(json.dumps(args)+'\\n')
++if mode == 'accept_then_fail': raise SystemExit(1)
++''')
++        self.initial['last_sync_at'] = (self.clock - dt.timedelta(hours=30.25)).isoformat()
++        self.initial['listener']['until'] = (self.clock + dt.timedelta(hours=72)).isoformat()
++        self.w.write_json(self.w.STATUS, self.initial)
++
++    def notices(self):
++        path = self.root / 'notices.ndjson'
++        return [json.loads(row) for row in path.read_text().splitlines()] if path.exists() else []
++
++    def rows(self):
++        return [json.loads(line) for path in (self.root/'logs').glob('*.ndjson')
++                for line in path.read_text().splitlines() if json.loads(line)['name'] == 'sync.run']
++
++    def state(self):
++        return json.loads((self.root/'reauth_reminder.json').read_text())
++
++    def notice_attempts(self):
++        path = self.root/'notice-attempts.ndjson'
++        return [json.loads(row) for row in path.read_text().splitlines()] if path.exists() else []
++
++    def expire_listener(self):
++        self.w.set_status(listener=None, state='login_expired')
++
++    def recover_expired_notice(self, original):
++        # State is read from disk on each tick, including after a process restart.
++        self.clock += dt.timedelta(hours=23, minutes=59)
++        attempts_before = len(self.notice_attempts())
++        self.assertEqual(self.invoke()[0], 1)
++        self.assertEqual(len(self.notice_attempts()), attempts_before)
++        self.clock += dt.timedelta(minutes=1)
++        self.assertEqual(self.invoke()[0], 1)
++        self.assertEqual(self.notice_attempts()[-1], original)
++        self.assertEqual(len(self.notices()), 1)
++        self.assertEqual(self.notices()[0], original)
++        self.assertEqual(self.state()['expired_notice'], {
++            'key': original['--key'], 'text': original['--text'], 'accepted': True})
++        self.assertEqual(self.state()['last_sent_at'], self.clock.isoformat())
++        self.clock += dt.timedelta(hours=25)
++        self.assertEqual(self.invoke()[0], 1)
++        self.assertEqual(len(self.notice_attempts()), attempts_before+1)
++        self.assertEqual(len(self.notices()), 1)
++        for content in (json.dumps(self.state()), json.dumps(self.notice_attempts()), json.dumps(self.rows())):
++            self.assertNotIn('Private', content)
++            self.assertNotIn('synthetic-state', content)
++
++    def test_expired_send_failure_recovers_after_24h_with_same_key_and_text(self):
++        self.expire_listener()
++        (self.root/'notice-mode').write_text('reject')
++        self.assertEqual(self.invoke()[0], 1)
++        self.assertEqual(self.notices(), [])
++        original, = self.notice_attempts()
++        self.assertFalse(self.rows()[-1]['props']['reminderSent'])
++        self.assertNotIn('last_sent_at', self.state())
++        (self.root/'notice-mode').write_text('accept')
++        # Changing source status must not change an already claimed payload.
++        self.w.set_status(last_sync_at='PrivateChangedStatus')
++        self.recover_expired_notice(original)
++
++    def test_expired_acceptance_without_ack_retries_deduplicate(self):
++        self.expire_listener()
++        (self.root/'notice-mode').write_text('accept_then_fail')
++        self.assertEqual(self.invoke()[0], 1)
++        original, = self.notice_attempts()
++        self.assertEqual(len(self.notices()), 1)
++        self.assertFalse(self.state()['expired_notice']['accepted'])
++        (self.root/'notice-mode').write_text('accept')
++        self.recover_expired_notice(original)
++
++    def test_repeated_expired_failures_keep_original_payload_across_days(self):
++        self.expire_listener()
++        (self.root/'notice-mode').write_text('reject')
++        self.assertEqual(self.invoke()[0], 1)
++        original, = self.notice_attempts()
++        self.clock += dt.timedelta(hours=25)
++        self.assertEqual(self.invoke()[0], 1)
++        self.assertEqual(self.notice_attempts(), [original, original])
++        self.assertEqual(self.notices(), [])
++        self.assertFalse(self.state()['expired_notice']['accepted'])
++        (self.root/'notice-mode').write_text('accept')
++        self.recover_expired_notice(original)
++
++    def test_expired_prequeue_crash_retains_retry_payload(self):
++        self.expire_listener()
++        with mock.patch.object(self.w, 'notify_reauth', side_effect=KeyboardInterrupt):
++            with self.assertRaises(KeyboardInterrupt):
++                self.invoke()
++        self.assertEqual(self.notices(), [])
++        notice = self.state()['expired_notice']
++        original = {'--source': 'whoop-sync', '--severity': 'attention',
++                    '--key': notice['key'], '--text': notice['text']}
++        self.recover_expired_notice(original)
++
++    def test_expired_acceptance_state_write_failure_retries_deduplicate(self):
++        self.expire_listener()
++        write_json = self.w.write_json
++        def fail_accepted_state(path, obj, mode=0o644):
++            if (str(path).endswith('/reauth_reminder.json')
++                    and obj.get('expired_notice', {}).get('accepted') is True):
++                raise OSError('PrivateWriteFailure')
++            write_json(path, obj, mode)
++        with mock.patch.object(self.w, 'write_json', side_effect=fail_accepted_state):
++            self.assertEqual(self.invoke()[0], 1)
++        original, = self.notice_attempts()
++        self.assertEqual(len(self.notices()), 1)
++        self.assertTrue(self.rows()[-1]['props']['reminderSent'])
++        self.assertFalse(self.state()['expired_notice']['accepted'])
++        self.recover_expired_notice(original)
++
++    def expired_timeout(self, queue_first):
++        self.expire_listener()
++        notify = self.w.notify_reauth
++        def timeout(text, key):
++            if queue_first:
++                self.assertTrue(notify(text, key))
++            raise subprocess.TimeoutExpired('PrivateCommand', 25)
++        with mock.patch.object(self.w, 'notify_reauth', side_effect=timeout):
++            self.assertEqual(self.invoke()[0], 1)
++        self.assertEqual(len(self.notices()), int(queue_first))
++        self.assertFalse(self.rows()[-1]['props']['reminderSent'])
++        self.assertNotIn('last_sent_at', self.state())
++        notice = self.state()['expired_notice']
++        original = {'--source': 'whoop-sync', '--severity': 'attention',
++                    '--key': notice['key'], '--text': notice['text']}
++        self.recover_expired_notice(original)
++
++    def test_expired_timeout_before_queue_recovers(self):
++        self.expired_timeout(False)
++
++    def test_expired_timeout_after_queue_retries_deduplicate(self):
++        self.expired_timeout(True)
++
++    def test_success_discards_unsent_expired_notice(self):
++        self.expire_listener()
++        (self.root/'notice-mode').write_text('reject')
++        self.assertEqual(self.invoke()[0], 1)
++        self.assertIn('expired_notice', self.state())
++        self.w._sync.side_effect = lambda *args: self.w.set_status(state='ok', last_sync_at=self.clock.isoformat())
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertNotIn('expired_notice', self.state())
++        (self.root/'notice-mode').write_text('accept')
++        self.clock += dt.timedelta(hours=25)
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(len(self.notice_attempts()), 1)
++        self.assertEqual(self.notices(), [])
++
++    def test_rolling_24_hours_survives_midnight(self):
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(len(self.notices()), 1)
++        notice = self.notices()[0]
++        self.assertEqual(notice['--key'], 'whoop-reauth-pending:2026-11-22')
++        self.assertIn('data stopped 2026-11-21', notice['--text'])
++        self.assertIn('link valid until 2026-11-25 10:00 UTC', notice['--text'])
++        self.assertIn(self.w.LOGIN_LINK, notice['--text'])
++        self.assertTrue(self.rows()[-1]['props']['reminderSent'])
++        self.assertEqual(self.rows()[-1]['props']['hoursSinceLastSuccess'], 30.25)
++        self.assertEqual(self.rows()[-1]['props']['reauthPendingSinceDay'], '2026-11-22')
++        saved = self.state()
++        self.clock += dt.timedelta(hours=23, minutes=59)
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertFalse(self.rows()[-1]['props']['reminderSent'])
++        self.assertEqual(len(self.notices()), 1)
++        self.assertEqual(self.state(), saved)
++        self.clock += dt.timedelta(minutes=1)
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(len(self.notices()), 2)
++        self.assertEqual(self.notices()[-1]['--key'], 'whoop-reauth-pending:2026-11-23')
++        self.assertEqual(self.state()['last_sent_at'], self.clock.isoformat())
++        self.assertEqual((self.root/'reauth_reminder.json').stat().st_mode & 0o777, 0o600)
++        for content in (json.dumps(self.rows()), json.dumps(self.notices()), json.dumps(self.state())):
++            self.assertNotIn('Private', content)
++            self.assertNotIn('synthetic-state', content)
++            self.assertNotIn('oauth2/auth', content)
++
++    def test_expiry_waits_for_throttle_then_notices_only_once(self):
++        self.invoke()
++        self.clock += dt.timedelta(hours=1)
++        self.w.set_status(listener=None, state='login_expired')
++        self.assertEqual(self.invoke()[0], 1)
++        self.assertEqual(len(self.notices()), 1)
++        self.clock += dt.timedelta(hours=23)
++        self.assertEqual(self.invoke()[0], 1)
++        self.assertEqual(len(self.notices()), 2)
++        text = self.notices()[-1]['--text']
++        self.assertIn('login link expired', text)
++        self.assertIn('whoop.py authurl', text)
++        self.assertIn('launchctl kickstart', text)
++        self.clock += dt.timedelta(days=3)
++        self.assertEqual(self.invoke()[0], 1)
++        self.assertEqual(len(self.notices()), 2)
++        self.assertFalse(self.rows()[-1]['props']['reauthPending'])
++
++    def test_success_stops_episode_and_preserves_global_throttle(self):
++        self.invoke()
++        self.w._sync.side_effect = lambda *args: self.w.set_status(state='ok', last_sync_at=self.clock.isoformat())
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.clock += dt.timedelta(days=2)
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(len(self.notices()), 1)
++        self.assertNotIn('pending_since', self.state())
++        self.assertIn('last_sent_at', self.state())
++
++    def test_real_sync_error_still_alerts_with_no_reminder(self):
++        self.w.count_failure.side_effect = lambda **kw: self.w.update_status(
++            lambda st: dict(kw, consecutive_failures=st.get('consecutive_failures', 0)+1))
++        self.w._sync.side_effect = RuntimeError('synthetic network error')
++        Path(self.w.AUTH_STATE).unlink()
++        rc, out, err = self.invoke()
++        self.assertEqual((rc, out), (1, ''))
++        self.assertIn('WHOOP sync failed:', err)
++        self.assertEqual(self.status()['state'], 'sync_error')
++        self.assertEqual(self.notices(), [])
++        self.assertFalse(self.rows()[-1]['ok'])
++        self.assertNotIn('reauthPending', self.rows()[-1]['props'])
++
++    def test_never_authorized_and_callback_races_do_not_notify(self):
++        self.tokens = None
++        self.w.write_json(self.w.STATUS, {'state': 'awaiting_login'})
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(self.notices(), [])
++        self.tokens = {'refresh_token': 'PrivateNewToken'}
++        error = self.w.ReauthNeeded('PrivateOldError')
++        error.rejected = 'PrivateOldToken'
++        self.w._sync.side_effect = error
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertEqual(self.notices(), [])
++
++    def test_missing_last_success_never_copies_untrusted_status_text(self):
++        self.w.set_status(last_sync_at='PrivateInjectedDate')
++        self.assertEqual(self.invoke(), (0, '', ''))
++        self.assertIn('data stopped unknown', self.notices()[0]['--text'])
++        self.assertIsNone(self.rows()[-1]['props']['hoursSinceLastSuccess'])
++        self.assertNotIn('Private', json.dumps(self.notices()))
++
++    def test_failed_or_uncertain_send_is_claimed_before_retry(self):
++        for result in (False, subprocess.TimeoutExpired('PrivateCommand', 25)):
++            with self.subTest(result=type(result).__name__):
++                path = self.root/'reauth_reminder.json'
++                if path.exists(): path.unlink()
++                notifier = mock.Mock(return_value=False) if result is False else mock.Mock(side_effect=result)
++                with mock.patch.object(self.w, 'notify_reauth', notifier):
++                    self.assertEqual(self.invoke(), (0, '', ''))
++                    self.assertEqual(self.invoke(), (0, '', ''))
++                self.assertEqual(notifier.call_count, 1)
++                self.assertNotIn('last_sent_at', self.state())
++                self.assertFalse(self.rows()[-1]['props']['reminderSent'])
++                self.assertNotIn('Private', json.dumps(self.rows()))
++
++    def test_two_processes_share_real_token_lock_and_one_notice(self):
++        driver = self.root/'driver.py'
++        driver.write_text('''import importlib.util,sys
++from pathlib import Path
++spec=importlib.util.spec_from_file_location('fixture',sys.argv[1])
++w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
++root=Path.home()
++w.HERE=str(root);w.LOCK=str(root/'.lock');w.STATUS=str(root/'status.json')
++w.now=lambda:w.datetime(2026,11,22,10,tzinfo=w.timezone.utc)
++with w.TokenLock(): w.record_reauth_reminder(True,{})
++''')
++        processes = [subprocess.Popen([sys.executable, '-I', '-B', str(driver), self.w.__file__],
++                    stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
++        for process in processes:
++            stdout, stderr = process.communicate(timeout=10)
++            self.assertEqual((process.returncode, stdout, stderr), (0, b'', b''))
++        self.assertEqual(len(self.notices()), 1)
++
++    def test_actual_quiet_run_rollup_and_next_real_error(self):
++        with mock.patch.object(log, 'utcnow', side_effect=lambda: self.clock):
++            self.assertEqual(self.invoke(), (0, '', ''))
++            result = log.rollup(self.clock.date().isoformat())
++            self.assertEqual(result['errorCount'], 0)
++            self.assertEqual(result['whoop']['pendingReauthRuns'], 1)
++            self.assertEqual(result['whoop']['consecutiveFailures'], 1)
++            self.assertEqual(result['whoop']['authFailures'], [
++                {'authStage': 'token_refresh', 'reason': 'refresh_rejected', 'count': 1}])
++            destination = os.environ.get('CARD34_EVIDENCE')
++            if destination:
++                Path(destination).write_text(json.dumps({'syncRow': self.rows()[-1],
++                    'notice': self.notices()[0], 'rollup': result}, indent=2)+'\n')
++            self.w.count_failure.side_effect = lambda **kw: self.w.update_status(lambda st: kw)
++            self.w._sync.side_effect = RuntimeError('synthetic network failure')
++            self.clock += dt.timedelta(seconds=1)
++            self.assertEqual(self.invoke()[0], 1)
++            result = log.rollup(self.clock.date().isoformat())
++            self.assertEqual(result['errorCount'], 1)
++            self.assertEqual(result['whoop']['pendingReauthRuns'], 1)
++            self.assertEqual(len(self.notices()), 1)
++
++
++class PendingRollupTests(unittest.TestCase):
++    setUp = log_fixture.ToolLogTests.setUp
++
++    def test_only_explicit_quiet_rejections_leave_error_rollup(self):
++        clock = dt.datetime(2026,11,22,12,3,17,tzinfo=dt.timezone.utc)
++        # Whole input class: marker type/value, reason, component and name.
++        cases = [
++            ('whoop-sync','sync.run','refresh_rejected',True),
++            ('whoop-sync','sync.run','refresh_rejected',False),
++            ('whoop-sync','sync.run','refresh_rejected',None),
++            ('whoop-sync','sync.run','refresh_rejected','true'),
++            ('whoop-sync','sync.run','refresh_network',True),
++            ('whoop-sync','sync.run','token_missing',True),
++            ('whoop','sync.run','refresh_rejected',True),
++            ('whoop','cli.run','refresh_rejected',True),
++        ]
++        with mock.patch.object(log,'utcnow',return_value=clock):
++            for index,(component,name,reason,marker) in enumerate(cases):
++                props={'reason':reason,'authStage':'token_refresh','reauthPendingSinceDay':'2026-11-21'}
++                if marker is not None: props['reauthPending']=marker
++                log.emit(component,name,kind='error',ok=False,tag='reauth_needed',props=props,
++                         _now=clock+dt.timedelta(seconds=index))
++            log.emit('whoop-sync','sync.run',ok=True,_now=clock+dt.timedelta(seconds=10))
++            log.emit('whoop-sync','sync.run',kind='error',ok=False,tag='reauth_needed',
++                     props={'reason':'refresh_rejected','reauthPending':True},_now=clock+dt.timedelta(seconds=11))
++            result=log.rollup('2026-11-22')
++        self.assertIsNotNone(result)
++        self.assertEqual(result['whoop']['pendingReauthRuns'],2)
++        self.assertEqual(result['whoop']['reauthPendingSinceDay'],'2026-11-21')
++        self.assertEqual(result['errorCount'],7)
++        self.assertEqual(result['okCount'],1)
++        self.assertEqual(result['errorRate'],7/8)
++        self.assertEqual(result['countsByKind']['error'],9)
++        self.assertEqual(sum(row['count'] for row in result['topErrors']),7)
++        self.assertEqual(result['whoop']['consecutiveFailures'],6)
++        self.assertEqual(sum(row['count'] for row in result['whoop']['authFailures']),6)
++
++    def test_all_pending_and_legacy_rows_have_defined_behavior(self):
++        clock=dt.datetime(2026,11,22,12,3,17,tzinfo=dt.timezone.utc)
++        with mock.patch.object(log,'utcnow',return_value=clock):
++            props={'reason':'refresh_rejected','reauthPending':True}
++            log.emit('whoop-sync','sync.run',kind='error',ok=False,tag='reauth_needed',props=props)
++            result=log.rollup('2026-11-22')
++            self.assertEqual(result['whoop']['pendingReauthRuns'],1)
++            self.assertEqual(result['whoop']['reauthPendingSinceDay'],'2026-11-22')
++            self.assertEqual(result['errorCount'],0)
++            self.assertIsNone(result['errorRate'])
++            self.assertEqual(result['topErrors'],[])
++            log.emit('whoop-sync','sync.run',kind='error',ok=False,tag='reauth_needed',props={'reason':'refresh_rejected'})
++            result=log.rollup('2026-11-22')
++            self.assertEqual(result['errorCount'],1)
++            self.assertEqual(result['whoop']['pendingReauthRuns'],1)
++
++    def test_logging_fields_reject_secrets_and_invalid_shapes(self):
++        for value in ('PrivateToken',True,-1,float('nan'),float('inf'),{},[]):
++            clean=log._props('sync.run',{'reminderSent':value,'hoursSinceLastSuccess':value,
++                                      'reauthPendingSinceDay':value,'secret':'PrivateToken'})
++            self.assertNotIn('hoursSinceLastSuccess',clean)
++            self.assertNotIn('reauthPendingSinceDay',clean)
++            self.assertNotIn('Private',json.dumps(clean))
++        for day in ('2026-11-21','2026-11-21Z','2026-02-30','2026-1-1'):
++            clean=log._props('sync.run',{'reauthPendingSinceDay':day})
++            self.assertEqual('reauthPendingSinceDay' in clean,day=='2026-11-21')

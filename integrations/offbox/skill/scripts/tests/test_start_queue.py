@@ -30,8 +30,17 @@ class AllocationWaitTests(Isolated):
             'import fcntl,sys; f=open(sys.argv[1],"a+"); fcntl.flock(f,fcntl.LOCK_EX); '
             'print("held",flush=True); sys.stdin.read()', str(path)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        self.addCleanup(child.wait)
-        self.addCleanup(child.stdout.close)
+        def reap_child():
+            if not child.stdin.closed:
+                child.stdin.close()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+            finally:
+                child.stdout.close()
+        self.addCleanup(reap_child)
         self.assertEqual(child.stdout.readline().strip(), 'held')
         real = allocation.file_lock
         attempts = []
@@ -330,6 +339,21 @@ class ResumeQueueTests(Isolated):
             resume.assert_not_called()
             self.assertIsNotNone(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:cold'").fetchone())
 
+    def test_unanswered_stopping_message_is_once_per_queued_run(self):
+        self.box('cold', 'stopped', member=True)
+        self.marker('cold', 99999999)
+        for attempt in range(2):
+            before = len(self.err.getvalue())
+            with patch.dict(os.environ, {'OFFBOX_POOL_SIZE':'1'}), \
+                    patch.object(api, 'get', return_value={'state':'stopping','type':'large'}), \
+                    patch.object(api, 'resume') as resume:
+                with self.assertRaises(pool.PoolBusyError):
+                    self.take()
+            resume.assert_not_called()
+            text = self.err.getvalue()[before:]
+            self.assertEqual(text.count('cold is stopping; skipping it for now'), 1)
+            self.assertNotIn('is stopping; waiting for it to settle', text)
+
     def test_outer_reconcile_box_lock_is_busy_not_90(self):
         self.box('cold','stopped',member=True)
         self.box('peer',member=True)
@@ -471,8 +495,9 @@ class ResumeQueueTests(Isolated):
             def sleep(s):
                 self.clock.t += s
                 if phase[0]=='stopping':
-                    self.marker('cold',os.getpid())
-                    phase[0]='archived'
+                    if self.clock.t >= 1006:
+                        self.marker('cold',os.getpid())
+                        phase[0]='archived'
                 else:
                     allocation.clear_resume(self.con,'cold')
                     phase[0]='running'
@@ -480,7 +505,7 @@ class ResumeQueueTests(Isolated):
                     patch.object(lease,'_bring_up'),patch.object(lease,'ensure_ttl'),patch.object(api,'resume') as resume:
                 self.assertEqual(self.take()['size'],'xlarge')
             resume.assert_not_called()
-        self.assertIn('is stopping; skipping',self.err.getvalue())
+        self.assertEqual(self.err.getvalue().count('cold is stopping; skipping it for now'), 1)
 
     def test_resize_intent_survives_grower_skip_and_smaller_caller(self):
         self.box('grow','running',member=True)
@@ -737,6 +762,8 @@ class ResumeQueueTests(Isolated):
         send.assert_called_once()
 
     def test_pending_grow_precedes_ssh_shortcut_for_smaller_callers(self):
+        token = lease.offbox_protection.CALLER.set({'actor': 'test:pending-grow', 'holder': None})
+        self.addCleanup(lease.offbox_protection.CALLER.reset, token)
         self.box('grow','running',member=True)
         self.con.execute("INSERT INTO kv VALUES ('resize_size:grow','xlarge',0)")
         self.con.commit()

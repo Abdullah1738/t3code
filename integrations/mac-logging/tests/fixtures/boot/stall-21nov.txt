@@ -1,0 +1,14 @@
+Date/Time:        2026-11-21 14:11:56.760 +0400
+End time:         2026-11-21 14:11:57.763 +0400
+OS Version:       macOS 27.0.1 (Build 26A434)
+Architecture:     arm64e
+Report Version:   73
+
+Data Source:      Stackshots
+Shared Cache:     C284A291-B68B-3D0D-A1A0-3F866F87EFDC slid base address 0x1938dc000 (System Primary)
+Shared Cache:     7898DD48-6D8C-339E-BCD3-1FE6FBA0B485 slid base address 0x19a2c8000 (DriverKit)
+Shared Cache:     C284A291-B68B-3D0D-A1A0-3F866F87EFDC slid base address 0x185c38000
+
+Event:            shutdown stall
+Duration:         1.00s (sampling started after 2 seconds)
+Steps:            101 (10ms sampling interval)

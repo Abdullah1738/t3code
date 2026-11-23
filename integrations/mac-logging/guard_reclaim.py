@@ -24,6 +24,7 @@ NEVER = ['offbox wait/_bg-queue holders and descendants', 'Robob app/server',
 LOG_KEYS = set('cpuPct cpuBasis passId step result reason trigger phase onset ts durationS conditions evidence pid ppid start comm args family ancestors rssBeforeMb rssAfterMb freedRssMb janitor gui renice before after swapUsedBytes swapTotalBytes pressureLevel workerStarted workerDelivered threadId partial errors observedAt completedAt niceBefore niceAfter count returncode'.split())
 LOG_KEYS.update('stages stage identityRead identityRecheck getpriority setpriority readBack taskpolicy same errno rc stderr strerror'.split())
 LOG_KEYS.update(('report', 'problems', 'phaseMs'))
+LOG_KEYS.update(('protectedBy', 'protectedAncestor'))
 
 
 def log_fields(value, depth=0):
@@ -208,8 +209,8 @@ def protection(p, rows, guard):
         return 'system-or-foreign-user'
     if not p.get('args') or not p.get('comm') or not p.get('start'):
         return 'unknown-identity'
-    # Builds below a provider are eligible; providers themselves and shell
-    # session wrappers stay protected. Never propagate protection to all builds.
+    # Provider ancestry alone does not protect builds; providers themselves and
+    # shell session wrappers stay protected.
     if any('/mac-logging/' in arg and Path(arg).name in ('host.py', 'mac_guard.py', 'guard_reclaim.py') for arg in words(p)):
         return 'guard-or-host-sampler'
     if guard(p, rows):

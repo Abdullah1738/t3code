@@ -60,7 +60,7 @@ class TriageLoggingTests(unittest.TestCase):
                     _sampled.add(row['name'])
 
     def rows(self, name=None):
-        rows = [json.loads(line) for path in self.logs.glob('*.ndjson') for line in path.read_text().splitlines()]
+        rows = [t.tool_log.__globals__["expand_helper"](json.loads(line)) for path in self.logs.glob('*.ndjson') for line in path.read_text().splitlines()]
         return [row for row in rows if name is None or row['name'] == name]
 
     def decisions(self, item_id):

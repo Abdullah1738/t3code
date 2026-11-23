@@ -2,7 +2,13 @@
 
 Source for the parked overload watchdog (Watchers #109). Nothing in this package
 loads a LaunchAgent. `install.zsh` writes the installed files and plist and creates
-the disabled marker. The standing restart authority expires **23 Nov 2026, 00:00 UTC**.
+the disabled marker. The watchdog's own checks stop at `EXPIRES`, currently
+**23 Nov 2026, 00:00 UTC**. `status` reports this as `expiresScope: "check"`.
+
+`restart [stamp]` serves callers with their own restart authority, including
+mac-guard under Mac #91. It remains available past `EXPIRES` and keeps every
+other limit. Its arguments, alphanumeric stamp, detached tmux launch on socket
+`restart` / session `robob-restart`, logs and result files are unchanged.
 
 ## Activation, in order
 
@@ -45,7 +51,16 @@ worker crash, exception or supervisor TERM/INT/HUP. It never waits indefinitely
 for a killed process. Readiness logs a start and outcome for each attempt; a
 deadline also writes an outcome from the parent. The usual 15-minute readiness
 window, two-hour cooldown and minimum uptime, build/install/restart exclusions,
-disabled marker, expiry and both overload rules remain.
+disabled marker and both overload rules remain. Expiry stops only the watchdog's
+own checks, including their automatic restart triggers.
+
+Install exclusions also inspect every pane on tmux socket `qf-install` in sessions
+matching `^install\d*$`. A live pane holds while its command is not an idle shell
+(`zsh`, `-zsh`, `bash`, `sh`, `login`), or its session was active within 30 minutes.
+Old idle shells and dead panes do not hold forever. Exit 1, `no server running`
+or `error connecting` establishes absence; other probe failures hold. Session
+holds keep reason `restart-or-install-session` and log `detail` with the matching
+socket/session, command and idle age, or the probe failure.
 
 The supervisor alone writes one `restart.done`/`restart.failed` per cycle stamp.
 It then retries the result notice up to three times, with the same Telegram key
@@ -68,7 +83,9 @@ without t3ctl's detached helper, so a supervisor kill covers the entire probe.
 
 All path overrides use the `ROBOB_OVERLOAD_` prefix: `HOME` (installed source),
 `STATE`, `LOG`, `APP`, `USERDATA`, `SSD_PROBE`, `MAC_MARKER`, `HOLD`, `HOLD_CLI`,
-`NODE`, `TMUX`, `BUN`, `TELEGRAM`. Installer-only `PLIST_DIR` changes the output
+`NODE`, `TMUX`, `BUN`, `TELEGRAM`, `QF_SOCKET`, `QF_SESSION_RE`, `QF_IDLE_SEC`.
+The QF overrides default to `qf-install`, `^install\d*$` and 1800 seconds.
+Installer-only `PLIST_DIR` changes the output
 directory. `DEADLINE` defaults to 1500 seconds, `PROBE_TIMEOUT` to 8,
 `PROBE_SLOW` to 4, `NOTIFY_TIMEOUT` to 20 and `NOTIFY_DELAY` to 30. `DRY=1`
 suppresses quit/hold/open/Telegram. Never redirect supervisor storage to the SSD.

@@ -17,8 +17,8 @@ import uuid
 
 from host import Sampler
 from toollog import directory, emit
-from causes import launchctl_info
-from observer import FIELDS, Timings, clock_sample, gap, launchctl_print, measured, phase
+from causes import BYTE_PHASES, RESOURCE_FIELDS, SUBSTEPS, gap_info, launchctl_info
+from observer import FIELDS, Timings, clock_sample, gap, launchctl_print, measured, phase, progress_clock
 
 LABEL = 'com.abdullah.9router-fork'
 FRESH_MS = 300000
@@ -46,7 +46,20 @@ class PollChild:
         self.started = time.monotonic()
         self.wall_start = time.time() * 1000
         self.phase, self.pending = 'other', b''
-        self.reader, writer = os.pipe()
+        self.progress_started = self.phase_started = progress_clock()
+        self.reported_start = None
+        self.completed = {}
+        self.discarding = False
+        # Darwin may shrink pipes to 512 bytes under pressure. Buffered local
+        # datagrams preserve atomic updates between guard checks;
+        # old children still write to the inherited FD with os.write.
+        reader_socket, writer_socket = socket.socketpair(type=socket.SOCK_DGRAM)
+        try:
+            writer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            reader_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        except OSError:
+            pass
+        self.reader, writer = reader_socket.detach(), writer_socket.detach()
         os.set_blocking(self.reader, False)
         os.set_blocking(writer, False)
         try:
@@ -64,18 +77,100 @@ class PollChild:
             os.close(self.reader)
             self.reader = None
 
+    def progress_line(self, line):
+        if not line.startswith(b'='):
+            name = line.decode('ascii', errors='replace')
+            self.phase = name if name in (*FIELDS, 'other') else 'other'
+            self.phase_started = (self.reported_start[1] if self.reported_start and self.reported_start[0] == name
+                                  else progress_clock())
+            self.reported_start = None
+            return
+        try:
+            data = json.loads(line[1:])
+            if not isinstance(data, dict):
+                return
+            name, step = data.get('p'), data.get('s')
+            if set(data) == {'p', 'at'}:
+                at = data['at']
+                if (isinstance(name, str) and name in (*FIELDS, 'other', 'none')
+                        and type(at) in (int, float) and 0 <= at <= 2**53 - 1
+                        and self.progress_started <= at / 1000 <= progress_clock()):
+                    self.reported_start = (name, at / 1000)
+                return
+            if not isinstance(name, str) or name not in FIELDS:
+                return
+            fields = {'ms': 'Ms', 'cpu': 'CpuMs'}
+            if step is not None:
+                if name not in BYTE_PHASES or not isinstance(step, str) or step not in SUBSTEPS:
+                    return
+            else:
+                fields.update(zip(('ib', 'mf', 'iv', 'v'), RESOURCE_FIELDS))
+            if name in BYTE_PHASES:
+                fields.update(bh='BytesHashed', bp='BytesParsed')
+            if set(data) != {'p', *fields, *({'s'} if step is not None else set())}:
+                return
+            values = {}
+            for key, suffix in fields.items():
+                value = data[key]
+                # Limit numeric width as well as retained names and pipe bytes.
+                if type(value) not in (int, float) or not 0 <= value <= 2**53 - 1:
+                    return
+                if suffix not in ('Ms', 'CpuMs') and type(value) is not int:
+                    return
+                field = FIELDS[name][:-2] + (step or '') + suffix
+                if suffix.startswith('Bytes'):
+                    field = FIELDS[name][:-2] + suffix
+                values[field] = round(value, 3) if type(value) is float else value
+            for key, value in values.items():
+                self.completed[key] = max(self.completed.get(key, 0), value)
+        except (ValueError, TypeError, RecursionError):
+            pass
+
+    def drain(self):
+        # A noisy/broken child cannot monopolize the listener guard.
+        remaining = 262144
+        while remaining:
+            try:
+                chunk = os.read(self.reader, min(remaining, 65536))
+            except OSError:
+                # Darwin datagrams report ECONNRESET once the child closes.
+                # Progress is diagnostic; a closed FD must not mask wait4.
+                return
+            if not chunk:
+                return
+            remaining -= len(chunk)
+            lines = (self.pending + chunk).split(b'\n')
+            self.pending = lines.pop()
+            for line in lines:
+                if not self.discarding and len(line) <= 1024:
+                    self.progress_line(line)
+                self.discarding = False
+            if len(self.pending) > 1024:
+                self.pending = b''
+                self.discarding = True
+
+    def timeout_props(self, usage, elapsed):
+        cpu_ms = (usage.ru_utime + usage.ru_stime) * 1000
+        props = dict(self.completed, pid=self.process.pid, phase=self.phase, wallMs=elapsed * 1000,
+                     cpuMs=cpu_ms, startedAtMs=self.wall_start, finishedAtMs=time.time() * 1000,
+                     activePhaseMs=max(0, (progress_clock() - self.phase_started) * 1000))
+        props['activePhaseCpuMs'] = max(0, cpu_ms - sum(self.completed.get(field[:-2] + 'CpuMs', 0)
+                                                       for field in FIELDS.values()))
+        for suffix, attribute in RESOURCE_FIELDS.items():
+            total = max(0, getattr(usage, attribute))
+            props['child' + suffix] = total
+            props['activePhase' + suffix] = max(0, total - sum(self.completed.get(field[:-2] + suffix, 0)
+                                                              for field in FIELDS.values()))
+        props.update(gap_info(props), phase=self.phase)
+        at_ms = time.time() * 1000
+        props.update(host=Sampler()(), hostAtMs=at_ms)
+        return props
+
     def check(self):
         if self.process.poll() is not None:
             self.close()
             return True
-        try:
-            while chunk := os.read(self.reader, 65536):
-                self.pending += chunk
-                while b'\n' in self.pending:
-                    name, self.pending = self.pending.split(b'\n', 1)
-                    self.phase = name.decode('ascii') if name.decode('ascii') in (*FIELDS, 'other') else 'other'
-        except BlockingIOError:
-            pass
+        self.drain()
         elapsed = time.monotonic() - self.started
         if elapsed < POLL_DEADLINE_SECONDS:
             return False
@@ -87,14 +182,14 @@ class PollChild:
             return True
         _, status, usage = os.wait4(self.process.pid, 0)
         self.process.returncode = os.waitstatus_to_exitcode(status)
+        # Include completions written between the last check and SIGKILL.
+        self.drain()
         self.close()
         if self.process.returncode != -signal.SIGKILL:
             return True
-        cpu_ms = (usage.ru_utime + usage.ru_stime) * 1000
         emit('poller', 'poll.timeout', kind='error', ok=False, durationMs=elapsed * 1000,
              error=dict(tag='tick_deadline'),
-             props=dict(pid=self.process.pid, phase=self.phase, wallMs=elapsed * 1000, cpuMs=cpu_ms,
-                        startedAtMs=self.wall_start, finishedAtMs=time.time() * 1000))
+             props=self.timeout_props(usage, elapsed))
         return True
 
     def stop(self):

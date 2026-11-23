@@ -1,8 +1,9 @@
 #!/usr/bin/python3
-"""Bounded overload restart watchdog. Installed disabled; expires 23 Nov 2026.
+"""Bounded overload restart watchdog. Installed disabled; checks expire 23 Nov 2026.
 
 check: five-minute health sampler and detached tmux trigger.
-restart: external supervisor; owns the hold, deadline and terminal result.
+restart [stamp]: serves callers with their own authority (mac-guard, Mac #91).
+    Owns the hold, deadline and terminal result; keeps every limit except check expiry.
 probe: read-only startup dependency checks, with no hold, quit or notification.
 status: read-only internal state and listener identity.
 """
@@ -12,6 +13,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import uuid
 import shlex
@@ -34,6 +36,9 @@ MAC_SSD_MARKER = Path(os.environ.get("ROBOB_OVERLOAD_MAC_MARKER", HOME / ".local
 HOLD_CLI = os.environ.get("ROBOB_OVERLOAD_HOLD_CLI", str(HOME / ".local/bin/robob-install-hold"))
 OPEN_CLEAN = HERE / "open-robob-clean.zsh"
 TMUX = os.environ.get("ROBOB_OVERLOAD_TMUX", "/opt/homebrew/bin/tmux")
+QF_SOCKET = os.environ.get("ROBOB_OVERLOAD_QF_SOCKET", "qf-install")
+QF_SESSION_RE = re.compile(os.environ.get("ROBOB_OVERLOAD_QF_SESSION_RE", r"^install\d*$"))
+QF_IDLE_SEC = float(os.environ.get("ROBOB_OVERLOAD_QF_IDLE_SEC", "1800"))
 NODE = os.environ.get("ROBOB_OVERLOAD_NODE", str(HOME / ".local/bin/node"))
 HEALTH = HERE / "health-probe.mjs"
 BUN = os.environ.get("ROBOB_OVERLOAD_BUN", str(HOME / ".bun/bin/bun"))
@@ -51,7 +56,7 @@ MIN_GAP = 2 * 3600        # owner: max once per 2 hours
 NEED = 4                  # consecutive stalled checks (5 min apart: 15+ min)
 LONG = 8                  # rule 2 window: about 40 min with no healthy check
 MAX_STEP = 420            # checks further apart than this are not consecutive
-EXPIRES = "2026-11-23T00:00:00+00:00"   # stops by itself; the tracker extends or removes it
+EXPIRES = "2026-11-23T00:00:00+00:00"   # check stops by itself; the tracker extends or removes it
 BY = "overload-restart"
 DRY = os.environ.get("ROBOB_OVERLOAD_DRY") == "1"
 
@@ -251,12 +256,50 @@ def hold_live():
     return hold.get("by", "?") if alive and fresh else None
 
 
-def tmux_session(socket, name):
+def tmux_session(socket, name, details=None):
     try:
         rc = run([TMUX, "-L", socket, "has-session", "-t", name], 10).returncode
-        return rc != 1  # Only the documented "no session" exit establishes absence.
-    except (OSError, subprocess.SubprocessError):
-        return True
+        if rc == 1:  # Only the documented "no session" exit establishes absence.
+            return False
+        detail = f"{socket}/{name}" if rc == 0 else f"{socket}/{name} probe-failed rc={rc}"
+    except (OSError, subprocess.SubprocessError) as error:
+        detail = f"{socket}/{name} probe-failed {type(error).__name__}"
+    if details is not None:
+        details["detail"] = detail
+    return True
+
+
+def qf_install_active(details=None):
+    """Hold on active install panes or failed probes, but let old idle shells linger."""
+    try:
+        result = run([TMUX, "-L", QF_SOCKET, "list-panes", "-a", "-F",
+                      "#{session_name}\t#{pane_dead}\t#{pane_current_command}\t#{session_activity}"], 10)
+        output = (result.stdout + result.stderr).lower()
+        if result.returncode == 1 or "no server running" in output or "error connecting" in output:
+            return False
+        if result.returncode:
+            detail = f"{QF_SOCKET} probe-failed rc={result.returncode}"
+        else:
+            for line in result.stdout.splitlines():
+                fields = line.split("\t")
+                if not QF_SESSION_RE.fullmatch(fields[0]):
+                    continue
+                if len(fields) != 4 or fields[1] not in ("0", "1") or not fields[2]:
+                    raise ValueError("unreadable pane")
+                name, dead, command, activity = fields
+                if dead == "1":
+                    continue
+                idle = max(0, time.time() - int(activity))
+                if command not in ("zsh", "-zsh", "bash", "sh", "login") or idle <= QF_IDLE_SEC:
+                    detail = f"{QF_SOCKET}/{name} cmd={command} idle={idle:.0f}s"
+                    break
+            else:
+                return False
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        detail = f"{QF_SOCKET} probe-failed {type(error).__name__}"
+    if details is not None:
+        details["detail"] = detail
+    return True
 
 
 def building():
@@ -349,15 +392,15 @@ def attention(reason):
            "robob-overload-restart:held:" + reason)
 
 
-def limits(state, own_session=False, own_hold=False):
+def limits(state, own_session=False, own_hold=False, details=None):
     now = time.time()
     if (STATE_DIR / "disabled").exists():
         return "disabled"
-    if now >= datetime.datetime.fromisoformat(EXPIRES).timestamp():
-        return "expired"
     if not own_hold and hold_live():
         return "live-install-hold"
-    if tmux_session("install", "robob-install") or (not own_session and tmux_session("restart", "robob-restart")):
+    if (tmux_session("install", "robob-install", details)
+            or (not own_session and tmux_session("restart", "robob-restart", details))
+            or qf_install_active(details)):
         return "restart-or-install-session"
     if building():
         return "building"
@@ -398,7 +441,8 @@ def check_locked():
     if now >= datetime.datetime.fromisoformat(EXPIRES).timestamp():
         log("expired", note="past EXPIRES; doing nothing")
         return 0
-    skip = limits(state)
+    details = {}
+    skip = limits(state, details=details)
     if skip is None and app_pid(processes()) is None:
         skip = "Robob is not running (the guard reopens it)"
     safety = preflight() if skip is None else None
@@ -407,7 +451,7 @@ def check_locked():
     if skip or safety:
         state["checks"] = []
         state["lastSkip"] = dict(at=iso(now), why=skip or safety)
-        log("check", stages={}, rule=None, held=skip or safety)
+        log("check", stages={}, rule=None, held=skip or safety, **details)
         write_json(STATE, state)
         return 0
     verdict, summary, report = deep_health()
@@ -503,10 +547,11 @@ def restart_worker():
     owned = tree(table, root)
     if os.getpid() in owned or os.getppid() in owned:
         return failed("inside-robob-tree")
-    reason = limits({}, own_session=True, own_hold=True) or preflight()
+    details = {}
+    reason = limits({}, own_session=True, own_hold=True, details=details) or preflight()
     if reason:
-        log("held", reason=reason)
-        return failed(reason)
+        log("held", reason=reason, **details)
+        return dict(failed(reason), **details)
     log("restart.tree", appPid=root, processes=len(owned))
     quit_at = time.time()
     try:
@@ -655,13 +700,14 @@ def supervise(stamp):
         pending = state.get("lastRestart") or {}
         # check reserves the cooldown before tmux. Only that exact cycle can consume it.
         reserved = pending.get("stamp") == stamp and not pending.get("consumed")
-        reason = limits(dict(state, lastRestartAt=0) if reserved else state, own_session=reserved)
+        details = {}
+        reason = limits(dict(state, lastRestartAt=0) if reserved else state, own_session=reserved, details=details)
         if not reason:
             reason = preflight()
             if reason:
                 log("held", reason=reason)
         if reason:
-            outcome = failed(reason)
+            outcome = dict(failed(reason), **details)
         elif DRY:
             outcome = failed("dry-run: nothing quit")
         else:
@@ -749,7 +795,7 @@ def supervise(stamp):
 def status():
     state = read_json(STATE, {})
     pid, started = server_started()
-    print(json.dumps(dict(disabled=(STATE_DIR / "disabled").exists(), expires=EXPIRES, serverPid=pid,
+    print(json.dumps(dict(disabled=(STATE_DIR / "disabled").exists(), expires=EXPIRES, expiresScope="check", serverPid=pid,
                           serverUptimeMin=round((time.time() - started) / 60) if started else None,
                           lastRestart=state.get("lastRestart"), lastSkip=state.get("lastSkip"),
                           checks=[dict(at=iso(c["at"]), verdict=c["verdict"]) for c in state.get("checks", [])]), indent=1))

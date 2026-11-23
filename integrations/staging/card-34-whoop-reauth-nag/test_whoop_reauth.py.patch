@@ -1,0 +1,11 @@
+--- a/test_whoop_reauth.py
++++ b/test_whoop_reauth.py
+@@ -236,6 +236,8 @@
+         self.patch('kc_set', side_effect=AssertionError('real Keychain must not be reached'))
+         self.patch('client_creds', return_value=('PrivateClient', 'PrivateSecret'))
+         self.patch('db', side_effect=AssertionError('DB must not be reached'))
++        if not getattr(self, 'real_notice', False):
++            self.patch('notify_reauth', return_value=True)
+         self.patch('_sync', side_effect=lambda *args: self.w.valid_access_token())
+         http = mock.patch.object(self.w.urllib.request, 'urlopen',
+                                  side_effect=lambda *args, **kw: self.http_error_raised())

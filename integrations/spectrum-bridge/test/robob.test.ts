@@ -44,7 +44,7 @@ afterEach(async () => {
 });
 
 /** A small in-memory stand-in for /api/ardud/control. */
-function fakeControl() {
+function fakeControl(ownedServers = servers) {
   const threads = new Map<string, Thread>();
   const natives = new Map<string, string>();
   const calls: Call[] = [];
@@ -107,12 +107,13 @@ function fakeControl() {
       if (thread && parts[2] === "messages") {
         const call = calls.at(-1)!;
         const since = searchParams.has("since") ? Number(searchParams.get("since")) : -Infinity;
-        const response = ok({ threadId: thread.threadId, state: state(thread), status: thread.runs.at(-1)?.status ?? "idle", runId: thread.runs.at(-1)?.runId ?? null,
-          messages: thread.messages.filter(message => message.role !== "system" && Date.parse(message.updatedAt ?? "") > since)
-            .sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? "") || a.messageId.localeCompare(b.messageId)) });
-        const payload = await response.clone().text();
-        Object.assign(call, { rows: JSON.parse(payload).messages.length, bytes: Buffer.byteLength(payload) });
-        return response;
+        const messages = thread.messages.filter(message => message.role !== "system" && Date.parse(message.updatedAt ?? "") > since)
+          .map(message => ({ message, created: Date.parse(message.createdAt ?? "") }))
+          .sort((a, b) => a.created - b.created || a.message.messageId.localeCompare(b.message.messageId))
+          .map(({ message }) => message);
+        const payload = JSON.stringify({ ok: true, threadId: thread.threadId, state: state(thread), status: thread.runs.at(-1)?.status ?? "idle", runId: thread.runs.at(-1)?.runId ?? null, messages });
+        Object.assign(call, { rows: messages.length, bytes: Buffer.byteLength(payload) });
+        return new Response(payload, { status: 200, headers: { "content-type": "application/json;charset=utf-8" } });
       }
       if (thread && parts[2] === "runs" && parts[4] === "evidence") {
         const runId = parts[3]!;
@@ -153,7 +154,7 @@ function fakeControl() {
       }
       return notFound();
     } });
-    servers.push(server);
+    ownedServers.push(server);
     return server.url.origin;
   })();
   /** Finishes the newest run with an assistant reply. */
@@ -170,6 +171,28 @@ function fakeControl() {
     finishes: ids => { lookups.push([...ids]); return new Map(ids.flatMap(id => finishes.has(id) ? [[id, finishes.get(id)!] as const] : [])); } });
   return { url, threads, natives, calls, projects, flags, reply, backend, finishes, lookups };
 }
+
+test("fake message reads preserve sort ties, JSON bytes and response metadata", async () => {
+  const control = fakeControl();
+  const chat = await control.backend().createChat();
+  const thread = control.threads.get(chat.id)!;
+  thread.messages = ["message-10", "message-2", "message-2", "message-1"].map((messageId, index) => ({
+    messageId, runId: null, role: index === 3 ? "system" : "assistant", streaming: false,
+    text: `café ☕ ${index}`, createdAt: index === 2 ? null : "2026-11-15T09:30:00Z", updatedAt: "2026-11-15T09:30:01Z",
+  }));
+  for (const since of [undefined, Date.parse("2026-11-15T09:30:00Z"), Date.parse("2026-11-15T09:30:01Z")]) {
+    const messages = thread.messages.filter(message => message.role !== "system" && Date.parse(message.updatedAt ?? "") > (since ?? -Infinity))
+      .sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? "") || a.messageId.localeCompare(b.messageId));
+    const expected = Response.json({ ok: true, threadId: chat.id, state: "idle", status: "idle", runId: null, messages });
+    const response = await fetch(`${control.url}/api/ardud/control/threads/${chat.id}/messages${since === undefined ? "" : `?since=${since}`}`, { headers: { authorization: "Bearer test-token" } });
+    expect(response.status).toBe(expected.status);
+    expect(response.headers.get("content-type")).toBe(expected.headers.get("content-type"));
+    const payload = await response.text();
+    expect(payload).toBe(await expected.text());
+    expect(control.calls.at(-1)).toMatchObject({ rows: messages.length, bytes: Buffer.byteLength(payload) });
+    thread.messages[0]!.createdAt = "2026-11-15T09:29:00Z";
+  }
+});
 
 test("backend switch defaults to OpenChamber and rejects unknown values", () => {
   expect(backendKind({}, {})).toBe("openchamber");
@@ -2107,6 +2130,7 @@ test("missing until, route change, merge conflict and ten-minute redaction resyn
 });
 
 // Replaying both HTTP histories can exceed Bun's five-second default under shared CPU load.
+// Default 5 s covers the 0.88 s median and 2.73 s max under single-core contention.
 test.each([100, 1_500].flatMap(historySize => ["idle", "active", "steer"].map(scenario => ({ historySize, scenario }))))(
   "60-second router budgets preserve completion timing ($historySize rows, $scenario)", async ({ historySize, scenario }) => {
   const start = Date.parse("2026-11-15T09:30:00Z");
@@ -2115,58 +2139,64 @@ test.each([100, 1_500].flatMap(historySize => ["idle", "active", "steer"].map(sc
     const results = [];
     for (const legacy of [true, false]) {
       setSystemTime(start);
-      const control = fakeControl();
+      const ownedServers: typeof servers = [];
+      const control = fakeControl(ownedServers);
       const backend = control.backend();
       if (legacy) {
         backend.messageReadScope = body => body();
         backend.client.messages = id => ControlClient.prototype.messages.call(backend.client, id);
       }
-      const store = new Store(":memory:"); stores.push(store);
-      const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } }, {
-        owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alert",
-        alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 5_000,
-      });
-      const chat = await backend.createChat();
-      const thread = control.threads.get(chat.id)!;
-      thread.driver = { instanceId: "codex", model: "test" };
-      await backend.prompt(chat.id, chat.directory, `msg_${"0".repeat(64)}`, "history");
-      for (let i = 0; i < historySize; i++) thread.messages.push({ messageId: `history-${i}`, role: "assistant", phase: "narration", text: "old text ".repeat(100),
-        runId: thread.runs[0]!.runId, streaming: false, createdAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString(), updatedAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString() });
-      thread.messages[0]!.createdAt = thread.messages[0]!.updatedAt = new Date(start - 120_000).toISOString();
-      thread.runs[0]!.status = "completed";
-      store.set("route", { ...chat, generation: 1 });
-      if (scenario !== "idle") {
-        store.acceptInbound("budget", { id: "budget", text: "hello", attachments: [], isAudioMessage: false, source: "typed", receivedAt: start });
-        await router.tick();
-        thread.messages.push({ messageId: "stream", role: "assistant", phase: "narration", text: "working", streaming: true,
-          runId: thread.runs.at(-1)!.runId, createdAt: new Date(start + 500).toISOString(), updatedAt: new Date(start + 500).toISOString() });
-      }
-      const startup = control.calls.filter(call => call.path.includes("/messages?"));
-      control.calls.length = 0;
-      const paths: Record<string, { messages: number; thread: number; evidence: number }> = {};
-      const collect = (path: string, from: number) => {
-        paths[path] ??= { messages: 0, thread: 0, evidence: 0 };
-        for (const call of control.calls.slice(from)) if (call.method === "GET") {
-          if (call.path.includes("/messages?")) paths[path]!.messages++;
-          else if (call.path.endsWith("/evidence")) paths[path]!.evidence++;
-          else if (/^\/threads\/[^/?]+$/.test(call.path)) paths[path]!.thread++;
+      const store = new Store(":memory:");
+      try {
+        const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } }, {
+          owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alert",
+          alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 5_000,
+        });
+        const chat = await backend.createChat();
+        const thread = control.threads.get(chat.id)!;
+        thread.driver = { instanceId: "codex", model: "test" };
+        await backend.prompt(chat.id, chat.directory, `msg_${"0".repeat(64)}`, "history");
+        for (let i = 0; i < historySize; i++) thread.messages.push({ messageId: `history-${i}`, role: "assistant", phase: "narration", text: "old text ".repeat(100),
+          runId: thread.runs[0]!.runId, streaming: false, createdAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString(), updatedAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString() });
+        thread.messages[0]!.createdAt = thread.messages[0]!.updatedAt = new Date(start - 120_000).toISOString();
+        thread.runs[0]!.status = "completed";
+        store.set("route", { ...chat, generation: 1 });
+        if (scenario !== "idle") {
+          store.acceptInbound("budget", { id: "budget", text: "hello", attachments: [], isAudioMessage: false, source: "typed", receivedAt: start });
+          await router.tick();
+          thread.messages.push({ messageId: "stream", role: "assistant", phase: "narration", text: "working", streaming: true,
+            runId: thread.runs.at(-1)!.runId, createdAt: new Date(start + 500).toISOString(), updatedAt: new Date(start + 500).toISOString() });
         }
-      };
-      let completedAt = 0;
-      for (let second = 1; second <= 60; second++) {
-        setSystemTime(start + second * 1_000);
-        const stream = thread.messages.find(message => message.messageId === "stream");
-        if (stream && second < 50) { stream.text += "."; stream.updatedAt = new Date().toISOString(); }
-        if (second === 30 && scenario === "steer") store.acceptInbound("budget-steer", { id: "budget-steer", text: "also this", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() });
-        if (second === 50 && scenario !== "idle") control.reply(chat.id, "done", "completed");
-        let from = control.calls.length; await router.checkCompletion(); collect("completion", from);
-        from = control.calls.length; await router.tick(); collect(second === 30 && scenario === "steer" ? "tick-steer" : "tick", from);
-        if (!completedAt && scenario !== "idle" && store.pendingOutbox().some(op => op.kind === "conversation" && op.text === "done")) completedAt = second;
+        const startup = control.calls.filter(call => call.path.includes("/messages?"));
+        control.calls.length = 0;
+        const paths: Record<string, { messages: number; thread: number; evidence: number }> = {};
+        const collect = (path: string, from: number) => {
+          paths[path] ??= { messages: 0, thread: 0, evidence: 0 };
+          for (const call of control.calls.slice(from)) if (call.method === "GET") {
+            if (call.path.includes("/messages?")) paths[path]!.messages++;
+            else if (call.path.endsWith("/evidence")) paths[path]!.evidence++;
+            else if (/^\/threads\/[^/?]+$/.test(call.path)) paths[path]!.thread++;
+          }
+        };
+        let completedAt = 0;
+        for (let second = 1; second <= 60; second++) {
+          setSystemTime(start + second * 1_000);
+          const stream = thread.messages.find(message => message.messageId === "stream");
+          if (stream && second < 50) { stream.text += "."; stream.updatedAt = new Date().toISOString(); }
+          if (second === 30 && scenario === "steer") store.acceptInbound("budget-steer", { id: "budget-steer", text: "also this", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() });
+          if (second === 50 && scenario !== "idle") control.reply(chat.id, "done", "completed");
+          let from = control.calls.length; await router.checkCompletion(); collect("completion", from);
+          from = control.calls.length; await router.tick(); collect(second === 30 && scenario === "steer" ? "tick-steer" : "tick", from);
+          if (!completedAt && scenario !== "idle" && store.pendingOutbox().some(op => op.kind === "conversation" && op.text === "done")) completedAt = second;
+        }
+        const reads = control.calls.filter(call => call.path.includes("/messages?"));
+        const full = reads.filter(call => !call.path.includes("since="));
+        results.push({ legacy, paths, gets: reads.length, full: full.length + startup.length, startupGets: startup.length, incremental: reads.length - full.length,
+          rows: reads.reduce((sum, call) => sum + (call.rows ?? 0), 0), bytes: reads.reduce((sum, call) => sum + (call.bytes ?? 0), 0), completedAt });
+      } finally {
+        await Promise.all(ownedServers.map(server => server.stop(true)));
+        store.db.close();
       }
-      const reads = control.calls.filter(call => call.path.includes("/messages?"));
-      const full = reads.filter(call => !call.path.includes("since="));
-      results.push({ legacy, paths, gets: reads.length, full: full.length + startup.length, startupGets: startup.length, incremental: reads.length - full.length,
-        rows: reads.reduce((sum, call) => sum + (call.rows ?? 0), 0), bytes: reads.reduce((sum, call) => sum + (call.bytes ?? 0), 0), completedAt });
     }
     const [before, after] = results;
     expect(after!.full).toBeLessThanOrEqual(before!.full * .1);
@@ -2177,7 +2207,7 @@ test.each([100, 1_500].flatMap(historySize => ["idle", "active", "steer"].map(sc
     table.push({ historySize, scenario, before, after });
     console.log("message-read-budget", JSON.stringify(table));
   } finally { setSystemTime(); }
-}, 30_000);
+});
 
 test("message read modes, full reasons and returned bytes survive the minute log aggregation", async () => {
   const root = mkdtempSync(join(tmpdir(), "message-reads-log-")); dirs.push(root);

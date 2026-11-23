@@ -20,7 +20,7 @@ copy_file() {
     install -m "$perm" "$src" "$dst"
   fi
 }
-for file in overload.py overload_io.py overload_notify.py host.py host_native.py host_signal.py spawn_sample.py spawn_schema.py logwindow.py toollog.py toollog.sh jobs.py collector.py memory.py deep_inventory.py homebrew.py rollup.py status.py cpu.py cpu_labels.py tailnet.py u_sample.py ssd_probe.py volume_crawls.py process_argv.py disk_budgets.py disk-budgets.json disk_low.py guard_reclaim.py mac_guard.py mac_guard_worker_prompt.md suspend_lease.py; do
+for file in boot.py boot_identity.py shutdown_evidence.py overload.py overload_io.py overload_notify.py host.py host_native.py host_signal.py spawn_sample.py spawn_schema.py logwindow.py toollog.py toollog.sh jobs.py collector.py memory.py deep_inventory.py homebrew.py rollup.py status.py cpu.py cpu_labels.py tailnet.py u_sample.py ssd_probe.py volume_crawls.py process_argv.py disk_budgets.py disk-budgets.json disk_low.py mac_guard.py mac_guard_worker_prompt.md guard_reclaim.py suspend_lease.py; do
   copy_file "$here/$file" "$HOME/.local/lib/mac-logging/$file" 600
 done
 # A plain executable wrapper keeps imports local to the installed helper directory.

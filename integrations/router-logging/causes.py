@@ -20,6 +20,8 @@ WAIT_FIELDS = {field[:-2] + suffix for field in PHASES.values() for suffix in RE
 WAIT_FIELDS.update(PHASES[name][:-2] + suffix for name in BYTE_PHASES for suffix in BYTE_FIELDS)
 SUBSTEP_FIELDS = {PHASES[name][:-2] + step + suffix
                   for name in BYTE_PHASES for step in SUBSTEPS for suffix in ('Ms', 'CpuMs')}
+TIMEOUT_FIELDS = {'activePhaseMs', 'activePhaseCpuMs'} | {
+    prefix + suffix for prefix in ('activePhase', 'child') for suffix in RESOURCE_FIELDS}
 
 
 def positive(value):
@@ -94,6 +96,15 @@ def launchctl_info(props, legacy=False):
 
 def gap_info(props, phase=None, duration_ms=None):
     props = props if isinstance(props, dict) else {}
+    active = props.get('phase')
+    if 'activePhaseMs' in props:
+        wall = props['activePhaseMs']
+        if isinstance(active, str) and active in PHASES and (positive(wall) or type(wall) in (int, float) and wall == 0):
+            counters = {PHASES[active][:-2] + suffix: props.get('activePhase' + suffix) for suffix in RESOURCE_FIELDS}
+            cause = phase_cause(active, wall, props.get('activePhaseCpuMs'), counters)
+            return dict(phase=active, phaseMs=wall, **evidence(cause, 'activePhaseMs', wall))
+        # Completed phases cannot name the active remainder of a killed child.
+        return dict(phase=active if active in ('other', 'none') else 'other', **unknown('active_phase_name_or_duration'))
     values = [(name, props.get(field)) for name, field in PHASES.items() if positive(props.get(field))]
     detail = {}
     if values:

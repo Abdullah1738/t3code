@@ -1014,9 +1014,12 @@ test("a rejected shared read retains its timeout class in every dependent failur
     entries: [{ sessionId: "ses_1", directory: "/Chats", title: "Deployment", state: "running", workRevision: 1, updatedAt: now }] };
   Object.assign(h.backend, { pendingRequests: async () => { throw { causeClass: "timeout" }; } });
   await h.attention.tick();
+  expect(logs.entries().filter(row => row.kind === "error").map(row => row.error?.tag)).toEqual(["tg.attention.requests", "tg.attention.directories", "tg.attention.pendingRequests"]);
+  logs.flushErrors();
   const failures = logs.entries().filter(row => row.kind === "error");
   expect(failures.map(row => row.error?.tag)).toEqual(["tg.attention.requests", "tg.attention.directories", "tg.attention.pendingRequests", "tg.attention.pendingRequests"]);
   expect(failures.every(row => row.props?.cause === "timeout")).toBe(true);
+  expect(failures.at(-1)?.props?.repeats).toBe(1);
 });
 
 
@@ -1031,8 +1034,11 @@ test("pendingRequests keeps socket detail through the control wrapper and shared
     globalThis.fetch = Object.assign(async () => { throw { code: "ConnectionClosed", message: "private-token" }; }, { preconnect: original.preconnect });
     await h.attention.tick();
   } finally { globalThis.fetch = original; }
+  expect(logs.entries().filter(row => row.error?.tag === "tg.attention.pendingRequests")).toHaveLength(1);
+  logs.flushErrors();
   const failures = logs.entries().filter(row => row.error?.tag === "tg.attention.pendingRequests");
   expect(failures).toHaveLength(2);
+  expect(failures.at(-1)?.props?.repeats).toBe(1);
   expect(failures.every(row => row.props?.cause === "socket_closed" && row.props.detail === "ConnectionClosed")).toBe(true);
   for (const part of ["private-thread-id", "/private-folder", "Private title", "private-token"]) expect(logs.text()).not.toContain(part);
 });

@@ -90,7 +90,7 @@ def resolve(harness, event, timeout=0.3):
     native = event.get("session_id")
     if not isinstance(native, str) or not native or len(native) > 200:
         return None
-    params = {"nativeId": native, "driver": "claudeAgent" if harness == "claude" else "codex"}
+    params = {"nativeId": native, "driver": {"claude": "claudeAgent", "antigravity": "antigravity"}.get(harness, "codex")}
     agent = event.get("agent_id")
     if harness == "claude" and agent:
         params["agentId"] = agent
@@ -264,7 +264,9 @@ def handle(harness, event):
         claim = None
         if name == "UserPromptSubmit":
             state = db.get(key)
-            eligible = bool(prompt.strip()) and not prompt.lstrip().startswith(SKIP_PREFIXES) and not event.get("agent_id") and (state["fresh"] or first_transcript(event))
+            # Robob runs this hook for Antigravity itself and flags the session's first prompt.
+            first = harness == "antigravity" and event.get("first_prompt") is True
+            eligible = bool(prompt.strip()) and not prompt.lstrip().startswith(SKIP_PREFIXES) and not event.get("agent_id") and (state["fresh"] or first or first_transcript(event))
             generation = db.claim_first(key, prompt, eligible)
             if generation is not None:
                 claim = ("first_prompt", "first", prompt)
@@ -348,7 +350,7 @@ def handle(harness, event):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--harness", choices=("claude", "codex"), required=True)
+    parser.add_argument("--harness", choices=("claude", "codex", "antigravity"), required=True)
     args = parser.parse_args()
     try:
         event = json.load(sys.stdin)

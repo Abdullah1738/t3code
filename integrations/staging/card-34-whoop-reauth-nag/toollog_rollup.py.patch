@@ -1,0 +1,15 @@
+--- a/toollog_rollup.py
++++ b/toollog_rollup.py
+@@ -23,7 +23,11 @@
+ include pagination, retry waits and any refresh within that fetch; refreshMs is
+ also totaled separately, so phases overlap. slowSyncs counts whoop-sync sync.run
+ rows with durationMs strictly over 15000, including failures, excluding cli.run.
+-Historical rows without diagnostics use null for the added fields.
++Quiet failed WHOOP refresh_rejected runs explicitly marked reauthPending=true count
++as pendingReauthRuns and do not contribute to errorCount/errorRate/topErrors.
++reauthPendingSinceDay is the earliest recorded pending day among those runs.
++Raw countsByKind, errorKindRate, authFailures and consecutiveFailures stay intact.
++Historical rows without the explicit pending marker remain errors.
+ Per-component lateRuns counts observed schedule gaps strictly over 1.25 times
+ the configured interval. lateRunsByHour uses the later run's UTC hour. No day
+ boundary or guessed schedule phase contributes. p95GapSeconds uses nearest-rank

@@ -6,6 +6,7 @@ export const LOOP_OPERATIONS = ["inbound.pending", "inbound.latency", "inbound.p
   "log.append", "log.scan", "log.sources", "log.counters"] as const;
 type OperationName = typeof LOOP_OPERATIONS[number];
 type Operation = { startedAt: number; endedAt: number };
+export type RuntimeSample = { loopLagMaxMs: number; loopLagP95Ms: number; cpuUserMs: number; cpuSystemMs: number; rssMb: number; loadAvg1: number };
 export type Stall = { stallMs: number; loadAvg1: number; freeMemoryBytes: number; rssBytes: number; operations: string };
 
 export function createLoopOperations(now = () => performance.now()) {
@@ -44,6 +45,7 @@ export function traceLoopOperation<T>(name: OperationName, work: () => T): T {
 
 /** A separate heartbeat avoids changing the callback histogram's sampling/reset semantics. */
 export function createLoopStallMonitor(emit: (stall: Stall) => void, options: {
+  sample?: (sample: RuntimeSample) => void; cpu?: () => NodeJS.CpuUsage; tick?: () => void;
   now?: () => number; operations?: ReturnType<typeof createLoopOperations>;
   host?: () => Omit<Stall, "stallMs" | "operations">;
 } = {}) {
@@ -51,6 +53,11 @@ export function createLoopStallMonitor(emit: (stall: Stall) => void, options: {
   const operations = options.operations ?? loopOperations;
   const host = options.host ?? (() => ({ loadAvg1: loadavg()[0]!, freeMemoryBytes: freemem(), rssBytes: process.memoryUsage.rss() }));
   let previous = now();
+  let minuteStart = previous;
+  const cpu = options.cpu ?? (() => process.cpuUsage());
+  let previousCpu = cpu();
+  let latestLag = 0;
+  const lags: number[] = [];
   let lastEmission = -Infinity;
   let timer: ReturnType<typeof setInterval> | undefined;
   function check() {
@@ -58,6 +65,23 @@ export function createLoopStallMonitor(emit: (stall: Stall) => void, options: {
     const start = previous;
     previous = at;
     const stallMs = at - start - 250;
+    latestLag = Math.max(0, stallMs);
+    lags.push(latestLag);
+    if (at - minuteStart >= 60_000) {
+      const usage = cpu();
+      const sorted = lags.sort((a, b) => a - b);
+      try {
+        const metadata = host();
+        options.sample?.({ loopLagMaxMs: sorted.at(-1) ?? 0, loopLagP95Ms: sorted[Math.ceil(sorted.length * .95) - 1] ?? 0,
+          cpuUserMs: Math.max(0, usage.user - previousCpu.user) / 1000,
+          cpuSystemMs: Math.max(0, usage.system - previousCpu.system) / 1000,
+          rssMb: metadata.rssBytes / 1024 / 1024, loadAvg1: metadata.loadAvg1 });
+        options.tick?.();
+      } catch { /* Sampling is best effort, including during shutdown. */ }
+      previousCpu = usage;
+      minuteStart = at;
+      lags.length = 0;
+    }
     if (stallMs <= 1_000 || at - lastEmission < 10_000) return;
     lastEmission = at;
     try { emit({ ...host(), stallMs, operations: operations.during(start, at) }); }
@@ -65,9 +89,13 @@ export function createLoopStallMonitor(emit: (stall: Stall) => void, options: {
   }
   return {
     check,
+    loopLag: () => latestLag,
     start() {
       if (timer) return;
       previous = now();
+      minuteStart = previous;
+      previousCpu = cpu();
+      lags.length = 0;
       timer = setInterval(check, 250);
       timer.unref();
     },
