@@ -137,6 +137,12 @@ class LoggingTests(unittest.TestCase):
         probes = patch.object(jobs, 'storage_probes', return_value={})
         probes.start()
         self.addCleanup(probes.stop)
+        snapshots = patch.object(jobs, 'backup_snapshot_age', return_value=(None, 'unavailable'))
+        self.snapshot_age = snapshots.start()
+        self.addCleanup(snapshots.stop)
+        status = patch.object(jobs, 'backup_status', return_value={})
+        status.start()
+        self.addCleanup(status.stop)
 
     def rows(self):
         return [json.loads(line) for p in sorted(self.logs.glob('*.ndjson')) for line in p.read_text().splitlines()]
@@ -246,6 +252,11 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(a['props']['snapshotAgeS'],1)
         self.assertNotIn('snapshotAgeS', b['props'])
         self.assertEqual(b['props']['resticExitCode'],3)
+        self.snapshot_age.return_value = (5, None)
+        with patch.object(jobs.time,'time',return_value=100):
+            jobs.backup_run('health',90,0,0,99,summary)
+        self.assertEqual(self.rows()[-1]['props']['snapshotAgeS'],5)
+        self.assertEqual(self.rows()[-1]['props']['lastGoodSnapshotSource'],'restic')
         self.assertNotIn('banned',str(self.rows()))
         self.assertNotIn('failed with password',str(self.rows()))
 
@@ -359,8 +370,9 @@ class LoggingTests(unittest.TestCase):
                     value['at']-=86400
             jobs.save_state('disk-inventory',state)
         value=[100]
+        expected=jobs.disk_throttle(['/usr/bin/du','-skl'])
         def run(cmd,**kwargs):
-            self.assertEqual(cmd[:2],['/usr/bin/du','-skl'])
+            self.assertEqual(cmd[:len(expected)],expected)
             return SimpleNamespace(returncode=0,stdout=str(value[0])+'\t'+cmd[-1])
         jobs.directory_inventory([cache,worktree],run)
         jobs.disk_sample(self.root,self.root,volumes=(self.root,self.root),paths=[])
