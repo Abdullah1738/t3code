@@ -117,8 +117,12 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       continue;
     }
     if (entry.name === "bridge-loop-stall") {
-      if (["stallMs", "loadAvg1", "freeMemoryBytes", "rssBytes"].includes(key)
+      if (["stallMs", "loadAvg1", "freeMemoryBytes", "rssBytes", "windowMs", "measuredMaxMs", "threadCpuMs", "offCpuMs"].includes(key)
         && typeof value === "number" && Number.isFinite(value) && value >= 0) { props[key] = value; continue; }
+      if (key === "operationMs" && typeof value === "string" && value.length <= 500 && value.split(",").every(item => {
+        const [name, ms, extra] = item.split(":");
+        return extra === undefined && LOOP_OPERATIONS.some(allowed => allowed === name) && /^\d{1,9}$/.test(ms ?? "");
+      })) { props[key] = value; continue; }
       if (key === "operations" && typeof value === "string" && value.length <= 500
         && (value === "" || value.split(",").every(name => LOOP_OPERATIONS.some(allowed => allowed === name)))) {
         props[key] = value; continue;

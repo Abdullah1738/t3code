@@ -1032,9 +1032,8 @@ export class Router {
           continue;
         }
         const parent = row.state === "batched" ? this.store.db.query<{ leader: string }, [string]>(
-          `SELECT substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
-            JOIN inbound ON inbound.id = substr(kv.key, 7)
-            WHERE kv.key GLOB 'batch:*' AND member.value = ? AND inbound.state IN ('pending', 'processing')`,
+          `SELECT batch_members.leader FROM batch_members JOIN inbound ON inbound.id = batch_members.leader
+            WHERE batch_members.member = ? AND inbound.state IN ('pending', 'processing') ORDER BY batch_members.leader LIMIT 1`,
         ).get(row.id)?.leader : undefined;
         // One sealed operation owns every member, including unsent siblings with later receipt times.
         if (!this.expireWakeBatch(parent ?? row.id)) this.failWake(row.id, stale ? "stale" : overdue ? "delivery_deadline" : "ambiguity_deadline");
@@ -1084,9 +1083,7 @@ export class Router {
       const { row, input, ageMs, action, leaderKind: kind } = due;
       const state = { ...input.unanswered };
       if (state.overdueAt !== undefined && !due.requeue && !due.alert) continue;
-      const parent = this.store.db.query<{ id: string }, [string]>(
-        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key GLOB 'batch:*' AND member.value = ? LIMIT 1",
-      ).get(row.id)?.id;
+      const parent = this.store.batchLeaders(row.id)[0];
       const retained = this.store.get<SteerAttempt>(`steer-attempt:${parent ?? row.id}`);
       const retryExhausted = !!this.store.get(`failed-retry-exhausted:${row.id}`) || !!(parent && this.store.get(`failed-retry-exhausted:${parent}`));
       if (due.requeue && !retryExhausted && !retained?.response && !retained?.sameMode && !retained?.reconcileOnly) {
@@ -1210,8 +1207,9 @@ export class Router {
     // Sealed membership changes on a seal, not on the one-second delivery clock.
     if (now - this.latencyParentsAt >= 60_000) {
       this.latencyParents = new Map(traceLoopOperation("inbound.parents", () => this.store.db.query<{ member: string; leader: string }, []>(
-        `SELECT member.value AS member, substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
-          JOIN inbound ON inbound.id = member.value WHERE kv.key GLOB 'batch:*' AND inbound.state = 'batched'`,
+        // Leader order keeps the previous last-key-wins choice for a member listed by several seals.
+        `SELECT batch_members.member, batch_members.leader FROM inbound JOIN batch_members ON batch_members.member = inbound.id
+          WHERE inbound.state = 'batched' ORDER BY batch_members.member, batch_members.leader`,
       ).all()).map(row => [row.member, row.leader]));
       this.latencyParentsAt = now;
     }
@@ -1598,7 +1596,7 @@ export class Router {
       if (at === undefined || now - at < 120_000) continue;
       const batch = this.store.get<NormalizedInbound | null>(`batch:${row.id}`);
       const parent = this.store.db.query<{ id: string }, [string]>(
-        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key LIKE 'batch:%' AND member.value = ? ORDER BY kv.rowid LIMIT 1",
+        "SELECT batch_members.leader AS id FROM batch_members JOIN kv ON kv.key = 'batch:' || batch_members.leader WHERE batch_members.member = ? ORDER BY kv.rowid LIMIT 1",
       ).get(row.id)?.id ?? row.id;
       const stillFailed = () => this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state === "failed";
       // landed() writes this receipt. A later failed run must never erase its proof of admission.
