@@ -14,8 +14,8 @@ export type LogEntry = {
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper", "meantFor"]);
-const numeric = new Set(["exitCode", "httpStatus", "timeoutMs", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays", "slotWaitMs", "slotQueueDepth", "slotActiveAtEnqueue", "startLateMs", "intervalMs", "depth", "oldestWaitMs", "active", "cap", "dueAt", "lateMs", "recentMinMs", "load", "elapsedMs"]);
-const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace", "loadMode", "sendDeferred"]);
+const numeric = new Set(["exitCode", "httpStatus", "timeoutMs", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays", "slotWaitMs", "slotQueueDepth", "slotActiveAtEnqueue", "startLateMs", "intervalMs", "depth", "oldestWaitMs", "active", "cap", "dueAt", "lateMs", "recentMinMs", "load", "elapsedMs", "staleMs"]);
+const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace", "loadMode", "sendDeferred", "starved"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
@@ -39,6 +39,8 @@ const values: Record<string, readonly string[]> = {
   confirmed: ["pending", "n/a"],
   operation: ["check", "pending"],
   lane: ["fast", "slow"],
+  slotPickReason: ["fifo", "urgent"],
+  lastOutcome: ["queued", "load timeout", "fail", "starved", "fire", "no_change"],
   lane_reason: ["fast", "fast:sticky", "fast:overdue", "slow:new", "slow:recent"],
   trigger: ["schedule", "trigger", "retry", "final"],
 };
@@ -244,7 +246,7 @@ function percentiles(samples: number[]) {
   return { p50: samples[Math.ceil(samples.length * .5) - 1] ?? null, p95: samples[Math.ceil(samples.length * .95) - 1] ?? null, max: samples.at(-1) ?? null };
 }
 function watcherStats() {
-  return { runs: 0, actualRuns: 0, intervals: [] as { at: number; ms: number }[], lates: [] as number[], fires: 0, outcomes: outcomes(), durations: [] as number[], queued: [] as number[], slotWaits: [] as number[], lateRuns: 0, failStreak: 0, longestFailStreak: 0, lastFailureTag: null as string | null };
+  return { runs: 0, starvedRuns: 0, loadModeRuns: 0, actualRuns: 0, intervals: [] as { at: number; ms: number }[], lates: [] as number[], fires: 0, outcomes: outcomes(), durations: [] as number[], queued: [] as number[], slotWaits: [] as number[], lateRuns: 0, failStreak: 0, longestFailStreak: 0, lastFailureTag: null as string | null };
 }
 function helperStats() {
   return { runs: 0, failures: 0, exitCodes: Object.create(null) as Record<string, number>, durations: [] as number[] };
@@ -391,6 +393,8 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
           const id = watcher ?? "unknown", stats = watchers.get(id) ?? watcherStats();
           watchers.set(id, stats);
           stats.runs++;
+          if (props.starved === true) stats.starvedRuns++;
+          if (props.loadMode === true) stats.loadModeRuns++;
           if (props.trigger === undefined || props.trigger === "schedule") stats.actualRuns++;
           if (milliseconds(props.lateMs)) stats.lates.push(props.lateMs);
           const outcome = props.outcome;
@@ -480,7 +484,7 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
     // Keep every known interval watcher visible even when it completed zero runs.
     // Legacy sources without cadence metadata retain the existing compact top 40.
     const byWatcher = Object.fromEntries([...watchers].sort(byRuns).filter(([, stats], i) => i < 40 || stats.intervals.length).map(([id, stats]) => [id, {
-      runs: stats.runs, outcomes: stats.outcomes, fires: stats.fires, durationMs: percentiles(stats.durations), queuedMs: { p95: percentiles(stats.queued).p95 },
+      runs: stats.runs, starvedRuns: stats.starvedRuns, loadModeRuns: stats.loadModeRuns, outcomes: stats.outcomes, fires: stats.fires, durationMs: percentiles(stats.durations), queuedMs: { p95: percentiles(stats.queued).p95 },
       ...cadenceStats(stats),
       longestFailStreak: stats.longestFailStreak, lastFailureTag: stats.lastFailureTag,
       slotWaitMs: { count: stats.slotWaits.length, total: stats.slotWaits.reduce((sum, ms) => sum + ms, 0), p95: percentiles(stats.slotWaits).p95 }, lateRuns: stats.lateRuns,

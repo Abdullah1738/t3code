@@ -606,10 +606,10 @@ test("slot telemetry measures four sleeping checks, names holders after 30s, and
   release[0]!(); release[1]!();
   await Promise.all(jobs.slice(0, 2));
   expect(timings).toEqual([
-    { slotWaitMs: 0, slotQueueDepth: 0, slotActiveAtEnqueue: 0, startLateMs: 0, slotLane: "slow" },
-    { slotWaitMs: 0, slotQueueDepth: 0, slotActiveAtEnqueue: 1, startLateMs: 0, slotLane: "slow" },
-    { slotWaitMs: 130_000, slotQueueDepth: 0, slotActiveAtEnqueue: 2, startLateMs: 130_000, slotLane: "slow" },
-    { slotWaitMs: 130_000, slotQueueDepth: 1, slotActiveAtEnqueue: 2, startLateMs: 130_000, slotLane: "slow" },
+    { slotWaitMs: 0, slotQueueDepth: 0, slotActiveAtEnqueue: 0, startLateMs: 0, slotLane: "slow", slotPickReason: "fifo" },
+    { slotWaitMs: 0, slotQueueDepth: 0, slotActiveAtEnqueue: 1, startLateMs: 0, slotLane: "slow", slotPickReason: "fifo" },
+    { slotWaitMs: 130_000, slotQueueDepth: 0, slotActiveAtEnqueue: 2, startLateMs: 130_000, slotLane: "slow", slotPickReason: "fifo" },
+    { slotWaitMs: 130_000, slotQueueDepth: 1, slotActiveAtEnqueue: 2, startLateMs: 130_000, slotLane: "slow", slotPickReason: "fifo" },
   ]);
   clock = 131_000;
   release[2]!(); release[3]!(); await Promise.all(jobs);

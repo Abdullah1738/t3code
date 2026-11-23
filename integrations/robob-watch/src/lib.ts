@@ -105,6 +105,7 @@ export type Watcher = {
   max_fires: number;
   /** Serialize with every other serial check and all wa usage (the WhatsApp TUI cannot be driven concurrently). */
   serial: boolean;
+  urgent?: boolean;
   paused: boolean;
   /** 0 keeps retrying with backoff; otherwise pause after this many failures (default 5). */
   max_consecutive_failures?: number;
@@ -158,6 +159,22 @@ export type State = {
   failure_alerted: boolean;
   load_timeouts?: number;
   load_timeout_since?: string;
+  urgent_retry_at?: number;
+  cadence?: {
+    since: number;
+    lastStart?: number;
+    lastEnd?: number;
+    lastCompleted?: number;
+    suspendedAt?: number;
+    suspendedUntil?: number;
+    suspendedMs?: number;
+    lastOutcome?: "fire" | "no_change" | "load timeout" | "fail" | "starved";
+    lastQueuedMs?: number;
+    staleAt?: number;
+    alerted?: boolean;
+    alertRetryAt?: number;
+    alertText?: string;
+  };
   failure_paused_at?: string;
   failure_probe_attempts?: number;
   failure_probe_next_at?: string;
@@ -551,6 +568,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (input.inflight_check !== undefined && (typeof input.inflight_check !== "string" || !input.inflight_check.trim())) errors.push("inflight_check must be a nonempty read-only reply check command");
   if (input.pending_check !== undefined && (typeof input.pending_check !== "string" || !input.pending_check.trim())) errors.push("pending_check must be a nonempty command");
   const interval = input.interval_s === undefined ? DEFAULT_INTERVAL : Number(input.interval_s);
+  if (input.urgent !== undefined && typeof input.urgent !== "boolean") errors.push("urgent must be a boolean");
   if (!Number.isInteger(interval) || interval < MIN_INTERVAL) errors.push(`interval_s must be an integer >= ${MIN_INTERVAL}`);
   const timeout = input.timeout_s;
   if (timeout !== undefined && (!Number.isInteger(timeout) || timeout < 1 || timeout > 600)) errors.push("timeout_s must be an integer from 1 to 600");
@@ -598,7 +616,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     context: String(input.context ?? "").trim(), expires_at: expires === null ? null : new Date(expires).toISOString(),
     // Only checks that drive the old whatscli TUI need the shared lock; whatsapp-new-message reads a DB now.
     max_fires: maxFires, serial: input.serial === true || /(^|[\s;|&(`$])wa\s+(tui|screen)\b/.test(input.check!),
-    paused: input.paused === true,
+    paused: input.paused === true, urgent: input.urgent === true,
     ...(input.inflight_check !== undefined ? { inflight_check: input.inflight_check.trim() } : {}),
     ...(input.pending_check !== undefined ? { pending_check: input.pending_check } : {}),
     ...(timeout !== undefined ? { timeout_s: timeout } : {}),

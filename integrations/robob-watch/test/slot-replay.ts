@@ -1,10 +1,11 @@
 import { CheckSlots, checkLane, checkClassification, recentCheckRuntimes, LoadMode, checkTimeout, LOAD_GRACE_MS, LOAD_HIGH, type SlotEvent } from "../src/host.ts";
 import { TIMEOUT_BACKOFF_CAP_S, normalize, shouldPause, failureProbeDelay, clearFailureState, type State } from "../src/lib.ts";
+import { isStarved, urgentLoadRetry } from "../src/cadence.ts";
 import fixture from "./fixtures/slot-replay.json";
 
-export type ReplayMix = { source: string; watchers: { watcher: string; intervalMs: number; checkMs: number; timeout_s?: number }[] };
+export type ReplayMix = { source: string; watchers: { watcher: string; intervalMs: number; checkMs: number; urgent?: boolean; timeout_s?: number }[] };
 export type ReplayOptions = { mix?: ReplayMix; loads?: { at: number; load: number }[]; hysteresis?: boolean; fastSlots?: number; anchor?: boolean;
-  sticky?: boolean; borrowFast?: boolean; runtime?: (watcher: ReplayMix["watchers"][number], at: number, run: number) => number;
+  urgent?: boolean; sticky?: boolean; borrowFast?: boolean; runtime?: (watcher: ReplayMix["watchers"][number], at: number, run: number) => number;
   freeze?: { at: number; ms: number }; existingTimeouts?: boolean; accountFrom?: number; accountUntil?: number;
   observedRelease?: (watcher: ReplayMix["watchers"][number], at: number, run: number) => { ms: number; timedOut: boolean };
   releaseDelayMs?: number; failureProbes?: boolean; initialStates?: Record<string, Partial<State>>;
@@ -13,13 +14,13 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
   const mix = options.mix ?? fixture;
   let clock = 0;
   const limit = hours * 3600_000;
-  const samples: { watcher: string; at: number; waitMs: number; lateMs: number; fast: boolean; fastLane: boolean; frequent: boolean }[] = [];
+  const samples: { watcher: string; at: number; waitMs: number; lateMs: number; fast: boolean; fastLane: boolean; frequent: boolean; starved: boolean }[] = [];
   const events: { at: number; event: SlotEvent }[] = [];
   const timers: { at: number; resolve: () => void }[] = [];
   const running = new Set<string>(), jobs: Promise<void>[] = [];
   const history = new Map<string, number[]>(), last = new Map(mix.watchers.map(w => [w.watcher, w.checkMs])), runCounts = new Map<string, number>();
   const completions: { watcher: string; started: number; at: number; timedOut: boolean; frozen: boolean; borrowed: boolean; dueAt: number; probe: boolean }[] = [];
-  const definitions = new Map(mix.watchers.map(w => [w.watcher, normalize({ id: w.watcher, title: w.watcher, check: "true", mode: "notify", interval_s: w.intervalMs / 1000, ...(w.timeout_s ? { timeout_s: w.timeout_s } : {}) })]));
+  const definitions = new Map(mix.watchers.map(w => [w.watcher, normalize({ id: w.watcher, title: w.watcher, check: "true", mode: "notify", interval_s: w.intervalMs / 1000, urgent: options.urgent && w.urgent === true, ...(w.timeout_s ? { timeout_s: w.timeout_s } : {}) })]));
   const states = new Map<string, State>(mix.watchers.map(w => [w.watcher, { status: "active", fires: 0, consecutive_failures: 0, ...options.initialStates?.[w.watcher] }]));
   const next = new Map(mix.watchers.map(w => [w.watcher, states.get(w.watcher)!.next_at ?? 0]));
   const mode = new LoadMode();
@@ -76,7 +77,7 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
         : checkLane(options.runtime ? last.get(watcher.watcher) : watcher.checkMs);
       jobs.push(slots.run(async timing => {
         borrowedNow.set(watcher.watcher, lane === "slow" && timing.slotLane === "fast");
-        samples.push({ watcher: watcher.watcher, at: clock, waitMs: timing.slotWaitMs, lateMs: timing.startLateMs, fast: watcher.checkMs < 1000, fastLane: (timing.slotLane ?? lane) === "fast", frequent: watcher.intervalMs <= 60_000 });
+        samples.push({ watcher: watcher.watcher, at: clock, waitMs: timing.slotWaitMs, lateMs: timing.startLateMs, fast: watcher.checkMs < 1000, fastLane: (timing.slotLane ?? lane) === "fast", frequent: watcher.intervalMs <= 60_000, starved: isStarved(watcher.intervalMs / 1000, timing.slotWaitMs) });
         const due = dueAt;
         next.set(watcher.watcher, options.anchor ? due + (Math.floor(Math.max(0, clock - due) / watcher.intervalMs) + 1) * watcher.intervalMs : clock + watcher.intervalMs);
         const probe = !!state.failure_paused_at;
@@ -98,6 +99,7 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
             if (Math.max(startLoad, load) >= LOAD_HIGH) state.load_timeout_since ??= new Date(clock).toISOString();
             if (Math.max(startLoad, load) >= LOAD_HIGH && clock - Date.parse(state.load_timeout_since!) < LOAD_GRACE_MS) {
               next.set(watcher.watcher, clock + Math.min(watcher.intervalMs, TIMEOUT_BACKOFF_CAP_S * 1000));
+              if (urgentLoadRetry(definitions.get(watcher.watcher)!, state, clock)) next.set(watcher.watcher, state.next_at!);
             } else {
               state.consecutive_failures++;
               state.failing_since ??= new Date(started).toISOString();
@@ -113,7 +115,7 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
         history.set(watcher.watcher, recentCheckRuntimes(history.get(watcher.watcher) ?? [watcher.checkMs], ms));
         last.set(watcher.watcher, ms);
         completions.push({ watcher: watcher.watcher, started, at: clock, timedOut, dueAt, probe, frozen: !!options.freeze && started < options.freeze.at && started + runtime >= options.freeze.at, borrowed: lane === "slow" && timing.slotLane === "fast" });
-      }, { watcher: watcher.watcher, dueAt, intervalMs: watcher.intervalMs, lane, recentMinMs: Math.min(...(history.get(watcher.watcher) ?? [watcher.checkMs])), operation: "check" }).finally(() => { running.delete(watcher.watcher); }));
+      }, { watcher: watcher.watcher, dueAt, intervalMs: watcher.intervalMs, lane, recentMinMs: Math.min(...(history.get(watcher.watcher) ?? [watcher.checkMs])), operation: "check", urgent: options.urgent && watcher.urgent === true }).finally(() => { running.delete(watcher.watcher); }));
     }
     await flush();
     if (clock > limit + 2 * 3600_000) throw new Error("queue did not drain within two hours");
@@ -123,7 +125,7 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
   const waits = (rows: typeof samples) => {
     const sorted = rows.map(row => row.waitMs).sort((a, b) => a - b);
     const late = rows.map(row => row.lateMs).sort((a, b) => a - b);
-    return { count: rows.length, p95S: (sorted[Math.ceil(sorted.length * .95) - 1] ?? 0) / 1000, maxS: (sorted.at(-1) ?? 0) / 1000,
+    return { count: rows.length, starvedRuns: rows.filter(row => row.starved).length, p50S: (sorted[Math.ceil(sorted.length * .5) - 1] ?? 0) / 1000, p95S: (sorted[Math.ceil(sorted.length * .95) - 1] ?? 0) / 1000, maxS: (sorted.at(-1) ?? 0) / 1000,
       lateP95S: (late[Math.ceil(late.length * .95) - 1] ?? 0) / 1000 };
   };
   const byWatcher = mix.watchers.map(w => {
@@ -148,7 +150,9 @@ export async function replaySlots(Slots = CheckSlots, cap = 6, hours = 6, option
     waitWindows,
     windowHolds: Object.fromEntries(windowHolds), windowBorrowed: Object.fromEntries(windowBorrowed),
     hourlyHolds: hourlyHolds.map(holds => Object.fromEntries(holds)), hourlySupplyMs,
-    all: waits(measured), fast: waits(measured.filter(row => row.fast)), fastFrequent: waits(measured.filter(row => row.fast && row.frequent)), slow: waits(measured.filter(row => !row.fast)),
+    all: waits(measured), nonUrgent: waits(measured.filter(row => !mix.watchers.find(w => w.watcher === row.watcher)?.urgent)),
+    nonUrgentSlow: waits(measured.filter(row => !row.fastLane && !mix.watchers.find(w => w.watcher === row.watcher)?.urgent)),
+    fast: waits(measured.filter(row => row.fast)), fastFrequent: waits(measured.filter(row => row.fast && row.frequent)), slow: waits(measured.filter(row => !row.fast)),
     fastLane: waits(measured.filter(row => row.fastLane)), slowLane: waits(measured.filter(row => !row.fastLane)),
     busyMinutes: busyMs / 60_000, topHolders: [...heldMs].sort(([, a], [, b]) => b - a).slice(0, 5).map(([watcher, ms]) => ({ watcher, slotSeconds: ms / 1000 })),
     minRuns: Math.min(...byWatcher.map(row => row.runs)), lateRuns: measured.filter(row => row.lateMs > mix.watchers.find(w => w.watcher === row.watcher)!.intervalMs).length,

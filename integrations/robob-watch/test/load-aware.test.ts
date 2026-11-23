@@ -12,6 +12,7 @@ function fixture(options: Record<string, string> = {}) {
   writeFileSync(stub, `import {appendFileSync} from "node:fs";
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n"); console.log('{"created":true}');`);
   const env: Record<string, string | undefined> = { ...process.env, BUN_INSPECT: undefined, ROBOB_WATCH_TEST_BATCH_MS: "0", ROBOB_WATCH_ROOT: root,
+    TOOLLOG_DIR: join(sandbox, "logs"),
     ROBOB_WATCH_TELEGRAM_CLI: stub, ROBOB_WATCH_SPECTRUM_CLI: stub,
     ROBOB_WATCH_BRIDGE_DB: join(sandbox, "absent.sqlite"), WACLI_STORE_DIR: join(sandbox, "wacli"),
     // macOS loads the owner's noninteractive shell hooks before even a `true` check can run.
@@ -227,3 +228,165 @@ test.each(pipeExitCases)("known exit %s survives kill grace with detached descen
     }
   }
 }, 15_000);
+
+test("urgent CLI persists and preserves opt-in and show includes cadence", () => {
+  const f = fixture();
+  const args = ["add", "--id", "urgent", "--title", "urgent", "--check", "true", "--mode", "notify", "--no-prime"];
+  expect(f.cli(...args, "--urgent").exitCode).toBe(0);
+  expect(JSON.parse(readFileSync(f.path("urgent", "watcher.json"), "utf8")).urgent).toBe(true);
+  expect(f.cli(...args, "--replace").exitCode).toBe(0);
+  expect(JSON.parse(readFileSync(f.path("urgent", "watcher.json"), "utf8")).urgent).toBe(true);
+  expect(f.cli("list").stdout.toString()).toContain("urgent=true");
+  expect(f.cli("show", "urgent").stdout.toString()).toContain("Cadence\n");
+});
+
+test("runner retries urgent load timeout once immediately and then uses normal backoff", async () => {
+  const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9" });
+  f.add("urgent", { urgent: true });
+  await f.run("urgent", s => s.load_timeouts === 1);
+  const first = f.state("urgent");
+  expect(first.next_at).toBe(first.urgent_retry_at);
+  expect(first.next_at! - Date.now()).toBeLessThanOrEqual(0);
+  await f.run("urgent", s => s.load_timeouts === 2);
+  expect(f.state("urgent").urgent_retry_at).toBe(first.urgent_retry_at);
+  expect(f.state("urgent").next_at! - Date.now()).toBeGreaterThan(110_000);
+});
+
+test("urgent stale cadence sends one notice across ticks, recovers, and re-arms", async () => {
+  const f = fixture(); f.add("urgent", { urgent: true, check: "true" });
+  const at = Date.now();
+  f.save("urgent", { ...f.state("urgent"), next_at: at + 3600_000, cadence: { since: at - 31 * 60_000, lastOutcome: "starved" } });
+  const child = f.start();
+  await until(() => f.state("urgent").cadence?.alerted === true);
+  expect(f.calls()).toHaveLength(1);
+  expect(f.calls()[0]).toContain("has not completed a check for 31 min");
+  expect(f.calls()[0]).toContain("last: starved");
+  // A restart also exercises persisted episode deduplication.
+  await f.stop(child);
+  const second = f.start();
+  await until(() => existsSync(join(f.root, "slot-queue.json")) && readFileSync(join(f.root, "slot-queue.json"), "utf8").includes(String(second.pid)));
+  expect(f.calls()).toHaveLength(1);
+  f.save("urgent", { ...f.state("urgent"), next_at: 0 });
+  await until(() => f.state("urgent").cadence?.lastCompleted !== undefined);
+  expect(readFileSync(f.path("urgent", "log"), "utf8")).toContain("cadence recovered after 31 min");
+  expect(f.state("urgent").cadence?.alerted).toBeUndefined();
+  const recovered = f.state("urgent");
+  f.save("urgent", { ...recovered, next_at: Date.now() + 3600_000, cadence: { ...recovered.cadence!, lastCompleted: at - 31 * 60_000 } });
+  await until(() => f.state("urgent").cadence?.alerted === true);
+  await f.stop(second);
+  expect(f.calls()).toHaveLength(2);
+  const rows = readFileSync(join(f.sandbox, "logs", new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").map(row => JSON.parse(row));
+  expect(rows.filter(row => row.name === "watch.cadence_stale")).toHaveLength(2);
+  expect(rows.filter(row => row.name === "watch.cadence_recovered")).toHaveLength(1);
+}, 15_000);
+
+test.each(["resume", "maintenance off", "maintenance expiry"] as const)("urgent cadence counts eligible downtime after %s", async release => {
+  const f = fixture(), at = Date.now(), minute = 60_000;
+  f.add("urgent", { urgent: true, check: "true", depends: ["phone"] });
+  f.save("urgent", { ...f.state("urgent"), next_at: at + 3600_000, cadence: { since: at - 81 * minute, lastCompleted: at - 81 * minute } });
+  const cliAt = (time: number, ...args: string[]) => {
+    const preload = join(f.sandbox, "clock.ts"); writeFileSync(preload, `Date.now = () => ${time};`);
+    const result = Bun.spawnSync([process.execPath, "--preload", preload, join(import.meta.dir, "../src/cli.ts"), ...args], { env: f.env });
+    expect(result.exitCode).toBe(0);
+  };
+  if (release === "resume") {
+    cliAt(at - 80 * minute, "pause", "urgent");
+    cliAt(at - 40 * minute, "resume", "urgent");
+  } else {
+    cliAt(at - 80 * minute, "maintenance", "on", "--for", release === "maintenance expiry" ? "40m" : "2h", "--depends", "phone");
+    if (release === "maintenance off") cliAt(at - 40 * minute, "maintenance", "off");
+  }
+  f.save("urgent", { ...f.state("urgent"), next_at: at + 3600_000 });
+  const child = f.start();
+  await until(() => f.state("urgent").cadence?.alerted === true);
+  await f.stop(child);
+  const notices = f.calls().filter(call => call.includes("has not completed a check"));
+  expect(notices).toHaveLength(1);
+  expect(notices[0]).toContain("for 41 min");
+});
+
+test.each(["pause", "maintenance", "ssd", "failure pause"] as const)("urgent cadence excludes a 40 minute %s across runner restart and release", async hold => {
+  const f = fixture({ ROBOB_WATCH_CHECK_TIMEOUT_MS: "5000" }), mount = join(f.sandbox, "ssd");
+  f.env.ROBOB_WATCH_SSD_PATH = mount;
+  symlinkSync("/dev", mount);
+  f.add("urgent", { urgent: true, interval_s: 60, check: "true", depends: ["ssd"] });
+  await f.run("urgent", s => s.cadence?.lastCompleted !== undefined);
+  if (hold === "pause") expect(f.cli("pause", "urgent").exitCode).toBe(0);
+  else if (hold === "maintenance") expect(f.cli("maintenance", "on", "--for", "1h", "--depends", "ssd").exitCode).toBe(0);
+  else if (hold === "ssd") { rmSync(mount); mkdirSync(mount); }
+  else f.save("urgent", { ...f.state("urgent"), failure_paused_at: new Date().toISOString(), failure_probe_next_at: new Date(Date.now() + 3600_000).toISOString() });
+  const heldRunner = f.start();
+  await until(() => f.state("urgent").cadence?.suspendedAt !== undefined);
+  await f.stop(heldRunner);
+  const at = Date.now(), lastCompleted = at - 41 * 60_000;
+  f.save("urgent", { ...f.state("urgent"), next_at: at + 3600_000, cadence: {
+    ...f.state("urgent").cadence!, lastCompleted, suspendedAt: at - 40 * 60_000,
+  } });
+  if (hold === "pause") expect(f.cli("resume", "urgent").exitCode).toBe(0);
+  else if (hold === "maintenance") expect(f.cli("maintenance", "off").exitCode).toBe(0);
+  else if (hold === "ssd") { rmSync(mount, { recursive: true }); symlinkSync("/dev", mount); }
+  const resumed = f.state("urgent");
+  delete resumed.failure_paused_at;
+  f.save("urgent", { ...resumed, next_at: at + 3600_000 });
+  const child = f.start();
+  await until(() => f.state("urgent").cadence?.suspendedAt === undefined);
+  expect(f.state("urgent").cadence?.lastCompleted).toBe(lastCompleted);
+  expect(f.state("urgent").cadence?.staleAt).toBeUndefined();
+  expect(f.calls().filter(call => call.includes("has not completed a check"))).toHaveLength(0);
+  // After release, eligible time still reaches the stale threshold normally.
+  const active = f.state("urgent"); active.cadence!.lastCompleted! -= 30 * 60_000; f.save("urgent", active);
+  await until(() => f.state("urgent").cadence?.alerted === true);
+  await f.stop(child);
+  expect(f.calls().filter(call => call.includes("has not completed a check"))).toHaveLength(1);
+});
+
+test.each([
+  { check: "sleep 3", wait: 601_000, starved: true },
+  { check: "sleep 3", wait: 1000, starved: false },
+  { check: "true", wait: 601_000, starved: true },
+])("runner labels starved completion/timeout with wait $wait and check $check", async ({ check, wait, starved }) => {
+  const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9" }); f.add("label", { check });
+  const preload = join(f.sandbox, "timing.ts");
+  writeFileSync(preload, `import { CheckSlots } from ${JSON.stringify(join(import.meta.dir, "../src/host.ts"))};
+const run = CheckSlots.prototype.run;
+CheckSlots.prototype.run = function (fn, request) { return run.call(this, timing => fn({...timing, slotWaitMs: ${wait}, slotQueueDepth: 30, slotActiveAtEnqueue: 2}), request); };`);
+  const child = f.start(preload);
+  await until(() => check === "true" ? f.state("label").cadence?.lastCompleted !== undefined : f.state("label").load_timeouts === 1);
+  await f.stop(child);
+  const log = readFileSync(f.path("label", "log"), "utf8");
+  expect(log.includes("starved:")).toBe(starved);
+  if (check !== "true") expect(log.includes("load timeout (1)")).toBe(!starved);
+  const rows = readFileSync(join(f.sandbox, "logs", new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").map(row => JSON.parse(row));
+  expect(rows.filter(row => row.name === "watch.run")).toHaveLength(1);
+  expect(rows.find(row => row.name === "watch.run").props).toMatchObject({ starved, urgent: false, slotPickReason: "fifo" });
+});
+
+test("quiet hours hold a stale cadence notice until they end", async () => {
+  const f = fixture();
+  const hour = new Date().getUTCHours();
+  f.add("quiet", { urgent: true, quiet: { start: hour, end: (hour + 2) % 24, time_zone: "UTC" } });
+  const at = Date.now();
+  f.save("quiet", { ...f.state("quiet"), next_at: at + 3600_000, cadence: { since: at - 31 * 60_000, lastOutcome: "load timeout" } });
+  const child = f.start();
+  await until(() => f.state("quiet").cadence?.staleAt !== undefined);
+  expect(f.calls()).toHaveLength(0);
+  const path = f.path("quiet", "watcher.json"), definition = JSON.parse(readFileSync(path, "utf8"));
+  delete definition.quiet; writeFileSync(path, JSON.stringify(definition));
+  await until(() => f.state("quiet").cadence?.alerted === true);
+  await f.stop(child);
+  expect(f.calls()).toHaveLength(1);
+});
+
+test("show distinguishes a live queued watcher from a running check", async () => {
+  const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: "9", ROBOB_WATCH_LOAD_DWELL_MS: "0" });
+  f.add("a-holder", { check: "sleep 3", timeout_s: 5 });
+  f.add("b-holder", { check: "sleep 3", timeout_s: 5 });
+  f.add("z-urgent", { urgent: true, check: "true" });
+  const child = f.start();
+  await until(() => existsSync(join(f.root, "slot-queue.json")) && readFileSync(join(f.root, "slot-queue.json"), "utf8").includes("z-urgent"));
+  expect(f.cli("show", "z-urgent").stdout.toString()).toContain("waiting for slot: yes, position 1/1");
+  expect(f.cli("show", "a-holder").stdout.toString()).toContain("waiting for slot: no");
+  await until(() => f.state("z-urgent").cadence?.lastCompleted !== undefined);
+  await f.stop(child);
+  expect(f.cli("show", "z-urgent").stdout.toString()).toContain("waiting for slot: unknown");
+});

@@ -76,8 +76,8 @@ export function isMounted(path: string): boolean {
   try { return statSync(path).dev !== statSync(dirname(path)).dev; } catch { toolError("runner", "watch.mount_stat_failed"); return false; }
 }
 
-export type SlotRequest = { watcher: string; run?: string; operation?: "check" | "pending"; dueAt?: number; intervalMs?: number; lane?: CheckLane; recentMinMs?: number };
-export type SlotTiming = { slotWaitMs: number; slotQueueDepth: number; slotActiveAtEnqueue: number; startLateMs: number; slotLane?: CheckLane };
+export type SlotRequest = { watcher: string; urgent?: boolean; run?: string; operation?: "check" | "pending"; dueAt?: number; intervalMs?: number; lane?: CheckLane; recentMinMs?: number };
+export type SlotTiming = { slotWaitMs: number; slotQueueDepth: number; slotActiveAtEnqueue: number; startLateMs: number; slotLane?: CheckLane; slotPickReason?: "fifo" | "urgent" };
 type Holder = { watcher: string; elapsedMs: number };
 export type SlotEvent =
   | { name: "slot.wait"; request: SlotRequest; waitMs: number; holders: Holder[] }
@@ -98,9 +98,12 @@ export class CheckSlots {
   private backlogAt: number | undefined;
   private busyAt: number | undefined;
   private usageAt: number | undefined;
-  constructor(private readonly cap: () => number, private readonly telemetry: { now?: () => number; emit?: (event: SlotEvent) => void } = {}, private readonly fastCap = 0, private readonly borrowFast: () => boolean = () => false) {}
+  constructor(private readonly cap: () => number, private readonly telemetry: { now?: () => number; emit?: (event: SlotEvent) => void; queueChanged?: () => void } = {}, private readonly fastCap = 0, private readonly borrowFast: () => boolean = () => false) {}
 
   private now(): number { return (this.telemetry.now ?? Date.now)(); }
+  queue() {
+    return this.waiters.map(waiter => ({ watcher: waiter.request.watcher, queuedAt: waiter.at, lane: waiter.lane, urgent: waiter.request.urgent === true }));
+  }
   private emit(event: SlotEvent): void {
     try { this.telemetry.emit?.(event); } catch { toolError("runner", "slot.telemetry_failed"); }
   }
@@ -153,6 +156,11 @@ export class CheckSlots {
     }
     for (;;) {
       let index = this.waiters.findIndex(waiter => waiter.lane === "fast" ? this.fastActive < this.fastCap : this.active < cap);
+      let slotPickReason: "fifo" | "urgent" = "fifo";
+      if (index >= 0 && this.waiters[index]!.lane === "slow") {
+        const urgent = this.waiters.findIndex(waiter => waiter.lane === "slow" && waiter.request.urgent === true);
+        if (urgent >= 0) { index = urgent; slotPickReason = "urgent"; }
+      }
       if (index < 0 && this.borrowFast() && !this.borrowedFast && !this.overrunActive && this.fastActive === 0 && this.fastCap > 0) {
         // Preserve slow FIFO admissions and genuine fast work. Only otherwise
         // idle reserved capacity serves overdue 5–10 minute checks.
@@ -181,7 +189,7 @@ export class CheckSlots {
       this.holders.set(waiter, { at, accountedAt: at });
       this.usageAt ??= at;
       waiter.resolve({ slotWaitMs: Math.max(0, at - waiter.at), slotQueueDepth: waiter.depth, slotActiveAtEnqueue: waiter.active,
-        slotLane: waiter.lane === "overrun" ? "fast" : waiter.lane,
+        slotLane: waiter.lane === "overrun" ? "fast" : waiter.lane, slotPickReason,
         startLateMs: waiter.request.dueAt === undefined ? 0 : Math.max(0, at - waiter.request.dueAt) });
     }
     this.busy(at, cap);
@@ -195,6 +203,7 @@ export class CheckSlots {
     }
     // Flush partial holdings across UTC boundaries and while a check is still running.
     if (this.usageAt !== undefined && at - this.usageAt >= 60_000) this.usage(at);
+    try { this.telemetry.queueChanged?.(); } catch { toolError("runner", "slot.snapshot_failed"); }
   }
 
   async run<T>(fn: (timing: SlotTiming) => Promise<T>, request: SlotRequest = { watcher: "unknown" }): Promise<T> {
