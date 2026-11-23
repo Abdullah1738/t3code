@@ -51,8 +51,42 @@ worker crash, exception or supervisor TERM/INT/HUP. It never waits indefinitely
 for a killed process. Readiness logs a start and outcome for each attempt; a
 deadline also writes an outcome from the parent. The usual 15-minute readiness
 window, two-hour cooldown and minimum uptime, build/install/restart exclusions,
-disabled marker and both overload rules remain. Expiry stops only the watchdog's
+disabled marker and both overload windows remain. Expiry stops only the watchdog's
 own checks, including their automatic restart triggers.
+
+Only the watchdog reclassifies deep health. `lag.stalls1s`, `lag.stalls5s` and
+`lag.worstMs` provide event-loop evidence for the ten-minute window. A raw
+`stalled` needs at least one 5-second stall or three 1-second stalls; a successful
+connection below those thresholds becomes `slow-roundtrip`. Missing or invalid
+counts become `unknown`. The summary's counts are a compatibility fallback only
+when structured count fields are absent; each check logs `stallSource` as
+`lag`, `summary` or null. The hard-stall duration uses only `lag.worstMs`.
+Connection errors/timeouts count as stalled even if the raw verdict is unknown.
+Rules use only `effectiveVerdict`: four stalled checks in succession, or at
+least four in eight checks with at most one healthy/degraded result. Slow round
+trips count as neither healthy nor stalled. Old rows without an effective verdict
+cannot contribute stalls. Checks and history retain both `rawVerdict` and
+`effectiveVerdict`; `verdict` now means the effective verdict.
+
+Host load above twice `os.cpu_count()` holds a firing rule without clearing its
+history. A hard stall bypasses the load and agent-cost holds: a recorded stall
+of at least 30 seconds, or failed connections on every check of the triggering
+window (including retries). When provider processes are running, a softer stall
+needs at least two 5-second stalls on the last check. Otherwise `held` records
+`agents running (<n>), stall not hard`.
+
+Every check logs `cost`: `treeProcesses` includes Robob and its descendants;
+`agentProcesses` counts descendant commands named `claude`, `codex`, `opencode`,
+`cursor-agent` or `grok` (`AGENT_COMMANDS`), plus `node` executing one of those
+scripts or the known npm entrypoints in `NODE_PROVIDER_SCRIPTS`. Other Node
+servers are excluded. Node launch options are handled before the script; later
+prompt text is ignored. Ambiguous Node prefixes or incomplete argv inventory
+leave the agent count unknown. A bounded process snapshot and, for Node descendants,
+a five-second argv probe supply counts; argv is never logged. Unknown inventory
+counts are null and hold soft restarts. `runningTurns` and `runningSubagents`
+are null: this health protocol provides neither, and no new control request is
+made. Counts describe processes, not a one-to-one count of turns or subagents.
+Trigger rows, `lastRestart.cost` and the start notice carry the same cost.
 
 Install exclusions also inspect every pane on tmux socket `qf-install` in sessions
 matching `^install\d*$`. A live pane holds while its command is not an idle shell
@@ -85,6 +119,9 @@ All path overrides use the `ROBOB_OVERLOAD_` prefix: `HOME` (installed source),
 `STATE`, `LOG`, `APP`, `USERDATA`, `SSD_PROBE`, `MAC_MARKER`, `HOLD`, `HOLD_CLI`,
 `NODE`, `TMUX`, `BUN`, `TELEGRAM`, `QF_SOCKET`, `QF_SESSION_RE`, `QF_IDLE_SEC`.
 The QF overrides default to `qf-install`, `^install\d*$` and 1800 seconds.
+`ROBOB_OVERLOAD_STALL_5S` and `ROBOB_OVERLOAD_STALL_1S` set the minimum stall
+counts (defaults 1 and 3, clamped to at least 1). `ROBOB_OVERLOAD_LOAD_FACTOR`
+sets the per-CPU load limit (default 2).
 Installer-only `PLIST_DIR` changes the output
 directory. `DEADLINE` defaults to 1500 seconds, `PROBE_TIMEOUT` to 8,
 `PROBE_SLOW` to 4, `NOTIFY_TIMEOUT` to 20 and `NOTIFY_DELAY` to 30. `DRY=1`
