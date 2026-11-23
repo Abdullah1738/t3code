@@ -44,6 +44,19 @@ class WorkerTests(JanitorTestCase):
                 self.assertEqual([c.args for c in send.call_args_list],
                                  [(42, signal.SIGTERM)] if protect_after_term else [])
 
+    def test_expo_below_robob_provider_still_signals(self):
+        rows = {10: dict(pid=10, ppid=1, args='node apps/server/dist/bin.mjs --bootstrap-fd 3'),
+                20: dict(pid=20, ppid=10, args='/opt/codex exec'),
+                30: dict(pid=30, ppid=20, args='/bin/zsh build.sh'),
+                42: dict(pid=42, ppid=30, args='node expo.js')}
+        with patch.object(dev_janitor.leftover_processes, 'cpu_processes', return_value=rows), \
+                patch.object(dev_janitor.os, 'kill') as send, \
+                patch.object(dev_janitor.time, 'sleep'), \
+                patch.object(dev_janitor, 'sh', return_value=(0, '', '')):
+            ok, reason = dev_janitor.act(dict(kind='expo', pids=[42]))
+        self.assertTrue(ok, reason)
+        self.assertEqual([c.args for c in send.call_args_list], [(42, signal.SIGTERM), (42, signal.SIGKILL)])
+
     def test_log_run_keeps_counters_and_adds_one_summary_and_timings(self):
         summary = dev_janitor.leftover_processes.detect({}, {}, {}, dict(complete=True))['mcp_summary']
         with patch.object(dev_janitor.time, 'monotonic', return_value=2), \

@@ -569,7 +569,7 @@ class SuspendTests(unittest.TestCase):
                 parent = dict(proc(pid=30, comm=comm, command=command), ppid=40)
                 host = m.Host(lambda *a, **kw: subprocess.CompletedProcess([], 0, '', ''))
                 host.process = lambda pid: {30: parent, 40: dict(proc(pid=40), robobServer=True)}[pid]
-                self.assertTrue(host.protected(dict(proc(), ppid=30)))
+                self.assertEqual(host.protected(dict(proc(), ppid=30)), not provider)
 
     def test_expected_birth_and_duplicate_stop_refused(self):
         with self.assertRaises(ValueError):
@@ -581,7 +581,7 @@ class SuspendTests(unittest.TestCase):
             self.stop()
         self.assertEqual(self.ledger()['leases']['20']['deadline'], deadline)
 
-    def test_every_signal_refuses_robob_ancestry_across_provider(self):
+    def test_every_signal_respects_robob_provider_boundary(self):
         for provider in (False, True):
             for sig in (signal.SIGSTOP, signal.SIGCONT, signal.SIGTERM, signal.SIGKILL):
                 with self.subTest(provider=provider, sig=sig):
@@ -593,9 +593,68 @@ class SuspendTests(unittest.TestCase):
                     host.process = lambda pid: copy.deepcopy(rows.get(pid))
                     host.signal = Mock()
                     service = m.SuspendLease(self.path, host, lambda: self.now, lambda *a, **kw: None)
-                    with self.assertRaisesRegex(ValueError, 'protected process'):
+                    if provider:
                         service.send(rows[20], sig, [])
+                        host.signal.assert_called_once_with(20, sig)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'protected process'):
+                            service.send(rows[20], sig, [])
+                        host.signal.assert_not_called()
+
+    def test_lease_below_provider_proceeds_server_renderer_refused(self):
+        for provider in (False, True):
+            with self.subTest(provider=provider):
+                job = dict(proc(), ppid=30)
+                rows = {20: job,
+                        30: dict(proc(pid=30, comm='codex' if provider else '/opt/chrome',
+                                      command='codex exec' if provider else '/opt/chrome'), ppid=40),
+                        40: dict(proc(pid=40), robobServer=True)}
+                host = m.Host(lambda *a, **kw: subprocess.CompletedProcess([], 0, '', ''))
+                host.process = lambda pid: copy.deepcopy(rows.get(pid))
+                def send(pid, sig):
+                    rows[pid]['stat'] = 'T' if sig == signal.SIGSTOP else 'S'
+                host.signal = Mock(side_effect=send)
+                service = m.SuspendLease(self.path, host, lambda: self.now, lambda *a, **kw: None)
+                if provider:
+                    service.stop(20, '1m', 'cont', 'load', 'test')
+                    self.assertIn('20', self.ledger()['leases'])
+                    self.assertEqual(rows[20]['stat'], 'T')
+                    self.assertTrue(service.release(20, 'resume')['ok'])
+                else:
+                    with self.assertRaisesRegex(ValueError, 'protected process'):
+                        service.stop(20, '1m', 'cont', 'load', 'test')
                     host.signal.assert_not_called()
+
+    def test_live_rebuild_regen_chain_below_claude_can_be_leased(self):
+        app = '/Applications/Robob.app/Contents/MacOS/Robob'
+        claude = '/Users/test/.robob/harness-cli/claude/current/bin/claude'
+        entries = [
+            (45313, 61049, 'node', 'node scripts/test-rebuild-start-paths-regen.mjs'),
+            (61049, 60963, '/opt/python/Python.app/Contents/MacOS/Python', 'python3 probe.py'),
+            (60963, 60962, 'node', 'node /opt/safe-chain/bin/safe-chain.js python3 probe.py'),
+            (60962, 60787, '/bin/zsh', 'zsh -c job'),
+            (60787, 62309, '/bin/zsh', 'zsh -l'),
+            (62309, 80622, claude, claude),
+            (80622, 80256, app, app + ' apps/server/dist/bin.mjs --bootstrap-fd 3'),
+            (80256, 1, app, app),
+        ]
+        rows = {pid: dict(proc(pid=pid, comm=comm, command=command), ppid=ppid)
+                for pid, ppid, comm, command in entries}
+        rows[45313]['start'] = 'Mon Nov 23 03:18:44 2026'
+        host = m.Host(lambda *a, **kw: subprocess.CompletedProcess([], 0, '', ''))
+        host.process = lambda pid: copy.deepcopy(rows.get(pid))
+        def send(pid, sig):
+            rows[pid]['stat'] = 'T' if sig == signal.SIGSTOP else 'S'
+        host.signal = Mock(side_effect=send)
+        service = m.SuspendLease(self.path, host, lambda: self.now, lambda *a, **kw: None)
+        service.stop(45313, '10m', 'cont', 'CPU-heavy agent test', 'critical responder',
+                     expected_start=rows[45313]['start'])
+        host.signal.assert_called_once_with(45313, signal.SIGSTOP)
+        self.assertEqual(self.ledger()['leases']['45313']['deadline'], self.now + 600)
+        self.assertEqual(rows[45313]['stat'], 'T')
+        self.assertTrue(service.release(45313, 'resume')['ok'])
+        self.assertEqual(host.signal.call_args.args, (45313, signal.SIGCONT))
+        self.assertNotIn('45313', self.ledger()['leases'])
 
     def test_unknown_birth_retained_other_expired_lease_still_recovers(self):
         self.stop()

@@ -59,6 +59,22 @@ class ProcessTests(JanitorTestCase):
                 reason = lp.keep_reason(renderer, [parent], {}, ())
                 self.assertEqual(reason == 'robob-descendant', expected)
 
+    def test_robob_ancestry_stops_at_provider_before_server(self):
+        commands = ['claude', 'codex', 'opencode', 'gemini', 'cursor-agent', 'grok', 'antigravity',
+                    '/Users/test/.robob/harness-cli/claude/current/bin/claude',
+                    '/opt/codex-aarch64-apple-darwin',
+                    'node /opt/@openai/codex/bin/codex.js',
+                    'bun /opt/@anthropic-ai/claude-code/cli.js']
+        for command in commands:
+            with self.subTest(command=command):
+                job = dict(pid=42, ppid=30, args='node build.js', tty='??')
+                shell = dict(pid=30, ppid=20, args='/bin/zsh job.sh', tty='??')
+                provider = dict(pid=20, ppid=10, args=command, tty='??')
+                server = dict(pid=10, ppid=1, args='node /repo/apps/server/dist/bin.mjs --bootstrap-fd 3', tty='??')
+                self.assertFalse(lp.robob_ancestry(job, [shell, provider, server]))
+                self.assertIsNone(lp.keep_reason(job, [shell, provider, server], {}, ()))
+                self.assertTrue(lp.robob_ancestry(job, [shell, server, provider]))
+
     def test_mcp_summary_counts_rss_parent_chains_and_unknown_verdict(self):
         def row(pid, ppid, args, rss):
             return dict(pid=pid, ppid=ppid, start='old', tty='??', args=args, rss_kib=rss)

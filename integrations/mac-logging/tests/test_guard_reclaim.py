@@ -217,7 +217,8 @@ class ReclaimTests(unittest.TestCase):
     def test_release_build_below_provider_eligible_offbox_child_is_not(self):
         build = nproc(args='node /Users/a/.robob/release-builds/quickfix/clone/node_modules/typescript/bin/tsc --noEmit', ppid=30)
         provider = nproc(30, comm='/opt/homebrew/bin/codex', args='codex app-server')
-        self.native.rows = {20:build,30:provider}
+        self.native.rows = {20:build,30:provider,40:nproc(40, comm='/Applications/Robob.app/Contents/MacOS/Robob')}
+        provider['ppid'] = 40
         self.tick()
         self.assertEqual(self.native.effects, [20])
         provider['args'] = 'python3 /tool/offbox.py _bg-queue'

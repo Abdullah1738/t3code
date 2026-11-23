@@ -209,8 +209,8 @@ def protection(p, rows, guard):
         return 'system-or-foreign-user'
     if not p.get('args') or not p.get('comm') or not p.get('start'):
         return 'unknown-identity'
-    # Provider ancestry alone does not protect builds; providers themselves and
-    # shell session wrappers stay protected.
+    # Builds below a provider are eligible; providers themselves and shell
+    # session wrappers stay protected. Never propagate protection to all builds.
     if any('/mac-logging/' in arg and Path(arg).name in ('host.py', 'mac_guard.py', 'guard_reclaim.py') for arg in words(p)):
         return 'guard-or-host-sampler'
     if guard(p, rows):

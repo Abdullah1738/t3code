@@ -217,8 +217,18 @@ def robob(p, rows):
     return False
 
 
+def robob_ancestor(p, rows):
+    # chain() is nearest-parent first; provider jobs do not inherit app protection.
+    for ancestor in chain(p, rows):
+        if provider(ancestor):
+            return None
+        if robob(ancestor, rows):
+            return ancestor
+    return None
+
+
 def robob_descendant(p, rows):
-    return any(robob(a, rows) for a in chain(p, rows))
+    return robob_ancestor(p, rows) is not None
 
 
 def label(p, rows):
@@ -772,7 +782,7 @@ class Guard:
         gui_job = self.gui_jobs.get((p['pid'], p['start']))
         gui_ok = (cls == 'G' and gui_job and gui_job['phase'] == 'force'
                   and self.gui_force_growth(p, gui_job) and self.gui_allowed(p, gui_job))
-        ancestor = next((a for a in chain(p, self.rows) if robob(a, self.rows)), None)
+        ancestor = robob_ancestor(p, self.rows)
         if cls == 'G':
             safe = gui_ok
         elif cls == 'D' or action == 'CONT':
