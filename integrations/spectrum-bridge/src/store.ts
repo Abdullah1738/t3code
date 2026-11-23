@@ -1,4 +1,4 @@
-import { deliveredReplyCoverage, humanRow, markControlAcked, markAnswered, turnMembers, type ReplyTurn, type AnsweredInput } from "./unanswered.ts";
+import { deliveredReplyCoverage, humanInput, humanRow, markControlAcked, markAnswered, turnMembers, type ReplyTurn, type AnsweredInput } from "./unanswered.ts";
 import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
@@ -9,7 +9,7 @@ const steerSourceKey = (sessionId: string, generation: number, inboundId: string
   `steer-reply-source:${createHash("sha256").update(JSON.stringify([sessionId, generation, inboundId])).digest("hex")}`;
 
 export type FileAttachment = { sha256: string; name: string; mimeType: string; size: number };
-export type ReplyAttribution = { inboundId?: string; covered?: string[]; attribution?: "explicit" | "active_turn" | "none" };
+export type ReplyAttribution = { inboundId?: string; covered?: string[]; attribution?: "explicit" | "active_turn" | "pending_inbound" | "none" };
 export const RECENT_REPLY_TURN_MS = 5 * 60_000;
 export type OutboxPoll = { title: string; options: string[] };
 export type OutboxApp = {
@@ -213,8 +213,29 @@ export class Store {
       : recent && recent.turn.id === sessionId && recent.turn.generation === generation
         && Date.now() >= recent.at && Date.now() - recent.at <= RECENT_REPLY_TURN_MS ? recent.turn : undefined;
     if (!turn) return { covered: [], attribution: "none" };
-    const covered = turnMembers(this, turn).filter(id => humanRow(id) && (turn === active || !!this.db.query(`SELECT 1 FROM inbound
-      WHERE id = ? AND json_extract(payload, '$.answeredAt') IS NULL AND state NOT IN ('cancelled', 'observed')`).get(id)));
+    const turnHumans = turnMembers(this, turn).filter(humanRow);
+    // Attribution A (#111): when ALL of the turn's own human members are already answered,
+    // an un-quoted send on the same chat credits pending/queued human inbound(s) and retires their turn.
+    if (turnHumans.length > 0 && turnHumans.every(id => !!this.db.query(
+      "SELECT 1 FROM inbound WHERE id = ? AND json_type(payload, '$.answeredAt') = 'integer'",
+    ).get(id))) {
+      const pendingRows = this.db.query<{ id: string; payload: string }, []>(`SELECT id, payload FROM inbound
+        WHERE state IN ('pending', 'batched')
+          AND json_extract(payload, '$.answeredAt') IS NULL
+          AND json_extract(payload, '$.settledAt') IS NULL
+        ORDER BY rowid`).all();
+      const pendingCovered = pendingRows.filter(row => {
+        if (!humanRow(row.id)) return false;
+        const input = JSON.parse(row.payload) as AnsweredInput;
+        if (!humanInput(input) && !(input.source === undefined && input.id === row.id && Array.isArray(input.attachments))) return false;
+        return !/^\/(?:new|stop|reset)\b/i.test((input.text ?? "").trim());
+      }).map(row => row.id);
+      if (pendingCovered.length > 0) {
+        return { inboundId: pendingCovered[0], covered: pendingCovered, attribution: "pending_inbound" };
+      }
+    }
+    const covered = turnHumans.filter(id => turn === active || !!this.db.query(`SELECT 1 FROM inbound
+      WHERE id = ? AND json_extract(payload, '$.answeredAt') IS NULL AND state NOT IN ('cancelled', 'observed')`).get(id));
     const source = turn.replyInboundId ?? turn.inboundId;
     return { inboundId: turn === active ? source ?? covered[0] : source && covered.includes(source) ? source : covered[0], covered,
       attribution: source || covered.length ? "active_turn" : "none" };

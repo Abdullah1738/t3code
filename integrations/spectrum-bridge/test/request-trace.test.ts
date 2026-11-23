@@ -17,7 +17,7 @@ test("send traces one sanitized row and preserves the real queue response", asyn
   const store = new Store(":memory:");
   const day = "2026-11-22";
   const log = createToolLog({ root, now: () => Date.parse(`${day}T12:00:00Z`), capBytes: 1 });
-  const trace = createRequestTrace(entry => log.write(entry), { loopLag: () => 12 });
+  const trace = createRequestTrace(entry => log.write(entry), { clock: () => Date.parse(`${day}T12:00:00Z`), loopLag: () => 12 });
   store.set("route", { id: "current", generation: 1 });
   const api = createApi({ store, photon: { async react() {} }, router: () => undefined,
     chatGuid: () => "iMessage;-;+15555550123", enabled: () => true, health: () => ({}) });
