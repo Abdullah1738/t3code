@@ -13,18 +13,41 @@ test("stalls above one second emit once, include overlapping operations and rate
   let at = 0;
   const operations = createLoopOperations(() => at);
   const rows: unknown[] = [];
-  const monitor = createLoopStallMonitor(row => rows.push(row), { now: () => at, operations, host });
+  const monitor = createLoopStallMonitor(row => rows.push(row), { now: () => at, operations, host, threadCpu: null });
   at = 1250; monitor.check();
   expect(rows).toHaveLength(0);
   const finish = operations.begin("inbound.pending");
   at = 3000; finish(); monitor.check();
-  expect(rows).toEqual([{ ...host(), stallMs: 1500, operations: "inbound.pending" }]);
+  expect(rows).toEqual([{ ...host(), stallMs: 1500, operations: "inbound.pending", windowMs: 1750, measuredMaxMs: 1750, operationMs: "inbound.pending:1750" }]);
   monitor.check();
   at = 8000; monitor.check();
   expect(rows).toHaveLength(1);
   at = 13000; monitor.check();
   expect(rows).toHaveLength(2);
-  expect(rows[1]).toEqual({ ...host(), stallMs: 4750, operations: "" });
+  expect(rows[1]).toEqual({ ...host(), stallMs: 4750, operations: "", windowMs: 5000 });
+});
+
+test("stall timing separates measured synchronous work, main-thread CPU and off-CPU time", () => {
+  let at = 0;
+  let cpu = { user: 0, system: 0 };
+  const operations = createLoopOperations(() => at);
+  const rows: Record<string, unknown>[] = [];
+  const monitor = createLoopStallMonitor(row => rows.push(row), { now: () => at, operations, host, threadCpu: () => cpu });
+  const awaited = operations.begin("log.scan");
+  at = 250; monitor.check();
+  // A synchronous query inside the window, plus a scan that began before it and spans an await.
+  const query = operations.begin("inbound.parents");
+  at = 1_750; query();
+  operations.begin("log.append")();
+  at = 2_000; awaited();
+  cpu = { user: 1_200_000, system: 300_000 };
+  at = 4_250; monitor.check();
+  expect(rows).toEqual([{ ...host(), stallMs: 3750, operations: "inbound.parents,log.append,log.scan", windowMs: 4000,
+    measuredMaxMs: 1500, operationMs: "inbound.parents:1500,log.append:0", threadCpuMs: 1500, offCpuMs: 2500 }]);
+  // A failing CPU reader drops only the CPU fields.
+  const failing = createLoopStallMonitor(row => rows.push(row), { now: () => at, operations, host, threadCpu: () => { throw new Error("synthetic"); } });
+  at += 5_000; failing.check();
+  expect(rows[1]).toEqual({ ...host(), stallMs: 4750, operations: "", windowMs: 5000 });
 });
 
 test("per-name coverage retains active and just-finished operations and drops stale work", () => {
@@ -87,19 +110,25 @@ test("host and sink failures stay best effort and rate-limited", () => {
 });
 
 test("stall JSON survives the cap and contains only numeric host metadata and fixed operation names", () => {
+  const timing = { windowMs: 4250, measuredMaxMs: 3200, operationMs: "inbound.parents:3200,log.append:1", threadCpuMs: 3300, offCpuMs: 950 };
   const root = mkdtempSync(join(tmpdir(), "loop-stall-")); dirs.push(root);
   const log = createToolLog({ root, now: () => Date.parse("2026-11-20T12:00:00Z"), capBytes: 1 });
   log.write({ component: "fixture", kind: "event", name: "fixture" });
   log.write({ component: "process", kind: "event", name: "bridge-loop-stall", ids: { chat: "PRIVATE_HANDLE" },
-    props: { ...host(), stallMs: 4000, operations: "inbound.pending,share.records", text: "PRIVATE_TEXT", token: "PRIVATE_TOKEN", source: "PRIVATE_SOURCE" } });
+    props: { ...host(), stallMs: 4000, operations: "inbound.pending,share.records", ...timing, text: "PRIVATE_TEXT", token: "PRIVATE_TOKEN", source: "PRIVATE_SOURCE" } });
   const raw = readFileSync(join(root, "2026-11-20.ndjson"), "utf8");
   const row = raw.trim().split("\n").map(line => JSON.parse(line)).find(line => line.name === "bridge-loop-stall");
-  expect(row.props).toEqual({ ...host(), stallMs: 4000, operations: "inbound.pending,share.records" });
+  expect(row.props).toEqual({ ...host(), stallMs: 4000, operations: "inbound.pending,share.records", ...timing });
   expect(Object.keys(row.ids)).toEqual(["runId"]);
   expect(raw).not.toContain("PRIVATE_");
   log.write({ component: "process", kind: "event", name: "bridge-loop-stall", props: {
     operations: "PRIVATE_HANDLE", stallMs: Infinity, loadAvg1: -1, freeMemoryBytes: NaN, rssBytes: "PRIVATE_TOKEN",
+    operationMs: "PRIVATE_HANDLE:1", threadCpuMs: -1, offCpuMs: "PRIVATE_TOKEN", windowMs: Infinity, measuredMaxMs: NaN,
   } });
+  for (const operationMs of ["inbound.parents:1.5", "inbound.parents:1:2", "inbound.parents", "inbound.parents:-1"]) {
+    log.write({ component: "process", kind: "event", name: "bridge-loop-stall", props: { operationMs } });
+    expect(JSON.parse(readFileSync(join(root, "2026-11-20.ndjson"), "utf8").trim().split("\n").at(-1)!).props).toBeUndefined();
+  }
   const last = JSON.parse(readFileSync(join(root, "2026-11-20.ndjson"), "utf8").trim().split("\n").at(-1)!);
   expect(last.props).toBeUndefined();
 });

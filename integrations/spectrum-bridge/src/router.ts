@@ -33,8 +33,8 @@ import { groupLines, inboundTime, inboundWords, JEV_CHUNK, JEV_THRESHOLD, JudgeE
 import type { Swipes, SwipeTarget } from "./swipe.ts";
 import { criticalWake, FAILED_INBOUND_ALERT_MAX_AGE_MS, FAILED_INBOUND_REPLAY_MAX_AGE_MS, failureMessage, wakeEventPreview } from "./inbound-failure.ts";
 import { isAgentBusWake } from "./agent-bus.ts";
-import { leaderKind, requeueHuman, type RequeueReason } from "./inbound-routing.ts";
-import { controlDisposition, controlFailureProps } from "./control-errors.ts";
+import { HUMAN_FAILURE_BACKOFF_MS, leaderKind, MAX_FAILED_ATTEMPTS, requeueHuman, type RequeueHumanOptions, type RequeueOutcome, type RequeueReason } from "./inbound-routing.ts";
+import { controlDisposition, controlFailureProps, type ControlFailure } from "./control-errors.ts";
 import { WakeDelivery, wakeStatus, WAKE_AMBIGUITY_MS, WAKE_DELIVERY_MS } from "./wake-delivery.ts";
 export { leaderKind, requeueHuman } from "./inbound-routing.ts";
 
@@ -186,6 +186,11 @@ const sameAddress = (a: string, b: string) => a.replace(/[\s()-]/g, "").toLowerC
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 /** A session whose turn the model provider refused; the next inbound batch starts a fresh session. */
 type Refused = { sessionId: string; generation: number; at: number; messageIds: string[] };
+/** Consecutive no-output failed turns on the same route; at FAILURE_STREAK_ROTATE we rotate to a fresh session. */
+type FailureStreak = { sessionId: string; generation: number; count: number };
+type FailureStreakRoute = { sessionId: string; generation: number; at: number; streak: number };
+const FAILURE_STREAK_ROTATE = 3;
+const MAX_TRANSIENT_STEER_REFUSALS = 2;
 
 const MAX_CONTEXT = 8_000;
 const MAX_REPLY_QUOTE = 500;
@@ -1034,9 +1039,8 @@ export class Router {
           continue;
         }
         const parent = row.state === "batched" ? this.store.db.query<{ leader: string }, [string]>(
-          `SELECT substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
-            JOIN inbound ON inbound.id = substr(kv.key, 7)
-            WHERE kv.key GLOB 'batch:*' AND member.value = ? AND inbound.state IN ('pending', 'processing')`,
+          `SELECT batch_members.leader FROM batch_members JOIN inbound ON inbound.id = batch_members.leader
+            WHERE batch_members.member = ? AND inbound.state IN ('pending', 'processing') ORDER BY batch_members.leader LIMIT 1`,
         ).get(row.id)?.leader : undefined;
         // One sealed operation owns every member, including unsent siblings with later receipt times.
         if (!this.expireWakeBatch(parent ?? row.id)) this.failWake(row.id, stale ? "stale" : overdue ? "delivery_deadline" : "ambiguity_deadline");
@@ -1086,11 +1090,10 @@ export class Router {
       const { row, input, ageMs, action, leaderKind: kind } = due;
       const state = { ...input.unanswered };
       if (state.overdueAt !== undefined && !due.requeue && !due.alert) continue;
-      const parent = this.store.db.query<{ id: string }, [string]>(
-        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key GLOB 'batch:*' AND member.value = ? LIMIT 1",
-      ).get(row.id)?.id;
+      const parent = this.store.batchLeaders(row.id)[0];
       const retained = this.store.get<SteerAttempt>(`steer-attempt:${parent ?? row.id}`);
-      if (due.requeue && !retained?.response && !retained?.sameMode && !retained?.reconcileOnly) {
+      const retryExhausted = !!this.store.get(`failed-retry-exhausted:${row.id}`) || !!(parent && this.store.get(`failed-retry-exhausted:${parent}`));
+      if (due.requeue && !retryExhausted && !retained?.response && !retained?.sameMode && !retained?.reconcileOnly) {
         this.store.db.transaction(() => {
           // The shared own-turn marker prevents steering the retry back into a wake.
           // Only a human batch keeps its sealed members. A swallowed wake member gets its own turn.
@@ -1211,8 +1214,9 @@ export class Router {
     // Sealed membership changes on a seal, not on the one-second delivery clock.
     if (now - this.latencyParentsAt >= 60_000) {
       this.latencyParents = new Map(traceLoopOperation("inbound.parents", () => this.store.db.query<{ member: string; leader: string }, []>(
-        `SELECT member.value AS member, substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
-          JOIN inbound ON inbound.id = member.value WHERE kv.key GLOB 'batch:*' AND inbound.state = 'batched'`,
+        // Leader order keeps the previous last-key-wins choice for a member listed by several seals.
+        `SELECT batch_members.member, batch_members.leader FROM inbound JOIN batch_members ON batch_members.member = inbound.id
+          WHERE inbound.state = 'batched' ORDER BY batch_members.member, batch_members.leader`,
       ).all()).map(row => [row.member, row.leader]));
       this.latencyParentsAt = now;
     }
@@ -1590,6 +1594,7 @@ export class Router {
       const input = row.payload as NormalizedInbound;
       const critical = criticalWake(row.id, input.text);
       if (!critical && (synthetic(row.id) || input.source !== "typed")) continue;
+      if (this.store.get(`failed-retry-exhausted:${row.id}`)) continue;
       if (this.skipStaleFailedInbound(row.id, input)) continue;
       // Failure logging (including legacy backfill) must never refresh the received age.
       const receivedAt = input.receivedAt ?? input.sentAt;
@@ -1598,7 +1603,7 @@ export class Router {
       if (at === undefined || now - at < 120_000) continue;
       const batch = this.store.get<NormalizedInbound | null>(`batch:${row.id}`);
       const parent = this.store.db.query<{ id: string }, [string]>(
-        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key LIKE 'batch:%' AND member.value = ? ORDER BY kv.rowid LIMIT 1",
+        "SELECT batch_members.leader AS id FROM batch_members JOIN kv ON kv.key = 'batch:' || batch_members.leader WHERE batch_members.member = ? ORDER BY kv.rowid LIMIT 1",
       ).get(row.id)?.id ?? row.id;
       const stillFailed = () => this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state === "failed";
       // landed() writes this receipt. A later failed run must never erase its proof of admission.
@@ -1767,9 +1772,10 @@ export class Router {
     return `synthetic-retry:${id}`;
   }
 
-  /** A synthetic row still backing off after a failed attempt. */
+  /** A synthetic or human retry row still backing off after a failed attempt. */
   private backingOff(id: string, now = Date.now()): boolean {
-    return synthetic(id) && (this.store.get<SyntheticRetry | null>(this.retryKey(id))?.nextAt ?? 0) > now;
+    if (synthetic(id)) return (this.store.get<SyntheticRetry | null>(this.retryKey(id))?.nextAt ?? 0) > now;
+    return (this.store.get<number | null>(`human-backoff-until:${id}`) ?? 0) > now;
   }
 
   /**
@@ -1933,6 +1939,8 @@ export class Router {
         this.store.set(`human-own-turn:${turn.inboundId}`, false);
         this.trackHuman(turn, turn.inboundId);
       }
+      this.store.set(`human-backoff-until:${turn.inboundId}`, null);
+      this.store.set(`steer-transient-refusals:${turn.inboundId}`, null);
       this.delivered(turn.inboundId);
       this.store.set(`steer-attempt:${turn.inboundId}`, null);
       this.store.set(`latency-route:${turn.inboundId}`, null);
@@ -2155,7 +2163,7 @@ export class Router {
         for (const row of rows) if (row.state === "pending" && !synthetic(row.id)) this.store.set(`human-own-turn:${row.id}`, true);
         return;
       }
-      const leader = steer ? rows.find(row => row.state === "pending" && !synthetic(row.id) && !this.store.get(`human-own-turn:${row.id}`))
+      const leader = steer ? rows.find(row => row.state === "pending" && !synthetic(row.id) && !this.backingOff(row.id, now) && !this.store.get(`human-own-turn:${row.id}`))
         : rows.find(row => row.state === "pending" && resetRow(row.id))
         ?? humanNext
         ?? dueBus
@@ -2329,6 +2337,8 @@ export class Router {
       if (!this.current(attempt) || (state !== "processing" && !queued)) return;
       const messageId = this.promptId(id);
       this.store.set(`human-own-turn:${id}`, false);
+      this.store.set(`human-backoff-until:${id}`, null);
+      this.store.set(`steer-transient-refusals:${id}`, null);
       this.probeBackoff.clear(id);
       this.probeBackoff.clear(`prompt:${attempt.id}:${messageId}`);
       let turn = this.store.get<Turn | null>("activeTurn");
@@ -2382,9 +2392,36 @@ export class Router {
   private requeueRefusedSteer(id: string, failure?: unknown): void {
     this.store.db.transaction(() => {
       this.store.set(`steer-attempt:${id}`, null);
-      this.requeueHuman(id, "steer_failed", false, failure);
       const turn = this.store.get<Turn | null>("activeTurn");
-      if (turn) this.setTurn({ ...turn, steered: turn.steered?.filter(prompt => prompt !== `msg_${hash(id)}`) });
+      const currentPrompt = this.promptId(id);
+      if (turn) this.setTurn({ ...turn, steered: turn.steered?.filter(prompt => prompt !== `msg_${hash(id)}` && prompt !== currentPrompt) });
+      // Transient retry-safe no_steerable_turn (e.g. provider session still initializing): retry steer
+      // after STEER_RETRY_MS instead of permanently locking this message to human-own-turn.
+      const cf = failure && typeof failure === "object" ? failure as ControlFailure : undefined;
+      if (cf?.reason === "no_steerable_turn" && cf.retrySafe === true && turn) {
+        const key = `steer-transient-refusals:${id}`;
+        const prev = this.store.get<{ messageId: string; count: number } | null>(key);
+        const count = prev?.messageId === turn.messageId ? prev.count + 1 : 1;
+        if (count <= MAX_TRANSIENT_STEER_REFUSALS) {
+          this.store.set(key, { messageId: turn.messageId, count });
+          const members = this.store.get<NormalizedInbound>(`batch:${id}`)?.batchIds ?? [id];
+          for (const member of members) {
+            this.store.updateInbound(member, member === id ? "pending" : "batched");
+            this.store.db.query("DELETE FROM kv WHERE key = ?").run(`inbound-delivered:${member}`);
+          }
+          this.store.set(`batch-phase:${id}`, "queued-steer");
+          toolLog.capture(() => toolLog.write({
+            component: "router",
+            kind: "event",
+            name: "inbound.requeued",
+            ids: { inboundId: id, chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id },
+            props: { reason: "steer_failed", attempt: count, ...controlFailureProps(failure) },
+          }));
+          return;
+        }
+        this.store.set(key, null);
+      }
+      this.requeueHuman(id, "steer_failed", false, failure);
     }).immediate();
   }
 
@@ -4444,7 +4481,9 @@ export class Router {
     if (unresolved) return route;
     const mark = this.store.get<Refused | null>("refusedRoute");
     const refused = mark?.sessionId === route.id && mark.generation === route.generation;
-    if (route.createdAt === undefined && !refused) {
+    const failureMark = this.store.get<FailureStreakRoute | null>("failureStreakRoute");
+    const failedStreak = failureMark?.sessionId === route.id && failureMark.generation === route.generation;
+    if (route.createdAt === undefined && !refused && !failedStreak) {
       // Routes from before rotation existed start their clock now.
       const stamped = { ...route, createdAt: Date.now() };
       this.store.set("route", stamped);
@@ -4452,7 +4491,7 @@ export class Router {
     }
     const resetting = this.backend.resetsContext?.(route.id) === true;
     const due = resetting ? !this.resetsInPlace(route) : this.contextDue(route);
-    if (!due && !refused) return route;
+    if (!due && !refused && !failedStreak) return route;
     const context = this.store.get<{ sessionId: string; tokens: number }>("routeContext");
     const large = !resetting && context?.sessionId === route.id && context.tokens >= (this.options.rotateAtTokens ?? ROTATE_AT_TOKENS);
     // Never strand undelivered output or running background work.
@@ -4466,7 +4505,14 @@ export class Router {
       const children = await this.reading(this.backend.children(route.id, route.directory));
       if (children.some(child => others.includes(child.id))) return route;
     }
-    const records = await this.reading(this.backend.messages(route.id, route.directory, { limit: 100 }));
+    let records: MessageRecord[];
+    try {
+      records = await this.reading(this.backend.messages(route.id, route.directory, { limit: 100 }));
+    } catch (caughtError) {
+      if (!failedStreak || caughtError instanceof RobobLinkDown || this.backend.linkAvailable === false) throw caughtError;
+      toolError("router", "router.rotate_messages", caughtError);
+      records = [];
+    }
     const lines: string[] = [];
     let size = 0;
     // Everything before the latest reset nudge belongs to a context already handed off (or wiped by /new).
@@ -4504,11 +4550,14 @@ export class Router {
       this.store.set("watermark", null);
       this.store.set("routeContext", null);
       if (refused) this.store.set("refusedRoute", null);
+      if (failedStreak) this.store.set("failureStreakRoute", null);
+      this.store.set("routeFailureStreak", null);
     }).immediate();
-    this.options.log?.("route-rotated", refused ? "providerRefusal" : large ? "contextSize" : "age");
+    const rotateReason = refused ? "providerRefusal" : failedStreak ? "providerFailureStreak" : large ? "contextSize" : "age";
+    this.options.log?.("route-rotated", rotateReason);
     toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "context.rotated",
       ids: { chat: this.options.context?.chat.slug ?? "owner", fromThreadId: route.id, toThreadId: next.id },
-      props: { reason: refused ? "providerRefusal" : large ? "contextSize" : "age", seedChars: seed.length,
+      props: { reason: rotateReason, ...(failedStreak ? { streakCount: failureMark!.streak } : {}), seedChars: seed.length,
         recapLines: lines.length, pendingOrders: orders !== null, pendingOrdersChars: orders?.length ?? 0 } }));
     this.retireOthers();
     return next;
@@ -5524,6 +5573,10 @@ export class Router {
         ...this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? []])];
       for (const reply of outgoing) if (this.store.getOperation(`reply:${turn.generation}:${reply.id}`))
         this.store.set(`reply-covered:reply:${turn.generation}:${reply.id}`, this.replyCoverage(turn, scope, reply.id, covered, handledInputs).filter(id => !this.store.get(`human-own-turn:${id}`)));
+      if (this.current(turn)) {
+        this.store.set("routeFailureStreak", null);
+        this.store.set("failureStreakRoute", null);
+      }
       this.logTurnEnd(turn, said.length ? "replied" : "no_reply");
       if (said.length) this.noteGroupReply(turn.inboundId, said);
       if (turn.background && said.some(words => stripInternalText(words).trim())) this.store.set("deferredNotice", null);
@@ -5704,8 +5757,8 @@ export class Router {
         filesTaken: batch?.attachments.length ?? 0 } }));
   }
 
-  requeueHuman(id: string, reason: RequeueReason, completed = false, failure?: unknown): void {
-    requeueHuman(this.store, id, reason, { chat: this.options.context?.chat.slug ?? "owner", completed, failure });
+  requeueHuman(id: string, reason: RequeueReason, completed = false, failure?: unknown, extra: Omit<RequeueHumanOptions, "chat" | "completed" | "failure"> = {}): RequeueOutcome {
+    return requeueHuman(this.store, id, reason, { chat: this.options.context?.chat.slug ?? "owner", completed, failure, ...extra });
   }
 
   private async postResponse(id: string, turn: Turn, sessionId: string, directory: string, requestId: string, retry: ResponseRetry): Promise<void> {
@@ -5905,6 +5958,10 @@ export class Router {
     return !!this.store.db.query("SELECT 1 FROM inbound WHERE id = ? AND json_type(payload, '$.answeredAt') = 'integer'").get(id);
   }
 
+  private settled(id: string): boolean {
+    return !!this.store.db.query("SELECT 1 FROM inbound WHERE id = ? AND json_type(payload, '$.settledAt') = 'integer'").get(id);
+  }
+
   private replyCoverage(turn: Turn, scope: MessageRecord[], replyId: string, covered: string[], handledInputs: Set<string>): string[] {
     const inputs = new Set<string>();
     const first = turn.background ? turn.messageId : handledInputs.values().next().value;
@@ -5929,7 +5986,8 @@ export class Router {
     return id;
   }
 
-  private recoverHumanHandoffs(turn: Turn, outcome: string): void {
+  private recoverHumanHandoffs(turn: Turn, outcome: string, failureText?: string): { requeued: Set<string>; exhausted: Set<string>; settled: Set<string> } {
+    const result = { requeued: new Set<string>(), exhausted: new Set<string>(), settled: new Set<string>() };
     const live = this.store.get<Turn | null>("activeTurn");
     const ids = new Set([...turn.covered ?? [], ...(live?.messageId === turn.messageId ? live.covered ?? [] : []),
       ...this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? []]);
@@ -5939,14 +5997,17 @@ export class Router {
     }
     if (turn.replyInboundId) ids.add(turn.replyInboundId);
     const leaders = [...this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? [], ...ids];
+    const doneLeaders = new Set(this.store.get<string[]>(`human-recovered:${turn.messageId}`) ?? []);
     const recovered = new Set<string>();
+    const chat = this.options.context?.chat.slug ?? "owner";
     for (const id of ids) {
       const leader = this.humanBatchLeader(id, leaders);
       const members = this.store.get<NormalizedInbound>(`batch:${leader}`)?.batchIds ?? [id];
-      if (synthetic(id) || recovered.has(id)) continue;
+      if (synthetic(id) || recovered.has(id) || doneLeaders.has(leader)) continue;
       if (members.every(member => this.answered(member))) {
+        doneLeaders.add(leader);
         if (outcome === "failed") toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.retry_skipped",
-          ids: { inboundId: id, threadId: turn.id, chat: this.options.context?.chat.slug ?? "owner" }, props: { reason: "reply_already_sent" } }));
+          ids: { inboundId: id, threadId: turn.id, chat }, props: { reason: "reply_already_sent" } }));
         continue;
       }
       // Parent completion says nothing about an unresolved response POST on a child.
@@ -5956,9 +6017,62 @@ export class Router {
           WHERE k.key = 'reply-covered:' || o.id AND c.value = ?)) LIMIT 1`).get(leader, id);
       if (!reply && (outcome === "no_reply" || outcome === "failed" || outcome === "replied")) {
         for (const member of members) recovered.add(member);
-        this.requeueHuman(leader, outcome === "failed" ? "turn_failed" : "background_no_reply", true);
+        doneLeaders.add(leader);
+        const isOwnTurn = turn.inboundId === leader && !turn.background && !synthetic(leader);
+        if (outcome === "failed") {
+          const nextAttempt = (this.store.get<number>(`human-failed-attempts:${leader}`) ?? 0) + 1;
+          this.store.set(`human-failed-attempts:${leader}`, nextAttempt);
+          if (nextAttempt >= MAX_FAILED_ATTEMPTS) {
+            this.store.db.transaction(() => {
+              this.store.set(`human-own-turn:${leader}`, false);
+              this.store.set(`human-backoff-until:${leader}`, null);
+              this.store.set(`steer-attempt:${leader}`, null);
+              this.store.set(`steer-transient-refusals:${leader}`, null);
+              this.store.set(`batch-phase:${leader}`, null);
+              for (const member of members) {
+                if (!this.answered(member)) {
+                  this.failInbound(member, "execution", failureText ?? "Provider turn failed.", turn);
+                  this.store.set(`failed-retry-exhausted:${member}`, true);
+                }
+              }
+              this.store.set("deferredNotice", null);
+              if (!this.store.get(`retry-exhausted-noticed:${leader}`)) {
+                this.store.set(`retry-exhausted-noticed:${leader}`, true);
+                const noticeId = `failed:${leader}:exhausted`;
+                if (!this.store.getOperation(noticeId)) this.store.enqueue({
+                  id: noticeId, kind: "control", text: OUTAGE_TEXT,
+                  sessionId: turn.id, generation: turn.generation, ...this.replyTarget(leader),
+                });
+              }
+            }).immediate();
+            toolLog.capture(() => toolLog.write({
+              component: "router",
+              kind: "error",
+              name: "inbound.retry_exhausted",
+              ok: false,
+              ids: { inboundId: leader, threadId: turn.id, chat },
+              props: { attempt: nextAttempt, reason: "turn_failed" },
+            }));
+            for (const member of members) result.exhausted.add(member);
+            continue;
+          }
+          let backoffMs = 0;
+          if (isOwnTurn) {
+            const ownFailures = (this.store.get<number>(`human-own-failed-attempts:${leader}`) ?? 0) + 1;
+            this.store.set(`human-own-failed-attempts:${leader}`, ownFailures);
+            backoffMs = HUMAN_FAILURE_BACKOFF_MS[Math.min(ownFailures - 1, HUMAN_FAILURE_BACKOFF_MS.length - 1)]!;
+          }
+          const requeueOutcome = this.requeueHuman(leader, "turn_failed", true, undefined, { attempt: nextAttempt, backoffMs, threadId: turn.id });
+          if (requeueOutcome === "requeued") for (const member of members) result.requeued.add(member);
+          continue;
+        }
+        const requeueOutcome = this.requeueHuman(leader, "background_no_reply", true, undefined, { threadId: turn.id });
+        if (requeueOutcome === "requeued") for (const member of members) result.requeued.add(member);
+        else if (requeueOutcome === "capped") for (const member of members) result.settled.add(member);
       }
     }
+    if (doneLeaders.size) this.store.set(`human-recovered:${turn.messageId}`, [...doneLeaders]);
+    return result;
   }
 
   private logTurnEnd(turn: Turn, outcome: "replied" | "failed" | "refused" | "no_reply", recover = true, endReason?: DropReason): void {
@@ -5974,7 +6088,7 @@ export class Router {
         const reply = this.store.db.query(`SELECT 1 FROM outbox o WHERE json_extract(o.payload, '$.kind') = 'conversation' AND o.state IN ('pending', 'sending', 'sent', 'uncertain') AND
           ((json_extract(o.payload, '$.replyTo') = ? AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)) OR EXISTS (SELECT 1 FROM kv k, json_each(k.value) c
             WHERE k.key = 'reply-covered:' || o.id AND c.value = ?)) LIMIT 1`).get(leader, id);
-        if (row && ["done", "failed", "unknown"].includes(row.state) && !reply && !this.answered(id) && !this.store.get(`human-own-turn:${id}`))
+        if (row && ["done", "failed", "unknown"].includes(row.state) && !reply && !this.answered(id) && !this.settled(id) && !this.store.get(`human-own-turn:${id}`))
           toolLog.capture(() => toolLog.write({ component: "router", kind: "error", name: "inbound.unanswered", ok: false,
             ids: { inboundId: id, chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id } }));
       }
@@ -5991,16 +6105,35 @@ export class Router {
   private fail(snapshot: Turn, text: string, watermark?: string, reason: DropReason = "failed", immediate = false): void {
     // A steer can be confirmed while failure reads await the backend; retain that ownership across restart.
     const turn = this.typedInto(snapshot) ? { ...snapshot, typed: true } : snapshot;
-    this.recoverHumanHandoffs(turn, "failed");
+    const recovery = this.recoverHumanHandoffs(turn, "failed", text);
+    if (!turn.background && reason !== "undelivered" && !this.store.get(`turn-streak-counted:${turn.messageId}`)) {
+      const producedReply = !!turn.earlyText || (turn.outbox !== undefined && this.sentSince(turn.generation, turn.outbox))
+        || (turn.inboundId !== undefined && this.answered(turn.inboundId));
+      if (!producedReply && this.current(turn)) {
+        this.store.set(`turn-streak-counted:${turn.messageId}`, true);
+        const prev = this.store.get<FailureStreak | null>("routeFailureStreak");
+        const count = prev?.sessionId === turn.id && prev.generation === turn.generation ? prev.count + 1 : 1;
+        this.store.set("routeFailureStreak", { sessionId: turn.id, generation: turn.generation, count } satisfies FailureStreak);
+        if (count >= FAILURE_STREAK_ROTATE) {
+          this.store.set("failureStreakRoute", { sessionId: turn.id, generation: turn.generation, at: Date.now(), streak: count } satisfies FailureStreakRoute);
+        }
+      }
+    }
     if (turn.inboundId && this.answered(turn.inboundId)) toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.retry_skipped",
       ids: { inboundId: turn.inboundId!, threadId: turn.id, chat: this.options.context?.chat.slug ?? "owner" }, props: { reason: "reply_already_sent" } }));
+    const ownBatch = turn.inboundId !== undefined
+      ? new Set(this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId])
+      : null;
+    const retryHandled = turn.inboundId !== undefined
+      && (recovery.requeued.has(turn.inboundId) || recovery.exhausted.has(turn.inboundId))
+      && [...recovery.requeued].every(id => ownBatch!.has(id));
     this.store.db.transaction(() => {
-      const ids = turn.inboundId && !this.store.get(`human-own-turn:${turn.inboundId}`)
+      const ids = turn.inboundId && !retryHandled && !this.store.get(`human-own-turn:${turn.inboundId}`)
         ? this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId] : [];
       if (immediate) {
         // A broken new chat or model needs repair, not automatic replay of a watcher wake.
         for (const id of ids) if (!this.answered(id) && !this.store.get(`human-own-turn:${id}`)) this.failInbound(id, "execution", text, turn);
-        if (!ids.length || ids.some(id => !this.answered(id))) this.notice(turn, "failed", text);
+        if (!retryHandled && (!ids.length || ids.some(id => !this.answered(id)))) this.notice(turn, "failed", text);
       }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
       else if (this.syntheticBatch(turn.inboundId)) {
@@ -6013,7 +6146,7 @@ export class Router {
           else this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
         }
       }
-      else {
+      else if (!retryHandled) {
         if (!turn.background && (!ids.length || ids.some(id => !this.answered(id)))) {
           if (reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
           else this.notice(turn, "failed", text);

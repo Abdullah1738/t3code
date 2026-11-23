@@ -300,6 +300,7 @@ class Ticks(unittest.TestCase):
         self.assertEqual(plist['Nice'],-5)
         self.assertEqual(plist['ProcessType'],'Interactive')
         self.assertEqual(plist['StartInterval'],30)
+        self.assertEqual(plist['EnvironmentVariables'].get('TCC_AUTO_RESTART'),'1')
 
     def test_decode_argv_preserves_empty_and_excludes_environment(self):
         raw = (3).to_bytes(4,'little',signed=True)+b'/bin/a\0\0'+b'/bin/a\0\0arg\0SECRET=value\0'
