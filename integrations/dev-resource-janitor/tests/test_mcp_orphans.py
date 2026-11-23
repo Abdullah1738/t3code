@@ -52,6 +52,29 @@ class McpTests(JanitorTestCase):
         self.assertEqual(send.call_count, 1)
         self.assertEqual(action['protectedBy'], 'robob-descendant')
 
+    def test_mcp_below_robob_provider_keeps_preexisting_service_rules(self):
+        self.parent('codex exec')
+        self.rows[30]['ppid'] = 20
+        self.rows[20] = dict(self.rows[30], pid=20, ppid=1,
+                             args='node apps/server/dist/bin.mjs --bootstrap-fd 3')
+        report = self.detect()
+        self.assertEqual(report['candidates'], [])
+        self.assertEqual(report['inventory'][0]['keep_reason'], 'protected_ancestor')
+        self.assertFalse(lp.robob_ancestry(self.row, lp.parent_chain(self.row, self.rows)))
+        self.row['ppid'] = 20
+        self.assertEqual(self.detect()['inventory'][0]['keep_reason'], 'robob-descendant')
+
+    def test_mcp_recheck_below_provider_does_not_add_robob_protection(self):
+        self.parent('codex exec')
+        report = self.detect()
+        self.rows[30]['ppid'] = 20
+        self.rows[20] = dict(self.rows[30], pid=20, ppid=1,
+                             args='node apps/server/dist/bin.mjs --bootstrap-fd 3')
+        action = self.reap(report, rescan=lambda pid: copy.deepcopy(report))[0]
+        self.assertNotIn('protectedBy', action)
+        self.assertEqual(action['reason'], 'changed_before_term')
+        self.assertEqual(action['signals'], [])
+
     def test_exact_executable_entry_matrix(self):
         forms = [(args, key) for key, args in HELPERS.items()] + [
             ('node /opt/dia-agent-bridge/src/server.js', 'dia'),

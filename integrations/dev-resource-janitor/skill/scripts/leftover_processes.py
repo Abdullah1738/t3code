@@ -192,6 +192,7 @@ def family(row):
 
 
 def robob_ancestry(row, chain):
+    # parent_chain() is nearest-first; protection ends at the first provider.
     for p in [row] + chain:
         try:
             argv = shlex.split(p.get('args', ''))
@@ -199,6 +200,16 @@ def robob_ancestry(row, chain):
             continue
         if not argv:
             continue
+        name = Path(argv[0]).name.lower()
+        if (mcp_provider(p) or name in {'gemini', 'cursor-agent', 'grok', 'antigravity'}
+                or any(name.startswith(n + '-') for n in ('codex', 'claude', 'opencode'))):
+            return False
+        if name in {'node', 'bun', 'npx', 'bash', 'zsh', 'sh', 'python', 'python3'}:
+            for word in argv[1:]:
+                if word in {'-c', '-e', '--eval', '--prompt', '-p'}:
+                    break
+                if re.search(r'(?:^|[/@])(?:claude(?:-code)?|codex|opencode|gemini(?:-cli)?|cursor-agent|grok|antigravity)(?:$|[/.-])', word, re.I):
+                    return False
         if argv[0].startswith('/Applications/Robob.app/'):
             return True
         if (Path(argv[0]).name in ('node', 'bun') and len(argv) > 1
