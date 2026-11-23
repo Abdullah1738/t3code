@@ -27,7 +27,6 @@ class FakeBackend extends OpenChamber {
   questionsFail = false;
   records: MessageRecord[] = [];
   prompts: { session: string; id: string; text: string; system?: string }[] = [];
-  pendingPerms: { id: string; sessionID: string; action: string; resources: string[]; save?: boolean; source?: string }[] = [];
   constructor() { super("http://127.0.0.1:1"); }
   override async request<T>(): Promise<T | undefined> { throw new Error("Unexpected backend access"); }
   override async createChat() {
@@ -35,7 +34,7 @@ class FakeBackend extends OpenChamber {
     return { id: "ses_1", directory: "/Chats/ses_1" };
   }
   override async isSessionAutoAccepting() { return false; }
-  override async permissions() { return this.pendingPerms; }
+  override async permissions() { return []; }
   override async questions() {
     if (this.questionsFail) throw new Error("questions down");
     return [];

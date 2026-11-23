@@ -40,7 +40,7 @@ function setup(react: (id: string, reaction: string) => Promise<void> = async ()
       if (chat.store !== ownerStore) stores.push(chat.store);
       if (chat.info.slug === "moni") chat.remote = new RemoteBox({ kind: "remote-box", url: "http://127.0.0.1:12345",
         tokenFile, callbackTokenFile: tokenFile, publicKeyFile, callbackPort: 12346, epoch: "test", boxId: "bx_test" }, chat.store,
-      { log, notice: async () => { throw new Error("receipt must not send text"); }, active: () => true,
+      { log, active: () => true,
         fetch: async () => { throw new Error("receipt must not contact the box"); } });
       return {};
     },

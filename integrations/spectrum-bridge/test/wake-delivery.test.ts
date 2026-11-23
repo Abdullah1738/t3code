@@ -56,6 +56,11 @@ class Backend extends OpenChamber {
 }
 const stores: Store[] = [];
 afterEach(() => { stores.splice(0).forEach(store => store.close()); setSystemTime(); });
+function expectDroppedNotices(store: Store, count = 1) {
+  expect(store.pendingOutbox().filter(op => op.kind === "control")).toEqual([]);
+  expect(store.operationalNotices().filter(notice => notice.kind === "dropped")).toHaveLength(count);
+}
+
 function setup() {
   setSystemTime(start);
   const store = new Store(":memory:"); stores.push(store);
@@ -121,7 +126,7 @@ test.each(["main.ts", "sb-main.ts"].flatMap(file => [false, true].flatMap(restar
 ("$file sender expires receipts while transport is unready ($restart/$initiallyReady)", async ({ file, restart, initiallyReady }) => {
   const h = setup(); new WakeDelivery(h.store).accept(id);
   let router = h.router();
-  let backendCalls = 0, deliveryTicks = 0;
+  let backendCalls = 0, deliveryTicks = 0, noticeFlushes = 0;
   h.backend.promptAccepted = async () => { backendCalls++; return false; };
   h.backend.messages = async () => { backendCalls++; return []; };
   const errors: unknown[] = [], checks: Promise<void>[] = [];
@@ -145,11 +150,13 @@ test.each(["main.ts", "sb-main.ts"].flatMap(file => [false, true].flatMap(restar
   let fire: (() => void) | undefined;
   const interval = new Bun.Transpiler({ loader: "ts" }).transformSync(source.slice(begin, end + "  }, 1_000);".length));
   const install = new Function("setInterval", "ready", "router", "delivery", "replyGap", "chats", "toolError", "log", "store", "backend", "RobobBackend",
+    "flushOperationalNotices", "socketPost", "telegramBridgeSocket",
     `let routerBusy = true;\n${interval}`);
   let ready = initiallyReady;
   install((callback: () => void, ms: number) => { expect(ms).toBe(1_000); fire = callback; }, () => ready,
     clock, delivery, replyGap, { all: () => [{ store: h.store, parts: { router: clock, delivery, replyGap, busy: true } }] },
-    (...args: unknown[]) => errors.push(args), (...args: unknown[]) => errors.push(args), h.store, new MarkerBackend(), MarkerBackend);
+    (...args: unknown[]) => errors.push(args), (...args: unknown[]) => errors.push(args), h.store, new MarkerBackend(), MarkerBackend,
+    async (store: Store) => { expect(store).toBe(h.store); noticeFlushes++; }, () => {}, "/test/alert.sock");
   fire!(); await Promise.all(checks.splice(0));
   backendCalls = 0; ready = false;
   const logs = await captureLogs(async () => {
@@ -165,6 +172,7 @@ test.each(["main.ts", "sb-main.ts"].flatMap(file => [false, true].flatMap(restar
   });
   expect(logs.filter(line => line.name === "wake.failed")).toHaveLength(1);
   expect(deliveryTicks).toBe(4);
+  expect(noticeFlushes).toBe(initiallyReady ? 3 : 4);
   expect(backendCalls).toBe(0);
   expect(h.backend.prompts).toEqual([]);
   expect(errors).toEqual([]);
@@ -269,7 +277,7 @@ test.each([30 * 60_000, 24 * 60 * 60_000, 24 * 60 * 60_000 + 1])("legacy wake mi
     expect(h.state()).toBe("failed");
     expect(wakeStatus(h.store, id)?.state).toBe("failed");
     expect(h.backend.prompts).toEqual([]);
-    expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toHaveLength(age <= 24 * 60 * 60_000 ? 1 : 0);
+    expectDroppedNotices(h.store, age <= 24 * 60 * 60_000 ? 1 : 0);
     expect(h.store.get<{ id: string }[]>("missedSynthetic")?.some(row => row.id === id) ?? false).toBe(age <= 6 * 60 * 60_000);
   });
 });
@@ -288,7 +296,7 @@ test("an ambiguous wake expires on the local clock even while the link gate stay
     expect(wakeStatus(h.store, id)?.state).toBe("failed");
     expect(h.backend.prompts).toEqual([promptId]);
     h.backend.available = true; await router.tick();
-    expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toHaveLength(1);
+    expectDroppedNotices(h.store);
   });
 });
 
@@ -433,7 +441,7 @@ test("a batch with permanently unreadable receipts retires every member once at 
     for (const member of [id, second]) expect(wakeStatus(h.store, member)?.state).toBe("failed");
     expect(h.store.pendingInbound()).toEqual([]);
     expect(h.store.get<{ id: string }[]>("missedSynthetic")?.map(row => row.id)).toEqual([id, second]);
-    expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toHaveLength(1);
+    expectDroppedNotices(h.store);
     expect(h.backend.prompts).toEqual([promptId]);
   });
   expect(logs.filter(line => line.name === "wake.failed")).toHaveLength(2);
@@ -497,7 +505,7 @@ test("gate closure at exhaustion commits terminal inbound state for the whole wa
     setSystemTime(start + 31 * 60_000); await router.tick();
     expect(h.store.pendingInbound()).toEqual([]);
     expect(h.backend.prompts).toHaveLength(sends);
-    expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toHaveLength(1);
+    expectDroppedNotices(h.store);
   });
 });
 
@@ -565,7 +573,7 @@ test.each([false, true])("an unadmitted execution retry exhausts without erasing
     router = h.router(); await router.tick(); await router.tick();
     expect(h.backend.prompts).toHaveLength(sends);
     expect(h.store.pendingInbound()).toEqual([]);
-    expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toHaveLength(1);
+    expectDroppedNotices(h.store);
   });
   expect(logs.filter(line => line.name === "wake.admitted")).toHaveLength(2);
   expect(logs.filter(line => line.name === "wake.failed")).toHaveLength(0);
@@ -598,7 +606,7 @@ test.each([false, true].flatMap(expiredLeader => (expiredLeader ? [false, true] 
     setSystemTime(start + 61 * 60_000); await router.tick(); await router.checkInboundLatency(); await router.tick();
     expect(h.backend.prompts).toEqual([]);
     expect(h.store.pendingInbound()).toEqual([]);
-    expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toHaveLength(1);
+    expectDroppedNotices(h.store);
     expect(h.store.get<{ id: string }[]>("missedSynthetic")?.map(row => row.id)).toEqual(reminder ? [id] : [id, second]);
   });
   for (const member of [id, second]) expect(logs.filter(line => line.name === "wake.failed" && line.ids?.inboundId === member)).toHaveLength(1);
@@ -628,7 +636,7 @@ test.each([false, true])("migration keeps attempted mixed-age members fenced tog
     expect(h.store.get<{ id: string; uncertain?: boolean }[]>("missedSynthetic")).toEqual([
       expect.objectContaining({ id, uncertain: true }), expect.objectContaining({ id: second, uncertain: true }),
     ]);
-    expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toHaveLength(1);
+    expectDroppedNotices(h.store);
   });
 });
 
@@ -676,7 +684,7 @@ test.each(["absent", "unreadable"] as const)("a timed-out wake whose probe is %s
     }
     expect(h.state()).toBe("failed");
     expect(h.store.get<{ id: string }[]>("missedSynthetic")?.map(row => row.id)).toContain(id);
-    expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toHaveLength(1);
+    expectDroppedNotices(h.store);
     expect(h.store.get<{ attempts: number }>(`synthetic-retry:${id}`)?.attempts).toBeGreaterThan(0);
     expect(new Set(h.backend.prompts)).toEqual(new Set([promptId]));
     if (outcome === "unreadable") expect(h.backend.prompts).toEqual([promptId]);

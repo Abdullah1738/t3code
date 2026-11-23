@@ -608,7 +608,8 @@ test.each([
   const expected = Array.from({ length: 5 }, (_, i) => `Later answer ${i}`);
   if (firstStatus === "completed" && partial) expected.unshift("Partial first-run output");
   expect(store.pendingOutbox().filter(item => item.kind === "conversation").map(item => item.text)).toEqual(expected);
-  expect(store.pendingOutbox().filter(item => item.kind === "control")).toHaveLength(firstStatus === "failed" ? 1 : 0);
+  expect(store.pendingOutbox().filter(item => item.kind === "control")).toEqual([]);
+  expect(store.operationalNotices().filter(item => item.kind === "failed")).toHaveLength(firstStatus === "failed" ? 1 : 0);
   if (firstStatus === "failed") expect(alerts[0]).toContain("Run failed without error details");
 });
 

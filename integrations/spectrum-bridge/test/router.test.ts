@@ -8139,7 +8139,8 @@ test.each((["final", "tool"] as const).flatMap(replyMode => ["generic", "model-e
   expect(inbounds(h.store).filter(row => ["second", "second-member"].includes(row.id)).map(row => row.state))
     .toEqual(["admitted", "admitted"]);
   expect(h.store.get<object>("watermark")).toMatchObject({ id: lastIdle });
-  expect(h.controls()).toHaveLength(1);
+  expect(h.controls()).toEqual([]);
+  expect(h.notices("failed")).toHaveLength(1);
   expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(replyMode === "tool"
     ? ["Original question", "Second question\nAnother part of the successful question"] : ["Original question", "Third question"]);
   if (replyMode === "tool") {
@@ -10031,7 +10032,8 @@ test.each(interruptedBlockCases)("native block order preserves reply and silence
   await h.router.tick();
   await h.router.tick();
   expect(h.conversations().map(op => op.text)).toEqual(quiet ? [] : texts);
-  expect(h.controls()).toHaveLength(quiet ? 1 : 0);
+  expect(h.controls()).toEqual([]);
+  expect(h.notices("failed")).toHaveLength(quiet ? 1 : 0);
 });
 
 test.each([
@@ -10059,7 +10061,8 @@ test.each([
   await h.router.tick();
   await h.router.tick();
   expect(h.conversations().map(op => op.text)).toEqual([...visible]);
-  expect(h.controls()).toHaveLength(visible.length ? 0 : 1);
+  expect(h.controls()).toEqual([]);
+  expect(h.notices("failed")).toHaveLength(visible.length ? 0 : 1);
 });
 
 test.each(["running", "visible", "quiet", "failed", "interrupted"].flatMap(outcome =>

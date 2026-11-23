@@ -1034,7 +1034,8 @@ test("gate-held owner DM still alarms at 10 minutes and keeps the technical noti
       expect(h.alerts).toEqual([]);
       await h.advance(start + 600_000); await h.router.tick(); await h.router.checkUnanswered();
       expect(h.alerts).toEqual([start + 600_000]);
-      expect(h.store.db.query("SELECT id FROM outbox WHERE json_extract(payload, '$.text') LIKE '%technical%'").all()).toHaveLength(1);
+      expect(h.store.pendingOutbox()).toEqual([]);
+      expect(h.store.operationalNotices()).toMatchObject([{ kind: "outage", chat: "owner", createdAt: start + 600_000 }]);
       expect(h.store.pendingInbound().map(row => row.id)).toEqual(["waiting"]);
     });
   } finally { h.fetcher.mockRestore(); }
