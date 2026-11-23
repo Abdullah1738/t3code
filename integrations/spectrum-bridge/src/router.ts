@@ -5166,7 +5166,7 @@ export class Router {
         const completion = messages.findIndex((record, index) => record.type === "idle"
           && (run?.completionId ? record.id === run.completionId : index > start));
         const observed = run?.messageIds?.every(id => messages.some(record => record.id === id));
-        if (this.idleBackground(turn) && run?.terminal && !(start >= 0 && completion > start)) {
+        if (this.idleBackground(turn) && run?.terminal && !(start >= 0 && messages.slice(start + 1).some(record => record.type === "idle"))) {
           this.releaseBackground(turn, "run_terminal", messages);
           return;
         }
@@ -5448,9 +5448,9 @@ export class Router {
       // `start >= 0`: the watermark record is on the page read, so `after` is
       // really "nothing new on the root". If it fell off the page, the root
       // has moved on and the ordinary background handling below applies.
-      if (turn.origin === "request" && turn.phase === "running" && start >= 0) {
-        // Opened only to ask a subagent's request. Once the root itself runs
-        // or writes records, the ordinary background-turn handling takes over.
+      if (turn.background && !turn.inboundId && (turn.origin === "request" || this.ownsHuman(turn) && !after.length) && turn.phase === "running" && start >= 0) {
+        // A response can be accepted by a request holder or an adopted run.
+        // Root activity still follows ordinary background completion handling.
         const now = Date.now();
         if (after.length || statuses[turn.id] !== undefined) {
           turn = { ...turn, origin: undefined, activeAt: undefined };
@@ -5695,7 +5695,10 @@ export class Router {
         && (released.recordsKey ? released.recordsKey === this.backgroundRecordsKey(messages) : released.lastId === messages.at(-1)?.id);
       if (unchanged && !released?.recordsKey) return;
       const run = this.backend.backgroundRun ? await this.reading(this.backend.backgroundRun(route.id, route.directory)) : undefined;
-      if (unchanged && (!run || released?.runId === run.runId)) return;
+      const completed = after.some(record => record.type === "idle");
+      // A terminal binding may be empty while another completed run has an
+      // undelivered answer. Its readable completion must reach ordinary polling.
+      if (unchanged && (!run || released?.runId === run.runId) && !(run?.terminal && completed)) return;
       if (!this.current(route) || this.store.get<Turn | null>("activeTurn")?.phase?.match(/^(submitting|running|unknown|held)$/)) return;
       const adopted: Turn = {
         id: route.id, directory: route.directory, generation: route.generation,
@@ -5707,7 +5710,7 @@ export class Router {
       this.setTurn(adopted);
       toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.hold_adopted",
         ids: { threadId: route.id, messageId: mark.id }, props: { runStatus: run?.status ?? "unknown", ...(run ? { holderRunId: run.runId } : {}) } }));
-      if (run?.terminal && !after.some(record => record.type === "idle" && (!run.completionId || record.id === run.completionId))) this.releaseBackground(adopted, "run_terminal", messages);
+      if (run?.terminal && !completed) this.releaseBackground(adopted, "run_terminal", messages);
     } catch (caughtError) { toolError("router", "router.catch49", caughtError);
       // Best effort; the next tick looks again.
     }
@@ -5879,7 +5882,7 @@ export class Router {
             || active.origin === "request" && active.leaderId === (turn.leaderId ?? turn.inboundId));
           if (parent) {
             this.store.set(`human-response-prompt:${id}`, active!.steered?.at(-1) ?? active!.messageId);
-            if (active!.origin === "request") this.setTurn({ ...active!, activeAt: Date.now() });
+            if (active!.background) this.setTurn({ ...active!, activeAt: Date.now() });
           }
           this.trackHuman(parent ? active! : turn, id);
           if (!parent && this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state === "admitted")

@@ -12881,14 +12881,21 @@ test.each(terminalHandoffCases)("idle holder review: terminal run without a late
 
 const quiescentHandoffCases = ["question", "permission"].flatMap(kind =>
   ["final", "tool"].flatMap(replyMode => [false, true].flatMap(restart =>
-    ["cleanup", "preemption"].map(path => ({ kind, replyMode: replyMode as "final" | "tool", restart, path })))));
-test.each(quiescentHandoffCases)("idle holder review: quiescent accepted $kind releases without replay ($replyMode, restart=$restart, $path)", async ({ kind, replyMode, restart, path }) => {
+    ["cleanup", "preemption"].flatMap(path => ["request", "adopted"].map(origin => ({ kind, replyMode: replyMode as "final" | "tool", restart, path, origin }))))));
+test.each(quiescentHandoffCases)("idle holder review: quiescent accepted $kind releases without replay ($replyMode, restart=$restart, $path, $origin)", async ({ kind, replyMode, restart, path, origin }) => {
   const start = 10_000; setSystemTime(start);
   const alerts: string[][] = [];
   const h = setup(":memory:", { watchMs: 0, replyMode, notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
   h.input("before-quiescent", "Hi"); await h.router.tick();
   if (replyMode === "tool") agentSends(h, "ready", "Ready");
   h.backend.final("Ready"); await h.router.tick(); deliver(h.store);
+  let terminal = false;
+  if (origin === "adopted") {
+    h.backend.states.ses_1 = { type: "busy" };
+    Object.assign(h.backend, { backgroundRun: async () => ({ runId: "run75", completionId: "idle:run75",
+      status: terminal ? "completed" : "running", terminal, ...(terminal ? { messageIds: [] } : {}) }) });
+    await h.router.tick();
+  }
   h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
   h.backend.states.ses_child = { type: "busy" };
   if (kind === "question") h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
@@ -12898,6 +12905,9 @@ test.each(quiescentHandoffCases)("idle holder review: quiescent accepted $kind r
   h.input("answer", kind === "question" ? "A" : "/approve perm_1 once", { source: "typed" }); await h.router.tick();
   expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
   const prompt = h.store.get<string>("human-response-prompt:answer");
+  expect(h.store.get<{ origin?: string }>("activeTurn")?.origin).toBe(origin === "request" ? "request" : undefined);
+  terminal = true;
+  delete h.backend.states.ses_1;
   delete h.backend.states.ses_child;
   const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
   setSystemTime(start + 60 * 60_000);
@@ -12916,4 +12926,50 @@ test.each(quiescentHandoffCases)("idle holder review: quiescent accepted $kind r
   expect(h.store.get<boolean>("human-own-turn:answer")).toBe(false);
   expect(h.store.get<string>("human-response-prompt:answer")).toEqual(prompt);
   expect(alerts).toHaveLength(1);
+});
+
+
+const emptyLatestCases = ["adoption", "poll", "bound"].flatMap(path =>
+  [false, true].map(restart => ({ path, restart })));
+test.each(emptyLatestCases)("idle holder review: empty newest terminal run preserves older readable completion ($path, restart=$restart)", async ({ path, restart }) => {
+  const start = 10_000; setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-empty-latest", "Hi", "Ready");
+  const thread: ThreadDetail = { threadId: "thread-test", projectId: "chats", title: "Owner", state: "idle", status: "completed",
+    origin: "imessage", nativeSessionId: null, model: { instanceId: "antigravity", model: "ag/gemini-4-neon-high" },
+    runtimeMode: "full-access", parentThreadId: null, rootThreadId: "thread-test", worktreePath: "/Chats", pendingRequest: null,
+    lastError: null, createdAt: null, updatedAt: null, run: { runId: "run77", ordinal: 77, status: "completed" },
+    recentRuns: [{ runId: "run75", ordinal: 75, status: "completed" }, { runId: "run77", ordinal: 77, status: "completed" }], pendingRequests: [] };
+  const adapter = new RobobBackend({ chatRoot: "/chats", url: "http://127.0.0.1:1", token: "test", linkGate: false });
+  spyOn(adapter.client, "thread").mockResolvedValue({ thread });
+  spyOn(adapter.client, "runEvidence").mockImplementation(async (_id, runId) => ({ runId, status: "completed" as const, complete: true, toolEvidence: "unknown" as const, messages: [] }));
+  const records = recordsFromThread(thread, [{ messageId: "answer75", runId: "run75", role: "assistant", phase: "answer", text: "Earlier result",
+    streaming: false, createdAt: new Date(start).toISOString(), updatedAt: new Date(start).toISOString() }]);
+  expect(records.map(record => record.id)).toEqual(["answer75", "idle:run75"]);
+  expect(await adapter.backgroundRun(thread.threadId, "/Chats")).toMatchObject({ runId: "run77", terminal: true });
+  h.backend.records.push(...records);
+  Object.assign(h.backend, { backgroundRun: (_id: string, _directory: string, bound?: string) => adapter.backgroundRun(thread.threadId, "/Chats", bound) });
+  const mark = h.store.get<{ id: string }>("watermark")!;
+  if (path === "poll") {
+    h.store.set("activeTurn", { ...h.store.get<object>("route"), messageId: mark.id, holderRunId: "run77",
+      startedAt: start, phase: "running", background: true });
+  } else if (path === "bound") {
+    thread.run!.status = "running";
+    thread.recentRuns.find(run => run.runId === "run77")!.status = "running";
+    h.backend.states.ses_1 = { type: "busy" };
+    await h.router.tick(); await h.router.tick();
+    expect(h.conversations()).toEqual([]);
+    thread.run!.status = "completed";
+    thread.recentRuns.find(run => run.runId === "run77")!.status = "completed";
+    delete h.backend.states.ses_1;
+    setSystemTime(start + 15 * 60_000);
+  }
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  for (let i = 0; i < 5; i++) await router.tick();
+  const result = h.conversations().filter(op => op.text === "Earlier result");
+  expect(result).toHaveLength(1);
+  h.store.outboxState(result[0]!.id, "sent");
+  for (let i = 0; i < 3; i++) await router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("activeTurn")).toBeNull();
 });
