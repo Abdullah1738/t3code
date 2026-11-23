@@ -1187,9 +1187,10 @@ Each rung also records the latest logged swap/pressure before and after it,
 with observation timestamps. A fresh janitor report with inventory problems
 produces `inventory-unavailable`, even if the worker exited zero; missing or
 stale reports are labelled. Priority actions retain individual command/syscall
-outcomes, bounded error reasons and known errno values. `gone` identifies an
-exited process; `partial` records a successful renice followed by a failed
-backgrounding command. Action evidence survives the day-file cap.
+outcomes, bounded error reasons and numeric errno or exit codes. `gone` identifies
+an exited process. Softening uses renice only, skips nice values at least 10,
+and checks identity before reading back the new nice value. Action evidence
+survives the day-file cap.
 Install the corresponding janitor reporter update too: its scan timestamp must
 retain fractional seconds to pass the guard's strict report-freshness check.
 

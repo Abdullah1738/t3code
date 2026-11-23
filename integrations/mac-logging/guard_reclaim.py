@@ -1,6 +1,7 @@
 """Consume host.overload transitions; never infer overload from host counters."""
 import ctypes as c
 import datetime as dt
+import errno as errno_codes
 import fcntl
 import json
 import math
@@ -313,6 +314,8 @@ class Darwin:
                 value = operation()
             except (OSError, ValueError) as exc:
                 failure = failure_details(exc, stage)
+                if failure.get('errno') is None and failure.get('rc') is None:
+                    failure['errno'] = errno_codes.EINVAL if isinstance(exc, ValueError) else errno_codes.EIO
                 stages[stage] = failure
                 return dict(outcome, stage=stage, **failure)
             stages[stage] = dict(result='sent')
@@ -324,6 +327,10 @@ class Darwin:
                     return dict(outcome, result='identity-changed')
             elif stage == 'getpriority':
                 outcome['niceBefore'] = value
+                if value >= 10:
+                    outcome['niceAfter'] = value
+                    stages['setpriority'] = dict(result='skipped', reason='already-nice')
+                    return dict(outcome, result='skipped', reason='already-nice')
             elif stage == 'readBack':
                 outcome['niceAfter'] = value
         return dict(outcome, result='sent')

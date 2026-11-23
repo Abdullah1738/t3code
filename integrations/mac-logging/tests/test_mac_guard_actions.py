@@ -65,34 +65,32 @@ class CommandOutcomeTests(unittest.TestCase):
 
     def test_command_stage_matrix_and_guard_action_rows(self):
         cases = [
-            ('success', 0, '', True, 0, '', 'sent', None, None),
-            ('taskpolicy-error', 0, '', True, 1, 'Operation not permitted', 'partial', None, None),
-            ('renice-gone', 1, 'renice: No such process', False, 0, '', 'gone', errno.ESRCH, 'renice-failed'),
-            ('unproven-gone', 1, 'renice: No such process', True, 0, '', 'error', None, 'renice-failed'),
-            ('identity-changed', 0, '', False, 0, '', 'sent', None, 'identity-changed'),
-            ('long-stderr', 9, 'x'*400, True, 0, '', 'error', None, 'renice-failed'),
+            ('success', 0, '', True, 20, 'sent', 'readBack'),
+            ('renice-gone', 1, 'renice: No such process', False, 20, 'gone', 'renice'),
+            ('unproven-gone', 1, 'renice: No such process', True, 20, 'error', 'renice'),
+            ('identity-changed', 0, '', False, 20, 'identity-changed', 'identityRecheck'),
+            ('long-stderr', 9, 'x'*400, True, 20, 'error', 'renice'),
+            ('readback-mismatch', 0, '', True, 0, 'error', 'readBack'),
+            ('readback-clamped', 0, '', True, 19, 'error', 'readBack'),
         ]
-        for name, rc, stderr, same, taskrc, taskerr, expected, number, skipped in cases:
+        for name, rc, stderr, same, after, expected, stage in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 commands = []
                 def run(argv, **kw):
                     commands.append(Path(argv[0]).name)
-                    return subprocess.CompletedProcess(argv, rc if commands[-1] == 'renice' else taskrc,
-                                                       '', stderr if commands[-1] == 'renice' else taskerr)
+                    return subprocess.CompletedProcess(argv, rc, '', stderr)
                 real = m.Host(run)
-                with patch.object(real, 'identity_recheck', return_value=dict(same=same)):
+                with patch.object(real, 'identity_recheck', side_effect=[dict(same=True), dict(same=same)]), \
+                        patch.object(os, 'getpriority', side_effect=[0, after]) as get:
                     outcome = real.soften(proc(20))
                 self.assertEqual(outcome['result'], expected)
-                self.assertEqual(outcome['errno'], number)
+                self.assertEqual(outcome['stage'], stage)
+                self.assertEqual(commands, ['renice'])
                 self.assertEqual(outcome['stages']['renice']['rc'], rc)
-                self.assertEqual(outcome['stages']['identityRecheck']['same'], same)
-                if skipped:
-                    self.assertEqual(outcome['stages']['taskpolicy'], dict(result='skipped', reason=skipped))
-                    self.assertEqual(commands, ['renice'])
-                else:
-                    self.assertEqual(commands, ['renice', 'taskpolicy'])
-                    self.assertEqual(outcome['stages']['taskpolicy']['rc'], taskrc)
-                if expected in ('error', 'partial', 'gone'):
+                self.assertEqual(get.call_count, 2 if rc == 0 and same else 1)
+                if expected == 'error':
+                    self.assertTrue(any(type(outcome.get(k)) is int for k in ('errno', 'rc')))
+                if expected != 'sent':
                     self.assertTrue(outcome['reason'])
                     self.assertLessEqual(len(outcome['reason']), 200)
                 host = FakeHost()
@@ -107,9 +105,13 @@ class CommandOutcomeTests(unittest.TestCase):
                 row = guard.actions[-1]
                 self.assertEqual(row['result'], expected)
                 self.assertEqual(row['stages'], outcome['stages'])
+                if expected == 'error':
+                    self.assertEqual(row['stage'], stage)
+                    self.assertNotEqual(row.get('errno', 'absent'), None)
+                    self.assertTrue(any(type(row.get(k)) is int for k in ('errno', 'rc')))
                 self.assertEqual(toollog.safe_fields(row, 'macguard.action'), row)
 
-    def test_identity_probe_retains_failure_and_esrch_skips_taskpolicy(self):
+    def test_identity_probe_retains_failure_and_esrch_skips_renice(self):
         for number in (errno.EPERM, errno.ESRCH):
             def run(argv, **kw):
                 raise OSError(number, os.strerror(number))
@@ -117,10 +119,77 @@ class CommandOutcomeTests(unittest.TestCase):
             identity = host.identity_recheck(proc(20))
             self.assertFalse(identity['same'])
             self.assertEqual(identity['errno'], number)
-            with patch.object(host, 'identity_recheck', return_value=dict(same=False)):
-                outcome = host.soften(proc(20))
+            outcome = host.soften(proc(20))
             self.assertEqual(outcome['result'], 'gone' if number == errno.ESRCH else 'error')
-            self.assertEqual(outcome['stages']['taskpolicy']['reason'], 'renice-failed')
+            self.assertEqual(outcome['stage'], 'identityRead')
+            self.assertEqual(outcome['stages']['renice']['result'], 'skipped')
+
+    def test_soften_already_nice_table_never_demotes_again(self):
+        for nice in (10, 15, 20):
+            with self.subTest(nice=nice), patch.object(os, 'getpriority', return_value=nice), \
+                    patch.object(os, 'setpriority') as setter:
+                host = m.Host()
+                with patch.object(host, 'identity_recheck', return_value=dict(same=True)), patch.object(host, 'cmd') as run:
+                    outcome = host.soften(proc(20))
+                self.assertEqual((outcome['result'], outcome['reason']), ('skipped', 'already-nice'))
+                self.assertEqual(outcome['niceAfter'], nice)
+                setter.assert_not_called()
+                run.assert_not_called()
+
+    def test_soften_errors_and_gone_at_each_stage(self):
+        for stage in ('identityRead', 'getpriority', 'renice', 'identityRecheck', 'readBack'):
+            for number in (errno.EPERM, errno.ESRCH):
+                with self.subTest(stage=stage, number=number):
+                    host = m.Host()
+                    failure = OSError(number, os.strerror(number))
+                    calls = []
+                    def identity(p):
+                        which = 'identityRead' if not calls else 'identityRecheck'
+                        calls.append(which)
+                        return dict(same=False, **cpu.failure_details(failure, 'ps')) if stage == which else dict(same=True)
+                    reads = []
+                    def priority(*a):
+                        which = 'getpriority' if not reads else 'readBack'
+                        reads.append(which)
+                        if stage == which:
+                            raise failure
+                        return 0 if which == 'getpriority' else 20
+                    with patch.object(host, 'identity_recheck', side_effect=identity), \
+                            patch.object(os, 'getpriority', side_effect=priority), \
+                            patch.object(host, 'cmd', side_effect=failure if stage == 'renice' else None):
+                        outcome = host.soften(proc(20))
+                    self.assertEqual((outcome['stage'], outcome['errno']), (stage, number))
+                    self.assertEqual(outcome['result'], 'gone' if number == errno.ESRCH else 'error')
+
+    def test_soften_ps_no_matching_process_is_gone(self):
+        host = m.Host(lambda argv, **kw: subprocess.CompletedProcess(argv, 1, '', ''))
+        with patch.object(os, 'getpriority') as get:
+            outcome = host.soften(proc(20))
+        self.assertEqual((outcome['result'], outcome['stage'], outcome['errno']), ('gone', 'identityRead', errno.ESRCH))
+        get.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS nice 20; Linux clamps to 19')
+    def test_soften_live_owned_child_renice_readback_and_no_taskpolicy(self):
+        child = subprocess.Popen(['/bin/sleep', '30'])
+        try:
+            if os.getpriority(os.PRIO_PROCESS, child.pid) >= 10:
+                self.skipTest('owned child inherited nice >=10; must not promote it')
+            start = subprocess.check_output(['/bin/ps', '-p', str(child.pid), '-o', 'lstart='], text=True).strip()
+            comm = subprocess.check_output(['/bin/ps', '-p', str(child.pid), '-o', 'comm='], text=True).strip()
+            args = subprocess.check_output(['/bin/ps', '-p', str(child.pid), '-o', 'args='], text=True).strip()
+            seen = []
+            def run(argv, **kw):
+                seen.append(argv)
+                return subprocess.run(argv, **kw)
+            outcome = m.Host(run).soften(proc(child.pid, comm, start=start, args=args))
+            self.assertEqual(outcome['result'], 'sent', outcome)
+            self.assertEqual(outcome['niceAfter'], 20)
+            self.assertEqual(os.getpriority(os.PRIO_PROCESS, child.pid), 20)
+            self.assertFalse(any('taskpolicy' in str(a) for argv in seen for a in argv))
+            self.assertIsNone(child.poll())
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
 
     def test_probe_error_without_errno_has_action_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,7 +202,8 @@ class CommandOutcomeTests(unittest.TestCase):
                 self.assertFalse(guard.action(p, 'B', 'renice'))
             row = guard.actions[-1]
             self.assertEqual(row['result'], 'error')
-            self.assertIsNone(row['errno'])
+            self.assertEqual(row['errno'], errno.EIO)
+            self.assertEqual(row['stage'], 'renice')
             self.assertEqual(row['reason'], 'renice rc=None: exit')
 
 
