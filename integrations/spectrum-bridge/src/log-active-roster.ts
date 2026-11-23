@@ -1,6 +1,16 @@
 import type { LogLine } from "./toollog.ts";
 
-export const ROSTER_ACTIONS = ["fetches", "startup", "roster_event", "safety", "stream_down", "incomplete", "error_retry", "joins", "hits", "patches", "misses", "streamUp", "streamDown", "errors", "children", "ambiguous", "duration"] as const;
+export const ROSTER_TRIGGERS = [
+  "status_terminal", "status_unknown", "status_unordered", "status_during_fetch", "status_invalid", "status_run_changed",
+  "subagent_no_root", "request_opened_bad", "request_opened_unknown", "request_opened_unordered", "request_opened_during_fetch",
+  "request_resolved", "created", "updated_archived", "updated_unarchived", "updated_deleted", "updated_settled",
+  "updated_unsettled", "updated_metadata", "resync", "ready", "error", "detail_ambiguous", "list_held",
+] as const;
+export type RosterTrigger = typeof ROSTER_TRIGGERS[number];
+type TriggerAction = `miss_${RosterTrigger}` | `fetch_${RosterTrigger}`;
+export const ROSTER_TRIGGER_ACTIONS = ROSTER_TRIGGERS.flatMap(trigger => [`miss_${trigger}`, `fetch_${trigger}`] as TriggerAction[]);
+
+export const ROSTER_ACTIONS = ["fetches", "startup", "roster_event", "safety", "stream_down", "incomplete", "error_retry", "joins", "hits", "patches", "misses", "streamUp", "streamDown", "errors", "children", "ambiguous", "detailReads", "detailJoins", "detailErrors", "detailOverflow", "drops", "duration", ...ROSTER_TRIGGER_ACTIONS] as const;
 const COUNTS = [...ROSTER_ACTIONS.filter(key => key !== "duration"), "rows", "total", "fetchMsP50", "fetchMsMax", "generation", "lastFetchAt", "retryAt"];
 
 /** Health and log fields are code-owned scalars; no thread/event payload crosses this boundary. */

@@ -376,3 +376,25 @@ test.each(["minute tick", "bridge.stop"])("roster and prompt-probe counts both f
   log.flush();
   expect(summaries()).toHaveLength(2);
 });
+
+
+test("closed roster trigger counters survive aggregation and health sanitization", async () => {
+  const { ROSTER_TRIGGERS, cleanRosterHealth } = await import("../src/log-active-roster.ts");
+  let time = at;
+  const { log, lines } = setup({ now: () => time });
+  const keys = ROSTER_TRIGGERS.flatMap(trigger => [`miss_${trigger}`, `fetch_${trigger}`]);
+  for (const rosterAction of [...keys, "miss_PRIVATE_THREAD", "fetch_PRIVATE_TITLE"]) {
+    log.write({ component: "robob", kind: "perf", name: "robob.roster_action",
+      props: { rosterAction, rows: 94, total: 94, threadId: "PRIVATE_THREAD", title: "PRIVATE_TITLE" } });
+  }
+  time += 60_000;
+  await log.tick();
+  const summaries = lines().filter(line => line.name === "robob.active_roster");
+  expect(summaries).toHaveLength(1);
+  for (const key of keys) expect(summaries[0]!.props![key]).toBe(1);
+  const safe = cleanRosterHealth({ ...summaries[0]!.props, miss_PRIVATE_THREAD: 1, fetch_PRIVATE_TITLE: 1,
+    miss_status_terminal: -1, fetch_status_unknown: NaN, fetch_created: {}, miss_ready: "1" });
+  for (const key of keys.filter(key => !["miss_status_terminal", "fetch_status_unknown", "fetch_created", "miss_ready"].includes(key))) expect(safe?.[key]).toBe(1);
+  for (const key of ["miss_status_terminal", "fetch_status_unknown", "fetch_created", "miss_ready"]) expect(safe?.[key]).toBeUndefined();
+  expect(JSON.stringify({ summaries, safe })).not.toContain("PRIVATE");
+});
