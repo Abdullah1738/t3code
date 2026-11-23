@@ -108,6 +108,10 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       && ["unknown", "preparing", "queued", "starting", "running", "waiting", "completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(String(value))) {
       props[key] = value; continue;
     }
+    if (entry.name === "turn.output_end" && key === "reason"
+      && ["output_settled", "output_removed", "output_bound", "route_changed"].includes(String(value))) {
+      props[key] = value; continue;
+    }
     if (entry.name === "turn.hold_changed" && (key === "holderPhase" || key === "phase")
       && ["submitting", "running", "unknown", "held", "failed", "released"].includes(String(value))
       || entry.name === "turn.hold_changed" && key === "reason" && ["link_down", "turn_transition"].includes(String(value))) {
@@ -295,7 +299,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.hold_adopted", "turn.hold_age", "turn.robob_calls", "robob.active_roster", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.hold_adopted", "turn.hold_age", "turn.output_end", "turn.robob_calls", "robob.active_roster", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }

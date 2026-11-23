@@ -123,6 +123,8 @@ type Pending = {
   unsupported?: boolean;
 };
 type Watermark = { sessionId: string; id: string };
+/** Terminal-run output can become readable after a sibling advanced the watermark. */
+type BackgroundOutput = Route & { runId: string; messageIds: string[]; completionId?: string; startedAt: number };
 const firstFailureText = (modelError?: boolean) => modelError
   ? "The chat's model isn't available, so I couldn't process that message. Resending it won't fix this."
   : "I couldn't process that message because this chat hit a system error. Please don't resend it yet.";
@@ -1965,6 +1967,10 @@ export class Router {
 
   private async run(): Promise<void> {
     this.sweepWakeDelivery();
+    for (const output of this.store.get<BackgroundOutput[]>("pendingBackgroundOutput") ?? []) {
+      if (!this.current(output)) this.clearBackgroundOutput(output, "route_changed");
+      else if (Date.now() - output.startedAt >= WAKE_DELIVERY_MS) this.clearBackgroundOutput(output, "output_bound");
+    }
     const linkDown = () => this.backend.linkAvailable === false;
     if (linkDown()) {
       toolLog.skipRobob("router.tick");
@@ -5153,7 +5159,7 @@ export class Router {
         }
         // The bound run may predate the watermark and the newest page. Do not
         // confuse paged-out evidence with output missing from a stale snapshot.
-        if (run?.terminal && this.ownsHuman(turn)
+        if (run?.terminal
           && !messages.some(record => record.id === run.completionId)
           && !run.messageIds?.every(id => messages.some(record => record.id === id))) {
           const until = run.messageIds?.find(id => !messages.some(record => record.id === id)) ?? run.completionId;
@@ -5166,6 +5172,19 @@ export class Router {
         const completion = messages.findIndex((record, index) => record.type === "idle"
           && (run?.completionId ? record.id === run.completionId : index > start));
         const observed = run?.messageIds?.every(id => messages.some(record => record.id === id));
+        if (this.idleBackground(turn) && run?.terminal && run.messageIds?.length && !observed) {
+          this.store.db.transaction(() => {
+            const pending = this.store.get<BackgroundOutput[]>("pendingBackgroundOutput") ?? [];
+            if (!pending.some(output => output.id === turn!.id && output.generation === turn!.generation && output.runId === run.runId)) {
+              this.store.set("pendingBackgroundOutput", [...pending, {
+                id: turn!.id, directory: turn!.directory, generation: turn!.generation,
+                runId: run.runId, messageIds: run.messageIds!, completionId: run.completionId, startedAt: Date.now(),
+              } satisfies BackgroundOutput]);
+            }
+            this.releaseBackground(turn!, "run_terminal", messages);
+          }).immediate();
+          return;
+        }
         if (this.idleBackground(turn) && run?.terminal && !(start >= 0 && messages.slice(start + 1).some(record => record.type === "idle"))) {
           this.releaseBackground(turn, "run_terminal", messages);
           return;
@@ -5627,6 +5646,7 @@ export class Router {
     if (!noticeDue && !deferredWaiting && now - this.watchedAt < (this.options.watchMs ?? 5_000)) return;
     this.watchedAt = now;
     try {
+      await this.recoverBackgroundOutput(route);
       const mark = this.store.get<Watermark | null>("watermark");
       if (!mark || mark.sessionId !== route.id) {
         const [last] = (await this.reading(this.backend.messages(route.id, route.directory, { limit: 1 }))).slice(-1);
@@ -5739,6 +5759,54 @@ export class Router {
 
   private backgroundRecordsKey(messages: MessageRecord[]): string {
     return hash(JSON.stringify(messages.map(record => [record.id, record.type === "assistant" ? record.time.completed : undefined])));
+  }
+
+  private clearBackgroundOutput(output: BackgroundOutput, reason: "output_settled" | "output_removed" | "output_bound" | "route_changed"): void {
+    const pending = this.store.get<BackgroundOutput[]>("pendingBackgroundOutput") ?? [];
+    this.store.set("pendingBackgroundOutput", pending.filter(next => next.id !== output.id
+      || next.generation !== output.generation || next.runId !== output.runId));
+    toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.output_end",
+      ids: { threadId: output.id, runId: output.runId },
+      props: { reason, ageMs: Math.max(0, Date.now() - output.startedAt), boundMs: WAKE_DELIVERY_MS } }));
+  }
+
+  private async recoverBackgroundOutput(route: Route): Promise<void> {
+    for (const output of this.store.get<BackgroundOutput[]>("pendingBackgroundOutput") ?? []) {
+      if (!this.current(output)) continue;
+      const messages = await this.reading(this.backend.messages(route.id, route.directory, { until: output.messageIds[0] }));
+      if (!this.current(output)) return;
+      const positions = output.messageIds.map(id => messages.findIndex(record => record.id === id));
+      const end = messages.findIndex((record, index) => record.type === "idle"
+        && (output.completionId ? record.id === output.completionId : index > Math.max(...positions)));
+      if (positions.some(index => index < 0) || end < 0) {
+        const run = this.backend.backgroundRun ? await this.reading(this.backend.backgroundRun(route.id, route.directory, output.runId)) : undefined;
+        if (this.current(output) && run?.terminal && run.messageIds
+          && output.messageIds.every(id => !run.messageIds!.includes(id))) this.clearBackgroundOutput(output, "output_removed");
+        continue;
+      }
+      let start = Math.min(...positions) - 1;
+      while (start >= 0 && messages[start]!.type !== "idle") start--;
+      const scope = withoutProgressReplies(messages.slice(start + 1, end));
+      const idle = messages[end] as Extract<MessageRecord, { type: "idle" }>;
+      const replies = scope.filter((record): record is Extract<MessageRecord, { type: "assistant" }> =>
+        record.type === "assistant" && output.messageIds.includes(record.id));
+      const quiet = quietMessages(scope);
+      const final = replies.at(-1);
+      if (final && (final.time.completed === undefined || final.finish === "tool-calls")) continue;
+      const runningTools = replies.flatMap(reply => reply.content).some(part => part.type === "tool"
+        && !["completed", "error"].includes((part as { state?: { status?: string } }).state?.status ?? ""));
+      if (runningTools) continue;
+      const outgoing = !this.toolMode && idle.outcome === "succeeded" && !idle.modelError && !idle.firstTurnFailure && !scope.some(ownerPrompt)
+        ? replies.filter(reply => !reply.error && !quiet.has(reply.id) && (reply === final ? reply.answer !== false : reply.answer === true))
+          .map(reply => ({ id: `reply:${output.generation}:${reply.id}`, text: replyText(assistantText(reply)) }))
+          .filter(reply => stripInternalText(reply.text).trim() && !this.store.getOperation(reply.id)) : [];
+      this.store.db.transaction(() => {
+        if (!this.current(output)) return;
+        for (const reply of outgoing) this.store.enqueue({ ...reply, kind: "conversation", sessionId: output.id, generation: output.generation }, { covered: [] });
+        // The durable outbox now owns retries; this bookkeeping must never own a turn or an inbound.
+        this.clearBackgroundOutput(output, "output_settled");
+      }).immediate();
+    }
   }
 
   private releaseBackground(turn: Turn, reason: "run_terminal" | "hold_bound", messages?: MessageRecord[]): void {

@@ -12973,3 +12973,143 @@ test.each(emptyLatestCases)("idle holder review: empty newest terminal run prese
   expect(h.conversations()).toEqual([]);
   expect(h.store.get("activeTurn")).toBeNull();
 });
+
+
+async function terminalOutputGap(replyMode: "final" | "tool" = "final") {
+  const start = 10_000; setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0, replyMode });
+  h.input("before-terminal-gap", "Hi"); await h.router.tick();
+  if (replyMode === "tool") agentSends(h, "ready", "Ready");
+  h.backend.final("Ready"); await h.router.tick();
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
+  const mark = h.backend.records.at(-1)!;
+  const assistant = (id: string, runId: string, text: string): MessageRecord => ({
+    id, runId, type: "assistant", answer: true, content: [{ type: "text", text }], time: { created: start, completed: start },
+  });
+  const sibling: MessageRecord[] = [assistant("answer59", "run59", "Sibling answer"),
+    { id: "idle:run59", type: "idle", outcome: "succeeded", time: { created: start } }];
+  h.backend.states.ses_1 = { type: "busy" };
+  let terminal = false;
+  let messageIds = ["answer57"];
+  Object.assign(h.backend, { backgroundRun: async (_id: string, _dir: string, bound?: string) => {
+    const runId = bound ?? (terminal ? "run59" : "run57");
+    return { runId, completionId: `idle:${runId}`, status: terminal ? "completed" : "running", terminal,
+      ...(terminal ? { messageIds: runId === "run57" ? messageIds : ["answer59"] } : {}) };
+  } });
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ holderRunId: "run57" });
+  h.backend.records.push(...sibling);
+  await h.router.tick();
+  expect(h.store.get("watermark")).toMatchObject({ id: mark.id });
+  terminal = true; delete h.backend.states.ses_1;
+  return { h, start,
+    remove: () => { messageIds = []; },
+    expectMessages: (ids: string[]) => { messageIds = ids; },
+    publish: () => {
+      const at = h.backend.records.findIndex(record => record.id === "answer59");
+      h.backend.records.splice(at, 0, assistant("answer57", "run57", "Bound answer"),
+        { id: "idle:run57", type: "idle", outcome: "succeeded", time: { created: start } });
+    },
+  };
+}
+
+test.each([{ restart: false }, { restart: true }])("idle holder review: terminal snapshot gap preserves older bound output (restart=$restart)", async ({ restart }) => {
+  const { h, publish } = await terminalOutputGap();
+  let router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  // Exact run status is terminal, but the message endpoint still lacks its answer/idle.
+  await router.tick();
+  expect(h.store.get<{ holderRunId?: string } | null>("activeTurn")?.holderRunId).not.toBe("run57");
+  expect(h.store.get<unknown[]>("pendingBackgroundOutput")).toMatchObject([{ runId: "run57", messageIds: ["answer57"] }]);
+  if (restart) router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  for (let i = 0; i < 4; i++) await router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Sibling answer"]);
+  expect(h.store.get("watermark")).toMatchObject({ id: "idle:run59" });
+  // Robob's run-ordinal order inserts the bound output before the already-sent sibling.
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  publish();
+  for (let i = 0; i < 6; i++) await router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Bound answer"]);
+  expect(h.store.get<unknown[]>("pendingBackgroundOutput")).toEqual([]);
+  expect(h.store.get("watermark")).toMatchObject({ id: "idle:run59" });
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.conversations()).toEqual([]);
+  const sent = h.store.db.query<{ text: string }, []>("SELECT json_extract(payload, '$.text') AS text FROM outbox WHERE state = 'sent' AND id LIKE 'reply:%'").all();
+  expect(sent.filter(op => op.text === "Bound answer")).toHaveLength(1);
+  expect(sent.filter(op => op.text === "Sibling answer")).toHaveLength(1);
+});
+
+test.each([false, true])("idle holder review: pending terminal output leaves owner admission free (restart=%s)", async restart => {
+  const { h, publish } = await terminalOutputGap();
+  await h.router.tick();
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  for (let i = 0; i < 4; i++) await router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  h.input("next-human", "Next work", { source: "typed" });
+  await router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Hi", "Next work"]);
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: "next-human", phase: "running" });
+  expect(h.store.get<number>("inbound-delivered:next-human")).toBeDefined();
+  publish(); h.backend.final("Next handled");
+  for (let i = 0; i < 4; i++) await router.tick();
+  const bound = h.conversations().find(op => op.text === "Bound answer")!;
+  expect(bound).toBeDefined();
+  expect(h.store.get<string[]>(`reply-covered:${bound.id}`)).toEqual([]);
+  expect(h.conversations().filter(op => op.text === "Next handled")).toHaveLength(1);
+  expect(h.store.get<unknown[]>("pendingBackgroundOutput")).toEqual([]);
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.conversations()).toEqual([]);
+  expect(inbounds(h.store).find(row => row.id === "next-human")?.state).toBe("done");
+});
+
+const terminalOutputClearCases = ["removed", "bound", "route"].flatMap(reason => [false, true].map(restart => ({ reason, restart })));
+test.each(terminalOutputClearCases)("idle holder review: pending terminal output clears ($reason, restart=$restart)", async ({ reason, restart }) => {
+  const { h, start, remove, publish } = await terminalOutputGap();
+  await h.router.tick();
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.store.get<unknown[]>("pendingBackgroundOutput")).toMatchObject([{ runId: "run57" }]);
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  // The age bound also clears during ordinary owner work, without waiting for idle discovery.
+  if (reason === "bound") {
+    h.input("next-human", "Next work", { source: "typed" });
+    await router.tick();
+    setSystemTime(start + 30 * 60_000);
+  } else if (reason === "removed") remove();
+  else h.store.set("route", { ...h.store.get<object>("route"), generation: 2 });
+  const lines = await captureLogs(async () => { await router.tick(); });
+  expect(h.store.get<unknown[]>("pendingBackgroundOutput")).toEqual([]);
+  expect(lines.find(line => line.name === "turn.output_end")).toMatchObject({
+    ids: { runId: "run57" }, props: { reason: reason === "bound" ? "output_bound" : reason === "removed" ? "output_removed" : "route_changed", boundMs: 30 * 60_000 },
+  });
+  if (reason === "bound") { h.backend.final("Next handled"); await router.tick(); for (const op of h.conversations()) h.store.outboxState(op.id, "sent"); }
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  publish();
+  for (let i = 0; i < 3; i++) await router.tick();
+  expect(h.store.get<unknown[]>("pendingBackgroundOutput")).toEqual([]);
+  expect(h.conversations()).toEqual([]);
+});
+
+
+const terminalOutputReplyCases = ["tool-step", "silent", "failed", "tool-mode"].flatMap(kind => [false, true].map(restart => ({ kind, restart })));
+test.each(terminalOutputReplyCases)("idle holder review: pending terminal output keeps reply semantics ($kind, restart=$restart)", async ({ kind, restart }) => {
+  const { h, start, publish, expectMessages } = await terminalOutputGap(kind === "tool-mode" ? "tool" : "final");
+  if (kind === "tool-step") expectMessages(["step57", "answer57"]);
+  await h.router.tick();
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  publish();
+  const answer = h.backend.records.find((record): record is Assistant => record.type === "assistant" && record.id === "answer57")!;
+  if (kind === "tool-step") h.backend.records.splice(h.backend.records.indexOf(answer), 0, {
+    id: "step57", runId: "run57", type: "assistant", answer: false, finish: "tool-calls",
+    content: [{ type: "text", text: "Checking" }], time: { created: start, completed: start },
+  });
+  else if (kind === "silent") answer.content = [{ type: "text", text: "Internal note\nNO_REPLY" }];
+  else if (kind === "failed") Object.assign(h.backend.records.find(record => record.id === "idle:run57")!, { outcome: "failed" });
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  const logs = await captureLogs(async () => { for (let i = 0; i < 4; i++) await router.tick(); });
+  expect(h.conversations().map(op => op.text)).toEqual(kind === "tool-step" ? ["Bound answer"] : []);
+  expect(h.store.get<unknown[]>("pendingBackgroundOutput")).toEqual([]);
+  expect(logs.find(line => line.name === "turn.output_end")).toMatchObject({ ids: { runId: "run57" }, props: { reason: "output_settled" } });
+});
