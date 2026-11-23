@@ -105,7 +105,7 @@ test.each(createdCases)("state-less creation: $family, detail $state", async ({ 
   await f.confirmed("created"); await f.roster["fetching"];
   const statuses = await f.admission();
   if (busy) {
-    const expected = { type: "busy", root: parentThreadId === null ? null : rootThreadId };
+    const expected = { type: "busy" as const, root: parentThreadId === null ? null : rootThreadId };
     expect(statuses.created).toEqual(expected); expect(statuses.ses_created).toEqual(expected);
   } else expect(statuses).toEqual(before);
   expect(f.detail).toHaveBeenCalledTimes(1);
@@ -138,7 +138,7 @@ test.each(createdRequestCases)("inactive creation then $kind: $family, detail $s
   f.server.set("created", row("created", { parentThreadId, rootThreadId, state: "needs-input", pendingRequest }));
   f.event({ type: "request.opened", threadId: "created", ...pendingRequest });
   await f.confirmed("created"); await f.roster["fetching"];
-  const statuses = await f.admission(), expected = { type: "busy", root: parentThreadId === null ? null : rootThreadId };
+  const statuses = await f.admission(), expected = { type: "busy" as const, root: parentThreadId === null ? null : rootThreadId };
   expect(statuses.created).toEqual(expected); expect(statuses.ses_created).toEqual(expected);
   expect(f.detail).toHaveBeenCalledTimes(2);
   expect(f.lists).toHaveBeenCalledTimes(missingRoot ? 2 : 1);
@@ -175,7 +175,7 @@ test.each(createdListCases)("creation removal and list fences: $family, start $s
   const statuses = await f.admission();
   if (start === "list-first") expect(statuses).toEqual(before);
   else {
-    const expected = { type: "busy", root: parentThreadId === null ? null : rootThreadId };
+    const expected = { type: "busy" as const, root: parentThreadId === null ? null : rootThreadId };
     expect(statuses.created).toEqual(expected); expect(statuses.ses_created).toEqual(expected);
   }
   expect(f.lists).toHaveBeenCalledTimes(2); expect(f.detail).toHaveBeenCalledTimes(1);
