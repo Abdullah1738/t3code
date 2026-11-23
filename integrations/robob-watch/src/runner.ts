@@ -1,5 +1,6 @@
 import { applyOwnerAlertResults, dispatchOwnerAlerts, ownerFailureAlerts, queueOwnerFailure, queueOwnerRecovery } from "./owner-alerts.ts";
 import { randomUUID } from "node:crypto";
+import { cadenceStale, completeCadence, isStarved, starvedText, syncCadenceSuspension, urgentLoadRetry } from "./cadence.ts";
 import type { DependencyBusy } from "./cause.ts";
 import type { CheckGroup } from "./check-groups.ts";
 import { recordHealthDelivery, isHealthNag } from "./healthDelivery.ts";
@@ -9,7 +10,7 @@ import { join } from "node:path";
 import {
   clearFailureState, clearFailureEscalation, ensureFailureProbe, failureProbeDue, failureProbeDelay, pausedDuration, pauseRetryText,
   CheckShutdownError, CheckStuckError, checkGroups, withRelayLock, withRelayLockAsync, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
-  trackConfirmation, confirmWakes, inboundState, inQuiet, iso, installCheckShutdown, killRunningChecks, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
+  trackConfirmation, confirmWakes, inboundState, inQuiet, iso, installCheckShutdown, killRunningChecks, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, writeJson, type State, telegram, type TrackedWake,
   heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, TriggerError, triggerSig, type MissingTrigger, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
@@ -26,6 +27,14 @@ let ssdMounted = true;
 const loadMode = new LoadMode();
 let loadAccountedAt: number | undefined;
 const cadence = new Map<string, string>();
+let queueSnapshot = "", queueSnapshotAt = 0;
+function saveQueueSnapshot(): void {
+  const queue = slots.queue(), snapshot = JSON.stringify(queue), at = now();
+  if (snapshot === queueSnapshot && at - queueSnapshotAt < 60_000) return;
+  writeJson(join(ROOT, "slot-queue.json"), { pid: process.pid, at, queue });
+  queueSnapshot = snapshot;
+  queueSnapshotAt = at;
+}
 function sampleLoad(): number {
   const load = hostLoad(), at = now(), wasHigh = loadMode.high;
   const high = loadMode.sample(load, at);
@@ -42,7 +51,7 @@ function sampleLoad(): number {
   if (duration !== undefined) log(null, `host load mode still on: ${load.toFixed(2)}/core for ${Math.floor(duration / 60_000)} min`);
   return load;
 }
-const slots = new CheckSlots(() => checkSlotCap(loadMode.high), { emit: event => {
+const slots = new CheckSlots(() => checkSlotCap(loadMode.high), { queueChanged: saveQueueSnapshot, emit: event => {
   if (event.name === "slot.overrun") log(event.request.watcher, `fast lane overrun: ${(event.elapsedMs / 1000).toFixed(1)}s`);
   if (event.name === "slot.wait" || event.name === "slot.backlog") {
     const holders = event.holders.map(holder => `${holder.watcher}:${(holder.elapsedMs / 1000).toFixed(1)}s`).join(",");
@@ -98,7 +107,7 @@ async function runPendingCheck(watcher: Watcher, at: number, mainChecked = false
     });
     if (!result || shuttingDown) return;
     log(watcher.id, `pending check exit=${result.code} timeout=${result.timedOut}`);
-  }, { watcher: watcher.id, operation: "pending", dueAt: at, intervalMs: watcher.interval_s * 1_000 });
+  }, { watcher: watcher.id, operation: "pending", dueAt: at, intervalMs: watcher.interval_s * 1_000, urgent: watcher.urgent === true });
 }
 
 /** Returns true once the event is delivered (or had been already). */
@@ -697,6 +706,7 @@ async function tickWatcher(id: string): Promise<void> {
     runId = recoveredRun ?? attemptId;
     if (final && !handoffRun) { finalDeadline = state.closing_until; state.closing_final_started = true; }
     checkedWatcher = current;
+    (state.cadence ??= { since: now() }).lastStart = now();
     state.admitted_run = { run: runId, attempt: attemptId, watcher: current };
     schedule();
     startLoad = sampleLoad();
@@ -707,13 +717,16 @@ async function tickWatcher(id: string): Promise<void> {
     return runCheck(current, watcherDir(id), { HEALTH_TOOLLOG_SCHEDULED_AT: scheduledAt, HEALTH_TOOLLOG_TRIGGER: state.consecutive_failures || state.load_timeouts ? "retry" : "schedule", WATCH_RUN: runId, WATCH_ATTEMPT: attemptId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
     });
   }, { watcher: id, run: attemptId, operation: "check", intervalMs: watcher.interval_s * 1_000,
-    dueAt, lane, recentMinMs: classification.recentMinMs });
+    dueAt, lane, recentMinMs: classification.recentMinMs, urgent: watcher.urgent === true });
   if (!result || shuttingDown) return;
   const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
   const failed = runTimedOut || result.code !== 0;
-  toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: result.busy ? "busy" : runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", ...(result.busy ? { stderrClass: "dependency_busy", dependency: result.busy.dependency } : {}), exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs: Math.max(0, now() - t - result.ms), ...slotTiming, dueAt, lateMs, lane, lane_reason: laneReason, recentMinMs: classification.recentMinMs, loadMode: loadModeAtAdmission, intervalMs: watcher.interval_s * 1_000, trigger }, ...(failed ? { error: { tag: result.busy ? "watch.dependency_busy" : runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
-  if (!sameInstance()) return;
   const endLoad = sampleLoad();
+  const loadTimeout = runTimedOut && Math.max(startLoad, endLoad) >= LOAD_HIGH;
+  const queuedMs = Math.max(0, now() - t - result.ms);
+  const starved = (!failed || loadTimeout) && isStarved(watcher.interval_s, slotTiming?.slotWaitMs ?? 0);
+  toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: result.busy ? "busy" : runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", ...(result.busy ? { stderrClass: "dependency_busy", dependency: result.busy.dependency } : {}), exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs, urgent: watcher.urgent === true, starved, slotPickReason: slotTiming?.slotPickReason ?? "fifo", ...slotTiming, dueAt, lateMs, lane, lane_reason: laneReason, recentMinMs: classification.recentMinMs, loadMode: loadModeAtAdmission, intervalMs: watcher.interval_s * 1_000, trigger }, ...(failed ? { error: { tag: result.busy ? "watch.dependency_busy" : runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
+  if (!sameInstance()) return;
   let fresh = loadState(id);
   const currentDefinition = loadWatcher(id);
   const current = currentDefinition && pollingWatcher(currentDefinition, fresh);
@@ -741,8 +754,13 @@ async function tickWatcher(id: string): Promise<void> {
   }
   fresh.recent_check_ms = recentCheckRuntimes(fresh.recent_check_ms ?? (fresh.last_run_ms === undefined ? [] : [fresh.last_run_ms]), result.ms);
   fresh.last_run_ms = result.ms;
+  const cadenceState = fresh.cadence ??= { since: t };
+  cadenceState.lastEnd = now();
+  cadenceState.lastQueuedMs = queuedMs;
+  if (failed) cadenceState.lastOutcome = starved ? "starved" : loadTimeout ? "load timeout" : "fail";
   const queued = now() - t - result.ms;
-  if (result.ms >= SLOW_RUN_MS || queued >= 5_000) log(id, `slow run: check ${(result.ms / 1000).toFixed(1)}s, queued ${(queued / 1000).toFixed(1)}s, slot_wait ${((slotTiming?.slotWaitMs ?? 0) / 1000).toFixed(1)}s, depth ${slotTiming?.slotQueueDepth ?? 0}, active ${slotTiming?.slotActiveAtEnqueue ?? 0}`);
+  if (starved) log(id, starvedText(queuedMs, slotTiming!, checkSlotCap(loadModeAtAdmission) + 2, result.ms, loadTimeout ? timeoutMs : undefined));
+  else if (result.ms >= SLOW_RUN_MS || queued >= 5_000) log(id, `slow run: check ${(result.ms / 1000).toFixed(1)}s, queued ${(queued / 1000).toFixed(1)}s, slot_wait ${((slotTiming?.slotWaitMs ?? 0) / 1000).toFixed(1)}s, depth ${slotTiming?.slotQueueDepth ?? 0}, active ${slotTiming?.slotActiveAtEnqueue ?? 0}`);
   // A shell can exit nonzero while a descendant holds its pipes until the deadline.
   const timedOut = result.timedOut && (result.code === null || result.code === 0);
   if (timedOut || result.code !== 0) {
@@ -775,8 +793,9 @@ async function tickWatcher(id: string): Promise<void> {
         fresh.last_error = `timed out after ${timeoutMs / 1000}s under host load ${Math.max(startLoad, endLoad).toFixed(1)}/core`;
         delete fresh.last_error_sources;
         fresh.next_at = now() + Math.min(watcher.interval_s, TIMEOUT_BACKOFF_CAP_S) * 1_000;
+        urgentLoadRetry(current, fresh, now());
         saveState(id, fresh);
-        log(id, `load timeout (${fresh.load_timeouts}): ${fresh.last_error}`);
+        if (!starved) log(id, `load timeout (${fresh.load_timeouts}): ${fresh.last_error}`);
         return;
       }
     }
@@ -787,6 +806,11 @@ async function tickWatcher(id: string): Promise<void> {
     return;
   }
   if (finalDeadline !== undefined && fresh.status === "closing" && fresh.closing_until === finalDeadline) fresh.closing_final_check = true;
+  const recoveredCadence = completeCadence(fresh, now(), result.stdout.trim() ? "fire" : "no_change", queuedMs, starved);
+  if (recoveredCadence) {
+    log(id, `cadence recovered after ${Math.floor(recoveredCadence.staleMs / 60_000)} min`);
+    toolLog({ component: "runner", kind: "event", name: "watch.cadence_recovered", ids: { watcher: id }, props: recoveredCadence });
+  }
   delete fresh.load_timeouts;
   delete fresh.load_timeout_since;
   if (fresh.consecutive_failures) {
@@ -838,6 +862,43 @@ async function tickWatcher(id: string): Promise<void> {
 }
 
 let previousMaintenance: Maintenance | undefined;
+let urgentWarningAt: number | undefined;
+const cadenceNotices = new Set<string>();
+async function monitorCadence(id: string): Promise<void> {
+  const instance = watcherInstance(id);
+  const notice = await withRelayLockAsync(() => {
+    const definition = loadWatcher(id), state = loadState(id);
+    const watcher = definition && pollingWatcher(definition, state);
+    if (!watcher?.urgent || !checking(state)) return;
+    const at = now(), suspended = !!(watcher.paused || held(watcher) || state.failure_paused_at);
+    if (syncCadenceSuspension(watcher, state, at, maintenance, ssdMounted)) saveState(id, state);
+    if (suspended) return;
+    const stale = cadenceStale(watcher, state, at);
+    if (!stale) return;
+    const c = state.cadence!;
+    const queue = slots.queue();
+    const lastOutcome = c.lastOutcome === "starved" ? "starved" : queue.some(row => row.watcher === id) ? "queued" : stale.lastOutcome;
+    if (c.staleAt === undefined) {
+      c.staleAt = at;
+      toolLog({ component: "runner", kind: "event", name: "watch.cadence_stale", ids: { watcher: id }, props: { ...stale, lastOutcome } });
+      saveState(id, state);
+    }
+    if (c.alerted || (c.alertRetryAt ?? 0) > at || inQuiet(watcher.quiet)) return;
+    c.alertRetryAt = at + 60_000;
+    c.alertText ??= `robob-watch: ${id} has not completed a check for ${Math.floor(stale.staleMs / 60_000)} min (last: ${lastOutcome}, queue depth ${queue.length}, load ${hostLoad().toFixed(1)}/core)`;
+    saveState(id, state);
+    return { watcher, episode: c.staleAt, text: c.alertText };
+  });
+  if (!notice) return;
+  const sent = await alert(notice.watcher, notice.text, `robob-watch:${id}:cadence:${notice.episode}`);
+  await withRelayLockAsync(() => {
+    if (watcherInstance(id) !== instance) return;
+    const state = loadState(id);
+    if (state.cadence?.staleAt !== notice.episode) return;
+    if (sent.ok) state.cadence.alerted = true;
+    saveState(id, state);
+  });
+}
 let rollingDay: string | undefined;
 export function previousDayRollup(): void {
   const at = new Date();
@@ -876,7 +937,20 @@ export async function tick(): Promise<void> {
   if (!maintenance && previousMaintenance) log(null, "maintenance ended");
   previousMaintenance = maintenance;
   const jobs: Promise<void>[] = [];
+  let live = 0, urgent = 0;
   for (const id of listIds()) {
+    const definition = loadWatcher(id), state = loadState(id);
+    const watcher = definition && pollingWatcher(definition, state);
+    if (watcher && checking(state)) {
+      if (!watcher.paused) live++;
+      if (watcher.urgent) {
+        if (!watcher.paused) urgent++;
+        if (!cadenceNotices.has(id)) {
+          cadenceNotices.add(id);
+          void monitorCadence(id).catch(() => toolError("runner", "watch.cadence_failed", { watcher: id })).finally(() => cadenceNotices.delete(id));
+        }
+      }
+    }
     if (running.has(id)) {
       // A queued check can span midnight without entering tickWatcher again.
       if (!cadence.get(id)?.startsWith(`${iso().slice(0, 10)}:`)) {
@@ -887,6 +961,10 @@ export async function tick(): Promise<void> {
     }
     running.add(id);
     jobs.push(tickOne(id).catch(error => { toolError("runner", "watch.runner_failed", { watcher: id }); log(id, `runner error: ${String(error).slice(0, 500)}`); }).finally(() => running.delete(id)));
+  }
+  if (urgent > live / 4 && (urgentWarningAt === undefined || now() - urgentWarningAt >= 3600_000)) {
+    urgentWarningAt = now();
+    log(null, `urgent watchers: ${urgent} of ${live}`);
   }
   // Watchers run concurrently; a slow one never delays the next tick of the others.
   void Promise.all(jobs);
