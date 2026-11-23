@@ -188,6 +188,16 @@ def gap_summary(rows, day, generated):
         # Attribute the full span before clipping its duration to this UTC day.
         elapsed = max(end - start, duration if positive(duration) else 0)
         explanation = gap_info(timing_props, props.get('phase'), duration_ms=elapsed)
+        if row.get('name') == 'poll.timeout':
+            active, wall = props.get('phase'), props.get('wallMs')
+            # Before active-remainder metrics, timeout rows only recorded the
+            # child's phase and total wall/CPU time. Keep that legacy evidence.
+            if 'activePhaseMs' not in props and isinstance(active, str) and active in PHASES and positive(wall):
+                explanation = dict(phase=active, phaseMs=wall,
+                                   cause=phase_cause(active, wall, props.get('cpuMs'), props))
+            explanation['timedOut'] = True
+            if explanation['cause'].startswith(('tick_starved:', 'tick_blocked:', 'tick_io:')):
+                explanation.update(causeEvidenceField='poll.timeout', causeEvidenceValue=explanation['phaseMs'])
         if explanation.get('causeEvidenceField') == 'poolFetchMs':
             explanation['causeEvidenceField'] = 'durationMs'
         bucket = groups['guardGaps' if component == 'guard' else 'pollGaps']
@@ -206,6 +216,8 @@ def gap_summary(rows, day, generated):
         counters.update({key: value for key, value in props.items()
                          if key in TIMEOUT_FIELDS and type(value) in (int, float) and (value == 0 or positive(value))})
         if row.get('name') == 'poll.timeout':
+            counters.update({key: props[key] for key in ('wallMs', 'cpuMs')
+                             if type(props.get(key)) in (int, float) and (props[key] == 0 or positive(props[key]))})
             host = clean_host(props.get('host'))
             if host:
                 hosts['host'] = host
