@@ -1581,7 +1581,8 @@ test("owner, Moni and group outages each get one notice, with held messages orde
   setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
   for (const h of chats) {
     await h.router.tick();
-    expect(h.store.pendingOutbox().map(op => [op.text, op.replyTo])).toEqual([["I'm having a technical problem; I'll answer this as soon as I'm back.", "first"]]);
+    expect(h.store.pendingOutbox()).toEqual([]);
+    expect(h.store.operationalNotices().map(n => n.kind)).toEqual(["outage"]);
     h.backend.prompt = Recorder.prototype.prompt.bind(h.backend);
   }
   // The health endpoint stays down: the thread answering is what brings the held batch back, a minute after the last try.

@@ -28,7 +28,7 @@ function setup(mirrorSink?: MirrorSink, harness?: (root: string) => Harness) {
   const token = "a".repeat(40), callbackToken = "b".repeat(40);
   for (const [name, value] of Object.entries({ token, callbackToken, publicKey: keys.publicKey })) writeFileSync(join(mac, name), value);
   const config: RemoteBoxConfig = { kind: "remote-box", url: "http://127.0.0.1:12345", tokenFile: join(mac, "token"), callbackTokenFile: join(mac, "callbackToken"), publicKeyFile: join(mac, "publicKey"), callbackPort: 12346, epoch: "test", boxId: "bx_test" };
-  const logs: string[] = [], notices: string[] = [], texts: string[] = [];
+  const logs: string[] = [], texts: string[] = [];
   const alerts: { text: string; key: string }[] = [], requests: { path: string; body: Record<string, unknown> }[] = [];
   let eventsFail = false, routerReady = true, callbackReady = true;
   let requestHook: ((path: string) => Promise<Response | void>) | undefined;
@@ -40,7 +40,7 @@ function setup(mirrorSink?: MirrorSink, harness?: (root: string) => Harness) {
   const io = { now: () => now, active: () => active,
     mirror: mirrorSink ? new ChatMirror(store, mirrorSink, { now: () => now, timeoutMs: 20 }) : undefined,
     ownerAlert: async (_severity: "attention", text: string, key: string): Promise<boolean> => { alerts.push({ text, key }); return true; },
-    log: (name: string, code?: string) => logs.push(`${name} ${code ?? ""}`), notice: async (id: string) => { notices.push(id); },
+    log: (name: string, code?: string) => logs.push(`${name} ${code ?? ""}`),
     fetch: (async (url, init) => { if (!online) throw new Error("private error should never be logged");
       const path = new URL(String(url)).pathname; requests.push({ path, body: JSON.parse(String(init?.body)) });
       const hooked = await requestHook?.(path); if (hooked) return hooked;
@@ -55,14 +55,13 @@ function setup(mirrorSink?: MirrorSink, harness?: (root: string) => Harness) {
     sendText: async () => ({ handle: "sent" }), upload: async () => "https://media.example/file", getMessage: async () => undefined,
     sendApp: async () => ({ handle: "sent" }), react: async () => {}, typing: async () => {}, read: async () => {},
     requestLocation: async () => {}, location: async () => undefined, setOptOut: async () => {}, download: async () => ({ data: new Uint8Array(), name: "", mimeType: "" }) };
-  return { root, mac, box, get remote() { return remote; }, mirror: io.mirror, runner, store, config, logs, notices, texts, alerts, requests, line,
+  return { root, mac, box, get remote() { return remote; }, mirror: io.mirror, runner, store, config, logs, get notices() { return store.operationalNotices().filter(n => n.kind === "outage"); }, texts, alerts, requests, line,
     failEvents: () => { eventsFail = true; },
     failReadyLog: () => { const log = io.log; io.log = (name, code) => { if (name === "moni-callback-ready") throw new Error("PRIVATE_LOG_FAILURE"); return log(name, code); }; },
     readiness: (router: boolean, callback: boolean) => { routerReady = router; callbackReady = callback; },
     ownerAlert: (alert: typeof io.ownerAlert) => { io.ownerAlert = alert; },
     requestHook: (hook: typeof requestHook) => { requestHook = hook; },
     restart: () => { remote.stop(); const reopened = new Store(join(mac, "state.sqlite")); closes.push(() => reopened.close()); remote = new RemoteBox(config, reopened, io); },
-    failNotice: () => { io.notice = async id => { notices.push(id); throw new Error("ambiguous notice"); }; },
     advance: (ms = 65_000) => { now += ms; }, offline: () => { online = false; }, online: () => { online = true; }, drop: () => { dropAck = true; }, rollback: () => { active = false; },
     afterStatus: (hook: ()=>Promise<void>) => {afterStatus=hook;},
     request: (path: string, body: unknown = {}, auth = callbackToken) => new Request(`http://bridge${path}`, { method: "POST", headers: { authorization: `Bearer ${auth}` }, body: JSON.stringify({ epoch: "test", ...body as object }) }),
@@ -852,7 +851,7 @@ test("pending action metadata is projected explicitly and rejects private or mal
   const s = setup();
   const action = { id: "a".repeat(12), path: "/react", attempts: 2, lastStatus: 502, nextAt: 9000, inboxId: "b".repeat(12) };
   let rows: unknown = [{ ...action, payload: "PRIVATE_PAYLOAD", target: "PRIVATE_TARGET", token: "PRIVATE_TOKEN" }];
-  const remote = new RemoteBox(s.config, s.store, { active: () => true, log: () => {}, notice: async () => {},
+  const remote = new RemoteBox(s.config, s.store, { active: () => true, log: () => {},
     fetch: async () => Response.json({ events: [], actions: rows }) });
   expect(await remote.events()).toEqual({ events: [], actions: [action] });
   for (const patch of [
@@ -970,10 +969,10 @@ test("restart cannot count unobserved time as sustained recovery", async () => {
   s.advance(300_000); await s.remote.tick(); expect(s.store.get("remoteOutage")).toBeNull();
 });
 
-test("an uncertain notice reserves both caps before sending and survives restart", async () => {
-  const s = setup(); s.failNotice(); s.remote.accept("waiting", { text: "private" });
+test("a queued notice reserves both caps and survives restart", async () => {
+  const s = setup(); s.remote.accept("waiting", { text: "private" });
   s.offline(); await s.remote.tick(); s.advance(120_000); await s.remote.tick();
-  expect(s.notices).toHaveLength(1); expect(s.logs.join()).toContain("moni-notice-error");
+  expect(s.notices).toHaveLength(1);
   s.restart(); s.advance(); await s.remote.tick(); expect(s.notices).toHaveLength(1);
   s.online(); s.advance(); await s.remote.tick(); await s.runner.tick();
   s.advance(5_000); await s.remote.tick(); s.advance(300_000); await s.remote.tick();
@@ -1273,17 +1272,17 @@ test("one transport outage cannot send a second notice after its waiting episode
 });
 
 test.each(["fence", "router", "callback", "both", "pending", "running"].flatMap(stall =>
-  ["sent", "uncertain", "not-attempted"].map(notice => ({ stall, notice }))))(
+  ["sent", "pending", "not-attempted"].map(notice => ({ stall, notice }))))(
   "$stall stall with $notice notice preserves the reservation when transport fails", async ({ stall, notice }) => {
     const s = setup(), head = opaqueId("transition-head");
     if (["fence", "pending", "running"].includes(stall)) {
       s.runner.enqueue(head, { kind: "inbound", text: "PRIVATE_TRANSITION_HEAD" });
       s.runner.db.query("UPDATE inbox SET state=?,interrupted_at=1000 WHERE id=?").run(stall === "fence" ? "interrupted" : stall, head);
     } else s.readiness(stall !== "router" && stall !== "both", stall !== "callback" && stall !== "both");
-    if (notice === "uncertain") s.failNotice();
     s.remote.accept("transition-first", { text: "PRIVATE_TRANSITION" }); await s.remote.tick();
     s.advance(notice === "not-attempted" ? 60_000 : 120_000); await s.remote.tick();
     expect(s.notices).toHaveLength(notice === "not-attempted" ? 0 : 1);
+    if (notice === "sent") s.store.updateOperationalNotice(s.notices[0]!.id, "sent", 1, 0);
     expect(s.store.get("remoteOutage")).toBeUndefined();
 
     s.offline(); s.advance(5_000); await s.remote.tick();

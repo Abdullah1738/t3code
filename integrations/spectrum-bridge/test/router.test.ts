@@ -356,7 +356,8 @@ function setup(path = ":memory:", overrides: Partial<ConstructorParameters<typeo
   const input = (id: string, text: string, extra: Partial<NormalizedInbound> = {}) => store.acceptInbound(id, { id, text, attachments: [], isAudioMessage: false, receivedAt: Date.now(), ...extra } satisfies NormalizedInbound);
   const conversations = () => store.pendingOutbox().filter(op => op.kind === "conversation");
   const controls = () => store.pendingOutbox().filter(op => op.kind === "control");
-  return { store, backend, transport, router, routerOptions, input, conversations, controls, downloads, hints };
+  const notices = (kind?: string) => store.operationalNotices().filter(n => kind === undefined || n.kind === kind);
+  return { store, backend, transport, router, routerOptions, input, conversations, controls, notices, downloads, hints };
 }
 
 function permission(id = "perm_1", sessionID = "ses_1"): PermissionRequest {
@@ -1303,8 +1304,8 @@ test("failure after the early send preserves it and follows with the usual failu
   h.backend.failed();
   await h.router.tick();
   expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${first.id}`]);
-  expect(h.store.pendingOutbox().map(op => op.kind)).toEqual(["conversation", "control"]);
-  expect(h.controls()[0]!.text).toContain("Something went wrong");
+  expect(h.store.pendingOutbox().map(op => op.kind)).toEqual(["conversation"]);
+  expect(h.notices("failed")[0]!.text).toContain("system error");
   expect(h.store.get("activeTurn")).toMatchObject({ phase: "failed", earlySent: first.id });
 });
 
@@ -1994,7 +1995,7 @@ test("an interrupted preparation or uncertain create never repeats the inbound o
   h.store.updateInbound("prepared", "processing");
   await h.router.tick();
   expect(h.backend.creates).toEqual([]);
-  expect(h.controls()[0]!.text).toBe("Something interrupted that one before I could get to it. Mind sending it again?");
+  expect(h.notices("interrupted")).toHaveLength(1);
   h.backend.createBehavior = async () => {
     expect(h.store.pendingInbound()[0]!.state).toBe("processing");
     throw new Error("SECRET_CREATE_ERROR");
@@ -2004,7 +2005,7 @@ test("an interrupted preparation or uncertain create never repeats the inbound o
   await new Router(h.store, h.backend, h.transport, options).tick();
   expect(h.backend.creates).toHaveLength(1);
   expect(h.backend.prompts).toEqual([]);
-  expect(h.controls()).toHaveLength(1);
+  expect(h.notices()).toHaveLength(1);
   expect(inbounds(h.store).find(row => row.id === "create")?.state).toBe("processing");
   expect(h.controls().some(c => c.text.includes("SECRET"))).toBe(false);
 });
@@ -2166,7 +2167,7 @@ test("a crash during permission POST preserves its submitting fence", async () =
   h.input("retry", "/approve perm_1 once");
   await new Router(h.store, h.backend, h.transport, options).tick();
   expect(h.backend.permissionReplies).toEqual([]);
-  expect(h.controls().some(c => c.replyTo === "interrupted" && c.text === "Something interrupted that one before I could get to it. Mind sending it again?")).toBe(true);
+  expect(h.notices("interrupted")).toHaveLength(1);
   expect(inbounds(h.store).find(row => row.id === "interrupted")!.state).toBe("unknown");
 });
 
@@ -2597,9 +2598,9 @@ test("a watcher turn that failed while running is reported honestly, never retri
   h.backend.failed();
   await h.router.tick();
   expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
-  const notices = h.controls();
+  const notices = h.notices("dropped");
   expect(notices).toHaveLength(1);
-  expect(notices[0]!.text).toBe(syntheticDropped(wake, wakeBody(), "failed"));
+  expect(notices[0]!.text).toBe("Owner chat: " + syntheticDropped(wake, wakeBody(), "failed"));
   expect(notices[0]!.text).toContain("watcher: Daily board");
   expect(notices[0]!.text).not.toMatch(RESEND);
   expect("replyTo" in notices[0]!).toBe(false);
@@ -2634,7 +2635,7 @@ test("a watcher turn that errored before any tool is retried, then reported once
   h.backend.failed();
   await h.router.tick();
   expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
-  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "errored")]);
+  expect(h.notices("dropped").map(op => op.text)).toEqual(["Owner chat: " + syntheticDropped(wake, wakeBody(), "errored")]);
   expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([{ id: wake, text: wakeBody(), at: Date.now() }]);
 });
 
@@ -2650,7 +2651,7 @@ test("a first-call provider error with no tool evidence is reported once and nev
   h.backend.failed();
   await h.router.tick();
   expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
-  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "failed")]);
+  expect(h.notices("dropped").map(op => op.text)).toEqual(["Owner chat: " + syntheticDropped(wake, wakeBody(), "failed")]);
   setSystemTime(start + 10 * 60_000);
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(1);
@@ -2686,7 +2687,7 @@ test("a failed turn whose tool use the backend cannot rule out is never retried"
   h.backend.settle("failed");
   await h.router.tick();
   expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
-  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "failed")]);
+  expect(h.notices("dropped").map(op => op.text)).toEqual(["Owner chat: " + syntheticDropped(wake, wakeBody(), "failed")]);
   setSystemTime(start + 120_000);
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(1);
@@ -2730,9 +2731,9 @@ test("dropped notices close together go out as one", async () => {
   expect(h.controls()).toEqual([]);
   setSystemTime(start + 10 * 60_000);
   await h.router.tick();
-  expect(h.controls()).toHaveLength(1);
-  expect(h.controls()[0]!.text).toContain("watcher: Daily board");
-  expect(h.controls()[0]!.text).toContain("watcher: HW call David");
+  expect(h.notices("dropped")).toHaveLength(1);
+  expect(h.notices("dropped")[0]!.text).toContain("watcher: Daily board");
+  expect(h.notices("dropped")[0]!.text).toContain("watcher: HW call David");
 });
 
 test("synthetic rows never get resend notices from interrupted or failed starts", async () => {
@@ -2819,12 +2820,12 @@ test.each(["prompt", "preparation", "rebuild"] as const)("a held %s notices once
   const lastReplayAt = h.store.get<{ replayAt: number }>("deliveryOutage")!.replayAt;
   setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
   await restarted.tick();
-  expect(h.controls().map(op => [op.text, op.replyTo])).toEqual([[outageText, "first"]]);
+  expect(h.notices("outage").map(n => n.id)).toEqual([`imessage:outage:owner:${messageId("first").slice(4)}`]);
   expect(h.store.get("deliveryOutage")).toMatchObject({ noticed: true, replayAt: lastReplayAt });
   const after = new Router(h.store, h.backend, h.transport, h.routerOptions);
   setSystemTime(start + OUTAGE_NOTICE_AFTER_MS + 120_000);
   await after.tick();
-  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.notices("outage")).toHaveLength(1);
 });
 
 test.each(["earlier", "missing"] as const)("outage notice uses the inbound receipt clock (%s receipt)", async receipt => {
@@ -2843,7 +2844,7 @@ test.each(["earlier", "missing"] as const)("outage notice uses the inbound recei
   expect(h.controls()).toEqual([]);
   setSystemTime(due);
   await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
-  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.notices("outage")).toHaveLength(1);
 });
 
 test("a rebuilt held batch still awaiting acceptance keeps its original notice deadline", async () => {
@@ -2861,7 +2862,7 @@ test("a rebuilt held batch still awaiting acceptance keeps its original notice d
   expect(h.controls()).toEqual([]);
   setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
   await h.router.tick();
-  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.notices("outage")).toHaveLength(1);
 });
 
 test.each(["prompt", "preparation"] as const)("/new cancels a held %s notice and the next held text gets its own deadline", async kind => {
@@ -2883,11 +2884,11 @@ test.each(["prompt", "preparation"] as const)("/new cancels a held %s notice and
   h.input("second", "New question");
   await h.router.tick();
   for (const offset of [300_000, 360_000, OUTAGE_NOTICE_AFTER_MS]) { setSystemTime(start + offset); await h.router.tick(); }
-  expect(h.controls().filter(op => op.text === outageText)).toEqual([]);
+  expect(h.notices("outage")).toEqual([]);
   setSystemTime(start + 240_000 + OUTAGE_NOTICE_AFTER_MS);
   await h.router.tick();
   await h.router.tick();
-  expect(h.controls().filter(op => op.text === outageText).map(op => op.replyTo)).toEqual(["second"]);
+  expect(h.notices("outage").map(n => n.id)).toEqual([`imessage:outage:owner:${messageId("second").slice(4)}`]);
   expect(deferred).toEqual(["first"]);
 });
 
@@ -2914,7 +2915,8 @@ test("a pending outage notice survives closing and reopening the database at six
   for (const offset of [OUTAGE_NOTICE_AFTER_MS, OUTAGE_NOTICE_AFTER_MS + 60_000]) {
     setSystemTime(start + offset);
     await restarted.tick();
-    expect(reopened.pendingOutbox().map(op => op.text)).toEqual([outageText]);
+    expect(reopened.pendingOutbox()).toEqual([]);
+    expect(reopened.operationalNotices()).toHaveLength(1);
   }
 });
 
@@ -2954,7 +2956,7 @@ test("an outage persisted by an older build does not enqueue its notice again", 
   setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
   await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
   expect(h.store.get("deliveryOutage")).toMatchObject({ noticed: true });
-  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.notices("outage")).toHaveLength(1);
 });
 
 test.each(["final", "tool"] as const)("unaccepted sealed batch retries once, notices once, then replays before newer messages (%s)", async replyMode => {
@@ -2989,7 +2991,7 @@ test.each(["final", "tool"] as const)("unaccepted sealed batch retries once, not
   setSystemTime(start + 20 * 60_000 + 30_000);
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(3);
-  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.notices("outage")).toHaveLength(1);
   const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
   h.backend.promptBehavior = undefined;
   setSystemTime(start + 20 * 60_000 + ACCEPT_WAIT_MS);
@@ -3095,7 +3097,7 @@ test("a turn that failed before acceptance and has nothing left to replay is clo
   h.input("later", "Newer question");
   for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS + 1000]) { setSystemTime(start + offset); await h.router.tick(); }
   expect(h.store.get<{ phase: string } | null>("activeTurn")?.phase).not.toBe("held");
-  expect(h.controls().map(op => op.text)).not.toContain(outageText);
+  expect(h.notices("outage")).toEqual([]);
   expect(h.backend.prompts.at(-1)!.text).toBe("Newer question");
 });
 
@@ -3198,7 +3200,7 @@ test("watchdog notices even when normal poll reads fail, and never retries an un
   h.backend.permissionBehavior = async () => { throw new Error("offline"); };
   for (const offset of [60_000, 120_000, 180_000, OUTAGE_NOTICE_AFTER_MS]) { setSystemTime(start + offset); await h.router.tick(); }
   expect(h.backend.prompts).toHaveLength(1);
-  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.notices("outage")).toHaveLength(1);
   expect(inbounds(h.store)[0]!.state).toBe("processing");
 });
 
@@ -3428,9 +3430,10 @@ test.each(["removed", "options", "custom", "multiple", "foreign", "refresh-error
         expect(h.backend.questionReplies).toEqual([]);
       }
     } else {
-      expect(h.controls().filter(c => c.replyTo === "answer").map(c => c.text)).toEqual([
-        kind === "refresh-error" ? "Couldn't check that question just now. Try again in a moment." : "Those answers don't fit the current question.",
-      ]);
+      expect(h.controls().filter(c => c.replyTo === "answer").map(c => c.text)).toEqual(
+        kind === "refresh-error" ? [] : ["Those answers don't fit the current question."],
+      );
+      expect(h.notices("command_failed")).toHaveLength(kind === "refresh-error" ? 1 : 0);
     }
   }
 });
@@ -3636,7 +3639,8 @@ test("response errors yield a safe control and long work is never cut off", asyn
   h.backend.failed();
   await h.router.tick();
   expect(h.store.get("activeTurn")).toMatchObject({ phase: "failed" });
-  expect(h.controls()).toMatchObject([{ text: "Something went wrong on my end with that one. Mind trying again?", replyTo: "error" }]);
+  expect(h.controls()).toEqual([]);
+  expect(h.notices("failed")).toHaveLength(1);
   expect(h.conversations()).toEqual([]);
   // A failed turn does not block the next message, which continues the same chat.
   h.input("timeout", "Wait forever");
@@ -3645,7 +3649,7 @@ test("response errors yield a safe control and long work is never cut off", asyn
   setSystemTime(new Date("2026-09-10T12:30:00Z"));
   await h.router.tick();
   await h.router.tick();
-  expect(h.controls()).toHaveLength(1);
+  expect(h.notices()).toHaveLength(1);
   expect(h.backend.aborts).toEqual([]);
   expect(h.store.get("activeTurn")).toMatchObject({ phase: "running", inboundId: "timeout" });
   expect(JSON.stringify(h.router.status())).not.toMatch(/PRIVATE|\/Chats|notification-skill|1555555/);
@@ -4186,15 +4190,16 @@ test("exhausted downloads persist one clear failure across reopen and never repl
     await h.router.tick();
   }
   expect(attempts).toBe(3);
-  expect(h.controls()).toHaveLength(1);
-  expect(h.controls()[0]!.text).toBe("I couldn't download that attachment. Mind resending it once it's fully uploaded?");
+  expect(h.notices()).toHaveLength(1);
+  expect(h.notices("attachment_failed")[0]?.text).toContain("could not download");
   expect(inbounds(h.store).map(row => row.state)).toEqual(["failed", "batched"]);
   h.store.close();
   const reopened = new Store(path);
   stores.push(reopened);
   await new Router(reopened, h.backend, h.transport, options).tick();
   expect(attempts).toBe(3);
-  expect(reopened.pendingOutbox()).toHaveLength(1);
+  expect(reopened.pendingOutbox()).toEqual([]);
+  expect(reopened.operationalNotices()).toHaveLength(1);
   expect(reopened.pendingInbound()).toEqual([]);
   expect(h.backend.prompts).toEqual([]);
   expect(h.backend.creates).toEqual([]);
@@ -4346,7 +4351,7 @@ test("storage errors do not create an active turn or send an unpersisted attachm
   expect(h.backend.prompts).toHaveLength(1);
   expect(h.store.get("activeTurn")).toBeNull();
   expect(logs.filter(line => line.name === "turn.start" || line.name === "turn.end")).toEqual([]);
-  expect(h.controls().at(-1)!.text).toBe("I couldn't save those files. Mind sending them again?");
+  expect(h.notices("attachment_failed").at(-1)?.text).toContain("could not save");
   expect(readdirSync(h.root)).toEqual(["ses_1"]);
 });
 
@@ -4746,7 +4751,7 @@ test.each(["download", "create"])("batch %s failure never submits or leaves memb
   expect(h.backend.creates).toHaveLength(kind === "create" ? 1 : 0);
   expect(h.store.pendingInbound().map(row => row.state)).toEqual(kind === "create" ? ["processing"] : []);
   expect(inbounds(h.store).slice(1).every(row => row.state === "batched")).toBe(true);
-  expect(h.controls()).toHaveLength(kind === "create" ? 0 : 1);
+  expect(h.notices("attachment_failed")).toHaveLength(kind === "create" ? 0 : 1);
 });
 
 test("a failed atomic seal rolls back the aggregate and all source states", async () => {
@@ -5252,9 +5257,7 @@ test("an interrupted or failed turn gets one friendly notice, never a reply, and
     await h.router.tick();
     expect(h.conversations()).toEqual([]);
     expect(h.store.get("activeTurn")).toMatchObject({ phase: "failed" });
-    expect(h.controls().map(c => [c.replyTo, c.text])).toEqual([["in", outcome === "interrupted"
-      ? "The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"
-      : "Something went wrong on my end with that one. Mind trying again?"]]);
+    expect(h.notices("failed")[0]?.text).toContain(outcome === "interrupted" ? "interrupted by a restart" : "system error");
     expect(inbounds(h.store)[0]!.state).toBe("failed");
     h.input("again", "Try again");
     await h.router.tick();
@@ -7622,7 +7625,7 @@ test("a held failure notice is sent once the grace passes with no recovery", asy
   expect(h.controls()).toEqual([]);
   setSystemTime(new Date("2026-09-10T12:06:00Z"));
   await h.router.tick();
-  expect(h.controls().map(c => [c.replyTo, c.text])).toEqual([["in", "Something went wrong on my end with that one. Mind trying again?"]]);
+  expect(h.notices("failed")).toHaveLength(1);
 });
 
 test("review633: a late uncertain steer cannot consume a newer batched message", async () => {
@@ -9569,9 +9572,7 @@ test.each(["storage-file", "storage-symlink", "download"])("held-turn rebuild pr
     expect(h.store.get("activeTurn")).toBeNull();
     expect(h.store.get("preparingDelivery")).toBeNull();
     expect(h.backend.prompts).toHaveLength(attempts);
-    expect(h.controls().at(-1)?.text).toBe(failure === "download"
-      ? "That attachment came through broken. Mind resending it?"
-      : "I couldn't save those files. Mind sending them again?");
+    expect(h.notices("attachment_failed").at(-1)?.text).toContain(failure === "download" ? "invalid" : "could not save");
     await h.router.tick();
     h.input("after-preparation-failure", "/new");
     await h.router.tick();
@@ -9670,7 +9671,7 @@ test("Robob interruption recovery uses native completion evidence, not its settl
     h.backend.records = adapter["markInterrupted"](adapter["markAnswers"](records));
     for (let i = 0; i < 3; i++) await h.router.tick();
     expect(h.conversations().map(c => c.text)).toEqual(kind === "completed" ? ["The final text"] : []);
-    expect(h.controls().map(c => c.text)).toEqual(kind === "completed" ? [] : ["The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"]);
+    expect(h.notices("failed")).toHaveLength(kind === "completed" ? 0 : 1);
     expect(inbounds(h.store)[0]!.state).toBe(kind === "completed" ? "done" : "failed");
   }
 });
@@ -9707,7 +9708,7 @@ test("a quiet multi-block interrupted answer gets a notice, not an invisible met
   h.backend.settle("interrupted");
   await h.router.tick();
   expect(h.conversations()).toEqual([]);
-  expect(h.controls().map(c => c.text)).toEqual(["The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"]);
+  expect(h.notices("failed")).toHaveLength(1);
 });
 
 test("a complete multi-block interrupted reply retains each block in order", async () => {
@@ -9752,7 +9753,7 @@ test("interrupted incomplete, tool-call, errored and empty steps never become re
     h.backend.settle("interrupted");
     for (let i = 0; i < 3; i++) await h.router.tick();
     expect(h.conversations()).toEqual([]);
-    expect(h.controls().map(c => c.text)).toEqual(["The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"]);
+    expect(h.notices("failed")).toHaveLength(1);
     expect(inbounds(h.store)[0]!.state).toBe("failed");
   }
 });
@@ -9766,7 +9767,7 @@ test("a failed turn with a finished error still sends only the existing failure 
   h.backend.settle("failed");
   for (let i = 0; i < 3; i++) await h.router.tick();
   expect(h.conversations()).toEqual([]);
-  expect(h.controls().map(c => c.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
+  expect(h.notices("failed")).toHaveLength(1);
   expect(inbounds(h.store)[0]!.state).toBe("failed");
 });
 
@@ -9813,7 +9814,7 @@ test("a held failure notice survives a background watch until the grace passes",
   setSystemTime(start + 5 * 60_000);
   await h.router.tick();
   await h.router.tick();
-  expect(h.controls().map(c => [c.replyTo, c.text])).toEqual([["in", "Something went wrong on my end with that one. Mind trying again?"]]);
+  expect(h.notices("failed")).toHaveLength(1);
   expect(h.store.get("deferredNotice")).toBeNull();
 });
 
@@ -9888,7 +9889,7 @@ test("a background watch that ends without a reply still leaves the held notice"
   expect(h.store.get("deferredNotice")).not.toBeNull();
   setSystemTime(start + 5 * 60_000);
   await h.router.tick();
-  expect(h.controls()).toHaveLength(1);
+  expect(h.notices("failed")).toHaveLength(1);
 });
 
 test("an admitted failed batch preserves its replay receipt", async () => {
@@ -9928,7 +9929,7 @@ test.each(["codex", "claudeAgent", "opencode"].flatMap(driver =>
   await h.router.tick();
   const recover = complete && phase === "answer";
   expect(h.conversations().map(op => op.text)).toEqual(recover ? ["Finished safely"] : []);
-  expect(h.controls()).toHaveLength(recover ? 0 : 1);
+  expect(h.notices("failed")).toHaveLength(recover ? 0 : 1);
 });
 
 test("an early reply followed by interruption is not queued twice", async () => {
@@ -9959,7 +9960,7 @@ test("a metadata-only background result does not cancel the notice", async () =>
   h.backend.final("@572@");
   setSystemTime(start + 5 * 60_000);
   await h.router.tick();
-  expect(h.controls().map(c => c.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
+  expect(h.notices("failed")).toHaveLength(1);
 });
 
 test("interruption recovery retains an earlier successful reply without a native finish", async () => {
@@ -10089,8 +10090,10 @@ test.each(["running", "visible", "quiet", "failed", "interrupted"].flatMap(outco
   await h.router.tick();
   setSystemTime(start + 6 * 60_000);
   await h.router.tick();
-  expect(h.controls().filter(op => op.replyTo === "old")).toEqual([]);
-  expect(h.controls().filter(op => op.replyTo === "new")).toHaveLength(["failed", "interrupted"].includes(outcome) ? 1 : 0);
+  expect(h.controls()).toEqual([]);
+  const notices = h.notices("failed");
+  expect(notices).toHaveLength(["failed", "interrupted"].includes(outcome) ? 1 : 0);
+  if (notices.length) expect(notices[0]!.id).toEndWith(`:${messageId("new")}`);
 });
 
 test.each((["succeeded", "failed", "interrupted"] as const).flatMap(previousOutcome =>
@@ -10113,7 +10116,7 @@ test.each((["succeeded", "failed", "interrupted"] as const).flatMap(previousOutc
   h.backend.settle("interrupted");
   await h.router.tick();
   await h.router.tick();
-  expect(h.controls().map(op => op.text)).toEqual(["The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"]);
+  expect(h.notices("failed")).toHaveLength(1);
   expect(stages).not.toContain("reply-recovered-after-interrupt");
 });
 
@@ -10775,7 +10778,7 @@ test.each(["watcher", "bus"] as const)("mixed agent-bus/watcher failure preserve
   expect(h.backend.prompts[0]!.text).toContain("Daily board");
   h.backend.failed().error = { type: "ProviderError", message: privateText };
   await h.router.tick();
-  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(watcher, wakeBody(), "failed")]);
+  expect(h.notices("dropped").map(op => op.text)).toEqual(["Owner chat: " + syntheticDropped(watcher, wakeBody(), "failed")]);
   expect(logs.join("\n")).not.toContain(privateText);
   expect(JSON.stringify(h.store.pendingOutbox())).not.toContain(privateText);
 });

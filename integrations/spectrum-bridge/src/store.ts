@@ -1,5 +1,6 @@
 import { deliveredReplyCoverage, humanInput, humanRow, markControlAcked, markAnswered, turnMembers, type ReplyTurn, type AnsweredInput } from "./unanswered.ts";
 import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
+import type { OperationalNoticePayload, OperationalNoticeRecord } from "./operational-notice.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
 import { traceLoopOperation } from "./loop-stall.ts";
@@ -111,6 +112,11 @@ export class Store {
         CREATE TABLE IF NOT EXISTS blobs (sha256 TEXT PRIMARY KEY, data BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS session_notices (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS session_notices_state ON session_notices(state);
+        CREATE TABLE IF NOT EXISTS operational_notices (
+          id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS operational_notices_state ON operational_notices(state, next_at);
       `);
       const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(inbound)").all();
       if (!columns.some(column => column.name === "failure")) this.db.exec("ALTER TABLE inbound ADD COLUMN failure TEXT");
@@ -429,5 +435,55 @@ export class Store {
 
   findOutbox(id: string): OutboxRecord | undefined {
     return this.getOperation(id) ?? this.byProviderId(id);
+  }
+
+  enqueueOperationalNotice(notice: OperationalNoticePayload): boolean {
+    const payload = json({
+      id: notice.id,
+      chat: notice.chat,
+      kind: notice.kind,
+      severity: notice.severity,
+      text: notice.text,
+      createdAt: notice.createdAt,
+    });
+    const result = this.db.query(
+      "INSERT INTO operational_notices (id, payload, state, attempts, next_at) VALUES (?, ?, 'pending', 0, 0) ON CONFLICT(id) DO NOTHING",
+    ).run(notice.id, payload);
+    return result.changes > 0;
+  }
+
+  getOperationalNotice(id: string): OperationalNoticeRecord | undefined {
+    const row = this.db.query<{ payload: string; state: string; attempts: number; next_at: number }, [string]>(
+      "SELECT payload, state, attempts, next_at FROM operational_notices WHERE id = ?",
+    ).get(id);
+    if (!row) return undefined;
+    return { ...(JSON.parse(row.payload) as OperationalNoticePayload), state: row.state as OperationalNoticeRecord["state"], attempts: row.attempts, nextAt: row.next_at };
+  }
+
+  dueOperationalNotices(now: number, limit = 20): OperationalNoticeRecord[] {
+    return this.db.query<{ payload: string; state: string; attempts: number; next_at: number }, [number, number]>(
+      "SELECT payload, state, attempts, next_at FROM operational_notices WHERE state = 'pending' AND next_at <= ? ORDER BY rowid LIMIT ?",
+    ).all(now, limit).map(row => ({
+      ...(JSON.parse(row.payload) as OperationalNoticePayload),
+      state: row.state as OperationalNoticeRecord["state"],
+      attempts: row.attempts,
+      nextAt: row.next_at,
+    }));
+  }
+
+  operationalNotices(): OperationalNoticeRecord[] {
+    return this.db.query<{ payload: string; state: string; attempts: number; next_at: number }, []>(
+      "SELECT payload, state, attempts, next_at FROM operational_notices ORDER BY rowid",
+    ).all().map(row => ({
+      ...(JSON.parse(row.payload) as OperationalNoticePayload),
+      state: row.state as OperationalNoticeRecord["state"],
+      attempts: row.attempts,
+      nextAt: row.next_at,
+    }));
+  }
+
+  updateOperationalNotice(id: string, state: "pending" | "sent" | "failed", attempts: number, nextAt: number): void {
+    this.db.query("UPDATE operational_notices SET state = ?, attempts = ?, next_at = ? WHERE id = ?")
+      .run(state, attempts, nextAt, id);
   }
 }

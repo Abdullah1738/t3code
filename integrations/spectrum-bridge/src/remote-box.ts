@@ -1,3 +1,5 @@
+import { enqueueOperationalNotice, flushOperationalNotices, operationalKey } from "./operational-notice.ts";
+import { socketPost } from "./telegram-fallback.ts";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { createPublicKey, createHmac } from "node:crypto";
 import { toolLog } from "./toollog.ts";
@@ -57,7 +59,7 @@ export class RemoteBox {
   private readonly callbackLoopDelay = monitorEventLoopDelay({ resolution: 100 });
   constructor(readonly config: RemoteBoxConfig, readonly store: Store, private readonly io: {
     fetch?: Fetch; now?: () => number; log: (event: string, code?: string) => void;
-    notice: (id: string, text: string) => Promise<void>; active: () => boolean;
+    alertSocketPath?: string; active: () => boolean;
     ownerAlert?: (severity: "attention", text: string, key: string) => Promise<boolean>;
     mirror?: ChatMirror;
   }) {
@@ -310,11 +312,18 @@ export class RemoteBox {
     if (reason) { if (!previous) this.store.set("remoteWaitingNotice", state); this.emit("moni-notice-suppressed", reason); return; }
     if (!this.io.active()) return;
     this.store.db.transaction(() => {
+      this.queueNotice("outage", state.id, "Moni chat: the agent is temporarily unavailable. Incoming messages are queued.");
       this.store.set("remoteNoticeAt", this.now()); this.store.set("remoteWaitingNotice", { ...state, attempted: true });
       if (outage) this.store.set("remoteOutage", { ...outage, noticeAttempted: true });
-    })();
-    try { await this.io.notice(state.id, "I’m temporarily offline. I’ll reply when I’m back."); }
-    catch { this.emit("moni-notice-error"); }
+    }).immediate();
+  }
+  private queueNotice(kind: "outage" | "attachment_failed", id: string, text: string): void {
+    enqueueOperationalNotice(this.store, {
+      id: operationalKey(kind.replaceAll("_", "-"), "moni", id), chat: "moni", kind, text, now: this.now(),
+    });
+  }
+  async flushNotices(): Promise<void> {
+    if (this.io.alertSocketPath) await flushOperationalNotices(this.store, socketPost(this.io.alertSocketPath, 1_000), { now: () => this.now() });
   }
   async tick(): Promise<void> {
     this.flushCallbackErrors();
@@ -525,6 +534,14 @@ export class RemoteBox {
       }
       if (!validId(body.id) || typeof body.text !== "string" || body.text.length > 12_000 || (body.mediaUrl !== undefined && (typeof body.mediaUrl !== "string" || !body.mediaUrl.startsWith("https://")))) return reply(400, { error: "Invalid send" });
       if (body.inboxId !== undefined && !validId(body.inboxId)) return reply(400, { error: "Invalid inbox id" });
+      // The box runner reserves this operation ID for its own attachment error.
+      // Agent sends use a different ID and retain their normal iMessage path.
+      if (validId(body.inboxId) && body.id === opaqueId(`attachment-failed:${body.inboxId}`)) {
+        this.queueNotice("attachment_failed", body.inboxId, "Moni chat: the agent could not read an incoming attachment.");
+        this.finish(body.inboxId);
+        await this.flushNotices();
+        return reply(200, { id: body.id });
+      }
       const result = await this.send(body.id, body.text, typeof body.mediaUrl === "string" ? body.mediaUrl : undefined, io.line, io.chat);
       if (validId(body.inboxId)) { this.unanswered.answered(body.inboxId, this.now()); this.finish(body.inboxId); }
       return reply(200, result);

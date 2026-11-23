@@ -207,18 +207,18 @@ test.each([false, true])("a split younger member retains failed-read cooldown an
 test.each(["pending", "sent"])("expiry gets its own durable notice after a %s exhaustion notice", async state => {
   const h = setup(), id = "wake:expiry-after-notice";
   await exhaust(h, id);
-  const initial = h.controls()[0]!;
-  expect(initial.text).toBe(syntheticDropped(id, body(id), "undelivered"));
-  if (state === "sent") h.store.outboxState(initial.id, "sent");
+  const initial = h.store.operationalNotices()[0]!;
+  expect(initial.text).toBe("Owner chat: " + syntheticDropped(id, body(id), "undelivered"));
+  if (state === "sent") h.store.updateOperationalNotice(initial.id, "sent", 1, Date.now());
   h.router = h.restart();
   setSystemTime(Date.now() + HORIZON + 1);
   const logs = await captureLogs(async () => { await submit(h); await h.router.tick(); await h.router.tick(); });
   expect(h.missed()).toEqual([]);
   expect(logs.filter(l => l.name === "synthetic.carry_evicted")).toHaveLength(1);
-  const expired = h.controls().filter(op => op.text === syntheticDropped(id, body(id), "expired"));
+  const expired = h.store.operationalNotices().filter(op => op.text === "Owner chat: " + syntheticDropped(id, body(id), "expired"));
   expect(expired).toHaveLength(1);
   expect(expired[0]!.id).not.toBe(initial.id);
-  expect(h.store.getOperation(initial.id)?.text).toBe(initial.text);
+  expect(h.store.getOperationalNotice(initial.id)?.text).toBe(initial.text);
 });
 
 test("eight exhausted wakes survive and land FIFO in prompts of five then three", async () => {
@@ -259,7 +259,7 @@ test("prompt build expires a six-hour carry once with a bodyless log and owner n
     ids: { inboundId: id, chat: "owner" }, props: { reason: "expired", ageMs: HORIZON + 1 },
   }]);
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_PAYLOAD");
-  expect(h.controls().map(n => n.text)).toEqual([syntheticDropped(id, body(id), "expired")]);
+  expect(h.store.operationalNotices().map(n => n.text)).toEqual(["Owner chat: " + syntheticDropped(id, body(id), "expired")]);
 });
 
 test("the 51st exhausted carry evicts only the oldest with overflow evidence and replaces its queued notice", async () => {
@@ -271,8 +271,8 @@ test("the 51st exhausted carry evicts only the oldest with overflow evidence and
   expect(logs.filter(l => l.name === "synthetic.carry_evicted")).toMatchObject([{
     ids: { inboundId: ids[0] }, props: { reason: "overflow" },
   }]);
-  const text = h.controls().map(n => n.text).join("\n");
-  expect(text).toContain("too old to pick up after it couldn't reach me, skipped");
+  const text = h.store.operationalNotices().map(n => n.text).join("\n");
+  expect(text).toContain("expired before it could be carried into a turn");
   expect(text.match(/Update wake:stored-0/g)).toHaveLength(1);
 });
 
@@ -288,7 +288,7 @@ test("legacy carries get one durable migration timestamp and are selected oldest
   // Restore after an outage: another build must not renew the migrated timestamp.
   h.store.set("activeTurn", null); h.store.updateInbound("human", "failed");
   await submit(h, "later"); await h.router.tick();
-  expect(h.controls().map(op => op.text).join("\n")).toContain("too old to pick up");
+  expect(h.store.operationalNotices().map(op => op.text).join("\n")).toContain("expired before it could be carried");
 });
 
 test.each([

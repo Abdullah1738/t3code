@@ -26,6 +26,7 @@ import { sweepSecrets } from "./secrets.ts";
 import { cloudflaredTunnel, Shares } from "./share.ts";
 import { Store } from "./store.ts";
 import { transcribe } from "./stt.ts";
+import { flushOperationalNotices } from "./operational-notice.ts";
 import { socketPost, telegramOutlet } from "./telegram-fallback.ts";
 import { createAttachmentRecovery } from "./local-attachments.ts";
 
@@ -308,6 +309,7 @@ async function main(): Promise<void> {
     const route = store.get<{ id: string } | null>("route");
     if (ready() && backend instanceof RobobBackend) backend.beginMessageTick(route ? [route.id] : []);
     void delivery.tick().catch((caughtError) => { toolError("main", "main.catch12", caughtError); return log("sender-failed"); });
+    if (!ready()) void flushOperationalNotices(store, socketPost(telegramBridgeSocket, 1_000)).catch(error => toolError("main", "operational-notice.flush", error));
     if (ready()) void router?.checkCompletion();
     if (ready()) void replyGap.tick().catch((caughtError) => { toolError("main", "reply-gap.check", caughtError); });
     void router?.checkInboundLatency(ready()).catch((caughtError) => { toolError("main", "main.catch13", caughtError); return log("inbound-latency-check-failed"); });

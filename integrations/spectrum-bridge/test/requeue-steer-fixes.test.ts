@@ -554,10 +554,12 @@ test("#130 hard stop at attempt 5 across routes + restart persistence + single O
     expect(payload.answeredAt).toBeUndefined();
     expect(payload.settledAt).toBeUndefined();
 
-    const controlNotices = reopened.pendingOutbox().filter(op => op.kind === "control");
-    expect(controlNotices).toHaveLength(1);
-    expect(controlNotices[0]!.id).toBe("failed:EXHAUST1:exhausted");
-    expect(controlNotices[0]!.text).toContain("technical problem");
+    // #129: the exhausted notice is operational, so it goes to Telegram once and never to the chat.
+    expect(reopened.pendingOutbox().filter(op => op.kind === "control")).toHaveLength(0);
+    const notices = reopened.operationalNotices();
+    expect(notices.map(n => [n.id, n.kind, n.chat])).toEqual([["imessage:failed:owner:EXHAUST1:exhausted", "failed", "owner"]]);
+    expect(notices[0]!.text).toStartWith("Owner chat: ");
+    expect(notices[0]!.text).not.toContain("technical problem");
   });
 
   const exhausted = logs.find(l => l.name === "inbound.retry_exhausted");

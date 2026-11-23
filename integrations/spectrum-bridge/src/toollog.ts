@@ -95,6 +95,15 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
     if (entry.name === "turn.retry_skipped" && key === "reason" && value === "reply_already_sent") { props[key] = value; continue; }
+    if (entry.name === "notice.routed") {
+      if (key === "chat" && typeof value === "string" && /^[a-zA-Z0-9_.-]{1,100}$/.test(value) && !/^\+?\d{6,}$/.test(value)
+        || key === "kind" && typeof value === "string" && ["dropped", "outage", "failed", "interrupted", "command_failed", "attachment_failed", "guest_note"].includes(value)
+        || key === "key" && typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,200}$/.test(value)
+        || key === "telegram" && typeof value === "string" && ["sent", "failed", "retry"].includes(value)) {
+        props[key] = value; continue;
+      }
+      continue;
+    }
     if (entry.name === "cli.send_timeout" && key === "path" && ["/send", "/files"].includes(String(value))) {
       props[key] = value; continue;
     }

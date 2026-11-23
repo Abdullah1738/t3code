@@ -45,6 +45,7 @@ import { Sendblue } from "./sendblue.ts";
 import { Store } from "./store.ts";
 import { chatDbSwipes } from "./swipe.ts";
 import { transcribe } from "./stt.ts";
+import { enqueueOperationalNotice, flushOperationalNotices, operationalKey } from "./operational-notice.ts";
 import { fenceOwnerAlert, notificationAccepted, socketPost, telegramOutlet } from "./telegram-fallback.ts";
 
 export type MainIo = {
@@ -243,7 +244,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
           try { const live = JSON.parse(readFileSync(join(stateRoot, "config.json"), "utf8"));
             return remoteBoxConfig(live, "moni")?.epoch === remoteConfig.epoch; } catch { return false; }
         },
-        notice: async (id, text) => { await remote.send(hash(`notice:${id}`), text, undefined, observed, chat.info.key); },
+        alertSocketPath: telegramBridgeSocket,
       });
       chat.remote = remote;
       return { remote, mirror, api: async () => Response.json({ error: "This chat lives on its box" }, { status: 403 }), busy: false };
@@ -304,9 +305,9 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   // Scoped third parties: grants in guests.json, audit in guests-audit.jsonl (guests.ts).
   const guestBook = new GuestBook(stateRoot);
   const wakeOwner = (text: string, key: string) => { chats.wake(chats.owner, text, key); };
-  /** A plain bridge line into the owner's chat, no agent turn. */
+  /** Operational guest notices go straight to the owner’s alert queue. */
   const tellOwner = (text: string, key: string) => {
-    try { chats.owner.store.enqueue({ id: `guest-note:${hash(key)}`, kind: "conversation", text }); } catch (caughtError) { toolError("sb-main", "sb-main.catch6", caughtError); log("guest-note-failed"); }
+    try { enqueueOperationalNotice(chats.owner.store, { id: operationalKey("guest-note", "owner", hash(key)), chat: "owner", kind: "guest_note", text }); } catch (caughtError) { toolError("sb-main", "sb-main.catch6", caughtError); log("guest-note-failed"); }
   };
   const shareContact = (address: string) => line.shareContact(address);
   const flights = flightyDb();
@@ -415,10 +416,12 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     }));
     for (const chat of chats.all()) {
       if (chat.parts.remote) {
+        void chat.parts.remote.flushNotices().catch(error => toolError("sb-main", "operational-notice.flush", error));
         void chat.parts.mirror?.tick().catch(() => log("mirror-worker-failed"));
         if (ready()) void chat.parts.remote.tick();
         continue;
       }
+      if (!ready()) void flushOperationalNotices(chat.store, socketPost(telegramBridgeSocket, 1_000)).catch(error => toolError("sb-main", "operational-notice.flush", error));
       void chat.parts.delivery?.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
       if (ready()) void chat.parts.router?.checkCompletion();
       if (ready()) void chat.parts.replyGap?.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });

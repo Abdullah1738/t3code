@@ -24,6 +24,8 @@ import { textingStyle } from "./texting-style.ts";
 import { commandWord, controlCommand, isCommand } from "./commands.ts";
 import { chatKey } from "./line.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
+import { enqueueOperationalNotice, flushOperationalNotices, migrateOperationalNotices, operationalChatLabel, operationalKey, type OperationalNoticeKind } from "./operational-notice.ts";
+import { socketPost } from "./telegram-fallback.ts";
 import { telegramNotificationLookup, type TelegramReference } from "./telegram-lookup.ts";
 import { imessagePreferences } from "./preferred-model.ts";
 import { isAudio, SttError, type SttInput } from "./stt.ts";
@@ -473,7 +475,7 @@ export const READ_WAIT_MS = 30_000;
 export const SEND_WAIT_MS = 90_000;
 /** A control (/new, an answer) waiting to be handled is not kept behind one backend call longer than this. */
 const CONTROL_WAIT_MS = 10_000;
-const OUTAGE_TEXT = "I'm having a technical problem; I'll answer this as soon as I'm back.";
+
 type Outage = { id: string; batchId: string; noticeAt: number; noticed: boolean; probeAt: number; replayAt?: number };
 type PreparingDelivery = {
   id: string; startedAt: number; attemptAt: number; attempt: number; held?: boolean;
@@ -485,7 +487,7 @@ type SentPrompt = { sessionId: string; directory: string; generation?: number; m
 type SyntheticRetry = { attempts: number; nextAt: number; prompts: SentPrompt[]; reason?: DropReason; delivery?: { turn: Turn; body: ResendBody } };
 type DropReason = "undelivered" | "failed" | "errored" | "expired";
 /** A dropped synthetic row waiting to be sent in the combined notice. */
-type DroppedNotice = { id: string; label: string; reason: DropReason; text: string; at: number };
+type DroppedNotice = { id: string; label: string; reason: DropReason; at: number };
 const clip = (text: string, max: number) => {
   const flat = text.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 3).trimEnd()}...`;
@@ -509,22 +511,17 @@ function syntheticLabel(id: string, text: string): string {
   return `secure form: ${clip(/^Filled in the secure form "([\s\S]*?)" \(fields:/.exec(text)?.[1] ?? "", 80) || "unnamed"}`;
 }
 export function syntheticDropped(id: string, text: string, reason: DropReason = "undelivered"): string {
-  const label = syntheticLabel(id, text);
-  if (reason === "expired") return `A background update (${label}) was too old to pick up after it couldn't reach me, so I skipped it.`;
-  if (reason === "failed") return `A background update (${label}) hit an error on my end while I was handling it, so it may be only partly done.`;
-  if (reason === "errored") return `A background update (${label}) failed on my end ${MAX_SYNTHETIC_ATTEMPTS} times before it started, so it didn't run. I'll pick it up on my next turn.`;
-  return `A background update (${label}) didn't reach me after ${MAX_SYNTHETIC_ATTEMPTS} tries. I'll recheck it on my next turn.`;
+  return droppedBatchText([{ id, label: syntheticLabel(id, text), reason, at: 0 }]);
 }
-/** One message for dropped rows that landed close together: one entry keeps its own text, several are listed. */
 function droppedBatchText(list: DroppedNotice[]): string {
-  if (list.length === 1) return list[0]!.text;
   const why: Record<DropReason, string> = {
-    failed: "hit an error while running, may be partly done",
-    errored: "the model errored before it started, so it didn't run; I'll pick it up next turn",
-    undelivered: "didn't reach me; I'll pick it up next turn",
-    expired: "too old to pick up after it couldn't reach me, skipped",
+    failed: "failed while running and may be partly done.",
+    errored: `failed before starting after ${MAX_SYNTHETIC_ATTEMPTS} tries and is carried into the next turn.`,
+    undelivered: `did not reach the agent after ${MAX_SYNTHETIC_ATTEMPTS} tries and is carried into the next turn.`,
+    expired: "expired before it could be carried into a turn.",
   };
-  return ["These background updates didn't go through on my end:", ...list.map(n => `- ${n.label}: ${why[n.reason]}`)].join("\n");
+  if (list.length === 1) return `${list[0]!.label} ${why[list[0]!.reason]}`;
+  return ["Background updates were dropped.", ...list.map(n => `- ${n.label} ${why[n.reason]}`)].join("\n");
 }
 /** Synthetic rows given up on, carried into the next submitted turn as quoted data. */
 type Missed = { id: string; text: string; at: number; uncertain?: true };
@@ -937,6 +934,7 @@ export class Router {
     new Intl.DateTimeFormat("en-US", { timeZone: options.timezone });
     const chat = options.context?.chat;
     this.store.set("log-chat", chat?.slug ?? "owner");
+    migrateOperationalNotices(store, chat?.slug ?? "owner");
     this.store.set("unanswered-chat", !chat || chat.kind === "owner" ? "owner" : chat.kind === "dm" && chat.slug === "moni" ? "moni" : "other");
     const restored = this.store.get<Turn | null>("activeTurn");
     if (restored && this.current(restored)) this.restoreSteeredCoverage(restored);
@@ -1050,6 +1048,7 @@ export class Router {
   tick(): Promise<void> {
     const turn = this.store.get<Turn | null>("activeTurn");
     return this.ticking ??= timeTick({ chat: this.options.context?.chat.slug ?? "owner", ...(turn ? { threadId: turn.id } : {}) }, () => this.backend.messageReadScope ? this.backend.messageReadScope(() => this.run()) : this.run())
+      .finally(() => flushOperationalNotices(this.store, socketPost(this.options.alertSocketPath, 1_000)))
       .finally(() => { this.ticking = undefined; });
   }
 
@@ -1727,7 +1726,13 @@ export class Router {
       && ["sent", "uncertain"].includes(this.store.getOperation(p.prompt)?.state ?? ""));
   }
 
-  private acknowledge(id: string, text: string, state = "done", answersInbound = false): void {
+  private operationalNotice(kind: OperationalNoticeKind, suffix: string, text: string): void {
+    const chat = this.options.context?.chat.slug ?? "owner";
+    enqueueOperationalNotice(this.store, { id: operationalKey(kind.replaceAll("_", "-"), chat, suffix),
+      chat, kind, text: `${operationalChatLabel(chat)}: ${text}` });
+  }
+
+  private acknowledge(id: string, text: string, state = "done", answersInbound = false, operational?: OperationalNoticeKind): void {
     this.store.db.transaction(() => {
       // The owner never typed a synthetic row, so no notice may ask them to resend it.
       if (this.syntheticBatch(id)) {
@@ -1742,7 +1747,8 @@ export class Router {
         });
         this.store.set("preparingDelivery", null);
       }
-      this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", ...(answersInbound ? { answersInbound: true } : {}), text, ...this.replyTarget(id) });
+      if (operational) this.operationalNotice(operational, hash(id), text);
+      else this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", ...(answersInbound ? { answersInbound: true } : {}), text, ...this.replyTarget(id) });
       if (state === "failed") this.failInbound(id, "prepare", text);
       else this.store.updateInbound(id, state);
     }).immediate();
@@ -1932,11 +1938,11 @@ export class Router {
     if (isAgentBusWake(id)) return;
     const list = this.store.get<DroppedNotice[] | null>("droppedNotices") ?? [];
     if (list.some(n => n.id === id && (reason !== "expired" || n.reason === "expired"))) return;
-    this.store.set("droppedNotices", [...list.filter(n => n.id !== id), { id, label: syntheticLabel(id, text), reason, text: syntheticDropped(id, text, reason), at: Date.now() }]);
+    this.store.set("droppedNotices", [...list.filter(n => n.id !== id), { id, label: syntheticLabel(id, text), reason, at: Date.now() }]);
   }
 
   /**
-   * Sends the queued dropped-row notices as one control message once the
+   * Queues the dropped-row notices as one Telegram message once the
    * oldest has waited out the batch window. The list lives in kv, so a bridge
    * restart keeps it.
    */
@@ -1945,8 +1951,9 @@ export class Router {
     if (list.length === 0) return;
     if (Date.now() - list[0]!.at < (this.options.droppedBatchMs ?? DROPPED_BATCH_MS)) return;
     this.store.db.transaction(() => {
-      const notice = `synthetic-dropped:${hash(JSON.stringify(list.map(n => [n.id, n.reason])))}`;
-      if (!this.store.getOperation(notice)) this.store.enqueue({ id: notice, kind: "control", text: droppedBatchText(list) });
+      const pairs = list.map(n => `${n.id}:${n.reason}`).sort();
+      const suffix = pairs.length === 1 ? pairs[0]! : `batch:${hash(JSON.stringify(pairs))}`;
+      this.operationalNotice("dropped", suffix, droppedBatchText(list));
       this.store.set("droppedNotices", null);
     }).immediate();
   }
@@ -2001,17 +2008,18 @@ export class Router {
     if (moved) { this.store.set("deferredNotice", null); return; }
     if (Date.now() - held.at < (this.options.failureNoticeMs ?? FAILURE_NOTICE_GRACE)) return;
     this.store.db.transaction(() => {
-      this.notice(held.turn, "failed", held.text);
+      this.notice(held.turn, held.text);
       this.store.set("deferredNotice", null);
     }).immediate();
   }
 
-  private notice(turn: Turn, key: string, text: string): void {
-    if (!this.typedInto(turn) && this.syntheticBatch(turn.inboundId)?.every(isAgentBusWake)) return;
-    const id = `turn:${turn.generation}:${turn.messageId}:${key}`;
-    if (!this.store.getOperation(id)) this.store.enqueue({
-      id, kind: "control", text, sessionId: turn.id, generation: turn.generation, ...this.replyTarget(turn.inboundId),
-    });
+  private notice(turn: Turn, text: string): void {
+    if (!text || !this.typedInto(turn) && this.syntheticBatch(turn.inboundId)?.every(isAgentBusWake)) return;
+    const plain = text.startsWith("The app restarted while I was")
+      ? "The agent run was interrupted by a restart and may be partly done."
+      : text === firstFailureText(true) ? "The chat model was unavailable."
+      : "The agent could not complete the turn due to a system error.";
+    this.operationalNotice("failed", `${turn.generation}:${turn.messageId}`, plain);
   }
 
   private async run(): Promise<void> {
@@ -2060,7 +2068,7 @@ export class Router {
           }
           // A steer cut short is retried under its prompt id below, never dropped.
           if (!this.owns(row.id) && !this.steering(row.id) && this.store.get<PreparingDelivery | null>("preparingDelivery")?.id !== row.id && !this.store.get(`latency-route:${row.id}`)) {
-            this.acknowledge(row.id, "Something interrupted that one before I could get to it. Mind sending it again?", "unknown");
+            this.acknowledge(row.id, "An incoming message was interrupted before the agent could process it.", "unknown", false, "interrupted");
           }
         } else {
           this.controlNow = row.id;
@@ -3185,7 +3193,7 @@ export class Router {
         this.store.updateInbound(inboundId, "pending");
         throw caughtError;
       }
-      this.acknowledge(inboundId, "Couldn't start fresh just now. Try /new again in a moment.", "unknown");
+      this.acknowledge(inboundId, "The bridge could not start a new chat.", "unknown", false, "command_failed");
     }
   }
 
@@ -3367,7 +3375,7 @@ export class Router {
       request = (await this.reading(this.backend.questions(sessionId, directory)))?.find(r => r.id === pending.id && r.sessionID === sessionId);
     } catch (caughtError) { toolError("router", "router.catch24", caughtError);
       if (caughtError instanceof RobobLinkDown || this.backend.linkAvailable === false) throw caughtError;
-      this.acknowledge(inboundId, "Couldn't check that question just now. Try again in a moment.");
+      this.acknowledge(inboundId, "The bridge could not check the question for /answer.", "done", false, "command_failed");
       return;
     }
     const answers = parsed as string[][];
@@ -3971,9 +3979,9 @@ export class Router {
           undelivered.push(undeliveredNote(attachment, detail));
           continue;
         }
-        const reason = failure.code === "invalidAttachment" ? "That attachment came through broken. Mind resending it?"
-          : "I couldn't download that attachment. Mind resending it once it's fully uploaded?";
-        this.acknowledge(row.id, reason, "failed");
+        const reason = failure.code === "invalidAttachment" ? "An incoming attachment was invalid."
+          : "The bridge could not download an incoming attachment.";
+        this.acknowledge(row.id, reason, "failed", false, "attachment_failed");
         return;
       }
     }
@@ -4038,7 +4046,7 @@ export class Router {
       }
     } catch (caughtError) { toolError("router", "router.catch37", caughtError);
       if (interrupted()) return;
-      this.acknowledge(row.id, "I couldn't save those files. Mind sending them again?", "failed");
+      this.acknowledge(row.id, "The bridge could not save incoming files.", "failed", false, "attachment_failed");
       return;
     }
     if (interrupted() || !this.current(route)) return;
@@ -4714,7 +4722,7 @@ export class Router {
       if (this.wakeBatch(id) || this.store.get(`inbound-delivered:${id}`) !== undefined) return;
       const row = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id);
       if (row?.state !== "processing" && !(row?.state === "pending" && this.backend.linkAvailable === false)) return;
-      this.store.enqueue({ id: outage.id, kind: "control", text: OUTAGE_TEXT, ...this.replyTarget(id) });
+      this.operationalNotice("outage", outage.id.replace(/^outage:/, ""), "The agent is temporarily unavailable. The incoming message is queued.");
       this.store.set("deliveryOutage", { ...outage, noticed: true });
       this.watchdogLog("notice", { inboundId: id, messageId: this.promptId(id) });
     }).immediate();
@@ -5656,7 +5664,7 @@ export class Router {
     const folded = this.toolMode ? [] : await this.foldTexts(turn, outgoing.map(reply => reply.text), outgoing.at(-1)?.id ?? idle.id, "final");
     if (!this.current(turn) || this.store.get<Turn | null>("activeTurn")?.messageId !== turn.messageId) return;
     this.store.db.transaction(() => {
-      if (priorFailure) this.notice(turn, "failed", firstFailureText(priorFailure.modelError));
+      if (priorFailure) this.notice(turn, firstFailureText(priorFailure.modelError));
       // Tool mode: the agent texted the chat itself; what it queued during this turn is what it said.
       const sent = this.toolMode ? this.turnSends(turn) : undefined;
       if (!this.toolMode) {
@@ -6255,11 +6263,8 @@ export class Router {
               this.store.set("deferredNotice", null);
               if (!this.store.get(`retry-exhausted-noticed:${leader}`)) {
                 this.store.set(`retry-exhausted-noticed:${leader}`, true);
-                const noticeId = `failed:${leader}:exhausted`;
-                if (!this.store.getOperation(noticeId)) this.store.enqueue({
-                  id: noticeId, kind: "control", text: OUTAGE_TEXT,
-                  sessionId: turn.id, generation: turn.generation, ...this.replyTarget(leader),
-                });
+                this.operationalNotice("failed", `${leader}:exhausted`,
+                  `An incoming message failed ${MAX_FAILED_ATTEMPTS} times and was not answered; it will not be retried.`);
               }
             }).immediate();
             toolLog.capture(() => toolLog.write({
@@ -6376,7 +6381,7 @@ export class Router {
       if (immediate) {
         // A broken new chat or model needs repair, not automatic replay of a watcher wake.
         for (const id of ids) if (!this.answered(id) && !this.store.get(`human-own-turn:${id}`)) this.failInbound(id, "execution", text, turn);
-        if (!retryHandled && (!ids.length || ids.some(id => !this.answered(id)))) this.notice(turn, "failed", text);
+        if (!retryHandled && (!ids.length || ids.some(id => !this.answered(id)))) this.notice(turn, text);
       }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
       else if (this.syntheticBatch(turn.inboundId)) {
@@ -6385,14 +6390,14 @@ export class Router {
         // A person's text was steered into this watcher turn: they hear about it like any typed turn.
         // An errored wake is retried within the notice's grace and would cancel it, so that one goes out now.
         if (typed && !turn.background && reason !== "undelivered" && text) {
-          if (reason === "errored") this.notice(turn, "failed", text);
+          if (reason === "errored") this.notice(turn, text);
           else this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
         }
       }
       else if (!retryHandled) {
         if (!turn.background && (!ids.length || ids.some(id => !this.answered(id)))) {
           if (reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
-          else this.notice(turn, "failed", text);
+          else this.notice(turn, text);
         }
         for (const id of ids) if (!this.answered(id) && !this.store.get(`human-own-turn:${id}`)) this.failInbound(id, reason === "undelivered" ? "dispatch" : "execution", text, turn);
       }

@@ -396,9 +396,8 @@ test.each(["owner", "forChat"])("%s first-turn failures send one attention alert
   expect(posts[0]).toMatchObject({ path: "/notify", body: { source: "iMessage bridge", severity: "attention", dedupeKey: `${id}:first-turn-failed` } });
   for (const value of [thread.title, id, thread.driver.model, thread.driver.instanceId, thread.lastError]) expect(posts[0]!.body.text).toContain(value);
   expect(store.pendingOutbox().filter(item => item.kind === "conversation")).toEqual([]);
-  expect(store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
-    "The chat's model isn't available, so I couldn't process that message. Resending it won't fix this.",
-  ]);
+  expect(store.pendingOutbox().filter(item => item.kind === "control")).toEqual([]);
+  expect(store.operationalNotices().map(item => item.text)).toEqual(["Owner chat: The chat model was unavailable."]);
   expect(inbounds(store)).toEqual([{ id: "first", state: "failed" }]);
   expect(store.inboundFailure("first")).toMatchObject({ stage: "execution" });
   expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
@@ -540,9 +539,8 @@ test.each([
   await router.tick();
   await router.tick();
   expect(store.pendingOutbox().filter(item => item.kind === "conversation").map(item => item.text)).toEqual(status === "completed" ? Array(laterRuns).fill("This reply worked") : []);
-  expect(store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
-    "The chat's model isn't available, so I couldn't process that message. Resending it won't fix this.",
-  ]);
+  expect(store.pendingOutbox().filter(item => item.kind === "control")).toEqual([]);
+  expect(store.operationalNotices().map(item => item.text)).toEqual(["Owner chat: The chat model was unavailable."]);
   expect(alerts).toHaveLength(1);
   expect(alerts[0]).toContain("failed its first turn");
 });
@@ -1295,9 +1293,8 @@ test("a new chat's first-call error with text is reported without replaying the 
   expect(run.states).toEqual(["failed", "failed"]);
   expect(run.store.inboundFailure(run.wake)).toMatchObject({ stage: "execution" });
   expect(run.sends()).toBe(1);
-  expect(run.store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
-    "I couldn't process that message because this chat hit a system error. Please don't resend it yet.",
-  ]);
+  expect(run.store.pendingOutbox().filter(item => item.kind === "control")).toEqual([]);
+  expect(run.store.operationalNotices().map(item => item.text)).toEqual(["Owner chat: The agent could not complete the turn due to a system error."]);
 });
 
 test("a new chat's first-call error with reasoning is reported without replaying the wake", async () => {
