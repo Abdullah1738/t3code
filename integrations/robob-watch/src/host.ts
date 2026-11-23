@@ -29,6 +29,8 @@ export function checkSlotCap(load: number | boolean): number {
 export class LoadMode {
   high = false;
   private since: number | undefined;
+  private startedAt = 0;
+  private reportedAt = 0;
   constructor(private readonly thresholds = { high: LOAD_HIGH, low: LOAD_LOW, dwellMs: LOAD_DWELL_MS }) {}
   sample(load: number, at: number): boolean {
     const crossing = this.high ? load < this.thresholds.low : load >= this.thresholds.high;
@@ -38,9 +40,16 @@ export class LoadMode {
       if (at - this.since >= this.thresholds.dwellMs) {
         this.high = !this.high;
         this.since = undefined;
+        if (this.high) this.startedAt = this.reportedAt = at;
       }
     }
     return this.high;
+  }
+
+  report(at: number): number | undefined {
+    if (!this.high || at - this.reportedAt < 3600_000) return;
+    this.reportedAt = at;
+    return Math.max(0, at - this.startedAt);
   }
 }
 
@@ -48,12 +57,27 @@ export type CheckLane = "fast" | "slow";
 export const checkLane = (lastRunMs: number | undefined): CheckLane =>
   lastRunMs !== undefined && Number.isFinite(lastRunMs) && lastRunMs >= 0 && lastRunMs < FAST_CHECK_MS ? "fast" : "slow";
 
+export function checkClassification(lastRunMs: number | undefined, recent: number[] | undefined) {
+  const history = recentCheckRuntimes(recent, undefined);
+  const runtimes = history.length ? history : recentCheckRuntimes(undefined, lastRunMs);
+  const recentMinMs = runtimes.length ? Math.min(...runtimes) : undefined;
+  const lane: CheckLane = recentMinMs !== undefined && recentMinMs < FAST_CHECK_MS ? "fast" : "slow";
+  const reason = lane === "fast" ? checkLane(lastRunMs) === "fast" ? "fast" : "fast:sticky"
+    : recentMinMs === undefined ? "slow:new" : "slow:recent";
+  return { lane, reason, recentMinMs };
+}
+
+export function recentCheckRuntimes(recent: number[] | undefined, lastRunMs: number | undefined): number[] {
+  return [...(Array.isArray(recent) ? recent : []), ...(lastRunMs === undefined ? [] : [lastRunMs])]
+    .filter(ms => Number.isFinite(ms) && ms >= 0).slice(-3);
+}
+
 export function isMounted(path: string): boolean {
   try { return statSync(path).dev !== statSync(dirname(path)).dev; } catch { toolError("runner", "watch.mount_stat_failed"); return false; }
 }
 
-export type SlotRequest = { watcher: string; run?: string; operation?: "check" | "pending"; dueAt?: number; intervalMs?: number; lane?: CheckLane };
-export type SlotTiming = { slotWaitMs: number; slotQueueDepth: number; slotActiveAtEnqueue: number; startLateMs: number };
+export type SlotRequest = { watcher: string; urgent?: boolean; run?: string; operation?: "check" | "pending"; dueAt?: number; intervalMs?: number; lane?: CheckLane; recentMinMs?: number };
+export type SlotTiming = { slotWaitMs: number; slotQueueDepth: number; slotActiveAtEnqueue: number; startLateMs: number; slotLane?: CheckLane; slotPickReason?: "fifo" | "urgent" };
 type Holder = { watcher: string; elapsedMs: number };
 export type SlotEvent =
   | { name: "slot.wait"; request: SlotRequest; waitMs: number; holders: Holder[] }
@@ -61,21 +85,25 @@ export type SlotEvent =
   | { name: "slot.hold"; request: SlotRequest; durationMs: number }
   | { name: "slot.overrun"; request: SlotRequest; elapsedMs: number }
   | { name: "slot.busy"; durationMs: number };
-type Waiter = { resolve: (timing: SlotTiming) => void; request: SlotRequest; at: number; depth: number; active: number; warned: boolean; overrunLogged: boolean; lane: CheckLane | "overrun" };
+type Waiter = { resolve: (timing: SlotTiming) => void; request: SlotRequest; at: number; depth: number; active: number; warned: boolean; overrunLogged: boolean; lane: CheckLane | "overrun"; borrowed: boolean };
 
 /** Recheck the cap on every admission; lowering it never interrupts an admitted check. */
 export class CheckSlots {
   private active = 0;
   private fastActive = 0;
   private overrunActive = 0;
+  private borrowedFast = false;
   private waiters: Waiter[] = [];
   private holders = new Map<Waiter, { at: number; accountedAt: number }>();
   private backlogAt: number | undefined;
   private busyAt: number | undefined;
   private usageAt: number | undefined;
-  constructor(private readonly cap: () => number, private readonly telemetry: { now?: () => number; emit?: (event: SlotEvent) => void } = {}, private readonly fastCap = 0) {}
+  constructor(private readonly cap: () => number, private readonly telemetry: { now?: () => number; emit?: (event: SlotEvent) => void; queueChanged?: () => void } = {}, private readonly fastCap = 0, private readonly borrowFast: () => boolean = () => false) {}
 
   private now(): number { return (this.telemetry.now ?? Date.now)(); }
+  queue() {
+    return this.waiters.map(waiter => ({ watcher: waiter.request.watcher, queuedAt: waiter.at, lane: waiter.lane, urgent: waiter.request.urgent === true }));
+  }
   private emit(event: SlotEvent): void {
     try { this.telemetry.emit?.(event); } catch { toolError("runner", "slot.telemetry_failed"); }
   }
@@ -111,9 +139,10 @@ export class CheckSlots {
         }
         // One overflow holder frees fast capacity without taking a FIFO slow
         // slot. Further overruns retain their fast slot until overflow clears.
-        if (!this.overrunActive) {
+        if (!this.overrunActive && (!this.borrowedFast || waiter.borrowed)) {
           waiter.lane = "overrun";
           this.fastActive--;
+          if (waiter.borrowed) this.borrowedFast = false;
           this.overrunActive++;
         }
       }
@@ -126,7 +155,33 @@ export class CheckSlots {
       }
     }
     for (;;) {
-      const index = this.waiters.findIndex(waiter => waiter.lane === "fast" ? this.fastActive < this.fastCap : this.active < cap);
+      let index = this.waiters.findIndex(waiter => waiter.lane === "fast" ? this.fastActive < this.fastCap : this.active < cap);
+      let slotPickReason: "fifo" | "urgent" = "fifo";
+      if (index >= 0 && this.waiters[index]!.lane === "slow") {
+        const urgent = this.waiters.findIndex(waiter => waiter.lane === "slow" && waiter.request.urgent === true);
+        if (urgent >= 0) { index = urgent; slotPickReason = "urgent"; }
+      }
+      if (index < 0 && this.borrowFast() && !this.borrowedFast && !this.overrunActive && this.fastActive === 0 && this.fastCap > 0) {
+        // Preserve slow FIFO admissions and genuine fast work. Only otherwise
+        // idle reserved capacity serves overdue 5–10 minute checks.
+        // Require runtimes well beyond the fast threshold, leaving brief overruns
+        // to sticky classification. Old state can qualify from last_run_ms.
+        // An older fast holder must retain access to overflow at its own deadline.
+        let deadline = Infinity;
+        for (let i = 0; i < this.waiters.length; i++) {
+          const request = this.waiters[i]!.request;
+          if (request.recentMinMs === undefined || !Number.isFinite(request.recentMinMs) || request.recentMinMs < FAST_CHECK_MS * 2
+            || request.operation !== "check" || request.dueAt === undefined || !Number.isFinite(request.dueAt) || request.dueAt > at
+            || request.intervalMs === undefined || !Number.isFinite(request.intervalMs) || request.intervalMs < 300_000 || request.intervalMs > 600_000) continue;
+          const candidate = request.dueAt + request.intervalMs;
+          if (candidate < deadline) { deadline = candidate; index = i; }
+        }
+        if (index >= 0) {
+          this.waiters[index]!.lane = "fast";
+          this.waiters[index]!.request.lane = "fast";
+          this.waiters[index]!.borrowed = this.borrowedFast = true;
+        }
+      }
       if (index < 0) break;
       const waiter = this.waiters.splice(index, 1)[0]!;
       if (waiter.lane === "fast") this.fastActive++;
@@ -134,6 +189,7 @@ export class CheckSlots {
       this.holders.set(waiter, { at, accountedAt: at });
       this.usageAt ??= at;
       waiter.resolve({ slotWaitMs: Math.max(0, at - waiter.at), slotQueueDepth: waiter.depth, slotActiveAtEnqueue: waiter.active,
+        slotLane: waiter.lane === "overrun" ? "fast" : waiter.lane, slotPickReason,
         startLateMs: waiter.request.dueAt === undefined ? 0 : Math.max(0, at - waiter.request.dueAt) });
     }
     this.busy(at, cap);
@@ -147,13 +203,14 @@ export class CheckSlots {
     }
     // Flush partial holdings across UTC boundaries and while a check is still running.
     if (this.usageAt !== undefined && at - this.usageAt >= 60_000) this.usage(at);
+    try { this.telemetry.queueChanged?.(); } catch { toolError("runner", "slot.snapshot_failed"); }
   }
 
   async run<T>(fn: (timing: SlotTiming) => Promise<T>, request: SlotRequest = { watcher: "unknown" }): Promise<T> {
     let waiter: Waiter;
     const timing = await new Promise<SlotTiming>(resolve => {
       waiter = { resolve, request, at: this.now(), depth: this.waiters.length, active: this.active + this.fastActive + this.overrunActive, warned: false, overrunLogged: false,
-        lane: this.fastCap > 0 && request.lane === "fast" ? "fast" : "slow" };
+        lane: this.fastCap > 0 && request.lane === "fast" ? "fast" : "slow", borrowed: false };
       this.waiters.push(waiter);
       this.drain();
     });
@@ -161,7 +218,7 @@ export class CheckSlots {
       const at = this.now(), holder = this.holders.get(waiter!);
       if (holder && at > holder.accountedAt) this.emit({ name: "slot.hold", request, durationMs: at - holder.accountedAt });
       this.holders.delete(waiter!);
-      if (waiter!.lane === "fast") this.fastActive--;
+      if (waiter!.lane === "fast") { this.fastActive--; if (waiter!.borrowed) this.borrowedFast = false; }
       else if (waiter!.lane === "overrun") this.overrunActive--;
       else this.active--;
       this.drain();

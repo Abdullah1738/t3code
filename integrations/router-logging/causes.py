@@ -11,6 +11,17 @@ PHASES = {'history_scan_parse': 'historyScanParseMs', 'rollup_write': 'rollupWri
           'snapshot': 'snapshotMs', 'log_write': 'logWriteMs',
           'observer_snapshot_start': 'observerSnapshotStartMs',
           'post_end_diag': 'postEndDiagMs', 'child_wait': 'childWaitMs', 'pool_fetch': 'poolFetchMs'}
+RESOURCE_FIELDS = {'InblockN': 'ru_inblock', 'MajfltN': 'ru_majflt',
+                   'NivcswN': 'ru_nivcsw', 'NvcswN': 'ru_nvcsw'}
+BYTE_PHASES = ('history_scan_parse', 'listener_history')
+BYTE_FIELDS = ('BytesHashed', 'BytesParsed')
+SUBSTEPS = ('LoadState', 'ValidateCursor', 'ParseLines', 'BuildReport', 'SaveState')
+WAIT_FIELDS = {field[:-2] + suffix for field in PHASES.values() for suffix in RESOURCE_FIELDS}
+WAIT_FIELDS.update(PHASES[name][:-2] + suffix for name in BYTE_PHASES for suffix in BYTE_FIELDS)
+SUBSTEP_FIELDS = {PHASES[name][:-2] + step + suffix
+                  for name in BYTE_PHASES for step in SUBSTEPS for suffix in ('Ms', 'CpuMs')}
+TIMEOUT_FIELDS = {'activePhaseMs', 'activePhaseCpuMs'} | {
+    prefix + suffix for prefix in ('activePhase', 'child') for suffix in RESOURCE_FIELDS}
 
 
 def positive(value):
@@ -28,13 +39,31 @@ def unknown(reason):
     return dict(cause='unknown_no_data', missingEvidence=reason)
 
 
-def phase_cause(name, wall_ms, cpu_ms):
+def phase_cause(name, wall_ms, cpu_ms, props=None):
     try:
-        starved = (positive(wall_ms) and wall_ms > 120000 and type(cpu_ms) in (int, float)
+        waiting = (positive(wall_ms) and wall_ms > 30000 and type(cpu_ms) in (int, float)
                    and math.isfinite(cpu_ms) and 0 <= cpu_ms < wall_ms * .1)
     except OverflowError:
-        starved = False
-    return ('tick_starved:' if starved else 'tick_blocked:') + name
+        waiting = False
+    cause = 'tick_blocked:'
+    if waiting:
+        props = props if isinstance(props, dict) else {}
+        counters = [props.get(PHASES[name][:-2] + suffix) for suffix in RESOURCE_FIELDS]
+        if all(type(value) is int and value >= 0 for value in counters):
+            inblock, majflt, involuntary, voluntary = counters
+            # Match the 30 s diagnostic gate, with <10% CPU. Require >=16 input
+            # operations or major faults AND >=16 voluntary switches, at least
+            # 4x involuntary switches, for I/O. >=16 dominant involuntary
+            # switches signal preemption. Mixed/quiet counters stay blocked:
+            # rusage counts suggest a wait class, not its exact elapsed time.
+            if max(inblock, majflt) >= 16 and voluntary >= 16 and voluntary >= 4 * max(1, involuntary):
+                cause = 'tick_io:'
+            elif involuntary >= 16 and involuntary > voluntary:
+                cause = 'tick_starved:'
+        elif not any(value is not None for value in counters) and wall_ms > 120000:
+            # Preserve #100's low-CPU classification for legacy rows only.
+            cause = 'tick_starved:'
+    return cause + name
 
 
 def launchctl_info(props, legacy=False):
@@ -67,6 +96,15 @@ def launchctl_info(props, legacy=False):
 
 def gap_info(props, phase=None, duration_ms=None):
     props = props if isinstance(props, dict) else {}
+    active = props.get('phase')
+    if 'activePhaseMs' in props:
+        wall = props['activePhaseMs']
+        if isinstance(active, str) and active in PHASES and (positive(wall) or type(wall) in (int, float) and wall == 0):
+            counters = {PHASES[active][:-2] + suffix: props.get('activePhase' + suffix) for suffix in RESOURCE_FIELDS}
+            cause = phase_cause(active, wall, props.get('activePhaseCpuMs'), counters)
+            return dict(phase=active, phaseMs=wall, **evidence(cause, 'activePhaseMs', wall))
+        # Completed phases cannot name the active remainder of a killed child.
+        return dict(phase=active if active in ('other', 'none') else 'other', **unknown('active_phase_name_or_duration'))
     values = [(name, props.get(field)) for name, field in PHASES.items() if positive(props.get(field))]
     detail = {}
     if values:
@@ -92,13 +130,13 @@ def gap_info(props, phase=None, duration_ms=None):
             explanation = unknown('unmeasured_tick_time')
         else:
             cpu_ms = props.get(PHASES[name][:-2] + 'CpuMs')
-            explanation = evidence('child_wait' if name == 'child_wait' else phase_cause(name, duration, cpu_ms),
+            explanation = evidence('child_wait' if name == 'child_wait' else phase_cause(name, duration, cpu_ms, props),
                                    PHASES[name], duration)
         return dict(detail, **explanation)
     if detail.get('unmeasuredMs', 0) > 0:
         return dict(detail, **unknown('unmeasured_tick_time'))
     recorded = props.get('cause', '')
     has_label = (isinstance(phase, str) and phase in PHASES or
-                 isinstance(recorded, str) and recorded.startswith(('tick_blocked:', 'tick_starved:')))
+                 isinstance(recorded, str) and recorded.startswith(('tick_blocked:', 'tick_starved:', 'tick_io:')))
     return dict(detail, **unknown('tick_phase_durations' if detail or has_label
                                   else 'inter_tick_phase_or_scheduler_state'))

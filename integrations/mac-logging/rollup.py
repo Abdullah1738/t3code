@@ -3,12 +3,13 @@
 import argparse
 from collections import Counter, defaultdict
 import datetime as dt
+import fcntl
 import json
 import math
 import os
 from pathlib import Path
 import tempfile
-from toollog import directory, private_dir, safe_fields, finite_number, memory_command
+from toollog import directory, private_dir, safe_fields, finite_number, memory_command, emit
 from status import report
 from jobs import INVENTORY_PARTS_FRESH_S
 
@@ -66,7 +67,25 @@ def budget_rollup(day, root):
     return dict(pathsMeasured=len(latest), topOverBudget=sorted(over, key=lambda p: (-p['overBy'], p['path']))[:10])
 
 
-def rollup(day, root=None):
+def rollup(day, root=None, publish=False, now=None):
+    day = dt.date.fromisoformat(day).isoformat()
+    root = Path(root) if root else directory()
+    private_dir(root/'state')
+    # A delayed boot can repair a completed day while the hourly collector is
+    # rolling it up. Serialize the snapshot, replacement and published counts.
+    with (root/'state'/('rollup-'+day+'.lock')).open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = aggregate(day, root)
+        if publish:
+            props = {'backup.'+key+'.'+target: count
+                     for key, targets in result['backup'].items() for target, count in targets.items()}
+            props.update(day=day, boots=result['boots'], uncleanBoots=result['uncleanBoots'])
+            if not emit('rollup', 'event', 'log.rollup', ok=True, props=props, now=now):
+                raise OSError('rollup publication failed')
+        return result
+
+
+def aggregate(day, root):
     day = dt.date.fromisoformat(day).isoformat()
     root = Path(root) if root else directory()
     names, kinds, durations, tags, samples = Counter(), Counter(), defaultdict(list), Counter(), {}
@@ -78,6 +97,7 @@ def rollup(day, root=None):
     waits = dict(runs=0, maxStuckForS=None, latestStuckUnmountMountPoint=None, busyRuns=0, topBusyComms=[])
     busy_comms = Counter()
     latest_unmount_at = ''
+    boots = {}
     spikes = dict(minutes=0, highestLoad=[])
     u_episodes = {}
     total = oks = failed = outcomes = malformed = 0
@@ -93,6 +113,10 @@ def rollup(day, root=None):
                     names[name] += 1
                     kinds[kind] += 1
                     total += 1
+                    if name == 'boot.observed':
+                        props = safe_fields(row.get('props'), name)
+                        if props.get('bootTime') and type(props.get('clean')) is bool:
+                            boots[props['bootTime']] = props['clean']
                     if name == 'cpu.spike':
                         props = safe_fields(row.get('props', {}), name)
                         load = props.get('load')
@@ -191,7 +215,7 @@ def rollup(day, root=None):
     for name, values in durations.items():
         values.sort()
         stats[name] = {key: values[max(0, math.ceil(len(values) * pct) - 1)] for key, pct in [('p50', .5), ('p95', .95), ('max', 1)]}
-    result = dict(day=day, tool='mac', cpuSpikes=spikes, backup=backup, diskTooling=disk, diskWait=waits, diskInventory=inventory, total=total, countsByName=dict(names), countsByKind=dict(kinds),
+    result = dict(day=day, tool='mac', boots=len(boots), uncleanBoots=sum(not clean for clean in boots.values()), cpuSpikes=spikes, backup=backup, diskTooling=disk, diskWait=waits, diskInventory=inventory, total=total, countsByName=dict(names), countsByKind=dict(kinds),
                   outcomes=outcomes, okRate=oks / outcomes if outcomes else None,
                   errorRate=kinds['error'] / total if total else None,
                   failedRate=failed / outcomes if outcomes else None, durationMs=stats, malformed=malformed,

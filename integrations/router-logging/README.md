@@ -19,7 +19,27 @@ restarts. The HTTP snapshot runs in a separate child every five minutes.
 The observer runs at launchd `Standard` priority and records its configured
 ProcessType, nice value and scheduling priority once per supervisor start.
 The guard kills and reaps its captured poll child after four minutes, recording
-one `poll.timeout` with the active phase, wall time and child CPU time. It keeps
+one `poll.timeout` with the active phase, wall time and child CPU time. The child
+sends cumulative finished-phase and history-substep metrics over a non-blocking
+inherited FD; the timeout retains these under the same field names as `poll.phases`.
+Buffered Unix datagrams avoid Darwin's small pipe buffers and keep each update
+atomic. Start/resume timestamps use cross-process `CLOCK_MONOTONIC`, including
+on the deployed Python 3.9 runtime.
+`activePhaseMs` measures wall time since the latest phase start/resume;
+`activePhaseCpuMs` and `activePhase{InblockN,MajfltN,NivcswN,NvcswN}` are whole-child
+rusage minus completed phases, clamped at zero. Substeps are not subtracted twice.
+`child{InblockN,MajfltN,NivcswN,NvcswN}` retain the whole-child counters.
+Unfinished parent work and any dropped pipe updates remain in the active remainder;
+it is not an exact attribution of that remainder to the active phase. An active
+`other`/`none` stays unknown, rather than borrowing a completed phase's name.
+The row also carries a bounded host sample at kill time and a cause/evidence pair
+using the existing starved/I/O/blocked thresholds. `pollGaps` and its cause counts
+retain the active phase, remainder counters and host sample. Legacy children still
+send plain phase names; their start time is the guard's observation time and their
+completed-phase fields are unavailable. Both old/new child-guard pairings work.
+Progress is best effort: full pipes drop writes, later cumulative updates recover
+completed work, and the guard bounds both buffered bytes and retained field names.
+It keeps
 the regular five-minute schedule for the next child; it never kills by pattern.
 
 Unknown transitions retain the router's `launchctlExit` (numeric, `timeout`,
@@ -43,9 +63,25 @@ listener/pool history, report writes, state saves, NDJSON writes (`logWriteMs`),
 lock waits and HTTP work;
 nested work is not counted twice. `log.rollup` now measures only that rollup
 call. `pool-alerts` emits `pool.endpoint.get` for its independent fetches.
-Each measured phase also has a matching `*CpuMs` field, excluding nested work.
-A phase over two minutes using less than 10% CPU is tagged
-`tick_starved:<phase>`; other slow phases retain `tick_blocked:<phase>`.
+Each measured phase also has matching `*CpuMs`, `*InblockN`, `*MajfltN`,
+`*NivcswN` and `*NvcswN` fields, excluding nested work. History scan/parse and
+listener history additionally carry `*BytesHashed` and `*BytesParsed` (input
+bytes examined by the line reader, including filtered or unfinished lines).
+Both histories also split wall/CPU into `*LoadStateMs`/`*LoadStateCpuMs`,
+`*ValidateCursorMs`/`*ValidateCursorCpuMs`, `*ParseLinesMs`/`*ParseLinesCpuMs`,
+`*BuildReportMs`/`*BuildReportCpuMs` and `*SaveStateMs`/`*SaveStateCpuMs`.
+Substeps exclude one another and nested phases, including checkpoint saves
+inside parsing; BuildReport covers aggregate restoration and report construction.
+For phases over 30 seconds using less than 10% CPU, `tick_io:<phase>` requires
+at least 16 input operations or major faults and 16 voluntary switches, with
+voluntary switches at least four times involuntary switches. Dominant
+involuntary switches (at least 16) yield `tick_starved:<phase>`. Mixed or quiet
+counters retain `tick_blocked:<phase>`; counters are wait signals rather than
+measurements of time spent waiting. Legacy rows without counters retain the
+CPU-only inference above two minutes. These fields extend existing diagnostics
+without new rows.
+These sparse diagnostics (`poll.phases`, `rollup.phases`, `guard.tick_late`, `poll.timeout`)
+have an 8 KiB serialized limit to fit the fixed fields; ordinary rows retain 4 KiB.
 Scheduling, child-wait and missing-evidence causes keep their existing rules.
 `pollGaps`/`guardGaps` number measured spans over two minutes, clipped for daily
 duration totals. `coverage` explains threshold-only `healthByHour`, exhaustion
@@ -133,6 +169,18 @@ until newline termination. Listener transitions, cross-day health joins and
 pool history share a sparse append cache with the same checkpoint bounds.
 `--full` bypasses aggregate and listener caches for comparison or repair.
 `complete` means `generatedAt` is on or after the next UTC midnight; incomplete rollups are regenerated after 00:05Z, and lock `distinct` counts dedupe account/provider/model/deadline-minute while `count` keeps raw lines.
+
+`stickyMoves` counts every `proxy.sticky_miss` row, including held/unavailable
+selections (`byDecision`), by reason, previous lock cause, model, and UTC hour.
+`byHourReason` shows whether a cluster shares a cause. Legacy dimensions are
+`unknown`; absent reasons never disappear from the totals.
+`fallbacks` groups reasons and from/to provider-model pairs. Its chain histogram
+counts fallback rows per request, including zero for requests with no fallback.
+The denominator is the union of IDs from all observed `proxy.*` rows;
+`rowsWithoutRequest` keeps unjoinable rows visible outside that denominator.
+A partial day or capped log can undercount chains. Replay a retained day without
+rewriting its live report with
+`python3 -I integrations/router-logging/test/replay_routing.py <day-file> --day YYYY-MM-DD`.
 
 `account.lock` and `account.unlock` carry hashed account IDs, scope, classifier
 cause, deadline and the source request ID when known. DB expiry is recorded on

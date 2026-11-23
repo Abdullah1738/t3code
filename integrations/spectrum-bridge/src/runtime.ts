@@ -356,6 +356,13 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
     try {
       if (request.method === "GET") {
         if (path === "/health") return reply(200, options.health());
+        if (path.startsWith("/send-status/")) {
+          if (request.headers.has("origin")) return reply(403, { error: "Forbidden" });
+          const sessionId = new URL(request.url).searchParams.get("sessionId");
+          if (!sessionId) return reply(400, { error: "Invalid request" });
+          const caller = registry.forSession(sessionId);
+          return caller ? caller.parts.api(request) : reply(409, { error: "No chat for this session" });
+        }
         if (path === "/router" || path.startsWith("/wake/")) return registry.owner.parts.api(request);
         return reply(404, { error: "Not found" });
       }
@@ -463,10 +470,10 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           }
         }
         case "/agent-requests": {
-          only(body, ["sessionId"]);
+          only(body, ["sessionId", "request"]);
           live();
-          if (!text(sessionId, 200)) throw new HttpError(400, "Invalid request");
-          return result(bus.requests(sessionId));
+          if (!text(sessionId, 200) || body.request !== undefined && !validAgentRequestId(body.request)) throw new HttpError(400, "Invalid request");
+          return result(bus.requests(sessionId, body.request as string | undefined));
         }
         case "/app": {
           if (request.headers.has("origin")) throw new HttpError(403, "Forbidden");

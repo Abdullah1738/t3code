@@ -881,6 +881,9 @@ class BoxDiskTests(Isolated):
         import offbox_protection
         from offbox_lib import allocation
         from test_pool_affinity import Clock
+        # Real parent-process inspection would run subprocess waits against this test's fake clock.
+        token = lease.offbox_protection.CALLER.set({'actor': 'test:retired-resume', 'holder': None})
+        self.addCleanup(lease.offbox_protection.CALLER.reset, token)
         self.box('bad', member=True, state='stopped')
         box_disk.retire(self.con, 'bad', space(tmp=4096), 'tmp', stop=False)
         for backend in ('boat', 'server'):

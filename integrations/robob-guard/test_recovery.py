@@ -13,10 +13,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
 
 import guard
+from guard_test_support import GuardTestCase
 from hold import Holds
 
 
-class StaleRegistrationTests(unittest.TestCase):
+
+# Backend recovery simulations own their inputs; TCC behavior is tested separately.
+def setUpModule():
+    global tcc_patch, tier_patch
+    tcc_patch = patch("guard.tcc_jam_tick")
+    tcc_patch.start()
+    tier_patch = patch("guard.protected_tier_tick")
+    tier_patch.start()
+
+
+def tearDownModule():
+    tier_patch.stop()
+    tcc_patch.stop()
+
+
+class StaleRegistrationTests(GuardTestCase):
     def process_run(self, command, **kwargs):
         if command[0] == "/usr/bin/lsappinfo":
             return subprocess.CompletedProcess(command, 0, stdout=self.registration)
@@ -32,6 +48,7 @@ class StaleRegistrationTests(unittest.TestCase):
         self.fail("unexpected command: %s" % command)
 
     def setUp(self):
+        super().setUp()
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.home = Path(temp.name)
@@ -144,7 +161,7 @@ class StaleRegistrationTests(unittest.TestCase):
                 self.assertIsNone(state["unready_since"])
 
 
-class RecoveryTests(unittest.TestCase):
+class RecoveryTests(GuardTestCase):
     desktop = dict(pid=42, identity="fixture-birth", startedAt=9000)
 
     def test_orphaned_workers_do_not_prevent_absent_desktop_reopen(self):
@@ -391,7 +408,7 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(guard.read_state(state_path)["history"], [])
 
 
-class HealthTests(unittest.TestCase):
+class HealthTests(GuardTestCase):
     def test_existing_t3ctl_component_credential_is_supported(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -516,8 +533,14 @@ class HealthTests(unittest.TestCase):
                 self.assertFalse(guard.backend_ready(Path(directory)))
 
 
-class LateRecoveryTests(unittest.TestCase):
+class LateRecoveryTests(GuardTestCase):
     identity = "Mon Nov 16 07:24:59 2026"
+
+    def setUp(self):
+        super().setUp()
+        diagnostics = patch("guard.process_diagnostics", return_value="fixture")
+        diagnostics.start()
+        self.addCleanup(diagnostics.stop)
 
     def seed(self, home):
         started = time.mktime(time.strptime(self.identity, "%a %b %d %H:%M:%S %Y"))
@@ -643,7 +666,7 @@ class LateRecoveryTests(unittest.TestCase):
                     self.assertEqual(state["history"], [self.now])
 
 
-class ProvenanceLockTests(unittest.TestCase):
+class ProvenanceLockTests(GuardTestCase):
     def test_provenance_failure_cleans_only_its_new_acquisition(self):
         for acquisition in ["fresh", "reuse", "replace-beater"]:
             for failure in ["lookup", "write", "new-same-owner", "new-other-owner"]:
@@ -828,10 +851,11 @@ class NestedHoldTests(unittest.TestCase):
                         self.assertEqual(path.exists(), alive)
 
 
-class DesktopRecoveryTests(unittest.TestCase):
+class DesktopRecoveryTests(GuardTestCase):
     identity = "Mon Nov 16 07:24:59 2026"
 
     def setUp(self):
+        super().setUp()
         self.snapshot_patch = patch("guard.desktop_snapshot", side_effect=[dict(pid=42, identity=self.identity), None])
         self.snapshot_mock = self.snapshot_patch.start()
         self.addCleanup(self.snapshot_patch.stop)

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Delivery, State, Watcher } from "../src/lib.ts";
 import type { LogEntry } from "../src/toollog.ts";
+import { expandTelemetry } from "../src/log-format.ts";
 
 setDefaultTimeout(30_000);
 
@@ -44,6 +45,8 @@ type Fixture = {
   statusFailure?: string;
   sendFailure?: string;
   sendOutput?: string;
+  runEvidence?: Record<string, unknown>;
+  runMissing?: boolean;
 };
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
@@ -111,6 +114,20 @@ if (${JSON.stringify(cli)} === 't3ctl') {
 `, { mode: 0o755 });
       return file;
     };
+    writeFileSync(join(dir, "client.mjs"), `
+import { appendFileSync, readFileSync } from 'node:fs';
+export class ControlClient {
+  async request(method, path) {
+    appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ cli: 'run-lookup', args: [method, path] }) + '\\n');
+    const config = JSON.parse(readFileSync(${JSON.stringify(config)}, 'utf8'));
+    const parts = path.split('/');
+    const threadId = decodeURIComponent(parts[2]);
+    const runId = decodeURIComponent(parts[4]);
+    if (config.runMissing) throw Object.assign(new Error(\`Run \${runId} was not found on thread \${threadId}.\`), { code: 'not_found' });
+    if (!config.runEvidence) throw new Error('lookup unavailable');
+    return { ok: true, threadId, runId, ...config.runEvidence };
+  }
+}`);
     const t3ctl = stub("t3ctl");
     const spectrum = stub("spectrum");
     const telegram = stub("telegram");
@@ -153,12 +170,12 @@ console.log(JSON.stringify(await (async () => (${body}))()));`;
     const logsDir = join(dir, "logs");
     return { result: JSON.parse(lines.pop()!) as Delivery & { state: State; held: State; before: State; same: boolean; env: string; deliveries: Delivery[] },
       sentLogs: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson"))
-        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry))
+        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line)) as LogEntry[]))
         .filter(row => row.name === "wake.sent") : [],
       runnerLog: lines.join("\n"),
-      logs: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson")).flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry)) : [],
+      logs: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson")).flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line)) as LogEntry[])) : [],
       fallbacks: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson"))
-        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry))
+        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line)) as LogEntry[]))
         .filter(row => row.name === "wake.creator_fallback") : [],
       calls: existsSync(callsFile) ? readFileSync(callsFile, "utf8").trim().split("\n").map(line => JSON.parse(line) as Call) : [],
       log: existsSync(join(watcherDir, "log")) ? readFileSync(join(watcherDir, "log"), "utf8") : "" };
@@ -501,7 +518,7 @@ test("direct creator and owner fallback deliveries log one attempt each", async 
     const { result, sentLogs } = await fixture({ sendError });
     expect(result.route).toBe(sendError ? "owner" : "creator");
     expect(sentLogs).toHaveLength(1);
-    expect(sentLogs[0]).toMatchObject({ component: "wakes", kind: "event", ok: false,
+    expect(sentLogs[0]).toMatchObject({ component: "wakes", kind: "event", ok: !sendError,
       ids: { watcher: "route-test" }, props: { via: sendError ? "wake:owner-fallback" : "thread:abcd1234", confirmed: "pending", accepted: true, events: 1 } });
     expect(sentLogs[0]!.durationMs).toBeGreaterThanOrEqual(0);
     expect(JSON.stringify(sentLogs)).not.toContain("event happened");
@@ -822,31 +839,31 @@ test('an archived escalation target falls back to the owner', async () => {
   expect(wakeText(calls)).toStartWith('(meant for thread abcd1234, which could not be reached)\n');
 });
 
-test('busy thread queue acceptance confirms a one-shot wake during escalation', async () => {
+test('busy thread queue acceptance stays pending during one-shot escalation', async () => {
   const { result, calls, logs, log } = await fixture({ watcher: { max_fires: 1 }, sendAmbiguous: true }, confirmBody(`
     if (before.status !== 'done') throw new Error('one-shot watcher did not finish');
     writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, archived: false,
       recentRuns: [{ requestedAt: new Date(base - 60_000).toISOString() }] },
-      sendOutput: JSON.stringify({ ok: true, status: 'queued', delivery: 'queued' }) }));
+      sendOutput: JSON.stringify({ ok: true, runId: 'wake-X', messageId: 'message-X', status: 'queued', delivery: 'queued' }) }));
     await tickOne(watcher.id);
     Date.now = () => at + 31_000;
     await tickOne(watcher.id);
   `));
   expect(result.state.status).toBe('done');
-  expect(result.state.confirm).toBeUndefined();
+  expect(result.state.confirm).toMatchObject({ runId: 'wake-X', runState: 'queued' });
   expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(1);
   expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
   const sends = calls.filter(call => call.cli === 't3ctl' && call.args[0] === 'send');
   expect(sends).toHaveLength(2);
   expect(sends[0]!.args).toEqual(sends[1]!.args);
-  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(1);
+  expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(0);
   expect(log).not.toContain('via=wake:owner-fallback');
 });
 
-test('a busy thread queue receipt confirms the first send too', async () => {
+test('a busy thread queue receipt stays pending on the first send too', async () => {
   const { result } = await fixture({ sendOutput: JSON.stringify({ ok: true, status: 'queued', delivery: 'queued' }) });
-  expect(result.ok).toBe(true);
-  expect(result.confirmation).toBeUndefined();
+  expect(result).toMatchObject({ ok: false, accepted: true, confirmed: 'pending' });
+  expect(result.confirmation).toBeDefined();
 });
 
 test('deferred retries follow exponential backoff and the five-minute cap', async () => {
@@ -1159,7 +1176,7 @@ for (const outcome of ['completed', 'failed', 'cancelled', 'five newer runs']) {
       const recentRuns = ${outcome === 'five newer runs'} ? Array.from({ length: 5 }, (_, i) => ({
         runId: 'newer-' + i, status: 'completed', requestedAt: new Date(originalAt + 100 + i).toISOString() })) : [run];
       writeFileSync(configPath, JSON.stringify({ sendOutput: JSON.stringify({ ok: true, runId: 'original-run', status: run.status }),
-        status: { threadId: watcher.created_by_session, archived: false, recentRuns } }));
+        status: { threadId: watcher.created_by_session, archived: false, recentRuns }, runEvidence: run }));
       const restartTick = async at => {
         const code = 'Date.now = () => ' + at + '; const { tickOne } = await import(' + ${JSON.stringify(JSON.stringify(runnerPath))} + '); await tickOne("route-test");';
         const child = Bun.spawn([process.execPath, '-e', code], { env: process.env, stdout: 'pipe', stderr: 'pipe' });
@@ -1178,7 +1195,8 @@ for (const outcome of ['completed', 'failed', 'cancelled', 'five newer runs']) {
     expect(sends[0]!.args).toEqual(sends[1]!.args);
     expect(result.state.confirm).toBeUndefined();
     expect(logs.filter(row => row.name === 'wake.confirmed')).toHaveLength(1);
-    expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+    expect(calls.filter(call => call.cli !== 't3ctl' && call.cli !== 'run-lookup')).toHaveLength(0);
+    expect(calls.filter(call => call.cli === 'run-lookup')).toHaveLength(outcome === 'five newer runs' ? 1 : 0);
   });
 }
 
@@ -1196,4 +1214,143 @@ test('the first send time is persisted before dispatch even when the send times 
   expect(result.accepted).toBe(true);
   expect(result.state.pending?.creatorSend?.thread).toBe(projectThread);
   expect(calls.filter(call => call.cli !== 't3ctl')).toHaveLength(0);
+});
+
+const ownRunId = 'run:thread:work:ordinal:314';
+const queuedReceipt = { ok: true, runId: ownRunId, messageId: 'message-X', status: 'queued', delivery: 'queued' };
+
+test.each(['run', 'recentRuns', 'runs'])('only the wake own run confirms through %s, with queue timing and honest delivery logs', async field => {
+  const { result, calls, logs, log } = await fixture({ sendOutput: JSON.stringify(queuedReceipt) }, confirmBody(`
+    Date.now = () => base + 31_000;
+    const own = { runId: ${JSON.stringify(ownRunId)}, status: 'queued', startedAt: null, requestedAt: new Date(base).toISOString() };
+    const status = { threadId: watcher.created_by_session, state: 'running',
+      run: { runId: 'unrelated-Y', status: 'running', startedAt: new Date(base + 1).toISOString() },
+      ${field}: ${field === 'run' ? 'own' : '[own]'} };
+    writeFileSync(configPath, JSON.stringify({ status }));
+    await tickOne(watcher.id);
+    if (!loadState(watcher.id).confirm) throw new Error('unrelated run or queue confirmed');
+    const show = Bun.spawnSync([${JSON.stringify(process.execPath)}, ${JSON.stringify(join(import.meta.dir, '../src/cli.ts'))}, 'show', watcher.id], { env: { ...process.env, ...testEnv() } });
+    if (!show.stdout.toString().includes('confirmation=pending run=314 state=queued')) throw new Error('show omitted run state');
+    Date.now = () => base + 62_000;
+    own.status = 'running'; own.startedAt = new Date(base + 40_000).toISOString();
+    writeFileSync(configPath, JSON.stringify({ status }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toBeUndefined();
+  expect(calls.filter(call => call.args[0] === 'send')).toHaveLength(1);
+  expect(logs.find(row => row.name === 'wake.confirmed')?.props).toMatchObject({ method: 'run', runState: 'running', queuedMs: 40_000 });
+  expect(logs.find(row => row.name === 'wake.sent')).toMatchObject({ ok: true, props: { runId: ownRunId, messageId: 'message-X', delivery: 'queued' } });
+  expect(log).toContain('send=ok delivery=queued run=314 via=thread:abcd1234 confirmed=pending');
+  expect(log).not.toContain('ok=false');
+  expect(log).not.toContain('"ok":true');
+});
+
+test.each(['cancelled', 'interrupted', 'failed', 'server_restart'])('own run %s before starting re-sends once with a derived key, then confirms the replacement', async status => {
+  const { result, calls, logs, log } = await fixture({ sendOutput: JSON.stringify(queuedReceipt) }, confirmBody(`
+    Date.now = () => base + 31_000;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session,
+      run: { runId: ${JSON.stringify(ownRunId)}, status: ${JSON.stringify(status)}, startedAt: null, cancelReason: 'server_restart' } },
+      sendOutput: JSON.stringify({ ...${JSON.stringify(queuedReceipt)}, runId: 'replacement' }) }));
+    await tickOne(watcher.id);
+    const pending = loadState(watcher.id).confirm;
+    if (pending.runId !== 'replacement' || pending.resends !== 1) throw new Error('replacement not tracked');
+    Date.now = () => base + 62_000;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session,
+      run: { runId: 'replacement', status: 'completed', startedAt: new Date(base + 32_000).toISOString() } } }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toBeUndefined();
+  const sends = calls.filter(call => call.args[0] === 'send');
+  expect(sends.map(call => [call.args[1], call.args[4]])).toEqual([[projectThread, 'robob-watch:route-test:1:stable-event'], [projectThread, 'robob-watch:route-test:1:stable-event:r1']]);
+  expect(sends[0]!.args[2]).toBe(sends[1]!.args[2]);
+  expect(log).toContain('wake run lost key=robob-watch:route-test:1:stable-event run=314');
+  expect(logs.find(row => row.name === 'wake.run_lost')?.props).toMatchObject({ state: status, attempt: 1 });
+  expect(logs.find(row => row.name === 'wake.resent')?.props).toMatchObject({ requestId: 'robob-watch:route-test:1:stable-event:r1', runId: 'replacement', attempt: 1 });
+  expect(logs.find(row => row.name === 'wake.confirmed')?.props?.method).toBe('run');
+});
+
+test('three lost-run re-sends cap out and retain once-only thread escalation and alert', async () => {
+  const { result, calls, logs } = await fixture({ sendOutput: JSON.stringify(queuedReceipt) }, confirmBody(`
+    for (let n = 1; n <= 6; n++) {
+      Date.now = () => at + n * 31_000;
+      const pending = loadState(watcher.id).confirm;
+      writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session,
+        run: { runId: pending.runId, status: 'cancelled', startedAt: null } },
+        sendOutput: JSON.stringify({ ...${JSON.stringify(queuedReceipt)}, runId: n <= 3 ? 'replacement-' + n : pending.runId }) }));
+      await tickOne(watcher.id);
+    }
+  `));
+  expect(result.state.confirm).toMatchObject({ resends: 3, alertDone: true, fallbackDone: true });
+  const keys = calls.filter(call => call.args[0] === 'send').map(call => call.args[4]);
+  expect([...new Set(keys)]).toEqual(['robob-watch:route-test:1:stable-event', ...[1, 2, 3].map(n => 'robob-watch:route-test:1:stable-event:r' + n)]);
+  expect(logs.filter(row => row.name === 'wake.resent')).toHaveLength(3);
+  expect(calls.filter(call => call.cli === 'telegram')).toHaveLength(1);
+  expect(calls.filter(call => call.cli === 'spectrum')).toHaveLength(0);
+});
+
+test('a lost-run send deferred across an outage retries the reserved derived key after reload', async () => {
+  const { result, calls } = await fixture({ sendOutput: JSON.stringify(queuedReceipt) }, confirmBody(`
+    Date.now = () => base + 31_000;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session,
+      run: { runId: ${JSON.stringify(ownRunId)}, status: 'failed', startedAt: null } }, sendFailure: 'fetch failed' }));
+    await tickOne(watcher.id);
+    const pending = loadState(watcher.id).confirm;
+    if (pending.requestId !== key + ':r1' || !pending.sendPending) throw new Error('retry key not reserved');
+    Date.now = () => pending.nextAt;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session },
+      sendOutput: JSON.stringify({ ...${JSON.stringify(queuedReceipt)}, runId: 'replacement' }) }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toMatchObject({ resends: 1, runId: 'replacement' });
+  expect(calls.filter(call => call.args[0] === 'send').map(call => call.args[4])).toEqual(['robob-watch:route-test:1:stable-event', 'robob-watch:route-test:1:stable-event:r1', 'robob-watch:route-test:1:stable-event:r1']);
+});
+
+test.each([
+  { name: 'completed beyond recent window', evidence: { status: 'completed' }, confirmed: true },
+  { name: 'queued beyond recent window', evidence: { status: 'queued' }, confirmed: false },
+  { name: 'older cancelled evidence without start timestamp', evidence: { status: 'cancelled' }, confirmed: false },
+  { name: 'lookup unavailable', evidence: undefined, confirmed: false },
+])('$name never treats recent retention as a lost wake', async ({ evidence, confirmed }) => {
+  const { result, calls, logs } = await fixture({ sendOutput: JSON.stringify(queuedReceipt) }, confirmBody(`
+    Date.now = () => base + 31_000;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, state: 'running',
+      recentRuns: [{ runId: 'unrelated-Y', status: 'running' }] }, runEvidence: ${JSON.stringify(evidence)} }));
+    await tickOne(watcher.id);
+  `));
+  expect(!!result.state.confirm).toBe(!confirmed);
+  expect(calls.filter(call => call.cli === 'run-lookup')).toHaveLength(1);
+  expect(calls.filter(call => call.args[0] === 'send')).toHaveLength(1);
+  expect(logs.filter(row => row.name === 'wake.run_lost')).toHaveLength(0);
+});
+
+test('a queued run confirmed absent by per-run lookup is re-sent', async () => {
+  const { result, calls } = await fixture({ sendOutput: JSON.stringify(queuedReceipt) }, confirmBody(`
+    Date.now = () => base + 31_000;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session }, runMissing: true,
+      sendOutput: JSON.stringify({ ...${JSON.stringify(queuedReceipt)}, runId: 'replacement' }) }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toMatchObject({ runId: 'replacement', resends: 1 });
+  expect(calls.filter(call => call.args[0] === 'send')).toHaveLength(2);
+});
+
+test('cancelled after starting is confirmed rather than duplicated', async () => {
+  const { result, calls } = await fixture({ sendOutput: JSON.stringify(queuedReceipt) }, confirmBody(`
+    Date.now = () => base + 31_000;
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session,
+      run: { runId: ${JSON.stringify(ownRunId)}, status: 'cancelled', startedAt: new Date(base + 1).toISOString() } } }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toBeUndefined();
+  expect(calls.filter(call => call.args[0] === 'send')).toHaveLength(1);
+});
+
+test('old server sends use explicitly logged heuristic confirmation', async () => {
+  const { result, logs, log } = await fixture({}, confirmBody(`
+    writeFileSync(configPath, JSON.stringify({ status: { threadId: watcher.created_by_session, state: 'running' } }));
+    await tickOne(watcher.id);
+  `));
+  expect(result.state.confirm).toBeUndefined();
+  expect(logs.find(row => row.name === 'wake.confirmed')?.props?.method).toBe('heuristic');
+  expect(log).toContain('confirm=heuristic');
 });

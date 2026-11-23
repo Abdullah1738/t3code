@@ -87,7 +87,8 @@ SCHEMAS = {
                 'argc': int, 'rejected': 'rejected', **AUTH_SCHEMA},
     'watcher.run': {'trigger': 'trigger', 'scheduledAt': 'optional_iso',
                     'startLagMs': 'lag_ms', 'hostLoad1m': 'load'},
-    'sync.run': {'trigger': 'trigger', 'refreshMs': int, 'writeMs': int, 'hostLoad1m': 'load', 'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
+    'sync.run': {'offsetFallbacks': int, 'offsetSamples': 'offset_samples', 'reauthPending': bool, 'reminderSent': bool, 'hoursSinceLastSuccess': 'hours',
+        'reauthPendingSinceDay': 'day', 'trigger': 'trigger', 'refreshMs': int, 'writeMs': int, 'hostLoad1m': 'load', 'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
         'lastScoredSleep': 'iso', 'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool, 'reason': WHOOP_AUTH_REASONS, **AUTH_SCHEMA,
         **{k: ENDPOINT_SCHEMA for k in ('sleep', 'recovery', 'cycle', 'body')}},
     'sync.gap': {'count': int, 'lastSleepEnd': 'iso', 'lastRecoveryEnd': 'iso', 'gapHours': 'seconds'},
@@ -172,6 +173,14 @@ def _fields(schema, props):
         elif spec == 'lag_ms' and (value is None or type(value) in (int, float)
                                    and math.isfinite(value)):
             out[key] = value
+        elif spec == 'day' and isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+            try:
+                out[key] = dt.date.fromisoformat(value).isoformat()
+            except ValueError:
+                pass
+        elif spec == 'hours' and (value is None or type(value) in (int, float)
+                                  and math.isfinite(value) and value >= 0):
+            out[key] = value
         elif spec == 'load' and type(value) in (int, float) and math.isfinite(value) and value >= 0:
             out[key] = round(value, 1)
         elif spec == 'oauth_code' and key in props:
@@ -191,6 +200,8 @@ def _fields(schema, props):
             out[key] = value
         elif spec == 'rejected' and isinstance(value, (list, tuple)):
             out[key] = rejected_names(value, props.get('reason'))
+        elif spec == 'offset_samples' and isinstance(value, (list, tuple)):
+            out[key] = list(dict.fromkeys(v for v in value if isinstance(v, str)))[:3]
         elif spec == 'check_ids' and isinstance(value, (list, tuple)):
             out[key] = sorted({v for v in value if isinstance(v, str) and v in VALIDATE_CHECK_IDS})
         elif spec is bool and type(value) is bool:
@@ -836,6 +847,7 @@ def rollup(day=None):
         malformed = 0
         zero_sleep, last_scored = 0, None
         auth_failures, whoop_runs = Counter(), []
+        pending_reauth, pending_since = 0, None
         sync_phases, slow_syncs = defaultdict(list), 0
         food_errors, delivered, expected = Counter(), {}, set()
         receipt_sources = {}
@@ -852,9 +864,18 @@ def rollup(day=None):
                         raise ValueError()
                     names[r['name']] += 1
                     kinds[r['kind']] += 1
-                    if type(r.get('ok')) is bool:
-                        outcomes['ok' if r['ok'] else 'error'] += 1
                     props = _props(r['name'], r.get('props') or {})
+                    pending = (r['name'] == 'sync.run' and r.get('component') == 'whoop-sync'
+                               and r.get('ok') is False and props.get('reason') == 'refresh_rejected'
+                               and props.get('reauthPending') is True)
+                    if type(r.get('ok')) is bool and not pending:
+                        outcomes['ok' if r['ok'] else 'error'] += 1
+                    if pending:
+                        pending_reauth += 1
+                        stamp = iso_stamp(r.get('ts'))
+                        since = props.get('reauthPendingSinceDay') or (stamp[:10] if stamp else None)
+                        if since:
+                            pending_since = min(pending_since or since, since)
                     component = r.get('component')
                     if r['name'] in ('watcher.run', 'sync.run') and component in COMPONENTS:
                         stamp = iso_stamp(r.get('ts'))
@@ -915,7 +936,7 @@ def rollup(day=None):
                     if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                         durations[r['name']].append(value)
                     tag = r.get('error', {}).get('tag')
-                    if tag in TAGS:
+                    if tag in TAGS and not pending:
                         cause = (tag, props.get('reason'))
                         diagnostics[cause].add((props.get('exceptionClass'), props.get('exitCode')))
                         rejected_top[cause].update(props.get('rejected', rejected_names(
@@ -947,7 +968,8 @@ def rollup(day=None):
                   'durationMs': {}, 'topErrors': [],
                   'components': {component: _run_summary(run_times[component], start, end, intervals.get(component))
                                  for component in sorted(set(run_times) | set(intervals))},
-                  'whoop': {'lastScoredSleep': last_scored, 'zeroSleepRuns': zero_sleep,
+                  'whoop': {'pendingReauthRuns': pending_reauth, 'reauthPendingSinceDay': pending_since,
+                            'lastScoredSleep': last_scored, 'zeroSleepRuns': zero_sleep,
                             'syncPhaseMs': {phase: {'p50': _percentile(sorted(sync_phases[phase]), .5) if sync_phases[phase] else None,
                                                    'p95': _percentile(sorted(sync_phases[phase]), .95) if sync_phases[phase] else None,
                                                    'max': max(sync_phases[phase]) if sync_phases[phase] else None}

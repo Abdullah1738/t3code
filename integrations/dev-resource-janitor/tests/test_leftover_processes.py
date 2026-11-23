@@ -41,6 +41,40 @@ OPAQUE_RELATIVE_TOKENS = [
 
 
 class ProcessTests(JanitorTestCase):
+    def test_robob_ancestry_uses_executable_entry_not_tool_path(self):
+        renderer = dict(pid=42, ppid=30, args='/Users/test/.robob/tools/chrome-headless-shell --type=renderer', tty='??')
+        cases = [
+            ('/Applications/Robob.app/Contents/MacOS/Robob', True),
+            ('node /repo/apps/server/dist/bin.mjs --bootstrap-fd 3', True),
+            ('bun apps/server/src/bin.ts', True),
+            ('node /repo/other.js /repo/apps/server/dist/bin.mjs', False),
+            ('node -e "apps/server/dist/bin.mjs"', False),
+            ('/bin/zsh /repo/build.sh', False),
+            ('/Users/test/.robob/tools/chrome-headless-shell', False),
+        ]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                parent = dict(pid=30, ppid=1, args=args, tty='??')
+                self.assertEqual(lp.robob_ancestry(renderer, [parent]), expected)
+                reason = lp.keep_reason(renderer, [parent], {}, ())
+                self.assertEqual(reason == 'robob-descendant', expected)
+
+    def test_robob_ancestry_stops_at_provider_before_server(self):
+        commands = ['claude', 'codex', 'opencode', 'gemini', 'cursor-agent', 'grok', 'antigravity',
+                    '/Users/test/.robob/harness-cli/claude/current/bin/claude',
+                    '/opt/codex-aarch64-apple-darwin',
+                    'node /opt/@openai/codex/bin/codex.js',
+                    'bun /opt/@anthropic-ai/claude-code/cli.js']
+        for command in commands:
+            with self.subTest(command=command):
+                job = dict(pid=42, ppid=30, args='node build.js', tty='??')
+                shell = dict(pid=30, ppid=20, args='/bin/zsh job.sh', tty='??')
+                provider = dict(pid=20, ppid=10, args=command, tty='??')
+                server = dict(pid=10, ppid=1, args='node /repo/apps/server/dist/bin.mjs --bootstrap-fd 3', tty='??')
+                self.assertFalse(lp.robob_ancestry(job, [shell, provider, server]))
+                self.assertIsNone(lp.keep_reason(job, [shell, provider, server], {}, ()))
+                self.assertTrue(lp.robob_ancestry(job, [shell, server, provider]))
+
     def test_mcp_summary_counts_rss_parent_chains_and_unknown_verdict(self):
         def row(pid, ppid, args, rss):
             return dict(pid=pid, ppid=ppid, start='old', tty='??', args=args, rss_kib=rss)
@@ -205,6 +239,24 @@ class ProcessTests(JanitorTestCase):
         self.assertEqual(candidate['parent_chain'][0]['pid'], 1)
         self.assertNotIn('topsecret', json.dumps(report))
         self.assertTrue(report['report_only'])
+
+    def test_final_roster_recheck_cannot_authorize_after_observation_deadline(self):
+        clock = [0]
+        rows = lp.parse_ps(PS)
+
+        def refresh_roster():
+            clock[0] = 600
+            return ROSTER
+
+        with patch.object(lp.time, 'monotonic', side_effect=lambda: clock[0]):
+            report = lp.detect(rows, lp.parse_top(TOP), {}, ROSTER,
+                               inspect=lambda row: copy.deepcopy(DETAILS),
+                               resolve=lambda binding: copy.deepcopy(OWNER),
+                               refresh=lambda pid: {pid: rows[pid]}, refresh_roster=refresh_roster,
+                               deadline=600, now=1794787200)
+        self.assertEqual(report['candidates'], [])
+        self.assertEqual(report['budget_skipped'], 1)
+        self.assertEqual(report['inventory'][0]['keep_reason'], 'observation_budget_exhausted')
 
     def test_b_live_owner_is_kept(self):
         own = copy.deepcopy(OWNER)

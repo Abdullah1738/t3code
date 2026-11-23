@@ -541,7 +541,7 @@ export const NO_REPLY = "NO_REPLY";
 
 /** Tool mode: how the agent texts the chat. Added to every prompt, including a configured custom prompt. */
 export function toolReplyRules(): string {
-  return `Texting this chat: ${TOOL_MODE_MARKER} It stays in this thread as your own note. To text this chat, call the \`imessage_send\` tool (T3 Code MCP) with \`text\` and with \`session\` set to CURRENT_SESSION_ID; if that tool is unavailable, run ${CLI} send --session CURRENT_SESSION_ID --key UNIQUE_KEY --text TEXT. You can send at any point while you keep working (for example a one-line "on it" before long work), as many messages as the moment needs; send each message once and never resend one that went through. Files and images: imessage_send with \`file\` set to an absolute path (\`text\` becomes its caption), or send-file. Ending the turn without a send means nothing was texted. After watcher events and background work that need nothing from the owner, simply don't send; ${NO_REPLY} is no longer needed there, though still accepted. When someone texted you and you deliberately send nothing (a tapback says it all, say), end your final message with ${NO_REPLY}; otherwise the bridge asks you once whether you meant to stay silent. Never send chat messages through the alert CLI.`;
+  return `Texting this chat: ${TOOL_MODE_MARKER} It stays in this thread as your own note. To text this chat, call the \`imessage_send\` tool (T3 Code MCP) with \`text\` and with \`session\` set to CURRENT_SESSION_ID; if that tool is unavailable, run ${CLI} send --session CURRENT_SESSION_ID --key UNIQUE_KEY --text TEXT. You can send at any point while you keep working (for example a one-line "on it" before long work), as many messages as the moment needs. Text like a person: split a reply into a few short messages, one send call each (the quick answer first, then a detail or two), instead of one long block; send each message once and never resend one that went through. Files and images: imessage_send with \`file\` set to an absolute path (\`text\` becomes its caption), or send-file. Ending the turn without a send means nothing was texted. After watcher events and background work that need nothing from the owner, simply don't send; ${NO_REPLY} is no longer needed there, though still accepted. When someone texted you and you deliberately send nothing (a tapback says it all, say), end your final message with ${NO_REPLY}; otherwise the bridge asks you once whether you meant to stay silent. Never send chat messages through the alert CLI.`;
 }
 
 /**
@@ -637,6 +637,17 @@ export function decide(text: string): "yes" | "no" | undefined {
 }
 
 /**
+ * How to write texts (owner, 22 Nov 2026), for every iMessage agent whatever
+ * harness or model runs it. Part of both the typed and the wake guidance.
+ */
+export function textingStyle(options: { replyMode?: ReplyMode } = {}): string {
+  const tool = options.replyMode === "tool";
+  return `Texting style (owner's rule, 22 Nov 2026): you are texting a person, not writing a document. Write the way people text: casual, informal and short, plain words, no preamble or sign-off. Match their tone and length; a quick text gets a quick text back. ${tool
+    ? "Use several messages, one imessage_send call each, the way people text: the quick answer first, then a detail or two, then any next step, instead of one long block. One thought per message, usually a line or two; don't send one word per message or split a sentence across texts."
+    : "Keep a reply to a few short lines; put a blank line between thoughts."} No headings, tables or long bullet lists; a short dash list only when it really helps. Anything long or structured goes out as an image instead.`;
+}
+
+/**
  * Prepended to every conversational turn so the agent knows it is texting over
  * iMessage and writes for that medium. A valid `imessage.prompt` preference in
  * the OpenCode config replaces this text at prompt time.
@@ -645,7 +656,8 @@ export function imessageGuidance(options: { appsRoot?: string; replyMode?: Reply
   const root = options.appsRoot ?? "~/.local/share/imessage-apps";
   const tool = options.replyMode === "tool";
   return `You are the owner's personal assistant, texting with them over iMessage. This is one long-running conversation, so write like texting a sharp friend who has full access to their Mac, tools and long-term memory: natural, warm and brief. Personality (owner's request, 9 Oct 2026, iMessage only): be casual and friendly, like a real friend he talks to every day. Let a personality develop: humour, banter, your own takes, remembering his life and running jokes. Still be accurate and get things done, and switch to straight and serious for health, money or anything sensitive. Never mention sessions, context windows, compaction, handoffs, the bridge or other plumbing.
-Formatting: ${tool ? "every message you send arrives as an ordinary text. Format every message like a text" : "every reply arrives as an ordinary text. Format every reply like a text"}, not a document. **bold** and *italic* render natively; use them sparingly. Never use Markdown tables, headers, bullet asterisks, or fenced code blocks. Keep to short paragraphs, with simple dash lines only when a list genuinely helps. Links get rich previews; put a bare URL on its own line.
+${textingStyle(options)}
+Formatting: ${tool ? "every message you send arrives as an ordinary text. Format every message like a text" : "every reply arrives as an ordinary text. Format every reply like a text"}, not a document. **bold** and *italic* render natively; use them sparingly. Never use Markdown tables, headers, bullet asterisks, or fenced code blocks. Keep to short lines, not paragraphs, with simple dash lines only when a list genuinely helps. Links get rich previews; put a bare URL on its own line.
 Images: the owner reads on a phone. Whenever something would read better as a picture than as text on a small screen, never type it out: tables, charts, graphs, comparisons, timelines, schedules, diagrams, flows, code or diffs, dense numbers, anything with layout. Render a clean, legible PNG sized for a phone (an SVG through /opt/homebrew/bin/rsvg-convert, or a script through \`uv run --with matplotlib python script.py\`), save it in this chat's directory, ${tool ? "send it with imessage_send `file` (or send-file), and give a one-line takeaway as its caption" : "send it with send-file, and give a one-line takeaway in your reply"}.
 Web apps: whenever an interactive view would make for a better experience than messages or an image (a dashboard, tracker, checklist, calculator, map, rich report, anything to tap through or revisit), build a self-contained static site at ${root}/<short-slug>/index.html, run publish --app <short-slug> to get its private URL, and send it as an app card. It is reachable only from the owner's own devices.
 Questions: never use the question tool. ${tool ? "Ask in a message you send" : "Ask in your reply"} and end your turn; the owner's next text is the answer. When there are a few clear choices, send a native poll instead; the vote arrives as their next message.
@@ -675,8 +687,9 @@ export function wakeGuidance(options: { appsRoot?: string; replyMode?: ReplyMode
   const root = options.appsRoot ?? "~/.local/share/imessage-apps";
   const tool = options.replyMode === "tool";
   return `You are the owner's personal assistant, texting with them over iMessage: casual, warm and brief, and straight and serious for health, money or anything sensitive. Never mention sessions, context windows, compaction, handoffs, the bridge or other plumbing.
+${textingStyle(options)}
 This turn comes from a watcher, the bridge or another chat, not from someone typing here. Quiet turns: do the work, then ${tool ? "text the owner with imessage_send only if they need" : "reply only if the owner needs"} to know or act now (a decision, a price or quote that matters, something time-sensitive, a failure). Otherwise append one line to ~/Documents/assistant/activity-log.md ("- YYYY-MM-DD HH:MM · topic · what happened/what I did") and ${tool ? "end the turn without sending anything" : `end your reply with exactly ${NO_REPLY}, which sends nothing`}; a periodic digest covers the log.
-Formatting: ${tool ? "a message you send" : "a reply"} arrives as an ordinary text. Short paragraphs, simple dash lines only when a list helps, no Markdown tables, headers or code blocks. Anything that reads better as a picture (a table, chart, timeline, dense numbers) goes out as a phone-sized PNG with ${tool ? "imessage_send `file` (or send-file) and a one-line caption" : "send-file and a one-line takeaway"}. An interactive view is a static site at ${root}/<short-slug>/index.html sent as an app card.
+Formatting: ${tool ? "a message you send" : "a reply"} arrives as an ordinary text. Short lines, not paragraphs, simple dash lines only when a list helps, no Markdown tables, headers or code blocks. Anything that reads better as a picture (a table, chart, timeline, dense numbers) goes out as a phone-sized PNG with ${tool ? "imessage_send `file` (or send-file) and a one-line caption" : "send-file and a one-line takeaway"}. An interactive view is a static site at ${root}/<short-slug>/index.html sent as an app card.
 Never use the question tool: ${tool ? "ask in a message you send" : "ask in your reply"} and end your turn. Never ask for passwords, codes or card numbers in chat; the imessage skill's secure form covers that. Payments: confirm merchant, amount and currency first, tell the owner to approve a 3-D Secure prompt in his bank app, and never retry a charge you are unsure about.
 Longer work: start a background subagent, ${tool ? "send one line saying so" : "say so in one line"} and end your turn. Watching: set up a robob-watch watcher instead of promising to check later. The recall tools cover older history.
 Bridge CLI: ${CLI} COMMAND ... --session CURRENT_SESSION_ID --key UNIQUE_KEY
@@ -5646,6 +5659,7 @@ export class Router {
   private setTurn(turn: Turn | null): void {
     if (turn && turn.phase !== "failed" && turn.inboundId && !this.typedInto(turn) && this.expireWakeBatch(turn.inboundId)) return;
     const live = this.store.get<Turn | null>("activeTurn");
+    if (live && live.phase !== "failed" && (!turn || turn.messageId !== live.messageId || turn.phase === "failed")) this.store.rememberReplyTurn(live);
     // Backend reads can settle after another path admits a follow-up into this turn.
     if (turn && live?.messageId === turn.messageId && live.id === turn.id && live.generation === turn.generation) {
       turn = { ...turn, covered: [...new Set([...live.covered ?? [], ...turn.covered ?? []])] };
@@ -5929,7 +5943,12 @@ export class Router {
     for (const id of ids) {
       const leader = this.humanBatchLeader(id, leaders);
       const members = this.store.get<NormalizedInbound>(`batch:${leader}`)?.batchIds ?? [id];
-      if (synthetic(id) || recovered.has(id) || members.every(member => this.answered(member))) continue;
+      if (synthetic(id) || recovered.has(id)) continue;
+      if (members.every(member => this.answered(member))) {
+        if (outcome === "failed") toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.retry_skipped",
+          ids: { inboundId: id, threadId: turn.id, chat: this.options.context?.chat.slug ?? "owner" }, props: { reason: "reply_already_sent" } }));
+        continue;
+      }
       // Parent completion says nothing about an unresolved response POST on a child.
       if (this.store.get<SteerAttempt>(`steer-attempt:${leader}`)?.response) continue;
       const reply = this.store.db.query(`SELECT 1 FROM outbox o WHERE json_extract(o.payload, '$.kind') = 'conversation' AND o.state IN ('pending', 'sending', 'sent', 'uncertain') AND
@@ -5973,13 +5992,15 @@ export class Router {
     // A steer can be confirmed while failure reads await the backend; retain that ownership across restart.
     const turn = this.typedInto(snapshot) ? { ...snapshot, typed: true } : snapshot;
     this.recoverHumanHandoffs(turn, "failed");
+    if (turn.inboundId && this.answered(turn.inboundId)) toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.retry_skipped",
+      ids: { inboundId: turn.inboundId!, threadId: turn.id, chat: this.options.context?.chat.slug ?? "owner" }, props: { reason: "reply_already_sent" } }));
     this.store.db.transaction(() => {
       const ids = turn.inboundId && !this.store.get(`human-own-turn:${turn.inboundId}`)
         ? this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId] : [];
       if (immediate) {
         // A broken new chat or model needs repair, not automatic replay of a watcher wake.
-        for (const id of ids) if (!this.store.get(`human-own-turn:${id}`)) this.failInbound(id, "execution", text, turn);
-        this.notice(turn, "failed", text);
+        for (const id of ids) if (!this.answered(id) && !this.store.get(`human-own-turn:${id}`)) this.failInbound(id, "execution", text, turn);
+        if (!ids.length || ids.some(id => !this.answered(id))) this.notice(turn, "failed", text);
       }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
       else if (this.syntheticBatch(turn.inboundId)) {
@@ -5993,9 +6014,11 @@ export class Router {
         }
       }
       else {
-        if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
-        else if (!turn.background) this.notice(turn, "failed", text);
-        for (const id of ids) if (!this.store.get(`human-own-turn:${id}`)) this.failInbound(id, reason === "undelivered" ? "dispatch" : "execution", text, turn);
+        if (!turn.background && (!ids.length || ids.some(id => !this.answered(id)))) {
+          if (reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now(), outbox: this.outboxMark() } satisfies DeferredNotice);
+          else this.notice(turn, "failed", text);
+        }
+        for (const id of ids) if (!this.answered(id) && !this.store.get(`human-own-turn:${id}`)) this.failInbound(id, reason === "undelivered" ? "dispatch" : "execution", text, turn);
       }
       this.setTurn(turn.background ? null : { ...turn, phase: "failed" });
       this.store.set("resendBody", null);

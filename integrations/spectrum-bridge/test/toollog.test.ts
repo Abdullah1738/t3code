@@ -26,6 +26,30 @@ test("notice suppression reasons survive structured-log redaction", () => {
   expect(lines().map(line => line.props?.reason)).toEqual(reasons);
 });
 
+test.each([undefined, 1])("remote fetch diagnostics are allowlisted with cap %s", capBytes => {
+  const { log, lines } = setup({ capBytes });
+  log.write({ component: "fixture", kind: "event", name: "fill" });
+  for (const name of ["moni-box-down", "moni-runner-error"]) {
+    for (const errorCode of ["ConnectionRefused", "E", "E".repeat(40), "ERR_SOCKET_2"]) {
+      log.write({ component: "remote-box", kind: "error", name, props: { errorCode, loopDelayMs: 123, message: "PRIVATE_MESSAGE", url: "http://x" } });
+      expect(lines().at(-1)?.props).toEqual({ errorCode, loopDelayMs: 123 });
+    }
+    for (const errorCode of ["connect http://x", "", "E".repeat(41), "ECONNRESET\n", "ERR-SOCKET", "ÉCONNRESET", 123, false]) {
+      log.write({ component: "remote-box", kind: "error", name, props: { errorCode, loopDelayMs: -1 } });
+      expect(lines().at(-1)?.props).toBeUndefined();
+    }
+    for (const loopDelayMs of [NaN, Infinity, "123", false]) {
+      log.write({ component: "remote-box", kind: "error", name, props: { loopDelayMs } });
+      expect(lines().at(-1)?.props).toBeUndefined();
+    }
+  }
+  log.write({ component: "remote-box", kind: "error", name: "unrelated", props: { errorCode: "ConnectionRefused", loopDelayMs: 123 } });
+  expect(lines().at(-1)?.props).toBeUndefined();
+  const raw = JSON.stringify(lines());
+  for (const value of ["PRIVATE_", "http"]) expect(raw).not.toContain(value);
+  if (capBytes) expect(lines().some(row => row.name === "log.degraded")).toBe(true);
+});
+
 test("wake lifecycle rows survive the log cap and keep only delivery metadata", () => {
   const { log, lines } = setup({ capBytes: 1 });
   for (const name of ["wake.accepted", "wake.turn_start", "wake.send_ambiguous", "wake.admitted", "wake.retry_scheduled", "wake.failed"]) {
@@ -303,6 +327,18 @@ test("failed control perf rows retain safe error detail and tick/completion meas
   expect(lines[2]!.props).toEqual({ completionLagMs: 123 });
 });
 
+
+test.each(["/send", "/files", "/agent-answer"])("CLI %s timeouts survive the cap with only hashed key, path and elapsed time", path => {
+  const { log, lines } = setup({ capBytes: 1 });
+  log.write(entry);
+  log.write({ component: "cli", kind: "event", name: "cli.send_timeout",
+    ids: { operationId: `send:${"a".repeat(64)}`, key: "PRIVATE_KEY" },
+    props: { path, elapsedMs: 15_000, text: "PRIVATE_TEXT", name: "PRIVATE_FILE" } });
+  expect(lines().at(-1)).toMatchObject({ name: "cli.send_timeout", ids: { operationId: `send:${"a".repeat(64)}` },
+    props: { path, elapsedMs: 15_000 } });
+  expect(JSON.stringify(lines())).not.toContain("PRIVATE");
+});
+
 test("active roster aggregates per minute with reasons, joins, patching, children and fetch latency", async () => {
   let time = at;
   const { log, lines } = setup({ now: () => time });
@@ -339,4 +375,26 @@ test.each(["minute tick", "bridge.stop"])("roster and prompt-probe counts both f
   // A later explicit flush cannot emit either count again.
   log.flush();
   expect(summaries()).toHaveLength(2);
+});
+
+
+test("closed roster trigger counters survive aggregation and health sanitization", async () => {
+  const { ROSTER_TRIGGERS, cleanRosterHealth } = await import("../src/log-active-roster.ts");
+  let time = at;
+  const { log, lines } = setup({ now: () => time });
+  const keys = ROSTER_TRIGGERS.flatMap(trigger => [`miss_${trigger}`, `fetch_${trigger}`]);
+  for (const rosterAction of [...keys, "miss_PRIVATE_THREAD", "fetch_PRIVATE_TITLE"]) {
+    log.write({ component: "robob", kind: "perf", name: "robob.roster_action",
+      props: { rosterAction, rows: 94, total: 94, threadId: "PRIVATE_THREAD", title: "PRIVATE_TITLE" } });
+  }
+  time += 60_000;
+  await log.tick();
+  const summaries = lines().filter(line => line.name === "robob.active_roster");
+  expect(summaries).toHaveLength(1);
+  for (const key of keys) expect(summaries[0]!.props![key]).toBe(1);
+  const safe = cleanRosterHealth({ ...summaries[0]!.props, miss_PRIVATE_THREAD: 1, fetch_PRIVATE_TITLE: 1,
+    miss_status_terminal: -1, fetch_status_unknown: NaN, fetch_created: {}, miss_ready: "1" });
+  for (const key of keys.filter(key => !["miss_status_terminal", "fetch_status_unknown", "fetch_created", "miss_ready"].includes(key))) expect(safe?.[key]).toBe(1);
+  for (const key of ["miss_status_terminal", "fetch_status_unknown", "fetch_created", "miss_ready"]) expect(safe?.[key]).toBeUndefined();
+  expect(JSON.stringify({ summaries, safe })).not.toContain("PRIVATE");
 });

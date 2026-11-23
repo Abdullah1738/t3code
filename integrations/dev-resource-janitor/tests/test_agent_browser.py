@@ -370,7 +370,7 @@ class BrowserTests(JanitorTestCase):
                 return result, None
             with self.subTest(phase=phase), patch.dict(lp.os.environ, DEV_JANITOR_REAP_AGENT_BROWSER='1'), \
                     patch.object(lp.active_sessions, 'robob_active',
-                                 side_effect=lambda timeout: source('robob_active', {'other': other})), \
+                                 side_effect=lambda timeout, **kwargs: source('robob_active', {'other': other})), \
                     patch.object(lp.active_sessions, 'opencode_active',
                                  side_effect=lambda timeout: source('opencode_active', set())), \
                     patch.object(lp.active_sessions, 'project_roots',

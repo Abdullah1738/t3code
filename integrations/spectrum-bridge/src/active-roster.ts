@@ -1,13 +1,21 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type { ControlClient, ControlEventFrame, ThreadState, ThreadSummary } from "./control.ts";
 import type { SessionStatus } from "./openchamber.ts";
+import { ROSTER_TRIGGER_ACTIONS, type RosterTrigger } from "./log-active-roster.ts";
 import { toolError, toolLog } from "./toollog.ts";
 
 export const ROSTER_REASONS = ["startup", "roster_event", "safety", "stream_down", "incomplete", "error_retry"] as const;
 type Reason = typeof ROSTER_REASONS[number];
 const BUSY = new Set<ThreadState>(["running", "needs-input", "queued"]);
 const STATES = new Set<unknown>(["idle", "running", "waiting", "needs-input", "queued"]);
-const CHANGES = new Set(["thread.archived", "thread.unarchived", "thread.deleted", "thread.settled", "thread.unsettled", "thread.metadata-updated"]);
+const SAFETY_MS = 30_000;
+const STREAM_DOWN_MS = 10_000;
+const ROSTER_EVENT_MS = 5_000;
+const MAX_EVENT_DETAILS = 2;
+const CHANGES: Record<string, RosterTrigger> = {
+  "thread.archived": "updated_archived", "thread.unarchived": "updated_unarchived", "thread.deleted": "updated_deleted",
+  "thread.settled": "updated_settled", "thread.unsettled": "updated_unsettled",
+};
 
 /** Keep imported route identities local to each backend, as before sharing the roster. */
 export function rosterStatuses(threads: Iterable<ThreadSummary>, native: ReadonlyMap<string, string> = new Map()): Record<string, SessionStatus> {
@@ -25,7 +33,7 @@ export function rosterStatuses(threads: Iterable<ThreadSummary>, native: Readonl
 }
 
 type Snapshot = { threads: ThreadSummary[]; total: number; fetchedAt: number; complete: boolean };
-type DetailRead = { ticket: number; revision: number; fetch: number; fetching: boolean };
+type DetailRead = { ticket: number; revision: number; fetch: number; fetching: boolean; event?: boolean };
 function clearsEvidence(previous: ThreadSummary, next?: ThreadSummary): boolean {
   return BUSY.has(previous.state) && (!next || !BUSY.has(next.state))
     || !!previous.pendingRequest && previous.pendingRequest.requestId !== next?.pendingRequest?.requestId
@@ -37,8 +45,9 @@ function sameRow(a: ThreadSummary, b: ThreadSummary): boolean {
     && a.pendingRequest?.requestId === b.pendingRequest?.requestId
     && a.activeRunId === b.activeRunId && a.latestRunId === b.latestRunId;
 }
-const counters = () => ({ fetches: 0, startup: 0, roster_event: 0, safety: 0, stream_down: 0, incomplete: 0, error_retry: 0,
-  joins: 0, hits: 0, patches: 0, misses: 0, streamUp: 0, streamDown: 0, errors: 0, children: 0, ambiguous: 0 });
+const triggerCounters = () => Object.fromEntries(ROSTER_TRIGGER_ACTIONS.map(key => [key, 0])) as Record<typeof ROSTER_TRIGGER_ACTIONS[number], number>;
+const counters = () => ({ ...triggerCounters(), fetches: 0, startup: 0, roster_event: 0, safety: 0, stream_down: 0, incomplete: 0, error_retry: 0,
+  joins: 0, hits: 0, patches: 0, misses: 0, streamUp: 0, streamDown: 0, errors: 0, children: 0, ambiguous: 0, detailReads: 0, detailJoins: 0, detailErrors: 0, detailOverflow: 0, drops: 0 });
 
 /** One active-family read and one event connection for all of the process's chats. */
 export class ActiveRoster {
@@ -51,11 +60,17 @@ export class ActiveRoster {
   private ambiguousRefresh = false;
   private ambiguousGeneration = -1;
   private revisions = new Map<string, number>();
+  private removed = new Set<string>();
   // One start clock also orders a list's not-yet-discovered threads; fences stay per thread.
   private ticket = 0;
   private details = new Map<string, Map<number, DetailRead>>();
   private confirmations = new Map<string, DetailRead>();
   private dirty = 0;
+  private pendingTrigger?: RosterTrigger;
+  private urgent = false;
+  private lastRosterFetch = -Infinity;
+  private eventDetails = new Map<string, Promise<void>>();
+  private provisional = new Set<string>();
   private clean = 0;
   private stream = false;
   private epoch = 0;
@@ -72,7 +87,7 @@ export class ActiveRoster {
   private lastFetchAt: number | null = null;
   generation = 0;
 
-  constructor(private readonly client: Pick<ControlClient, "listThreads" | "events">, private readonly now: () => number = Date.now) {}
+  constructor(private readonly client: Pick<ControlClient, "listThreads" | "events"> & Partial<Pick<ControlClient, "thread">>, private readonly now: () => number = Date.now) {}
 
   status() {
     const sorted = [...this.durations].sort((a, b) => a - b);
@@ -112,7 +127,9 @@ export class ActiveRoster {
     this.count(up ? "streamUp" : "streamDown");
   }
 
-  private invalidate(): void {
+  private invalidate(trigger: RosterTrigger): void {
+    this.pendingTrigger ??= trigger;
+    this.urgent ||= trigger === "ready" || trigger === "resync";
     this.generation++;
     this.dirty++;
     this.background();
@@ -167,7 +184,7 @@ export class ActiveRoster {
     this.generation++;
   }
 
-  private ambiguous(row?: ThreadSummary, read?: DetailRead): void {
+  private ambiguous(row?: ThreadSummary, read?: DetailRead, trigger: RosterTrigger = "detail_ambiguous"): void {
     if (row) {
       const current = this.known.get(row.threadId) ?? row;
       const request = current.pendingRequest ?? row.pendingRequest;
@@ -175,11 +192,16 @@ export class ActiveRoster {
         state: request ? "needs-input" : BUSY.has(row.state) ? row.state : BUSY.has(current.state) ? current.state : "running" },
       read?.ticket ?? this.revision(row.threadId));
     }
-    this.reconcile(read?.fetch ?? this.fetchVersion);
+    this.reconcile(read?.fetch ?? this.fetchVersion, trigger);
   }
 
-  private reconcile(generation: number): void {
+  private miss(trigger: RosterTrigger): void {
     this.count("misses");
+    this.count(`miss_${trigger}`);
+  }
+
+  private reconcile(generation: number, trigger: RosterTrigger = "list_held"): void {
+    this.miss(trigger);
     // A read started during a fetch needs one follow-up, even if its response lands later.
     // Repeated evidence from that same generation joins the already queued reconciliation.
     if (generation < this.fetchVersion || this.ambiguousGeneration >= generation) {
@@ -187,11 +209,12 @@ export class ActiveRoster {
     }
     this.ambiguousGeneration = generation;
     this.ambiguousRefresh = true;
-    this.invalidate();
+    this.invalidate(trigger);
   }
 
   private patch(row: ThreadSummary, ticket: number): void {
     if (ticket < this.revision(row.threadId)) return;
+    this.removed.delete(row.threadId);
     const previous = this.known.get(row.threadId);
     this.known.set(row.threadId, row);
     if (previous && sameRow(previous, row)) return;
@@ -205,54 +228,134 @@ export class ActiveRoster {
     this.count("patches");
   }
 
+  private hold(threadId: string, ticket: number, state?: unknown): void {
+    const previous = this.known.get(threadId);
+    if (!previous) this.provisional.add(threadId);
+    const row = previous ?? { threadId, projectId: "", title: "", state: "running", status: "running", origin: null,
+      nativeSessionId: null, runtimeMode: "full-access", parentThreadId: null, rootThreadId: threadId,
+      worktreePath: null, pendingRequest: null, createdAt: null, updatedAt: null };
+    this.patch({ ...row, state: row.pendingRequest ? "needs-input" : BUSY.has(state as ThreadState) ? state as ThreadState
+      : BUSY.has(row.state) ? row.state : "running" }, ticket);
+  }
+
+  private confirm(threadId: string, trigger: RosterTrigger): void {
+    if (this.eventDetails.has(threadId)) { this.count("detailJoins"); return; }
+    // Reserve the other poll permits for route/reply reads; a burst shares roster discovery.
+    if (this.eventDetails.size >= MAX_EVENT_DETAILS) { this.count("detailOverflow"); this.invalidate(trigger); return; }
+    const read = this.checkpoint(threadId);
+    read.event = true;
+    this.count("detailReads");
+    const work = (async () => {
+      try {
+        if (!this.client.thread) throw new Error("Thread detail unavailable");
+        const result = await this.client.thread(threadId);
+        const thread = result.thread.archived ? { ...result.thread, state: "idle" as const, pendingRequest: null, activeRunId: null } : result.thread;
+        this.finish(threadId, read);
+        if (read.ticket < this.revision(threadId)) {
+          // Newer busy evidence is already safe. An unresolved identity still needs discovery.
+          if (this.provisional.has(threadId)) this.invalidate(trigger);
+          return;
+        }
+        const previous = this.known.get(threadId);
+        const changedFamily = this.provisional.has(threadId) || !previous
+          || previous.parentThreadId !== thread.parentThreadId || previous.rootThreadId !== thread.rootThreadId;
+        // An inactive creation cannot add busy family members, even when its root is absent.
+        const inactiveCreation = trigger === "created" && !BUSY.has(thread.state) && !thread.pendingRequest;
+        if (thread.threadId !== threadId || changedFamily && !inactiveCreation && thread.parentThreadId !== null
+          && (!thread.rootThreadId || !this.known.has(thread.rootThreadId))) {
+          this.invalidate(trigger); return;
+        }
+        if (previous && clearsEvidence(previous, thread)
+          && ([...this.details.get(threadId)?.values() ?? []].some(other => other.ticket >= this.revision(threadId))
+            || read.ticket < (this.confirmations.get(threadId)?.ticket ?? 0))) {
+          this.invalidate(trigger); return;
+        }
+        // Unlike a run event, detail is the thread's aggregate state. Its start ticket
+        // fences later events/lists; unrelated in-flight lists cannot invalidate it.
+        this.provisional.delete(threadId);
+        if (inactiveCreation) {
+          // Forget idle identity so its first busy event must place the family afresh.
+          this.advance(threadId, read.ticket);
+          this.removed.add(threadId);
+          this.known.delete(threadId);
+          if (this.cache) this.cache.threads = this.cache.threads.filter(row => row.threadId !== threadId);
+          this.rebuild();
+          this.count("drops");
+          return;
+        }
+        this.patch(thread, read.ticket);
+      } catch (error) {
+        this.count("detailErrors");
+        toolError("robob", "robob.roster_detail", error);
+        this.invalidate(trigger);
+      } finally { this.finish(threadId, read); }
+    })().finally(() => { this.eventDetails.delete(threadId); });
+    this.eventDetails.set(threadId, work);
+  }
+
   event(frame: ControlEventFrame): void {
     const ticket = ++this.ticket;
     const data = frame.data;
-    if (data.type === "error") { this.streamState(false); this.invalidate(); return; }
-    if (data.type === "ready") { this.streamState(true); this.invalidate(); return; }
+    if (data.type === "error") { this.streamState(false); this.invalidate("error"); return; }
+    if (data.type === "ready") { this.streamState(true); this.invalidate("ready"); return; }
+    if (data.type === "resync") { this.invalidate("resync"); return; }
     const id = typeof data.threadId === "string" ? data.threadId : undefined;
     const sequence = frame.id && /^\d+$/.test(frame.id) ? Number(frame.id) : NaN;
     const ordered = Number.isSafeInteger(sequence) && sequence > (id ? this.sequences.get(id) ?? -1 : -1);
     if (id && ordered) this.sequences.set(id, sequence);
-    if (data.type === "request.resolved") {
-      if (id) this.advance(id, ticket);
-      // A summary contains only one pending request; resolution needs the aggregate server view.
-      const thread = id ? this.known.get(id) : undefined;
-      if (!thread) { this.count("misses"); this.invalidate(); return; }
-      this.ambiguous(thread); return;
+    if (data.type === "thread.updated" && data.change === "thread.metadata-updated") { this.count("drops"); return; }
+    const change = data.type === "thread.updated" ? CHANGES[String(data.change)] : undefined;
+    if (data.type !== "thread.status" && data.type !== "request.opened" && data.type !== "request.resolved"
+      && data.type !== "thread.created" && !change) return;
+    const trigger: RosterTrigger = data.type === "thread.created" ? "created" : change ?? (data.type === "request.resolved" ? "request_resolved"
+      : data.type === "request.opened" ? "request_opened_unknown" : "status_unknown");
+    if (!id) { this.miss(trigger); this.invalidate(trigger); return; }
+    const thread = this.known.get(id);
+    if (ordered && change === "updated_deleted") {
+      this.advance(id, ticket);
+      if (thread) this.patch({ ...thread, state: "idle", status: "idle", pendingRequest: null, activeRunId: null }, ticket);
+      else this.count("drops");
+      this.provisional.delete(id);
+      return;
     }
-    if (data.type === "thread.created" || data.type === "resync"
-      || data.type === "thread.updated" && CHANGES.has(String(data.change))) {
-      if (id) this.advance(id, ticket);
-      this.invalidate(); return;
+    if (data.type === "thread.status" && !thread && STATES.has(data.state) && !BUSY.has(data.state as ThreadState) && !data.pendingRequest) {
+      this.miss("status_unknown"); this.count("drops"); return;
     }
-    // A non-state event supplies no fact that could supersede a detail's state/request.
-    if (data.type !== "thread.status" && data.type !== "request.opened") return;
-    if (id) this.advance(id, ticket);
-    const thread = id ? this.known.get(id) : undefined;
+    if (data.type === "thread.created" && STATES.has(data.state) && !BUSY.has(data.state as ThreadState) && !data.pendingRequest) {
+      this.count("drops"); return;
+    }
+    this.advance(id, ticket);
+    if (data.type === "thread.created" || change || data.type === "request.resolved") {
+      this.miss(trigger);
+      if (thread || data.type === "request.resolved" || BUSY.has(data.state as ThreadState)) this.hold(id, ticket, data.state);
+      this.confirm(id, trigger); return;
+    }
     if (!thread || thread.parentThreadId !== null && !thread.rootThreadId) {
-      // Family discovery needs an identity/root, which a status event cannot supply.
-      this.count("misses"); this.invalidate(); return;
+      const cause = thread ? "subagent_no_root" : trigger;
+      this.miss(cause); this.hold(id, ticket, data.state); this.confirm(id, cause); return;
     }
     if (data.type === "request.opened") {
       if (typeof data.requestId !== "string" || (data.kind !== "question" && data.kind !== "approval") || typeof data.requestKind !== "string") {
-        this.ambiguous(thread); return;
+        this.miss("request_opened_bad"); this.hold(id, ticket); this.confirm(id, "request_opened_bad"); return;
       }
       const pendingRequest: NonNullable<ThreadSummary["pendingRequest"]> = { requestId: data.requestId, kind: data.kind, requestKind: data.requestKind };
-      const row = { ...thread, state: "needs-input" as const, pendingRequest };
-      if (!ordered || this.fetching) this.ambiguous(row);
-      else this.patch(row, this.revision(thread.threadId));
+      this.patch({ ...thread, state: "needs-input", pendingRequest }, ticket);
+      if (!ordered || this.fetching) {
+        const cause = !ordered ? "request_opened_unordered" : "request_opened_during_fetch";
+        this.miss(cause); this.confirm(id, cause);
+      }
       return;
     }
     const runId = typeof data.runId === "string" ? data.runId : undefined;
     const current = thread.activeRunId ?? thread.latestRunId;
     if (!ordered || this.fetching || !STATES.has(data.state) || runId && current && runId !== current
       || !BUSY.has(data.state as ThreadState) && !thread.pendingRequest) {
-      // A waiting/terminal run cannot prove no other run remains active.
-      this.ambiguous(thread); return;
+      const cause = !ordered ? "status_unordered" : this.fetching ? "status_during_fetch"
+        : !STATES.has(data.state) ? "status_invalid" : runId && current && runId !== current ? "status_run_changed" : "status_terminal";
+      this.miss(cause); this.hold(id, ticket, data.state); this.confirm(id, cause); return;
     }
     this.patch({ ...thread, state: thread.pendingRequest ? "needs-input" : data.state as ThreadState,
-      status: typeof data.status === "string" ? data.status : thread.status }, this.revision(thread.threadId));
+      status: typeof data.status === "string" ? data.status : thread.status }, ticket);
   }
 
   private async listen(signal: AbortSignal): Promise<void> {
@@ -283,7 +386,7 @@ export class ActiveRoster {
     if (this.dirty !== this.clean) return "roster_event";
     if (!this.cache.complete && (complete || this.now() >= this.retryAt)) return "incomplete";
     if (complete && (!this.stream || this.epoch !== this.fetchedEpoch)) return "stream_down";
-    if (this.now() - this.cache.fetchedAt >= (this.stream ? 30_000 : 10_000)) return this.stream ? "safety" : "stream_down";
+    if (this.now() - this.cache.fetchedAt >= (this.stream ? SAFETY_MS : STREAM_DOWN_MS)) return this.stream ? "safety" : "stream_down";
   }
 
   private rebuild(): void {
@@ -297,7 +400,9 @@ export class ActiveRoster {
     clearTimeout(this.timer);
     if (!this.controller || this.controller.signal.aborted) return;
     const due = this.failure !== undefined || this.cache && !this.cache.complete ? this.retryAt
-      : this.dirty !== this.clean ? this.now() : (this.cache?.fetchedAt ?? this.now()) + (this.stream ? 30_000 : 10_000);
+      : this.dirty !== this.clean ? Math.min(this.urgent ? this.now() : Math.max(this.now(), this.lastRosterFetch + ROSTER_EVENT_MS),
+        (this.cache?.fetchedAt ?? this.now()) + (this.stream ? SAFETY_MS : STREAM_DOWN_MS))
+      : (this.cache?.fetchedAt ?? this.now()) + (this.stream ? SAFETY_MS : STREAM_DOWN_MS);
     this.timer = setTimeout(() => this.background(), Math.max(1, due - this.now()));
     this.timer.unref();
   }
@@ -306,11 +411,15 @@ export class ActiveRoster {
 
   private async refresh(complete: boolean): Promise<void> {
     if (this.fetching) { this.count("joins"); return this.fetching; }
-    const reason = this.reason(complete);
+    let reason = this.reason(complete);
     if (!reason) { this.count("hits"); return; }
     if (this.failure !== undefined && this.now() < this.retryAt) {
       if (complete || !this.cache) throw this.failure;
       return;
+    }
+    if (reason === "roster_event" && !complete && !this.urgent && this.now() < this.lastRosterFetch + ROSTER_EVENT_MS) {
+      if (this.cache && this.now() - this.cache.fetchedAt >= (this.stream ? SAFETY_MS : STREAM_DOWN_MS)) reason = this.stream ? "safety" : "stream_down";
+      else { this.schedule(); return; }
     }
     const version = this.dirty;
     const epoch = this.epoch;
@@ -323,11 +432,16 @@ export class ActiveRoster {
     this.lastReason = reason;
     this.lastFetchAt = this.now();
     this.count("fetches"); this.count(reason);
+    // One initiating trigger owns each full fetch; further triggers remain visible as misses.
+    if (reason === "roster_event") { this.count(`fetch_${this.pendingTrigger ?? "list_held"}`); this.lastRosterFetch = this.now(); }
+    this.urgent = false;
+    this.pendingTrigger = undefined;
     this.fetching = (async () => {
       const started = this.now();
       try {
         const { total, threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
-        const rows = threads.map(thread => ({ ...thread }));
+        // Removal fences outlive known rows; an older list cannot restore their identity.
+        const rows = threads.filter(thread => !this.removed.has(thread.threadId) || ticket >= this.revision(thread.threadId)).map(thread => ({ ...thread }));
         const held = new Set<string>();
         for (const [id, previous] of this.known) {
           const index = rows.findIndex(row => row.threadId === id);
@@ -336,10 +450,19 @@ export class ActiveRoster {
           const confirmation = this.confirmations.get(id);
           const reaffirmed = confirmation && confirmation.ticket > ticket;
           if (ticket >= this.revision(id) && !((details.length || reaffirmed) && clearsEvidence(previous, next))) continue;
+          // A pending event detail cannot hide new busy/request evidence from a later list.
+          // Retain the old request if necessary, but fence the older detail with the list ticket.
+          if (ticket >= this.revision(id) && details.some(read => read.event) && next && (BUSY.has(next.state) || next.pendingRequest)) {
+            rows[index] = { ...next, pendingRequest: next.pendingRequest ?? previous.pendingRequest,
+              state: next.pendingRequest || previous.pendingRequest ? "needs-input" : next.state };
+            this.advance(id, ticket);
+            this.provisional.delete(id);
+            continue;
+          }
           held.add(id);
           if (index < 0) rows.push(previous);
           else rows[index] = previous;
-          for (const read of details) this.reconcile(read.fetch);
+          for (const read of details) if (!read.event) this.reconcile(read.fetch);
           if (reaffirmed) this.reconcile(confirmation.fetch);
         }
         const isComplete = total <= threads.length;
@@ -350,10 +473,12 @@ export class ActiveRoster {
         for (const id of new Set([...this.known.keys(), ...rows.map(row => row.threadId)])) {
           if (!held.has(id)) {
             this.advance(id, ticket);
+            this.provisional.delete(id);
             if ((this.confirmations.get(id)?.ticket ?? 0) <= ticket) this.confirmations.delete(id);
           }
         }
         this.cache = { threads: rows, total, complete: isComplete, fetchedAt: this.now() };
+        for (const id of this.removed) if (ticket >= this.revision(id)) this.removed.delete(id);
         for (const row of rows) this.known.set(row.threadId, row);
         if (isComplete || this.known.size > 2_000) {
           // Rows leaving the active set must not retain an old pending request for later run events.
@@ -392,10 +517,12 @@ export class ActiveRoster {
 
   async read(complete: boolean, native: ReadonlyMap<string, string>): Promise<Record<string, SessionStatus>> {
     if (!complete && (this.cache || this.known.size)) return this.view(native);
+    if (complete && this.eventDetails.size) await Promise.all(this.eventDetails.values());
     await this.refresh(complete);
-    // A roster event arriving during the fetch needs one subsequent complete read.
+    // Events may start confirmation while the list is in flight; admission must include those reads too.
+    if (complete && this.eventDetails.size) await Promise.all(this.eventDetails.values());
     if (complete && (this.dirty !== this.clean || this.fetchEpoch !== this.epoch)) await this.refresh(true);
-    if (complete && (!this.cache?.complete || this.dirty !== this.clean || this.fetchEpoch !== this.epoch || this.failure !== undefined)) throw new Error("Incomplete active family discovery");
+    if (complete && (this.eventDetails.size || this.provisional.size || !this.cache?.complete || this.dirty !== this.clean || this.fetchEpoch !== this.epoch || this.failure !== undefined)) throw new Error("Incomplete active family discovery");
     return native.size ? rosterStatuses(this.cache?.threads ?? this.known.values(), native) : { ...this.busy };
   }
 }

@@ -18,6 +18,12 @@ export function requeueHuman(store: Store, id: string, reason: RequeueReason, op
     const row = store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id);
     if (!row || row.state === "pending" && store.get(`human-own-turn:${id}`)) return;
     const members = store.get<NormalizedInbound>(`batch:${id}`)?.batchIds ?? [id];
+    if (members.every(member => store.db.query("SELECT 1 FROM inbound WHERE id = ? AND json_type(payload, '$.answeredAt') = 'integer'").get(member))) {
+      for (const member of members) store.updateInbound(member, "done");
+      toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "turn.retry_skipped",
+        ids: { inboundId: id, chat: options.chat ?? "owner" }, props: { reason: "reply_already_sent" } }));
+      return;
+    }
     if (options.completed) {
       // A completed run's idempotency receipt cannot start the unanswered work again.
       const count = (store.get<number>(`human-retries:${id}`) ?? 0) + 1;

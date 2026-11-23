@@ -3,6 +3,7 @@ import argparse
 from collections import Counter
 import datetime as dt
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+import io
 import json
 import math
 import os
@@ -15,6 +16,23 @@ import sys
 import time
 
 UTC = dt.timezone.utc
+
+
+def parse_boottime(text):
+    match = re.search(r'\bsec\s*=\s*(\d+)', text)
+    micros = re.search(r'\busec\s*=\s*(-?\d+)', text)
+    if not match or ('usec' in text and not micros) or not 0 <= int(micros[1] if micros else 0) < 1000000:
+        raise ValueError('invalid kern.boottime')
+    return int(match[1])+int(micros[1] if micros else 0)/1000000
+
+
+def current_boottime(run=subprocess.run, timeout=2):
+    result = run(['/usr/sbin/sysctl', '-n', 'kern.boottime'], capture_output=True,
+                 text=True, timeout=timeout,
+                 env={**{k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'}, 'TZ': 'UTC'})
+    if result.returncode:
+        raise ValueError('boot discovery failed')
+    return parse_boottime(result.stdout)
 
 
 class BootTimes(list):
@@ -113,7 +131,7 @@ def wtmp_boots():
 def boot_times(since, until, run=subprocess.run, deadline=None):
     if sys.platform != 'darwin':
         return []
-    env = {**os.environ, 'LC_ALL': 'C', 'TZ': 'UTC'}
+    env = {**{k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'}, 'LC_ALL': 'C', 'TZ': 'UTC'}
     def read(args):
         remaining = 2 if deadline is None else min(2, deadline-time.monotonic())
         if remaining <= 0:
@@ -122,10 +140,7 @@ def boot_times(since, until, run=subprocess.run, deadline=None):
         if result.returncode:
             raise ValueError('boot discovery failed')
         return result.stdout
-    current = re.search(r'\bsec\s*=\s*(\d+)', read(['/usr/sbin/sysctl', '-n', 'kern.boottime']))
-    if not current:
-        raise ValueError('invalid kern.boottime')
-    boots = {int(current[1])}
+    boots = {int(parse_boottime(read(['/usr/sbin/sysctl', '-n', 'kern.boottime'])))}
     minutes = []
     for line in read(['/usr/bin/last', '-y', 'reboot']).splitlines():
         if not line.startswith('reboot time'):
@@ -242,7 +257,8 @@ def read_slice(command, start, end, include_end, stop, out, outside):
     terminating = None
     try:
         child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                 start_new_session=True, env={**os.environ, 'TZ': 'UTC'})
+                                 start_new_session=True,
+                                 env={**{k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'}, 'TZ': 'UTC'})
         with selectors.DefaultSelector() as selector:
             os.set_blocking(child.stdout.fileno(), False)
             selector.register(child.stdout, selectors.EVENT_READ)
@@ -320,6 +336,84 @@ def read_slice(command, start, end, include_end, stop, out, outside):
                 result['exitCode'] = child.returncode
             result['elapsedMs'] = round((time.monotonic()-began)*1000)
     return result
+
+
+def read_window(start, end, predicate, run=subprocess.run, timeout=15, info=False, debug=False,
+                after_boot=None):
+    # Reserve the reader's TERM grace and reap inside the caller's deadline.
+    stop = time.monotonic()+timeout-4
+    start, end = Decimal(str(start)), Decimal(str(end))
+    boots = boot_times(start, end, run=run, deadline=stop)
+    include_end = True
+    errors = set()
+    if after_boot is not None:
+        following = [Decimal(str(b)) for b in boots if b > math.floor(after_boot)]
+        if following and min(following) <= end:
+            end, include_end = min(following), False
+        # An unresolved minute may hide a later boot anywhere in that span.
+        # Attribution cannot resume after it, even though generic reads can.
+        uncertain = [max(start, Decimal(str(a))) for a,b in getattr(boots, 'unresolved', ())
+                     if a <= end and b > start]
+        if uncertain and min(uncertain) <= end:
+            end, include_end = min(uncertain), False
+            errors.add('boot_unresolved')
+    out, stats = io.BytesIO(), counters()
+    if end <= start and not include_end:
+        errors.add('boot_window_empty')
+    stats['windowEnd'] = query_bound(end, ROUND_CEILING)
+    for left, right, _ in reader_slices(start, end, max(Decimal(1), end-start), boots):
+        piece = io.BytesIO()
+        remaining = stop-time.monotonic()
+        if remaining <= 0:
+            errors.add('deadline')
+            break
+        if left >= right and not include_end:
+            break
+        if boot_skip(left, right, boots):
+            errors.add('boot_unresolved')
+            continue
+        command = [os.environ.get('MAC_LOG_WINDOW_LOG_BIN', '/usr/bin/log'), 'show',
+                   '--style', 'ndjson', '--timezone', 'UTC',
+                   '--start', query_bound(left, ROUND_FLOOR),
+                   '--end', query_bound(right, ROUND_CEILING)]
+        command += (['--info'] if info else [])+(['--debug'] if debug else [])
+        command += ['--predicate', predicate]
+        if boot_second(left, right, boots) is not None:
+            remaining = min(6, remaining)
+        if run is subprocess.run:
+            part = read_slice(command, left, right, right == end and include_end,
+                              time.monotonic()+remaining, piece, None)
+            if part['status'] != 'complete':
+                errors.add('partial' if part['status'] == 'partial' else 'log_error')
+        else:
+            # Injected command runners use the same exact timestamp filter.
+            try:
+                result = run(command, capture_output=True, text=True, timeout=remaining,
+                             env={**{k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'},
+                                  'LC_ALL': 'C', 'TZ': 'UTC'})
+                output = result.stdout
+                if result.returncode:
+                    errors.add('log_error')
+            except subprocess.TimeoutExpired as exc:
+                output = exc.output or ''
+                errors.add('partial')
+            except OSError:
+                output = ''
+                errors.add('log_error')
+            if isinstance(output, bytes):
+                output = output.decode(errors='replace')
+            part = counters()
+            lines = output.splitlines(keepends=True)
+            for i, line in enumerate(lines):
+                keep_row(line.encode(), left, right, right == end and include_end, piece, None, part,
+                         final=i == len(lines)-1)
+        merge_counts(stats, part)
+        data = piece.getvalue()
+        out.write(data)
+        if data and not data.endswith(b'\n'):
+            out.write(b'\n')
+    stats['error'] = ','.join(sorted(errors)) or None
+    return out.getvalue().decode(), stats
 
 
 class ArgumentError(ValueError):

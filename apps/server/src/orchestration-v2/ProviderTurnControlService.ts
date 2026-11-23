@@ -453,12 +453,23 @@ export const layer: Layer.Layer<
             return;
           }
 
-          yield* loaded.session.value.interruptTurn({
+          const runtime = loaded.session.value;
+          yield* runtime.interruptTurn({
             providerThread: loaded.providerThread,
             providerTurnId: loaded.providerTurn.id,
           });
+          // The session manager records a native turn end as the event leaves
+          // the adapter, while its projection write can sit behind a backlog of
+          // earlier events for longer than the cleanup deadline. The native end
+          // is what frees the session for the replacement prompt.
+          const nativeEnded =
+            runtime.hasObservedTurnEnd?.({
+              providerThreadId: input.providerThreadId,
+              providerTurnId: input.providerTurnId,
+            }) ?? Effect.succeed(false);
 
           for (let remaining = 1_000; remaining > 0; remaining -= 1) {
+            if (yield* nativeEnded) return;
             const { providerTurn, attempt } = yield* projections.getProviderControlContext(
               input.threadId,
               {

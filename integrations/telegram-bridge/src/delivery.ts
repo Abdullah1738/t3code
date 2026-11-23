@@ -1,3 +1,4 @@
+import { flushDigest, type AskLookup } from "./digest.ts";
 import { redact } from "./redact.ts";
 import { allowQueuedAsk, flushBursts, runCloudUp } from "./notification-policy.ts";
 import { classifySendFailure, type SendFailure, type Telegram } from "./telegram.ts";
@@ -12,6 +13,7 @@ type Options = {
   beforeSend?: (item: OutboxRecord) => Promise<"send" | "wait" | "cancel">;
   log?: (event: string, code?: string) => void;
   sleep?: (ms: number) => Promise<void>;
+  getAsk?: AskLookup;
   askNotified?: (key: string, at: number) => Promise<void>;
 };
 type Checkpoint = { accepted: boolean; providerId?: number };
@@ -74,21 +76,34 @@ export class Delivery {
     this.store.db.transaction(() => {
       this.store.outboxState(id, "sent", providerId);
       this.store.set(`acceptedAt:${id}`, this.store.get<number>(`acceptedAt:${id}`) ?? Date.now());
-      const key = this.store.get<string>(`ask-timing-key:${id}`);
-      if (key !== undefined && !this.store.get<boolean>(`ask-timing-reported:${id}`)) this.store.set(`ask-timing-pending:${id}`, { key, at: this.store.get<number>(`acceptedAt:${id}`)! });
+      this.queueAskTimings(id);
     }).immediate();
     this.options.log?.("outbound-accepted");
+  }
+
+  private queueAskTimings(id: string): void {
+    const at = this.store.get<number>(`acceptedAt:${id}`)!;
+    const single = this.store.get<string>(`ask-timing-key:${id}`);
+    const keys = this.store.get<string[]>(`ask-timing-keys:${id}`) ?? (single ? [single] : []);
+    for (const key of keys) {
+      const pending = this.store.get<{ key: string; at: number }>(`ask-timing-pending:${key}`);
+      if (!this.store.get<boolean>(`ask-timing-reported:${id}`) && !this.store.get<boolean>(`ask-timing-reported:${key}`))
+        this.store.set(`ask-timing-pending:${key}`, { key, at: Math.min(at, pending?.at ?? at) });
+    }
   }
 
   private async reportAskTimings(): Promise<void> {
     if (!this.options.askNotified) return;
     const rows = this.store.db.query<{ key: string; value: string }, []>(
-      "SELECT key, value FROM kv WHERE key LIKE 'ask-timing-pending:%' ORDER BY key LIMIT 100",
+      // Older installations keyed receipts by operation. Drain those in acceptance order too.
+      "SELECT key, value FROM kv WHERE key LIKE 'ask-timing-pending:%' ORDER BY json_extract(value, '$.at'), key LIMIT 100",
     ).all();
     for (const row of rows) {
       const receipt = JSON.parse(row.value) as { key: string; at: number };
       try {
-        await this.options.askNotified(receipt.key, receipt.at);
+        if (!this.store.get<boolean>(`ask-timing-reported:${receipt.key}`))
+          await this.options.askNotified(receipt.key, receipt.at);
+        this.store.set(`ask-timing-reported:${receipt.key}`, true);
         this.store.set(row.key.replace("ask-timing-pending:", "ask-timing-reported:"), true);
         this.store.db.query("DELETE FROM kv WHERE key = ?").run(row.key);
       } catch (error) { toolError("telegram", "tg.askTiming.receipt", undefined, error); break; }
@@ -118,6 +133,7 @@ export class Delivery {
     const boundChat = this.options.chatId();
     if (boundChat === undefined) return;
     flushBursts(this.store);
+    if (this.options.getAsk) await flushDigest(this.store, Date.now(), this.options.getAsk);
     let dispatched = 0;
     operations: for (const queued of this.store.pendingOutbox()) {
       if (dispatched >= 10) break;
@@ -252,9 +268,7 @@ export class Delivery {
         this.store.db.transaction(() => {
           this.store.set(chunkKey, { accepted: true, providerId: result.providerId } satisfies Checkpoint);
           this.store.set(`acceptedAt:${item.id}`, this.store.get<number>(`acceptedAt:${item.id}`) ?? Date.now());
-          const askKey = this.store.get<string>(`ask-timing-key:${item.id}`);
-          if (askKey !== undefined && !this.store.get<boolean>(`ask-timing-reported:${item.id}`))
-            this.store.set(`ask-timing-pending:${item.id}`, { key: askKey, at: this.store.get<number>(`acceptedAt:${item.id}`)! });
+          this.queueAskTimings(item.id);
           if (result.providerId !== undefined) {
             const key = `provider-operation:${result.providerId}`;
             const existing = this.store.get<string>(key) ?? this.store.byProviderId(result.providerId)?.id;

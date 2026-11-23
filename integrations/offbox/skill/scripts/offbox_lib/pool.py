@@ -898,6 +898,16 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     pending_retries = set()
     pending_busy = {}
     rejected_alternatives = set()
+    stopping_reported = queue.setdefault('stopping_reported', set())
+
+    def report_skip(bid, error, prefix=''):
+        if 'is stopping;' in str(error):
+            if bid in stopping_reported:
+                return
+            stopping_reported.add(bid)
+            say(f'{bid} is stopping; skipping it for now')
+            return
+        say(prefix + str(error))
     affinity_deadline = min(deadline, started + AFFINITY_WAIT_S)
     grew = False
     prune_checked = False
@@ -1018,7 +1028,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                     if isinstance(e, lease.ResumeStopped) or getattr(e, 'resume_retry_box', None) == bid:
                         pending_retries.add(bid)
                     _unreserve_and_release(con, waiter, guard)
-                    say(str(e))
+                    report_skip(bid, e)
                     pending_busy[bid] = time.monotonic() + 2
                     continue
                 except (lease.ResumeProvisionStalled, prepare.Stalled) as e:
@@ -1289,13 +1299,13 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                             unusable.add(row['box_id'])
                         elif row['box_id'] in mine and time.monotonic() < affinity_deadline:
                             # Yield readiness/box guards into the queue while preserving the caller's cache affinity.
-                            say(str(e))
+                            report_skip(row['box_id'], e)
                             break
                         # Busy-like: the box is still archiving, so try the next member. It does not
                         # make the pool look full, so a create still runs when under cap.
                         if row['state'] != 'running':
                             stopped_tries -= 1  # skipped, not tried: the next stopped member still gets its turn
-                        say(f"skipping pool box {row['box_id']}: {e}")
+                        report_skip(row['box_id'], e, f"skipping pool box {row['box_id']}: ")
                         continue
                     except lease.DiskTooBig as e:
                         # Marked and left stopped: it no longer counts toward the pool. Not stopped_error, so a

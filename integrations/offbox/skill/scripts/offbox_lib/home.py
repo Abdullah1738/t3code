@@ -543,6 +543,13 @@ def failure_class(reason):
     return "slow" if "home still slow" in reason else "starting" if "home still starting" in reason else "hard"
 
 
+def record_box_failure(error, run_id=''):
+    if not active() or getattr(error, 'api_code', None) != 'incus_slow' or getattr(error, '_home_failure_recorded', False):
+        return
+    error._home_failure_recorded = True
+    record_failure(str(error), run_id or PRE_START.get() or invocation_run(), classification='incus_slow')
+
+
 def record_failure(reason: str, run_id: str = "", *, base: str | None = None, base_kept: bool = False, classification: str | None = None) -> None:
     """One line for the health monitor: a run could not reach home before it was accepted."""
     try:

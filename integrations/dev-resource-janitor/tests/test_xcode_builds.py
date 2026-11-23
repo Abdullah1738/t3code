@@ -126,6 +126,41 @@ class XcodeTests(JanitorTestCase):
             rescan.assert_not_called()
             send.assert_not_called()
 
+    def test_robob_build_is_kept_and_signal_rechecks_ancestry(self):
+        report = self.detect()
+        self.rows[1]['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+        self.after = copy.deepcopy(self.rows)
+        self.assertEqual(self.detect()['inventory'][0]['keep_reason'], 'robob-descendant')
+        self.assertEqual(self.detect()['candidates'], [])
+        send = Mock()
+        action = self.stop(report, send=send)[0]
+        send.assert_not_called()
+        self.assertEqual(action['protectedBy'], 'robob-descendant')
+
+    def test_xcode_below_robob_provider_still_stops(self):
+        self.rows[1]['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+        self.rows[2] = dict(self.rows[10], pid=2, ppid=1, args='node apps/server/dist/bin.mjs --bootstrap-fd 3')
+        self.rows[3] = dict(self.rows[10], pid=3, ppid=2, args='/opt/codex exec')
+        self.rows[10].update(ppid=3, args='/bin/zsh build.sh')
+        self.after = copy.deepcopy(self.rows)
+        report = self.detect()
+        self.assertEqual([p['pid'] for p in report['candidates']], [20])
+        send = Mock()
+        action = self.stop(report, send=send)[0]
+        self.assertIn(dict(pid=20, signal='SIGTERM'), action['signals'])
+        self.assertIn(dict(pid=20, signal='SIGKILL'), action['signals'])
+        self.assertNotIn('protectedBy', action)
+        self.assertTrue(send.called)
+
+    def test_robob_ancestry_rechecked_before_xcode_kill(self):
+        send = Mock()
+        def pause(seconds):
+            self.after[1]['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+        action = self.stop(send=send, pause=pause)[0]
+        self.assertEqual(action['signals'], [dict(pid=20, signal='SIGTERM')])
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(action['protectedBy'], 'robob-descendant')
+
     def test_term_outer_then_services_then_kill_only_survivors(self):
         report = self.detect()
         self.after[900] = dict(pid=900, ppid=1, start='other', tty='??', args='/opt/xcodebuild', cpu_seconds=0)

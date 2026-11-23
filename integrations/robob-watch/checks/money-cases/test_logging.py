@@ -62,6 +62,15 @@ class Logging(Base):
         self.assertNotIn('PRIVATE', json.dumps(self.rows()))
         self.assertEqual((HERE / 'toollog.py').read_bytes(), SHARED.read_bytes())
 
+    def test_structured_marketplace_refresh_metadata_survives_logging(self):
+        value = {'status': 'launch_failed', 'snapshot_age_s': 7200, 'last_result': 'launch_error',
+                 'last_at': '2026-11-20T00:00:00Z', 'order': 'PRIVATE', 'amount': 'PRIVATE'}
+        mc.toollog.emit('money-cases', 'check.run', props={'marketplace_refresh': value})
+        row, = self.rows('check.run')
+        self.assertEqual(row['props']['marketplace_refresh'], {'status': 'launch_failed',
+            'snapshot_age_s': 7200, 'last_result': 'launch_error', 'last_at': '2026-11-20T00:00:00+00:00'})
+        self.assertNotIn('PRIVATE', json.dumps(row))
+
     def test_owner_cache_reset_diagnostics_wait_for_book_unlock(self):
         path = self.data / 'owner-snapshot.json'
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,13 +244,31 @@ class Logging(Base):
     def test_check_timing_success_timeout_and_save_failure(self):
         self.case()
         now = at('2026-10-24T10:00')
-        event = mc.run_check(self.wd, 'fixture', self.data, self.root, now, finder(), nobody)
+        clock = [1000.0]
+        write = mc.write_json
+
+        def commit_tail(path, obj, timing=None):
+            if timing is None:
+                return write(path, obj)
+            def sample():
+                result = timing()
+                # The footer fsync and replace happen after this persisted sample.
+                clock[0] += .025
+                return result
+            return write(path, obj, timing=sample)
+
+        with patch.object(mc.time, 'time', lambda: clock[0]), \
+                patch.object(mc.time, 'monotonic', lambda: clock[0]), \
+                patch.object(mc, 'write_json', commit_tail):
+            event = mc.run_check(self.wd, 'fixture', self.data, self.root, now, finder(), nobody)
         row = self.rows('check.run')[-1]
         self.assertTrue(row['ok'])
         self.assertEqual(row['props']['fired'], int(bool(event)))
         self.assertEqual(row['props']['openCases'], 1)
         timing = json.loads((self.wd / 'pings.json').read_text())['timing']
-        self.assertAlmostEqual(row['durationMs'], timing['total_s'] * 1000, delta=10)
+        history = json.loads((self.wd / 'runs.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(row['durationMs'], history['total_s'] * 1000)
+        self.assertEqual(row['durationMs'] - timing['total_s'] * 1000, 25)
         with patch.object(mc, 'follow', side_effect=mc.CheckTimeout('fixture timeout')):
             mc.run_check(self.wd, 'timeout', self.data, self.root, now, finder(), nobody)
         self.assertFalse(self.rows('check.run')[-1]['props']['budgetHit'])
@@ -318,7 +345,7 @@ class Logging(Base):
         row, = self.rows('check.run')
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
-        self.assertEqual(row['props'], {'marketplace_refresh': 'skipped', 'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
+        self.assertEqual(row['props'], {'marketplace_refresh': {'status': 'skipped', 'snapshot_age_s': None, 'last_result': None, 'last_at': None}, 'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
             **dict.fromkeys((key for key in (*mc.TIMING_KEYS, *mc.charges.OWNER_TIMING_KEYS)
                              if key != 'dataless_error'), 0), 'owner_result': 'ok', 'follow_ms': 40000, 'questions_ms': 40000,
             'starved_by': 'questions', **mc.charges.receipt_timing({})})

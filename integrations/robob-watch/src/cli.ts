@@ -1,4 +1,6 @@
 import { queueOwnerRecovery } from "./owner-alerts.ts";
+import { syncCadenceSuspension } from "./cadence.ts";
+import { isMounted, SSD_PATH } from "./host.ts";
 import { assertMacWatcher } from "./person-box.ts";
 import { toolLog, toolError, rollup, logMarker } from "./toollog.ts";
 import { stderrCause } from "./cause.ts";
@@ -8,18 +10,18 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   clearFailureProbe, clearFailureState, dubaiClock, checkWakeRoute, trackConfirmation, watcherInstance, retiredWatcher, pollingWatcher, heldByMaintenance, loadMaintenance, MAINTENANCE_FILE, validDepends, type Dependency, addStop, editContext, editWatcher, removeWatcher, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
-  saveState, sendNotes, type State, type Stop, stopFor, unscopedSender, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
+  saveState, sendNotes, ROOT, type State, type Stop, stopFor, unscopedSender, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
 } from "./lib.ts";
 
 const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob) when something happens.
 
   robob-watch add --id ID --title TEXT --check CMD [--interval 30] [--mode wake|notify]
-                  (--context TEXT | --context-file PATH) [--expires 14d|ISO] [--max-fires 1] [--serial]
+                  (--context TEXT | --context-file PATH) [--expires 14d|ISO] [--max-fires 1] [--serial] [--urgent]
                   [--session CURRENT_SESSION_ID] [--trigger FILE]... [--replace] [--no-prime] [--owner-only]
                   [--depends ssd,phone] [--inflight-check CMD]
                   [--chat SLUG]  (wake that bridge chat, e.g. moni, instead of the owner's; her own data)
   robob-watch add --json FILE|-          same fields as watcher.json (id, title, check, interval_s, mode, context,
-                                         expires_at, max_fires, inflight_check, timeout_s, max_consecutive_failures, failure_notice_after, failure_pause_probe, owner_imessage_alerts, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
+                                         expires_at, max_fires, inflight_check, timeout_s, max_consecutive_failures, failure_notice_after, failure_pause_probe, owner_imessage_alerts, depends, serial, urgent, triggers, quiet, trip, relays, chat, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
   robob-watch context ID [--json FILE|- | --context TEXT | --context-file PATH] [--replace]
@@ -123,7 +125,7 @@ async function main(argv: string[]): Promise<void> {
       since: { type: "string" }, until: { type: "string" }, out: { type: "string" },
       day: { type: "string" }, "inflight-check": { type: "string" }, id: { type: "string" }, title: { type: "string" }, check: { type: "string" }, interval: { type: "string" },
       mode: { type: "string" }, context: { type: "string" }, "context-file": { type: "string" }, expires: { type: "string" },
-      "max-fires": { type: "string" }, serial: { type: "boolean" }, session: { type: "string" }, replace: { type: "boolean" },
+      "max-fires": { type: "string" }, serial: { type: "boolean" }, urgent: { type: "boolean" }, session: { type: "string" }, replace: { type: "boolean" },
       "no-prime": { type: "boolean" }, trigger: { type: "string", multiple: true }, json: { type: "string" }, n: { type: "string" }, help: { type: "boolean", short: "h" }, now: { type: "boolean" },
       depends: { type: "string" }, for: { type: "string" }, reason: { type: "string" },
       chat: { type: "string" }, to: { type: "string" }, eta: { type: "string" }, quote: { type: "string" }, "owner-only": { type: "boolean" },
@@ -153,6 +155,7 @@ async function main(argv: string[]): Promise<void> {
           ...(values.mode === undefined ? {} : { mode: values.mode }),
           ...(values["max-fires"] === undefined ? {} : { max_fires: Number(values["max-fires"]) }),
           ...(values.serial ? { serial: true } : {}),
+          ...(values.urgent ? { urgent: true } : {}),
           ...(values.trigger?.length ? { triggers: values.trigger } : {}),
           ...(values.session === undefined ? {} : { created_by_session: values.session }),
           ...(values.chat === undefined ? {} : { chat: values.chat }),
@@ -161,6 +164,7 @@ async function main(argv: string[]): Promise<void> {
         };
       }
       assertMacWatcher(input.chat);
+      if (values.urgent) input.urgent = true;
       if (values.expires !== undefined) input.expires_at = duration(values.expires);
       if (input.expires_at === undefined) input.expires_at = duration("14d");
       if (values["owner-only"]) input.relays = [];
@@ -179,6 +183,7 @@ async function main(argv: string[]): Promise<void> {
         if (values.json === undefined && previous?.max_consecutive_failures !== undefined) candidate.max_consecutive_failures = previous.max_consecutive_failures;
         if (values.json === undefined && previous?.failure_notice_after !== undefined) candidate.failure_notice_after = previous.failure_notice_after;
         if (values.json === undefined && previous?.failure_pause_probe !== undefined) candidate.failure_pause_probe = previous.failure_pause_probe;
+        if (values.json === undefined && previous?.urgent && values.urgent === undefined) candidate.urgent = true;
         if (values.json === undefined && previous?.owner_imessage_alerts) candidate.owner_imessage_alerts = true;
         if (values.json === undefined && previous?.trip) candidate.trip = previous.trip;
         if (values.json === undefined && previous?.chat && values.chat === undefined) candidate.chat = previous.chat;
@@ -233,7 +238,7 @@ async function main(argv: string[]): Promise<void> {
         log(watcher.id, prime);
       }
       console.log(JSON.stringify({ added: watcher.id, mode: watcher.mode, interval_s: watcher.interval_s, expires_at: watcher.expires_at,
-        max_fires: watcher.max_fires, serial: watcher.serial, dir, prime, ...(wakeRoute ? { wake_route: wakeRoute } : {}) }, null, 2));
+        max_fires: watcher.max_fires, urgent: watcher.urgent === true, serial: watcher.serial, dir, prime, ...(wakeRoute ? { wake_route: wakeRoute } : {}) }, null, 2));
       return;
     }
     case "depends": {
@@ -260,6 +265,14 @@ async function main(argv: string[]): Promise<void> {
         const w = pollingWatcher(loadWatcher(id)!, s);
         return !!w && (s.status === "active" || s.status === "closing") && !w.paused && !s.failure_paused_at && heldByMaintenance(w, maintenance);
       });
+      if (positionals[0] === "on" || positionals[0] === "off") withRelayLock(() => {
+        const mounted = isMounted(SSD_PATH);
+        for (const id of listIds()) {
+          const state = loadState(id), watcher = pollingWatcher(loadWatcher(id)!, state);
+          if (watcher?.urgent && (state.status === "active" || state.status === "closing")
+            && syncCadenceSuspension(watcher, state, Date.now(), maintenance, mounted)) saveState(id, state);
+        }
+      });
       console.log(JSON.stringify({ maintenance: maintenance ?? null, held }, null, 2));
       return;
     }
@@ -271,7 +284,7 @@ async function main(argv: string[]): Promise<void> {
         const s = loadState(id);
         const status = statusLabel(w, s);
         const triggerHint = w.triggers?.length ? (s.trigger_missing?.paths.length ? "+trigger(waiting)" : "+trigger") : "";
-        console.log(`${id}  [${status}] ${w.mode} every ${w.interval_s}s${triggerHint}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.last_run_ms !== undefined ? ` (${(s.last_run_ms / 1000).toFixed(1)}s)` : ""}${s.pending ? "  UNDELIVERED EVENT" : s.batch ? `  BATCHING ${s.batch.events.length} EVENTS` : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}${s.load_timeouts ? `  load-timeouts ${s.load_timeouts}` : ""}\n    ${w.title}`);
+        console.log(`${id}  [${status}] ${w.mode} urgent=${w.urgent === true} every ${w.interval_s}s${triggerHint}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.last_run_ms !== undefined ? ` (${(s.last_run_ms / 1000).toFixed(1)}s)` : ""}${s.pending ? "  UNDELIVERED EVENT" : s.batch ? `  BATCHING ${s.batch.events.length} EVENTS` : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}${s.load_timeouts ? `  load-timeouts ${s.load_timeouts}` : ""}\n    ${w.title}`);
       }
       return;
     }
@@ -280,12 +293,24 @@ async function main(argv: string[]): Promise<void> {
       const s = loadState(w.id);
       const wakeRoute = await checkWakeRoute(w);
       if (wakeRoute) process.stderr.write(`Note for ${w.id}: ${wakeRoute.route === "refused" ? `wakes go to the owner chat (${wakeRoute.reason}; creator is not a live thread)` : wakeRoute.note}\n`);
-      console.log(JSON.stringify({ watcher: w, state: s, status: statusLabel(w, s), dir: watcherDir(w.id), ...(wakeRoute ? { wake_route: wakeRoute } : {}) }, null, 2));
+      console.log(JSON.stringify({ watcher: { ...w, urgent: w.urgent === true }, state: s, status: statusLabel(w, s), dir: watcherDir(w.id), ...(wakeRoute ? { wake_route: wakeRoute } : {}) }, null, 2));
       for (const entry of [s.confirm, ...(s.confirmations ?? [])]) {
+        if (entry?.thread && !entry.ownerFallback) console.log(`confirmation=pending run=${entry.runId?.split(":ordinal:").at(-1) ?? "unknown"} state=${entry.runState ?? "unknown"}`);
         if (entry?.sendPending) console.log(`send=deferred attempts=${entry.sendAttempts ?? 0} next_retry=${entry.nextAt ? new Date(entry.nextAt).toISOString() : "due"}`);
       }
       if (s.load_timeouts) console.log(`load-timeouts ${s.load_timeouts}`);
       console.log(`--- log (last 20)\n${tail(w.id, 20)}`);
+      let waiting = "unknown (no current runner snapshot)";
+      try {
+        const snapshot = JSON.parse(readFileSync(join(ROOT, "slot-queue.json"), "utf8")) as { pid: number; at: number; queue: { watcher: string; queuedAt: number }[] };
+        process.kill(snapshot.pid, 0);
+        if (Date.now() - snapshot.at < 120_000) {
+          const position = snapshot.queue.findIndex(row => row.watcher === w.id);
+          waiting = position < 0 ? "no" : `yes, position ${position + 1}/${snapshot.queue.length}, queued ${Math.floor((Date.now() - snapshot.queue[position]!.queuedAt) / 60_000)} min (enqueue order)`;
+        }
+      } catch { /* A stopped runner cannot report its queue. */ }
+      const time = (at?: number) => at === undefined ? "-" : iso(at);
+      console.log(`Cadence\n  last check start: ${time(s.cadence?.lastStart)}\n  last check end: ${time(s.cadence?.lastEnd)}\n  outcome: ${s.cadence?.lastOutcome ?? "-"}\n  last queuedMs: ${s.cadence?.lastQueuedMs ?? "-"}\n  consecutive load timeouts: ${s.load_timeouts ?? 0}\n  waiting for slot: ${waiting}\n  next due: ${time(s.next_at)}`);
       return;
     }
     case "context": {
@@ -360,6 +385,7 @@ async function main(argv: string[]): Promise<void> {
           clearFailureState(s);
         }
         if (command === "pause") clearFailureProbe(s);
+        if (w.urgent) syncCadenceSuspension(w, s, Date.now(), loadMaintenance(), isMounted(SSD_PATH));
         s.next_at = 0;
         saveState(w.id, s);
         if (endedGrace !== undefined) toolLog({ component: "cli", kind: "event", name: "watch.grace_ended", ids: { watcher: w.id }, props: { reason: "resume", relays: endedGrace } });

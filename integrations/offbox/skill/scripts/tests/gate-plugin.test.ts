@@ -1,7 +1,7 @@
 // bun test: the gate plugin's shell hook. The plugin imports the classifier
 // relative to ~/.config/opencode/plugin, so it is loaded from a temp copy laid
 // out the same way.
-import { afterAll, expect, mock, spyOn, test } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test"
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { homedir } from "node:os"
@@ -147,4 +147,65 @@ test("a returned classifier error is recorded as an error, never as a light succ
   const raw = readdirSync(folder).filter(f => f.endsWith(".ndjson")).map(f => readFileSync(join(folder, f), "utf8")).join("")
   expect(JSON.parse(raw.trim().split("\n").at(-1)!)).toMatchObject({ name: "gate.decision", ok: false, error: { tag: "gate_failed" } })
   expect(raw).not.toContain("private-classifier-body")
+})
+
+describe("slow hook.decision rows carry the gate's measured phases", () => {
+  const real = performance.now.bind(performance)
+  let offset = 0
+  const hookRows = () => {
+    const folder = join(root, "board-logs/agent-tools")
+    const { readdirSync } = require("node:fs")
+    return readdirSync(folder).filter((f: string) => f.endsWith(".ndjson"))
+      .flatMap((f: string) => readFileSync(join(folder, f), "utf8").split("\n"))
+      .map((line: string) => { try { return JSON.parse(line) } catch { return null } })
+      .filter((row: any) => row?.name === "hook.decision" && row.props?.guard === "offbox-gate")
+  }
+  async function gate(mode: string, verdict: () => any, session: () => any = () => null) {
+    process.env.OFFBOX_GATE_MODE = mode
+    mock.module(join(root, "skills/remote-compute/scripts/classify.ts"), () => ({ classify: verdict, loadRules: () => {} }))
+    const { default: plugin } = await import(join(root, "plugin/offbox-gate.ts"))
+    const hooks: Record<string, (e: any) => unknown> = {}
+    const on = (name: string) => ({ hook: async (event: string, fn: any) => { hooks[`${name}:${event}`] = fn } })
+    await plugin.setup({ tool: on("tool"), shell: on("shell"), session: { ...on("session"), get: async () => session() } })
+    return hooks["tool:execute.before"]
+  }
+  const secret = "gate-phase-private-arg"
+  let clock: ReturnType<typeof spyOn>, random: ReturnType<typeof spyOn>
+  beforeEach(() => {
+    offset = 0
+    clock = spyOn(performance, "now").mockImplementation(() => real() + offset)
+    // A sampler that would drop every sampled row: slow rows must still be written.
+    random = spyOn(Math, "random").mockReturnValue(0.99)
+  })
+  afterEach(() => { clock.mockRestore(); random.mockRestore(); delete process.env.OFFBOX_GATE_MODE })
+
+  test("a slow classifier is named as classify_ms", async () => {
+    const run = await gate("observe", () => { offset += 2600; return { heavy: false, rule: null } })
+    await run({ tool: "shell", sessionID: "phase-classify", input: { command: `echo ${secret}` } })
+    const row = hookRows().at(-1)
+    expect(row.durationMs).toBeGreaterThan(2000)
+    expect(row.props.classify_ms).toBeGreaterThanOrEqual(2600)
+    expect(row.props.lineage_ms).toBeUndefined()
+    expect(row.props.sampleRate).toBeUndefined()
+    expect(JSON.stringify(row)).not.toContain(secret)
+  })
+
+  test("a slow session-parent lookup is named as lineage_ms", async () => {
+    const heavy = { heavy: true, rule: "go-test", class: "heavy", why: "fixture", rewrite: "offbox run -- fixture" }
+    const run = await gate("enforce", () => heavy, () => { offset += 2700; return { data: { parentID: null } } })
+    await run({ tool: "shell", sessionID: "phase-lineage", input: { command: `go test ./... ${secret}` } })
+    const row = hookRows().at(-1)
+    expect(row.props.lineage_ms).toBeGreaterThanOrEqual(2700)
+    expect(row.props.classify_ms).toBeLessThan(500)
+    expect(JSON.stringify(row)).not.toContain(secret)
+  })
+
+  test("a classifier that throws still reports the time it took", async () => {
+    const run = await gate("observe", () => { offset += 2500; throw new Error(secret) })
+    await run({ tool: "shell", sessionID: "phase-throw", input: { command: "true" } })
+    const row = hookRows().at(-1)
+    expect(row.error.tag).toBe("hook.error")
+    expect(row.props.classify_ms).toBeGreaterThanOrEqual(2500)
+    expect(JSON.stringify(row)).not.toContain(secret)
+  })
 })

@@ -1,3 +1,4 @@
+import { expandTelemetry } from "../src/log-volume.ts";
 import { afterEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync, readdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -103,7 +104,7 @@ const emptyBreakdown = {
   wake: { attempts: 0, sent: 0, failed: 0, replyGuard: { total: 0, blocked: 0, accepted: 0 } },
 };
 const day = () => new Date().toISOString().slice(0, 10);
-const rows = (dir: string) => readFileSync(join(dir, `${day()}.ndjson`), "utf8").trim().split("\n").map(line => JSON.parse(line));
+const rows = (dir: string) => readFileSync(join(dir, `${day()}.ndjson`), "utf8").trim().split("\n").flatMap(line => expandTelemetry(JSON.parse(line)));
 afterEach(() => { if (before === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = before; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 test.each([
@@ -394,7 +395,7 @@ test("relay metadata keeps bounded values and rejects text in every new field", 
 
 test('queued wakes retain route and confirmation metadata and count as sent only after confirmation', async () => {
   const dir = fixture();
-  toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: false,
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: true,
     props: { via: 'thread:abcd1234', confirmed: 'pending', accepted: true } });
   toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: false,
     props: { via: 'wake:owner-fallback', meant_for: 'abcd1234', confirmed: 'pending', accepted: true } });

@@ -3,7 +3,7 @@
 Recovers `/Applications/Robob.app` in the background when its backend is unavailable,
 and at login. It never reads the Robob database or signals OpenCode/provider workers.
 An unready registered desktop can be terminated before reopening. Only an unexpired
-install hold with a fresh heartbeat holds off recovery. There
+install hold with a fresh heartbeat or a live SSD read block holds off recovery. There
 is no stay-quit file or mode switch.
 
 `com.ardud.robob-guard` checks every 30 seconds, including `RunAtLoad`.
@@ -65,6 +65,49 @@ Failed notifications retry on subsequent checks using the same key. Crash
 loop episodes end after an hour without a reopen; failure episodes end on
 recovery or an install hold. Alert times use Dubai time; log times use UTC.
 
+## SSD jam detector
+
+Each tick independently counts sandboxd threads with two-second process deadlines.
+Two consecutive counts of at least 78 start a jam; a count below 60 clears it.
+Two unavailable inventories enter `unknown_stall`: samples of sandboxd and any
+known stuck read-probe child, U-state processes and 60 seconds of TCC logs are
+captured, with no recovery actions. Healthy ticks run no samples or log queries.
+
+`~/.local/state/robob-guard/tcc-jam.ndjson` records each diagnosis, outstanding
+prompts, attributed processes and launchd labels, the three largest subjects,
+request rates from sandboxd msgID deltas, bounded raw log receipts (including
+truncation flags), recovery receipts and every notification
+attempt (full text, key and exit code). Raw excerpts are limited to 2 MB; analysis
+streams up to 32 MB / 32,768 requests with a separate five-second deadline.
+An exhausted analysis budget or failed query allows evidence only. Flood recovery
+requires >50/s over the full 60-second window and new progress on consecutive ticks.
+It counts observed subjects or msgID deltas between nearby requests with matching
+service, subject and PID attribution covering at least 30 distinct seconds. This tolerates
+dropped log records; unknown or mixed-service/subject/PID records break inferred
+attribution. Ambiguous shared-interpreter PIDs cannot select a flood target.
+Attribution older than the target's process
+birth is rejected, and outstanding prompts survive the 60-second log window.
+Recovery first removes leftover askers, then suspends a nonprotected flooder
+after two >50 req/s observations. Continued flooding unloads its verified
+LaunchAgent and kills it, recording the bootstrap undo command. Suspensions have
+a persisted 60-second resume lease, activated only after a successful STOP
+receipt and resolved once inventory is available again. An interrupted,
+unconfirmed intent raises an alert for journal reconciliation and never
+authorizes CONT by itself.
+Process identity, ancestry and launchd ownership are checked before each action;
+system processes, Robob/provider sessions, OpenCode and GUI apps are protected.
+Every mutation is also journalled to the #106 board artifact `actions.ndjson`.
+
+User tccd restart is the final rung: two prompt-wait samples, no remaining asker,
+exact uid/path identity and at most one attempt per hour. `TCC_AUTO_RESTART`
+is **off by default**; only an explicit `1`, `true` or `yes` enables it. Obtain
+the owner's standing approval before configuring that environment variable.
+The root tccd and sandboxd are never restarted. Detection state and the restart
+cooldown live under `tcc_jam` in the existing guard `state.json`.
+
+Fixtures retain only timestamp/message excerpts from #106's
+`tccd432-1235.ndjson` (17 Nov), plus a small healthy `ps -M` inventory.
+
 ## Install holds
 
 ```zsh
@@ -89,6 +132,15 @@ and its beat is less than 90 seconds old (missing, nonnumeric and future
 timestamps are invalid). At the age limit the beater stops and the guard
 ignores the hold even if its owner and heartbeat remain alive. Stale/dead holds are logged and left in
 place, and do not prevent reopening. Install holds reset the down count.
+
+Mac Upkeep #107 owns `~/.local/state/mac-upkeep/ssd-launchd-read-blocked`.
+While Robob is down, the guard holds recovery only if that marker is a JSON object
+and `~/.local/state/mac-upkeep/ssd-read-probe.json` is less than 300 seconds old.
+It logs `ssd-block:<lastOutcome>` with `since` and `lastOutcome`, without a new alert;
+a stale probe or unreadable marker is logged and ignored. Down checks keep counting,
+so recovery can proceed on the next check after the block clears. Install holds
+take precedence. Tests can override the paths with `ROBOB_GUARD_SSD_BLOCK_PATH`
+and `ROBOB_GUARD_SSD_PROBE_STATE_PATH`.
 
 The cutover scripts source `scripts/install-hold.zsh` before their first quit.
 It shares a verified parent hold across nested scripts and uses `zshexit`,
@@ -127,7 +179,7 @@ read failures appear in the row. `orphan_backend` records the runtime owner's PI
 parent, port, start time and loopback listener check, or null. Runtime and child-log
 reads are capped at 64 KiB with a two-second deadline; an uncertain ownership read
 holds recovery until ownership can be checked.
-The guard writes only in this directory. The hold helper also writes the
+The guard writes here and in the shared #106 actions journal. The hold helper also writes the
 install hold file. Runtime ownership and the child log are read from `~/.robob/userdata`;
 the guard never opens SQLite.
 

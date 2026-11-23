@@ -8,13 +8,15 @@ import os
 from pathlib import Path
 import re
 import uuid
+from boot_identity import identity
 
 RUN_ID = uuid.uuid4().hex
 VOLUME_THREAD_ID = re.compile(r'(?:thread:project:[^\s:]+:)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 CAP_BYTES = 50 * 1024 * 1024
 # Explicit schema: unknown keys and nested payloads cannot enter a log by accident.
-NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
+NUMBERS = {'boots', 'uncleanBoots'}
+NUMBERS.update('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
 NUMBERS.update('elapsedMs deniedCount partialChildCount inventorySourceErrors'.split())
 NUMBERS.update('rootsOk rootsTimeout rootsDenied scanMs'.split())
@@ -250,7 +252,7 @@ def cpu_fields(values):
     numeric = {'windowS', 'cpuS', 'totalCpuPct', 'ncpu', 'processCount', 'runnable',
                'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb',
                'skippedLines', 'badLines', 'lines', 'exiting', 'systemCpuPct',
-               'userPct', 'sysPct', 'nicePct', 'idlePct', 'kernelTaskPct', 'kernelTaskWindowS',
+               'userPct', 'sysPct', 'nicePct', 'idlePct', 'kernelTaskPct', 'kernelTaskWindowS', 'kernelTaskWallMs',
                'unattributedCpuPct', 'spawned', 'exited', 'uid', 'perMinute',
                'childCpuPct', 'childReadable', 'childUnreadable', 'childUncertainParents',
                'lostParents', 'unattributedAfterChildrenPct', 'observedSpawnsLowerBound',
@@ -447,12 +449,14 @@ def host_fields(values, event):
 
 MACGUARD_KEYS = set("""pid start comm args action result errno actionClass owner cpuDelta footprintGiB compressedGiB growthGiBMin history at cpuS memoryClass label key threadId evidence summary probe failure cycleMs durationS signals load rCount rZeroCount lagS pressure swap usedMb totalMb largest treeGiB strain reason tmuxSession log idlePct""".split())
 MACGUARD_KEYS.update(('app', 'bundleId', 'growthGiBHour', 'footprintSeries', 'step', 'detail'))
+MACGUARD_KEYS.update('stages stage renice identityRead identityRecheck getpriority readBack niceBefore niceAfter taskpolicy same rc stderr strerror mode'.split())
+MACGUARD_KEYS.update(('protectedBy', 'protectedAncestor'))
 
 
 def macguard_fields(values, depth=0):
     # Only mac-guard opts into this bounded nested schema. Shared event kinds
     # retain their existing filters; process arguments use the CPU redactor.
-    from cpu_labels import command_label
+    from cpu_labels import command_label, bounded_detail
     if depth > 5:
         return None
     if isinstance(values, dict):
@@ -460,7 +464,9 @@ def macguard_fields(values, depth=0):
         for key, value in values.items():
             if key not in MACGUARD_KEYS:
                 continue
-            if key == 'threadId' and isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9:_%./@+-]{1,1000}', value):
+            if key in ('reason', 'stderr', 'strerror') and isinstance(value, str):
+                result[key] = bounded_detail(value)
+            elif key == 'threadId' and isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9:_%./@+-]{1,1000}', value):
                 result[key] = value
             else:
                 result[key] = macguard_fields(value, depth+1)
@@ -555,7 +561,108 @@ def janitor_mcp_fields(values):
     return result
 
 
+def suspend_fields(values):
+    from cpu_labels import command_label
+
+    result = {}
+    for key, value in values.items():
+        if key in ('pid', 'ppid', 'createdAt', 'deadline', 'firstSeen', 'ageS', 'count', 'unownedCount',
+                   'timeoutS', 'elapsedMs', 'loadAvg1') and finite_number(value):
+            result[key] = value
+        elif key in ('recovered', 'overdue') and type(value) is bool:
+            result[key] = value
+        elif key in ('comm', 'command', 'owner') and isinstance(value, str):
+            result[key] = command_label(value) or '[redacted]'
+        elif key in ('start', 'stat', 'comm', 'command', 'owner', 'reason', 'actor', 'card', 'then', 'phase', 'result', 'cmd') and isinstance(value, str):
+            result[key] = '[redacted]' if SECRET.search(value) else ''.join(c if c.isprintable() else ' ' for c in value[:1000])
+        elif key == 'readBack' and isinstance(value, list):
+            result[key] = [{k: v for k, v in row.items()
+                            if (k in ('signal', 'stat') and isinstance(v, str)
+                                and re.fullmatch(r'[A-Za-z+<>?-]{1,32}', v))
+                            or (k == 'sent' and type(v) is bool)}
+                           for row in value[:8] if isinstance(row, dict)]
+    return result
+
+
+def boot_fields(values):
+    result = {}
+    def path(value):
+        # Date-bearing diagnostic names resemble card numbers to the generic
+        # secret detector; these fixed report roots contain requested metadata.
+        if isinstance(value, str) and len(value) <= 512 and re.fullmatch(
+                r'(?:/Library/Logs/DiagnosticReports|/Users/[^/]+/Library/Logs/DiagnosticReports)/(?:Retired/)?[A-Za-z0-9_.()+ -]+', value):
+            return value
+        return text(value)
+    def text(value, limit=512):
+        if value is None:
+            return None
+        if isinstance(value, str) and len(value) <= limit and not SECRET.search(value):
+            return ''.join(c for c in value if c.isprintable())
+        return None
+    for key, value in (values or {}).items():
+        if key in ('bootTime', 'previousBootTime'):
+            result[key] = text(value, 40)
+        elif key in ('uptimeAtPreviousSample', 'lastSampleGapS', 'observedAt'):
+            result[key] = value if finite_number(value) and value >= 0 else None
+        elif key in ('clean', 'shutdownRecord', 'forcedWatchdogTimeout') and (value is None or type(value) is bool):
+            result[key] = value
+        elif key in ('shutdownReason', 'bootReason'):
+            result[key] = text(value, 2048)
+        elif key == 'shutdownRequest' and isinstance(value, dict):
+            result[key] = {k: text(value.get(k)) for k in (
+                'operation', 'requestedAt', 'confirmedAt', 'senderBundle', 'senderName',
+                'humanActor', 'callerChain', 'initiatedAt')}
+            result[key]['senderPid'] = value.get('senderPid') if type(value.get('senderPid')) is int else None
+            for field in ('softwareUpdate', 'senderForeground'):
+                result[key][field] = value.get(field) if type(value.get(field)) is bool else None
+        elif key == 'bootFaults':
+            result[key] = (dict(raw=text(value.get('raw'), 256),
+                                bootFailureCount=value.get('bootFailureCount')
+                                if type(value.get('bootFailureCount')) is int else None)
+                           if isinstance(value, dict) else None)
+        elif key == 'shutdownCause':
+            result[key] = (dict(code=value.get('code') if type(value.get('code')) is int else None,
+                                meaning='unmapped') if isinstance(value, dict) else None)
+        elif key in ('panic', 'shutdownStall') and isinstance(value, dict):
+            result[key] = dict(present=value.get('present') is True, path=path(value.get('path')))
+            if key == 'shutdownStall':
+                result[key].update({k: text(value.get(k), 40) for k in ('sampleStart', 'sampleEnd')})
+        elif key == 'jetsamReportsLast2h' and isinstance(value, dict):
+            result[key] = dict(count=value.get('count') if type(value.get('count')) is int else None,
+                               newestPath=path(value.get('newestPath')))
+        elif key == 'source' and isinstance(value, dict):
+            result[key] = {}
+            for field, source in value.items():
+                if field not in ('bootTime', 'previousBootTime', 'uptimeAtPreviousSample',
+                                 'lastSampleGapS', 'clean', 'shutdownCause', 'bootFaults',
+                                 'panic', 'shutdownStall', 'jetsamReportsLast2h', 'shutdownRequest',
+                                 'shutdownRecord', 'shutdownReason', 'bootReason', 'forcedWatchdogTimeout') or not isinstance(source, dict):
+                    continue
+                result[key][field] = {k: (path(v) if k == 'path' else v if v is None or type(v) in (int, bool) else text(v))
+                    for k, v in source.items() if k in ('read', 'error', 'path', 'windowStart',
+                    'windowEnd', 'droppedRows', 'dumpPanic', 'lastRow', 'lastSample',
+                    'shutdownRecord', 'abnormalEvidence', 'sampleRead', 'sampleError', 'verdict')}
+    return result
+
+
 def safe_fields(values, event=None):
+    if event in ('janitor.tmpdir_remove', 'janitor.tmpdir_run'):
+        result = {}
+        for key, value in (values or {}).items():
+            if key in ('bytes', 'ageS', 'found', 'removed', 'removed_bytes', 'idle_hours') and finite_number(value) and value >= 0:
+                result[key] = value
+            elif key in ('report_only', 'partial') and type(value) is bool:
+                result[key] = value
+            elif key == 'rule' and value in ('agent', 'guard', 'vitest'):
+                result[key] = value
+            elif key == 'path' and isinstance(value, str) and value.startswith('/'):
+                result[key] = '[redacted]' if SECRET.search(value) else value[:2048]
+        return result
+    if event == 'guard.reclaim':
+        from guard_reclaim import log_fields
+        return log_fields(values or {})
+    if event and event.startswith('suspend.'):
+        return suspend_fields(values or {})
     if event and event.startswith('macguard.'):
         return macguard_fields(values or {})
     if event == 'host.spawn_sample':
@@ -628,6 +735,15 @@ def safe_fields(values, event=None):
         return result
     if event in ('host.vitals', 'host.families_lite'):
         return host_fields(values, event)
+    if event == 'boot.observed':
+        return boot_fields(values)
+    if event == 'log.rollup':
+        result = safe_fields(values)
+        try:
+            result['day'] = dt.date.fromisoformat(values['day']).isoformat()
+        except (KeyError, TypeError, ValueError):
+            pass
+        return result
     if event == 'scan.volume_crawl':
         result = {}
         for key, value in (values or {}).items():
@@ -853,6 +969,11 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
         raise ValueError('invalid component')
     row = dict(ts=now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), tool='mac',
                component=component, kind=kind, name=name)
+    # Boot observations use the original boot timestamp, including queued writes.
+    boot_id = (dict(bootEpoch=now.timestamp(), bootTime=now.isoformat().replace('+00:00', 'Z'))
+               if name == 'boot.observed' else identity())
+    if boot_id:
+        row.update(boot_id)
     if finite_number(duration_ms) and duration_ms >= 0:
         row['durationMs'] = round(duration_ms, 3)
     if type(ok) is bool:
@@ -1006,8 +1127,8 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                     'crash.unified.skip', 'crash.source', 'crash.collect') and
                     row.get('props', {}).get('skippedS', 0) > 0)
                 # Preserve the bounded host heartbeat through a noisy day's cap.
-                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload', 'host.spawn_sample')
-                if kind != 'error' and not coverage_gap and not host_sample and not dedup_id:
+                host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload', 'host.spawn_sample', 'guard.reclaim', 'macguard.action')
+                if kind != 'error' and not coverage_gap and not host_sample and not dedup_id and name != 'boot.observed':
                     return
             append(fd, row)
             return True

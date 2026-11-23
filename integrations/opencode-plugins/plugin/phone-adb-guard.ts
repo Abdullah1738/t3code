@@ -1,5 +1,5 @@
 import { hook as toolLogHook, runSource } from "../lib/toollog";
-import { failureProps, runClassifier } from "../lib/classifier";
+import { classifierPhases, failureProps, runClassifier } from "../lib/classifier";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -28,12 +28,12 @@ export function createGuardHook(directory: string, check = classify) {
     try { verdict = await check(command); }
     catch (error) {
       toolLogHook("phone-adb", "allowed", "phone-adb-unavailable", started, command, "hook.classifier_failed", { sessionId: event.sessionID }, { cwd },
-        failureProps(classifier, error, command, started));
+        failureProps(classifier, error, command, started), classifierPhases(error));
       return;
     }
     if (verdict.matched || verdict.error) {
       toolLogHook("phone-adb", verdict.reason ? "denied" : "allowed", verdict.rule ?? "phone-adb-unavailable", started, command, verdict.error ?? undefined, { sessionId: event.sessionID }, { cwd },
-        { holder: verdict.holder, adbVerb: verdict.adbVerb, source: runSource() });
+        { holder: verdict.holder, adbVerb: verdict.adbVerb, source: runSource() }, classifierPhases(verdict));
     }
     if (verdict.reason) {
       event.input = { ...input, [field]: `printf '%s\\n' ${quote(verdict.reason)} >&2; exit 5`, background: false };

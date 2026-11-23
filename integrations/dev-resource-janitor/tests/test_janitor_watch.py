@@ -24,6 +24,39 @@ import janitor_watch  # noqa: E402
 
 
 class WorkerTests(JanitorTestCase):
+    def test_expo_signal_rechecks_robob_ancestry(self):
+        for protect_after_term in (False, True):
+            with self.subTest(protect_after_term=protect_after_term):
+                parent = dict(pid=30, ppid=1, args='/bin/zsh')
+                target = dict(pid=42, ppid=30, args='node expo.js')
+                rows = {30: parent, 42: target}
+                if not protect_after_term:
+                    parent['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+                def pause(seconds):
+                    parent['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+                with patch.object(dev_janitor.leftover_processes, 'cpu_processes', return_value=rows), \
+                        patch.object(dev_janitor.os, 'kill') as send, \
+                        patch.object(dev_janitor.time, 'sleep', side_effect=pause), \
+                        patch.object(dev_janitor, 'sh', return_value=(0, '', '')):
+                    ok, reason = dev_janitor.act(dict(kind='expo', pids=[42]))
+                self.assertFalse(ok)
+                self.assertEqual(reason, 'protected Robob descendant')
+                self.assertEqual([c.args for c in send.call_args_list],
+                                 [(42, signal.SIGTERM)] if protect_after_term else [])
+
+    def test_expo_below_robob_provider_still_signals(self):
+        rows = {10: dict(pid=10, ppid=1, args='node apps/server/dist/bin.mjs --bootstrap-fd 3'),
+                20: dict(pid=20, ppid=10, args='/opt/codex exec'),
+                30: dict(pid=30, ppid=20, args='/bin/zsh build.sh'),
+                42: dict(pid=42, ppid=30, args='node expo.js')}
+        with patch.object(dev_janitor.leftover_processes, 'cpu_processes', return_value=rows), \
+                patch.object(dev_janitor.os, 'kill') as send, \
+                patch.object(dev_janitor.time, 'sleep'), \
+                patch.object(dev_janitor, 'sh', return_value=(0, '', '')):
+            ok, reason = dev_janitor.act(dict(kind='expo', pids=[42]))
+        self.assertTrue(ok, reason)
+        self.assertEqual([c.args for c in send.call_args_list], [(42, signal.SIGTERM), (42, signal.SIGKILL)])
+
     def test_log_run_keeps_counters_and_adds_one_summary_and_timings(self):
         summary = dev_janitor.leftover_processes.detect({}, {}, {}, dict(complete=True))['mcp_summary']
         with patch.object(dev_janitor.time, 'monotonic', return_value=2), \
@@ -46,8 +79,10 @@ class WorkerTests(JanitorTestCase):
                     patch.object(dev_janitor, 'procs', return_value=[]), \
                     patch.object(dev_janitor, 'sh', return_value=(1, '', '')), \
                     patch.object(dev_janitor, 'keep_list', return_value=[]), \
+                    patch.object(dev_janitor.time, 'time', return_value=100.8), \
                     patch.object(lp, 'scan', **kw), patch.object(dev_janitor.time, 'monotonic', side_effect=lambda: next(clock)):
                 report = dev_janitor.scan()
+            self.assertEqual(report['ts'], 100.8)
             for phase in ('sessions', 'liveness', 'resource_processes', 'simulators', 'expo', 'docker',
                           'session_evidence', 'leftover_processes'):
                 self.assertEqual(report['phase_ms'][phase], 1.0)
@@ -159,6 +194,7 @@ class WorkerTests(JanitorTestCase):
                      "owner_calls": {"by_native": {"count": 3, "p50_ms": 10, "p95_ms": 20,
                                                    "max_ms": 20, "failures": {"404": 1}}}}
         report = {"ts": 123, "resources": [], "candidates": [], "processes": processes,
+                  "liveness": dict(attempts=3, seconds=67, last_error="control api projects: timed out"),
                   "liveness_unavailable": "control api projects: timed out"}
         with (self.state_dir / "lock").open("a+") as lock, \
                 patch.object(dev_janitor, "scan", return_value=report), \
@@ -169,6 +205,7 @@ class WorkerTests(JanitorTestCase):
         self.assertEqual(janitor_watch.read_state()['processes'], processes)
         entry = json.loads((self.root / "audit.jsonl").read_text())
         self.assertEqual(entry, {"ts": 123, "event": "report", "processes": processes,
+                                 "liveness": report['liveness'],
                                  "phase_ms": {},
                                  "liveness_unavailable": report["liveness_unavailable"]})
 

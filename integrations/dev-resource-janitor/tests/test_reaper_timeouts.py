@@ -37,11 +37,11 @@ class ReaperTimeoutTests(JanitorTestCase):
         status = json.loads(output.getvalue()[output.getvalue().index('{\n'):])
         self.assertEqual(status['kept']['main_worktree'], 20)
         self.assertEqual(status['skipped_timeouts'][0]['path'], '/slow')
-        self.assertEqual(status['skipped_timeouts'][0]['phase'], 'discover')
+        self.assertEqual(status['skipped_timeouts'][0]['phase'], 'binding')
         self.assertEqual(status['timeouts'], 1)
 
     def run_fixture(self, fail=None, *, dry_run=True, count=20, history=None, listing=False, commons=None,
-                    archive_error=None, real_cwds=False):
+                    archive_error=None, real_cwds=False, discovery=None):
         import tempfile
         from types import SimpleNamespace
         calls = []
@@ -78,7 +78,8 @@ class ReaperTimeoutTests(JanitorTestCase):
                 (reaper, 'session_activity', {'return_value': history if history is not None else {}}),
                 (reaper, 'removal_activity', {'return_value': {}}),
                 (reaper, 'keep_list', {'return_value': []}),
-                (reaper, 'discover', {'return_value': commons or ['/repo.git']}),
+                (reaper, 'discover', {'side_effect': discovery} if discovery else
+                 {'return_value': commons or ['/repo.git']}),
                 (reaper.os.path, 'isdir', {'return_value': True}),
                 (reaper.os, 'stat', {'return_value': SimpleNamespace(st_birthtime=1)}),
                 (reaper.time, 'time', {'return_value': now}),
@@ -192,6 +193,58 @@ class ReaperTimeoutTests(JanitorTestCase):
         self.assertIn('git_timeout', error)
         activity.assert_not_called()
 
+    def test_find_timeout_does_not_block_known_or_unrelated_project_history(self):
+        for skipped in ['/home', '/home/slow']:
+            with self.subTest(skipped=skipped):
+                history = reaper.Activity({}, {'p': '/home/project'}, {}, None)
+
+                def discover(dirs, tracker):
+                    tracker.skip(skipped, 'discover', subprocess.TimeoutExpired(['find', skipped], 300))
+                    return ['/repo.git']
+
+                with patch.object(reaper.active_sessions, 'project_activity', return_value=({}, None)):
+                    rc, status, _, _, _ = self.run_fixture(history=history, discovery=discover)
+                self.assertEqual(rc, 0, status)
+                self.assertEqual(status['activity_history_unavailable'], {})
+                self.assertEqual(len(status['would_remove']), 20)
+
+    def test_known_binding_is_not_blocked_by_another_binding_timeout(self):
+        tracker = reaper.Timeouts()
+        tracker.skip('/project/child', 'binding', subprocess.TimeoutExpired(['git', 'rev-parse'], 20))
+        history = reaper.Activity({}, {'p': '/project'}, {}, None)
+        history.commons = {'p': '/other.git'}
+        with patch.object(reaper.active_sessions, 'project_activity') as activity:
+            result, error = reaper.activity_for_repo('/repo.git', history, 100, ['/old'], tracker)
+        self.assertEqual(result, {})
+        self.assertIsNone(error)
+        activity.assert_not_called()
+
+    def test_project_binding_timeout_keeps_all_repos_in_main(self):
+        history = reaper.Activity({}, {'p': '/project'}, {}, None)
+
+        def fail(cmd, calls):
+            return 'rev-parse' in cmd and '/project' in cmd
+
+        rc, status, _, archive, _ = self.run_fixture(fail, history=history)
+        self.assertEqual(rc, 0, status)
+        self.assertIn('project repository binding unavailable', status['activity_history_unavailable']['/repo.git'])
+        self.assertEqual(status['kept']['activity_history_unavailable'], 20)
+        self.assertEqual(status['would_remove'], [])
+        self.assertEqual(archive, [])
+
+    def test_find_timeout_still_protects_worktrees_in_its_subtree(self):
+        for dry_run in [True, False]:
+            with self.subTest(dry_run=dry_run):
+                def discover(dirs, tracker):
+                    tracker.skip('/work/0', 'discover', subprocess.TimeoutExpired(['find', '/work/0'], 300))
+                    return ['/repo.git']
+                rc, status, calls, archive, _ = self.run_fixture(discovery=discover, dry_run=dry_run)
+                self.assertEqual(rc, 0, status)
+                self.assertEqual(status['kept']['git_timeout'], 1)
+                self.assertEqual(len(status['would_remove'] + status['removed']), 19)
+                self.assertFalse(any('remove' in cmd and '/work/0' in cmd for cmd in calls))
+                self.assertFalse(any(call.args[0]['path'] == '/work/0' for call in archive))
+
     def test_discovery_timeout_path_is_kept_even_if_roster_finds_it(self):
         tracker = reaper.Timeouts()
         tracker.skip('/work/0/subdir', 'discover', subprocess.TimeoutExpired(['git', 'rev-parse'], 20))
@@ -232,10 +285,14 @@ class ReaperTimeoutTests(JanitorTestCase):
                 raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
             return subprocess.CompletedProcess(cmd, 0, '/repo.git\n' if cmd[0] == 'git' else '/work/.git\n', '')
         tracker = reaper.Timeouts()
+        from types import SimpleNamespace
         with patch.object(reaper, 'SCAN_ROOTS', [('/scan', 3)]), \
+                patch.object(reaper.os, 'scandir') as scandir, \
                 patch.object(reaper.os.path, 'isdir', return_value=True), \
                 patch.object(reaper.subprocess, 'run', side_effect=run), \
                 contextlib.redirect_stdout(io.StringIO()):
+            scandir.return_value.__enter__.return_value = [SimpleNamespace(
+                name='work', path='/scan/work', is_symlink=lambda: False, is_dir=lambda: True)]
             self.assertEqual(reaper.discover({'/work'}, tracker), ['/repo.git'])
         self.assertEqual(len([cmd for cmd in calls if cmd[0] == 'git']), 2)
         self.assertEqual(tracker.skipped, [])

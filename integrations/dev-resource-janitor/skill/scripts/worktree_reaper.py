@@ -58,6 +58,7 @@ class Timeouts:
     def __init__(self):
         self.events = []
         self.skipped = []
+        self.discover_roots = []
         self.wait_s = 0
 
     def run(self, cmd, path, phase, timeout, retry=False, cwd=None):
@@ -70,15 +71,16 @@ class Timeouts:
                 self.wait_s += elapsed
                 event = 'timeout'
             else:
-                if attempt == 1:
+                if attempt == 1 and cmd[0] != 'find':
                     return result
                 elapsed = time.monotonic() - started
-                event = 'retry_complete'
+                event = 'complete' if attempt == 1 else 'retry_complete'
             row = dict(path=path, cmd=shlex.join(cmd), timeout_s=timeout, attempt=attempt,
                        phase=phase, event=event, duration_s=round(elapsed, 3))
-            self.events.append(row)
+            if event != 'complete':
+                self.events.append(row)
             print('worktree_reaper_command ' + json.dumps(row), flush=True)
-            if event == 'retry_complete':
+            if event != 'timeout':
                 return result
             if not retry or attempt == 2:
                 raise subprocess.TimeoutExpired(cmd, timeout)
@@ -88,10 +90,11 @@ class Timeouts:
         if row not in self.skipped:
             self.skipped.append(row)
 
-    def blocked(self, path):
+    def blocked(self, path, phases=None):
         path = os.path.realpath(path)
         return any(inside(path, os.path.realpath(row['path'])) or
-                   inside(os.path.realpath(row['path']), path) for row in self.skipped)
+                   inside(os.path.realpath(row['path']), path) for row in self.skipped
+                   if phases is None or row['phase'] in phases)
 
 
 def git(args, cwd=None, timeout=60, *, timeouts=None, path=None, phase='check', retry=True):
@@ -113,10 +116,10 @@ def inside(path, root):
 def common_dir(d, timeouts=None):
     try:
         rc, out, _ = git(["-C", d, "rev-parse", "--path-format=absolute", "--git-common-dir"], timeout=20,
-                         timeouts=timeouts, path=d, phase='discover')
+                         timeouts=timeouts, path=d, phase='binding')
     except subprocess.TimeoutExpired as error:
         if timeouts is not None:
-            timeouts.skip(d, 'discover', error)
+            timeouts.skip(d, 'binding', error)
         return None
     return os.path.realpath(out.strip()) if rc == 0 and out.strip() else None
 
@@ -141,17 +144,31 @@ def discover(session_dirs, timeouts=None):
     for root, depth in SCAN_ROOTS:
         if not os.path.isdir(root):
             continue
-        cmd = ["find", root, "-maxdepth", str(depth)]
-        for n in FIND_PRUNE:
-            cmd += ["-name", n, "-prune", "-o"]
-        cmd += ["-name", ".git", "-print"]
-        try:
-            p = timeouts.run(cmd, root, 'discover', 300)
-        except subprocess.TimeoutExpired as error:
-            timeouts.skip(root, 'discover', error)
+        if os.path.basename(root.rstrip('/')) in FIND_PRUNE:
             continue
-        for g in p.stdout.splitlines():
-            add(os.path.dirname(g))
+        with os.scandir(root) as entries:
+            children = sorted(entry.path for entry in entries if entry.name not in FIND_PRUNE
+                              and (entry.name == '.git' or (not entry.is_symlink() and entry.is_dir())))
+        for child in children:
+            cmd = ["find", child, "-maxdepth", str(depth - 1)]
+            for n in FIND_PRUNE:
+                cmd += ["-name", n, "-prune", "-o"]
+            cmd += ["-name", ".git", "-print"]
+            row = dict(root=child, duration_s=0, found=0, timed_out=False)
+            timeouts.discover_roots.append(row)
+            started = time.monotonic()
+            try:
+                p = timeouts.run(cmd, child, 'discover', 300)
+            except subprocess.TimeoutExpired as error:
+                timeouts.skip(child, 'discover', error)
+                row['timed_out'] = True
+                continue
+            finally:
+                row['duration_s'] = round(time.monotonic() - started, 3)
+            found = p.stdout.splitlines()
+            row['found'] = len(found)
+            for g in found:
+                add(os.path.dirname(g))
     return sorted(commons)
 
 
@@ -217,7 +234,8 @@ def activity_for_repo(common, history, now, worktree_paths=None, timeouts=None):
     if history.commons is None:
         history.commons = {pid: common_dir(root, timeouts) for pid, root in history.projects.items() if os.path.isdir(root)}
     # Unknown project bindings cannot prove that this repo has no recent threads.
-    if timeouts and any(timeouts.blocked(root) for root in history.projects.values()):
+    if timeouts and any(history.commons.get(pid) is None and timeouts.blocked(root, {'binding'})
+                        for pid, root in history.projects.items()):
         return None, 'git_timeout: project repository binding unavailable'
     activity = dict(history)
     if worktree_paths is None:
@@ -519,6 +537,7 @@ def main():
         st["state"] = "error"
         st["errors"].append(f"{type(e).__name__}: {e}")
     st['skipped_timeouts'] = timeouts.skipped
+    st['discover_roots'] = timeouts.discover_roots
     st['timeout_events'] = timeouts.events
     st['timeouts'] = len({os.path.realpath(row['path']) for row in timeouts.skipped})
     st['timeout_wait_s'] = round(timeouts.wait_s, 3)

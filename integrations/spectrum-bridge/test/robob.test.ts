@@ -47,7 +47,7 @@ afterEach(async () => {
 });
 
 /** A small in-memory stand-in for /api/ardud/control. */
-function fakeControl() {
+function fakeControl(ownedServers = servers) {
   const threads = new Map<string, Thread>();
   const natives = new Map<string, string>();
   const calls: Call[] = [];
@@ -149,12 +149,13 @@ function fakeControl() {
       if (thread && parts[2] === "messages") {
         const call = calls.at(-1)!;
         const since = searchParams.has("since") ? Number(searchParams.get("since")) : -Infinity;
-        const response = ok({ threadId: thread.threadId, state: state(thread), status: thread.runs.at(-1)?.status ?? "idle", runId: thread.runs.at(-1)?.runId ?? null,
-          messages: thread.messages.filter(message => message.role !== "system" && Date.parse(message.updatedAt ?? "") > since)
-            .sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? "") || a.messageId.localeCompare(b.messageId)) });
-        const payload = await response.clone().text();
-        Object.assign(call, { rows: JSON.parse(payload).messages.length, bytes: Buffer.byteLength(payload) });
-        return response;
+        const messages = thread.messages.filter(message => message.role !== "system" && Date.parse(message.updatedAt ?? "") > since)
+          .map(message => ({ message, created: Date.parse(message.createdAt ?? "") }))
+          .sort((a, b) => a.created - b.created || a.message.messageId.localeCompare(b.message.messageId))
+          .map(({ message }) => message);
+        const payload = JSON.stringify({ ok: true, threadId: thread.threadId, state: state(thread), status: thread.runs.at(-1)?.status ?? "idle", runId: thread.runs.at(-1)?.runId ?? null, messages });
+        Object.assign(call, { rows: messages.length, bytes: Buffer.byteLength(payload) });
+        return new Response(payload, { status: 200, headers: { "content-type": "application/json;charset=utf-8" } });
       }
       if (thread && parts[2] === "runs" && parts[4] === "evidence") {
         const runId = parts[3]!;
@@ -195,7 +196,7 @@ function fakeControl() {
       }
       return notFound();
     } });
-    servers.push(server);
+    ownedServers.push(server);
     return server.url.origin;
   })();
   /** Finishes the newest run with an assistant reply. */
@@ -212,6 +213,28 @@ function fakeControl() {
     finishes: ids => { lookups.push([...ids]); return new Map(ids.flatMap(id => finishes.has(id) ? [[id, finishes.get(id)!] as const] : [])); } });
   return { url, threads, natives, calls, projects, flags, reply, backend, finishes, lookups };
 }
+
+test("fake message reads preserve sort ties, JSON bytes and response metadata", async () => {
+  const control = fakeControl();
+  const chat = await control.backend().createChat();
+  const thread = control.threads.get(chat.id)!;
+  thread.messages = ["message-10", "message-2", "message-2", "message-1"].map((messageId, index) => ({
+    messageId, runId: null, role: index === 3 ? "system" : "assistant", streaming: false,
+    text: `café ☕ ${index}`, createdAt: index === 2 ? null : "2026-11-15T09:30:00Z", updatedAt: "2026-11-15T09:30:01Z",
+  }));
+  for (const since of [undefined, Date.parse("2026-11-15T09:30:00Z"), Date.parse("2026-11-15T09:30:01Z")]) {
+    const messages = thread.messages.filter(message => message.role !== "system" && Date.parse(message.updatedAt ?? "") > (since ?? -Infinity))
+      .sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? "") || a.messageId.localeCompare(b.messageId));
+    const expected = Response.json({ ok: true, threadId: chat.id, state: "idle", status: "idle", runId: null, messages });
+    const response = await fetch(`${control.url}/api/ardud/control/threads/${chat.id}/messages${since === undefined ? "" : `?since=${since}`}`, { headers: { authorization: "Bearer test-token" } });
+    expect(response.status).toBe(expected.status);
+    expect(response.headers.get("content-type")).toBe(expected.headers.get("content-type"));
+    const payload = await response.text();
+    expect(payload).toBe(await expected.text());
+    expect(control.calls.at(-1)).toMatchObject({ rows: messages.length, bytes: Buffer.byteLength(payload) });
+    thread.messages[0]!.createdAt = "2026-11-15T09:29:00Z";
+  }
+});
 
 test("backend switch defaults to OpenChamber and rejects unknown values", () => {
   expect(backendKind({}, {})).toBe("openchamber");
@@ -2960,58 +2983,64 @@ for (const { historySize, scenario } of [100, 1_500].flatMap(historySize => ["id
     const results = [];
     for (const legacy of [true, false]) {
       setSystemTime(start);
-      const control = fakeControl();
+      const ownedServers: typeof servers = [];
+      const control = fakeControl(ownedServers);
       const backend = control.backend();
       if (legacy) {
         backend.messageReadScope = body => body();
         backend.client.messages = id => ControlClient.prototype.messages.call(backend.client, id);
       }
-      const store = new Store(":memory:"); stores.push(store);
-      const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } }, {
-        owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alert",
-        alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 5_000,
-      });
-      const chat = await backend.createChat();
-      const thread = control.threads.get(chat.id)!;
-      thread.driver = { instanceId: "codex", model: "test" };
-      await backend.prompt(chat.id, chat.directory, `msg_${"0".repeat(64)}`, "history");
-      for (let i = 0; i < historySize; i++) thread.messages.push({ messageId: `history-${i}`, role: "assistant", phase: "narration", text: "old text ".repeat(100),
-        runId: thread.runs[0]!.runId, streaming: false, createdAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString(), updatedAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString() });
-      thread.messages[0]!.createdAt = thread.messages[0]!.updatedAt = new Date(start - 120_000).toISOString();
-      thread.runs[0]!.status = "completed";
-      store.set("route", { ...chat, generation: 1 });
-      if (scenario !== "idle") {
-        store.acceptInbound("budget", { id: "budget", text: "hello", attachments: [], isAudioMessage: false, source: "typed", receivedAt: start });
-        await router.tick();
-        thread.messages.push({ messageId: "stream", role: "assistant", phase: "narration", text: "working", streaming: true,
-          runId: thread.runs.at(-1)!.runId, createdAt: new Date(start + 500).toISOString(), updatedAt: new Date(start + 500).toISOString() });
-      }
-      const startup = control.calls.filter(call => call.path.includes("/messages?"));
-      control.calls.length = 0;
-      const paths: Record<string, { messages: number; thread: number; evidence: number }> = {};
-      const collect = (path: string, from: number) => {
-        paths[path] ??= { messages: 0, thread: 0, evidence: 0 };
-        for (const call of control.calls.slice(from)) if (call.method === "GET") {
-          if (call.path.includes("/messages?")) paths[path]!.messages++;
-          else if (call.path.endsWith("/evidence")) paths[path]!.evidence++;
-          else if (/^\/threads\/[^/?]+$/.test(call.path)) paths[path]!.thread++;
+      const store = new Store(":memory:");
+      try {
+        const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } }, {
+          owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alert",
+          alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 5_000,
+        });
+        const chat = await backend.createChat();
+        const thread = control.threads.get(chat.id)!;
+        thread.driver = { instanceId: "codex", model: "test" };
+        await backend.prompt(chat.id, chat.directory, `msg_${"0".repeat(64)}`, "history");
+        for (let i = 0; i < historySize; i++) thread.messages.push({ messageId: `history-${i}`, role: "assistant", phase: "narration", text: "old text ".repeat(100),
+          runId: thread.runs[0]!.runId, streaming: false, createdAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString(), updatedAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString() });
+        thread.messages[0]!.createdAt = thread.messages[0]!.updatedAt = new Date(start - 120_000).toISOString();
+        thread.runs[0]!.status = "completed";
+        store.set("route", { ...chat, generation: 1 });
+        if (scenario !== "idle") {
+          store.acceptInbound("budget", { id: "budget", text: "hello", attachments: [], isAudioMessage: false, source: "typed", receivedAt: start });
+          await router.tick();
+          thread.messages.push({ messageId: "stream", role: "assistant", phase: "narration", text: "working", streaming: true,
+            runId: thread.runs.at(-1)!.runId, createdAt: new Date(start + 500).toISOString(), updatedAt: new Date(start + 500).toISOString() });
         }
-      };
-      let completedAt = 0;
-      for (let second = 1; second <= 60; second++) {
-        setSystemTime(start + second * 1_000);
-        const stream = thread.messages.find(message => message.messageId === "stream");
-        if (stream && second < 50) { stream.text += "."; stream.updatedAt = new Date().toISOString(); }
-        if (second === 30 && scenario === "steer") store.acceptInbound("budget-steer", { id: "budget-steer", text: "also this", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() });
-        if (second === 50 && scenario !== "idle") control.reply(chat.id, "done", "completed");
-        let from = control.calls.length; await router.checkCompletion(); collect("completion", from);
-        from = control.calls.length; await router.tick(); collect(second === 30 && scenario === "steer" ? "tick-steer" : "tick", from);
-        if (!completedAt && scenario !== "idle" && store.pendingOutbox().some(op => op.kind === "conversation" && op.text === "done")) completedAt = second;
+        const startup = control.calls.filter(call => call.path.includes("/messages?"));
+        control.calls.length = 0;
+        const paths: Record<string, { messages: number; thread: number; evidence: number }> = {};
+        const collect = (path: string, from: number) => {
+          paths[path] ??= { messages: 0, thread: 0, evidence: 0 };
+          for (const call of control.calls.slice(from)) if (call.method === "GET") {
+            if (call.path.includes("/messages?")) paths[path]!.messages++;
+            else if (call.path.endsWith("/evidence")) paths[path]!.evidence++;
+            else if (/^\/threads\/[^/?]+$/.test(call.path)) paths[path]!.thread++;
+          }
+        };
+        let completedAt = 0;
+        for (let second = 1; second <= 60; second++) {
+          setSystemTime(start + second * 1_000);
+          const stream = thread.messages.find(message => message.messageId === "stream");
+          if (stream && second < 50) { stream.text += "."; stream.updatedAt = new Date().toISOString(); }
+          if (second === 30 && scenario === "steer") store.acceptInbound("budget-steer", { id: "budget-steer", text: "also this", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() });
+          if (second === 50 && scenario !== "idle") control.reply(chat.id, "done", "completed");
+          let from = control.calls.length; await router.checkCompletion(); collect("completion", from);
+          from = control.calls.length; await router.tick(); collect(second === 30 && scenario === "steer" ? "tick-steer" : "tick", from);
+          if (!completedAt && scenario !== "idle" && store.pendingOutbox().some(op => op.kind === "conversation" && op.text === "done")) completedAt = second;
+        }
+        const reads = control.calls.filter(call => call.path.includes("/messages?"));
+        const full = reads.filter(call => !call.path.includes("since="));
+        results.push({ legacy, paths, gets: reads.length, full: full.length + startup.length, startupGets: startup.length, incremental: reads.length - full.length,
+          rows: reads.reduce((sum, call) => sum + (call.rows ?? 0), 0), bytes: reads.reduce((sum, call) => sum + (call.bytes ?? 0), 0), completedAt });
+      } finally {
+        await Promise.all(ownedServers.map(server => server.stop(true)));
+        store.db.close();
       }
-      const reads = control.calls.filter(call => call.path.includes("/messages?"));
-      const full = reads.filter(call => !call.path.includes("since="));
-      results.push({ legacy, paths, gets: reads.length, full: full.length + startup.length, startupGets: startup.length, incremental: reads.length - full.length,
-        rows: reads.reduce((sum, call) => sum + (call.rows ?? 0), 0), bytes: reads.reduce((sum, call) => sum + (call.bytes ?? 0), 0), completedAt });
     }
     const [before, after] = results;
     expect(after!.full).toBeLessThanOrEqual(before!.full * .1);
@@ -3188,7 +3217,8 @@ function rosterFixture() {
   });
   const server = { threads: [row("owner")], total: 1 };
   const reads = spyOn(client, "listThreads").mockImplementation(async () => structuredClone(server));
-  const roster = new ActiveRoster(client, () => time);
+  // These list-race cases exercise the full-list fallback; event-detail success has its own matrix.
+  const roster = new ActiveRoster({ listThreads: client.listThreads.bind(client), events: options => client.events(options) }, () => time);
   const backend = new RobobBackend({ chatRoot: "/chats", client, activeRoster: roster, finishes: () => new Map() });
   const chats = [backend, ...["moni", "group-a", "group-b", "idle-a", "idle-b"].map(name => backend.forChat(`chats/${name}`, name))];
   const event = (threadId: string, state: string, runId?: string) => {
@@ -3309,7 +3339,7 @@ test.each(["idle", "active", "steer", "stream-down"])("six Sendblue routers reta
   } finally { setSystemTime(); for (const store of stores) store.db.close(); }
 });
 
-test("sequenced busy patches need no GET; a draining run reconciles before clearing idle", async () => {
+test("sequenced busy patches need no GET; unavailable event detail falls back before clearing idle", async () => {
   const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
   f.event("owner", "idle");
   await f.backend.statuses(true);
@@ -3317,10 +3347,10 @@ test("sequenced busy patches need no GET; a draining run reconciles before clear
   f.event("owner", "running");
   for (const chat of f.chats) expect(await chat.statuses(true)).toEqual({ owner: { type: "busy", root: null } });
   expect(f.reads).toHaveBeenCalledTimes(2);
-  expect(f.roster.status()).toMatchObject({ ambiguous: 1, roster_event: 1 });
+  expect(f.roster.status()).toMatchObject({ detailErrors: 1, roster_event: 1 });
 });
 
-test("unknown threads, creation, archive, delete and resync refetch once", async () => {
+test("fallback discovery refetches; deletion removes locally and reconnect refetches", async () => {
   for (const data of [
     { type: "thread.status", threadId: "unknown", state: "running" }, { type: "thread.created", threadId: "new" },
     { type: "thread.updated", threadId: "owner", change: "thread.archived" },
@@ -3328,8 +3358,9 @@ test("unknown threads, creation, archive, delete and resync refetch once", async
   ]) {
     const f = rosterFixture(); f.roster.streamState(true); await f.backend.statuses();
     rosterEvent(f.roster, data); await Promise.all(f.chats.map(chat => chat.statuses(true)));
-    expect(f.reads).toHaveBeenCalledTimes(2);
-    expect(f.roster.status().roster_event).toBe(1); f.reads.mockRestore();
+    const localRemoval = data.change === "thread.deleted";
+    expect(f.reads).toHaveBeenCalledTimes(localRemoval ? 1 : 2);
+    expect(f.roster.status().roster_event).toBe(localRemoval ? 0 : 1); f.reads.mockRestore();
   }
 });
 
@@ -3348,7 +3379,7 @@ test("healthy steer admission uses cache, a stream gap awaits one fetch, replies
   expect((await f.chats[1]!.statuses()).owner?.type).toBe("busy");
   reconciliation.resolve(structuredClone(f.server)); await admission;
   expect(f.reads).toHaveBeenCalledTimes(3);
-  expect(f.roster.status().ambiguous).toBe(1);
+  expect(f.roster.status().detailErrors).toBeGreaterThanOrEqual(1);
   expect((await f.backend.statuses()).owner?.type).toBe("busy");
 });
 
@@ -3386,7 +3417,7 @@ test("events during a slow refresh survive its older snapshot", async () => {
   reconciliation.resolve(structuredClone(f.server));
   expect(await admission).toEqual({});
   expect(await f.backend.statuses()).toEqual({}); expect(f.reads).toHaveBeenCalledTimes(3);
-  expect(f.roster.status().ambiguous).toBe(1);
+  expect(f.roster.status().detailErrors).toBeGreaterThanOrEqual(1);
 });
 
 test("old-run status cannot clear a newer busy foreground", async () => {
@@ -3564,7 +3595,7 @@ test.each([false, true])("an in-flight run-1 completion cannot erase a fetched b
   reconciliation.resolve(structuredClone(f.server));
   expect(await admission).toEqual({ owner: { type: "busy", root: null } });
   expect(f.reads).toHaveBeenCalledTimes(3);
-  expect(f.roster.status().ambiguous).toBe(1);
+  expect(f.roster.status().detailErrors).toBeGreaterThanOrEqual(1);
 });
 
 test.each(["opening", "fetched", "resolved"])("request state remains authoritative during a slow refresh: %s", async source => {
@@ -3597,7 +3628,7 @@ test.each(["opening", "fetched", "resolved"])("request state remains authoritati
   expect(await admission).toEqual(source === "resolved" ? {} : { owner: { type: "busy", root: null } });
   expect(await f.backend.statuses()).toEqual(source === "resolved" ? {} : { owner: { type: "busy", root: null } });
   expect(f.reads).toHaveBeenCalledTimes(3);
-  expect(f.roster.status().ambiguous).toBe(1);
+  expect(f.roster.status().detailErrors).toBeGreaterThanOrEqual(1);
 });
 
 const detailRequestRaces = (["question", "approval"] as const).flatMap(kind =>
@@ -3732,7 +3763,7 @@ test.each(["resolved", "expired", "cancelled"])("a %s request cannot be revived 
   expect(await f.backend.statuses(true)).toEqual({});
   rosterEvent(f.roster, { type: "thread.status", threadId: "owner", runId: "run-1", status: "completed", state: "idle" });
   expect(await f.backend.statuses(true)).toEqual({});
-  expect(f.reads).toHaveBeenCalledTimes(3);
+  expect(f.reads).toHaveBeenCalledTimes(2);
 });
 
 test.each([
@@ -3831,7 +3862,7 @@ test.each([undefined, "9", "10", "bad", "9007199254740992"])("unordered event se
   const admission = Promise.all(f.chats.map(chat => chat.statuses(true)));
   response.resolve(structuredClone(f.server)); await admission;
   expect(f.reads).toHaveBeenCalledTimes(2);
-  expect(f.roster.status()).toMatchObject({ ambiguous: 1, roster_event: 1 });
+  expect(f.roster.status()).toMatchObject({ detailErrors: 1, roster_event: 1 });
 });
 
 test.each(["before", "during", "after"])("detail started %s the latest fetch clears only when ordered", async order => {

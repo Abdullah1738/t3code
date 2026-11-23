@@ -44,7 +44,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.identity_calls.append(self.path)
         self.reply({"identity": {"resolution": "resolved", "robobThreadId": "fixture-root", "rootThreadId": "fixture-root",
-                    "executionKind": "top-level", "driver": "claudeAgent" if "claudeAgent" in self.path else "codex",
+                    "executionKind": "top-level", "driver": "claudeAgent" if "claudeAgent" in self.path else "antigravity" if "antigravity" in self.path else "codex",
                     "providerInstanceId": "fixture", "parentThreadId": None}})
 
     def do_POST(self):
@@ -123,6 +123,24 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         return json.loads(result.stdout)["hookSpecificOutput"] if result.stdout.strip() else None
+
+    def test_antigravity_first_prompt_comes_from_robob_flag(self):
+        # Robob runs the hook for Antigravity; there is no transcript to inspect.
+        event = {"transcript_path": None, "first_prompt": True, "session_id": "agy-session"}
+        context = self.call("antigravity", **event)
+        self.assertIn("<recall>", context["additionalContext"])
+        self.assertEqual(context["hookEventName"], "UserPromptSubmit")
+        self.assertIn("driver=antigravity", self.server.identity_calls[-1])
+        self.assertEqual([r["trigger"] for r in self.server.requests], ["first_prompt"])
+        # The first-prompt check runs once per native session, even if Robob flags it again.
+        self.server.requests = []
+        self.call("antigravity", **event)
+        self.call("antigravity", **{**event, "first_prompt": False, "prompt": "next"})
+        self.assertEqual([r["trigger"] for r in self.server.requests], [])
+        # Without the flag a fresh session is not treated as a first prompt.
+        self.server.requests = []
+        self.assertIsNone(self.call("antigravity", transcript_path=None, session_id="agy-other"))
+        self.assertEqual(self.server.requests, [])
 
     def test_default_hooks_never_deny_or_note_from_the_rule_index(self):
         from test_recall_project import Layouts

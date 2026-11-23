@@ -7,7 +7,25 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import guard
+from guard_test_support import GuardTestCase
 from hold import Holds
+
+SOURCE = Path(__file__).resolve().parent
+
+
+# Backend recovery simulations own their inputs; TCC behavior is tested separately.
+def setUpModule():
+    global tcc_patch, tier_patch
+    tcc_patch = patch("guard.tcc_jam_tick")
+    tcc_patch.start()
+    tier_patch = patch("guard.protected_tier_tick")
+    tier_patch.start()
+
+
+def tearDownModule():
+    tier_patch.stop()
+    tcc_patch.stop()
+
 
 class DecisionTests(unittest.TestCase):
     def setUp(self):
@@ -142,11 +160,236 @@ class DecisionTests(unittest.TestCase):
         self.opened();self.tick(200,hold=dict(by='install',pid=2,startedAt=10000,beatAt=self.now+200),hold_pid_alive=True)
         self.assertEqual(self.state['failed_reopens'],0);self.assertEqual(self.tick()[1],'none');self.assertEqual(self.tick()[1],'reopen')
 
-class IOTests(unittest.TestCase):
-    def setUp(self):
-        protected = patch('guard.protected_tier_tick')
-        protected.start()
-        self.addCleanup(protected.stop)
+    def test_live_ssd_block_preserves_attempts_without_alerts(self):
+        self.state.update(last_reopen=9000, awaiting_reopen=True, failed_reopens=2,
+                          history=[8000, 8100, 8200, 8300, 8400], crash_episode=8000)
+        previous = dict(self.state)
+        for tick in range(150):
+            statuses, action = self.tick(ssd_block=dict(since='incident', lastOutcome='timeout'),
+                                         ssd_block_live=True)
+            self.assertEqual(action, 'none')
+            self.assertIn('ssd-block:timeout', statuses)
+            self.assertEqual(self.state, dict(previous, down_count=tick + 1))
+            self.assertEqual(self.state['pending_alerts'], {})
+
+    def test_ssd_block_clears_after_three_down_checks(self):
+        for tick in range(3):
+            self.assertEqual(self.tick(ssd_block={}, ssd_block_live=True)[1], 'none')
+        self.assertEqual(self.state['down_count'], 3)
+        self.assertEqual(self.tick()[1], 'reopen')
+        self.assertEqual(self.state['last_reopen'], self.now)
+
+    def test_stale_ssd_block_does_not_delay_reopen(self):
+        self.tick()
+        statuses, action = self.tick(ssd_block=dict(lastOutcome='error'), ssd_block_live=False)
+        self.assertEqual(action, 'reopen')
+        self.assertIn('stale-ssd-block', statuses)
+
+    def test_up_ignores_live_ssd_block(self):
+        self.opened()
+        expected = guard.decide(self.state, now=self.now + 30, up=True, boot_time=0)
+        self.assertEqual(self.tick(up=True, ssd_block=dict(lastOutcome='jam'), ssd_block_live=True),
+                         (expected[1], expected[2]))
+        self.assertEqual(self.state, expected[0])
+
+    def test_install_hold_wins_over_ssd_block(self):
+        self.opened()
+        statuses, action = self.tick(
+            hold=dict(by='install', pid=2, startedAt=self.now, beatAt=self.now), hold_pid_alive=True,
+            ssd_block=dict(lastOutcome='jam'), ssd_block_live=True)
+        self.assertEqual((statuses, action), (['hold:install'], 'none'))
+        self.assertEqual(self.state['down_count'], 0)
+
+class IOTests(GuardTestCase):
+    def test_ssd_marker_and_probe_freshness_corpus(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            root = home / '.local/state/mac-upkeep'
+            root.mkdir(parents=True)
+            marker = root / 'ssd-launchd-read-blocked'
+            probe = root / 'ssd-read-probe.json'
+            self.assertEqual(guard.read_ssd_block(home, 10000), (None, False, []))
+            block = dict(since='incident', lastOutcome='timeout')
+            guard.atomic_json(marker, block)
+            self.assertEqual(guard.read_ssd_block(home, 10000), (block, False, []))
+            probe.write_text('probe freshness uses mtime, not JSON')
+            for age, live in [(0, True), (299, True), (299.9, True), (300, False), (301, False), (-1, False)]:
+                with self.subTest(age=age):
+                    os.utime(probe, (10000 - age, 10000 - age))
+                    self.assertEqual(guard.read_ssd_block(home, 10000), (block, live, []))
+            for raw in [b'{', b'[]', b'null', b'true', b'1', b'"marker"', b'\xff',
+                        b' ' * guard.SSD_MARKER_MAX_BYTES + b'{}', b'[' * 2000]:
+                with self.subTest(raw=raw[:30]):
+                    marker.write_bytes(raw)
+                    self.assertEqual(guard.read_ssd_block(home, 10000),
+                                     (None, False, ['ssd-block-unreadable']))
+            with patch('guard.Path.open', side_effect=PermissionError):
+                self.assertEqual(guard.read_ssd_block(home, 10000),
+                                 (None, False, ['ssd-block-unreadable']))
+
+    def test_ssd_path_overrides_and_bounded_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            marker, probe = home / 'marker', home / 'probe'
+            marker.write_text('{}')
+            probe.touch()
+            os.utime(probe, (10000, 10000))
+            env = dict(ROBOB_GUARD_SSD_BLOCK_PATH=str(marker), ROBOB_GUARD_SSD_PROBE_STATE_PATH=str(probe))
+            with patch.dict(os.environ, env):
+                self.assertEqual(guard.read_ssd_block(home, 10000), ({}, True, []))
+                with patch('guard.Path.open') as opened:
+                    opened.return_value.__enter__.return_value.read.return_value = b'{}'
+                    self.assertEqual(guard.read_ssd_block(home, 10000), ({}, True, []))
+                    opened.return_value.__enter__.return_value.read.assert_called_once_with(
+                        guard.SSD_MARKER_MAX_BYTES + 1)
+
+    def test_ssd_block_check_logging_and_reopen(self):
+        import contextlib
+        import io
+        for kind, up, expected in [('live', False, 'ssd-block:timeout'), ('live', True, 'up'),
+                                   ('stale', False, 'stale-ssd-block'),
+                                   ('unreadable', False, 'ssd-block-unreadable')]:
+            with self.subTest(kind=kind, up=up), tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                root = home / '.local/state/mac-upkeep'
+                marker, probe = root / 'ssd-launchd-read-blocked', root / 'ssd-read-probe.json'
+                guard.atomic_json(marker, dict(since='2026-11-17T18:32:00Z', lastOutcome='timeout'))
+                probe.touch()
+                os.utime(probe, (9700 if kind == 'stale' else 10000,) * 2)
+                if kind == 'unreadable':
+                    marker.write_text('{')
+                state_path = home / '.local/state/robob-guard/state.json'
+                guard.atomic_json(state_path, dict(guard.initial_state(), down_count=1))
+                out = io.StringIO()
+                with patch('guard.backend_ready', return_value=up), patch('guard.desktop_snapshot', return_value=None), \
+                        patch('guard.backend_ownership', return_value=(None, None, [])), \
+                        patch('guard.process_diagnostics', return_value='processes={}'), \
+                        patch('guard.boot_epoch', return_value=0), patch('guard.time.time', return_value=10000), \
+                        patch('guard.reopen') as opened, patch('guard.notify') as notified, \
+                        contextlib.redirect_stdout(out):
+                    guard.check(home)
+                    self.assertEqual(opened.call_count, int(kind != 'live' and not up))
+                    notified.assert_not_called()
+                self.assertEqual(out.getvalue(), '')
+                log = (state_path.parent / 'guard.log').read_text()
+                self.assertIn(expected, log)
+                if kind == 'live' and not up:
+                    self.assertIn('"since":"2026-11-17T18:32:00Z","lastOutcome":"timeout"', log)
+                    self.assertEqual(guard.read_state(state_path)['down_count'], 2)
+                if up:
+                    self.assertNotIn('ssd-block:', log)
+
+    def test_ssd_block_arriving_during_final_recheck_cancels_reopen(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            state_path = home / '.local/state/robob-guard/state.json'
+            previous = dict(guard.initial_state(), down_count=1)
+            guard.atomic_json(state_path, previous)
+            calls = []
+            def health(home):
+                calls.append(True)
+                if len(calls) == 2:
+                    root = home / '.local/state/mac-upkeep'
+                    guard.atomic_json(root / 'ssd-launchd-read-blocked', dict(since='incident', lastOutcome='jam'))
+                    (root / 'ssd-read-probe.json').touch()
+                    os.utime(root / 'ssd-read-probe.json', (10000, 10000))
+                return False
+            with patch('guard.backend_ready', side_effect=health), \
+                    patch('guard.desktop_snapshot', return_value=None), \
+                    patch('guard.backend_ownership', return_value=(None, None, [])), \
+                    patch('guard.process_diagnostics', return_value='processes={}'), \
+                    patch('guard.boot_epoch', return_value=0), patch('guard.time.time', return_value=10000), \
+                    patch('guard.reopen') as opened, patch('guard.notify') as notified:
+                guard.check(home)
+                opened.assert_not_called()
+                notified.assert_not_called()
+            self.assertEqual(guard.read_state(state_path), dict(previous, down_count=2))
+            self.assertIn('ssd-block:jam', (state_path.parent / 'guard.log').read_text())
+
+    def test_ssd_block_arriving_during_recovery_corpus(self):
+        for phase in ['absent-ownership', 'replace-stop', 'replace-ownership']:
+            for kind in ['live', 'stale', 'unreadable', 'absent']:
+                with self.subTest(phase=phase, kind=kind), tempfile.TemporaryDirectory() as d:
+                    home = Path(d)
+                    state_path = home / '.local/state/robob-guard/state.json'
+                    previous = dict(guard.initial_state(), down_count=3)
+                    desktop = None
+                    if phase.startswith('replace'):
+                        desktop = dict(pid=42, identity='birth', startedAt=9000)
+                        previous.update(unready_since=9700, unready_last=9970, unready_ticks=2,
+                                        unready_desktop='42:birth')
+                    guard.atomic_json(state_path, previous)
+                    def publish():
+                        if kind == 'absent':
+                            return
+                        root = home / '.local/state/mac-upkeep'
+                        marker = root / 'ssd-launchd-read-blocked'
+                        guard.atomic_json(marker, dict(since='late', lastOutcome='jam'))
+                        (root / 'ssd-read-probe.json').touch()
+                        os.utime(root / 'ssd-read-probe.json', (9700 if kind == 'stale' else 10000,) * 2)
+                        if kind == 'unreadable':
+                            marker.write_text('{')
+                    ownership_calls = []
+                    def ownership(*args):
+                        ownership_calls.append(True)
+                        if len(ownership_calls) == 3 and phase.endswith('ownership'):
+                            publish()
+                        return None, None, []
+                    def stop(*args):
+                        if phase == 'replace-stop':
+                            publish()
+                        return True
+                    with patch('guard.backend_ready', return_value=False), \
+                            patch('guard.desktop_snapshot', return_value=desktop), \
+                            patch('guard.backend_ownership', side_effect=ownership), \
+                            patch('guard.stop_unready_desktop', side_effect=stop), \
+                            patch('guard.process_diagnostics', return_value='processes={}'), \
+                            patch('guard.boot_epoch', return_value=0), patch('guard.time.time', return_value=10000), \
+                            patch('guard.reopen') as opened, patch('guard.notify') as notified:
+                        guard.check(home)
+                        self.assertEqual(len(ownership_calls), 3)
+                        self.assertEqual(opened.call_count, int(kind != 'live'))
+                        notified.assert_not_called()
+                    state = guard.read_state(state_path)
+                    log = (state_path.parent / 'guard.log').read_text()
+                    if kind == 'live':
+                        self.assertEqual(state, dict(previous, down_count=4))
+                        self.assertIn('ssd-block:jam', log)
+                        self.assertIn('action=none', log)
+                    else:
+                        self.assertEqual(state['last_reopen'], 10000)
+                        self.assertEqual(state['history'], [10000])
+                        if kind != 'absent':
+                            self.assertIn('stale-ssd-block' if kind == 'stale' else 'ssd-block-unreadable', log)
+
+    def test_ssd_marker_status_input_corpus_logs_one_utf8_row(self):
+        rows = [('missing', {}), ('ascii', dict(lastOutcome='timeout')),
+                ('unicode', dict(lastOutcome='é🛠')), ('high-surrogate', dict(lastOutcome='\ud800')),
+                ('low-surrogate', dict(lastOutcome='\udfff')), ('quotes', dict(lastOutcome='"\\')),
+                ('whitespace', dict(lastOutcome='error\nnext\r\tline')),
+                ('controls', dict(lastOutcome='\x00\x1b')), ('null', dict(lastOutcome=None)),
+                ('bool', dict(lastOutcome=False)), ('number', dict(lastOutcome=42)),
+                ('array', dict(lastOutcome=['\ud800'])), ('object', dict(lastOutcome={'key': '\udfff'}))]
+        for name, marker in rows:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                root = home / '.local/state/mac-upkeep'
+                marker['since'] = '\ud800'
+                guard.atomic_json(root / 'ssd-launchd-read-blocked', marker)
+                (root / 'ssd-read-probe.json').touch()
+                os.utime(root / 'ssd-read-probe.json', (10000, 10000))
+                with patch('guard.backend_ready', return_value=False), \
+                        patch('guard.process_diagnostics', return_value='processes={}'), \
+                        patch('guard.boot_epoch', return_value=0), patch('guard.time.time', return_value=10000), \
+                        patch('guard.reopen') as opened, patch('guard.notify') as notified:
+                    guard.check(home)
+                    opened.assert_not_called()
+                    notified.assert_not_called()
+                log = (home / '.local/state/robob-guard/guard.log').read_text(encoding='utf-8')
+                self.assertEqual(len(log.splitlines()), 1)
+                self.assertIn('ssd-block:', log)
+                self.assertIn('action=none', log)
+                self.assertIn('"since":"\\ud800"', log)
 
     def test_bounded_process_diagnostics_and_failed_reads(self):
         output = "malformed\n1 0 /sbin/launchd /sbin/launchd\n42 1 /Applications/Ro %s\n" % guard.EXECUTABLE
@@ -231,13 +474,13 @@ class IOTests(unittest.TestCase):
                 def process(home):
                     guard.atomic_json(home/'.robob/install-hold.json',dict(by='arriving',pid=os.getpid(),startedAt=10000,beatAt=beat))
                     return False
-                with patch('guard.backend_ready',side_effect=process),patch('guard.boot_epoch',return_value=0),patch('guard.time.time',side_effect=[10000,10001]),patch('guard.reopen') as opened:
+                with patch('guard.desktop_snapshot',return_value=None),patch('guard.process_diagnostics',return_value='fixture'),patch('guard.backend_ready',side_effect=process),patch('guard.boot_epoch',return_value=0),patch('guard.time.time',side_effect=[10000,10001]),patch('guard.reopen') as opened:
                     guard.check(home);opened.assert_not_called()
                 state=guard.read_state(p)
                 self.assertEqual(state['history'],[]);self.assertFalse(state['awaiting_reopen'])
                 self.assertIn('hold:arriving',(p.parent/'guard.log').read_text())
     def test_plist(self):
-        p=plistlib.loads(Path('scripts/com.ardud.robob-guard.plist').read_bytes());self.assertEqual(p['StartInterval'],30);self.assertIs(p['RunAtLoad'],True)
+        p=plistlib.loads((SOURCE / 'scripts/com.ardud.robob-guard.plist').read_bytes());self.assertEqual(p['StartInterval'],30);self.assertIs(p['RunAtLoad'],True)
     def test_shell_syntax_without_execution(self):
         repo=Path(__file__).resolve().parents[2]
         scripts=['integrations/deploy.zsh','integrations/robob-guard/scripts/install-hold.zsh']
@@ -247,7 +490,7 @@ class IOTests(unittest.TestCase):
             with self.subTest(script=script):
                 subprocess.run(['/bin/zsh','-n',str(repo/script)],check=True,capture_output=True,timeout=10)
     def test_shell_nested_hold_preserves_exit_cleanup(self):
-        library=Path('scripts/install-hold.zsh').resolve()
+        library=(SOURCE / 'scripts/install-hold.zsh').resolve()
         with tempfile.TemporaryDirectory() as d:
             home=Path(d);bin_dir=home/'.local/bin';bin_dir.mkdir(parents=True)
             helper=bin_dir/'robob-install-hold'
@@ -261,7 +504,7 @@ class IOTests(unittest.TestCase):
             calls=(home/'calls').read_text().splitlines()
             self.assertEqual([line.split()[0] for line in calls],['start','beat','cleanup','stop'])
     def test_repair_wait_keeps_hold_until_healthy(self):
-        library=Path('scripts/install-hold.zsh').resolve()
+        library=(SOURCE / 'scripts/install-hold.zsh').resolve()
         for failures in [0,1,3]:
             with self.subTest(failures=failures),tempfile.TemporaryDirectory() as d:
                 home=Path(d);bin_dir=home/'.local/bin';bin_dir.mkdir(parents=True)
@@ -276,8 +519,8 @@ class IOTests(unittest.TestCase):
                 self.assertEqual(calls[-2],'healthy');self.assertEqual(calls.count('wait'),failures)
     def test_external_supervisor_exit_gates(self):
         import re
-        blocks=re.findall(r'```zsh\n(.*?)```',Path('release-supervisor.md').read_text(),re.S)
-        setup=blocks[0].replace('/Volumes/ExternalSSD/t3code-fork/integrations/robob-guard/scripts/install-hold.zsh',str(Path('scripts/install-hold.zsh').resolve()))
+        blocks=re.findall(r'```zsh\n(.*?)```',(SOURCE / 'release-supervisor.md').read_text(),re.S)
+        setup=blocks[0].replace('/Volumes/ExternalSSD/t3code-fork/integrations/robob-guard/scripts/install-hold.zsh',str((SOURCE / 'scripts/install-hold.zsh').resolve()))
         for exit_code,tail in [(0,blocks[1]),(7,blocks[1]),(1,blocks[2])]:
             with self.subTest(exit_code=exit_code),tempfile.TemporaryDirectory() as d:
                 home=Path(d);bin_dir=home/'.local/bin';bin_dir.mkdir(parents=True)
@@ -293,7 +536,7 @@ class IOTests(unittest.TestCase):
                 self.assertTrue(calls[0].startswith('start '));self.assertTrue(calls[-1].startswith('stop '))
                 self.assertEqual(calls[1:-1],['probe','wait','probe','wait','probe'])
     def test_shell_health_response_corpus(self):
-        library=Path('scripts/install-hold.zsh').resolve()
+        library=(SOURCE / 'scripts/install-hold.zsh').resolve()
         rows=[('<html>login</html>',False),('null',False),('[]',False),('{}',False),
               ('{"ok":true,"status":"starting"}',False),('{"ok":false,"status":"healthy"}',False),
               ('{"ok":"true","status":"healthy"}',False),('',False),('{"ok":',False),
@@ -326,7 +569,7 @@ class HoldTests(unittest.TestCase):
         self.assertFalse(self.h.beat('test',self.pid,'old-token'));self.assertFalse(self.h.beat('other',self.pid))
     def test_real_cli_lifecycle_in_temporary_home(self):
         env=dict(os.environ,HOME=str(self.h.home),PYTHONDONTWRITEBYTECODE='1')
-        helper=str(Path('bin/robob-install-hold').resolve())
+        helper=str((SOURCE / 'bin/robob-install-hold').resolve())
         def call(action,by='cli'):
             return subprocess.run([helper,action,'--by',by,'--pid',str(self.pid)],env=env,check=True,capture_output=True,text=True,timeout=10)
         beater=int(call('start').stdout.strip())

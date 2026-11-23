@@ -82,6 +82,16 @@ class HistoryTests(unittest.TestCase):
         self.assertNotIn('test-secret', self.path.read_text())
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
+    def test_summary_reports_snapshot_age_and_last_refresh(self):
+        self.row['marketplace_refresh'] = {'status': 'started', 'snapshot_age_s': 7200,
+                                          'last_result': 'list_error', 'last_at': '2026-11-16T09:00:00Z',
+                                          'order': 'private'}
+        self.assertTrue(history.append(self.wd, self.row))
+        result = history.summary(self.wd, now=dt.datetime(2026, 11, 16, 11, tzinfo=dt.timezone.utc))
+        self.assertEqual(result['marketplace_refresh']['snapshot_age_s'], 7200)
+        self.assertIn('marketplace snapshot age: 7200 s; last refresh: list_error', history.format_summary(result))
+        self.assertNotIn('private', self.path.read_text())
+
     def test_untrusted_errors_never_retain_messages_or_secrets(self):
         for text in ('msgs exit 1: I paid Acme, password: test-secret',
                      'refund mail private-case: 4111 1111 1111 1111 OTP 123456',

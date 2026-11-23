@@ -69,19 +69,24 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
   for (const run of [...thread.recentRuns ?? [], ...(thread.run ? [thread.run] : [])]) runs.set(run.runId, run);
   const ordinal = (runId: string) => runs.get(runId)?.ordinal ?? runOrdinal(runId);
   const byRun = new Map<string, ControlMessage[]>();
+  const createdAt = new Map<ControlMessage, number>();
   for (const message of messages) {
     if (message.runId === null || message.role === "system") continue;
-    byRun.set(message.runId, [...byRun.get(message.runId) ?? [], message]);
+    let group = byRun.get(message.runId);
+    if (!group) { group = []; byRun.set(message.runId, group); }
+    group.push(message);
+    createdAt.set(message, epoch(message.createdAt));
   }
   const latest = [...runs.values()].sort((a, b) => b.ordinal - a.ordinal)[0]?.runId;
   const records: MessageRecord[] = [];
-  for (const [runId, group] of [...byRun].sort((a, b) => ordinal(a[0]) - ordinal(b[0]))) {
-    group.sort((a, b) => epoch(a.createdAt) - epoch(b.createdAt) || a.messageId.localeCompare(b.messageId, undefined, { numeric: true }));
+  const groups = [...byRun].map(([runId, group]) => ({ runId, group, ordinal: ordinal(runId) }));
+  for (const { runId, group } of groups.sort((a, b) => a.ordinal - b.ordinal)) {
+    group.sort((a, b) => createdAt.get(a)! - createdAt.get(b)! || a.messageId.localeCompare(b.messageId, undefined, { numeric: true }));
     const run = runs.get(runId);
     const settled = run !== undefined && TERMINAL.has(run.status);
     let last: Extract<MessageRecord, { type: "assistant" }> | undefined;
     for (const message of group) {
-      const created = epoch(message.createdAt);
+      const created = createdAt.get(message)!;
       if (message.role === "user") {
         const id = promptId(thread.threadId, message);
         const bridgeSent = id !== message.messageId && BRIDGE_PROMPT.test(id);

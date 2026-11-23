@@ -124,3 +124,8 @@ export const bridgeCliError = (stderr: string, exitCode: number | null): string 
     ? detail
     : `iMessage bridge CLI failed${exitCode === null ? "" : ` (exit ${exitCode})`}`;
 };
+
+// Kept at the CLI protocol boundary; spectrum-bridge is deployed independently.
+export const SEND_TIMEOUT_EXIT_CODE = 75;
+export const bridgeSendOutcomeUnknown = (stderr: string, exitCode: number | null): boolean =>
+  exitCode === SEND_TIMEOUT_EXIT_CODE || parseRecord(lastLine(stderr))?.outcome === "unknown";
