@@ -35,6 +35,72 @@ def finished(name='history_scan_parse', step=None, **changes):
     return b'=' + json.dumps(data, separators=(',', ':')).encode()
 
 
+class TimeoutRollupTests(unittest.TestCase):
+    def row(self, **changes):
+        start = NOW.timestamp() * 1000 - 243112
+        props = dict(pid=42, phase='listener_history', wallMs=243112, cpuMs=5322,
+                     startedAtMs=start, finishedAtMs=NOW.timestamp() * 1000)
+        props.update(changes)
+        return dict(tool='9router', component='poller', name='poll.timeout',
+                    ts=observer.iso(props['finishedAtMs']), durationMs=243112, props=props)
+
+    def test_legacy_timeout_uses_recorded_phase_and_cpu(self):
+        cases = [('listener_history', 243112, 5322, 'starved'),
+                 ('snapshot', 243343, 3833, 'starved'),
+                 ('history_scan_parse', 241428, 16966, 'starved'),
+                 ('history_scan_parse', 241323, 16382, 'starved'),
+                 ('listener_history', 240951, 10508, 'starved'),
+                 ('snapshot', 240000, 24000, 'blocked'),
+                 ('snapshot', 240000, 200000, 'blocked')]
+        for phase, wall, cpu, cause in cases:
+            with self.subTest(phase=phase, cpu=cpu):
+                row = self.row(phase=phase, wallMs=wall, cpuMs=cpu)
+                gap = observer.gap_summary([row], '2026-11-22', NOW)['pollGaps'][0]
+                self.assertEqual(gap['phase'], phase)
+                self.assertEqual(gap['phaseMs'], wall)
+                self.assertEqual(gap['wallMs'], wall)
+                self.assertEqual(gap['cpuMs'], cpu)
+                self.assertEqual(gap['cause'], 'tick_' + cause + ':' + phase)
+                self.assertTrue(gap['timedOut'])
+                self.assertEqual(gap['causeEvidenceField'], 'poll.timeout')
+                self.assertEqual(gap['causeEvidenceValue'], wall)
+                self.assertNotIn('missingEvidence', gap)
+
+    def test_timeout_fallback_leaves_other_gap_rows_unchanged(self):
+        for name in ('poll.phases', 'rollup.phases', 'observer.gap', 'guard.tick_late'):
+            with self.subTest(name=name):
+                row = self.row()
+                row['name'] = name
+                key = 'pollGaps'
+                if name == 'guard.tick_late':
+                    row['component'], key = 'guard', 'guardGaps'
+                self.assertEqual(observer.gap_summary([row], '2026-11-22', NOW)[key], [dict(
+                    number=1, start=observer.iso(row['props']['startedAtMs']), end=observer.iso(NOW.timestamp() * 1000),
+                    component=row['component'], durationMs=243112,
+                    cause='unknown_no_data', missingEvidence='tick_phase_durations')])
+
+    def test_invalid_legacy_phase_or_wall_does_not_infer_a_cause(self):
+        for changes in ({'phase': value} for value in ('other', 'none', 'new_phase', None, [])):
+            row = self.row(**changes)
+            gap = observer.gap_summary([row], '2026-11-22', NOW)['pollGaps'][0]
+            self.assertEqual(gap['cause'], 'unknown_no_data')
+        for wall in (0, -1, None, True, '243112', float('nan'), float('inf')):
+            with self.subTest(wall=wall):
+                row = self.row(wallMs=wall)
+                gap = observer.gap_summary([row], '2026-11-22', NOW)['pollGaps'][0]
+                self.assertEqual(gap['cause'], 'unknown_no_data')
+
+    def test_legacy_timeout_full_and_cached_rollups_agree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '2026-11-22.ndjson').write_text(json.dumps(self.row()) + '\n')
+            full = rollup.rollup('2026-11-22', root, NOW, incremental=False)
+            self.assertEqual(full['pollGapsByCause'], [dict(
+                cause='tick_starved:listener_history', count=1, durationMs=243112)])
+            self.assertEqual(full, rollup.rollup('2026-11-22', root, NOW))
+            self.assertEqual(full, rollup.rollup('2026-11-22', root, NOW))
+
+
 class TimeoutTests(unittest.TestCase):
     def child(self, payload):
         script = ('import os,signal\n'
@@ -109,6 +175,14 @@ class TimeoutTests(unittest.TestCase):
                 self.assertEqual(report['pollGapsByCause'][0]['count'], 1)
                 gap = report['pollGaps'][0]
                 self.assertEqual(gap['phase'], 'snapshot')
+                self.assertTrue(gap['timedOut'])
+                self.assertEqual(gap['causeEvidenceField'], 'poll.timeout')
+                self.assertEqual(gap['wallMs'], props['wallMs'])
+                self.assertEqual(gap['cpuMs'], props['cpuMs'])
+                self.assertEqual(gap['host'], HOST)
+                for key in causes.WAIT_FIELDS | causes.SUBSTEP_FIELDS:
+                    if key in props:
+                        self.assertEqual(gap[key], props[key])
                 for key in causes.TIMEOUT_FIELDS:
                     self.assertEqual(gap[key], props[key])
                 if expected == 'starved' and os.environ.get('ROUTER_TIMEOUT_SAMPLE'):
