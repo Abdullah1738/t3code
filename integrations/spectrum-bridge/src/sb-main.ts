@@ -1,3 +1,4 @@
+import { createRequestTrace } from "./request-trace.ts";
 import { ProbeBudget } from "./probe-policy.ts";
 import { RemoteBox, remoteBoxConfig } from "./remote-box.ts";
 import { createChatMirror, type ChatMirror } from "./mirror.ts";
@@ -135,7 +136,11 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const releaseLock = acquireLock(join(stateRoot, "bridge.lock"));
   process.once("exit", releaseLock);
   startRobobLinkAlerts(socketPost(telegramBridgeSocket, 5_000));
-  const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }));
+  const requests = createRequestTrace(entry => toolLog.write(entry), { loopLag: () => loopStalls.loopLag() });
+  const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }), {
+    sample: props => toolLog.write({ component: "process", kind: "perf", name: "runtime.sample", props }),
+    tick: () => requests.flush(),
+  });
   loopStalls.start();
   process.once("exit", () => loopStalls.stop());
   const socketPath = join(stateRoot, "bridge.sock");
@@ -144,7 +149,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const server = Bun.serve({
     unix: socketPath,
     maxRequestBodySize: 28 * 1024 * 1024,
-    fetch: request => api ? api(request) : Response.json({ error: "Bridge starting" }, { status: 503 }),
+    fetch: request => requests.handle(request, request => api ? api(request) : Response.json({ error: "Bridge starting" }, { status: 503 })),
   });
   await chmod(socketPath, 0o600);
   const ownerStore = new Store(join(stateRoot, "state.sqlite"));
@@ -429,6 +434,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     stopping = true;
     loopStalls.stop();
     if (backend instanceof RobobBackend) backend.activeRoster.stop();
+    requests.flush(true);
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     abort.abort();
     clearInterval(timer);

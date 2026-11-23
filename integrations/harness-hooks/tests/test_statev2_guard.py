@@ -2028,6 +2028,260 @@ bash "$TASK_DIR/step5r.sh"
         self.assertEqual(rule, UNRESOLVED, cause)
         self.assertIn('python: non-isolated startup', cause)
 
+    def cwd_fixture(self):
+        # An inherited zsh FPATH voids every same-call writer proof; keep it out
+        # so these rows compare spellings rather than the caller's shell.
+        clean = patch.dict(os.environ)
+        clean.start()
+        self.addCleanup(clean.stop)
+        os.environ.pop('FPATH', None)
+        self.write('t/a.test.mjs', "import test from 'node:test'; test('a', () => {});")
+        self.write('t/b.test.mjs', "import test from 'node:test'; test('b', () => {});")
+        self.write('x.mjs', 'console.log(1)')
+        self.write('sub/x.mjs', 'console.log(2)')
+        self.write('sub/only.mjs', f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        self.write('tmp/v.X/check.py', 'print(1)')
+        self.write('s.sh', 'echo ok')
+        self.write('live.mjs', f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        os.symlink('live.mjs', self.root / 'link.mjs')
+
+    @staticmethod
+    def remote_only(command):
+        # #221: --bg never falls back to the Mac (offbox cli.py). The shared
+        # helper also gives up on unquoted caller substitutions; they don't
+        # change that.
+        return remote_only_offbox(command) or command.startswith('offbox run --bg ')
+
+    @staticmethod
+    def cwd_forms(path, directory):
+        # The literal twins first, then every cwd-derived spelling (#235).
+        return [path, f'{directory}/{path}', f'"$PWD/{path}"', f'"${{PWD}}/{path}"', f'$PWD/{path}',
+                f'"$(pwd)/{path}"', f'"`pwd`/{path}"', f'"$(realpath {path})"', f'$(realpath "{path}")',
+                f'`realpath {path}`']
+
+    @trusted_node_test
+    def test_cwd_derived_script_paths_match_literal_twins(self):
+        self.cwd_fixture()
+        root, sub = str(self.root), str(self.root / 'sub')
+        writer = self.heredoc('{p}', f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        rows = [
+            ('node --test {p} {q}', 't/a.test.mjs', 't/b.test.mjs', root, None),
+            ('node {p}', 'x.mjs', None, root, None),
+            ('python3 -I {p} --head 623161af', 'tmp/v.X/check.py', None, root, None),
+            ('bash {p}', 's.sh', None, root, None),
+            ('cd sub && node {p}', 'x.mjs', None, sub, None),
+            ('cd sub && node {p}', 'only.mjs', None, sub, SCRIPT),
+            ('node {p}', 'live.mjs', None, root, SCRIPT),
+            ('node {p}', 'link.mjs', None, root, SCRIPT),
+            (writer + 'node {p}', 'x.mjs', None, root, SCRIPT),
+            ("offbox run --bg -- 'node --test {p} && terraform -chdir=tf test'", 't/a.test.mjs', None, root, None),
+            ("offbox run -- 'node --test {p} && terraform -chdir=tf test'", 't/a.test.mjs', None, root, None),
+            ("offbox run --bg -- 'node --test --test-concurrency=1 {p} {q}'", 't/a.test.mjs', 't/b.test.mjs', root, None),
+            ("offbox run --bg --step 'node --test {p} {q}' --step 'terraform -chdir=tf init -backend=false -input=false'",
+             't/a.test.mjs', 't/b.test.mjs', root, None),
+            ("offbox run --bg --git --step 'git rev-parse HEAD' --step 'node --test {p}'", 't/a.test.mjs', None, root, None),
+            ("offbox run --bg --git --include tmp/v.X --pull tmp/v.X --step 'python3 -I {p} --head 623161af'",
+             'tmp/v.X/check.py', None, root, None),
+            ("offbox run --bg -- bash -lc 'node --version && export TERRAFORM_BINARY=\"$(command -v terraform)\" && node --test {p}'",
+             't/a.test.mjs', None, root, None),
+            ("offbox run --bg -- 'node {p}'", 'live.mjs', None, root, SCRIPT),
+            ('offbox run --bg -- node --test {p}', 't/a.test.mjs', None, root, None),
+            ('offbox run --bg -- node {p}', 'live.mjs', None, root, SCRIPT),
+            # A foreground payload with no fallback-refused character can run
+            # on the Mac, so it keeps the local proof after #221.
+            ('offbox run -- node --test {p}', 't/a.test.mjs', None, root, None),
+            ('offbox run -- node {p}', 'live.mjs', None, root, SCRIPT),
+            ('offbox run --git -- python3 -I {p} --head 623161af', 'tmp/v.X/check.py', None, root, None),
+            ('env A=1 timeout 60 node {p}', 'x.mjs', None, root, None),
+            ('env A=1 timeout 60 node {p}', 'live.mjs', None, root, SCRIPT),
+            ('export A="b $USER"; node {p}', 'x.mjs', None, root, None),
+            ("printf '%s\\n' \"$USER\"; node {p}", 'x.mjs', None, root, None),
+            ('d={p}; node --test "$d/a.test.mjs"', 't', None, root, None),
+            ('d={p}; node "$d/live.mjs"', 'tmp/..', None, root, SCRIPT),
+            ('node --test {p}', 't/*.test.mjs', None, root, None),
+            ("bash -c 'node {p}'", 'x.mjs', None, root, None),
+            ("bash -c 'node {p}'", 'live.mjs', None, root, SCRIPT),
+            (self.heredoc('{p}', 'console.log(1)') + 'node {p}', 'x.mjs', None, root, None),
+        ]
+        for template, first, second, directory, expected in rows:
+            for p, q in zip(self.cwd_forms(first, directory), self.cwd_forms(second or first, directory)):
+                command = template.replace('{p}', p).replace('{q}', q)
+                if "'" in template and "'" in p + q or '*' in p and 'realpath' in p:
+                    continue
+                twin = template.replace('{p}', first).replace('{q}', second or first)
+                # #221: offbox never runs these on the Mac; the twin agrees.
+                expected_here = None if self.remote_only(command) and self.remote_only(twin) else expected
+                with self.subTest(command=command):
+                    rule, cause = guard.classify_detail(command, root)
+                    if 'realpath' in p and '$(command -v' in template and expected_here is not None:
+                        # An earlier opaque substitution may replace realpath on PATH.
+                        self.assertIsNotNone(rule)
+                        continue
+                    self.assertEqual(rule, expected_here, cause)
+                    self.assertEqual(rule, guard.classify(twin, root))
+
+    def test_cwd_derived_live_reads_stay_reads(self):
+        self.cwd_fixture()
+        relative = os.path.relpath(LIVE, self.root)
+        for path in self.cwd_forms(relative, str(self.root)):
+            with self.subTest(path=path):
+                self.assertEqual(self.classify('sqlite3 ' + path + ' .tables'), READ)
+        for live_root in (Path.home() / '.t3/userdata', Path.home() / '.robob/userdata'):
+            for name in ('state.sqlite', 'statev2.sqlite'):
+                for path in self.cwd_forms(name, str(live_root)):
+                    with self.subTest(live_root=live_root, path=path):
+                        self.assertEqual(guard.classify('sqlite3 -readonly ' + path + ' .tables', str(live_root)), READ)
+
+    @trusted_node_test
+    def test_cwd_derived_paths_stay_unresolved_when_pwd_may_change(self):
+        self.cwd_fixture()
+        target = '"$PWD/x.mjs"'
+        for command in [
+            'PWD=/elsewhere node "$PWD/x.mjs"', 'export PWD=/x; node "$PWD/x.mjs"', 'P""WD=/x; node "$PWD/x.mjs"',
+            'unset PWD; node "$PWD/x.mjs"', 'read -r PWD; node "$PWD/x.mjs"', 'declare PWD=/x; node "$PWD/x.mjs"',
+            'printf -v PWD /x; node "$PWD/x.mjs"', 'node "${PWD:-/x}/x.mjs"',
+            'cd "$unknown"; node "$PWD/x.mjs"', 'cd -P sub && node "$PWD/x.mjs"', 'set -P; cd sub && node "$PWD/x.mjs"',
+            'CDPATH=/x cd sub && node "$PWD/x.mjs"', "eval 'cd /'; node \"$PWD/x.mjs\"", 'source ./env.sh; node "$PWD/x.mjs"',
+            '. ./env.sh; node "$PWD/x.mjs"', 'pushd sub; node "$PWD/x.mjs"',
+            "node '$PWD/x.mjs'", 'node "\\$PWD/x.mjs"', 'f() { cd /; }; f; node "$PWD/x.mjs"',
+            'realpath() { echo /x; }; node "$(realpath x.mjs)"', 'alias realpath=echo; node "$(realpath x.mjs)"',
+            'pwd() { echo /x; }; node "$(pwd)/x.mjs"', 'PATH=/evil:$PATH node "$(realpath x.mjs)"',
+            'node "$(realpath "$v")"', 'node "$(realpath -m x.mjs)"', 'node "$(realpath x.mjs y.mjs)"',
+            'node "$(pwd -P)/x.mjs"', 'node "$(cat x.mjs)"', 'node "$(realpath $HOME/x.mjs)"',
+            'export PWD=/x; offbox run -- node "$PWD/x.mjs"',
+            'path=(/evil $path); node "$(realpath x.mjs)"', 'commands[realpath]=/evil; node "$(realpath x.mjs)"',
+        ] + [prefix + '; node "$PWD/x.mjs"' for prefix in self.runtime_pwd_bindings('/evil')] + [
+            'o=-P; cd $o sub && node "$PWD/x.mjs"', 'o=physical; set -o "$o"; cd sub && node "$PWD/x.mjs"',
+            'set -o chaselinks; cd sub && node "$PWD/x.mjs"', 'options[chaselinks]=on; cd sub && node "$PWD/x.mjs"',
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.classify(command))
+        self.assertIsNone(self.classify('node ' + target))
+        # #221: a binding inside a payload offbox never runs on the Mac is the
+        # box's business, as is the same payload with a literal path.
+        for command in ["offbox run --bg -- 'export PWD=/x; node \"$PWD/x.mjs\"'",
+                        "offbox run --bg -- 'a=W; declare \"P${a}D=/evil\"; node \"$PWD/x.mjs\"'",
+                        "offbox run --bg --step 'a=W; printf -v \"P${a}D\" %s /evil; node \"$PWD/x.mjs\"'"]:
+            with self.subTest(remote_only=command):
+                self.assertTrue(self.remote_only(command))
+                self.assertIsNone(self.classify(command))
+
+    @staticmethod
+    def runtime_pwd_bindings(value):
+        # Every way bash/zsh bind PWD through a name built at runtime (review r2).
+        return [f'a=W; declare "P${{a}}D={value}"', f'a=W; printf -v "P${{a}}D" %s {value}',
+                f'a=W; typeset "P${{a}}D={value}"', f'a=W; local "P${{a}}D={value}"', f'a=W; export "P${{a}}D={value}"',
+                f'a=W; readonly "P${{a}}D={value}"', f'a=W; command declare "P${{a}}D={value}"',
+                f'a=W; read "P${{a}}D" <<< {value}', f'a=W; mapfile -t "P${{a}}D" <<< {value}', 'a=W; unset "P${a}D"',
+                'a=W; getopts x "P${a}D" -x', 'a=W; let "P${a}D=5"', 'a=W; x="P${a}D=5"; (( x ))',
+                'a=W; x="P${a}D=5"; y=$(( x ))', 'a=W; x="P${a}D=5"; arr=(1); : "${arr[x]}"',
+                'a=W; x="P${a}D=5"; [[ 1 -eq x ]]', 'a=W; typeset -i z="P${a}D=5"',
+                f'a=W; declare -n r="P${{a}}D"; r={value}', f'c=declare; a=W; $c "P${{a}}D={value}"',
+                f'a=W; n="P${{a}}D"; : "${{!n:={value}}}"', f'a=W; trap "declare P${{a}}D={value}" DEBUG']
+
+    def realpath_fixture(self):
+        self.cwd_fixture()
+        self.write('safe.sh', 'echo ok')
+        self.write('unsafe.sh', f'sqlite3 {LIVE} .tables')
+        return [template.replace('{p}', form) for form in ('"$(realpath safe.sh)"', '"`realpath safe.sh`"', '$(realpath safe.sh)')
+                for template in ('/bin/bash {p}', 'offbox run -- /bin/bash {p}', 'offbox run --bg -- /bin/bash {p}',
+                                 "offbox run --bg -- '/bin/bash {p}'",
+                                 "offbox run --bg --step '/bin/bash {p}'")]
+
+    def test_cwd_realpath_resolves_only_through_the_system_realpath(self):
+        commands = self.realpath_fixture()
+        self.assertEqual(self.classify('/bin/bash unsafe.sh'), SCRIPT)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+        # A realpath earlier on the inherited PATH can print any path (review r1).
+        shadow = self.write('bin/realpath', f'#!/bin/sh\necho {self.root}/unsafe.sh\n')
+        shadow.chmod(0o755)
+        environments = [{'PATH': os.pathsep.join((str(shadow.parent), os.environ['PATH']))},
+                        {'BASH_FUNC_realpath%%': '() { echo unsafe.sh; }'}, {'BASH_FUNC_pwd%%': '() { echo /; }'}]
+        # #221: offbox never runs a remote-only payload on the Mac, so those
+        # rows get the decision their literal twin gets on main.
+        self.assertTrue(any(command.startswith('offbox run -- ') and not self.remote_only(command) for command in commands))
+
+        def check(command, remote, exact=True, **labels):
+            with self.subTest(**labels, command=command):
+                rule = self.classify(command)
+                if not remote:
+                    self.assertIsNotNone(rule)
+                    return
+                twin = self.classify(command.replace('"$(realpath safe.sh)"', 'unsafe.sh')
+                                     .replace('"`realpath safe.sh`"', 'unsafe.sh').replace('$(realpath safe.sh)', 'unsafe.sh'))
+                if exact:
+                    self.assertEqual(rule, twin)
+                elif rule is None:
+                    # A rebinding prefix may still refuse; it may never allow
+                    # what the literal twin refuses.
+                    self.assertIsNone(twin)
+        for environment in environments:
+            with patch.dict(os.environ, environment):
+                for command in commands:
+                    check(command, self.remote_only(command), environment=environment)
+        # PATH or the lookup tables rebound in the call, often through a
+        # name built at runtime (review r2).
+        bin_dir = f'{shadow.parent}:/bin'
+        bindings = [p.replace('P${a}D', 'P${a}TH').replace('/evil', bin_dir) for p in self.runtime_pwd_bindings('/evil')
+                    if '=5' not in p and 'unset' not in p and 'getopts' not in p]
+        bindings += [f'n=PATH; declare -x "$n={bin_dir}"', f'read PATH <<< {bin_dir}', f'declare -n r=PATH; r={bin_dir}',
+                     f'BASH_CMDS[realpath]={shadow}', "functions[realpath]='echo unsafe.sh'", 'autoload realpath',
+                     f'export "PA""TH={bin_dir}"']
+        for prefix in bindings:
+            for command in commands + [f'for PATH in {bin_dir}; do /bin/bash "$(realpath safe.sh)"; done']:
+                if command.startswith('for ') and prefix != bindings[0]:
+                    continue
+                remote = self.remote_only(command)
+                command = command if command.startswith('for ') else prefix + '; ' + command
+                check(command, remote, exact=False, binding=prefix)
+        shadow.unlink()
+        # An exported function under another name shadows neither command.
+        with patch.dict(os.environ, {'BASH_FUNC_module%%': '() { :; }'}):
+            for command in commands + ['/bin/bash "$(pwd)/safe.sh"']:
+                with self.subTest(unrelated_function=True, command=command):
+                    self.assertIsNone(self.classify(command))
+        # Same-call writes into a PATH entry ahead of /bin replace the lookup.
+        with patch.dict(os.environ, {'PATH': os.pathsep.join((str(shadow.parent), os.environ['PATH']))}):
+            for command in commands:
+                writer = f"printf '#!/bin/sh\\necho unsafe.sh\\n' > {shadow}; chmod +x {shadow}; "
+                check(writer + command, self.remote_only(command), writer=True)
+
+    @trusted_node_test
+    def test_quoted_cwd_reads_keep_parity_in_a_directory_with_spaces(self):
+        self.cwd_fixture()
+        spaced = self.root / 'project space'
+        for name in ('safe.sh', 'x.mjs'):
+            (spaced / name).parent.mkdir(exist_ok=True)
+            (spaced / name).write_text('echo ok' if name.endswith('.sh') else 'console.log(1)')
+        (spaced / 'live.mjs').write_text(f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        quoted = ['"$PWD/{p}"', '"${{PWD}}/{p}"', '"$(pwd)/{p}"', '"`pwd`/{p}"', '"$(realpath {p})"']
+        unquoted = ['$PWD/{p}', '${{PWD}}/{p}', '$(pwd)/{p}', '`pwd`/{p}', '$(realpath {p})']
+        rows = [('/bin/bash {p}', 'safe.sh', None), ('node {p}', 'x.mjs', None), ('node {p}', 'live.mjs', SCRIPT),
+                ('offbox run --bg -- node {p}', 'x.mjs', None), ('offbox run --bg -- node {p}', 'live.mjs', SCRIPT),
+                ("offbox run --bg --step 'node {p}'", 'x.mjs', None), ("offbox run --bg -- 'node {p}'", 'live.mjs', SCRIPT)]
+        rows += [('offbox run -- node {p}', 'live.mjs', SCRIPT)]
+        for template, path, expected in rows:
+            if self.remote_only(template.replace('{p}', path)):
+                expected = None
+            self.assertEqual(guard.classify(template.replace('{p}', path), str(spaced)), expected)
+            for form in quoted:
+                command = template.replace('{p}', form.format(p=path))
+                with self.subTest(command=command):
+                    rule, cause = guard.classify_detail(command, str(spaced))
+                    self.assertEqual(rule, expected, cause)
+            for form in unquoted:
+                command = template.replace('{p}', form.format(p=path))
+                with self.subTest(command=command, quoted=False):
+                    if self.remote_only(command):
+                        # #221 may skip the payload; caller-side splitting can
+                        # still refuse. Never more permissive than the twin.
+                        if guard.classify(command, str(spaced)) is None:
+                            self.assertIsNone(expected)
+                    else:
+                        self.assertIsNotNone(guard.classify(command, str(spaced)))
+
     @trusted_node_test
     def test_same_call_offbox_steps_keep_wrapper_proof(self):
         for runner, filename, body in [('python3 -I', 'step.py', 'print(1)'),
@@ -3091,7 +3345,10 @@ bash "$TASK_DIR/step5r.sh"
         for path in ['state.sqlite', '$D/state.sqlite', '${D}/state.sqlite', '~/$D/state.sqlite', '~/*/state.sqlite', '$(pwd)/state.sqlite']:
             command = f'sqlite3 -readonly "{path}" "select 1"'
             with self.subTest(path=path):
-                self.assertEqual(self.classify(command), READ)
+                # $(pwd) names the tracked cwd (#235): it gets its absolute twin's decision.
+                expected = (self.classify(command.replace('$(pwd)', str(self.root))) if path.startswith('$(pwd)')
+                            else READ)
+                self.assertEqual(self.classify(command), expected)
                 script = self.write('tmp/unknown.sh', 'CLI=/Users/ardud/.local/share/tool/cli.ts\n' + command)
                 self.assertEqual(self.classify('zsh ' + shlex.quote(str(script))), SCRIPT)
         for directory in ['~/.robob/userdata', '~/.t3/userdata']:
@@ -7782,7 +8039,7 @@ class LiveDatabaseGuardTests(unittest.TestCase):
 
     def test_unresolved_cwd_denies_explicit_scripts_not_unrelated_binaries(self):
         for command in [
-            'cd "$TARGET" && python3 probe.py', 'cd "$(pwd)" && node probe.mjs',
+            'cd "$TARGET" && python3 probe.py', 'cd "$(git rev-parse --show-toplevel)" && node probe.mjs',
             "cd sub || python3 probe.py", "pushd sub; python3 probe.py",
             'bash -lc \'cd "$TARGET"; python3 probe.py\'',
             "if true; then cd sub; fi; python3 probe.py",
@@ -7792,6 +8049,11 @@ class LiveDatabaseGuardTests(unittest.TestCase):
         for command in ['cd "$TARGET" && npm test', "npm run missing-script", "missing-tool", 'cd "$TARGET" && python3 --version']:
             with self.subTest(command=command):
                 self.assertIsNone(guard.classify(command, str(self.root)))
+        # $(pwd) and $PWD are the tracked cwd (#235), so cd into them changes nothing.
+        for command in ['cd "$(pwd)" && node probe.mjs', 'cd "$PWD" && node probe.mjs']:
+            with self.subTest(command=command):
+                self.assertEqual(guard.classify(command, str(self.root)),
+                                 guard.classify(f'cd {shlex.quote(str(self.root))} && node probe.mjs', str(self.root)))
         event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "session_id": "fixture",
                  "cwd": str(self.root), "tool_input": {"command": 'cd "$TARGET" && python3 probe.py'}}
         with patch.object(engine, "resolve_identity", side_effect=AssertionError("identity called")):

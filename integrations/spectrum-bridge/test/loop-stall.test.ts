@@ -103,3 +103,33 @@ test("stall JSON survives the cap and contains only numeric host metadata and fi
   const last = JSON.parse(readFileSync(join(root, "2026-11-20.ndjson"), "utf8").trim().split("\n").at(-1)!);
   expect(last.props).toBeUndefined();
 });
+
+test("minute sample uses the same heartbeat, resets CPU deltas and retains descheduling", () => {
+  let at = 0;
+  let usage = { user: 1000, system: 2000 };
+  const samples: unknown[] = [];
+  let ticks = 0;
+  const monitor = createLoopStallMonitor(() => {}, { now: () => at, host, cpu: () => usage,
+    sample: row => samples.push(row), tick: () => ticks++ });
+  for (let i = 0; i < 239; i++) { at += 250; monitor.check(); }
+  expect(samples).toHaveLength(0);
+  usage = { user: 11000, system: 7000 };
+  at = 65000; monitor.check();
+  expect(samples).toEqual([{ loopLagMaxMs: 5000, loopLagP95Ms: 0, cpuUserMs: 10, cpuSystemMs: 5, rssMb: 2048 / 1024 / 1024, loadAvg1: 50 }]);
+  expect(monitor.loopLag()).toBe(5000);
+  at += 60_000; usage = { user: 12000, system: 9000 }; monitor.check();
+  expect(samples[1]).toMatchObject({ cpuUserMs: 1, cpuSystemMs: 2, loopLagMaxMs: 59750, loopLagP95Ms: 59750 });
+  expect(ticks).toBe(2);
+});
+
+test("runtime samples survive redaction and the log cap", () => {
+  const root = mkdtempSync(join(tmpdir(), "runtime-sample-")); dirs.push(root);
+  const log = createToolLog({ root, now: () => Date.parse("2026-11-22T12:00:00Z"), capBytes: 1 });
+  log.write({ component: "fixture", kind: "event", name: "fixture" });
+  const props = { loopLagMaxMs: 20000, loopLagP95Ms: 10, cpuUserMs: 30, cpuSystemMs: 5, rssMb: 80, loadAvg1: 200 };
+  log.write({ component: "process", kind: "perf", name: "runtime.sample", props: { ...props, text: "PRIVATE_TEXT", secret: "PRIVATE_SECRET" } });
+  const raw = readFileSync(join(root, "2026-11-22.ndjson"), "utf8");
+  const rows = raw.trim().split("\n").map(row => JSON.parse(row));
+  expect(rows.find(row => row.name === "runtime.sample")?.props).toEqual(props);
+  expect(raw).not.toContain("PRIVATE_");
+});

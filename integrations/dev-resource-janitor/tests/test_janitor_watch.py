@@ -24,6 +24,26 @@ import janitor_watch  # noqa: E402
 
 
 class WorkerTests(JanitorTestCase):
+    def test_expo_signal_rechecks_robob_ancestry(self):
+        for protect_after_term in (False, True):
+            with self.subTest(protect_after_term=protect_after_term):
+                parent = dict(pid=30, ppid=1, args='/bin/zsh')
+                target = dict(pid=42, ppid=30, args='node expo.js')
+                rows = {30: parent, 42: target}
+                if not protect_after_term:
+                    parent['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+                def pause(seconds):
+                    parent['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+                with patch.object(dev_janitor.leftover_processes, 'cpu_processes', return_value=rows), \
+                        patch.object(dev_janitor.os, 'kill') as send, \
+                        patch.object(dev_janitor.time, 'sleep', side_effect=pause), \
+                        patch.object(dev_janitor, 'sh', return_value=(0, '', '')):
+                    ok, reason = dev_janitor.act(dict(kind='expo', pids=[42]))
+                self.assertFalse(ok)
+                self.assertEqual(reason, 'protected Robob descendant')
+                self.assertEqual([c.args for c in send.call_args_list],
+                                 [(42, signal.SIGTERM)] if protect_after_term else [])
+
     def test_log_run_keeps_counters_and_adds_one_summary_and_timings(self):
         summary = dev_janitor.leftover_processes.detect({}, {}, {}, dict(complete=True))['mcp_summary']
         with patch.object(dev_janitor.time, 'monotonic', return_value=2), \

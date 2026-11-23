@@ -191,12 +191,30 @@ def family(row):
     return None
 
 
+def robob_ancestry(row, chain):
+    for p in [row] + chain:
+        try:
+            argv = shlex.split(p.get('args', ''))
+        except ValueError:
+            continue
+        if not argv:
+            continue
+        if argv[0].startswith('/Applications/Robob.app/'):
+            return True
+        if (Path(argv[0]).name in ('node', 'bun') and len(argv) > 1
+                and re.search(r'(?:^|/)apps/server/(?:dist/bin\.mjs|src/bin\.ts)$', argv[1])):
+            return True
+    return False
+
+
 def keep_reason(row, chain, labels, keep):
     args = row["args"].lower()
+    if robob_ancestry(row, chain):
+        return 'robob-descendant'
     if row["tty"] not in {"??", "?", "-"}:
         return "tty"
-    # A service's children can be per-thread MCPs, so only the process itself
-    # inherits the registration exemption, not every descendant of Robob.
+    # Other services can host per-thread MCPs; registration alone only keeps
+    # the registered process itself.
     if row["pid"] in labels:
         return "launchd_registered"
     if ".app/contents/" in args and "/python.app/" not in args:
@@ -1028,7 +1046,9 @@ def detect_xcode_builds(rows, before, after, roster, labels, keep=(), *, metadat
             reason = None
             # Xcode's toolchain binaries live inside Xcode.app too; exempt the
             # actual GUI launcher, not every executable in that application bundle.
-            if any(p.get('tty', '??') not in {'??', '?', '-'} or
+            if robob_ancestry(row, chain):
+                reason = 'robob-descendant'
+            elif any(p.get('tty', '??') not in {'??', '?', '-'} or
                    re.search(r'/(?:Xcode|Terminal|iTerm2?)\.app/Contents/MacOS/', p.get('args', ''), re.I)
                    for p in [row] + chain):
                 reason = 'interactive_launcher'
@@ -1139,6 +1159,9 @@ def stop_xcode_builds(report, *, rescan=None, observe=cpu_processes, send=os.kil
                                 os.path.basename(shlex.split(rows[pid]['args'])[0]) in {'SWBBuildService', 'XCBBuildService'}]
                     def signal_exact(pid, sig):
                         current = observe()
+                        if current.get(pid) and robob_ancestry(current[pid], parent_chain(current[pid], current)):
+                            entry['protectedBy'] = 'robob-descendant'
+                            return False
                         if pid == item['pid'] and sig == signal.SIGTERM and not unchanged_tree(current):
                             return False
                         if same(pid, current):
@@ -1362,6 +1385,9 @@ def reap_mcp_orphans(report, *, rescan=None, observe=cpu_processes, send=os.kill
                 # before each signal; never signal a PID obtained by name alone.
                 rows = observe()
                 current = rows.get(item['pid'])
+                if current and robob_ancestry(current, parent_chain(current, rows)):
+                    entry['protectedBy'] = 'robob-descendant'
+                    return False
                 chain = [{**{k: p[k] for k in ('pid', 'ppid', 'start', 'missing') if k in p},
                           'command': redact(p.get('args', ''))} for p in parent_chain(current, rows)] if current else None
                 if (not current or process_identity({**current, 'args': redact(current['args'])})
