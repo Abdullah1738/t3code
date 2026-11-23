@@ -208,6 +208,8 @@ export type WakeConfirmation = {
   nextAt?: number; escalated?: boolean; ownerFallback?: boolean; nativeSession?: string;
   deadlineAt?: number; unconfirmedAt?: number; alertDone?: boolean; fallbackDone?: boolean; fallbackText?: string;
   sendPending?: boolean; sendAttempts?: number; deferredAt?: number;
+  runId?: string; messageId?: string; runState?: string; seenQueued?: boolean;
+  requestId?: string; resends?: number; lostRunId?: string;
 };
 export const WAKE_CONFIRM_MS = Number(process.env.ROBOB_WATCH_CONFIRM_MS ?? 10 * 60_000);
 const CONFIRM_POLL_MS = 30_000;
@@ -1069,14 +1071,28 @@ const transientSend = (result: SendResult) => {
   const failure = sendFailureClass(result);
   return failure !== "definite" && (ambiguousSend(result) || ["timeout", "control_api_unavailable"].includes(failure));
 };
-const queuedThreadSend = (result: SendResult) => {
-  if (!result.ok) return false;
-  try { const value = JSON.parse(result.out); return value?.ok === true && value.delivery === "queued"; } catch { return false; }
-};
+const nonempty = (value: unknown): string | undefined => typeof value === "string" && value.trim() ? value : undefined;
+function threadReceipt(result: { ok: boolean; out: string }) {
+  if (!result.ok) return {};
+  try {
+    const value: unknown = JSON.parse(result.out);
+    if (!jsonObject(value) || value.ok !== true) return {};
+    return { runId: nonempty(value.runId), messageId: nonempty(value.messageId),
+      runState: nonempty(value.status), delivery: nonempty(value.delivery) };
+  } catch { return {}; }
+}
+function rememberReceipt(entry: WakeConfirmation, result: { ok: boolean; out: string }) {
+  const receipt = threadReceipt(result);
+  if (receipt.runId) entry.runId = receipt.runId;
+  if (receipt.messageId) entry.messageId = receipt.messageId;
+  if (receipt.runState) entry.runState = receipt.runState;
+  if (receipt.delivery === "queued" || receipt.runState === "queued") entry.seenQueued = true;
+}
+export const runOrdinal = (runId?: string) => runId?.split(":ordinal:").at(-1) ?? "unknown";
 
 function wakeThread(cli: string, thread: string, text: string, key: string, watcher: string) {
   if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return Promise.resolve({ ...refused("t3ctl send"), code: 127, signal: null });
-  return run([cli, "send", thread, clip(text, MAX_WAKE), "--request-id", key, "--mode", "queue"], creatorSendTimeout(), undefined, { watcher, op: "send" });
+  return run([cli, "send", thread, clip(text, MAX_WAKE), "--request-id", key, "--mode", "queue"], creatorSendTimeout(), 100_000, { watcher, op: "send" });
 }
 
 function creatorSendAt(watcher: Watcher, key: string, thread: string): number {
@@ -1430,7 +1446,7 @@ export function wakeText(watcher: Watcher, event: string, state: State, test = f
 
 export type Delivery = { ok: boolean; accepted?: boolean; via: string; detail: string; route?: WakeRoute;
   confirmed?: "pending" | "n/a"; confirmation?: WakeConfirmation; meantFor?: string; sendDeferred?: boolean;
-  failureClass?: ReturnType<typeof sendFailureClass> };
+  failureClass?: ReturnType<typeof sendFailureClass>; threadSend?: ReturnType<typeof threadReceipt> };
 
 export function trackConfirmation(state: State, delivery: Delivery): void {
   const entry = delivery.confirmation;
@@ -1479,9 +1495,12 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
         let reason = "error";
         try {
           const result = await wakeThread(cli, creator.thread, `${prefix}\n${text}`, key, watcher.id);
-          if (queuedThreadSend(result)) { route = "creator"; return finish({ ok: true, via: `thread:${shortThread(creator.thread)}`, detail: result.out }); }
-          if (result.ok) { route = "creator"; return queued(`thread:${shortThread(creator.thread)}`, result.out,
-            { ...confirmation(), sentAt: firstSentAt, thread: creator.thread }); }
+          if (result.ok) {
+            route = "creator";
+            const entry = { ...confirmation(), sentAt: firstSentAt, thread: creator.thread };
+            rememberReceipt(entry, result);
+            return finish({ ...queued(`thread:${shortThread(creator.thread)}`, "", entry), threadSend: threadReceipt(result) });
+          }
           reason = exitReason(result);
           failureClass = sendFailureClass(result);
           if (transientSend(result) && !ambiguousSend(result)) {
@@ -1525,11 +1544,12 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
   } finally {
     const via = delivery?.via ?? "none";
     const accepted = delivery?.accepted || delivery?.ok;
-    toolLog({ component: "wakes", kind: delivery?.accepted ? "event" : delivery?.ok ? "perf" : "error", name: "wake.sent", ok: delivery?.ok ?? false,
+    toolLog({ component: "wakes", kind: delivery?.accepted ? "event" : delivery?.ok ? "perf" : "error", name: "wake.sent", ok: delivery?.threadSend ? true : delivery?.ok ?? false,
       durationMs: Math.max(0, now() - started), ids: { watcher: watcher.id, chat: route, key: wakeInboundId(key),
         ...(delivery?.meantFor ? { meantFor: delivery.meantFor } : {}), ...(delivery?.confirmation?.thread ? { thread: delivery.confirmation.thread } : {}) },
       props: { via: watcher.chat && via.startsWith("wake:") ? "wake" : via,
         ...(delivery?.meantFor ? { meant_for: shortThread(delivery.meantFor) } : {}),
+        ...(delivery?.threadSend ?? {}),
         confirmed: delivery?.confirmed ?? "n/a", accepted: !!accepted, events: pending?.count ?? 1,
         ...(delivery?.sendDeferred ? { sendDeferred: true } : {}), ...(failureClass ? { failureClass } : {}) },
       ...(accepted ? {} : { error: { tag: "wake.delivery_failed" } }) });
@@ -1564,13 +1584,17 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
     saveState(watcher.id, fresh);
     return true;
   };
-  const confirm = (entry: WakeConfirmation) => {
+  const confirm = (entry: WakeConfirmation, method: "run" | "heuristic" = "heuristic", run?: Record<string, unknown>) => {
     if (!update(entry, true)) return;
     const durationMs = Math.max(0, now() - (entry.deferredAt ?? entry.sentAt));
-    const message = `wake confirmed after ${(durationMs / 1000).toFixed(1)}s key=${entry.key}`;
+    const message = `wake confirmed after ${(durationMs / 1000).toFixed(1)}s key=${entry.key} method=${method}${method === "heuristic" ? " confirm=heuristic" : ""} run=${runOrdinal(entry.runId)}`;
     log(watcher.id, message); log(null, `${message} watcher=${watcher.id}`);
     toolLog({ component: "wakes", kind: "event", name: "wake.confirmed", ok: true, durationMs,
-      ids: { watcher: watcher.id, key: wakeInboundId(entry.key), thread: entry.thread ?? entry.nativeSession ?? "owner" } });
+      ids: { watcher: watcher.id, key: wakeInboundId(entry.key), thread: entry.thread ?? entry.nativeSession ?? "owner" },
+      props: { method, runState: entry.runState ?? null,
+        queuedMs: typeof run?.requestedAt === "string" && typeof run.startedAt === "string"
+          && Number.isFinite(Date.parse(run.requestedAt)) && Number.isFinite(Date.parse(run.startedAt))
+          ? Math.max(0, Date.parse(run.startedAt) - Date.parse(run.requestedAt)) : null } });
   };
   const fallbackThread = async (entry: WakeConfirmation, missed = true) => {
     entry.ownerFallback = true;
@@ -1595,8 +1619,8 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
     // Bypass the successful-route cache: a thread may have been archived since its first send.
     const route = await creatorRoute(watcher, entry.thread!, cli);
     const ids = { watcher: watcher.id, key: wakeInboundId(entry.key), thread: entry.thread! };
-    const record = (outcome: string) => toolLog({ component: "wakes", kind: "event", name: "wake.send_retry",
-      durationMs: Math.max(0, now() - started), ids, props: { op: "send", attempt: entry.sendAttempts, outcome } });
+    const record = (outcome: string, receipt?: ReturnType<typeof threadReceipt>) => toolLog({ component: "wakes", kind: "event", name: "wake.send_retry",
+      durationMs: Math.max(0, now() - started), ids, props: { op: "send", attempt: entry.sendAttempts, outcome, ...receipt } });
     if (route.kind === "unreachable") {
       record("definite");
       await fallbackThread(entry);
@@ -1609,12 +1633,13 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
     }
     const sendStarted = now();
     const result = await wakeThread(cli, entry.thread!,
-      `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]\n${entry.text}`, entry.key, watcher.id)
+      `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]\n${entry.text}`, entry.requestId ?? entry.key, watcher.id)
       .catch(error => ({ ok: false, code: 127, signal: null, out: String(error).slice(0, 300) }));
     const failure = result.ok ? undefined : sendFailureClass(result);
-    record(result.ok ? "accepted" : failure === "definite" ? "definite" : ambiguousSend(result) ? "ambiguous" : "deferred");
+    record(result.ok ? "accepted" : failure === "definite" ? "definite" : ambiguousSend(result) ? "ambiguous" : "deferred", threadReceipt(result));
     if (failure === "definite") { await fallbackThread(entry); return; }
     if (result.ok || ambiguousSend(result)) {
+      rememberReceipt(entry, result);
       delete entry.sendPending;
       if (wasPending) {
         // A same-key replay can return an earlier receipt whose run already finished.
@@ -1635,7 +1660,6 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
     // sessions retain their existing escalation because there is no thread destination yet.
     if (!update(entry, false, `thread:${shortThread(entry.thread!)}`)) return;
     if (escalation) log(watcher.id, `wake escalation key=${entry.key} via=thread:${shortThread(entry.thread!)} confirmed=pending (target ${route.kind === "thread" && !route.unverified ? "live" : "unverified"})`);
-    if (queuedThreadSend(result)) confirm(entry);
   };
   for (const entry of entries) {
     const retryDue = (entry.nextAt ?? 0) <= now();
@@ -1665,10 +1689,12 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
         if (!update(entry)) return;
         const sendStarted = now();
         const result = await wakeThread(cli, route.thread,
-          `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]\n${entry.text}`, entry.key, watcher.id)
+          `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]\n${entry.text}`, entry.requestId ?? entry.key, watcher.id)
           .catch(error => ({ ok: false, code: 127, signal: null, out: String(error).slice(0, 300) }));
-        log(watcher.id, `native wake resolved thread=${route.thread} accepted=${result.ok} ${result.out.slice(0, 300)}`);
-        if (queuedThreadSend(result)) { confirm(entry); continue; }
+        rememberReceipt(entry, result);
+        log(watcher.id, result.ok
+          ? `native wake resolved thread=${route.thread} send=ok delivery=${threadReceipt(result).delivery ?? "unknown"} run=${runOrdinal(entry.runId)} confirmed=pending`
+          : `native wake resolved thread=${route.thread} ${probeDetail("send", result, sendStarted)}`);
         if (!result.ok && transientSend(result) && !ambiguousSend(result)) {
           entry.sendPending = true;
           entry.sendAttempts = 0;
@@ -1701,6 +1727,8 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
       }
       if (!update(entry)) return;
     }
+    let ownRun: Record<string, unknown> | undefined;
+    let lostState: string | undefined;
     if (entry.thread && !entry.ownerFallback && !entry.sendPending && !(underTest() && !process.env.ROBOB_WATCH_T3CTL)) {
       try {
         const result = await run([t3ctlCli(), "status", entry.thread], creatorTimeout(), 100_000, { watcher: watcher.id, op: "confirm" });
@@ -1709,12 +1737,69 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
           if (jsonObject(value) && jsonObject(value.thread) && value.thread.threadId === entry.thread) {
             const thread = value.thread;
             const runs = [thread.run, ...(Array.isArray(thread.recentRuns) ? thread.recentRuns : []),
-              ...(Array.isArray(thread.runs) ? thread.runs : [])];
-            confirmed = thread.state === "running" || thread.status === "running" || runs.some(run => jsonObject(run)
-              && [run.requestedAt, run.startedAt].some(at => typeof at === "string" && Date.parse(at) >= entry.sentAt));
+              ...(Array.isArray(thread.runs) ? thread.runs : [])].filter(jsonObject);
+            if (entry.runId) {
+              ownRun = runs.find(candidate => candidate.runId === entry.runId || candidate.id === entry.runId);
+              if (!ownRun) {
+                // Status returns only five recent runs. A successful per-run lookup distinguishes
+                // retention from loss; transport errors and unsupported endpoints prove neither.
+                const lookup = await run([BUN, join(import.meta.dir, "wake-run.mjs"), t3ctlCli(), entry.thread, entry.runId],
+                  creatorTimeout(), 100_000, { watcher: watcher.id, op: "confirm_run" });
+                if (lookup.ok) {
+                  const evidence: unknown = JSON.parse(lookup.out);
+                  if (jsonObject(evidence) && evidence.ok === true && evidence.threadId === entry.thread && evidence.runId === entry.runId) {
+                    if (evidence.missing === true && entry.seenQueued) lostState = "missing";
+                    else ownRun = evidence;
+                  }
+                }
+              }
+              if (ownRun) {
+                entry.runState = nonempty(ownRun.status) ?? nonempty(ownRun.state) ?? "unknown";
+                if (entry.runState === "queued") entry.seenQueued = true;
+                confirmed = typeof ownRun.startedAt === "string" && Number.isFinite(Date.parse(ownRun.startedAt))
+                  || ["running", "completed"].includes(entry.runState);
+                // Older per-run evidence has no startedAt. A bare cancelled status cannot tell
+                // a never-started run from a turn interrupted after starting; keep it pending.
+                if (!confirmed && ownRun.startedAt === null
+                  && ["cancelled", "interrupted", "failed", "rolled_back", "server_restart"].includes(entry.runState)) lostState = entry.runState;
+              }
+              if (!update(entry)) return;
+            } else {
+              confirmed = thread.state === "running" || thread.status === "running" || runs.some(candidate =>
+                [candidate.requestedAt, candidate.startedAt].some(at => typeof at === "string" && Date.parse(at) >= entry.sentAt));
+            }
           }
         }
       } catch { /* A failed probe leaves the wake pending; its deadline still escalates below. */ }
+    }
+    if (lostState && entry.lostRunId !== entry.runId) {
+      entry.lostRunId = entry.runId;
+      if (!update(entry)) return;
+      toolLog({ component: "wakes", kind: "event", name: "wake.run_lost",
+        ids: { watcher: watcher.id, key: wakeInboundId(entry.key), thread: entry.thread! },
+        props: { runId: entry.runId, state: lostState, attempt: (entry.resends ?? 0) + 1 } });
+      if ((entry.resends ?? 0) >= 3) log(watcher.id, `wake run lost key=${entry.key} run=${runOrdinal(entry.runId)} state=${lostState}; re-send cap reached`);
+    }
+    if (lostState && (entry.resends ?? 0) < 3 && !inQuiet(watcher.quiet)) {
+      const runId = entry.runId;
+      const attempt = (entry.resends ?? 0) + 1;
+      const requestId = `${entry.key}:r${attempt}`;
+      entry.resends = attempt;
+      entry.requestId = requestId;
+      entry.runState = lostState;
+      delete entry.runId;
+      delete entry.messageId;
+      delete entry.seenQueued;
+      entry.sendPending = true;
+      // Reserve the derived key before sending. Outages and crashes retry that same key,
+      // while only a proved-lost run consumes another of the three re-sends.
+      if (!update(entry)) return;
+      const ids = { watcher: watcher.id, key: wakeInboundId(entry.key), thread: entry.thread! };
+      await retryThread(entry);
+      log(watcher.id, `wake run lost key=${entry.key} run=${runOrdinal(runId)} state=${lostState}; re-sent as ${requestId}${entry.sendPending ? " send=deferred" : ""}`);
+      toolLog({ component: "wakes", kind: "event", name: "wake.resent", ok: !entry.sendPending, ids,
+        props: { requestId, runId: entry.runId, messageId: entry.messageId, state: entry.runState, attempt, sendDeferred: !!entry.sendPending } });
+      continue;
     }
     if (!confirmed && ((!entry.thread && !entry.nativeSession) || entry.ownerFallback)) {
       const row = await inboundState(wakeInboundId(entry.key), watcher.id);
@@ -1724,7 +1809,7 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
     const durationMs = Math.max(0, now() - entry.sentAt);
     const ids = { watcher: watcher.id, key: wakeInboundId(entry.key), thread: entry.thread ?? entry.nativeSession ?? "owner" };
     if (confirmed) {
-      confirm(entry);
+      confirm(entry, entry.runId && !entry.ownerFallback ? "run" : "heuristic", ownRun);
     } else if (now() - (entry.deadlineAt ?? entry.sentAt) >= WAKE_CONFIRM_MS) {
       const target = entry.thread ?? entry.nativeSession ?? "owner chat";
       if (!entry.escalated) {

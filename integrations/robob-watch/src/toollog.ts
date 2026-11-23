@@ -33,7 +33,7 @@ const values: Record<string, readonly string[]> = {
   stderrClass: ["ride_ended", "usage_error", "missing_file", "permission", "timeout", "dependency_busy", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
   step: ["native", "status", "send"],
-  op: ["native", "native_retry", "status", "status_retry", "send", "confirm"],
+  op: ["native", "native_retry", "status", "status_retry", "send", "confirm", "confirm_run"],
   route: ["person", "owner", "group", "creator", "other", "thread", "unverified", "refused"],
   via: ["wake", "thread", "imessage-send", "telegram", "none", "wake:owner-fallback", "native:pending"],
   confirmed: ["pending", "n/a"],
@@ -74,7 +74,15 @@ function fields(entry: LogEntry, at: Date) {
   const props: Record<string, unknown> = {};
   const fileEvent = ["data_read.retried", "data_read.failed", "data_write.retried", "data_write.failed", "runs_log.write_failed"].includes(entry.name);
   const stuckEvent = entry.component === "runner" && ["watch.skip", "watch.stuck_group", "watch.stuck_exited"].includes(entry.name);
+  const wakeEvent = entry.component === "wakes" && ["wake.sent", "wake.confirmed", "wake.send_retry", "wake.run_lost", "wake.resent"].includes(entry.name);
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (wakeEvent && ["runId", "messageId", "requestId"].includes(key)
+      && typeof value === "string" && /^[A-Za-z0-9:%_.-]{1,4096}$/.test(value)) { props[key] = value; continue; }
+    if (wakeEvent && key === "method" && (value === "run" || value === "heuristic")) { props[key] = value; continue; }
+    if (wakeEvent && key === "delivery" && (value === "queued" || value === "started")) { props[key] = value; continue; }
+    if (wakeEvent && ["runState", "state"].includes(key) && (value === null || typeof value === "string"
+      && ["preparing", "queued", "starting", "running", "waiting", "completed", "interrupted", "failed", "cancelled", "rolled_back", "server_restart", "missing", "unknown"].includes(value))) { props[key] = value; continue; }
+    if (wakeEvent && key === "queuedMs" && value === null) { props[key] = null; continue; }
     // Only triage supplies a bounded, credential-redacted classifier diagnostic.
     if (entry.component === "triage" && entry.name === "triage.classify" && key === "classifier_error"
       && typeof value === "string" && value.length <= 400 && !/[\x00-\x1f]/.test(value)) props[key] = value;
@@ -428,7 +436,7 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
         }
         if (row.name === "wake.sent") {
           wake.attempts++;
-          if (row.ok === true) wake.sent++;
+          if (row.ok === true && props.confirmed !== "pending") wake.sent++;
           else if (row.ok === false && props.accepted !== true) wake.failed++;
         } else if (row.name === "wake.confirmed") {
           wake.sent++;
