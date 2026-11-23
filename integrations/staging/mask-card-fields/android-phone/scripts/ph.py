@@ -238,6 +238,72 @@ def token(value, fallback="unknown"):
 def component(value):
     return value if re.fullmatch(r"(?:android|[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)/\.?[A-Za-z_$][\w.$]*", value, re.A) else None
 
+# System windows (NotificationShade, StatusBar, PopupWindow:1a2b) have no package/class form.
+_WINDOW_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_.$:-]{0,79}", re.A)
+_FOCUS_LINE = re.compile(r"mCurrentFocus=Window\{\S+ u\d+ ([^{}]*)\}")
+_FOCUSED_APP = re.compile(r"mFocusedApp=\S*?\{\S+ u\d+ ([^\s{}]+)")
+# The full `dumpsys window` dump is heavy; the displays section carries both focus lines.
+FOCUS_CMD = "dumpsys window displays | grep -E 'mCurrentFocus|mFocusedApp'"
+OWNER_ENV = ("PH_LEASE_OWNER", "PHONE_HOLD_OWNER")
+
+def window_name(value):
+    value = value.strip()
+    if component(value): return value
+    return value if _WINDOW_TOKEN.fullmatch(value) and redact_text(value) == value else None
+
+def parse_focus(out):
+    """(focused_window, focused_app, focus_status, unmatched line or None) from FOCUS_CMD output."""
+    app = next((component(m.group(1)) for m in _FOCUSED_APP.finditer(out) if component(m.group(1))), None)
+    lines = [line.strip() for line in out.splitlines() if "mCurrentFocus=" in line]
+    for line in lines:
+        match = _FOCUS_LINE.search(line)
+        name = window_name(match.group(1)) if match else None
+        if name: return name, app, "ok", None
+    real = [line for line in lines if not re.search(r"mCurrentFocus=null\b", line)]
+    if lines and not real: return None, app, "null_focus", None
+    if not out.strip(): return None, app, "no_output", None
+    return None, app, "no_match", (real or out.strip().splitlines())[0]
+
+def _read(args, t):
+    """Bounded read that tells a timeout apart from empty output."""
+    try: return _run(args, t=t, strict=True), False
+    except subprocess.TimeoutExpired: return "", True
+    except subprocess.CalledProcessError as exc: return exc.stdout or "", False  # grep exits 1 on no lines
+    except (TimeoutError, PhoneBusy): raise
+    except Exception: return "", False
+
+def capture_gate():
+    """Token for why read-only phone context cannot be captured, or None when reads are allowed."""
+    try: allowed, reason = phonelock.check(action=False)
+    except Exception: return "lease_unreadable"
+    if allowed: return None
+    return "priority_hold" if reason in (phonelock.HOLD_REASON, phonelock.HOLD_LOST_REASON) else "lease_unreadable"
+
+def capture(kind, row, now):
+    raw_ime = _run(["adb", "-s", SERIAL, "shell", "settings", "get", "secure", "default_input_method"], t=3).strip()
+    row["ime"] = component(raw_ime)
+    out, timed_out = _read(["adb", "-s", SERIAL, "shell", FOCUS_CMD], 3)
+    window, app, status, unmatched = (None, None, "timeout", None) if timed_out else parse_focus(out)
+    row.update(focused_window=window, focused_app=app, focus_status=status)
+    if status == "no_output" and not raw_ime:
+        # Neither read answered: the phone is not reachable, so logcat would only add delay.
+        row["capture_skipped"] = "no_device"
+        return
+    if kind in ("reconnect", "maybe_sent", "failed", "external_drop"):
+        raw = _run(["adb", "-s", SERIAL, "logcat", "-d", "-t", "300"], t=5)
+        lines = [diagnostic(line) for line in raw.splitlines() if re.search(
+            r"uiautomator|uia2|wetest|AndroidRuntime|lowmemorykiller|ActivityManager: Killing|InputMethod|ImeTracker|BiometricPrompt|FATAL", line, re.I)][-80:]
+        if unmatched:
+            # Kept out of the row; this copy exists only so the focus regex can be fixed later.
+            lines.insert(0, "focus_line: " + diagnostic(unmatched)[:120])
+        try:
+            drops = STATE / "drops"
+            drops.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path = drops / (now.strftime("%Y%m%dT%H%M%S.%fZ") + "-" + row["cmd"] + ".log")
+            with path.open("x", encoding="utf-8") as out: out.write("\n".join(lines) + ("\n" if lines else ""))
+            row["drop_log"] = str(path)
+        except Exception: pass
+
 def maintain_logs():
     try:
         STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -264,22 +330,13 @@ def event(kind, exc=None, *, source="ph", cmd=None, phase=None, message=None, de
                    elapsed_ms=round((time.monotonic() - _context.get("started", time.monotonic())) * 1000),
                    serial=SERIAL, ime=None, focused_window=None, drop_log=None)
         row.update(fields)
-        if device and not phonelock.check(action=False)[1]:
-            row["ime"] = component(_run(["adb", "-s", SERIAL, "shell", "settings", "get", "secure", "default_input_method"], t=3).strip())
-            focus = _run(["adb", "-s", SERIAL, "shell", "dumpsys window | grep mCurrentFocus"], t=3)
-            match = re.search(r"mCurrentFocus=.*?\bu\d+\s+([^\s}]+)", focus)
-            row["focused_window"] = component(match.group(1)) if match else None
-            if kind in ("reconnect", "maybe_sent", "failed", "external_drop"):
-                raw = _run(["adb", "-s", SERIAL, "logcat", "-d", "-t", "300"], t=5)
-                lines = [diagnostic(line) for line in raw.splitlines() if re.search(
-                    r"uiautomator|uia2|wetest|AndroidRuntime|lowmemorykiller|ActivityManager: Killing|InputMethod|ImeTracker|BiometricPrompt|FATAL", line, re.I)][-80:]
-                try:
-                    drops = STATE / "drops"
-                    drops.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    path = drops / (now.strftime("%Y%m%dT%H%M%S.%fZ") + "-" + row["cmd"] + ".log")
-                    with path.open("x", encoding="utf-8") as out: out.write("\n".join(lines) + ("\n" if lines else ""))
-                    row["drop_log"] = str(path)
-                except Exception: pass
+        if device:
+            # Reads are allowed under a foreign lease; only a hold the caller doesn't own refuses them.
+            skipped = capture_gate()
+            if skipped: row["capture_skipped"] = skipped
+            else:
+                try: capture(kind, row, now)
+                except PhoneBusy: row["capture_skipped"] = "priority_hold"
         STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(STATE / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as out: out.write(json.dumps(row) + "\n")
@@ -291,13 +348,24 @@ def note_drop(args):
     for name in ("source", "cmd", "exc"): parser.add_argument("--" + name, required=True)
     parser.add_argument("--msg", default="")
     parser.add_argument("--phase", choices=("read", "action"), default="read")
+    parser.add_argument("--owner", default="")
     opts = parser.parse_args(args)
-    event("external_drop", source=opts.source, cmd=opts.cmd, phase=opts.phase,
-          message=opts.msg, exc=type(token(opts.exc), (Exception,), {})(opts.msg))
+    # --owner stands in for an unexported PH_LEASE_OWNER/PHONE_HOLD_OWNER during this event's
+    # read-only capture only; note-drop never sends actions, resets u2 or takes a lease.
+    owner = opts.owner if opts.owner and opts.owner == opts.owner.strip() else ""
+    saved = {name: os.environ.get(name) for name in OWNER_ENV}
+    if owner: os.environ.update(dict.fromkeys(OWNER_ENV, owner))
+    try:
+        event("external_drop", source=opts.source, cmd=opts.cmd, phase=opts.phase,
+              message=opts.msg, exc=type(token(opts.exc), (Exception,), {})(opts.msg))
+    finally:
+        for name, value in saved.items():
+            if value is None: os.environ.pop(name, None)
+            else: os.environ[name] = value
 
 def show_log(n=20):
     recent = collections.deque(maxlen=max(0, n))
-    types, sources, leases, reasons = (collections.Counter() for _ in range(4))
+    types, sources, leases, reasons, skipped, focus = (collections.Counter() for _ in range(6))
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
     for path in (STATE / "events.jsonl.1", STATE / "events.jsonl"):
         try:
@@ -313,6 +381,8 @@ def show_log(n=20):
                             sources[token(row["source"])] += 1
                             if "lease_state" in row: leases[token(row["lease_state"])] += 1
                             if row["event"] == "busy_refused": reasons[token(row.get("reason", "unknown"))] += 1
+                            if row.get("capture_skipped"): skipped[token(str(row["capture_skipped"]))] += 1
+                            if row.get("focus_status"): focus[token(str(row["focus_status"]))] += 1
                     except (ValueError, TypeError, KeyError): continue
         except OSError: pass
     for row in recent:
@@ -324,12 +394,16 @@ def show_log(n=20):
             claim = f" lease={row.get('lease_state')} reason={row.get('reason', '-')} caller={names} project={project}"
         print(diagnostic(f"{row['ts']} {row['event']} {row['source']} {row.get('cmd', '?')} "
                          f"{row.get('phase', '?')} {row.get('exc_type') or '-'} "
-                         f"ime={row.get('ime')} focus={row.get('focused_window')} drop={row.get('drop_log')}{claim}"))
+                         f"ime={row.get('ime')} focus={row.get('focused_window')} drop={row.get('drop_log')}"
+                         + "".join(f" {k}={row[k]}" for k in ("focus_status", "focused_app", "capture_skipped") if row.get(k))
+                         + claim))
     print("Last 7 days by event: " + (", ".join(f"{k}={v}" for k, v in sorted(types.items())) or "none"))
     print("Last 7 days by source: " + (", ".join(f"{k}={v}" for k, v in sorted(sources.items())) or "none"))
 
     print("Last 7 days by lease_state: " + (", ".join(f"{k}={v}" for k, v in sorted(leases.items())) or "none"))
     print("Last 7 days busy_refused by reason: " + (", ".join(f"{k}={v}" for k, v in sorted(reasons.items())) or "none"))
+    print("Last 7 days capture_skipped: " + (", ".join(f"{k}={v}" for k, v in sorted(skipped.items())) or "none"))
+    print("Last 7 days by focus_status: " + (", ".join(f"{k}={v}" for k, v in sorted(focus.items())) or "none"))
 
 NOISE = re.compile(r"notification:|signal|Battery|clock|key_pos|Location requests active", re.I)
 def show(allnodes=False):
@@ -370,8 +444,8 @@ wake                       wake + unlock (no PIN) screen
 sms [n]                    last n (default 4) incoming SMS/iMessages on the Mac (OTP codes land here)
 sh CMD...                  raw adb shell (treated as an action; never auto-repeated)
 log [n]                    last n events (default 20), counts by event/source over 7 days
-note-drop --source NAME --cmd VERB --exc TYPE [--msg TEXT] [--phase read|action]
-                           log a direct-u2 drop without connecting or resetting u2
+note-drop --source NAME --cmd VERB --exc TYPE [--msg TEXT] [--phase read|action] [--owner T]
+                           log a direct-u2 drop without connecting or resetting u2; --owner = your hold/lease token
 hold acquire --token T | hold refresh|release | hold status [--json]
 lease acquire|run --owner T --purpose P [--ttl 20m] [-- CMD...]
 lease refresh|release --owner T | lease status [--json]

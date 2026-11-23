@@ -221,7 +221,7 @@ Grant permissions up front: `ph sh pm grant PKG android.permission.ACCESS_FINE_L
 - `adb devices` shows nothing: check the cable/port, then `adb kill-server; adb devices`. If the phone prompts, accept the RSA prompt on it (ask Abdullah).
 - Read failures reconnect once; `MAYBE_SENT` (exit 4) resets u2 but never repeats the action. Check `ph ui` before repeating, especially pay/confirm taps. Use `ph log` for drop events and evidence.
 
-Direct-u2 scripts (`d(text=...).click()`, `.exists`, `.wait()` via objInfo/waitForExists) bypass this protection. On `RemoteDisconnected`/`ConnectionError`, run `ph note-drop --source <caller> --cmd <verb> --exc <type> [--msg <message>] [--phase read|action]`, reconnect, then re-read the screen before repeating an action. Drops are most common after IME switches or system dialogs (BiometricPrompt, Copy). For visible keyboard keys, prefer adb taps on fresh key bounds over `d.send_keys`, which swaps the IME.
+Direct-u2 scripts (`d(text=...).click()`, `.exists`, `.wait()` via objInfo/waitForExists) bypass this protection. On `RemoteDisconnected`/`ConnectionError`, run `ph note-drop --source <caller> --cmd <verb> --exc <type> [--msg <message>] [--phase read|action]`, reconnect, then re-read the screen before repeating an action. Under your own lease or hold, export `PH_LEASE_OWNER`/`PHONE_HOLD_OWNER` (or pass `--owner <your token>`) when calling `ph note-drop` so the drop gets IME/focus/logcat evidence. Drops are most common after IME switches or system dialogs (BiometricPrompt, Copy). For visible keyboard keys, prefer adb taps on fresh key bounds over `d.send_keys`, which swaps the IME.
 
 ## Fast mode: plan + Jev runner (`scripts/jevrun.py`)
 
