@@ -14,6 +14,7 @@ from volume import REASONS, integer
 from listener_rollup import windows as listener_windows, history_rows
 from pool_rollup import summarize as pool_summary
 from routing_rollup import RoutingSummary
+from rejected_rollup import RejectedNoCredentials
 from observer import gap_summary, measured, observed
 from host_rollup import HostLoad, timestamp as host_timestamp
 import append_cursor as cache
@@ -83,7 +84,7 @@ def lock_identity(row, fallback):
 
 
 # Bump when ingestion or persisted aggregate semantics change.
-AGGREGATE_VERSION = 3
+AGGREGATE_VERSION = 4
 CHECKPOINT_BYTES = 8 * 1024 * 1024
 CHECKPOINT_SECONDS = 30
 AGGREGATE_FIELDS = (
@@ -95,7 +96,7 @@ AGGREGATE_FIELDS = (
     'distinct', 'account_distinct', 'unlocks', 'supervisor', 'heartbeat_observations',
     'health_hours', 'health_late', 'volume_writers', 'ok', 'failed',
     'total', 'malformed',
-    'host_state', 'host_pending', 'routing_state',
+    'host_state', 'host_pending', 'routing_state', 'rejected_state',
 )
 
 
@@ -120,6 +121,8 @@ def rollup(day, root=None, now=None, incremental=True):
     pool_rows = []
     routing = RoutingSummary()
     routing_state = vars(routing)
+    rejected = RejectedNoCredentials()
+    rejected_state = vars(rejected)
     times, samples = defaultdict(list), {}
     targets = defaultdict(Counter)
     target_components = defaultdict(Counter)
@@ -169,6 +172,10 @@ def rollup(day, root=None, now=None, incremental=True):
                         or any(type(aggregate['routing_state'][key]) is not type(value)
                                for key, value in routing_state.items())):
                     raise ValueError('routing state needs rebuild')
+                if aggregate is not None and (set(aggregate['rejected_state']) != set(rejected_state)
+                        or any(type(aggregate['rejected_state'][key]) is not type(value)
+                               for key, value in rejected_state.items())):
+                    raise ValueError('rejection state needs rebuild')
             except (ValueError, TypeError, KeyError, AttributeError):
                 aggregate, append = None, False
             if aggregate is not None:
@@ -180,13 +187,15 @@ def rollup(day, root=None, now=None, incremental=True):
                     session_sources, attempts, abort_ttfb, locks, lock_accounts,
                     distinct, account_distinct, unlocks, supervisor, heartbeat_observations,
                     health_hours, health_late, volume_writers, ok, failed,
-                    total, malformed, host_state, host_pending, routing_state,
+                    total, malformed, host_state, host_pending, routing_state, rejected_state,
                 ) = (aggregate[key] for key in AGGREGATE_FIELDS)
                 host_load.__dict__.update(host_state)
                 host_load.generated = generated
                 host_state = vars(host_load)
                 routing.__dict__.update(routing_state)
                 routing_state = vars(routing)
+                rejected.__dict__.update(rejected_state)
+                rejected_state = vars(rejected)
                 pending, host_pending = host_pending, []
                 for row in pending:
                     if future_host(row, generated):
@@ -385,6 +394,7 @@ def rollup(day, root=None, now=None, incremental=True):
                         if client not in ('claude-code', 'codex', 't3', 'opencode', 'ai-sdk', 'curl', 'node', 'python', 'browser', 'other'):
                             client = 'unknown'
                         key_id = proxy_key_id(props.get('keyId'))
+                        rejected.add(row, key_id, key[0], client)
                         for group_identity in (clients[client], keys[key_id]):
                             group_identity['count'] += 1
                             group_identity['aborted'] += aborted
@@ -450,6 +460,8 @@ def rollup(day, root=None, now=None, incremental=True):
         durations[name] = {'p50': values[math.ceil(len(values) * .50) - 1], 'p95': values[math.ceil(len(values) * .95) - 1], 'max': values[-1]}
     measured = ok + failed
     result = dict(day=day, total=total, malformed=malformed, countsByName=dict(counts), countsByKind=dict(kinds), okRate=ok / measured if measured else None, errorRate=kinds['error'] / total if total else None, failedRate=failed / measured if measured else None, durationMs=durations, topErrors=[dict(tag=tag, count=count, sampleIds=samples[tag]) for tag, count in tags.most_common(20)])
+    result['rejectedNoCredentials'] = rejected.result()
+    result.update(rejected.rates(total, kinds['error'], measured, failed))
     result.update(generatedAt=generated.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), complete=generated >= next_day)
     result['pools'] = pool_summary(day, root, generated, pool_rows, incremental)
     for error in result['topErrors']:
