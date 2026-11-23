@@ -19,6 +19,7 @@ import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./f
 import { assistantText, isCompletionNoticeText, PromptExpiredError, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
+import { textingStyle } from "./texting-style.ts";
 import { commandWord, controlCommand, isCommand } from "./commands.ts";
 import { chatKey } from "./line.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
@@ -37,6 +38,7 @@ import { HUMAN_FAILURE_BACKOFF_MS, leaderKind, MAX_FAILED_ATTEMPTS, requeueHuman
 import { controlDisposition, controlFailureProps, type ControlFailure } from "./control-errors.ts";
 import { WakeDelivery, wakeStatus, WAKE_AMBIGUITY_MS, WAKE_DELIVERY_MS } from "./wake-delivery.ts";
 export { leaderKind, requeueHuman } from "./inbound-routing.ts";
+export { textingStyle } from "./texting-style.ts";
 
 /**
  * `createdAt` is when the agent's current context started (a new thread or the
@@ -639,17 +641,6 @@ export function decide(text: string): "yes" | "no" | undefined {
   if (consentOnly(words, YES_PHRASES)) return "yes";
   if (consentOnly(words, NO_PHRASES)) return "no";
   return;
-}
-
-/**
- * How to write texts (owner, 22 Nov 2026), for every iMessage agent whatever
- * harness or model runs it. Part of both the typed and the wake guidance.
- */
-export function textingStyle(options: { replyMode?: ReplyMode } = {}): string {
-  const tool = options.replyMode === "tool";
-  return `Texting style (owner's rule, 22 Nov 2026): you are texting a person, not writing a document. Write the way people text: casual, informal and short, plain words, no preamble or sign-off. Match their tone and length; a quick text gets a quick text back. ${tool
-    ? "Use several messages, one imessage_send call each, the way people text: the quick answer first, then a detail or two, then any next step, instead of one long block. One thought per message, usually a line or two; don't send one word per message or split a sentence across texts."
-    : "Keep a reply to a few short lines; put a blank line between thoughts."} No headings, tables or long bullet lists; a short dash list only when it really helps. Anything long or structured goes out as an image instead.`;
 }
 
 /**
