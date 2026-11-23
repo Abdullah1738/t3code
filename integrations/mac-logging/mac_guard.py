@@ -363,6 +363,8 @@ class Host:
             return dict(same=(len(args) == 6 and ' '.join(args[:5]) == p['start']
                     and hashlib.sha256(args[5].encode()).hexdigest() == p.get('argsHash', hashlib.sha256(p['args'].encode()).hexdigest())))
         except (ProbeError, OSError) as exc:
+            if isinstance(exc, ProbeError) and exc.rc == 1 and not exc.stderr:
+                return dict(same=False, result='gone', errno=errno_codes.ESRCH)
             return dict(same=False, **failure_details(exc, 'ps'))
 
     def same_birth(self, p):
@@ -376,38 +378,58 @@ class Host:
         os.kill(p['pid'], sig)
 
     def soften(self, p):
-        def send(argv):
-            try:
-                self.cmd(argv, 2)
-                return dict(rc=0, result='sent', stderr='')
-            except (ProbeError, OSError) as exc:
-                return failure_details(exc, argv[0])
-        renice = send(['/usr/bin/renice', '20', '-p', str(p['pid'])])
-        identity = self.identity_recheck(p)
-        # Text-only ESRCH reports need a failed identity check as corroboration.
-        for outcome in (renice, identity):
-            if not identity['same'] and re.search(r'no such process', outcome.get('stderr', ''), re.I):
-                outcome.update(result='gone', errno=errno_codes.ESRCH)
-        if renice['result'] != 'sent':
-            taskpolicy = dict(result='skipped', reason='renice-failed')
-        elif not identity['same']:
-            taskpolicy = dict(result='skipped', reason='identity-changed')
-        else:
-            taskpolicy = send(['/usr/bin/taskpolicy', '-b', '-p', str(p['pid'])])
-            if (taskpolicy['result'] == 'error' and re.search(r'no such process', taskpolicy.get('stderr', ''), re.I)
-                    and not self.identity(p)):
-                taskpolicy.update(result='gone', errno=errno_codes.ESRCH)
-        stages = dict(renice=renice, identityRecheck=identity, taskpolicy=taskpolicy)
-        failed = next((s for s in stages.values() if s.get('result') == 'gone'), None)
-        if failed:
-            result = 'gone'
-        elif renice['result'] != 'sent':
-            result, failed = 'error', renice
-        else:
-            failed = next((s for s in (identity, taskpolicy) if s.get('result') == 'error'), None)
-            result = 'partial' if failed else 'sent'
-        return dict(result=result, stages=stages, errno=failed.get('errno') if failed else None,
-                    **(dict(reason=failed['reason']) if failed else {}))
+        # Renice is bounded in a helper; Darwin background mode can starve lock holders.
+        stages = {name:dict(result='skipped', reason='prior-stage-failed')
+                  for name in ('identityRead', 'getpriority', 'renice', 'identityRecheck', 'readBack')}
+        outcome = dict(stages=stages)
+
+        def finish(stage, value):
+            value = {k:v for k,v in value.items() if v is not None}
+            if value.get('result') == 'error' and not any(type(value.get(k)) is int for k in ('errno', 'rc')):
+                value['errno'] = errno_codes.EIO
+            stages[stage] = value
+            return dict(outcome, stage=stage, **value)
+
+        def identify(stage):
+            identity = self.identity_recheck(p)
+            if identity['same']:
+                stages[stage] = dict(result='sent', same=True)
+                return None
+            result = identity.get('result', 'identity-changed')
+            return finish(stage, dict(identity, result=result, reason=identity.get('reason', result)))
+
+        changed = identify('identityRead')
+        if changed:
+            return changed
+        try:
+            outcome['niceBefore'] = os.getpriority(os.PRIO_PROCESS, p['pid'])
+        except OSError as exc:
+            return finish('getpriority', failure_details(exc, 'getpriority'))
+        stages['getpriority'] = dict(result='sent')
+        if outcome['niceBefore'] >= 10:
+            outcome['niceAfter'] = outcome['niceBefore']
+            return finish('renice', dict(result='skipped', reason='already-nice'))
+        try:
+            self.cmd(['/usr/bin/renice', '20', '-p', str(p['pid'])], 2)
+        except (ProbeError, OSError) as exc:
+            failure = failure_details(exc, 'renice')
+            if re.search(r'no such process', failure.get('stderr', ''), re.I):
+                identify('identityRecheck')
+                identity = stages['identityRecheck']
+                if not identity['same'] and identity.get('result') != 'error':
+                    failure.update(result='gone', errno=errno_codes.ESRCH)
+            return finish('renice', failure)
+        stages['renice'] = dict(result='sent', rc=0)
+        changed = identify('identityRecheck')
+        if changed:
+            return changed
+        try:
+            outcome['niceAfter'] = os.getpriority(os.PRIO_PROCESS, p['pid'])
+        except OSError as exc:
+            return finish('readBack', failure_details(exc, 'getpriority'))
+        if outcome['niceAfter'] != 20:
+            return finish('readBack', dict(result='error', errno=errno_codes.EIO, reason='nice-readback-mismatch'))
+        return finish('readBack', dict(result='sent'))
 
     def app_info(self, p):
         try:
@@ -820,14 +842,22 @@ class Guard:
         value = dict(pid=p['pid'], start=p['start'], comm=p['comm'], args=command_label(p.get('args', '')),
                      action=action, result=result, errno=errno, actionClass=cls, owner=p.get('owner', {}).get('state', 'unknown'),
                      cpuDelta=p.get('cpuDelta', 0), footprintGiB=p.get('footprintGiB'), label=label(p, self.rows))
-        value.update({k:details[k] for k in ('stages', 'reason') if k in details})
+        value.update({k:details[k] for k in ('stages', 'stage', 'reason', 'rc', 'niceBefore', 'niceAfter') if k in details})
         if ancestor:
             value.update(protectedBy='robob-descendant', protectedAncestor={k: ancestor[k] for k in ('pid', 'start', 'comm')})
+        if action == 'renice' and result == 'error':
+            value.setdefault('stage', 'renice')
+            if errno is None:
+                if type(value.get('rc')) is int:
+                    value.pop('errno')
+                else:
+                    value['errno'] = errno_codes.EIO
         if cls == 'G':
             value.update(step='force-quit', **{k: p.get(k) for k in ('app', 'bundleId', 'growthGiBHour', 'footprintSeries')})
         self.actions.append(value)
         self.log('action', **value)
         performed = (result == 'sent' or details.get('stages', {}).get('renice', {}).get('result') == 'sent'
+                     or action == 'renice' and result == 'skipped' and details.get('reason') == 'already-nice'
                      or self.dry and allowed and safe and matched)
         if performed:
             if cls == 'G' and action == 'KILL' and gui_job:
