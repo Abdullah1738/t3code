@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { toolError } from "../src/toollog.ts";
+import { errorInfo, toolError } from "../src/toollog.ts";
 import { useToolLogFixture } from "./toollog-fixture.ts";
 import { OpenChamber, type JsonValue } from "../src/openchamber.ts";
 import { parseNotificationEvent } from "../src/notification-events.ts";
@@ -197,12 +197,17 @@ test("legacy fetch and JSON body failures preserve every non-Error input form", 
         try { await client.request("/api/permission/request"); } catch (error) { caught = error; }
         expect(caught).toBeInstanceOf(Error);
         toolError("telegram", "tg.attention.pendingRequests", undefined, caught);
-        const props: Record<string, string> = { cause, detail };
-        if (cause === "unclassified") props.errorClass = detail;
-        expect(legacyLogs.entries().at(-1)?.props).toEqual(props);
+        const props = { cause, detail, ...(cause === "unclassified" ? { errorClass: detail } : {}) };
+        expect(errorInfo(caught)).toEqual(props);
+        expect(legacyLogs.entries().find(row => row.props?.cause === cause && row.props?.detail === detail)?.props).toEqual(props);
       }
     }
   } finally { globalThis.fetch = original; }
-  expect(legacyLogs.entries().filter(row => row.error?.tag === "tg.attention.pendingRequests")).toHaveLength(cases.length * 2);
+  const firsts = legacyLogs.entries().filter(row => row.error?.tag === "tg.attention.pendingRequests");
+  expect(firsts.map(row => [row.props?.detail, row.props?.repeats ?? 1])).toEqual(["Undefined", "Null", "String", "Number", "Boolean", "BigInt", "Symbol", "Function", "Object", "Array"].map(detail => [detail, 1]));
+  legacyLogs.flushErrors();
+  const errors = legacyLogs.entries().filter(row => row.error?.tag === "tg.attention.pendingRequests");
+  expect(errors.slice(firsts.length).map(row => [row.props?.detail, row.props?.repeats])).toEqual([["Undefined", 1], ["Null", 1], ["String", 3], ["Number", 5], ["Boolean", 3], ["BigInt", 1], ["Symbol", 1], ["Function", 1], ["Object", 1], ["Array", 1]]);
+  expect(errors.reduce((sum, row) => sum + Number(row.props?.repeats ?? 1), 0)).toBe(cases.length * 2);
   for (const part of secret.split(" ")) expect(legacyLogs.text()).not.toContain(part);
 });

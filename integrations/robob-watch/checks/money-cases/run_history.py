@@ -14,7 +14,7 @@ import stat
 import signal
 import time
 
-from charges import within
+from charges import within, toollog as orders_log
 from data_io import DataUnavailable
 
 MAX_BYTES = 2 * 1024 * 1024
@@ -140,6 +140,8 @@ def run_row(values):
                         for k, val in value.items() if k in {'receipt', 'order', 'refund', 'history', 'other',
                                                                          'found', 'none', 'out_of_time', 'error'}
                         and (numeric(val) or isinstance(val, dict))}
+    if isinstance(values.get('marketplace_refresh'), dict):
+        row['marketplace_refresh'] = orders_log.marketplace_refresh_fields(values['marketplace_refresh'])
     row['at'] = values['at']
     row['exit'] = values.get('exit') if type(values.get('exit')) is int else None
     row['slowest'] = values.get('slowest') if values.get('slowest') in PHASES else 'unknown'
@@ -421,6 +423,8 @@ def summary(wd, since='24h', now=None):
                         'max': max(totals) if totals else None},
             'slow_runs': [{key: row.get(key) for key in ('at', 'total_s', 'slowest')}
                           for row in rows if row['total_s'] > 40],
+            'marketplace_refresh': next((row['marketplace_refresh'] for row in reversed(rows)
+                                         if 'marketplace_refresh' in row), {}),
             'owner_results': dict(sorted(Counter(row.get('owner_result', 'not_read') for row in rows).items())),
             'question_errors': dict(sorted(errors.items())), 'invalid_lines': invalid}
 
@@ -434,6 +438,9 @@ def format_summary(result):
     owner = result['owner']
     lines.insert(3, f"Owner: sources={owner['sources']}; cache age max={owner['cache_age_s_max']} s; "
                     f"list window max={owner['list_window_s_max']} s; last refresh={owner['last_refresh']}")
+    refresh = result.get('marketplace_refresh', {})
+    age = refresh.get('snapshot_age_s')
+    lines[0] += f"; marketplace snapshot age: {str(age) + ' s' if age is not None else 'unknown'}; last refresh: {refresh.get('last_result') or 'unknown'}"
     lines += [f'  {n}x {error}' for error, n in result['question_errors'].items()]
     lines += [f"  {row['at']}: {row['total_s']} s, slowest={row['slowest']}" for row in result['slow_runs']]
     if result['invalid_lines']:

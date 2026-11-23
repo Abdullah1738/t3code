@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
+from observer import count_bytes, submeasured, substep
 
 
 def request_group():
@@ -19,6 +20,9 @@ FACTORIES = {f.__name__: f for f in (list, set, Counter, request_group, provider
 
 
 def encode(value):
+    # Most retained percentile samples and counter keys are already JSON scalars.
+    if isinstance(value, (str, int, float)) or value is None:
+        return value
     # JSON pairs retain tuple keys and insertion order (including tied top counts).
     if isinstance(value, dict):
         kind = ('defaultdict:' + value.default_factory.__name__ if isinstance(value, defaultdict)
@@ -51,6 +55,7 @@ def decode(value):
     return result
 
 
+@submeasured('LoadState')
 def load(path, version):
     try:
         value = json.loads(path.read_text())
@@ -59,13 +64,16 @@ def load(path, version):
         return {}
 
 
+@submeasured('SaveState')
 def save(path, version, cursor, aggregate):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     cursor['sha256'] = cursor.digest.hexdigest()
     fd, temporary = tempfile.mkstemp(prefix='.aggregate-', dir=path.parent)
     try:
         with os.fdopen(fd, 'w') as out:
-            json.dump(dict(version=version, cursor=cursor, aggregate=encode(aggregate)), out, separators=(',', ':'))
+            # dumps uses the C encoder; dump iterates and writes every JSON chunk in Python.
+            out.write(json.dumps(dict(version=version, cursor=cursor, aggregate=encode(aggregate)),
+                                 separators=(',', ':')))
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
@@ -78,6 +86,7 @@ class Cursor(dict):
         self.digest = digest
 
 
+@submeasured('ValidateCursor')
 def cursor_for(source, previous):
     previous = previous if isinstance(previous, dict) else {}
     info = os.fstat(source.fileno())
@@ -97,6 +106,7 @@ def cursor_for(source, previous):
             if not chunk:
                 break
             digest.update(chunk)
+            count_bytes('BytesHashed', len(chunk))
             remaining -= len(chunk)
         append = remaining == 0 and previous.get('sha256') == digest.hexdigest()
     if not append:
@@ -106,16 +116,19 @@ def cursor_for(source, previous):
 
 
 def lines(source, cursor):
-    if cursor['offset'] == 0:
-        # A caller may reject the aggregate after validating its cursor.
-        cursor.digest = hashlib.sha256()
-    source.seek(cursor['offset'])
-    while source.tell() < cursor['size']:
-        line = source.readline(cursor['size'] - source.tell())
-        if not line:
-            break
-        complete = line.endswith(b'\n')
-        if complete:
-            cursor.digest.update(line)
-            cursor['offset'] = source.tell()
-        yield line, complete
+    with substep('ParseLines'):
+        if cursor['offset'] == 0:
+            # A caller may reject the aggregate after validating its cursor.
+            cursor.digest = hashlib.sha256()
+        source.seek(cursor['offset'])
+        while source.tell() < cursor['size']:
+            line = source.readline(cursor['size'] - source.tell())
+            if not line:
+                break
+            complete = line.endswith(b'\n')
+            count_bytes('BytesParsed', len(line))
+            if complete:
+                cursor.digest.update(line)
+                count_bytes('BytesHashed', len(line))
+                cursor['offset'] = source.tell()
+            yield line, complete

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { digestLabel, parseAskKey, type Admission, type DigestItem } from "./digest.ts";
 import { redact } from "./redact.ts";
 import type { OutboxRecord, Store } from "./store.ts";
 import { toolError, toolLog } from "./toollog.ts";
@@ -9,7 +10,7 @@ const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 type Ask = { firstAt: number; count: number; lastId: string };
 type Burst = { source: string; nextAt: number; count: number; latest: string; includesFirst: boolean;
   lastId: string; lastTotal: number; carried?: boolean };
-type Notice = { id: string; source: string; text: string; severity: string; askKey?: string; burstKey?: string };
+export type Notice = { id: string; source: string; text: string; severity: string; askKey?: string; burstKey?: string };
 
 function saveLogSeverity(store: Store, id: string, severity: string): void {
   // Delivery can happen after a restart, so retain only the severity alongside the immutable operation.
@@ -67,7 +68,7 @@ export function allowQueuedAsk(store: Store, item: OutboxRecord, now = Date.now(
 }
 
 /** Admission and deferred summaries share the outbox transaction, so retries and restarts cannot double-count. */
-export function enqueueNotice(store: Store, notice: Notice, now = Date.now()): boolean {
+export function enqueueNotice(store: Store, notice: Notice, now = Date.now(), admission?: Admission): boolean {
   return store.db.transaction(() => {
     const receiptKey = `notice-receipt:${notice.id}`;
     const spec = hash(JSON.stringify(notice));
@@ -102,16 +103,42 @@ export function enqueueNotice(store: Store, notice: Notice, now = Date.now()): b
         ids: { operation: notice.id, key: notice.id }, props: { action: "check", deduped: true } });
       return false;
     }
-    const askKey = notice.askKey ?? boardAskKey(notice.source, notice.text);
+    if (admission && "drop" in admission) {
+      store.set(receiptKey, spec);
+      return false;
+    }
+    const resolvedKey = notice.askKey ?? boardAskKey(notice.source, notice.text);
+    const askKey = resolvedKey && parseAskKey(resolvedKey) ? resolvedKey.toLowerCase() : resolvedKey;
     if (askKey !== undefined) {
-      if (/^[a-z0-9-]+:\d+:q\d+$/.test(askKey.toLowerCase()))
-        store.set(`ask-timing-key:${notice.id}`, askKey.toLowerCase());
       const key = `notice-ask:${hash(askKey)}`;
-      if (!reserveAsk(store, key, notice.id, now)) {
+      const queued = store.get<DigestItem>(`digest-item:${askKey}`);
+      if (queued && !admission?.digest) {
+        store.enqueue({ id: queued.noticeId, kind: "notification", text: `[${queued.source}] ${queued.text}` });
+        store.set(`ask-timing-key:${queued.noticeId}`, askKey);
+        saveLogSeverity(store, queued.noticeId, queued.severity);
+        store.db.query("DELETE FROM kv WHERE key = ?").run(`digest-item:${askKey}`);
+        store.set(receiptKey, spec);
+        return true;
+      }
+      if (!reserveAsk(store, key, notice.id, now) && !(queued && admission?.digest)) {
         store.set(receiptKey, spec);
         return false;
       }
     }
+    if (admission?.digest && askKey && parseAskKey(askKey)) {
+      const identity = parseAskKey(askKey)!;
+      const ask = admission.ask;
+      const queued = store.get<DigestItem>(`digest-item:${askKey}`);
+      store.set(`digest-item:${askKey}`, { askKey, cardId: ask.cardId,
+        board: digestLabel(ask.boardName || identity.board), title: digestLabel(ask.title || ask.text),
+        kind: ask.kind, queuedAt: queued?.queuedAt ?? now, revision: (queued?.revision ?? 0) + 1, noticeId: queued?.noticeId ?? notice.id, source: notice.source,
+        text: redact(notice.text), severity: notice.severity } satisfies DigestItem);
+      store.set(receiptKey, spec);
+      toolLog({ component: "telegram", kind: "event", name: "tg.digest", ok: true,
+        props: { action: "queued", board: identity.board, kind: ask.kind ?? "unknown" } });
+      return true;
+    }
+    if (askKey && parseAskKey(askKey)) store.set(`ask-timing-key:${notice.id}`, askKey);
     if (notice.burstKey !== undefined) {
       flushBursts(store, now);
       const key = `notice-burst:${hash(JSON.stringify([notice.source, notice.burstKey]))}`;

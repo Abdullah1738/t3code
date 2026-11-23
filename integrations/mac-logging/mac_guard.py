@@ -2,7 +2,9 @@
 """Thirty-second resource backstop. All destructive decisions require birth identity."""
 import argparse
 from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
+import errno as errno_codes
 import fcntl
 import importlib.util
 import hashlib
@@ -13,6 +15,7 @@ import plistlib
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -24,7 +27,7 @@ import uuid
 # Helper subprocesses use -I; load only the reviewed siblings beside this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cpu import PS, ProbeError, command, deltas, parse_ps, seconds, cpu_ticks, runnable_threads, spike
+from cpu import PS, ProbeError, command, failure_details, deltas, parse_ps, seconds, cpu_ticks, runnable_threads, spike
 from cpu_labels import command_label
 from memory import STATS, parse_top, parse_swap, ProbeError as MemoryError
 from toollog import emit
@@ -50,6 +53,12 @@ SLOW_LEAK_SECONDS = 1800
 OVERLOAD_SCRIPT = Path.home() / '.local/share/robob-overload-restart/robob-overload-restart.py'
 OVERLOAD_STATE = Path(os.environ.get('ROBOB_OVERLOAD_STATE', str(Path.home()/'.local/state/robob-overload-restart')))
 WORKER = ('codex', 'gpt-6.1-sol')
+WORKER_HTTP_TIMEOUT = 45
+WORKER_HELPER_TIMEOUT = 50
+STRAIN_WORKER_INTERVAL = 600
+STEER_SIGNALS = {2, 3, 4, 5, 6}
+LOAD_ONLY_WORKER_DELAY = 600
+WORKER_SKIP_LOG_INTERVAL = 60
 STATE = Path.home() / '.local/state/mac-guard'
 EVIDENCE = Path.home() / '.robob/board-artifacts/mac-guard'
 T3CTL = str(Path.home() / '.local/bin/t3ctl')
@@ -87,7 +96,23 @@ def worker_thread_id(request_id):
     return 'ardud-control:thread:'+request_id
 
 
-def worker_control(request, opener=urllib.request.urlopen):
+class WorkerControlError(ProbeError):
+    def __init__(self, failure, durationS=None, status=None):
+        super().__init__(failure)
+        self.failure, self.durationS, self.status = failure, durationS, status
+
+
+def worker_failure(exc):
+    if isinstance(exc, WorkerControlError):
+        return exc.failure
+    if isinstance(exc, (TimeoutError, socket.timeout, subprocess.TimeoutExpired)):
+        return 'timeout'
+    if isinstance(exc, urllib.error.URLError):
+        return 'timeout' if isinstance(exc.reason, (TimeoutError, socket.timeout)) else 'unavailable'
+    return 'bad_response' if isinstance(exc, (ValueError, KeyError, TypeError)) else 'unavailable'
+
+
+def worker_control(request, opener=urllib.request.urlopen, metrics=None):
     # Match t3ctl's credential precedence. The parent bounds this helper's whole
     # lifetime, including HTTP response reads, and never logs credentials.
     url, token = os.environ.get('T3_CONTROL_URL'), os.environ.get('T3_CONTROL_TOKEN')
@@ -112,17 +137,24 @@ def worker_control(request, opener=urllib.request.urlopen):
     req = urllib.request.Request(url.rstrip('/')+'/api/ardud/control'+request['path'],
               data=json.dumps(body).encode() if body is not None else None, method=request['method'],
               headers={'Authorization': 'Bearer '+token, 'Content-Type': 'application/json', 'Accept': 'application/json'})
+    started = time.monotonic()
     try:
-        with opener(req, timeout=8) as response:
+        with opener(req, timeout=WORKER_HTTP_TIMEOUT) as response:
             value = json_object(response.read(2_000_000).decode())
     except urllib.error.HTTPError as exc:
-        value = json_object(exc.read(2_000_000).decode())
+        try:
+            value = json_object(exc.read(2_000_000).decode())
+        except ValueError:
+            value = {}
         if (request['method'] == 'GET' and exc.code == 404
                 and isinstance(value.get('error'), dict) and value['error'].get('code') == 'not_found'):
             return dict(missing=True)
-        raise ProbeError('worker_control_http') from None
+        raise WorkerControlError('http_status', status=exc.code) from None
+    finally:
+        if metrics is not None:
+            metrics['durationS'] = time.monotonic()-started
     if value.get('ok') is False:
-        raise ProbeError('worker_control_response')
+        raise WorkerControlError('bad_response')
     return value
 
 
@@ -186,11 +218,27 @@ def robob(p, rows):
     return False
 
 
+def robob_ancestor(p, rows):
+    # chain() is nearest-parent first; provider jobs do not inherit app protection.
+    for ancestor in chain(p, rows):
+        if provider(ancestor):
+            return None
+        if robob(ancestor, rows):
+            return ancestor
+    return None
+
+
+def robob_descendant(p, rows):
+    return robob_ancestor(p, rows) is not None
+
+
 def label(p, rows):
     return next((q['label'] for q in [p]+chain(p, rows) if q.get('label')), None)
 
 
 def exempt(p, rows, system_gui=False):
+    if any(re.search(r'(?:^|[/\s])offbox(?:\.py)?(?:\s|$)', q.get('args', '')) for q in [p]+chain(p, rows)):
+        return True
     if (label(p, rows) in MEMORY_EXEMPT['service_labels'] or p.get('sessionWrapper')
             or p['pid'] == os.getpid() or (system(p) and not system_gui) or provider(p) or robob(p, rows)):
         return True
@@ -198,8 +246,9 @@ def exempt(p, rows, system_gui=False):
     return False
 
 
-def protected(p, rows):
-    return exempt(p, rows) or bool(label(p, rows)) or 'cua-driver' in p['comm']
+def protected(p, rows, *, renice=False):
+    return (exempt(p, rows) or bool(label(p, rows)) or 'cua-driver' in p['comm']
+            or not renice and robob_descendant(p, rows))
 
 
 def gui(p):
@@ -312,17 +361,22 @@ class Host:
         return command(argv, self.run, timeout)
 
     def identity(self, p):
+        return self.identity_recheck(p)['same']
+
+    def identity_recheck(self, p):
         try:
             raw = self.cmd(['/bin/ps', '-ww', '-p', str(p['pid']), '-o', 'lstart=,comm='], 2).strip()
             parts = raw.split(None, 5)
             same = len(parts) == 6 and ' '.join(parts[:5]) == p['start'] and parts[5] == p['comm']
             if not same or not p.get('args'):
-                return False
+                return dict(same=False)
             args = self.cmd(['/bin/ps', '-ww', '-p', str(p['pid']), '-o', 'lstart=,args='], 2).strip().split(None, 5)
-            return (len(args) == 6 and ' '.join(args[:5]) == p['start']
-                    and hashlib.sha256(args[5].encode()).hexdigest() == p.get('argsHash', hashlib.sha256(p['args'].encode()).hexdigest()))
-        except ProbeError:
-            return False
+            return dict(same=(len(args) == 6 and ' '.join(args[:5]) == p['start']
+                    and hashlib.sha256(args[5].encode()).hexdigest() == p.get('argsHash', hashlib.sha256(p['args'].encode()).hexdigest())))
+        except (ProbeError, OSError) as exc:
+            if isinstance(exc, ProbeError) and exc.rc == 1 and not exc.stderr:
+                return dict(same=False, result='gone', errno=errno_codes.ESRCH)
+            return dict(same=False, **failure_details(exc, 'ps'))
 
     def same_birth(self, p):
         try:
@@ -335,10 +389,58 @@ class Host:
         os.kill(p['pid'], sig)
 
     def soften(self, p):
-        self.cmd(['/usr/bin/renice', '20', '-p', str(p['pid'])], 2)
-        # Revalidate between commands too.
-        if self.identity(p):
-            self.cmd(['/usr/bin/taskpolicy', '-b', '-p', str(p['pid'])], 2)
+        # Renice is bounded in a helper; Darwin background mode can starve lock holders.
+        stages = {name:dict(result='skipped', reason='prior-stage-failed')
+                  for name in ('identityRead', 'getpriority', 'renice', 'identityRecheck', 'readBack')}
+        outcome = dict(stages=stages)
+
+        def finish(stage, value):
+            value = {k:v for k,v in value.items() if v is not None}
+            if value.get('result') == 'error' and not any(type(value.get(k)) is int for k in ('errno', 'rc')):
+                value['errno'] = errno_codes.EIO
+            stages[stage] = value
+            return dict(outcome, stage=stage, **value)
+
+        def identify(stage):
+            identity = self.identity_recheck(p)
+            if identity['same']:
+                stages[stage] = dict(result='sent', same=True)
+                return None
+            result = identity.get('result', 'identity-changed')
+            return finish(stage, dict(identity, result=result, reason=identity.get('reason', result)))
+
+        changed = identify('identityRead')
+        if changed:
+            return changed
+        try:
+            outcome['niceBefore'] = os.getpriority(os.PRIO_PROCESS, p['pid'])
+        except OSError as exc:
+            return finish('getpriority', failure_details(exc, 'getpriority'))
+        stages['getpriority'] = dict(result='sent')
+        if outcome['niceBefore'] >= 10:
+            outcome['niceAfter'] = outcome['niceBefore']
+            return finish('renice', dict(result='skipped', reason='already-nice'))
+        try:
+            self.cmd(['/usr/bin/renice', '20', '-p', str(p['pid'])], 2)
+        except (ProbeError, OSError) as exc:
+            failure = failure_details(exc, 'renice')
+            if re.search(r'no such process', failure.get('stderr', ''), re.I):
+                identify('identityRecheck')
+                identity = stages['identityRecheck']
+                if not identity['same'] and identity.get('result') != 'error':
+                    failure.update(result='gone', errno=errno_codes.ESRCH)
+            return finish('renice', failure)
+        stages['renice'] = dict(result='sent', rc=0)
+        changed = identify('identityRecheck')
+        if changed:
+            return changed
+        try:
+            outcome['niceAfter'] = os.getpriority(os.PRIO_PROCESS, p['pid'])
+        except OSError as exc:
+            return finish('readBack', failure_details(exc, 'getpriority'))
+        if outcome['niceAfter'] != 20:
+            return finish('readBack', dict(result='error', errno=errno_codes.EIO, reason='nice-readback-mismatch'))
+        return finish('readBack', dict(result='sent'))
 
     def app_info(self, p):
         try:
@@ -397,19 +499,23 @@ class Host:
             raise ValueError('unreadable thread')
         return value
 
-    def worker_send(self, tid, text, request_id=None):
-        self.cmd([T3CTL, 'send', tid, text]+(['--request-id', request_id] if request_id else []), 5)
+    def worker_send(self, tid, text, request_id=None, mode='auto'):
+        self.cmd([T3CTL, 'send', tid, text]+(['--request-id', request_id] if request_id else [])
+                 +(['--mode', mode] if mode != 'auto' else []), 5)
 
     def worker_request(self, method, path, body=None):
+        self.worker_duration = None
         try:
             result = self.run(['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--worker-control'],
                               input=json.dumps(dict(method=method, path=path, body=body)), capture_output=True,
-                              text=True, timeout=10, env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
-        except (subprocess.TimeoutExpired, OSError):
-            raise ProbeError('worker_control_unavailable') from None
+                              text=True, timeout=WORKER_HELPER_TIMEOUT, env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise WorkerControlError(worker_failure(exc)) from None
+        value = json_object(result.stdout)
+        self.worker_duration = value.pop('_durationS', None)
         if result.returncode:
-            raise ProbeError('worker_control_unavailable')
-        return json_object(result.stdout)
+            raise WorkerControlError(value.get('failure', 'unavailable'), self.worker_duration, value.get('status'))
+        return value
 
     def worker_lookup(self, request_id):
         value = self.worker_request('GET', '/threads/'+urllib.parse.quote(worker_thread_id(request_id), safe=''))
@@ -420,8 +526,38 @@ class Host:
             raise ValueError('unreadable launch correlation')
         return thread['threadId']
 
+    def worker_initial(self, launch):
+        tid = worker_thread_id(launch['clientRequestId'])
+        path = '/threads/'+urllib.parse.quote(tid, safe='')
+        value = self.worker_request('GET', path+'/messages?role=user&limit=1000')
+        messages = value.get('messages')
+        if value.get('threadId') != tid or not isinstance(messages, list):
+            raise ValueError('unreadable initial message history')
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError('unreadable initial message')
+            if message.get('messageId') != tid:
+                continue
+            if (message.get('role') != 'user' or message.get('text') != launch['prompt'].strip()
+                    or not isinstance(message.get('runId'), str) or not message['runId']):
+                raise ValueError('unconfirmed initial message')
+            return tid
+        if type(value.get('total')) is not int or value['total'] != len(messages):
+            raise ValueError('incomplete initial message history')
+        return None
+
+    def worker_resume(self, launch):
+        # Reuse the server's original initial-message receipt: the timed-out
+        # launch can still commit after our history snapshot. A new send ID
+        # would accept a second run in that race.
+        path = '/threads/'+urllib.parse.quote(worker_thread_id(launch['clientRequestId']), safe='')+'/resume-launch'
+        return self._worker_launch(launch, path)
+
     def worker_create(self, launch):
-        value = self.worker_request('POST', '/threads', launch)
+        return self._worker_launch(launch, '/threads')
+
+    def _worker_launch(self, launch, path):
+        value = self.worker_request('POST', path, launch)
         tid = worker_thread_id(launch['clientRequestId'])
         if (value.get('threadId') != tid or value.get('messageId') != tid
                 or not isinstance(value.get('runId'), str) or not value['runId']):
@@ -524,7 +660,10 @@ class Host:
             ('pressure', ['/usr/sbin/sysctl', '-n', 'kern.memorystatus_vm_pressure_level'], lambda s: int(s.strip()), 2),
             ('swap', ['/usr/sbin/sysctl', '-n', 'vm.swapusage'], parse_swap, 2)):
             try:
+                observed_at = time.time()
                 snapshot[key] = parser(self.cmd(argv, timeout))
+                if key == 'top':
+                    snapshot['footprintObservedAt'] = observed_at
             except (ProbeError, MemoryError, ValueError) as exc:
                 snapshot[key] = None
                 snapshot['errors'].append(dict(probe=key, failure=str(exc)))
@@ -566,7 +705,7 @@ def health_lag(health):
 
 
 class Guard:
-    def __init__(self, host=None, state=STATE, evidence=EVIDENCE, dry=None, logger=emit, clock=time.time):
+    def __init__(self, host=None, state=STATE, evidence=EVIDENCE, dry=None, logger=emit, clock=time.time, worker_submit=None):
         self.host = host or Host()
         self.state, self.evidence = Path(state), Path(evidence)
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -597,6 +736,11 @@ class Guard:
         self.diag_episode = False
         self.incidents = set()
         self.restart_incident = None
+        # The executor only runs bounded helper subprocesses, never guard state
+        # changes. One in-flight request keeps reconcile and POST serialized.
+        self.worker_executor = ThreadPoolExecutor(max_workers=1) if worker_submit is None else None
+        self.worker_submit = worker_submit or self.worker_executor.submit
+        self.worker_job = None
 
     @property
     def muted(self):
@@ -657,18 +801,22 @@ class Guard:
             p = dict(current, argsHash=p.get('argsHash', current.get('argsHash')))
         allowed = cls not in ('A', 'B', 'C') or self.strain or action == 'CONT'
         result, errno = ('cancelled_strain_clear' if not allowed else 'would_'+action if self.muted else 'skipped_identity'), None
+        details = {}
         stop_intent, prior_stage = False, None
         gui_job = self.gui_jobs.get((p['pid'], p['start']))
         gui_ok = (cls == 'G' and gui_job and gui_job['phase'] == 'force'
                   and self.gui_force_growth(p, gui_job) and self.gui_allowed(p, gui_job))
+        ancestor = robob_ancestor(p, self.rows)
         if cls == 'G':
             safe = gui_ok
         elif cls == 'D' or action == 'CONT':
             safe = not exempt(p, self.rows)
         else:
-            safe = not protected(p, self.rows)
+            safe = not protected(p, self.rows, renice=action == 'renice')
+        if ancestor and action != 'renice':
+            safe = False
         if allowed and not safe:
-            result = 'cancelled_gui_authorization' if cls == 'G' else 'cancelled_protection'
+            result = 'cancelled_gui_authorization' if cls == 'G' and not ancestor else 'cancelled_protection'
         elif not matched:
             result = 'skipped_identity'
         if (allowed and not self.muted and p['pid'] in self.rows and self.rows[p['pid']]['start'] == p['start']
@@ -686,14 +834,16 @@ class Guard:
                     stop_intent = True
                     self.save()
                 if action == 'renice':
-                    self.host.soften(p)
+                    details = self.host.soften(p)
+                    result, errno = details['result'], details.get('errno')
                 else:
                     self.host.signal(p, getattr(signal, 'SIG'+action))
                     if action == 'STOP':
                         self.hogs[ident].update(confirmed=True, at=max(self.now, self.clock()))
-                result = 'sent'
+                    result = 'sent'
             except (ProbeError, OSError) as exc:
-                result, errno = 'error', getattr(exc, 'errno', None)
+                details = failure_details(exc, action)
+                result, errno = details['result'], details['errno']
                 if stop_intent:
                     self.stopped = [q for q in self.stopped if (q['pid'], q['start']) != ident]
                     if prior_stage is None:
@@ -704,11 +854,23 @@ class Guard:
         value = dict(pid=p['pid'], start=p['start'], comm=p['comm'], args=command_label(p.get('args', '')),
                      action=action, result=result, errno=errno, actionClass=cls, owner=p.get('owner', {}).get('state', 'unknown'),
                      cpuDelta=p.get('cpuDelta', 0), footprintGiB=p.get('footprintGiB'), label=label(p, self.rows))
+        value.update({k:details[k] for k in ('stages', 'stage', 'reason', 'rc', 'niceBefore', 'niceAfter') if k in details})
+        if ancestor:
+            value.update(protectedBy='robob-descendant', protectedAncestor={k: ancestor[k] for k in ('pid', 'start', 'comm')})
+        if action == 'renice' and result == 'error':
+            value.setdefault('stage', 'renice')
+            if errno is None:
+                if type(value.get('rc')) is int:
+                    value.pop('errno')
+                else:
+                    value['errno'] = errno_codes.EIO
         if cls == 'G':
             value.update(step='force-quit', **{k: p.get(k) for k in ('app', 'bundleId', 'growthGiBHour', 'footprintSeries')})
         self.actions.append(value)
         self.log('action', **value)
-        performed = result == 'sent' or self.dry and allowed and safe and matched
+        performed = (result == 'sent' or details.get('stages', {}).get('renice', {}).get('result') == 'sent'
+                     or action == 'renice' and result == 'skipped' and details.get('reason') == 'already-nice'
+                     or self.dry and allowed and safe and matched)
         if performed:
             if cls == 'G' and action == 'KILL' and gui_job:
                 gui_job['phase'] = 'complete'
@@ -879,42 +1041,126 @@ class Guard:
             self.pending = remaining
             self.save()
 
-    def launch_worker(self, path, adopted=False):
+    def worker_launch_step(self, launch, path, reconcile, operation=None):
         if self.muted:
+            return
+        if self.worker_job is None:
+            operation = operation or ('worker_lookup' if reconcile else 'worker_create')
+            def request():
+                started = time.monotonic()
+                try:
+                    if operation == 'worker_lookup':
+                        value = self.host.worker_lookup(launch['clientRequestId'])
+                    elif operation == 'worker_initial':
+                        value = self.host.worker_initial(launch)
+                    elif operation == 'worker_resume':
+                        value = self.host.worker_resume(launch)
+                    else:
+                        value = self.host.worker_create(launch)
+                    return dict(value=value, durationS=getattr(self.host, 'worker_duration', None) or time.monotonic()-started)
+                except (ProbeError, OSError, ValueError, KeyError, TypeError) as exc:
+                    return dict(failure=worker_failure(exc),
+                                durationS=getattr(exc, 'durationS', None) or getattr(self.host, 'worker_duration', None) or time.monotonic()-started,
+                                status=getattr(exc, 'status', None))
+            self.worker_job = dict(requestId=launch['clientRequestId'], operation=operation,
+                                   future=self.worker_submit(request))
+        job = self.worker_job
+        if job['requestId'] != launch['clientRequestId'] or not job['future'].done():
+            return
+        result = job['future'].result()
+        self.worker_job = None
+        failure = result.get('failure')
+        self.log(job['operation'], result='failed' if failure else 'missing' if result['value'] is None else 'found',
+                 durationS=result['durationS'], failure=failure, errno=result.get('status'))
+        if failure:
+            self.log('error', probe=job['operation'], failure=failure,
+                     durationS=result['durationS'], errno=result.get('status'))
+            return
+        if job['operation'] == 'worker_lookup':
+            return self.worker_launch_step(launch, path, reconcile=result['value'] is not None,
+                                           operation='worker_initial' if result['value'] is not None else 'worker_create')
+        if job['operation'] == 'worker_initial' and result['value'] is None:
+            return self.worker_launch_step(launch, path, reconcile=True, operation='worker_resume')
+        self.log('worker_spawned', threadId=result['value'], evidence=str(path),
+                 result='sent' if job['operation'] == 'worker_create' else 'adopted')
+        return result['value']
+
+    def launch_worker(self, path, reconcile=False):
+        if self.muted:
+            return
+        if self.worker_job is None and self.now < self.worker.get('nextReconcileAt', 0):
             return
         self.worker['nextReconcileAt'] = self.now+30
+        self.worker['evidence'] = str(path)
         write_json(self.state/'worker.json', self.worker)
-        try:
-            tid = self.host.worker_create(self.worker['launch'])
+        tid = self.worker_launch_step(self.worker['launch'], path, reconcile)
+        if tid:
             self.worker = dict(threadId=tid, startedAt=self.worker['startedAt'])
             write_json(self.state/'worker.json', self.worker)
-            self.log('worker_spawned', threadId=tid, evidence=str(path), result='adopted' if adopted else 'sent')
-            return tid
-        except (ProbeError, OSError, ValueError, KeyError):
-            self.log('error', probe='worker_create', failure='unknown')
+        return tid
 
-    def worker_needed(self, path, summary, urgent=False, delivery=None):
+    def worker_skipped(self, reason, signals, path):
+        last = self.saved.get('workerSkippedAt')
+        if last is not None and 0 <= self.now-last < WORKER_SKIP_LOG_INTERVAL:
+            return
+        self.saved['workerSkippedAt'] = self.now
+        self.log('worker_skipped', reason=reason, signals=signals, evidence=str(path))
+        self.save()
+
+    def record_strain_worker(self, signals, path, request_id=None, mode='auto', census=False):
+        # Both triggers reserve before sending: a timeout may still be accepted.
+        tid = self.worker.get('threadId')
+        if not tid and self.worker.get('launchUnknown'):
+            tid = worker_thread_id(self.worker['launch']['clientRequestId'])
+        last = self.strain_worker_change(signals)[0]
+        # Queued census coverage cannot stand in for an immediate urgent update.
+        immediate = set(last.get('immediateSignals', last['signals'] or [])) if last else set()
+        if mode == 'auto':
+            immediate = set(signals or []) & STEER_SIGNALS
+        elif not census:
+            immediate &= set(signals or [])
+        self.saved['strainWorker'] = dict(signals=sorted(set(signals)) if signals is not None else None,
+                                        at=self.now, evidence=str(path), threadId=tid, requestId=request_id,
+                                        immediateSignals=sorted(immediate))
+        self.save()
+
+    def strain_worker_change(self, signals, immediate=False):
+        last = self.saved.get('strainWorker')
+        tid = self.worker.get('threadId')
+        if not tid and self.worker.get('launchUnknown'):
+            tid = worker_thread_id(self.worker['launch']['clientRequestId'])
+        if last and last.get('threadId', tid) != tid:
+            last = None
+        gained = set(signals or [])
+        if last:
+            # An onset can precede the first sample. Its census covers load/slow
+            # strain, but a newly observed emergency must still reach the worker.
+            gained = gained & STEER_SIGNALS if last['signals'] is None else gained-set(last['signals'])
+            if immediate:
+                covered = set(last.get('immediateSignals', last['signals'] or []))
+                gained = (gained-STEER_SIGNALS) | ((set(signals or []) & STEER_SIGNALS)-covered)
+        recent = last and not gained and 0 <= self.now-last['at'] < STRAIN_WORKER_INTERVAL
+        return last, gained, bool(recent)
+
+    def worker_needed(self, path, summary, urgent=False, delivery=None, signals=None, allow_launch=True,
+                      mode='auto', census=False):
+        if signals is not None and not census:
+            if not signals:
+                self.worker_skipped('empty_signals', signals, path)
+                return
+            last, gained, recent = self.strain_worker_change(signals, immediate=True)
+            if recent:
+                self.worker_skipped('unchanged', signals, path)
+                return
+            mode = 'auto' if gained & STEER_SIGNALS else 'queue'
+            if last and not gained:
+                summary += '; still ongoing'
         if self.muted:
             self.log('worker_steered' if self.worker.get('threadId') else 'worker_spawned',
-                     result='would_act', evidence=str(path), summary=summary)
+                     result='would_act', evidence=str(path), summary=summary, mode=mode)
             return
         if self.worker.get('launchUnknown'):
-            if self.now < self.worker.get('nextReconcileAt', 0):
-                return
-            self.worker['nextReconcileAt'] = self.now+30
-            write_json(self.state/'worker.json', self.worker)
-            try:
-                tid = self.host.worker_lookup(self.worker['launch']['clientRequestId'])
-            except (ProbeError, OSError, ValueError, KeyError):
-                self.log('error', probe='worker_reconcile', failure='unavailable')
-                return
-            if self.muted:
-                return
-            # Thread creation precedes initial-message acceptance. Replay the
-            # same command even for a found thread, and retain the full safety
-            # prompt until the server confirms its durable initial run. The
-            # shared command/message IDs also deduplicate a late first request.
-            if not self.launch_worker(path, adopted=tid is not None):
+            if not self.launch_worker(path, reconcile=True):
                 return
         tid = self.worker.get('threadId')
         if tid:
@@ -928,14 +1174,21 @@ class Guard:
             if not ended:
                 if self.muted:
                     return
+                if census and self.strain_worker_change(signals)[2]:
+                    delivery['suppressed'] = True
+                    self.worker_skipped('unchanged', signals, path)
+                    return
+                if delivery is not None:
+                    delivery.update(threadId=tid, mode=mode)
+                if signals is not None or census:
+                    self.record_strain_worker(signals, path, delivery['requestId'] if delivery is not None else None,
+                                              mode=mode, census=census)
+                elif delivery is not None:
+                    self.save()
                 try:
-                    if delivery is not None:
-                        delivery['threadId'] = tid
-                        self.save()
-                        self.host.worker_send(tid, str(path)+'\n'+summary, delivery['requestId'])
-                    else:
-                        self.host.worker_send(tid, str(path)+'\n'+summary)
-                    self.log('worker_steered', threadId=tid, evidence=str(path))
+                    self.host.worker_send(tid, str(path)+'\n'+summary,
+                                          delivery['requestId'] if delivery is not None else None, mode=mode)
+                    self.log('worker_steered', threadId=tid, evidence=str(path), mode=mode)
                     return True
                 except (ProbeError, OSError):
                     self.log('error', probe='worker_send', failure='unavailable')
@@ -943,6 +1196,12 @@ class Guard:
             self.worker.pop('threadId', None)
             self.worker['endedAt'] = self.now
             write_json(self.state/'worker.json', self.worker)
+        if not allow_launch:
+            if signals is not None:
+                self.worker_skipped('load_only_wait', signals, path)
+            return
+        if self.worker_job is not None:
+            return
         if not urgent and self.now-self.worker.get('endedAt', 0) < 1200:
             return
         if self.muted:
@@ -957,6 +1216,8 @@ class Guard:
             delivery.update(launch=launch, startedAt=self.now)
             self.save()
         write_json(self.state/'worker.json', self.worker)
+        if signals is not None or census:
+            self.record_strain_worker(signals, path)
         return self.launch_worker(path)
 
     def queue_restart_responder(self, path, reason, urgent):
@@ -965,47 +1226,90 @@ class Guard:
         self.save()
 
     def deliver_restart_responder(self):
-        report = self.saved.get('restartResponder')
+        return self.deliver_responder('restartResponder')
+
+    def deliver_strain_clears(self):
+        for key in [k for k in self.saved if k.startswith('strainClearResponder:')]:
+            report = self.saved[key]
+            if self.muted or self.now < report.get('nextAttemptAt', 0):
+                continue
+            if (self.worker.get('launchUnknown')
+                    and report['threadId'] == worker_thread_id(self.worker['launch']['clientRequestId'])):
+                continue  # the original safety message must be accepted first
+            try:
+                value = self.host.worker_status(report['threadId'])
+            except (ProbeError, OSError, ValueError):
+                report['nextAttemptAt'] = self.now+30
+                self.save()
+                self.log('error', probe='worker_status', failure='unavailable', threadId=report['threadId'])
+                continue
+            ended = (value.get('state') == 'idle' and value.get('status') in ('completed', 'failed', 'cancelled', 'interrupted')
+                     and not value.get('activeRunId') and not value.get('pendingRequests'))
+            if ended:
+                self.saved.pop(key)
+                self.save()
+            else:
+                # The existing responder path retries the same send identity;
+                # a lost ack never selects a different worker or creates one.
+                self.deliver_responder(key)
+
+    def deliver_responder(self, key):
+        report = self.saved.get(key)
         if not report or self.muted or self.now < report.get('nextAttemptAt', 0):
             return
         report['nextAttemptAt'] = self.now+30
+        census = key.startswith('overloadResponder:')
+        mode = report.get('mode', 'queue' if census or key.startswith('strainClearResponder:') else 'auto')
+        if census:
+            report.setdefault('signals', self.saved.get('strainSignals') or None)
         self.save()
         # A lost acknowledgment may belong to a worker that has since ended.
         # Replay its original operation, without selecting a new worker.
         try:
             if report.get('launch'):
                 launch = report['launch']
-                adopt = (self.worker.get('launch', {}).get('clientRequestId') == launch['clientRequestId']
-                         or not self.worker.get('threadId') and not self.worker.get('launchUnknown'))
-                if adopt:
-                    self.worker = dict(launchUnknown=True, launch=launch, startedAt=report['startedAt'],
-                                       nextReconcileAt=self.now+30)
-                    write_json(self.state/'worker.json', self.worker)
-                found = self.host.worker_lookup(launch['clientRequestId'])
-                if self.muted:
-                    return
-                tid = self.host.worker_create(launch)
-                if adopt:
-                    self.worker = dict(threadId=tid, startedAt=report['startedAt'])
-                    write_json(self.state/'worker.json', self.worker)
-                self.log('worker_spawned', threadId=tid, evidence=report['evidence'],
-                         result='adopted' if found is not None else 'sent')
+                if self.worker.get('threadId') != worker_thread_id(launch['clientRequestId']):
+                    adopt = (self.worker.get('launch', {}).get('clientRequestId') == launch['clientRequestId']
+                             or not self.worker.get('threadId') and not self.worker.get('launchUnknown'))
+                    if adopt:
+                        if not self.worker.get('launchUnknown'):
+                            self.worker = dict(launchUnknown=True, launch=launch, startedAt=report['startedAt'])
+                            write_json(self.state/'worker.json', self.worker)
+                        tid = self.launch_worker(Path(report['evidence']), reconcile=True)
+                    else:
+                        tid = self.worker_launch_step(launch, Path(report['evidence']), reconcile=True)
+                    if not tid:
+                        return
+                    if adopt:
+                        self.worker = dict(threadId=tid, startedAt=report['startedAt'])
+                        write_json(self.state/'worker.json', self.worker)
                 delivered = True
             elif report.get('threadId'):
                 if self.muted:
                     return
-                self.host.worker_send(report['threadId'], report['evidence']+'\n'+report['summary'], report['requestId'])
-                self.log('worker_steered', threadId=report['threadId'], evidence=report['evidence'])
-                delivered = True
+                if census and report['threadId'] == self.worker.get('threadId'):
+                    last = self.strain_worker_change(report['signals'])[0]
+                    if last and last.get('requestId') != report['requestId']:
+                        report['suppressed'] = True
+                        self.worker_skipped('unchanged', report['signals'], Path(report['evidence']))
+                    else:
+                        self.record_strain_worker(report['signals'], Path(report['evidence']), report['requestId'],
+                                                  mode=mode, census=True)
+                delivered = not report.get('suppressed')
+                if delivered:
+                    self.host.worker_send(report['threadId'], report['evidence']+'\n'+report['summary'], report['requestId'], mode=mode)
+                    self.log('worker_steered', threadId=report['threadId'], evidence=report['evidence'], mode=mode)
             else:
                 delivered = self.worker_needed(Path(report['evidence']), report['summary'], urgent=report['urgent'],
-                                               delivery=report)
+                                               delivery=report, mode=mode, census=census,
+                                               signals=report['signals'] if census else None)
         except (ProbeError, OSError, ValueError, KeyError):
-            self.log('error', probe='restart_responder', failure='unavailable')
+            self.log('error', probe=key, failure='unavailable')
             return
-        if delivered:
-            self.saved.pop('restartResponder')
+        if delivered or report.get('suppressed'):
+            self.saved.pop(key)
             self.save()
+        return bool(delivered)
 
     def memory_event(self, p, kind, action):
         self.log('memory_runaway', pid=p['pid'], start=p['start'], comm=p['comm'], label=label(p, self.rows),
@@ -1155,7 +1459,17 @@ class Guard:
 
     def tick(self, sample, now):
         self.now, self.sample = now, sample
+        last_observation = self.saved.get('lastObservationAt', self.saved.get('lastSample', now))
+        # Only a completed classification can carry continuity forward. An
+        # interrupted tick's intermediate saves leave the timer invalidated.
+        load_only_since = self.saved.pop('loadOnlySince', None)
+        if not 0 <= now-last_observation <= 60:
+            load_only_since = None
+        self.saved['lastObservationAt'] = now
         self.cycle += 1
+        # Reconcile even after strain clears: a pending launch still owns its ID.
+        if self.worker.get('launchUnknown'):
+            self.launch_worker(Path(self.worker.get('evidence', self.evidence)), reconcile=True)
         if self.previous.get('at') and not 0 < now-self.previous['at'] <= 60:
             self.streak = self.calm = 0
         self.rows = {p['pid']: dict(p) for p in sample['rows']}
@@ -1183,7 +1497,8 @@ class Guard:
             p['cpuDelta'] = cpus.get(p['pid'], 0)
             footprint = top.get(p['pid'])
             if footprint:
-                p.update(footprintGiB=footprint['memMb']/1024, compressedGiB=footprint['cmprsMb']/1024)
+                p.update(footprintGiB=footprint['memMb']/1024, compressedGiB=footprint['cmprsMb']/1024,
+                         footprintObservedAt=sample.get('footprintObservedAt', now))
             p['growthGiBMin'] = 0
             # Two intervals means three observations, never a single 30s jump.
             if (len(hist) >= 2 and hist[-1]['footprintGiB'] is not None
@@ -1241,6 +1556,9 @@ class Guard:
                        and any(self.gui_allowed(p) for p in slow if gui(p)))
         if slow_strain:
             signals.append(7)
+        self.saved['strainSignals'] = signals
+        self.runnable = [p for p in self.rows.values() if p['state'].startswith('R')]
+        self.r_zero = dict(Counter(p['family'] for p in self.runnable if p['cpuDelta'] == 0))
         self.streak = self.streak+1 if signals else 0
         self.calm = 0 if signals else self.calm+1
         if not self.strain and (self.streak >= 2 or memory or robob_trip or slow_strain):
@@ -1250,7 +1568,19 @@ class Guard:
             self.strain = False
             self.first_action = None
             self.log('strain_clear', durationS=now-self.since, signals=[])
+            path = self.snapshot('strain ended after %.0f seconds' % (now-self.since))
+            # A clear only wraps up an existing worker; it never starts one.
+            tid = self.worker.get('threadId')
+            if not tid and self.worker.get('launchUnknown'):
+                tid = worker_thread_id(self.worker['launch']['clientRequestId'])
+            if tid:
+                request_id = 'mac-guard-strain-clear-'+uuid.uuid4().hex
+                self.saved['strainClearResponder:'+request_id] = dict(threadId=tid, evidence=str(path),
+                    summary='strain ended; duration %.0f seconds' % (now-self.since), requestId=request_id)
+            self.save()
+            self.saved.pop('strainWorker', None)
             self.hogs = {}
+        self.deliver_strain_clears()
         self.cancel_calm_kills()
         if not self.strain and self.stopped:
             remaining = []
@@ -1262,8 +1592,6 @@ class Guard:
             if not self.muted:
                 self.stopped = remaining
             self.hogs = {}
-        self.runnable = [p for p in self.rows.values() if p['state'].startswith('R')]
-        self.r_zero = dict(Counter(p['family'] for p in self.runnable if p['cpuDelta'] == 0))
         if robob_trip:
             self.robob_restart(robobs, tree_total)
         else:
@@ -1274,7 +1602,7 @@ class Guard:
             new_incidents.add(incident)
             if robob(p, self.rows) or incident in pending_ids:
                 continue
-            kind = 'protected' if exempt(p, self.rows) else 'carve-out'
+            kind = 'protected' if exempt(p, self.rows) or robob_descendant(p, self.rows) else 'carve-out'
             self.memory_event(p, kind, 'protected_alert' if kind == 'protected' else 'TERM')
             path = self.snapshot('memory runaway pid %s' % p['pid'])
             name = label(p, self.rows) or p['comm']
@@ -1293,9 +1621,19 @@ class Guard:
         if not memory and not robob_trip:
             self.slow_actions(slow)
         offenders = self.cpu_actions(memory4 | slow_offenders) if self.strain else 0
+        load_only = (self.strain and signals == [1] and self.lag is not None and self.lag <= 5
+                     and sample.get('pressure') is not None and sample['pressure'] < 4
+                     and not memory and not robob_trip and not slow_strain and not offenders)
+        if load_only:
+            self.saved['loadOnlySince'] = load_only_since if load_only_since is not None else now
         if self.strain and not memory and not robob_trip and (not offenders or now-(self.first_action if self.first_action is not None else self.since) >= 180):
             path = self.snapshot('strain persists' if offenders else 'strain without an identified offender')
-            self.worker_needed(path, 'strain: signals '+str(signals))
+            if signals:
+                summary = 'strain: signals %s; load %s; lag %s s; pressure %s' % (signals, sample['load'], self.lag, sample.get('pressure'))
+                self.worker_needed(path, summary, signals=signals,
+                                   allow_launch=not load_only or now-self.saved['loadOnlySince'] >= LOAD_ONLY_WORKER_DELAY)
+            else:
+                self.worker_skipped('empty_signals', signals, path)
         self.diagnostic_trigger(sample.get('ticks'))
         largest = max((p for p in self.rows.values() if 'footprintGiB' in p), key=lambda p: p['footprintGiB'], default={})
         summary = dict(load=sample['load'], rCount=len(self.runnable), rZeroCount=sum(self.r_zero.values()),
@@ -1318,12 +1656,17 @@ class Guard:
         handled = {(e['proc']['pid'], e['proc']['start']) for e in self.pending}
         for p in sorted(self.rows.values(), key=lambda p: len(chain(p, self.rows))):
             ident = (p['pid'], p['start'])
-            if ident in handled or protected(p, self.rows) or p['state'].startswith('?'):
+            if ident in handled or protected(p, self.rows, renice=True) or p['state'].startswith('?'):
                 continue
             ancestors = chain(p, self.rows)
             browser = p in browsers
             job = bool(JOBS.fullmatch(Path(p['comm']).name)) or script_job(p)
             if not job and p.get('cpuDelta', 0) <= 100 and p['pid'] not in memory4 and ident not in self.hogs:
+                continue
+            if robob_descendant(p, self.rows):
+                offenders += 1
+                if ident not in self.hogs and self.action(p, 'B', 'renice'):
+                    self.hogs[ident] = dict(stage=1, at=self.now)
                 continue
             build = next((b for q in [p]+ancestors if (b := self.host.build(q, self.rows, self.now))), {}) if job else {}
             owner = self.host.ownership(p, self.rows, self.now)
@@ -1442,17 +1785,29 @@ def main():
         capture_diagnostic(args.diagnostic)
         return
     if args.worker_control:
+        metrics = {}
         try:
-            print(json.dumps(worker_control(json_object(sys.stdin.read()))))
-        except (ProbeError, OSError, ValueError):
+            value = worker_control(json_object(sys.stdin.read()), metrics=metrics)
+            print(json.dumps(dict(value, _durationS=metrics.get('durationS'))))
+        except (ProbeError, OSError, ValueError) as exc:
+            print(json.dumps(dict(failure=worker_failure(exc), status=getattr(exc, 'status', None),
+                                  _durationS=metrics.get('durationS'))))
             raise SystemExit(1)
         return
     guard = Guard()
+    from guard_reclaim import Reclaimer
+    reclaimer = Reclaimer(guard)
     with (guard.state/'guard.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         deadline = time.monotonic()
         while True:
             started = time.monotonic()
+            try:
+                # Consume the no-fork onset before ps/top, which can fail under load.
+                reclaimer.tick(time.time())
+            except (ProbeError, OSError, ValueError) as exc:
+                guard.now = time.time()
+                guard.log('error', probe='reclaim', failure=type(exc).__name__)
             try:
                 sample = guard.host.collect(guard.cycle)
                 sample['cycleMs'] = (time.monotonic()-started)*1000

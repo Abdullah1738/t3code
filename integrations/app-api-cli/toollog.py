@@ -46,6 +46,7 @@ _NAMES = {
     'collector.hold_seen', 'collector.hold_cleared',
     'bridge.error',
     'track.checkout_link', 'track.checkout_auto_add', 'track.checkout_mismatch',
+    'track.import_terminal', 'checkout.sibling_link', 'track.meta_corrected',
 }
 _ENUMS = {
     'route': {'cdp', 'phone', 'unspecified'},
@@ -78,7 +79,7 @@ _ENUMS = {
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
 _BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled',
           'untrackable', 'eta_given'}
-_NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
+_NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exitCode', 'amountMinor', 'oldAmountMinor', 'newAmountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
             'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
             'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
@@ -88,7 +89,7 @@ _NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exi
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
 _MONEY_PROPS = {
-    'marketplace.refresh': {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'result', 'snapshot_error'},
+    'marketplace.refresh': {'exitCode', 'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'result', 'snapshot_error'},
     'case.open': {'kind', 'unmatched'},
     'case.update': {'fields', 'deadlineMoved', 'answered'},
     'case.close': {'kind', 'ageDays'},
@@ -257,7 +258,7 @@ UNSUPPORTED_NATIVE_MARKETPLACE_QUIET_DELIVERY UNSUPPORTED_QUIET_OPTION_SEMANTICS
 
 _KNOWN_TAGS = _GUARD_TAGS | DELEGATION_REASONS | STANDING_REASONS | frozenset("""
 BRIDGE_REQUEST_FAILED
-OPERATION_FAILED LOG_CAP TRACK_REGISTRATION_FAILED TRACK_POLL_SOURCE_ERROR
+OPERATION_FAILED LOG_CAP TRACK_REGISTRATION_FAILED TRACK_POLL_SOURCE_ERROR TERMINAL_REPAIR_REFUSED
 AUTH_EXPIRED AUTH_FORBIDDEN ACCOUNT_CAPTURE_REQUIRED INVALID_ORDER_ID INVALID_ARGUMENTS
 DIA_BRIDGE_UNAVAILABLE DIA_INVALID_RESPONSE DIA_TRANSPORT_FAILED FAILED SOURCE_ERRORS
 PAYMENT_WAIT_TIMEOUT PAYMENT_WAIT_UNCONFIRMED
@@ -576,6 +577,30 @@ def _phases(scope, start, end):
     return {name + 'Ms': round(value, 3) for name, value in totals.items()}
 
 
+MARKETPLACE_STATUSES = {'started', 'busy', 'fresh', 'skipped', 'launch_failed',
+                        'held_data_unavailable', 'held_deadline', 'held_abort'}
+
+
+def marketplace_refresh_fields(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    if type(value.get('status')) is str and value['status'] in MARKETPLACE_STATUSES:
+        result['status'] = value['status']
+    age = value.get('snapshot_age_s')
+    result['snapshot_age_s'] = age if type(age) is int and 0 <= age <= 10**12 else None
+    outcome = value.get('last_result')
+    result['last_result'] = outcome if type(outcome) is str and outcome in _ENUMS['result'] else None
+    at = value.get('last_at')
+    result['last_at'] = None
+    if type(at) is str and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+]00:00)', at):
+        try:
+            result['last_at'] = dt.datetime.fromisoformat(at.replace('Z', '+00:00')).isoformat()
+        except ValueError:
+            pass
+    return result
+
+
 def _fields(props):
     result = {}
     for key, value in (props or {}).items():
@@ -585,6 +610,8 @@ def _fields(props):
             result[key] = value if value in _ENUMS['merchant'] else 'other'
         elif key in _ENUMS and type(value) is str and value in _ENUMS[key]:
             result[key] = value
+        elif key == 'marketplace_refresh' and isinstance(value, dict):
+            result[key] = marketplace_refresh_fields(value)
         elif key == 'trigger' and type(value) is str and value in _TRIGGERS:
             result[key] = value
         elif key in {'pagesFetched', 'rowsReturned'} and type(value) is int and 0 <= value <= 10**9:

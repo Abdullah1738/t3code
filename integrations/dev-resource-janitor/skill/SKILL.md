@@ -28,6 +28,7 @@ Resource ids: `sim:<UDID>`, `simulator-app` (Simulator.app open with no booted d
 An Expo server is only protected by a running session whose directory is the Expo cwd or inside it. A session in a parent directory such as `~` does not count.
 Actions: `xcrun simctl shutdown` (quits Simulator.app when none are left booted),
 SIGTERM for expo + its `npm exec` parent, `docker stop -t 30`, `docker desktop stop`.
+If the janitor suspends a process under the board's standing authority, it must use `mac-suspend stop --pid N --deadline 10m --then cont|kill --reason 'why this process must pause' --actor 'dev-resource-janitor' --card '#N'`. Replace `cont|kill` with the chosen action; an explicit deadline is required and cannot exceed 60 minutes. Never send raw SIGSTOP or use `kill -STOP`. Use `mac-suspend resume --pid N` or `mac-suspend kill --pid N` for the janitor's own lease and read back the result. Run `mac-suspend sweep --json` before finishing and report unowned stopped processes without signalling them. Existing keep rules and protected-process rules still apply; a tool refusal is not permission to bypass them.
 Audit: `~/.local/share/dev-janitor/audit.jsonl`; last scan `last.json`.
 Keep list (one id, name or cwd per line): `~/.config/opencode/dev-janitor-keep.txt`.
 
@@ -103,7 +104,7 @@ Previous flow (kept for reference), run as the Robob scheduled task "Dev resourc
 4. Reply with a short list: what was stopped, memory freed (rss_mb / vm_rss_mb),
    what was kept and why. No Telegram unless something failed.
 
-## Leftover agent processes (report-only)
+## Leftover agent processes
 
 `processes` in the scan report inventories Python/Node agent tools and MCP
 runtimes with PID, `lstart`, parent chain to launchd, launchctl label, tty,
@@ -131,7 +132,7 @@ advance that state. Reports and log lines include checked, skipped and budget-sk
 counts (checked means an owner/binding check was attempted, including unknowns).
 `owner_calls` reports count, nearest-rank p50/p95/max milliseconds (including failures),
 and failures by status for by-native, detail and recovery calls, without ids or URLs.
-Cua/Dia/Perplexity stdio children additionally require that
+Ordinary report-only Cua/Dia/Perplexity candidates additionally require that
 binding and at least two hours since the owner's last activity.
 
 PID/start/args/tty, cwd, listeners/clients, native binding, owner and complete
@@ -142,8 +143,29 @@ them. The reporter sends no signals and deletes no files.
 
 The exact candidate list (identity, evidence, MEM/CMPRS) and failure reasons are
 written to the report and one audit line; hourly checks stay silent.
-Pass candidates to the evaluator for an exact TERM approval. Any KILL needs a
-separate exact-PID ask; this reporter implements neither action.
+Pass ordinary report-only candidates to the evaluator for an exact TERM approval.
+Any KILL needs a separate exact-PID ask; this reporter implements neither action.
+
+### Orphaned MCP backstop
+
+The hourly worker separately reaps `mcp_orphan` candidates: exact Cua `mcp`,
+Perplexity package `dist/index.js`, and Dia bridge `src/server.js` entries, at
+least five minutes old, with a complete roster and positive terminal,
+settled/archived owner proof showing no held, queued or delegated work. The
+helper must have PID 1 or a missing parent, or an exact provider parent whose
+owner is also positively ended. Unknown owners stay kept. Helpers beneath
+Robob, shared Codex app-server, OpenCode services, registered services, the
+shared Cua daemon or GUI apps stay kept, as do explicit keep-file entries.
+
+`DEV_JANITOR_REAP_MCP_ORPHAN` defaults to `1`; set it to `0` to disable reaping.
+Each signal checks only its exact target, refreshes the complete work roster
+after owner queries, then rechecks PID, start time, command and ancestry.
+The worker sends TERM, waits ten seconds, and sends KILL only after those
+checks still pass. Each attempted reap has one `mcp_orphan` audit row; the
+report includes helper/rule counts and snapshot RSS KiB for candidates and
+confirmed exits. These RSS sums are not unique physical memory measurements.
+This narrow automatic rule uses the owner's standing janitor authority and
+does not require the ordinary report-only approval flow above.
 
 ## Stale git worktrees (daily, separate job)
 

@@ -1,0 +1,5 @@
+{"bug_type":"115","timestamp":"2026-11-16 12:23:39.00 +0400"}
+Reset count: 0
+Boot failure count: 1
+Boot faults: rst btn_rst,btn_seq_reset target_off_restart
+Boot stage: 0x40

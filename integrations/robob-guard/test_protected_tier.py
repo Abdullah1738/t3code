@@ -296,7 +296,7 @@ class Ticks(unittest.TestCase):
             self.assertEqual(events[-1]['issues'][0]['fallback'],'exact-argv')
 
     def test_interval_guard_starts_in_protected_tier(self):
-        plist = plistlib.loads(Path('scripts/com.ardud.robob-guard.plist').read_bytes())
+        plist = plistlib.loads((Path(__file__).resolve().parent / 'scripts/com.ardud.robob-guard.plist').read_bytes())
         self.assertEqual(plist['Nice'],-5)
         self.assertEqual(plist['ProcessType'],'Interactive')
         self.assertEqual(plist['StartInterval'],30)

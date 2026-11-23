@@ -34,7 +34,9 @@ class PreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'HOME': tmp}):
             home = Path(tmp)
             manifest = pre.gh.load_manifest()
-            manifest['paritySources'] = {}
+            # A source inside this package is checked in the copy being installed: the first
+            # install of a new one (antigravity/mcp_shield.py) has nothing under ~/.local/share yet.
+            manifest['paritySources'] = {'in-package': ['antigravity/mcp_shield.py']}
             manifest['homes'] = {name: str(home / 'homes' / name) for name in pre.gh.HARNESSES}
             manifest['mcpServers'] = [server for server in manifest['mcpServers'] if server['id'] in ('flighty', 'inbody')]
             manifest['skillRoots'] = [str(home / 'skills')]

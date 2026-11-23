@@ -28,7 +28,7 @@ class HelperLoggingTests(unittest.TestCase):
         self.env = dict(os.environ, ROBOB_TEST='1', WATCH_ID='fixture', TOOLLOG_DIR=str(self.root / 'logs'))
 
     def rows(self):
-        return [json.loads(line) for p in (self.root / 'logs').glob('*.ndjson') for line in p.read_text().splitlines()]
+        return [log.expand_helper(json.loads(line)) for p in (self.root / 'logs').glob('*.ndjson') for line in p.read_text().splitlines()]
 
     def test_real_shell_helper_success_and_failure_preserve_stdout_and_exit(self):
         good = subprocess.run(['/bin/zsh', str(HELPERS / 'time-reached'), '2000-01-01T00:00:00+00:00', 'PRIVATE_TEXT'], env=self.env, capture_output=True, text=True)

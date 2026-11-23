@@ -1,0 +1,4 @@
+USER   PID   TT   %CPU STAT PRI     STIME     UTIME COMMAND
+root   174   ??    0.0 S    31T   0:00.00   0:00.00 /usr/libexec/sandboxd
+       174         0.0 S    20T   0:00.00   0:00.00
+       174         0.0 S    31T   0:00.00   0:00.00

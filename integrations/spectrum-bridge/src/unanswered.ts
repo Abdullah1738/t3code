@@ -43,9 +43,14 @@ export class RemoteUnanswered {
   }
 }
 export const humanRow = (id: string) => !/^(?:wake|secret|reset):/.test(id);
-export type AnsweredInput = NormalizedInbound & { answeredAt?: number; unanswered?: {
-  overdueAt?: number; requeuedAt?: number; alertAttempts?: number; alertedAt?: number;
-} };
+export type AnsweredInput = NormalizedInbound & {
+  answeredAt?: number;
+  settledAt?: number;
+  settledReason?: string;
+  unanswered?: {
+    overdueAt?: number; requeuedAt?: number; alertAttempts?: number; alertedAt?: number;
+  };
+};
 export const humanInput = (input: NormalizedInbound) => input.source === "typed" || input.source === "composed" && input.isAudioMessage;
 export type ReplyTurn = { id: string; generation: number; messageId: string; inboundId?: string;
   covered?: string[]; steered?: string[]; startedAt?: number; outbox?: number; earlyOutbox?: string; background?: boolean; phase: string };
@@ -177,17 +182,11 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
       const row = store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id = ?").get(id);
       return row ? [{ id, state: row.state, input: JSON.parse(row.payload) as AnsweredInput }] : [];
     });
-    // A late delivery can win before dispatch starts the watchdog retry. Retire only whole,
-    // still-pending batches; a retry already submitted to the backend keeps its lifecycle.
-    const queuedRetries = new Set(rows.filter(({ id, state, input }) => state === "pending"
-      && input.unanswered?.requeuedAt !== undefined && store.get(`human-own-turn:${id}`)
-      && sealedBatch(store, id).members.every(member => covered.has(member))).map(row => row.id));
     for (const { id, state, input } of rows) {
       // Explicit reply coverage also settles older normalized rows without a source field.
       if (state === "cancelled" || state === "observed"
         || !humanInput(input) && !(input.source === undefined && input.id === id && Array.isArray(input.attachments))) continue;
-      const retryAnswered = (state === "pending" || state === "batched") && queuedRetries.has(sealedBatch(store, id).leader);
-      const nextState = state === "admitted" || retryAnswered ? "done" : state;
+      const nextState = state === "admitted" || state === "failed" ? "done" : state;
       if (input.answeredAt !== undefined) {
         if (nextState !== state) store.updateInbound(id, nextState);
         continue;
@@ -202,6 +201,54 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
           ids: { inboundId: id, chat }, props: { ageMs } });
       });
     }
+    // Separate replies (or pending_inbound attribution) can finish a queued batch.
+    // Retire it only after all answers are persisted; a batch already submitted keeps its backend lifecycle.
+    for (const leader of new Set(rows.map(({ id }) => sealedBatch(store, id).leader))) {
+      if (!store.db.query("SELECT 1 FROM inbound WHERE id = ? AND state = 'pending'").get(leader)) continue;
+      const { members } = sealedBatch(store, leader);
+      if (members.every(id => store.db.query(`SELECT 1 FROM inbound WHERE id = ?
+        AND state IN ('pending', 'batched') AND json_type(payload, '$.answeredAt') = 'integer'`).get(id))) {
+        for (const id of members) store.updateInbound(id, "done");
+        store.set(`human-own-turn:${leader}`, false);
+        store.set(`human-backoff-until:${leader}`, null);
+        store.set(`steer-attempt:${leader}`, null);
+        store.set(`steer-transient-refusals:${leader}`, null);
+        store.set(`batch-phase:${leader}`, null);
+      }
+    }
+  }).immediate();
+}
+
+/** Settle a human inbound intentionally (e.g. own-turn NO_REPLY) without falsely stamping answeredAt. */
+export function markSettled(
+  store: Store,
+  ids: string[],
+  reason: "agent_no_reply",
+  opts: { now?: number; threadId?: string } = {},
+): void {
+  const now = opts.now ?? Date.now();
+  store.db.transaction(() => {
+    const covered = new Set(ids.filter(humanRow));
+    const chat = store.get<string>("log-chat") ?? store.get<string>("unanswered-chat") ?? "other";
+    for (const id of covered) {
+      const row = store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id = ?").get(id);
+      if (!row || row.state === "cancelled" || row.state === "observed") continue;
+      const input = JSON.parse(row.payload) as AnsweredInput;
+      if (input.answeredAt !== undefined || input.settledAt !== undefined) continue;
+      const nextState = ["admitted", "pending", "batched", "processing"].includes(row.state) ? "done" : row.state;
+      store.updateInbound(id, nextState, { ...input, settledAt: now, settledReason: reason });
+      store.set(`human-own-turn:${id}`, false);
+      store.set(`human-backoff-until:${id}`, null);
+      store.set(`steer-attempt:${id}`, null);
+      store.set(`steer-transient-refusals:${id}`, null);
+      toolLog.capture(() => toolLog.write({
+        component: "router",
+        kind: "event",
+        name: "inbound.settled",
+        ids: { inboundId: id, chat, ...(opts.threadId ? { threadId: opts.threadId } : {}) },
+        props: { reason },
+      }));
+    }
   }).immediate();
 }
 
@@ -211,7 +258,7 @@ export function findOverdue(rows: readonly InboundRecord[], running: Running | u
   if (opts.chat !== "owner" && opts.chat !== "moni") return [];
   return rows.flatMap(row => {
     const input = row.payload as AnsweredInput;
-    if (!humanRow(row.id) || !humanInput(input) || input.answeredAt !== undefined
+    if (!humanRow(row.id) || !humanInput(input) || input.answeredAt !== undefined || input.settledAt !== undefined
       || ["cancelled", "observed"].includes(row.state) || !Number.isSafeInteger(input.receivedAt)
       || input.receivedAt! < opts.startedAt - UNANSWERED_RESTART_WINDOW_MS) return [];
     const ageMs = now - input.receivedAt!;

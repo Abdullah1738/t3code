@@ -112,7 +112,9 @@ export class Delivery {
       const receivedAt = this.store.get<number>(`log-inbound-at:${id}`) ?? (inbound ? (JSON.parse(inbound.payload) as { receivedAt?: number }).receivedAt : undefined);
       toolLog.capture(() => toolLog.write({ component: "delivery", kind: "perf", name: "reply.sent", ok: true,
         durationMs: Math.max(0, at - (receivedAt ?? queuedAt)), ids: this.logIds(id, item),
-        props: { kind: item?.kind ?? "conversation", ...(item?.answersInbound ? { answersInbound: true } : {}), inboundKnown: receivedAt !== undefined, outboxDelayMs: Math.max(0, at - queuedAt), parts: item ? splitFormatted(formatText(item.text), BUBBLE_CHARS).length : 0, files: item?.attachment ? 1 : 0 } }));
+        props: { kind: item?.kind ?? "conversation", ...(item?.answersInbound ? { answersInbound: true } : {}),
+          attribution: this.store.get<string>(`log-attribution:${id}`) ?? (this.logIds(id, item).inboundId ? "explicit" : "none"),
+          inboundKnown: receivedAt !== undefined, outboxDelayMs: Math.max(0, at - queuedAt), parts: item ? splitFormatted(formatText(item.text), BUBBLE_CHARS).length : 0, files: item?.attachment ? 1 : 0 } }));
       const kind = item?.app ? cardKind(item.app.url) : item?.attachment ? cardKind(item.attachment.name) : "other";
       if (item?.app || kind !== "other") toolLog.capture(() => toolLog.write({ component: "cards", kind: "event", name: "card.sent", ok: true, ids: { operationId: id }, props: { cardKind: kind } }));
       if (/^(?:outage:|failed:|notice:|turn:|drop:)/.test(id)) toolLog.capture(() => toolLog.write({ component: "recovery", kind: "event", name: "recovery.notice_sent", ids: { operationId: id } }));

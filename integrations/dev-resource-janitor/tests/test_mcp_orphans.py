@@ -34,6 +34,47 @@ class McpTests(JanitorTestCase):
         self.row['ppid'] = 30
         self.rows[30] = dict(pid=30, ppid=1, start=self.start, tty='??', args=args, rss_kib=100)
 
+    def test_mcp_signal_rechecks_robob_ancestry(self):
+        report = self.detect()
+        self.rows[1]['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+        send = Mock()
+        action = self.reap(report, rescan=lambda pid: copy.deepcopy(report), send=send)[0]
+        send.assert_not_called()
+        self.assertEqual(action['protectedBy'], 'robob-descendant')
+
+    def test_mcp_kill_rechecks_robob_ancestry(self):
+        report = self.detect()
+        send = Mock()
+        def pause(seconds):
+            self.rows[1]['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+        action = self.reap(report, rescan=lambda pid: copy.deepcopy(report), send=send, pause=pause)[0]
+        self.assertEqual(action['signals'], ['SIGTERM'])
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(action['protectedBy'], 'robob-descendant')
+
+    def test_mcp_below_robob_provider_keeps_preexisting_service_rules(self):
+        self.parent('codex exec')
+        self.rows[30]['ppid'] = 20
+        self.rows[20] = dict(self.rows[30], pid=20, ppid=1,
+                             args='node apps/server/dist/bin.mjs --bootstrap-fd 3')
+        report = self.detect()
+        self.assertEqual(report['candidates'], [])
+        self.assertEqual(report['inventory'][0]['keep_reason'], 'protected_ancestor')
+        self.assertFalse(lp.robob_ancestry(self.row, lp.parent_chain(self.row, self.rows)))
+        self.row['ppid'] = 20
+        self.assertEqual(self.detect()['inventory'][0]['keep_reason'], 'robob-descendant')
+
+    def test_mcp_recheck_below_provider_does_not_add_robob_protection(self):
+        self.parent('codex exec')
+        report = self.detect()
+        self.rows[30]['ppid'] = 20
+        self.rows[20] = dict(self.rows[30], pid=20, ppid=1,
+                             args='node apps/server/dist/bin.mjs --bootstrap-fd 3')
+        action = self.reap(report, rescan=lambda pid: copy.deepcopy(report))[0]
+        self.assertNotIn('protectedBy', action)
+        self.assertEqual(action['reason'], 'changed_before_term')
+        self.assertEqual(action['signals'], [])
+
     def test_exact_executable_entry_matrix(self):
         forms = [(args, key) for key, args in HELPERS.items()] + [
             ('node /opt/dia-agent-bridge/src/server.js', 'dia'),
@@ -49,6 +90,31 @@ class McpTests(JanitorTestCase):
             ('(node)', None), ('node', None), ('node "unterminated', None)]
         for args, expected in forms:
             with self.subTest(args=args): self.assertEqual(lp.mcp_helper(args), expected)
+
+    def test_expired_hourly_budget_keeps_mcp_candidate_without_resetting_the_clock(self):
+        def control(path, timeout):
+            return 200, (dict(ok=True, threads=[dict(threadId='owner', **OWNER['recovery'])])
+                         if path.startswith('/recovery/') else dict(ok=True, thread=OWNER['thread']))
+
+        for tick, expected_candidates in [(599, 1), (600, 0), (601, 0)]:
+            with self.subTest(tick=tick), \
+                    patch.object(lp.time, 'monotonic', return_value=tick), \
+                    patch.object(lp.time, 'time', return_value=self.now), \
+                    patch.object(lp, 'cpu_processes', return_value=self.rows), \
+                    patch.object(lp, 'environment_values', return_value=self.binding), \
+                    patch.object(lp.active_sessions, '_control_get', side_effect=control), \
+                    patch.object(lp, 'launch_services', return_value={}), \
+                    patch.object(lp, 'processes', return_value={}), \
+                    patch.object(lp, 'run', return_value=''), \
+                    patch.object(lp, 'parse_top', return_value={}), \
+                    patch.object(lp, 'cwd_inventory', return_value={}), \
+                    patch.object(lp, 'scan_agent_browsers', return_value={}), \
+                    patch.object(lp, 'scan_xcode_builds', return_value={}):
+                report = lp.scan(ROSTER, deadline=600)
+            self.assertEqual(len(report['mcp_orphan']['candidates']), expected_candidates)
+            if not expected_candidates:
+                self.assertEqual(report['mcp_orphan']['inventory'][0]['keep_reason'],
+                                 'observation_budget_exhausted')
 
     def test_every_helper_old_parentless_missing_or_ended_provider(self):
         for helper, args in HELPERS.items():

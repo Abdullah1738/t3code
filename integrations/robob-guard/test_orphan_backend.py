@@ -8,11 +8,28 @@ import unittest
 from unittest.mock import patch
 
 import guard
+from guard_test_support import GuardTestCase
 notify = guard.notify
 
 
-class OrphanTests(unittest.TestCase):
+
+# Backend recovery simulations own their inputs; TCC behavior is tested separately.
+def setUpModule():
+    global tcc_patch, tier_patch
+    tcc_patch = patch("guard.tcc_jam_tick")
+    tcc_patch.start()
+    tier_patch = patch("guard.protected_tier_tick")
+    tier_patch.start()
+
+
+def tearDownModule():
+    tier_patch.stop()
+    tcc_patch.stop()
+
+
+class OrphanTests(GuardTestCase):
     def setUp(self):
+        super().setUp()
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.home = Path(temp.name)

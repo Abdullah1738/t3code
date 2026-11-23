@@ -203,6 +203,27 @@ function sendConflict(store: Store, dedupeKey: string, route: { id: string; gene
   return saved !== undefined && saved !== sendSpec(id, route, content);
 }
 
+/** Delivery metadata only; aliases can point at the turn's early acknowledgement. */
+function sendStatus(store: Store, key: string, sessionId: string, selectedKind?: "send" | "file") {
+  const route = liveSendRoute(store, sessionId);
+  const matches = [];
+  for (const kind of ["send", "file"] as const) {
+    if (selectedKind && kind !== selectedKind) continue;
+    const id = `${kind}:${hash(key)}`;
+    const saved = store.get<{ operationId?: string; queuedAt?: number }>(`api:${kind}:${id}`);
+    const item = store.getOperation(saved?.operationId ?? id);
+    if (!item) continue;
+    if (item.sessionId !== route.id || item.generation !== route.generation) throw new ApiError(403);
+    const status = item.state === "pending" ? "queued"
+      : ["sending", "sent", "failed", "cancelled"].includes(item.state) ? item.state : "unknown";
+    const queuedAt = saved?.queuedAt ?? store.get<number>(`log-queued:${item.id}`);
+    const sentAt = store.get<number>(`sent-at:${item.id}`);
+    matches.push({ status, kind, ...(queuedAt === undefined ? {} : { queuedAt }), ...(sentAt === undefined ? {} : { sentAt }) });
+  }
+  if (matches.length > 1) throw new ApiError(409, "Key has text and file operations; use --kind send or --kind file");
+  return matches[0] ?? { status: "unknown", kind: selectedKind ?? null };
+}
+
 /** Fetch-compatible handler only; socket ownership and listening belong to main. */
 export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, foldText, log }: Options): (request: Request) => Promise<Response> {
   const pairedChat = () => {
@@ -242,6 +263,14 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
           // An absent router means nothing is owned; this route is never readiness-gated.
           const active = router();
           return json(active ? active.routerStatus() : { route: null, pending: [] });
+        }
+        if (path.startsWith("/send-status/")) {
+          const params = new URL(request.url).searchParams;
+          const key = path === "/send-status/" ? params.get("key") : decodeURIComponent(path.slice("/send-status/".length));
+          const sessionId = params.get("sessionId");
+          const kind = params.get("kind");
+          if (!string(key, 200) || !validSession(sessionId) || kind !== null && kind !== "send" && kind !== "file") throw new ApiError(400);
+          return json(sendStatus(store, key, sessionId, kind ?? undefined));
         }
         if (path.startsWith("/wake/")) {
           const status = wakeStatus(store, decodeURIComponent(path.slice("/wake/".length)));

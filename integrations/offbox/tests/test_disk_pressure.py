@@ -180,12 +180,74 @@ class ServerPressure(Base):
             boatd.disk_maintenance(self.con)
         self.assertEqual([c[3] for c in self.f.calls if c[:2]==('snapshot','delete')],['auto-0'])
 
-    def test_auto_snapshot_skips_below_floor(self):
-        bid=self.box()
-        with patch.object(disk,'sample',return_value=storage(0)),patch.object(boatd.toollog,'emit') as emit:
-            self.assertIsNone(boatd.snapshot(self.con,bid,'auto'))
-        self.assertFalse(any(c[:2]==('snapshot','create') for c in self.f.calls))
-        self.assertTrue(any(c.args[1]=='snapshot.skip' for c in emit.call_args_list))
+    def test_run_snapshots_at_ok_level_ignore_cleanup_shortfall(self):
+        bid = self.box()
+        for total, free, target, shortfall in ((1744, 95, 130, 35), (100, 30, 0, 0)):
+            for kind in boatd.RUN_KINDS:
+                with self.subTest(total=total, kind=kind):
+                    self.con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('disk_cleanup',?)",
+                                     (json.dumps({'target_bytes': target*G}),))
+                    self.f.calls.clear()
+                    with patch.object(disk, 'sample', return_value=storage(free*G, total*G)), \
+                            patch.object(boatd.toollog, 'emit') as emit:
+                        name = boatd.snapshot(self.con, bid, kind)
+                    self.assertIsNotNone(name)
+                    self.assertIn(('snapshot', 'create', boatd.ct(bid), name), self.f.calls)
+                    row = self.con.execute('SELECT kind FROM snaps WHERE box_id=? AND name=?', (bid, name)).fetchone()
+                    self.assertEqual(row['kind'], kind)
+                    value = json.loads(self.con.execute("SELECT v FROM meta WHERE k='disk'").fetchone()[0])
+                    self.assertEqual(value['level'], 'ok')
+                    self.assertEqual(value['cleanup']['shortfall_bytes'], shortfall*G)
+                    self.assertEqual(value['cleanup']['target_bytes'], target*G)
+                    self.assertFalse(any(c.args[1] == 'snapshot.skip' for c in emit.call_args_list))
+
+    def test_run_snapshots_skip_unsafe_levels_even_without_cleanup_shortfall(self):
+        bid = self.box()
+        for free, level in ((85, 'low'), (35, 'full'), (None, 'unknown')):
+            value = storage(free*G, 1744*G) if free is not None else {
+                'level': 'unknown', 'disk_full': False, 'disk_low': True, 'filesystems': [], 'errors': ['unreadable']}
+            self.assertEqual(value['level'], level)
+            for shortfall in (0, 35*G):
+                value['cleanup'] = {'shortfall_bytes': shortfall}
+                for kind in boatd.RUN_KINDS:
+                    with self.subTest(level=level, shortfall=shortfall, kind=kind), \
+                            patch.object(boatd, 'disk_maintenance', return_value=value), \
+                            patch.object(boatd.toollog, 'emit') as emit:
+                        self.assertIsNone(boatd.snapshot(self.con, bid, kind))
+                        emit.assert_called_once_with('boatd', 'snapshot.skip', ok=True, ids={'box': bid}, props={
+                            'snapshot': kind, 'bytes_freed': 0, 'reason': 'server_disk_low', 'disk': value})
+        self.assertFalse(any(c[:2] == ('snapshot', 'create') for c in self.f.calls))
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM snaps').fetchone()[0], 0)
+
+    def test_repository_run_snapshots_skip_over_budget_at_ok_level(self):
+        bid = self.box(name='offbox example | repository pool')
+        usage = {bid: {'snapshot_bytes': 8*G, 'live_bytes': 10*G}}
+        for kind in boatd.RUN_KINDS:
+            with self.subTest(kind=kind), patch.object(disk, 'sample', return_value=storage(95*G, 1744*G)), \
+                    patch.object(disk, 'inventory', return_value=(usage, [])), patch.object(boatd.toollog, 'emit') as emit:
+                self.assertIsNone(boatd.snapshot(self.con, bid, kind))
+            event = next(c for c in emit.call_args_list if c.args[1] == 'snapshot.skip')
+            self.assertEqual(event.kwargs['props']['reason'], 'snapshot_budget')
+            self.assertEqual(event.kwargs['props']['disk']['level'], 'ok')
+        self.assertFalse(any(c[:2] == ('snapshot', 'create') for c in self.f.calls))
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM snaps').fetchone()[0], 0)
+
+    def test_timer_snapshots_are_not_gated_by_disk_pressure_or_budget(self):
+        bid = self.box(name='offbox example | repository pool')
+        value = dict(storage(85*G, 1744*G), cleanup={'shortfall_bytes': 45*G},
+                     boxes={bid: {'snapshot_bytes': 8*G, 'live_bytes': 10*G}})
+        for level in ('ok', 'low', 'full', 'unknown'):
+            value['level'] = level
+            for kind in boatd.TIMER_KINDS:
+                with self.subTest(level=level, kind=kind), \
+                        patch.object(boatd, 'disk_maintenance', return_value=value) as maintenance, \
+                        patch.object(boatd.toollog, 'emit') as emit:
+                    name = boatd.snapshot(self.con, bid, kind)
+                    maintenance.assert_not_called()
+                self.assertIsNotNone(name)
+                self.assertIn(('snapshot', 'create', boatd.ct(bid), name), self.f.calls)
+                self.assertEqual(self.con.execute('SELECT kind FROM snaps WHERE name=?', (name,)).fetchone()['kind'], kind)
+                self.assertFalse(any(c.args[1] == 'snapshot.skip' for c in emit.call_args_list))
 
     def test_creates_resumes_and_starts_refused_without_mutation(self):
         bid=self.box()
@@ -243,6 +305,113 @@ class Round2(Base):
 
     def deletes(self):
         return [c for c in self.f.calls if c[:2] == ('snapshot','delete')]
+
+    def real_incus(self):
+        self.stack.enter_context(patch.object(boatd, 'incus', self.saved['incus']))
+        self.stack.enter_context(patch.object(boatd, '_INCUS_SLOW_UNTIL', 0))
+        self.stack.enter_context(patch.dict(boatd.REAP_REFUSED, clear=True))
+        self.stack.enter_context(patch.dict(boatd.DISK, {'ts': 0, 'value': None}, clear=True))
+
+        def run(argv, **kwargs):
+            if argv[0] == 'ps':
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            self.assertEqual(argv[0], 'incus')
+            return self.f.incus(*argv[1:], timeout=kwargs['timeout'], check=False)
+
+        self.stack.enter_context(patch.object(boatd.subprocess, 'run', side_effect=run))
+
+    def test_snapshot_yield_retries_after_bringup_without_skipping_to_pool_boxes(self):
+        self.real_incus()
+        self.clock = 100 * 86400
+        source = self.box('bx_source00')
+        pending = self.box('bx_pending0', state='resuming', running=False)
+        old = self.box('bx_old00000', state='archived', running=False,
+                       name='offbox example | repository pool')
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?', (self.clock-30*3600, old))
+        self.install_rows(snaps(source, count=2), {})
+
+        def tick():
+            value = boatd.disk_maintenance(self.con)
+            selected = boatd.reap_stopped_box(self.con, [self.state(old)], self.clock)
+            self.assertIsNone(selected)
+            self.assertIsNone(self.state(old)['deleted_at'])
+            self.assertFalse(any(c[0] == 'delete' for c in self.f.calls))
+            return value
+
+        self.assertEqual(tick()['cleanup']['snapshots_left'], 2)
+        cleanup = json.loads(self.con.execute("SELECT v FROM meta WHERE k='disk_cleanup'").fetchone()[0])
+        self.assertEqual(cleanup['refused_snapshots'], [])
+        self.assertEqual(self.deletes(), [])
+        boatd.set_box(self.con, pending, state='ready')
+        self.clock += 1
+        tick()
+        self.assertEqual(self.deletes(), [], 'a temporary yield still observes delete pacing')
+        self.clock += 61
+        self.assertEqual(tick()['cleanup']['snapshots_left'], 2)
+        self.assertEqual([c[3] for c in self.deletes()], ['auto-0'])
+        self.clock += 61
+        self.assertEqual(tick()['cleanup']['snapshots_left'], 1)
+        self.assertEqual([c[3] for c in self.deletes()], ['auto-0', 'auto-1'])
+        self.assertEqual(self.f.snapshots[boatd.ct(source)], [])
+
+    def test_box_yield_retries_after_bringup_without_refusal_or_new_delete_fence(self):
+        self.real_incus()
+        self.clock = 100 * 86400
+        old = self.box('bx_old00000', state='archived', running=False,
+                       name='offbox example | repository pool')
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?', (self.clock-8*86400, old))
+        pending = self.box('bx_pending0', state='provisioning', running=False)
+        self.install_rows([], {})
+
+        self.assertIsNone(boatd.reap_stopped_box(self.con, [self.state(old)], self.clock))
+        self.assertNotIn(old, boatd.REAP_REFUSED)
+        self.assertIsNone(self.con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:'+old,)).fetchone())
+        self.assertIsNone(self.state(old)['deleted_at'])
+        self.assertFalse(any(c[0] == 'delete' for c in self.f.calls))
+        boatd.set_box(self.con, pending, state='ready')
+        self.clock += 1
+        self.assertIsNone(boatd.reap_stopped_box(self.con, [self.state(old)], self.clock))
+        self.assertFalse(any(c[0] == 'delete' for c in self.f.calls))
+        self.clock += 61
+        self.assertEqual(boatd.reap_stopped_box(self.con, [self.state(old)], self.clock), old)
+        self.assertEqual(len([c for c in self.f.calls if c[0] == 'delete']), 1)
+        self.assertEqual(self.state(old)['state'], 'deleted')
+        self.assertIsNone(self.con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:'+old,)).fetchone())
+
+    def test_box_yield_preserves_a_previous_uncertain_delete_fence(self):
+        self.real_incus()
+        old = self.box('bx_old00000', state='archived', running=False)
+        self.box('bx_pending0', state='resuming', running=False)
+        self.con.execute('INSERT INTO meta(k,v) VALUES (?,?)', ('delete_pending:'+old, '1'))
+        with self.assertRaises(boatd.Fail) as caught:
+            boatd.delete_box(self.con, old)
+        self.assertEqual(caught.exception.code, 'incus_busy')
+        self.assertIsNotNone(self.con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:'+old,)).fetchone())
+        self.assertFalse(any(c[0] == 'delete' for c in self.f.calls))
+
+    def test_dispatched_box_refusal_keeps_fence_and_hour_backoff(self):
+        self.real_incus()
+        self.clock = 100 * 86400
+        old = self.box('bx_old00000', state='archived', running=False,
+                       name='offbox example | repository pool')
+        self.con.execute('UPDATE boxes SET stopped_at=? WHERE id=?', (self.clock-8*86400, old))
+
+        def refuse(argv, **kwargs):
+            if argv[0] == 'ps':
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            if argv[1] == 'delete':
+                self.f.calls.append(tuple(argv[1:]))
+                return subprocess.CompletedProcess(argv, 1, b'', b'dataset is busy')
+            return self.f.incus(*argv[1:], timeout=kwargs['timeout'], check=False)
+
+        with patch.object(boatd.subprocess, 'run', side_effect=refuse):
+            self.assertIsNone(boatd.reap_stopped_box(self.con, [self.state(old)], self.clock))
+            self.assertEqual(boatd.REAP_REFUSED[old], self.clock)
+            self.clock += 61
+            self.assertIsNone(boatd.reap_stopped_box(self.con, [self.state(old)], self.clock))
+        self.assertEqual(len([c for c in self.f.calls if c[0] == 'delete']), 1)
+        self.assertIsNotNone(self.con.execute('SELECT 1 FROM meta WHERE k=?', ('delete_pending:'+old,)).fetchone())
+        self.assertIsNone(self.state(old)['deleted_at'])
 
     def test_freeing_and_live_io_pressure_yield_without_delete(self):
         bid=self.box();self.install_rows(snaps(bid), {})

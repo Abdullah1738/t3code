@@ -31,6 +31,38 @@ def load(name, path):
 
 
 class LoggingTests(unittest.TestCase):
+    def test_suspend_timeout_fields_survive_logger_and_drop_unlisted_data(self):
+        fields = dict(cmd='launchctl procinfo', timeoutS=2, elapsedMs=2125.5, loadAvg1=70.25)
+        values = dict(fields, result='TimeoutExpired', argv=['launchctl', 'procinfo', '123'], stderr='private')
+        self.assertEqual(toollog.suspend_fields(values), dict(fields, result='TimeoutExpired'))
+        toollog.emit('suspend', 'error', 'suspend.error', ok=False, props=values)
+        self.assertEqual(self.rows()[0]['props'], dict(fields, result='TimeoutExpired'))
+
+    def test_suspend_cmd_uses_secret_redaction_and_printable_filter(self):
+        for cmd, expected in [('ps -axo', 'ps -axo'), ('ps\x00-axo', 'ps -axo'),
+                              ('tool password=EXAMPLE_ONLY', '[redacted]'),
+                              ('tool '+('x'*1000)+' token=EXAMPLE_ONLY', '[redacted]')]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(toollog.suspend_fields(dict(cmd=cmd)), dict(cmd=expected))
+        self.assertEqual(toollog.suspend_fields(dict(cmd=['ps', '-axo'])), {})
+
+    def test_suspend_timeout_numbers_reject_nonfinite_and_wrong_types(self):
+        for key in ('timeoutS', 'elapsedMs', 'loadAvg1'):
+            for value in (float('nan'), float('inf'), -float('inf'), True, '8', None, 10**1000):
+                with self.subTest(key=key, value=value):
+                    self.assertEqual(toollog.suspend_fields({key: value}), {})
+
+    def test_tmpdir_removal_and_summary_fields_survive_logger(self):
+        remove = {'path': '/private/var/folders/example/T/tmp.scratch', 'bytes': 4096,
+                  'ageS': 86400, 'rule': 'agent'}
+        summary = {'found': 2, 'removed': 1, 'removed_bytes': 4096, 'bytes': 8192,
+                   'idle_hours': 24, 'report_only': False, 'partial': False}
+        for name, props in [('janitor.tmpdir_remove', remove), ('janitor.tmpdir_run', summary)]:
+            toollog.emit('janitor', 'event', name, ok=True, props={**props, 'unexpected': 'secret'})
+            self.assertEqual(self.rows()[-1]['props'], props)
+        self.assertEqual(toollog.safe_fields({'path': '/tmp/password=secret'}, 'janitor.tmpdir_remove'),
+                         {'path': '[redacted]'})
+
     def test_janitor_summary_and_phases_survive_the_real_logger_without_free_text(self):
         scripts = REPO / 'integrations/dev-resource-janitor/skill/scripts'
         sys.path.insert(0, str(scripts))
@@ -105,6 +137,12 @@ class LoggingTests(unittest.TestCase):
         probes = patch.object(jobs, 'storage_probes', return_value={})
         probes.start()
         self.addCleanup(probes.stop)
+        snapshots = patch.object(jobs, 'backup_snapshot_age', return_value=(None, 'unavailable'))
+        self.snapshot_age = snapshots.start()
+        self.addCleanup(snapshots.stop)
+        status = patch.object(jobs, 'backup_status', return_value={})
+        status.start()
+        self.addCleanup(status.stop)
 
     def rows(self):
         return [json.loads(line) for p in sorted(self.logs.glob('*.ndjson')) for line in p.read_text().splitlines()]
@@ -214,6 +252,11 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(a['props']['snapshotAgeS'],1)
         self.assertNotIn('snapshotAgeS', b['props'])
         self.assertEqual(b['props']['resticExitCode'],3)
+        self.snapshot_age.return_value = (5, None)
+        with patch.object(jobs.time,'time',return_value=100):
+            jobs.backup_run('health',90,0,0,99,summary)
+        self.assertEqual(self.rows()[-1]['props']['snapshotAgeS'],5)
+        self.assertEqual(self.rows()[-1]['props']['lastGoodSnapshotSource'],'restic')
         self.assertNotIn('banned',str(self.rows()))
         self.assertNotIn('failed with password',str(self.rows()))
 
@@ -327,8 +370,9 @@ class LoggingTests(unittest.TestCase):
                     value['at']-=86400
             jobs.save_state('disk-inventory',state)
         value=[100]
+        expected=jobs.disk_throttle(['/usr/bin/du','-skl'])
         def run(cmd,**kwargs):
-            self.assertEqual(cmd[:2],['/usr/bin/du','-skl'])
+            self.assertEqual(cmd[:len(expected)],expected)
             return SimpleNamespace(returncode=0,stdout=str(value[0])+'\t'+cmd[-1])
         jobs.directory_inventory([cache,worktree],run)
         jobs.disk_sample(self.root,self.root,volumes=(self.root,self.root),paths=[])

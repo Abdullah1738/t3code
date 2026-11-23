@@ -311,7 +311,7 @@ class CrpkoSetupTests(unittest.TestCase):
         (self.home/'state').write_text(json.dumps(self.state))
         with patch.object(runs,'REPO_RECIPES_DIR',self.recipes), \
              patch.object(runs,'DOCKER_REPAIR',':'), patch.object(runs,'LDCACHE_REPAIR',':'), \
-             patch.object(runs,'SQLITE_SETUP',':'), \
+             patch.object(runs,'SQLITE_SETUP',':'), patch.object(runs,'NODE_OWNER_REPAIR',':'), \
              patch.object(runs.quint_tools,'block',return_value=':'), \
              patch.object(runs,'GO_REPAIR',':'), patch.object(runs.userns,'setup',return_value=':'):
             script = runs.remote_script(repo,'.',[command],None,'run-test',repo_key=KEY,node=node)

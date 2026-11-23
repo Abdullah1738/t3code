@@ -4,6 +4,8 @@ import { cardKind, logCardRender, toolError } from "./toollog.ts";
  * media upload, so the page can stay private and the provider never receives an unreachable image URL.
  */
 import { LineError, type LineFile } from "./line.ts";
+import { cardUrlClass, pageFetchCause, renderCardId, type CardFetchFailure } from "./log-card-fetch.ts";
+import { errorDetail } from "./log-error.ts";
 
 const TIMEOUT_MS = 5_000;
 const MAX_HTML = 512 * 1024;
@@ -12,7 +14,7 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
   "image/jpeg": "jpg", "image/png": "png", "image/heic": "heic", "image/heif": "heif", "image/webp": "webp",
 };
 
-async function boundedBody(response: Response, limit: number): Promise<Uint8Array | undefined> {
+async function boundedBody(response: Response, limit: number, received?: (bytes: number) => void): Promise<Uint8Array | undefined> {
   if (!response.body) return undefined;
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -22,6 +24,7 @@ async function boundedBody(response: Response, limit: number): Promise<Uint8Arra
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
+      received?.(size);
       if (size > limit) return undefined;
       chunks.push(value);
     }
@@ -63,18 +66,25 @@ export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fe
     const at = performance.now();
     let ok = false;
     let failureCode = "invalid_url";
+    let fetchFailure: CardFetchFailure | undefined;
+    let httpStatus: number | undefined;
+    let bytesReceived = 0;
+    let pageUrlClass = "other";
     try {
-    if (!httpsUrl(pageUrl)) throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
+    const parsed = httpsUrl(pageUrl);
+    if (!parsed) throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
+    pageUrlClass = cardUrlClass(parsed);
     try {
       failureCode = "page_fetch";
       const page = await fetchFn(pageUrl, { redirect: "follow", signal: AbortSignal.timeout(TIMEOUT_MS) });
+      httpStatus = page.status;
       if (!page.ok || !/text\/html/i.test(page.headers.get("content-type") ?? "")) {
         failureCode = page.ok ? "page_type" : "page_http";
         await page.body?.cancel();
         throw new Error("invalid preview page");
       }
       failureCode = "page_body";
-      const html = await boundedBody(page, MAX_HTML);
+      const html = await boundedBody(page, MAX_HTML, bytes => { bytesReceived = bytes; });
       if (!html) throw new Error("invalid preview page");
       const image = ogImageOf(new TextDecoder().decode(html), page.url || pageUrl);
       if (!image) { failureCode = "none"; ok = true; return undefined; }
@@ -94,12 +104,20 @@ export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fe
       failureCode = "none";
       ok = true;
       return result.href;
-    } catch (caughtError) { toolError("card-preview", "card-preview.catch3", caughtError);
+    } catch (caughtError) {
+      if (["page_fetch", "page_http", "page_type", "page_body"].includes(failureCode)) {
+        httpStatus ??= errorDetail(caughtError).status;
+        fetchFailure = { fetchCause: failureCode === "page_http" || failureCode === "page_fetch" && httpStatus !== undefined ? "http_status" : pageFetchCause(caughtError, failureCode === "page_body"),
+          ...(httpStatus !== undefined ? { httpStatus } : {}), urlClass: pageUrlClass,
+          elapsedMs: performance.now() - at, bytesReceived };
+      }
+      toolError("card-preview", "card-preview.catch3", caughtError);
       throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
     }
     } finally {
       if (ok) attempts.delete(pageUrl);
-      logCardRender("cards", cardKind(pageUrl), performance.now() - at, ok, { chat, failureCode, attempt });
+      logCardRender("cards", cardKind(pageUrl), performance.now() - at, ok, { chat, failureCode, attempt,
+        ...(fetchFailure ? { cardId: renderCardId(pageUrl), ...fetchFailure } : {}) });
     }
   };
 }

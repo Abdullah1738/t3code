@@ -1,0 +1,20 @@
+--- a/toollog.py
++++ b/toollog.py
+@@ -87,7 +87,7 @@
+                 'argc': int, 'rejected': 'rejected', **AUTH_SCHEMA},
+     'watcher.run': {'trigger': 'trigger', 'scheduledAt': 'optional_iso',
+                     'startLagMs': 'lag_ms', 'hostLoad1m': 'load'},
+-    'sync.run': {'reauthPending': bool, 'reminderSent': bool, 'hoursSinceLastSuccess': 'hours',
++    'sync.run': {'offsetFallbacks': int, 'offsetSamples': 'offset_samples', 'reauthPending': bool, 'reminderSent': bool, 'hoursSinceLastSuccess': 'hours',
+         'reauthPendingSinceDay': 'day', 'trigger': 'trigger', 'refreshMs': int, 'writeMs': int, 'hostLoad1m': 'load', 'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
+         'lastScoredSleep': 'iso', 'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool, 'reason': WHOOP_AUTH_REASONS, **AUTH_SCHEMA,
+         **{k: ENDPOINT_SCHEMA for k in ('sleep', 'recovery', 'cycle', 'body')}},
+@@ -200,6 +200,8 @@
+             out[key] = value
+         elif spec == 'rejected' and isinstance(value, (list, tuple)):
+             out[key] = rejected_names(value, props.get('reason'))
++        elif spec == 'offset_samples' and isinstance(value, (list, tuple)):
++            out[key] = list(dict.fromkeys(v for v in value if isinstance(v, str)))[:3]
+         elif spec == 'check_ids' and isinstance(value, (list, tuple)):
+             out[key] = sorted({v for v in value if isinstance(v, str) and v in VALIDATE_CHECK_IDS})
+         elif spec is bool and type(value) is bool:

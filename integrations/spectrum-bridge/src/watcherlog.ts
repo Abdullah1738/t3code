@@ -1,3 +1,4 @@
+import { expandTelemetry } from "./log-format.ts";
 import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { logDirectory as bridgeLogDirectory } from "./log-directory.ts";
@@ -101,24 +102,30 @@ export async function rollup(day: string, dir = logDirectory()) {
     let total = 0, ok = 0, failed = 0, withOk = 0;
     const lines = createInterface({ input: createReadStream(join(dir, `${day}.ndjson`)), crlfDelay: Infinity });
     for await (const line of lines) {
-      let row; try { row = JSON.parse(line); } catch { continue; }
-      if (!row || row.tool !== "watchers" || !token.test(row.name) || !["event", "perf", "error"].includes(row.kind)) continue;
-      total++; counts[row.name] = (counts[row.name] ?? 0) + 1; kinds[row.kind] = (kinds[row.kind] ?? 0) + 1;
-      if (typeof row.ok === "boolean") { withOk++; if (row.ok) ok++; else failed++; }
-      if (typeof row.durationMs === "number" && Number.isFinite(row.durationMs) && row.durationMs >= 0) (durations[row.name] ??= []).push(row.durationMs);
-      if (row.error && token.test(row.error.tag)) {
-        const tag = row.error.tag;
-        const entry = errors[tag] ??= { count: 0 };
-        entry.count++;
-        // Reuse sanitized IDs only, never text from a malformed fixture line.
-        if (row.ids && typeof row.ids === "object") for (const [key, value] of Object.entries(row.ids)) {
-          if (!idKeys.has(key) || typeof value !== "string") continue;
-          if (/^[a-f0-9]{24}$/.test(value) || ((key === "watcher" || key === "helper") && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(value) && !/\d{5}/.test(value))) {
-            entry.sampleId ??= value;
-            break;
+      let input; try { input = JSON.parse(line); } catch { continue; }
+      if (!input || typeof input !== "object") continue;
+      for (const expanded of expandTelemetry(input)) {
+        const row = expanded as LogEntry & { tool?: string };
+        if (!row || row.tool !== "watchers" || !token.test(row.name) || !["event", "perf", "error"].includes(row.kind)) continue;
+        const repeats = row.props?.repeats;
+        const occurrences = row.kind === "error" && typeof repeats === "number" && Number.isSafeInteger(repeats) && repeats > 0 ? repeats : 1;
+        total += occurrences; counts[row.name] = (counts[row.name] ?? 0) + occurrences; kinds[row.kind] = (kinds[row.kind] ?? 0) + occurrences;
+        if (typeof row.ok === "boolean") { withOk += occurrences; if (row.ok) ok += occurrences; else failed += occurrences; }
+        if (typeof row.durationMs === "number" && Number.isFinite(row.durationMs) && row.durationMs >= 0) (durations[row.name] ??= []).push(row.durationMs);
+        if (row.error && token.test(row.error.tag)) {
+          const tag = row.error.tag;
+          const entry = errors[tag] ??= { count: 0 };
+          entry.count += occurrences;
+          // Reuse sanitized IDs only, never text from a malformed fixture line.
+          if (row.ids && typeof row.ids === "object") for (const [key, value] of Object.entries(row.ids)) {
+            if (!idKeys.has(key) || typeof value !== "string") continue;
+            if (/^[a-f0-9]{24}$/.test(value) || ((key === "watcher" || key === "helper") && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(value) && !/\d{5}/.test(value))) {
+              entry.sampleId ??= value;
+              break;
+            }
           }
         }
-      }
+    }
     }
     const timing = Object.fromEntries(Object.entries(durations).map(([name, samples]) => {
       samples.sort((a, b) => a - b);

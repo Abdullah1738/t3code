@@ -12,6 +12,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
 import * as Scope from "effect/Scope";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
@@ -34,6 +35,10 @@ import {
   makeAntigravityUserInputResponse,
   normalizeAntigravityToolCall,
 } from "../../provider/acp/AntigravityProtocol.ts";
+import {
+  antigravityTurnContextPath,
+  makeAntigravityPromptContext,
+} from "../../provider/acp/AntigravityTurnContext.ts";
 import {
   AcpProviderCapabilitiesV2,
   makeAcpAdapterV2,
@@ -113,6 +118,7 @@ interface AntigravityFlavorServices {
   readonly fileSystem: FileSystem.FileSystem;
   readonly path: Path.Path;
   readonly host: ProviderHost.ProviderHost["Service"];
+  readonly spawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
 }
 
 export function makeAntigravityAcpAdapterFlavor(
@@ -216,6 +222,16 @@ export function makeAntigravityAcpAdapterFlavor(
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
     supportsImagePrompts: true,
     supportsCompaction: true,
+    // No global rules file and no prompt-hook context in this runtime: Robob sends both.
+    promptContext: (input) =>
+      Effect.suspend(() =>
+        makeAntigravityPromptContext({
+          configPath: antigravityTurnContextPath(options.path, options.host.paths.baseDir),
+          instanceId: options.instanceId,
+          fileSystem: options.fileSystem,
+          spawner: options.spawner,
+        })(input),
+      ),
   };
 }
 
@@ -227,6 +243,7 @@ export const makeAntigravityAdapterV2 = Effect.fn("makeAntigravityAdapterV2")(fu
     fileSystem: yield* FileSystem.FileSystem,
     path: yield* Path.Path,
     host: yield* ProviderHost.ProviderHost,
+    spawner: yield* ChildProcessSpawner.ChildProcessSpawner,
   };
   return yield* makeAcpAdapterV2({
     instanceId: options.instanceId,

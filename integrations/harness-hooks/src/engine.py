@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -30,7 +31,6 @@ import desktop_lease
 import statev2_guard
 import snapshot_guard
 import shared_deps_guard
-import quint_verify_guard
 import rootwide_search_guard
 import phone_adb_guard
 
@@ -91,7 +91,7 @@ _LOG_RULES = {
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
     "live-database-snapshot",
-    "rootwide-search", "quint-verify", "shared-dependencies", "card-mask",
+    "rootwide-search", "shared-dependencies", "card-mask",
     "phone-adb-state", "phone-adb-forward", "phone-adb-state-unleased", "phone-adb-forward-unleased", "phone-adb-unavailable",
 }
 _LOG_ERRORS = {
@@ -116,7 +116,7 @@ def _log(**record):
     try:
         rule = _log_enum(record.get("rule"), _LOG_RULES) or "no-policy"
         guard = ("statev2" if rule.startswith("live-database") else "betterstack-scope" if rule == "betterstack-scope"
-                 else "phone-adb" if rule.startswith("phone-adb") else "quint-verify" if rule == "quint-verify" else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
+                 else "phone-adb" if rule.startswith("phone-adb") else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
                      "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
                      "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
                      "docker-run", "docker-container-run", "docker-build", "docker-buildx-build", "docker-compose-up", "docker-compose-v1",
@@ -132,7 +132,7 @@ def _log(**record):
                           "nativeAgentId": record.get("nativeAgentId"),
                           "cardNumber": record.get("cardNumber")}, cwd=record.get("cwd"), matched=record.get("matchedRoot"),
                      identity_source=_log_enum(record.get("identity_source"), {"cache", "control", "negative-cache"}),
-                     extra=record.get("extra"))
+                     extra=record.get("extra"), phases=record.get("phases"))
         path = _state()
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         thread_id = record.get("robobThreadId")
@@ -150,7 +150,7 @@ def _log(**record):
         row = {
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "event": _log_enum(record.get("event"), _LOG_EVENTS),
-            "harness": _log_enum(record.get("harness"), {"claude", "codex"}),
+            "harness": _log_enum(record.get("harness"), {"claude", "codex", "antigravity"}),
             "tool": _log_enum(record.get("tool"), _LOG_TOOLS),
             "robobThreadId_sha256": hashlib.sha256(thread_id.encode("utf-8")).hexdigest() if isinstance(thread_id, str) and thread_id else None,
             "rule": _log_enum(record.get("rule"), _LOG_RULES),
@@ -270,6 +270,10 @@ def _get_unbounded(path, deadline, *, timeout=1.2):
 def _native(event, harness):
     session = event.get("session_id")
     agent = event.get("agent_id")
+    if harness == "antigravity":
+        # hooks.json payloads carry the ACP session id as conversationId; the
+        # adapter passes it as session_id. Antigravity has no native child ids.
+        return session, None, "antigravity"
     if harness in {"codex", "codex-cu"}:
         # The hook inherits the app-server's environment, not the tool shell's.
         # Only payload IDs identify the executing agent; shim fallbacks pass
@@ -560,7 +564,7 @@ def resolve_identity(event, harness, *, fresh=False):
             if age >= 60:
                 binding.pop("model", None)
             return binding
-        fallback_cache = harness in {"claude", "codex", "codex-cu"} and valid_cache and 0 <= age < _IDENTITY_FALLBACK_TTL
+        fallback_cache = harness in {"claude", "codex", "codex-cu", "antigravity"} and valid_cache and 0 <= age < _IDENTITY_FALLBACK_TTL
         unavailable = _read_json(unavailable_file, {})
         failed_at = unavailable.get("at") if isinstance(unavailable, dict) else None
         if not fallback_cache and type(failed_at) in (int, float) and 0 <= time.time() - failed_at < _IDENTITY_UNAVAILABLE_TTL:
@@ -778,9 +782,46 @@ def _shell_input_field(event, harness):
     return None
 
 
+@contextlib.contextmanager
+def _phase(phases, key):
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        phases[key] = phases.get(key, 0.0) + (time.monotonic() - started) * 1000
+
+
+@contextlib.contextmanager
+def _live_db_phase(phases):
+    # statev2 scans offbox/ssh payloads inside its check; report that scan on its own.
+    scanned = statev2_guard.remote_scan_ms
+    try:
+        with _phase(phases, "live_db_ms"):
+            yield
+    finally:
+        scan = statev2_guard.remote_scan_ms - scanned
+        phases["live_db_ms"] -= scan
+        phases["remote_scan_ms"] = phases.get("remote_scan_ms", 0.0) + scan
+
+
+@contextlib.contextmanager
+def _desktop_phase(phases):
+    # Lock waits are reported on their own, so the two phases do not overlap.
+    waited = desktop_lease.lock_wait_ms
+    try:
+        with _phase(phases, "desktop_ms"):
+            yield
+    finally:
+        lock = desktop_lease.lock_wait_ms - waited
+        phases["desktop_ms"] -= lock
+        phases["lock_wait_ms"] = phases.get("lock_wait_ms", 0.0) + lock
+
+
 def decide(event, harness):
     """Return {decision, reason, context}; JSONL-log every call, including failures."""
     desktop_timing = {}
+    # Monotonic spans inside this call; toollog keeps them only on rows over 2 s.
+    phases = {}
     start = time.monotonic()
     command = None
     identity = {}
@@ -799,11 +840,12 @@ def decide(event, harness):
         if lineage_nodes is None:
             if lineage_deadline is None:
                 lineage_deadline = time.monotonic() + _LINEAGE_TIMEOUT
-            lineage_nodes = _lineage(identity, deadline=lineage_deadline)
+            with _phase(phases, "lineage_ms"):
+                lineage_nodes = _lineage(identity, deadline=lineage_deadline)
         return lineage_nodes
 
     try:
-        if not isinstance(event, dict) or harness not in {"claude", "codex"}:
+        if not isinstance(event, dict) or harness not in {"claude", "codex", "antigravity"}:
             raise ValueError("invalid-event")
         tool, cwd = event.get("tool_name", ""), event.get("cwd")
         kind = event.get("hook_event_name")
@@ -811,11 +853,12 @@ def decide(event, harness):
             log_tool = "desktop-node-repl" if tool == desktop_lease.NODE_REPL else "desktop-cua"
             # This policy must not enter the general engine's fail-open identity path.
             try:
-                if kind == "PreToolUse":
-                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control, _state(), desktop_timing)
-                else:
-                    rule, error_type = desktop_lease.finish(event, harness, _control, _state(), desktop_timing)
-                    decision, reason = "allow", ""
+                with _desktop_phase(phases):
+                    if kind == "PreToolUse":
+                        decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control, _state(), desktop_timing)
+                    else:
+                        rule, error_type = desktop_lease.finish(event, harness, _control, _state(), desktop_timing)
+                        decision, reason = "allow", ""
                 result = {"decision": decision, "reason": reason, "context": {"rule": rule}}
             except Exception as error:
                 error_type = type(error).__name__
@@ -825,7 +868,8 @@ def decide(event, harness):
             return result
         if kind in desktop_lease.TURN_END:
             log_tool = "desktop-flush"
-            rule, error_type = desktop_lease.flush(event, harness, _control, _state())
+            with _desktop_phase(phases):
+                rule, error_type = desktop_lease.flush(event, harness, _control, _state())
             result = {"decision": "allow", "reason": "", "context": {"rule": rule}}
             return result
         command = _command(event) if kind == "PreToolUse" else None
@@ -834,7 +878,8 @@ def decide(event, harness):
             command_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
             cwd = command_cwd
             try:
-                phone = phone_adb_guard.classify(command)
+                with _phase(phases, "guard_ms"):
+                    phone = phone_adb_guard.classify(command)
             except Exception:
                 # A phone-parser failure must not bypass the independent
                 # search, database or offbox guards below.
@@ -847,10 +892,12 @@ def decide(event, harness):
             if phone['matched'] or phone['error']:
                 # Admission continues through the independent guards. Keep a
                 # separate phone decision so unleased calls remain countable.
-                _log(harness=harness, event=kind, tool=tool, command=command, cwd=cwd,
-                     rule=phone['rule'], decision="allow", error=phone['error'], extra=_phone_props(phone))
+                with _phase(phases, "log_write_ms"):
+                    _log(harness=harness, event=kind, tool=tool, command=command, cwd=cwd,
+                         rule=phone['rule'], decision="allow", error=phone['error'], extra=_phone_props(phone))
             try:
-                shared_reason = shared_deps_guard.classify(command, command_cwd)
+                with _phase(phases, "guard_ms"):
+                    shared_reason = shared_deps_guard.classify(command, command_cwd)
             except Exception as error:
                 # This policy must not disable the independent database and offbox guards.
                 error_type = type(error).__name__
@@ -859,12 +906,9 @@ def decide(event, harness):
                 result = {"decision": "deny", "reason": shared_reason,
                           "context": {"rule": "shared-dependencies"}}
                 return result
-            if quint_verify_guard.classify(command, command_cwd):
-                result = {"decision": "deny", "reason": quint_verify_guard.REASON,
-                          "context": {"rule": "quint-verify"}}
-                return result
             try:
-                root = rootwide_search_guard.classify(command, command_cwd)
+                with _phase(phases, "guard_ms"):
+                    root = rootwide_search_guard.classify(command, command_cwd)
             except Exception as error:
                 # A search-parser failure must not disable the independent DB,
                 # offbox policy later in this hook.
@@ -878,13 +922,16 @@ def decide(event, harness):
             # The live DB rule is independent of native identity and offbox
             # availability, so a service outage cannot disable this local check.
             try:
-                if snapshot_guard.exact_invocation(command, command_cwd):
+                with _live_db_phase(phases):
+                    exact_snapshot = snapshot_guard.exact_invocation(command, command_cwd)
+                    if not exact_snapshot:
+                        hit, cause = statev2_guard.classify_detail(command, command_cwd)
+                        if not hit and snapshot_guard.snapshot_attempt(command, command_cwd):
+                            hit, cause = "live-database-snapshot", "Snapshot requests require the exact installed, pinned helper invocation."
+                if exact_snapshot:
                     result = {"decision": "allow", "reason": "",
                               "context": {"rule": "live-database-snapshot"}}
                     return result
-                hit, cause = statev2_guard.classify_detail(command, command_cwd)
-                if not hit and snapshot_guard.snapshot_attempt(command, command_cwd):
-                    hit, cause = "live-database-snapshot", "Snapshot requests require the exact installed, pinned helper invocation."
             except Exception as error:
                 error_type = type(error).__name__
                 result = {"decision": "deny", "reason": "Live database guard unavailable; this shell command was NOT run. Retry after the guard is available; do not bypass it.",
@@ -905,7 +952,8 @@ def decide(event, harness):
             # Shell calls need only the binding used to sign command context.
             binding_only = (kind == "PreToolUse" and
                             _shell_input_field(event, harness) and _command(event))
-            identity = resolve_identity(event, harness, fresh=not binding_only)
+            with _phase(phases, "identity_ms"):
+                identity = resolve_identity(event, harness, fresh=not binding_only)
             if identity.get("resolution") != "resolved":
                 error_type = "identity-" + str(identity.get("resolution", "unavailable"))
         if event.get("hook_event_name") != "PreToolUse":
@@ -920,11 +968,13 @@ def decide(event, harness):
                 cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
                 mode = _offbox_mode()
                 if mode == "off":
-                    _tool_log(ok=True, props={"harness": harness, "decision": "allowed", "commandClass": "unknown"})
+                    with _phase(phases, "log_write_ms"):
+                        _tool_log(ok=True, props={"harness": harness, "decision": "allowed", "commandClass": "unknown"})
                 if mode != "off":
                     try:
                         started = time.monotonic()
-                        verdict = _classify_offbox(command, cwd)
+                        with _phase(phases, "classify_ms"):
+                            verdict = _classify_offbox(command, cwd)
                         gate_decision = "allowed"
                         if verdict["heavy"]:
                             cap = _read_json(_offbox_state() / "cap.json", {})
@@ -938,14 +988,16 @@ def decide(event, harness):
                             else:
                                 gate_decision = "local-override" if exempt else "allowed"
                                 result["context"]["rule"] = "offbox-observe" if mode == "observe" else "offbox-exempt" if exempt else "offbox-unavailable"
-                        _tool_log(kind="perf", ok=True, duration_ms=(time.monotonic()-started)*1000,
-                                  props={"harness": harness, "decision": gate_decision,
-                                         "commandClass": verdict.get("class", "heavy") if verdict["heavy"] else "light"})
+                        with _phase(phases, "log_write_ms"):
+                            _tool_log(kind="perf", ok=True, duration_ms=(time.monotonic()-started)*1000,
+                                      props={"harness": harness, "decision": gate_decision,
+                                             "commandClass": verdict.get("class", "heavy") if verdict["heavy"] else "light"})
                     except Exception as error:
                         error_type = type(error).__name__
                         result["context"].update(rule="offbox-unresolved")
-                        _tool_log(kind="error", ok=False, tag="gate_failed",
-                                  props={"harness": harness, "decision": "allowed", "commandClass": "unknown"})
+                        with _phase(phases, "log_write_ms"):
+                            _tool_log(kind="error", ok=False, tag="gate_failed",
+                                      props={"harness": harness, "decision": "allowed", "commandClass": "unknown"})
                 if result["decision"] != "deny" and shell_field:
                     # Always refresh or clear this execution's context, even if
                     # the service is unavailable. Inherited tokens must not
@@ -970,7 +1022,8 @@ def decide(event, harness):
         if (isinstance(event, dict) and event.get("hook_event_name") == "PostToolUse"
                 and (harness == "claude" or str(event.get("tool_name", "")).startswith("mcp__"))):
             try:
-                masked, changed = card_mask.mask_value(event.get("tool_response"))
+                with _phase(phases, "mask_ms"):
+                    masked, changed = card_mask.mask_value(event.get("tool_response"))
                 if changed:
                     result["context"]["updatedToolOutput"] = masked
                     result["context"]["rule"] = "card-mask"
@@ -987,7 +1040,7 @@ def decide(event, harness):
              nativeAgentId=event.get("agent_id") if harness == "claude" and isinstance(event, dict) else None,
              cardNumber=identity.get("cardNumber"), cwd=cwd, matchedRoot=matched_root,
              command=command, rewritten="updatedInput" in result["context"] or "updatedToolOutput" in result["context"], ms=round((time.monotonic() - start) * 1000, 3), error=error_type,
-             extra=log_extra)
+             extra=log_extra, phases=phases)
     return result
 
 

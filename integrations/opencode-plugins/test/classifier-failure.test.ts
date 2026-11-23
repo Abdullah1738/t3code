@@ -5,7 +5,6 @@ import { join, resolve } from "node:path";
 import { cmdKind } from "../lib/toollog";
 import { runClassifier } from "../lib/classifier";
 import * as rootwide from "../plugin/rootwide-search-guard";
-import * as quint from "../plugin/quint-verify-guard";
 import * as shared from "../plugin/shared-deps-guard";
 import * as phone from "../plugin/phone-adb-guard";
 import * as statev2 from "../plugin/statev2-guard";
@@ -32,7 +31,6 @@ const failures: [string, () => Promise<unknown>, string, string][] = [
 
 for (const [label, guard, classifier, failMode] of [
   ["rootwide-search", rootwide, "rootwide_search_guard", "open"],
-  ["quint-verify", quint, "quint_verify_guard", "open"],
   ["shared-dependencies", shared, "shared_deps_guard", "open"],
   ["phone-adb", phone, "phone_adb_guard", "open"],
   ["statev2", statev2, "statev2_check", "fallback"],

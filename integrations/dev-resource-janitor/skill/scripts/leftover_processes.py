@@ -191,12 +191,41 @@ def family(row):
     return None
 
 
+def robob_ancestry(row, chain):
+    # parent_chain() is nearest-first; protection ends at the first provider.
+    for p in [row] + chain:
+        try:
+            argv = shlex.split(p.get('args', ''))
+        except ValueError:
+            continue
+        if not argv:
+            continue
+        name = Path(argv[0]).name.lower()
+        if (mcp_provider(p) or name in {'gemini', 'cursor-agent', 'grok', 'antigravity'}
+                or any(name.startswith(n + '-') for n in ('codex', 'claude', 'opencode'))):
+            return False
+        if name in {'node', 'bun', 'npx', 'bash', 'zsh', 'sh', 'python', 'python3'}:
+            for word in argv[1:]:
+                if word in {'-c', '-e', '--eval', '--prompt', '-p'}:
+                    break
+                if re.search(r'(?:^|[/@])(?:claude(?:-code)?|codex|opencode|gemini(?:-cli)?|cursor-agent|grok|antigravity)(?:$|[/.-])', word, re.I):
+                    return False
+        if argv[0].startswith('/Applications/Robob.app/'):
+            return True
+        if (Path(argv[0]).name in ('node', 'bun') and len(argv) > 1
+                and re.search(r'(?:^|/)apps/server/(?:dist/bin\.mjs|src/bin\.ts)$', argv[1])):
+            return True
+    return False
+
+
 def keep_reason(row, chain, labels, keep):
     args = row["args"].lower()
+    if robob_ancestry(row, chain):
+        return 'robob-descendant'
     if row["tty"] not in {"??", "?", "-"}:
         return "tty"
-    # A service's children can be per-thread MCPs, so only the process itself
-    # inherits the registration exemption, not every descendant of Robob.
+    # Other services can host per-thread MCPs; registration alone only keeps
+    # the registered process itself.
     if row["pid"] in labels:
         return "launchd_registered"
     if ".app/contents/" in args and "/python.app/" not in args:
@@ -569,6 +598,9 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
                     if not fresh["complete"]:
                         report["problems"].append("liveness_unavailable: " + "; ".join(fresh["problems"]))
                         reason = "liveness_unavailable"
+                    elif deadline is not None and time.monotonic() >= deadline:
+                        reason = "observation_budget_exhausted"
+                        report['budget_skipped'] += 1
                     else:
                         current = refresh(row["pid"]).get(row["pid"])
                         # RSS can change without changing process identity.
@@ -855,10 +887,11 @@ def report_summary(report):
     return result
 
 
-def scan(roster, keep=(), cursor=0):
+def scan(roster, keep=(), cursor=0, *, deadline=None, liveness=None):
     phases = {}
+    deadline = time.monotonic() + OBSERVATION_BUDGET if deadline is None else deadline
     with timed_phase(phases, "mcp_orphan"):
-        mcp_report = scan_mcp_orphans(roster, keep)
+        mcp_report = scan_mcp_orphans(roster, keep, deadline=deadline)
     try:
         with timed_phase(phases, "inventory"):
             rows = processes()
@@ -872,7 +905,9 @@ def scan(roster, keep=(), cursor=0):
         except Exception:
             hints = {}
         with timed_phase(phases, "detection"):
-            report = detect(rows, memory, labels, roster, keep, deadline=time.monotonic() + OBSERVATION_BUDGET,
+            report = detect(rows, memory, labels, roster, keep, deadline=deadline,
+                            refresh_roster=lambda: active_sessions.checked_snapshot(
+                                timeout=OWNER_CALL_TIMEOUT, max_attempts=3, deadline=deadline, stats=liveness),
                             cursor=cursor, cwd_hints=hints)
         with timed_phase(phases, "agent_browser"):
             report["agent_browser"] = scan_agent_browsers(roster, keep)
@@ -1022,7 +1057,9 @@ def detect_xcode_builds(rows, before, after, roster, labels, keep=(), *, metadat
             reason = None
             # Xcode's toolchain binaries live inside Xcode.app too; exempt the
             # actual GUI launcher, not every executable in that application bundle.
-            if any(p.get('tty', '??') not in {'??', '?', '-'} or
+            if robob_ancestry(row, chain):
+                reason = 'robob-descendant'
+            elif any(p.get('tty', '??') not in {'??', '?', '-'} or
                    re.search(r'/(?:Xcode|Terminal|iTerm2?)\.app/Contents/MacOS/', p.get('args', ''), re.I)
                    for p in [row] + chain):
                 reason = 'interactive_launcher'
@@ -1133,6 +1170,9 @@ def stop_xcode_builds(report, *, rescan=None, observe=cpu_processes, send=os.kil
                                 os.path.basename(shlex.split(rows[pid]['args'])[0]) in {'SWBBuildService', 'XCBBuildService'}]
                     def signal_exact(pid, sig):
                         current = observe()
+                        if current.get(pid) and robob_ancestry(current[pid], parent_chain(current[pid], current)):
+                            entry['protectedBy'] = 'robob-descendant'
+                            return False
                         if pid == item['pid'] and sig == signal.SIGTERM and not unchanged_tree(current):
                             return False
                         if same(pid, current):
@@ -1356,6 +1396,9 @@ def reap_mcp_orphans(report, *, rescan=None, observe=cpu_processes, send=os.kill
                 # before each signal; never signal a PID obtained by name alone.
                 rows = observe()
                 current = rows.get(item['pid'])
+                if current and robob_ancestry(current, parent_chain(current, rows)):
+                    entry['protectedBy'] = 'robob-descendant'
+                    return False
                 chain = [{**{k: p[k] for k in ('pid', 'ppid', 'start', 'missing') if k in p},
                           'command': redact(p.get('args', ''))} for p in parent_chain(current, rows)] if current else None
                 if (not current or process_identity({**current, 'args': redact(current['args'])})

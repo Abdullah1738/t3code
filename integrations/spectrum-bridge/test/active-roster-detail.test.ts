@@ -290,20 +290,22 @@ test("an aggregate removal fences both parallel details against reviving a child
   expect(await f.backend.statuses(true)).toEqual({});
   expect(await f.scan()).toEqual([]);
   expect(childReads).toBe(2);
-  expect(f.reads()).toBe(2);
+  expect(f.reads()).toBe(1);
 });
 
 test.each(["running", "needs-input"] as const)("fetch merge retains %s detail facts across a later non-state event", async state => {
-  const f = fixture(); const statuses = await f.backend.statuses(true);
+  let clock = 1_000;
+  const f = fixture(() => clock); const statuses = await f.backend.statuses(true);
   const response = Promise.withResolvers<{ total: number; threads: ThreadDetail[] }>();
   f.lists.mockImplementationOnce(async () => response.promise);
-  f.roster.event({ id: "1", data: { type: "thread.updated", threadId: "child", change: "thread.metadata-updated" } });
+  clock += 30_000;
+  const refresh = f.backend.statuses(true);
   f.server.child = row("child", { state, pendingRequest: state === "needs-input" ? question : null,
     pendingRequests: state === "needs-input" ? [question] : [] });
   await f.router["requests"]({ id: "owner", directory: "/chats", generation: 1, messageId: "msg_work", startedAt: Date.now(), phase: "running" }, statuses, true);
   f.roster.event({ id: "2", data: { type: "message.completed", threadId: "child" } });
   response.resolve({ total: 1, threads: [row("child", { state: "idle", status: "idle" })] });
-  expect(await f.backend.statuses(true)).toEqual({ child: { type: "busy", root: "owner" } });
+  expect(await refresh).toEqual({ child: { type: "busy", root: "owner" } });
   if (state === "needs-input") expect((await f.scan()).map(item => item.request.id)).toEqual(["question"]);
   expect(f.reads()).toBe(3);
 });
@@ -441,6 +443,7 @@ test.each((["running", "question", "deleted", "archived"] as const).flatMap(chan
   const event = () => {
     f.server.child = change === "question" ? row("child", { state: "needs-input", pendingRequest: question, pendingRequests: [question] })
       : row("child", { state: "running", status: "running" });
+    if (change === "archived") f.server.child.archived = true;
     if (change === "deleted" || change === "archived") f.lists.mockResolvedValue({ total: 0, threads: [] });
     f.roster.event({ id: "50", data: change === "question" ? { type: "request.opened", threadId: "child", ...question }
       : change === "running" ? { type: "thread.status", threadId: "child", runId: "run-1", state: "running" }

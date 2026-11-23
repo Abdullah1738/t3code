@@ -1,8 +1,9 @@
 #!/usr/bin/python3
-"""Bounded overload restart watchdog. Installed disabled; expires 23 Nov 2026.
+"""Bounded overload restart watchdog. Installed disabled; checks expire 23 Nov 2026.
 
 check: five-minute health sampler and detached tmux trigger.
-restart: external supervisor; owns the hold, deadline and terminal result.
+restart [stamp]: serves callers with their own authority (mac-guard, Mac #91).
+    Owns the hold, deadline and terminal result; keeps every limit except check expiry.
 probe: read-only startup dependency checks, with no hold, quit or notification.
 status: read-only internal state and listener identity.
 """
@@ -10,8 +11,10 @@ import datetime
 from contextlib import contextmanager
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
+import re
 import signal
 import uuid
 import shlex
@@ -34,6 +37,9 @@ MAC_SSD_MARKER = Path(os.environ.get("ROBOB_OVERLOAD_MAC_MARKER", HOME / ".local
 HOLD_CLI = os.environ.get("ROBOB_OVERLOAD_HOLD_CLI", str(HOME / ".local/bin/robob-install-hold"))
 OPEN_CLEAN = HERE / "open-robob-clean.zsh"
 TMUX = os.environ.get("ROBOB_OVERLOAD_TMUX", "/opt/homebrew/bin/tmux")
+QF_SOCKET = os.environ.get("ROBOB_OVERLOAD_QF_SOCKET", "qf-install")
+QF_SESSION_RE = re.compile(os.environ.get("ROBOB_OVERLOAD_QF_SESSION_RE", r"^install\d*$"))
+QF_IDLE_SEC = float(os.environ.get("ROBOB_OVERLOAD_QF_IDLE_SEC", "1800"))
 NODE = os.environ.get("ROBOB_OVERLOAD_NODE", str(HOME / ".local/bin/node"))
 HEALTH = HERE / "health-probe.mjs"
 BUN = os.environ.get("ROBOB_OVERLOAD_BUN", str(HOME / ".bun/bin/bun"))
@@ -51,7 +57,20 @@ MIN_GAP = 2 * 3600        # owner: max once per 2 hours
 NEED = 4                  # consecutive stalled checks (5 min apart: 15+ min)
 LONG = 8                  # rule 2 window: about 40 min with no healthy check
 MAX_STEP = 420            # checks further apart than this are not consecutive
-EXPIRES = "2026-11-23T00:00:00+00:00"   # stops by itself; the tracker extends or removes it
+STALL_5S = max(1, int(os.environ.get("ROBOB_OVERLOAD_STALL_5S", "1")))
+STALL_1S = max(1, int(os.environ.get("ROBOB_OVERLOAD_STALL_1S", "3")))
+LOAD_FACTOR = float(os.environ.get("ROBOB_OVERLOAD_LOAD_FACTOR", "2"))
+AGENT_COMMANDS = frozenset(("claude", "codex", "opencode", "cursor-agent", "grok"))
+NODE_PROVIDER_SCRIPTS = re.compile(
+    r"/(?:@anthropic-ai/claude-code/cli\.js|@openai/codex/bin/codex\.js|"
+    r"opencode-ai/bin/opencode|@xai-official/grok/(?:dist/)?(?:index|cli)\.js)$")
+NODE_VALUE_OPTIONS = frozenset(("-r", "--require", "--import", "--loader", "--experimental-loader",
+                                "-C", "--conditions", "--title", "--icu-data-dir", "--openssl-config",
+                                "--experimental-specifier-resolution"))
+NODE_BOOLEAN_OPTIONS = frozenset(("--no-warnings", "--trace-warnings", "--enable-source-maps",
+                                  "--no-deprecation", "--trace-deprecation", "--inspect", "--inspect-brk",
+                                  "--experimental-strip-types"))
+EXPIRES = "2026-11-23T00:00:00+00:00"   # check stops by itself; the tracker extends or removes it
 BY = "overload-restart"
 DRY = os.environ.get("ROBOB_OVERLOAD_DRY") == "1"
 
@@ -194,9 +213,12 @@ def notify(severity, text, key):
     return False
 
 
-def processes():
+def processes(timeout=20):
     """pid -> (ppid, start time text, command)."""
-    out = run(["/bin/ps", "-axo", "pid=,ppid=,lstart=,comm="], 20).stdout
+    result = run(["/bin/ps", "-axo", "pid=,ppid=,lstart=,comm="], timeout)
+    if result.returncode:
+        raise OSError("process inventory failed")
+    out = result.stdout
     table = {}
     for line in out.splitlines():
         parts = line.split(None, 7)
@@ -222,6 +244,120 @@ def tree(table, root):
         found[pid] = table[pid][1]
         stack.extend(children.get(pid, []))
     return found
+
+
+def node_provider(command):
+    # ps prints argv joined by spaces, not shell-escaped. Consume only the launch
+    # prefix: quotes in later prompts are irrelevant, ambiguous paths/options hold.
+    args = shlex.shlex(command, posix=True)
+    args.whitespace_split = True
+    args.commenters = ""
+    value_option = False
+    try:
+        if Path(next(args)).name != "node":
+            return None
+        for token in args:
+            option = token.split("=", 1)[0]
+            if option in NODE_VALUE_OPTIONS:
+                # A ps value may have unescaped spaces. After consuming values,
+                # only positive provider identification can establish a count.
+                value_option = True
+                if "=" not in token:
+                    next(args)
+            elif token in NODE_BOOLEAN_OPTIONS:
+                continue
+            elif token.startswith("--") and "=" in token and option not in ("--eval", "--print"):
+                value_option = True
+                continue
+            else:
+                script = next(args) if token == "--" else token
+                if script.startswith("-"):
+                    return None
+                if Path(script).name in AGENT_COMMANDS or NODE_PROVIDER_SCRIPTS.search("/" + script):
+                    return True
+                if not value_option and Path(script).suffix in (".js", ".mjs", ".cjs"):
+                    return False
+                return None
+    except (ValueError, StopIteration):
+        pass
+    return None
+
+
+def cost(table=None):
+    result = dict(treeProcesses=None, agentProcesses=None, runningTurns=None, runningSubagents=None)
+    try:
+        table = processes(timeout=5) if table is None else table
+        root = app_pid(table)
+        if root is None:
+            return result
+        owned = tree(table, root)
+        result["treeProcesses"] = len(owned)
+        descendants = [pid for pid in owned if pid != root]
+        agents = sum(Path(table[pid][2]).name in AGENT_COMMANDS for pid in descendants)
+        nodes = [pid for pid in descendants if Path(table[pid][2]).name == "node"]
+        if nodes:
+            # comm identifies binaries; only node needs argv to distinguish CLIs from servers.
+            # Never persist argv: provider arguments can contain prompts and credentials.
+            out = run(["/bin/ps", "-o", "pid=,args=", "-p", ",".join(map(str, nodes))], 5)
+            if out.returncode:
+                return result
+            classified = {}
+            for line in out.stdout.splitlines():
+                fields = line.split(None, 1)
+                if len(fields) != 2 or not fields[0].isdigit() or int(fields[0]) in classified:
+                    return result
+                classified[int(fields[0])] = node_provider(fields[1])
+            if set(classified) != set(nodes) or any(value is None for value in classified.values()):
+                return result
+            agents += sum(classified.values())
+        result["agentProcesses"] = agents
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return result
+
+
+def stall_evidence(report):
+    lag = report.get("lag")
+    source = "missing"
+    counts = (None, None)
+    worst = lag.get("worstMs") if isinstance(lag, dict) else None
+    if isinstance(lag, dict) and any(key in lag for key in ("stalls1s", "stalls5s")):
+        source = "lag"
+        counts = (lag.get("stalls1s"), lag.get("stalls5s"))
+    else:
+        summary = report.get("summary")
+        summary = summary if isinstance(summary, str) else ""
+        match = re.match(r"^(?:healthy|degraded|unknown|stalled): ([0-9]+) stalls >=1s in 10 min \(([0-9]+) >=5s\)(?=$|[,;])", summary)
+        if match:
+            source = "summary"
+            counts = tuple(map(int, match.groups()))
+    valid = all(type(n) in (int, float) and math.isfinite(n) and n >= 0 and n == int(n) for n in counts)
+    valid = valid and counts[1] <= counts[0]
+    if not valid:
+        counts = (None, None)
+    if type(worst) not in (int, float) or not math.isfinite(worst) or worst < 0:
+        worst = None
+    return dict(source=source, stalls1s=counts[0], stalls5s=counts[1], worstMs=worst)
+
+
+def connection_failed(report):
+    connection = report.get("connection")
+    return isinstance(connection, dict) and connection.get("status") in ("error", "failed", "timeout")
+
+
+def effective_verdict(verdict, report):
+    if connection_failed(report):
+        return "stalled"
+    if verdict != "stalled":
+        return verdict
+    evidence = stall_evidence(report)
+    if evidence["stalls1s"] is None:
+        return "unknown"
+    if (evidence["stalls5s"] >= STALL_5S or evidence["stalls1s"] >= STALL_1S
+            or evidence["stalls5s"] >= 1 and (evidence["worstMs"] or 0) >= 30000):
+        return "stalled"
+    connection = report.get("connection")
+    return "slow-roundtrip" if isinstance(connection, dict) and connection.get("status") == "ok" else "unknown"
 
 
 def survivors(owned):
@@ -251,12 +387,50 @@ def hold_live():
     return hold.get("by", "?") if alive and fresh else None
 
 
-def tmux_session(socket, name):
+def tmux_session(socket, name, details=None):
     try:
         rc = run([TMUX, "-L", socket, "has-session", "-t", name], 10).returncode
-        return rc != 1  # Only the documented "no session" exit establishes absence.
-    except (OSError, subprocess.SubprocessError):
-        return True
+        if rc == 1:  # Only the documented "no session" exit establishes absence.
+            return False
+        detail = f"{socket}/{name}" if rc == 0 else f"{socket}/{name} probe-failed rc={rc}"
+    except (OSError, subprocess.SubprocessError) as error:
+        detail = f"{socket}/{name} probe-failed {type(error).__name__}"
+    if details is not None:
+        details["detail"] = detail
+    return True
+
+
+def qf_install_active(details=None):
+    """Hold on active install panes or failed probes, but let old idle shells linger."""
+    try:
+        result = run([TMUX, "-L", QF_SOCKET, "list-panes", "-a", "-F",
+                      "#{session_name}\t#{pane_dead}\t#{pane_current_command}\t#{session_activity}"], 10)
+        output = (result.stdout + result.stderr).lower()
+        if result.returncode == 1 or "no server running" in output or "error connecting" in output:
+            return False
+        if result.returncode:
+            detail = f"{QF_SOCKET} probe-failed rc={result.returncode}"
+        else:
+            for line in result.stdout.splitlines():
+                fields = line.split("\t")
+                if not QF_SESSION_RE.fullmatch(fields[0]):
+                    continue
+                if len(fields) != 4 or fields[1] not in ("0", "1") or not fields[2]:
+                    raise ValueError("unreadable pane")
+                name, dead, command, activity = fields
+                if dead == "1":
+                    continue
+                idle = max(0, time.time() - int(activity))
+                if command not in ("zsh", "-zsh", "bash", "sh", "login") or idle <= QF_IDLE_SEC:
+                    detail = f"{QF_SOCKET}/{name} cmd={command} idle={idle:.0f}s"
+                    break
+            else:
+                return False
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        detail = f"{QF_SOCKET} probe-failed {type(error).__name__}"
+    if details is not None:
+        details["detail"] = detail
+    return True
 
 
 def building():
@@ -349,15 +523,15 @@ def attention(reason):
            "robob-overload-restart:held:" + reason)
 
 
-def limits(state, own_session=False, own_hold=False):
+def limits(state, own_session=False, own_hold=False, details=None):
     now = time.time()
     if (STATE_DIR / "disabled").exists():
         return "disabled"
-    if now >= datetime.datetime.fromisoformat(EXPIRES).timestamp():
-        return "expired"
     if not own_hold and hold_live():
         return "live-install-hold"
-    if tmux_session("install", "robob-install") or (not own_session and tmux_session("restart", "robob-restart")):
+    if (tmux_session("install", "robob-install", details)
+            or (not own_session and tmux_session("restart", "robob-restart", details))
+            or qf_install_active(details)):
         return "restart-or-install-session"
     if building():
         return "building"
@@ -398,8 +572,10 @@ def check_locked():
     if now >= datetime.datetime.fromisoformat(EXPIRES).timestamp():
         log("expired", note="past EXPIRES; doing nothing")
         return 0
-    skip = limits(state)
-    if skip is None and app_pid(processes()) is None:
+    details = {}
+    skip = limits(state, details=details)
+    impact = cost()
+    if skip is None and impact["treeProcesses"] is None:
         skip = "Robob is not running (the guard reopens it)"
     safety = preflight() if skip is None else None
     if safety:
@@ -407,56 +583,77 @@ def check_locked():
     if skip or safety:
         state["checks"] = []
         state["lastSkip"] = dict(at=iso(now), why=skip or safety)
-        log("check", stages={}, rule=None, held=skip or safety)
+        log("check", rawVerdict=None, effectiveVerdict=None, stallSource=None, cost=impact,
+            stages={}, rule=None, held=skip or safety, **details)
         write_json(STATE, state)
         return 0
-    verdict, summary, report = deep_health()
+    raw, summary, report = deep_health()
+    report = dict(report, summary=summary)
+    verdict = effective_verdict(raw, report)
+    disconnected = connection_failed(report)
     if verdict == "stalled":
         # One retry so a single slow connect does not count.
         time.sleep(20)
-        verdict, summary, report = deep_health()
+        raw, summary, report = deep_health()
+        report = dict(report, summary=summary)
+        verdict = effective_verdict(raw, report)
+        disconnected = disconnected and connection_failed(report)
+    evidence = stall_evidence(report)
     stages = {name: "%s/%s" % ((report.get(name) or {}).get("status"), (report.get(name) or {}).get("ms"))
               for name in ("connection", "roundTrip")}
-    state["checks"] = (state["checks"] + [dict(at=now, verdict=verdict, summary=summary)])[-12:]
+    source = evidence["source"] if evidence["source"] in ("lag", "summary") else None
+    state["checks"] = (state["checks"] + [dict(at=now, verdict=verdict, rawVerdict=raw,
+        effectiveVerdict=verdict, stallSource=source, summary=summary, connectionFailed=disconnected, evidence=evidence)])[-12:]
 
     def run_of(count):
         rows = state["checks"][-count:]
-        whole = len(rows) == count and all(b["at"] - a["at"] <= MAX_STEP for a, b in zip(rows, rows[1:]))
+        whole = len(rows) == count and all(0 <= b["at"] - a["at"] <= MAX_STEP for a, b in zip(rows, rows[1:]))
         return rows if whole else []
 
-    # Rule 1: stalled on NEED checks in a row. Rule 2 (added 16 Nov 12:10Z): over LONG checks
-    # (about 40 min) at most one healthy or degraded answer and at least NEED stalled. "unknown" here
-    # means the /health probe failed without timing out; it used to break rule 1's streak, so
-    # 50 minutes without a single healthy check (10:57-11:48Z) restarted nothing.
+    # Legacy rows contain only the unsafe raw verdict; require freshly classified evidence.
     recent = run_of(NEED)
     rule = None
-    if recent and all(c["verdict"] == "stalled" for c in recent):
+    if recent and all(c.get("effectiveVerdict") == "stalled" for c in recent):
         rule = "stalled on %d checks in a row" % NEED
     else:
         recent = run_of(LONG)
-        if (recent and sum(c["verdict"] in ("healthy", "degraded") for c in recent) <= 1
-                and sum(c["verdict"] == "stalled" for c in recent) >= NEED):
-            rule = "at most one healthy check in %d (%d stalled)" % (LONG, sum(c["verdict"] == "stalled" for c in recent))
+        if (recent and sum(c.get("effectiveVerdict") in ("healthy", "degraded") for c in recent) <= 1
+                and sum(c.get("effectiveVerdict") == "stalled" for c in recent) >= NEED):
+            rule = "at most one healthy check in %d (%d stalled)" % (LONG, sum(c.get("effectiveVerdict") == "stalled" for c in recent))
     sustained = rule is not None
+    hard = (verdict == "stalled" and evidence["stalls5s"] is not None
+            and evidence["stalls5s"] >= 1 and (evidence["worstMs"] or 0) >= 30000)
+    hard = hard or bool(sustained and all(c.get("connectionFailed") for c in recent))
+    load = os.getloadavg()[0]
+    ncpu = os.cpu_count() or 1
+    load_limit = LOAD_FACTOR * ncpu
     pid, started = server_started()
     uptime = now - started if started else None
     reason = None
     if sustained:
+        impact = cost()  # Refresh after the health retry before weighing active provider processes.
         if uptime is None:
             reason = "server start time unreadable"
         elif uptime < MIN_GAP:
             reason = "server up %d min, under the 2-hour limit" % (uptime / 60)
         elif now - state["lastRestartAt"] < MIN_GAP:
             reason = "last restart %d min ago, under the 2-hour limit" % ((now - state["lastRestartAt"]) / 60)
+        elif not hard and load > load_limit:
+            reason = "host load %g > %g" % (load, load_limit)
+        elif not hard and impact["agentProcesses"] is None:
+            reason = "agent process cost unavailable"
+        elif (not hard and impact["agentProcesses"] > 0
+              and (evidence["stalls5s"] or 0) < 2):
+            reason = "agents running (%d), stall not hard" % impact["agentProcesses"]
         elif building():
             reason = "release build, probe or install running: " + "; ".join(building())
         else:
             reason = preflight()
             if reason:
                 attention(reason)
-    load = os.getloadavg()[0]
-    log("check", verdict=verdict, summary=summary, stages=stages, sustained=sustained, rule=rule, serverPid=pid,
-        uptimeMin=round(uptime / 60) if uptime else None, load1=round(load, 1), held=reason)
+    log("check", verdict=verdict, rawVerdict=raw, effectiveVerdict=verdict, stallSource=source, evidence=evidence,
+        summary=summary, stages=stages, sustained=sustained, rule=rule, serverPid=pid, cost=impact, hardStall=hard,
+        uptimeMin=round(uptime / 60) if uptime else None, load1=round(load, 1), ncpu=ncpu, loadLimit=load_limit, held=reason)
     if not sustained or reason:
         write_json(STATE, state)
         return 0
@@ -465,27 +662,27 @@ def check_locked():
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = STATE_DIR / ("restart-%s.log" % stamp)
     state["lastRestartAt"] = now          # written before the quit: a crashed restart cannot repeat early
-    state["lastRestart"] = dict(at=iso(now), why=why, log=str(out), serverPid=pid, uptimeMin=round(uptime / 60), stamp=stamp)
+    state["lastRestart"] = dict(at=iso(now), why=why, log=str(out), serverPid=pid, uptimeMin=round(uptime / 60), stamp=stamp, cost=impact)
     state["checks"] = []
     write_json(STATE, state)
     command = shlex.join(["/bin/zsh", "-f", str(HERE / "launchd-entry.zsh"), "restart", stamp])
     command += " >> " + shlex.quote(str(out)) + " 2>&1"
     if DRY:
-        log("dry.trigger", command=command)
+        log("dry.trigger", command=command, cost=impact)
         return 0
     try:
         started_tmux = run([TMUX, "-L", "restart", "new-session", "-d", "-s", "robob-restart", command], 20)
     except (OSError, subprocess.SubprocessError) as error:
-        log("trigger.failed", error=type(error).__name__)
+        log("trigger.failed", error=type(error).__name__, cost=impact)
         terminal(stamp, failed("trigger-error:" + type(error).__name__))
         return 1
     if started_tmux.returncode != 0:
-        log("trigger.failed", stderr=started_tmux.stderr[:200])
+        log("trigger.failed", stderr=started_tmux.stderr[:200], cost=impact)
         terminal(stamp, {"ok": False, "reason": "trigger-failed"})
         return 1
-    log("trigger", why=why, log=str(out))
-    notify("info", "Robob is overloaded (%s; server up %.1f h). Restarting it now. Watch: tmux -L restart attach -t robob-restart, or tail -f %s"
-           % (why, uptime / 3600, out), "robob-overload-restart:%s:start" % stamp)
+    log("trigger", why=why, log=str(out), cost=impact)
+    notify("info", "Robob is overloaded (%s; server up %.1f h; would stop %s agent processes, %s tree processes; running turns/subagents unavailable). Restarting it now. Watch: tmux -L restart attach -t robob-restart, or tail -f %s"
+           % (why, uptime / 3600, impact["agentProcesses"], impact["treeProcesses"], out), "robob-overload-restart:%s:start" % stamp)
     return 0
 
 
@@ -503,10 +700,11 @@ def restart_worker():
     owned = tree(table, root)
     if os.getpid() in owned or os.getppid() in owned:
         return failed("inside-robob-tree")
-    reason = limits({}, own_session=True, own_hold=True) or preflight()
+    details = {}
+    reason = limits({}, own_session=True, own_hold=True, details=details) or preflight()
     if reason:
-        log("held", reason=reason)
-        return failed(reason)
+        log("held", reason=reason, **details)
+        return dict(failed(reason), **details)
     log("restart.tree", appPid=root, processes=len(owned))
     quit_at = time.time()
     try:
@@ -655,13 +853,14 @@ def supervise(stamp):
         pending = state.get("lastRestart") or {}
         # check reserves the cooldown before tmux. Only that exact cycle can consume it.
         reserved = pending.get("stamp") == stamp and not pending.get("consumed")
-        reason = limits(dict(state, lastRestartAt=0) if reserved else state, own_session=reserved)
+        details = {}
+        reason = limits(dict(state, lastRestartAt=0) if reserved else state, own_session=reserved, details=details)
         if not reason:
             reason = preflight()
             if reason:
                 log("held", reason=reason)
         if reason:
-            outcome = failed(reason)
+            outcome = dict(failed(reason), **details)
         elif DRY:
             outcome = failed("dry-run: nothing quit")
         else:
@@ -749,7 +948,7 @@ def supervise(stamp):
 def status():
     state = read_json(STATE, {})
     pid, started = server_started()
-    print(json.dumps(dict(disabled=(STATE_DIR / "disabled").exists(), expires=EXPIRES, serverPid=pid,
+    print(json.dumps(dict(disabled=(STATE_DIR / "disabled").exists(), expires=EXPIRES, expiresScope="check", serverPid=pid,
                           serverUptimeMin=round((time.time() - started) / 60) if started else None,
                           lastRestart=state.get("lastRestart"), lastSkip=state.get("lastSkip"),
                           checks=[dict(at=iso(c["at"]), verdict=c["verdict"]) for c in state.get("checks", [])]), indent=1))

@@ -1,5 +1,6 @@
+import { createRequestTrace } from "./request-trace.ts";
 import { ProbeBudget } from "./probe-policy.ts";
-import { toolError, toolLog } from "./toollog.ts";
+import { startRobobLinkAlerts, toolError, toolLog } from "./toollog.ts";
 import { createLoopStallMonitor } from "./loop-stall.ts";
 import { acknowledgePhoton, notifyFailedInbound } from "./inbound-failure.ts";
 import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
@@ -114,7 +115,12 @@ async function main(): Promise<void> {
   let api: ReturnType<typeof createApi> | undefined;
   const releaseLock = acquireLock(join(stateRoot, "bridge.lock"));
   process.once("exit", releaseLock);
-  const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }));
+  startRobobLinkAlerts(socketPost(telegramBridgeSocket, 5_000));
+  const requests = createRequestTrace(entry => toolLog.write(entry), { loopLag: () => loopStalls.loopLag() });
+  const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }), {
+    sample: props => toolLog.write({ component: "process", kind: "perf", name: "runtime.sample", props }),
+    tick: () => requests.flush(),
+  });
   loopStalls.start();
   process.once("exit", () => loopStalls.stop());
   const socketPath = join(stateRoot, "bridge.sock");
@@ -123,7 +129,7 @@ async function main(): Promise<void> {
   const server = Bun.serve({
     unix: socketPath,
     maxRequestBodySize: 28 * 1024 * 1024,
-    fetch: request => api ? api(request) : Response.json({ error: "Bridge starting" }, { status: 503 }),
+    fetch: request => requests.handle(request, request => api ? api(request) : Response.json({ error: "Bridge starting" }, { status: 503 })),
   });
   await chmod(socketPath, 0o600);
   const store = new Store(join(stateRoot, "state.sqlite"));
@@ -319,6 +325,7 @@ async function main(): Promise<void> {
     stopping = true;
     loopStalls.stop();
     if (backend instanceof RobobBackend) backend.activeRoster.stop();
+    requests.flush(true);
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     clearInterval(timer);
     clearInterval(unansweredTimer);

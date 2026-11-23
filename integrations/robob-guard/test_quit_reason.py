@@ -132,7 +132,7 @@ class QuitReasonTests(unittest.TestCase):
             root = Path(directory)
             script = root / "scripts/install-hold.zsh"
             script.parent.mkdir()
-            script.write_text(Path("scripts/install-hold.zsh").read_text())
+            script.write_text((Path(__file__).resolve().parent / "scripts/install-hold.zsh").read_text())
             (root / "quit_reason.py").write_text(
                 "import sys; print('isolated-helper', *sys.argv[1:])\n")
             result = subprocess.run([

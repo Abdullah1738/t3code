@@ -364,9 +364,9 @@ class RetryTests(unittest.TestCase):
         exe.chmod(0o700)
         real = self.real_run
         timeouts = []
-        def fast_run(args, t=5):
+        def fast_run(args, t=5, **kw):
             timeouts.append(t)
-            return real(args, t=min(t, 0.05))
+            return real(args, t=min(t, 0.05), **kw)
         with patch.dict(os.environ, {"PATH": str(ph.STATE)}), patch.object(ph, "_run", fast_run):
             self.assertEqual(self.cli("note-drop", "--source", "test", "--cmd", "probe", "--exc", "ConnectionError")[0], 0)
         self.assertEqual(timeouts, [3, 3, 5])
@@ -417,8 +417,215 @@ class RetryTests(unittest.TestCase):
         self.assertIn("by event: external_drop=1, reconnect=2", out)
         self.assertIn("by source: ph=2, torssh=1", out)
         self.assertNotIn("failed", out)
-        self.assertEqual(len(out.splitlines()), 6)
+        self.assertEqual(len(out.splitlines()), 8)
         ph.d.assert_not_called()
+
+    # --- #188: capture under leases and holds, focus_status ---
+
+    def owners(self, **env):
+        clean = {k: v for k, v in os.environ.items() if k not in ph.OWNER_ENV}
+        return patch.dict(os.environ, {**clean, **env}, clear=True)
+
+    def lease(self, owner="other-agent", purpose="private purpose text"):
+        ph.phonelock.LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        ph.phonelock.acquire(owner, purpose, 600)
+
+    def hold(self, token="holder-token"):
+        ph.phonelock.LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        ph.phonelock.HOLD.write_text(token)
+        # Owned-hold metadata imports `ph`; keep it on this module so no real process probe runs.
+        p = patch.dict(sys.modules, {"ph": ph})
+        p.start(); self.addCleanup(p.stop)
+
+    def note_drop(self, *extra):
+        return self.cli("note-drop", "--source", "fixture", "--cmd", "hierarchy", "--exc", "RemoteDisconnected", *extra)
+
+    def assertCaptured(self, row):
+        self.assertIn("LatinIME", row["ime"])
+        self.assertIn("AuthContainerView", row["focused_window"])
+        self.assertEqual(row["focus_status"], "ok")
+        self.assertTrue(Path(row["drop_log"]).exists())
+        self.assertNotIn("capture_skipped", row)
+
+    def test_foreign_lease_read_drop_and_note_drop_capture(self):
+        self.lease()
+        with self.owners():
+            ph.event("reconnect", RemoteDisconnected("lost"), phase="read")
+            self.assertEqual(self.note_drop()[0], 0)
+        rows = self.events()
+        self.assertEqual([r["event"] for r in rows], ["reconnect", "external_drop"])
+        for row in rows: self.assertCaptured(row)
+        self.assertNotIn("private purpose", (ph.STATE / "events.jsonl").read_text())
+
+    def test_foreign_hold_skips_capture_without_adb(self):
+        self.hold()
+        with self.owners():
+            ph.event("reconnect", RemoteDisconnected("lost"), phase="read")
+            self.assertEqual(self.note_drop()[0], 0)
+            self.assertEqual(self.note_drop("--owner", "someone-else")[0], 0)
+        self.assertEqual(self.calls, [])
+        rows = self.events()
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            self.assertEqual(row["capture_skipped"], "priority_hold")
+            self.assertEqual((row["ime"], row["focused_window"], row["drop_log"]), (None, None, None))
+        self.assertNotIn("holder-token", (ph.STATE / "events.jsonl").read_text())
+
+    def test_hold_appearing_mid_capture_keeps_the_row(self):
+        def busy(*a, **kw): raise ph.PhoneBusy()
+        with self.owners(), patch.object(ph, "_run", busy):
+            self.assertEqual(self.note_drop()[0], 0)
+        row, = self.events()
+        self.assertEqual(row["capture_skipped"], "priority_hold")
+
+    def test_unreadable_lock_state_is_named(self):
+        with self.owners(), patch.object(ph.phonelock, "check", side_effect=OSError("broken")):
+            self.assertEqual(self.note_drop()[0], 0)
+        row, = self.events()
+        self.assertEqual(row["capture_skipped"], "lease_unreadable")
+        self.assertEqual(self.calls, [])
+
+    def test_owned_hold_via_env_or_owner_flag_captures(self):
+        self.hold()
+        with self.owners(PHONE_HOLD_OWNER="holder-token"):
+            self.assertEqual(self.note_drop()[0], 0)
+        with self.owners():
+            self.assertEqual(self.note_drop("--owner", "holder-token")[0], 0)
+            self.assertFalse(any(k in os.environ for k in ph.OWNER_ENV))
+        rows = self.events()
+        self.assertEqual(len(rows), 2)
+        for row in rows: self.assertCaptured(row)
+        self.assertNotIn("holder-token", (ph.STATE / "events.jsonl").read_text())
+
+    def test_owner_flag_restores_existing_env(self):
+        self.hold()
+        with self.owners(PH_LEASE_OWNER="mine"):
+            self.note_drop("--owner", "holder-token")
+            self.assertEqual(os.environ.get("PH_LEASE_OWNER"), "mine")
+            self.assertNotIn("PHONE_HOLD_OWNER", os.environ)
+
+    def test_owner_flag_never_enables_actions(self):
+        for setup, owner in [(self.hold, "holder-token"), (self.lease, "other-agent")]:
+            with self.subTest(owner=owner), self.owners():
+                setup()
+                self.assertEqual(self.note_drop("--owner", owner)[0], 0)
+                self.assertEqual(self.cli("key", "back")[0], 5)
+                self.device.press.assert_not_called()
+                self.assertFalse(any("pkill" in str(a) for a, _ in self.calls))
+                ph.phonelock.HOLD.unlink(missing_ok=True)
+        ph.d.assert_not_called()
+        lease = json.loads(ph.phonelock.LEASE.read_text())
+        self.assertEqual(lease["owner"], "other-agent")
+
+    def test_owner_flag_with_whitespace_is_ignored(self):
+        self.hold()
+        with self.owners():
+            self.note_drop("--owner", " holder-token")
+        row, = self.events()
+        self.assertEqual(row["capture_skipped"], "priority_hold")
+
+    def test_parse_focus_line_shapes(self):
+        cases = [
+            ("  mCurrentFocus=Window{abc u0 com.pkg/com.pkg.Main}\n", "com.pkg/com.pkg.Main", "ok"),
+            ("  mCurrentFocus=Window{abc u0 com.pkg/.Main}\n", "com.pkg/.Main", "ok"),
+            ("  mCurrentFocus=Window{abc u0 NotificationShade}\n", "NotificationShade", "ok"),
+            ("  mCurrentFocus=Window{abc u0 StatusBar}\n", "StatusBar", "ok"),
+            ("  mCurrentFocus=Window{abc u0 PopupWindow:1a2b3c}\n", "PopupWindow:1a2b3c", "ok"),
+            ("  mCurrentFocus=null\n", None, "null_focus"),
+            ("  mCurrentFocus=null\n  mCurrentFocus=Window{def u0 StatusBar}\n", "StatusBar", "ok"),
+            ("  mCurrentFocus=Window{abc u0 Unlock private title}\n", None, "no_match"),
+            ("  mCurrentFocus=Window{abc u0 a4111111111111111}\n", None, "no_match"),
+            ("  mCurrentFocus=Window{abc u0 com.pkg/.Main private text}\n", None, "no_match"),
+            ("garbage output with secret words\n", None, "no_match"),
+            ("", None, "no_output"),
+        ]
+        for out, window, status in cases:
+            with self.subTest(out=out):
+                got = ph.parse_focus(out)
+                self.assertEqual(got[0], window)
+                self.assertEqual(got[2], status)
+                self.assertEqual(got[3] is not None, status == "no_match")
+        app = ph.parse_focus("mCurrentFocus=null\nmFocusedApp=ActivityRecord{abc u0 com.nothing.launcher/com.android.searchlauncher.SearchLauncher t970}\n")
+        self.assertEqual(app[1:3], ("com.nothing.launcher/com.android.searchlauncher.SearchLauncher", "null_focus"))
+        self.assertIsNone(ph.parse_focus("mFocusedApp=ActivityRecord{abc u0 Private title t1}\n")[1])
+
+    def focus_drop(self, focus_out):
+        base = self.adb
+        def adb(args, t=5, strict=False, *, device_action=False):
+            if any("dumpsys window" in a for a in args):
+                self.calls.append((args, t))
+                return focus_out
+            return base(args, t, strict, device_action=device_action)
+        with self.owners(), patch.object(ph, "_run", adb):
+            self.assertEqual(self.note_drop()[0], 0)
+        return self.events()[-1]
+
+    def test_focus_capture_fills_or_explains(self):
+        cases = [("mCurrentFocus=Window{abc u0 com.pkg/com.pkg.Main}\n", "com.pkg/com.pkg.Main", "ok"),
+                 ("mCurrentFocus=Window{abc u0 NotificationShade}\n", "NotificationShade", "ok"),
+                 ("mCurrentFocus=null\nmFocusedApp=ActivityRecord{abc u0 com.pkg/.Main t3}\n", None, "null_focus")]
+        for out, window, status in cases:
+            with self.subTest(out=out):
+                row = self.focus_drop(out)
+                self.assertEqual((row["focused_window"], row["focus_status"]), (window, status))
+                self.assertNotIn("capture_skipped", row)
+        self.assertEqual(row["focused_app"], "com.pkg/.Main")
+        focus_cmds = [a for a, _ in self.calls if any("dumpsys" in v for v in a)]
+        self.assertTrue(all(a[-1] == ph.FOCUS_CMD for a in focus_cmds))
+        self.assertTrue(all("displays" in a[-1] for a in focus_cmds))
+
+    def test_focus_no_match_keeps_raw_line_out_of_row(self):
+        secret = "Unlock card 4111 1111 1111 1111 " + "x" * 200
+        row = self.focus_drop("  mCurrentFocus=Window{abc u0 " + secret + "}\n")
+        self.assertEqual((row["focused_window"], row["focus_status"]), (None, "no_match"))
+        self.assertNotIn("Unlock", json.dumps(row))
+        first = Path(row["drop_log"]).read_text().splitlines()[0]
+        self.assertTrue(first.startswith("focus_line: "))
+        self.assertLessEqual(len(first) - len("focus_line: "), 120)
+        self.assertNotIn("4111 1111", first)
+
+    def test_unreachable_phone_is_no_device_without_logcat(self):
+        with self.owners(), patch.object(ph, "_run", lambda args, t=5, strict=False, **kw: self.calls.append((args, t)) or ""):
+            self.assertEqual(self.note_drop()[0], 0)
+        row, = self.events()
+        self.assertEqual((row["capture_skipped"], row["focus_status"], row["drop_log"]), ("no_device", "no_output", None))
+        self.assertFalse(any("logcat" in a for a, _ in self.calls))
+
+    def test_hanging_focus_read_is_timeout_within_bound(self):
+        self.guard.stop()
+        exe = ph.STATE / "adb"
+        exe.write_text("#!/bin/sh\ncase \"$*\" in\n*default_input_method*) echo com.example.ime/.Ime;;\n"
+                       "*dumpsys*) exec /bin/sleep 30;;\nesac\n")
+        exe.chmod(0o700)
+        real, timeouts = self.real_run, []
+        def capped(args, t=5, **kw):
+            timeouts.append(t)
+            return real(args, t=min(t, 0.3), **kw)
+        start = ph.time.monotonic()
+        with self.owners(), patch.dict(os.environ, {"PATH": str(ph.STATE)}), patch.object(ph, "_run", capped):
+            self.assertEqual(self.note_drop()[0], 0)
+        self.assertLess(ph.time.monotonic() - start, 3)
+        self.assertEqual(timeouts, [3, 3, 5])
+        row, = self.events()
+        self.assertEqual((row["ime"], row["focused_window"], row["focus_status"]), ("com.example.ime/.Ime", None, "timeout"))
+
+    def test_log_counts_capture_skipped_and_focus_status(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        rows = [dict(ts=(now-datetime.timedelta(days=days)).isoformat(), event="external_drop", source="t", **extra)
+                for days, extra in [(9, dict(capture_skipped="priority_hold")), (2, dict(capture_skipped="priority_hold")),
+                                    (1, dict(focus_status="ok", focused_window="NotificationShade")),
+                                    (0, dict(focus_status="null_focus", focused_app="com.pkg/.Main")),
+                                    (0, dict(capture_skipped="no_device", focus_status="no_output"))]]
+        (ph.STATE / "events.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        code, out = self.cli("log", "5")
+        self.assertEqual(code, 0)
+        self.assertIn("Last 7 days capture_skipped: no_device=1, priority_hold=1", out)
+        self.assertIn("Last 7 days by focus_status: no_output=1, null_focus=1, ok=1", out)
+        self.assertIn("focus_status=null_focus focused_app=com.pkg/.Main", out)
+        self.assertIn("capture_skipped=priority_hold", out)
+        (ph.STATE / "events.jsonl").write_text("")
+        self.assertIn("capture_skipped: none", self.cli("log")[1])
+        self.assertIn("by focus_status: none", self.cli("log")[1])
 
     real_run = staticmethod(ph._run)
 

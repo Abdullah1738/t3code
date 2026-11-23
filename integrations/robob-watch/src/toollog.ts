@@ -1,3 +1,4 @@
+import { LogCompactor, expandTelemetry } from "./log-volume.ts";
 import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, mkdtempSync, openSync, readdirSync, statSync, renameSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
@@ -13,12 +14,13 @@ export type LogEntry = {
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper", "meantFor"]);
-const numeric = new Set(["exitCode", "timeoutMs", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays", "slotWaitMs", "slotQueueDepth", "slotActiveAtEnqueue", "startLateMs", "intervalMs", "depth", "oldestWaitMs", "active", "cap", "dueAt", "lateMs", "load", "elapsedMs"]);
-const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace", "loadMode", "sendDeferred"]);
+const numeric = new Set(["exitCode", "httpStatus", "timeoutMs", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays", "slotWaitMs", "slotQueueDepth", "slotActiveAtEnqueue", "startLateMs", "intervalMs", "depth", "oldestWaitMs", "active", "cap", "dueAt", "lateMs", "recentMinMs", "load", "elapsedMs", "staleMs"]);
+const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace", "loadMode", "sendDeferred", "starved"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
   alertKind: ["pause", "failing", "recovered"],
+  reason: ["dedupe_conflict_changed_content"],
   severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy", "stuck_previous", "accepted", "ambiguous", "deferred", "definite", "owner"],
   failureClass: ["control_api_unavailable", "timeout", "definite", "other"],
   source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored", "logged"],
@@ -31,12 +33,15 @@ const values: Record<string, readonly string[]> = {
   stderrClass: ["ride_ended", "usage_error", "missing_file", "permission", "timeout", "dependency_busy", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
   step: ["native", "status", "send"],
-  op: ["native", "native_retry", "status", "status_retry", "send", "confirm"],
+  op: ["native", "native_retry", "status", "status_retry", "send", "confirm", "confirm_run"],
   route: ["person", "owner", "group", "creator", "other", "thread", "unverified", "refused"],
   via: ["wake", "thread", "imessage-send", "telegram", "none", "wake:owner-fallback", "native:pending"],
   confirmed: ["pending", "n/a"],
   operation: ["check", "pending"],
   lane: ["fast", "slow"],
+  slotPickReason: ["fifo", "urgent"],
+  lastOutcome: ["queued", "load timeout", "fail", "starved", "fire", "no_change"],
+  lane_reason: ["fast", "fast:sticky", "fast:overdue", "slow:new", "slow:recent"],
   trigger: ["schedule", "trigger", "retry", "final"],
 };
 let testRoot: string | undefined;
@@ -71,7 +76,15 @@ function fields(entry: LogEntry, at: Date) {
   const props: Record<string, unknown> = {};
   const fileEvent = ["data_read.retried", "data_read.failed", "data_write.retried", "data_write.failed", "runs_log.write_failed"].includes(entry.name);
   const stuckEvent = entry.component === "runner" && ["watch.skip", "watch.stuck_group", "watch.stuck_exited"].includes(entry.name);
+  const wakeEvent = entry.component === "wakes" && ["wake.sent", "wake.confirmed", "wake.send_retry", "wake.run_lost", "wake.resent"].includes(entry.name);
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (wakeEvent && ["runId", "messageId", "requestId"].includes(key)
+      && typeof value === "string" && /^[A-Za-z0-9:%_.-]{1,4096}$/.test(value)) { props[key] = value; continue; }
+    if (wakeEvent && key === "method" && (value === "run" || value === "heuristic")) { props[key] = value; continue; }
+    if (wakeEvent && key === "delivery" && (value === "queued" || value === "started")) { props[key] = value; continue; }
+    if (wakeEvent && ["runState", "state"].includes(key) && (value === null || typeof value === "string"
+      && ["preparing", "queued", "starting", "running", "waiting", "completed", "interrupted", "failed", "cancelled", "rolled_back", "server_restart", "missing", "unknown"].includes(value))) { props[key] = value; continue; }
+    if (wakeEvent && key === "queuedMs" && value === null) { props[key] = null; continue; }
     // Only triage supplies a bounded, credential-redacted classifier diagnostic.
     if (entry.component === "triage" && entry.name === "triage.classify" && key === "classifier_error"
       && typeof value === "string" && value.length <= 400 && !/[\x00-\x1f]/.test(value)) props[key] = value;
@@ -140,6 +153,26 @@ function appendLine(file: string, line: unknown): void {
   finally { closeSync(fd); }
 }
 
+const DROP_HOUR = 3_600_000;
+let capDrops: { file: string; day: string; since: number; dropped: Record<string, number> } | undefined;
+function flushCapDrops(at: Date, force = false): void {
+  if (!capDrops || (!force && at.getTime() - capDrops.since < DROP_HOUR)) return;
+  const pending = capDrops;
+  if (Object.keys(pending.dropped).length) appendLine(pending.file, {
+    ts: new Date(Math.min(at.getTime(), Date.parse(`${pending.day}T23:59:59.999Z`))).toISOString(),
+    tool: "watchers", component: "logger", kind: "error", name: "log.capDropped",
+    props: { dropped: pending.dropped, since: new Date(pending.since).toISOString() },
+  });
+  capDrops = { ...pending, since: at.getTime(), dropped: Object.create(null) };
+}
+function countCapDrop(file: string, day: string, at: Date, entry: LogEntry): void {
+  capDrops ??= { file, day, since: at.getTime(), dropped: Object.create(null) };
+  const key = `${entry.component}:${entry.kind}:${entry.name}`;
+  const target = Object.hasOwn(capDrops.dropped, key) || Object.keys(capDrops.dropped).filter(key => key !== "other").length < 50 ? key : "other";
+  capDrops.dropped[target] = (capDrops.dropped[target] ?? 0) + 1;
+}
+
+let compactSink: { file: string; compactor: LogCompactor } | undefined;
 export function toolLog(entry: LogEntry): void {
   try {
     if ((process.env.ROBOB_TEST || process.env.NODE_ENV === "test" || process.env.PYTEST_CURRENT_TEST) && !process.env.TOOLLOG_DIR) return;
@@ -158,17 +191,36 @@ export function toolLog(entry: LogEntry): void {
       }
       initialized.add(identity);
     }
-    const size = existsSync(file) ? statSync(file).size : 0;
-    if (size > CAP) {
-      try {
-        const marker = openSync(join(dir, `${day}.cap`), "wx", 0o600); closeSync(marker);
-        appendLine(file, { ts: at.toISOString(), tool: "watchers", component: "logger", kind: "error", name: "log.cap", ok: false, error: { tag: "log.cap", message: "log.cap" } });
-      } catch { /* Another component already recorded the cap. */ }
-      if (entry.kind !== "error" && entry.name !== "deploy.marker") return;
+    if (compactSink && compactSink.file !== file) {
+      if (existsSync(compactSink.file)) compactSink.compactor.flush(at.getTime(), true);
+      compactSink = undefined;
     }
-    appendLine(file, line);
+    compactSink ??= { file, compactor: new LogCompactor(row => {
+      const at = new Date(row.ts), day = row.ts.slice(0, 10);
+      const size = existsSync(file) ? statSync(file).size : 0;
+      if (size > CAP) {
+        try {
+          const marker = openSync(join(dir, `${day}.cap`), "wx", 0o600); closeSync(marker);
+          appendLine(file, { ts: at.toISOString(), tool: "watchers", component: "logger", kind: "error", name: "log.cap", ok: false, error: { tag: "log.cap", message: "log.cap" } });
+        } catch { /* Another component already recorded the cap. */ }
+        if (row.kind !== "error" && row.name !== "deploy.marker") { countCapDrop(file, day, at, { ...row, kind: row.kind ?? "perf", component: row.component ?? (row.name === "helper.run" ? "helpers" : "runner") }); return; }
+      }
+      appendLine(file, row);
+    }) };
+    if (capDrops && capDrops.file !== file) {
+      if (dirname(capDrops.file) === dir && existsSync(capDrops.file)) flushCapDrops(at, true);
+      capDrops = undefined;
+    }
+    flushCapDrops(at);
+    compactSink.compactor.push(line);
   } catch { /* Logging cannot affect the caller. */ }
 }
+
+const perfFlushTimer = setInterval(() => {
+  try { compactSink?.compactor.flush(Date.now()); flushCapDrops(new Date()); } catch { /* Best effort telemetry. */ }
+}, 60_000);
+perfFlushTimer.unref();
+process.once("exit", () => { try { compactSink?.compactor.flush(Date.now(), true); } catch { /* Best effort telemetry. */ } });
 
 export function toolError(component: string, tag: string, ids?: Record<string, unknown>, props?: Record<string, unknown>): void {
   toolLog({ component, kind: "error", name: `${component}.error`, ok: false, ids, props, error: { tag } });
@@ -202,7 +254,7 @@ function percentiles(samples: number[]) {
   return { p50: samples[Math.ceil(samples.length * .5) - 1] ?? null, p95: samples[Math.ceil(samples.length * .95) - 1] ?? null, max: samples.at(-1) ?? null };
 }
 function watcherStats() {
-  return { runs: 0, actualRuns: 0, intervals: [] as { at: number; ms: number }[], lates: [] as number[], fires: 0, outcomes: outcomes(), durations: [] as number[], queued: [] as number[], slotWaits: [] as number[], lateRuns: 0, failStreak: 0, longestFailStreak: 0, lastFailureTag: null as string | null };
+  return { runs: 0, starvedRuns: 0, loadModeRuns: 0, actualRuns: 0, intervals: [] as { at: number; ms: number }[], lates: [] as number[], fires: 0, outcomes: outcomes(), durations: [] as number[], queued: [] as number[], slotWaits: [] as number[], lateRuns: 0, failStreak: 0, longestFailStreak: 0, lastFailureTag: null as string | null };
 }
 function helperStats() {
   return { runs: 0, failures: 0, exitCodes: Object.create(null) as Record<string, number>, durations: [] as number[] };
@@ -225,11 +277,16 @@ function isoTime(value: unknown): number | undefined {
 
 type SourceError = { tag: string; source: string; id: string; count: number };
 const byErrors = (a: SourceError, b: SourceError) => b.count - a.count || a.tag.localeCompare(b.tag) || a.source.localeCompare(b.source) || a.id.localeCompare(b.id);
-function countSource(map: Map<string, SourceError>, tag: string, source: string, id: string) {
+function countSource(map: Map<string, SourceError>, tag: string, source: string, id: string, occurrences = 1) {
   const key = JSON.stringify([tag, source, id]);
   const entry = map.get(key) ?? { tag, source, id, count: 0 };
-  entry.count++;
+  entry.count += occurrences;
   map.set(key, entry);
+}
+
+function errorOccurrences(row: Record<string, unknown>): number {
+  const repeats = record(row.props).repeats;
+  return row.kind === "error" && typeof repeats === "number" && Number.isSafeInteger(repeats) && repeats > 0 ? repeats : 1;
 }
 
 export async function rollup(selection: string | LogWindow, dir = logDirectory(), out?: string) {
@@ -253,7 +310,7 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
     const sourceErrors = new Map<string, SourceError>();
     const hours = new Map<string, { errors: Map<string, SourceError>; runs: number; fail: number; timeout: number; durations: number[] }>();
     const markers: { ts: string; service: string; sha: string; step: string }[] = [];
-    const errorTimes: number[] = [];
+    const errorTimes: { at: number; count: number }[] = [];
     const wake = { sent: 0, failed: 0, attempts: 0, replyGuard: { total: 0, blocked: 0, accepted: 0 } };
     let allSlotsBusyMs = 0;
     let loadModeMs = 0, loadModeSwitches = 0;
@@ -277,10 +334,11 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
       catch (error) { if (record(error).code === "ENOENT") continue; throw error; }
       const lines = createInterface({ input: createReadStream(source), crlfDelay: Infinity });
       for await (const line of lines) {
-        let row; try { row = record(JSON.parse(line)); } catch { continue; }
+        let input; try { input = record(JSON.parse(line)); } catch { continue; }
+        for (const row of expandTelemetry(input)) {
         if (row.tool !== "watchers" || typeof row.name !== "string" || !token.test(row.name) || typeof row.kind !== "string" || !["event", "perf", "error"].includes(row.kind)) continue;
         const ts = isoTime(row.ts);
-        if (ts !== undefined && ts >= since - HALF_HOUR && ts < until + HALF_HOUR && row.kind === "error") errorTimes.push(ts);
+        if (ts !== undefined && ts >= since - HALF_HOUR && ts < until + HALF_HOUR && row.kind === "error") errorTimes.push({ at: ts, count: errorOccurrences(row) });
         // Usage is flushed at least once a minute, including while a check spans midnight.
         if (ts !== undefined && milliseconds(row.durationMs) && (row.name === "slot.busy" || row.name === "slot.hold")) {
           const overlap = Math.max(0, Math.min(ts, until) - Math.max(ts - row.durationMs, since));
@@ -311,9 +369,10 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
           hour = hours.get(key) ?? { errors: new Map<string, SourceError>(), runs: 0, fail: 0, timeout: 0, durations: [] as number[] };
           hours.set(key, hour);
         }
-        total++; counts[row.name] = (counts[row.name] ?? 0) + 1; kinds[row.kind] = (kinds[row.kind] ?? 0) + 1;
+        const occurrences = errorOccurrences(row);
+        total += occurrences; counts[row.name] = (counts[row.name] ?? 0) + occurrences; kinds[row.kind] = (kinds[row.kind] ?? 0) + occurrences;
         if (row.name === "host.load_mode" && typeof record(row.props).loadMode === "boolean") loadModeSwitches++;
-        if (typeof row.ok === "boolean") { withOk++; if (row.ok) ok++; else failed++; }
+        if (typeof row.ok === "boolean") { withOk += occurrences; if (row.ok) ok += occurrences; else failed += occurrences; }
         if (milliseconds(row.durationMs)) (durations[row.name] ??= []).push(row.durationMs);
         const ids = record(row.ids), props = record(row.props), error = record(row.error);
         const watcher = safeId("watcher", ids.watcher) ? ids.watcher : undefined;
@@ -321,7 +380,7 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
         const tag = typeof error.tag === "string" && token.test(error.tag) ? error.tag : undefined;
         const sourceKind = helper ? "helper" : watcher ? "watcher" : "component";
         const sourceId = helper ?? watcher ?? (typeof row.component === "string" && token.test(row.component) ? row.component : "unknown");
-        if (row.kind === "error" && hour) countSource(hour.errors, tag ?? row.name, sourceKind, sourceId);
+        if (row.kind === "error" && hour) countSource(hour.errors, tag ?? row.name, sourceKind, sourceId, occurrences);
         if (row.name === "deploy.marker" && row.kind === "event" && ts !== undefined) {
           const props = markerProps(row.props);
           if (props) markers.push({ ts: new Date(ts).toISOString(), ...props });
@@ -342,6 +401,8 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
           const id = watcher ?? "unknown", stats = watchers.get(id) ?? watcherStats();
           watchers.set(id, stats);
           stats.runs++;
+          if (props.starved === true) stats.starvedRuns++;
+          if (props.loadMode === true) stats.loadModeRuns++;
           if (props.trigger === undefined || props.trigger === "schedule") stats.actualRuns++;
           if (milliseconds(props.lateMs)) stats.lates.push(props.lateMs);
           const outcome = props.outcome;
@@ -379,7 +440,7 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
         }
         if (row.name === "wake.sent") {
           wake.attempts++;
-          if (row.ok === true) wake.sent++;
+          if (row.ok === true && props.confirmed !== "pending") wake.sent++;
           else if (row.ok === false && props.accepted !== true) wake.failed++;
         } else if (row.name === "wake.confirmed") {
           wake.sent++;
@@ -391,10 +452,11 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
           else if (props.accepted === true) wake.replyGuard.accepted++;
         }
         if (tag) {
-          errors[tag] = (errors[tag] ?? 0) + 1;
-          countSource(sourceErrors, tag, sourceKind, sourceId);
+          errors[tag] = (errors[tag] ?? 0) + occurrences;
+          countSource(sourceErrors, tag, sourceKind, sourceId, occurrences);
         }
       }
+    }
     }
     const timing = Object.fromEntries(Object.entries(durations).map(([name, samples]) => {
       samples.sort((a, b) => a - b);
@@ -430,7 +492,7 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
     // Keep every known interval watcher visible even when it completed zero runs.
     // Legacy sources without cadence metadata retain the existing compact top 40.
     const byWatcher = Object.fromEntries([...watchers].sort(byRuns).filter(([, stats], i) => i < 40 || stats.intervals.length).map(([id, stats]) => [id, {
-      runs: stats.runs, outcomes: stats.outcomes, fires: stats.fires, durationMs: percentiles(stats.durations), queuedMs: { p95: percentiles(stats.queued).p95 },
+      runs: stats.runs, starvedRuns: stats.starvedRuns, loadModeRuns: stats.loadModeRuns, outcomes: stats.outcomes, fires: stats.fires, durationMs: percentiles(stats.durations), queuedMs: { p95: percentiles(stats.queued).p95 },
       ...cadenceStats(stats),
       longestFailStreak: stats.longestFailStreak, lastFailureTag: stats.lastFailureTag,
       slotWaitMs: { count: stats.slotWaits.length, total: stats.slotWaits.reduce((sum, ms) => sum + ms, 0), p95: percentiles(stats.slotWaits).p95 }, lateRuns: stats.lateRuns,
@@ -443,14 +505,16 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
       hour, errors: [...stats.errors.values()].sort(byErrors).slice(0, 10),
       watchRun: { count: stats.runs, fail: stats.fail, timeout: stats.timeout, p95: percentiles(stats.durations).p95 },
     }));
-    errorTimes.sort((a, b) => a - b);
+    errorTimes.sort((a, b) => a.at - b.at);
+    const errorPrefix = [0];
+    for (const sample of errorTimes) errorPrefix.push(errorPrefix.at(-1)! + sample.count);
     function lowerBound(time: number) {
       let lo = 0, hi = errorTimes.length;
-      while (lo < hi) { const mid = (lo + hi) >>> 1; if (errorTimes[mid]! < time) lo = mid + 1; else hi = mid; }
+      while (lo < hi) { const mid = (lo + hi) >>> 1; if (errorTimes[mid]!.at < time) lo = mid + 1; else hi = mid; }
       return lo;
     }
     const rate = (start: number, end: number) => {
-      const errors = lowerBound(end) - lowerBound(start);
+      const errors = errorPrefix[lowerBound(end)]! - errorPrefix[lowerBound(start)]!;
       return { errors, minutes: 30, errorsPerMinute: errors / 30, complete: end <= Date.now() };
     };
     const deployMarkers = markers.sort((a, b) => a.ts.localeCompare(b.ts)).map(marker => {

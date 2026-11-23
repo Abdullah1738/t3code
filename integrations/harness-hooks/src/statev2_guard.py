@@ -12,10 +12,17 @@ import re
 import shlex
 import shutil
 import stat
+import time
 import unicodedata
 import warnings
 from urllib.parse import unquote
 
+
+# Milliseconds this process spent scanning remote (offbox/ssh) payloads. Only the
+# outermost scan is timed, so nested payloads are not counted twice. The hook
+# engine reports the change across one call as its own phase.
+remote_scan_ms = 0.0
+_remote_scan_depth = 0
 
 REPLICA = re.compile(r"(?<![\w.-])\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?(?![\w./-])")
 LIVE = re.compile(
@@ -85,8 +92,32 @@ NODE_VALUE_OPTIONS = {
     '--trace-event-categories', '--trace-event-file-pattern', '--trace-require-module',
     '--unhandled-rejections', '--use-largepages', '--v8-pool-size', '--watch-kill-signal', '--watch-path',
 }
-REASON = (
-    "statev2 guard: this command was NOT run (owner incident 2026-11-05).\n"
+BUN_SUBCOMMANDS = {
+    'test', 'install', 'i', 'add', 'a', 'remove', 'rm', 'update', 'outdated', 'audit',
+    'dedupe', 'prune', 'link', 'unlink', 'publish', 'patch', 'pm', 'info', 'why',
+    'build', 'init', 'create', 'c', 'upgrade', 'completions', 'x', 'repl', 'exec',
+}
+# Required global operands from Bun 1.4 help. Inspector addresses are '=' only;
+# preload and inline code operands stay on their content-scanning paths.
+BUN_VALUE_OPTIONS = {
+    '--cwd', '--filter', '-F', '--elide-lines', '--shell', '--watch-kill-signal',
+    '--cpu-prof-name', '--cpu-prof-dir', '--cpu-prof-interval', '--heap-prof-name',
+    '--heap-prof-dir', '--heap-prof-interval', '--install', '--port', '--conditions',
+    '--fetch-preconnect', '--max-http-header-size', '--dns-result-order',
+    '--redirect-warnings', '--disable-warning', '--title', '--unhandled-rejections',
+    '--console-depth', '--user-agent', '--cron-title', '--cron-period', '--main-fields',
+    '--extension-order', '--tsconfig-override', '--define', '-d', '--drop', '--feature',
+    '--loader', '-l', '--jsx-factory', '--jsx-fragment', '--jsx-import-source',
+    '--jsx-runtime', '--env-file', '--config', '-c',
+}
+# Bun 1.4 test options; optional numeric operands must not swallow a test file.
+BUN_TEST_VALUE_OPTIONS = {
+    '-t', '--test-name-pattern', '--timeout', '--rerun-each', '--retry', '--seed',
+    '--coverage-reporter', '--coverage-dir', '--reporter', '--reporter-outfile',
+    '--max-concurrency', '--path-ignore-patterns', '--parallel-delay', '--shard', '--timings',
+}
+REASON_HEADER = "statev2 guard: this command was NOT run (owner incident 2026-11-05).\n"
+REASON_GUIDANCE = (
     "Shell reads of Robob's live statev2.sqlite and OpenCode's live opencode.db are blocked, "
     "including sqlite3/python/node scripts and read-only SQL. They contend with the live writers.\n"
     "Use Robob tools/APIs (board_*/card_*, t3ctl, /api/ardud/control/*), recall for past sessions, "
@@ -95,6 +126,7 @@ REASON = (
     "`live-db-snapshot --card <id> --ask <id> --db <path>` once he approves.\n"
     "If only the database can answer, report the exact queries and stop."
 )
+REASON = REASON_HEADER + REASON_GUIDANCE
 
 
 def protected_databases():
@@ -468,6 +500,143 @@ def _trusted_fixture_tool(executable, name, directory):
     return resolved is not None and os.path.realpath(resolved) in {os.path.realpath(path) for path in trusted}
 
 
+# Files a PATH shim or the interpreter itself reads to choose what runs:
+# pyenv/uv/mise/asdf/direnv selectors from the cwd or its parents, and the
+# venv marker. Matched by basename wherever they are written.
+LOOKUP_SELECTOR = re.compile(r'\.python-versions?|\.tool-versions|\.envrc|pyvenv\.cfg|'
+                             r'\.?(?:mise|rtx)(?:\.[^/]+)?\.toml')
+HOMEBREW_PREFIXES = ('/opt/homebrew', '/usr/local')
+
+
+def _homebrew_python(executable):
+    """The Homebrew prefix and python minor version when `executable` resolves
+    into Homebrew's versioned python framework, the layout that names the
+    interpreter the way Cellar and nvm paths do for node in
+    _trusted_fixture_tool. A copy or wrapper anywhere else is unproved."""
+    real = os.path.realpath(executable)
+    for prefix in HOMEBREW_PREFIXES:
+        match = re.fullmatch(re.escape(prefix) + r'/Cellar/python@3\.(\d+)/[^/]+/Frameworks/Python\.framework/'
+                             r'Versions/3\.\1/bin/python3(?:\.\1)?', real)
+        if match:
+            return prefix, match.group(1)
+    return None
+
+
+def _path_keys(value):
+    # Case-insensitive APFS: compare folded realpaths, plus inode identity for
+    # paths that exist.
+    real = os.path.realpath(value)
+    found = {unicodedata.normalize('NFD', real.casefold())}
+    try:
+        info = os.stat(real)
+        found.add((info.st_dev, info.st_ino))
+    except OSError:
+        pass
+    return found
+
+
+def _python_startup_roots(resolved, home):
+    """Path keys of every tree a Homebrew python reads at -I startup, or why
+    they cannot be bounded. That is the whole Homebrew prefix (its shared
+    lib/python3.N/site-packages sits outside the framework, whatever symlink
+    chain the invocation took), each install prefix (bin/..) along that chain,
+    each stdlib and site directory's real path, and every directory a global
+    .pth adds.
+    A .pth import line runs code from anywhere, and a virtual environment has
+    site-packages of its own, so either keeps the proof closed."""
+    prefix, minor = home
+    roots, hop = _path_keys(prefix), os.path.abspath(resolved)
+    for _ in range(40):
+        roots |= _path_keys(os.path.dirname(os.path.dirname(hop)))
+        # getpath looks for pyvenv.cfg beside the invoked name and one up.
+        if any(os.path.lexists(os.path.join(directory, 'pyvenv.cfg'))
+               for directory in (os.path.dirname(hop), os.path.dirname(os.path.dirname(hop)))):
+            return 'a virtual environment interpreter'
+        if not os.path.islink(hop):
+            break
+        try:
+            hop = os.path.abspath(os.path.join(os.path.dirname(hop), os.readlink(hop)))
+        except OSError:
+            return 'an unresolved interpreter link'
+    else:
+        return 'an unresolved interpreter link'
+    framework = os.path.dirname(os.path.dirname(os.path.realpath(resolved)))
+    roots |= _path_keys(framework)
+    lib = f'lib/python3.{minor}'
+    for site, is_site in sorted({(os.path.realpath(os.path.join(root, layout)), layout != lib)
+                                 for root in (prefix, framework) for layout in (lib, lib + '/site-packages')}):
+        roots |= _path_keys(site)
+        try:
+            names = sorted(os.listdir(site))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return f'an unreadable site directory {site}'
+        for name in names:
+            if not (name.endswith('.pth') and is_site or
+                    name in {'sitecustomize.py', 'usercustomize.py'}):
+                continue
+            pth = os.path.join(site, name)
+            # A symlinked startup file reads from outside every root; following
+            # it could miss an alias, so the route stays closed instead.
+            if os.path.realpath(pth) != pth:
+                return f'a symlinked startup file {pth}'
+            if not (name.endswith('.pth') and is_site):
+                continue
+            # site.addpackage decodes utf-8-sig (dropping a BOM) before its
+            # locale fallback; anything that isn't strict UTF-8 stays unbounded.
+            try:
+                with open(pth, 'rb') as handle:
+                    lines = handle.read().decode('utf-8-sig').splitlines()
+            except (OSError, UnicodeDecodeError):
+                return f'an unreadable startup file {pth}'
+            for line in lines:
+                if line.startswith(('import ', 'import\t')):
+                    return f'an install whose {pth} runs startup code'
+                if line.strip() and not line.startswith('#'):
+                    roots |= _path_keys(os.path.join(site, line.rstrip()))
+    return roots
+
+
+def _lookup_write_risk(path, roots):
+    """Why one same-call write could change what a bare python3 lookup runs or
+    loads at startup, or None. `roots` is _python_startup_roots. Homebrew's
+    tree is user-writable, so a known write keeps lookup proved only when it
+    lands outside every PATH directory, every startup root and every
+    version-selector file, and aliases no other file. Unknown targets never
+    qualify."""
+    if path is None:
+        return 'an unknown path'
+    base = unicodedata.normalize('NFD', path.name.casefold())
+    if (LOOKUP_SELECTOR.fullmatch(base) or
+            base.endswith('.toml') and any(part.casefold() in {'mise', '.mise', 'rtx', '.rtx'} for part in path.parts)):
+        return 'a version selector file'
+    if isinstance(roots, str):
+        return roots
+    spellings = {os.path.abspath(path), os.path.realpath(path)}
+    for spelling in spellings:
+        try:
+            info = os.stat(spelling)
+        except OSError:
+            continue
+        # Another name for the same inode may be a startup file.
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            return 'a file with other hard links'
+    parents = set().union(*(_path_keys(os.path.dirname(spelling)) for spelling in spellings))
+    if any(parents & _path_keys(entry) for entry in os.get_exec_path() if os.path.isabs(entry)):
+        return 'a PATH directory'
+    for spelling in spellings:
+        current = spelling
+        while True:
+            if _path_keys(current) & roots:
+                return "the interpreter's install or startup tree"
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+    return None
+
+
 FIXTURE_TOOLS = ('mktemp', 'cat', 'ln', 'cp', 'mkdir', 'rm', 'chmod', 'touch', 'mkfifo')
 # Reviewed integrations/local-helpers/libexec/repo-node-pin files (sha256).
 # init.sh evals select.py's output and select.py runs no other program, so
@@ -479,7 +648,8 @@ REPO_NODE_PIN_HASHES = {
     'init.sh': {'d97da32ec68ee02cbf663db7675199cd12e9bd47db27cd9bb45468d133e9a4b0',
                 '90a6436ed6c5ab91b13da9fd27e57d26cdd96b6dcfe0677e591ca5f942f38327',
                 'c853ec309cdbdf38108e133875a54141bf348c6e23b6cd4e881010aa24d37aea'},
-    'select.py': {'7be0cf8c91fdb19d5ea261085f67d8fe88d9100bf39d3ebca1eec4f6d867eaa4',
+    'select.py': {'cdb4e86e5dbf41b98f26e519747f8b45bec31fb614241a06d942b1dd12c8ae24',
+                  '7be0cf8c91fdb19d5ea261085f67d8fe88d9100bf39d3ebca1eec4f6d867eaa4',
                   '1ded56be26d29b956ca8a62217e94c1ca952513f2cd96934a9680c08c045d61d'},
 }
 # @aikidosec/safe-chain 1.5.29; its only startup read is this exact script.
@@ -488,7 +658,7 @@ REPO_NODE_PIN_SAFE_CHAIN_SOURCE = b'[ ! -r "$HOME/.safe-chain/scripts/init-posix
 REPO_NODE_PIN_PYTHON = '/opt/homebrew/bin/python3'
 # select.py may move these harness guard dirs to the front of PATH.
 REPO_NODE_PIN_MANAGED = ('.config/opencode/skills/remote-compute/scripts/blockers',
-                         '.local/share/harness-hooks/coord-blockers', '.local/share/quint-guard/bin')
+                         '.local/share/harness-hooks/coord-blockers')
 REPO_NODE_PIN_INPUTS = ('package.json', '.nvmrc', '.node-version', 'pnpm-lock.yaml')
 REPO_NODE_PIN_COMMAND = re.compile(
     r'ROBOB_REPO_|_repo_node_|NVM_DIR|COREPACK_HOME|repo-node-pin|\.nvm\b|libexec|corepack|'
@@ -2366,7 +2536,8 @@ def refusal_reason(rule, cause, cwd):
         return ("statev2 guard: this command was NOT run.\n"
                 f"Could not check {cause or 'the script path'}. Resolved workdir: {cwd}.\n{fix}")
     if cause:
-        return "statev2 guard: this command was NOT run.\n" + cause
+        guidance = "\n" + REASON_GUIDANCE if rule in {"live-database-read", "live-database-script"} else ""
+        return "statev2 guard: this command was NOT run.\n" + cause + guidance
     return REASON
 
 
@@ -2816,6 +2987,110 @@ def _direct_read(words, directory):
     return False
 
 
+# $PWD, ${PWD}, $(pwd) and $(realpath <literal>) name the tracked cwd only
+# while nothing in the call can rebind PWD, change cd's mode or shadow the
+# two commands. The check is textual over the whole caller command (offbox
+# payloads included) and fails closed: any match keeps the word unresolved.
+CWD_READ = re.compile(r'\$PWD(?!\w)|\$\{PWD\}')
+CWD_UNPROVED = re.compile(
+    r'(?<![\w$])PWD(?!\w)'
+    r'|(?<![\w-])(?:eval|alias|unalias|source|enable|hash|shopt|setopt|unsetopt|pushd|popd|builtin|function|chpwd)(?![\w-])'
+    r'|(?:^|[;&|(){}\n])\s*\.\s'
+    r'|(?:^|[;&|(){}\n])\s*[A-Za-z_][\w-]*\s*\(\s*\)|\(\s*\)\s*\{'
+    r'|(?<![\w-])cd\s+(?:-[A-Za-z]*\s+)*-[A-Za-z]*P'
+    r'|(?<![\w-])set\s+(?:[-+][A-Za-z]*\s+)*(?:-[A-Za-z]*P|[-+]o\s+physical)'
+    r'|CDPATH|(?<![\w$])PATH\+?=|(?<![\w$./-])path(?:\[[^\]]*\])?\+?=|(?<![\w$])commands\['
+    # Code run later, zsh's other lookup tables, cd's physical mode and
+    # indirect expansion can also rebind PWD/PATH or shadow the commands.
+    r'|(?<![\w-])(?:trap|fc|autoload|disable|zmodload|emulate)(?![\w-])|fpath|FPATH|BASH_CMDS|BASH_ALIASES'
+    r'|(?<![\w$])(?:functions|aliases|galiases|saliases|options)\[|(?i:chase_?(?:links|dots))|\$\{!|\$\{\([^)]*P'
+    # Arithmetic evaluates a variable's value as an expression, so a value
+    # built at runtime ("P${a}D=5") assigns whatever name it spells.
+    r'|\(\(|\$\[|(?<![\w-])let(?![\w-])|\[\[[^\]]*\s-(?:eq|ne|lt|le|gt|ge)\s'
+    r'|(?<![\w$])[A-Za-z_]\w*\[[^\]]*[A-Za-z_$`]|\$\{[A-Za-z_]\w*:(?![-=+?])')
+# Builtins that bind a variable named by an operand. A name built at runtime
+# ("P${a}D", "$n") can spell PWD or PATH, so it voids the proof (review r2).
+CWD_DECLARERS = frozenset({'declare', 'typeset', 'local', 'export', 'readonly', 'integer', 'float', 'private', 'nameref'})
+CWD_NAME_BINDERS = frozenset({'set', 'read', 'mapfile', 'readarray', 'getopts', 'unset', 'vared', 'zparseopts', 'zstyle',
+                              'strftime', 'sysread', 'wait', 'coproc', 'compadd', 'zle', 'zregexparse'})
+CWD_BOUND_NAMES = frozenset({'PWD', 'OLDPWD', 'PATH', 'path', 'CDPATH', 'cdpath'})
+CWD_KEYWORDS = frozenset({'!', 'do', 'then', 'else', 'elif', 'if', 'while', 'until', 'time', 'command', 'noglob', 'nocorrect', '-', 'exec'})
+CWD_SEPARATOR = re.compile(r'[;&|()<>{}]+')
+CWD_PATH = re.compile(r'[A-Za-z0-9_./@%+=:,-]+')
+# Inside double quotes a cwd with spaces stays one word, as its literal twin does.
+CWD_QUOTED_PATH = re.compile(r'[^\0\n$`"\'\\*?\[\]{}]+')
+CWD_SUBSTITUTION = re.compile(r'\$\{PWD\}|\$\(\s*pwd\s*\)|`\s*pwd\s*`|'
+                              r'\$\(\s*realpath\s+([\'"]?)(?!-)([A-Za-z0-9_./@%+=:,-]+)\1\s*\)|'
+                              r'`\s*realpath\s+([\'"]?)(?!-)([A-Za-z0-9_./@%+=:,-]+)\3\s*`')
+
+
+def _cwd_unproved(command: str) -> bool:
+    # Quotes and backslashes do not hide a binding from the shell (P""WD=).
+    return any(CWD_UNPROVED.search(CWD_READ.sub('', text))
+               for text in (command, re.sub(r'[\'"\\]', '', command))) or _cwd_runtime_binding(command)
+
+
+def _cwd_runtime_binding(text: str, depth: int = 0) -> bool:
+    if depth > 6:
+        return True
+    text = CWD_SUBSTITUTION.sub('', CWD_READ.sub('', text)).replace('\n', ';')
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=';&|()<>')
+    lexer.commenters, lexer.whitespace_split = '', True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        # Unbalanced quotes (a heredoc body): split the unquoted text instead.
+        tokens = re.findall(r'[;&|()<>{}]+|[^\s;&|()<>{}]+', re.sub(r'[\'"\\]', '', text))
+    dynamic = lambda token: '$' in token or '`' in token
+    segment: list[str] = []
+    for token in tokens + [';']:
+        if CWD_SEPARATOR.fullmatch(token):
+            if _cwd_segment_binds(segment, dynamic):
+                return True
+            segment = []
+            continue
+        # Payload text and quoted scripts are shell text of their own.
+        if re.search(r'[\s;&|()<>{}]', token) and _cwd_runtime_binding(token, depth + 1):
+            return True
+        segment.append(token)
+    return False
+
+
+def _cwd_segment_binds(words: list[str], dynamic) -> bool:
+    while words and (words[0] in CWD_KEYWORDS or re.fullmatch(r'[A-Za-z_]\w*\+?=.*', words[0], re.S)):
+        words = words[1:]
+    if not words:
+        return False
+    # A command word built at runtime may name a binding builtin.
+    if dynamic(words[0]) and any(dynamic(word) for word in words[1:]):
+        return True
+    for index, word in enumerate(words):
+        operands = words[index + 1:]
+        if word in CWD_DECLARERS:
+            # Namerefs and numeric types evaluate the value too.
+            if any(re.fullmatch(r'[-+][A-Za-z]*[niEF][A-Za-z]*', op) for op in operands):
+                if any(dynamic(op) for op in operands):
+                    return True
+            for op in operands:
+                if re.fullmatch(r'[-+][A-Za-z]*', op):
+                    continue
+                name = re.split(r'\+?=|\[', op, maxsplit=1)[0]
+                if dynamic(name) or name in CWD_BOUND_NAMES:
+                    return True
+        elif word in CWD_NAME_BINDERS:
+            if any(dynamic(op) or op in CWD_BOUND_NAMES for op in operands):
+                return True
+        elif word in {'printf', 'print'}:
+            if operands and (dynamic(operands[0]) or any(re.fullmatch(r'-[A-Za-z]*v.*', op, re.S) for op in operands)):
+                if any(dynamic(op) or op in CWD_BOUND_NAMES for op in operands):
+                    return True
+        elif word in {'for', 'select'}:
+            names = operands[:operands.index('in')] if 'in' in operands else operands[:1]
+            if any(name in CWD_BOUND_NAMES for name in names):
+                return True
+    return False
+
+
 def _literal_path(value: str, cwd: Path | None) -> Path | None:
     value = re.sub(r"^(?:~|\$HOME|\$\{HOME\})(?=/|$)", str(Path.home()), value)
     if not value or re.search(r"[$`*?\[\]]", value) or value == "-":
@@ -2890,6 +3165,8 @@ def _interpreter_args(binary, args):
         operands |= {"-o", "+o", "-O", "+O"}
     if binary in {"node", "bun", "deno"}:
         operands |= {"--test-name-pattern", "--test-skip-pattern", "--test-reporter", "--test-reporter-destination", "--test-concurrency"}
+    if binary == 'bun':
+        operands |= BUN_VALUE_OPTIONS
     result, index = [], 0
     while index < len(args):
         flag = args[index]
@@ -2901,6 +3178,50 @@ def _interpreter_args(binary, args):
         if flag not in operands:
             result.append(flag)
     return result
+
+
+def _bun_arguments(args):
+    mode, result, directories, index, options = None, [], [], 0, True
+    explicit_run = False
+    while index < len(args):
+        arg = args[index]
+        flag, equal, value = arg.partition('=')
+        if options and flag in {'-', '-e', '--eval', '-p', '--print'}:
+            return 'script', result + args[index:], directories
+        if options and flag == '--preload':
+            result.append(arg)
+            if not equal and index + 1 < len(args):
+                index += 1
+                result.append(args[index])
+        elif options and flag in BUN_VALUE_OPTIONS | (BUN_TEST_VALUE_OPTIONS if mode == 'test' else set()):
+            if not equal:
+                index += 1
+                value = args[index] if index < len(args) else ''
+            if flag == '--cwd':
+                directories.append(value)
+        elif options and mode == 'test' and flag in {'--bail', '--parallel'}:
+            if not equal and index + 1 < len(args) and args[index + 1].isdigit():
+                index += 1
+        elif options and arg == '--':
+            options = False
+            result.append(arg)
+        elif mode is None and not explicit_run and options and arg == 'run':
+            explicit_run = True
+        elif mode is None and not explicit_run and options and arg in BUN_SUBCOMMANDS:
+            mode = arg
+            if mode not in {'test', 'exec'}:
+                return mode, result + args[index + 1:], directories
+        elif not options or not arg.startswith('-'):
+            if mode is None:
+                mode = 'script' if '/' in arg or re.search(r'\.(?:[cm]?[jt]s|[jt]sx)$', arg) else 'task'
+                return mode, result + args[index:], directories
+            if mode == 'exec':
+                return mode, result + args[index:], directories
+            result.append(arg)
+        else:
+            result.append(arg)
+        index += 1
+    return mode or 'script', result, directories
 
 
 def _node_arguments(args):
@@ -3263,6 +3584,33 @@ def _fresh_mktemp(value):
     return len(args) <= 1 and all(not arg.startswith('-') and not re.search(r'[$`*?\[\]{}]', arg) for arg in args)
 
 
+def _fresh_mktemp_parent(value, directory, tmpdir):
+    """The existing directory a _fresh_mktemp binding creates its root in."""
+    args = shlex.split(value[2:-1])[2:]
+    if not args or args[0] == '-t':
+        return Path(tmpdir) if tmpdir else None
+    template = re.sub(r'\$\{?HOME\}?', str(Path.home()), args[0])
+    if re.search(r'\$\{?PWD\}?', template):
+        if directory is None:
+            return None
+        template = re.sub(r'\$\{?PWD\}?', str(directory), template)
+    path = _lexical_path(template, directory)
+    return path.parent if path is not None else None
+
+
+def _lexical_path(value, cwd):
+    """An absolute spelling of a literal path without resolving symlinks."""
+    value = re.sub(r"^(?:~|\$HOME|\$\{HOME\})(?=/|$)", str(Path.home()), value)
+    if not value or re.search(r"[$`*?\[\]]", value) or value == "-":
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        if cwd is None:
+            return None
+        path = cwd / path
+    return Path(os.path.abspath(path))
+
+
 def _attached_script_operand(word, binary):
     flag, equal, value = word.partition('=')
     options = NODE_SCRIPT_OPTIONS | NODE_FILE_OPTIONS if binary == 'node' else {'--preload'} if binary == 'bun' else set()
@@ -3359,7 +3707,7 @@ def _fixture_wrapped_invocation(command):
     return target, run
 
 
-def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None, _preservation=True, _budget=None, _glob_writes=None, _cwd_candidates=None) -> list[Path]:
+def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None, _preservation=True, _budget=None, _glob_writes=None, _cwd_candidates=None, _cwd_unproved_text=None) -> list[Path]:
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
     script_files, node_test_files = _budget if _budget is not None else (set(), set())
@@ -3369,10 +3717,15 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     write_history = {}
     variable_written = set()
     tool_changes = set()
+    # Redirect targets with their lexical spelling (a symlink's own name can
+    # be a selector file) and fresh-root representatives, for lookup proofs.
+    lookup_writes = {}
+    fresh_parents = {}
     unbounded_predecessors = []
     stdin_words, stdin_bodies = _stdin or ([], {})
     if _sources is not None:
-        prior_written, prior_invalidated, prior_history, prior_variable, prior_tool_changes = _sources
+        prior_written, prior_invalidated, prior_history, prior_variable, prior_tool_changes, prior_lookup_writes = _sources
+        lookup_writes.update(prior_lookup_writes)
         written.update(prior_written)
         invalidated_written.update(prior_invalidated)
         write_history.update((path, list(history)) for path, history in prior_history.items())
@@ -3382,6 +3735,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     unknown_directories = set(_cwd_candidates or ())
     conditional = 0
     inherited_values, inherited_unsafe, caller_command = _environment or ({}, False, None)
+    cwd_unproved = (_cwd_unproved_text if _cwd_unproved_text is not None else
+                    _cwd_unproved(command) or caller_command is not None and _cwd_unproved(caller_command))
     shell_values = {"HOME": str(Path.home()), **inherited_values}
     path_values = {}
     live_assignments = set()
@@ -3788,8 +4143,28 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     return False
         if not builtin:
             trusted = _trusted_fixture_tool(words[0], os.path.basename(words[0]), directory)
+            lookup_failure = None
+            name = os.path.basename(words[0])
+            resolved = (shutil.which(words[0]) if re.fullmatch(r'python3(?:\.\d+)?', name) and
+                        ('/' not in words[0] or os.path.isabs(words[0])) and not trusted and
+                        unchanged_tool(words[0], directory) else None)
+            home = _homebrew_python(resolved) if resolved else None
+            if home:
+                # Homebrew's python stays proved when no write so far in this
+                # call can reach its lookup or startup inputs.
+                writes = sorted(tool_changes | set(lookup_writes), key=str)
+                roots = _python_startup_roots(resolved, home) if writes else set()
+                risky = next(((path, risk) for path in writes if (risk := _lookup_write_risk(path, roots))), None)
+                if risky is None:
+                    trusted = True
+                else:
+                    line = lookup_writes.get(risky[0])
+                    target = f'{risky[0]} ({risky[1]})' if risky[0] else 'an unbounded target'
+                    lookup_failure = (f"{label}: executable provenance or mutation proof failed: "
+                                      f"{f'line {line}' if line else 'this call'} writes {target}, which could change "
+                                      f"what {words[0]} resolves to; use /usr/bin/python3 or run it in a separate call")
             if not trusted or not unchanged_tool(words[0], directory):
-                proof_failure = label + ': executable provenance or mutation proof failed'
+                proof_failure = lookup_failure or label + ': executable provenance or mutation proof failed'
                 if not trusted and words[0] == 'python3' and unchanged_tool(words[0], directory):
                     python_lookup_unproved = True
                 if None in tool_changes and unbounded_predecessors:
@@ -4359,6 +4734,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             script_values[name] = candidates | script_values.get(name, {"$" + name}) if uncertain_write or transient else candidates
             if not uncertain_write and not transient and _fresh_mktemp(value):
                 fresh_variables.add(name)
+                fresh_parents[name] = _fresh_mktemp_parent(value, directory, None if 'TMPDIR' in shell_values else
+                                                           os.environ.get('TMPDIR') or '/tmp')
                 binding_causes.pop(name, None)
             else:
                 reason = ('conditional or transient binding' if uncertain_write or transient else
@@ -4724,9 +5101,46 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return (preservation_tool(words, directory) and
                 _trusted_fixture_tool(words[0], 'mktemp', directory) and unchanged_tool(words[0], directory))
 
+    def tracked_cwd(directory, quoted=False):
+        if cwd_unproved or unsafe_bindings or directory is None or 'PWD' in shell_values or 'PWD' in script_values:
+            return None
+        return str(directory) if (CWD_QUOTED_PATH if quoted else CWD_PATH).fullmatch(str(directory)) else None
+
+    def resolve_cwd_reads(text, directory, quoted=False):
+        # An escaped \$PWD stays literal.
+        base = tracked_cwd(directory, quoted)
+        return text if base is None else re.sub(r'(?<!\\)\$(?:PWD(?!\w)|\{PWD\})', lambda _: base, text)
+
+    def resolve_cwd_substitution(literal, directory, quoted=False):
+        match = CWD_SUBSTITUTION.fullmatch(literal)
+        base = tracked_cwd(directory, quoted) if match else None
+        target = match and (match[2] or match[4])
+        # An exported Bash function named pwd or realpath shadows that command.
+        if base is None or any(re.fullmatch(r'BASH_FUNC_(?:pwd|realpath)(?:%%|\(\))?', name) for name in os.environ):
+            return None
+        # Only the system realpath, found through the inherited PATH and not
+        # replaced earlier in the call, is known to print the resolved path.
+        if target and not (_trusted_fixture_tool('realpath', 'realpath', directory) and unchanged_tool('realpath', directory)):
+            return None
+        # realpath follows symlinks; check the path the shell would pass.
+        resolved = os.path.realpath(os.path.join(base, target)) if target else base
+        return resolved if (CWD_QUOTED_PATH if quoted else CWD_PATH).fullmatch(resolved) else None
+
     def decode_word(value, directory, depth, quoted, checked, cwd_only=False, bodies=None, preserve_mktemp=False):
         nonlocal conditional, uncertain_write, last_invalidation
+        value = resolve_cwd_reads(value, directory)
         for key, literal in reversed(quoted.items()):
+            if key in value and key.startswith('\0guard_quoted_'):
+                resolved = resolve_cwd_substitution(literal, directory)
+                if resolved is not None:
+                    value = value.replace(key, resolved)
+                    continue
+            if key in value and key.startswith('\0guard_double_'):
+                literal = resolve_cwd_reads(literal, directory, quoted=True)
+                for inner in re.findall(r'\0guard_quoted_\d+__', literal):
+                    resolved = resolve_cwd_substitution(quoted.get(inner, ''), directory, quoted=True)
+                    if resolved is not None:
+                        literal = literal.replace(inner, resolved)
             if key in value and key not in checked and not key.startswith('\0guard_literal_') and literal.startswith(("${", "$(", "`")) and not cwd_only:
                 checked.add(key)
                 for substitution in _substitutions(literal, shell=True):
@@ -4768,7 +5182,18 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             fresh_variables.update(previous_fresh)
             opaque_written.clear()
 
-    def scan_remote(source, directory, depth, input_words=(), input_bodies=None, inherit_environment=False, opaque=None, preservation=True):
+    def scan_remote(*args, **kwargs):
+        global remote_scan_ms, _remote_scan_depth
+        started = time.monotonic() if _remote_scan_depth == 0 else None
+        _remote_scan_depth += 1
+        try:
+            return scan_remote_payload(*args, **kwargs)
+        finally:
+            _remote_scan_depth -= 1
+            if started is not None:
+                remote_scan_ms += (time.monotonic() - started) * 1000
+
+    def scan_remote_payload(source, directory, depth, input_words=(), input_bodies=None, inherit_environment=False, opaque=None, preservation=True):
         # Synced source evidence may be read remotely, but remote writes,
         # bindings and cwd cannot prove anything about the caller's files.
         # Only payloads offbox may run locally after an outage reach here
@@ -4782,11 +5207,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             REPO_NODE_PIN_COMMAND.search(name + '=')},
                            unsafe_binding_cause if unsafe_bindings else False, caller_command if caller_command is not None else command)
         remote_paths = scripts_in(source, directory, _depth=depth,
-                                  _sources=(written, invalidated_written, write_history, variable_written, tool_changes),
+                                  _sources=(written, invalidated_written, write_history, variable_written, tool_changes, lookup_writes),
                                   _stdin=(input_words, input_bodies or {}), _environment=environment, _opaque=opaque,
                                   _preservation=_preservation and preservation,
                                   _budget=(script_files, node_test_files), _glob_writes=glob_writes,
-                                  _cwd_candidates=unknown_directories)
+                                  _cwd_candidates=unknown_directories, _cwd_unproved_text=cwd_unproved)
         paths.extend(path for path in remote_paths if path not in paths)
         check_budget()
 
@@ -4941,7 +5366,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 pieces.append((text[end:], None))
                 result = {''}
                 for key, literal in pieces:
-                    if literal is not None:
+                    cwd = resolve_cwd_substitution(literal, directory, quoted_context) if key.startswith('\0guard_quoted_') else None
+                    if cwd is not None:
+                        values = {cwd}
+                    elif literal is not None:
                         if key.startswith('\0guard_literal_double_'):
                             values = resolve(double_text(literal), True)
                         elif key.startswith('\0guard_literal_'):
@@ -5234,6 +5662,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         # A fresh root cannot contain an existing executable, but
                         # failed mktemp leaves the absolute empty-root fallback.
                         tool_changes.add(opaque_fallback(target, directory))
+                        parent = fresh_parents.get(key[1])
+                        lookup_writes.setdefault(parent and parent / 'mktemp.fresh' / target[target.index('/') + 1:], current_line)
+                    else:
+                        lookup_writes.setdefault(path, current_line)
+                        lexical = _lexical_path(candidate, directory)
+                        if lexical is not None:
+                            lookup_writes.setdefault(lexical, current_line)
                     affected = affected_sources(path, track_tool=not fresh_target)
                     if op in {'>', '>>'} and documents and binary in {'cat', 'tee'}:
                         affected.discard(path)
@@ -5469,7 +5904,12 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             raise AmbiguousScript("migrate-dev-db package command not found")
         shells = {"bash", "sh", "zsh", "dash", "ksh"}
         python = bool(re.fullmatch(r"python[\d.]*", binary))
+        bun_mode = None
         if binary == 'bun':
+            bun_mode, args, bun_directories = _bun_arguments(args)
+            if bun_directories:
+                # Bun resolves only the last --cwd against the invocation directory.
+                directory = change_directory(bun_directories[-1], directory)
             remaining, index, options = [], 0, True
             while index < len(args):
                 arg = args[index]
@@ -5488,11 +5928,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     add(value, directory, 'bun')
                 else:
                     remaining.append(arg)
-                    if arg == '--' or arg not in {'test', 'run'} and not arg.startswith('-') and args[:1] != ['test']:
+                    if arg == '--' or not arg.startswith('-') and bun_mode != 'test':
                         options = False
                 index += 1
             args = remaining
-        if python or binary in shells | {"bun", "deno"}:
+        if python or binary in shells | {"deno"}:
+            args = _interpreter_args(binary, args)
+        if binary == 'bun':
             args = _interpreter_args(binary, args)
         node_test = False
         node_inputs = []
@@ -5505,9 +5947,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 if argument in invocation_literals:
                     invocation_literals.add(operand)
             args, node_inputs, node_test, node_runtime_options = _node_arguments(args)
-        if binary == 'bun' and args[:1] == ['test']:
-            node_test, args = True, args[1:]
-        if binary in {'bun', 'deno'} and args[:1] == ['run']:
+        if binary == 'deno' and args[:1] == ['run']:
             args = _interpreter_args(binary, args[1:])
         program_args = list(args)
         while (program_args and program_args[0] != '-' and
@@ -5516,6 +5956,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             if flag in {'--', '-c'} or binary not in shells and flag in {'-e', '--eval', '-p', '--print', '-m'}:
                 break
         stdin_code = not args or program_args[:1] == ['-'] or all(arg.startswith('-') for arg in args)
+        if bun_mode and bun_mode != 'script':
+            stdin_code = False
         shell_options = args[:len(args) - len(program_args)] if binary in shells else []
         shell_stdin = any(re.fullmatch(r'-[a-z]*s[a-z]*', arg) for arg in shell_options)
         shell_command = any(re.fullmatch(r'-[a-z]*c[a-z]*', arg) for arg in shell_options)
@@ -5694,6 +6136,21 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 return finish_invocation()
         if binary == "eval":
             return scan(" ".join(args), directory, depth + 1)
+        if bun_mode == 'exec':
+            if program_args:
+                scan_child(program_args[0], directory, depth + 1)
+            return finish_invocation()
+        if bun_mode == 'test':
+            # Match vp test run after a non-literal cd; filters are not scripts.
+            for target in args:
+                if target.startswith('-') or directory is None and not (os.path.isabs(target) or target.startswith(('~/', '$HOME/', '${HOME}/'))):
+                    continue
+                path = script_path(target, directory, binary)
+                if path.is_file():
+                    add(target, directory, binary, test_target=target)
+            return finish_invocation()
+        if bun_mode and bun_mode != 'script':
+            return finish_invocation()
         if binary == 'ssh':
             remote = list(args)
             while remote and remote[0].startswith('-'):

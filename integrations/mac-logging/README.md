@@ -1,5 +1,40 @@
 # Mac upkeep logs
 
+## Suspension leases
+
+Every upkeep SIGSTOP needs a durable deadline and a follow-up. Use an explicit
+`--deadline 10m` (recommended; required, maximum 60m) and `--then cont|kill`:
+
+```sh
+mac-suspend stop --pid 123 --deadline 10m --then cont --reason 'resource pressure' --actor 'mac worker' --card '#118'
+mac-suspend list --json
+mac-suspend resume --pid 123
+mac-suspend kill --pid 123
+mac-suspend sweep --json
+```
+
+The ledger is `~/.robob/logs/tools/mac/state/suspend-lease.json` (or beneath
+`TOOLLOG_DIR/state`), locked across each operation and fsynced before SIGSTOP.
+Every signal rechecks pid + start time and records a read-back. Resume and kill
+require an owned lease; kill sends TERM, waits five seconds if still alive,
+then sends KILL. Failed recovery retains the lease for the next sweep.
+PID reuse drops the old lease without signalling its replacement. System,
+Robob, provider and GUI processes are protected. The tool never signals
+unowned stops, including debugger stops and Ctrl-Z jobs.
+
+`com.abdullah.mac-suspend` runs a separate sweep every minute, with a 50-second
+whole-run limit and bounded ps/launchctl calls. `install.zsh` copies the helper,
+wrapper and plist; the evaluator loads the LaunchAgent after review.
+Subprocess timeouts are centralized in `TIMEOUTS` (ps 8s, protection list 5s, owner list 3s, procinfo 2s, notify 5s), only the stopped-process listing retries once, and timed-out calls log `cmd`, `timeoutS`, `elapsedMs` and `loadAvg1` on `suspend.error`.
+`mac-log-status` checks its launchd state and three-minute logging cadence.
+Events use toollog: `suspend.stop`, `suspend.stop_failed`, `suspend.resume`,
+`suspend.kill`, `suspend.expired`, `suspend.cleared`, `suspend.orphan`,
+`suspend.alert`, `suspend.sweep` and `suspend.error`. Orphans log at first sight
+and once after ten minutes of observation. The latter and failed kills queue
+one Telegram attention alert per pid + start; uncertain delivery retries use
+the same key and text. Agent prompts and the janitor rule are updated separately
+after owner approval.
+
 Source scripts use `toollog.py` (or the `toollog.sh` bridge) for local metadata at
 `~/.robob/logs/tools/mac/YYYY-MM-DD.ndjson`, with UTC dates. Run
 `mac-log-rollup --day YYYY-MM-DD` to write `rollup-YYYY-MM-DD.json`; with no day,
@@ -69,6 +104,49 @@ and its predecessor, capped to 36 hours. Each job has `lastSeen` (normalized
 UTC), `lastOk`, `lines` (matching lines in that window), `ageMin`, `gapMaxMin`,
 `since`, and `status`. `missingJobs` contains the `LATE` and `SILENT` job keys;
 backup keys are `backup.run:health` and `backup.run:memory`.
+
+Each row includes the exact `kern.boottime` epoch and UTC `bootTime` when
+available. The minute CPU sampler and hourly collector share a nonblocking boot
+lock. Each newly seen boot is saved immediately, including its kernel reason
+strings; a second reboot during the evidence wait leaves it queued for finalization.
+After the ten-minute panic-file window closes, `boot.observed` records
+the previous boot, the last prior sample's uptime, the gap from the last prior log row,
+ResetCounter faults/failure count, panic and shutdown-stall reports within ten
+minutes of boot, and Jetsam reports in the preceding two hours. Missing evidence
+remains null or carries a per-field source error. The gap measures logging silence; it does
+not establish how long the Mac froze.
+
+A clean boot requires the adjacent shutdown record from `last -y reboot shutdown`
+and no positive panic/reset-fault evidence. A shutdown-stall report records a
+slow orderly shutdown; its presence alone does not make the boot unclean.
+The record includes the requested operation, loginwindow sender PID/bundle and
+confirmation time, launchd's caller chain, sessionlogoutd's non-update verdict,
+and the raw `kern.shutdownreason`/`kern.bootreason` values from that same boot.
+The sender identifies a process; the human or automation activating the request
+remains unknown. A `wdog,reset_in_1` token alone does not establish an unclean
+boot or a forced watchdog timeout; `forcedWatchdogTimeout` stays null without
+explicit timeout/check-in-failure evidence. Shutdown-stall files are decoded
+with `spindump -i` on a private copy to obtain the actual sample start/end;
+the filename timestamp (or mtime when absent) matches reports to boots. The
+native decoder appends input metadata, so the original file is never passed
+to it. Decode failures preserve presence and a source error.
+#92 found no numeric shutdown cause on this Apple-silicon host; any future numeric code is retained as unmapped,
+without Intel cause tables. Filtered unified-log queries cover the three minutes
+before boot for shutdown context and the first three minutes after boot for
+shutdown cause, using the shared `logwindow` reader with explicit UTC bounds,
+reboot splits, a 15-second process-group deadline and timestamp filtering.
+The post-boot read starts at the first whole second at or after boot.
+ResetCounter uses plain reads, without sudo. Observations are
+timestamped at boot (`observedAt` records collection time), persisted once per
+boot and survive the daily log cap. Unclean boots and orderly shutdown stalls queue one
+Telegram alert with a stable boot key; failed sends retry that same key/text,
+even across later boots. Unfinished observations remain in a persistent queue;
+each invocation retries one queued boot alongside the current boot. A late
+append to an earlier UTC day rebuilds that day's rollup and publishes updated
+`log.rollup` counts with its `day`; failed repairs remain queued. Rollup writers
+share a per-day lock so an older snapshot cannot overwrite a repair.
+CPU process, host-tick and child baselines reset on boot changes. Rollups add
+`boots` and `uncleanBoots`, also emitted in `log.rollup`.
 
 The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
@@ -387,10 +465,11 @@ long-lived high PIDs hid a real 200-process burst after allocator wrap on this M
 The optional thread read has a two-second timeout.
 
 `userPct` excludes nice time; user + sys + nice is busy CPU. `kernelTaskPct`
-is null on normal samples. Spikes read the second frame of a bounded
-`top -l 2 -s 1 -pid 0` call, with `kernelTaskWindowS: 1` and cumulative
-`kernelTaskTime` for reference; failure sets `kernelTaskError`.
-The expensive read is limited to once per five minutes, including failed
+is null on normal samples. Spikes read the second frame of a
+`top -l 2 -s 1 -pid 0` call with a 15-second timeout, `kernelTaskWindowS: 1` and cumulative
+`kernelTaskTime` for reference; failure sets `kernelTaskError`. `kernelTaskWallMs`
+records the call's wall time rounded to the nearest millisecond, including errors.
+The expensive read is limited to once per 30 minutes, including failed
 attempts, using a wall timestamp in the existing sampler state. Skipped spikes
 report null CPU with `kernelTaskSkipped: "rate"`; quiet samples retain the
 cooldown, and a clock rollback starts a fresh cooldown.
@@ -1063,10 +1142,57 @@ recorded as unavailable evidence. Stack capture runs outside the guard loop.
 
 Worker launches persist their request ID and exact payload before using the
 control API (`t3ctl create` does not forward a request ID). After an uncertain
-response the guard looks up that ID and replays the same idempotent request,
-completing any partial thread launch. It confirms the initial safety message
-and durable run before adoption or steering. Unavailable lookups wait;
-they never authorize a second worker. These calls have a ten-second bound.
+response the guard looks up the deterministic thread ID first. A matching
+thread is adopted after its user-message history confirms acceptance of the
+full saved safety prompt with a durable run. If complete history shows that
+initial message missing, the guard resumes that same launch through
+`POST /threads/:threadId/resume-launch`. The server reuses the original
+initial-message command and receipt, so a late original dispatch cannot accept
+a second run. Both paths apply the create API's prompt trimming. Pause is
+checked between history and recovery. It retains the launch payload and any restart
+report until acceptance is confirmed, including after strain clears. Only an
+authoritative missing thread permits a re-POST of the same create payload and
+request ID. Unavailable lookups or message history wait;
+they never authorize a second worker. HTTP requests allow 45 seconds; the
+parent bounds each isolated helper's full lifetime to 50 seconds in a background
+executor, leaving sampling and the strain ladder running. Pending launches
+reconcile on later ticks even after strain clears. `macguard.worker_create`
+and `macguard.worker_lookup` record `durationS` and failures (`timeout`,
+`http_status` with the status in `errno`, `bad_response`, or `unavailable`).
+
+Overload transitions (`host.overload`, emitted by the host sampler) also drive
+an immediate reclaim pass before the guard's fork-based probes. A fresh onset
+runs the installed janitor worker under its hourly lock (120-second timeout),
+reuses the GUI leak rule when recent footprint history is available, lowers
+eligible local builds/tests to nice 10 with `setpriority`, then starts or steers
+the existing critical worker. Offbox holders and their descendants are exempt
+from every guard action. Builds below providers, including release-build clones,
+remain eligible; the provider itself stays protected. This path never invokes
+`taskpolicy` or sends process signals of its own.
+
+Passes are limited to one per 20 minutes, persisted across restarts. A fresh
+peak can repeat the pass for the same episode after 20 minutes if the previous
+pass observed less than 1 GiB of RSS reduction. Unknown counters do not count
+as memory freed. RSS deltas are observations, not proof that the rung caused
+the decrease. No overload is inferred from raw load or missing samples.
+
+Read `guard.reclaim` rows in the mac day file and
+`~/.local/state/mac-guard/guard.log`. Each pass writes a census under the normal
+guard evidence directory, including the original overload row, families/spawn
+samples, kept identities, rung results and the never-touch list. The next
+host-vitals row after completion fills in pressure/swap after the pass;
+`after: null` means that row has not arrived. Worker delivery retries use the
+existing durable responder path, including its idempotent launch/steer IDs.
+Each rung also records the latest logged swap/pressure before and after it,
+with observation timestamps. A fresh janitor report with inventory problems
+produces `inventory-unavailable`, even if the worker exited zero; missing or
+stale reports are labelled. Priority actions retain individual command/syscall
+outcomes, bounded error reasons and numeric errno or exit codes. `gone` identifies
+an exited process. Softening uses renice only, skips nice values at least 10,
+and checks identity before reading back the new nice value. Action evidence
+survives the day-file cap.
+Install the corresponding janitor reporter update too: its scan timestamp must
+retain fractional seconds to pass the guard's strict report-freshness check.
 
 Pause with `touch ~/.local/state/mac-guard/paused`; remove that file to resume.
 `MAC_GUARD_DRY_RUN=1` records proposed actions while sending no signals,
