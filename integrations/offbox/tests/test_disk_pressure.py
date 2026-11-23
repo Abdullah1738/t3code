@@ -180,12 +180,74 @@ class ServerPressure(Base):
             boatd.disk_maintenance(self.con)
         self.assertEqual([c[3] for c in self.f.calls if c[:2]==('snapshot','delete')],['auto-0'])
 
-    def test_auto_snapshot_skips_below_floor(self):
-        bid=self.box()
-        with patch.object(disk,'sample',return_value=storage(0)),patch.object(boatd.toollog,'emit') as emit:
-            self.assertIsNone(boatd.snapshot(self.con,bid,'auto'))
-        self.assertFalse(any(c[:2]==('snapshot','create') for c in self.f.calls))
-        self.assertTrue(any(c.args[1]=='snapshot.skip' for c in emit.call_args_list))
+    def test_run_snapshots_at_ok_level_ignore_cleanup_shortfall(self):
+        bid = self.box()
+        for total, free, target, shortfall in ((1744, 95, 130, 35), (100, 30, 0, 0)):
+            for kind in boatd.RUN_KINDS:
+                with self.subTest(total=total, kind=kind):
+                    self.con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('disk_cleanup',?)",
+                                     (json.dumps({'target_bytes': target*G}),))
+                    self.f.calls.clear()
+                    with patch.object(disk, 'sample', return_value=storage(free*G, total*G)), \
+                            patch.object(boatd.toollog, 'emit') as emit:
+                        name = boatd.snapshot(self.con, bid, kind)
+                    self.assertIsNotNone(name)
+                    self.assertIn(('snapshot', 'create', boatd.ct(bid), name), self.f.calls)
+                    row = self.con.execute('SELECT kind FROM snaps WHERE box_id=? AND name=?', (bid, name)).fetchone()
+                    self.assertEqual(row['kind'], kind)
+                    value = json.loads(self.con.execute("SELECT v FROM meta WHERE k='disk'").fetchone()[0])
+                    self.assertEqual(value['level'], 'ok')
+                    self.assertEqual(value['cleanup']['shortfall_bytes'], shortfall*G)
+                    self.assertEqual(value['cleanup']['target_bytes'], target*G)
+                    self.assertFalse(any(c.args[1] == 'snapshot.skip' for c in emit.call_args_list))
+
+    def test_run_snapshots_skip_unsafe_levels_even_without_cleanup_shortfall(self):
+        bid = self.box()
+        for free, level in ((85, 'low'), (35, 'full'), (None, 'unknown')):
+            value = storage(free*G, 1744*G) if free is not None else {
+                'level': 'unknown', 'disk_full': False, 'disk_low': True, 'filesystems': [], 'errors': ['unreadable']}
+            self.assertEqual(value['level'], level)
+            for shortfall in (0, 35*G):
+                value['cleanup'] = {'shortfall_bytes': shortfall}
+                for kind in boatd.RUN_KINDS:
+                    with self.subTest(level=level, shortfall=shortfall, kind=kind), \
+                            patch.object(boatd, 'disk_maintenance', return_value=value), \
+                            patch.object(boatd.toollog, 'emit') as emit:
+                        self.assertIsNone(boatd.snapshot(self.con, bid, kind))
+                        emit.assert_called_once_with('boatd', 'snapshot.skip', ok=True, ids={'box': bid}, props={
+                            'snapshot': kind, 'bytes_freed': 0, 'reason': 'server_disk_low', 'disk': value})
+        self.assertFalse(any(c[:2] == ('snapshot', 'create') for c in self.f.calls))
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM snaps').fetchone()[0], 0)
+
+    def test_repository_run_snapshots_skip_over_budget_at_ok_level(self):
+        bid = self.box(name='offbox example | repository pool')
+        usage = {bid: {'snapshot_bytes': 8*G, 'live_bytes': 10*G}}
+        for kind in boatd.RUN_KINDS:
+            with self.subTest(kind=kind), patch.object(disk, 'sample', return_value=storage(95*G, 1744*G)), \
+                    patch.object(disk, 'inventory', return_value=(usage, [])), patch.object(boatd.toollog, 'emit') as emit:
+                self.assertIsNone(boatd.snapshot(self.con, bid, kind))
+            event = next(c for c in emit.call_args_list if c.args[1] == 'snapshot.skip')
+            self.assertEqual(event.kwargs['props']['reason'], 'snapshot_budget')
+            self.assertEqual(event.kwargs['props']['disk']['level'], 'ok')
+        self.assertFalse(any(c[:2] == ('snapshot', 'create') for c in self.f.calls))
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM snaps').fetchone()[0], 0)
+
+    def test_timer_snapshots_are_not_gated_by_disk_pressure_or_budget(self):
+        bid = self.box(name='offbox example | repository pool')
+        value = dict(storage(85*G, 1744*G), cleanup={'shortfall_bytes': 45*G},
+                     boxes={bid: {'snapshot_bytes': 8*G, 'live_bytes': 10*G}})
+        for level in ('ok', 'low', 'full', 'unknown'):
+            value['level'] = level
+            for kind in boatd.TIMER_KINDS:
+                with self.subTest(level=level, kind=kind), \
+                        patch.object(boatd, 'disk_maintenance', return_value=value) as maintenance, \
+                        patch.object(boatd.toollog, 'emit') as emit:
+                    name = boatd.snapshot(self.con, bid, kind)
+                    maintenance.assert_not_called()
+                self.assertIsNotNone(name)
+                self.assertIn(('snapshot', 'create', boatd.ct(bid), name), self.f.calls)
+                self.assertEqual(self.con.execute('SELECT kind FROM snaps WHERE name=?', (name,)).fetchone()['kind'], kind)
+                self.assertFalse(any(c.args[1] == 'snapshot.skip' for c in emit.call_args_list))
 
     def test_creates_resumes_and_starts_refused_without_mutation(self):
         bid=self.box()

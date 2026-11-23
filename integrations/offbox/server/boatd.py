@@ -1540,7 +1540,9 @@ def snapshot(con, box_id: str, kind: str, *, before_dispatch=None) -> str | None
         box = con.execute('SELECT name FROM boxes WHERE id=?', (box_id,)).fetchone()
         over_budget = bool(box and 'repository pool' in (box['name'] or '') and usage.get('live_bytes', 0) > 0
                            and usage.get('snapshot_bytes', 0) > disk.SNAPSHOT_RATIO * usage['live_bytes'])
-        if value['level'] in ('full', 'unknown') or (value.get('cleanup') or {}).get('shortfall_bytes', 0) or over_budget:
+        # Bclone deletes return about a quarter of their size, so big pools can stay short of cleanup's target
+        # for days at level ok. Only disk pressure or the box's snapshot budget gates run snapshots.
+        if value['level'] in ('low', 'full', 'unknown') or over_budget:
             toollog.emit('boatd', 'snapshot.skip', ok=True, ids={'box': box_id},
                          props={'snapshot': kind, 'bytes_freed': 0, 'reason': 'snapshot_budget' if over_budget else 'server_disk_low', 'disk': value})
             con.execute('DELETE FROM snapshot_pending WHERE box_id=? AND kind=? AND generation=?', (box_id, kind, generation))
