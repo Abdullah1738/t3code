@@ -100,8 +100,10 @@ class FakeHost:
 
     def soften(self, p):
         self.effects.append(('soften', p['pid']))
-        return dict(result='sent', stages=dict(renice=dict(rc=0, result='sent', stderr=''),
-                    identityRecheck=dict(same=True), taskpolicy=dict(rc=0, result='sent', stderr='')))
+        return dict(result='sent', niceBefore=0, niceAfter=20,
+                    stages=dict(identityRead=dict(result='sent', same=True), getpriority=dict(result='sent'),
+                                renice=dict(rc=0, result='sent'), identityRecheck=dict(result='sent', same=True),
+                                readBack=dict(result='sent')))
 
     def notify(self, key, text):
         self.effects.append(('notify', key, text))
@@ -126,10 +128,11 @@ class FakeHost:
     def worker_status(self, tid):
         return self.worker
 
-    def worker_send(self, tid, text, request_id=None):
-        if request_id is None or request_id not in self.sent_requests:
-            self.effects.append(('steer', tid, text))
-            self.sent_requests.add(request_id)
+    def worker_send(self, tid, text, request_id=None, mode='auto'):
+        identity = (tid, request_id)
+        if request_id is None or identity not in self.sent_requests:
+            self.effects.append(('steer', tid, text, mode))
+            self.sent_requests.add(identity)
 
     def worker_lookup(self, request_id):
         self.lookups.append(request_id)
@@ -347,6 +350,18 @@ class GuardTests(unittest.TestCase):
             self.tick([proc(10, cpu=540)])
         self.assertIn(('signal', 10, 'SIGCONT'), self.effects('signal'))
 
+    def test_already_nice_skip_does_not_stall_hog_ladder(self):
+        self.host.soften = lambda p:dict(result='skipped', reason='already-nice', niceBefore=20, niceAfter=20,
+                                        stages=dict(renice=dict(result='skipped', reason='already-nice')))
+        for i in range(10):
+            self.tick([proc(10, cpu=i*60)], load=200)
+            self.guard.drain(self.now-20)
+        self.assertIn(('signal', 10, 'SIGSTOP'), self.effects('signal'))
+        self.assertIn(('signal', 10, 'SIGTERM'), self.effects('signal'))
+        skipped = [e for e in self.events_named('action') if e['action'] == 'renice']
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]['reason'], 'already-nice')
+
     def test_gui_hogs_soften_only(self):
         for i in range(15):
             self.tick([proc(10, '/Applications/Dia.app/Contents/MacOS/Dia', cpu=i*60),
@@ -470,6 +485,238 @@ class GuardTests(unittest.TestCase):
         self.assertTrue(skipped)
         self.assertLessEqual(len(skipped), 11)
 
+    def test_worker_update_modes_for_each_gained_signal(self):
+        cases = [(None, [1], 'queue'), (None, [7], 'queue'),
+                 ([2], [1, 2], 'queue'), ([1], [1, 7], 'queue')]
+        cases += [([1], [1, signal], 'auto') for signal in (2, 3, 4, 5, 6)]
+        for before, signals, mode in cases:
+            with self.subTest(before=before, signals=signals):
+                self.guard.saved.pop('strainWorker', None)
+                self.guard.worker = dict(threadId='existing', startedAt=NOW)
+                self.guard.now = self.now
+                if before is not None:
+                    self.guard.record_strain_worker(before, self.guard.evidence)
+                self.guard.worker_needed(self.guard.evidence, 'strain update', signals=signals)
+                self.assertEqual(self.effects('steer')[-1][3], mode)
+                row = self.events_named('worker_steered')[-1]
+                self.assertEqual(row['mode'], mode)
+                self.assertEqual(toollog.safe_fields(row, 'macguard.worker_steered'), row)
+
+    def test_ongoing_urgent_signal_queues_after_ten_minutes(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        self.guard.now = NOW
+        self.guard.worker_needed(self.guard.evidence, 'lag', signals=[2])
+        self.guard.now += m.STRAIN_WORKER_INTERVAL
+        self.guard.worker_needed(self.guard.evidence, 'lag', signals=[2])
+        self.assertEqual([e[3] for e in self.effects('steer')], ['auto', 'queue'])
+        self.assertIn('still ongoing', self.effects('steer')[-1][2])
+
+    def census_report(self, signals=None):
+        key = 'overloadResponder:test'
+        report = dict(evidence=str(self.guard.evidence), summary='host.overload census',
+                      urgent=True, requestId='census-request')
+        if signals is not None:
+            report['signals'] = signals
+        self.guard.saved[key] = report
+        self.guard.save()
+        return key
+
+    def test_census_then_periodic_shares_record_across_strain_start_and_restart(self):
+        for observed in (None, [], [1]):
+            with self.subTest(observed=observed):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    case.guard.worker = dict(threadId='existing', startedAt=NOW)
+                    m.write_json(case.guard.state/'worker.json', case.guard.worker)
+                    case.guard.now = case.now
+                    if observed is not None:
+                        case.guard.saved['strainSignals'] = observed
+                    self.assertTrue(case.guard.deliver_responder(case.census_report()))
+                    record = copy.deepcopy(case.guard.saved['strainWorker'])
+                    case.restart_guard()
+                    case.now += 30
+                    case.tick([], load=100)
+                    case.tick([], load=100)
+                    self.assertEqual(len(case.effects('steer')), 1)
+                    self.assertEqual(case.effects('steer')[0][3], 'queue')
+                    self.assertEqual(case.guard.saved['strainWorker'], record)
+                    self.assertEqual(case.events_named('worker_skipped')[-1]['reason'], 'unchanged')
+                finally:
+                    case.doCleanups()
+
+    def test_periodic_then_census_suppresses_unless_new_signal(self):
+        for gained in (None, 2, 3, 4, 5, 6):
+            with self.subTest(gained=gained):
+                self.host.effects.clear()
+                self.host.sent_requests.clear()
+                self.guard.saved.pop('strainWorker', None)
+                self.guard.worker = dict(threadId='existing', startedAt=NOW)
+                self.guard.now = NOW
+                self.guard.worker_needed(self.guard.evidence, 'strain', signals=[1])
+                self.guard.now += 60
+                signals = [1, gained] if gained else [1]
+                key = self.census_report(signals)
+                self.assertEqual(bool(self.guard.deliver_responder(key)), bool(gained))
+                self.assertNotIn(key, self.guard.saved)
+                self.assertEqual(len(self.effects('steer')), 2 if gained else 1)
+                self.assertEqual(self.effects('steer')[-1][3], 'queue')
+
+    def test_census_unknown_signals_still_allows_new_urgent_signal(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        self.guard.now = NOW
+        self.guard.deliver_responder(self.census_report())
+        self.guard.now += 60
+        self.guard.worker_needed(self.guard.evidence, 'lag', signals=[1, 2])
+        self.assertEqual([e[3] for e in self.effects('steer')], ['queue', 'auto'])
+
+    def test_queued_census_cannot_cover_first_immediate_urgent_signal(self):
+        for signal in (2, 3, 4, 5, 6):
+            with self.subTest(signal=signal):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    case.guard.worker = dict(threadId='existing', startedAt=NOW)
+                    m.write_json(case.guard.state/'worker.json', case.guard.worker)
+                    case.guard.now = NOW
+                    case.guard.deliver_responder(case.census_report([signal]))
+                    case.restart_guard()
+                    case.guard.now = NOW+30
+                    case.guard.worker_needed(case.guard.evidence, 'urgent', signals=[signal])
+                    case.guard.now += 30
+                    case.guard.worker_needed(case.guard.evidence, 'urgent', signals=[signal])
+                    self.assertEqual([e[3] for e in case.effects('steer')], ['queue', 'auto'])
+                finally:
+                    case.doCleanups()
+
+    def test_census_between_first_lag_sample_and_strain_start(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        self.tick([], lag=8)
+        self.guard.deliver_responder(self.census_report())
+        self.tick([], lag=8)
+        self.assertEqual([e[3] for e in self.effects('steer')], ['queue', 'auto'])
+
+    def test_old_census_retry_never_replaces_newer_urgent_coverage(self):
+        sets = [[signal] for signal in (2, 3, 4, 5, 6)] + [[2, 4]]
+        for old in sets:
+            for new in sets:
+                with self.subTest(old=old, new=new):
+                    case = GuardTests()
+                    case.setUp()
+                    try:
+                        case.guard.worker = dict(threadId='existing', startedAt=NOW)
+                        case.guard.now = NOW
+                        key = case.census_report(old)
+                        with patch.object(case.host, 'worker_send', side_effect=m.ProbeError('unavailable')):
+                            case.guard.deliver_responder(key)
+                        case.guard.now += 30
+                        case.guard.worker_needed(case.guard.evidence, 'new emergency', signals=new)
+                        case.guard.now += 30
+                        case.guard.deliver_responder(key)
+                        case.guard.now += 30
+                        case.guard.worker_needed(case.guard.evidence, 'same emergency', signals=new)
+                        self.assertEqual([e[3] for e in case.effects('steer')], ['auto'])
+                        self.assertNotIn(key, case.guard.saved)
+                    finally:
+                        case.doCleanups()
+
+    def test_fresh_census_preserves_immediate_coverage_for_other_signals(self):
+        for before in (2, 3, 4, 5, 6):
+            for census in (2, 3, 4, 5, 6):
+                with self.subTest(before=before, census=census):
+                    case = GuardTests()
+                    case.setUp()
+                    try:
+                        case.guard.worker = dict(threadId='existing', startedAt=NOW)
+                        case.guard.now = NOW
+                        case.guard.worker_needed(case.guard.evidence, 'urgent', signals=[before])
+                        case.guard.now += 30
+                        case.guard.deliver_responder(case.census_report([census]))
+                        case.guard.now += 30
+                        case.guard.worker_needed(case.guard.evidence, 'unchanged', signals=[before])
+                        expected = ['auto'] if before == census else ['auto', 'queue']
+                        self.assertEqual([e[3] for e in case.effects('steer')], expected)
+                        case.guard.now += 30
+                        case.guard.worker_needed(case.guard.evidence, 'new urgent', signals=[census])
+                        self.assertEqual([e[3] for e in case.effects('steer')], expected+([] if before == census else ['auto']))
+                    finally:
+                        case.doCleanups()
+
+    def test_urgent_signal_regained_after_nonurgent_update_is_immediate(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        self.guard.now = NOW
+        for signals in ([2], [1], [1, 2]):
+            self.guard.worker_needed(self.guard.evidence, 'strain', signals=signals)
+            self.guard.now += 30
+        self.assertEqual([e[3] for e in self.effects('steer')], ['auto', 'queue', 'auto'])
+
+    def test_census_queue_lost_ack_replays_same_request_after_restart(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        m.write_json(self.guard.state/'worker.json', self.guard.worker)
+        self.guard.now = NOW
+        key = self.census_report([1])
+        send = self.host.worker_send
+        def lost_ack(*args, **kwargs):
+            send(*args, **kwargs)
+            raise m.ProbeError('timeout after delivery')
+        with patch.object(self.host, 'worker_send', side_effect=lost_ack):
+            self.assertFalse(self.guard.deliver_responder(key))
+        self.restart_guard()
+        self.guard.now = NOW+30
+        self.assertTrue(self.guard.deliver_responder(key))
+        self.assertNotIn(key, self.guard.saved)
+        self.assertEqual(len(self.effects('steer')), 1)
+        self.assertEqual(self.effects('steer')[0][3], 'queue')
+
+    def test_shared_record_does_not_suppress_replacement_worker(self):
+        self.guard.now = NOW
+        self.guard.worker = dict(threadId='old', startedAt=NOW)
+        self.guard.worker_needed(self.guard.evidence, 'strain', signals=[1])
+        self.guard.worker = dict(threadId='replacement', startedAt=NOW)
+        self.guard.worker_needed(self.guard.evidence, 'strain', signals=[1])
+        self.assertEqual([e[1] for e in self.effects('steer')], ['old', 'replacement'])
+
+    def test_census_retry_covers_periodic_until_pending_delivery_finishes(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        self.guard.now = NOW
+        key = self.census_report([1])
+        with patch.object(self.host, 'worker_send', side_effect=m.ProbeError('unavailable')):
+            self.guard.deliver_responder(key)
+            self.guard.now = NOW+570
+            self.guard.deliver_responder(key)
+        self.guard.now = NOW+600
+        self.guard.worker_needed(self.guard.evidence, 'strain', signals=[1])
+        self.guard.deliver_responder(key)
+        self.assertEqual(len(self.effects('steer')), 1)
+        self.assertIn('census', self.effects('steer')[0][2])
+
+    def test_pending_census_is_consumed_after_newer_urgent_signal(self):
+        self.guard.worker = dict(threadId='existing', startedAt=NOW)
+        self.guard.now = NOW
+        key = self.census_report([1])
+        with patch.object(self.host, 'worker_send', side_effect=m.ProbeError('unavailable')):
+            self.guard.deliver_responder(key)
+        self.guard.now = NOW+60
+        self.guard.worker_needed(self.guard.evidence, 'new lag', signals=[1, 2])
+        self.guard.now += 30
+        self.assertFalse(self.guard.deliver_responder(key))
+        self.assertNotIn(key, self.guard.saved)
+        self.assertEqual(len(self.effects('steer')), 1)
+        self.assertEqual(self.effects('steer')[0][3], 'auto')
+
+    def test_worker_send_mode_argv(self):
+        host = m.Host()
+        for mode in ('auto', 'queue'):
+            for request_id in (None, 'stable-request'):
+                with self.subTest(mode=mode, request_id=request_id), patch.object(host, 'cmd') as cmd:
+                    host.worker_send('worker', 'update', request_id, mode=mode)
+                    expected = [m.T3CTL, 'send', 'worker', 'update']
+                    if request_id:
+                        expected += ['--request-id', request_id]
+                    if mode == 'queue':
+                        expected += ['--mode', 'queue']
+                    cmd.assert_called_once_with(expected, 5)
+
     def test_strain_clear_sends_one_final_without_launching(self):
         self.tick([], lag=8)
         self.tick([], lag=8)
@@ -479,6 +726,7 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(len(self.effects('steer')), 1)
         self.assertIn('strain ended', self.effects('steer')[0][2])
         self.assertIn('300', self.effects('steer')[0][2])
+        self.assertEqual(self.effects('steer')[0][3], 'queue')
         self.tick([])
         self.restart_guard()
         self.tick([])
@@ -561,6 +809,7 @@ class GuardTests(unittest.TestCase):
         self.tick([proc(1, ROBOB)], {1: 25}, load=100)
         self.assertEqual(len(self.effects('steer')), 3)
         self.assertIn('Robob restart skipped', self.effects('steer')[-1][2])
+        self.assertEqual([e[3] for e in self.effects('steer')], ['queue', 'auto', 'auto'])
 
     def test_empty_signals_never_launch_in_calm_countdown(self):
         self.tick([], load=100)
@@ -586,8 +835,8 @@ class GuardTests(unittest.TestCase):
         self.guard.worker = dict(threadId='existing', startedAt=NOW)
         m.write_json(self.guard.state/'worker.json', self.guard.worker)
         send = self.host.worker_send
-        def lost_ack(*args):
-            send(*args)
+        def lost_ack(*args, **kwargs):
+            send(*args, **kwargs)
             raise m.ProbeError('timeout after delivery')
         with patch.object(self.host, 'worker_send', side_effect=lost_ack):
             self.tick([], lag=8)
@@ -681,10 +930,10 @@ class GuardTests(unittest.TestCase):
                         case.tick([])
                     send = case.host.worker_send
                     requests = []
-                    def deliver(tid, text, request_id=None):
+                    def deliver(tid, text, request_id=None, mode='auto'):
                         requests.append(request_id)
                         if failure == 'lost_ack' or len(requests) > 1:
-                            send(tid, text, request_id)
+                            send(tid, text, request_id, mode=mode)
                         if len(requests) == 1:
                             raise m.ProbeError('send unavailable')
                     status_result = dict(side_effect=m.ProbeError('unavailable')) if failure == 'status' else dict(return_value=case.host.worker)
@@ -697,9 +946,9 @@ class GuardTests(unittest.TestCase):
                     if failure == 'paused':
                         (case.guard.state/'paused').unlink()
                     # The successful retry uses the same identity after a lost ack.
-                    def retry(tid, text, request_id=None):
+                    def retry(tid, text, request_id=None, mode='auto'):
                         requests.append(request_id)
-                        send(tid, text, request_id)
+                        send(tid, text, request_id, mode=mode)
                     with patch.object(case.host, 'worker_send', side_effect=retry):
                         case.tick([])
                         case.tick([])
@@ -1150,23 +1399,77 @@ class GuardTests(unittest.TestCase):
         self.assertTrue(m.robob_descendant(self.guard.rows[11], self.guard.rows))
         self.assertFalse(m.robob(self.guard.rows[11], self.guard.rows))
 
-    def test_robob_descendant_signal_classes_and_provider_table(self):
-        for parent in ('server', 'provider'):
-            self.tick(robob_browser_tree(parent), load=100, lag=8)
-            self.guard.strain = True
+    def test_robob_descendant_signal_classes(self):
+        self.tick(robob_browser_tree(), load=100, lag=8)
+        self.guard.strain = True
+        for cls in ('A', 'B', 'C', 'D', 'G'):
+            for action in ('STOP', 'CONT', 'TERM', 'KILL'):
+                with self.subTest(cls=cls, action=action):
+                    self.assertFalse(self.guard.action(self.guard.rows[11], cls, action))
+                    row = self.events_named('action')[-1]
+                    self.assertEqual(row['result'], 'cancelled_protection')
+                    self.assertEqual(row['protectedBy'], 'robob-descendant')
+                    self.assertIn(row['protectedAncestor']['pid'], (1, 2))
+                    self.assertFalse(self.effects('signal'))
+                    logged = toollog.record('mac-guard', 'event', 'macguard.action',
+                                            dt.datetime.now(dt.timezone.utc), props=row)
+                    self.assertEqual(logged['props']['protectedBy'], 'robob-descendant')
+                    self.assertEqual(logged['props']['protectedAncestor']['pid'], row['protectedAncestor']['pid'])
+
+    def test_provider_boundary_signal_classes(self):
+        for command in ('claude', 'codex', 'opencode', 'gemini', 'cursor-agent', 'grok',
+                        'antigravity', '/Users/test/.robob/harness-cli/claude/current/bin/claude',
+                        'node /opt/@openai/codex/bin/codex.js'):
             for cls in ('A', 'B', 'C', 'D', 'G'):
                 for action in ('STOP', 'CONT', 'TERM', 'KILL'):
-                    with self.subTest(parent=parent, cls=cls, action=action):
-                        self.assertFalse(self.guard.action(self.guard.rows[11], cls, action))
+                    with self.subTest(command=command, cls=cls, action=action):
+                        self.setUp()
+                        rows = robob_browser_tree('provider')
+                        rows[2].update(comm=command.split()[0], args=command)
+                        self.tick(rows, load=100, lag=8)
+                        self.guard.strain = True
+                        sent = self.guard.action(self.guard.rows[11], cls, action)
                         row = self.events_named('action')[-1]
-                        self.assertEqual(row['result'], 'cancelled_protection')
-                        self.assertEqual(row['protectedBy'], 'robob-descendant')
-                        self.assertIn(row['protectedAncestor']['pid'], (1, 2))
-                        self.assertFalse(self.effects('signal'))
-                        logged = toollog.record('mac-guard', 'event', 'macguard.action',
-                                                dt.datetime.now(dt.timezone.utc), props=row)
-                        self.assertEqual(logged['props']['protectedBy'], 'robob-descendant')
-                        self.assertEqual(logged['props']['protectedAncestor']['pid'], row['protectedAncestor']['pid'])
+                        self.assertNotIn('protectedBy', row)
+                        self.assertNotIn('protectedAncestor', row)
+                        self.assertEqual(sent, cls != 'G')
+                        self.assertEqual(row['result'], 'cancelled_gui_authorization' if cls == 'G' else 'sent')
+                        self.assertTrue(m.exempt(self.guard.rows[3], self.guard.rows))
+
+    def test_live_safe_chain_job_below_claude_reaches_class_b_stop(self):
+        self.host.owners[50812] = 'ended'
+        for i in range(4):
+            rows = [proc(80256, ROBOB),
+                    proc(80622, 'node', ppid=80256, args='node apps/server/dist/bin.mjs --bootstrap-fd 3'),
+                    proc(62309, '/Users/test/.robob/harness-cli/claude/current/bin/claude', ppid=80622),
+                    proc(50001, 'zsh', ppid=62309, args='zsh -l'),
+                    proc(50002, 'zsh', ppid=50001, args='zsh -c job'),
+                    proc(50003, 'node', ppid=50002, args='node /opt/safe-chain/bin/safe-chain.js python3 probe.py'),
+                    proc(50004, 'python3', ppid=50003, args='python3 probe.py'),
+                    proc(50812, 'node', ppid=50004, args='node test.js', cpu=i*36)]
+            self.tick(rows, load=113, lag=8)
+        self.assertGreater(self.guard.rows[50812]['cpuDelta'], 100)
+        self.assertIn(('signal', 50812, 'SIGSTOP'), self.effects('signal'))
+        actions = [r for r in self.events_named('action') if r['pid'] == 50812]
+        self.assertIn(('B', 'STOP', 'sent'), [(r['actionClass'], r['action'], r['result']) for r in actions])
+        self.assertTrue(all('protectedBy' not in r and 'protectedAncestor' not in r for r in actions))
+        self.assertFalse(m.robob_descendant(self.guard.rows[50812], self.guard.rows))
+
+    def test_server_direct_mcp_and_checkpoint_are_signal_protected(self):
+        for comm, args in [('node', 'node /opt/mcp/server.js'), ('git', 'git update-ref refs/checkpoints/test')]:
+            with self.subTest(args=args):
+                self.tick(robob_browser_tree()[:2] + [proc(12, comm, ppid=2, args=args)])
+                self.guard.strain = True
+                self.assertEqual(m.robob_ancestor(self.guard.rows[12], self.guard.rows)['pid'], 2)
+                self.assertFalse(self.guard.action(self.guard.rows[12], 'D', 'TERM'))
+                self.assertEqual(self.events_named('action')[-1]['protectedBy'], 'robob-descendant')
+        self.assertFalse(self.effects('signal'))
+
+    def test_memory_runaway_below_provider_uses_existing_carve_out(self):
+        self.tick(robob_browser_tree('provider'), {11: 50})
+        self.assertIn(('signal', 11, 'SIGTERM'), self.effects('signal'))
+        self.assertEqual(self.events_named('memory_runaway')[0]['memoryClass'], 'carve-out')
+        self.assertTrue(all('protectedBy' not in r for r in self.events_named('action')))
 
     def test_same_browser_binary_without_robob_ancestry_can_be_signalled(self):
         self.tick(robob_browser_tree('standalone'), load=100, lag=8)

@@ -1,6 +1,7 @@
 """Consume host.overload transitions; never infer overload from host counters."""
 import ctypes as c
 import datetime as dt
+import errno as errno_codes
 import fcntl
 import json
 import math
@@ -209,8 +210,8 @@ def protection(p, rows, guard):
         return 'system-or-foreign-user'
     if not p.get('args') or not p.get('comm') or not p.get('start'):
         return 'unknown-identity'
-    # Provider ancestry alone does not protect builds; providers themselves and
-    # shell session wrappers stay protected.
+    # Builds below a provider are eligible; providers themselves and shell
+    # session wrappers stay protected. Never propagate protection to all builds.
     if any('/mac-logging/' in arg and Path(arg).name in ('host.py', 'mac_guard.py', 'guard_reclaim.py') for arg in words(p)):
         return 'guard-or-host-sampler'
     if guard(p, rows):
@@ -314,6 +315,8 @@ class Darwin:
                 value = operation()
             except (OSError, ValueError) as exc:
                 failure = failure_details(exc, stage)
+                if failure.get('errno') is None and failure.get('rc') is None:
+                    failure['errno'] = errno_codes.EINVAL if isinstance(exc, ValueError) else errno_codes.EIO
                 stages[stage] = failure
                 return dict(outcome, stage=stage, **failure)
             stages[stage] = dict(result='sent')
@@ -325,6 +328,10 @@ class Darwin:
                     return dict(outcome, result='identity-changed')
             elif stage == 'getpriority':
                 outcome['niceBefore'] = value
+                if value >= 10:
+                    outcome['niceAfter'] = value
+                    stages['setpriority'] = dict(result='skipped', reason='already-nice')
+                    return dict(outcome, result='skipped', reason='already-nice')
             elif stage == 'readBack':
                 outcome['niceAfter'] = value
         return dict(outcome, result='sent')
@@ -597,5 +604,5 @@ class Reclaimer:
             self.save()
         self.log(passId=key.split(':', 1)[1], step='worker', evidence=report['evidence'],
                  workerDelivered=bool(delivered), workerStarted=self.last_worker_started, threadId=g.worker.get('threadId'),
-                 result='delivered' if delivered else 'pending')
+                 result='delivered' if delivered else 'suppressed' if report.get('suppressed') else 'pending')
         return bool(delivered)

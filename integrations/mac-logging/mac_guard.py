@@ -56,6 +56,7 @@ WORKER = ('codex', 'gpt-6.1-sol')
 WORKER_HTTP_TIMEOUT = 45
 WORKER_HELPER_TIMEOUT = 50
 STRAIN_WORKER_INTERVAL = 600
+STEER_SIGNALS = {2, 3, 4, 5, 6}
 LOAD_ONLY_WORKER_DELAY = 600
 WORKER_SKIP_LOG_INTERVAL = 60
 STATE = Path.home() / '.local/state/mac-guard'
@@ -217,8 +218,18 @@ def robob(p, rows):
     return False
 
 
+def robob_ancestor(p, rows):
+    # chain() is nearest-parent first; provider jobs do not inherit app protection.
+    for ancestor in chain(p, rows):
+        if provider(ancestor):
+            return None
+        if robob(ancestor, rows):
+            return ancestor
+    return None
+
+
 def robob_descendant(p, rows):
-    return any(robob(a, rows) for a in chain(p, rows))
+    return robob_ancestor(p, rows) is not None
 
 
 def label(p, rows):
@@ -363,6 +374,8 @@ class Host:
             return dict(same=(len(args) == 6 and ' '.join(args[:5]) == p['start']
                     and hashlib.sha256(args[5].encode()).hexdigest() == p.get('argsHash', hashlib.sha256(p['args'].encode()).hexdigest())))
         except (ProbeError, OSError) as exc:
+            if isinstance(exc, ProbeError) and exc.rc == 1 and not exc.stderr:
+                return dict(same=False, result='gone', errno=errno_codes.ESRCH)
             return dict(same=False, **failure_details(exc, 'ps'))
 
     def same_birth(self, p):
@@ -376,38 +389,58 @@ class Host:
         os.kill(p['pid'], sig)
 
     def soften(self, p):
-        def send(argv):
-            try:
-                self.cmd(argv, 2)
-                return dict(rc=0, result='sent', stderr='')
-            except (ProbeError, OSError) as exc:
-                return failure_details(exc, argv[0])
-        renice = send(['/usr/bin/renice', '20', '-p', str(p['pid'])])
-        identity = self.identity_recheck(p)
-        # Text-only ESRCH reports need a failed identity check as corroboration.
-        for outcome in (renice, identity):
-            if not identity['same'] and re.search(r'no such process', outcome.get('stderr', ''), re.I):
-                outcome.update(result='gone', errno=errno_codes.ESRCH)
-        if renice['result'] != 'sent':
-            taskpolicy = dict(result='skipped', reason='renice-failed')
-        elif not identity['same']:
-            taskpolicy = dict(result='skipped', reason='identity-changed')
-        else:
-            taskpolicy = send(['/usr/bin/taskpolicy', '-b', '-p', str(p['pid'])])
-            if (taskpolicy['result'] == 'error' and re.search(r'no such process', taskpolicy.get('stderr', ''), re.I)
-                    and not self.identity(p)):
-                taskpolicy.update(result='gone', errno=errno_codes.ESRCH)
-        stages = dict(renice=renice, identityRecheck=identity, taskpolicy=taskpolicy)
-        failed = next((s for s in stages.values() if s.get('result') == 'gone'), None)
-        if failed:
-            result = 'gone'
-        elif renice['result'] != 'sent':
-            result, failed = 'error', renice
-        else:
-            failed = next((s for s in (identity, taskpolicy) if s.get('result') == 'error'), None)
-            result = 'partial' if failed else 'sent'
-        return dict(result=result, stages=stages, errno=failed.get('errno') if failed else None,
-                    **(dict(reason=failed['reason']) if failed else {}))
+        # Renice is bounded in a helper; Darwin background mode can starve lock holders.
+        stages = {name:dict(result='skipped', reason='prior-stage-failed')
+                  for name in ('identityRead', 'getpriority', 'renice', 'identityRecheck', 'readBack')}
+        outcome = dict(stages=stages)
+
+        def finish(stage, value):
+            value = {k:v for k,v in value.items() if v is not None}
+            if value.get('result') == 'error' and not any(type(value.get(k)) is int for k in ('errno', 'rc')):
+                value['errno'] = errno_codes.EIO
+            stages[stage] = value
+            return dict(outcome, stage=stage, **value)
+
+        def identify(stage):
+            identity = self.identity_recheck(p)
+            if identity['same']:
+                stages[stage] = dict(result='sent', same=True)
+                return None
+            result = identity.get('result', 'identity-changed')
+            return finish(stage, dict(identity, result=result, reason=identity.get('reason', result)))
+
+        changed = identify('identityRead')
+        if changed:
+            return changed
+        try:
+            outcome['niceBefore'] = os.getpriority(os.PRIO_PROCESS, p['pid'])
+        except OSError as exc:
+            return finish('getpriority', failure_details(exc, 'getpriority'))
+        stages['getpriority'] = dict(result='sent')
+        if outcome['niceBefore'] >= 10:
+            outcome['niceAfter'] = outcome['niceBefore']
+            return finish('renice', dict(result='skipped', reason='already-nice'))
+        try:
+            self.cmd(['/usr/bin/renice', '20', '-p', str(p['pid'])], 2)
+        except (ProbeError, OSError) as exc:
+            failure = failure_details(exc, 'renice')
+            if re.search(r'no such process', failure.get('stderr', ''), re.I):
+                identify('identityRecheck')
+                identity = stages['identityRecheck']
+                if not identity['same'] and identity.get('result') != 'error':
+                    failure.update(result='gone', errno=errno_codes.ESRCH)
+            return finish('renice', failure)
+        stages['renice'] = dict(result='sent', rc=0)
+        changed = identify('identityRecheck')
+        if changed:
+            return changed
+        try:
+            outcome['niceAfter'] = os.getpriority(os.PRIO_PROCESS, p['pid'])
+        except OSError as exc:
+            return finish('readBack', failure_details(exc, 'getpriority'))
+        if outcome['niceAfter'] != 20:
+            return finish('readBack', dict(result='error', errno=errno_codes.EIO, reason='nice-readback-mismatch'))
+        return finish('readBack', dict(result='sent'))
 
     def app_info(self, p):
         try:
@@ -466,8 +499,9 @@ class Host:
             raise ValueError('unreadable thread')
         return value
 
-    def worker_send(self, tid, text, request_id=None):
-        self.cmd([T3CTL, 'send', tid, text]+(['--request-id', request_id] if request_id else []), 5)
+    def worker_send(self, tid, text, request_id=None, mode='auto'):
+        self.cmd([T3CTL, 'send', tid, text]+(['--request-id', request_id] if request_id else [])
+                 +(['--mode', mode] if mode != 'auto' else []), 5)
 
     def worker_request(self, method, path, body=None):
         self.worker_duration = None
@@ -772,7 +806,7 @@ class Guard:
         gui_job = self.gui_jobs.get((p['pid'], p['start']))
         gui_ok = (cls == 'G' and gui_job and gui_job['phase'] == 'force'
                   and self.gui_force_growth(p, gui_job) and self.gui_allowed(p, gui_job))
-        ancestor = next((a for a in chain(p, self.rows) if robob(a, self.rows)), None)
+        ancestor = robob_ancestor(p, self.rows)
         if cls == 'G':
             safe = gui_ok
         elif cls == 'D' or action == 'CONT':
@@ -820,14 +854,22 @@ class Guard:
         value = dict(pid=p['pid'], start=p['start'], comm=p['comm'], args=command_label(p.get('args', '')),
                      action=action, result=result, errno=errno, actionClass=cls, owner=p.get('owner', {}).get('state', 'unknown'),
                      cpuDelta=p.get('cpuDelta', 0), footprintGiB=p.get('footprintGiB'), label=label(p, self.rows))
-        value.update({k:details[k] for k in ('stages', 'reason') if k in details})
+        value.update({k:details[k] for k in ('stages', 'stage', 'reason', 'rc', 'niceBefore', 'niceAfter') if k in details})
         if ancestor:
             value.update(protectedBy='robob-descendant', protectedAncestor={k: ancestor[k] for k in ('pid', 'start', 'comm')})
+        if action == 'renice' and result == 'error':
+            value.setdefault('stage', 'renice')
+            if errno is None:
+                if type(value.get('rc')) is int:
+                    value.pop('errno')
+                else:
+                    value['errno'] = errno_codes.EIO
         if cls == 'G':
             value.update(step='force-quit', **{k: p.get(k) for k in ('app', 'bundleId', 'growthGiBHour', 'footprintSeries')})
         self.actions.append(value)
         self.log('action', **value)
         performed = (result == 'sent' or details.get('stages', {}).get('renice', {}).get('result') == 'sent'
+                     or action == 'renice' and result == 'skipped' and details.get('reason') == 'already-nice'
                      or self.dry and allowed and safe and matched)
         if performed:
             if cls == 'G' and action == 'KILL' and gui_job:
@@ -1065,25 +1107,57 @@ class Guard:
         self.log('worker_skipped', reason=reason, signals=signals, evidence=str(path))
         self.save()
 
-    def record_strain_worker(self, signals, path):
-        # Reserve before send: a timeout can still have delivered the steer.
-        self.saved['strainWorker'] = dict(signals=sorted(set(signals)), at=self.now, evidence=str(path))
+    def record_strain_worker(self, signals, path, request_id=None, mode='auto', census=False):
+        # Both triggers reserve before sending: a timeout may still be accepted.
+        tid = self.worker.get('threadId')
+        if not tid and self.worker.get('launchUnknown'):
+            tid = worker_thread_id(self.worker['launch']['clientRequestId'])
+        last = self.strain_worker_change(signals)[0]
+        # Queued census coverage cannot stand in for an immediate urgent update.
+        immediate = set(last.get('immediateSignals', last['signals'] or [])) if last else set()
+        if mode == 'auto':
+            immediate = set(signals or []) & STEER_SIGNALS
+        elif not census:
+            immediate &= set(signals or [])
+        self.saved['strainWorker'] = dict(signals=sorted(set(signals)) if signals is not None else None,
+                                        at=self.now, evidence=str(path), threadId=tid, requestId=request_id,
+                                        immediateSignals=sorted(immediate))
         self.save()
 
-    def worker_needed(self, path, summary, urgent=False, delivery=None, signals=None, allow_launch=True):
-        if signals is not None:
+    def strain_worker_change(self, signals, immediate=False):
+        last = self.saved.get('strainWorker')
+        tid = self.worker.get('threadId')
+        if not tid and self.worker.get('launchUnknown'):
+            tid = worker_thread_id(self.worker['launch']['clientRequestId'])
+        if last and last.get('threadId', tid) != tid:
+            last = None
+        gained = set(signals or [])
+        if last:
+            # An onset can precede the first sample. Its census covers load/slow
+            # strain, but a newly observed emergency must still reach the worker.
+            gained = gained & STEER_SIGNALS if last['signals'] is None else gained-set(last['signals'])
+            if immediate:
+                covered = set(last.get('immediateSignals', last['signals'] or []))
+                gained = (gained-STEER_SIGNALS) | ((set(signals or []) & STEER_SIGNALS)-covered)
+        recent = last and not gained and 0 <= self.now-last['at'] < STRAIN_WORKER_INTERVAL
+        return last, gained, bool(recent)
+
+    def worker_needed(self, path, summary, urgent=False, delivery=None, signals=None, allow_launch=True,
+                      mode='auto', census=False):
+        if signals is not None and not census:
             if not signals:
                 self.worker_skipped('empty_signals', signals, path)
                 return
-            last = self.saved.get('strainWorker')
-            if last and not set(signals)-set(last['signals']):
-                if 0 <= self.now-last['at'] < STRAIN_WORKER_INTERVAL:
-                    self.worker_skipped('unchanged', signals, path)
-                    return
+            last, gained, recent = self.strain_worker_change(signals, immediate=True)
+            if recent:
+                self.worker_skipped('unchanged', signals, path)
+                return
+            mode = 'auto' if gained & STEER_SIGNALS else 'queue'
+            if last and not gained:
                 summary += '; still ongoing'
         if self.muted:
             self.log('worker_steered' if self.worker.get('threadId') else 'worker_spawned',
-                     result='would_act', evidence=str(path), summary=summary)
+                     result='would_act', evidence=str(path), summary=summary, mode=mode)
             return
         if self.worker.get('launchUnknown'):
             if not self.launch_worker(path, reconcile=True):
@@ -1100,16 +1174,21 @@ class Guard:
             if not ended:
                 if self.muted:
                     return
-                if signals is not None:
-                    self.record_strain_worker(signals, path)
+                if census and self.strain_worker_change(signals)[2]:
+                    delivery['suppressed'] = True
+                    self.worker_skipped('unchanged', signals, path)
+                    return
+                if delivery is not None:
+                    delivery.update(threadId=tid, mode=mode)
+                if signals is not None or census:
+                    self.record_strain_worker(signals, path, delivery['requestId'] if delivery is not None else None,
+                                              mode=mode, census=census)
+                elif delivery is not None:
+                    self.save()
                 try:
-                    if delivery is not None:
-                        delivery['threadId'] = tid
-                        self.save()
-                        self.host.worker_send(tid, str(path)+'\n'+summary, delivery['requestId'])
-                    else:
-                        self.host.worker_send(tid, str(path)+'\n'+summary)
-                    self.log('worker_steered', threadId=tid, evidence=str(path))
+                    self.host.worker_send(tid, str(path)+'\n'+summary,
+                                          delivery['requestId'] if delivery is not None else None, mode=mode)
+                    self.log('worker_steered', threadId=tid, evidence=str(path), mode=mode)
                     return True
                 except (ProbeError, OSError):
                     self.log('error', probe='worker_send', failure='unavailable')
@@ -1137,7 +1216,7 @@ class Guard:
             delivery.update(launch=launch, startedAt=self.now)
             self.save()
         write_json(self.state/'worker.json', self.worker)
-        if signals is not None:
+        if signals is not None or census:
             self.record_strain_worker(signals, path)
         return self.launch_worker(path)
 
@@ -1179,6 +1258,10 @@ class Guard:
         if not report or self.muted or self.now < report.get('nextAttemptAt', 0):
             return
         report['nextAttemptAt'] = self.now+30
+        census = key.startswith('overloadResponder:')
+        mode = report.get('mode', 'queue' if census or key.startswith('strainClearResponder:') else 'auto')
+        if census:
+            report.setdefault('signals', self.saved.get('strainSignals') or None)
         self.save()
         # A lost acknowledgment may belong to a worker that has since ended.
         # Replay its original operation, without selecting a new worker.
@@ -1204,16 +1287,26 @@ class Guard:
             elif report.get('threadId'):
                 if self.muted:
                     return
-                self.host.worker_send(report['threadId'], report['evidence']+'\n'+report['summary'], report['requestId'])
-                self.log('worker_steered', threadId=report['threadId'], evidence=report['evidence'])
-                delivered = True
+                if census and report['threadId'] == self.worker.get('threadId'):
+                    last = self.strain_worker_change(report['signals'])[0]
+                    if last and last.get('requestId') != report['requestId']:
+                        report['suppressed'] = True
+                        self.worker_skipped('unchanged', report['signals'], Path(report['evidence']))
+                    else:
+                        self.record_strain_worker(report['signals'], Path(report['evidence']), report['requestId'],
+                                                  mode=mode, census=True)
+                delivered = not report.get('suppressed')
+                if delivered:
+                    self.host.worker_send(report['threadId'], report['evidence']+'\n'+report['summary'], report['requestId'], mode=mode)
+                    self.log('worker_steered', threadId=report['threadId'], evidence=report['evidence'], mode=mode)
             else:
                 delivered = self.worker_needed(Path(report['evidence']), report['summary'], urgent=report['urgent'],
-                                               delivery=report)
+                                               delivery=report, mode=mode, census=census,
+                                               signals=report['signals'] if census else None)
         except (ProbeError, OSError, ValueError, KeyError):
             self.log('error', probe=key, failure='unavailable')
             return
-        if delivered:
+        if delivered or report.get('suppressed'):
             self.saved.pop(key)
             self.save()
         return bool(delivered)
@@ -1463,13 +1556,13 @@ class Guard:
                        and any(self.gui_allowed(p) for p in slow if gui(p)))
         if slow_strain:
             signals.append(7)
+        self.saved['strainSignals'] = signals
         self.runnable = [p for p in self.rows.values() if p['state'].startswith('R')]
         self.r_zero = dict(Counter(p['family'] for p in self.runnable if p['cpuDelta'] == 0))
         self.streak = self.streak+1 if signals else 0
         self.calm = 0 if signals else self.calm+1
         if not self.strain and (self.streak >= 2 or memory or robob_trip or slow_strain):
             self.strain, self.since = True, now
-            self.saved.pop('strainWorker', None)
             self.log('strain_start', signals=signals)
         if self.strain and self.calm >= 10:
             self.strain = False

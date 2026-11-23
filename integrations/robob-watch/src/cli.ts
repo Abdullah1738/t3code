@@ -295,6 +295,7 @@ async function main(argv: string[]): Promise<void> {
       if (wakeRoute) process.stderr.write(`Note for ${w.id}: ${wakeRoute.route === "refused" ? `wakes go to the owner chat (${wakeRoute.reason}; creator is not a live thread)` : wakeRoute.note}\n`);
       console.log(JSON.stringify({ watcher: { ...w, urgent: w.urgent === true }, state: s, status: statusLabel(w, s), dir: watcherDir(w.id), ...(wakeRoute ? { wake_route: wakeRoute } : {}) }, null, 2));
       for (const entry of [s.confirm, ...(s.confirmations ?? [])]) {
+        if (entry?.thread && !entry.ownerFallback) console.log(`confirmation=pending run=${entry.runId?.split(":ordinal:").at(-1) ?? "unknown"} state=${entry.runState ?? "unknown"}`);
         if (entry?.sendPending) console.log(`send=deferred attempts=${entry.sendAttempts ?? 0} next_retry=${entry.nextAt ? new Date(entry.nextAt).toISOString() : "due"}`);
       }
       if (s.load_timeouts) console.log(`load-timeouts ${s.load_timeouts}`);

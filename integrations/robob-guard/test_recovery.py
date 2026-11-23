@@ -17,6 +17,21 @@ from guard_test_support import GuardTestCase
 from hold import Holds
 
 
+
+# Backend recovery simulations own their inputs; TCC behavior is tested separately.
+def setUpModule():
+    global tcc_patch, tier_patch
+    tcc_patch = patch("guard.tcc_jam_tick")
+    tcc_patch.start()
+    tier_patch = patch("guard.protected_tier_tick")
+    tier_patch.start()
+
+
+def tearDownModule():
+    tier_patch.stop()
+    tcc_patch.stop()
+
+
 class StaleRegistrationTests(GuardTestCase):
     def process_run(self, command, **kwargs):
         if command[0] == "/usr/bin/lsappinfo":
@@ -520,6 +535,12 @@ class HealthTests(GuardTestCase):
 
 class LateRecoveryTests(GuardTestCase):
     identity = "Mon Nov 16 07:24:59 2026"
+
+    def setUp(self):
+        super().setUp()
+        diagnostics = patch("guard.process_diagnostics", return_value="fixture")
+        diagnostics.start()
+        self.addCleanup(diagnostics.stop)
 
     def seed(self, home):
         started = time.mktime(time.strptime(self.identity, "%a %b %d %H:%M:%S %Y"))

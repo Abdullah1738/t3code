@@ -137,6 +137,21 @@ class XcodeTests(JanitorTestCase):
         send.assert_not_called()
         self.assertEqual(action['protectedBy'], 'robob-descendant')
 
+    def test_xcode_below_robob_provider_still_stops(self):
+        self.rows[1]['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+        self.rows[2] = dict(self.rows[10], pid=2, ppid=1, args='node apps/server/dist/bin.mjs --bootstrap-fd 3')
+        self.rows[3] = dict(self.rows[10], pid=3, ppid=2, args='/opt/codex exec')
+        self.rows[10].update(ppid=3, args='/bin/zsh build.sh')
+        self.after = copy.deepcopy(self.rows)
+        report = self.detect()
+        self.assertEqual([p['pid'] for p in report['candidates']], [20])
+        send = Mock()
+        action = self.stop(report, send=send)[0]
+        self.assertIn(dict(pid=20, signal='SIGTERM'), action['signals'])
+        self.assertIn(dict(pid=20, signal='SIGKILL'), action['signals'])
+        self.assertNotIn('protectedBy', action)
+        self.assertTrue(send.called)
+
     def test_robob_ancestry_rechecked_before_xcode_kill(self):
         send = Mock()
         def pause(seconds):

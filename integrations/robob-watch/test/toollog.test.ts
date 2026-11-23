@@ -395,7 +395,7 @@ test("relay metadata keeps bounded values and rejects text in every new field", 
 
 test('queued wakes retain route and confirmation metadata and count as sent only after confirmation', async () => {
   const dir = fixture();
-  toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: false,
+  toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: true,
     props: { via: 'thread:abcd1234', confirmed: 'pending', accepted: true } });
   toolLog({ component: 'wakes', kind: 'event', name: 'wake.sent', ok: false,
     props: { via: 'wake:owner-fallback', meant_for: 'abcd1234', confirmed: 'pending', accepted: true } });
