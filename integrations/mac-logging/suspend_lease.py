@@ -194,18 +194,20 @@ class Host:
         services = {int(f[0]) for line in r.stdout.splitlines()
                     if len(f := line.split()) == 3 and f[0].isdigit()
                     and f[2].startswith(PROTECTED['service_labels'])}
-        seen = set()
+        seen, below_provider = set(), False
         while p and p['pid'] not in seen:
             seen.add(p['pid'])
+            # Service membership continues across providers; app ancestry does not.
             if p['pid'] in services:
                 return True
-            if p.get('robobServer') or p['comm'].startswith(PROTECTED['robob_app']):
+            if not below_provider and (p.get('robobServer') or p['comm'].startswith(PROTECTED['robob_app'])):
                 return True
             if p['ppid'] == 1:
                 return False
             parent = self.process(p['ppid'])
             if parent is None:
                 raise OSError('parent protection lookup changed')
+            below_provider = below_provider or provider_process(parent)
             p = parent
             if len(seen) >= 32:
                 raise OSError('parent protection chain too deep')

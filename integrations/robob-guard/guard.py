@@ -17,6 +17,9 @@ import threading
 import time
 from urllib.parse import urlsplit
 from protected_tier import tick as protected_tier_tick
+from tcc_jam import tick as tcc_jam_tick
+from tcc_jam import run as tcc_bounded_run
+from tcc_jam import validate_state as tcc_validate_state
 
 APP = "/Applications/Robob.app"
 EXECUTABLE = APP + "/Contents/MacOS/Robob"
@@ -265,6 +268,9 @@ def read_state(path):
     defaults = initial_state()
     if not isinstance(state, dict):
         return defaults
+    if "tcc_jam" in state:
+        defaults["tcc_jam"] = tcc_validate_state(state["tcc_jam"])
+        state["tcc_jam"] = defaults["tcc_jam"]
     state = dict(defaults, **state)
     for key in ("down_count", "backoff_step", "failed_reopens", "unready_ticks", "check_error_count"):
         if type(state[key]) is not int or state[key] < 0:
@@ -649,7 +655,9 @@ def reopen(home):
 def notify(home, key, alert):
     dubai = datetime.timezone(datetime.timedelta(hours=4), "Dubai")
     when = datetime.datetime.fromtimestamp(alert["at"], dubai).strftime("%d %b %H:%M:%S Dubai")
-    if alert["kind"] == "orphan-backend":
+    if alert["kind"] == "tcc-jam":
+        event, followup = alert["text"], ""
+    elif alert["kind"] == "orphan-backend":
         backend = alert.get("backend")
         if backend:
             try:
@@ -672,11 +680,19 @@ def notify(home, key, alert):
     command = [str(home / ".bun/bin/bun"), str(home / ".local/share/telegram-bridge/src/cli.ts"),
                "notify", "--source", "Robob guard", "--severity", "attention",
                "--text", event + " at " + when + followup, "--key", key]
+    alert["notification_text"] = event + " at " + when + followup
+    if alert["kind"] == "tcc-jam":
+        receipt = tcc_bounded_run(command, 20, env=clean_environment(home))
+        alert["exit_code"] = receipt["exit_code"]
+        return receipt["exit_code"] == 0
     try:
-        subprocess.run(command, env=clean_environment(home), stdin=subprocess.DEVNULL,
-                       capture_output=True, check=True, timeout=30)
+        result = subprocess.run(command, env=clean_environment(home), stdin=subprocess.DEVNULL,
+                                capture_output=True, check=True,
+                                timeout=20 if alert["kind"] == "tcc-jam" else 30)
+        alert["exit_code"] = result.returncode
         return True
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as error:
+        alert["exit_code"] = getattr(error, "returncode", None)
         return False
 
 
@@ -693,6 +709,12 @@ def check(home):
         state_path = root / "state.json"
         hold_path = home / ".robob/install-hold.json"
         previous = read_state(state_path)
+        # Persist independently of later backend failures or recovery decisions.
+        try:
+            tcc_jam_tick(home, previous, now, lambda: atomic_json(state_path, previous), notify)
+            atomic_json(state_path, previous)
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+            append_log(root / "guard.log", now, ["tcc-check-error"], "none", type(error).__name__)
         hold = read_json(hold_path, {"by": "invalid"}) if hold_path.exists() else None
         ssd_block, ssd_block_live, ssd_statuses = read_ssd_block(home, now)
         up = None

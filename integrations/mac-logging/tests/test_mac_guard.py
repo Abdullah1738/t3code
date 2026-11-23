@@ -1164,23 +1164,77 @@ class GuardTests(unittest.TestCase):
         self.assertTrue(m.robob_descendant(self.guard.rows[11], self.guard.rows))
         self.assertFalse(m.robob(self.guard.rows[11], self.guard.rows))
 
-    def test_robob_descendant_signal_classes_and_provider_table(self):
-        for parent in ('server', 'provider'):
-            self.tick(robob_browser_tree(parent), load=100, lag=8)
-            self.guard.strain = True
+    def test_robob_descendant_signal_classes(self):
+        self.tick(robob_browser_tree(), load=100, lag=8)
+        self.guard.strain = True
+        for cls in ('A', 'B', 'C', 'D', 'G'):
+            for action in ('STOP', 'CONT', 'TERM', 'KILL'):
+                with self.subTest(cls=cls, action=action):
+                    self.assertFalse(self.guard.action(self.guard.rows[11], cls, action))
+                    row = self.events_named('action')[-1]
+                    self.assertEqual(row['result'], 'cancelled_protection')
+                    self.assertEqual(row['protectedBy'], 'robob-descendant')
+                    self.assertIn(row['protectedAncestor']['pid'], (1, 2))
+                    self.assertFalse(self.effects('signal'))
+                    logged = toollog.record('mac-guard', 'event', 'macguard.action',
+                                            dt.datetime.now(dt.timezone.utc), props=row)
+                    self.assertEqual(logged['props']['protectedBy'], 'robob-descendant')
+                    self.assertEqual(logged['props']['protectedAncestor']['pid'], row['protectedAncestor']['pid'])
+
+    def test_provider_boundary_signal_classes(self):
+        for command in ('claude', 'codex', 'opencode', 'gemini', 'cursor-agent', 'grok',
+                        'antigravity', '/Users/test/.robob/harness-cli/claude/current/bin/claude',
+                        'node /opt/@openai/codex/bin/codex.js'):
             for cls in ('A', 'B', 'C', 'D', 'G'):
                 for action in ('STOP', 'CONT', 'TERM', 'KILL'):
-                    with self.subTest(parent=parent, cls=cls, action=action):
-                        self.assertFalse(self.guard.action(self.guard.rows[11], cls, action))
+                    with self.subTest(command=command, cls=cls, action=action):
+                        self.setUp()
+                        rows = robob_browser_tree('provider')
+                        rows[2].update(comm=command.split()[0], args=command)
+                        self.tick(rows, load=100, lag=8)
+                        self.guard.strain = True
+                        sent = self.guard.action(self.guard.rows[11], cls, action)
                         row = self.events_named('action')[-1]
-                        self.assertEqual(row['result'], 'cancelled_protection')
-                        self.assertEqual(row['protectedBy'], 'robob-descendant')
-                        self.assertIn(row['protectedAncestor']['pid'], (1, 2))
-                        self.assertFalse(self.effects('signal'))
-                        logged = toollog.record('mac-guard', 'event', 'macguard.action',
-                                                dt.datetime.now(dt.timezone.utc), props=row)
-                        self.assertEqual(logged['props']['protectedBy'], 'robob-descendant')
-                        self.assertEqual(logged['props']['protectedAncestor']['pid'], row['protectedAncestor']['pid'])
+                        self.assertNotIn('protectedBy', row)
+                        self.assertNotIn('protectedAncestor', row)
+                        self.assertEqual(sent, cls != 'G')
+                        self.assertEqual(row['result'], 'cancelled_gui_authorization' if cls == 'G' else 'sent')
+                        self.assertTrue(m.exempt(self.guard.rows[3], self.guard.rows))
+
+    def test_live_safe_chain_job_below_claude_reaches_class_b_stop(self):
+        self.host.owners[50812] = 'ended'
+        for i in range(4):
+            rows = [proc(80256, ROBOB),
+                    proc(80622, 'node', ppid=80256, args='node apps/server/dist/bin.mjs --bootstrap-fd 3'),
+                    proc(62309, '/Users/test/.robob/harness-cli/claude/current/bin/claude', ppid=80622),
+                    proc(50001, 'zsh', ppid=62309, args='zsh -l'),
+                    proc(50002, 'zsh', ppid=50001, args='zsh -c job'),
+                    proc(50003, 'node', ppid=50002, args='node /opt/safe-chain/bin/safe-chain.js python3 probe.py'),
+                    proc(50004, 'python3', ppid=50003, args='python3 probe.py'),
+                    proc(50812, 'node', ppid=50004, args='node test.js', cpu=i*36)]
+            self.tick(rows, load=113, lag=8)
+        self.assertGreater(self.guard.rows[50812]['cpuDelta'], 100)
+        self.assertIn(('signal', 50812, 'SIGSTOP'), self.effects('signal'))
+        actions = [r for r in self.events_named('action') if r['pid'] == 50812]
+        self.assertIn(('B', 'STOP', 'sent'), [(r['actionClass'], r['action'], r['result']) for r in actions])
+        self.assertTrue(all('protectedBy' not in r and 'protectedAncestor' not in r for r in actions))
+        self.assertFalse(m.robob_descendant(self.guard.rows[50812], self.guard.rows))
+
+    def test_server_direct_mcp_and_checkpoint_are_signal_protected(self):
+        for comm, args in [('node', 'node /opt/mcp/server.js'), ('git', 'git update-ref refs/checkpoints/test')]:
+            with self.subTest(args=args):
+                self.tick(robob_browser_tree()[:2] + [proc(12, comm, ppid=2, args=args)])
+                self.guard.strain = True
+                self.assertEqual(m.robob_ancestor(self.guard.rows[12], self.guard.rows)['pid'], 2)
+                self.assertFalse(self.guard.action(self.guard.rows[12], 'D', 'TERM'))
+                self.assertEqual(self.events_named('action')[-1]['protectedBy'], 'robob-descendant')
+        self.assertFalse(self.effects('signal'))
+
+    def test_memory_runaway_below_provider_uses_existing_carve_out(self):
+        self.tick(robob_browser_tree('provider'), {11: 50})
+        self.assertIn(('signal', 11, 'SIGTERM'), self.effects('signal'))
+        self.assertEqual(self.events_named('memory_runaway')[0]['memoryClass'], 'carve-out')
+        self.assertTrue(all('protectedBy' not in r for r in self.events_named('action')))
 
     def test_same_browser_binary_without_robob_ancestry_can_be_signalled(self):
         self.tick(robob_browser_tree('standalone'), load=100, lag=8)
