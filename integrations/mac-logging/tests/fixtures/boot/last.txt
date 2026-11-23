@@ -1,0 +1,9 @@
+reboot time                                Sat Nov 21 2026 14:12
+shutdown time                              Sat Nov 21 2026 14:11
+reboot time                                Tue Nov 17 2026 16:30
+shutdown time                              Tue Nov 17 2026 16:30
+reboot time                                Mon Nov 16 2026 12:22
+reboot time                                Tue Nov 10 2026 03:21
+reboot time                                Tue Nov 10 2026 03:02
+reboot time                                Mon Nov  2 2026 10:25
+shutdown time                              Mon Nov  2 2026 10:24

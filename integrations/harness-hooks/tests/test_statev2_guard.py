@@ -7,6 +7,7 @@ else:
 
 from contextlib import redirect_stdout
 from functools import wraps
+import hashlib
 import io
 import json
 import os
@@ -30,7 +31,6 @@ READ = "live-database-read"
 SCRIPT = "live-database-script"
 UNRESOLVED = "live-database-script-unresolved"
 UNPROVED_REPORTERS = {
-    'torssh-2-bootstrap-offbox.sh': 'command wrapper proof failed',
     'crpko-2697-source-and-test-heredocs.sh': 'python: non-isolated startup',
     'crpko-2738-terraform-append-node-test.sh': 'executable provenance or mutation proof failed',
     'crpko-2739-markdown-parity.sh': 'executable provenance or mutation proof failed',
@@ -40,7 +40,6 @@ UNPROVED_REPORTERS = {
     'usdtwallet-162-s76-create-relative-python.sh': 'python: non-isolated startup',
     'usdtwallet-150-evidence.sh': 'python: non-isolated startup',
     'usdtwallet-143-verify.sh': 'python: non-isolated startup',
-    'usdtwallet-140-proof-offbox.sh': 'command wrapper proof failed',
     'usdtwallet-140-proof-body-offbox.sh': 'command wrapper proof failed',
     'robob-712-heredoc-absolute-no-workdir.sh': 'python: non-isolated startup',
     'robob-649-test-source-unittest.sh': 'python: non-isolated startup',
@@ -66,6 +65,40 @@ UNPROVED_REPORTERS = {
     'usdtwallet-146-create-tests-offbox.sh': 'python: non-isolated startup',
 }
 
+
+def remote_only_offbox(command):
+    """Test-side model of #221: the whole command is one `offbox run` that offbox
+    can never hand back to the Mac (cli.py flags, several steps, or one quoted
+    payload word holding a character fallback.allowed refuses)."""
+    head, separator, payload = command.partition(' -- ')
+    # An unquoted newline starts a second, local command.
+    if '\n' in payload and not payload.startswith("'") or '\n' in head and '--step' not in head:
+        return False
+
+    def tokens(text):
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=';&|<>()')
+        lexer.whitespace = ' \t'
+        lexer.whitespace_split = True
+        return list(lexer)
+
+    try:
+        words, argv = tokens(head), tokens(payload) if separator else []
+    except ValueError:
+        return False
+    if words[:2] != ['offbox', 'run'] or any(set(word) <= set(';&|<>()\n') for word in words + argv):
+        return False
+    steps, index = 0, 2
+    while index < len(words):
+        flag = words[index].partition('=')[0]
+        if flag in ('--bg', '--no-fallback', '--remote'):
+            return True
+        if flag == '--step':
+            steps += 1
+        if '=' not in words[index] and flag in ('--include', '--size', '--template', '--base', '--pull', '--env', '--step'):
+            index += 1
+        index += 1
+    return steps > 1 or (len(argv) == 1 and payload.startswith("'") and
+                         any(char in argv[0] for char in ';|&`$\n<>'))
 
 def assert_verdict(test, command, cwd, expected):
     rule, reason = guard.classify_detail(command, str(cwd))
@@ -214,6 +247,63 @@ def trusted_node_test(method):
     return run
 
 
+class RefusalGuidanceTests(unittest.TestCase):
+    def test_recall_sqlite_detail_keeps_the_approved_route(self):
+        command = ("sqlite3 -readonly 'file:/Users/ardud/.local/share/opencode/opencode.db?immutable=1' "
+                   '"SELECT type,name,sql FROM sqlite_schema WHERE name IN (...)"')
+        rule, cause = guard.classify_detail(command, '/tmp')
+        self.assertEqual(rule, READ)
+        self.assertIn('line 1 names', cause)
+        self.assert_guidance(rule, cause)
+
+    def test_inline_python_detail_keeps_the_approved_route(self):
+        source = 'import sqlite3\n' + '# context\n' * 7 + "sqlite3.connect('/Users/ardud/.local/share/opencode/opencode.db')\n"
+        rule, cause = guard.classify_detail("python3 -I - <<'EOF'\n" + source + 'EOF', '/tmp')
+        self.assertEqual(rule, READ)
+        self.assertIn('<inline script>:9 names', cause)
+        self.assert_guidance(rule, cause)
+
+    def assert_guidance(self, rule, cause):
+        reason = guard.refusal_reason(rule, cause, '/tmp')
+        tail = guard.REASON.partition('\n')[2]
+        self.assertEqual(reason, 'statev2 guard: this command was NOT run.\n' + cause + '\n' + tail)
+        self.assertIn('live-db-snapshot --card <id> --ask <id> --db <path>', reason)
+
+    def test_only_live_database_detail_rules_append_guidance(self):
+        for rule in [READ, SCRIPT]:
+            with self.subTest(rule=rule):
+                self.assert_guidance(rule, 'line 1 names opencode.db.')
+        for rule in ['live-database-snapshot', 'live-database-unavailable', 'other-rule']:
+            with self.subTest(rule=rule):
+                self.assertEqual(guard.refusal_reason(rule, 'existing detail', '/tmp'),
+                                 'statev2 guard: this command was NOT run.\nexisting detail')
+
+    def test_no_cause_policy_is_byte_identical(self):
+        self.assertEqual(hashlib.sha256(guard.REASON.encode()).hexdigest(),
+                         '1683e7c85b2292019767ab04fbf800f2aed028d62b9e74718b5adf1625de463f')
+        for rule in [READ, SCRIPT]:
+            with self.subTest(rule=rule):
+                self.assertEqual(guard.refusal_reason(rule, None, '/tmp'), guard.REASON)
+
+    def test_unresolved_messages_are_byte_identical(self):
+        snapshots = {
+            'script source changed after its heredoc write':
+                'Could not check script source changed after its heredoc write. Resolved workdir: /tmp.\n'
+                'An intervening command may replace the checked source. Split source preparation and execution into separate calls.',
+            'node: repo-node-pin invalid':
+                'Could not check node: repo-node-pin invalid. Resolved workdir: /tmp.\n'
+                'Resolve the named startup input, then retry.',
+            'python3: bare executable lookup unproved; missing pin\nAccepted: use a literal path':
+                'Could not check python3: bare executable lookup unproved; missing pin. Resolved workdir: /tmp.\n'
+                'Accepted: retry this same call with /usr/bin/python3 -I … instead of bare python3; '
+                'the executable, startup and mutation checks still apply.',
+        }
+        for cause, snapshot in snapshots.items():
+            with self.subTest(cause=cause):
+                self.assertEqual(guard.refusal_reason(UNRESOLVED, cause, '/tmp'),
+                                 'statev2 guard: this command was NOT run.\n' + snapshot)
+
+
 class GuardTests(unittest.TestCase):
     def setUp(self):
         clean = isolated_source_cases.fixture_environment_patch()
@@ -280,16 +370,12 @@ class GuardTests(unittest.TestCase):
                         'crpko4156-guard-1.sh',
                         'crpko4156-guard-2.sh',
                         'crpko4156-guard-5.sh',
-                        'crpko4308-guard-2.sh',
-                        'crpko4308-guard-4.sh',
                         'crpko4364-exact.sh',
                         'mac40-guard-1.sh',
                         'mac40-guard-2.sh',
                         'mac40-guard-5.sh',
                         'mac54-guard-2.sh',
                         'mac54-guard-4.sh',
-                        'offbox129-guard-3.sh',
-                        'offbox129-guard-4.sh',
                         'offbox129-guard-6.sh',
                         'offbox129-guard-7.sh',
                         'recall52-discover-11.sh',
@@ -509,9 +595,17 @@ class GuardTests(unittest.TestCase):
                 'offbox payload': prefix + edits['stdin write_text'] + "offbox run -- 'node --check tmp/checked.mjs; python3 -I tmp/checked.py'",
                 'bash executable': prefix + self.heredoc('/bin/bash', writer) + '/bin/bash -n tmp/checked.mjs\npython3 -I tmp/checked.py',
             }.items():
+                # The ';' payload would be remote-only (#221), but this cwd holds
+                # the patched home, and offbox syncs cwd outside git, so the
+                # live directory would leave the Mac: full checks stay.
+                expected = UNRESOLVED
                 with self.subTest(mutation=label):
-                    self.assertEqual(self.classify(command), UNRESOLVED)
-                    self.adapters(command, UNRESOLVED)
+                    self.assertEqual(self.classify(command), expected)
+                    self.adapters(command, expected)
+            # One argv the box may hand back to the Mac keeps the proof.
+            command = prefix + edits['stdin write_text'] + 'offbox run -- python3 -I tmp/checked.py'
+            with self.subTest(mutation='offbox fallback payload'):
+                self.assertEqual(self.classify(command), UNRESOLVED)
             shadow = self.write('shadow/node', writer)
             shadow.chmod(0o644)
             shadow_link = self.root / 'shadow-hardlink'
@@ -669,10 +763,13 @@ class GuardTests(unittest.TestCase):
             'script': ('d=$(mktemp -d)\n' + self.heredoc('"$d/port.py"', 'print(1)') +
                        'PYTHON -I "$d/port.py"'),
         }
+        # A version-selector write can change which python3 a shim runs, so
+        # the bare lookup stays unproved (#239 keeps other known writes proved).
+        selector = self.heredoc('.python-version', '3.12')
         with patch.dict(os.environ, {'PATH': str(shadow.parent) + os.pathsep + os.environ['PATH']}):
             for label, shape in shapes.items():
                 for python in ('python3', 'command python3'):
-                    command = shape.replace('PYTHON', python)
+                    command = selector + shape.replace('PYTHON', python)
                     with self.subTest(shape=label, python=python):
                         rule, cause = guard.classify_detail(command, str(self.root))
                         self.assertEqual(rule, UNRESOLVED, cause)
@@ -683,7 +780,7 @@ class GuardTests(unittest.TestCase):
                         self.assertNotIn('PRIVATE_CODE', reason)
                         self.assertNotIn('WRAPPER_MUST_NOT_RUN', reason)
                         self.adapters(command, UNRESOLVED, expected_reason=hint)
-                command = shape.replace('PYTHON', '/usr/bin/python3')
+                command = selector + shape.replace('PYTHON', '/usr/bin/python3')
                 with self.subTest(shape=label, python='absolute'):
                     self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
                     self.adapters(command)
@@ -1769,9 +1866,10 @@ bash "$TASK_DIR/step5r.sh"
         self.adapters(command, UNRESOLVED)
 
     def test_same_call_watchers47(self):
+        # The heredoc-written suite runs only under `offbox run --bg`, so the box is the only reader.
         command = self.reporter_body('watchers47.sh')
-        self.assertEqual(self.classify(command), UNRESOLVED)
-        self.adapters(command, UNRESOLVED)
+        self.assertIsNone(self.classify(command))
+        self.adapters(command, None)
 
     @trusted_node_test
     def test_same_call_literal_reporters(self):
@@ -1923,11 +2021,266 @@ bash "$TASK_DIR/step5r.sh"
                         prefix = self.heredoc(destination, self.reporter_body('benchmark_recall_storage.py'))
                         command = prefix + 'git show HEAD:src/storage.py > tmp/baseline.py\n' + wrapper + binary + ' ' + target
                         with self.subTest(destination=destination, target=target, binary=binary, wrapper=wrapper):
-                            self.assertEqual(self.classify(command), UNRESOLVED)
+                            # --bg runs the script only on the box (#221).
+                            self.assertEqual(self.classify(command), None if '--bg' in wrapper else UNRESOLVED)
         body = 'import os, sqlite3, tempfile\nwith tempfile.TemporaryDirectory() as tmp:\n sqlite3.connect(os.path.join(tmp, "bench.db"))\n'
         rule, cause = guard.classify_detail(self.heredoc(relative, body) + 'offbox run -- python3 ' + relative, str(self.root))
         self.assertEqual(rule, UNRESOLVED, cause)
         self.assertIn('python: non-isolated startup', cause)
+
+    def cwd_fixture(self):
+        # An inherited zsh FPATH voids every same-call writer proof; keep it out
+        # so these rows compare spellings rather than the caller's shell.
+        clean = patch.dict(os.environ)
+        clean.start()
+        self.addCleanup(clean.stop)
+        os.environ.pop('FPATH', None)
+        self.write('t/a.test.mjs', "import test from 'node:test'; test('a', () => {});")
+        self.write('t/b.test.mjs', "import test from 'node:test'; test('b', () => {});")
+        self.write('x.mjs', 'console.log(1)')
+        self.write('sub/x.mjs', 'console.log(2)')
+        self.write('sub/only.mjs', f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        self.write('tmp/v.X/check.py', 'print(1)')
+        self.write('s.sh', 'echo ok')
+        self.write('live.mjs', f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        os.symlink('live.mjs', self.root / 'link.mjs')
+
+    @staticmethod
+    def remote_only(command):
+        # #221: --bg never falls back to the Mac (offbox cli.py). The shared
+        # helper also gives up on unquoted caller substitutions; they don't
+        # change that.
+        return remote_only_offbox(command) or command.startswith('offbox run --bg ')
+
+    @staticmethod
+    def cwd_forms(path, directory):
+        # The literal twins first, then every cwd-derived spelling (#235).
+        return [path, f'{directory}/{path}', f'"$PWD/{path}"', f'"${{PWD}}/{path}"', f'$PWD/{path}',
+                f'"$(pwd)/{path}"', f'"`pwd`/{path}"', f'"$(realpath {path})"', f'$(realpath "{path}")',
+                f'`realpath {path}`']
+
+    @trusted_node_test
+    def test_cwd_derived_script_paths_match_literal_twins(self):
+        self.cwd_fixture()
+        root, sub = str(self.root), str(self.root / 'sub')
+        writer = self.heredoc('{p}', f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        rows = [
+            ('node --test {p} {q}', 't/a.test.mjs', 't/b.test.mjs', root, None),
+            ('node {p}', 'x.mjs', None, root, None),
+            ('python3 -I {p} --head 623161af', 'tmp/v.X/check.py', None, root, None),
+            ('bash {p}', 's.sh', None, root, None),
+            ('cd sub && node {p}', 'x.mjs', None, sub, None),
+            ('cd sub && node {p}', 'only.mjs', None, sub, SCRIPT),
+            ('node {p}', 'live.mjs', None, root, SCRIPT),
+            ('node {p}', 'link.mjs', None, root, SCRIPT),
+            (writer + 'node {p}', 'x.mjs', None, root, SCRIPT),
+            ("offbox run --bg -- 'node --test {p} && terraform -chdir=tf test'", 't/a.test.mjs', None, root, None),
+            ("offbox run -- 'node --test {p} && terraform -chdir=tf test'", 't/a.test.mjs', None, root, None),
+            ("offbox run --bg -- 'node --test --test-concurrency=1 {p} {q}'", 't/a.test.mjs', 't/b.test.mjs', root, None),
+            ("offbox run --bg --step 'node --test {p} {q}' --step 'terraform -chdir=tf init -backend=false -input=false'",
+             't/a.test.mjs', 't/b.test.mjs', root, None),
+            ("offbox run --bg --git --step 'git rev-parse HEAD' --step 'node --test {p}'", 't/a.test.mjs', None, root, None),
+            ("offbox run --bg --git --include tmp/v.X --pull tmp/v.X --step 'python3 -I {p} --head 623161af'",
+             'tmp/v.X/check.py', None, root, None),
+            ("offbox run --bg -- bash -lc 'node --version && export TERRAFORM_BINARY=\"$(command -v terraform)\" && node --test {p}'",
+             't/a.test.mjs', None, root, None),
+            ("offbox run --bg -- 'node {p}'", 'live.mjs', None, root, SCRIPT),
+            ('offbox run --bg -- node --test {p}', 't/a.test.mjs', None, root, None),
+            ('offbox run --bg -- node {p}', 'live.mjs', None, root, SCRIPT),
+            # A foreground payload with no fallback-refused character can run
+            # on the Mac, so it keeps the local proof after #221.
+            ('offbox run -- node --test {p}', 't/a.test.mjs', None, root, None),
+            ('offbox run -- node {p}', 'live.mjs', None, root, SCRIPT),
+            ('offbox run --git -- python3 -I {p} --head 623161af', 'tmp/v.X/check.py', None, root, None),
+            ('env A=1 timeout 60 node {p}', 'x.mjs', None, root, None),
+            ('env A=1 timeout 60 node {p}', 'live.mjs', None, root, SCRIPT),
+            ('export A="b $USER"; node {p}', 'x.mjs', None, root, None),
+            ("printf '%s\\n' \"$USER\"; node {p}", 'x.mjs', None, root, None),
+            ('d={p}; node --test "$d/a.test.mjs"', 't', None, root, None),
+            ('d={p}; node "$d/live.mjs"', 'tmp/..', None, root, SCRIPT),
+            ('node --test {p}', 't/*.test.mjs', None, root, None),
+            ("bash -c 'node {p}'", 'x.mjs', None, root, None),
+            ("bash -c 'node {p}'", 'live.mjs', None, root, SCRIPT),
+            (self.heredoc('{p}', 'console.log(1)') + 'node {p}', 'x.mjs', None, root, None),
+        ]
+        for template, first, second, directory, expected in rows:
+            for p, q in zip(self.cwd_forms(first, directory), self.cwd_forms(second or first, directory)):
+                command = template.replace('{p}', p).replace('{q}', q)
+                if "'" in template and "'" in p + q or '*' in p and 'realpath' in p:
+                    continue
+                twin = template.replace('{p}', first).replace('{q}', second or first)
+                # #221: offbox never runs these on the Mac; the twin agrees.
+                expected_here = None if self.remote_only(command) and self.remote_only(twin) else expected
+                with self.subTest(command=command):
+                    rule, cause = guard.classify_detail(command, root)
+                    if 'realpath' in p and '$(command -v' in template and expected_here is not None:
+                        # An earlier opaque substitution may replace realpath on PATH.
+                        self.assertIsNotNone(rule)
+                        continue
+                    self.assertEqual(rule, expected_here, cause)
+                    self.assertEqual(rule, guard.classify(twin, root))
+
+    def test_cwd_derived_live_reads_stay_reads(self):
+        self.cwd_fixture()
+        relative = os.path.relpath(LIVE, self.root)
+        for path in self.cwd_forms(relative, str(self.root)):
+            with self.subTest(path=path):
+                self.assertEqual(self.classify('sqlite3 ' + path + ' .tables'), READ)
+        for live_root in (Path.home() / '.t3/userdata', Path.home() / '.robob/userdata'):
+            for name in ('state.sqlite', 'statev2.sqlite'):
+                for path in self.cwd_forms(name, str(live_root)):
+                    with self.subTest(live_root=live_root, path=path):
+                        self.assertEqual(guard.classify('sqlite3 -readonly ' + path + ' .tables', str(live_root)), READ)
+
+    @trusted_node_test
+    def test_cwd_derived_paths_stay_unresolved_when_pwd_may_change(self):
+        self.cwd_fixture()
+        target = '"$PWD/x.mjs"'
+        for command in [
+            'PWD=/elsewhere node "$PWD/x.mjs"', 'export PWD=/x; node "$PWD/x.mjs"', 'P""WD=/x; node "$PWD/x.mjs"',
+            'unset PWD; node "$PWD/x.mjs"', 'read -r PWD; node "$PWD/x.mjs"', 'declare PWD=/x; node "$PWD/x.mjs"',
+            'printf -v PWD /x; node "$PWD/x.mjs"', 'node "${PWD:-/x}/x.mjs"',
+            'cd "$unknown"; node "$PWD/x.mjs"', 'cd -P sub && node "$PWD/x.mjs"', 'set -P; cd sub && node "$PWD/x.mjs"',
+            'CDPATH=/x cd sub && node "$PWD/x.mjs"', "eval 'cd /'; node \"$PWD/x.mjs\"", 'source ./env.sh; node "$PWD/x.mjs"',
+            '. ./env.sh; node "$PWD/x.mjs"', 'pushd sub; node "$PWD/x.mjs"',
+            "node '$PWD/x.mjs'", 'node "\\$PWD/x.mjs"', 'f() { cd /; }; f; node "$PWD/x.mjs"',
+            'realpath() { echo /x; }; node "$(realpath x.mjs)"', 'alias realpath=echo; node "$(realpath x.mjs)"',
+            'pwd() { echo /x; }; node "$(pwd)/x.mjs"', 'PATH=/evil:$PATH node "$(realpath x.mjs)"',
+            'node "$(realpath "$v")"', 'node "$(realpath -m x.mjs)"', 'node "$(realpath x.mjs y.mjs)"',
+            'node "$(pwd -P)/x.mjs"', 'node "$(cat x.mjs)"', 'node "$(realpath $HOME/x.mjs)"',
+            'export PWD=/x; offbox run -- node "$PWD/x.mjs"',
+            'path=(/evil $path); node "$(realpath x.mjs)"', 'commands[realpath]=/evil; node "$(realpath x.mjs)"',
+        ] + [prefix + '; node "$PWD/x.mjs"' for prefix in self.runtime_pwd_bindings('/evil')] + [
+            'o=-P; cd $o sub && node "$PWD/x.mjs"', 'o=physical; set -o "$o"; cd sub && node "$PWD/x.mjs"',
+            'set -o chaselinks; cd sub && node "$PWD/x.mjs"', 'options[chaselinks]=on; cd sub && node "$PWD/x.mjs"',
+        ]:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.classify(command))
+        self.assertIsNone(self.classify('node ' + target))
+        # #221: a binding inside a payload offbox never runs on the Mac is the
+        # box's business, as is the same payload with a literal path.
+        for command in ["offbox run --bg -- 'export PWD=/x; node \"$PWD/x.mjs\"'",
+                        "offbox run --bg -- 'a=W; declare \"P${a}D=/evil\"; node \"$PWD/x.mjs\"'",
+                        "offbox run --bg --step 'a=W; printf -v \"P${a}D\" %s /evil; node \"$PWD/x.mjs\"'"]:
+            with self.subTest(remote_only=command):
+                self.assertTrue(self.remote_only(command))
+                self.assertIsNone(self.classify(command))
+
+    @staticmethod
+    def runtime_pwd_bindings(value):
+        # Every way bash/zsh bind PWD through a name built at runtime (review r2).
+        return [f'a=W; declare "P${{a}}D={value}"', f'a=W; printf -v "P${{a}}D" %s {value}',
+                f'a=W; typeset "P${{a}}D={value}"', f'a=W; local "P${{a}}D={value}"', f'a=W; export "P${{a}}D={value}"',
+                f'a=W; readonly "P${{a}}D={value}"', f'a=W; command declare "P${{a}}D={value}"',
+                f'a=W; read "P${{a}}D" <<< {value}', f'a=W; mapfile -t "P${{a}}D" <<< {value}', 'a=W; unset "P${a}D"',
+                'a=W; getopts x "P${a}D" -x', 'a=W; let "P${a}D=5"', 'a=W; x="P${a}D=5"; (( x ))',
+                'a=W; x="P${a}D=5"; y=$(( x ))', 'a=W; x="P${a}D=5"; arr=(1); : "${arr[x]}"',
+                'a=W; x="P${a}D=5"; [[ 1 -eq x ]]', 'a=W; typeset -i z="P${a}D=5"',
+                f'a=W; declare -n r="P${{a}}D"; r={value}', f'c=declare; a=W; $c "P${{a}}D={value}"',
+                f'a=W; n="P${{a}}D"; : "${{!n:={value}}}"', f'a=W; trap "declare P${{a}}D={value}" DEBUG']
+
+    def realpath_fixture(self):
+        self.cwd_fixture()
+        self.write('safe.sh', 'echo ok')
+        self.write('unsafe.sh', f'sqlite3 {LIVE} .tables')
+        return [template.replace('{p}', form) for form in ('"$(realpath safe.sh)"', '"`realpath safe.sh`"', '$(realpath safe.sh)')
+                for template in ('/bin/bash {p}', 'offbox run -- /bin/bash {p}', 'offbox run --bg -- /bin/bash {p}',
+                                 "offbox run --bg -- '/bin/bash {p}'",
+                                 "offbox run --bg --step '/bin/bash {p}'")]
+
+    def test_cwd_realpath_resolves_only_through_the_system_realpath(self):
+        commands = self.realpath_fixture()
+        self.assertEqual(self.classify('/bin/bash unsafe.sh'), SCRIPT)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+        # A realpath earlier on the inherited PATH can print any path (review r1).
+        shadow = self.write('bin/realpath', f'#!/bin/sh\necho {self.root}/unsafe.sh\n')
+        shadow.chmod(0o755)
+        environments = [{'PATH': os.pathsep.join((str(shadow.parent), os.environ['PATH']))},
+                        {'BASH_FUNC_realpath%%': '() { echo unsafe.sh; }'}, {'BASH_FUNC_pwd%%': '() { echo /; }'}]
+        # #221: offbox never runs a remote-only payload on the Mac, so those
+        # rows get the decision their literal twin gets on main.
+        self.assertTrue(any(command.startswith('offbox run -- ') and not self.remote_only(command) for command in commands))
+
+        def check(command, remote, exact=True, **labels):
+            with self.subTest(**labels, command=command):
+                rule = self.classify(command)
+                if not remote:
+                    self.assertIsNotNone(rule)
+                    return
+                twin = self.classify(command.replace('"$(realpath safe.sh)"', 'unsafe.sh')
+                                     .replace('"`realpath safe.sh`"', 'unsafe.sh').replace('$(realpath safe.sh)', 'unsafe.sh'))
+                if exact:
+                    self.assertEqual(rule, twin)
+                elif rule is None:
+                    # A rebinding prefix may still refuse; it may never allow
+                    # what the literal twin refuses.
+                    self.assertIsNone(twin)
+        for environment in environments:
+            with patch.dict(os.environ, environment):
+                for command in commands:
+                    check(command, self.remote_only(command), environment=environment)
+        # PATH or the lookup tables rebound in the call, often through a
+        # name built at runtime (review r2).
+        bin_dir = f'{shadow.parent}:/bin'
+        bindings = [p.replace('P${a}D', 'P${a}TH').replace('/evil', bin_dir) for p in self.runtime_pwd_bindings('/evil')
+                    if '=5' not in p and 'unset' not in p and 'getopts' not in p]
+        bindings += [f'n=PATH; declare -x "$n={bin_dir}"', f'read PATH <<< {bin_dir}', f'declare -n r=PATH; r={bin_dir}',
+                     f'BASH_CMDS[realpath]={shadow}', "functions[realpath]='echo unsafe.sh'", 'autoload realpath',
+                     f'export "PA""TH={bin_dir}"']
+        for prefix in bindings:
+            for command in commands + [f'for PATH in {bin_dir}; do /bin/bash "$(realpath safe.sh)"; done']:
+                if command.startswith('for ') and prefix != bindings[0]:
+                    continue
+                remote = self.remote_only(command)
+                command = command if command.startswith('for ') else prefix + '; ' + command
+                check(command, remote, exact=False, binding=prefix)
+        shadow.unlink()
+        # An exported function under another name shadows neither command.
+        with patch.dict(os.environ, {'BASH_FUNC_module%%': '() { :; }'}):
+            for command in commands + ['/bin/bash "$(pwd)/safe.sh"']:
+                with self.subTest(unrelated_function=True, command=command):
+                    self.assertIsNone(self.classify(command))
+        # Same-call writes into a PATH entry ahead of /bin replace the lookup.
+        with patch.dict(os.environ, {'PATH': os.pathsep.join((str(shadow.parent), os.environ['PATH']))}):
+            for command in commands:
+                writer = f"printf '#!/bin/sh\\necho unsafe.sh\\n' > {shadow}; chmod +x {shadow}; "
+                check(writer + command, self.remote_only(command), writer=True)
+
+    @trusted_node_test
+    def test_quoted_cwd_reads_keep_parity_in_a_directory_with_spaces(self):
+        self.cwd_fixture()
+        spaced = self.root / 'project space'
+        for name in ('safe.sh', 'x.mjs'):
+            (spaced / name).parent.mkdir(exist_ok=True)
+            (spaced / name).write_text('echo ok' if name.endswith('.sh') else 'console.log(1)')
+        (spaced / 'live.mjs').write_text(f"import fs from 'node:fs'; fs.readFileSync({LIVE!r});")
+        quoted = ['"$PWD/{p}"', '"${{PWD}}/{p}"', '"$(pwd)/{p}"', '"`pwd`/{p}"', '"$(realpath {p})"']
+        unquoted = ['$PWD/{p}', '${{PWD}}/{p}', '$(pwd)/{p}', '`pwd`/{p}', '$(realpath {p})']
+        rows = [('/bin/bash {p}', 'safe.sh', None), ('node {p}', 'x.mjs', None), ('node {p}', 'live.mjs', SCRIPT),
+                ('offbox run --bg -- node {p}', 'x.mjs', None), ('offbox run --bg -- node {p}', 'live.mjs', SCRIPT),
+                ("offbox run --bg --step 'node {p}'", 'x.mjs', None), ("offbox run --bg -- 'node {p}'", 'live.mjs', SCRIPT)]
+        rows += [('offbox run -- node {p}', 'live.mjs', SCRIPT)]
+        for template, path, expected in rows:
+            if self.remote_only(template.replace('{p}', path)):
+                expected = None
+            self.assertEqual(guard.classify(template.replace('{p}', path), str(spaced)), expected)
+            for form in quoted:
+                command = template.replace('{p}', form.format(p=path))
+                with self.subTest(command=command):
+                    rule, cause = guard.classify_detail(command, str(spaced))
+                    self.assertEqual(rule, expected, cause)
+            for form in unquoted:
+                command = template.replace('{p}', form.format(p=path))
+                with self.subTest(command=command, quoted=False):
+                    if self.remote_only(command):
+                        # #221 may skip the payload; caller-side splitting can
+                        # still refuse. Never more permissive than the twin.
+                        if guard.classify(command, str(spaced)) is None:
+                            self.assertIsNone(expected)
+                    else:
+                        self.assertIsNotNone(guard.classify(command, str(spaced)))
 
     @trusted_node_test
     def test_same_call_offbox_steps_keep_wrapper_proof(self):
@@ -1941,6 +2294,11 @@ bash "$TASK_DIR/step5r.sh"
                 command = prefix + 'offbox run ' + flags
                 with self.subTest(runner=runner, flags=flags):
                     rule, cause = guard.classify_detail(command, str(self.root))
+                    if flags.count('--step') > 1:
+                        # Several steps run as one '; '-joined remote string (#221).
+                        self.assertIsNone(rule, cause)
+                        self.adapters(command, None)
+                        continue
                     self.assertEqual(rule, UNRESOLVED, cause)
                     self.assertIn('command wrapper proof failed', cause)
                     self.adapters(command, UNRESOLVED)
@@ -1995,7 +2353,7 @@ bash "$TASK_DIR/step5r.sh"
                     setup = 'd=$(mktemp -d' + template + ')\n'
                     command = setup + self.heredoc('"$d/' + filename + '"', body) + wrapper + binary + ' "$d/' + filename + '"'
                     with self.subTest(template=template, binary=binary, wrapper=wrapper):
-                        self.assertEqual(self.classify(command), UNRESOLVED if wrapper else None)
+                        self.assertEqual(self.classify(command), UNRESOLVED if wrapper and '--bg' not in wrapper else None)
                 for wrapper in ['', 'offbox run -- ']:
                     command = wrapper + binary + ' "$(mktemp -d' + template + ')/' + filename + '"'
                     self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None), command)
@@ -2131,6 +2489,9 @@ bash "$TASK_DIR/step5r.sh"
                     for command in commands:
                         with self.subTest(command=command):
                             rule, cause = guard.classify_detail(command, str(self.root))
+                            if remote_only_offbox(command):
+                                self.assertIsNone(rule, cause)
+                                continue
                             self.assertEqual(rule, UNRESOLVED)
                             self.assertRegex(cause, 'print flags may reassign|command wrapper proof failed')
                             self.assertRegex(cause, 'in a loop at line|interpreter startup')
@@ -2144,9 +2505,8 @@ bash "$TASK_DIR/step5r.sh"
                     self.assertEqual(rule, UNRESOLVED, cause)
                     self.assertRegex(cause, 'provenance or mutation proof failed|command wrapper proof failed')
                     if not wrapper:
-                        rule, cause = guard.classify_detail('offbox run -- ' + shlex.quote(command), str(self.root))
-                        self.assertEqual(rule, UNRESOLVED, cause)
-                        self.assertIn('command wrapper proof failed', cause)
+                        # A multi-line payload only runs on the box (#221).
+                        self.assertEqual(guard.classify_detail('offbox run -- ' + shlex.quote(command), str(self.root)), (None, None))
 
     def test_mktemp_109_loop_prefixes_and_case_patterns(self):
         setup = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.py"', 'print(1)')
@@ -2173,6 +2533,9 @@ bash "$TASK_DIR/step5r.sh"
                     for command in commands:
                         with self.subTest(command=command):
                             rule, cause = guard.classify_detail(command, str(self.root))
+                            if remote_only_offbox(command):
+                                self.assertIsNone(rule, cause)
+                                continue
                             if output_only and (wrapper or command.startswith('offbox run -- ')):
                                 self.assertEqual(rule, UNRESOLVED, cause)
                                 self.assertIn('command wrapper proof failed', cause)
@@ -2202,7 +2565,7 @@ bash "$TASK_DIR/step5r.sh"
                             commands.append('offbox run -- ' + shlex.quote(direct))
                         for command in commands:
                             with self.subTest(command=command):
-                                self.assertEqual(self.classify(command), SCRIPT)
+                                self.assertEqual(self.classify(command), None if remote_only_offbox(command) else SCRIPT)
                         for flags in ['-v d --', '-rv d --', '"$FLAGS" d', '-v PATH --', '-r --']:
                             mutation = 'case "$n" in 1) : ' + tail.format(command='print ' + flags + ' /literal/rebound')
                             loop = setup + 'for n in 1 2; do\n' + wrapper + 'python3 -I "$d/x.py"\n' + mutation + '\ndone'
@@ -2212,6 +2575,9 @@ bash "$TASK_DIR/step5r.sh"
                             for command in commands:
                                 with self.subTest(command=command):
                                     rule, cause = guard.classify_detail(command, str(self.root))
+                                    if remote_only_offbox(command):
+                                        self.assertIsNone(rule, cause)
+                                        continue
                                     if flags == '-r --' and (wrapper or command.startswith('offbox run -- ')):
                                         self.assertEqual(rule, UNRESOLVED, cause)
                                         self.assertIn('command wrapper proof failed', cause)
@@ -2240,6 +2606,9 @@ bash "$TASK_DIR/step5r.sh"
                             for command in commands:
                                 with self.subTest(command=command):
                                     rule, cause = guard.classify_detail(command, str(self.root))
+                                    if remote_only_offbox(command):
+                                        self.assertIsNone(rule, cause)
+                                        continue
                                     if separator == ';;' or path == str(safe):
                                         self.assertIsNone(rule, cause)
                                     else:
@@ -2251,7 +2620,7 @@ bash "$TASK_DIR/step5r.sh"
                         for command in [case, 'offbox run -- ' + shlex.quote(case)]:
                             with self.subTest(command=command):
                                 rule, cause = guard.classify_detail(command, str(self.root))
-                                if separator == ';;' or quote:
+                                if separator == ';;' or quote or remote_only_offbox(command):
                                     self.assertIsNone(rule, cause)
                                 else:
                                     self.assertEqual(rule, UNRESOLVED)
@@ -2284,8 +2653,10 @@ bash "$TASK_DIR/step5r.sh"
                                 'offbox run -- ' + shlex.quote(command)]:
                     with self.subTest(command=wrapped):
                         rule, cause = guard.classify_detail(wrapped, str(self.root))
-                        self.assertEqual(rule, expected, cause)
-                        if expected:
+                        # The box runs a remote-only payload; sub/arm.py never reaches the Mac.
+                        expected_here = None if remote_only_offbox(wrapped) else expected
+                        self.assertEqual(rule, expected_here, cause)
+                        if expected_here:
                             self.assertTrue(any(part in cause for part in [
                                 'directory changed', 'a loop that changes directory',
                             ]), cause)
@@ -2304,7 +2675,8 @@ bash "$TASK_DIR/step5r.sh"
                 for wrapped in [full, full.replace('python3 -I ', 'offbox run -- python3 -I '),
                                 'offbox run -- ' + shlex.quote(full)]:
                     with self.subTest(command=wrapped):
-                        self.assertEqual(guard.classify(wrapped, str(self.root)), expected)
+                        self.assertEqual(guard.classify(wrapped, str(self.root)),
+                                         None if remote_only_offbox(wrapped) else expected)
 
     def test_loop_cwd_enclosing_relative_database_reads(self):
         roots = [
@@ -2335,7 +2707,9 @@ bash "$TASK_DIR/step5r.sh"
                             with self.subTest(command=wrapped):
                                 # The existing JS reader does not recognize a
                                 # bare legacy state.sqlite even at known cwd.
-                                if name == 'state.sqlite' and reader.startswith('node -e '):
+                                # A remote-only payload that names the live directory is refused.
+                                if (name == 'state.sqlite' and reader.startswith('node -e ') and
+                                        not remote_only_offbox(wrapped)):
                                     self.assertIsNone(guard.classify(wrapped, str(self.root)))
                                 else:
                                     self.assertIsNotNone(guard.classify(wrapped, str(self.root)))
@@ -2361,7 +2735,11 @@ bash "$TASK_DIR/step5r.sh"
                     for wrapped in [command, prefix + recovery + 'offbox run -- ' + reader,
                                     'offbox run -- ' + shlex.quote(command)]:
                         with self.subTest(command=wrapped):
-                            self.assertEqual(guard.classify_detail(wrapped, str(self.root)), (None, None))
+                            # No remote-only payload has a reason to name the live directory.
+                            if remote_only_offbox(wrapped):
+                                self.assertEqual(guard.classify(wrapped, str(self.root)), READ)
+                            else:
+                                self.assertEqual(guard.classify_detail(wrapped, str(self.root)), (None, None))
 
     def test_loop_cwd_enclosing_cwd_relative_readers(self):
         for root in ['/Users/x/.robob/userdata', str(Path.home() / '.t3/userdata'),
@@ -2384,7 +2762,8 @@ bash "$TASK_DIR/step5r.sh"
                         for wrapped in [command, prefix + 'offbox run -- ' + reader,
                                         'offbox run -- ' + shlex.quote(command)]:
                             with self.subTest(command=wrapped):
-                                self.assertEqual(guard.classify(wrapped, str(self.root)), None if recovery else READ)
+                                expected = READ if remote_only_offbox(wrapped) or not recovery else None
+                                self.assertEqual(guard.classify(wrapped, str(self.root)), expected)
 
     def test_loop_cwd_enclosing_later_directory_changes(self):
         enclosing_blocks = [
@@ -2444,7 +2823,8 @@ bash "$TASK_DIR/step5r.sh"
                 for command in [local, argv, 'offbox run -- ' + shlex.quote(local),
                                 'offbox run -- ' + shlex.quote(argv)]:
                     with self.subTest(command=command):
-                        self.assertEqual(guard.classify(command, str(cwd)), UNRESOLVED)
+                        self.assertEqual(guard.classify(command, str(cwd)),
+                                         None if remote_only_offbox(command) else UNRESOLVED)
                 absolute = prefix + '; python3 -I ' + shlex.quote(str(safe_script))
                 absolute_argv = prefix + '; offbox run -- python3 -I ' + shlex.quote(str(safe_script))
                 recovery = prefix + '; cd ' + shlex.quote(str(cwd)) + '; offbox run -- ' + script
@@ -2510,13 +2890,16 @@ bash "$TASK_DIR/step5r.sh"
 
     def test_mktemp_109_single_string_payload_scope(self):
         prefix = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.py"', 'print(1)')
-        self.assertEqual(self.classify(prefix + 'offbox run -- \'python3 "$d/x.py"\''), UNRESOLVED)
+        # A literal $ keeps these payloads on the box, so their scratch
+        # scripts never run on the Mac (#221); a caller-expanded $d may.
+        self.assertIsNone(self.classify(prefix + 'offbox run -- \'python3 "$d/x.py"\''))
+        self.assertEqual(self.classify(prefix + 'offbox run -- python3 "$d/x.py"'), UNRESOLVED)
         for cd in ['', 'cd tmp\n']:
             for body in ['print(1)', f'open({LIVE!r}).read()']:
                 payload = 'd=$(mktemp -d)\n' + cd + self.heredoc('"$d/x.py"', body) + 'python3 "$d/x.py"'
                 result = guard.classify_detail('offbox run -- ' + shlex.quote(payload), str(self.root))
-                self.assertEqual(result[0], UNRESOLVED, result)
-                self.assertIn('command wrapper proof failed', result[1])
+                # A live path spelled in the payload text is still refused.
+                self.assertEqual(result[0], READ if 'open(' in body else None, result)
 
     def test_mktemp_109_bun_preload_and_messages(self):
         for flag in ['--preload "$d/clock.ts"', '--preload="$d/clock.ts"']:
@@ -2644,6 +3027,269 @@ bash "$TASK_DIR/step5r.sh"
     def classify(self, command):
         return guard.classify(command, str(self.root))
 
+    def test_bun_115_subcommands(self):
+        payload = ('bun install --frozen-lockfile --cwd integrations/spectrum-bridge && '
+                   'baseline_dir=$(mktemp -d) && '
+                   'tar -xf tmp/imessage25.dT1ECD/base.tar -C "$baseline_dir" && '
+                   'ln -s "$PWD/integrations/spectrum-bridge/node_modules" '
+                   '"$baseline_dir/integrations/spectrum-bridge/node_modules" && '
+                   'cd "$baseline_dir/integrations/spectrum-bridge" && '
+                   'bun test test/robob.test.ts test/lock.test.ts')
+        commands = [
+            'offbox run --bg --include tmp/imessage25.dT1ECD/base.tar -- ' + shlex.quote(payload),
+            'd=$(mktemp -d) && cd "$d" && bun test test/a.test.ts test/b.test.ts',
+            'cd "$d" && bun test', 'cd "$d" && bun run test',
+            'cd "$d" && bun install --frozen-lockfile', 'bun --cwd pkg run test',
+            'cd "$d" && bun check', 'bun run --filter "pkg*" test',
+            'bun --cwd=pkg run --filter="pkg*" test', 'cd "$d" && bunx prettier',
+        ]
+        for subcommand in ('install', 'i', 'add', 'a', 'remove', 'rm', 'update', 'outdated',
+                           'audit', 'dedupe', 'prune', 'link', 'unlink', 'publish', 'patch',
+                           'pm', 'info', 'why', 'build', 'init', 'create', 'c', 'upgrade',
+                           'completions', 'x', 'repl'):
+            commands.append('cd "$d" && bun ' + subcommand)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+
+    def test_bun_115_test_option_values(self):
+        self.write('test/ok.test.ts', 'console.log("ok")')
+        commands = [
+            'bun test test/ok.test.ts',
+            "bun test test/ok.test.ts -t 'real bridge route cancellation.*pause'",
+            "bun test -t 'a.*b' test/ok.test.ts",
+            "bun test test/ok.test.ts --test-name-pattern 'a.*b'",
+            "bun test test/ok.test.ts --reporter junit --reporter-outfile 'out*.xml'",
+            "bun test test/ok.test.ts --timeout 5000 -t 'x|y'",
+            'env -u BUN_INSPECT ROBOB_TEST=1 bun test test/ok.test.ts --test-name-pattern '
+            "'runner SIGTERM leaves no check process.*owner=runner|checks carry environment identity'",
+            "offbox run --bg --step 'bun install --frozen-lockfile' --step "
+            + shlex.quote("bun test test/ok.test.ts --test-name-pattern 'pre-upgrade accepted steers|other name'")
+            + " --step 'bun run check'",
+        ]
+        for flag in ('-t', '--test-name-pattern', '--timeout', '--rerun-each', '--retry',
+                     '--reporter', '--reporter-outfile', '--coverage-reporter', '--coverage-dir',
+                     '--seed', '--max-concurrency', '--path-ignore-patterns', '--parallel-delay',
+                     '--shard', '--timings'):
+            for separator in (' ', '='):
+                for position in ('before', 'after'):
+                    option = flag + separator + shlex.quote('a.*b|c')
+                    args = option + ' test/ok.test.ts' if position == 'before' else 'test/ok.test.ts ' + option
+                    commands.append('bun test ' + args)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+
+    def test_bun_115_filters_and_optional_values(self):
+        self.write('test/ok.test.ts', 'console.log("ok")')
+        self.write('named-filter', 'console.log("ok")')
+        (self.root / 'directory-filter').mkdir()
+        for command in ('bun test named-filter directory-filter missing.test.ts',
+                        'bun test --bail test/ok.test.ts', 'bun test --bail 2 test/ok.test.ts',
+                        'bun test --changed test/ok.test.ts', 'bun test --changed main test/ok.test.ts',
+                        'bun test --parallel test/ok.test.ts', 'bun test --parallel 2 test/ok.test.ts'):
+            with self.subTest(command=command):
+                self.assertIsNone(self.classify(command))
+
+    def test_bun_115_package_tasks_and_preloads(self):
+        for name in ('test', 'install', 'check'):
+            self.write(name, f'require("fs").readFileSync({LIVE!r})')
+            self.assertIsNone(self.classify('bun run ' + name))
+        self.write('pkg/hook.ts', f'require("fs").readFileSync({LIVE!r})')
+        for flag in ('--preload hook.ts', '--preload=hook.ts'):
+            for args in ('--cwd pkg ' + flag + ' test', flag + ' --cwd=pkg test',
+                         '--cwd pkg test ' + flag + " -t 'a.*b'"):
+                with self.subTest(args=args):
+                    self.assertIsNotNone(self.classify('bun ' + args))
+
+    def test_bun_115_preloads_before_subcommands(self):
+        self.write('bad.ts', f'require("fs").readFileSync({LIVE!r})')
+        for subcommand in ('repl', 'install', 'x prettier', 'exec "echo ok"', 'test', 'run check'):
+            for separator in (' ', '='):
+                command = 'bun --preload' + separator + './bad.ts ' + subcommand
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_bun_115_exec_cwd(self):
+        self.write('read.js', 'console.log("ok")')
+        self.write('pkg/read.js', f'require("fs").readFileSync({LIVE!r})')
+        for cwd in ('--cwd pkg', '--cwd=pkg'):
+            for separator in (' ', ' -- '):
+                for prefix in ('bun ' + cwd + ' exec', 'bun exec ' + cwd):
+                    command = prefix + separator + "'node read.js'"
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+        for separator in (' ', ' -- '):
+            self.assertIsNone(self.classify('bun exec' + separator + "'node read.js'"))
+            self.assertEqual(self.classify('bun exec' + separator + "'node pkg/read.js'"), SCRIPT)
+
+    def test_bun_115_repeated_cwd_uses_last_value(self):
+        for directory in ('one', 'two', 'one/two', 'two/two'):
+            for name in ('safe', 'bad'):
+                content = 'console.log("ok")'
+                if (name == 'bad') == (directory == 'two'):
+                    content = f'require("fs").readFileSync({LIVE!r})'
+                self.write(f'{directory}/{name}.js', content)
+                self.write(f'{directory}/test/{name}.test.ts', content)
+        values = [('one', 'two'), ('two', 'two'),
+                  (str(self.root / 'one'), 'two'), ('one', str(self.root / 'two')),
+                  ('"$unknown"', 'two'), ('one', 'two/../two')]
+        for first, last in values:
+            for first_separator, last_separator in ((' ', ' '), ('=', '='), (' ', '='), ('=', ' ')):
+                earlier = '--cwd' + first_separator + first
+                later = '--cwd' + last_separator + last
+                for mode in ('exec', 'test', 'run', ''):
+                    for name, expected in (('safe', None), ('bad', SCRIPT)):
+                        operand = (shlex.quote('node ' + name + '.js') if mode == 'exec' else
+                                   'test/' + name + ".test.ts -t 'a.*b'" if mode == 'test' else name + '.js')
+                        for prefix in ('bun ' + earlier + ' ' + mode + ' ' + later,
+                                       'bun ' + mode + ' ' + earlier + ' ' + later):
+                            command = prefix + ' ' + operand
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_repeated_cwd_preloads_use_final_directory(self):
+        self.write('one/two/safe.js', f'require("fs").readFileSync({LIVE!r})')
+        self.write('one/two/bad.js', 'console.log("ok")')
+        self.write('two/safe.js', 'console.log("ok")')
+        self.write('two/bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for separator in (' ', '='):
+            for names in (('safe', 'safe'), ('safe', 'bad'), ('bad', 'safe')):
+                expected = SCRIPT if 'bad' in names else None
+                first = '--preload' + separator + './' + names[0] + '.js'
+                last = '--preload' + separator + './' + names[1] + '.js'
+                for mode in ('test', 'exec "echo ok"', 'run check'):
+                    command = 'bun --cwd one ' + first + ' --cwd two ' + last + ' ' + mode
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_other_path_options_preserve_cwd_and_body(self):
+        self.write('pkg/safe.js', 'console.log("ok")')
+        self.write('pkg/bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for option in ('--cpu-prof-name', '--cpu-prof-dir', '--heap-prof-name', '--heap-prof-dir',
+                       '--redirect-warnings', '--tsconfig-override', '--env-file', '--config', '-c',
+                       '--coverage-dir', '--reporter-outfile'):
+            for separator in (' ', '='):
+                values = option + separator + 'one ' + option + separator + 'two'
+                for name, expected in (('safe', None), ('bad', SCRIPT)):
+                    command = 'bun --cwd pkg test ' + values + ' ./' + name + '.js'
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+                    if option not in {'--coverage-dir', '--reporter-outfile'}:
+                        command = 'bun --cwd pkg exec ' + values + ' ' + shlex.quote('node ' + name + '.js')
+                        with self.subTest(command=command):
+                            self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_exec_options_select_shell_operand(self):
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for option in ('--silent', '--smol', '--no-clear-screen', '--silent --smol',
+                       '--filter "pkg*"', '--filter="pkg*"'):
+            for prefix in ('bun ' + option + ' exec', 'bun exec ' + option,
+                           'bun ' + option + ' exec ' + option):
+                for separator in (' ', ' -- '):
+                    for name, expected in (('safe', None), ('bad', SCRIPT)):
+                        command = prefix + separator + shlex.quote('node ' + name + '.js')
+                        with self.subTest(command=command):
+                            self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_exec_value_options_select_shell_operand(self):
+        self.write('empty.env', '')
+        self.write('empty.toml', '')
+        self.write('tsconfig.json', '{}')
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        options = {
+            '--env-file': 'empty.env', '--cwd': '.', '--config': 'empty.toml', '-c': 'empty.toml',
+            '--filter': 'pkg*', '-F': 'pkg*', '--elide-lines': '2', '--shell': 'bun',
+            '--watch-kill-signal': 'SIGTERM', '--cpu-prof-name': 'cpu', '--cpu-prof-dir': '.',
+            '--cpu-prof-interval': '1000', '--heap-prof-name': 'heap', '--heap-prof-dir': '.',
+            '--heap-prof-interval': '524288', '--install': 'fallback', '--port': '3000',
+            '--conditions': 'development', '--fetch-preconnect': 'https://example.invalid',
+            '--max-http-header-size': '16384', '--dns-result-order': 'verbatim',
+            '--redirect-warnings': 'warnings.log', '--disable-warning': 'DEP0005',
+            '--title': 'bun exec test', '--unhandled-rejections': 'strict', '--console-depth': '2',
+            '--user-agent': 'bun test', '--cron-title': 'test', '--cron-period': '1000',
+            '--main-fields': 'main', '--extension-order': '.ts,.js',
+            '--tsconfig-override': 'tsconfig.json', '--define': 'TEST:true', '-d': 'TEST:true',
+            '--drop': 'console', '--feature': 'TEST', '--loader': '.js:js', '-l': '.js:js',
+            '--jsx-factory': 'React.createElement', '--jsx-fragment': 'React.Fragment',
+            '--jsx-import-source': 'react', '--jsx-runtime': 'automatic',
+        }
+        for flag, value in options.items():
+            for operand_separator in (' ', '='):
+                option = flag + operand_separator + shlex.quote(value)
+                for prefix in ('bun ' + option + ' exec', 'bun exec ' + option,
+                               'bun ' + option + ' exec ' + option):
+                    for separator in (' ', ' -- '):
+                        for name, expected in (('safe', None), ('bad', SCRIPT)):
+                            command = prefix + separator + shlex.quote('node ' + name + '.js')
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_exec_optional_inspect_values(self):
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        # Bun only takes an inspector address when attached with '='.
+        for flag in ('--inspect', '--inspect-wait', '--inspect-brk'):
+            for suffix in ('', '=127.0.0.1:0'):
+                option = flag + suffix
+                for prefix in ('bun ' + option + ' exec', 'bun exec ' + option):
+                    for separator in (' ', ' -- '):
+                        for name, expected in (('safe', None), ('bad', SCRIPT)):
+                            command = prefix + separator + shlex.quote('node ' + name + '.js')
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_exec_delimiter_preserves_leading_dash_body(self):
+        self.write('safe.js', 'console.log("ok")')
+        self.write('bad.js', f'require("fs").readFileSync({LIVE!r})')
+        for prefix in ('bun exec', 'bun --silent exec', 'bun exec --silent',
+                       'bun --silent exec --smol'):
+            for body_prefix in ('-missing || ', '--missing; ', '-e; ', '--preload=missing || '):
+                for name, expected in (('safe', None), ('bad', SCRIPT)):
+                    command = prefix + ' -- ' + shlex.quote(body_prefix + 'node ' + name + '.js')
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_absolute_test_files_after_unknown_cwd(self):
+        good = self.write('test/ok.test.ts', 'console.log("ok")')
+        bad = self.write('test/bad.test.ts', f'require("fs").readFileSync({LIVE!r})')
+        for prefix in ('cd "$d" && bun test ', 'bun --cwd "$d" test ',
+                       'offbox run -- \'cd "$d" && bun test '):
+            # Remote-only offbox payloads are allowed per #221.
+            bad_expected = None if prefix.startswith('offbox') else SCRIPT
+            for option in ('', ' -t "a.*b"', ' --test-name-pattern="a.*b"'):
+                for path, expected in ((good, None), (bad, bad_expected)):
+                    command = prefix + str(path) + option + ("'" if prefix.startswith('offbox') else '')
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+
+        with patch.object(Path, 'home', return_value=self.root), patch.dict(os.environ, {'HOME': str(self.root)}):
+            for home in ('~', '$HOME', '${HOME}'):
+                for name, expected in (('ok', None), ('bad', SCRIPT)):
+                    command = 'cd "$d" && bun test "' + home + '/test/' + name + '.test.ts"'
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), expected)
+
+    def test_bun_115_still_refuses(self):
+        self.write('test/bad.test.ts', f'require("fs").readFileSync({LIVE!r})')
+        self.write('pkg/bad.ts', f'require("fs").readFileSync({LIVE!r})')
+        commands = [
+            'bun test test/bad.test.ts', "bun test test/bad.test.ts -t 'a.*b'",
+            "bun test -t 'a.*b' test/bad.test.ts",
+            "env -u BUN_INSPECT ROBOB_TEST=1 bun test test/bad.test.ts --test-name-pattern 'a.*b|c'",
+            'cd "$d" && bun x.ts', 'cd "$d" && bun run scripts/x.ts',
+            'bun exec ' + shlex.quote('sqlite3 ' + LIVE),
+            'bun -e ' + shlex.quote(f'require("fs").readFileSync({LIVE!r})'),
+            "bun test 'test/*.test.ts'", 'bun --cwd pkg bad.ts', 'bun --cwd=pkg run bad.ts',
+            'bun test --bail test/bad.test.ts', 'bun test --bail 2 test/bad.test.ts',
+            'bun test --parallel test/bad.test.ts', 'bun test --changed test/bad.test.ts',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.classify(command))
+
     def table(self, rows):
         for command, expected in rows:
             with self.subTest(command=command):
@@ -2699,7 +3345,10 @@ bash "$TASK_DIR/step5r.sh"
         for path in ['state.sqlite', '$D/state.sqlite', '${D}/state.sqlite', '~/$D/state.sqlite', '~/*/state.sqlite', '$(pwd)/state.sqlite']:
             command = f'sqlite3 -readonly "{path}" "select 1"'
             with self.subTest(path=path):
-                self.assertEqual(self.classify(command), READ)
+                # $(pwd) names the tracked cwd (#235): it gets its absolute twin's decision.
+                expected = (self.classify(command.replace('$(pwd)', str(self.root))) if path.startswith('$(pwd)')
+                            else READ)
+                self.assertEqual(self.classify(command), expected)
                 script = self.write('tmp/unknown.sh', 'CLI=/Users/ardud/.local/share/tool/cli.ts\n' + command)
                 self.assertEqual(self.classify('zsh ' + shlex.quote(str(script))), SCRIPT)
         for directory in ['~/.robob/userdata', '~/.t3/userdata']:
@@ -3449,7 +4098,9 @@ bash "$TASK_DIR/step5r.sh"
                     self.assertEqual(self.classify(wrapper(safe.replace('echo hi', 'sqlite3 ' + LIVE))), READ)
             for payload in ['bash <<"EOF\necho hi\nEOF\n', 'bash <<EOF\necho hi\n']:
                 with self.subTest(wrapper=wrapper, payload=payload):
-                    self.assertEqual(self.classify(wrapper(payload)), UNRESOLVED)
+                    # Remote-only (#221): a broken heredoc fails on the box, not here.
+                    self.assertEqual(self.classify(wrapper(payload)),
+                                     None if remote_only_offbox(wrapper(payload)) else UNRESOLVED)
         self.table([
             ('bash <<EOF\nsqlite3 ' + LIVE + '\nEOF\n', READ),
             ('cat <<EOF\n$(sqlite3 ' + LIVE + ')\nEOF\n', READ),
@@ -3527,7 +4178,9 @@ bash "$TASK_DIR/step5r.sh"
             ('S=tmp/t; python3 "$S"\'.py\'', None),
             ('S=tmp/live; python3 "$S"\'.py\'', SCRIPT),
             ('S=safe.py; offbox run -- python3 "$S"; python3 tmp/live.py', SCRIPT),
-            ('S=safe.py; offbox run -- bash -c \'S=tmp/live.py; python3 "$S"\'', SCRIPT),
+            # The quoted ';' keeps this payload on the box (#221).
+            ('S=safe.py; offbox run -- bash -c \'S=tmp/live.py; python3 "$S"\'', None),
+            ('S=safe.py; offbox run -- bash -c \'python3 tmp/live.py\'', SCRIPT),
             ('S=tmp/live.py; offbox run -- bash -c \'S=safe.py; python3 "$S"\'', None),
             ('S=tmp/live.py; offbox run -- \'S=safe.py; python3 "$S"\'', None),
             ('S="python3 safe.py"; offbox run -- "$S"', None),
@@ -3549,10 +4202,12 @@ bash "$TASK_DIR/step5r.sh"
     def test_remote_argv_keeps_literal_dollar_segments(self):
         self.write('$S', 'print(1)')
         self.write('tmp/$S.py', 'print(1)')
-        for operand in ["'$S'", r'\$S', r'"\$S"']:
+        # A literal $ reaches offbox, whose fallback refuses it (#221); the
+        # guard counts double-quoted $ as caller-expanded and keeps checking.
+        for operand, expected in [("'$S'", None), (r'\$S', None), (r'"\$S"', UNRESOLVED)]:
             with self.subTest(operand=operand):
-                self.assertEqual(self.classify('S=tmp/live.py; offbox run -- python3 ' + operand), UNRESOLVED)
-        self.assertEqual(self.classify('D=tmp; S=live; offbox run -- python3 "$D"/\'$S.py\''), UNRESOLVED)
+                self.assertEqual(self.classify('S=tmp/live.py; offbox run -- python3 ' + operand), expected)
+        self.assertIsNone(self.classify('D=tmp; S=live; offbox run -- python3 "$D"/\'$S.py\''))
         self.assertEqual(self.classify('D=tmp; S=live; offbox run -- python3 "$D"/"$S.py"'), SCRIPT)
         self.assertIsNone(self.classify('S=tmp/live.py; offbox run -- cat \'$S\''))
 
@@ -5099,6 +5754,10 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
         for command in commands:
             with self.subTest(command=command):
                 rule, reason = guard.classify_detail(command, str(self.root))
+                if remote_only_offbox(command) and 'statev2' not in command:
+                    # The fixture runs only on the box (#221).
+                    self.assertIsNone(rule, reason)
+                    continue
                 self.assertIsNotNone(rule)
                 self.assertTrue(reason)
                 if rule == SCRIPT:
@@ -5125,6 +5784,9 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
                 for wrapped in commands:
                     with self.subTest(name=name, separator=separator, command=wrapped):
                         rule, reason = guard.classify_detail(wrapped, str(self.root))
+                        if remote_only_offbox(wrapped):
+                            self.assertIsNone(rule, reason)
+                            continue
                         self.assertIsNotNone(rule)
                         self.assertTrue(reason)
         for operator in (';', ';;', ';&', ';;&', '\n', '&&', '||', '&', '|', '|&', '(', ')', '{', '}',
@@ -5283,9 +5945,10 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             self.assertNotEqual(source, original, label)
             self.write(path, source)
             for command in ('bash ' + path, '/bin/bash ' + str(self.root / path),
-                            'offbox run --bg -- bash ' + path):
+                            'offbox run -- bash ' + path, 'offbox run --bg -- bash ' + path):
                 with self.subTest(case=label, command=command):
-                    self.assertEqual(self.classify(command), SCRIPT)
+                    # --bg runs the fixture only on the box (#221).
+                    self.assertEqual(self.classify(command), None if remote_only_offbox(command) else SCRIPT)
         self.write(path, original)
         for command in ('sed -i "s/mktemp/echo/g" ' + path + '; bash ' + path,
                         'BASH_ENV=/tmp/preload.sh bash ' + path,
@@ -5293,7 +5956,8 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             with self.subTest(command=command):
                 self.assertEqual(self.classify(command), SCRIPT)
         # offbox can fall back to a local run, so its payload inherits the
-        # caller's startup bindings however they were set.
+        # caller's startup bindings however they were set. Such a binding may
+        # also rebind offbox itself, so it voids the remote-only skip (#221).
         for wrapper in ('offbox run -- ', 'offbox run --bg -- ', 'offbox run --remote --no-fallback -- '):
             for prefix in ('BASH_ENV=/tmp/preload.sh ', 'ENV=/tmp/preload.sh ', 'env BASH_ENV=/tmp/preload.sh ',
                            'export BASH_ENV=/tmp/preload.sh; ', 'BASH_ENV=/tmp/preload.sh; export BASH_ENV; ',
@@ -5305,19 +5969,22 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
                 self.assertIsNone(self.classify(wrapper + 'bash ' + path))
         with patch.dict(os.environ, {'BASH_FUNC_mktemp%%': '() { echo "$HOME"; }'}):
             self.assertEqual(self.classify('bash ' + path), SCRIPT)
-            self.assertEqual(self.classify('offbox run --bg -- bash ' + path), SCRIPT)
+            self.assertEqual(self.classify('offbox run -- bash ' + path), SCRIPT)
+            # An exported local function never reaches a --bg run (#221).
+            self.assertIsNone(self.classify('offbox run --bg -- bash ' + path))
         # The snapshot root repeats $T, so an inherited temp prefix with parent
         # segments (or one the script reassigns) must void the fixture proof.
-        commands = ('bash ' + path, '/bin/bash ' + str(self.root / path), 'offbox run --bg -- bash ' + path)
+        commands = ('bash ' + path, '/bin/bash ' + str(self.root / path), 'offbox run -- bash ' + path,
+                    'offbox run --bg -- bash ' + path)
         for prefix in ('relative/tmp', '/tmp/../..', '/tmp/x/../../Users'):
             with patch.dict(os.environ, {'TMPDIR': prefix}):
                 for command in commands:
                     with self.subTest(tmpdir=prefix, command=command):
-                        self.assertEqual(self.classify(command), SCRIPT)
+                        self.assertEqual(self.classify(command), None if remote_only_offbox(command) else SCRIPT)
         self.write(path, 'TMPDIR=/tmp/../..\n' + original)
         for command in commands:
             with self.subTest(case='script-assigns-tmpdir', command=command):
-                self.assertEqual(self.classify(command), SCRIPT)
+                self.assertEqual(self.classify(command), None if remote_only_offbox(command) else SCRIPT)
 
     def repo_node_pin(self, init=None, select=None, wrapper=None):
         """A temp HOME carrying a repo-node-pin chain shaped like the fork's."""
@@ -5480,6 +6147,7 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
                     for prefix in (assignment + ' ', 'env ' + assignment + ' ', 'export ' + assignment + '; ',
                                    'unset ' + name + '; '):
                         with self.subTest(name=name, prefix=prefix, payload=payload):
+                            # A caller-side binding keeps even a remote-only payload checked.
                             self.assertIsNotNone(self.classify(prefix + payload))
             for prefix in ('NODE_OPTIONS=--require=/unproved ', 'env NODE_OPTIONS=--require=/unproved ',
                            'export NODE_OPTIONS=--require=/unproved; '):
@@ -5701,8 +6369,8 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
         chain('pnpm-bin-shadows-rm', setup=lambda home, helper: (helper / 'pnpm-bin/rm').write_text(''))
         chain('added-node-shadows-cp', environment={'_repo_node_added_node': '{home}/added'},
               setup=lambda home, helper: ((home / 'added').mkdir(), (home / 'added/cp').write_text('')))
-        chain('managed-dir-shadows-cat', setup=lambda home, helper: ((home / '.local/share/quint-guard/bin').mkdir(parents=True),
-                                                                      (home / '.local/share/quint-guard/bin/cat').write_text('')))
+        chain('managed-dir-shadows-cat', setup=lambda home, helper: ((home / '.config/opencode/skills/remote-compute/scripts/blockers').mkdir(parents=True),
+                                                                      (home / '.config/opencode/skills/remote-compute/scripts/blockers/cat').write_text('')))
         chain('helper-module-hijack', setup=lambda home, helper: (helper / 'json.py').write_text(''))
         chain('helper-package-hijack', setup=lambda home, helper: ((helper / 're').mkdir(), (helper / 're/__init__.py').write_text('')))
         chain('python-startup', environment={'PYTHONPATH': '/tmp'})
@@ -5772,7 +6440,7 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             ('nvm-pnpm-package-live', lambda: link(nvm / 'versions/node/v26.0.0/lib/node_modules/pnpm/package.json', marker), SCRIPT),
             ('corepack-package-live', lambda: link(corepack / 'v1/pnpm/10.0.0/package.json', marker), SCRIPT),
             ('path-pnpm-root-package-live', lambda: (regular(str(pnpm_root / 'bin/pnpm.cjs'), ''),
-                                                    link(home / '.local/share/quint-guard/bin/pnpm', pnpm_root / 'bin/pnpm.cjs'),
+                                                    link(home / '.config/opencode/skills/remote-compute/scripts/blockers/pnpm', pnpm_root / 'bin/pnpm.cjs'),
                                                     link(pnpm_root / 'package.json', marker)), SCRIPT),
             ('cwd-package-json-regular', lambda: regular('package.json'), None),
             ('cwd-package-json-plain-link', lambda: link(self.root / 'package.json', plain), None),
@@ -5951,11 +6619,13 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
                 for command in self.fixture_wrapper_commands():
                     with self.subTest(case=label, command=command):
                         self.assertIsNone(self.classify(command))
-                # The same wrappers never excuse a fixture that reads a live path.
+                # The same wrappers never excuse a fixture that reads a live path,
+                # unless only the box runs it; an inherited BASH_ENV keeps even that checked.
                 self.write('tmp/fixture.sh', original + '\ncat "' + LIVE + '"\n')
                 for command in self.fixture_wrapper_commands():
+                    remote = label == 'no-bash-env' and command.startswith('offbox run --bg ')
                     with self.subTest(case=label + ':live-fixture', command=command):
-                        self.assertEqual(self.classify(command), SCRIPT)
+                        self.assertEqual(self.classify(command), None if remote else SCRIPT)
 
     def test_fixture_wrapper_refusals(self):
         self.write_plain_subpath_fixture()
@@ -6103,9 +6773,9 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             self.write('tmp/fixture.sh', source.replace('"' + root + '/fixture-live/userdata/statev2.sqlite"',
                                                        "'" + root + "/fixture-live/userdata/statev2.sqlite'"))
             for command in ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
-                            'offbox run --bg -- bash tmp/fixture.sh'):
+                            'offbox run -- bash tmp/fixture.sh', 'offbox run --bg -- bash tmp/fixture.sh'):
                 with self.subTest(root=root, command=command):
-                    self.assertEqual(self.classify(command), SCRIPT)
+                    self.assertEqual(self.classify(command), None if remote_only_offbox(command) else SCRIPT)
 
     def test_mktemp_fixture_quoted_traversal_tails(self):
         rows = [('"', separator) for separator in (')', '(', ' ', '\t', '\n', '\r', '\v', '\f', ';', '&', '|', '<', '>')]
@@ -6118,9 +6788,9 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
                       + '../' * 32 + '$HOME/.ro""bob/userdata/state""v2.sqlite' + quote + '\n')
             self.write('tmp/fixture.sh', source)
             for command in ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
-                            'offbox run --bg -- bash tmp/fixture.sh'):
+                            'offbox run -- bash tmp/fixture.sh', 'offbox run --bg -- bash tmp/fixture.sh'):
                 with self.subTest(quote=quote, separator=separator, command=command):
-                    self.assertEqual(self.classify(command), SCRIPT)
+                    self.assertEqual(self.classify(command), None if remote_only_offbox(command) else SCRIPT)
 
     def test_mktemp_fixture_tool_identity(self):
         backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
@@ -6140,7 +6810,8 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             self.write('integrations/memory-system/tests/test_backup_replica.sh', source)
             for shape, command, cwd in commands:
                 with self.subTest(variant=variant, shape=shape):
-                    self.assertEqual(guard.classify(command, str(cwd)), expected)
+                    # `offbox run --remote --no-fallback` runs the copy only on the box.
+                    self.assertEqual(guard.classify(command, str(cwd)), None if shape == 'offbox-options' else expected)
 
     def test_fixture_review_control_corpus(self):
         backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
@@ -6148,7 +6819,9 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             self.write('tmp/fixture.sh', source)
             for prefix in ('bash ', 'offbox run -- bash ', 'offbox run --remote --no-fallback -- bash '):
                 with self.subTest(case=label, source=source, prefix=prefix):
-                    self.assertEqual(self.classify(prefix + 'tmp/fixture.sh'), expected)
+                    # A remote-only run never executes the fixture here (#221).
+                    self.assertEqual(self.classify(prefix + 'tmp/fixture.sh'),
+                                     None if remote_only_offbox(prefix + 'tmp/fixture.sh') else expected)
 
     @unittest.skipUnless(Path('/opt/homebrew/opt/sqlite/bin/sqlite3').is_file(), 'requires fixture SQLite CLI')
     def test_safe_sqlite_dump_restore(self):
@@ -6875,16 +7548,22 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
         command = (fixtures / "crpko-2154-python-offbox-timeout.sh").read_text()
         cwd = "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-021d"
         self.assertIsNone(guard.classify(command, cwd))
-        script = Path(os.path.realpath(Path(cwd) / "tmp/hc021d/check.sh"))
-        self.assertIn(script, guard.scripts_in(command, cwd))
         setup, separator, remote = command.partition("\n offbox run ")
         self.assertIn("python3 - <<'PY'", setup)
         self.assertTrue(separator)
         wrapped = "offbox run " + remote
+        self.assertIn('--remote', wrapped)
+        # --remote never falls back (#221): the box runs check.sh, so its
+        # content is not scanned. Without the flag it may run here.
+        local = wrapped.replace('--remote ', '', 1)
+        script = Path(os.path.realpath(self.root / "tmp/hc021d/check.sh"))
         self.write("tmp/hc021d/check.sh", "echo safe\n")
         self.assertIsNone(self.classify(wrapped))
+        self.assertIsNone(self.classify(local))
+        self.assertIn(script, guard.scripts_in(local, str(self.root)))
         self.write("tmp/hc021d/check.sh", "sqlite3 ~/.robob/userdata/statev2.sqlite .tables\n")
-        self.assertEqual(self.classify(wrapped), SCRIPT)
+        self.assertIsNone(self.classify(wrapped))
+        self.assertEqual(self.classify(local), SCRIPT)
 
     def test_diagnostics_and_limits(self):
         for command, detail in [
@@ -7360,7 +8039,7 @@ class LiveDatabaseGuardTests(unittest.TestCase):
 
     def test_unresolved_cwd_denies_explicit_scripts_not_unrelated_binaries(self):
         for command in [
-            'cd "$TARGET" && python3 probe.py', 'cd "$(pwd)" && node probe.mjs',
+            'cd "$TARGET" && python3 probe.py', 'cd "$(git rev-parse --show-toplevel)" && node probe.mjs',
             "cd sub || python3 probe.py", "pushd sub; python3 probe.py",
             'bash -lc \'cd "$TARGET"; python3 probe.py\'',
             "if true; then cd sub; fi; python3 probe.py",
@@ -7370,6 +8049,11 @@ class LiveDatabaseGuardTests(unittest.TestCase):
         for command in ['cd "$TARGET" && npm test', "npm run missing-script", "missing-tool", 'cd "$TARGET" && python3 --version']:
             with self.subTest(command=command):
                 self.assertIsNone(guard.classify(command, str(self.root)))
+        # $(pwd) and $PWD are the tracked cwd (#235), so cd into them changes nothing.
+        for command in ['cd "$(pwd)" && node probe.mjs', 'cd "$PWD" && node probe.mjs']:
+            with self.subTest(command=command):
+                self.assertEqual(guard.classify(command, str(self.root)),
+                                 guard.classify(f'cd {shlex.quote(str(self.root))} && node probe.mjs', str(self.root)))
         event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "session_id": "fixture",
                  "cwd": str(self.root), "tool_input": {"command": 'cd "$TARGET" && python3 probe.py'}}
         with patch.object(engine, "resolve_identity", side_effect=AssertionError("identity called")):
@@ -7608,6 +8292,229 @@ class ZshStartupTests(unittest.TestCase):
                 self.assertEqual(guard.classify(command, str(self.root)), READ)
             with self.subTest(flags=flags, empty_command=True):
                 self.assertEqual(guard.classify('/bin/zsh ' + flags + " ''", str(self.root)), None)
+
+
+class LookupWriteProvenanceTests(unittest.TestCase):
+    """#239: known same-call writes keep Homebrew's python3 proved."""
+
+    def setUp(self):
+        clean = isolated_source_cases.fixture_environment_patch()
+        clean.start()
+        self.addCleanup(clean.stop)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(os.path.realpath(temporary.name))
+        # A Homebrew-shaped install: bin/python3 -> Cellar/.../bin/python3
+        # -> Frameworks/.../Versions/3.14/bin/python3.14. Never executed.
+        brew = self.root / 'opt/brew'
+        version = brew / 'Cellar/python@3.14/3.14.0/Frameworks/Python.framework/Versions/3.14'
+        self.real_python = self.executable(version / 'bin/python3.14')
+        (brew / 'Cellar/python@3.14/3.14.0/bin').mkdir(parents=True)
+        (brew / 'Cellar/python@3.14/3.14.0/bin/python3').symlink_to('../Frameworks/Python.framework/Versions/3.14/bin/python3.14')
+        (brew / 'bin').mkdir()
+        (brew / 'bin/python3').symlink_to('../Cellar/python@3.14/3.14.0/bin/python3')
+        self.site = brew / 'lib/python3.14/site-packages'
+        self.site.mkdir(parents=True)
+        self.stdlib = version / 'lib/python3.14'
+        self.stdlib.mkdir(parents=True)
+        self.brew = brew
+        prefixes = patch.object(guard, 'HOMEBREW_PREFIXES', (str(brew),))
+        prefixes.start()
+        self.addCleanup(prefixes.stop)
+        self.home = self.root / 'home'
+        self.node = self.executable(self.home / '.nvm/versions/node/v24.0.0/bin/node')
+        self.user_bin = self.home / '.local/bin'
+        self.user_bin.mkdir(parents=True)
+        self.missing_bin = self.home / '.cargo/bin'
+        self.work = self.root / 'work/repo'
+        (self.work / 'scripts').mkdir(parents=True)
+        (self.work / 'scripts/check.py').write_text('print(1)\n')
+        self.scratch = self.root / 'scratch'
+        self.scratch.mkdir()
+        search = [str(self.user_bin), str(self.missing_bin), str(brew / 'bin'), str(self.node.parent), '/usr/bin', '/bin']
+        environment = patch.dict(os.environ, {'PATH': os.pathsep.join(search), 'HOME': str(self.home),
+                                              'TMPDIR': str(self.scratch)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def executable(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('#!/bin/sh\nexit 0\n')
+        path.chmod(0o755)
+        return path
+
+    def heredoc(self, target, body='package x\n', append=False):
+        return ('cat >> ' if append else 'cat > ') + target + " <<'EOF'\n" + body.rstrip() + '\nEOF\n'
+
+    def classify(self, command):
+        return guard.classify_detail(command, str(self.work))
+
+    def assert_allowed(self, rows):
+        for label, command in rows.items():
+            with self.subTest(case=label):
+                self.assertEqual(self.classify(command), (None, None))
+
+    def assert_lookup_denied(self, rows, fragment='executable provenance or mutation proof failed'):
+        for label, command in rows.items():
+            with self.subTest(case=label):
+                rule, cause = self.classify(command)
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn(fragment, cause)
+
+    def test_known_data_writes_keep_bare_interpreter_proved(self):
+        self.assertEqual(guard.shutil.which('python3'), str(self.brew / 'bin/python3'))
+        overlay = "python3 -I - \"$PWD\" \"$d\" <<'PY'\nimport json, sys\nprint(json.dumps({'Replace': {}}))\nPY\n"
+        fixture = (Path(__file__).with_name('fixtures') / 'lookup-writes' / 'crpko-4655-go-overlay.sh').read_text()
+        self.assert_allowed({
+            'exact 4655 command': fixture,
+            'row C mktemp scratch': 'd=$(mktemp -d)\n' + self.heredoc('"$d/early_hold_test.go"') + overlay,
+            'row C template scratch': (f'd=$(mktemp -d {self.work}/tmp.XXXXXX)\n' +
+                                       self.heredoc('"$d/early_hold_test.go"') + overlay),
+            'row I literal relative': self.heredoc('tmp-x/early_hold_test.go') + overlay.replace('"$d"', 'tmp-x'),
+            'append to literal .ts': self.heredoc('scripts/remote-box.test.ts', 'test(1)', append=True) +
+                                     'python3 -I scripts/check.py\n',
+            'stdin edit after .py write': (self.heredoc('scripts/sync.py', 'print(2)') +
+                                           "python3 -I - <<'PY'\nprint(3)\nPY\n"),
+            'scratch script run': 'd=$(mktemp -d)\n' + self.heredoc('"$d/probe.py"', 'print(1)') + 'python3 -I "$d/probe.py"\n',
+            'scratch script -I -B': 'd=$(mktemp -d)\n' + self.heredoc('"$d/probe.py"', 'print(1)') + 'python3 -I -B "$d/probe.py"\n',
+            'absolute brew path': ('d=$(mktemp -d)\n' + self.heredoc('"$d/probe.py"', 'print(1)') +
+                                   f'{self.brew}/bin/python3 -I -B "$d/probe.py"\n'),
+            'node -e': 'd=$(mktemp -d)\n' + self.heredoc('"$d/a.go"') + "node -e 'console.log(1)'\n",
+            'node stdin': 'd=$(mktemp -d)\n' + self.heredoc('"$d/a.go"') + "node - <<'JS'\nconsole.log(1)\nJS\n",
+        })
+
+    def test_writes_that_reach_lookup_or_startup_stay_refused(self):
+        link = self.work / 'bin-link'
+        link.symlink_to(self.user_bin)
+        (self.work / 'innocent.txt').symlink_to(self.user_bin / 'python3')
+        (self.work / 'notes.txt').symlink_to(self.work / '.python-version')
+        stdin = "python3 -I - <<'PY'\nprint(1)\nPY\n"
+        rows = {
+            'home PATH dir': '"$HOME/.local/bin/python3"',
+            'PATH dir sibling': f'{self.brew}/bin/notes',
+            'resolved symlink itself': f'{self.brew}/bin/python3',
+            'PATH dir case variant': str(self.user_bin).upper() + '/python3',
+            'missing PATH dir': f'{self.missing_bin}/python3',
+            'python-version': './.python-version',
+            'tool-versions parent': '../.tool-versions',
+            'envrc': 'sub/.envrc',
+            'mise toml': 'mise.toml',
+            'mise dotted toml': '.mise.local.toml',
+            'mise config dir': '.config/mise/config.toml',
+            'pyvenv.cfg': 'pyvenv.cfg',
+            'site pth': f'{self.site}/x.pth',
+            'stdlib sitecustomize': f'{self.stdlib}/sitecustomize.py',
+            'symlinked parent into PATH': 'bin-link/python3',
+            'symlink into PATH': 'innocent.txt',
+            'symlink to selector': 'notes.txt',
+        }
+        self.assert_lookup_denied({label: self.heredoc(target) + stdin for label, target in rows.items()})
+        self.assert_lookup_denied({
+            'fresh selector': 'd=$(mktemp -d)\n' + self.heredoc('"$d/.python-version"') + stdin,
+            'fresh root in site-packages': f'd=$(mktemp -d {self.site}/t.XXXXXX)\n' + self.heredoc('"$d/f.txt"') + stdin,
+            'echo redirect into PATH': self.heredoc('a.go') + f'echo x > {self.user_bin}/python3\n' + stdin,
+            'tee into PATH': f"tee {self.user_bin}/python3 <<'EOF'\nx\nEOF\n" + stdin,
+            'absolute brew path': self.heredoc(f'{self.site}/x.pth') + f"{self.brew}/bin/python3 -I -c 'print(1)'\n",
+        })
+        # Provenance still comes from the install layout: a wrapper ahead on
+        # PATH or a Cellar-shaped copy outside a Homebrew prefix stays unproved.
+        scratch_run = 'd=$(mktemp -d)\n' + self.heredoc('"$d/probe.py"', 'print(1)') + 'python3 -I "$d/probe.py"\n'
+        copy = self.executable(self.root / 'migrated' / self.real_python.relative_to(self.brew))
+        (self.root / 'migrated/bin').mkdir()
+        (self.root / 'migrated/bin/python3').symlink_to(copy)
+        for label, executable in (('wrapper ahead on PATH', self.executable(self.user_bin / 'python3')),
+                                  ('copy outside the prefix', self.root / 'migrated/bin/python3')):
+            with self.subTest(case=label), patch.dict(os.environ, {'PATH': os.pathsep.join((str(executable.parent), os.environ['PATH']))}):
+                rule, cause = self.classify(scratch_run)
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn('python3: executable provenance or mutation proof failed', cause)
+                self.assertNotIn('could change what', cause)
+        (self.user_bin / 'python3').unlink()
+        # With nothing remembered from a heredoc, base never asks for lookup
+        # provenance, so these start from a known checked write.
+        source = self.heredoc('a.go')
+        for label, command in {
+            'unbound root': source + self.heredoc('"$x/f"') + stdin,
+            'PATH-derived dir': source + self.heredoc('"${PATH%%:*}/python3"') + stdin,
+            'glob target': source + self.heredoc(f'{self.user_bin}/py*') + stdin,
+            'in-call symlink': source + f'ln -s {self.user_bin} lnk\n' + self.heredoc('lnk/python3') + stdin,
+            'PATH export': 'export PATH=/tmp/evil:$PATH\n' + self.heredoc('a.go') + stdin,
+            'TMPDIR rebinding': f'TMPDIR={self.site}\nd=$(mktemp -d)\n' + self.heredoc('"$d/f.txt"') + stdin,
+            'non-isolated': self.heredoc('a.go') + "python3 -c 'print(1)'\n",
+            'opaque predecessor before run': (self.heredoc('scripts/new.py', 'print(1)') + 'opaque-tool\n' +
+                                              'python3 -I scripts/new.py\n'),
+            'loop write after run': (source + f'for i in 1 2; do\npython3 -I -c \'print(1)\'\n' +
+                                     self.heredoc(f'{self.user_bin}/python3') + 'done\n'),
+        }.items():
+            with self.subTest(case=label):
+                rule, cause = self.classify(command)
+                self.assertIsNotNone(rule, cause)
+        rule, cause = self.classify(self.heredoc('a.go') + 'python3 -I -c ' + shlex.quote(f'open({LIVE!r}).read()'))
+        self.assertEqual(rule, READ, cause)
+
+    def test_startup_inputs_outside_the_symlink_chain_stay_refused(self):
+        isolated = "python3 -I -c 'print(3)'\n"
+        shared_pth = self.heredoc(f'{self.site}/x.pth', 'import harmless')
+        self.assert_lookup_denied({'Cellar framework path, shared pth': shared_pth + f"{self.real_python} -I -c 'print(3)'\n"})
+        (self.user_bin / 'python3').symlink_to(self.real_python)
+        self.assert_lookup_denied({'direct framework symlink, shared pth': shared_pth + isolated})
+        (self.user_bin / 'python3').unlink()
+        startup = self.stdlib / 'sitecustomize.py'
+        startup.write_text('print(1)\n')
+        (self.work / 'notes.go').hardlink_to(startup)
+        self.assert_lookup_denied({'hard link to sitecustomize': self.heredoc('notes.go', 'print(2)') + isolated},
+                                  'a file with other hard links')
+        (self.work / 'notes.go').unlink()
+        external = self.root / 'editable-package'
+        external.mkdir()
+        (self.site / 'editable.pth').write_text(f'{external}\n')
+        self.assert_lookup_denied({'module in a .pth path dir': self.heredoc(f'{external}/bootprobe.py', 'print(2)') + isolated},
+                                  "install or startup tree")
+        (self.site / 'editable.pth').write_text(f'{external}\nimport bootprobe\n')
+        self.assert_lookup_denied({
+            'module a .pth imports': self.heredoc(f'{external}/bootprobe.py', 'print(2)') + isolated,
+            'any write beside a .pth import': self.heredoc('a.go') + isolated,
+        }, 'runs startup code')
+        bootprobe = self.heredoc(f'{external}/bootprobe.py', 'print(2)') + isolated
+        (self.site / 'editable.pth').write_text('\ufeff' + f'import sys; sys.path.insert(0, {str(external)!r}); import bootprobe\n')
+        self.assert_lookup_denied({'BOM before a .pth import': bootprobe}, 'runs startup code')
+        (self.site / 'editable.pth').write_bytes(b'\xff\xfe' + f'{external}\n'.encode('utf-16-le'))
+        self.assert_lookup_denied({'.pth that is not UTF-8': bootprobe}, 'an unreadable startup file')
+        (self.site / 'editable.pth').unlink()
+        virtual = self.root / 'venv'
+        (virtual / 'bin').mkdir(parents=True)
+        (virtual / 'bin/python3').symlink_to(self.real_python)
+        (virtual / 'pyvenv.cfg').write_text('include-system-site-packages = false\n')
+        venv_site = virtual / 'lib/python3.14/site-packages'
+        venv_site.mkdir(parents=True)
+        (venv_site / 'editable.pth').write_text(f'{external}\nimport bootprobe\n')
+        with patch.dict(os.environ, {'PATH': os.pathsep.join((str(virtual / 'bin'), os.environ['PATH']))}):
+            self.assert_lookup_denied({'venv over the Homebrew framework': bootprobe}, 'a virtual environment interpreter')
+        relocated = self.root / 'relocated-site-packages'
+        self.site.rename(relocated)
+        self.site.symlink_to(relocated)
+        self.assert_lookup_denied({'relocated shared site real path': self.heredoc(f'{relocated}/new.pth', 'import harmless') + isolated},
+                                  'install or startup tree')
+        startup_data = external / 'startup-data'
+        startup_data.write_text('# empty\n')
+        overwrite = self.heredoc(str(startup_data), 'import harmless') + isolated
+        (relocated / 'config.pth').symlink_to(startup_data)
+        self.assert_lookup_denied({'symlinked .pth target': overwrite,
+                                   'unrelated write beside a symlinked .pth': self.heredoc('a.go') + isolated},
+                                  'a symlinked startup file')
+        (relocated / 'config.pth').unlink()
+        startup.unlink()
+        startup.symlink_to(startup_data)
+        self.assert_lookup_denied({'symlinked sitecustomize target': overwrite}, 'a symlinked startup file')
+
+    def test_lookup_refusal_names_the_write_and_the_way_out(self):
+        command = self.heredoc('./.python-version', '3.12') + "python3 -I - <<'PY'\nprint(1)\nPY\n"
+        rule, cause = self.classify(command)
+        self.assertEqual(rule, UNRESOLVED, cause)
+        self.assertIn('python3: executable provenance or mutation proof failed: line 1 writes '
+                      f'{self.work}/.python-version (a version selector file), which could change what python3 '
+                      'resolves to; use /usr/bin/python3 or run it in a separate call', cause)
+        self.assertIn('/usr/bin/python3', guard.refusal_reason(rule, cause, str(self.work)))
 
 
 if __name__ == "__main__":

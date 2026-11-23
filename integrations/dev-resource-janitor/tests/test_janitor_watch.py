@@ -24,6 +24,89 @@ import janitor_watch  # noqa: E402
 
 
 class WorkerTests(JanitorTestCase):
+    def test_expo_signal_rechecks_robob_ancestry(self):
+        for protect_after_term in (False, True):
+            with self.subTest(protect_after_term=protect_after_term):
+                parent = dict(pid=30, ppid=1, args='/bin/zsh')
+                target = dict(pid=42, ppid=30, args='node expo.js')
+                rows = {30: parent, 42: target}
+                if not protect_after_term:
+                    parent['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+                def pause(seconds):
+                    parent['args'] = '/Applications/Robob.app/Contents/MacOS/Robob'
+                with patch.object(dev_janitor.leftover_processes, 'cpu_processes', return_value=rows), \
+                        patch.object(dev_janitor.os, 'kill') as send, \
+                        patch.object(dev_janitor.time, 'sleep', side_effect=pause), \
+                        patch.object(dev_janitor, 'sh', return_value=(0, '', '')):
+                    ok, reason = dev_janitor.act(dict(kind='expo', pids=[42]))
+                self.assertFalse(ok)
+                self.assertEqual(reason, 'protected Robob descendant')
+                self.assertEqual([c.args for c in send.call_args_list],
+                                 [(42, signal.SIGTERM)] if protect_after_term else [])
+
+    def test_log_run_keeps_counters_and_adds_one_summary_and_timings(self):
+        summary = dev_janitor.leftover_processes.detect({}, {}, {}, dict(complete=True))['mcp_summary']
+        with patch.object(dev_janitor.time, 'monotonic', return_value=2), \
+                patch.object(dev_janitor, 'emit') as emit:
+            dev_janitor.log_run(1, 7, 2, True, {'sessions': 123.4}, summary)
+        self.assertEqual([c.args[2] for c in emit.call_args_list], ['janitor.mcp_summary', 'janitor.run'])
+        self.assertEqual(emit.call_args_list[0].kwargs, dict(ok=True, props={'mcp_summary': summary}))
+        self.assertEqual(emit.call_args.kwargs, dict(ok=True, duration_ms=1000,
+                         props={'found': 7, 'killed': 2, 'phase_ms': {'sessions': 123.4}}, error_tag=None))
+
+    def test_scan_reports_each_phase_and_process_scan_failures(self):
+        lp = dev_janitor.leftover_processes
+        good = lp.detect({}, {}, {}, dict(complete=True))
+        for failure in (None, RuntimeError('token=must-not-escape'), {}):
+            kw = {'side_effect': failure} if isinstance(failure, Exception) else {'return_value': good if failure is None else failure}
+            clock = iter(i / 1000 for i in range(200))
+            with self.subTest(failure=failure), \
+                    patch.object(dev_janitor.active_sessions, 'checked_snapshot', return_value={}), \
+                    patch.object(dev_janitor, 'running_sessions', return_value=(set(), {}, None)), \
+                    patch.object(dev_janitor, 'procs', return_value=[]), \
+                    patch.object(dev_janitor, 'sh', return_value=(1, '', '')), \
+                    patch.object(dev_janitor, 'keep_list', return_value=[]), \
+                    patch.object(dev_janitor.time, 'time', return_value=100.8), \
+                    patch.object(lp, 'scan', **kw), patch.object(dev_janitor.time, 'monotonic', side_effect=lambda: next(clock)):
+                report = dev_janitor.scan()
+            self.assertEqual(report['ts'], 100.8)
+            for phase in ('sessions', 'liveness', 'resource_processes', 'simulators', 'expo', 'docker',
+                          'session_evidence', 'leftover_processes'):
+                self.assertEqual(report['phase_ms'][phase], 1.0)
+            summary = report['processes']['mcp_summary']
+            self.assertEqual(summary['ok'], failure is None)
+            self.assertEqual(summary['verdict'], 'clean' if failure is None else 'unverified')
+            self.assertNotIn('must-not-escape', json.dumps(summary))
+            with patch.object(dev_janitor, 'scan', return_value=report), \
+                    patch.object(dev_janitor, 'record_report'), patch.object(dev_janitor, 'emit') as emit, \
+                    (self.state_dir / 'lock').open('a+') as lock:
+                self.assertEqual(janitor_watch.worker(lock.fileno()), 0)
+            events = [c for c in emit.call_args_list if c.args[2] == 'janitor.mcp_summary']
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].kwargs['ok'], failure is None)
+            self.assertEqual(emit.call_args.kwargs['props']['phase_ms'], report['phase_ms'])
+
+    def test_scan_aborts_before_processes_still_emits_unverified_summary_once(self):
+        with patch.object(dev_janitor, 'scan', side_effect=RuntimeError('private')), \
+                patch.object(dev_janitor, 'emit') as emit, (self.state_dir / 'lock').open('a+') as lock:
+            self.assertEqual(janitor_watch.worker(lock.fileno()), 1)
+        events = [c for c in emit.call_args_list if c.args[2] == 'janitor.mcp_summary']
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0].kwargs['ok'])
+        self.assertEqual(events[0].kwargs['props']['mcp_summary']['reason'], 'process_scan_skipped')
+
+    def test_summary_reaches_report_audit_and_last_json(self):
+        lp = dev_janitor.leftover_processes
+        report = dict(ts=1, liveness_unavailable=None, phase_ms={'sessions': 1.0},
+                      processes=lp.unavailable_report('process_scan_failed'))
+        with patch.object(dev_janitor, 'LAST', str(self.root / 'last.json')):
+            dev_janitor.record_report(report)
+        last = json.loads((self.root / 'last.json').read_text())
+        audit = json.loads((self.root / 'audit.jsonl').read_text())
+        self.assertEqual(last['processes']['mcp_summary'], audit['processes']['mcp_summary'])
+        self.assertEqual(last['phase_ms'], audit['phase_ms'])
+        self.assertFalse(audit['processes']['mcp_summary']['ok'])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -98,6 +181,7 @@ class WorkerTests(JanitorTestCase):
                      "owner_calls": {"by_native": {"count": 3, "p50_ms": 10, "p95_ms": 20,
                                                    "max_ms": 20, "failures": {"404": 1}}}}
         report = {"ts": 123, "resources": [], "candidates": [], "processes": processes,
+                  "liveness": dict(attempts=3, seconds=67, last_error="control api projects: timed out"),
                   "liveness_unavailable": "control api projects: timed out"}
         with (self.state_dir / "lock").open("a+") as lock, \
                 patch.object(dev_janitor, "scan", return_value=report), \
@@ -108,6 +192,8 @@ class WorkerTests(JanitorTestCase):
         self.assertEqual(janitor_watch.read_state()['processes'], processes)
         entry = json.loads((self.root / "audit.jsonl").read_text())
         self.assertEqual(entry, {"ts": 123, "event": "report", "processes": processes,
+                                 "liveness": report['liveness'],
+                                 "phase_ms": {},
                                  "liveness_unavailable": report["liveness_unavailable"]})
 
     def test_detached_worker_survives_check_group_and_does_not_overlap(self):
@@ -129,6 +215,7 @@ def scan():
     return {'resources': [], 'candidates': []}
 def apply(ids): raise AssertionError('no candidates')
 def log_run(*args): pass
+def collect_scan_stats(*args): pass
 def record_report(scan): pass
 """)
         env = {**os.environ, "DEV_JANITOR_WATCH_STATE": str(self.state_dir), "FAKE_ROOT": str(self.root),

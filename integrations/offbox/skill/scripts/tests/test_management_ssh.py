@@ -2,6 +2,7 @@
 import contextlib
 import ast
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import subprocess
@@ -391,20 +392,39 @@ class HomeHost(server_tests.Base):
         self.assertTrue(all(f"connect=tcp:127.0.0.1:{common.MGMT_PORT}" in c for c in additions))
 
     def test_inherited_proxy_is_retargeted_before_a_copied_box_starts(self):
-        box = self.box()
-        incus = self.f.incus
-        def devices(*args, **kw):
-            if args[:3] == ("config", "device", "list"):
-                return subprocess.CompletedProcess(args, 0, b"ssh\noffbox-mgmt-ssh\n", b"")
-            return incus(*args, **kw)
-        with patch.object(boatd, "incus", side_effect=devices), patch.object(boatd, "_fresh_identity"):
-            boatd.provision(box, ("box", "bx_source"), "default")
-        calls = self.f.calls
-        retarget = next(i for i, c in enumerate(calls) if c[:3] == ("config", "device", "set") and c[4] == "offbox-mgmt-ssh")
-        start = next(i for i, c in enumerate(calls) if c[0] == "start")
-        self.assertLess(retarget, start)
-        self.assertIn("listen=tcp:127.0.0.1:22001", calls[retarget])
-        self.assertIn(f"connect=tcp:127.0.0.1:{common.MGMT_PORT}", calls[retarget])
+        for index, source in enumerate((("box", "bx_source"), ("saved", "sv_fixture"))):
+            with self.subTest(source=source[0]):
+                box = self.box(f"bx_copy000{index}", state="provisioning", running=False, port=22000 + index * 10)
+                inherited = {device: {"type": "proxy", "listen": "tcp:127.0.0.1:22999",
+                                      "connect": "tcp:127.0.0.1:9999", "bind": "host"}
+                             for device in ("ssh", "offbox-mgmt-ssh")}
+                self.f.calls.clear()
+                incus = self.f.incus
+
+                def devices(*args, **kw):
+                    response = incus(*args, **kw)
+                    if args == ("query", f"/1.0/instances/{boatd.ct(box)}"):
+                        config = json.loads(response.stdout)
+                        return subprocess.CompletedProcess(args, 0, json.dumps({**config, "devices": inherited}).encode(), b"")
+                    if args[:3] == ("config", "device", "set"):
+                        inherited[args[4]].update(value.split("=", 1) for value in args[5:])
+                    return response
+
+                with patch.object(boatd, "incus", side_effect=devices), patch.object(boatd, "_fresh_identity") as identity:
+                    boatd.provision(box, source, "default")
+                calls = self.f.calls
+                start = next(i for i, c in enumerate(calls) if c[0] == "start")
+                row = self.state(box)
+                for device, port, connect in (("ssh", row["ssh_port"], 22),
+                                              ("offbox-mgmt-ssh", row["mgmt_ssh_port"], common.MGMT_PORT)):
+                    retarget = next(i for i, c in enumerate(calls)
+                                    if c[:3] == ("config", "device", "set") and c[4] == device)
+                    self.assertLess(retarget, start)
+                    self.assertEqual(inherited[device], {"type": "proxy", "listen": f"tcp:127.0.0.1:{port}",
+                                                         "connect": f"tcp:127.0.0.1:{connect}", "bind": "host"})
+                self.assertEqual(row["state"], "ready")
+                self.assertEqual(row["identity_pending"], 0)
+                identity.assert_called_once_with(box)
 
     def test_image_and_old_box_boot_readiness_use_their_own_listener(self):
         for legacy, expected in ((True, 22), (False, common.MGMT_PORT)):

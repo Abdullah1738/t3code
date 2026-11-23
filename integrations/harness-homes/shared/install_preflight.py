@@ -32,6 +32,9 @@ def preflight(staged, baseline=None):
                         raise gh.HomeError(f'install opencode-plugins first: missing {relative}')
                     raise gh.HomeError(f'required installed parity source missing: {installed}')
                 installed.read_bytes()
+            elif not spec.startswith('../'):
+                # Inside this package: the install copies it, so check the copy being installed.
+                gh.source_digest(str(gh.PKG / spec))
             else:
                 # plan_all reads repo siblings; the installed generator reads
                 # siblings under ~/.local/share instead. Check those as well.

@@ -164,6 +164,13 @@ export type State = {
   failure_pause_notice?: string;
   failure_pause_escalation?: string;
   failure_pause_escalation_fallback?: string;
+  failure_escalation_key?: string;
+  failure_escalation_source?: string;
+  failure_escalation_attempts?: number;
+  failure_escalation_next_at?: string;
+  failure_escalation_notice?: string;
+  failure_escalation_notice_sent?: boolean;
+  failure_escalation_pending?: { channel: "wake" | "imessage"; key: string };
   failure_recovery_notices?: { key: string; text: string; retry_at?: number }[];
   /** Separate from Telegram flags; retained through resume until bridge acceptance. */
   owner_imessage_episodes?: OwnerAlertEpisode[];
@@ -179,6 +186,7 @@ export type State = {
   failure_escalated?: boolean;
   /** Wall time of the last check run, in ms. */
   last_run_ms?: number;
+  recent_check_ms?: number[];
   /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
   pending?: { key: string; event: string; at: string; count?: number; urgent?: boolean; route?: WakeRoute; watcher?: Watcher; creatorSend?: { thread: string; sentAt: number }; context_file?: string; healthRun?: string; healthRuns?: string[] };
   last_delivery?: string;
@@ -199,9 +207,14 @@ export type WakeConfirmation = {
   key: string; thread?: string; sentAt: number; attempts: number; event: string; text: string;
   nextAt?: number; escalated?: boolean; ownerFallback?: boolean; nativeSession?: string;
   deadlineAt?: number; unconfirmedAt?: number; alertDone?: boolean; fallbackDone?: boolean; fallbackText?: string;
+  sendPending?: boolean; sendAttempts?: number; deferredAt?: number;
 };
 export const WAKE_CONFIRM_MS = Number(process.env.ROBOB_WATCH_CONFIRM_MS ?? 10 * 60_000);
 const CONFIRM_POLL_MS = 30_000;
+export function wakeSendBackoff(attempt: number): number {
+  const base = Number(process.env.ROBOB_WATCH_SEND_RETRY_MS ?? 30_000);
+  return Math.min(5 * 60_000, (Number.isFinite(base) && base > 0 ? base : 30_000) * 2 ** Math.min(attempt, 20));
+}
 
 export const PERSON_BATCH_MS = 150_000;
 export const REMOVAL_GRACE_MS = 15 * 60_000;
@@ -888,7 +901,11 @@ function creatorSendTimeout(): number {
   return underTest() && process.env.ROBOB_WATCH_T3CTL && Number.isInteger(override) && override > 0 && override < 20_000 ? override : 20_000;
 }
 
-const definiteRouteFailure = (out: string) => /\b(not_found|archived|invalid[_ ](?:id|thread|session))\b/i.exec(out)?.[1]?.toLowerCase().replaceAll(" ", "_");
+const definiteRouteFailure = (out: string) => {
+  // t3ctl prints <code>: <message>; the message can quote a thread title containing route-error words.
+  const code = /^\s*([a-z][a-z0-9_]*|invalid (?:id|thread|session)):/i.exec(out)?.[1];
+  return /\b(not_found|archived|invalid[_ ](?:id|thread|session))\b/i.exec(code ?? out)?.[1]?.toLowerCase().replaceAll(" ", "_");
+};
 
 async function creatorRoute(watcher: Watcher, session: string, cli: string, diagnostics = true): Promise<CreatorRoute> {
   const routeLog = (id: string | null, message: string) => { if (diagnostics) log(id, message); };
@@ -1004,10 +1021,9 @@ export async function checkWakeRoute(watcher: Watcher): Promise<WakeRouteCheck |
       note: `--session ${session} is not a live thread (${reason}); wakes would go to the owner chat. Pass the thread id from t3ctl, or omit --session for owner wakes.` };
   } else {
     const reason = result.kind === "refused" ? result.reason : result.reason ?? "lookup unavailable";
-    const deadline = `${WAKE_CONFIRM_MS / 60_000} minutes without confirmation`;
-    const fallback = result.kind === "native_failed" && !result.transient
-      ? `immediately if the native lookup still fails, or after ${deadline}`
-      : `on a definite delivery failure or after ${deadline}`;
+    const fallback = result.kind === "native_failed"
+      ? `if the native lookup cannot resolve a thread or on a definite delivery failure`
+      : `on a definite delivery failure; a down or slow server keeps the wake on its thread`;
     check = { route: "unverified", reason, durationMs, thread: result.kind === "thread" ? result.thread : session,
       note: `could not check thread ${shortThread(session!)} (${reason} after ${durationMs}ms); wakes will try it first and fall back to the owner chat ${fallback}.` };
   }
@@ -1037,6 +1053,27 @@ function resolveCreator(watcher: Watcher, cli: string): Promise<CreatorRoute> {
 
 const ambiguousSend = (result: { code: number; signal: NodeJS.Signals | null }) => result.signal === "SIGKILL" || result.code === 4;
 
+type SendResult = { ok: boolean; code: number; signal: NodeJS.Signals | null; out: string; stderr?: string };
+// t3ctl's transport retry hint echoes the full message, which may itself mention an archived or invalid thread.
+const sendDiagnostic = (result: SendResult) => [result.stderr ?? "", result.out]
+  .map(output => output.split("Retry safely with:", 1)[0]).join("\n");
+const controlApiUnavailable = (diagnostic: string) => /\b(?:fetch failed|ECONNREFUSED|ECONNRESET|socket hang up|EPIPE|server_restart|HTTP\s+(?:502|503|504)|connection dropped)\b/i.test(diagnostic);
+function sendFailureClass(result: SendResult): "control_api_unavailable" | "timeout" | "definite" | "other" {
+  const diagnostic = sendDiagnostic(result);
+  if (!ambiguousSend(result) && definiteRouteFailure(diagnostic)) return "definite";
+  if (result.signal === "SIGKILL" || /(?:^|\n)unavailable:/i.test(diagnostic)
+    || /\b(?:timed? out|timeout|TimeoutError)\b/i.test(diagnostic)) return "timeout";
+  return controlApiUnavailable(diagnostic) ? "control_api_unavailable" : "other";
+}
+const transientSend = (result: SendResult) => {
+  const failure = sendFailureClass(result);
+  return failure !== "definite" && (ambiguousSend(result) || ["timeout", "control_api_unavailable"].includes(failure));
+};
+const queuedThreadSend = (result: SendResult) => {
+  if (!result.ok) return false;
+  try { const value = JSON.parse(result.out); return value?.ok === true && value.delivery === "queued"; } catch { return false; }
+};
+
 function wakeThread(cli: string, thread: string, text: string, key: string, watcher: string) {
   if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return Promise.resolve({ ...refused("t3ctl send"), code: 127, signal: null });
   return run([cli, "send", thread, clip(text, MAX_WAKE), "--request-id", key, "--mode", "queue"], creatorSendTimeout(), undefined, { watcher, op: "send" });
@@ -1062,9 +1099,15 @@ function clearCreatorSend(watcher: Watcher, key: string): void {
   saveState(watcher.id, fresh);
 }
 
-export function wake(source: string, text: string, key: string, watcher?: string): Promise<{ ok: boolean; out: string }> {
+const bridgeHttpStatus = (result: { out: string }) => {
+  const match = result.out.match(/\bHTTP ([1-5][0-9]{2})\b/);
+  return match ? Number(match[1]) : undefined;
+};
+
+export async function wake(source: string, text: string, key: string, watcher?: string): Promise<{ ok: boolean; out: string; httpStatus?: number }> {
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return Promise.resolve(refused("wake"));
-  return run([BUN, spectrumCli(), "wake", `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`], undefined, undefined, { watcher });
+  const result = await run([BUN, spectrumCli(), "wake", `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`], undefined, undefined, { watcher });
+  return { ...result, httpStatus: bridgeHttpStatus(result) };
 }
 
 /**
@@ -1386,7 +1429,8 @@ export function wakeText(watcher: Watcher, event: string, state: State, test = f
 }
 
 export type Delivery = { ok: boolean; accepted?: boolean; via: string; detail: string; route?: WakeRoute;
-  confirmed?: "pending" | "n/a"; confirmation?: WakeConfirmation; meantFor?: string };
+  confirmed?: "pending" | "n/a"; confirmation?: WakeConfirmation; meantFor?: string; sendDeferred?: boolean;
+  failureClass?: ReturnType<typeof sendFailureClass> };
 
 export function trackConfirmation(state: State, delivery: Delivery): void {
   const entry = delivery.confirmation;
@@ -1404,6 +1448,7 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
   // queueEvent already read the registry; legacy/direct calls have no recorded chat classification.
   let route: WakeRoute = watcher.chat ? pending?.route ?? "other" : "owner";
   let delivery: Delivery | undefined;
+  let failureClass: Delivery["failureClass"];
   const finish = (result: Delivery) => delivery = { confirmed: "n/a", ...result, route };
   const queued = (via: string, detail: string, confirmation: WakeConfirmation, meantFor?: string) =>
     finish({ ok: false, accepted: true, via, detail, confirmed: "pending", confirmation, meantFor });
@@ -1434,22 +1479,32 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
         let reason = "error";
         try {
           const result = await wakeThread(cli, creator.thread, `${prefix}\n${text}`, key, watcher.id);
+          if (queuedThreadSend(result)) { route = "creator"; return finish({ ok: true, via: `thread:${shortThread(creator.thread)}`, detail: result.out }); }
           if (result.ok) { route = "creator"; return queued(`thread:${shortThread(creator.thread)}`, result.out,
             { ...confirmation(), sentAt: firstSentAt, thread: creator.thread }); }
           reason = exitReason(result);
-          if (ambiguousSend(result)) {
+          failureClass = sendFailureClass(result);
+          if (transientSend(result) && !ambiguousSend(result)) {
+            route = "creator";
+            const detail = probeDetail("send", result, sendStarted);
+            log(watcher.id, `creator send deferred thread=${creator.thread} ${detail}`);
+            return finish({ ...queued(`thread:${shortThread(creator.thread)}`, detail,
+              { ...confirmation(), sentAt: firstSentAt, thread: creator.thread, sendPending: true, sendAttempts: 0,
+                deferredAt: firstSentAt, nextAt: now() + wakeSendBackoff(0) }), sendDeferred: true });
+          }
+          if (transientSend(result)) {
             route = "creator";
             log(watcher.id, `creator send unconfirmed thread=${creator.thread} ${probeDetail("send", result, sendStarted)}`);
             return queued(`thread:${shortThread(creator.thread)}`, probeDetail("send", result, sendStarted),
               { ...confirmation(), sentAt: firstSentAt, thread: creator.thread });
           }
           missed = { thread: creator.thread, reason: [creator.reason, probeDetail("send", result, sendStarted)].filter(Boolean).join(", ") };
-        } catch (error) { missed = { thread: creator.thread, reason: [creator.reason, `send error after ${((now() - sendStarted) / 1000).toFixed(1)}s: ${String(error).slice(0, 300)}`].filter(Boolean).join(", ") }; }
+        } catch (error) { failureClass = "other"; missed = { thread: creator.thread, reason: [creator.reason, `send error after ${((now() - sendStarted) / 1000).toFixed(1)}s: ${String(error).slice(0, 300)}`].filter(Boolean).join(", ") }; }
         clearCreatorSend(watcher, key);
         creatorFallback(watcher, "send", reason, sendStarted);
         // log(watcher.id, ...) below stays in the watcher archive; stdout reaches runner.log.
         log(null, `creator wake fallback watcher=${watcher.id} thread=${creator.thread} reason=${reason}`);
-      } else if (creator.kind === "unreachable") missed = creator;
+      } else if (creator.kind === "unreachable") { missed = creator; failureClass = "definite"; }
       if (missed) {
         text = `(meant for thread ${shortThread(missed.thread)}, which could not be reached)\n${text}`;
         log(watcher.id, `creator wake fallback thread=${missed.thread} ${missed.reason}`);
@@ -1475,7 +1530,8 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
         ...(delivery?.meantFor ? { meantFor: delivery.meantFor } : {}), ...(delivery?.confirmation?.thread ? { thread: delivery.confirmation.thread } : {}) },
       props: { via: watcher.chat && via.startsWith("wake:") ? "wake" : via,
         ...(delivery?.meantFor ? { meant_for: shortThread(delivery.meantFor) } : {}),
-        confirmed: delivery?.confirmed ?? "n/a", accepted: !!accepted, events: pending?.count ?? 1 },
+        confirmed: delivery?.confirmed ?? "n/a", accepted: !!accepted, events: pending?.count ?? 1,
+        ...(delivery?.sendDeferred ? { sendDeferred: true } : {}), ...(failureClass ? { failureClass } : {}) },
       ...(accepted ? {} : { error: { tag: "wake.delivery_failed" } }) });
   }
 }
@@ -1508,12 +1564,97 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
     saveState(watcher.id, fresh);
     return true;
   };
+  const confirm = (entry: WakeConfirmation) => {
+    if (!update(entry, true)) return;
+    const durationMs = Math.max(0, now() - (entry.deferredAt ?? entry.sentAt));
+    const message = `wake confirmed after ${(durationMs / 1000).toFixed(1)}s key=${entry.key}`;
+    log(watcher.id, message); log(null, `${message} watcher=${watcher.id}`);
+    toolLog({ component: "wakes", kind: "event", name: "wake.confirmed", ok: true, durationMs,
+      ids: { watcher: watcher.id, key: wakeInboundId(entry.key), thread: entry.thread ?? entry.nativeSession ?? "owner" } });
+  };
+  const fallbackThread = async (entry: WakeConfirmation, missed = true) => {
+    entry.ownerFallback = true;
+    delete entry.sendPending;
+    entry.fallbackText ??= missed ? `(meant for thread ${shortThread(entry.thread!)}, which could not be reached)\n${entry.text}` : entry.text;
+    // Save the route before sending: a crash must never confirm this rejected wake from a thread run.
+    if (!update(entry)) return;
+    const result = await deliverToOwner(watcher, entry.event, entry.fallbackText, entry.key);
+    const via = result.via === "wake" && missed ? "wake:owner-fallback" : result.via;
+    entry.fallbackDone = result.ok;
+    update(entry, result.ok && result.via !== "wake", via);
+    log(watcher.id, `wake escalation key=${entry.key} via=${via} confirmed=pending`);
+  };
+  const retryThread = async (entry: WakeConfirmation, escalation = false) => {
+    const cli = t3ctlCli();
+    if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return;
+    const started = now();
+    const wasPending = entry.sendPending;
+    entry.sendAttempts = (entry.sendAttempts ?? 0) + 1;
+    entry.nextAt = now() + wakeSendBackoff(entry.sendAttempts);
+    if (!update(entry)) return;
+    // Bypass the successful-route cache: a thread may have been archived since its first send.
+    const route = await creatorRoute(watcher, entry.thread!, cli);
+    const ids = { watcher: watcher.id, key: wakeInboundId(entry.key), thread: entry.thread! };
+    const record = (outcome: string) => toolLog({ component: "wakes", kind: "event", name: "wake.send_retry",
+      durationMs: Math.max(0, now() - started), ids, props: { op: "send", attempt: entry.sendAttempts, outcome } });
+    if (route.kind === "unreachable") {
+      record("definite");
+      await fallbackThread(entry);
+      return;
+    }
+    if (route.kind === "owner") {
+      record("owner");
+      await fallbackThread(entry, false);
+      return;
+    }
+    const sendStarted = now();
+    const result = await wakeThread(cli, entry.thread!,
+      `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]\n${entry.text}`, entry.key, watcher.id)
+      .catch(error => ({ ok: false, code: 127, signal: null, out: String(error).slice(0, 300) }));
+    const failure = result.ok ? undefined : sendFailureClass(result);
+    record(result.ok ? "accepted" : failure === "definite" ? "definite" : ambiguousSend(result) ? "ambiguous" : "deferred");
+    if (failure === "definite") { await fallbackThread(entry); return; }
+    if (result.ok || ambiguousSend(result)) {
+      delete entry.sendPending;
+      if (wasPending) {
+        // A same-key replay can return an earlier receipt whose run already finished.
+        // Keep the first possible send time so that run still confirms the wake.
+        const totalDelayMs = Math.max(0, now() - (entry.deferredAt ?? started));
+        log(watcher.id, `creator send delivered after ${entry.sendAttempts} retries thread=${entry.thread}`);
+        toolLog({ component: "wakes", kind: "event", name: "wake.send_delivered_late", ok: true, ids,
+          props: { op: "send", retries: entry.sendAttempts, totalDelayMs } });
+      }
+      entry.nextAt = now() + CONFIRM_POLL_MS;
+      if (escalation) entry.fallbackDone = true;
+    } else {
+      entry.sendPending = true;
+      entry.deferredAt ??= entry.sentAt;
+      log(watcher.id, `creator send deferred thread=${entry.thread} ${probeDetail("send", result, sendStarted)}`);
+    }
+    // A native session already resolved to a thread follows the same rule. Unresolved native
+    // sessions retain their existing escalation because there is no thread destination yet.
+    if (!update(entry, false, `thread:${shortThread(entry.thread!)}`)) return;
+    if (escalation) log(watcher.id, `wake escalation key=${entry.key} via=thread:${shortThread(entry.thread!)} confirmed=pending (target ${route.kind === "thread" && !route.unverified ? "live" : "unverified"})`);
+    if (queuedThreadSend(result)) confirm(entry);
+  };
   for (const entry of entries) {
-    if ((entry.nextAt ?? 0) > now()) continue;
+    const retryDue = (entry.nextAt ?? 0) <= now();
+    // Send backoff must not postpone the once-only ten-minute alert.
+    if (!retryDue && !(entry.sendPending && !entry.escalated
+      && now() - (entry.deadlineAt ?? entry.sentAt) >= WAKE_CONFIRM_MS)) continue;
     entry.attempts++;
-    entry.nextAt = now() + CONFIRM_POLL_MS;
+    if (retryDue) entry.nextAt = now() + CONFIRM_POLL_MS;
     if (!update(entry)) return;
     let confirmed = false;
+    let retried = false;
+    if (retryDue && entry.sendPending && entry.thread && !entry.ownerFallback && !inQuiet(watcher.quiet)) {
+      retried = true;
+      await retryThread(entry);
+      // A send is never proved by an unrelated running turn while it is still deferred.
+      // Escalation/alert work below still runs, but cannot bypass this retry's backoff.
+      const fresh = loadState(watcher.id);
+      if (![fresh.confirm, ...(fresh.confirmations ?? [])].some(item => item?.key === entry.key)) continue;
+    }
     if (entry.nativeSession && !entry.thread && !entry.escalated && !entry.ownerFallback && !inQuiet(watcher.quiet)) {
       const cli = t3ctlCli();
       const route = await resolveCreator({ ...watcher, created_by_session: entry.nativeSession }, cli);
@@ -1527,7 +1668,14 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
           `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]\n${entry.text}`, entry.key, watcher.id)
           .catch(error => ({ ok: false, code: 127, signal: null, out: String(error).slice(0, 300) }));
         log(watcher.id, `native wake resolved thread=${route.thread} accepted=${result.ok} ${result.out.slice(0, 300)}`);
-        if (!result.ok && !ambiguousSend(result)) {
+        if (queuedThreadSend(result)) { confirm(entry); continue; }
+        if (!result.ok && transientSend(result) && !ambiguousSend(result)) {
+          entry.sendPending = true;
+          entry.sendAttempts = 0;
+          entry.deferredAt = entry.sentAt;
+          entry.nextAt = now() + wakeSendBackoff(0);
+          log(watcher.id, `creator send deferred thread=${route.thread} ${probeDetail("send", result, sendStarted)}`);
+        } else if (!result.ok && !transientSend(result)) {
           creatorFallback(watcher, "send", exitReason(result), sendStarted);
           const detail = probeDetail("send", result, sendStarted);
           log(watcher.id, `creator wake fallback thread=${route.thread} ${detail}`);
@@ -1553,7 +1701,7 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
       }
       if (!update(entry)) return;
     }
-    if (entry.thread && !entry.ownerFallback && !(underTest() && !process.env.ROBOB_WATCH_T3CTL)) {
+    if (entry.thread && !entry.ownerFallback && !entry.sendPending && !(underTest() && !process.env.ROBOB_WATCH_T3CTL)) {
       try {
         const result = await run([t3ctlCli(), "status", entry.thread], creatorTimeout(), 100_000, { watcher: watcher.id, op: "confirm" });
         if (result.ok) {
@@ -1576,10 +1724,7 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
     const durationMs = Math.max(0, now() - entry.sentAt);
     const ids = { watcher: watcher.id, key: wakeInboundId(entry.key), thread: entry.thread ?? entry.nativeSession ?? "owner" };
     if (confirmed) {
-      if (!update(entry, true)) return;
-      const message = `wake confirmed after ${(durationMs / 1000).toFixed(1)}s key=${entry.key}`;
-      log(watcher.id, message); log(null, `${message} watcher=${watcher.id}`);
-      toolLog({ component: "wakes", kind: "event", name: "wake.confirmed", ok: true, durationMs, ids });
+      confirm(entry);
     } else if (now() - (entry.deadlineAt ?? entry.sentAt) >= WAKE_CONFIRM_MS) {
       const target = entry.thread ?? entry.nativeSession ?? "owner chat";
       if (!entry.escalated) {
@@ -1601,6 +1746,11 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
         if (!update(entry)) return;
       }
       if (entry.fallbackDone) continue;
+      if (entry.thread && !entry.ownerFallback) {
+        if (retried && !entry.sendPending) { entry.fallbackDone = true; if (!update(entry)) return; }
+        else if (!entry.sendPending) await retryThread(entry, true);
+        continue;
+      }
       // An existing owner wake is immutable under its key. Retrying must preserve its payload.
       entry.fallbackText ??= entry.ownerFallback || !entry.thread && !entry.nativeSession ? entry.text
         : `(meant for thread ${shortThread(target)}; its wake is still unconfirmed)\n${entry.text}`;
@@ -1641,8 +1791,7 @@ export function clearFailureState(state: State): void {
   clearFailureProbe(state);
   delete state.failure_paused_at;
   delete state.failure_pause_notice;
-  delete state.failure_pause_escalation;
-  delete state.failure_pause_escalation_fallback;
+  clearFailureEscalation(state);
   delete state.trigger_error;
   delete state.load_timeouts;
   delete state.load_timeout_since;
@@ -1654,6 +1803,19 @@ export function clearFailureState(state: State): void {
   delete state.failure_episode;
   delete state.last_error;
   delete state.last_error_sources;
+}
+
+export function clearFailureEscalation(state: State): void {
+  delete state.failure_escalated;
+  delete state.failure_pause_escalation;
+  delete state.failure_pause_escalation_fallback;
+  delete state.failure_escalation_key;
+  delete state.failure_escalation_source;
+  delete state.failure_escalation_attempts;
+  delete state.failure_escalation_next_at;
+  delete state.failure_escalation_notice;
+  delete state.failure_escalation_notice_sent;
+  delete state.failure_escalation_pending;
 }
 
 export function ensureFailureProbe(watcher: Watcher, state: State): boolean {
@@ -1698,7 +1860,10 @@ export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t
 export const ESCALATE_AFTER_MS = Number(process.env.ROBOB_WATCH_ESCALATE_AFTER_MS ?? 15 * 60_000);
 
 export function shouldEscalate(watcher: Watcher, state: State, t = now()): boolean {
-  if (watcher.mode !== "wake" || state.failure_escalated || !state.failing_since) return false;
+  if (watcher.mode !== "wake" || !state.failing_since) return false;
+  if (state.failure_escalated && !state.failure_escalation_pending
+    && (!state.failure_escalation_notice || state.failure_escalation_notice_sent)) return false;
+  if (state.failure_escalation_next_at && Date.parse(state.failure_escalation_next_at) > t) return false;
   if (state.dependency_busy) return t - Date.parse(state.dependency_busy.since) >= BUSY_ALERT_AFTER_MS;
   return !!state.failure_paused_at || t - Date.parse(state.failing_since) >= ESCALATE_AFTER_MS;
 }
@@ -1756,22 +1921,139 @@ export function escalationFallbackText(watcher: Watcher, state: State, mins: num
 
 export async function escalate(watcher: Watcher, state: State, key: string, imessageFallback = true): Promise<Delivery> {
   const started = now();
+  const instance = watcherInstance(watcher.id), since = state.failing_since, episode = state.failure_episode;
+  const sameEpisode = (fresh: State) => !!loadWatcher(watcher.id) && watcherInstance(watcher.id) === instance
+    && fresh.failing_since === since && fresh.failure_episode === episode;
+  // Claim the retry window and freeze both bodies before any transport can accept them.
+  const prepared = await withRelayLockAsync(() => {
+    const fresh = loadState(watcher.id);
+    if (!sameEpisode(fresh) || !shouldEscalate(watcher, fresh)) return;
+    const mins = Math.round((Date.parse(fresh.failure_paused_at ?? iso()) - Date.parse(fresh.dependency_busy?.since ?? fresh.failing_since!)) / 60_000);
+    fresh.failure_pause_escalation ??= escalationText(watcher, fresh, mins);
+    fresh.failure_pause_escalation_fallback ??= escalationFallbackText(watcher, fresh, mins);
+    // Missing key means an episode from before this release: retain its legacy wake identity.
+    fresh.failure_escalation_key ??= key;
+    fresh.failure_escalation_source ??= `robob-watch ${watcher.id} ${fresh.dependency_busy ? "dependency busy" : "failing"}`;
+    const attempt = (fresh.failure_escalation_attempts ?? 0) + 1;
+    fresh.failure_escalation_attempts = attempt;
+    fresh.failure_escalation_next_at = iso(now() + ([1, 2, 5, 15, 30][attempt - 1] ?? 60) * 60_000);
+    saveState(watcher.id, fresh);
+    return fresh;
+  });
+  if (!prepared) return { ok: false, via: "deferred", detail: "escalation no longer due" };
+  state = prepared;
+  const wakeKey = state.failure_escalation_key!, sendKey = `${key}:imsg`;
+  const update = (change: (fresh: State) => void) => withRelayLockAsync(() => {
+    const fresh = loadState(watcher.id);
+    if (!sameEpisode(fresh) || fresh.failure_escalation_key !== wakeKey
+      || fresh.failure_escalation_attempts !== prepared.failure_escalation_attempts) return;
+    change(fresh); saveState(watcher.id, fresh); return fresh;
+  });
   let delivery: Delivery | undefined;
+  let httpStatus: number | undefined;
+  let reason: "dedupe_conflict_changed_content" | undefined;
+  const conflictReason = (out: string) => {
+    try {
+      const value: unknown = JSON.parse(out);
+      return jsonObject(value) && value.reason === "dedupe_conflict_changed_content" ? value.reason : undefined;
+    } catch { return; }
+  };
+  let exists = false;
+  let needsNotice = !!state.failure_escalation_notice;
+  const noticeText = (fresh: State) => `Watcher "${watcher.title}" is ${fresh.failure_paused_at ? "paused" : "failing"}; the agent could not be woken. Last error: ${(fresh.last_error ?? "unknown").slice(0, 500)}. Log: ${join(watcherDir(watcher.id), "log")}`;
+  // Persist acceptance before probing: a restart must only read receipts, never repost the key.
+  const markAccepted = (pending: NonNullable<State["failure_escalation_pending"]>) => update(fresh => {
+    fresh.failure_escalated = true;
+    fresh.failure_escalation_pending = pending;
+    if (exists) fresh.failure_escalation_notice ??= noticeText(fresh);
+  });
+  const attempt = async (send: () => Promise<{ ok: boolean; out: string; httpStatus?: number }>) => {
+    try { return await send(); }
+    catch (error) { return { ok: false, out: error instanceof Error ? error.message : "bridge helper failed", httpStatus: undefined }; }
+  };
+  let pending = state.failure_escalation_pending;
+  let acceptedResponse: string | undefined;
   try {
-    const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.dependency_busy?.since ?? state.failing_since!)) / 60_000);
-    const text = (state.failure_paused_at && state.failure_pause_escalation) || escalationText(watcher, state, mins);
-    const woke = await wake(`robob-watch ${watcher.id} ${state.dependency_busy ? "dependency busy" : "failing"}`, text, key, watcher.id);
-    if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
-    else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
+    if (state.failure_escalated) delivery = { ok: true, via: pending?.channel === "imessage" ? "imessage-existing" : "wake-existing", detail: "accepted key; reconciling delivery" };
     else {
-      const summary = (state.failure_paused_at && state.failure_pause_escalation_fallback) || escalationFallbackText(watcher, state, mins);
-      const sent = await imessage(summary, key, { watcher: watcher.id });
-      delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
+      const woke = await attempt(() => wake(state.failure_escalation_source!, state.failure_pause_escalation!, wakeKey, watcher.id));
+      httpStatus = woke.httpStatus;
+      if (woke.ok || httpStatus === 409) {
+        exists = httpStatus === 409;
+        if (exists) reason = conflictReason(woke.out);
+        pending = { channel: "wake", key: wakeKey };
+        delivery = { ok: true, via: exists ? "wake-existing" : "wake", detail: woke.out };
+        if (!await markAccepted(pending)) return { ok: true, via: "wake-existing", detail: "episode ended during send" };
+        if (exists) log(watcher.id, "failure escalation key already accepted (409); not resending");
+        acceptedResponse = woke.ok ? woke.out : undefined;
+      } else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
+      else {
+        // A legacy /send may already have accepted a different body under the old key.
+        // Reconcile it before using the new channel key; never duplicate it during migration.
+        if (wakeKey === key) {
+          const prior = await attempt(() => run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB,
+            `select exists(select 1 from kv where key='api:send:send:${hash(key)}')`], 10_000, undefined, { watcher: watcher.id }));
+          if (!prior.ok || prior.out.trim() !== "0") {
+            pending = { channel: "imessage", key };
+            exists = true;
+          }
+        }
+        if (!pending) {
+          const sent = await attempt(() => imessage(state.failure_pause_escalation_fallback!, sendKey, { watcher: watcher.id }));
+          if (sent.ok || bridgeHttpStatus(sent) === 409) {
+            exists = bridgeHttpStatus(sent) === 409;
+            if (exists) { httpStatus = 409; reason = conflictReason(sent.out); }
+            pending = { channel: "imessage", key: sendKey };
+            delivery = { ok: true, via: exists ? "imessage-existing" : "imessage-send", detail: sent.out };
+          } else delivery = { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
+        } else delivery = { ok: true, via: "imessage-existing", detail: "legacy send acceptance" };
+        if (pending && !await markAccepted(pending)) return { ok: true, via: "imessage-existing", detail: "episode ended during send" };
+      }
+    }
+    let confirmed = false;
+    let failed = false;
+    if (pending) {
+      if (pending.channel === "wake") {
+        const pendingKey = pending.key;
+        const receipt = await attempt(() => run([BUN, spectrumCli(), "wake-status", `--key=${pendingKey}`], undefined, 5_000, { watcher: watcher.id }));
+        const readStatus = (out: string | undefined) => {
+          try {
+            const value: unknown = JSON.parse(out ?? "");
+            return jsonObject(value) && value.id === wakeInboundId(pendingKey) && typeof value.state === "string" ? value.state : undefined;
+          } catch { return; }
+        };
+        const status = (receipt.ok ? readStatus(receipt.out) : undefined) ?? readStatus(acceptedResponse);
+        confirmed = status === "admitted";
+        failed = status === "failed";
+        delivery!.detail = `accepted wake delivery ${status ?? "unproven"}`;
+      } else {
+        const receipt = await imessageReceipt(state.failure_pause_escalation_fallback!, pending.key, watcher.id).catch(() => undefined);
+        confirmed = receipt?.ok === true;
+        failed = !!receipt && !receipt.ok && !receipt.pending;
+        delivery!.detail = receipt?.out ?? "accepted send delivery unproven";
+      }
+      needsNotice = !confirmed && (needsNotice || exists || failed || state.failure_escalation_attempts! >= 3);
+    } else needsNotice ||= !delivery!.ok && state.failure_escalation_attempts! >= 3;
+    const saved = await update(fresh => {
+      fresh.failure_escalated = delivery!.ok;
+      if (confirmed) delete fresh.failure_escalation_pending;
+      if (needsNotice) fresh.failure_escalation_notice ??= noticeText(fresh);
+      else if (!fresh.failure_escalation_notice_sent) delete fresh.failure_escalation_notice;
+    });
+    if (saved?.failure_escalation_notice && !saved.failure_escalation_notice_sent) {
+      const sent = await attempt(() => telegram(`Watcher ${watcher.id}`, saved.failure_escalation_notice!,
+        `robob-watch:${watcher.id}:escalate-undelivered:${hash(episode ?? since ?? "").slice(0, 32)}`, "attention", undefined, watcher.id));
+      await update(fresh => { fresh.failure_escalation_notice_sent = sent.ok; });
+      toolLog({ component: "wakes", kind: "error", name: "failure_escalation.undelivered", ok: sent.ok,
+        ids: { watcher: watcher.id, key: wakeInboundId(wakeKey) },
+        props: { attempt: saved.failure_escalation_attempts, httpStatus, reason, failureClass: exists ? "other" : /timed out|timeout/i.test(delivery.detail) ? "timeout" : "other" },
+        error: { tag: "wake.delivery_failed" } });
     }
     return delivery;
   } finally {
-    toolLog({ component: "wakes", kind: delivery?.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - started), ok: delivery?.ok ?? false,
-      ids: { watcher: watcher.id, chat: "owner", key: wakeInboundId(key) }, ...(delivery?.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
+    log(watcher.id, `failure escalation ok=${delivery?.ok ?? false} via=${delivery?.via ?? "none"} attempt=${state.failure_escalation_attempts} next retry=${state.failure_escalation_next_at}${delivery?.ok ? "" : ` ${delivery?.detail ?? "helper failed"}`}`);
+    toolLog({ component: "wakes", kind: httpStatus === 409 ? "event" : delivery?.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - started), ok: delivery?.ok ?? false,
+      ids: { watcher: watcher.id, chat: "owner", key: wakeInboundId(wakeKey) }, props: { httpStatus, reason, attempt: state.failure_escalation_attempts }, ...(delivery?.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
   }
 }
 

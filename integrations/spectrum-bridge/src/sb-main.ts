@@ -1,8 +1,10 @@
+import { createRequestTrace } from "./request-trace.ts";
 import { ProbeBudget } from "./probe-policy.ts";
 import { RemoteBox, remoteBoxConfig } from "./remote-box.ts";
 import { createChatMirror, type ChatMirror } from "./mirror.ts";
 import { readFileSync } from "node:fs";
-import { toolError, toolLog, type LogLine } from "./toollog.ts";
+import { startRobobLinkAlerts, toolError, toolLog, type LogLine } from "./toollog.ts";
+import { createLoopStallMonitor } from "./loop-stall.ts";
 import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 /**
  * Sendblue serve loop. Kept apart from main.ts so the Photon path stays exactly as it was:
@@ -133,13 +135,21 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   let api: ((request: Request) => Promise<Response>) | undefined;
   const releaseLock = acquireLock(join(stateRoot, "bridge.lock"));
   process.once("exit", releaseLock);
+  startRobobLinkAlerts(socketPost(telegramBridgeSocket, 5_000));
+  const requests = createRequestTrace(entry => toolLog.write(entry), { loopLag: () => loopStalls.loopLag() });
+  const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }), {
+    sample: props => toolLog.write({ component: "process", kind: "perf", name: "runtime.sample", props }),
+    tick: () => requests.flush(),
+  });
+  loopStalls.start();
+  process.once("exit", () => loopStalls.stop());
   const socketPath = join(stateRoot, "bridge.sock");
   await io.removeStaleSocket(socketPath);
   // Bind before opening SQLite: a second process must not run crash recovery on live sends.
   const server = Bun.serve({
     unix: socketPath,
     maxRequestBodySize: 28 * 1024 * 1024,
-    fetch: request => api ? api(request) : Response.json({ error: "Bridge starting" }, { status: 503 }),
+    fetch: request => requests.handle(request, request => api ? api(request) : Response.json({ error: "Bridge starting" }, { status: 503 })),
   });
   await chmod(socketPath, 0o600);
   const ownerStore = new Store(join(stateRoot, "state.sqlite"));
@@ -325,6 +335,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
         lastEventAt: seen.lastEventAt, connected: seen.synchronized, openchamberConnected: backendOk,
         uptimeSeconds: Math.floor((Date.now() - health.startedAt) / 1000),
         catchingUp: !seen.synchronized, enabled: config.enabled, paired: true, ready: ready(),
+        ...(backend instanceof RobobBackend ? { activeRoster: backend.activeRoster.status() } : {}),
         ...(appsUrl ? { appsUrl } : {}), appsRoot: config.appsRoot,
       };
     },
@@ -406,7 +417,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       void chat.parts.delivery?.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
       if (ready()) void chat.parts.router?.checkCompletion();
       if (ready()) void chat.parts.replyGap?.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });
-      if (ready()) void chat.parts.router?.checkInboundLatency().catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
+      void chat.parts.router?.checkInboundLatency(ready()).catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
       if (ready() && !chat.parts.busy) {
         chat.parts.busy = true;
         const revision = chat.revision;
@@ -417,9 +428,13 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       if (ready()) void chat.parts.router?.checkFailedInbound().catch((caughtError) => { toolError("sb-main", "sb-main.catch16", caughtError); return log("failed-inbound-check-failed"); });
     }
   }, 1_000);
+  if (backend instanceof RobobBackend) backend.activeRoster.start();
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    loopStalls.stop();
+    if (backend instanceof RobobBackend) backend.activeRoster.stop();
+    requests.flush(true);
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     abort.abort();
     clearInterval(timer);

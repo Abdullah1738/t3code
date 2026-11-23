@@ -1,5 +1,7 @@
+import { createRequestTrace } from "./request-trace.ts";
 import { ProbeBudget } from "./probe-policy.ts";
-import { toolError, toolLog } from "./toollog.ts";
+import { startRobobLinkAlerts, toolError, toolLog } from "./toollog.ts";
+import { createLoopStallMonitor } from "./loop-stall.ts";
 import { acknowledgePhoton, notifyFailedInbound } from "./inbound-failure.ts";
 import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -113,13 +115,21 @@ async function main(): Promise<void> {
   let api: ReturnType<typeof createApi> | undefined;
   const releaseLock = acquireLock(join(stateRoot, "bridge.lock"));
   process.once("exit", releaseLock);
+  startRobobLinkAlerts(socketPost(telegramBridgeSocket, 5_000));
+  const requests = createRequestTrace(entry => toolLog.write(entry), { loopLag: () => loopStalls.loopLag() });
+  const loopStalls = createLoopStallMonitor(props => toolLog.write({ component: "process", kind: "event", name: "bridge-loop-stall", props }), {
+    sample: props => toolLog.write({ component: "process", kind: "perf", name: "runtime.sample", props }),
+    tick: () => requests.flush(),
+  });
+  loopStalls.start();
+  process.once("exit", () => loopStalls.stop());
   const socketPath = join(stateRoot, "bridge.sock");
   await removeStaleSocket(socketPath);
   // Bind before opening SQLite: a second process must not run crash recovery on live sends.
   const server = Bun.serve({
     unix: socketPath,
     maxRequestBodySize: 28 * 1024 * 1024,
-    fetch: request => api ? api(request) : Response.json({ error: "Bridge starting" }, { status: 503 }),
+    fetch: request => requests.handle(request, request => api ? api(request) : Response.json({ error: "Bridge starting" }, { status: 503 })),
   });
   await chmod(socketPath, 0o600);
   const store = new Store(join(stateRoot, "state.sqlite"));
@@ -202,6 +212,7 @@ async function main(): Promise<void> {
       uptimeSeconds: Math.floor((Date.now() - health.startedAt) / 1000),
       lastEventAt: health.photonLastOk,
       catchingUp: !synchronized,
+      ...(backend instanceof RobobBackend ? { activeRoster: backend.activeRoster.status() } : {}),
       ...(appsUrl ? { appsUrl } : {}),
       appsRoot: config.appsRoot,
     }) });
@@ -297,7 +308,7 @@ async function main(): Promise<void> {
     void delivery.tick().catch((caughtError) => { toolError("main", "main.catch12", caughtError); return log("sender-failed"); });
     if (ready()) void router?.checkCompletion();
     if (ready()) void replyGap.tick().catch((caughtError) => { toolError("main", "reply-gap.check", caughtError); });
-    if (ready()) void router?.checkInboundLatency().catch((caughtError) => { toolError("main", "main.catch13", caughtError); return log("inbound-latency-check-failed"); });
+    void router?.checkInboundLatency(ready()).catch((caughtError) => { toolError("main", "main.catch13", caughtError); return log("inbound-latency-check-failed"); });
     if (ready() && router && !routerBusy) {
       routerBusy = true;
       const currentRouter = router;
@@ -308,9 +319,13 @@ async function main(): Promise<void> {
     }
     if (ready()) void router?.checkFailedInbound().catch((caughtError) => { toolError("main", "main.catch15", caughtError); return log("failed-inbound-check-failed"); });
   }, 1_000);
+  if (backend instanceof RobobBackend) backend.activeRoster.start();
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    loopStalls.stop();
+    if (backend instanceof RobobBackend) backend.activeRoster.stop();
+    requests.flush(true);
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     clearInterval(timer);
     clearInterval(unansweredTimer);

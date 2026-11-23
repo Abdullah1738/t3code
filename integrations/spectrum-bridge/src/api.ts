@@ -1,3 +1,4 @@
+import { cleanRosterHealth } from "./log-active-roster.ts";
 import { markAnswered } from "./unanswered.ts";
 import { WakeDelivery, wakeId, wakeStatus } from "./wake-delivery.ts";
 import { parseHealthSidecar } from "./health-receipts.ts";
@@ -251,6 +252,8 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
           for (const key of ["appsUrl", "appsRoot"]) {
             if (typeof state[key] === "string" && line(state[key], 2048)) safe[key] = state[key];
           }
+          const roster = cleanRosterHealth(state.activeRoster);
+          if (roster) safe.activeRoster = roster;
           const active = enabled();
           const paired = pairedChat() !== undefined;
           return json({ ...safe, enabled: active, paired, ready: active && paired && router() !== undefined });

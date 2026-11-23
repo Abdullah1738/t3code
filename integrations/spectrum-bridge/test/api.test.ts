@@ -457,3 +457,15 @@ test.each([".", "..", "...", "%2e", "%2e%2e", "./", "../", "a/../b", "/", "\\", 
     expect((await h.get(foreign.path)).status).toBe(403);
     expect((await h.get("/send-status/?sessionId=other@2")).status).toBe(400);
   });
+
+test("health exposes only scalar active roster counters", async () => {
+  const f = setup();
+  f.state.health.activeRoster = { fetches: 5, safety: 4, startup: 1, children: 2, ambiguous: 3, rows: 9, total: 9,
+    streamHealthy: true, streamUp: 1, streamDown: 0, lastFetchAt: now, lastFetchReason: "safety", complete: true,
+    retryAt: 0, fetchMsP50: 15, fetchMsMax: 30, threads: ["PRIVATE_THREAD"], token: "PRIVATE_TOKEN" };
+  const result = await (await f.get("/health")).json();
+  expect(result.activeRoster).toEqual({ fetches: 5, safety: 4, startup: 1, children: 2, ambiguous: 3, rows: 9, total: 9,
+    streamHealthy: true, streamUp: 1, streamDown: 0, lastFetchAt: now, lastFetchReason: "safety", complete: true,
+    retryAt: 0, fetchMsP50: 15, fetchMsMax: 30 });
+  expect(JSON.stringify(result)).not.toContain("PRIVATE_");
+});

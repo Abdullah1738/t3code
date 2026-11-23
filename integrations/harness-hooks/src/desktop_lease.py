@@ -163,21 +163,31 @@ def _pending_file(state_dir, native):
     return Path(state_dir) / "desktop-pending" / (key + ".json")
 
 
+# Milliseconds this process has spent waiting for pending-file locks; the
+# engine reads the change across one hook call for its slow-row phase timings.
+lock_wait_ms = 0.0
+
+
 @contextlib.contextmanager
 def _pending_lock(path):
+    global lock_wait_ms
     # Lock a stable sidecar: locking the JSON inode would not survive atomic replacement.
     fd = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
-    deadline = time.monotonic() + PENDING_LOCK_WAIT
+    waited = time.monotonic()
+    deadline = waited + PENDING_LOCK_WAIT
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("control-pending-lock")
-                time.sleep(min(0.01, remaining))
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("control-pending-lock")
+                    time.sleep(min(0.01, remaining))
+        finally:
+            lock_wait_ms += (time.monotonic() - waited) * 1000
         yield
     finally:
         os.close(fd)
@@ -260,7 +270,7 @@ def admit(event, harness, control, state_dir=None, diagnostics=None):
         session, agent, call_id = event.get("session_id"), event.get("agent_id"), event.get("tool_use_id")
         if not valid_id(session) or not valid_id(call_id) or (agent is not None and not valid_id(agent)):
             raise ValueError("missing-desktop-identity")
-        payload = {"driver": "claudeAgent" if harness == "claude" else "codex",
+        payload = {"driver": {"claude": "claudeAgent", "antigravity": "antigravity"}.get(harness, "codex"),
                    "nativeId": agent if harness == "codex" and agent else session,
                    "toolUseId": call_id}
         if harness == "claude" and agent:

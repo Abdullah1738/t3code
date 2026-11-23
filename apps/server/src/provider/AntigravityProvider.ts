@@ -128,6 +128,34 @@ interface AntigravityProviderOptions {
   readonly clearUsage?: Effect.Effect<void>;
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
   readonly auth?: { readonly type: string; readonly label: string };
+  /**
+   * Gateway sign-in only: the gateway's model list. A success is the usable backend (models plus
+   * an accepted key); a failure is shown as the provider's error so child tasks are refused.
+   */
+  readonly gatewayModels?: Effect.Effect<
+    ReadonlyArray<{ readonly id: string; readonly name: string }>,
+    ProviderSetupError
+  >;
+}
+
+function sameModelIds(
+  left: ReadonlyArray<ServerProviderModel>,
+  right: ReadonlyArray<ServerProviderModel>,
+): boolean {
+  const ids = new Set(left.map((model) => model.slug));
+  return left.length === right.length && right.every((model) => ids.has(model.slug));
+}
+
+export function buildAntigravityGatewayModels(
+  models: ReadonlyArray<{ readonly id: string; readonly name: string }>,
+): ReadonlyArray<ServerProviderModel> {
+  return models.map((model, index) => ({
+    slug: model.id,
+    name: model.name,
+    isCustom: false,
+    ...(index === 0 ? { isDefault: true, aliases: [ANTIGRAVITY_DEFAULT_MODEL] } : {}),
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  }));
 }
 
 export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(function* (
@@ -175,10 +203,24 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       Effect.timeoutOption(HEALTH_CHECK_TIMEOUT),
       Effect.result,
     );
-    const initialized =
+    const probed =
       Result.isSuccess(result) && Option.isSome(result.success) ? result.success.value : undefined;
-    const version = initialized?.agentInfo?.version;
-    const failure = Result.isFailure(result) ? result.failure : undefined;
+    const gateway =
+      probed !== undefined && options.gatewayModels
+        ? yield* options.gatewayModels.pipe(Effect.result)
+        : undefined;
+    const gatewayModels =
+      gateway !== undefined && Result.isSuccess(gateway)
+        ? buildAntigravityGatewayModels(gateway.success)
+        : undefined;
+    const gatewayFailed = gateway !== undefined && Result.isFailure(gateway);
+    const initialized = gatewayFailed ? undefined : probed;
+    const version = probed?.agentInfo?.version;
+    const failure = Result.isFailure(result)
+      ? result.failure
+      : gateway !== undefined && Result.isFailure(gateway)
+        ? gateway.failure
+        : undefined;
     const missingInstallation = failure !== undefined && isMissingInstallation(failure);
     const errorMessage =
       initialized !== undefined
@@ -197,7 +239,20 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
     const next = yield* SubscriptionRef.updateAndGet(metadata, (state) => {
       if (state.authRevision !== before.authRevision) return state;
-      const { message: _previousMessage, ...draft } = state.draft;
+      const { message: _previousMessage, ...current } = state.draft;
+      const draft: typeof current =
+        gatewayModels === undefined
+          ? current
+          : {
+              ...current,
+              auth: {
+                status: "authenticated",
+                type: options.auth?.type ?? "gateway",
+                label: options.auth?.label ?? "Gateway (9router)",
+              },
+              // A session's list carries the selected model; keep it while the ids are unchanged.
+              models: sameModelIds(current.models, gatewayModels) ? current.models : gatewayModels,
+            };
       const authenticated = draft.auth.status === "authenticated";
       const message =
         errorMessage ??
@@ -231,6 +286,8 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
                 supportsTextGeneration: false,
               }
             : {}),
+          // A down gateway cannot generate text, whatever it served before.
+          ...(gatewayFailed ? { supportsTextGeneration: false } : {}),
           ...(initialized !== undefined
             ? {
                 supportsTextGeneration:

@@ -16,6 +16,24 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_orders_cli_includes_health_summary_and_tolerates_failure(self):
+        import subprocess
+        health = {'day': self.day, 'runs': 2, 'one_line': 'money-cases fixture: runs=2 receipts=1/3'}
+        with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, json.dumps(health), '')) as run, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(toollog.main(['rollup', '--board', 'orders', '--day', self.day]), 0)
+        self.assertIn(health['one_line'], out.getvalue())
+        run.assert_called_once_with(['money-cases', 'health', '--day', self.day, '--json'],
+                                   capture_output=True, text=True, timeout=2, check=True)
+        path = toollog.board_dir('orders') / ('rollup-' + self.day + '.json')
+        self.assertEqual(json.loads(path.read_text())['moneyCasesHealth'], health)
+        for failure in (FileNotFoundError(), subprocess.TimeoutExpired('money-cases', 2),
+                        subprocess.CalledProcessError(1, 'money-cases')):
+            with self.subTest(failure=type(failure)), patch('subprocess.run', side_effect=failure), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(toollog.main(['rollup', '--board', 'orders', '--day', self.day]), 0)
+            self.assertNotIn('moneyCasesHealth', json.loads(path.read_text()))
+
     def test_prompt_probe_outcomes_survive_request_catch_deduplication(self):
         directory = toollog.board_dir('imessage')
         directory.mkdir(parents=True)
@@ -496,6 +514,66 @@ class ToolLogTests(unittest.TestCase):
     def rows(self, board='agent-tools'):
         return list(toollog.read(board, self.day))
 
+    def test_watchers_packed_records_preserve_rollups_and_read_filters(self):
+        directory = toollog.board_dir('watchers')
+        directory.mkdir(parents=True)
+        path = directory / (self.day + '.ndjson')
+        at = int(datetime.fromisoformat(self.day).replace(tzinfo=timezone.utc).timestamp() * 1000)
+        stamp = lambda ms: datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+        timing = dict(zip(toollog._WATCHER_TIMING_KEYS, [12, 2, 1, 20, 60000, 0, 'no_change', 0, None, False, at, 20, 'slow', False, 'schedule']))
+        base = {'tool': 'watchers', 'component': 'runner', 'kind': 'perf', 'ids': {'watcher': 'fixture', 'run': 'abc'}}
+        for failed, slow_wait, partial_holds in [(False, False, False), (True, False, False), (False, True, True)]:
+            with self.subTest(failed=failed, slow_wait=slow_wait, partial_holds=partial_holds):
+                start = {**base, 'ts': stamp(at), 'name': 'slot.start',
+                         'props': {**{key: timing[key] for key in toollog._WATCHER_TIMING_KEYS[:5]}, 'operation': 'check'}}
+                hold = {**base, 'ts': stamp(at + 12), 'name': 'slot.hold', 'durationMs': 12, 'props': {'operation': 'check', 'lane': 'slow'}}
+                run = {**base, 'ts': stamp(at + 24), 'name': 'watch.run', 'ok': not failed, 'durationMs': 24, 'props': timing,
+                       **({'kind': 'error', 'error': {'tag': 'watch.check_failed'}} if failed else {})}
+                helper = {'tool': 'watchers', 'component': 'triage', 'kind': 'perf', 'name': 'helper.run', 'ts': stamp(at),
+                          'ok': True, 'durationMs': 5, 'ids': {'helper': 'fixture', 'watcher': 'fixture'},
+                          'props': {'exitCode': 0, 'signal': None, 'timedOut': False}}
+                path.write_text(''.join(json.dumps(row) + '\n' for row in [start, hold, run, helper]))
+                before = toollog.rollup('watchers', self.day)
+                packed_run = {**run, 'v': 1, 'ids': {'w': 'fixture', 'r': 'abc'},
+                              'props': {'timing': [(1 << len(timing)) - 1, *timing.values()], 'slotAt': at,
+                                        **({'slotWritten': True} if slow_wait else {}),
+                                        **({'holdParts': [[at + 12, 12]]} if partial_holds else {'holdAt': at + 12, 'holdMs': 12})}}
+                for key in ('tool', 'component', 'kind'):
+                    if key != 'kind' or not failed:
+                        packed_run.pop(key)
+                packed_helper = {'v': 1, 'component': 'triage', 'name': 'helper.run', 'ts': stamp(at),
+                                 'durationMs': 5, 'ids': {'h': 'fixture'}, 'props': {'compact': 'stw'}}
+                path.write_text(''.join(json.dumps(row) + '\n' for row in ([start] if slow_wait else []) + [packed_run, packed_helper]))
+                after = toollog.rollup('watchers', self.day)
+                self.assertEqual(after.pop('recordedRows'), 3 if slow_wait else 2)
+                before.pop('recordedRows')
+                self.assertEqual(after, before)
+                slots = list(toollog.read('watchers', self.day, kind='perf', name='slot.start'))
+                self.assertEqual(slots, [start])
+                self.assertEqual(list(toollog.read('watchers', self.day, kind='perf', name='slot.hold')), [hold])
+                self.assertEqual(list(toollog.read('watchers', self.day, kind='perf', name='helper.run')), [helper])
+                decoded_run = next(toollog.read('watchers', self.day, name='watch.run'))
+                self.assertEqual({key: decoded_run['props'][key] for key in timing}, timing)
+
+    def test_watchers_error_repeats_are_exact_occurrences_not_sampling(self):
+        directory = toollog.board_dir('watchers')
+        directory.mkdir(parents=True)
+        first = {'tool': 'watchers', 'component': 'telegram', 'kind': 'error', 'name': 'telegram.error',
+                 'ok': False, 'ts': self.day + 'T00:00:00.000Z', 'ids': {'watcher': 'fixture'},
+                 'error': {'tag': 'tg.attention.pendingRequests'}, 'props': {'cause': 'ECONNREFUSED'}}
+        summary = {**first, 'props': {**first['props'], 'repeats': 999, 'windowMs': 60000}}
+        (directory / (self.day + '.ndjson')).write_text(json.dumps(first) + '\n' + json.dumps(summary) + '\n')
+        result = toollog.rollup('watchers', self.day)
+        self.assertEqual((result['total'], result['failedCount'], result['recordedRows'], result['sampled']), (1000, 1000, 2, False))
+        self.assertEqual(result['countsByName'], {'telegram.error': 1000})
+        self.assertEqual(result['countsByKind'], {'error': 1000})
+        self.assertEqual(result['topErrorTags'][0]['count'], 1000)
+        for invalid in (None, True, 0, -1, 1.5, '99', 2**53):
+            with self.subTest(repeats=invalid):
+                summary['props']['repeats'] = invalid
+                (directory / (self.day + '.ndjson')).write_text(json.dumps(summary) + '\n')
+                self.assertEqual(toollog.rollup('watchers', self.day)['total'], 1)
+
     def test_hook_identity_source_only_logs_known_values(self):
         for source in ('cache', 'control', 'negative-cache', 'PRIVATE_FIXTURE', {'secret': 'PRIVATE_FIXTURE'}):
             toollog.hook('codex', 'shell', 'allowed', 'no-policy', 0.1,
@@ -676,7 +754,7 @@ class ToolLogTests(unittest.TestCase):
                                       'props': {'decision': 'allowed', 'rule': 'classifier-unavailable', **props}}
         rows = ([failed('13', {'guard': 'rootwide-search', 'classifier': 'rootwide_search_guard', 'errorClass': 'timeout'})] * 3
                 + [failed('13', {'guard': 'rootwide-search', 'classifier': 'rootwide_search_guard', 'errorClass': 'exit:1'})]
-                + [failed('02', {'guard': 'quint-verify', 'classifier': 'quint_verify_guard', 'errorClass': 'timeout'})] * 2
+                + [failed('02', {'guard': 'shared-dependencies', 'classifier': 'shared_deps_guard', 'errorClass': 'timeout'})] * 2
                 + [failed('02', {'guard': 'phone-adb'})]
                 + [failed('02', {'guard': 'shared-dependencies', 'classifier': f'c{i}', 'errorClass': 'parse'}) for i in range(4)]
                 + [{'ts': f'{self.day}T11:59:59Z', 'error': {'tag': 'phone-adb-state'},
@@ -689,7 +767,7 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(list(result['errorTagsByHour']), ['hook.classifier_failed', 'phone-adb-state'])
         self.assertEqual(result['topClassifierFailures'], [
             {'classifier': 'rootwide_search_guard', 'count': 4, 'errorClasses': {'timeout': 3, 'exit:1': 1}},
-            {'classifier': 'quint_verify_guard', 'count': 2, 'errorClasses': {'timeout': 2}},
+            {'classifier': 'shared_deps_guard', 'count': 2, 'errorClasses': {'timeout': 2}},
             {'classifier': 'c0', 'count': 1, 'errorClasses': {'parse': 1}},
             {'classifier': 'c1', 'count': 1, 'errorClasses': {'parse': 1}},
             {'classifier': 'c2', 'count': 1, 'errorClasses': {'parse': 1}}])

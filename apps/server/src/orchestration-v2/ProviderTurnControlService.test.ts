@@ -402,6 +402,111 @@ it.effect(
     }),
 );
 
+// Antigravity (ACP): session/cancel resolves the prompt within milliseconds and the
+// adapter finalizes the turn, but the run's ingestion can sit behind a backlog of
+// projection writes for longer than the 30 second restart cleanup deadline. The
+// replacement was then dropped although the native turn had already ended.
+it.effect.each(["cancelled by the restart", "ended before the restart", "still running"] as const)(
+  "restart cleanup settles on native turn end while the projected ACP turn lags: %s",
+  (nativeState) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const acpDriver = ProviderDriverKind.make("antigravity");
+      const threadId = ThreadId.make("thread:acp-restart-lag");
+      const providerSessionId = ProviderSessionId.make("provider-session:acp-restart-lag");
+      const providerTurnId = ProviderTurnId.make("provider-turn:acp-restart-lag");
+      const attemptId = RunAttemptId.make("run-attempt:acp-restart-lag");
+      const providerThread: OrchestrationV2ProviderThread = {
+        id: ProviderThreadId.make("provider-thread:acp-restart-lag"),
+        driver: acpDriver,
+        providerInstanceId: ProviderInstanceId.make("antigravity"),
+        providerSessionId,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: { driver: acpDriver, nativeId: "acp-session", strength: "strong" },
+        nativeConversationHeadRef: null,
+        status: "active",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      // The superseded attempt is settled; the projected turn never leaves "running".
+      const projection = makeProjection({
+        now,
+        threadId,
+        providerThread,
+        providerTurnId,
+        attemptId,
+      });
+      // Native end evidence the session manager keeps from the adapter's
+      // `turn.terminal` (nativeWorkEnded) as it leaves the event pump.
+      const nativeEnded = yield* Ref.make(nativeState === "ended before the restart");
+      const interrupts = yield* Ref.make(0);
+      const runtime = {
+        interruptTurn: () =>
+          Ref.update(interrupts, (count) => count + 1).pipe(
+            Effect.andThen(
+              nativeState === "cancelled by the restart" ? Ref.set(nativeEnded, true) : Effect.void,
+            ),
+          ),
+        hasObservedTurnEnd: (target: { providerThreadId: string; providerTurnId: string }) =>
+          Ref.get(nativeEnded).pipe(
+            Effect.map(
+              (ended) =>
+                ended &&
+                target.providerThreadId === providerThread.id &&
+                target.providerTurnId === providerTurnId,
+            ),
+          ),
+      };
+      const cleanup = yield* Effect.gen(function* () {
+        const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+        return yield* control
+          .interruptAndAwaitTerminal({
+            threadId,
+            providerSessionId,
+            providerThreadId: providerThread.id,
+            providerTurnId,
+            interruptedAttemptId: attemptId,
+          })
+          .pipe(Effect.exit);
+      }).pipe(
+        Effect.provide(
+          ProviderTurnControlService.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                  getProviderControlContext: () =>
+                    Effect.succeed({
+                      providerThread,
+                      providerTurn: projection.providerTurns[0],
+                      attempt: projection.attempts[0],
+                    } as never),
+                }),
+                Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+                  get: () =>
+                    Effect.succeedSome(
+                      runtime as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
+                    ),
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+      assert.equal(yield* Ref.get(interrupts), 1);
+      // Without native end evidence the cleanup still waits for the projection.
+      assert.equal(
+        cleanup._tag,
+        nativeState === "still running" ? "Failure" : "Success",
+        nativeState,
+      );
+    }),
+);
+
 it.effect.each(["confirmed", "unanswered"] as const)(
   "bounds targeted parked-turn cleanup without stopping inherited work: %s",
   (cleanup) =>

@@ -191,6 +191,9 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         self.assertTrue(os.access(self.live(".local/bin/opencode"), os.X_OK))
         self.assertEqual(stat.S_IMODE(os.stat(self.live(".local/libexec/opencode/service-bin.zsh")).st_mode), 0o644)
         self.assertTrue(os.access(self.live(".local/bin/quint"), os.X_OK))
+        with open(self.live(".local/bin/quint")) as installed, open(os.path.join(HERE, "bin/quint")) as source:
+            self.assertEqual(installed.read(), source.read())
+        self.assertFalse(os.path.lexists(self.live(".local/share/quint-guard")))
         self.assertTrue(os.access(self.live(".local/libexec/vp/toolchain"), os.X_OK))
         self.assertTrue(os.access(self.live(".local/bin/timeout"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
@@ -294,6 +297,8 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         for name in ("9router-log-poll", "9router-log-rollup", "rclaude-key-helper"):
             self.assertTrue(os.access(self.live(".local/bin/" + name), os.X_OK))
         self.assertIn("com.ardud.9router-log-poll", os.listdir(self.loaded))
+        with open(self.live("Library/LaunchAgents/com.ardud.9router-log-poll.plist"), "rb") as source:
+            self.assertEqual(plistlib.load(source)["ProcessType"], "Standard")
 
     def test_second_run_changes_nothing_and_check_passes(self):
         self.ready()
@@ -599,26 +604,6 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
                 self.assertEqual(rc, 1)
                 self.assertIn(target + " differs", err)
                 self.assertEqual(self.run_install()[0], 0)
-
-    def test_quint_guard_link_is_idempotent_and_check_reports_drift(self):
-        self.ready()
-        guard = self.live(".local/share/quint-guard/bin/quint")
-        target = self.live(".local/bin/quint")
-        self.assertEqual(self.run_install("--dry-run")[0], 0)
-        self.assertFalse(os.path.lexists(guard))
-        rc, _, err = self.run_install()
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(os.readlink(guard), target)
-        self.assertEqual(os.listdir(os.path.dirname(guard)), ["quint"])
-        self.assertEqual(self.run_install("--check")[0], 0)
-        self.assertEqual(self.run_install()[0], 0)
-        os.unlink(guard)
-        os.symlink("/missing/quint", guard)
-        rc, _, err = self.run_install("--check")
-        self.assertEqual(rc, 1)
-        self.assertIn("is not a link to " + target, err)
-        self.assertEqual(self.run_install()[0], 0)
-        self.assertEqual(os.readlink(guard), target)
 
     def test_links_point_at_deployed_helpers_but_never_replace_a_real_file(self):
         helpers = self.live(".local/share/robob-watch/helpers")

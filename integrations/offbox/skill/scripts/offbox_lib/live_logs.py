@@ -174,10 +174,14 @@ def frames(box, pid, out, err, *, timeout, until, stop, run_id, clock, command=N
                         continue
                     answered = True
                     data = page.get('data') or ''
+                    metadata = {key: page[key] for key in ('attempt', 'commandId', 'nodeSetup') if key in page}
                     if data:
                         emit('stream_silent', server_has_output=True, silent_s=round(clock() - last_byte, 3))
                         offsets[i] += len(data.encode())
-                        yield dict(type=('stdout', 'stderr')[i], data=data, nextOffset=offsets[i])
+                        yield dict(metadata, type=('stdout', 'stderr')[i], data=data, nextOffset=offsets[i],
+                                   _history_until=poll_end)
+                    elif metadata:
+                        yield dict(metadata, type='follow_tick', _history_until=poll_end)
         if not attached and not answered:
             # A local timer is not a remote heartbeat. Let the outer follower account for a failed epoch through
             # its existing retries and outage window, rather than clearing failures with a synthetic tick.

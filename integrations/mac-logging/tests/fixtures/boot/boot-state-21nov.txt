@@ -1,0 +1,3 @@
+kern.boottime: { sec = 1795255948, usec = 443847 } Sat Nov 21 14:12:28 2026
+kern.shutdownreason:  wdog,reset_in_1 rst_in,reset_in_1_deassert wdog,reset_in_1 ap_restart
+kern.bootreason:  gcb_wakeup gcb_off_wakeup gcb_wakeup

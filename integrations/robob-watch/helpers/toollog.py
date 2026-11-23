@@ -30,13 +30,15 @@ _VALUES = {
     'class': ('urgent', 'today', 'info', 'noise', 'candidate', 'charge', 'bank', 'security', 'otp', 'unknown', 'fail_open', 'deduped'),
     'action': ('create', 'queue', 'cancel', 'snooze', 'sent', 'retry', 'check', 'wake', 'notify', 'send', 'coalesce', 'conflict', 'expire', 'pause', 'remove', 'cap', 'resume'),
     'state': ('pending', 'sending', 'sent', 'uncertain', 'cancelled', 'failed', 'scheduled', 'queued', 'done', 'expired', 'paused', 'active'),
-    'stderrClass': ('usage_error', 'missing_file', 'permission', 'timeout', 'python_traceback', 'auth', 'connect', 'json', 'unknown'),
+    'timeoutSide': ('none', 'cli_process', 'http'),
+    'stderrClass': ('ride_ended', 'usage_error', 'missing_file', 'permission', 'timeout', 'python_traceback', 'auth', 'connect', 'json', 'unknown'),
     'triggerKind': ('file', 'wal'),
 }
 _initialized = set()
 
 # Same order and normalization as src/cause.ts; classification never retains text in a log.
 _PATTERNS = tuple((name, re.compile(pattern, re.I)) for name, pattern in (
+    ('ride_ended', r'(?:^|\n)ride-card: trip [a-f0-9-]{36} already ended \((?:done|cancelled|failed|unknown)\); not sending a new card(?:\n|$)'),
     ('usage_error', r'(?:^|\n)\s*usage:|unrecognized arguments?|unknown (?:option|argument)|invalid (?:option|choice)|argument .*required|not (?:an exact trip UUID|a bridge chat slug)|no bridge chat|unsafe display name|invalid command arguments|duplicate command option|unexpected positional arguments|--[a-z-]+ (?:is required|must be)'),
     ('missing_file', r'no such file or directory|filenotfounderror|\bENOENT\b|command not found|cannot find module|modulenotfounderror'),
     ('permission', r'permission denied|operation not permitted|permissionerror|\b(?:EACCES|EPERM)\b'),
@@ -231,6 +233,29 @@ def _fields(entry, at):
 
 
 def _append(path, row):
+    if row.get('name') == 'helper.run' and row.get('ok') is True and row.get('props', {}).get('exitCode') == 0:
+        row = dict(row)
+        props, ids = dict(row.get('props', {})), dict(row.get('ids', {}))
+        del row['ok']
+        del props['exitCode']
+        defaults = ''
+        if 'signal' in props and props['signal'] is None:
+            del props['signal']
+            defaults += 's'
+        if props.get('timedOut') is False:
+            del props['timedOut']
+            defaults += 't'
+        if ids.get('watcher') is not None and ids.get('watcher') == ids.get('helper'):
+            del ids['watcher']
+            defaults += 'w'
+        props['compact'] = defaults or '1'
+        row['props'], row['ids'] = props, ids
+        row['ids'] = { {'watcher': 'w', 'run': 'r', 'helper': 'h'}.get(k, k): v for k, v in ids.items() }
+        row['v'] = 1
+        row.pop('tool', None)
+        if row.get('component') == 'helpers':
+            row.pop('component', None)
+        row.pop('kind', None)
     payload = (json.dumps(row, ensure_ascii=True, allow_nan=False, separators=(',', ':')) + '\n').encode('utf-8')
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     try:
@@ -392,3 +417,28 @@ def _main():
 
 if __name__ == '__main__':
     _main()
+
+
+def expand_helper(row):
+    """Restore v1 helper defaults for consumers of the shared watcher log."""
+    if row.get('v') != 1 or row.get('name') != 'helper.run':
+        return row
+    row = dict(row)
+    row.pop('v')
+    row.setdefault('tool', 'watchers')
+    row.setdefault('component', 'helpers')
+    row.setdefault('kind', 'perf')
+    ids = {{'w': 'watcher', 'r': 'run', 'h': 'helper'}.get(k, k): v for k, v in row.get('ids', {}).items()}
+    props = dict(row.get('props', {}))
+    compact = props.pop('compact', '')
+    if re.fullmatch(r'(?:s?t?w?|1)', compact):
+        row['ok'] = True
+        props['exitCode'] = 0
+        if 's' in compact:
+            props['signal'] = None
+        if 't' in compact:
+            props['timedOut'] = False
+        if 'w' in compact:
+            ids['watcher'] = ids.get('helper')
+    row['ids'], row['props'] = ids, props
+    return row

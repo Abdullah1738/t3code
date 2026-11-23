@@ -39,8 +39,8 @@ class UnifiedCatchupTests(unittest.TestCase):
 
     def command(self, cmd, **kwargs):
         def stamp(flag):
-            return dt.datetime.fromisoformat(cmd[cmd.index(flag)+1]).replace(tzinfo=dt.timezone.utc).timestamp()
-        start, end = stamp('--start'), stamp('--end')-1
+            return dt.datetime.strptime(cmd[cmd.index(flag)+1], '%Y-%m-%d %H:%M:%S%z').replace(tzinfo=dt.timezone.utc).timestamp()
+        start, end = stamp('--start'), stamp('--end')
         cost = self.cost(end-start)
         self.calls.append((start, end, kwargs['timeout'], cost <= kwargs['timeout']))
         self.clock += min(cost, kwargs['timeout'])

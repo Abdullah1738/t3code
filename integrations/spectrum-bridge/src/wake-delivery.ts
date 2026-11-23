@@ -4,6 +4,8 @@ import type { Store } from "./store.ts";
 import { toolLog } from "./toollog.ts";
 
 export const WAKE_AMBIGUITY_MS = 30 * 60_000;
+/** Queueing and pre-POST deferrals count too; a watcher needs a timely fallback receipt. */
+export const WAKE_DELIVERY_MS = 30 * 60_000;
 export const wakeId = (key: string) => `wake:${createHash("sha256").update(key).digest("hex")}`;
 export type WakeStatus = {
   id: string; state: "queued" | "sending" | "ambiguous" | "admitted" | "failed";
@@ -11,7 +13,7 @@ export type WakeStatus = {
   attempts: number; threadId?: string; runId?: string;
 };
 type Record = WakeStatus & { source: string; turnStarted?: boolean; waitedBehind?: string;
-  legacy?: boolean; beforeSend?: Pick<WakeStatus, "state" | "attempts" | "firstSendAt"> };
+  waitLoggedAt?: number; legacy?: boolean; beforeSend?: Pick<WakeStatus, "state" | "attempts" | "firstSendAt"> };
 const key = (id: string) => `wake-delivery:${id}`;
 const terminal = (status: WakeStatus) => status.state === "admitted" || status.state === "failed";
 
@@ -70,6 +72,16 @@ export class WakeDelivery {
     const record = this.record(id);
     if (record && !terminal(record) && !record.waitedBehind) this.store.set(key(id), { ...record, waitedBehind: run });
   }
+  reportWaiting(id: string, holder: { runId: string; phase: string } | undefined,
+    reason: "holder" | "link_down" | "cooldown" | "admission"): void {
+    const record = this.record(id);
+    if (!record || terminal(record) || record.waitLoggedAt !== undefined && Date.now() - record.waitLoggedAt < 5 * 60_000) return;
+    this.store.set(key(id), { ...record, waitLoggedAt: Date.now(),
+      ...(holder && !record.waitedBehind ? { waitedBehind: holder.runId } : {}) });
+    this.log(record, "wake.waiting", { reason, waitMs: Math.max(0, Date.now() - record.acceptedAt),
+      boundMs: WAKE_DELIVERY_MS, remainingMs: Math.max(0, record.acceptedAt + WAKE_DELIVERY_MS - Date.now()),
+      ...(holder ? { holderRunId: holder.runId, holderPhase: holder.phase } : {}) });
+  }
   start(id: string, threadId: string, batchSize: number): void {
     this.accept(id);
     const record = this.record(id);
@@ -114,11 +126,12 @@ export class WakeDelivery {
     this.store.set(key(id), next);
     this.log(next, "wake.admitted", { elapsedMs: Math.max(0, Date.now() - record.acceptedAt) });
   }
-  failed(id: string, reason: "ambiguity_deadline" | "stale" | "attempts_exhausted" | "route_retired"): void {
+  failed(id: string, reason: "ambiguity_deadline" | "delivery_deadline" | "stale" | "attempts_exhausted" | "route_retired"): void {
     const record = this.record(id);
     if (!record || terminal(record)) return;
     const next: Record = { ...record, state: "failed", failedAt: Date.now() };
     this.store.set(key(id), next);
-    this.log(next, "wake.failed", { reason, ageMs: Math.max(0, Date.now() - record.acceptedAt) });
+    this.log(next, "wake.failed", { reason, ageMs: Math.max(0, Date.now() - record.acceptedAt), attempt: record.attempts,
+      ...(record.waitedBehind ? { holderRunId: record.waitedBehind } : {}) });
   }
 }

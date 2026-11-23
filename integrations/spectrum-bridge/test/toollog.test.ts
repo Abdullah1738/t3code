@@ -26,6 +26,30 @@ test("notice suppression reasons survive structured-log redaction", () => {
   expect(lines().map(line => line.props?.reason)).toEqual(reasons);
 });
 
+test.each([undefined, 1])("remote fetch diagnostics are allowlisted with cap %s", capBytes => {
+  const { log, lines } = setup({ capBytes });
+  log.write({ component: "fixture", kind: "event", name: "fill" });
+  for (const name of ["moni-box-down", "moni-runner-error"]) {
+    for (const errorCode of ["ConnectionRefused", "E", "E".repeat(40), "ERR_SOCKET_2"]) {
+      log.write({ component: "remote-box", kind: "error", name, props: { errorCode, loopDelayMs: 123, message: "PRIVATE_MESSAGE", url: "http://x" } });
+      expect(lines().at(-1)?.props).toEqual({ errorCode, loopDelayMs: 123 });
+    }
+    for (const errorCode of ["connect http://x", "", "E".repeat(41), "ECONNRESET\n", "ERR-SOCKET", "ÉCONNRESET", 123, false]) {
+      log.write({ component: "remote-box", kind: "error", name, props: { errorCode, loopDelayMs: -1 } });
+      expect(lines().at(-1)?.props).toBeUndefined();
+    }
+    for (const loopDelayMs of [NaN, Infinity, "123", false]) {
+      log.write({ component: "remote-box", kind: "error", name, props: { loopDelayMs } });
+      expect(lines().at(-1)?.props).toBeUndefined();
+    }
+  }
+  log.write({ component: "remote-box", kind: "error", name: "unrelated", props: { errorCode: "ConnectionRefused", loopDelayMs: 123 } });
+  expect(lines().at(-1)?.props).toBeUndefined();
+  const raw = JSON.stringify(lines());
+  for (const value of ["PRIVATE_", "http"]) expect(raw).not.toContain(value);
+  if (capBytes) expect(lines().some(row => row.name === "log.degraded")).toBe(true);
+});
+
 test("wake lifecycle rows survive the log cap and keep only delivery metadata", () => {
   const { log, lines } = setup({ capBytes: 1 });
   for (const name of ["wake.accepted", "wake.turn_start", "wake.send_ambiguous", "wake.admitted", "wake.retry_scheduled", "wake.failed"]) {
@@ -313,4 +337,42 @@ test.each(["/send", "/files", "/agent-answer"])("CLI %s timeouts survive the cap
   expect(lines().at(-1)).toMatchObject({ name: "cli.send_timeout", ids: { operationId: `send:${"a".repeat(64)}` },
     props: { path, elapsedMs: 15_000 } });
   expect(JSON.stringify(lines())).not.toContain("PRIVATE");
+});
+
+test("active roster aggregates per minute with reasons, joins, patching, children and fetch latency", async () => {
+  let time = at;
+  const { log, lines } = setup({ now: () => time });
+  for (const rosterAction of ["fetches", "startup", "fetches", "safety", "joins", "hits", "patches", "misses", "streamUp", "streamDown", "children", "errors", "ambiguous"]) {
+    log.write({ component: "robob", kind: "perf", name: "robob.roster_action", props: { rosterAction, rows: 4, total: 4, text: "PRIVATE_ROSTER_EVENT" } });
+  }
+  for (const durationMs of [15, 31, 200]) log.write({ component: "robob", kind: "perf", name: "robob.roster_action", durationMs,
+    props: { rosterAction: "duration", rows: 4, total: 4 } });
+  time += 60_000;
+  await log.tick();
+  const summaries = lines().filter(line => line.name === "robob.active_roster");
+  expect(summaries).toHaveLength(1);
+  expect(summaries[0]!.props).toMatchObject({ fetches: 2, startup: 1, safety: 1, joins: 1, hits: 1, patches: 1,
+    misses: 1, streamUp: 1, streamDown: 1, children: 1, errors: 1, ambiguous: 1, rows: 4, total: 4, fetchMsP50: 31, fetchMsMax: 200 });
+  expect(JSON.stringify(lines())).not.toContain("PRIVATE_ROSTER_EVENT");
+  expect(lines().some(line => line.name === "robob.roster_action")).toBe(false);
+});
+
+test.each(["minute tick", "bridge.stop"])("roster and prompt-probe counts both flush once on %s", async boundary => {
+  let time = at;
+  const { log, lines } = setup({ now: () => time });
+  // Prime the hourly rollup so the minute case cannot pass through flushAll().
+  await log.tick();
+  log.write({ component: "robob", kind: "perf", name: "robob.roster_action",
+    props: { rosterAction: "fetches", rows: 2, total: 2 } });
+  log.write({ component: "router", kind: "perf", name: "router.prompt_probe", ids: { threadId: "thread-fixture" },
+    props: { probeOutcome: "accepted", elapsedMs: 15, attempt: 1, msUntilAccepted: 25 } });
+  if (boundary === "minute tick") { time += 60_000; await log.tick(); }
+  else log.write({ component: "process", kind: "event", name: "bridge.stop" });
+  const summaries = () => lines().filter(line => ["robob.active_roster", "router.prompt_probes"].includes(line.name));
+  expect(summaries()).toHaveLength(2);
+  expect(summaries().find(line => line.name === "robob.active_roster")?.props).toMatchObject({ fetches: 1, rows: 2, total: 2 });
+  expect(summaries().find(line => line.name === "router.prompt_probes")?.promptProbe).toMatchObject({ calls: 1, accepted: 1 });
+  // A later explicit flush cannot emit either count again.
+  log.flush();
+  expect(summaries()).toHaveLength(2);
 });

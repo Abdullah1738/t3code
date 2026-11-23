@@ -35,9 +35,20 @@ test("fixture replay classifies every error shape without unknown or private tex
     [{ status: 999, code: secret, name: secret }, "unclassified", "Object"],
     [Object.defineProperty({}, "status", { get() { throw new Error(secret); } }), "unclassified", "Object"],
   ];
-  for (const [error] of cases) toolError("telegram", "tg.attention.pendingRequests", { thread: secret, directory: secret }, error);
+  for (const [error] of cases) {
+    toolError("telegram", "tg.attention.pendingRequests", { thread: secret, directory: secret }, error);
+  }
   const entries = logs.entries();
-  expect(entries.map(row => [row.props?.cause, row.props?.detail])).toEqual(cases.map(([, cause, detail]) => [cause, detail]));
+  const expected = new Map<string, { cause: string | number; detail: string; count: number }>();
+  for (const [error, cause, detail] of cases) {
+    expect(errorInfo(error)).toEqual({ cause, detail, ...(cause === "unclassified" ? { errorClass: detail } : {}) });
+    const key = JSON.stringify([cause, detail]);
+    const prior = expected.get(key);
+    expected.set(key, { cause, detail, count: (prior?.count ?? 0) + 1 });
+  }
+  expect(entries.map(row => [row.props?.cause, row.props?.detail, row.props?.repeats ?? 1])).toEqual([...expected.values()].map(({ cause, detail }) => [cause, detail, 1]));
+  logs.flushErrors();
+  expect(logs.entries().slice(entries.length).map(row => [row.props?.cause, row.props?.detail, row.props?.repeats])).toEqual([...expected.values()].filter(({ count }) => count > 1).map(({ cause, detail, count }) => [cause, detail, count - 1]));
   expect(entries.filter(row => row.props?.cause === "unknown")).toHaveLength(0);
   for (const row of entries) {
     expect(String(row.props?.detail).length).toBeLessThanOrEqual(80);

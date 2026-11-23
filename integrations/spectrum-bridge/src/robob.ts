@@ -1,3 +1,4 @@
+import { ActiveRoster } from "./active-roster.ts";
 import { MessageCache } from "./message-cache.ts";
 import { toolError } from "./toollog.ts";
 import { assertPromptUnexpired, IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
@@ -67,19 +68,24 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
   for (const run of [...thread.recentRuns ?? [], ...(thread.run ? [thread.run] : [])]) runs.set(run.runId, run);
   const ordinal = (runId: string) => runs.get(runId)?.ordinal ?? runOrdinal(runId);
   const byRun = new Map<string, ControlMessage[]>();
+  const createdAt = new Map<ControlMessage, number>();
   for (const message of messages) {
     if (message.runId === null || message.role === "system") continue;
-    byRun.set(message.runId, [...byRun.get(message.runId) ?? [], message]);
+    let group = byRun.get(message.runId);
+    if (!group) { group = []; byRun.set(message.runId, group); }
+    group.push(message);
+    createdAt.set(message, epoch(message.createdAt));
   }
   const latest = [...runs.values()].sort((a, b) => b.ordinal - a.ordinal)[0]?.runId;
   const records: MessageRecord[] = [];
-  for (const [runId, group] of [...byRun].sort((a, b) => ordinal(a[0]) - ordinal(b[0]))) {
-    group.sort((a, b) => epoch(a.createdAt) - epoch(b.createdAt) || a.messageId.localeCompare(b.messageId, undefined, { numeric: true }));
+  const groups = [...byRun].map(([runId, group]) => ({ runId, group, ordinal: ordinal(runId) }));
+  for (const { runId, group } of groups.sort((a, b) => a.ordinal - b.ordinal)) {
+    group.sort((a, b) => createdAt.get(a)! - createdAt.get(b)! || a.messageId.localeCompare(b.messageId, undefined, { numeric: true }));
     const run = runs.get(runId);
     const settled = run !== undefined && TERMINAL.has(run.status);
     let last: Extract<MessageRecord, { type: "assistant" }> | undefined;
     for (const message of group) {
-      const created = epoch(message.createdAt);
+      const created = createdAt.get(message)!;
       if (message.role === "user") {
         const id = promptId(thread.threadId, message);
         const bridgeSent = id !== message.messageId && BRIDGE_PROMPT.test(id);
@@ -124,6 +130,7 @@ function dataUrl(url: string): { mimeType: string; bytes: Uint8Array } {
 }
 
 export interface RobobBackendOptions extends ControlConfigOptions {
+  activeRoster?: ActiveRoster;
   /** Root for per-chat folders. It must be a registered Robob project root (see README). */
   chatRoot: string;
   /**
@@ -161,6 +168,7 @@ export class RobobBackend implements ChatBackend {
 
   readonly brand = { app: "Robob" };
   readonly client: ControlClient;
+  readonly activeRoster: ActiveRoster;
   private readonly chatRoot: string;
   private readonly directories: ThreadDirectories;
   private readonly native = new Map<string, string>();
@@ -215,6 +223,7 @@ export class RobobBackend implements ChatBackend {
     if (options.subdir !== undefined && !/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/.test(options.subdir)) throw new Error("Invalid iMessage chat folder");
     this.client = options.client ?? new ControlClient({ ...options, linkGate: options.linkGate ?? true });
     this.directories = new ThreadDirectories(this.client);
+    this.activeRoster = options.activeRoster ?? new ActiveRoster(this.client);
     this.messageCache = new MessageCache(this.client);
     this.finishes = options.finishes ?? opencodeFinishes();
     this.completedSteps = options.completedSteps ?? opencodeCompletedSteps();
@@ -258,7 +267,13 @@ export class RobobBackend implements ChatBackend {
   }
 
   private async detail(id: string): Promise<ThreadDetail> {
-    return (await this.client.thread(await this.resolve(id))).thread;
+    const threadId = await this.resolve(id);
+    const read = this.activeRoster.checkpoint(threadId);
+    try {
+      const { thread } = await this.client.thread(threadId);
+      this.activeRoster.observe(thread, read);
+      return thread;
+    } finally { this.activeRoster.finish(threadId, read); }
   }
 
   async health() {
@@ -337,7 +352,7 @@ export class RobobBackend implements ChatBackend {
 
   /** Backend for one non-owner Sendblue chat: same server and client, its own folder and thread title. */
   forChat(subdir: string, title: string): RobobBackend {
-    return new RobobBackend({ ...this.options, client: this.client, finishes: this.finishes, completedSteps: this.completedSteps, subdir, title });
+    return new RobobBackend({ ...this.options, client: this.client, activeRoster: this.activeRoster, finishes: this.finishes, completedSteps: this.completedSteps, subdir, title });
   }
 
   chatFolder(): string {
@@ -399,6 +414,7 @@ export class RobobBackend implements ChatBackend {
 
   async children(id: string, _directory?: string, complete = false): Promise<SessionRecord[]> {
     const threadId = await this.resolve(id);
+    this.activeRoster.childrenRead();
     const { total, threads } = await this.client.listThreads({ parentThreadId: threadId, includeSubagents: true, limit: 500 });
     if (complete && total > threads.length) throw new Error("Incomplete child discovery");
     return Promise.all(threads.filter(thread => thread.parentThreadId === threadId).map(thread => this.record(thread.threadId, thread, id)));
@@ -409,7 +425,7 @@ export class RobobBackend implements ChatBackend {
     const threadId = await this.resolve(id);
     // Read messages after the run state: an earlier page must not make a just-completed
     // first turn look successful before its selected-model error text has arrived.
-    let { thread } = await this.client.thread(threadId);
+    let thread = await this.detail(threadId);
     let messages = await this.readMessages(threadId, thread, until);
     try {
       thread = await this.restoreRunStatuses(thread, messages, until, limit);
@@ -787,25 +803,17 @@ export class RobobBackend implements ChatBackend {
 
   /** Busy threads, keyed by thread id and, for imported threads, by their `ses_` id too. */
   async statuses(complete = false): Promise<Record<string, SessionStatus>> {
-    const { total, threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
-    if (complete && total > threads.length) throw new Error("Incomplete active family discovery");
-    const alias = new Map([...this.native].map(([session, threadId]) => [threadId, session]));
-    const statuses: Record<string, SessionStatus> = {};
-    for (const thread of threads) {
-      if (!BUSY.has(thread.state)) continue;
-      // Routes may be stored under an imported `ses_` id, so name the root the way the router knows it.
-      const root = thread.parentThreadId === null ? null : alias.get(thread.rootThreadId) ?? thread.rootThreadId;
-      const busy: SessionStatus = { type: "busy", root };
-      statuses[thread.threadId] = busy;
-      if (thread.nativeSessionId) statuses[thread.nativeSessionId] = busy;
-    }
-    for (const [session, threadId] of this.native) if (statuses[threadId]) statuses[session] = statuses[threadId];
-    return statuses;
+    return this.activeRoster.read(complete, this.native);
+  }
+
+  activeStatuses(): Record<string, SessionStatus> {
+    return this.activeRoster.view(this.native);
   }
 
   /** One thread's detail answers in well under a second; the thread list behind `statuses()` takes several. */
   async sessionBusy(id: string): Promise<boolean> {
-    return BUSY.has((await this.detail(id)).state);
+    const thread = await this.detail(id);
+    return BUSY.has(thread.state) || this.activeRoster.isBusy(thread.threadId);
   }
 
   /** Busy, or waiting on background work a reset would cut off (see `resetBlocked` in openchamber.ts). */

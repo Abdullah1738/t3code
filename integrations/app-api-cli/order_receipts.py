@@ -201,6 +201,10 @@ def can_report(order, *, _sibling=False):
         running = running and _epoch(expires) > time.time()
     held = (cfg.get('delivery_card') or {}).get('held')
     ok = cfg.get('active') is True and not held and (cfg.get('untrackable') is True or running)
+    if cfg.get('app') == 'amazon':
+        from amazon_checkout import order_state
+        saved = order_state(tracker, cfg)
+        ok = ok or (not held and tracker.terminal_order(cfg, saved.get('last_result', {})))
     if cfg.get('app') == 'amazon' and not _sibling:
         from amazon_email_orders import track
         from amazon_checkout import config_path, log, order_state
@@ -225,7 +229,8 @@ def can_report(order, *, _sibling=False):
             return {'ok': False, 'order': order, 'tracker': wid, 'missing_orders': missing,
                     'reason': 'Untracked checkout order(s): ' + ', '.join(missing),
                     'error': 'amazon checkout has untracked siblings'}
-    result = tracker.read(tracker.WATCHERS / wid / 'order-tracker-state.json').get('last_result', {})
+    result = (saved if cfg.get('app') == 'amazon' else
+              tracker.read(tracker.WATCHERS / wid / 'order-tracker-state.json')).get('last_result', {})
     eta = result.get('eta_text') or result.get('eta') or cfg.get('eta')
     return {'ok': bool(ok), 'order': order, 'tracker': wid, 'untrackable': cfg.get('untrackable', False),
             'eta': eta or 'no ETA given', 'error': None if ok else 'tracker not running or payment still held'}

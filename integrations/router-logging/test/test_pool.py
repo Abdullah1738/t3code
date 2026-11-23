@@ -215,6 +215,7 @@ class PoolTests(unittest.TestCase):
 
     def test_listener_guard_keeps_checking_while_pool_delivery_child_is_blocked(self):
         import guard
+        import observer
         import signal
         with tempfile.TemporaryDirectory() as directory:
             runtime=Mock()
@@ -232,7 +233,7 @@ class PoolTests(unittest.TestCase):
             child=Mock()
             child.poll.return_value=None
             clock=iter(range(0,1000,16))
-            with patch.object(guard,'Runtime',return_value=runtime), patch.object(guard.signal,'signal',side_effect=lambda key,callback:handlers.update({key:callback})), patch.object(guard.time,'monotonic',side_effect=lambda:next(clock)), patch.object(guard.subprocess,'Popen',return_value=child) as spawn:
+            with patch.object(guard,'scheduling_snapshot',return_value={}), patch.object(observer,'job_snapshot',return_value={}), patch.object(guard,'Runtime',return_value=runtime), patch.object(guard.signal,'signal',side_effect=lambda key,callback:handlers.update({key:callback})), patch.object(guard.time,'monotonic',side_effect=lambda:next(clock)), patch.object(guard.subprocess,'Popen',return_value=child) as spawn:
                 guard.serve()
             self.assertEqual(len(checks),2)
             runtime.notify.assert_not_called()

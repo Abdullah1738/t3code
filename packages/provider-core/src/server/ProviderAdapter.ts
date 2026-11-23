@@ -777,6 +777,10 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly interruptTurn: (
     input: ProviderAdapterV2InterruptInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /** Probe native state when no run owns the thread; stop only its open native turn. */
+  readonly interruptOrphanedTurn?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+  }) => Effect.Effect<boolean, ProviderAdapterV2Error>;
   readonly stopSubagent?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly nativeTaskId: string;

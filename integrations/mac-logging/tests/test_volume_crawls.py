@@ -473,9 +473,12 @@ class VolumeCrawlTests(unittest.TestCase):
             return SimpleNamespace(returncode=0,stdout=json.dumps({'50':dict(
                 argv=words,executable='/usr/bin/rg',startS=start,ppid=20,uid=501)}))
         with patch.object(scans,'argv_snapshot',wraps=ARGV_READ),patch.object(cpu,'hints',return_value=None),patch.object(cpu.os,'getloadavg',return_value=(0,0,0)):
-            cpu.sample(run=run,ticks_read=lambda:(1,2,3,4),children_read=lambda *a,**kw:({},{}),reader_factory=lambda:False)
-        self.assertEqual(len(calls),3)
-        self.assertEqual(calls.count(cpu.PS),1)
+            for _ in range(2):
+                cpu.sample(run=run,ticks_read=lambda:(1,2,3,4),children_read=lambda *a,**kw:({},{}),reader_factory=lambda:False)
+        self.assertEqual(len(calls),5)
+        self.assertEqual(calls.count(cpu.PS),2)
+        self.assertEqual(sum(call[0] == sys.executable for call in calls),1)
+        self.assertTrue(jobs.read_state('cpu')['volumeCrawlCache'])
         self.assertEqual(self.events()[0]['props']['argv'],['/usr/bin/rg','/Volumes/ExternalSSD'])
         self.assertNotIn('private-value',json.dumps(self.events()))
         self.assertNotIn('private-value',json.dumps(jobs.read_state('cpu')))
@@ -545,3 +548,256 @@ class KernelArgvTests(unittest.TestCase):
         result=process_argv.collect(list(range(1000)),read)
         self.assertEqual(len(calls),process_argv.MAX_PIDS)
         self.assertLessEqual(len(json.dumps(result).encode()),process_argv.MAX_OUTPUT)
+
+
+SESSION = '21860509-c0e3-429b-bd58-4bba747cb889'
+OTHER_SESSION = 'dd8bf593-96d4-4aa1-9469-146b1290cd75'
+
+
+class ProviderAttributionTests(unittest.TestCase):
+    setUp = VolumeCrawlTests.setUp
+    run_lsof = VolumeCrawlTests.run_lsof
+    events = VolumeCrawlTests.events
+
+    def chain(self, provider='claude', words=None):
+        rows = cpu.parse_ps(fixture())
+        rows[0].update(pid=81905, ppid=81901, elapsedS=81)
+        for pid, ppid, name in [(81901,81531,'zsh'), (81531,35313,'zsh'),
+                                (35313,3722,provider), (3722,1,'Robob')]:
+            comm = '/bin/'+name
+            args = remember(comm, words if pid == 35313 and words is not None else [name])
+            rows.append(dict(rows[0], pid=pid, ppid=ppid, tool=name, comm=comm, args=args))
+        return rows
+
+    def props(self, rows, previous=None):
+        with patch.object(scans, 'emit') as emit:
+            cache = scans.volume_crawls(rows, previous or {}, 120, self.run_lsof, HOME)
+            return emit.call_args.kwargs['props'], cache
+
+    def test_live_shaped_claude_chain(self):
+        props, cache = self.props(self.chain(words=['claude','--resume',SESSION]))
+        self.assertEqual(props['providerPid'],35313)
+        self.assertEqual(props['provider'],'claude')
+        self.assertEqual(props['providerSessionId'],SESSION)
+        self.assertFalse(props['providerSessionAmbiguous'])
+        self.assertIsNone(props['threadId'])
+        self.assertEqual(props['parentChain'],[dict(pid=p,name=n) for p,n in
+            [(81901,'zsh'),(81531,'zsh'),(35313,'claude'),(3722,'Robob')]])
+        row = toollog.record('scan','event','scan.volume_crawl',dt.datetime.now(dt.timezone.utc),props=props)
+        self.assertEqual(row['props']['providerSessionId'],SESSION)
+        self.assertEqual(row['props']['providerPid'],35313)
+        self.assertNotIn('--resume',json.dumps(cache))
+
+    def test_provider_session_argument_class(self):
+        cases = [
+            ('claude',['--resume',SESSION],SESSION,False),
+            ('claude',['--resume='+SESSION],SESSION,False),
+            ('claude',['--session-id',SESSION],SESSION,False),
+            ('claude',['--session-id='+SESSION],SESSION,False),
+            ('claude',['-r',SESSION],SESSION,False),
+            ('claude',['--model','test','--session-id='+SESSION],SESSION,False),
+            ('claude',['--settings','--resume',SESSION],None,False),
+            ('claude',['--', '--resume',SESSION],None,False),
+            ('claude',['prompt','--resume',SESSION],None,False),
+            ('claude',['--resume'],None,True),
+            ('claude',['--resume','last'],None,True),
+            ('claude',['--session-id',SESSION,'--resume',OTHER_SESSION],None,True),
+            ('claude',['--new-unknown-flag','--resume',SESSION],None,True),
+            ('codex',['app-server'],None,True),
+            ('codex',['app-server','--session-id',SESSION],None,True),
+            ('codex',['resume',SESSION],SESSION,False),
+            ('codex',['exec','resume',SESSION],SESSION,False),
+            ('codex',['resume','--last'],None,True),
+            ('opencode',['run','--session','ses_ABC123'], 'ses_ABC123',False),
+            ('opencode',['--session=ses_ABC123'], 'ses_ABC123',False),
+            ('opencode',['serve','--session','ses_ABC123'],None,True),
+        ]
+        for provider, words, expected, ambiguous in cases:
+            with self.subTest(provider=provider, words=words):
+                self.assertEqual(scans.provider_session(provider,[provider,*words]),(expected,ambiguous))
+
+    def test_shared_server_global_option_class_on_cached_ticks(self):
+        cases = [('codex',['app-server']),
+                 ('codex',['--config','model="test"','app-server']),
+                 ('codex',['--config=model="test"','app-server']),
+                 ('codex',['-c','model="test"','app-server']),
+                 ('codex',['-cmodel="test"','app-server']),
+                 ('codex',['--enable','feature','--config','model="test"','app-server']),
+                 ('codex',['--','app-server']),
+                 ('opencode',['--port','1234','serve']),
+                 ('opencode',['--port=1234','web'])]
+        original = self.vector_read.side_effect
+        for provider, args in cases:
+            for tagged_pid in (81905,81901,35313):
+                with self.subTest(provider=provider,args=args,tagged_pid=tagged_pid):
+                    rows = self.chain(provider,[provider,*args])
+                    def read(rows, run):
+                        result = original(rows,run)
+                        if tagged_pid in result:
+                            result[tagged_pid]['threadId'] = THREAD
+                        return result
+                    self.vector_read.side_effect = read
+                    props, cache = self.props(rows)
+                    for props in (props,self.props(rows,dict(volumeCrawlCache=cache))[0]):
+                        self.assertEqual(props['provider'],provider)
+                        self.assertEqual(props['providerPid'],35313)
+                        self.assertIsNone(props['providerSessionId'])
+                        self.assertIsNone(props['threadId'])
+                        self.assertTrue(props['providerSessionAmbiguous'])
+                        row = toollog.record('scan','event','scan.volume_crawl',dt.datetime.now(dt.timezone.utc),props=props)
+                        self.assertTrue(row['props']['providerSessionAmbiguous'])
+
+    def test_claude_print_boolean_class_on_cached_ticks(self):
+        for flag in ('-p','--print'):
+            for identity in (['--session-id',SESSION],['--session-id='+SESSION],
+                             ['--resume',SESSION],['--resume='+SESSION],['-r',SESSION]):
+                for args in ([flag,*identity],[*identity,flag]):
+                    with self.subTest(args=args):
+                        props,cache = self.props(self.chain(words=['claude',*args]))
+                        rows = self.chain(words=['claude',*args])
+                        for props in (props,self.props(rows,dict(volumeCrawlCache=cache))[0]):
+                            self.assertEqual(props['providerSessionId'],SESSION)
+                            self.assertFalse(props['providerSessionAmbiguous'])
+        for args in (['--config','app-server'],['exec','app-server'],
+                     ['exec','--','app-server']):
+            with self.subTest(args=args):
+                self.assertEqual(scans.provider_session('codex',['codex',*args]),(None,False))
+
+    def test_no_provider_chain(self):
+        props, _ = self.props(self.chain('zsh'))
+        self.assertIsNone(props['provider'])
+        self.assertIsNone(props['providerPid'])
+        self.assertIsNone(props['providerSessionId'])
+        self.assertIsNone(props['threadId'])
+        self.assertFalse(props['providerSessionAmbiguous'])
+
+    def test_provider_exits_mid_read_cached_without_dropping_crawl(self):
+        rows = self.chain(words=['claude','--resume',SESSION])
+        original = self.vector_read.side_effect
+        def read(rows,run):
+            result = original(rows,run)
+            result.pop(35313,None)
+            return result
+        self.vector_read.side_effect = read
+        props, cache = self.props(rows)
+        self.assertEqual(props['providerPid'],35313)
+        self.assertIsNone(props['providerSessionId'])
+        self.assertIsNone(props['threadId'])
+        self.assertTrue(props['providerSessionAmbiguous'])
+        self.props(rows,dict(volumeCrawlCache=cache))
+        self.assertEqual(self.vector_read.call_count,1)
+
+    def test_cache_survives_tick_and_invalidates_pid_reuse(self):
+        rows = self.chain(words=['claude','--resume',SESSION])
+        props, cache = self.props(rows)
+        self.vector_read.reset_mock()
+        props, cache = self.props(rows,dict(volumeCrawlCache=json.loads(json.dumps(cache))))
+        self.assertEqual(props['providerSessionId'],SESSION)
+        self.vector_read.assert_not_called()
+        rows[0]['pid'] += 1
+        self.props(rows,dict(volumeCrawlCache=cache))
+        self.assertEqual([p['pid'] for p in self.vector_read.call_args.args[0]],[81906])
+        self.vector_read.reset_mock()
+        rows[3].update(start='Mon Nov 16 12:00:01 2026',args=remember('/bin/claude',['claude','--resume',OTHER_SESSION]))
+        props, _ = self.props(rows,dict(volumeCrawlCache=cache))
+        self.assertEqual(props['providerSessionId'],OTHER_SESSION)
+        self.assertIn(35313,[p['pid'] for p in self.vector_read.call_args.args[0]])
+        cache = scans.volume_crawls([],dict(volumeCrawlCache=cache),180,self.run_lsof,HOME)
+        self.assertEqual(cache,{})
+
+    def test_cache_does_not_persist_prompts_or_settings(self):
+        props, cache = self.props(self.chain(words=['claude','--settings','private-settings',
+                                                     '--session-id='+SESSION,'prompt-sentinel']))
+        self.assertEqual(props['providerSessionId'],SESSION)
+        self.assertNotIn('private-settings',json.dumps(cache))
+        self.assertNotIn('prompt-sentinel',json.dumps(cache))
+        self.assertNotIn('argv',json.dumps(cache))
+
+    def test_node_helpers_do_not_hide_known_provider(self):
+        for script, provider in [('/pkg/@anthropic-ai/claude-code/cli.js','claude'),
+                                 ('/pkg/@openai/codex/bin/codex.js','codex'),
+                                 ('/pkg/opencode-ai/bin/opencode','opencode'),
+                                 ('/pkg/mcp/server.js',None),('/pkg/claude.js',None)]:
+            with self.subTest(script=script):
+                self.assertEqual(scans.provider_name(dict(tool='node'),['node',script]),provider)
+        rows = self.chain(words=['claude','--resume',SESSION])
+        rows[1].update(tool='node',comm='/bin/node',args=remember('/bin/node',['node','/pkg/mcp/server.js']))
+        props, _ = self.props(rows)
+        self.assertEqual(props['providerSessionId'],SESSION)
+
+    def test_named_tag_only_when_valid_and_not_ambiguous(self):
+        rows = self.chain(words=['claude','--resume',SESSION])
+        original = self.vector_read.side_effect
+        for tag in (THREAD,'not-a-thread',None):
+            def read(rows,run):
+                values = original(rows,run)
+                values[35313]['threadId'] = tag
+                return values
+            self.vector_read.side_effect = read
+            props, _ = self.props(rows)
+            self.assertEqual(props['threadId'],THREAD if tag == THREAD else None)
+
+    def test_thread_tag_location_class_on_cached_ticks(self):
+        original = self.vector_read.side_effect
+        for tagged_pid in (81905,81901,81531,35313):
+            for provider, words in (('claude',['claude','--resume',SESSION]),('zsh',['zsh'])):
+                with self.subTest(tagged_pid=tagged_pid,provider=provider):
+                    def read(rows,run):
+                        result = original(rows,run)
+                        result[tagged_pid]['threadId'] = THREAD
+                        return result
+                    self.vector_read.side_effect = read
+                    rows = self.chain(provider,words)
+                    props,cache = self.props(rows)
+                    for props in (props,self.props(rows,dict(volumeCrawlCache=cache))[0]):
+                        self.assertEqual(props['threadId'],THREAD)
+
+    def test_known_node_entry_preserves_provider_session(self):
+        rows = self.chain('node',['node','/pkg/@anthropic-ai/claude-code/cli.js','--resume',SESSION])
+        props, _ = self.props(rows)
+        self.assertEqual(props['provider'],'claude')
+        self.assertEqual(props['providerSessionId'],SESSION)
+
+    def test_cache_bound_and_corrupt_state(self):
+        rows = self.chain(words=['claude','--resume',SESSION])
+        old = {}
+        for i in range(600):
+            row = dict(rows[-1],pid=100000+i)
+            rows.append(row)
+            old[str(row['pid'])] = dict(identity=scans.process_key(row))
+        old['malformed'] = None
+        _, cache = self.props(rows,dict(volumeCrawlCache=old))
+        self.assertLessEqual(len(cache),scans.MAX_CACHE)
+        for value in (None,[],42):
+            props, _ = self.props(rows,dict(volumeCrawlCache=value))
+            self.assertEqual(props['providerSessionId'],SESSION)
+
+    def test_provider_schema_rejects_arbitrary_strings(self):
+        props = toollog.record('scan','event','scan.volume_crawl',dt.datetime.now(dt.timezone.utc),
+                               props={'provider':'private-value','providerSessionId':'secret-value',
+                                      'providerPid':-1,'providerSessionAmbiguous':'true'})['props']
+        self.assertNotIn('private-value',json.dumps(props))
+        self.assertNotIn('secret-value',json.dumps(props))
+        self.assertNotIn('providerPid',props)
+        self.assertNotIn('providerSessionAmbiguous',props)
+
+
+class NamedEnvironmentTests(unittest.TestCase):
+    def test_only_exact_named_key_is_decoded(self):
+        blob = KernelArgvTests().blob(['claude','--resume',SESSION])
+        for suffix,expected in [(b'ROBOB_THREAD_ID='+THREAD.encode()+b'\0',THREAD),
+                                (b'OTHER_THREAD_ID='+THREAD.encode()+b'\0',None),
+                                (b'PREFIX_ROBOB_THREAD_ID='+THREAD.encode()+b'\0',None),
+                                (b'ROBOB_THREAD_ID=one\0ROBOB_THREAD_ID=two\0',None)]:
+            with self.subTest(suffix=suffix[:30]):
+                value = process_argv.read_process(50,lambda pid:(pid,20,501,1234,500),lambda pid:blob+suffix)
+                self.assertEqual(value['threadId'],expected)
+                self.assertNotIn('PRIVATE_ENV',json.dumps(value))
+                self.assertNotIn('do-not-emit',json.dumps(value))
+                self.assertEqual(value['argv'],['claude','--resume',SESSION])
+
+
+    def test_unterminated_environment_fails_closed(self):
+        blob = KernelArgvTests().blob(['claude'])+b'ROBOB_THREAD_ID=unterminated'
+        with self.assertRaises(ValueError):
+            process_argv.decode_process(blob)

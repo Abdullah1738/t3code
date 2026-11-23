@@ -342,6 +342,30 @@ export interface AcpAdapterV2Flavor {
    * fail before `session/prompt`.
    */
   readonly supportsImagePrompts?: boolean;
+  /**
+   * Text blocks sent ahead of a user turn: standing rules on a session's first
+   * prompt and hook-provided context (recall notes) for harnesses whose runtime
+   * has no global rules file or prompt hooks. Must not fail; empty means none.
+   */
+  readonly promptContext?: (input: AcpPromptContextInput) => Effect.Effect<AcpPromptContextResult>;
+}
+
+export interface AcpPromptContextInput {
+  readonly threadId: ThreadId;
+  readonly nativeSessionId: string;
+  readonly cwd: string | null;
+  readonly text: string;
+  /**
+   * The session's first-prompt context has not reached it yet through this adapter (again
+   * after a server restart). Stays true until a prompt carrying it is accepted.
+   */
+  readonly firstPromptInSession: boolean;
+}
+
+export interface AcpPromptContextResult {
+  readonly blocks: ReadonlyArray<string>;
+  /** The first-prompt context is in `blocks` (or there is none to send). */
+  readonly firstPromptContextIncluded: boolean;
 }
 
 export function acpSupportsImagePrompts(input: {
@@ -1611,6 +1635,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const activeSelection = yield* Ref.make<ModelSelection | null>(null);
         const activeInteractionMode = yield* Ref.make<ProviderInteractionMode | null>(null);
         const promptInstructionStates = yield* Ref.make(new Map<string, T3AcpInstructionState>());
+        const promptContextSessions = yield* Ref.make(new Set<string>());
         const runtimeRestartRequired = yield* Ref.make(false);
         const runtimeTeardownState = yield* Ref.make<AcpRuntimeTeardownState>({ _tag: "Idle" });
         const runtimeCallbackGeneration = yield* Ref.make(0);
@@ -7201,6 +7226,30 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             resolveAttachmentPath: host.resolveAttachmentPath,
           });
           const isNativeSlashCommand = turnInput.message.text.trimStart().startsWith("/");
+          let firstPromptContextSent = false;
+          if (!isNativeSlashCommand && flavor.promptContext !== undefined) {
+            const firstPromptInSession = !(yield* Ref.get(promptContextSessions)).has(sessionId);
+            const context = yield* flavor
+              .promptContext({
+                threadId: turnInput.threadId,
+                nativeSessionId: sessionId,
+                cwd: turnInput.runtimePolicy.cwd ?? null,
+                text: turnInput.message.text,
+                firstPromptInSession,
+              })
+              .pipe(
+                Effect.catchCause(() =>
+                  Effect.succeed<AcpPromptContextResult>({
+                    blocks: [],
+                    firstPromptContextIncluded: false,
+                  }),
+                ),
+              );
+            firstPromptContextSent = firstPromptInSession && context.firstPromptContextIncluded;
+            for (const block of context.blocks) {
+              if (block.trim().length > 0) prompt.push({ type: "text", text: block });
+            }
+          }
           const text = t3AcpPromptWithInstructions({
             prompt: messageText,
             state: instructionState,
@@ -7260,7 +7309,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               }),
             });
           }
-          return { prompt, instructionState: text === messageText ? undefined : instructionState };
+          return {
+            prompt,
+            instructionState: text === messageText ? undefined : instructionState,
+            firstPromptContextSent,
+          };
         });
 
         const restartRuntimeAfterTeardownIfRequired = Effect.fnUntraced(function* (
@@ -7579,6 +7632,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   updated.set(requestedSessionId, promptParts.instructionState);
                   return updated;
                 }),
+              ),
+              // First-prompt context counts as delivered only once a prompt carrying it is accepted.
+              Effect.tap(() =>
+                promptParts?.firstPromptContextSent
+                  ? Ref.update(promptContextSessions, (current) =>
+                      new Set(current).add(requestedSessionId),
+                    )
+                  : Effect.void,
               ),
               // Wire settlement precedes the completion callback's permit request so
               // settled-soft classification can observe the native return even when

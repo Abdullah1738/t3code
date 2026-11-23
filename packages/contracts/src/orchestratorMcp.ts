@@ -639,6 +639,7 @@ export const OrchestratorMcpThreadInterruptResult = Schema.Struct({
   status: Schema.Union([
     Schema.Literal("interrupt_requested"),
     Schema.Literal("no_active_run"),
+    Schema.Literal("orphan_turn_interrupted"),
     Schema.Literals(["completed", "failed", "cancelled", "interrupted", "rolled_back"]),
   ]),
 });

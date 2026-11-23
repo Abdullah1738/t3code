@@ -25,11 +25,13 @@ import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as ServerConfig from "../config.ts";
@@ -454,8 +456,80 @@ export const layer: Layer.Layer<
             !(yield* incomingIsCurrent)
           )
             return;
+          // Subscribe before the offer: adapters report identity through events, not their void result.
+          const startedTurn = handlesResume
+            ? undefined
+            : yield* liveSession.events.pipe(
+                Stream.filter(
+                  (event) =>
+                    event.type === "provider_turn.updated" &&
+                    event.providerTurn.runAttemptId === turnInput.attemptId &&
+                    event.providerTurn.nodeId === turnInput.rootNodeId,
+                ),
+                Stream.runHead,
+                Effect.forkChild({ startImmediately: true }),
+              );
+          const stopIfOwnershipLost = Effect.gen(function* () {
+            // The outer resume wrapper delegates to the already-guarded native offer.
+            if (handlesResume) return;
+            const records = yield* projectionStore
+              .getThreadRecords(turnInput.threadId, ["runs", "providerTurns"])
+              .pipe(Effect.mapError(readFailure));
+            const run = records.runs.find((row) => row.id === turnInput.runId);
+            if (
+              run?.activeAttemptId === turnInput.attemptId &&
+              (run.status === "starting" || run.status === "running") &&
+              !records.runs.some(
+                (row) =>
+                  row.ordinal > run.ordinal &&
+                  (row.status === "preparing" ||
+                    row.status === "starting" ||
+                    row.status === "running" ||
+                    row.status === "waiting"),
+              )
+            )
+              return;
+            const recorded = records.providerTurns.findLast(
+              (turn) =>
+                turn.runAttemptId === turnInput.attemptId && turn.nodeId === turnInput.rootNodeId,
+            );
+            if (recorded === undefined && liveSession.interruptStartingRun !== undefined) {
+              yield* liveSession.interruptStartingRun({
+                providerThread: turnInput.providerThread,
+                runId: turnInput.runId,
+                attemptId: turnInput.attemptId,
+                stopBackgroundWork: false,
+              });
+              return;
+            }
+            const startedEvent =
+              recorded === undefined
+                ? Option.getOrUndefined(
+                    yield* Fiber.join(startedTurn!).pipe(
+                      Effect.timeout(PROVIDER_START_CLEANUP_TIMEOUT_MS),
+                      Effect.mapError(readFailure),
+                    ),
+                  )
+                : undefined;
+            const turn =
+              recorded ??
+              (startedEvent?.type === "provider_turn.updated"
+                ? startedEvent.providerTurn
+                : undefined);
+            if (turn === undefined || (turn.status !== "pending" && turn.status !== "running"))
+              return;
+            yield* liveSession.interruptTurn({
+              providerThread: turnInput.providerThread,
+              providerTurnId: turn.id,
+              requestRuntimeRestart: false,
+              stopBackgroundWork: false,
+            });
+          }).pipe(Effect.timeout(PROVIDER_START_CLEANUP_TIMEOUT_MS), Effect.mapError(readFailure));
           const result = yield* Effect.result(start(turnInput));
-          if (result._tag === "Success") return;
+          if (result._tag === "Success") {
+            yield* stopIfOwnershipLost;
+            return;
+          }
           if (handlesResume) {
             if (
               recover !== undefined &&
@@ -496,7 +570,9 @@ export const layer: Layer.Layer<
           if (!(yield* incomingIsCurrent)) return;
           // Exactly one retry: another refusal belongs to normal start-failure handling.
           yield* start(turnInput);
+          yield* stopIfOwnershipLost;
         },
+        Effect.scoped,
         Effect.ensuring(
           Effect.sync(() => {
             recover = undefined;

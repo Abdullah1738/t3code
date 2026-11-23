@@ -72,6 +72,7 @@ export class RestartPacingState extends Context.Service<
       source: RestartSource,
       position: number | null,
       wait?: RestartWait,
+      isCurrent?: () => boolean,
     ) => Effect.Effect<boolean, RestartPacingStateError>;
   }
 >()("t3/ardud/restart-pacing/RestartPacingState") {}
@@ -278,7 +279,15 @@ const make = Effect.gen(function* () {
     Effect.mapError((cause) => new RestartPacingStateError({ cause })),
   );
   const status = Effect.fn("RestartPacingState.status")(
-    function* (source: RestartSource, position: number | null, wait?: RestartWait) {
+    function* (
+      source: RestartSource,
+      position: number | null,
+      wait?: RestartWait,
+      isCurrent?: () => boolean,
+    ) {
+      // Waiting notes publish outside the pacer mutex. Check freshness under
+      // the thread lock so a delayed snapshot cannot overwrite admission.
+      if (isCurrent !== undefined && !isCurrent()) return true;
       const projection = yield* projections.getThreadRecords(source.threadId, ["runs"]);
       const run = projection.runs.find((candidate) => candidate.id === source.sourceRunId);
       if (!run) return true;

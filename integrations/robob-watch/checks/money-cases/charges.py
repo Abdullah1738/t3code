@@ -166,6 +166,8 @@ OWNER_REQUEST_TIMEOUT = 3
 OWNER_TIMING_KEYS = (
     'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
     'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size')
+OWNER_LOG_KEYS = ('owner_cache_age_s', 'owner_list_window_s', 'owner_refresh_ms', 'owner_refresh_at',
+                  'owner_refresh_timeouts', 'owner_source', 'owner_refresh_result')
 OWNER_REQUEST_LIMIT = 64
 OWNER_CACHE_VERSION = 2
 _OWNER_STATS_LOCK = threading.Lock()
@@ -630,9 +632,9 @@ def control_config():
         raise Lookup('Robob control: credentials unavailable') from None
 
 
-def control_get(config, path, params, deadline, stats=None):
+def control_get(config, path, params, deadline, stats=None, *, request_timeout=None):
     url, token = config
-    timeout = left(deadline, OWNER_REQUEST_TIMEOUT)
+    timeout = left(deadline, OWNER_REQUEST_TIMEOUT if request_timeout is None else request_timeout)
     listed = path == '/threads'
     started = time.monotonic()
     if stats is not None:
@@ -732,13 +734,21 @@ def save_owner_cache(path, cache, since, until):
 
 
 def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_reset=None, *, write_cache=True):
-    """His app/iMessage typing, fetched once per check within its own total cap."""
+    from owner_refresh import cached_texts
+    return cached_texts(since, until, deadline, stats, cache_path, cache_reset)
+
+
+def live_owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_reset=None, *, write_cache=True,
+                     budget=None, request_timeout=None, thread_state=None, list_since=None, thread_capture=None):
+    """Control reads used by the detached refresher; checks use only cached_texts."""
     if stats is not None:
         for key in OWNER_TIMING_KEYS:
             stats.setdefault(key, 0)
+        stats['owner_source'] = 'live'
+        stats['owner_list_window_s'] = max(0, (until - since).total_seconds())
         stats['owner_result'] = 'list_failed'
-    stop = time.time() + (OWNER_BUDGET if deadline is None
-                          else min(OWNER_BUDGET, left(deadline, OWNER_BUDGET) - 0.5))
+    budget = OWNER_BUDGET if budget is None else budget
+    stop = time.time() + (budget if deadline is None else min(budget, left(deadline, budget) - 0.5))
     alarm = signal.getitimer(signal.ITIMER_REAL)[0]
     if alarm:
         stop = min(stop, time.time() + alarm - 0.5)
@@ -746,7 +756,9 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
     with within(stop, error):
         # Stop network work early enough to persist completed threads. The outer
         # deadline also bounds cache reads, fsync, pruning and result assembly.
-        rows = _owner_texts(since, until, stats, cache_path, cache_reset, stop - 0.25, write_cache=write_cache)
+        rows = _owner_texts(since, until, stats, cache_path, cache_reset, stop - 0.25, write_cache=write_cache,
+                            request_timeout=request_timeout, thread_state=thread_state,
+                            list_since=list_since, thread_capture=thread_capture)
         if time.time() >= stop:
             raise error
         if stats is not None:
@@ -754,12 +766,20 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
         return rows
 
 
-def _owner_texts(since, until, stats, cache_path, cache_reset, stop, *, write_cache=True):
+def _owner_texts(since, until, stats, cache_path, cache_reset, stop, *, write_cache=True,
+                 request_timeout=None, thread_state=None, list_since=None, thread_capture=None):
+    def get(path, params):
+        return control_get(config, path, params, stop, stats, request_timeout=request_timeout)
+
     with within(stop, Lookup('Robob control: incomplete thread list')):
         config = control_config()
         # The API's since filter is strict on updatedAt; include messages created exactly at since.
-        start = iso(since - dt.timedelta(milliseconds=1))
-        threads = {}
+        start = iso((list_since if list_since is not None else since) - dt.timedelta(milliseconds=1))
+        threads = dict(thread_state or {})
+        request_limit = OWNER_REQUEST_LIMIT if request_timeout is None else 512
+        if stats is not None:
+            stats['owner_source'] = 'incremental' if thread_state is not None else 'live'
+            stats['owner_list_window_s'] = max(0, (until - owner_time(start)).total_seconds())
         requests = stats.get('owner_queries', 0) if stats is not None else 0
         # He replies in app-created threads and MCP-launched top-level threads
         # (t3_thread_launch/create_threads stamp mcp), plus the iMessage bridge.
@@ -768,10 +788,10 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop, *, write_ca
             params = {'updatedSince': start, 'limit': 500, **kind}
             cursors, ids = set(), set()
             while True:
-                if requests >= OWNER_REQUEST_LIMIT:
+                if requests >= request_limit:
                     raise Lookup('Robob control: incomplete thread list')
                 requests += 1
-                result = control_get(config, '/threads', params, stop, stats)
+                result = get('/threads', params)
                 page, total = result.get('threads'), result.get('total')
                 if not isinstance(page, list):
                     raise Lookup('Robob control: invalid thread list')
@@ -795,6 +815,32 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop, *, write_ca
                 cursors.add(cursor)
                 params['cursor'] = cursor
 
+        if thread_state is not None:
+            # Delta listings omit archived/deleted threads. Reconcile known IDs
+            # without a time filter before renewing the snapshot's coverage.
+            known = list(thread_state)
+            for offset in range(0, len(known), 20):
+                batch = set(known[offset:offset + 20])
+                if requests >= request_limit:
+                    raise Lookup('Robob control: incomplete thread list')
+                requests += 1
+                result = get('/threads', {'ids': ','.join(sorted(batch)), 'limit': 500})
+                page, total = result.get('threads'), result.get('total')
+                if not isinstance(page, list) or type(total) is not int or total != len(page) \
+                        or result.get('nextCursor') is not None:
+                    raise Lookup('Robob control: incomplete thread list')
+                current = {}
+                for thread in page:
+                    if not isinstance(thread, dict):
+                        raise Lookup('Robob control: invalid thread list')
+                    tid = thread.get('threadId')
+                    if not isinstance(tid, str) or tid not in batch or tid in current:
+                        raise Lookup('Robob control: invalid thread list')
+                    current[tid] = thread
+                for tid in batch:
+                    threads.pop(tid, None)
+                threads.update(current)
+
     if stats is not None:
         stats['owner_result'] = 'incomplete'
     path = Path(cache_path) if cache_path is not None else Path(os.environ.get(
@@ -811,9 +857,9 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop, *, write_ca
         # A delta cannot validate retained texts, even when it contains new turns.
         # Replace the covered span on every thread change; unchanged threads stay cheap.
         read_from = min(since, owner_time(prior['coveredFrom'])) if prior else since
-        result = control_get(config, '/threads/' + urllib.parse.quote(tid, safe='') + '/messages',
+        result = get('/threads/' + urllib.parse.quote(tid, safe='') + '/messages',
                              {'since': iso(read_from - dt.timedelta(milliseconds=1)),
-                              'role': 'user', 'all': 'true'}, stop, stats)
+                              'role': 'user', 'all': 'true'})
         messages = result.get('messages')
         if not isinstance(messages, list):
             raise Lookup('Robob control: invalid message list')
@@ -858,6 +904,8 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop, *, write_ca
         except (KeyError, ValueError, TypeError, AttributeError):
             raise Lookup('Robob control: thread updatedAt unavailable; server update required') from None
         selected.append(thread)
+    if thread_state is not None:
+        selected = [thread for thread in selected if owner_time(thread['updatedAt']) >= since]
     selected.sort(key=lambda thread: owner_time(thread['updatedAt']), reverse=True)
     covered, needed = set(), []
     for thread in selected:
@@ -883,7 +931,7 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop, *, write_ca
     futures = {}
     try:
         futures = {pool.submit(read_thread, thread): thread['threadId']
-                   for thread in needed[:max(0, OWNER_REQUEST_LIMIT - requests)]}
+                   for thread in needed[:max(0, request_limit - requests)]}
         for future in as_completed(futures, timeout=max(0.001, stop - time.time())):
             # Harvest after shutdown, including successes behind a stalled read.
             pass
@@ -915,6 +963,10 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop, *, write_ca
                      f'continuing next check{detail}')
     out = [(row['createdAt'], row['text'], row['title']) for thread in selected
            for row in cache[thread['threadId']]['texts'] if since <= owner_time(row['createdAt']) <= until]
+    if thread_capture is not None:
+        thread_capture.update({thread['threadId']: {'threadId': thread['threadId'],
+                               'title': str(thread.get('title') or ''), 'updatedAt': thread['updatedAt']}
+                               for thread in selected})
     return sorted(out, key=lambda row: row[0], reverse=True)
 
 
@@ -1280,6 +1332,9 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
         receipt_result = 'out_of_time' if getattr(e, '_money_cases_timeout', False) or \
             time.time() >= receipt_end or 'out of time' in str(e) or \
             'over time' in str(e) or isinstance(e.__cause__, subprocess.TimeoutExpired) else 'error'
+        if isinstance(e, SourceLimit) or 'limit reached' in str(e):
+            from run_history import observe
+            observe(stats if stats is not None else TIMING_STATS.get(), 'budget_stop_reason', 'source_limit')
         reasons.append(e.reason if e.reason != 'other' else
                        'receipt_out_of_time' if receipt_result == 'out_of_time' else 'other')
         errors.append(f'receipt: {e}')
@@ -1292,11 +1347,16 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
         if target is not None:
             counts = target.setdefault('receipt_result', {})
             counts[receipt_result] = counts.get(receipt_result, 0) + 1
+            from run_history import observe
+            if receipt_result == 'out_of_time':
+                observe(target, 'budget_stop_reason', 'receipt_deadline')
     try:
         hit = order_receipt(charge, at, now, deadline, memo=memo, stats=stats)
         if hit:
             return {**hit, 'errors': errors}
     except SourceLimit as e:
+        from run_history import observe
+        observe(stats if stats is not None else TIMING_STATS.get(), 'budget_stop_reason', 'source_limit')
         reasons.append(e.reason)
         limits.append({'why': str(e), 'kinds': e.kinds, 'reason': e.reason})
     except Lookup as e:

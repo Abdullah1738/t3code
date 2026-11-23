@@ -9,6 +9,100 @@ from rollup import rollup
 
 
 class ProxyRollupTests(unittest.TestCase):
+    def test_provider_statuses_tokens_and_safe_upstream_codes(self):
+        props = [
+            dict(provider='antigravity', model='shared', status=200, usage={'in': 100, 'out': 20, 'reasoning': 5}),
+            dict(provider='antigravity', model='shared', status=429, upstreamCode='RESOURCE_EXHAUSTED'),
+            dict(provider='claude', model='shared', status=200, usage={'in': 30, 'out': 2, 'cacheRead': 10, 'cacheWrite': 3}),
+            dict(provider='claude', model='shared', status=499, usage={'in': 5, 'out': True, 'reasoning': -1, 'cacheRead': 'SECRET'}),
+            dict(model='legacy'),
+            dict(provider=['invalid'], model='bad', status=True, upstreamCode='PRIVATE MESSAGE', usage={'in': float('inf')}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [dict(tool='9router', kind='perf', name='proxy.request', props=dict(route='/v1/messages', stream=True, **p)) for p in props]
+            (Path(tmp) / '2026-11-19.ndjson').write_text('\n'.join(map(json.dumps, rows)))
+            result = rollup('2026-11-19', tmp)['proxySummary']
+            self.assertEqual(result['byProvider'], [
+                dict(provider='antigravity', count=2, aborted=0, statuses={'200': 1, '429': 1}, clientAbortRate=0),
+                dict(provider='claude', count=2, aborted=1, statuses={'200': 1, '499': 1}, clientAbortRate=.5),
+                dict(provider='unknown', count=2, aborted=0, statuses={'unknown': 2}, clientAbortRate=0),
+            ])
+            self.assertEqual(result['tokensByProvider'], [
+                dict(provider='antigravity', usage={'in': 100, 'out': 20, 'reasoning': 5}),
+                dict(provider='claude', usage={'in': 35, 'out': 2, 'cacheRead': 10, 'cacheWrite': 3}),
+            ])
+            self.assertEqual(result['tokensByProviderModel'], [dict(model='shared', **g) for g in result['tokensByProvider']])
+            self.assertEqual(result['upstreamCodeCounts'], {'RESOURCE_EXHAUSTED': 1})
+            self.assertNotIn('SECRET', json.dumps(result))
+            self.assertNotIn('PRIVATE MESSAGE', json.dumps(result))
+
+    def session_summary(self, rows):
+        with tempfile.TemporaryDirectory() as tmp:
+            events = [dict(row, tool='9router', kind='perf', name='proxy.request',
+                           props=dict(route='/v1/responses', stream=True, **row['props']))
+                      for row in rows]
+            (Path(tmp) / '2026-11-19.ndjson').write_text('\n'.join(map(json.dumps, events)))
+            return rollup('2026-11-19', tmp)['proxySummary']
+
+    def test_sessions_count_all_requests_but_concentration_uses_all_aborts(self):
+        rows = json.loads((Path(__file__).parent / 'fixtures/session-identity.json').read_text())
+        result = self.session_summary(rows)
+        self.assertEqual(result['distinctSessions'], 3)
+        self.assertEqual(result['sessionsWithAborts'], 2)
+        self.assertEqual(result['sessionSrcCounts'], dict(hdr_session=2, hdr_conversation=1, hdr_claude=1,
+                                                         body_cache_key=1, none=1, unknown=1))
+        self.assertEqual(result['abortsBySession'], [
+            dict(sessionId='s:000000000001', client='t3', uaProduct='t3', model='codex/sol', count=3,
+                 aborted=2, clientAbortRate=2/3, firstTs='2026-11-19T01:00:00.000Z', lastTs='2026-11-19T04:00:00.000Z'),
+            dict(sessionId='s:000000000002', client='claude-code', uaProduct='', model='claude/opus', count=1,
+                 aborted=1, clientAbortRate=1, firstTs='2026-11-19T02:00:00.000Z', lastTs='2026-11-19T02:00:00.000Z'),
+        ])
+        self.assertEqual(result['abortConcentration'], dict(top1=2/5, top5=3/5, top20=3/5))
+        self.assertEqual(result['abortsByClient']['t3'], 2)
+
+    def test_session_top_twenty_order_and_ties_are_stable(self):
+        rows = []
+        for n in range(1, 23):
+            for _ in range(n):
+                rows.append(dict(props=dict(model='a', client='t3', sessionId=f's:{n:012x}', status=499)))
+        # Same abort count as session 22; lexical id breaks the tie.
+        rows.extend(dict(props=dict(model='b', sessionId='s:000000000000', status=499)) for _ in range(22))
+        result = self.session_summary(list(reversed(rows)))
+        self.assertEqual(result['distinctSessions'], 23)
+        self.assertEqual(result['sessionsWithAborts'], 23)
+        self.assertEqual([r['sessionId'] for r in result['abortsBySession']],
+                         ['s:000000000000'] + [f's:{n:012x}' for n in range(22, 3, -1)])
+        total = sum(range(1, 23)) + 22
+        self.assertEqual(result['abortConcentration'], dict(top1=22/total, top5=(22+22+21+20+19)/total,
+                                                          top20=(total-1-2-3)/total))
+        self.assertIsNone(result['abortsBySession'][0]['firstTs'])
+
+    def test_session_labels_and_sources_reject_raw_or_invalid_values(self):
+        ids = [None, {}, [], 'RAW_SESSION_CANARY_83', 's:short', 's:0123456789AB', 's:0123456789ab\n', 'none']
+        rows = [dict(props=dict(model='a', status=499, sessionId=value, sessionSrc={'raw': 1})) for value in ids]
+        result = self.session_summary(rows)
+        self.assertEqual(result['distinctSessions'], 0)
+        self.assertEqual(result['sessionsWithAborts'], 0)
+        self.assertEqual(result['abortsBySession'], [])
+        self.assertEqual(result['sessionSrcCounts'], dict(unknown=8))
+        self.assertEqual(result['abortConcentration'], dict(top1=0, top5=0, top20=0))
+        self.assertNotIn('RAW_SESSION_CANARY_83', json.dumps(result))
+
+    def test_session_no_aborts_and_timestamp_normalization(self):
+        rows = [dict(ts=stamp, props=dict(model='b', client='t3', uaProduct='t3', status=200,
+                                         sessionId='s:000000000001', sessionSrc='hdr_session'))
+                for stamp in ['2026-11-19T04:00:00+04:00', 'bad', None, '2026-11-19T10:00:00Z']]
+        result = self.session_summary(rows)
+        self.assertEqual(result['distinctSessions'], 1)
+        self.assertEqual(result['sessionsWithAborts'], 0)
+        self.assertEqual(result['abortConcentration'], dict(top1=None, top5=None, top20=None))
+        rows.append(dict(ts='2026-11-19T01:00:00Z', props=dict(model='b', status=499, sessionId='s:000000000001')))
+        group = self.session_summary(rows)['abortsBySession'][0]
+        self.assertEqual(group['count'], 5)
+        self.assertEqual(group['firstTs'], '2026-11-19T00:00:00.000Z')
+        self.assertEqual(group['lastTs'], '2026-11-19T10:00:00.000Z')
+        self.assertEqual(self.session_summary([])['abortConcentration'], dict(top1=None, top5=None, top20=None))
+
     def test_dimensions_latency_ttfb_and_abort_rate(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows = []
