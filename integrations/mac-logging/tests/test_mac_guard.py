@@ -100,8 +100,10 @@ class FakeHost:
 
     def soften(self, p):
         self.effects.append(('soften', p['pid']))
-        return dict(result='sent', stages=dict(renice=dict(rc=0, result='sent', stderr=''),
-                    identityRecheck=dict(same=True), taskpolicy=dict(rc=0, result='sent', stderr='')))
+        return dict(result='sent', niceBefore=0, niceAfter=20,
+                    stages=dict(identityRead=dict(result='sent', same=True), getpriority=dict(result='sent'),
+                                renice=dict(rc=0, result='sent'), identityRecheck=dict(result='sent', same=True),
+                                readBack=dict(result='sent')))
 
     def notify(self, key, text):
         self.effects.append(('notify', key, text))
@@ -346,6 +348,18 @@ class GuardTests(unittest.TestCase):
         for _ in range(10):
             self.tick([proc(10, cpu=540)])
         self.assertIn(('signal', 10, 'SIGCONT'), self.effects('signal'))
+
+    def test_already_nice_skip_does_not_stall_hog_ladder(self):
+        self.host.soften = lambda p:dict(result='skipped', reason='already-nice', niceBefore=20, niceAfter=20,
+                                        stages=dict(renice=dict(result='skipped', reason='already-nice')))
+        for i in range(10):
+            self.tick([proc(10, cpu=i*60)], load=200)
+            self.guard.drain(self.now-20)
+        self.assertIn(('signal', 10, 'SIGSTOP'), self.effects('signal'))
+        self.assertIn(('signal', 10, 'SIGTERM'), self.effects('signal'))
+        skipped = [e for e in self.events_named('action') if e['action'] == 'renice']
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]['reason'], 'already-nice')
 
     def test_gui_hogs_soften_only(self):
         for i in range(15):

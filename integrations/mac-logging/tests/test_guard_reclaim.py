@@ -455,8 +455,10 @@ class InputTests(unittest.TestCase):
         p = nproc()
         native.row = lambda pid:dict(p)
         with patch.object(os,'getpriority',return_value=15), patch.object(os,'setpriority') as setprio:
-            self.assertEqual(native.soften(p)['niceAfter'],15)
-            setprio.assert_called_once_with(os.PRIO_PROCESS,p['pid'],15)
+            outcome = native.soften(p)
+            self.assertEqual(outcome['niceAfter'],15)
+            self.assertEqual((outcome['result'], outcome['reason']), ('skipped', 'already-nice'))
+            setprio.assert_not_called()
         native.row = lambda pid:dict(p,start=[NOW,1])
         with patch.object(os,'setpriority') as setprio:
             self.assertEqual(native.soften(p)['result'],'identity-changed')

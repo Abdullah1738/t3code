@@ -52,6 +52,7 @@ class History(unittest.TestCase):
                         if use_cache:
                             snapshot['orders'][order] = {'createdAt': at.isoformat(), 'delivered': True}
                         (data / 'marketplace-placements.json').write_text(json.dumps(snapshot))
+                        before = (data / 'marketplace-placements.json').read_bytes()
                         (data / 'order-details.json').write_text(json.dumps([cached] if use_cache else []))
                         first = self.page(order, True, 'cursor-one')
                         second = self.page(order, False, None)
@@ -70,16 +71,21 @@ class History(unittest.TestCase):
                             stats = marketplace.refresh(data, Path(__file__).resolve().parents[1])
                         self.assertEqual((stats['pages'], stats['fetched']), (2, 0 if use_cache else 1))
                         self.assertEqual(stats['result'], 'invalid_paging')
+                        self.assertEqual((data / 'marketplace-placements.json').read_bytes(), before)
                         snapshot, reason = marketplace.load(data)
                         self.assertIsNone(reason)
                         self.assertEqual(snapshot['walked_at'], walked_at)
                         self.assertIn('HELD', snapshot['orders'])
+                        # A successful detail remains cached, but an invalid walk
+                        # cannot add its placement to the previous snapshot.
+                        cache = order_lookup.load_cache(data / 'order-details.json')
+                        self.assertEqual([r['order'] for r in cache], [order])
                         with patch.object(core, 'request', side_effect=AssertionError('snapshot must not read network')):
                             result = order_lookup.native('noon', str(Path(__file__).resolve().parents[1]),
-                                services=('marketplace',), cache=order_lookup.load_cache(data / 'order-details.json'),
+                                services=('marketplace',), cache=cache,
                                 snapshot=snapshot)
                         lane = result['lanes']['marketplace']
-                        self.assertEqual((lane['pages'], lane['fetched'], lane['cached']), (0, 0, 1))
+                        self.assertEqual((lane['pages'], lane['fetched'], lane['cached']), (0, 0, int(use_cache)))
                         self.assertIn(at.isoformat(), lane['hold_times'])
                         with self.assertRaises(charges.SourceLimit) as exc:
                             charges.order_receipt(charge, at, at, lookup=lambda *a, **kw: result)

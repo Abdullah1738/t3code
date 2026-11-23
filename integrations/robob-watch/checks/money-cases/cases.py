@@ -3553,37 +3553,65 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *, 
     run_history.current()['stats'] = stats
     run_history.current()['slowest'] = 'loads'
     with data_io.scope(started + CHECK_BUDGET, stats):
-        stats['dataless_files'] = data_io.dataless_files(data or DATA)
-        skip = read_json(wd / 'data-skips.json', {})
-        stats['edeadlk_skips_before'] = skip.get('skip_streak', 0)
-        if skip:
-            stats.update(skip_last_file=skip.get('last_file'), skip_last_reason=skip.get('last_reason'),
-                         skip_first_at=skip.get('first_skip_at'))
-        # Discover an evicted dependency before any book or ping mutations.
-        for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json',
-                     'owner-texts.json', 'owner-snapshot.json', 'owner-refresh.json',
-                     'msgs-searches.json', 'order-details.json', 'marketplace-placements.json'):
-            try:
-                data_io.read_text((data or DATA) / name)
-            except FileNotFoundError:
-                pass
-        # Start before follow: its union-window read consumes only the previous
-        # complete snapshot, while this independent process warms the next run.
-        from owner_refresh import launch as launch_owner_refresh
-        owner_now = now or dt.datetime.now(TZ)
-        owner_times = []
-        for q in load_questions(data or DATA)['questions']:
-            try:
-                at = parse_time(q['at'])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if q.get('kind') == 'charge' and (active(q) or
-                    (q.get('status') == 'case' and owner_now - at <= FOLLOW_CASE)):
-                owner_times.append(at)
-        if refresh_owner and owner_times and said is None:
-            launch_owner_refresh(data or DATA, min(owner_times) - charges.OWNER_AROUND, stats=stats)
-        from marketplace import refresh_status, refresh_details
-        refresh = refresh_details(data or DATA, refresh_status(data or DATA))
+        from marketplace import refresh_status, refresh_details, launch_refresh
+        refresh = refresh_details(data or DATA, 'skipped')
+        run_history.current()['marketplace_refresh'] = refresh
+        try:
+            stats['dataless_files'] = data_io.dataless_files(data or DATA)
+            skip = read_json(wd / 'data-skips.json', {})
+            stats['edeadlk_skips_before'] = skip.get('skip_streak', 0)
+            if skip:
+                stats.update(skip_last_file=skip.get('last_file'), skip_last_reason=skip.get('last_reason'),
+                             skip_first_at=skip.get('first_skip_at'))
+            # Discover an evicted dependency before any book or ping mutations.
+            for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json',
+                         'owner-texts.json', 'owner-snapshot.json', 'owner-refresh.json',
+                         'msgs-searches.json', 'order-details.json', 'marketplace-placements.json'):
+                try:
+                    data_io.read_text((data or DATA) / name)
+                except FileNotFoundError:
+                    pass
+            # Start before follow: its union-window read consumes only the previous
+            # complete snapshot, while this independent process warms the next run.
+            from owner_refresh import launch as launch_owner_refresh
+            owner_now = now or dt.datetime.now(TZ)
+            owner_times = []
+            for q in load_questions(data or DATA)['questions']:
+                try:
+                    at = parse_time(q['at'])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if q.get('kind') == 'charge' and (active(q) or
+                        (q.get('status') == 'case' and owner_now - at <= FOLLOW_CASE)):
+                    owner_times.append(at)
+            if refresh_owner and owner_times and said is None:
+                launch_owner_refresh(data or DATA, min(owner_times) - charges.OWNER_AROUND, stats=stats)
+        except data_io.DataUnavailable:
+            refresh['status'] = 'held_data_unavailable'
+            raise
+        # Scratch checks and injected owner reads suppress both detached refreshers.
+        # Launch now so a later follow deadline cannot starve the next snapshot.
+        if refresh_owner and said is None:
+            data_unavailable_before_launch = data_io.current_scope()['failed']
+            if data_unavailable_before_launch:
+                refresh['status'] = 'held_data_unavailable'
+            elif time.time() + .5 > started + CHECK_BUDGET:
+                refresh['status'] = 'held_deadline'
+            else:
+                try:
+                    launch_end = time.time() + .5
+                    # The I/O scope alone cannot interrupt process creation.
+                    with data_io.scope(launch_end), charges.within(
+                            launch_end, data_io.DataUnavailable(data or DATA, 'deadline')):
+                        status = refresh_status(data or DATA)
+                        if status == 'started':
+                            launch_refresh(data or DATA)
+                        refresh['status'] = status
+                except data_io.DataUnavailable as exc:
+                    refresh['status'] = 'held_deadline' if exc.reason == 'deadline' else 'held_data_unavailable'
+                except OSError:
+                    refresh['status'] = 'launch_failed'
+                    record_event('marketplace.refresh', kind='error', ok=False, props={'result': 'launch_error'})
         result = _scoped_run_check(wd, run, data, root, now, find, said, stats, refresh, started)
         try:
             (wd / 'data-skips.json').unlink(missing_ok=True)
@@ -3609,29 +3637,6 @@ def _scoped_run_check(wd, run, data, root, now, find, said, stats, marketplace_r
         run_history.current().update({key: value for key, value in diagnostic.items()
                                       if key not in ('at', 'started', 'stats', 'owner_result')})
         run_history.current()['owner_result'] = stats.get('owner_result', 'not_read')
-        from marketplace import launch_refresh
-        error = sys.exc_info()[1]
-        scope = data_io.current_scope()
-        data_unavailable = isinstance(error, data_io.DataUnavailable) or bool(scope and scope['failed'])
-        deadline_aborted = (diagnostic['budgetHit'] or isinstance(error, CheckTimeout)
-                            or time.time() >= started + CHECK_BUDGET)
-        if marketplace_refresh['status'] == 'started':
-            marketplace_refresh['status'] = 'skipped'
-            if data_unavailable:
-                marketplace_refresh['status'] = 'held_data_unavailable'
-            elif deadline_aborted:
-                marketplace_refresh['status'] = 'held_deadline'
-            elif error is not None:
-                marketplace_refresh['status'] = 'held_abort'
-            else:
-                try:
-                    launch_refresh(data or DATA)
-                    marketplace_refresh['status'] = 'started'
-                except data_io.DataUnavailable as exc:
-                    marketplace_refresh['status'] = 'held_deadline' if exc.reason == 'deadline' else 'held_data_unavailable'
-                except OSError:
-                    marketplace_refresh['status'] = 'launch_failed'
-                    record_event('marketplace.refresh', kind='error', ok=False, props={'result': 'launch_error'})
         run_history.current()['marketplace_refresh'] = marketplace_refresh
         try:
             # The check owns the start and timing samples; logging adds no second timer.
