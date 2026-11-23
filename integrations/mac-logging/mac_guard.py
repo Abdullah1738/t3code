@@ -56,6 +56,7 @@ WORKER = ('codex', 'gpt-6.1-sol')
 WORKER_HTTP_TIMEOUT = 45
 WORKER_HELPER_TIMEOUT = 50
 STRAIN_WORKER_INTERVAL = 600
+STEER_SIGNALS = {2, 3, 4, 5, 6}
 LOAD_ONLY_WORKER_DELAY = 600
 WORKER_SKIP_LOG_INTERVAL = 60
 STATE = Path.home() / '.local/state/mac-guard'
@@ -466,8 +467,9 @@ class Host:
             raise ValueError('unreadable thread')
         return value
 
-    def worker_send(self, tid, text, request_id=None):
-        self.cmd([T3CTL, 'send', tid, text]+(['--request-id', request_id] if request_id else []), 5)
+    def worker_send(self, tid, text, request_id=None, mode='auto'):
+        self.cmd([T3CTL, 'send', tid, text]+(['--request-id', request_id] if request_id else [])
+                 +(['--mode', mode] if mode != 'auto' else []), 5)
 
     def worker_request(self, method, path, body=None):
         self.worker_duration = None
@@ -1065,25 +1067,57 @@ class Guard:
         self.log('worker_skipped', reason=reason, signals=signals, evidence=str(path))
         self.save()
 
-    def record_strain_worker(self, signals, path):
-        # Reserve before send: a timeout can still have delivered the steer.
-        self.saved['strainWorker'] = dict(signals=sorted(set(signals)), at=self.now, evidence=str(path))
+    def record_strain_worker(self, signals, path, request_id=None, mode='auto', census=False):
+        # Both triggers reserve before sending: a timeout may still be accepted.
+        tid = self.worker.get('threadId')
+        if not tid and self.worker.get('launchUnknown'):
+            tid = worker_thread_id(self.worker['launch']['clientRequestId'])
+        last = self.strain_worker_change(signals)[0]
+        # Queued census coverage cannot stand in for an immediate urgent update.
+        immediate = set(last.get('immediateSignals', last['signals'] or [])) if last else set()
+        if mode == 'auto':
+            immediate = set(signals or []) & STEER_SIGNALS
+        elif not census:
+            immediate &= set(signals or [])
+        self.saved['strainWorker'] = dict(signals=sorted(set(signals)) if signals is not None else None,
+                                        at=self.now, evidence=str(path), threadId=tid, requestId=request_id,
+                                        immediateSignals=sorted(immediate))
         self.save()
 
-    def worker_needed(self, path, summary, urgent=False, delivery=None, signals=None, allow_launch=True):
-        if signals is not None:
+    def strain_worker_change(self, signals, immediate=False):
+        last = self.saved.get('strainWorker')
+        tid = self.worker.get('threadId')
+        if not tid and self.worker.get('launchUnknown'):
+            tid = worker_thread_id(self.worker['launch']['clientRequestId'])
+        if last and last.get('threadId', tid) != tid:
+            last = None
+        gained = set(signals or [])
+        if last:
+            # An onset can precede the first sample. Its census covers load/slow
+            # strain, but a newly observed emergency must still reach the worker.
+            gained = gained & STEER_SIGNALS if last['signals'] is None else gained-set(last['signals'])
+            if immediate:
+                covered = set(last.get('immediateSignals', last['signals'] or []))
+                gained = (gained-STEER_SIGNALS) | ((set(signals or []) & STEER_SIGNALS)-covered)
+        recent = last and not gained and 0 <= self.now-last['at'] < STRAIN_WORKER_INTERVAL
+        return last, gained, bool(recent)
+
+    def worker_needed(self, path, summary, urgent=False, delivery=None, signals=None, allow_launch=True,
+                      mode='auto', census=False):
+        if signals is not None and not census:
             if not signals:
                 self.worker_skipped('empty_signals', signals, path)
                 return
-            last = self.saved.get('strainWorker')
-            if last and not set(signals)-set(last['signals']):
-                if 0 <= self.now-last['at'] < STRAIN_WORKER_INTERVAL:
-                    self.worker_skipped('unchanged', signals, path)
-                    return
+            last, gained, recent = self.strain_worker_change(signals, immediate=True)
+            if recent:
+                self.worker_skipped('unchanged', signals, path)
+                return
+            mode = 'auto' if gained & STEER_SIGNALS else 'queue'
+            if last and not gained:
                 summary += '; still ongoing'
         if self.muted:
             self.log('worker_steered' if self.worker.get('threadId') else 'worker_spawned',
-                     result='would_act', evidence=str(path), summary=summary)
+                     result='would_act', evidence=str(path), summary=summary, mode=mode)
             return
         if self.worker.get('launchUnknown'):
             if not self.launch_worker(path, reconcile=True):
@@ -1100,16 +1134,21 @@ class Guard:
             if not ended:
                 if self.muted:
                     return
-                if signals is not None:
-                    self.record_strain_worker(signals, path)
+                if census and self.strain_worker_change(signals)[2]:
+                    delivery['suppressed'] = True
+                    self.worker_skipped('unchanged', signals, path)
+                    return
+                if delivery is not None:
+                    delivery.update(threadId=tid, mode=mode)
+                if signals is not None or census:
+                    self.record_strain_worker(signals, path, delivery['requestId'] if delivery is not None else None,
+                                              mode=mode, census=census)
+                elif delivery is not None:
+                    self.save()
                 try:
-                    if delivery is not None:
-                        delivery['threadId'] = tid
-                        self.save()
-                        self.host.worker_send(tid, str(path)+'\n'+summary, delivery['requestId'])
-                    else:
-                        self.host.worker_send(tid, str(path)+'\n'+summary)
-                    self.log('worker_steered', threadId=tid, evidence=str(path))
+                    self.host.worker_send(tid, str(path)+'\n'+summary,
+                                          delivery['requestId'] if delivery is not None else None, mode=mode)
+                    self.log('worker_steered', threadId=tid, evidence=str(path), mode=mode)
                     return True
                 except (ProbeError, OSError):
                     self.log('error', probe='worker_send', failure='unavailable')
@@ -1137,7 +1176,7 @@ class Guard:
             delivery.update(launch=launch, startedAt=self.now)
             self.save()
         write_json(self.state/'worker.json', self.worker)
-        if signals is not None:
+        if signals is not None or census:
             self.record_strain_worker(signals, path)
         return self.launch_worker(path)
 
@@ -1179,6 +1218,10 @@ class Guard:
         if not report or self.muted or self.now < report.get('nextAttemptAt', 0):
             return
         report['nextAttemptAt'] = self.now+30
+        census = key.startswith('overloadResponder:')
+        mode = report.get('mode', 'queue' if census or key.startswith('strainClearResponder:') else 'auto')
+        if census:
+            report.setdefault('signals', self.saved.get('strainSignals') or None)
         self.save()
         # A lost acknowledgment may belong to a worker that has since ended.
         # Replay its original operation, without selecting a new worker.
@@ -1204,16 +1247,26 @@ class Guard:
             elif report.get('threadId'):
                 if self.muted:
                     return
-                self.host.worker_send(report['threadId'], report['evidence']+'\n'+report['summary'], report['requestId'])
-                self.log('worker_steered', threadId=report['threadId'], evidence=report['evidence'])
-                delivered = True
+                if census and report['threadId'] == self.worker.get('threadId'):
+                    last = self.strain_worker_change(report['signals'])[0]
+                    if last and last.get('requestId') != report['requestId']:
+                        report['suppressed'] = True
+                        self.worker_skipped('unchanged', report['signals'], Path(report['evidence']))
+                    else:
+                        self.record_strain_worker(report['signals'], Path(report['evidence']), report['requestId'],
+                                                  mode=mode, census=True)
+                delivered = not report.get('suppressed')
+                if delivered:
+                    self.host.worker_send(report['threadId'], report['evidence']+'\n'+report['summary'], report['requestId'], mode=mode)
+                    self.log('worker_steered', threadId=report['threadId'], evidence=report['evidence'], mode=mode)
             else:
                 delivered = self.worker_needed(Path(report['evidence']), report['summary'], urgent=report['urgent'],
-                                               delivery=report)
+                                               delivery=report, mode=mode, census=census,
+                                               signals=report['signals'] if census else None)
         except (ProbeError, OSError, ValueError, KeyError):
             self.log('error', probe=key, failure='unavailable')
             return
-        if delivered:
+        if delivered or report.get('suppressed'):
             self.saved.pop(key)
             self.save()
         return bool(delivered)
@@ -1463,13 +1516,13 @@ class Guard:
                        and any(self.gui_allowed(p) for p in slow if gui(p)))
         if slow_strain:
             signals.append(7)
+        self.saved['strainSignals'] = signals
         self.runnable = [p for p in self.rows.values() if p['state'].startswith('R')]
         self.r_zero = dict(Counter(p['family'] for p in self.runnable if p['cpuDelta'] == 0))
         self.streak = self.streak+1 if signals else 0
         self.calm = 0 if signals else self.calm+1
         if not self.strain and (self.streak >= 2 or memory or robob_trip or slow_strain):
             self.strain, self.since = True, now
-            self.saved.pop('strainWorker', None)
             self.log('strain_start', signals=signals)
         if self.strain and self.calm >= 10:
             self.strain = False

@@ -310,7 +310,7 @@ def building(): return []
                         with patch.object(case.host, 'worker_send', wraps=send) as retry:
                             case.tick([proc(1, ROBOB)], {1: 27})
                         retry.assert_called_once_with('existing-responder', report['evidence']+'\n'+report['summary'],
-                                                      report['requestId'])
+                                                      report['requestId'], mode='auto')
                         self.assertNotIn('restartResponder', case.guard.saved)
                         case.tick([proc(1, ROBOB)], {1: 28})
                         self.assertEqual(len(case.effects('steer')), 1)

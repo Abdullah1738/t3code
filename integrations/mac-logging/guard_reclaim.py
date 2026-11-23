@@ -597,5 +597,5 @@ class Reclaimer:
             self.save()
         self.log(passId=key.split(':', 1)[1], step='worker', evidence=report['evidence'],
                  workerDelivered=bool(delivered), workerStarted=self.last_worker_started, threadId=g.worker.get('threadId'),
-                 result='delivered' if delivered else 'pending')
+                 result='delivered' if delivered else 'suppressed' if report.get('suppressed') else 'pending')
         return bool(delivered)
