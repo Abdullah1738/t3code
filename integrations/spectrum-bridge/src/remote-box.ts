@@ -156,7 +156,9 @@ export class RemoteBox {
     return { retained: !!row, confirmed: row?.sealed === null, ...(row?.picked_up_at == null ? {} : { deliveredAt: row.picked_up_at }) };
   }
   async request(path: string, body: unknown): Promise<Record<string, unknown>> {
-    const response = await (this.io.fetch ?? fetch)(this.config.url + path, { method: "POST", redirect: "error",
+    // No pooled sockets: the box's Bun.serve closes idle keep-alive sockets at 10 s, twice the probe interval,
+    // and that close crosses the ssh -L forward too late, so a reused socket reset under /lease or /deliver.
+    const response = await (this.io.fetch ?? fetch)(this.config.url + path, { method: "POST", redirect: "error", keepalive: false,
       headers: { authorization: `Bearer ${this.token}`, "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(path === "/lease" ? 12_000 : 10_000) });
     if (!response.ok) throw new RemoteRequestError(response.status);
     return jsonBody(response as unknown as Request);
