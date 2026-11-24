@@ -1,7 +1,7 @@
 import { ActiveRoster } from "./active-roster.ts";
 import { MessageCache } from "./message-cache.ts";
 import { toolError } from "./toollog.ts";
-import { assertPromptUnexpired, IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
+import { assertPromptUnexpired, IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type RunDiag, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
@@ -39,6 +39,15 @@ function runFailure(thread: Pick<ThreadDetail, "lastError">, run: RunSummary, me
   if (!TERMINAL.has(run.status)) return;
   const complaint = messages.find(message => message.runId === run.runId && message.role === "assistant" && SELECTED_MODEL_ISSUE.test(message.text))?.text;
   return (latest && (run.status === "failed" || run.ordinal === 1 || complaint) && thread.lastError) || complaint || (run.status === "failed" ? "Run failed without error details" : undefined);
+}
+
+/** Run facts for the failed turn.end row (#137): status, model and length, never message text. */
+function runDiag(run: RunSummary): RunDiag {
+  const started = run.startedAt ? Date.parse(run.startedAt) : NaN;
+  const completed = run.completedAt ? Date.parse(run.completedAt) : NaN;
+  return { runStatus: run.status,
+    ...(run.model ? { provider: run.model.instanceId, model: run.model.model } : {}),
+    ...(Number.isFinite(started) && Number.isFinite(completed) && completed >= started ? { runMs: completed - started } : {}) };
 }
 
 /** The send route derives the message id from `clientRequestId`; this maps it back to the bridge's prompt id. */
@@ -118,6 +127,7 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
       ...(run.completedAt ? { completedAt: epoch(run.completedAt) } : {}),
       ...(failure && run.ordinal === 1 ? { firstTurnFailure: true } : {}),
       ...(group.some(message => message.role === "assistant" && SELECTED_MODEL_ISSUE.test(message.text)) ? { modelError: true } : {}),
+      ...(result !== "succeeded" ? { diag: runDiag(run) } : {}),
       time: { created: epoch(group.at(-1)?.updatedAt ?? null) } });
   }
   return records;

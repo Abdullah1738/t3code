@@ -5,6 +5,7 @@ import { callName, percentiles } from "./log-calls.ts";
 import { createRobobLinkAggregation } from "./log-robob-link.ts";
 import { createChainAggregation } from "./log-chains.ts";
 import { FETCH_CAUSES, cleanRenderCardId } from "./log-card-fetch.ts";
+import { INSTANT_FAIL_MS } from "./turn-fail-cause.ts";
 
 export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>, renderLines: LogLine[] = [], requestedDay?: string) {
   const apiHistograms = new Map<string, Map<number, number>>();
@@ -31,6 +32,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const promptProbe = emptyPromptProbe();
   const probeHours = new Map<string, PromptProbeStats>();
   const robobLink = createRobobLinkAggregation();
+  const failedTurns = createFailedTurnAggregation();
   let day = requestedDay;
   const firstReplies = new Map<number, number>();
   const alerts = new Set<string>();
@@ -164,6 +166,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     }
     robobLink.accept(line);
     chainAggregation.accept(line);
+    failedTurns.accept(line);
     if (line.name === "inbound.overdue") overdue++;
     if (line.name === "inbound.watchdog_requeued") requeued_by_watchdog++;
     if (["inbound.overdue_notice", "inbound.unanswered_alert", "unanswered.alert"].includes(line.name) && line.ids?.inboundId) alerts.add(`${line.ids.chat}:${line.ids.inboundId}`);
@@ -216,7 +219,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   return { apiRequests, cliRequestFailures: cliFailures, robob_link: robobLink.summary(day), overdue, requeued_by_watchdog, unanswered_alerts: alerts.size, answered_late, first_reply_latency_ms: percentiles(firstReplies), total, recordedRows, countsByName, countsByKind, ok, failed,
     dedupedFailures, okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countedErrors + failedCalls) / total : 0,
     promptProbe: { ...summarizePromptProbe(promptProbe), byHour: Object.fromEntries([...probeHours].sort().map(([hour, stats]) => [hour, summarizePromptProbe(stats)])) },
-    durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),
+    durationMs, byComponent, failedTurns: failedTurns.summary(), cardRenderFailures: Object.fromEntries(renderFailures),
     cardRenderFetchFailures: [...renderFetchFailures.values()].sort((a, b) => b.count - a.count || a.failureCode.localeCompare(b.failureCode) || a.fetchCause.localeCompare(b.fetchCause) || (a.httpStatus ?? 0) - (b.httpStatus ?? 0))
       .map(item => ({ ...item, cardIds: [...item.cardIds].sort() })),
     topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20).map(item => {
@@ -224,4 +227,31 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
       return rows ? { ...item, distinctInboundIds: rows.size, topInboundIds: [...rows].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 14).map(([inboundId, count]) => ({ inboundId, count })) } : item;
     }), chains: chainAggregation.summary(),
     topErrorTags: [...errors.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.name.localeCompare(b.name)).slice(0, 20) };
+}
+
+/** Rows written before #137 have no cause fields; they count under "unrecorded", apart from a logged "unknown". */
+export function createFailedTurnAggregation() {
+  let count = 0, under5s = 0;
+  const byCause: Record<string, number> = Object.create(null);
+  const byProviderModel: Record<string, number> = Object.create(null);
+  const byHour: Record<string, number> = Object.create(null);
+  const bump = (target: Record<string, number>, key: string) => { target[key] = (target[key] ?? 0) + 1; };
+  return {
+    accept(line: LogLine) {
+      if (line.name !== "turn.end" || line.ok !== false) return;
+      count++;
+      const props = line.props ?? {};
+      bump(byCause, typeof props.failCause === "string" ? props.failCause : "unrecorded");
+      bump(byProviderModel, typeof props.provider === "string" || typeof props.model === "string"
+        ? `${typeof props.provider === "string" ? props.provider : "?"}/${typeof props.model === "string" ? props.model : "?"}` : "unrecorded");
+      bump(byHour, line.ts.slice(11, 13));
+      const ms = typeof props.sinceTurnStartMs === "number" ? props.sinceTurnStartMs : line.durationMs;
+      if (typeof ms === "number" && ms < INSTANT_FAIL_MS) under5s++;
+    },
+    summary() {
+      const sorted = (record: Record<string, number>) => Object.fromEntries(Object.entries(record).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
+      return { count, under5s, byCause: sorted(byCause), byProviderModel: sorted(byProviderModel),
+        byHour: Object.fromEntries(Object.entries(byHour).sort((a, b) => a[0].localeCompare(b[0]))) };
+    },
+  };
 }
