@@ -5262,7 +5262,8 @@ export class Router {
         const completion = messages.findIndex((record, index) => record.type === "idle"
           && (run?.completionId ? record.id === run.completionId : index > start));
         const observed = run?.messageIds?.every(id => messages.some(record => record.id === id));
-        if (this.idleBackground(turn) && run?.terminal && run.messageIds?.length && !observed) {
+        // Without its own idle, a readable unphased reply would be scoped by a sibling's idle and judged narration.
+        if (this.idleBackground(turn) && run?.terminal && run.messageIds?.length && (!observed || completion < 0)) {
           this.store.db.transaction(() => {
             const pending = this.store.get<BackgroundOutput[]>("pendingBackgroundOutput") ?? [];
             if (!pending.some(output => output.id === turn!.id && output.generation === turn!.generation && output.runId === run.runId)) {
@@ -5280,8 +5281,8 @@ export class Router {
           return;
         }
         // Empty terminal runs have no idle marker. Evidence also fences a stale snapshot
-        // until every bound-run assistant record is present, wherever its idle sorts.
-        awaitingRun = !!run && (!run.terminal || this.ownsHuman(turn) && completion < 0 && !observed);
+        // until every bound-run assistant record and, when it wrote any, its own idle are present.
+        awaitingRun = !!run && (!run.terminal || this.ownsHuman(turn) && completion < 0 && (!observed || !!run.messageIds?.length));
       }
       if (turn.background) this.store.set(`holder-records:${turn.messageId}`, this.backgroundRecordsKey(messages));
       const deferredSteers = this.unresolvedSteers(turn, messages);
