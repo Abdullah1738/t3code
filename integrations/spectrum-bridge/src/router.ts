@@ -752,7 +752,14 @@ export class Router {
         }
         throw error;
       }
-      if (observation.probe && error !== probeDeferred) toolLog.capture(() => observation.probe?.failure(error));
+      if (error === probeDeferred) {
+        if (ownsLease()) {
+          this.probeBackoff.release(leader);
+          this.probeBackoff.release(promptKey);
+        }
+        throw error;
+      }
+      if (observation.probe) toolLog.capture(() => observation.probe?.failure(error));
       // A receipt can settle this read while it is pending; late failures cannot restore its history.
       if (!ownsLease()) throw probeDeferred;
       const backoff = this.probeBackoff.failed(leader);

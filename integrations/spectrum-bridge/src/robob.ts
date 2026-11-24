@@ -10,6 +10,7 @@ import { nativeMessageId, opencodeCompletedSteps, opencodeFinishes, opencodeRunE
 import { controlModelFields, imessagePreferences, type PreferredModel } from "./preferred-model.ts";
 import type { Store } from "./store.ts";
 import { controlDisposition } from "./control-errors.ts";
+import { probeDeferred } from "./probe-policy.ts";
 import { createHash } from "node:crypto";
 
 /**
@@ -161,6 +162,8 @@ export interface RobobBackendOptions extends ControlConfigOptions {
 }
 
 const CHATS_DIR = "chats";
+const caches = new WeakMap<ControlClient, MessageCache>();
+const nativeAliases = new WeakMap<ControlClient, Map<string, string>>();
 
 /** The iMessage router's backend on Robob's control API. Accepts thread ids and OpenCode `ses_` ids alike. */
 export class RobobBackend implements ChatBackend {
@@ -171,7 +174,7 @@ export class RobobBackend implements ChatBackend {
   readonly activeRoster: ActiveRoster;
   private readonly chatRoot: string;
   private readonly directories: ThreadDirectories;
-  private readonly native = new Map<string, string>();
+  private readonly native: Map<string, string>;
   private readonly finishes: StepFinishes;
   private readonly completedSteps: CompletedSteps;
   private readonly runEvidence: RunEvidence;
@@ -187,13 +190,18 @@ export class RobobBackend implements ChatBackend {
   private readonly sendBodies = new Map<string, Record<string, unknown>>();
   private readonly messageCache: MessageCache;
 
+  beginMessageTick(ids: string[]): Promise<void> {
+    // Imported routes need their one-time native-id resolution before they can join the marker batch.
+    return this.messageCache.beginTick(ids.map(id => this.native.get(id) ?? id).filter(id => !id.startsWith("ses_")));
+  }
+
   messageReadScope<T>(body: () => Promise<T>): Promise<T> {
     return this.messageCache.withinTick(body);
   }
 
   private readMessages(threadId: string, thread: ThreadDetail, until?: string): Promise<ControlMessage[]> {
     return this.messageCache.read(threadId, JSON.stringify([thread.run, thread.recentRuns, thread.lastError]), until === undefined ? undefined : messages =>
-      recordsFromThread(thread, messages).some(record => record.id === until)
+      this.messageCache.accepted(threadId, until) || recordsFromThread(thread, messages).some(record => record.id === until)
       || messages.some(message => until === `idle:${message.runId}` || until === `${message.runId}:error`));
   }
 
@@ -222,9 +230,13 @@ export class RobobBackend implements ChatBackend {
     this.chatRoot = options.chatRoot.replace(/\/+$/, "");
     if (options.subdir !== undefined && !/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/.test(options.subdir)) throw new Error("Invalid iMessage chat folder");
     this.client = options.client ?? new ControlClient({ ...options, linkGate: options.linkGate ?? true });
+    this.native = nativeAliases.get(this.client) ?? new Map();
+    nativeAliases.set(this.client, this.native);
     this.directories = new ThreadDirectories(this.client);
     this.activeRoster = options.activeRoster ?? new ActiveRoster(this.client);
-    this.messageCache = new MessageCache(this.client);
+    this.messageCache = caches.get(this.client) ?? new MessageCache(this.client);
+    caches.set(this.client, this.messageCache);
+    this.messageCache.observeDetails(this.activeRoster);
     this.finishes = options.finishes ?? opencodeFinishes();
     this.completedSteps = options.completedSteps ?? opencodeCompletedSteps();
     this.runEvidence = options.runEvidence ?? opencodeRunEvidence();
@@ -248,12 +260,12 @@ export class RobobBackend implements ChatBackend {
     if (!Number.isFinite(sinceMs)) return "unknown";
     try {
       const threadId = await this.resolve(id);
-      const { thread } = await this.client.thread(threadId);
+      const thread = await this.messageCache.detail(threadId);
       const started = (run: RunSummary) => Date.parse(run.requestedAt ?? run.startedAt ?? "");
       const runs = [...thread.recentRuns ?? [], ...(thread.run ? [thread.run] : [])];
       const run = runs.filter(candidate => started(candidate) >= sinceMs).sort((a, b) => started(a) - started(b))[0];
       if (!run) return "unknown";
-      const fromRobob = (await this.client.runEvidence(threadId, run.runId)).toolEvidence;
+      const fromRobob = (await this.messageCache.evidence(threadId, run.runId)).toolEvidence;
       if (fromRobob !== "unknown" || !this.isOpenCodeThread(thread) || !thread.nativeSessionId) return fromRobob;
       return this.runEvidence(thread.nativeSessionId, sinceMs);
     } catch (caughtError) { toolError("robob", "robob.catch2", caughtError);
@@ -267,13 +279,7 @@ export class RobobBackend implements ChatBackend {
   }
 
   private async detail(id: string): Promise<ThreadDetail> {
-    const threadId = await this.resolve(id);
-    const read = this.activeRoster.checkpoint(threadId);
-    try {
-      const { thread } = await this.client.thread(threadId);
-      this.activeRoster.observe(thread, read);
-      return thread;
-    } finally { this.activeRoster.finish(threadId, read); }
+    return this.messageCache.detail(await this.resolve(id));
   }
 
   async health() {
@@ -381,7 +387,7 @@ export class RobobBackend implements ChatBackend {
 
   async retireOthers(keepId: string): Promise<number> {
     const keep = await this.resolve(keepId);
-    this.messageCache.routeChange();
+    this.messageCache.routeChange(keep);
     const { threads } = await this.client.listThreads({ origin: IMESSAGE_ORIGIN, limit: 500 });
     let settled = 0;
     for (const thread of threads) {
@@ -497,7 +503,7 @@ export class RobobBackend implements ChatBackend {
       const key = `${thread.threadId}\u0000${runId}`;
       let run = this.historicalRuns.get(key);
       if (!run) {
-        const evidence = await this.client.runEvidence(thread.threadId, runId);
+        const evidence = await this.messageCache.evidence(thread.threadId, runId);
         if (evidence.runId !== runId || !TERMINAL.has(evidence.status)) throw new Error("Robob run outcome is not yet known");
         run = { runId, ordinal: runOrdinal(runId), status: evidence.status };
         // Waiting means a reply is available, not that recovery can no longer change the outcome.
@@ -543,7 +549,7 @@ export class RobobBackend implements ChatBackend {
         continue;
       }
       try {
-        const proof = await this.client.runEvidence(thread.threadId, runId);
+        const proof = await this.messageCache.evidence(thread.threadId, runId);
         const evidence = proof.toolEvidence;
         if (proof.complete && proof.status === "interrupted") completed.add(runId);
         byRun.set(runId, evidence);
@@ -656,7 +662,13 @@ export class RobobBackend implements ChatBackend {
 
   async promptAccepted(id: string, _directory: string, messageId: string): Promise<boolean> {
     const threadId = await this.resolve(id);
-    const { thread } = await this.client.thread(threadId);
+    if (await this.messageCache.prepared(threadId)) {
+      if (this.messageCache.accepted(threadId, messageId)) return true;
+      if (this.messageCache.reconciliationDeferred(threadId, messageId)) throw probeDeferred;
+      const messages = await this.messageCache.read(threadId, "accepted");
+      return messages.some(message => message.role === "user" && promptId(threadId, message) === messageId);
+    }
+    const thread = await this.messageCache.detail(threadId);
     const messages = await this.readMessages(threadId, thread);
     return messages.some(message => message.role === "user" && promptId(threadId, message) === messageId);
   }
@@ -664,7 +676,10 @@ export class RobobBackend implements ChatBackend {
   async responseResolved(id: string, _directory: string, requestId: string): Promise<boolean> {
     // /respond changes a runtime request, never a chat message. Only a successful
     // thread read can prove that the formerly pending request is now resolved.
-    const thread = await this.detail(id);
+    const threadId = await this.resolve(id);
+    if (this.messageCache.reconciliationDeferred(threadId, `respond:${requestId}`)) throw probeDeferred;
+    const thread = await this.detail(threadId);
+    if (this.messageCache.reconciliationDeferred(threadId, `respond:${requestId}`)) throw probeDeferred;
     return !thread.pendingRequests.some(request => request.requestId === requestId);
   }
 
@@ -673,6 +688,11 @@ export class RobobBackend implements ChatBackend {
       // A reader during the POST may have repopulated the same-tick snapshot before admission.
       this.messageCache.afterWrite(threadId);
       const accepted = await this.promptAccepted(threadId, "", messageId);
+      // The marker snapshot predates this POST. Absence cannot prove rejection until the next tick.
+      if (!accepted && await this.messageCache.prepared(threadId)) {
+        this.messageCache.deferReconciliation(threadId, messageId);
+        throw error;
+      }
       if (error instanceof ControlError) error.reconciled = true;
       return accepted;
     } catch (readError) {
@@ -764,6 +784,7 @@ export class RobobBackend implements ChatBackend {
         this.sendRuns.set(receiptKey, bound);
         this.firstTurnStore?.set(receiptKey, bound);
       }
+      this.messageCache.accept(threadId, messageId);
     } finally { this.messageCache.afterWrite(threadId); }
   }
 
@@ -782,6 +803,7 @@ export class RobobBackend implements ChatBackend {
         text, mode: "steer", clientRequestId: messageId, ...(guidance.trim() ? { guidance: guidance.trim() } : {}),
         ...(attachments.length ? { attachments } : {}),
       }), { timeoutMs: 60_000, signal: guard?.signal });
+      this.messageCache.accept(threadId, messageId);
       return delivery === "started" || delivery === "queued" ? delivery : "steered";
     } catch (error) { toolError("robob", "robob.catch8", error);
       guard?.onFailure?.(error);
@@ -861,6 +883,10 @@ export class RobobBackend implements ChatBackend {
     catch (error) {
       toolError("robob", "robob.respond_failed", error);
       if (controlDisposition(error) === "reconcile") {
+        if (await this.messageCache.prepared(threadId)) {
+          this.messageCache.deferReconciliation(threadId, `respond:${requestId}`);
+          throw error;
+        }
         try {
           await this.responseResolved(threadId, "", requestId);
           if (error instanceof ControlError) error.reconciled = true;
