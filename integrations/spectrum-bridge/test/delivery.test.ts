@@ -1232,6 +1232,27 @@ test("tool-mode latency keeps its inbound clock after the turn has already ended
 });
 
 
+test.each([
+  ["a stranded inbound 74 days old", "spc-msg-stranded", () => Date.now() - 6_380_253_876,
+    { durationUnknown: true, startSource: "received", durationInvalid: "over_24h", inboundKnown: true }],
+  ["a watcher wake", "wake:fixture", () => Date.now() - 500, { durationUnknown: true, startSource: "synthetic", inboundKnown: true }],
+  ["no inbound at all", undefined, () => undefined, { durationUnknown: true, startSource: "synthetic", inboundKnown: false }],
+] as const)("reply.sent for %s logs no duration and keeps the outbox delay", async (_label, inboundId, receivedAt, expected) => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const h = setup();
+    const at = receivedAt();
+    if (inboundId) h.store.acceptInbound(inboundId, { text: "PRIVATE_INBOUND", ...(at === undefined ? {} : { receivedAt: at }) });
+    h.enqueue("latency-reply", { kind: "conversation", text: "PRIVATE_REPLY", ...(inboundId ? { replyTo: inboundId } : {}) });
+    await h.delivery.tick();
+  });
+  const sent = logs.find(l => l.name === "reply.sent");
+  expect(sent && "durationMs" in sent).toBe(false);
+  expect(sent?.props).toMatchObject(expected);
+  expect(sent?.props?.outboxDelayMs).toBeNumber();
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});
+
 test.each(["validation", "provider"])("%s failure logs the chat, operation, thread and inbound id", async failure => {
   const { captureLogs } = await import("./log-fixture.ts");
   const logs = await captureLogs(async () => {

@@ -1,5 +1,6 @@
 import type { Store } from "./store.ts";
 import { toolLog } from "./toollog.ts";
+import { replyLatency } from "./reply-latency.ts";
 
 const CHECK_EVERY = 30_000;
 const HOUR = 60 * 60_000;
@@ -16,7 +17,8 @@ export class ReplyGapMonitor {
   constructor(private readonly store: Store, private readonly options: {
     chat: string;
     notify: (severity: "attention", text: string, key: string) => Promise<boolean>;
-    log?: (chat: string, gapMs: number) => void;
+    /** gapMs is undefined when the gap is too long to be a reply latency (#136). */
+    log?: (chat: string, gapMs: number | undefined) => void;
   }) {
     // Starting this monitor must not page about historical replies on its first deployment.
     if (store.get<number>(CURSOR) === undefined) store.set(CURSOR, this.highWater());
@@ -67,8 +69,9 @@ export class ReplyGapMonitor {
         || typeof receivedAt !== "number" || !Number.isSafeInteger(receivedAt) || receivedAt < 0 || receivedAt > sentAt) continue;
       const gapMs = sentAt - receivedAt;
       if (gapMs <= 60_000) continue;
-      if (this.options.log) this.options.log(chat, gapMs);
-      else toolLog.capture(() => toolLog.write({ component: "delivery", kind: "perf", name: "reply.gap", durationMs: gapMs, ids: { chat } }));
+      const latency = replyLatency(sentAt, receivedAt, "received");
+      if (this.options.log) this.options.log(chat, latency.durationMs);
+      else toolLog.capture(() => toolLog.write({ component: "delivery", kind: "perf", name: "reply.gap", ...latency, ids: { chat } }));
       largest = Math.max(largest, gapMs);
     }
     if (largest && !alert.pending && (alert.lastSentAt === undefined || now - alert.lastSentAt >= HOUR)) {

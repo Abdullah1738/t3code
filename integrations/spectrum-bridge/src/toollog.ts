@@ -25,6 +25,7 @@ import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./l
 import { CONTROL_REASONS, controlFailureProps } from "./control-errors.ts";
 import { LOOP_OPERATIONS, loopOperations, traceLoopOperation } from "./loop-stall.ts";
 import { FETCH_CAUSES, cleanCardUrlClass, cleanRenderCardId, type CardFetchFailure } from "./log-card-fetch.ts";
+import { DURATION_INVALID, REPLY_LATENCY_EVENTS, START_SOURCES } from "./reply-latency.ts";
 
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
@@ -207,6 +208,9 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
         props[key] = value; continue;
       }
     }
+    if (REPLY_LATENCY_EVENTS.includes(entry.name) && (key === "durationUnknown" && value === true
+      || key === "startSource" && START_SOURCES.some(source => source === value)
+      || key === "durationInvalid" && DURATION_INVALID.some(reason => reason === value))) { props[key] = value; continue; }
     if (entry.name === "robob.link_state" && key === "resumedByRun" && typeof value === "string" && /^[a-f0-9-]{36}$/.test(value)) { props[key] = value; continue; }
     if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1)) continue;
     if ((NUMBERS.has(key) || key === "replies" && entry.name === "notice.reply") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;

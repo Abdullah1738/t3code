@@ -228,3 +228,25 @@ test.each([
   // A genuine prior human anchor remains independently measurable; unrelated synthetic sources do not.
   expect(h.notify).toHaveBeenCalledTimes(repaired || root === "other-human" ? 1 : 0);
 });
+
+test("a gap over 24 h is logged without a duration but still alerts", async () => {
+  const h = setup();
+  h.accept(6_380_253_876);
+  await h.monitor.tick();
+  expect(h.log.mock.calls).toEqual([["owner", undefined]]);
+  expect(h.notify).toHaveBeenCalledTimes(1);
+});
+
+test("the default reply.gap row flags an over-24 h gap as unknown", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const h = setup();
+    const monitor = new ReplyGapMonitor(h.store, { chat: "owner", notify: h.notify });
+    h.store.set("reply-gap-cursor", 0);
+    h.accept(6_380_253_876); h.accept(90_000);
+    await monitor.tick();
+  });
+  const gaps = logs.filter(l => l.name === "reply.gap");
+  expect(gaps.map(l => l.durationMs)).toEqual([undefined, 90_000]);
+  expect(gaps[0]?.props).toEqual({ durationUnknown: true, startSource: "received", durationInvalid: "over_24h" });
+});

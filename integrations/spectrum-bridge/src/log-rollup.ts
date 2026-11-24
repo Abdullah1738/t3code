@@ -5,6 +5,7 @@ import { callName, percentiles } from "./log-calls.ts";
 import { createRobobLinkAggregation } from "./log-robob-link.ts";
 import { createChainAggregation } from "./log-chains.ts";
 import { FETCH_CAUSES, cleanRenderCardId } from "./log-card-fetch.ts";
+import { REPLY_LATENCY_EVENTS, unknownReplyLatency } from "./reply-latency.ts";
 
 export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>, renderLines: LogLine[] = [], requestedDay?: string) {
   const apiHistograms = new Map<string, Map<number, number>>();
@@ -33,6 +34,8 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const robobLink = createRobobLinkAggregation();
   let day = requestedDay;
   const firstReplies = new Map<number, number>();
+  const durationUnknownCount: Record<string, number> = Object.fromEntries(REPLY_LATENCY_EVENTS.map(name => [name, 0]));
+  let firstReplyUnknown = 0;
   const alerts = new Set<string>();
   let overdue = 0, requeued_by_watchdog = 0, answered_late = 0;
   let total = 0, ok = 0, failed = 0, recordedRows = 0, failedCalls = 0;
@@ -125,7 +128,15 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     }
     observeError(line);
   }
-  for await (const line of lines) {
+  for await (const raw of lines) {
+    // The row still counts as an event; only its duration stays out of the percentiles.
+    const unknownLatency = unknownReplyLatency(raw);
+    const line: LogLine = unknownLatency ? { ...raw } : raw;
+    if (unknownLatency) {
+      delete line.durationMs;
+      durationUnknownCount[line.name] = (durationUnknownCount[line.name] ?? 0) + 1;
+      if (line.name === "inbound.answered" && ["owner", "moni"].includes(line.ids?.chat ?? "")) firstReplyUnknown++;
+    }
     day ??= line.ts.slice(0, 10);
     recordedRows++;
     const path = line.props?.path;
@@ -213,7 +224,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const apiRequests = Object.fromEntries([...apiHistograms].map(([path, histogram]) => [path, {
     count: [...histogram.values()].reduce((sum, n) => sum + n, 0), handlerMs: percentiles(histogram),
   }]));
-  return { apiRequests, cliRequestFailures: cliFailures, robob_link: robobLink.summary(day), overdue, requeued_by_watchdog, unanswered_alerts: alerts.size, answered_late, first_reply_latency_ms: percentiles(firstReplies), total, recordedRows, countsByName, countsByKind, ok, failed,
+  return { apiRequests, cliRequestFailures: cliFailures, robob_link: robobLink.summary(day), overdue, requeued_by_watchdog, unanswered_alerts: alerts.size, answered_late, first_reply_latency_ms: { ...percentiles(firstReplies), durationUnknownCount: firstReplyUnknown }, durationUnknownCount, total, recordedRows, countsByName, countsByKind, ok, failed,
     dedupedFailures, okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countedErrors + failedCalls) / total : 0,
     promptProbe: { ...summarizePromptProbe(promptProbe), byHour: Object.fromEntries([...probeHours].sort().map(([hour, stats]) => [hour, summarizePromptProbe(stats)])) },
     durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),

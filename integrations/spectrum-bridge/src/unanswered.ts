@@ -1,6 +1,7 @@
 import type { NormalizedInbound } from "./photon.ts";
 import type { InboundRecord, OutboxOperation, Store } from "./store.ts";
 import { toolLog } from "./toollog.ts";
+import { replyLatency } from "./reply-latency.ts";
 
 export const UNANSWERED_REQUEUE_MS = 5 * 60_000;
 export const UNANSWERED_ALERT_MS = 10 * 60_000;
@@ -196,7 +197,7 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
       const chat = store.get<string>("log-chat") ?? store.get<string>("unanswered-chat") ?? "other";
       toolLog.capture(() => {
         if (opts.recordLatency !== false) toolLog.write({ component: "router", kind: "perf", name: "inbound.answered",
-          ids: { inboundId: id, chat }, durationMs: ageMs });
+          ids: { inboundId: id, chat }, ...replyLatency(now, input.receivedAt, "received") });
         if (input.unanswered?.overdueAt !== undefined) toolLog.write({ component: "router", kind: "event", name: "inbound.answered_late",
           ids: { inboundId: id, chat }, props: { ageMs } });
       });
