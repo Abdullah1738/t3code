@@ -36,7 +36,8 @@ export type AgentBusDeps = {
   now?: () => number;
 };
 const failure = (status: number, error: string): SbApiResult => ({ status, body: { error } });
-const TIMEOUT_MS = 10 * 60_000;
+export const AGENT_BUS_TIMEOUT_MS = 10 * 60_000;
+const TIMEOUT_MS = AGENT_BUS_TIMEOUT_MS;
 // Box acks normally take 3.6–11 seconds; allow 15 seconds before reporting no_ack.
 const REMOTE_ACK_GRACE_MS = 15_000;
 
