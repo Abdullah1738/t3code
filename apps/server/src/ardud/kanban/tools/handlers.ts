@@ -1539,8 +1539,19 @@ const handlers = {
       withCaller((service, caller) =>
         Effect.gen(function* () {
           const card = yield* cardFor(service, caller, input.card, input.boardId);
-          if (input.state === "skipped" && caller.actor._tag !== "owner") {
-            const subtask = card.subtasks.find((entry) => entry.id === input.subtask);
+          const subtask = card.subtasks.find((entry) => entry.id === input.subtask);
+          const role =
+            caller.link?.role === "work" || caller.link?.role === "review"
+              ? caller.link.role
+              : "evaluator";
+          const correctingRelease =
+            input.releasedAt !== undefined &&
+            role === "evaluator" &&
+            subtask?.interrupting &&
+            input.state === "done";
+          const refreshOnly =
+            input.state !== "open" && subtask?.state === input.state && !correctingRelease;
+          if (input.state === "skipped" && !refreshOnly && caller.actor._tag !== "owner") {
             const board = yield* boardFor(service, caller, card.boardId);
             if (
               subtask &&
@@ -1553,10 +1564,6 @@ const handlers = {
               );
           }
           yield* boundCard(caller, card);
-          const role =
-            caller.link?.role === "work" || caller.link?.role === "review"
-              ? caller.link.role
-              : "evaluator";
           return {
             card: yield* service.markSubtask(
               card.id,
@@ -1566,6 +1573,7 @@ const handlers = {
               caller.actor,
               role,
               input.releasedAt,
+              refreshOnly,
             ),
           };
         }),

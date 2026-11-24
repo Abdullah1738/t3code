@@ -859,6 +859,7 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
     role: Subtasks.SubtaskRole,
     releasedAt?: string,
+    refreshOnly?: boolean,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   /**
    * A board script hands its open subtask back to the card's evaluator with
@@ -21228,12 +21229,18 @@ const make = Effect.gen(function* () {
     );
 
   const markSubtask: KanbanServiceShape["markSubtask"] = Effect.fn("KanbanService.markSubtask")(
-    function* (cardId, subtaskId, state, note, actor, role, releasedAt) {
+    function* (cardId, subtaskId, state, note, actor, role, releasedAt, refreshOnly = false) {
       // Admission precedes board locks: completing a step can release them for thread I/O.
       const observed = yield* readDb(rawStore.card(cardId));
-      const paced =
-        state === "done" &&
-        observed?.subtasks.some((entry) => entry.id === subtaskId && entry.interrupting);
+      const observedSubtask = observed?.subtasks.find((entry) => entry.id === subtaskId);
+      const correctingRelease =
+        releasedAt !== undefined && role === "evaluator" && state === "done";
+      const expectedRefresh =
+        refreshOnly ||
+        (state !== "open" &&
+          observedSubtask?.state === state &&
+          !(correctingRelease && observedSubtask.interrupting));
+      const paced = state === "done" && observedSubtask?.interrupting && !expectedRefresh;
       const completing = savedCardGuard(
         "subtask.done",
         Effect.gen(function* () {
@@ -21241,6 +21248,52 @@ const make = Effect.gen(function* () {
           const card = yield* cardOf(cardId);
           const scriptName = role === "script" ? (yield* scriptFor(card, actor)).name : null;
           const gated = card.subtasks.find((subtask) => subtask.id === subtaskId);
+          const check = Subtasks.checkMark(
+            card,
+            subtaskId,
+            state,
+            role,
+            note,
+            scriptName,
+            correctingRelease,
+          );
+          const refreshing =
+            gated?.state === state &&
+            state !== "open" &&
+            !(correctingRelease && gated.interrupting);
+          if (expectedRefresh && !refreshing)
+            return yield* failWith(
+              "denied",
+              "the subtask changed; only refreshing its finished note is allowed",
+              "conflict",
+            );
+          if (refreshing && !check.ok)
+            return yield* failWith("denied", check.reason, check.denyReason);
+          if (check.ok && check.refresh) {
+            if (card.settledAt !== null && role !== "evaluator")
+              return yield* failWith(
+                "denied",
+                "only an evaluator can refresh a settled card's subtask note",
+                "card_settled",
+              );
+            if (releasedAt !== undefined)
+              return yield* failWith(
+                "invalid",
+                "releasedAt cannot be changed when refreshing a subtask note",
+              );
+            const newNote = note!.trim();
+            const next = {
+              ...card,
+              subtasks: Subtasks.refreshNote(card.subtasks, subtaskId, newNote),
+              updatedAt: yield* nowIso,
+            };
+            yield* logEvent(next, actor, "subtask", {
+              body: `${subtaskId} note updated: ${gated!.text} (${newNote})`,
+            });
+            analyticsActors.set(next, actor);
+            yield* saveCard(next);
+            return next;
+          }
           if (state === "done" && gated?.interrupting && !paced)
             return yield* failWith(
               "conflict",
@@ -21327,15 +21380,6 @@ const make = Effect.gen(function* () {
               "skipping a gated step needs a reason of 10 to 300 characters in note",
             );
           }
-          const check = Subtasks.checkMark(
-            card,
-            subtaskId,
-            state,
-            role,
-            note,
-            scriptName,
-            releaseAt !== undefined,
-          );
           if (!check.ok) return yield* failWith("denied", check.reason, check.denyReason);
           if (actor._tag !== "owner" && missing && !skipGate)
             return yield* failWith("denied", missing, "approval_required");
