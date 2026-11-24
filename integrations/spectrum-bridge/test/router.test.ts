@@ -13274,6 +13274,83 @@ test.each(terminalOutputClearCases)("idle holder review: pending terminal output
 });
 
 
+// Antigravity records carry no phase, so a bound run's reply has no `answer` flag. It can be
+// readable before its own idle while a sibling's idle already is; the sibling idle must not
+// scope it as narration.
+test.each([{ restart: false }, { restart: true }])("idle holder review: unphased bound answer without its idle survives a sibling idle (restart=$restart)", async ({ restart }) => {
+  const { h, start } = await terminalOutputGap();
+  const unphased = (id: string, runId: string, text: string): MessageRecord => ({
+    id, runId, type: "assistant", content: [{ type: "text", text }], time: { created: start, completed: start },
+  });
+  const at = h.backend.records.findIndex(record => record.id === "answer59");
+  h.backend.records.splice(at, 1, unphased("answer57", "run57", "Bound answer"), unphased("answer59", "run59", "Sibling answer"));
+  let router = h.router;
+  await router.tick();
+  expect(h.store.get<unknown[]>("pendingBackgroundOutput")).toMatchObject([{ runId: "run57", messageIds: ["answer57"], completionId: "idle:run57" }]);
+  expect(h.store.get<{ holderRunId?: string } | null>("activeTurn")?.holderRunId).not.toBe("run57");
+  if (restart) router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  for (let i = 0; i < 4; i++) await router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Sibling answer"]);
+  expect(h.store.get("watermark")).toMatchObject({ id: "idle:run59" });
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  // Robob sorts the bound run's idle before the sibling's, behind the watermark.
+  h.backend.records.splice(h.backend.records.findIndex(record => record.id === "answer57") + 1, 0,
+    { id: "idle:run57", type: "idle", outcome: "succeeded", time: { created: start } });
+  if (restart) router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  for (let i = 0; i < 6; i++) await router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Bound answer"]);
+  expect(h.store.get<unknown[]>("pendingBackgroundOutput")).toEqual([]);
+  expect(h.store.get("activeTurn")).toBeNull();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.conversations()).toEqual([]);
+  const replies = h.store.db.query<{ text: string }, []>("SELECT json_extract(payload, '$.text') AS text FROM outbox WHERE id LIKE 'reply:%'").all().map(row => row.text);
+  expect(replies.filter(text => text === "Bound answer")).toHaveLength(1);
+  expect(replies.filter(text => text === "Sibling answer")).toHaveLength(1);
+});
+
+// The accepted answer's run can be terminal with its unphased result readable before its idle.
+test.each([false, true])("idle holder review: an accepted answer's unphased result waits for its own idle past a sibling idle (restart=%s)", async restart => {
+  const start = 10_000; setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "before-handoff", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  let terminal = false;
+  Object.assign(h.backend, { backgroundRun: async (_id: string, _directory: string, bound?: string) => {
+    const runId = bound ?? (terminal ? "run59" : "run57");
+    return { runId, completionId: `idle:${runId}`, status: terminal ? "completed" : "running", terminal,
+      ...(terminal ? { messageIds: [runId === "run57" ? "answer57" : "answer59"] } : {}) };
+  } });
+  await h.router.tick();
+  h.backend.questionRequests = [question()];
+  await h.router.tick();
+  h.store.outboxState(h.controls().find(op => op.id.startsWith("request:"))!.id, "sent", "provider-request");
+  h.input("answer", "A");
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  let router = h.router;
+  terminal = true; delete h.backend.states.ses_1;
+  const unphased = (id: string, runId: string, text: string): MessageRecord => ({ id, runId, type: "assistant",
+    content: [{ type: "text", text }], time: { created: Date.now(), completed: Date.now() } });
+  h.backend.records.push(unphased("answer57", "run57", "Result for the accepted answer"), unphased("answer59", "run59", "Sibling answer"),
+    { id: "idle:run59", type: "idle", outcome: "succeeded", time: { created: Date.now() } });
+  for (let i = 0; i < 3; i++) await router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("activeTurn")).toMatchObject({ holderRunId: "run57", covered: ["answer"] });
+  if (restart) router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  h.backend.records.splice(h.backend.records.findIndex(record => record.id === "answer57") + 1, 0,
+    { id: "idle:run57", type: "idle", outcome: "succeeded", time: { created: Date.now() } });
+  for (let i = 0; i < 5; i++) await router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Result for the accepted answer", "Sibling answer"]);
+  const result = h.conversations().find(op => op.text === "Result for the accepted answer")!;
+  expect(h.store.get<string[]>(`reply-covered:${result.id}`)).toContain("answer");
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+  expect(h.store.get("watermark")).toMatchObject({ id: "idle:run59" });
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.conversations()).toEqual([]);
+});
+
 const terminalOutputReplyCases = ["tool-step", "silent", "failed", "tool-mode"].flatMap(kind => [false, true].map(restart => ({ kind, restart })));
 test.each(terminalOutputReplyCases)("idle holder review: pending terminal output keeps reply semantics ($kind, restart=$restart)", async ({ kind, restart }) => {
   const { h, start, publish, expectMessages } = await terminalOutputGap(kind === "tool-mode" ? "tool" : "final");
