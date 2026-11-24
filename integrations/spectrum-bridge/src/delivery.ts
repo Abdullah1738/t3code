@@ -6,6 +6,8 @@ import { BUBBLE_CHARS, formatText, isSingleUrl, splitFormatted, stripInternalTex
 import { isOptedOut } from "./line.ts";
 import { classifySendFailure, isEffect, TransportError, type Photon, type PollResult, type SendResult } from "./photon.ts";
 import { rememberUnmatchedPoll } from "./poll-match.ts";
+import { replyLatency } from "./reply-latency.ts";
+import { humanRow } from "./unanswered.ts";
 import type { OutboxRecord, PollRecord, Store } from "./store.ts";
 
 export { classifySendFailure } from "./photon.ts";
@@ -110,9 +112,14 @@ export class Delivery {
       const queuedAt = this.store.get<number>(`log-queued:${id}`) ?? at;
       const inbound = item?.replyTo ? this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(item.replyTo) : undefined;
       const receivedAt = this.store.get<number>(`log-inbound-at:${id}`) ?? (inbound ? (JSON.parse(inbound.payload) as { receivedAt?: number }).receivedAt : undefined);
+      const ids = this.logIds(id, item);
+      // A wake/secret/reset row's time or the outbox queue time is not when a person wrote in.
+      const startSource = receivedAt === undefined ? "synthetic"
+        : ids.inboundId !== undefined && !humanRow(ids.inboundId) ? "synthetic" : "received";
+      const latency = replyLatency(at, receivedAt, startSource);
       toolLog.capture(() => toolLog.write({ component: "delivery", kind: "perf", name: "reply.sent", ok: true,
-        durationMs: Math.max(0, at - (receivedAt ?? queuedAt)), ids: this.logIds(id, item),
-        props: { kind: item?.kind ?? "conversation", ...(item?.answersInbound ? { answersInbound: true } : {}),
+        ...(latency.durationMs !== undefined ? { durationMs: latency.durationMs } : {}), ids,
+        props: { kind: item?.kind ?? "conversation", ...(item?.answersInbound ? { answersInbound: true } : {}), ...latency.props,
           attribution: this.store.get<string>(`log-attribution:${id}`) ?? (this.logIds(id, item).inboundId ? "explicit" : "none"),
           inboundKnown: receivedAt !== undefined, outboxDelayMs: Math.max(0, at - queuedAt), parts: item ? splitFormatted(formatText(item.text), BUBBLE_CHARS).length : 0, files: item?.attachment ? 1 : 0 } }));
       const kind = item?.app ? cardKind(item.app.url) : item?.attachment ? cardKind(item.attachment.name) : "other";
