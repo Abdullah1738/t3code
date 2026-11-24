@@ -1176,6 +1176,19 @@ export class Router {
     this.store.set(`batch-phase:${leader}`, "accepted");
   }
 
+  private latencyProbeKey(threadId: string, prompt: string): string {
+    return `latency-probe:${hash(JSON.stringify([threadId, prompt]))}`;
+  }
+
+  private stopLatencyProbe(threadId: string, prompt: string, ageMs: number): void {
+    const key = this.latencyProbeKey(threadId, prompt);
+    const state = this.store.get<{ attempt: number; stoppedAt?: number }>(key);
+    if (state?.stoppedAt !== undefined) return;
+    this.store.set(key, { attempt: state?.attempt ?? 0, stoppedAt: Date.now() });
+    toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "router.prompt_probe_stopped",
+      ids: { threadId, messageId: prompt }, props: { attempt: state?.attempt ?? 0, ageMs, reason: "replay_deadline" } }));
+  }
+
   private async sweepInboundLatency(): Promise<void> {
     const chat = this.options.context?.chat;
     if (chat && chat.kind !== "owner" && chat.slug !== "moni") return;
@@ -1254,11 +1267,17 @@ export class Router {
       if (age > FAILED_INBOUND_REPLAY_MAX_AGE_MS && retryAt === undefined) continue;
       let absent = true;
       if (original) {
-        if (this.probeBackoff.cooling(leader)) absent = false;
+        const ids = [original.messageId, ...original.earlier ?? []];
+        // A stuck-wake retry keeps alerts/carry alive past the replay horizon, not acceptance reads.
+        if (age > FAILED_INBOUND_REPLAY_MAX_AGE_MS) {
+          for (const id of ids) this.stopLatencyProbe(original.id, id, age);
+          absent = false;
+        } else if (this.probeBackoff.cooling(leader)) absent = false;
         else {
           const steer = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
-          const ids = [original.messageId, ...original.earlier ?? []];
           for (const [probeIndex, id] of ids.entries()) {
+            const probeKey = this.latencyProbeKey(original.id, id);
+            if (this.store.get<{ stoppedAt?: number }>(probeKey)?.stoppedAt !== undefined) { absent = false; break; }
             const steeredAt = id === original.messageId && id === `msg_${hash(leader)}`
               && steer?.id === original.id && steer.directory === original.directory && steer.generation === original.generation
               ? steer.startedAt : undefined;
@@ -1266,6 +1285,7 @@ export class Router {
             const probeFailure: { value?: { error: unknown; props: Parameters<typeof toolError>[4] } } = {};
             try {
               if (await this.probeAccepted(original, id, leader, 10_000, () => {
+                this.store.set(probeKey, { attempt: (this.store.get<{ attempt: number }>(probeKey)?.attempt ?? 0) + 1 });
                 const probe = this.promptProbes.start(original.id, id, sentAt);
                 return { ...probe, failure: (error: unknown) => {
                   probeFailure.value = { error, props: undefined };

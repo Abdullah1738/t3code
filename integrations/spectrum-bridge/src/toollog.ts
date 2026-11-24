@@ -170,6 +170,9 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
         props[key] = value; continue;
       }
     }
+    if (entry.name === "router.prompt_probe_stopped" && key === "reason" && value === "replay_deadline") {
+      props[key] = value; continue;
+    }
     if (entry.name === "synthetic.carry_evicted" && key === "reason" && (value === "expired" || value === "overflow")
       || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
       props[key] = value; continue;

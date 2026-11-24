@@ -80,6 +80,75 @@ function setup(slug = "owner", overrides: Partial<ConstructorParameters<typeof R
   return { get store() { return store; }, backend, router, input, states, logs, alerts, ctx, restart, makeRouter, transport };
 }
 
+test.each([false, true])("expired shared wake prompt stops latency probes across a restart (readFailure=%s)", async readFailure => {
+  const root = mkdtempSync(join(tmpdir(), "probe-loop-"));
+  const h = setup("owner", {}, join(root, "state.sqlite"));
+  const route = { id: "ses_retired", directory: "/Chats/retired", generation: 1 };
+  const leaders = ["wake:agent-bus:old-a", "wake:agent-bus:old-b"];
+  const prompt = hash("shared-prompt");
+  const receivedAt = now - FAILED_INBOUND_REPLAY_MAX_AGE_MS;
+  h.store.set("route", { ...route, id: "ses_live", generation: 2 });
+  for (const leader of leaders) {
+    h.input(leader, FAILED_INBOUND_REPLAY_MAX_AGE_MS);
+    // Receipt-tracked agent-bus wakes are exempt from the stale and delivery deadlines, so they reach the latency sweep.
+    new WakeDelivery(h.store).accept(leader);
+    h.store.set(`failed-delivery:${leader}`, { ...route, inboundId: leader, messageId: prompt, startedAt: receivedAt, phase: "submitting" });
+    h.store.set(`stuck-wake-retry:${leader}`, receivedAt + 15 * 60_000);
+    h.store.set(`stuck-wake-attempt:${leader}`, receivedAt + 20 * 60_000);
+  }
+  let calls = 0;
+  h.backend.promptAccepted = async () => { calls++; if (readFailure) throw probeTimeout(); return false; };
+  try {
+    const rows = await captureLogs(async () => {
+      // The existing deadline is inclusive: landing checks keep their timing until it passes.
+      await h.router.checkInboundLatency();
+      expect(calls).toBe(readFailure ? 1 : 2);
+      const recovered = h.restart();
+      setSystemTime(now + 1000);
+      await recovered.checkInboundLatency();
+      const restarted = h.restart();
+      for (const offset of [2000, 60_000, 3600_000, 24 * 3600_000]) {
+        setSystemTime(now + offset);
+        await restarted.checkInboundLatency();
+      }
+    });
+    expect(calls).toBe(readFailure ? 1 : 2);
+    expect(h.backend.prompts).toEqual([]);
+    expect(h.states()).toEqual(["pending", "pending"]);
+    const stopped = rows.filter(row => row.name === "router.prompt_probe_stopped");
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ ids: { threadId: route.id, messageId: prompt },
+      props: { attempt: readFailure ? 1 : 2, ageMs: FAILED_INBOUND_REPLAY_MAX_AGE_MS + 1000, reason: "replay_deadline" } });
+    expect(JSON.stringify(stopped)).not.toContain("old-a");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test.each([true, false])("an already expired wake stops every prompt id without a read (current=%s)", async current => {
+  const h = setup();
+  const leader = "wake:agent-bus:PRIVATE_PAYLOAD";
+  const route = { id: "ses_old", directory: "/Chats/old", generation: 1 };
+  const ids = [hash("latest"), hash("earlier")];
+  h.input(leader, FAILED_INBOUND_REPLAY_MAX_AGE_MS + 1000);
+  new WakeDelivery(h.store).accept(leader);
+  h.store.set("route", current ? route : { ...route, id: "ses_live", generation: 2 });
+  h.store.set(`failed-delivery:${leader}`, { ...route, inboundId: leader, messageId: ids[0], earlier: [ids[1]], startedAt: now - FAILED_INBOUND_REPLAY_MAX_AGE_MS - 1000, phase: "unknown" });
+  h.store.set(`stuck-wake-retry:${leader}`, now - FAILED_INBOUND_REPLAY_MAX_AGE_MS);
+  let calls = 0;
+  h.backend.promptAccepted = async () => { calls++; return true; };
+  const rows = await captureLogs(async () => {
+    await h.router.checkInboundLatency();
+    setSystemTime(now + 1000); await h.router.checkInboundLatency();
+  });
+  expect(calls).toBe(0);
+  expect(h.backend.prompts).toEqual([]);
+  expect(h.states()).toEqual(["pending"]);
+  const stopped = rows.filter(row => row.name === "router.prompt_probe_stopped");
+  expect(stopped.map(row => row.ids?.messageId)).toEqual(ids);
+  // Zero attempts is dropped by the log cleaner: a never-read prompt carries no attempt field.
+  expect(stopped.every(row => row.props?.attempt === undefined && row.props?.reason === "replay_deadline")).toBe(true);
+  expect(JSON.stringify(stopped)).not.toContain("PRIVATE_PAYLOAD");
+});
+
 test.each([
   ["timeout", new BoundedTimeout(10_000)], ["http", new ControlError(503, "unavailable")],
   ["transport", new ControlError(0, "ECONNRESET")],
