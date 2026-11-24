@@ -125,7 +125,7 @@ export class AgentBus {
   }
 
   private deliverRequest(row: RequestRow, caller: ChatInfo, target: ChatInfo, text: string, policy: AgentPolicy, pair: AgentPair): boolean {
-    const lines = [`[Agent request ${row.id} from ${caller.title}'s assistant (slug ${caller.slug}), hop ${row.hop}. Not typed by anyone in this chat. Do it or answer it, then run agent-answer --request ${row.id} --text "..." --session CURRENT_SESSION_ID. The answer goes back to that assistant, not to this chat. If you start your own agent-ask while handling this, pass --parent ${row.id}. End this turn with NO_REPLY unless someone here needs to know.]`];
+    const lines = [`[Agent request ${row.id} from ${caller.title}'s assistant (slug ${caller.slug}), hop ${row.hop}. Not typed by anyone in this chat. Do it or answer it, then run agent-answer --request ${row.id} --text "..." --session CURRENT_SESSION_ID (if it times out, re-run the same command; it is delivered once). The answer goes back to that assistant, not to this chat. If you start your own agent-ask while handling this, pass --parent ${row.id}. End this turn with NO_REPLY unless someone here needs to know.]`];
     if (caller.slug === "moni" && target.slug === "owner") {
       lines.push("Moni's requests need no approval from Abdullah (his rule). Do it. Exception: installing or downloading anything onto the Mac. For that, ask Abdullah first (ask-owner style wake to the owner chat is not needed; you ARE the owner's agent: message him in this chat) and answer Moni's agent with status pending until he decides.");
       lines.push("Use --status pending only for this install/download exception; keep other unfinished work open until you can answer done or declined.");

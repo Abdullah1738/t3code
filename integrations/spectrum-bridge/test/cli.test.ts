@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -554,35 +555,58 @@ test.each([".", "..", "...", "%2e", "%2e%2e", "./", "../", "a/../b", "/", "\\", 
     expect(url.searchParams.get("sessionId")).toBe("s@2");
   });
 
-test("socket aborts distinguish send/file/agent-answer outcome unknown from read failures", async () => {
+test("socket aborts distinguish send/file/agent-answer/agent-ask outcome unknown from read failures", async () => {
+  const { toolLog } = await import("../src/toollog.ts");
   const root = await fs.mkdtemp(join(os.tmpdir(), "cli-timeout-"));
   const socket = join(root, "s.sock"), file = join(root, "fixture.txt");
   await fs.writeFile(file, "PRIVATE_CONTENT");
   const server = createServer();
   const oldSocket = process.env.SPECTRUM_BRIDGE_SOCKET;
   process.env.SPECTRUM_BRIDGE_SOCKET = socket;
+  const sha = (value: string) => createHash("sha256").update(value).digest("hex");
   try {
     await new Promise<void>(resolve => server.listen(socket, resolve));
     const requestId = `areq_${"a".repeat(64)}`;
-    for (const args of [["send", "--text=PRIVATE_TEXT", "--session=s", "--key=private-key"],
-      ["send-file", `--file=${file}`, "--session=s", "--key=private-key"],
-      ["agent-answer", `--request=${requestId}`, "--text=PRIVATE_TEXT", "--session=s"], ["health"]]) {
+    const cases = [
+      { args: ["send", "--text=PRIVATE_TEXT", "--session=s", "--key=private-key"],
+        failure: { exitCode: SEND_TIMEOUT_EXIT_CODE, body: { error: "Bridge request timed out", outcome: "unknown", key: "private-key",
+          hint: "The message may already be queued. Re-run with the same --key (it won't send twice) or check with send-status --key." } },
+        log: { name: "cli.send_timeout", ids: { operationId: `send:${sha("private-key")}` }, props: { path: "/send" } } },
+      { args: ["send-file", `--file=${file}`, "--session=s", "--key=private-key"],
+        failure: { exitCode: SEND_TIMEOUT_EXIT_CODE, body: { error: "Bridge request timed out", outcome: "unknown", key: "private-key",
+          hint: "The message may already be queued. Re-run with the same --key (it won't send twice) or check with send-status --key." } },
+        log: { name: "cli.send_timeout", ids: { operationId: `file:${sha("private-key")}` }, props: { path: "/files" } } },
+      { args: ["agent-answer", `--request=${requestId}`, "--text=PRIVATE_TEXT", "--session=s"],
+        failure: { exitCode: SEND_TIMEOUT_EXIT_CODE, body: { error: "Bridge request timed out", outcome: "unknown", requestId,
+          hint: "The answer may already be admitted. Check agent-requests --request <requestId> --session <session>, or repeat the identical agent-answer call (it won't deliver twice)." } },
+        log: { name: "cli.agent_bus_timeout", ids: { operationId: `agent-answer:${sha(requestId)}` }, props: { command: "agent-answer" } } },
+      { args: ["agent-ask", "--to=owner", "--text=PRIVATE_TEXT", "--session=s", "--key=private-key"],
+        failure: { exitCode: SEND_TIMEOUT_EXIT_CODE, body: { error: "Bridge request timed out", outcome: "unknown", key: "private-key",
+          hint: "The request may already be sent. Re-run the identical agent-ask with the same --key (it is created once per key) or check agent-requests --session <session>." } },
+        log: { name: "cli.agent_bus_timeout", ids: { operationId: `agent-ask:${sha("private-key")}` }, props: { command: "agent-ask" } } },
+      { args: ["agent-requests", "--session=s"], failure: { exitCode: 1, body: { error: "Bridge request timed out" } } },
+      { args: ["health"], failure: { exitCode: 1, body: { error: "Bridge request timed out" } } },
+    ];
+    for (const { args, failure: expected, log } of cases) {
       const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: Parameters<typeof setTimeout>[0]) => {
         queueMicrotask(() => { if (typeof callback === "function") callback(); });
         return 0 as unknown as ReturnType<typeof setTimeout>;
       }) as typeof setTimeout);
+      const writes = spyOn(toolLog, "write").mockImplementation(() => {});
       let failure;
       try { await sendCommand(parseCommand(args)); }
       catch (error) { failure = cliFailure(error); }
       finally { timer.mockRestore(); }
-      expect(failure).toEqual(args[0] === "health" ? { exitCode: 1, body: { error: "Bridge request timed out" } }
-        : args[0] === "agent-answer" ? { exitCode: SEND_TIMEOUT_EXIT_CODE,
-          body: { error: "Bridge request timed out", outcome: "unknown", requestId,
-            hint: "The answer may already be admitted. Check agent-requests --request <requestId> --session <session>, or repeat the identical agent-answer call (it won't deliver twice)." } } : {
-        exitCode: SEND_TIMEOUT_EXIT_CODE,
-        body: { error: "Bridge request timed out", outcome: "unknown", key: "private-key",
-          hint: "The message may already be queued. Re-run with the same --key (it won't send twice) or check with send-status --key." },
-      });
+      const timeouts = writes.mock.calls.map(([entry]) => entry).filter(entry => entry.name.endsWith("_timeout"));
+      writes.mockRestore();
+      expect(failure).toEqual(expected);
+      if (log === undefined) expect(timeouts).toEqual([]);
+      else {
+        expect(timeouts).toHaveLength(1);
+        expect(timeouts[0]).toMatchObject({ component: "cli", kind: "event", ...log });
+        expect(Object.keys(timeouts[0]!.props!).sort()).toEqual([...Object.keys(log.props), "elapsedMs"].sort());
+        expect(JSON.stringify(timeouts)).not.toMatch(/PRIVATE|private-key|areq_/);
+      }
     }
   } finally {
     if (oldSocket === undefined) delete process.env.SPECTRUM_BRIDGE_SOCKET;

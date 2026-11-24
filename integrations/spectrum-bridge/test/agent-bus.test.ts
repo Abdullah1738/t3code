@@ -160,6 +160,7 @@ test("dedupe is caller scoped and survives a new bus; changed payload does not r
   expect(env.wakes).toHaveLength(1);
   expect(env.id(env.ask("moni", "owner"))).not.toBe(id);
   expect(env.wakes[0]?.text).toContain(`agent-answer --request ${id}`);
+  expect(env.wakes[0]?.text).toContain("if it times out, re-run the same command; it is delivered once");
   expect(env.wakes[0]?.text).toContain(`--parent ${id}`);
   expect(env.wakes[0]?.text).toEndWith("\nPRIVATE_QUESTION");
 });
@@ -253,6 +254,45 @@ test.each(["pending", "done", "declined"] as const)("CLI timeout after %s admiss
     expect(env.bus.requests("session-moni").body).toMatchObject({ requests: [{ id, status }] });
     expect(await sendCommand(command)).toEqual({ id, status });
     expect(env.wakes.filter(wake => wake.key.startsWith(`agent-answer:${id}:`))).toHaveLength(1);
+  } finally {
+    if (oldSocket === undefined) delete process.env.SPECTRUM_BRIDGE_SOCKET;
+    else process.env.SPECTRUM_BRIDGE_SOCKET = oldSocket;
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test("CLI agent-ask timeout after admission is safe to repeat with the same key", async () => {
+  const env = setup();
+  const dir = mkdtempSync(join(tmpdir(), "agent-ask-timeout-")); dirs.push(dir);
+  const socket = join(dir, "s.sock");
+  const oldSocket = process.env.SPECTRUM_BRIDGE_SOCKET;
+  process.env.SPECTRUM_BRIDGE_SOCKET = socket;
+  let abort: (() => void) | undefined;
+  let loseAck = true;
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", chunk => chunks.push(chunk));
+    req.on("end", () => {
+      const result = env.bus.ask(JSON.parse(Buffer.concat(chunks).toString()));
+      if (loseAck) { loseAck = false; abort!(); }
+      else { res.writeHead(result.status, { "Content-Type": "application/json" }); res.end(JSON.stringify(result.body)); }
+    });
+  });
+  try {
+    await new Promise<void>(resolve => server.listen(socket, resolve));
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: Parameters<typeof setTimeout>[0]) => {
+      abort = () => { if (typeof callback === "function") callback(); };
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    const command = parseCommand(["agent-ask", "--to=moni", "--text=PRIVATE_QUESTION", "--session=session-owner", "--key=ask-key"]);
+    try {
+      await expect(sendCommand(command).catch(error => { throw cliFailure(error); })).rejects.toMatchObject({
+        exitCode: SEND_TIMEOUT_EXIT_CODE, body: { outcome: "unknown", key: "ask-key", hint: expect.stringContaining("same --key") } });
+    } finally { timer.mockRestore(); }
+    const [admitted] = (env.bus.requests("session-owner").body as { requests: { id: string }[] }).requests;
+    expect(admitted).toBeDefined();
+    expect(await sendCommand(command)).toEqual({ id: admitted!.id, created: false });
+    expect(env.wakes.filter(wake => wake.key === `agent-ask:${admitted!.id}`)).toHaveLength(1);
   } finally {
     if (oldSocket === undefined) delete process.env.SPECTRUM_BRIDGE_SOCKET;
     else process.env.SPECTRUM_BRIDGE_SOCKET = oldSocket;
