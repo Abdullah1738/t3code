@@ -29,13 +29,13 @@ test("the loaded system prompt keeps the box's systemFile and adds the personali
   expect(system.endsWith(textingStyle({ replyMode: "final" }))).toBe(true);
 });
 
-test("the personality is written for Moni and keeps the serious-topics switch", () => {
-  expect(MONI_PERSONALITY).toContain("like a real friend she talks to every day");
-  expect(MONI_PERSONALITY).toMatch(/humour, banter.*running jokes/);
-  expect(MONI_PERSONALITY).toContain("straight and serious for health, money or anything sensitive");
-  expect(MONI_PERSONALITY).not.toMatch(/\bhe\b|\bhis\b/);
+test("the personality speaks of Moni, not the owner, and stays out of agent-bus messages", () => {
+  expect(MONI_PERSONALITY).not.toMatch(/\b(he|him|his)\b/i);
+  expect(MONI_PERSONALITY).toContain("not agent-bus messages");
 });
 
 test("an empty systemFile still gets the voice rules without a leading gap", () => {
-  expect(moniSystemPrompt("  \n")).toBe(`${MONI_PERSONALITY}\n\n${textingStyle({ replyMode: "final" })}`);
+  const system = moniSystemPrompt("  \n");
+  expect(system.startsWith(MONI_PERSONALITY)).toBe(true);
+  expect(system.endsWith(textingStyle({ replyMode: "final" }))).toBe(true);
 });

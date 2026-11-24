@@ -2,7 +2,7 @@ import type { ReplyMode } from "./config.ts";
 
 /**
  * How to write texts (owner, 22 Nov 2026), for every iMessage agent whatever
- * harness or model runs it. Part of both the typed and the wake guidance.
+ * harness or model runs it: the bridge's typed and wake guidance, and Moni's box runner.
  */
 export function textingStyle(options: { replyMode?: ReplyMode } = {}): string {
   const tool = options.replyMode === "tool";
