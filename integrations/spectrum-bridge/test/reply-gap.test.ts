@@ -16,7 +16,7 @@ function setup(chat = "owner") {
   stores.push(store);
   store.set("route", { id: "session", generation: 1 });
   const notify = mock(async (_severity: "attention", _text: string, _key: string) => true);
-  const log = mock((_chat: string, _gapMs: number) => {});
+  const log = mock((_chat: string, _gapMs: number | undefined) => {});
   const options = { chat, notify, log };
   const monitor = new ReplyGapMonitor(store, options);
   let sequence = 0;
