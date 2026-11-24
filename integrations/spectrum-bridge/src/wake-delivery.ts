@@ -6,6 +6,13 @@ import { toolLog } from "./toollog.ts";
 export const WAKE_AMBIGUITY_MS = 30 * 60_000;
 /** Queueing and pre-POST deferrals count too; a watcher needs a timely fallback receipt. */
 export const WAKE_DELIVERY_MS = 30 * 60_000;
+/**
+ * attempts_exhausted only after real retries; agent_bus_timeout when the bus ask window
+ * closed first; inbound_failed when the row failed at its stage with no retry behind it.
+ */
+export type WakeFailReason = "ambiguity_deadline" | "delivery_deadline" | "stale" | "attempts_exhausted" | "route_retired"
+  | "agent_bus_timeout" | "inbound_failed";
+export type WakeFailStage = "synthetic" | "prepare" | "dispatch" | "execution";
 export const wakeId = (key: string) => `wake:${createHash("sha256").update(key).digest("hex")}`;
 export type WakeStatus = {
   id: string; state: "queued" | "sending" | "ambiguous" | "admitted" | "failed";
@@ -126,12 +133,17 @@ export class WakeDelivery {
     this.store.set(key(id), next);
     this.log(next, "wake.admitted", { elapsedMs: Math.max(0, Date.now() - record.acceptedAt) });
   }
-  failed(id: string, reason: "ambiguity_deadline" | "delivery_deadline" | "stale" | "attempts_exhausted" | "route_retired"): void {
+  failed(id: string, reason: WakeFailReason, stage: WakeFailStage, boundMs?: number): void {
     const record = this.record(id);
     if (!record || terminal(record)) return;
     const next: Record = { ...record, state: "failed", failedAt: Date.now() };
     this.store.set(key(id), next);
-    this.log(next, "wake.failed", { reason, ageMs: Math.max(0, Date.now() - record.acceptedAt), attempt: record.attempts,
+    // Retries cannot have run out when nothing was ever sent.
+    const honest = reason === "attempts_exhausted" && record.attempts < 1 ? "inbound_failed" : reason;
+    const bound = boundMs ?? (reason === "delivery_deadline" ? WAKE_DELIVERY_MS
+      : reason === "ambiguity_deadline" || reason === "stale" ? WAKE_AMBIGUITY_MS : undefined);
+    this.log(next, "wake.failed", { reason: honest, stage, ...(bound === undefined ? {} : { boundMs: bound }),
+      ageMs: Math.max(0, Date.now() - record.acceptedAt), attempt: record.attempts,
       ...(record.waitedBehind ? { holderRunId: record.waitedBehind } : {}) });
   }
 }
