@@ -10,6 +10,8 @@
 		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
 		<key>PYTHONDONTWRITEBYTECODE</key>
 		<string>1</string>
+		<key>TCC_AUTO_RESTART</key>
+		<string>1</string>
 	</dict>
 	<key>Label</key>
 	<string>com.ardud.robob-guard</string>

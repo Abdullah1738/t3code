@@ -113,12 +113,56 @@ export class Store {
       const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(inbound)").all();
       if (!columns.some(column => column.name === "failure")) this.db.exec("ALTER TABLE inbound ADD COLUMN failure TEXT");
       this.db.exec("CREATE INDEX IF NOT EXISTS inbound_failed ON inbound(state) WHERE state = 'failed'");
+      this.indexBatchMembers();
       // A provider may have accepted these sends before the process stopped.
       this.db.query("UPDATE outbox SET state = 'uncertain' WHERE state = 'sending'").run();
     } catch (error) { toolError("store", "store.catch1", error);
       this.db.close();
       throw error;
     }
+  }
+
+  /**
+   * Member -> leader lookups used to re-parse every historical `batch:*` value
+   * (7k rows, 18 MB in production): one minute-cadence join cost 6.5 s of main-thread CPU.
+   * Triggers keep this derived index inside the writer's transaction for any connection,
+   * so a rollback or a raw-SQL write cannot leave it stale.
+   */
+  private indexBatchMembers(): void {
+    const members = (value: string) => `SELECT substr(${value}.key, 7), member.value
+      FROM json_each(CASE WHEN json_valid(${value}.value) THEN ${value}.value ELSE 'null' END, '$.batchIds') member
+      WHERE member.type = 'text'`;
+    this.db.transaction(() => {
+      const created = !this.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'batch_members'").get();
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS batch_members (member TEXT NOT NULL, leader TEXT NOT NULL, PRIMARY KEY (member, leader)) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS batch_members_leader ON batch_members(leader);
+        DROP TRIGGER IF EXISTS batch_members_insert;
+        DROP TRIGGER IF EXISTS batch_members_update;
+        DROP TRIGGER IF EXISTS batch_members_delete;
+        -- INSERT OR REPLACE deletes the old row without firing AFTER DELETE (recursive_triggers is off).
+        CREATE TRIGGER batch_members_insert AFTER INSERT ON kv WHEN new.key GLOB 'batch:*' BEGIN
+          DELETE FROM batch_members WHERE leader = substr(new.key, 7);
+          INSERT OR IGNORE INTO batch_members (leader, member) ${members("new")};
+        END;
+        CREATE TRIGGER batch_members_update AFTER UPDATE ON kv WHEN old.key GLOB 'batch:*' OR new.key GLOB 'batch:*' BEGIN
+          DELETE FROM batch_members WHERE old.key GLOB 'batch:*' AND leader = substr(old.key, 7);
+          INSERT OR IGNORE INTO batch_members (leader, member) SELECT * FROM (${members("new")}) WHERE new.key GLOB 'batch:*';
+        END;
+        CREATE TRIGGER batch_members_delete AFTER DELETE ON kv WHEN old.key GLOB 'batch:*' BEGIN
+          DELETE FROM batch_members WHERE leader = substr(old.key, 7);
+        END;
+      `);
+      if (created) this.db.exec(`INSERT OR IGNORE INTO batch_members (leader, member) SELECT substr(kv.key, 7), member.value
+        FROM kv, json_each(CASE WHEN json_valid(kv.value) THEN kv.value ELSE 'null' END, '$.batchIds') member
+        WHERE kv.key GLOB 'batch:*' AND member.type = 'text'`);
+    }).immediate();
+  }
+
+  /** Leaders whose sealed `batch:*` record lists this member, in `batch:*` key order. */
+  batchLeaders(member: string): string[] {
+    return this.db.query<{ leader: string }, [string]>("SELECT leader FROM batch_members WHERE member = ? ORDER BY leader")
+      .all(member).map(row => row.leader);
   }
 
   close(): void {

@@ -345,3 +345,30 @@ test.each(["processing", "partial"])("late coverage does not retire a retry outs
   expect(s.db.query<{ state: string }, []>("SELECT state FROM inbound ORDER BY rowid").all().map(row => row.state))
     .toEqual([kind === "processing" ? "processing" : "pending", "batched"]);
 });
+
+test.each([
+  ["a normal inbound", "human-1", at, { durationMs: 42_000 }],
+  ["a spc-msg inbound with no receivedAt", "spc-msg-34799625-81e2-4d0b-8f12-b71c1bb735e4", undefined,
+    { props: { durationUnknown: true, startSource: "missing" } }],
+  // 23 Nov: one owner reply credited 212 stranded rows received between 10 Sep and 11 Nov.
+  ["a stranded inbound from 74 days ago", "86C2A1B0-1F2E-4D3C-9B8A-7F6E5D4C3B2A", at - 6_380_253_877 + 42_000,
+    { props: { durationUnknown: true, startSource: "received", durationInvalid: "over_24h" } }],
+  ["an inbound received in the future", "human-2", at + 42_000 + 61_000,
+    { props: { durationUnknown: true, startSource: "received", durationInvalid: "future" } }],
+] as const)("inbound.answered for %s carries a duration only when the start is real", async (_label, id, receivedAt, expected) => {
+  const s = store();
+  const { receivedAt: _drop, ...base } = input(id);
+  s.acceptInbound(id, receivedAt === undefined ? base : { ...base, receivedAt });
+  const logs = await captureLogs(async () => { markAnswered(s, [id], at + 42_000); });
+  const answered = logs.find(l => l.name === "inbound.answered");
+  expect(answered?.ids).toMatchObject({ inboundId: id, chat: "owner" });
+  if ("durationMs" in expected) {
+    expect(answered?.durationMs).toBe(expected.durationMs);
+    expect(answered?.props).toBeUndefined();
+  } else {
+    expect(answered && "durationMs" in answered).toBe(false);
+    expect(answered?.props).toEqual(expected.props);
+  }
+  // The answer itself is still recorded: only the log row changed.
+  expect(JSON.parse(s.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id)!.payload).answeredAt).toBe(at + 42_000);
+});

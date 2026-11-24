@@ -1,6 +1,7 @@
 import type { NormalizedInbound } from "./photon.ts";
 import type { InboundRecord, OutboxOperation, Store } from "./store.ts";
 import { toolLog } from "./toollog.ts";
+import { replyLatency } from "./reply-latency.ts";
 
 export const UNANSWERED_REQUEUE_MS = 5 * 60_000;
 export const UNANSWERED_ALERT_MS = 10 * 60_000;
@@ -59,7 +60,7 @@ function sealedBatch(store: Store, id: string): { leader: string; members: strin
   const batch = store.get<NormalizedInbound>(`batch:${id}`);
   if (batch) return { leader: id, members: batch.batchIds ?? [id] };
   const parent = store.db.query<{ key: string; value: string }, [string]>(
-    "SELECT kv.key, kv.value FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key GLOB 'batch:*' AND member.value = ? LIMIT 1",
+    "SELECT kv.key, kv.value FROM batch_members JOIN kv ON kv.key = 'batch:' || batch_members.leader WHERE batch_members.member = ? ORDER BY batch_members.leader LIMIT 1",
   ).get(id);
   return parent ? { leader: parent.key.slice("batch:".length), members: (JSON.parse(parent.value) as NormalizedInbound).batchIds! }
     : { leader: id, members: [id] };
@@ -196,7 +197,7 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
       const chat = store.get<string>("log-chat") ?? store.get<string>("unanswered-chat") ?? "other";
       toolLog.capture(() => {
         if (opts.recordLatency !== false) toolLog.write({ component: "router", kind: "perf", name: "inbound.answered",
-          ids: { inboundId: id, chat }, durationMs: ageMs });
+          ids: { inboundId: id, chat }, ...replyLatency(now, input.receivedAt, "received") });
         if (input.unanswered?.overdueAt !== undefined) toolLog.write({ component: "router", kind: "event", name: "inbound.answered_late",
           ids: { inboundId: id, chat }, props: { ageMs } });
       });

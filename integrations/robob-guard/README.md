@@ -100,8 +100,10 @@ Every mutation is also journalled to the #106 board artifact `actions.ndjson`.
 
 User tccd restart is the final rung: two prompt-wait samples, no remaining asker,
 exact uid/path identity and at most one attempt per hour. `TCC_AUTO_RESTART`
-is **off by default**; only an explicit `1`, `true` or `yes` enables it. Obtain
-the owner's standing approval before configuring that environment variable.
+is off in code unless an explicit `1`, `true` or `yes` is set. The installed
+LaunchAgent plist sets it to `1` (owner's standing approval, card #130 q1,
+23 Nov 2026). Remove that key from `scripts/com.ardud.robob-guard.plist` and
+redeploy to go back to log-only.
 The root tccd and sandboxd are never restarted. Detection state and the restart
 cooldown live under `tcc_jam` in the existing guard `state.json`.
 

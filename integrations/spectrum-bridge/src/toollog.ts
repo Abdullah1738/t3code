@@ -25,6 +25,7 @@ import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./l
 import { CONTROL_REASONS, controlFailureProps } from "./control-errors.ts";
 import { LOOP_OPERATIONS, loopOperations, traceLoopOperation } from "./loop-stall.ts";
 import { FETCH_CAUSES, cleanCardUrlClass, cleanRenderCardId, type CardFetchFailure } from "./log-card-fetch.ts";
+import { DURATION_INVALID, REPLY_LATENCY_EVENTS, START_SOURCES } from "./reply-latency.ts";
 
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
@@ -92,7 +93,10 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
     if (entry.name === "turn.retry_skipped" && key === "reason" && value === "reply_already_sent") { props[key] = value; continue; }
-    if (entry.name === "cli.send_timeout" && key === "path" && ["/send", "/files", "/agent-answer"].includes(String(value))) {
+    if (entry.name === "cli.send_timeout" && key === "path" && ["/send", "/files"].includes(String(value))) {
+      props[key] = value; continue;
+    }
+    if (entry.name === "cli.agent_bus_timeout" && key === "command" && ["agent-ask", "agent-answer"].includes(String(value))) {
       props[key] = value; continue;
     }
     if (["api.request", "api.request.rollup", "cli.request_failed", "runtime.sample"].includes(entry.name)) {
@@ -117,8 +121,12 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       continue;
     }
     if (entry.name === "bridge-loop-stall") {
-      if (["stallMs", "loadAvg1", "freeMemoryBytes", "rssBytes"].includes(key)
+      if (["stallMs", "loadAvg1", "freeMemoryBytes", "rssBytes", "windowMs", "measuredMaxMs", "threadCpuMs", "offCpuMs"].includes(key)
         && typeof value === "number" && Number.isFinite(value) && value >= 0) { props[key] = value; continue; }
+      if (key === "operationMs" && typeof value === "string" && value.length <= 500 && value.split(",").every(item => {
+        const [name, ms, extra] = item.split(":");
+        return extra === undefined && LOOP_OPERATIONS.some(allowed => allowed === name) && /^\d{1,9}$/.test(ms ?? "");
+      })) { props[key] = value; continue; }
       if (key === "operations" && typeof value === "string" && value.length <= 500
         && (value === "" || value.split(",").every(name => LOOP_OPERATIONS.some(allowed => allowed === name)))) {
         props[key] = value; continue;
@@ -211,6 +219,9 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
         props[key] = value; continue;
       }
     }
+    if (REPLY_LATENCY_EVENTS.includes(entry.name) && (key === "durationUnknown" && value === true
+      || key === "startSource" && START_SOURCES.some(source => source === value)
+      || key === "durationInvalid" && DURATION_INVALID.some(reason => reason === value))) { props[key] = value; continue; }
     if (entry.name === "robob.link_state" && key === "resumedByRun" && typeof value === "string" && /^[a-f0-9-]{36}$/.test(value)) { props[key] = value; continue; }
     if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1)) continue;
     if ((NUMBERS.has(key) || key === "replies" && entry.name === "notice.reply") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
@@ -355,7 +366,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["cli.send_timeout", "api.request", "api.request.rollup", "runtime.sample", "bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.hold_adopted", "turn.hold_age", "turn.output_end", "turn.robob_calls", "robob.active_roster", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_alert", "robob.link_alert_loaded", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && line.level !== "warn" && !WAKE_EVENTS.has(line.name) && !["cli.send_timeout", "cli.agent_bus_timeout", "api.request", "api.request.rollup", "runtime.sample", "bridge-loop-stall", "msg.received", "reply.sent", "inbound.answered", "inbound.acked", "inbound.delivered", "recovery.notice_sent", "turn.start", "turn.end", "turn.hold_changed", "turn.hold_adopted", "turn.hold_age", "turn.output_end", "turn.robob_calls", "robob.active_roster", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_alert", "robob.link_alert_loaded", "robob.link_reply", "robob.link_reset", "moni-box-up", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }

@@ -328,7 +328,7 @@ test("failed control perf rows retain safe error detail and tick/completion meas
 });
 
 
-test.each(["/send", "/files", "/agent-answer"])("CLI %s timeouts survive the cap with only hashed key, path and elapsed time", path => {
+test.each(["/send", "/files"])("CLI %s timeouts survive the cap with only hashed key, path and elapsed time", path => {
   const { log, lines } = setup({ capBytes: 1 });
   log.write(entry);
   log.write({ component: "cli", kind: "event", name: "cli.send_timeout",
@@ -337,6 +337,26 @@ test.each(["/send", "/files", "/agent-answer"])("CLI %s timeouts survive the cap
   expect(lines().at(-1)).toMatchObject({ name: "cli.send_timeout", ids: { operationId: `send:${"a".repeat(64)}` },
     props: { path, elapsedMs: 15_000 } });
   expect(JSON.stringify(lines())).not.toContain("PRIVATE");
+});
+
+test.each(["agent-ask", "agent-answer"])("CLI %s timeouts survive the cap with only hashed id, command and elapsed time", command => {
+  const { log, lines } = setup({ capBytes: 1 });
+  log.write(entry);
+  log.write({ component: "cli", kind: "event", name: "cli.agent_bus_timeout",
+    ids: { operationId: `${command}:${"a".repeat(64)}`, key: "PRIVATE_KEY" },
+    props: { command, elapsedMs: 15_000, text: "PRIVATE_TEXT", request: "PRIVATE_REQUEST" } });
+  expect(lines().at(-1)).toMatchObject({ name: "cli.agent_bus_timeout", ids: { operationId: `${command}:${"a".repeat(64)}` },
+    props: { command, elapsedMs: 15_000 } });
+  expect(Object.keys(lines().at(-1)!.props!).sort()).toEqual(["command", "elapsedMs"]);
+  expect(JSON.stringify(lines())).not.toContain("PRIVATE");
+});
+
+test("CLI timeout events keep only their own path or command values", () => {
+  const { log, lines } = setup({ capBytes: 1 });
+  log.write(entry);
+  log.write({ component: "cli", kind: "event", name: "cli.send_timeout", props: { path: "/agent-answer", elapsedMs: 1 } });
+  log.write({ component: "cli", kind: "event", name: "cli.agent_bus_timeout", props: { command: "PRIVATE_COMMAND", elapsedMs: 1 } });
+  expect(lines().slice(-2).map(line => line.props)).toEqual([{ elapsedMs: 1 }, { elapsedMs: 1 }]);
 });
 
 test("active roster aggregates per minute with reasons, joins, patching, children and fetch latency", async () => {

@@ -19,6 +19,7 @@ import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./f
 import { assistantText, isCompletionNoticeText, PromptExpiredError, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
+import { textingStyle } from "./texting-style.ts";
 import { commandWord, controlCommand, isCommand } from "./commands.ts";
 import { chatKey } from "./line.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
@@ -37,6 +38,7 @@ import { HUMAN_FAILURE_BACKOFF_MS, leaderKind, MAX_FAILED_ATTEMPTS, requeueHuman
 import { controlDisposition, controlFailureProps, type ControlFailure } from "./control-errors.ts";
 import { WakeDelivery, wakeStatus, WAKE_AMBIGUITY_MS, WAKE_DELIVERY_MS } from "./wake-delivery.ts";
 export { leaderKind, requeueHuman } from "./inbound-routing.ts";
+export { textingStyle } from "./texting-style.ts";
 
 /**
  * `createdAt` is when the agent's current context started (a new thread or the
@@ -649,17 +651,6 @@ export function decide(text: string): "yes" | "no" | undefined {
 }
 
 /**
- * How to write texts (owner, 22 Nov 2026), for every iMessage agent whatever
- * harness or model runs it. Part of both the typed and the wake guidance.
- */
-export function textingStyle(options: { replyMode?: ReplyMode } = {}): string {
-  const tool = options.replyMode === "tool";
-  return `Texting style (owner's rule, 22 Nov 2026): you are texting a person, not writing a document. Write the way people text: casual, informal and short, plain words, no preamble or sign-off. Match their tone and length; a quick text gets a quick text back. ${tool
-    ? "Use several messages, one imessage_send call each, the way people text: the quick answer first, then a detail or two, then any next step, instead of one long block. One thought per message, usually a line or two; don't send one word per message or split a sentence across texts."
-    : "Keep a reply to a few short lines; put a blank line between thoughts."} No headings, tables or long bullet lists; a short dash list only when it really helps. Anything long or structured goes out as an image instead.`;
-}
-
-/**
  * Prepended to every conversational turn so the agent knows it is texting over
  * iMessage and writes for that medium. A valid `imessage.prompt` preference in
  * the OpenCode config replaces this text at prompt time.
@@ -1039,9 +1030,8 @@ export class Router {
           continue;
         }
         const parent = row.state === "batched" ? this.store.db.query<{ leader: string }, [string]>(
-          `SELECT substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
-            JOIN inbound ON inbound.id = substr(kv.key, 7)
-            WHERE kv.key GLOB 'batch:*' AND member.value = ? AND inbound.state IN ('pending', 'processing')`,
+          `SELECT batch_members.leader FROM batch_members JOIN inbound ON inbound.id = batch_members.leader
+            WHERE batch_members.member = ? AND inbound.state IN ('pending', 'processing') ORDER BY batch_members.leader LIMIT 1`,
         ).get(row.id)?.leader : undefined;
         // One sealed operation owns every member, including unsent siblings with later receipt times.
         if (!this.expireWakeBatch(parent ?? row.id)) this.failWake(row.id, stale ? "stale" : overdue ? "delivery_deadline" : "ambiguity_deadline");
@@ -1091,9 +1081,7 @@ export class Router {
       const { row, input, ageMs, action, leaderKind: kind } = due;
       const state = { ...input.unanswered };
       if (state.overdueAt !== undefined && !due.requeue && !due.alert) continue;
-      const parent = this.store.db.query<{ id: string }, [string]>(
-        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key GLOB 'batch:*' AND member.value = ? LIMIT 1",
-      ).get(row.id)?.id;
+      const parent = this.store.batchLeaders(row.id)[0];
       const retained = this.store.get<SteerAttempt>(`steer-attempt:${parent ?? row.id}`);
       const responsePrompt = this.store.get<string>(`human-response-prompt:${parent ?? row.id}`);
       const acceptedResponse = this.store.get(`human-response-released:${parent ?? row.id}`)
@@ -1221,8 +1209,9 @@ export class Router {
     // Sealed membership changes on a seal, not on the one-second delivery clock.
     if (now - this.latencyParentsAt >= 60_000) {
       this.latencyParents = new Map(traceLoopOperation("inbound.parents", () => this.store.db.query<{ member: string; leader: string }, []>(
-        `SELECT member.value AS member, substr(kv.key, 7) AS leader FROM kv, json_each(kv.value, '$.batchIds') member
-          JOIN inbound ON inbound.id = member.value WHERE kv.key GLOB 'batch:*' AND inbound.state = 'batched'`,
+        // Leader order keeps the previous last-key-wins choice for a member listed by several seals.
+        `SELECT batch_members.member, batch_members.leader FROM inbound JOIN batch_members ON batch_members.member = inbound.id
+          WHERE inbound.state = 'batched' ORDER BY batch_members.member, batch_members.leader`,
       ).all()).map(row => [row.member, row.leader]));
       this.latencyParentsAt = now;
     }
@@ -1609,7 +1598,7 @@ export class Router {
       if (at === undefined || now - at < 120_000) continue;
       const batch = this.store.get<NormalizedInbound | null>(`batch:${row.id}`);
       const parent = this.store.db.query<{ id: string }, [string]>(
-        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key LIKE 'batch:%' AND member.value = ? ORDER BY kv.rowid LIMIT 1",
+        "SELECT batch_members.leader AS id FROM batch_members JOIN kv ON kv.key = 'batch:' || batch_members.leader WHERE batch_members.member = ? ORDER BY kv.rowid LIMIT 1",
       ).get(row.id)?.id ?? row.id;
       const stillFailed = () => this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state === "failed";
       // landed() writes this receipt. A later failed run must never erase its proof of admission.

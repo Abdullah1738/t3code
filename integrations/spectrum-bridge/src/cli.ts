@@ -40,15 +40,21 @@ class SendTimeout extends CliError {
 class AgentAnswerTimeout extends CliError {
   constructor(readonly requestId: string) { super("Bridge request timed out"); }
 }
+class AgentAskTimeout extends CliError {
+  constructor(readonly key: string) { super("Bridge request timed out"); }
+}
 
 export function cliFailure(error: unknown) {
   return {
-    exitCode: error instanceof SendTimeout || error instanceof AgentAnswerTimeout ? SEND_TIMEOUT_EXIT_CODE : 1,
+    exitCode: error instanceof SendTimeout || error instanceof AgentAnswerTimeout || error instanceof AgentAskTimeout ? SEND_TIMEOUT_EXIT_CODE : 1,
     body: { error: error instanceof CliError ? error.message : "Bridge request failed",
       ...(error instanceof SendTimeout ? { outcome: "unknown", key: error.key,
         hint: "The message may already be queued. Re-run with the same --key (it won't send twice) or check with send-status --key." } : {}),
       ...(error instanceof AgentAnswerTimeout ? { outcome: "unknown", requestId: error.requestId,
-        hint: "The answer may already be admitted. Check agent-requests --request <requestId> --session <session>, or repeat the identical agent-answer call (it won't deliver twice)." } : {}) },
+        hint: "The answer may already be admitted. Check agent-requests --request <requestId> --session <session>, or repeat the identical agent-answer call (it won't deliver twice)." } : {}),
+      // The request id is derived from the asking chat and --key, so the same --key can't create a second request.
+      ...(error instanceof AgentAskTimeout ? { outcome: "unknown", key: error.key,
+        hint: "The request may already be sent. Re-run the identical agent-ask with the same --key (it is created once per key) or check agent-requests --session <session>." } : {}) },
   };
 }
 /** A secret value printed verbatim, with no JSON wrapping or trailing newline. */
@@ -707,15 +713,21 @@ export async function sendCommand(command: Command, options: {
         const fail = () => {
           const sendKey = ["/send", "/files"].includes(command.path) && typeof body?.dedupeKey === "string" ? body.dedupeKey : undefined;
           const answerId = command.path === "/agent-answer" && typeof body?.request === "string" ? body.request : undefined;
-          if (controller.signal.aborted && command.method === "POST" && (sendKey !== undefined || answerId !== undefined)) {
+          const askKey = command.path === "/agent-ask" && typeof body?.dedupeKey === "string" ? body.dedupeKey : undefined;
+          const operationKey = sendKey ?? answerId ?? askKey;
+          if (controller.signal.aborted && command.method === "POST" && operationKey !== undefined) {
             if (!timeoutLogged) {
               timeoutLogged = true;
-              const keyHash = createHash("sha256").update(sendKey ?? answerId!).digest("hex");
-              toolLog.capture(() => toolLog.write({ component: "cli", kind: "event", name: "cli.send_timeout",
-                ids: { operationId: `${answerId !== undefined ? "agent-answer" : command.path === "/files" ? "file" : "send"}:${keyHash}` },
-                props: { path: command.path, elapsedMs: Math.max(0, performance.now() - startedAt) } }));
+              const keyHash = createHash("sha256").update(operationKey).digest("hex");
+              const elapsedMs = Math.max(0, performance.now() - startedAt);
+              const agentCommand = answerId !== undefined ? "agent-answer" : askKey !== undefined ? "agent-ask" : undefined;
+              toolLog.capture(() => toolLog.write(agentCommand !== undefined
+                ? { component: "cli", kind: "event", name: "cli.agent_bus_timeout",
+                  ids: { operationId: `${agentCommand}:${keyHash}` }, props: { command: agentCommand, elapsedMs } }
+                : { component: "cli", kind: "event", name: "cli.send_timeout",
+                  ids: { operationId: `${command.path === "/files" ? "file" : "send"}:${keyHash}` }, props: { path: command.path, elapsedMs } }));
             }
-            reject(answerId !== undefined ? new AgentAnswerTimeout(answerId) : new SendTimeout(sendKey!));
+            reject(answerId !== undefined ? new AgentAnswerTimeout(answerId) : askKey !== undefined ? new AgentAskTimeout(askKey) : new SendTimeout(sendKey!));
           } else reject(new CliError(controller.signal.aborted ? "Bridge request timed out" : "Bridge request failed"));
         };
         const req = (options.httpRequest ?? request)({

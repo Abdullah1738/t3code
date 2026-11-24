@@ -6,6 +6,7 @@ import { Shares, cloudflaredTunnel, shareRoute } from "../../spectrum-bridge/src
 import { BoxRunner, type RunnerConfig } from "./runner.ts";
 import { claudeHarness } from "./claude.ts";
 import { antigravityHarness } from "./antigravity.ts";
+import { moniSystemPrompt } from "./prompt.ts";
 import { createRouterReadinessTracker, routerConfig, routerReady } from "./router-auth.ts";
 
 export function loadRunnerConfig(path: string) {
@@ -15,7 +16,7 @@ export function loadRunnerConfig(path: string) {
   if (harness !== "claude" && harness !== "antigravity") throw new Error("Invalid harness");
   if (harness === "antigravity" && (typeof config.antigravity !== "string" || !config.antigravity.startsWith("/"))) throw new Error("Invalid antigravity directory");
   return { ...config, ...routerConfig(config), harness, model: config.model ?? (harness === "antigravity" ? "ag/gemini-4-neon-high" : "claude-opus-5-5"), token: secret("tokenFile"), callbackToken: secret("callbackTokenFile"),
-    privateKey: secret("privateKeyFile"), system: secret("systemFile") } as RunnerConfig & ReturnType<typeof routerConfig> & { port: number; harness: "claude" | "antigravity"; claude: string; antigravity: string; model: string; cloudflared: string };
+    privateKey: secret("privateKeyFile"), system: moniSystemPrompt(secret("systemFile")) } as RunnerConfig & ReturnType<typeof routerConfig> & { port: number; harness: "claude" | "antigravity"; claude: string; antigravity: string; model: string; cloudflared: string };
 }
 export async function startShareMaintenance(shares: Pick<Shares, "restore" | "sweep">, log: (code: string) => void,
   schedule: (tick: () => Promise<void>, ms: number) => unknown = (tick, ms) => setInterval(() => void tick(), ms)) {
