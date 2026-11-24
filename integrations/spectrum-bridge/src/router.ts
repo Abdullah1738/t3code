@@ -3,7 +3,7 @@ import { bounded } from "./bounded.ts";
 import { PromptProbeTracker } from "./prompt-probe.ts";
 import { RobobLinkDown } from "./robob-link-gate.ts";
 import { ProbeBackoff, ProbeBudget, probeDeferred } from "./probe-policy.ts";
-import { findOverdue, reconcileLegacyReplies, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
+import { findOverdue, reconcileLegacyReplies, settleStalePending, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
 import { toolLog as watcherLog } from "./watcherlog.ts";
 import { completionReady, toolError, toolLog } from "./toollog.ts";
 import { captureReadTiming, completionChecked, includeReadTiming, timeTick, type ReadTiming } from "./tick-timing.ts";
@@ -1041,6 +1041,7 @@ export class Router {
   private readonly unansweredStartedAt = Date.now();
   private checkingUnanswered?: Promise<void>;
   private reconciledLegacyReplies = false;
+  private settledStalePending = false;
 
   checkUnanswered(now = Date.now()): Promise<void> {
     return this.checkingUnanswered ??= this.sweepUnanswered(now).finally(() => { this.checkingUnanswered = undefined; });
@@ -1051,6 +1052,11 @@ export class Router {
   }
 
   private async sweepUnanswered(now: number): Promise<void> {
+    // Group chats skip overdue tracking, but they strand queued rows too.
+    if (!this.settledStalePending) {
+      settleStalePending(this.store, now);
+      this.settledStalePending = true;
+    }
     const chat = this.store.get<string>("unanswered-chat") ?? "other";
     if (chat === "other") return;
     if (!this.reconciledLegacyReplies) {

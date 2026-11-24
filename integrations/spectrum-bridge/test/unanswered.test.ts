@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store, type InboundRecord, type OutboxOperation } from "../src/store.ts";
-import { findOverdue, markAnswered, reconcileLegacyReplies, turnMembers, UNANSWERED_REQUEUE_MS, type AnsweredInput } from "../src/unanswered.ts";
+import { findOverdue, markAnswered, reconcileLegacyReplies, settleStalePending, STALE_PENDING_SETTLE_MS, turnMembers, UNANSWERED_REQUEUE_MS, type AnsweredInput } from "../src/unanswered.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { legacySteerStart, restoreLegacySteer } from "./fixtures/legacy-steer-upgrade.ts";
 import { summarizeLog } from "../src/log-rollup.ts";
@@ -371,4 +371,56 @@ test.each([
   }
   // The answer itself is still recorded: only the log row changed.
   expect(JSON.parse(s.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id)!.payload).answeredAt).toBe(at + 42_000);
+});
+
+test("#138 settleStalePending retires day-old stranded rows without marking them answered", async () => {
+  const s = store();
+  const now = at + 30 * 24 * 60 * 60_000;
+  const old = now - STALE_PENDING_SETTLE_MS - 1;
+  const fresh = now - STALE_PENDING_SETTLE_MS + 60_000;
+  const add = (id: string, receivedAt: number | undefined, state: string, extra: Partial<AnsweredInput> = {}) => {
+    s.acceptInbound(id, { ...input(id, receivedAt as number), ...extra });
+    s.updateInbound(id, state);
+  };
+  add("STALE_PENDING", old, "pending");
+  add("STALE_LEADER", now - 7 * 24 * 60 * 60_000, "pending");
+  add("STALE_MEMBER", now - 7 * 24 * 60 * 60_000, "batched");
+  s.set("batch:STALE_LEADER", { ...input("STALE_LEADER"), batchIds: ["STALE_LEADER", "STALE_MEMBER"] });
+  s.set("batch-phase:STALE_LEADER", "accepted");
+  add("UNDATED", undefined, "batched");
+  add("LEGACY_ATTACHMENT", old, "pending", { source: undefined });
+  add("FRESH", fresh, "pending");
+  add("MIXED_LEADER", old, "pending");
+  add("MIXED_MEMBER", fresh, "batched");
+  s.set("batch:MIXED_LEADER", { ...input("MIXED_LEADER"), batchIds: ["MIXED_LEADER", "MIXED_MEMBER"] });
+  add("IN_TURN", old, "pending");
+  s.set("activeTurn", { id: "ses_1", generation: 1, messageId: "p", covered: ["IN_TURN"], phase: "running" });
+  add("ANSWERED", old, "pending", { answeredAt: old + 1 });
+  add("wake:old", old, "pending");
+  add("FAILED", old, "failed");
+
+  let settled: string[] = [];
+  const logs = await captureLogs(async () => { settled = settleStalePending(s, now); });
+  const expected = ["STALE_PENDING", "STALE_LEADER", "STALE_MEMBER", "UNDATED", "LEGACY_ATTACHMENT"];
+  expect(settled.sort()).toEqual([...expected].sort());
+  const get = (id: string) => {
+    const r = s.db.query<{ state: string; payload: string }, [string]>("SELECT state, payload FROM inbound WHERE id = ?").get(id)!;
+    return { state: r.state, payload: JSON.parse(r.payload) as AnsweredInput };
+  };
+  for (const id of expected) {
+    expect(get(id).state).toBe("done");
+    expect(get(id).payload.settledAt).toBe(now);
+    expect(get(id).payload.settledReason).toBe("stale_stranded");
+    expect(get(id).payload.answeredAt).toBeUndefined();
+  }
+  expect(s.get("batch-phase:STALE_LEADER")).toBeNull();
+  for (const [id, state] of [["FRESH", "pending"], ["MIXED_LEADER", "pending"], ["MIXED_MEMBER", "batched"], ["IN_TURN", "pending"],
+    ["ANSWERED", "pending"], ["wake:old", "pending"], ["FAILED", "failed"]] as const) {
+    expect(get(id).state).toBe(state);
+    expect(get(id).payload.settledAt).toBeUndefined();
+  }
+  expect(logs.filter(l => l.name === "inbound.settled").map(l => [l.ids?.inboundId, l.props?.reason]).sort())
+    .toEqual(expected.map(id => [id, "stale_stranded"]).sort());
+  expect(logs.filter(l => l.name === "inbound.answered")).toHaveLength(0);
+  expect(settleStalePending(s, now)).toEqual([]);
 });
