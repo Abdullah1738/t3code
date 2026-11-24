@@ -1954,6 +1954,38 @@ test("bounded details: one held chat defers without delaying another beyond the 
   } finally { release.resolve(); await polling; detail.mockRestore(); }
 });
 
+test("bounded details: a chat whose detail always exceeds the deadline still completes", async () => {
+  const { control, backend, chats } = await markerFixture(2, true);
+  const [slow, healthy] = chats as [typeof chats[number], typeof chats[number]];
+  control.reply(slow.id, "slow final", "completed"); control.reply(healthy.id, "healthy final", "completed");
+  const read = backend.client.thread.bind(backend.client);
+  let inFlight = 0, overlapped = false;
+  const detail = spyOn(backend.client, "thread").mockImplementation(async (id, options) => {
+    const result = await read(id, options);
+    if (id === slow.id) {
+      overlapped ||= ++inFlight > 1;
+      await new Promise(resolve => setTimeout(resolve, DETAIL_DEADLINE_MS + 500));
+      inFlight--;
+    }
+    return result;
+  });
+  try {
+    let completedAt: number | undefined;
+    for (let tick = 1; tick <= 4 && completedAt === undefined; tick++) {
+      const started = performance.now();
+      await withinDetailBound(backend.beginMessageTick(chats.map(chat => chat.id)));
+      expect(performance.now() - started).toBeLessThan(DETAIL_DEADLINE_MS + 500);
+      expect(JSON.stringify(await backend.messages(healthy.id))).toContain("healthy final");
+      if (JSON.stringify(await backend.messages(slow.id)).includes("slow final")) completedAt = tick;
+    }
+    // The tick-1 read finishes during tick 2's window and is adopted at that tick's boundary.
+    expect(completedAt).toBe(2);
+    expect((await backend["messageCache"].detail(slow.id)).run?.status).toBe("completed");
+    expect(overlapped).toBe(false);
+    expect(control.calls.filter(call => call.path === `/threads/${slow.id}`)).toHaveLength(1);
+  } finally { detail.mockRestore(); }
+}, 30_000);
+
 test("bounded details: five slow reads cost one deadline and cannot publish late", async () => {
   const { control, backend, chats } = await markerFixture(5, true);
   const cache = backend["messageCache"], checkpoints = chats.map(chat => cache["entries"].get(chat.id));

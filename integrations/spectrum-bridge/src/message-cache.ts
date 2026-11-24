@@ -14,6 +14,11 @@ const SKEW_MS = 2_000;
 const BEGINNING = -8640000000000000;
 const OVERLAP_MS = 30_000;
 export const DETAIL_DEADLINE_MS = 2000;
+type Settled = { detail: ThreadDetail } | { error: unknown };
+// One physical detail read per thread survives tick deadlines, so a thread whose detail always takes
+// longer than DETAIL_DEADLINE_MS still progresses: a later tick boundary adopts the finished read.
+type Carried = { read: Promise<Settled>; result?: Settled; marker: number | undefined; generation: number;
+  writes: number | undefined; version: number | undefined; detach: AbortController };
 type Tick = { id: string; ready: Promise<void>; messages: Map<string, Snapshot>; summaries: Map<string, ThreadSummary>;
   details: Map<string, Promise<ThreadDetail>>; evidence: Map<string, Promise<RunEvidence>>; accepted: Set<string>; deferred: Set<string>; failed: Set<string>; detailDeferred: Set<string> };
 
@@ -34,24 +39,47 @@ export class MessageCache {
   private readonly detailStreaks = new Map<string, number>();
   private readonly metadataScope = new AsyncLocalStorage<Map<string, Promise<RunEvidence>>>();
   private readonly detailObservers = new Set<ActiveRoster>();
+  private readonly carried = new Map<string, Carried>();
 
   constructor(private readonly client: ControlClient) {}
 
   observeDetails(roster: ActiveRoster): void { this.detailObservers.add(roster); }
 
-  private async readDetail(threadId: string, signal?: AbortSignal): Promise<ThreadDetail> {
-    // Tickets order physical reads against SSE. Cached and deferred details are older facts.
+  /** `detach` releases the roster tickets and drops the roster observation; the HTTP read continues. */
+  private async readDetail(threadId: string, detach?: AbortSignal): Promise<ThreadDetail> {
+    // Tickets order physical reads against SSE. Cached, deferred and carried details are older facts.
     const reads = [...this.detailObservers].map(roster => ({ roster, read: roster.checkpoint(threadId) }));
     const finish = () => { for (const { roster, read } of reads) roster.finish(threadId, read); };
-    signal?.addEventListener("abort", finish, { once: true });
+    detach?.addEventListener("abort", finish, { once: true });
     try {
-      const { thread } = await this.client.thread(threadId, { signal });
-      if (!signal?.aborted) for (const { roster, read } of reads) roster.observe(thread, read);
+      const { thread } = await this.client.thread(threadId);
+      if (!detach?.aborted) for (const { roster, read } of reads) roster.observe(thread, read);
       return thread;
     } finally {
-      signal?.removeEventListener("abort", finish);
+      detach?.removeEventListener("abort", finish);
       finish();
     }
+  }
+
+  private launchDetail(threadId: string, marker: number | undefined): Carried {
+    const carried: Carried = { marker, generation: this.generation, writes: this.writes.get(threadId),
+      version: this.readVersions.get(threadId), detach: new AbortController(), read: undefined! };
+    carried.read = this.readDetail(threadId, carried.detach.signal).then(
+      detail => (carried.result = { detail }), error => (carried.result = { error }));
+    this.carried.set(threadId, carried);
+    return carried;
+  }
+
+  /** A carried read launched before a write, route change or read invalidation can't describe this transcript. */
+  private carriedFor(threadId: string): Carried | undefined {
+    const carried = this.carried.get(threadId);
+    if (carried && (carried.generation !== this.generation || carried.writes !== this.writes.get(threadId)
+      || carried.version !== this.readVersions.get(threadId))) {
+      carried.detach.abort();
+      this.carried.delete(threadId);
+      return undefined;
+    }
+    return carried;
   }
 
   withinTick<T>(body: () => Promise<T>): Promise<T> {
@@ -67,6 +95,7 @@ export class MessageCache {
       this.details.delete(id);
       this.archived.delete(id);
     }
+    for (const [id, carried] of this.carried) if (!tracked.has(id)) { carried.detach.abort(); this.carried.delete(id); }
     const tick: Tick = { id: randomUUID(), ready: Promise.resolve(), messages: new Map(), summaries: new Map(), details: new Map(), evidence: new Map(), accepted: new Set(), deferred: new Set(), failed: new Set(), detailDeferred: new Set() };
     this.tick = tick;
     for (const id of threadIds) if (this.archived.has(id) && this.entries.has(id)) {
@@ -122,31 +151,52 @@ export class MessageCache {
       }
       // Like #50, capture exact run/error state before reading its messages. A terminal detail
       // fetched afterwards could otherwise seal partial text or permanently clear a first-turn check.
-      const started = performance.now(), controller = new AbortController();
+      const started = performance.now();
       const timeout = Symbol("detail-deadline");
-      const deadline = new Promise<never>((_, reject) => {
-        controller.signal.addEventListener("abort", () => reject(timeout), { once: true });
-      });
-      const timer = setTimeout(() => controller.abort(), DETAIL_DEADLINE_MS);
+      let expire!: (value: typeof timeout) => void;
+      const deadline = new Promise<typeof timeout>(resolve => { expire = resolve; });
+      const timer = setTimeout(() => expire(timeout), DETAIL_DEADLINE_MS);
       let missingMarker = false;
       try { await Promise.all(ids.map(async id => {
         const summary = tick.summaries.get(id);
         const prior = this.details.get(id);
-        const read = prior && summary && this.canReuseDetail(prior, summary) ? Promise.resolve({ ...prior, ...summary })
-          : this.readDetail(id, controller.signal);
+        // Detail reads runs before its marker. Omitted summaries only have the previous poll's boundary.
+        let marker = missing.has(id) ? prior?.changeMarker : summary!.changeMarker;
         let detail: ThreadDetail;
-        try { detail = await Promise.race([read, deadline]); }
-        catch (error) {
-          this.deferDetail(tick, id, error === timeout ? "timeout" : error instanceof ControlError ? "status" : "error", performance.now() - started, error);
-          return;
+        if (prior && summary && this.canReuseDetail(prior, summary)) {
+          // The committed detail is newer than any read still in flight; never adopt that older read later.
+          this.carried.get(id)?.detach.abort();
+          this.carried.delete(id);
+          detail = { ...prior, ...summary };
+        } else {
+          let carried = this.carriedFor(id), finished: Carried | undefined;
+          if (carried?.result) {
+            // A finished carried read is a fallback; one fresh read may still beat the deadline.
+            this.carried.delete(id);
+            if ("detail" in carried.result) finished = carried;
+            carried = undefined;
+          }
+          const launched = !carried;
+          carried ??= this.launchDetail(id, marker);
+          const outcome = await Promise.race([carried.read, deadline]);
+          if (outcome !== timeout && this.carried.get(id) === carried) this.carried.delete(id);
+          if (outcome === timeout) carried.detach.abort();
+          const adopted = outcome !== timeout && "detail" in outcome ? carried : finished;
+          if (!adopted?.result || !("detail" in adopted.result)) {
+            const error = outcome !== timeout && "error" in outcome ? outcome.error : timeout;
+            this.deferDetail(tick, id, error === timeout ? "timeout" : error instanceof ControlError ? "status" : "error", performance.now() - started, error);
+            return;
+          }
+          if (adopted !== carried || !launched) this.pollLog(tick, id, { detailCarried: 1 });
+          detail = adopted.result.detail;
+          marker = adopted.marker;
         }
         if (!Number.isSafeInteger(detail.changeMarker) || detail.changeMarker! < 0) {
           missingMarker = true;
           return;
         }
         this.detailStreaks.delete(id);
-        // Detail reads runs before its marker. Omitted summaries only have the previous poll's boundary.
-        const captured = { ...detail, changeMarker: missing.has(id) ? prior?.changeMarker : summary!.changeMarker };
+        const captured = { ...detail, changeMarker: marker };
         details.set(id, captured);
         tick.details.set(id, Promise.resolve(captured));
         tick.summaries.set(id, captured);
