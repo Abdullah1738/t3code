@@ -137,8 +137,9 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       if (key === "source" && typeof value === "string" && value.length <= 100 && !/[\x00-\x1f\x7f-\x9f]/.test(value)
         || key === "causeKey" && typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,100}$/.test(value)
         || key === "route" && value === "/threads/:id/send"
-        || key === "reason" && ["ambiguity_deadline", "delivery_deadline", "stale", "attempts_exhausted", "route_retired", "holder", "link_down", "cooldown", "admission"].includes(String(value))
+        || key === "reason" && ["ambiguity_deadline", "delivery_deadline", "stale", "attempts_exhausted", "route_retired", "agent_bus_timeout", "inbound_failed", "holder", "link_down", "cooldown", "admission"].includes(String(value))
         || key === "holderPhase" && ["submitting", "running", "unknown", "held", "failed"].includes(String(value))
+        || key === "stage" && entry.name === "wake.failed" && ["synthetic", "prepare", "dispatch", "execution"].includes(String(value))
         || key === "attempt" && entry.name === "wake.failed" && value === 0
         || key === "remainingMs" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0
         || key === "nextAt" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
@@ -170,6 +171,9 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
         || ["latency_ms", "depth"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) {
         props[key] = value; continue;
       }
+    }
+    if (entry.name === "router.prompt_probe_stopped" && key === "reason" && value === "replay_deadline") {
+      props[key] = value; continue;
     }
     if (entry.name === "synthetic.carry_evicted" && key === "reason" && (value === "expired" || value === "overflow")
       || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {

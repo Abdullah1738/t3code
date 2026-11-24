@@ -33,10 +33,10 @@ import { appendObserved, classifyGroupMessage, GROUP_ENGAGED_MS, isTapback, ment
 import { groupLines, inboundTime, inboundWords, JEV_CHUNK, JEV_THRESHOLD, JudgeError, judgeState, replyTarget as judgeReplyTarget, speakerName, targetLine, type GroupJudge } from "./group-judge.ts";
 import type { Swipes, SwipeTarget } from "./swipe.ts";
 import { criticalWake, FAILED_INBOUND_ALERT_MAX_AGE_MS, FAILED_INBOUND_REPLAY_MAX_AGE_MS, failureMessage, wakeEventPreview } from "./inbound-failure.ts";
-import { isAgentBusWake } from "./agent-bus.ts";
+import { AGENT_BUS_TIMEOUT_MS, isAgentBusWake } from "./agent-bus.ts";
 import { HUMAN_FAILURE_BACKOFF_MS, leaderKind, MAX_FAILED_ATTEMPTS, requeueHuman, type RequeueHumanOptions, type RequeueOutcome, type RequeueReason } from "./inbound-routing.ts";
 import { controlDisposition, controlFailureProps, type ControlFailure } from "./control-errors.ts";
-import { WakeDelivery, wakeStatus, WAKE_AMBIGUITY_MS, WAKE_DELIVERY_MS } from "./wake-delivery.ts";
+import { WakeDelivery, wakeStatus, WAKE_AMBIGUITY_MS, WAKE_DELIVERY_MS, type WakeFailReason, type WakeFailStage } from "./wake-delivery.ts";
 export { leaderKind, requeueHuman } from "./inbound-routing.ts";
 export { textingStyle } from "./texting-style.ts";
 
@@ -951,7 +951,7 @@ export class Router {
   private readonly wakes: WakeDelivery;
 
   /** Finalize local failure independently of link state or a prior admission receipt. Call inside a transaction. */
-  private failWake(id: string, reason: Parameters<WakeDelivery["failed"]>[1]): void {
+  private failWake(id: string, reason: WakeFailReason): void {
     this.wakes.accept(id);
     const status = wakeStatus(this.store, id);
     if (!status) return;
@@ -960,7 +960,7 @@ export class Router {
     if (status.state === "admitted" && ["done", "admitted"].includes(row.state)) return;
     const input = JSON.parse(row.payload) as NormalizedInbound;
     if (status.state !== "failed" && !["failed", "cancelled"].includes(row.state)) {
-      this.wakes.failed(id, reason);
+      this.wakes.failed(id, reason, "synthetic");
       if (!isAgentBusWake(id) && !replyNudgeRow(id) && Date.now() - status.acceptedAt <= 24 * 60 * 60_000) {
         this.queueDropped(id, input.text, "undelivered");
         this.carryMissed(id, input.text, { uncertain: reason === "stale" || status.firstSendAt !== undefined,
@@ -1182,6 +1182,19 @@ export class Router {
     this.store.set(`batch-phase:${leader}`, "accepted");
   }
 
+  private latencyProbeKey(threadId: string, prompt: string): string {
+    return `latency-probe:${hash(JSON.stringify([threadId, prompt]))}`;
+  }
+
+  private stopLatencyProbe(threadId: string, prompt: string, ageMs: number): void {
+    const key = this.latencyProbeKey(threadId, prompt);
+    const state = this.store.get<{ attempt: number; stoppedAt?: number }>(key);
+    if (state?.stoppedAt !== undefined) return;
+    this.store.set(key, { attempt: state?.attempt ?? 0, stoppedAt: Date.now() });
+    toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "router.prompt_probe_stopped",
+      ids: { threadId, messageId: prompt }, props: { attempt: state?.attempt ?? 0, ageMs, reason: "replay_deadline" } }));
+  }
+
   private async sweepInboundLatency(): Promise<void> {
     const chat = this.options.context?.chat;
     if (chat && chat.kind !== "owner" && chat.slug !== "moni") return;
@@ -1260,11 +1273,17 @@ export class Router {
       if (age > FAILED_INBOUND_REPLAY_MAX_AGE_MS && retryAt === undefined) continue;
       let absent = true;
       if (original) {
-        if (this.probeBackoff.cooling(leader)) absent = false;
+        const ids = [original.messageId, ...original.earlier ?? []];
+        // A stuck-wake retry keeps alerts/carry alive past the replay horizon, not acceptance reads.
+        if (age > FAILED_INBOUND_REPLAY_MAX_AGE_MS) {
+          for (const id of ids) this.stopLatencyProbe(original.id, id, age);
+          absent = false;
+        } else if (this.probeBackoff.cooling(leader)) absent = false;
         else {
           const steer = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
-          const ids = [original.messageId, ...original.earlier ?? []];
           for (const [probeIndex, id] of ids.entries()) {
+            const probeKey = this.latencyProbeKey(original.id, id);
+            if (this.store.get<{ stoppedAt?: number }>(probeKey)?.stoppedAt !== undefined) { absent = false; break; }
             const steeredAt = id === original.messageId && id === `msg_${hash(leader)}`
               && steer?.id === original.id && steer.directory === original.directory && steer.generation === original.generation
               ? steer.startedAt : undefined;
@@ -1272,6 +1291,7 @@ export class Router {
             const probeFailure: { value?: { error: unknown; props: Parameters<typeof toolError>[4] } } = {};
             try {
               if (await this.probeAccepted(original, id, leader, 10_000, () => {
+                this.store.set(probeKey, { attempt: (this.store.get<{ attempt: number }>(probeKey)?.attempt ?? 0) + 1 });
                 const probe = this.promptProbes.start(original.id, id, sentAt);
                 return { ...probe, failure: (error: unknown) => {
                   probeFailure.value = { error, props: undefined };
@@ -1348,7 +1368,7 @@ export class Router {
             this.latencyParentsAt = -Infinity;
           }
           this.carryMissed(row.id, input.text, { uncertain: attemptUsed, at: input.receivedAt! });
-          this.failInbound(row.id, "synthetic", "undelivered");
+          this.failInbound(row.id, "synthetic", "undelivered", undefined, { reason: routeRetired ? "route_retired" : "attempts_exhausted" });
           toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "synthetic.carried_from_stranded",
             ids: { inboundId: row.id, chat: chat?.slug ?? "owner" },
             props: { cause: routeRetired ? "route_retired" : "stuck_attempt_used" } }));
@@ -1465,9 +1485,11 @@ export class Router {
     this.options.log?.("inbound-failed", JSON.stringify({ id, chat: this.options.context?.chat.slug ?? "owner", ...failure }));
   }
 
-  private failInbound(id: string, stage: string, error: unknown, route = this.store.get<Route | null>("route")): void {
+  /** A wake's reason defaults to the stage failure; callers name a retry exhaustion or a timeout themselves. */
+  private failInbound(id: string, stage: WakeFailStage, error: unknown, route = this.store.get<Route | null>("route"),
+    wake: { reason: WakeFailReason; boundMs?: number } = { reason: "inbound_failed" }): void {
     if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) return;
-    if (id.startsWith("wake:")) this.wakes.failed(id, "attempts_exhausted");
+    if (id.startsWith("wake:")) this.wakes.failed(id, wake.reason, stage, wake.boundMs);
     // Keep the transport exception rather than replacing it with a generic timeout notice.
     const prior = this.store.inboundFailure(id);
     if (!prior || prior.stage !== stage) this.recordFailure(id, stage, error, route);
@@ -1805,7 +1827,8 @@ export class Router {
       const saved = JSON.parse(payload.get(id)?.payload ?? "{}") as Partial<NormalizedInbound> & { agentExpiresAt?: number };
       const text = saved.text ?? "";
       if (isAgentBusWake(id) && reason === "undelivered" && saved.agentExpiresAt !== undefined && Date.now() >= saved.agentExpiresAt) {
-        this.failInbound(id, "synthetic", reason);
+        // The bus ask window closed before a turn took the wake; agent-bus tells the asker.
+        this.failInbound(id, "synthetic", reason, undefined, { reason: "agent_bus_timeout", boundMs: AGENT_BUS_TIMEOUT_MS });
         continue;
       }
       if (isAgentBusWake(id) && reason === "undelivered" && saved.agentExpiresAt !== undefined && Date.now() < saved.agentExpiresAt) {
@@ -1836,10 +1859,10 @@ export class Router {
         this.failWake(id, "attempts_exhausted");
         continue;
       }
-      this.wakes.failed(id, "attempts_exhausted");
+      this.wakes.failed(id, "attempts_exhausted", "synthetic");
       this.queueDropped(id, text, reason);
       if (!isAgentBusWake(id)) this.carryMissed(id, text, { uncertain: reason === "undelivered" && wakeStatus(this.store, id)?.firstSendAt !== undefined });
-      this.failInbound(id, "synthetic", reason);
+      this.failInbound(id, "synthetic", reason, undefined, { reason: "attempts_exhausted" });
     }
     if (sealed && this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(leader)?.state === "pending") {
       this.store.set(`batch:${leader}`, sealed);

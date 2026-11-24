@@ -107,7 +107,7 @@ test("Sendblue wake status reads the owner store without a session or delivery r
     if (state !== "queued") tracker.sending(id, "owner-thread");
     if (state === "ambiguous") tracker.ambiguous(id, new Error("network"), 60_000);
     if (state === "admitted") tracker.admitted(id);
-    if (state === "failed") tracker.failed(id, "ambiguity_deadline");
+    if (state === "failed") tracker.failed(id, "ambiguity_deadline", "synthetic");
     enabled = false;
     const response = await handler(new Request(`http://bridge/wake/${id}`));
     expect(response.status).toBe(200);
