@@ -6,6 +6,7 @@ import { ProbeBackoff, ProbeBudget, probeDeferred } from "./probe-policy.ts";
 import { findOverdue, reconcileLegacyReplies, settleStalePending, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
 import { toolLog as watcherLog } from "./watcherlog.ts";
 import { completionReady, toolError, toolLog } from "./toollog.ts";
+import { robobErrorCode, turnFailCause, type TurnFailInfo } from "./turn-fail-cause.ts";
 import { captureReadTiming, completionChecked, includeReadTiming, timeTick, type ReadTiming } from "./tick-timing.ts";
 import { appendFold, foldMedsLine, foldSkipped, type FoldOptions } from "./meds-fold.ts";
 import { createHash } from "node:crypto";
@@ -1532,7 +1533,7 @@ export class Router {
       for (const member of ids) this.store.db.query("UPDATE inbound SET state = 'failed' WHERE id = ? AND state IN ('processing', 'batched')").run(member);
       this.store.set(`batch-phase:${id}`, "expired");
       if (preparing?.id === id) this.store.set("preparingDelivery", null);
-      if (attempted) this.logTurnEnd(attempted, "failed");
+      if (attempted) this.logTurnEnd(attempted, "failed", true, undefined, { cause: "timeout" });
       if (active?.inboundId === id) this.setTurn({ ...active, phase: "failed" });
       if (this.store.get<ResendBody | null>("resendBody")?.inboundId === id) this.store.set("resendBody", null);
       if (preparing?.id === id || active?.inboundId === id) this.clearDeliveryOutage();
@@ -1726,7 +1727,7 @@ export class Router {
       if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) {
         if (state === "failed") toolLog.capture(() => {
           const original = this.store.get<Turn | null>(`failed-delivery:${id}`);
-          if (original) this.logTurnEnd(original, "failed");
+          if (original) this.logTurnEnd(original, "failed", true, undefined, { cause: "undelivered" });
         });
         this.store.set("preparingDelivery", null);
       }
@@ -4743,7 +4744,7 @@ export class Router {
         } satisfies PreparingDelivery);
         this.setTurn(null);
       } else {
-        this.logTurnEnd(turn, "failed");
+        this.logTurnEnd(turn, "failed", true, undefined, { cause: "undelivered" });
         this.setTurn({ ...turn, phase: "failed" });
         this.clearDeliveryOutage();
         if (id !== undefined && this.store.get(`batch-phase:${id}`) === "submitting") this.store.set(`batch-phase:${id}`, null);
@@ -5430,6 +5431,9 @@ export class Router {
         const completedEarlier = replies.filter(reply => successfulReplies.has(reply.id)
           && (earlier.includes(reply) || reply === final && reply.answer !== false && !reply.error)
           && reply.id !== turn!.earlySent && !quiet.has(reply.id));
+        const providerError = [...replies].reverse().find(reply => reply.error)?.error;
+        const failInfo: TurnFailInfo = { idleOutcome: idle.outcome, ...(idle.diag ? { diag: idle.diag } : {}),
+          ...(providerError !== undefined ? { error: providerError } : {}), ...(idle.modelError || priorFailure?.modelError ? { modelError: true } : {}) };
         const failAfterEarlier = async (text: string, reason: DropReason, immediate = false) => {
           const said = (this.toolMode ? [] : completedEarlier).map(reply => ({ reply, text: replyText(assistantText(reply)) }))
             .filter(item => item.text && !this.store.getOperation(`reply:${turn!.generation}:${item.reply.id}`));
@@ -5455,14 +5459,13 @@ export class Router {
             const completed = turn!.inboundId && successful.has(turn!.messageId)
               ? this.store.get<NormalizedInbound | null>(`batch:${turn!.inboundId}`)?.batchIds ?? [turn!.inboundId] : [];
             const admitted = new Set(completed.filter(id => this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state === "admitted"));
-            this.fail(turn!, text, idle.id, reason, immediate);
+            this.fail(turn!, text, idle.id, reason, immediate, failInfo);
             if (!this.store.get(`human-own-turn:${turn!.inboundId}`))
               for (const id of completed) this.store.updateInbound(id, admitted.has(id) ? "admitted" : "done");
           }).immediate();
           this.logNoticeReply(turn!, scope, idle, "watch", false, "failed");
           if (!this.toolMode && completedEarlier.length) this.stage("reply-enqueued", turn!.inboundId ?? turn!.messageId);
         };
-        const providerError = [...replies].reverse().find(reply => reply.error)?.error;
         if (turn.inboundId && providerError) {
           const detail = typeof providerError === "object" && "message" in providerError ? providerError.message : providerError;
           this.recordFailure(turn.inboundId, "execution", detail, turn);
@@ -6095,7 +6098,7 @@ export class Router {
     return result;
   }
 
-  private logTurnEnd(turn: Turn, outcome: "replied" | "failed" | "refused" | "no_reply", recover = true, endReason?: DropReason): void {
+  private logTurnEnd(turn: Turn, outcome: "replied" | "failed" | "refused" | "no_reply", recover = true, endReason?: DropReason, info?: TurnFailInfo): void {
     if (recover && !this.store.get(`human-settled:${turn.messageId}`)) {
       this.recoverHumanHandoffs(turn, outcome);
       this.store.set(`human-settled:${turn.messageId}`, true);
@@ -6118,11 +6121,36 @@ export class Router {
       if (this.store.get(`log-turn-end:${turn.messageId}`)) return;
       this.store.set(`log-turn-end:${turn.messageId}`, true);
       toolLog.write({ component: "router", kind: "perf", name: "turn.end", durationMs: Math.max(0, Date.now() - turn.startedAt),
-        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) }, props: { outcome, ...(endReason ? { endReason } : {}) } });
+        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) },
+        props: { outcome, ...(endReason ? { endReason } : {}), ...(outcome === "failed" || outcome === "refused" ? this.failProps(turn, outcome, endReason, info) : {}) } });
     });
   }
 
-  private fail(snapshot: Turn, text: string, watermark?: string, reason: DropReason = "failed", immediate = false): void {
+  /** Cause fields for a failed turn.end row (#137). Read-only: it never feeds a retry, and an odd input logs `unknown`. */
+  private failProps(turn: Turn, outcome: string, endReason?: DropReason, info?: TurnFailInfo): Record<string, string | number | boolean> {
+    const sinceTurnStartMs = Math.max(0, Date.now() - turn.startedAt);
+    try {
+      const linkDown = this.backend.linkAvailable === false;
+      const failCause = turnFailCause({ outcome, endReason, linkDown, info, sinceTurnStartMs });
+      const errorCode = robobErrorCode(info?.error, info?.modelError);
+      const attempt = (turn.inboundId ? this.store.get<number>(`human-failed-attempts:${turn.inboundId}`) : undefined) ?? turn.attempt ?? 1;
+      // Any row this turn carried that is queued again: its own (a wake's retry) or a person's handoff.
+      const carried = new Set([turn.inboundId, ...turn.covered ?? [], ...this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? []]);
+      const requeued = [...carried].some(id => id !== undefined
+        && this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state === "pending");
+      return { failCause, sinceTurnStartMs, attempt, requeued,
+        ...(info?.diag?.runStatus ? { robobRunStatus: info.diag.runStatus } : {}),
+        ...(info?.diag?.cancelReason ? { robobCancelReason: info.diag.cancelReason } : {}),
+        ...(errorCode ? { robobErrorCode: errorCode } : {}),
+        ...(info?.diag?.provider ? { provider: info.diag.provider } : {}),
+        ...(info?.diag?.model ? { model: info.diag.model } : {}) };
+    } catch (caughtError) {
+      toolError("router", "router.fail_props", caughtError);
+      return { failCause: "unknown", sinceTurnStartMs };
+    }
+  }
+
+  private fail(snapshot: Turn, text: string, watermark?: string, reason: DropReason = "failed", immediate = false, info?: TurnFailInfo): void {
     // A steer can be confirmed while failure reads await the backend; retain that ownership across restart.
     const turn = this.typedInto(snapshot) ? { ...snapshot, typed: true } : snapshot;
     const recovery = this.recoverHumanHandoffs(turn, "failed", text);
@@ -6181,6 +6209,6 @@ export class Router {
       if (watermark || reason !== "undelivered") this.store.set("watermark", watermark ? { sessionId: turn.id, id: watermark } satisfies Watermark : null);
       this.store.set("settledAt", Date.now());
     }).immediate();
-    this.logTurnEnd(turn, "failed", true, reason);
+    this.logTurnEnd(turn, "failed", true, reason, info);
   }
 }

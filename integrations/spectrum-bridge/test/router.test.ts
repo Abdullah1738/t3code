@@ -9502,7 +9502,7 @@ test("replay expiry ends the tracked turn as failed before it is cleared", async
     await h.router.tick();
     expect(h.store.get("activeTurn")).toMatchObject({ inboundId: "expiring-log", phase: "failed" });
   });
-  expect(logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("expiring-log")).map(l => [l.props?.outcome, l.ok])).toEqual([["failed", false]]);
+  expect(logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("expiring-log")).map(l => [l.props?.outcome, l.ok, l.props?.failCause])).toEqual([["failed", false, "timeout"]]);
   const later = await captureLogs(async () => {
     h.backend.promptBehavior = undefined;
     h.input("fresh-log", "New instruction", { source: "typed" });
@@ -9577,7 +9577,7 @@ test.each(["storage-file", "storage-symlink", "download"])("held-turn rebuild pr
     await h.router.tick();
   });
   expect(logs.filter(l => l.name === "turn.start" && l.ids?.messageId === messageId(id))).toHaveLength(1);
-  expect(logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId(id)).map(l => [l.props?.outcome, l.ok])).toEqual([["failed", false]]);
+  expect(logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId(id)).map(l => [l.props?.outcome, l.ok, l.props?.failCause])).toEqual([["failed", false, "undelivered"]]);
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
 });
 
@@ -12694,4 +12694,85 @@ test.each(["/status", "/Status", "/new", "/New"])("outage telemetry: substantive
   const payloads = inbounds(h.store).map(row => row.payload as import("../src/unanswered.ts").AnsweredInput);
   expect(payloads.find(input => input.id === "command")?.answeredAt).toBeNumber();
   expect(payloads.find(input => input.id === "earlier")?.answeredAt).toBeUndefined();
+});
+
+// #137: a failed turn.end row says why it failed, without any message or error text.
+test.each([
+  { name: "instant provider failure", diag: { runStatus: "failed", provider: "codex", model: "gpt-6-sol", runMs: 1_200 }, outcome: "failed" as const, error: "Rate limit exceeded PRIVATE_ERR", cause: "instant_fail", code: "rate_limited" },
+  { name: "slow provider failure", diag: { runStatus: "failed", provider: "claudeAgent", model: "claude-opus-5-5", runMs: 90_000 }, outcome: "failed" as const, error: "PRIVATE_ERR overloaded", cause: "provider_error", code: "overloaded" },
+  { name: "Robob restart", diag: { runStatus: "cancelled", cancelReason: "server_restart", runMs: 40_000 }, outcome: "interrupted" as const, error: "PRIVATE_ERR", cause: "robob_restart", code: "other" },
+  { name: "cancelled run", diag: { runStatus: "cancelled", cancelReason: "user_stop" }, outcome: "interrupted" as const, error: "PRIVATE_ERR", cause: "run_cancelled", code: "other" },
+  { name: "interrupted run", diag: { runStatus: "interrupted", cancelReason: "provider_interrupted" }, outcome: "interrupted" as const, error: "PRIVATE_ERR", cause: "run_cancelled", code: "other" },
+  { name: "OpenCode run without diagnostics", diag: undefined, outcome: "failed" as const, error: "Run failed without error details", cause: "instant_fail", code: "no_detail" },
+])("failed turn.end carries its cause: $name", async ({ diag, outcome, error, cause, code }) => {
+  const h = setup();
+  const logs = await captureLogs(async () => {
+    h.input("fail-cause", "PRIVATE_PROMPT", { source: "typed" });
+    await h.router.tick();
+    const step = h.backend.step("PRIVATE_TEXT", "error");
+    step.error = { type: "ProviderError", message: error };
+    h.backend.records.push({ id: "idle-fail-cause", type: "idle", outcome, ...(diag ? { diag } : {}), time: { created: Date.now() } } as MessageRecord);
+    await h.router.tick();
+  });
+  const ends = logs.filter(l => l.name === "turn.end" && l.ids?.messageId === messageId("fail-cause"));
+  expect(ends).toHaveLength(1);
+  expect(ends[0]!.ok).toBe(false);
+  expect(ends[0]!.props).toMatchObject({ outcome: "failed", failCause: cause, robobErrorCode: code, attempt: 1 });
+  expect(typeof ends[0]!.props?.requeued).toBe("boolean");
+  expect(ends[0]!.props?.sinceTurnStartMs).toBeNumber();
+  if (diag) expect(ends[0]!.props).toMatchObject({ robobRunStatus: diag.runStatus });
+  if (diag && "cancelReason" in diag) expect(ends[0]!.props).toMatchObject({ robobCancelReason: diag.cancelReason });
+  if (diag && "model" in diag) expect(ends[0]!.props).toMatchObject({ provider: diag.provider, model: diag.model });
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});
+
+test("a failed turn says whether it requeued the person's message, and its attempt number", async () => {
+  const h = setup();
+  h.input("wake:old", wakeBody());
+  await h.router.tick();
+  h.input("human", "Please answer");
+  h.store.updateInbound("human", "done");
+  const turn = h.store.get<{ messageId: string }>("activeTurn")!;
+  h.store.set(`turn-human:${turn.messageId}`, ["human"]);
+  const logs = await captureLogs(async () => {
+    h.backend.failed();
+    await h.router.tick();
+  });
+  const end = logs.find(l => l.name === "turn.end" && l.ids?.messageId === turn.messageId);
+  expect(logs.find(l => l.name === "inbound.requeued")?.props?.reason).toBe("turn_failed");
+  expect(end?.props).toMatchObject({ outcome: "failed", requeued: true, attempt: 1 });
+});
+
+test("a failed typed turn that is not requeued says so", async () => {
+  const h = setup();
+  const logs = await captureLogs(async () => {
+    h.input("fail-requeue", "PRIVATE_PROMPT", { source: "typed" });
+    await h.router.tick();
+    h.backend.failed();
+    await h.router.tick();
+  });
+  const end = logs.find(l => l.name === "turn.end" && l.ids?.messageId === messageId("fail-requeue"));
+  expect(inbounds(h.store).find(row => row.id === "fail-requeue")?.state).toBe("failed");
+  expect(end?.props).toMatchObject({ failCause: "instant_fail", requeued: false, attempt: 1 });
+});
+
+test("cause fields never break the turn.end row when the inputs are odd", async () => {
+  const h = setup();
+  const logs = await captureLogs(async () => {
+    h.input("fail-odd", "PRIVATE_PROMPT", { source: "typed" });
+    await h.router.tick();
+    const step = h.backend.step("PRIVATE_TEXT", "error");
+    step.error = { type: "ProviderError", message: 42 };
+    h.backend.records.push({ id: "idle-fail-odd", type: "idle", outcome: "failed",
+      diag: { runStatus: "PRIVATE STATUS with spaces", provider: "+971501234567", model: "PRIVATE model text", runMs: Number.NaN }, time: { created: Date.now() } } as MessageRecord);
+    await h.router.tick();
+  });
+  const end = logs.find(l => l.name === "turn.end" && l.ids?.messageId === messageId("fail-odd"));
+  expect(end?.props).toMatchObject({ outcome: "failed", robobErrorCode: "other" });
+  expect(["instant_fail", "provider_error"]).toContain(String(end?.props?.failCause));
+  expect(end?.props?.robobRunStatus).toBeUndefined();
+  expect(end?.props?.provider).toBeUndefined();
+  expect(end?.props?.model).toBeUndefined();
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE");
+  expect(JSON.stringify(logs)).not.toContain("971501234567");
 });

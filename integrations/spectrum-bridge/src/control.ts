@@ -53,6 +53,8 @@ export interface RunSummary {
   runId: string;
   ordinal: number;
   status: string;
+  /** Why a run ended `cancelled`/`interrupted` (contracts OrchestrationV2CancelReason); `server_restart` marks a Robob restart. */
+  cancelReason?: string | null;
   model?: ThreadSummary["model"];
   requestedAt?: string | null;
   startedAt?: string | null;
