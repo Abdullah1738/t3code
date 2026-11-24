@@ -247,7 +247,7 @@ test("box requests never reuse a pooled socket the box may have idle-closed", as
   closes.push(() => server.stop(true));
   let now = 1_000;
   const remote = new RemoteBox({ ...s.config, url: `http://127.0.0.1:${server.port}` }, s.store,
-    { now: () => now, active: () => true, log: () => {}, notice: async () => {} });
+    { now: () => now, active: () => true, log: () => {} });
   closes.push(() => remote.stop());
   for (let probe = 0; probe < 3; probe++) { await remote.tick(); now += 5_000; }
   expect(ports.length).toBeGreaterThanOrEqual(3);
