@@ -241,6 +241,20 @@ test.each(fetchFailures)("lease fetch diagnostics select only a safe error code:
   for (const value of ["PRIVATE_", "http"]) expect(JSON.stringify([rows, s.logs, raw])).not.toContain(value);
 });
 
+test("box requests never reuse a pooled socket the box may have idle-closed", async () => {
+  const s = setup(), ports: number[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (request, server) => {
+    ports.push(server.requestIP(request)!.port); return s.runner.handle(request); } });
+  closes.push(() => server.stop(true));
+  let now = 1_000;
+  const remote = new RemoteBox({ ...s.config, url: `http://127.0.0.1:${server.port}` }, s.store,
+    { now: () => now, active: () => true, log: () => {}, notice: async () => {} });
+  closes.push(() => remote.stop());
+  for (let probe = 0; probe < 3; probe++) { await remote.tick(); now += 5_000; }
+  expect(ports.length).toBeGreaterThanOrEqual(3);
+  expect(new Set(ports).size).toBe(ports.length);
+});
+
 test("probe loop delay is rounded without resetting the next readiness sample", async () => {
   const s = setup(), histogram = s.remote["callbackLoopDelay"];
   let max = 12_345_600_000, resets = 0;
