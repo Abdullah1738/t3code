@@ -84,6 +84,7 @@ export type MessageRecord =
 /** Backend facts about a run that did not succeed, for logging only (#137). */
 export interface RunDiag {
   runStatus: string;
+  cancelReason?: string;
   provider?: string;
   model?: string;
   runMs?: number;

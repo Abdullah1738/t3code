@@ -12700,8 +12700,9 @@ test.each(["/status", "/Status", "/new", "/New"])("outage telemetry: substantive
 test.each([
   { name: "instant provider failure", diag: { runStatus: "failed", provider: "codex", model: "gpt-6-sol", runMs: 1_200 }, outcome: "failed" as const, error: "Rate limit exceeded PRIVATE_ERR", cause: "instant_fail", code: "rate_limited" },
   { name: "slow provider failure", diag: { runStatus: "failed", provider: "claudeAgent", model: "claude-opus-5-5", runMs: 90_000 }, outcome: "failed" as const, error: "PRIVATE_ERR overloaded", cause: "provider_error", code: "overloaded" },
-  { name: "Robob restart", diag: { runStatus: "interrupted", runMs: 40_000 }, outcome: "interrupted" as const, error: "PRIVATE_ERR", cause: "robob_restart", code: "other" },
-  { name: "cancelled run", diag: { runStatus: "cancelled" }, outcome: "interrupted" as const, error: "PRIVATE_ERR", cause: "run_cancelled", code: "other" },
+  { name: "Robob restart", diag: { runStatus: "cancelled", cancelReason: "server_restart", runMs: 40_000 }, outcome: "interrupted" as const, error: "PRIVATE_ERR", cause: "robob_restart", code: "other" },
+  { name: "cancelled run", diag: { runStatus: "cancelled", cancelReason: "user_stop" }, outcome: "interrupted" as const, error: "PRIVATE_ERR", cause: "run_cancelled", code: "other" },
+  { name: "interrupted run", diag: { runStatus: "interrupted", cancelReason: "provider_interrupted" }, outcome: "interrupted" as const, error: "PRIVATE_ERR", cause: "run_cancelled", code: "other" },
   { name: "OpenCode run without diagnostics", diag: undefined, outcome: "failed" as const, error: "Run failed without error details", cause: "instant_fail", code: "no_detail" },
 ])("failed turn.end carries its cause: $name", async ({ diag, outcome, error, cause, code }) => {
   const h = setup();
@@ -12720,6 +12721,7 @@ test.each([
   expect(typeof ends[0]!.props?.requeued).toBe("boolean");
   expect(ends[0]!.props?.sinceTurnStartMs).toBeNumber();
   if (diag) expect(ends[0]!.props).toMatchObject({ robobRunStatus: diag.runStatus });
+  if (diag && "cancelReason" in diag) expect(ends[0]!.props).toMatchObject({ robobCancelReason: diag.cancelReason });
   if (diag && "model" in diag) expect(ends[0]!.props).toMatchObject({ provider: diag.provider, model: diag.model });
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
 });

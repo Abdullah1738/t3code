@@ -46,6 +46,7 @@ function runDiag(run: RunSummary): RunDiag {
   const started = run.startedAt ? Date.parse(run.startedAt) : NaN;
   const completed = run.completedAt ? Date.parse(run.completedAt) : NaN;
   return { runStatus: run.status,
+    ...(typeof run.cancelReason === "string" ? { cancelReason: run.cancelReason } : {}),
     ...(run.model ? { provider: run.model.instanceId, model: run.model.model } : {}),
     ...(Number.isFinite(started) && Number.isFinite(completed) && completed >= started ? { runMs: completed - started } : {}) };
 }

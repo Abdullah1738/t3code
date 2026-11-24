@@ -6104,6 +6104,7 @@ export class Router {
         && this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state === "pending");
       return { failCause, sinceTurnStartMs, attempt, requeued,
         ...(info?.diag?.runStatus ? { robobRunStatus: info.diag.runStatus } : {}),
+        ...(info?.diag?.cancelReason ? { robobCancelReason: info.diag.cancelReason } : {}),
         ...(errorCode ? { robobErrorCode: errorCode } : {}),
         ...(info?.diag?.provider ? { provider: info.diag.provider } : {}),
         ...(info?.diag?.model ? { model: info.diag.model } : {}) };

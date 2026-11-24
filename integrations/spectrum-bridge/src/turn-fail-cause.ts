@@ -8,6 +8,11 @@ export type FailCause = typeof FAIL_CAUSES[number];
 export const ROBOB_ERROR_CODES = ["selected_model", "rate_limited", "overloaded", "context_length", "auth", "refusal", "timeout", "no_detail", "other"] as const;
 export type RobobErrorCode = typeof ROBOB_ERROR_CODES[number];
 
+/** Robob's run cancel reasons (contracts OrchestrationV2CancelReason). Only these are logged. */
+export const CANCEL_REASONS = ["server_shutdown", "server_restart", "user_stop", "thread_reset", "thread_archive", "thread_settle", "thread_delete",
+  "workspace_change", "runtime_mode_change", "session_detach", "card_stop", "superseded", "promoted_to_steer", "task_cancel",
+  "delegated_parent_cancelled", "queued_cancel", "provider_cancelled", "provider_interrupted", "task_stalled", "unknown"] as const;
+
 /** A failed run this short is the instant-failure loop of #130, not a run that worked and then broke. */
 export const INSTANT_FAIL_MS = 5_000;
 
@@ -49,8 +54,12 @@ export function turnFailCause(input: { outcome: string; endReason?: string; link
   if (endReason === "expired") return "timeout";
   if (endReason === "undelivered") return linkDown ? "link_down" : "undelivered";
   const status = info?.diag?.runStatus;
-  if (status === "cancelled" || status === "rolled_back") return "run_cancelled";
-  if (status === "interrupted" || status === undefined && info?.idleOutcome === "interrupted") return "robob_restart";
+  // Robob ends its in-flight runs `cancelled` with these reasons when it restarts or shuts down
+  // (ProviderRuntimeRecoveryService); `interrupted` is a run.interrupt or provider interrupt.
+  const reason = info?.diag?.cancelReason;
+  if (reason === "server_restart" || reason === "server_shutdown") return "robob_restart";
+  if (status === "cancelled" || status === "interrupted" || status === "rolled_back"
+    || status === undefined && info?.idleOutcome === "interrupted") return "run_cancelled";
   if (status === "failed" || info?.idleOutcome === "failed" || info?.error !== undefined || info?.modelError) {
     const runMs = info?.diag?.runMs;
     const ms = typeof runMs === "number" && Number.isFinite(runMs) && runMs >= 0 ? runMs : sinceTurnStartMs;

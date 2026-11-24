@@ -24,7 +24,7 @@ import { cleanRenders, createRenderAggregation, renderChat } from "./log-renders
 import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./log-error.ts";
 import { CONTROL_REASONS, controlFailureProps } from "./control-errors.ts";
 import { LOOP_OPERATIONS, loopOperations, traceLoopOperation } from "./loop-stall.ts";
-import { FAIL_CAUSES, ROBOB_ERROR_CODES } from "./turn-fail-cause.ts";
+import { CANCEL_REASONS, FAIL_CAUSES, ROBOB_ERROR_CODES } from "./turn-fail-cause.ts";
 import { FETCH_CAUSES, cleanCardUrlClass, cleanRenderCardId, type CardFetchFailure } from "./log-card-fetch.ts";
 
 export type LogLine = {
@@ -153,9 +153,10 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     if (entry.name === "turn.end" && key === "endReason" && ["undelivered", "failed", "errored", "expired"].includes(String(value))) {
       props[key] = value; continue;
     }
-    if (entry.name === "turn.end" && ["failCause", "robobRunStatus", "robobErrorCode", "provider", "model", "requeued", "sinceTurnStartMs"].includes(key)) {
+    if (entry.name === "turn.end" && ["failCause", "robobRunStatus", "robobCancelReason", "robobErrorCode", "provider", "model", "requeued", "sinceTurnStartMs"].includes(key)) {
       if (key === "failCause" && FAIL_CAUSES.some(cause => cause === value)
         || key === "robobErrorCode" && ROBOB_ERROR_CODES.some(code => code === value)
+        || key === "robobCancelReason" && CANCEL_REASONS.some(reason => reason === value)
         || key === "robobRunStatus" && typeof value === "string" && /^[a-z][a-z_-]{0,29}$/.test(value)
         // Model ids are config labels (`claude-opus-5-5`, `ag/gemini-4-neon-high`), never message text.
         || (key === "provider" || key === "model") && typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_.:/@-]{0,99}$/.test(value) && !/\d{6,}/.test(value)

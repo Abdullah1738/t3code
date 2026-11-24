@@ -15,10 +15,14 @@ const paths: [string, Parameters<typeof turnFailCause>[0], FailCause][] = [
   ["delivery expiry", { outcome: "failed", endReason: "expired", sinceTurnStartMs: 0 }, "timeout"],
   ["never delivered", { outcome: "failed", endReason: "undelivered", sinceTurnStartMs: 0 }, "undelivered"],
   ["never delivered while the link is down", { outcome: "failed", endReason: "undelivered", linkDown: true, sinceTurnStartMs: 0 }, "link_down"],
-  ["cancelled run", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted", diag: { runStatus: "cancelled" } } }, "run_cancelled"],
+  ["Robob restart (cancelled, server_restart)", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted", diag: { runStatus: "cancelled", cancelReason: "server_restart" } } }, "robob_restart"],
+  ["Robob shutdown (cancelled, server_shutdown)", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted", diag: { runStatus: "cancelled", cancelReason: "server_shutdown" } } }, "robob_restart"],
+  ["cancelled run (user_stop)", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted", diag: { runStatus: "cancelled", cancelReason: "user_stop" } } }, "run_cancelled"],
+  ["cancelled run without a reason", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted", diag: { runStatus: "cancelled" } } }, "run_cancelled"],
   ["rolled back run", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted", diag: { runStatus: "rolled_back" } } }, "run_cancelled"],
-  ["interrupted run", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted", diag: { runStatus: "interrupted" } } }, "robob_restart"],
-  ["interrupted without diagnostics", { outcome: "failed", endReason: "errored", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted" } }, "robob_restart"],
+  ["interrupted run (provider_interrupted)", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted", diag: { runStatus: "interrupted", cancelReason: "provider_interrupted" } } }, "run_cancelled"],
+  ["interrupted run without a reason", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted", diag: { runStatus: "interrupted" } } }, "run_cancelled"],
+  ["interrupted without diagnostics", { outcome: "failed", endReason: "errored", sinceTurnStartMs: 0, info: { idleOutcome: "interrupted" } }, "run_cancelled"],
   ["failed run under 5 s", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 60_000, info: { idleOutcome: "failed", diag: { runStatus: "failed", runMs: 4_999 } } }, "instant_fail"],
   ["failed run of 5 s", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 0, info: { idleOutcome: "failed", diag: { runStatus: "failed", runMs: 5_000 } } }, "provider_error"],
   ["failed run, no run length, short turn", { outcome: "failed", endReason: "failed", sinceTurnStartMs: 1_000, info: { idleOutcome: "failed" } }, "instant_fail"],
@@ -62,7 +66,7 @@ test("a run that did not succeed carries its status, model and length; a success
   const runs: RunSummary[] = [
     { runId: "run:t:1", ordinal: 1, status: "completed", model: { instanceId: "codex", model: "gpt-6-sol" }, startedAt: "2026-11-23T01:00:00Z", completedAt: "2026-11-23T01:00:10Z" },
     { runId: "run:t:2", ordinal: 2, status: "failed", model: { instanceId: "antigravity", model: "ag/gemini-4-neon-high" }, startedAt: "2026-11-23T01:01:00Z", completedAt: "2026-11-23T01:01:01.500Z" },
-    { runId: "run:t:3", ordinal: 3, status: "cancelled", startedAt: null, completedAt: "2026-11-23T01:02:00Z" },
+    { runId: "run:t:3", ordinal: 3, status: "cancelled", cancelReason: "server_restart", startedAt: null, completedAt: "2026-11-23T01:02:00Z" },
   ];
   const message = (runId: string, n: number): ControlMessage => ({ messageId: `m${n}`, runId, role: "assistant", text: "PRIVATE_TEXT", streaming: false,
     createdAt: "2026-11-23T01:00:00Z", updatedAt: "2026-11-23T01:00:00Z" } as ControlMessage);
@@ -71,7 +75,7 @@ test("a run that did not succeed carries its status, model and length; a success
   expect(idles.map(record => record.diag)).toEqual([
     undefined,
     { runStatus: "failed", provider: "antigravity", model: "ag/gemini-4-neon-high", runMs: 1_500 },
-    { runStatus: "cancelled" },
+    { runStatus: "cancelled", cancelReason: "server_restart" },
   ]);
   expect(JSON.stringify(idles.map(record => record.diag))).not.toContain("PRIVATE");
 });
@@ -79,16 +83,16 @@ test("a run that did not succeed carries its status, model and length; a success
 test("the log keeps only clean cause fields on turn.end", async () => {
   const logs = await captureLogs(async () => {
     toolLog.write({ component: "router", kind: "perf", name: "turn.end", ok: false, durationMs: 1, ids: { chat: "owner" },
-      props: { outcome: "failed", endReason: "failed", failCause: "instant_fail", robobRunStatus: "failed", robobErrorCode: "rate_limited",
+      props: { outcome: "failed", endReason: "failed", failCause: "robob_restart", robobRunStatus: "cancelled", robobCancelReason: "server_restart", robobErrorCode: "rate_limited",
         provider: "codex", model: "ag/gemini-4-neon-high", attempt: 2, requeued: true, sinceTurnStartMs: 1_234 } });
     toolLog.write({ component: "router", kind: "perf", name: "turn.end", ok: false, durationMs: 1, ids: { chat: "owner" },
-      props: { outcome: "failed", failCause: "PRIVATE_cause", robobRunStatus: "PRIVATE status", robobErrorCode: "PRIVATE_code",
+      props: { outcome: "failed", failCause: "PRIVATE_cause", robobRunStatus: "PRIVATE status", robobCancelReason: "PRIVATE_reason", robobErrorCode: "PRIVATE_code",
         provider: "+971501234567", model: "PRIVATE model text", attempt: 0, requeued: "yes", sinceTurnStartMs: -1 } });
     // Cause keys mean nothing on other rows.
     toolLog.write({ component: "router", kind: "event", name: "turn.start", ids: { chat: "owner" }, props: { failCause: "instant_fail", model: "codex" } });
   });
   const ends = logs.filter(line => line.name === "turn.end");
-  expect(ends[0]!.props).toEqual({ outcome: "failed", endReason: "failed", failCause: "instant_fail", robobRunStatus: "failed", robobErrorCode: "rate_limited",
+  expect(ends[0]!.props).toEqual({ outcome: "failed", endReason: "failed", failCause: "robob_restart", robobRunStatus: "cancelled", robobCancelReason: "server_restart", robobErrorCode: "rate_limited",
     provider: "codex", model: "ag/gemini-4-neon-high", attempt: 2, requeued: true, sinceTurnStartMs: 1_234 });
   expect(ends[1]!.props).toEqual({ outcome: "failed" });
   expect(logs.find(line => line.name === "turn.start")?.props).toBeUndefined();
