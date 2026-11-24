@@ -21,6 +21,7 @@ import {
   handBack,
   inferGate,
   markSubtask,
+  refreshNote,
   PACKET_SUBTASK,
   passReview,
   reviewRoundStartedAt,
@@ -2579,6 +2580,102 @@ describe("marking subtasks", () => {
     expect(checkMark(card, "s2", "done", "review", null)).toMatchObject({ ok: false });
   });
 
+  it.each(["done", "skipped"] as const)(
+    "refreshes an earlier %s note without changing completion history",
+    (state) => {
+      const subtasks = markSubtask(planned(), "s1", state, "old evidence", owner, at);
+      const card = { number: 3, subtasks };
+      expect(kanbanOpenStep(card)).toBe(2);
+      expect(checkMark(card, "s1", state, "work", "new evidence")).toEqual({
+        ok: true,
+        refresh: true,
+      });
+      expect(checkMark(card, "s1", state, "evaluator", "new evidence")).toEqual({
+        ok: true,
+        refresh: true,
+      });
+      const refreshed = refreshNote(subtasks, "s1", "  new evidence  ");
+      expect(refreshed).toEqual(
+        subtasks.map((subtask) =>
+          subtask.id === "s1" ? { ...subtask, note: "new evidence" } : subtask,
+        ),
+      );
+      expect(kanbanOpenStep({ subtasks: refreshed })).toBe(2);
+      expect(subtasks[0]?.note).toBe("old evidence");
+      expect(
+        checkMark(card, "s1", state === "done" ? "skipped" : "done", "work", "new evidence"),
+      ).toEqual({
+        ok: false,
+        reason: "subtask s1 is in step 1; finish step 2 first",
+        denyReason: "subtask_not_in_current_step",
+      });
+    },
+  );
+
+  it.each(["done", "skipped"] as const)(
+    "refuses an empty or identical %s note and preserves open-to-open refusal",
+    (state) => {
+      const card = {
+        number: 3,
+        subtasks: markSubtask(planned(), "s1", state, "old evidence", owner, at),
+      };
+      for (const note of [null, "", "  ", "old evidence", "  old evidence  "]) {
+        expect(checkMark(card, "s1", state, "work", note)).toEqual({
+          ok: false,
+          reason: `subtask s1 is already ${state}${note?.trim() ? " with the same note" : ""}; to change its note, send state "${state}" with the new note`,
+          denyReason: "subtask_state_unchanged",
+        });
+      }
+      expect(
+        checkMark({ number: 3, subtasks: planned() }, "s1", "open", "evaluator", "new note"),
+      ).toEqual({
+        ok: false,
+        reason: "subtask s1 is already open",
+        denyReason: "subtask_state_unchanged",
+      });
+    },
+  );
+
+  it("keeps role and script ownership checks on finished notes", () => {
+    const card = { number: 3, subtasks: markSubtask(planned(), "s3", "done", "old", owner, at) };
+    expect(checkMark(card, "s3", "done", "work", "new")).toEqual({
+      ok: false,
+      reason: "subtask s3 is for the evaluator, not you",
+      denyReason: "subtask_owner_mismatch",
+    });
+    expect(checkMark(card, "s3", "done", "evaluator", "new")).toEqual({ ok: true, refresh: true });
+    expect(checkMark(card, "s3", "done", "review", "new")).toEqual({
+      ok: false,
+      reason: "a review ticks its subtasks with its verdict (card_review_result)",
+      denyReason: "review_verdict_required",
+    });
+    const scripts = {
+      ...card,
+      subtasks: card.subtasks.map((subtask) => ({
+        ...subtask,
+        owner: "script" as const,
+        script: "land",
+      })),
+    };
+    expect(checkMark(scripts, "s3", "done", "script", "new", "LAND")).toEqual({
+      ok: true,
+      refresh: true,
+    });
+    expect(checkMark(scripts, "s3", "done", "script", "new", "other")).toEqual({
+      ok: false,
+      reason: 'subtask s3 is for the script "land"',
+      denyReason: "subtask_script_mismatch",
+    });
+    const unnamed = {
+      ...scripts,
+      subtasks: scripts.subtasks.map(({ script: _script, ...subtask }) => subtask),
+    };
+    expect(checkMark(unnamed, "s3", "done", "script", "new", "any")).toEqual({
+      ok: true,
+      refresh: true,
+    });
+  });
+
   it("moves through the steps as they finish, and a review pass ticks the review", () => {
     let card = { subtasks: planned() };
     expect(kanbanOpenStep(card)).toBe(1);
@@ -3772,6 +3869,36 @@ describe("interrupting release pacing", () => {
       expect(
         checkMark({ ...card, subtasks: [done] }, done.id, "done", role, null, null, correcting).ok,
       ).toBe(allowed);
+    },
+  );
+  it.each([
+    { role: "evaluator", interrupting: true, correcting: true, refresh: false },
+    { role: "evaluator", interrupting: true, correcting: false, refresh: true },
+    { role: "evaluator", interrupting: false, correcting: true, refresh: true },
+    { role: "work", interrupting: true, correcting: true, refresh: true },
+    { role: "script", interrupting: true, correcting: true, refresh: true },
+  ] as const)(
+    "distinguishes a new note from release correction: $role/$interrupting/$correcting",
+    ({ role, interrupting, correcting, refresh }) => {
+      const done = {
+        ...subtask,
+        owner: role,
+        script: "release",
+        state: "done" as const,
+        interrupting,
+        note: "old",
+      };
+      expect(
+        checkMark(
+          { ...card, subtasks: [done] },
+          done.id,
+          "done",
+          role,
+          "new",
+          "release",
+          correcting,
+        ),
+      ).toEqual(refresh ? { ok: true, refresh: true } : { ok: true });
     },
   );
   it("post-hoc timestamps skip only pacing, preserving owner-only and other approval gates", () => {

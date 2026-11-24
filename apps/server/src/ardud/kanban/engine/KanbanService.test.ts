@@ -16786,6 +16786,300 @@ it.effect("verified ignores a stored secret gate on completed worker logging (9r
   }),
 );
 
+it.effect("refreshing a finished note saves one event without advancing or waking the card", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Refresh evidence",
+          prompt: "Work",
+          subtasks: [
+            { text: "Write PR", owner: "work" },
+            { text: "Review", owner: "review" },
+          ],
+        },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+      yield* kanban.markSubtask(card.id, "s1", "done", "old SHA", worker, "work");
+      const before = yield* kanban.card(card.id);
+      const threadsBefore = structuredClone(yield* Ref.get(fake.threads));
+      const refreshed = yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "  new SHA; green run  ",
+        worker,
+        "work",
+      );
+      assert.deepStrictEqual(refreshed, {
+        ...before.card,
+        updatedAt: refreshed.updatedAt,
+        subtasks: before.card.subtasks.map((subtask) =>
+          subtask.id === "s1" ? { ...subtask, note: "new SHA; green run" } : subtask,
+        ),
+      });
+      const after = yield* kanban.card(card.id);
+      assert.deepStrictEqual(after.card, refreshed);
+      const events = after.events.filter((event) => event.id > (before.events.at(-1)?.id ?? 0));
+      assert.strictEqual(events.length, 1);
+      assert.strictEqual(events[0]?.kind, "subtask");
+      assert.strictEqual(events[0]?.body, "s1 note updated: Write PR (new SHA; green run)");
+      assert.deepStrictEqual(yield* Ref.get(fake.threads), threadsBefore);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("refreshing a deploy note needs no new approval and preserves release receipts", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Deployed evidence",
+          prompt: "Work",
+          subtasks: [
+            {
+              text: "Deploy",
+              owner: "evaluator",
+              gate: "deploy",
+              interrupting: true,
+              service: "robob",
+            },
+          ],
+        },
+        evaluator,
+      );
+      // Retained completion after its approval was removed or expired.
+      const finished: KanbanCard = {
+        ...card,
+        stage: "deployed",
+        wakeNote: "Keep this wake note",
+        subtasks: card.subtasks.map((subtask) => ({
+          ...subtask,
+          state: "done",
+          note: "old receipt",
+          doneAt: card.createdAt,
+          doneBy: evaluator,
+        })),
+      };
+      yield* store.putCard(finished);
+      yield* store.putBoard({
+        ...board,
+        releaseLedger: [
+          {
+            boardId: board.id,
+            cardId: card.id,
+            cardNumber: card.number,
+            subtaskId: "s1",
+            at: card.createdAt,
+            service: "robob",
+            postHoc: true,
+            critical: null,
+            approvalId: null,
+          },
+        ],
+      });
+      const boardBefore = yield* store.board(board.id);
+      const before = yield* kanban.card(card.id);
+      const refreshed = yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "new receipt",
+        evaluator,
+        "evaluator",
+      );
+      assert.deepStrictEqual(refreshed, {
+        ...finished,
+        updatedAt: refreshed.updatedAt,
+        subtasks: [{ ...finished.subtasks[0]!, note: "new receipt" }],
+      });
+      assert.deepStrictEqual(yield* store.board(board.id), boardBefore);
+      assert.strictEqual((yield* kanban.card(card.id)).events.length, before.events.length + 1);
+      const invalid = yield* kanban
+        .markSubtask(card.id, "s1", "done", "later receipt", evaluator, "evaluator", card.createdAt)
+        .pipe(Effect.flip);
+      assert.include(invalid.detail, "no standing deploy approval");
+      assert.deepStrictEqual(yield* store.board(board.id), boardBefore);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).card, refreshed);
+
+      yield* store.putBoard({
+        ...boardBefore!,
+        standingApprovals: [
+          {
+            id: "sa-refresh-correction",
+            gate: "deploy",
+            quote: "Boards may release on their own",
+            sourceThreadId: "owner-thread",
+            saidAt: card.createdAt,
+            approvedAsk: { cardId: "source", askId: "q1" },
+            recordedAt: card.createdAt,
+            recordedBy: evaluator.threadId,
+            revokedAt: null,
+            revokedBy: null,
+            revokeReason: null,
+          },
+        ],
+      });
+      yield* TestClock.adjust("1 hour");
+      const restartedAt = DateTime.formatIso(
+        DateTime.add(DateTime.makeUnsafe(card.createdAt), { minutes: 30 }),
+      );
+      const corrected = yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "new receipt",
+        evaluator,
+        "evaluator",
+        restartedAt,
+      );
+      assert.strictEqual(corrected.subtasks[0]!.state, "done");
+      assert.notStrictEqual(corrected.subtasks[0]!.doneAt, refreshed.subtasks[0]!.doneAt);
+      const ledger = (yield* store.board(board.id))!.releaseLedger!;
+      assert.lengthOf(ledger, 1);
+      assert.strictEqual(ledger[0]!.at, restartedAt);
+      assert.isTrue(ledger[0]!.postHoc);
+      assert.include((yield* kanban.card(card.id)).events.at(-1)!.body!, "s1 done:");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  { state: "open", requested: "skipped" },
+  { state: "done", requested: "skipped" },
+  { state: "open", requested: "done" },
+  { state: "skipped", requested: "done" },
+] as const)(
+  "a refresh-only $requested request refuses a subtask changed to $state under the service lock",
+  ({ state, requested }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Raced refresh",
+            prompt: "Work",
+            subtasks: [{ text: "Deploy", owner: "evaluator", gate: "deploy" }],
+          },
+          owner,
+        );
+        const changed: KanbanCard = {
+          ...card,
+          subtasks: card.subtasks.map((subtask) => ({
+            ...subtask,
+            state,
+            note: state !== "open" ? "deployed" : null,
+            doneBy: state !== "open" ? evaluator : null,
+            doneAt: state !== "open" ? card.createdAt : null,
+          })),
+        };
+        yield* store.putCard(changed);
+        const events = (yield* kanban.card(card.id)).events;
+        const denied = yield* kanban
+          .markSubtask(
+            card.id,
+            "s1",
+            requested,
+            "New evidence",
+            evaluator,
+            "evaluator",
+            undefined,
+            true,
+          )
+          .pipe(Effect.flip);
+        assert.include(denied.detail, "only refreshing its finished note is allowed");
+        assert.strictEqual(denied.reason, "conflict");
+        assert.deepStrictEqual((yield* kanban.card(card.id)).card, changed);
+        assert.deepStrictEqual((yield* kanban.card(card.id)).events, events);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["work", "script"] as const)(
+  "only evaluators refresh settled %s subtask notes",
+  (role) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Settled", prompt: "Work", subtasks: [{ text: "Work", owner: role }] },
+          owner,
+        );
+        const scriptId = KanbanScriptId.make("script-land");
+        if (role === "script")
+          yield* store.putScript({
+            id: scriptId,
+            boardId: board.id,
+            name: "land",
+            path: "/unused/land.sh",
+            trigger: { _tag: "manual" },
+            enabled: true,
+            createdBy: owner,
+            createdAt: card.createdAt,
+            lastRun: null,
+          });
+        const actor: KanbanActor =
+          role === "script"
+            ? { _tag: "script", scriptId }
+            : { _tag: "thread", threadId: ThreadId.make("work") };
+        const settled: KanbanCard = {
+          ...card,
+          stage: "verified",
+          settledAt: card.createdAt,
+          subtasks: card.subtasks.map((subtask) => ({
+            ...subtask,
+            state: "skipped",
+            note: "no work",
+            doneBy: actor,
+            doneAt: card.createdAt,
+          })),
+        };
+        yield* store.putCard(settled);
+        const denied = yield* kanban
+          .markSubtask(card.id, "s1", "skipped", "new reason", actor, role)
+          .pipe(Effect.flip);
+        assert.include(
+          denied.detail,
+          "only an evaluator can refresh a settled card's subtask note",
+        );
+        assert.strictEqual(denied.reason, "card_settled");
+        assert.deepStrictEqual((yield* kanban.card(card.id)).card, settled);
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const refreshed = yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "skipped",
+          "new reason",
+          evaluator,
+          "evaluator",
+        );
+        assert.deepStrictEqual(refreshed, {
+          ...settled,
+          updatedAt: refreshed.updatedAt,
+          subtasks: [{ ...settled.subtasks[0]!, note: "new reason" }],
+        });
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("a card follows its subtasks: work, review, the evaluator's step, then work again", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

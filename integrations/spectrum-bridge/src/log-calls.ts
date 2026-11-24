@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { LogLine } from "./toollog.ts";
 
 const CALLS: Record<string, string> = {
-  "GET /health": "health", "GET /projects": "projects", "GET /threads": "threads",
+  "GET /messages": "crossThreadMessages", "GET /health": "health", "GET /projects": "projects", "GET /threads": "threads",
   "POST /threads": "createThread", "GET /threads/:id": "thread", "PATCH /threads/:id": "settle",
   "GET /threads/by-native/:id": "byNative", "GET /threads/:id/messages": "messages",
   "GET /threads/:id/runs/:id/evidence": "runEvidence", "POST /threads/:id/requests/:id/respond": "respond",

@@ -6,7 +6,7 @@ import { OpenChamber, type MessageRecord } from "../src/openchamber.ts";
 import { Router } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 import { captureLogs } from "./log-fixture.ts";
-import { WakeDelivery, wakeId, wakeStatus, WAKE_AMBIGUITY_MS } from "../src/wake-delivery.ts";
+import { WakeDelivery, wakeId, wakeStatus, WAKE_AMBIGUITY_MS, WAKE_DELIVERY_MS } from "../src/wake-delivery.ts";
 import { createApi } from "../src/api.ts";
 import { parseCommand } from "../src/cli.ts";
 import { RobobLinkDown } from "../src/robob-link-gate.ts";
@@ -111,7 +111,8 @@ test.each([false, true].flatMap(gateDown => [false, true].map(restart => ({ gate
     expect(h.store.get<{ id: string }[]>("missedSynthetic")?.map(row => row.id)).toEqual([id]);
   });
   expect(logs.filter(line => line.name === "wake.failed")).toHaveLength(1);
-  expect(logs.find(line => line.name === "wake.failed")?.props).toMatchObject({ reason: "delivery_deadline", attempt: 0 });
+  expect(logs.find(line => line.name === "wake.failed")?.props).toMatchObject({ reason: "delivery_deadline", attempt: 0,
+    stage: "synthetic", boundMs: WAKE_DELIVERY_MS });
   expect(logs.some(line => line.name === "wake.waiting" && line.props?.holderPhase === "running")).toBe(true);
 });
 
@@ -125,6 +126,9 @@ test.each(["main.ts", "sb-main.ts"].flatMap(file => [false, true].flatMap(restar
   h.backend.messages = async () => { backendCalls++; return []; };
   const errors: unknown[] = [], checks: Promise<void>[] = [];
   const backendWork = async () => { backendCalls++; };
+  class MarkerBackend {
+    async beginMessageTick(_ids: string[]) { backendCalls++; }
+  }
   const clock = {
     checkInboundLatency: (...args: Parameters<Router["checkInboundLatency"]>) => {
       const check = router.checkInboundLatency(...args); checks.push(check); return check;
@@ -140,12 +144,12 @@ test.each(["main.ts", "sb-main.ts"].flatMap(file => [false, true].flatMap(restar
   expect(begin).toBeGreaterThan(0); expect(end).toBeGreaterThan(begin);
   let fire: (() => void) | undefined;
   const interval = new Bun.Transpiler({ loader: "ts" }).transformSync(source.slice(begin, end + "  }, 1_000);".length));
-  const install = new Function("setInterval", "ready", "router", "delivery", "replyGap", "chats", "toolError", "log",
+  const install = new Function("setInterval", "ready", "router", "delivery", "replyGap", "chats", "toolError", "log", "store", "backend", "RobobBackend",
     `let routerBusy = true;\n${interval}`);
   let ready = initiallyReady;
   install((callback: () => void, ms: number) => { expect(ms).toBe(1_000); fire = callback; }, () => ready,
-    clock, delivery, replyGap, { all: () => [{ parts: { router: clock, delivery, replyGap, busy: true } }] },
-    (...args: unknown[]) => errors.push(args), (...args: unknown[]) => errors.push(args));
+    clock, delivery, replyGap, { all: () => [{ store: h.store, parts: { router: clock, delivery, replyGap, busy: true } }] },
+    (...args: unknown[]) => errors.push(args), (...args: unknown[]) => errors.push(args), h.store, new MarkerBackend(), MarkerBackend);
   fire!(); await Promise.all(checks.splice(0));
   backendCalls = 0; ready = false;
   const logs = await captureLogs(async () => {
@@ -242,7 +246,7 @@ test.each(["wake:failed-sibling", "wake:reply-nudge:failed-sibling"].flatMap(fai
   const h = setup();
   const tracker = new WakeDelivery(h.store); tracker.accept(id);
   h.store.acceptInbound(failedId, { id: failedId, text: "PRIVATE_FAILED", attachments: [], receivedAt: start });
-  tracker.accept(failedId); tracker.failed(failedId, "attempts_exhausted");
+  tracker.accept(failedId); tracker.failed(failedId, "attempts_exhausted", "synthetic");
   const leader = failedLeader ? failedId : id, member = failedLeader ? id : failedId;
   h.store.set(`batch:${leader}`, { id: leader, text: "PRIVATE_BATCH", attachments: [], batchIds: [leader, member], receivedAt: start });
   h.store.updateInbound(leader, "processing"); h.store.updateInbound(member, "batched");
@@ -352,7 +356,7 @@ test.each(["queued", "sending", "ambiguous", "admitted", "failed"] as const)("GE
     if (state !== "queued") tracker.sending(apiId, "session");
     if (state === "ambiguous") tracker.ambiguous(apiId, new ControlError(0), 60_000);
     if (state === "admitted") tracker.admitted(apiId);
-    if (state === "failed") tracker.failed(apiId, "ambiguity_deadline");
+    if (state === "failed") tracker.failed(apiId, "ambiguity_deadline", "synthetic");
     const before = JSON.stringify(h.store.get(`wake-delivery:${apiId}`));
     const result = await h.get(apiId);
     expect(result.status).toBe(200);
@@ -652,6 +656,10 @@ test("lifecycle logs retain source, waiting run, retry timing and final outcomes
   const started = lifecycle.find(line => line.name === "wake.turn_start" && line.ids?.inboundId === id)!;
   expect(started.props).toMatchObject({ source, holderRunId: "prior-run", waitMs: 60_000, batchSize: 1 });
   expect(lifecycle.find(line => line.name === "wake.send_ambiguous")?.props).toMatchObject({ route: "/threads/:id/send" });
+  const exhausted = lifecycle.find(line => line.name === "wake.failed" && line.ids?.inboundId === id)!;
+  expect(exhausted.props).toMatchObject({ reason: "attempts_exhausted", stage: "synthetic" });
+  expect(exhausted.props?.attempt).toBeGreaterThanOrEqual(1);
+  expect(exhausted.props).not.toHaveProperty("boundMs");
   expect(lifecycle.filter(line => line.ids?.inboundId === id).every(line => line.props?.source === source)).toBe(true);
   expect(JSON.stringify(lifecycle)).not.toMatch(/PRIVATE_EVENT|PRIVATE_NEXT/);
 });
@@ -673,4 +681,44 @@ test.each(["absent", "unreadable"] as const)("a timed-out wake whose probe is %s
     expect(new Set(h.backend.prompts)).toEqual(new Set([promptId]));
     if (outcome === "unreadable") expect(h.backend.prompts).toEqual([promptId]);
   });
+});
+
+test.each([false, true])("an agent-bus wake queued behind a running holder ends agent_bus_timeout at its bound, never attempts_exhausted (restart=%s)", async restart => {
+  const h = setup(), bus = "wake:agent-bus:held-behind-owner";
+  h.store.updateInbound(id, "done");
+  h.store.acceptInbound(bus, { id: bus, text: "[Agent request PRIVATE_ASK]", attachments: [], isAudioMessage: false,
+    receivedAt: start, agentExpiresAt: start + 10 * 60_000 } as never);
+  const holder = { id: "session", directory: "/test/chat", generation: 1, inboundId: "reset:holder",
+    messageId: "msg_holder", phase: "running", startedAt: start - 60_000 };
+  h.store.set("route", { id: holder.id, directory: holder.directory, generation: holder.generation });
+  h.store.set("activeTurn", holder);
+  const logs = await captureLogs(async () => {
+    let router = h.router();
+    new WakeDelivery(h.store).accept(bus);
+    new WakeDelivery(h.store).waiting(bus, "holder-run");
+    setSystemTime(start + 10 * 60_000 - 1);
+    await router.tick(); await router.checkInboundLatency();
+    expect(wakeStatus(h.store, bus)?.state).toBe("queued");
+    if (restart) router = h.router();
+    setSystemTime(start + 10 * 60_000 + 95);
+    await router.tick(); await router.checkInboundLatency(); await router.tick();
+    expect(wakeStatus(h.store, bus)).toMatchObject({ state: "failed", attempts: 0 });
+    expect(h.backend.prompts).toEqual([]);
+  });
+  const failed = logs.filter(line => line.name === "wake.failed");
+  expect(failed).toHaveLength(1);
+  expect(failed[0]?.props).toMatchObject({ reason: "agent_bus_timeout", stage: "synthetic", boundMs: 10 * 60_000,
+    attempt: 0, ageMs: 10 * 60_000 + 95, holderRunId: "holder-run" });
+  expect(JSON.stringify(logs)).not.toMatch(/attempts_exhausted|PRIVATE_ASK/);
+});
+
+test("exhaustion with no send ever made is logged as the stage failure, once", async () => {
+  const h = setup();
+  const logs = await captureLogs(async () => {
+    const tracker = new WakeDelivery(h.store);
+    tracker.accept(id); tracker.failed(id, "attempts_exhausted", "dispatch"); tracker.failed(id, "agent_bus_timeout", "synthetic");
+  });
+  const failed = logs.filter(line => line.name === "wake.failed");
+  expect(failed.map(line => line.props)).toEqual([expect.objectContaining({ reason: "inbound_failed", stage: "dispatch", attempt: 0 })]);
+  expect(failed[0]?.props).not.toHaveProperty("boundMs");
 });

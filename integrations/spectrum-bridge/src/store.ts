@@ -11,6 +11,8 @@ const steerSourceKey = (sessionId: string, generation: number, inboundId: string
 export type FileAttachment = { sha256: string; name: string; mimeType: string; size: number };
 export type ReplyAttribution = { inboundId?: string; covered?: string[]; attribution?: "explicit" | "active_turn" | "pending_inbound" | "none" };
 export const RECENT_REPLY_TURN_MS = 5 * 60_000;
+/** An un-quoted send can only plausibly answer queued messages from the last hour, not stranded history. */
+export const PENDING_ATTRIBUTION_MAX_AGE_MS = 60 * 60_000;
 export type OutboxPoll = { title: string; options: string[] };
 export type OutboxApp = {
   url: string; caption: string; subcaption?: string; trailingCaption?: string; trailingSubcaption?: string; summary?: string;
@@ -268,10 +270,13 @@ export class Store {
           AND json_extract(payload, '$.answeredAt') IS NULL
           AND json_extract(payload, '$.settledAt') IS NULL
         ORDER BY rowid`).all();
+      const now = Date.now();
       const pendingCovered = pendingRows.filter(row => {
         if (!humanRow(row.id)) return false;
         const input = JSON.parse(row.payload) as AnsweredInput;
         if (!humanInput(input) && !(input.source === undefined && input.id === row.id && Array.isArray(input.attachments))) return false;
+        if (typeof input.receivedAt !== "number" || !Number.isFinite(input.receivedAt)
+          || now - input.receivedAt > PENDING_ATTRIBUTION_MAX_AGE_MS) return false;
         return !/^\/(?:new|stop|reset)\b/i.test((input.text ?? "").trim());
       }).map(row => row.id);
       if (pendingCovered.length > 0) {

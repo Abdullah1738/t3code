@@ -9,7 +9,7 @@ import { HUMAN_FAILURE_BACKOFF_MS, MAX_FAILED_ATTEMPTS, requeueHuman } from "../
 import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "../src/openchamber.ts";
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
 import { Router } from "../src/router.ts";
-import { Store } from "../src/store.ts";
+import { PENDING_ATTRIBUTION_MAX_AGE_MS, Store } from "../src/store.ts";
 import type { AnsweredInput } from "../src/unanswered.ts";
 import { captureLogs } from "./log-fixture.ts";
 
@@ -244,6 +244,91 @@ test("#111 Attribution A guard: does NOT over-credit pending inbound while activ
   expect(h.inboundRow("M1").payload.answeredAt).toBeNumber();
   expect(h.inboundRow("M2").payload.answeredAt).toBeUndefined();
   expect(h.inboundRow("M2").state).toBe("pending");
+});
+
+// #138: one owner reply on 23 Nov 17:50Z credited 212 stranded rows up to 74 days old.
+async function answeredTurnWithQueued(start: number, queued: { id: string; receivedAt?: number; state: "pending" | "batched" }[]) {
+  setSystemTime(start);
+  const h = setup({ replyMode: "tool" });
+  h.input("M1", "First question");
+  await h.router.tick();
+  const api = createApi({
+    store: h.store,
+    router: () => h.router,
+    photon: { react: async () => {} },
+    chatGuid: () => BASE_OPTIONS.chatGuid,
+    enabled: () => true,
+    health: () => ({}),
+  });
+  const send = (dedupeKey: string) => api(new Request("http://localhost/send", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionId: "ses_1", dedupeKey, text: "Answer" }),
+  }));
+  expect((await send("reply-1")).status).toBe(202);
+  await deliverAll(h.store);
+  expect(h.inboundRow("M1").payload.answeredAt).toBeNumber();
+  for (const row of queued) {
+    h.input(row.id, `queued ${row.id}`, { receivedAt: row.receivedAt });
+    if (row.state === "batched") h.store.updateInbound(row.id, "batched");
+  }
+  const logs = await captureLogs(async () => {
+    expect((await send("reply-2")).status).toBe(202);
+    await deliverAll(h.store);
+  });
+  return { h, logs };
+}
+
+test("#138 pending_inbound credits only queued rows from the last hour", async () => {
+  const start = Date.parse("2026-11-23T17:50:00Z");
+  const { h, logs } = await answeredTurnWithQueued(start, [
+    { id: "STALE_7D", receivedAt: start - 7 * 24 * 60 * 60_000, state: "batched" },
+    { id: "STALE_2H", receivedAt: start - 2 * 60 * 60_000, state: "pending" },
+    { id: "JUST_OVER", receivedAt: start - PENDING_ATTRIBUTION_MAX_AGE_MS - 1, state: "pending" },
+    { id: "UNDATED", receivedAt: undefined, state: "pending" },
+    { id: "NAN", receivedAt: Number.NaN, state: "batched" },
+    { id: "AT_LIMIT", receivedAt: start - PENDING_ATTRIBUTION_MAX_AGE_MS, state: "batched" },
+    { id: "RECENT", receivedAt: start - 30 * 60_000, state: "pending" },
+  ]);
+  const sent = logs.find(l => l.name === "reply.sent" && l.props?.kind === "conversation");
+  expect(sent?.props?.attribution).toBe("pending_inbound");
+  expect(sent?.ids?.inboundId).toBe("AT_LIMIT");
+  expect(h.inboundRow("AT_LIMIT").payload.answeredAt).toBeNumber();
+  expect(h.inboundRow("RECENT").payload.answeredAt).toBeNumber();
+  for (const id of ["STALE_7D", "STALE_2H", "JUST_OVER", "UNDATED", "NAN"]) {
+    expect(h.inboundRow(id).payload.answeredAt).toBeUndefined();
+  }
+  expect(logs.filter(l => l.name === "inbound.answered").map(l => l.ids?.inboundId).sort()).toEqual(["AT_LIMIT", "RECENT"]);
+});
+
+test("#138 only stale or undated queued rows: un-quoted send credits none of them", async () => {
+  const start = Date.parse("2026-11-23T17:50:00Z");
+  const { h, logs } = await answeredTurnWithQueued(start, [
+    { id: "STALE_74D", receivedAt: start - 74 * 24 * 60 * 60_000, state: "batched" },
+    { id: "STALE_2H", receivedAt: start - 2 * 60 * 60_000, state: "pending" },
+    { id: "UNDATED", receivedAt: undefined, state: "batched" },
+  ]);
+  const sent = logs.find(l => l.name === "reply.sent" && l.props?.kind === "conversation");
+  expect(sent?.props?.attribution).not.toBe("pending_inbound");
+  for (const id of ["STALE_74D", "STALE_2H", "UNDATED"]) {
+    const row = h.inboundRow(id);
+    expect(row.payload.answeredAt).toBeUndefined();
+    expect(row.state).not.toBe("done");
+  }
+  expect(logs.filter(l => l.name === "inbound.answered")).toHaveLength(0);
+});
+
+test("#138 the first unanswered sweep settles stranded rows even in a group chat", async () => {
+  const start = Date.parse("2026-11-24T08:00:00Z");
+  setSystemTime(start);
+  const h = setup();
+  h.input("OCT21", "stranded", { receivedAt: Date.parse("2026-10-21T10:00:00Z") });
+  h.store.updateInbound("OCT21", "batched");
+  h.store.set("unanswered-chat", "other");
+  await h.router.checkUnanswered();
+  expect(h.inboundRow("OCT21").state).toBe("done");
+  expect(h.inboundRow("OCT21").payload.settledReason).toBe("stale_stranded");
+  expect(h.inboundRow("OCT21").payload.answeredAt).toBeUndefined();
 });
 
 test("#111 own-turn NO_REPLY settles cleanly (23 Nov BB27B14C replay): no requeue loop, answeredAt stays unset, #59 alarm stays silent", async () => {

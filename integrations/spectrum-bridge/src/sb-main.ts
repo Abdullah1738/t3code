@@ -408,6 +408,11 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     if (ready()) for (const chat of chats.all()) void (chat.parts.remote ?? chat.parts.router)?.checkUnanswered().catch(error => toolError("sb-main", "unanswered.check", error));
   }, 60_000);
   const timer = setInterval(() => {
+    if (ready() && backend instanceof RobobBackend) backend.beginMessageTick(chats.all().flatMap(chat => {
+      if (chat.parts.remote) return [];
+      const route = chat.store.get<{ id: string } | null>("route");
+      return route ? [route.id] : [];
+    }));
     for (const chat of chats.all()) {
       if (chat.parts.remote) {
         void chat.parts.mirror?.tick().catch(() => log("mirror-worker-failed"));

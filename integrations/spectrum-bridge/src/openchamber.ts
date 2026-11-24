@@ -78,8 +78,17 @@ export type MessageRecord =
       time: { created: number; completed?: number };
       [key: string]: unknown;
     }
-  | { id: string; type: "idle"; outcome: "succeeded" | "failed" | "interrupted"; firstTurnFailure?: boolean; modelError?: boolean; completedAt?: number; time: { created: number }; [key: string]: unknown }
+  | { id: string; type: "idle"; outcome: "succeeded" | "failed" | "interrupted"; firstTurnFailure?: boolean; modelError?: boolean; completedAt?: number; diag?: RunDiag; time: { created: number }; [key: string]: unknown }
   | { id: string; type: "agent-switched" | "model-switched" | "location-switched" | "synthetic" | "system" | "skill" | "shell" | "compaction"; time: { created: number }; [key: string]: unknown };
+
+/** Backend facts about a run that did not succeed, for logging only (#137). */
+export interface RunDiag {
+  runStatus: string;
+  cancelReason?: string;
+  provider?: string;
+  model?: string;
+  runMs?: number;
+}
 
 /** A native attachment the router prepared; sent as an OpenCode 2 prompt file (`uri` data URL). */
 export interface FilePart {

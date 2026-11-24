@@ -79,6 +79,13 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
   return records;
 }
 
+// Run diagnostics for the log (#137) came after the optimization; the oracle predates them.
+const withoutDiag = (records: MessageRecord[]) => records.map(record => {
+  if (record.type !== "idle" || !("diag" in record)) return record;
+  const { diag: _diag, ...rest } = record;
+  return rest;
+});
+
 test("recordsFromThread matches the original on 512 seeded mixed histories", () => {
   let seed = 0x93b0d6e7;
   const random = (limit: number) => {
@@ -112,11 +119,11 @@ test("recordsFromThread matches the original on 512 seeded mixed histories", () 
     // Duplicate references exercise stable sorting without mutating the input array.
     if (messages.length) messages.push(pick(messages));
     const original = structuredClone({ thread, messages });
-    expect(optimizedRecordsFromThread(thread, messages)).toEqual(recordsFromThread(thread, messages));
+    expect(withoutDiag(optimizedRecordsFromThread(thread, messages))).toEqual(recordsFromThread(thread, messages));
     expect({ thread, messages }).toEqual(original);
     if (messages.length) {
       messages[0]!.createdAt = pick(dates); messages[0]!.text = pick(texts);
-      expect(optimizedRecordsFromThread(thread, messages)).toEqual(recordsFromThread(thread, messages));
+      expect(withoutDiag(optimizedRecordsFromThread(thread, messages))).toEqual(recordsFromThread(thread, messages));
     }
   }
 });

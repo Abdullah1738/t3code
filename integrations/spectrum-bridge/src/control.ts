@@ -22,6 +22,7 @@ const LOOPBACK = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::[0-9]+)?\/?$/i
 export type ThreadState = "idle" | "running" | "waiting" | "needs-input" | "queued";
 
 export interface ThreadSummary {
+  changeMarker?: number;
   threadId: string;
   projectId: string;
   title: string;
@@ -52,6 +53,8 @@ export interface RunSummary {
   runId: string;
   ordinal: number;
   status: string;
+  /** Why a run ended `cancelled`/`interrupted` (contracts OrchestrationV2CancelReason); `server_restart` marks a Robob restart. */
+  cancelReason?: string | null;
   model?: ThreadSummary["model"];
   requestedAt?: string | null;
   startedAt?: string | null;
@@ -166,6 +169,8 @@ export function discoverControlConfig(options: ControlConfigOptions = {}): { url
 const linkGates = new Map<string, RobobLinkGate>();
 
 export class ControlClient {
+  private readTickId?: string;
+  beginReadTick(id: string): void { this.readTickId = id; }
   readonly linkGate?: RobobLinkGate;
   readonly url: string;
   private readonly token: string;
@@ -203,6 +208,22 @@ export class ControlClient {
     toolLog.capture(() => {
       const encoded = /^\/threads\/(?!by-native(?:\/|$))([^/?]+)/.exec(path)?.[1];
       loggingIds = { ...toolLog.runIds(encoded ? decodeURIComponent(encoded) : undefined), requestId };
+      if (this.readTickId) loggingIds.tickId = this.readTickId;
+      const field = method !== "GET" ? undefined : route === "/threads/:id/runs/:id/evidence" ? "evidenceReads"
+        : route === "/threads/:id" || route === "/threads/by-native/:id" ? "detailReads"
+        : route === "/threads" && !new URLSearchParams(path.split("?")[1]).has("ids") ? "discoveryReads" : undefined;
+      if (field) toolLog.write({ component: "robob", kind: "perf", name: "robob.messages_read",
+        ids: { ...loggingIds, threadId: loggingIds.threadId ?? "discovery:unscoped" }, props: { [field]: 1 } });
+      const query = new URLSearchParams(path.split("?")[1]);
+      const marker = method === "GET" && route === "/threads" && query.has("ids");
+      const crossThread = method === "GET" && route === "/messages" && query.has("threadIds");
+      // Physical reads are counted only after guard admission, including requests that later fail.
+      if (marker || crossThread) (query.get(marker ? "ids" : "threadIds") ?? "").split(",").forEach((threadId, index, ids) => {
+        toolLog.write({ component: "robob", kind: "perf", name: "robob.messages_read",
+          ids: { ...loggingIds, threadId, callBatchId: requestId }, props: marker
+            ? { markerPolls: index === 0 ? 1 : 0, markerChecks: 1, trackedThreads: ids.length }
+            : { crossThreadReads: index === 0 && !query.has("cursor") ? 1 : 0, crossThreadPages: index === 0 ? 1 : 0, crossThreadChecks: 1 } });
+      });
     });
     let loggingOk = false;
     let responseStatus: number | undefined;
@@ -283,8 +304,8 @@ export class ControlClient {
     }
   }
 
-  thread(threadId: string): Promise<{ thread: ThreadDetail }> {
-    return this.request("GET", `/threads/${encodeURIComponent(threadId)}`);
+  thread(threadId: string, options?: RequestOptions): Promise<{ thread: ThreadDetail }> {
+    return this.request("GET", `/threads/${encodeURIComponent(threadId)}`, undefined, options);
   }
 
   byNative(sessionId: string): Promise<{ thread: ThreadDetail }> {
@@ -310,6 +331,18 @@ export class ControlClient {
 
   messages(threadId: string, since?: number): Promise<{ messages: ControlMessage[]; state: ThreadState; status: string; runId: string | null }> {
     return this.request("GET", `/threads/${encodeURIComponent(threadId)}/messages?all=true&role=all${since === undefined ? "" : `&since=${since}`}`);
+  }
+
+  threadSummaries(ids: string[]): Promise<{ total: number; threads: ThreadSummary[] }> {
+    return this.listThreads({ ids, includeSubagents: true, limit: 50 });
+  }
+
+  crossThreadMessages({ threadIds, since, cursor, limit = 1000 }: { threadIds: string[]; since: number; cursor?: string; limit?: number }): Promise<{
+    messages: Array<ControlMessage & { threadId: string }>; nextCursor: string | null;
+  }> {
+    const query = new URLSearchParams({ role: "all", threadIds: threadIds.join(","), since: String(since), limit: String(limit) });
+    if (cursor !== undefined) query.set("cursor", cursor);
+    return this.request("GET", `/messages?${query}`);
   }
 
   projects(): Promise<{ projects: Array<{ projectId: string; title: string; workspaceRoot: string; scratch?: boolean }> }> {

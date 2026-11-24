@@ -3,9 +3,10 @@ import { bounded } from "./bounded.ts";
 import { PromptProbeTracker } from "./prompt-probe.ts";
 import { RobobLinkDown } from "./robob-link-gate.ts";
 import { ProbeBackoff, ProbeBudget, probeDeferred } from "./probe-policy.ts";
-import { findOverdue, reconcileLegacyReplies, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
+import { findOverdue, reconcileLegacyReplies, settleStalePending, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
 import { toolLog as watcherLog } from "./watcherlog.ts";
 import { completionReady, toolError, toolLog } from "./toollog.ts";
+import { robobErrorCode, turnFailCause, type TurnFailInfo } from "./turn-fail-cause.ts";
 import { captureReadTiming, completionChecked, includeReadTiming, timeTick, type ReadTiming } from "./tick-timing.ts";
 import { appendFold, foldMedsLine, foldSkipped, type FoldOptions } from "./meds-fold.ts";
 import { createHash } from "node:crypto";
@@ -33,10 +34,10 @@ import { appendObserved, classifyGroupMessage, GROUP_ENGAGED_MS, isTapback, ment
 import { groupLines, inboundTime, inboundWords, JEV_CHUNK, JEV_THRESHOLD, JudgeError, judgeState, replyTarget as judgeReplyTarget, speakerName, targetLine, type GroupJudge } from "./group-judge.ts";
 import type { Swipes, SwipeTarget } from "./swipe.ts";
 import { criticalWake, FAILED_INBOUND_ALERT_MAX_AGE_MS, FAILED_INBOUND_REPLAY_MAX_AGE_MS, failureMessage, wakeEventPreview } from "./inbound-failure.ts";
-import { isAgentBusWake } from "./agent-bus.ts";
+import { AGENT_BUS_TIMEOUT_MS, isAgentBusWake } from "./agent-bus.ts";
 import { HUMAN_FAILURE_BACKOFF_MS, leaderKind, MAX_FAILED_ATTEMPTS, requeueHuman, type RequeueHumanOptions, type RequeueOutcome, type RequeueReason } from "./inbound-routing.ts";
 import { controlDisposition, controlFailureProps, type ControlFailure } from "./control-errors.ts";
-import { WakeDelivery, wakeStatus, WAKE_AMBIGUITY_MS, WAKE_DELIVERY_MS } from "./wake-delivery.ts";
+import { WakeDelivery, wakeStatus, WAKE_AMBIGUITY_MS, WAKE_DELIVERY_MS, type WakeFailReason, type WakeFailStage } from "./wake-delivery.ts";
 export { leaderKind, requeueHuman } from "./inbound-routing.ts";
 export { textingStyle } from "./texting-style.ts";
 
@@ -759,7 +760,14 @@ export class Router {
         }
         throw error;
       }
-      if (observation.probe && error !== probeDeferred) toolLog.capture(() => observation.probe?.failure(error));
+      if (error === probeDeferred) {
+        if (ownsLease()) {
+          this.probeBackoff.release(leader);
+          this.probeBackoff.release(promptKey);
+        }
+        throw error;
+      }
+      if (observation.probe) toolLog.capture(() => observation.probe?.failure(error));
       // A receipt can settle this read while it is pending; late failures cannot restore its history.
       if (!ownsLease()) throw probeDeferred;
       const backoff = this.probeBackoff.failed(leader);
@@ -958,7 +966,7 @@ export class Router {
   private readonly wakes: WakeDelivery;
 
   /** Finalize local failure independently of link state or a prior admission receipt. Call inside a transaction. */
-  private failWake(id: string, reason: Parameters<WakeDelivery["failed"]>[1]): void {
+  private failWake(id: string, reason: WakeFailReason): void {
     this.wakes.accept(id);
     const status = wakeStatus(this.store, id);
     if (!status) return;
@@ -967,7 +975,7 @@ export class Router {
     if (status.state === "admitted" && ["done", "admitted"].includes(row.state)) return;
     const input = JSON.parse(row.payload) as NormalizedInbound;
     if (status.state !== "failed" && !["failed", "cancelled"].includes(row.state)) {
-      this.wakes.failed(id, reason);
+      this.wakes.failed(id, reason, "synthetic");
       if (!isAgentBusWake(id) && !replyNudgeRow(id) && Date.now() - status.acceptedAt <= 24 * 60 * 60_000) {
         this.queueDropped(id, input.text, "undelivered");
         this.carryMissed(id, input.text, { uncertain: reason === "stale" || status.firstSendAt !== undefined,
@@ -1048,6 +1056,7 @@ export class Router {
   private readonly unansweredStartedAt = Date.now();
   private checkingUnanswered?: Promise<void>;
   private reconciledLegacyReplies = false;
+  private settledStalePending = false;
 
   checkUnanswered(now = Date.now()): Promise<void> {
     return this.checkingUnanswered ??= this.sweepUnanswered(now).finally(() => { this.checkingUnanswered = undefined; });
@@ -1058,6 +1067,11 @@ export class Router {
   }
 
   private async sweepUnanswered(now: number): Promise<void> {
+    // Group chats skip overdue tracking, but they strand queued rows too.
+    if (!this.settledStalePending) {
+      settleStalePending(this.store, now);
+      this.settledStalePending = true;
+    }
     const chat = this.store.get<string>("unanswered-chat") ?? "other";
     if (chat === "other") return;
     if (!this.reconciledLegacyReplies) {
@@ -1187,6 +1201,19 @@ export class Router {
     this.store.set(`batch-phase:${leader}`, "accepted");
   }
 
+  private latencyProbeKey(threadId: string, prompt: string): string {
+    return `latency-probe:${hash(JSON.stringify([threadId, prompt]))}`;
+  }
+
+  private stopLatencyProbe(threadId: string, prompt: string, ageMs: number): void {
+    const key = this.latencyProbeKey(threadId, prompt);
+    const state = this.store.get<{ attempt: number; stoppedAt?: number }>(key);
+    if (state?.stoppedAt !== undefined) return;
+    this.store.set(key, { attempt: state?.attempt ?? 0, stoppedAt: Date.now() });
+    toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "router.prompt_probe_stopped",
+      ids: { threadId, messageId: prompt }, props: { attempt: state?.attempt ?? 0, ageMs, reason: "replay_deadline" } }));
+  }
+
   private async sweepInboundLatency(): Promise<void> {
     const chat = this.options.context?.chat;
     if (chat && chat.kind !== "owner" && chat.slug !== "moni") return;
@@ -1265,11 +1292,17 @@ export class Router {
       if (age > FAILED_INBOUND_REPLAY_MAX_AGE_MS && retryAt === undefined) continue;
       let absent = true;
       if (original) {
-        if (this.probeBackoff.cooling(leader)) absent = false;
+        const ids = [original.messageId, ...original.earlier ?? []];
+        // A stuck-wake retry keeps alerts/carry alive past the replay horizon, not acceptance reads.
+        if (age > FAILED_INBOUND_REPLAY_MAX_AGE_MS) {
+          for (const id of ids) this.stopLatencyProbe(original.id, id, age);
+          absent = false;
+        } else if (this.probeBackoff.cooling(leader)) absent = false;
         else {
           const steer = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
-          const ids = [original.messageId, ...original.earlier ?? []];
           for (const [probeIndex, id] of ids.entries()) {
+            const probeKey = this.latencyProbeKey(original.id, id);
+            if (this.store.get<{ stoppedAt?: number }>(probeKey)?.stoppedAt !== undefined) { absent = false; break; }
             const steeredAt = id === original.messageId && id === `msg_${hash(leader)}`
               && steer?.id === original.id && steer.directory === original.directory && steer.generation === original.generation
               ? steer.startedAt : undefined;
@@ -1277,6 +1310,7 @@ export class Router {
             const probeFailure: { value?: { error: unknown; props: Parameters<typeof toolError>[4] } } = {};
             try {
               if (await this.probeAccepted(original, id, leader, 10_000, () => {
+                this.store.set(probeKey, { attempt: (this.store.get<{ attempt: number }>(probeKey)?.attempt ?? 0) + 1 });
                 const probe = this.promptProbes.start(original.id, id, sentAt);
                 return { ...probe, failure: (error: unknown) => {
                   probeFailure.value = { error, props: undefined };
@@ -1353,7 +1387,7 @@ export class Router {
             this.latencyParentsAt = -Infinity;
           }
           this.carryMissed(row.id, input.text, { uncertain: attemptUsed, at: input.receivedAt! });
-          this.failInbound(row.id, "synthetic", "undelivered");
+          this.failInbound(row.id, "synthetic", "undelivered", undefined, { reason: routeRetired ? "route_retired" : "attempts_exhausted" });
           toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "synthetic.carried_from_stranded",
             ids: { inboundId: row.id, chat: chat?.slug ?? "owner" },
             props: { cause: routeRetired ? "route_retired" : "stuck_attempt_used" } }));
@@ -1470,9 +1504,11 @@ export class Router {
     this.options.log?.("inbound-failed", JSON.stringify({ id, chat: this.options.context?.chat.slug ?? "owner", ...failure }));
   }
 
-  private failInbound(id: string, stage: string, error: unknown, route = this.store.get<Route | null>("route")): void {
+  /** A wake's reason defaults to the stage failure; callers name a retry exhaustion or a timeout themselves. */
+  private failInbound(id: string, stage: WakeFailStage, error: unknown, route = this.store.get<Route | null>("route"),
+    wake: { reason: WakeFailReason; boundMs?: number } = { reason: "inbound_failed" }): void {
     if (error instanceof RobobLinkDown || this.backend.linkAvailable === false) return;
-    if (id.startsWith("wake:")) this.wakes.failed(id, "attempts_exhausted");
+    if (id.startsWith("wake:")) this.wakes.failed(id, wake.reason, stage, wake.boundMs);
     // Keep the transport exception rather than replacing it with a generic timeout notice.
     const prior = this.store.inboundFailure(id);
     if (!prior || prior.stage !== stage) this.recordFailure(id, stage, error, route);
@@ -1508,7 +1544,7 @@ export class Router {
       for (const member of ids) this.store.db.query("UPDATE inbound SET state = 'failed' WHERE id = ? AND state IN ('processing', 'batched')").run(member);
       this.store.set(`batch-phase:${id}`, "expired");
       if (preparing?.id === id) this.store.set("preparingDelivery", null);
-      if (attempted) this.logTurnEnd(attempted, "failed");
+      if (attempted) this.logTurnEnd(attempted, "failed", true, undefined, { cause: "timeout" });
       if (active?.inboundId === id) this.setTurn({ ...active, phase: "failed" });
       if (this.store.get<ResendBody | null>("resendBody")?.inboundId === id) this.store.set("resendBody", null);
       if (preparing?.id === id || active?.inboundId === id) this.clearDeliveryOutage();
@@ -1702,7 +1738,7 @@ export class Router {
       if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) {
         if (state === "failed") toolLog.capture(() => {
           const original = this.store.get<Turn | null>(`failed-delivery:${id}`);
-          if (original) this.logTurnEnd(original, "failed");
+          if (original) this.logTurnEnd(original, "failed", true, undefined, { cause: "undelivered" });
         });
         this.store.set("preparingDelivery", null);
       }
@@ -1810,7 +1846,8 @@ export class Router {
       const saved = JSON.parse(payload.get(id)?.payload ?? "{}") as Partial<NormalizedInbound> & { agentExpiresAt?: number };
       const text = saved.text ?? "";
       if (isAgentBusWake(id) && reason === "undelivered" && saved.agentExpiresAt !== undefined && Date.now() >= saved.agentExpiresAt) {
-        this.failInbound(id, "synthetic", reason);
+        // The bus ask window closed before a turn took the wake; agent-bus tells the asker.
+        this.failInbound(id, "synthetic", reason, undefined, { reason: "agent_bus_timeout", boundMs: AGENT_BUS_TIMEOUT_MS });
         continue;
       }
       if (isAgentBusWake(id) && reason === "undelivered" && saved.agentExpiresAt !== undefined && Date.now() < saved.agentExpiresAt) {
@@ -1841,10 +1878,10 @@ export class Router {
         this.failWake(id, "attempts_exhausted");
         continue;
       }
-      this.wakes.failed(id, "attempts_exhausted");
+      this.wakes.failed(id, "attempts_exhausted", "synthetic");
       this.queueDropped(id, text, reason);
       if (!isAgentBusWake(id)) this.carryMissed(id, text, { uncertain: reason === "undelivered" && wakeStatus(this.store, id)?.firstSendAt !== undefined });
-      this.failInbound(id, "synthetic", reason);
+      this.failInbound(id, "synthetic", reason, undefined, { reason: "attempts_exhausted" });
     }
     if (sealed && this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(leader)?.state === "pending") {
       this.store.set(`batch:${leader}`, sealed);
@@ -4722,7 +4759,7 @@ export class Router {
         } satisfies PreparingDelivery);
         this.setTurn(null);
       } else {
-        this.logTurnEnd(turn, "failed");
+        this.logTurnEnd(turn, "failed", true, undefined, { cause: "undelivered" });
         this.setTurn({ ...turn, phase: "failed" });
         this.clearDeliveryOutage();
         if (id !== undefined && this.store.get(`batch-phase:${id}`) === "submitting") this.store.set(`batch-phase:${id}`, null);
@@ -5466,6 +5503,9 @@ export class Router {
         const completedEarlier = replies.filter(reply => successfulReplies.has(reply.id)
           && (earlier.includes(reply) || reply === final && reply.answer !== false && !reply.error)
           && reply.id !== turn!.earlySent && !quiet.has(reply.id));
+        const providerError = [...replies].reverse().find(reply => reply.error)?.error;
+        const failInfo: TurnFailInfo = { idleOutcome: idle.outcome, ...(idle.diag ? { diag: idle.diag } : {}),
+          ...(providerError !== undefined ? { error: providerError } : {}), ...(idle.modelError || priorFailure?.modelError ? { modelError: true } : {}) };
         const failAfterEarlier = async (text: string, reason: DropReason, immediate = false) => {
           const said = (this.toolMode ? [] : completedEarlier).map(reply => ({ reply, text: replyText(assistantText(reply)) }))
             .filter(item => item.text && !this.store.getOperation(`reply:${turn!.generation}:${item.reply.id}`));
@@ -5491,14 +5531,13 @@ export class Router {
             const completed = turn!.inboundId && successful.has(turn!.messageId)
               ? this.store.get<NormalizedInbound | null>(`batch:${turn!.inboundId}`)?.batchIds ?? [turn!.inboundId] : [];
             const admitted = new Set(completed.filter(id => this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state === "admitted"));
-            this.fail(turn!, text, idle.id, reason, immediate);
+            this.fail(turn!, text, idle.id, reason, immediate, failInfo);
             if (!this.store.get(`human-own-turn:${turn!.inboundId}`))
               for (const id of completed) this.store.updateInbound(id, admitted.has(id) ? "admitted" : "done");
           }).immediate();
           this.logNoticeReply(turn!, scope, idle, "watch", false, "failed");
           if (!this.toolMode && completedEarlier.length) this.stage("reply-enqueued", turn!.inboundId ?? turn!.messageId);
         };
-        const providerError = [...replies].reverse().find(reply => reply.error)?.error;
         if (turn.inboundId && providerError) {
           const detail = typeof providerError === "object" && "message" in providerError ? providerError.message : providerError;
           this.recordFailure(turn.inboundId, "execution", detail, turn);
@@ -6252,7 +6291,7 @@ export class Router {
     return result;
   }
 
-  private logTurnEnd(turn: Turn, outcome: "replied" | "failed" | "refused" | "no_reply", recover = true, endReason?: DropReason | "run_terminal" | "hold_bound"): void {
+  private logTurnEnd(turn: Turn, outcome: "replied" | "failed" | "refused" | "no_reply", recover = true, endReason?: DropReason | "run_terminal" | "hold_bound", info?: TurnFailInfo): void {
     if (recover && !this.store.get(`human-settled:${turn.messageId}`)) {
       this.recoverHumanHandoffs(turn, outcome);
       this.store.set(`human-settled:${turn.messageId}`, true);
@@ -6276,11 +6315,36 @@ export class Router {
       if (this.store.get(key)) return;
       this.store.set(key, true);
       toolLog.write({ component: "router", kind: "perf", name: "turn.end", durationMs: Math.max(0, Date.now() - turn.startedAt),
-        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) }, props: { outcome, endReason: endReason ?? (outcome === "replied" || outcome === "no_reply" ? "run_completed" : outcome) } });
+        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) },
+        props: { outcome, endReason: endReason ?? (outcome === "replied" || outcome === "no_reply" ? "run_completed" : outcome), ...(outcome === "failed" || outcome === "refused" ? this.failProps(turn, outcome, endReason, info) : {}) } });
     });
   }
 
-  private fail(snapshot: Turn, text: string, watermark?: string, reason: DropReason = "failed", immediate = false): void {
+  /** Cause fields for a failed turn.end row (#137). Read-only: it never feeds a retry, and an odd input logs `unknown`. */
+  private failProps(turn: Turn, outcome: string, endReason?: DropReason | "run_terminal" | "hold_bound", info?: TurnFailInfo): Record<string, string | number | boolean> {
+    const sinceTurnStartMs = Math.max(0, Date.now() - turn.startedAt);
+    try {
+      const linkDown = this.backend.linkAvailable === false;
+      const failCause = turnFailCause({ outcome, endReason, linkDown, info, sinceTurnStartMs });
+      const errorCode = robobErrorCode(info?.error, info?.modelError);
+      const attempt = (turn.inboundId ? this.store.get<number>(`human-failed-attempts:${turn.inboundId}`) : undefined) ?? turn.attempt ?? 1;
+      // Any row this turn carried that is queued again: its own (a wake's retry) or a person's handoff.
+      const carried = new Set([turn.inboundId, ...turn.covered ?? [], ...this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? []]);
+      const requeued = [...carried].some(id => id !== undefined
+        && this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state === "pending");
+      return { failCause, sinceTurnStartMs, attempt, requeued,
+        ...(info?.diag?.runStatus ? { robobRunStatus: info.diag.runStatus } : {}),
+        ...(info?.diag?.cancelReason ? { robobCancelReason: info.diag.cancelReason } : {}),
+        ...(errorCode ? { robobErrorCode: errorCode } : {}),
+        ...(info?.diag?.provider ? { provider: info.diag.provider } : {}),
+        ...(info?.diag?.model ? { model: info.diag.model } : {}) };
+    } catch (caughtError) {
+      toolError("router", "router.fail_props", caughtError);
+      return { failCause: "unknown", sinceTurnStartMs };
+    }
+  }
+
+  private fail(snapshot: Turn, text: string, watermark?: string, reason: DropReason = "failed", immediate = false, info?: TurnFailInfo): void {
     // A steer can be confirmed while failure reads await the backend; retain that ownership across restart.
     const turn = this.typedInto(snapshot) ? { ...snapshot, typed: true } : snapshot;
     const recovery = this.recoverHumanHandoffs(turn, "failed", text);
@@ -6339,6 +6403,6 @@ export class Router {
       if (watermark || reason !== "undelivered") this.store.set("watermark", watermark ? { sessionId: turn.id, id: watermark } satisfies Watermark : null);
       this.store.set("settledAt", Date.now());
     }).immediate();
-    this.logTurnEnd(turn, "failed", true, reason);
+    this.logTurnEnd(turn, "failed", true, reason, info);
   }
 }

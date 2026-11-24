@@ -24,6 +24,7 @@ import { cleanRenders, createRenderAggregation, renderChat } from "./log-renders
 import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./log-error.ts";
 import { CONTROL_REASONS, controlFailureProps } from "./control-errors.ts";
 import { LOOP_OPERATIONS, loopOperations, traceLoopOperation } from "./loop-stall.ts";
+import { CANCEL_REASONS, FAIL_CAUSES, ROBOB_ERROR_CODES } from "./turn-fail-cause.ts";
 import { FETCH_CAUSES, cleanCardUrlClass, cleanRenderCardId, type CardFetchFailure } from "./log-card-fetch.ts";
 import { DURATION_INVALID, REPLY_LATENCY_EVENTS, START_SOURCES } from "./reply-latency.ts";
 
@@ -45,21 +46,22 @@ const processRunId = randomUUID();
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
-const ID_KEYS = new Set(["chat", "messageId", "inboundId", "outboxId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId", "requestId", "serverRequestId", "outageId"]);
+const ID_KEYS = new Set(["chat", "messageId", "inboundId", "outboxId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId", "requestId", "serverRequestId", "outageId", "tickId"]);
 const WAKE_EVENTS = new Set(["wake.accepted", "wake.turn_start", "wake.send_ambiguous", "wake.admitted", "wake.retry_scheduled", "wake.failed", "wake.waiting"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "generation", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews", "linkFailureCount", "boundMs", "elapsedMs", "msUntilAccepted", "downMs", "skippedCalls", "failedProbes", "streakCount", "backoffMs"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "generation", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews", "linkFailureCount", "boundMs", "elapsedMs", "msUntilAccepted", "downMs", "skippedCalls", "failedProbes", "streakCount", "backoffMs", "markerPolls", "crossThreadReads", "crossThreadPages", "markerSkips", "fallbacks", "trackedThreads", "detailReads", "detailDeferred", "streak", "evidenceReads", "discoveryReads", "markerChecks", "crossThreadChecks", "detailCarried"]);
 const ENUMS: Record<string, readonly string[]> = {
   causeKind: ["timeout", "http", "transport"],
   probeOutcome: ["accepted", "notAcceptedYet", "timeout", "http", "transport"],
   controlReason: CONTROL_REASONS,
   route: ["new_turn", "steer", "question_answer", "held_for_wake"],
   readMode: ["full", "incremental", "cached-skip", "shared"],
+  fallbackReason: ["marker-error", "missing-marker", "cross-thread-error", "state-raced"],
   fullReason: ["first-read", "route-change", "missing-until", "resync", "merge-conflict", "clock-skew"],
   kind: ["control", "conversation", "notification", "outage", "dropped", "failed", "nudge", "request", "other", "down", "up"],
   state: ["pending", "admitted", "processing", "batched", "done", "failed", "unknown", "cancelled", "observed"],
   action: ["requeued", "in_turn"], leaderKind: ["human", "wake", "reset", "background", "none"],
   telegram: ["sent", "failed"], severity: ["warn"],
-  replyMode: ["final", "tool"], reason: ["watchdog_overdue", "respond_failed", "steer_failed", "background_no_reply", "turn_failed", "agent_no_reply", "background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal", "providerFailureStreak", "grace", "not-waiting", "already-sent", "rate-limited"],
+  replyMode: ["final", "tool"], reason: ["timeout", "error", "status", "watchdog_overdue", "respond_failed", "steer_failed", "background_no_reply", "turn_failed", "agent_no_reply", "stale_stranded", "background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal", "providerFailureStreak", "grace", "not-waiting", "already-sent", "rate-limited"],
   attribution: ["explicit", "active_turn", "pending_inbound", "none"],
   source: ["live", "backfill", "watch", "settle_preceding"], outcome: ["replied", "failed", "refused", "no_reply", "ok", "fallback", "forwarded", "quiet", "owner_typed", "incomplete"],
   cardKind: ["quick", "delivery", "ride", "nutrition", "secure_form", "other"], phase: ["start", "stop"],
@@ -137,8 +139,9 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       if (key === "source" && typeof value === "string" && value.length <= 100 && !/[\x00-\x1f\x7f-\x9f]/.test(value)
         || key === "causeKey" && typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,100}$/.test(value)
         || key === "route" && value === "/threads/:id/send"
-        || key === "reason" && ["ambiguity_deadline", "delivery_deadline", "stale", "attempts_exhausted", "route_retired", "holder", "link_down", "cooldown", "admission"].includes(String(value))
+        || key === "reason" && ["ambiguity_deadline", "delivery_deadline", "stale", "attempts_exhausted", "route_retired", "agent_bus_timeout", "inbound_failed", "holder", "link_down", "cooldown", "admission"].includes(String(value))
         || key === "holderPhase" && ["submitting", "running", "unknown", "held", "failed"].includes(String(value))
+        || key === "stage" && entry.name === "wake.failed" && ["synthetic", "prepare", "dispatch", "execution"].includes(String(value))
         || key === "attempt" && entry.name === "wake.failed" && value === 0
         || key === "remainingMs" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0
         || key === "nextAt" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
@@ -161,6 +164,17 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     if (entry.name === "turn.end" && key === "endReason" && ["undelivered", "failed", "errored", "expired", "run_terminal", "hold_bound", "run_completed", "replied", "no_reply", "refused"].includes(String(value))) {
       props[key] = value; continue;
     }
+    if (entry.name === "turn.end" && ["failCause", "robobRunStatus", "robobCancelReason", "robobErrorCode", "provider", "model", "requeued", "sinceTurnStartMs"].includes(key)) {
+      if (key === "failCause" && FAIL_CAUSES.some(cause => cause === value)
+        || key === "robobErrorCode" && ROBOB_ERROR_CODES.some(code => code === value)
+        || key === "robobCancelReason" && CANCEL_REASONS.some(reason => reason === value)
+        || key === "robobRunStatus" && typeof value === "string" && /^[a-z][a-z_-]{0,29}$/.test(value)
+        // Model ids are config labels (`claude-opus-5-5`, `ag/gemini-4-neon-high`), never message text.
+        || (key === "provider" || key === "model") && typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_.:/@-]{0,99}$/.test(value) && !/\d{6,}/.test(value)
+        || key === "requeued" && typeof value === "boolean"
+        || key === "sinceTurnStartMs" && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
+      continue;
+    }
     if (entry.component === "robob" && entry.name === "robob.active_roster") {
       const fields = cleanRosterHealth({ [key]: value });
       if (typeof fields?.[key] === "number") props[key] = fields[key];
@@ -178,6 +192,9 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
         || ["latency_ms", "depth"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) {
         props[key] = value; continue;
       }
+    }
+    if (entry.name === "router.prompt_probe_stopped" && key === "reason" && value === "replay_deadline") {
+      props[key] = value; continue;
     }
     if (entry.name === "synthetic.carry_evicted" && key === "reason" && (value === "expired" || value === "overflow")
       || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
