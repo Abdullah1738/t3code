@@ -5,6 +5,7 @@ import { toolLog } from "./toollog.ts";
 export const UNANSWERED_REQUEUE_MS = 5 * 60_000;
 export const UNANSWERED_ALERT_MS = 10 * 60_000;
 export const UNANSWERED_RESTART_WINDOW_MS = 30 * 60_000;
+export const STALE_PENDING_SETTLE_MS = 24 * 60 * 60_000;
 
 /** Remote content stays encrypted; the relay needs only receipt times and reply attribution. */
 export class RemoteUnanswered {
@@ -223,7 +224,7 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
 export function markSettled(
   store: Store,
   ids: string[],
-  reason: "agent_no_reply",
+  reason: "agent_no_reply" | "stale_stranded",
   opts: { now?: number; threadId?: string } = {},
 ): void {
   const now = opts.now ?? Date.now();
@@ -250,6 +251,35 @@ export function markSettled(
       }));
     }
   }).immediate();
+}
+
+/** Retire queued human rows stranded for a day so they stop counting as pending, without claiming a reply. */
+export function settleStalePending(store: Store, now = Date.now()): string[] {
+  const active = store.get<ReplyTurn | null>("activeTurn");
+  const inTurn = new Set(active ? turnMembers(store, active) : []);
+  const queued = store.db.query<{ id: string; payload: string }, []>(`SELECT id, payload FROM inbound
+    WHERE state IN ('pending', 'batched')
+      AND json_extract(payload, '$.answeredAt') IS NULL
+      AND json_extract(payload, '$.settledAt') IS NULL
+    ORDER BY rowid`).all();
+  const stale = new Set(queued.filter(row => {
+    if (!humanRow(row.id) || inTurn.has(row.id)) return false;
+    const input = JSON.parse(row.payload) as AnsweredInput;
+    if (!humanInput(input) && !(input.source === undefined && input.id === row.id && Array.isArray(input.attachments))) return false;
+    return typeof input.receivedAt !== "number" || !Number.isFinite(input.receivedAt) || now - input.receivedAt > STALE_PENDING_SETTLE_MS;
+  }).map(row => row.id));
+  // Settle whole sealed batches only: a leader retired under a live member would orphan that member.
+  const live = new Set(queued.map(row => row.id));
+  const ids = [...stale].filter(id => sealedBatch(store, id).members.every(member => stale.has(member) || !live.has(member)));
+  if (!ids.length) return [];
+  markSettled(store, ids, "stale_stranded", { now });
+  const settled = ids.filter(id => {
+    const row = store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+    const input = row ? JSON.parse(row.payload) as AnsweredInput : undefined;
+    return input?.settledReason === "stale_stranded" && input.settledAt === now;
+  });
+  for (const id of settled) store.set(`batch-phase:${id}`, null);
+  return settled;
 }
 
 export type Running = { members: readonly string[]; leaderKind: "human" | "wake" | "reset" | "background" };

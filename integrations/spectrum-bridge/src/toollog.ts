@@ -58,7 +58,7 @@ const ENUMS: Record<string, readonly string[]> = {
   state: ["pending", "admitted", "processing", "batched", "done", "failed", "unknown", "cancelled", "observed"],
   action: ["requeued", "in_turn"], leaderKind: ["human", "wake", "reset", "background", "none"],
   telegram: ["sent", "failed"], severity: ["warn"],
-  replyMode: ["final", "tool"], reason: ["watchdog_overdue", "respond_failed", "steer_failed", "background_no_reply", "turn_failed", "agent_no_reply", "background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal", "providerFailureStreak", "grace", "not-waiting", "already-sent", "rate-limited"],
+  replyMode: ["final", "tool"], reason: ["watchdog_overdue", "respond_failed", "steer_failed", "background_no_reply", "turn_failed", "agent_no_reply", "stale_stranded", "background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal", "providerFailureStreak", "grace", "not-waiting", "already-sent", "rate-limited"],
   attribution: ["explicit", "active_turn", "pending_inbound", "none"],
   source: ["live", "backfill", "watch", "settle_preceding"], outcome: ["replied", "failed", "refused", "no_reply", "ok", "fallback", "forwarded", "quiet", "owner_typed", "incomplete"],
   cardKind: ["quick", "delivery", "ride", "nutrition", "secure_form", "other"], phase: ["start", "stop"],
